@@ -33,6 +33,12 @@ pub enum ScxError {
     #[error("unknown section type: {0}")]
     UnknownSectionType(u8),
 
+    #[error("codec error: {0}")]
+    Codec(#[from] scx_codec::CodecError),
+
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
