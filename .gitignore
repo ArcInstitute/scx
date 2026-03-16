@@ -1,0 +1,43 @@
+# Misc
+archive/
+tasks/
+tmp/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+.eggs/
+
+# pyscx / maturin
+pyscx/target/
+*.whl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data (large files)
+tests/test_data/*.h5ad
+tests/test_data/*.h5
+benchmarks/data/
+
+# Benchmark results (keep scripts, not outputs)
+benchmarks/results/
+
+# HDF5 build artifacts
+*.hdf5
