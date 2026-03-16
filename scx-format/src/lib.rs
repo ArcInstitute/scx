@@ -8,5 +8,4 @@ pub mod section;
 pub mod shard;
 pub mod writer;
 
-// Re-exports (uncomment when error types are implemented in task 1)
-// pub use error::{Result, ScxError};
+pub use error::{Result, ScxError};
