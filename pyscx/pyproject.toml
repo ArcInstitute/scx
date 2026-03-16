@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyscx"
+version = "0.1.0"
+description = "Python bindings for SCX (Sparse Cell eXpression System)"
+license = {text = "MIT"}
+authors = [
+    {name = "Nick Youngblut", email = "nick.youngblut@arcinstitute.org"}
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pyarrow",
+    "anndata",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "scanpy",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

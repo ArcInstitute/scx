@@ -1,0 +1,24 @@
+[package]
+name = "scx-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+scx-codec = { path = ".." }
+
+[[bin]]
+name = "fuzz_bitstream"
+path = "fuzz_targets/fuzz_bitstream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_rice"
+path = "fuzz_targets/fuzz_rice.rs"
+test = false
+doc = false

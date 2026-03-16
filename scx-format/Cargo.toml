@@ -1,0 +1,18 @@
+[package]
+name = "scx-format"
+version = "0.1.0"
+edition = "2021"
+description = "File layout, header, catalog, and shard I/O for SCX format"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+arrow = { workspace = true }
+zstd = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+scx-codec = { path = "../scx-codec" }

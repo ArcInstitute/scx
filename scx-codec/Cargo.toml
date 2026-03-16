@@ -1,0 +1,11 @@
+[package]
+name = "scx-codec"
+version = "0.1.0"
+edition = "2021"
+description = "Compression codecs for SCX (Rice, FOR-BP, Delta-Golomb)"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+byteorder = { workspace = true }
+thiserror = { workspace = true }

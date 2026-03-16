@@ -1,0 +1,19 @@
+[package]
+name = "scx-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for SCX: convert, info, validate"
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+hdf5 = ["dep:hdf5"]
+
+[dependencies]
+clap = { workspace = true }
+indicatif = { workspace = true }
+hdf5 = { workspace = true, optional = true }
+scx-format = { path = "../scx-format" }
+scx-codec = { path = "../scx-codec" }
+scx-sparse = { path = "../scx-sparse" }
