@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod convert;
 mod info;
 mod validate;

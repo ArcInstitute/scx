@@ -44,8 +44,7 @@ impl ScxReader {
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
 
         // Read root catalog at offset 256
-        let root_catalog =
-            RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..]))?;
+        let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..]))?;
 
         // Read full catalog using header's offset and length
         let fc_offset = header.full_catalog_offset as usize;
@@ -206,9 +205,7 @@ impl ScxReader {
             .full_catalog
             .entries
             .iter()
-            .filter(|e| {
-                e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix)
-            })
+            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix))
             .collect();
 
         if shards.is_empty() {
@@ -307,12 +304,10 @@ impl ScxReader {
         let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
 
         // Extract encoded byte slices
-        let indptr_bytes =
-            &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
+        let indptr_bytes = &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
         let indices_bytes =
             &section[sh.indices_rel_offset as usize..][..sh.indices_length as usize];
-        let values_bytes =
-            &section[sh.values_rel_offset as usize..][..sh.values_length as usize];
+        let values_bytes = &section[sh.values_rel_offset as usize..][..sh.values_length as usize];
         let block_index_bytes =
             &section[sh.block_index_rel_offset as usize..][..sh.block_index_length as usize];
 
@@ -328,8 +323,7 @@ impl ScxReader {
         }
 
         // Resolve codec and encoding from shard header (NOT file header)
-        let codec_id = CodecId::from_u8(sh.codec_id)
-            .ok_or(ScxError::UnknownCodec(sh.codec_id))?;
+        let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
         let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
             .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
         let index_dtype_u16 = sh.index_dtype == 0;
@@ -827,7 +821,14 @@ mod tests {
         // Write X shards
         let (indptr, indices, values) = sample_shard_data(6, 10);
         writer
-            .write_csr_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint8, 0)
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
             .unwrap();
 
         // Write "raw" layer shard

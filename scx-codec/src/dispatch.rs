@@ -211,10 +211,7 @@ fn encode_scx1(
     let indptr_bytes = delta_golomb_encode(indptr);
 
     // indices → FOR-BP (needs row_lengths from indptr)
-    let row_lengths: Vec<usize> = indptr
-        .windows(2)
-        .map(|w| (w[1] - w[0]) as usize)
-        .collect();
+    let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
     let indices_bytes = forbp_encode(indices, &row_lengths, index_dtype_u16);
 
     // values → reinterpret to u32, then Rice encode
@@ -449,9 +446,7 @@ mod tests {
     ///   row 0: cols [1, 3]       vals [5, 10]
     ///   row 1: cols [0, 2, 4]    vals [1, 3, 7]
     ///   row 2: cols [2]          vals [2]
-    fn make_test_csr(
-        value_encoding: ValueEncoding,
-    ) -> (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize) {
+    fn make_test_csr(value_encoding: ValueEncoding) -> (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize) {
         let indptr: Vec<u64> = vec![0, 2, 5, 6];
         let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
         let values_u32: Vec<u32> = vec![5, 10, 1, 3, 7, 2];
@@ -536,9 +531,15 @@ mod tests {
     #[test]
     fn test_none_produces_raw_bytes() {
         let (indptr, indices, values, _n_rows, _nnz) = make_test_csr(ValueEncoding::Uint32);
-        let encoded =
-            encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint32, false)
-                .unwrap();
+        let encoded = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint32,
+            false,
+        )
+        .unwrap();
 
         // indptr: 4 u64 values = 32 bytes
         assert_eq!(encoded.indptr_bytes.len(), 4 * 8);
@@ -596,9 +597,15 @@ mod tests {
             false,
         )
         .unwrap();
-        let (dec_indptr, dec_indices, dec_values) =
-            decode_shard(&encoded, CodecId::Zstd, ValueEncoding::Float32, n_rows, nnz, false)
-                .unwrap();
+        let (dec_indptr, dec_indices, dec_values) = decode_shard(
+            &encoded,
+            CodecId::Zstd,
+            ValueEncoding::Float32,
+            n_rows,
+            nnz,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(indptr, dec_indptr);
         assert_eq!(indices, dec_indices);

@@ -125,8 +125,7 @@ impl ScxWriter {
     fn write_arrow_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         {
-            let mut writer =
-                arrow::ipc::writer::FileWriter::try_new(&mut buf, batch.schema_ref())?;
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, batch.schema_ref())?;
             writer.write(batch)?;
             writer.finish()?;
         }
@@ -158,7 +157,12 @@ impl ScxWriter {
     /// Write an obsm embedding section (Arrow IPC).
     pub fn write_obsm(&mut self, name: &str, batch: &RecordBatch) -> Result<()> {
         let data = Self::write_arrow_ipc(batch)?;
-        self.write_section_bytes(format!("obsm/{name}"), SectionType::ObsmEmbedding, &data, None)
+        self.write_section_bytes(
+            format!("obsm/{name}"),
+            SectionType::ObsmEmbedding,
+            &data,
+            None,
+        )
     }
 
     /// Write the provenance section.
@@ -358,13 +362,7 @@ impl ScxWriter {
         self.current_offset += section_length;
 
         // Compute shard stats from raw values
-        let stats = compute_shard_stats(
-            values,
-            value_encoding,
-            row_start,
-            n_major as u64,
-            nnz,
-        );
+        let stats = compute_shard_stats(values, value_encoding, row_start, n_major as u64, nnz);
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
@@ -384,9 +382,7 @@ impl ScxWriter {
     pub fn finish(mut self) -> Result<PathBuf> {
         // Flush BufWriter and take inner File
         let buf_writer = self.file.take().expect("ScxWriter already finished");
-        let mut file = buf_writer
-            .into_inner()
-            .map_err(std::io::Error::from)?;
+        let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
 
         // 1. Write full catalog at EOF
         let aligned_offset = align_to_8(self.current_offset);
@@ -611,7 +607,9 @@ mod tests {
         let schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
         RecordBatch::try_new(
             Arc::new(schema),
-            vec![Arc::new(StringArray::from(vec!["cell_0", "cell_1", "cell_2"]))],
+            vec![Arc::new(StringArray::from(vec![
+                "cell_0", "cell_1", "cell_2",
+            ]))],
         )
         .unwrap()
     }
@@ -646,7 +644,14 @@ mod tests {
 
         let (indptr, indices, values) = sample_shard_data();
         writer
-            .write_csr_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint8, 0)
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
             .unwrap();
 
         let final_path = writer.finish().unwrap();
@@ -704,7 +709,14 @@ mod tests {
 
         let (indptr, indices, values) = sample_shard_data();
         writer
-            .write_csr_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint8, 0)
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
             .unwrap();
 
         writer.finish().unwrap();
@@ -783,7 +795,14 @@ mod tests {
 
         let (indptr, indices, values) = sample_shard_data();
         writer
-            .write_csr_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint8, 0)
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
             .unwrap();
 
         // Layer shard
@@ -869,7 +888,14 @@ mod tests {
 
         let (indptr, indices, values) = sample_shard_data();
         writer
-            .write_csr_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint8, 0)
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
             .unwrap();
 
         let final_path = writer.finish().unwrap();

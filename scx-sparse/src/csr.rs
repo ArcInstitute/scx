@@ -267,25 +267,13 @@ mod tests {
     // 12.10: single-row and single-column
     #[test]
     fn single_row_matrix() {
-        let csr = ScxCsr::new(
-            (1, 4),
-            vec![0, 2],
-            vec![1, 3],
-            vec![5.0, 9.0],
-        )
-        .unwrap();
+        let csr = ScxCsr::new((1, 4), vec![0, 2], vec![1, 3], vec![5.0, 9.0]).unwrap();
         assert_eq!(csr.to_dense(), vec![0.0, 5.0, 0.0, 9.0]);
     }
 
     #[test]
     fn single_column_matrix() {
-        let csr = ScxCsr::new(
-            (3, 1),
-            vec![0, 1, 1, 1],
-            vec![0],
-            vec![7.0],
-        )
-        .unwrap();
+        let csr = ScxCsr::new((3, 1), vec![0, 1, 1, 1], vec![0], vec![7.0]).unwrap();
         assert_eq!(csr.to_dense(), vec![7.0, 0.0, 0.0]);
     }
 
@@ -293,7 +281,13 @@ mod tests {
     #[test]
     fn error_indptr_length() {
         let err = ScxCsr::new((3, 5), vec![0, 2, 5], vec![], vec![]).unwrap_err();
-        assert!(matches!(err, CsrError::IndptrLength { got: 3, expected: 4 }));
+        assert!(matches!(
+            err,
+            CsrError::IndptrLength {
+                got: 3,
+                expected: 4
+            }
+        ));
     }
 
     #[test]
@@ -305,7 +299,13 @@ mod tests {
             vec![5.0], // only 1, but indices has 2
         )
         .unwrap_err();
-        assert!(matches!(err, CsrError::IndicesDataMismatch { indices: 2, data: 1 }));
+        assert!(matches!(
+            err,
+            CsrError::IndicesDataMismatch {
+                indices: 2,
+                data: 1
+            }
+        ));
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
         let err = ScxCsr::new(
             (1, 5),
             vec![0, 3], // claims 3 nnz
-            vec![1, 2],  // but only 2
+            vec![1, 2], // but only 2
             vec![1.0, 2.0],
         )
         .unwrap_err();
@@ -335,13 +335,7 @@ mod tests {
 
     #[test]
     fn error_indptr_negative_start() {
-        let err = ScxCsr::new(
-            (1, 5),
-            vec![-1, 0],
-            vec![],
-            vec![],
-        )
-        .unwrap_err();
+        let err = ScxCsr::new((1, 5), vec![-1, 0], vec![], vec![]).unwrap_err();
         assert!(matches!(err, CsrError::IndptrNegativeStart(-1)));
     }
 
@@ -357,19 +351,17 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            CsrError::IndexOutOfRange { index: 5, n_cols: 5, position: 1 }
+            CsrError::IndexOutOfRange {
+                index: 5,
+                n_cols: 5,
+                position: 1
+            }
         ));
     }
 
     #[test]
     fn error_negative_index() {
-        let err = ScxCsr::new(
-            (1, 5),
-            vec![0, 1],
-            vec![-1],
-            vec![1.0],
-        )
-        .unwrap_err();
+        let err = ScxCsr::new((1, 5), vec![0, 1], vec![-1], vec![1.0]).unwrap_err();
         assert!(matches!(err, CsrError::IndexOutOfRange { index: -1, .. }));
     }
 }

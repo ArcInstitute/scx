@@ -126,11 +126,7 @@ pub fn delta_golomb_decode(
 
     for _ in 0..n_deltas {
         let q = reader.read_unary()?;
-        let r = if k > 0 {
-            reader.read_bits(k)?
-        } else {
-            0
-        };
+        let r = if k > 0 { reader.read_bits(k)? } else { 0 };
         let delta = (q << k) | r;
         let prev = *indptr.last().unwrap();
         indptr.push(prev + delta);

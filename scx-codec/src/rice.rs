@@ -79,7 +79,11 @@ pub fn rice_encode(values: &[u32], block_size: usize) -> Vec<u8> {
 /// Decode Rice-encoded values.
 ///
 /// Returns `n_values` decoded values, each >= 1.
-pub fn rice_decode(data: &[u8], n_values: usize, block_size: usize) -> Result<Vec<u32>, BitStreamError> {
+pub fn rice_decode(
+    data: &[u8],
+    n_values: usize,
+    block_size: usize,
+) -> Result<Vec<u32>, BitStreamError> {
     let mut output = Vec::with_capacity(n_values);
     let mut reader = BitReader::new(data);
     let mut remaining = n_values;

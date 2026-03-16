@@ -157,9 +157,12 @@ pub fn forbp_decode(
 
     while rows_remaining > 0 {
         // Read block header
-        let _block_nnz = cursor.read_u32::<LittleEndian>().map_err(|_| BitStreamError)?;
-        let n_rows_in_block =
-            cursor.read_u16::<LittleEndian>().map_err(|_| BitStreamError)? as usize;
+        let _block_nnz = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|_| BitStreamError)?;
+        let n_rows_in_block = cursor
+            .read_u16::<LittleEndian>()
+            .map_err(|_| BitStreamError)? as usize;
 
         // Read per-row nnz varints from the remaining bytes
         let pos = cursor.position() as usize;
@@ -263,10 +266,7 @@ mod tests {
 
     #[test]
     fn multiple_rows() {
-        round_trip(
-            &[vec![1, 3, 7], vec![0, 2, 4, 6, 8], vec![100, 200]],
-            true,
-        );
+        round_trip(&[vec![1, 3, 7], vec![0, 2, 4, 6, 8], vec![100, 200]], true);
     }
 
     #[test]

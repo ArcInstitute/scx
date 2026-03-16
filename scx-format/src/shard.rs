@@ -219,10 +219,10 @@ mod tests {
         ShardHeader {
             magic: SHARD_MAGIC,
             shard_format_version: 1,
-            shard_type: 0, // CSR
-            codec_id: 1,   // Scx1
+            shard_type: 0,     // CSR
+            codec_id: 1,       // Scx1
             value_encoding: 1, // u16
-            index_dtype: 0, // u16
+            index_dtype: 0,    // u16
             reserved_flags: [0; 3],
             n_major: 16384,
             n_minor: 30000,
@@ -266,7 +266,10 @@ mod tests {
         assert_eq!(decoded.indices_length, original.indices_length);
         assert_eq!(decoded.values_rel_offset, original.values_rel_offset);
         assert_eq!(decoded.values_length, original.values_length);
-        assert_eq!(decoded.block_index_rel_offset, original.block_index_rel_offset);
+        assert_eq!(
+            decoded.block_index_rel_offset,
+            original.block_index_rel_offset
+        );
         assert_eq!(decoded.block_index_length, original.block_index_length);
         assert_eq!(decoded.checksum, original.checksum);
     }
@@ -337,9 +340,7 @@ mod tests {
 
     #[test]
     fn block_index_empty() {
-        let index = BlockIndex {
-            entries: vec![],
-        };
+        let index = BlockIndex { entries: vec![] };
 
         let mut buf = Vec::new();
         index.write_to(&mut buf).unwrap();

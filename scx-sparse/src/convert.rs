@@ -76,13 +76,7 @@ mod tests {
 
     #[test]
     fn csr_to_dense_delegates() {
-        let csr = ScxCsr::new(
-            (2, 3),
-            vec![0, 1, 3],
-            vec![2, 0, 1],
-            vec![5.0, 1.0, 2.0],
-        )
-        .unwrap();
+        let csr = ScxCsr::new((2, 3), vec![0, 1, 3], vec![2, 0, 1], vec![5.0, 1.0, 2.0]).unwrap();
         assert_eq!(csr_to_dense(&csr), csr.to_dense());
     }
 }

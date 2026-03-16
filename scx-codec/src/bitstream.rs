@@ -186,7 +186,9 @@ mod tests {
 
         let mut reader = BitReader::new(&data);
         for (i, &expected) in bits.iter().enumerate() {
-            let got = reader.read_bit().unwrap_or_else(|_| panic!("failed at bit {i}"));
+            let got = reader
+                .read_bit()
+                .unwrap_or_else(|_| panic!("failed at bit {i}"));
             assert_eq!(got, expected, "mismatch at bit {i}");
         }
     }

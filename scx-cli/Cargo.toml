@@ -8,12 +8,20 @@ authors.workspace = true
 
 [features]
 default = []
-hdf5 = ["dep:hdf5"]
+hdf5 = ["dep:hdf5", "dep:ndarray"]
 
 [dependencies]
 clap = { workspace = true }
 indicatif = { workspace = true }
 hdf5 = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+arrow = { workspace = true }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
+thiserror = { workspace = true }
 scx-format = { path = "../scx-format" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

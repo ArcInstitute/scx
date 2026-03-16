@@ -16,10 +16,10 @@ pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use error::{Result, ScxError};
 pub use header::{FileHeader, HEADER_SIZE, MAGIC};
 pub use provenance::{Provenance, ProvenanceEntry};
+pub use reader::ScxReader;
 pub use section::{align_to_8, SectionType};
 pub use shard::{
     BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE, SHARD_HEADER_SIZE,
     SHARD_MAGIC,
 };
-pub use reader::ScxReader;
 pub use writer::{ScxWriter, SECTIONS_START_OFFSET};
