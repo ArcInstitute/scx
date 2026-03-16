@@ -9,3 +9,4 @@ authors.workspace = true
 [dependencies]
 byteorder = { workspace = true }
 thiserror = { workspace = true }
+zstd = { workspace = true }
