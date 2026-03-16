@@ -1611,6 +1611,474 @@ Usage:
 
 ---
 
+## Detailed Task List
+
+Granular, checkable task list for Phase 1 implementation. Tasks are organized by step and crate, with dependencies noted. Each task should be checked off (`[x]`) as completed.
+
+### 0. Repo Setup & CI
+
+- [ ] **0.1** Create workspace `Cargo.toml` with members: `scx-format`, `scx-codec`, `scx-sparse`, `scx-cli`, `pyscx`
+- [ ] **0.2** Create `scx-codec/Cargo.toml` with dependencies: `byteorder`, `thiserror`
+- [ ] **0.3** Create `scx-format/Cargo.toml` with dependencies: `blake3`, `arrow` (with `ipc` feature), `zstd`, `memmap2`, `thiserror`, `byteorder`, `serde`, `serde_json`, `scx-codec`
+- [ ] **0.4** Create `scx-sparse/Cargo.toml` with dependency: `thiserror`
+- [ ] **0.5** Create `scx-cli/Cargo.toml` with dependencies: `clap` (with `derive` feature), `indicatif`, `hdf5`, `scx-format`, `scx-codec`, `scx-sparse`
+- [ ] **0.6** Create `pyscx/Cargo.toml` with dependencies: `pyo3` (0.23, `extension-module`), `numpy` (0.23), `scx-format`, `scx-sparse`
+- [ ] **0.7** Create `pyscx/pyproject.toml` with maturin build config
+- [ ] **0.8** Create directory structure: `tests/reference_files/`, `tests/test_data/`, `benchmarks/scripts/`
+- [ ] **0.9** Set up GitHub Actions CI: `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check`
+- [ ] **0.10** Add `cargo-fuzz` targets placeholder in `scx-codec/fuzz/` and `scx-format/fuzz/`
+- [ ] **0.11** Create stub `lib.rs` for each crate so the workspace compiles
+
+### 1. Error Types (scx-format)
+
+- [ ] **1.1** Create `scx-format/src/error.rs` with `ScxError` enum using `thiserror`
+- [ ] **1.2** Variants: `InvalidMagic`, `UnsupportedVersion`, `UnsupportedEndian`, `ChecksumMismatch`, `InvalidShardMagic`, `UnknownCodec`, `UnknownValueEncoding`, `InconsistentCsr`, `Io`, `Arrow`
+- [ ] **1.3** Implement `From<std::io::Error>` and `From<arrow::error::ArrowError>` via `#[from]`
+- [ ] **1.4** Export `ScxError` and `Result<T> = std::result::Result<T, ScxError>` from `scx-format/src/lib.rs`
+
+### 2. Bitstream Primitives (scx-codec)
+
+- [ ] **2.1** Create `scx-codec/src/bitstream.rs` with `BitWriter` struct
+  - [ ] `BitWriter::new() → Self` (empty buffer)
+  - [ ] `BitWriter::write_bit(bit: bool)`
+  - [ ] `BitWriter::write_bits(value: u64, n_bits: u8)` — LSB-first
+  - [ ] `BitWriter::write_unary(q: u64)` — q ones then one zero
+  - [ ] `BitWriter::flush() → Vec<u8>` — pad to byte boundary, return buffer
+- [ ] **2.2** Create `BitReader` struct in same file
+  - [ ] `BitReader::new(data: &[u8]) → Self`
+  - [ ] `BitReader::read_bit() → Result<bool>`
+  - [ ] `BitReader::read_bits(n_bits: u8) → Result<u64>` — LSB-first
+  - [ ] `BitReader::read_unary() → Result<u64>` — count ones until zero
+  - [ ] `BitReader::position() → usize` — current bit offset
+  - [ ] Graceful error on read past end of buffer (no panic)
+- [ ] **2.3** Tests: round-trip random bit sequences
+- [ ] **2.4** Tests: empty stream, single bit, byte-aligned, 64-bit values
+- [ ] **2.5** Tests: unary encode/decode for q = 0, 1, 2, 100, 1000
+- [ ] **2.6** Tests: mixed operations (interleave write_bits, write_unary, write_bit)
+- [ ] **2.7** Tests: boundary — write 7 bits, then 1 bit (completes byte), then 3 more
+- [ ] **2.8** Create `scx-codec/src/lib.rs` exporting `bitstream` module
+
+### 3. Rice Codec for Values (scx-codec)
+
+- [ ] **3.1** Create `scx-codec/src/rice.rs`
+- [ ] **3.2** Implement `rice_encode(values: &[u32], block_size: usize) → Vec<u8>`
+  - [ ] Shift values: `shifted[i] = values[i] - 1`
+  - [ ] Debug assert no zero values enter encoder
+  - [ ] Floor median computation (lower of two middle values for even-length)
+  - [ ] Rice parameter: `k = max(0, floor(log2(0.6931 * median)))`, clamp 0–15
+  - [ ] Per-block: write 1-byte header (k in bits 0–3), then Rice-coded values
+  - [ ] Handle last block with fewer than 256 values
+  - [ ] Pad each block's bitstream to byte boundary
+- [ ] **3.3** Implement `rice_decode(data: &[u8], n_values: usize) → Result<Vec<u32>>`
+  - [ ] Per-block: read k from header byte
+  - [ ] For each value: read unary q, read k bits → r, reconstruct `((q << k) | r) + 1`
+  - [ ] Handle partial last block
+- [ ] **3.4** Tests: conformance vectors — block of all 1s (shifted=0, k=0)
+- [ ] **3.5** Tests: conformance — [1,1,1,2,2,3] typical UMI distribution
+- [ ] **3.6** Tests: conformance — [1,2,3,4,5,6,7,8] uniform-ish, k≈2
+- [ ] **3.7** Tests: conformance — [1,1,1,500] outlier values (large quotient)
+- [ ] **3.8** Tests: single value, 256 values, 257 values (partial last block)
+- [ ] **3.9** Tests: round-trip with random u32 arrays (values 1–1000)
+- [ ] **3.10** Tests: verify k selection matches SPEC formula
+- [ ] **3.11** Tests: verify block byte alignment
+- [ ] **3.12** Commit reference test vectors to `tests/reference_files/`
+
+### 4. Delta-Golomb Codec for Indptr (scx-codec)
+
+- [ ] **4.1** Create `scx-codec/src/delta_golomb.rs`
+- [ ] **4.2** Implement `delta_golomb_encode(indptr: &[u64]) → Vec<u8>`
+  - [ ] Write `indptr[0]` as raw LE u64 (8 bytes)
+  - [ ] Compute deltas: `delta[i] = indptr[i+1] - indptr[i]`
+  - [ ] Floor median of deltas
+  - [ ] Rice parameter k (same formula as Rice codec), write as 1 byte
+  - [ ] Single-stream Rice encoding of all deltas (no blocks)
+  - [ ] Pad to byte boundary
+- [ ] **4.3** Implement `delta_golomb_decode(data: &[u8], n_rows_plus_one: usize) → Result<Vec<u64>>`
+  - [ ] Read initial u64, read k byte
+  - [ ] Decode n-1 deltas via Rice decoding
+  - [ ] Reconstruct via prefix sum
+- [ ] **4.4** Tests: typical indptr [0, 150, 280, 500, ...]
+- [ ] **4.5** Tests: sparse rows (some deltas are 0)
+- [ ] **4.6** Tests: single row (2-element indptr: [0, N])
+- [ ] **4.7** Tests: large deltas (delta > 10000)
+- [ ] **4.8** Tests: empty shard (1-element indptr, 0 deltas)
+- [ ] **4.9** Tests: verify decoded indptr is monotonically non-decreasing
+- [ ] **4.10** Tests: round-trip with random monotonic u64 sequences
+
+### 5. FOR-BP Codec for Indices (scx-codec)
+
+- [ ] **5.1** Create `scx-codec/src/forbp.rs`
+- [ ] **5.2** Implement LEB128 helpers: `write_varint(writer: &mut Vec<u8>, value: u32)`, `read_varint(reader: &mut &[u8]) → Result<u32>`
+- [ ] **5.3** Implement `forbp_encode(indices: &[u32], row_lengths: &[usize], index_dtype_u16: bool) → Vec<u8>`
+  - [ ] Process rows in blocks of B_idx = 128 rows
+  - [ ] Per block: write block_nnz (u32), n_rows_in_block (u16), LEB128 row_nnz per row
+  - [ ] Per row with nnz > 0: compute frame_min, deltas (delta[0] = 0, delta[j] = indices[j] - indices[j-1])
+  - [ ] Compute frame_bits = ceil(log2(max(deltas) + 1))
+  - [ ] Write frame_min as u16 or u32 per index_dtype
+  - [ ] Write frame_bits as u8
+  - [ ] Bit-pack deltas as frame_bits-bit integers, LSB-first
+  - [ ] Handle empty rows (nnz=0): emit varint 0, no frame_min/bits/deltas
+  - [ ] Handle last block with fewer than 128 rows
+- [ ] **5.4** Implement `forbp_decode(data: &[u8], n_rows: usize, index_dtype_u16: bool) → Result<(Vec<u32>, Vec<usize>)>`
+  - [ ] Per block: read block_nnz, n_rows_in_block, row_nnz varints
+  - [ ] Per row with nnz > 0: read frame_min, frame_bits, decode deltas
+  - [ ] Reconstruct indices via prefix sum from frame_min + deltas
+  - [ ] Return flat indices array + per-row nnz counts
+- [ ] **5.5** Tests: single row, multiple rows, empty rows
+- [ ] **5.6** Tests: row with single index (frame_bits=0)
+- [ ] **5.7** Tests: full block (128 rows), partial last block
+- [ ] **5.8** Tests: u16 indices (n_vars ≤ 65535) and u32 indices
+- [ ] **5.9** Tests: dense row (consecutive indices 0,1,2,...,999 → gaps=1, frame_bits=1)
+- [ ] **5.10** Tests: sparse row with large gaps ([0, 10000, 30000])
+- [ ] **5.11** Tests: round-trip random sorted index arrays with known row lengths
+- [ ] **5.12** Tests: verify block_nnz matches sum of row_nnz within each block
+- [ ] **5.13** Tests: LEB128 edge cases (0, 127, 128, 16383, 16384)
+
+### 6. Codec Dispatch (scx-codec)
+
+- [ ] **6.1** Create `scx-codec/src/dispatch.rs`
+- [ ] **6.2** Define `CodecId` enum: `None = 0`, `Scx1 = 1`, `Zstd = 2`
+  - [ ] Implement `CodecId::from_u8(v: u8) → Option<Self>`
+- [ ] **6.3** Define `ValueEncoding` enum: `Uint8 = 0`, `Uint16 = 1`, `Uint32 = 2`, `Float32 = 3`, `Float16 = 4`
+  - [ ] Implement `ValueEncoding::byte_width(&self) → usize`
+  - [ ] Implement `ValueEncoding::from_u8(v: u8) → Option<Self>`
+- [ ] **6.4** Define `EncodedShard` struct (indptr_bytes, indices_bytes, values_bytes)
+- [ ] **6.5** Implement `encode_shard(indptr, indices, values, codec_id, value_encoding, index_dtype_u16) → Result<EncodedShard>`
+  - [ ] `CodecId::None`: raw LE arrays
+  - [ ] `CodecId::Scx1`: Delta-Golomb + FOR-BP + Rice (integer only)
+  - [ ] `CodecId::Zstd`: zstd compress each array independently
+  - [ ] Return error for Scx1 + Float32/Float16
+- [ ] **6.6** Implement `decode_shard(encoded, codec_id, value_encoding, n_rows, nnz, index_dtype_u16) → Result<(Vec<u64>, Vec<u32>, Vec<u8>)>`
+- [ ] **6.7** Tests: round-trip through each codec_id × integer value_encoding
+- [ ] **6.8** Tests: `None` produces raw bytes matching input
+- [ ] **6.9** Tests: `Scx1` + `Float32` returns error
+- [ ] **6.10** Tests: `Zstd` + `Float32` round-trips correctly
+- [ ] **6.11** Export all codec types from `scx-codec/src/lib.rs`
+
+### 7. File Header + Section Types (scx-format)
+
+- [ ] **7.1** Create `scx-format/src/header.rs` with `FileHeader` struct (all fields per SPEC §3.1)
+  - [ ] Verify field sizes sum to 256 bytes (124 pre-reserved + 132 reserved)
+- [ ] **7.2** Implement `FileHeader::write_to(&self, writer: &mut impl Write) → Result<()>` using `byteorder::WriteBytesExt` (LE)
+- [ ] **7.3** Implement `FileHeader::read_from(reader: &mut impl Read) → Result<Self>`
+  - [ ] Validate magic `b"SCX\x01"`
+  - [ ] Validate endian == 0
+  - [ ] Validate format_version ≤ 1
+- [ ] **7.4** Implement flag accessors: `has_csc()`, `has_bitmap()`, `has_obsm()`, `has_obsp()`, `has_deletion_vectors()`
+- [ ] **7.5** Create `scx-format/src/section.rs` with `SectionType` enum (13 variants per SPEC §3.2)
+  - [ ] Implement `SectionType::from_u8(v: u8) → Option<Self>`
+  - [ ] Implement `SectionType::is_known(v: u8) → bool`
+- [ ] **7.6** Implement `fn align_to_8(offset: u64) → u64`
+- [ ] **7.7** Tests: write header → read back → compare all fields
+- [ ] **7.8** Tests: reject magic mismatch, endian ≠ 0, format_version > 1
+- [ ] **7.9** Tests: verify serialized size is exactly 256 bytes
+- [ ] **7.10** Tests: verify reserved bytes are all zero after round-trip
+- [ ] **7.11** Tests: flag accessor tests (set bits, verify accessors)
+
+### 8. Shard Header + Block Index (scx-format)
+
+- [ ] **8.1** Create `scx-format/src/shard.rs` with `ShardHeader` struct (all fields per SPEC §3.3)
+  - [ ] Verify field sizes sum to 76 bytes
+- [ ] **8.2** Implement `ShardHeader::write_to/read_from` (76 bytes, LE)
+  - [ ] Validate magic `b"SCXS"` on read
+- [ ] **8.3** Define `BlockIndexEntry` struct (22 bytes: row_start u32, n_rows u16, offsets, nnz_in_block u32)
+- [ ] **8.4** Define `BlockIndex` struct with `entries: Vec<BlockIndexEntry>`
+- [ ] **8.5** Implement `BlockIndex::write_to/read_from` (n_blocks u32 header + entries)
+- [ ] **8.6** Create `scx-format/src/checksum.rs` with BLAKE3 helpers
+  - [ ] `fn blake3_hash(data: &[u8]) → [u8; 32]`
+  - [ ] `fn blake3_truncated_64(data: &[u8]) → [u8; 8]`
+  - [ ] Shard checksum: BLAKE3 of payload after header, truncated to 64 bits
+- [ ] **8.7** Tests: write shard header → read back → compare all fields
+- [ ] **8.8** Tests: verify exactly 76 bytes serialized
+- [ ] **8.9** Tests: corrupt 1 byte of shard payload → checksum fails
+- [ ] **8.10** Tests: block index write 3 entries → read back → compare
+
+### 9. Catalogs (scx-format)
+
+- [ ] **9.1** Create `scx-format/src/catalog.rs`
+- [ ] **9.2** Define `RootCatalogEntry` struct (group_type u8, first_section_offset u64, total_group_length u64, n_sections u32, summary [u8; 32])
+- [ ] **9.3** Define `RootCatalog` struct (n_section_groups u16, entries)
+- [ ] **9.4** Implement `RootCatalog::write_to/read_from`
+  - [ ] Validate serialized size ≤ 4096 bytes on write
+- [ ] **9.5** Define `ShardStats` struct (row_start, row_end, nnz, value_min, value_max, value_sum, n_indexed_columns)
+- [ ] **9.6** Define `FullCatalogEntry` struct (name String, offset u64, length u64, section_type, checksum [u8; 32], stats Option<ShardStats>)
+- [ ] **9.7** Define `FullCatalog` struct (catalog_version u16, manifest_sequence u64, prev_catalog_offset u64, n_obs u64, entries)
+- [ ] **9.8** Implement `FullCatalog::write_to` — serialize entries, compute and append BLAKE3 checksum
+  - [ ] Entry names: name_length u16 + name_bytes
+  - [ ] Stats: stats_length u16 (0 if none) + stats bytes
+  - [ ] Trailing catalog_checksum: [u8; 32]
+- [ ] **9.9** Implement `FullCatalog::read_from` — deserialize, verify catalog checksum
+- [ ] **9.10** Implement `catalog.get(name: &str) → Option<&FullCatalogEntry>` — lookup by name
+- [ ] **9.11** Implement `catalog.shards(section_type: SectionType) → Vec<&FullCatalogEntry>` — filter by type
+- [ ] **9.12** Implement `catalog.shards_sorted() → Vec<&FullCatalogEntry>` — CSR shards ordered by row_start
+- [ ] **9.13** Tests: write catalog with 10 entries → read back → compare all fields
+- [ ] **9.14** Tests: catalog checksum — corrupt 1 byte → detection
+- [ ] **9.15** Tests: empty catalog (no shards, only obs + var)
+- [ ] **9.16** Tests: lookup by name and by type
+- [ ] **9.17** Tests: ShardStats round-trip
+
+### 10. ScxWriter — Atomic File Creation (scx-format)
+
+- [ ] **10.1** Create `scx-format/src/writer.rs` with `ScxWriter` struct
+- [ ] **10.2** Define `SECTIONS_START_OFFSET = 4352` (256 header + 4096 root catalog placeholder)
+- [ ] **10.3** Implement `ScxWriter::new(path, header) → Result<Self>` — open tmp file, seek to SECTIONS_START_OFFSET
+- [ ] **10.4** Implement section alignment padding — before each section write, pad current_offset to 8-byte boundary
+- [ ] **10.5** Implement `write_obs(&mut self, obs: &RecordBatch) → Result<()>` — Arrow IPC file format
+- [ ] **10.6** Implement `write_var(&mut self, var: &RecordBatch) → Result<()>` — Arrow IPC file format
+- [ ] **10.7** Implement `write_csr_shard(...)` — encode via codec_id, compute shard checksum, build block index, write shard header + payload
+  - [ ] Compute ShardStats (value_min, value_max, value_sum, nnz)
+  - [ ] Compute shard checksum (BLAKE3 of payload after header, truncated to 64 bits)
+  - [ ] Write block index entries
+  - [ ] Track section in internal `Vec<FullCatalogEntry>`
+- [ ] **10.8** Implement `write_layer_csr_shard(...)` — same as CSR shard with SectionType::LayerCsrShard and layer name in section path
+- [ ] **10.9** Implement `write_uns(&mut self, json: &serde_json::Value) → Result<()>` — raw JSON bytes
+- [ ] **10.10** Implement `write_obsm(&mut self, name: &str, data: &RecordBatch) → Result<()>` — Arrow IPC
+- [ ] **10.11** Implement `write_obsp_shard(...)` — sparse graph CSR shards
+- [ ] **10.12** Implement `write_provenance(&mut self, ops: &[ProvenanceEntry]) → Result<()>`
+- [ ] **10.13** Implement `finish(self) → Result<()>` — finalize the file
+  - [ ] Compute file-level BLAKE3 checksum
+  - [ ] Write full catalog at current_offset
+  - [ ] Build root catalog from accumulated sections
+  - [ ] `pwrite()` root catalog at offset 256
+  - [ ] `pwrite()` header at offset 0 (all offsets filled in)
+  - [ ] `fsync()` the file
+  - [ ] `rename(tmp_path, final_path)` — atomic on POSIX
+- [ ] **10.14** Tests: write minimal file (obs + var + 1 shard) → verify byte offsets are 8-aligned
+- [ ] **10.15** Tests: tmp file exists before `finish()`, no final file yet
+- [ ] **10.16** Tests: write file with multiple shards → catalog has correct entry count
+- [ ] **10.17** Tests: write file with obsm, uns, layers → all section types in catalog
+- [ ] **10.18** Tests: verify root catalog size ≤ 4096 bytes
+
+### 11. ScxReader (scx-format)
+
+- [ ] **11.1** Create `scx-format/src/reader.rs` with `ScxReader` struct (mmap, header, root_catalog, full_catalog)
+- [ ] **11.2** Implement `ScxReader::open(path) → Result<Self>` — mmap, read header, root catalog, full catalog
+  - [ ] Validate header magic, endian, format_version
+  - [ ] Validate full catalog checksum
+- [ ] **11.3** Implement `read_csr_shard(&self, shard_idx: usize) → Result<(Vec<u64>, Vec<u32>, Vec<f32>)>`
+  - [ ] Use shard header's codec_id (not file header's) per SPEC §4.5
+  - [ ] Verify shard header magic `b"SCXS"`
+  - [ ] Verify shard checksum (BLAKE3 truncated 64 bits)
+  - [ ] Type-convert: u64→i64 indptr (for ScxCsr), u16/u32→i32 indices, u8/u16/u32→f32 values
+- [ ] **11.4** Implement `read_all_csr_shards(&self) → Result<ScxCsr>`
+  - [ ] Read shards in row_start order
+  - [ ] Concatenate indptr (adjust offsets), indices, data
+  - [ ] Return assembled ScxCsr
+- [ ] **11.5** Implement `read_obs(&self) → Result<RecordBatch>` — Arrow IPC file reader from mmap slice
+- [ ] **11.6** Implement `read_var(&self) → Result<RecordBatch>`
+- [ ] **11.7** Implement `read_obsm(&self, name: &str) → Result<RecordBatch>`
+- [ ] **11.8** Implement `read_all_obsm(&self) → Result<HashMap<String, RecordBatch>>`
+- [ ] **11.9** Implement `read_layer(&self, name: &str) → Result<ScxCsr>`
+- [ ] **11.10** Implement `layer_names(&self) → Vec<String>`
+- [ ] **11.11** Implement `read_uns(&self) → Result<serde_json::Value>`
+- [ ] **11.12** Implement `validate(&self) → Result<Vec<(String, bool)>>` — BLAKE3 verification of every section
+  - [ ] Non-essential section corruption: report but continue
+  - [ ] Essential section corruption (obs/var/X): fail
+- [ ] **11.13** Implement summary accessors: `header()`, `catalog()`, `n_obs()`, `n_vars()`, `nnz()`
+- [ ] **11.14** Handle unknown section types: skip with warning log (SPEC §3.9)
+- [ ] **11.15** Tests: write file with ScxWriter → open with ScxReader → compare all data
+- [ ] **11.16** Tests: corrupt shard byte → checksum fails
+- [ ] **11.17** Tests: unknown section types → skipped with warning
+- [ ] **11.18** Tests: individual shard reads vs read_all_csr_shards → same result
+- [ ] **11.19** Tests: verify mmap reads return correct byte ranges
+
+### 12. ScxCsr In-Memory Representation (scx-sparse)
+
+- [ ] **12.1** Create `scx-sparse/src/csr.rs` with `ScxCsr` struct (shape, indptr: Vec<i64>, indices: Vec<i32>, data: Vec<f32>)
+- [ ] **12.2** Implement `ScxCsr::new(shape, indptr, indices, data) → Result<Self>` with validation:
+  - [ ] `indptr.len() == shape.0 + 1`
+  - [ ] indptr is monotonically non-decreasing
+  - [ ] `indptr[0] >= 0` and `indptr[n_rows] == nnz`
+  - [ ] `indices.len() == data.len() == nnz`
+  - [ ] All indices in `[0, shape.1)`
+- [ ] **12.3** Implement `row_slice(&self, start, end) → ScxCsr` — returns new CSR owning sliced copies
+- [ ] **12.4** Implement `to_dense(&self) → Vec<f32>` — flat row-major dense matrix
+- [ ] **12.5** Implement `nnz(&self) → usize`
+- [ ] **12.6** Create `scx-sparse/src/convert.rs` with dense ↔ CSR conversion helpers
+- [ ] **12.7** Tests: construct from known data → verify row_slice correctness
+- [ ] **12.8** Tests: to_dense matches manually computed dense matrix
+- [ ] **12.9** Tests: empty matrix (0 nnz, shape (5, 10))
+- [ ] **12.10** Tests: single-row and single-column matrices
+- [ ] **12.11** Tests: validation — mismatched indptr/indices/data lengths → error
+- [ ] **12.12** Tests: validation — non-monotonic indptr → error
+- [ ] **12.13** Tests: validation — out-of-range index → error
+
+### 13. h5ad / 10x Reader for Conversion (scx-cli)
+
+- [ ] **13.1** Create `scx-cli/src/convert.rs`
+- [ ] **13.2** Implement h5ad format detection
+  - [ ] Detect h5ad vs 10x h5 by checking for `obs` group (h5ad) vs `matrix/barcodes` (10x)
+  - [ ] Read `encoding-type` attribute on X group
+  - [ ] Fall back to structure inspection if attribute missing
+- [ ] **13.3** Implement h5ad X matrix reading
+  - [ ] CSR format: read indptr/indices/data directly
+  - [ ] CSC format: read and transpose to CSR (streaming scatter)
+  - [ ] Dense format: read full matrix, convert to CSR
+- [ ] **13.4** Implement integer dtype detection
+  - [ ] Detect float32 values that are actually integers
+  - [ ] Choose Rice codec (integer value_encoding) over Zstd for integer data
+  - [ ] Determine appropriate value_encoding: uint8 (max ≤ 255), uint16 (max ≤ 65535), uint32
+- [ ] **13.5** Implement h5ad obs reading → Arrow RecordBatch
+  - [ ] Numeric columns → Arrow Int/Float arrays
+  - [ ] String columns → Arrow Utf8 arrays (handle both fixed-length and variable-length HDF5 strings)
+  - [ ] Categorical columns → Arrow Dictionary arrays (handle both old and new categorical HDF5 encodings)
+  - [ ] Boolean columns → Arrow Boolean arrays
+  - [ ] Identify and set index column (convention: `_index` or first string column)
+- [ ] **13.6** Implement h5ad var reading → Arrow RecordBatch (same column conversion)
+- [ ] **13.7** Implement h5ad obsm reading → dict of Arrow RecordBatches
+- [ ] **13.8** Implement h5ad uns reading → JSON
+  - [ ] Skip pickled Python objects with warning
+  - [ ] Convert JSON-serializable entries only
+- [ ] **13.9** Implement h5ad layers reading → dict of CSR matrices
+- [ ] **13.10** Implement h5ad → scx conversion pipeline
+  - [ ] Determine index_dtype: u16 if n_vars ≤ 65535, else u32
+  - [ ] Chunk cells into shards of shard_target_rows (default 10,000)
+  - [ ] Per shard: slice arrays, compute ShardStats, determine value_encoding, encode, write
+  - [ ] Write obs, var, obsm, uns, layers, provenance
+  - [ ] Call ScxWriter::finish()
+- [ ] **13.11** Implement 10x h5 → scx conversion
+  - [ ] Read matrix/barcodes, matrix/features, matrix/data, matrix/indices, matrix/indptr, matrix/shape
+  - [ ] Transpose CSC → CSR (10x stores genes × cells in CSC)
+  - [ ] Build obs from barcodes, var from features
+  - [ ] Convert to scx via same pipeline
+- [ ] **13.12** Implement scx → h5ad reverse conversion
+  - [ ] Read all CSR shards → ScxCsr
+  - [ ] Read obs/var Arrow RecordBatch → HDF5 groups
+  - [ ] Arrow arrays → HDF5 datasets (including categorical → HDF5 categorical)
+  - [ ] Write X as csr_matrix with encoding-type attribute
+  - [ ] Write obsm, obsp, uns, layers
+- [ ] **13.13** Tests: h5ad → scx → h5ad round-trip, bit-exact for integer counts
+- [ ] **13.14** Tests: 10x h5 → scx → to_anndata, compare with scanpy's read_10x_h5
+- [ ] **13.15** Tests: handle dense X in h5ad
+- [ ] **13.16** Tests: handle CSC X in h5ad (transpose)
+- [ ] **13.17** Tests: handle uns with non-serializable items (skip with warning)
+- [ ] **13.18** Tests: empty obs columns, categorical columns, nullable columns
+- [ ] **13.19** Tests: detect h5ad vs 10x h5 format and error with helpful message on mismatch
+
+### 14. CLI Commands (scx-cli)
+
+- [ ] **14.1** Create `scx-cli/src/main.rs` with clap subcommands: `convert`, `info`, `validate`
+- [ ] **14.2** Implement `scx convert` subcommand
+  - [ ] `--from h5ad` / `--from 10x` input formats
+  - [ ] `--to h5ad` output format
+  - [ ] `--shard-size` option (default 10000)
+  - [ ] `--codec` option (scx1/zstd/none, default scx1)
+  - [ ] Progress bar via `indicatif` (shards written / total, bytes, elapsed)
+- [ ] **14.3** Implement `scx info` subcommand
+  - [ ] Display: format version, dimensions, nnz, shard count, codec, index dtype
+  - [ ] Display: value encoding, shard target rows, manifest sequence
+  - [ ] Display: file size with comparison estimate
+  - [ ] Display: per-section type sizes (obs, var, X CSR, obsm, uns, provenance)
+  - [ ] Display: flags (has_obsm, etc.)
+- [ ] **14.4** Implement `scx validate` subcommand
+  - [ ] Read every section, verify BLAKE3 checksums against full catalog
+  - [ ] Report per-section pass/fail
+  - [ ] `--verbose` flag: print checksum values
+  - [ ] Exit code 0 if all pass, 1 if any fail
+- [ ] **14.5** Tests: CLI integration tests using assert_cmd or similar
+- [ ] **14.6** Tests: convert h5ad → scx → validate passes
+- [ ] **14.7** Tests: info output matches expected format
+
+### 15. pyscx Python Bindings
+
+- [ ] **15.1** Create `pyscx/src/lib.rs` with PyO3 module root
+  - [ ] Register module functions: `open`, `from_anndata`, `from_10x`
+- [ ] **15.2** Create `pyscx/src/experiment.rs` with `PyExperiment` struct (lazy handle)
+  - [ ] Wraps `ScxReader`
+  - [ ] Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`
+  - [ ] Method: `to_anndata()` → AnnData
+- [ ] **15.3** Implement `scx.open(path) → PyExperiment`
+  - [ ] Reads only header + catalog (lazy)
+- [ ] **15.4** Create `pyscx/src/anndata.rs`
+- [ ] **15.5** Implement `to_anndata()` — the critical path
+  - [ ] Read all CSR shards → ScxCsr
+  - [ ] Transfer indptr/indices/data to numpy via `PyArray1::from_vec()` (zero-copy, moves ownership)
+  - [ ] Build `scipy.sparse.csr_matrix` from (data, indices, indptr) + shape
+  - [ ] Convert obs Arrow RecordBatch → pyarrow Table → pandas DataFrame (via Arrow C Data Interface / ToPyArrow)
+  - [ ] Convert var Arrow RecordBatch → pandas DataFrame
+  - [ ] Handle obs/var index column (set as DataFrame index)
+  - [ ] Read obsm → dict of numpy arrays
+  - [ ] Read uns → Python dict via json.loads
+  - [ ] Read layers → dict of scipy CSR matrices
+  - [ ] Construct AnnData(X=csr, obs=obs_df, var=var_df, obsm=obsm_dict, uns=uns_dict, layers=layers_dict)
+- [ ] **15.6** Implement `scx.from_anndata(adata, path, codec=None, shard_size=None)`
+  - [ ] Extract X as scipy CSR (convert if CSC or dense)
+  - [ ] Get indptr/indices/data numpy arrays → view as Rust slices (readonly borrow)
+  - [ ] Extract obs/var → Arrow RecordBatch via pyarrow
+  - [ ] Extract obsm, obsp, uns, layers
+  - [ ] Create ScxWriter, write all sections, finish()
+- [ ] **15.7** Implement `scx.from_10x(h5_path, scx_path)`
+- [ ] **15.8** Add `arrow-pyarrow` or equivalent crate for Arrow C Data Interface interop
+- [ ] **15.9** Python test: `test_round_trip_anndata` — synthetic AnnData → SCX → AnnData → compare
+- [ ] **15.10** Python test: `test_round_trip_integer_counts` — bit-exact for integer UMI counts (Go/No-Go gate)
+- [ ] **15.11** Python test: `test_layers_obsm_uns_round_trip` — layers, obsm, uns survive round-trip
+- [ ] **15.12** Python test: `test_scanpy_pipeline` — SCX → to_anndata → full scanpy pipeline (QC → PCA → Leiden → DE)
+- [ ] **15.13** Python test: verify zero-copy with `np.shares_memory()` for CSR arrays
+- [ ] **15.14** Python test: obs/var index column is correctly set
+- [ ] **15.15** Python test: categorical columns survive round-trip as pandas Categorical
+- [ ] **15.16** Create `pyscx/tests/` directory with pytest configuration
+
+### 16. Provenance (scx-format)
+
+- [ ] **16.1** Create `scx-format/src/provenance.rs`
+- [ ] **16.2** Define `ProvenanceEntry` struct (timestamp i64, action String, tool String, params_json Value, input_checksums Vec<[u8; 32]>)
+- [ ] **16.3** Define `ProvenanceSection` struct (version u8, operations Vec<ProvenanceEntry>)
+- [ ] **16.4** Implement `ProvenanceSection::write_to/read_from` per SPEC §3.7
+  - [ ] provenance_version u8
+  - [ ] n_operations u32
+  - [ ] Per entry: length-prefixed strings (u16 + UTF-8), u32-prefixed JSON, u8 count + 32-byte checksums
+- [ ] **16.5** ScxWriter auto-adds provenance entry on `finish()`
+  - [ ] scx convert: action="convert", tool="scx-cli {version}", params, input_checksums
+  - [ ] scx.from_anndata(): action="create", tool="pyscx {version}"
+- [ ] **16.6** `scx info` displays provenance history
+- [ ] **16.7** Tests: write provenance → read back → compare
+- [ ] **16.8** Tests: multiple operations in provenance chain
+
+### 17. Benchmarks & Conformance Tests
+
+- [ ] **17.1** Create `benchmarks/scripts/download_datasets.sh` for benchmark datasets
+  - [ ] PBMC 3K (~30 MB h5ad)
+  - [ ] Tabula Sapiens subset (~2 GB h5ad, 100K cells)
+  - [ ] CELLxGENE Census subset (~20 GB h5ad, 1M cells)
+  - [ ] Smart-seq2 dataset (non-UMI protocol for wider distribution testing)
+- [ ] **17.2** Create `benchmarks/scripts/benchmark_compression.py`
+  - [ ] Compression ratio: scx_size / h5ad_size (target: < 0.60 for expression matrix)
+  - [ ] Per-component sizes: indptr, indices, values, metadata
+  - [ ] Compare against same data stored as Zarr with Zstd
+- [ ] **17.3** Create `benchmarks/scripts/benchmark_read.py`
+  - [ ] `scx.open().to_anndata()` wall time
+  - [ ] `anndata.read_h5ad()` wall time (baseline comparison)
+  - [ ] Cold cache (drop caches) vs warm cache timings
+  - [ ] Peak RSS memory during read
+- [ ] **17.4** Create `benchmarks/scripts/benchmark_write.py`
+  - [ ] h5ad → scx conversion time (MB/s of input)
+- [ ] **17.5** Output markdown table of results
+- [ ] **17.6** Create conformance test vectors in `tests/reference_files/`
+  - [ ] Known-good .scx files with expected byte contents
+  - [ ] Rice codec reference vectors (input → exact encoded bytes)
+  - [ ] FOR-BP codec reference vectors
+  - [ ] Delta-Golomb codec reference vectors
+- [ ] **17.7** Fuzz testing setup: `cargo fuzz` targets for shard decoder and catalog parser
+- [ ] **17.8** Property-based tests: random CSR matrices survive encode → decode
+- [ ] **17.9** Go/No-Go gate validation:
+  - [ ] Verify h5ad → scx → h5ad round-trip is bit-exact for integer counts
+  - [ ] Verify SCX file < 60% the size of h5ad for PBMC 3K and Tabula Sapiens
+  - [ ] Verify `scx.open().to_anndata()` → full scanpy pipeline works (QC → PCA → Leiden → DE)
+
+### 18. Integration & End-to-End Tests
+
+- [ ] **18.1** Integration test: create ScxWriter → write obs/var/shards → ScxReader → read back → verify equality
+- [ ] **18.2** Integration test: multi-shard file (5+ shards) → read_all_csr_shards → verify assembled matrix
+- [ ] **18.3** Integration test: file with layers + obsm + uns → full round-trip
+- [ ] **18.4** Integration test: corrupt file bytes → appropriate error messages
+- [ ] **18.5** Integration test: very sparse matrix (99% zeros) → round-trip
+- [ ] **18.6** Integration test: single-row and single-column edge cases
+- [ ] **18.7** Integration test: maximum value sizes (uint8 max, uint16 max, uint32 values)
+- [ ] **18.8** Integration test: u16 vs u32 index dtype selection based on n_vars
+- [ ] **18.9** End-to-end: PBMC 3K h5ad → scx → to_anndata → scanpy QC → PCA → Leiden → DE
+
+---
+
 ## Implementation Order Summary
 
 | Week | What | Crate | Depends On |
