@@ -21,4 +21,5 @@ pub use shard::{
     BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE, SHARD_HEADER_SIZE,
     SHARD_MAGIC,
 };
+pub use reader::ScxReader;
 pub use writer::{ScxWriter, SECTIONS_START_OFFSET};

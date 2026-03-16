@@ -33,6 +33,12 @@ pub enum ScxError {
     #[error("unknown section type: {0}")]
     UnknownSectionType(u8),
 
+    #[error("section not found: {0}")]
+    SectionNotFound(String),
+
+    #[error("shard index {index} out of bounds (count: {count})")]
+    ShardIndexOutOfBounds { index: usize, count: usize },
+
     #[error("codec error: {0}")]
     Codec(#[from] scx_codec::CodecError),
 

@@ -16,6 +16,7 @@ byteorder = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 scx-codec = { path = "../scx-codec" }
+scx-sparse = { path = "../scx-sparse" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

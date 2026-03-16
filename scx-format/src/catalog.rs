@@ -264,8 +264,6 @@ impl FullCatalog {
             let offset = cur.read_u64::<LittleEndian>()?;
             let length = cur.read_u64::<LittleEndian>()?;
             let section_type_raw = cur.read_u8()?;
-            let section_type = SectionType::from_u8(section_type_raw)
-                .ok_or(ScxError::UnknownSectionType(section_type_raw))?;
 
             let mut checksum = [0u8; 32];
             cur.read_exact(&mut checksum)?;
@@ -278,6 +276,18 @@ impl FullCatalog {
                 Some(ShardStats::read_from(&mut stats_cur)?)
             } else {
                 None
+            };
+
+            // Skip unknown section types with a warning instead of erroring
+            let section_type = match SectionType::from_u8(section_type_raw) {
+                Some(st) => st,
+                None => {
+                    eprintln!(
+                        "warning: skipping unknown section type {} for entry '{}'",
+                        section_type_raw, name
+                    );
+                    continue;
+                }
             };
 
             entries.push(FullCatalogEntry {
