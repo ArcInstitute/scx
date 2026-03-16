@@ -36,13 +36,13 @@ O(1) random access to any component.
 - Workstation analysis with scanpy/Seurat replacements
 - Sharing via `cp`/`scp`/`rsync`/`rclone` of a single file
 
-**SCX is not optimized for cloud-native random access.** Object stores (S3, GCS)
-are best served by one-object-per-chunk formats like Zarr. SCX files can be stored
-on S3 and accessed via range reads, but the access pattern (many small range reads
-per query) will incur higher latency than a Zarr store. For cloud-hosted atlases
-where low-latency random access is the primary requirement, TileDB-SOMA or Zarr
-remain more appropriate. SCX targets the workflow where the file is staged locally
-(to scratch, to NVMe) before intensive computation or training.
+**Cloud access is supported but not the primary design target.** SCX provides
+cloud-optimized access patterns (§12) including a front-of-file catalog for
+single-read opens, shard coalescing, parallel range reads, and an optional exploded
+directory layout (`.scxd`) with one object per shard. With these optimizations,
+selective cloud queries achieve latencies comparable to Zarr v3 sharding. However,
+for intensive computation (GPU training, full-scan analysis), the recommended
+workflow remains staging the file locally before processing.
 
 ### 1.2 Design Principles
 
@@ -121,7 +121,7 @@ CSR-only as the default, with CSC as opt-in.
 experiment.scx (single binary file)
 ┌──────────────────────────────────────────────────────────────────┐
 │ FILE HEADER (256 bytes, offset 0, fixed)                         │
-│   magic: [u8; 4] = b"SCX\x01"                                   │
+│   magic: [u8; 4] = b"SCX\x01"                                    │
 │   format_version: u16        (current: 1)                        │
 │   header_length: u16         (256; allows future header growth)  │
 │   flags: u32                                                     │
@@ -138,10 +138,10 @@ experiment.scx (single binary file)
 │   n_csc_shards: u32          (0 if CSC not present)              │
 │   shard_target_rows: u32     (cells per CSR shard, default 10000)│
 │   codec_id: u8               (default codec for shards, see §4.5)│
-│   index_dtype: u8            (0=u16, 1=u32; see §3.3)           │
+│   index_dtype: u8            (0=u16, 1=u32; see §3.3)            │
 │   endian: u8                 (0=little, 1=big; little required)  │
 │   reserved_padding: [u8; 1]                                      │
-│   root_catalog_offset: u64   (offset of root catalog, see §3.2) │
+│   root_catalog_offset: u64   (offset of root catalog, see §3.2)  │
 │   root_catalog_length: u64                                       │
 │   full_catalog_offset: u64   (offset of active full catalog)     │
 │   full_catalog_length: u64                                       │
@@ -150,7 +150,7 @@ experiment.scx (single binary file)
 │   prev_catalog_offset: u64   (offset of previous full catalog,   │
 │                               0 if this is the first version)    │
 │   file_checksum: u64         (BLAKE3 truncated to 64 bits)       │
-│   reserved: [u8; 132]        (zeroed, future use)                │
+│   reserved: [u8; 148]        (zeroed, future use)                │
 ├──────────────────────────────────────────────────────────────────┤
 │ ROOT CATALOG (offset 256, max 4096 bytes)                        │
 │   Compact catalog with section count, summary stats, and         │
@@ -206,6 +206,12 @@ experiment.scx (single binary file)
 │   (Previous catalog remains for rollback.)                       │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**Header size accounting**: Fields before `reserved` sum to 108 bytes
+(4+2+2+4 + 8+8+8 + 4+4+4 + 1+1+1+1 + 8+8+8+8+8+8+8 = 108). With
+`reserved: [u8; 148]`, the total is 108 + 148 = 256 bytes. (Note: an earlier
+revision listed `reserved: [u8; 132]` which would give only 240 bytes — this was
+a bug in the spec.)
 
 **Byte ordering**: All multi-byte integers in the file format are little-endian.
 The `endian` field exists for validation; readers MUST reject files with
@@ -349,6 +355,11 @@ CSR SHARD (contiguous bytes)
 │   Enables O(1) random access to any row range.               │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+**Shard header size note**: The fields listed above sum to 76 bytes
+(4+1+1+1+1+1+3 + 4+4+8+8 + 4×8 + 8 = 76), not the 64 bytes shown in the diagram
+label. Implementations MUST use 76 bytes. The diagram label is incorrect and will be
+corrected in a future spec revision.
 
 **Index dtype**: With ≤65535 genes, `index_dtype=0` (uint16) halves index storage.
 Files with >65535 features use `index_dtype=1` (uint32). The value is set once per
@@ -641,6 +652,17 @@ state, because:
 not needed for concurrent readers. A single writer may append while multiple readers
 access the file concurrently.
 
+**Pitfall — mmap and network filesystems**: Memory-mapped I/O on network filesystems
+(NFS, GPFS, Lustre) has surprising characteristics:
+- GPFS mmap works but kernel readahead may not be optimal for the shard-level random
+  access pattern used by the query engine. Explicit `madvise(MADV_SEQUENTIAL)` per
+  shard group helps.
+- NFS mmap has known cache coherency issues if the file is modified (appended) while
+  mapped. Since SCX sections are immutable fragments and the reader maps only
+  sections referenced by the catalog it read at open time, this is safe in practice.
+- The reader MUST support both mmap and `pread()` code paths, selected at open time
+  based on filesystem type or a user hint. The `pread()` path is the safe fallback.
+
 ---
 
 ## 4. The SCX Codec — Bit-Level Specification
@@ -804,6 +826,37 @@ counts in X, float32 normalized values in a layer).
 Rice coding (codec_id=1) applies only to integer value encodings (0-2). Float layers
 use Zstd (codec_id=2) because float values do not follow the geometric distribution.
 
+### 4.6 Codec Limitations and Pitfalls
+
+**Rice coding assumes near-geometric distributions.** The ~2.2 bits/value projection
+is based on typical 10x Chromium UMI count distributions (55-65% ones, near-geometric
+tail). Performance degrades on:
+
+- **Non-UMI protocols** (Smart-seq2, VASA-seq): Counts are read-level, not UMI-deduplicated.
+  Distributions are wider with heavier tails. Rice coding still helps (counts are still
+  integer-valued with many small values), but the gap vs. Zstd narrows. Benchmarks
+  should include Smart-seq2 datasets alongside 10x data.
+- **Deeply sequenced datasets**: At high sequencing depth (>50K UMIs/cell), the
+  count distribution shifts rightward and the median increases. The per-block adaptive
+  `k` parameter handles this, but bits/value will be higher than the ~2.2 projection.
+- **Multimodal data**: CITE-seq protein counts (ADT) have different distributions
+  than RNA UMI counts (higher values, less sparsity). ATAC fragment counts are
+  binary-like but not identical to RNA. Per-shard codec override (§4.5) allows
+  falling back to Zstd for modalities where Rice is suboptimal.
+
+**Outlier values can cause pathological encoding.** A value of 500 with k=1 emits
+~250 bits in unary. While rare in typical UMI data (§2.1: values 16+ are <1%), merged
+datasets or high-depth protocols can produce outliers. Implementations SHOULD cap
+the unary quotient at a maximum (e.g., 15) and emit an escape code followed by a
+raw fixed-width value for larger quotients. This is not required for conformance in
+v1 but is recommended for robustness.
+
+**Indices dominate compressed size.** In a typical dataset, FOR-BP indices account
+for ~75-80% of the compressed CSR payload, while Rice values account for ~20%.
+Optimizing index compression (e.g., PFor-Delta with patching for outlier column gaps)
+has ~4× more impact on file size than further optimizing value compression. Future
+codec versions (codec_id ≥ 3) should prioritize index encoding improvements.
+
 ---
 
 ## 5. Detection Bitmap (Optional)
@@ -891,6 +944,21 @@ when the GPU path is used. Zero-copy.
 This means `to_anndata()` is cheap — the expensive part is constructing the
 AnnData Python object, not copying data. For the expression matrix (typically
 the largest component), there is no copy.
+
+**Zero-copy caveats**:
+- **String columns require a copy.** Arrow `Utf8Array` → pandas `object` dtype
+  allocates individual Python string objects on the Python heap. This is unavoidable
+  and can dominate `to_anndata()` time for datasets with many string metadata columns
+  (e.g., long cell barcode strings, free-text annotations). Using categorical/dictionary
+  encoding for repeated strings (cell_type, tissue, etc.) mitigates this — dictionary
+  indices transfer zero-copy and only the small dictionary needs Python string objects.
+- **scipy CSR constructor may copy if dtypes don't match.** The scipy `csr_matrix`
+  constructor with `copy=False` still copies if the input arrays have unexpected dtypes
+  (e.g., `uint32` indices instead of `int32`). ScxCsr MUST use the exact dtypes scipy
+  expects: `int64` indptr, `int32` indices, `float32` data.
+- **AnnData may copy X on construction.** Some AnnData versions copy the matrix when
+  the dtype doesn't match their internal expectations. Pin anndata ≥ 0.10 and verify
+  with `np.shares_memory()` in tests.
 
 ### 6.3 Lazy Handles
 
@@ -1000,8 +1068,12 @@ TileDB-SOMA-ML's loader is slow because:
 5. No overlap between I/O, transform, and GPU compute
 
 **Baseline note**: These observations are based on TileDB-SOMA-ML as of early 2026.
-TileDB-SOMA has been actively developed; all benchmark comparisons in §8.8 will
-use the latest available release with recommended configuration.
+TileDB-SOMA has been actively developed; the `tiledbsoma-ml` package (released March
+2025) provides `ExperimentDataset` with a 4-stage pipeline (partition → shuffle-chunk
+→ IO-batch → mini-batch), eager prefetching, and DDP-aware distributed training.
+All benchmark comparisons in §8.8 will use the latest available release with
+recommended configuration. Points 1-3 above may have been partially addressed in
+recent releases — benchmarks must verify current behavior, not historical.
 
 ### 8.2 SCX Training Loader Architecture
 
@@ -1256,7 +1328,331 @@ reserved for encrypted sections. Type 255 is reserved as a sentinel.
 
 ---
 
-## 12. Rust Crate Architecture
+## 12. Cloud Access Optimizations
+
+SCX is an HPC/local-first format (§1.1), but many single-cell datasets are hosted
+on cloud object stores (S3, GCS, Azure Blob). This section describes optimizations
+that make SCX files accessible from cloud storage without sacrificing any local
+performance characteristics or changing the core format.
+
+### 12.1 The Cloud Access Problem
+
+Cloud object stores have fundamentally different performance characteristics than
+local filesystems:
+
+| Operation | Local NVMe | S3 / GCS (standard) |
+|-----------|-----------|---------------------|
+| Random read latency | ~10 µs | 50–150 ms |
+| Sequential throughput | 3–7 GB/s | 10–100 Gbps (shared) |
+| Per-request overhead | ~0 | 50–150 ms (TCP + TLS + auth) |
+| Multi-range in one request | N/A (mmap) | **Not supported** |
+| Minimum efficient read size | 4 KB (page) | 256 KB–1 MB |
+| Optimal read size | any | 8–16 MB |
+
+The critical constraint: **S3/GCS do not support multiple byte ranges in a single
+HTTP request.** Every non-contiguous region costs a full round trip (50–150 ms).
+The number of sequential round trips — not bytes transferred — dominates cloud
+access latency.
+
+**Current SCX cloud access pattern** (unoptimized):
+
+1. `HEAD` request to get file size (~100 ms)
+2. Range read: first 4 KB — header + root catalog (~100 ms)
+3. Range read: full catalog at EOF — requires file size from step 1 (~100 ms)
+4. Range read: obs metadata section — for predicate evaluation (~100 ms)
+5. Range read: each matching shard (~100 ms each, parallelizable)
+
+**Total: 400 ms + 100 ms per shard** (steps 1–4 are sequential dependencies).
+For a selective query touching 5 shards in parallel, that is ~500 ms. For Zarr
+with a comparable query: ~200 ms (one read for `.zmetadata` + parallel chunk
+reads). The gap is 2–3 unnecessary round trips.
+
+### 12.2 Optimization 1: Front-of-File Catalog (Cloud-Ready Layout)
+
+The most impactful optimization: place a **copy of the full catalog at a known
+offset near the start of the file**, eliminating the `HEAD` + EOF round trips.
+
+**Mechanism:** A new header flag `bit 6: has_front_catalog` indicates that a copy
+of the active full catalog is stored at a fixed offset immediately after the root
+catalog region. The `front_catalog_offset` field (repurposed from `reserved` bytes
+in the header) points to it.
+
+```
+CLOUD-READY LAYOUT:
+┌──────────────────────────────────────────────────────────────┐
+│ FILE HEADER (256 bytes)                                       │
+│   ...                                                         │
+│   flags bit 6: has_front_catalog = 1                          │
+│   front_catalog_offset: u64    (within reserved region)       │
+│   front_catalog_length: u64    (within reserved region)       │
+├──────────────────────────────────────────────────────────────┤
+│ ROOT CATALOG (offset 256, ≤4096 bytes)                        │
+├──────────────────────────────────────────────────────────────┤
+│ FRONT CATALOG (offset ~4352, typically 8–128 KB)              │
+│   Byte-identical copy of the active full catalog.             │
+│   Enables single-read file opening from cloud.                │
+├──────────────────────────────────────────────────────────────┤
+│ SECTIONS (obs, var, shards, etc.)                             │
+│   ...                                                         │
+├──────────────────────────────────────────────────────────────┤
+│ FULL CATALOG at EOF (always present, for append compatibility)│
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Cloud access pattern** (with front catalog):
+
+1. Range read: first 256 KB — header + root catalog + front catalog (~100 ms)
+2. Parse catalog; use shard statistics for predicate pruning
+3. Range read: obs metadata section (~100 ms, can overlap with parsing)
+4. Range reads: matching shards (parallel, ~100 ms each)
+
+**Total: 200 ms + 100 ms per shard (parallel).** This matches the round-trip
+count of Zarr v3 sharding (one read for index, one per chunk).
+
+**Catalog size estimates:**
+
+| Dataset | Cells | Shards | Full catalog size |
+|---------|-------|--------|-------------------|
+| Small (PBMC 3K) | 3K | 1 | ~200 bytes |
+| Medium (100K cells) | 100K | 10 | ~2 KB |
+| Large (1M cells) | 1M | 100 | ~15 KB |
+| Atlas (10M cells) | 10M | 1,000 | ~150 KB |
+| Mega-atlas (100M) | 100M | 10,000 | ~1.5 MB |
+
+Even for a 100M-cell mega-atlas, the front catalog fits comfortably in a single
+256 KB–2 MB initial read — well within the optimal S3 read size.
+
+**Write path:** The writer reserves space at the front for header + root catalog +
+front catalog (256 bytes + 4 KB + estimated catalog size). Sections are written
+starting after the reserved region. At finalization:
+1. Write full catalog at EOF (as before)
+2. `pwrite()` a copy of the full catalog at the front catalog offset
+3. `pwrite()` root catalog at offset 256
+4. `pwrite()` header at offset 0 with `has_front_catalog` flag set
+5. `fsync()` + `rename()`
+
+**Append interaction:** Appending (§3.6.2) writes a new full catalog at EOF and
+updates the header's `full_catalog_offset`. The front catalog becomes stale — the
+header's `has_front_catalog` flag is cleared during append. A subsequent
+`scx cloud-optimize` or `scx compact` restores it. This means appended files
+lose the cloud optimization until re-optimized, which is acceptable because
+appending is an HPC/local operation.
+
+**Local readers:** Ignore the front catalog entirely. They use the root catalog
+(for streaming) or the EOF full catalog (for random access) as before. No
+performance penalty.
+
+**CLI:**
+
+```bash
+# Produce a cloud-ready file during conversion
+scx convert --from h5ad input.h5ad output.scx --cloud-ready
+
+# Cloud-optimize an existing file (rewrites with front catalog)
+scx cloud-optimize experiment.scx --output cloud_ready.scx
+
+# Also produced by scx compact (always cloud-ready)
+scx compact experiment.scx --output compacted.scx
+```
+
+### 12.3 Optimization 2: Shard Coalescing for Range Reads
+
+SCX shards are laid out **sequentially** in the file. Consecutive shards are
+physically adjacent on disk (and in the object). A cloud reader that needs shards
+5–10 can read them in a **single range read** rather than six separate requests.
+
+**Algorithm:** Given a set of shard indices to fetch, sort them by file offset.
+Merge adjacent or nearby shards into coalesced ranges:
+
+```
+Shard 5: offset 100MB, length 40MB
+Shard 6: offset 140MB, length 35MB    (adjacent to shard 5)
+Shard 7: offset 175MB, length 42MB    (adjacent to shard 6)
+Shard 12: offset 400MB, length 38MB   (gap — separate request)
+
+→ Coalesced reads:
+  Range 1: bytes 100MB–217MB  (shards 5, 6, 7 in one request)
+  Range 2: bytes 400MB–438MB  (shard 12)
+```
+
+**Gap threshold:** If two shards are separated by less than `coalesce_gap_bytes`
+(default: 256 KB), read the gap between them rather than issuing two requests.
+The cost of reading an extra 256 KB (~0 on cloud, where per-request overhead
+dwarfs bandwidth cost) is far less than the cost of an additional round trip
+(50–150 ms).
+
+This is an **implementation optimization** in the reader, not a format change.
+The shard layout already supports it because shards are written sequentially.
+
+### 12.4 Optimization 3: Parallel and Async Range Reads
+
+The reader issues **all shard range reads in parallel** using async HTTP/2
+connections. S3 supports thousands of concurrent GET requests. For a query
+touching N shards, the total latency is approximately:
+
+```
+total ≈ catalog_read_time + max(shard_read_times)
+       ≈ 100ms + max(100ms, transfer_time)
+```
+
+rather than `100ms + N × 100ms` (sequential).
+
+This is purely an implementation optimization. The `object_store` Rust crate
+(used by Arrow, Delta Lake, and Lance) provides this out of the box with S3,
+GCS, and Azure backends. The SCX reader delegates cloud I/O to `object_store`
+and uses `tokio` for async orchestration.
+
+### 12.5 Optimization 4: Exploded Directory Layout (`.scxd`)
+
+For true cloud-native deployment where the single-file model is unacceptable
+(e.g., hosting a public atlas on S3 with per-shard access), SCX supports an
+**exploded directory layout** that preserves the identical shard format:
+
+```
+experiment.scxd/                   (directory on S3)
+├── _catalog.bin                   (full catalog, typically <200 KB)
+├── _header.bin                    (256-byte file header)
+├── obs.arrow                      (obs metadata, Arrow IPC)
+├── var.arrow                      (var metadata, Arrow IPC)
+├── X/
+│   ├── 000000.shard               (CSR shard 0, self-contained)
+│   ├── 000001.shard               (CSR shard 1)
+│   └── ...
+├── obsm/
+│   ├── X_pca.arrow
+│   └── X_umap.arrow
+├── layers/
+│   └── raw_counts/
+│       ├── 000000.shard
+│       └── ...
+└── uns.json
+```
+
+**Each shard is byte-identical to its packed-file counterpart.** The shard header,
+codec, and data are the same. The only difference is physical packaging: one
+object per shard vs. concatenated in a single file.
+
+**Cloud access pattern:**
+
+1. GET `_catalog.bin` (~100 ms, <200 KB) — complete section index
+2. GET `obs.arrow` (~100 ms) — metadata for predicate evaluation
+3. GET matching shard files in parallel (~100 ms each, parallel)
+
+**Total: 200 ms + 100 ms** (matching the optimal Zarr/TileDB pattern). Each
+shard is a single complete S3 object — no range reads needed.
+
+**Round-trip tools:**
+
+```bash
+# Explode a packed .scx into a cloud-deployable directory
+scx explode experiment.scx experiment.scxd/
+
+# Pack an exploded directory back into a single file
+scx pack experiment.scxd/ experiment.scx
+
+# Upload to S3 (standard tooling)
+aws s3 sync experiment.scxd/ s3://bucket/experiment.scxd/
+```
+
+**The packed `.scx` and exploded `.scxd` are semantically equivalent.**
+`scx pack` followed by `scx explode` (or vice versa) produces identical data.
+Users choose the packaging based on deployment target:
+
+| Deployment | Recommended packaging |
+|------------|----------------------|
+| HPC cluster (GPFS, Lustre) | `.scx` (single file) |
+| Local NVMe / workstation | `.scx` (single file) |
+| Sharing via scp/rsync | `.scx` (single file) |
+| S3/GCS atlas hosting | `.scxd` (exploded) |
+| Cloud + local hybrid | `.scx --cloud-ready` (front catalog) |
+
+**Python API:**
+
+```python
+# Both work identically — the reader auto-detects format
+exp = scx.open("experiment.scx")            # packed file
+exp = scx.open("experiment.scxd/")          # exploded directory
+exp = scx.open("s3://bucket/experiment.scxd/")  # cloud directory
+exp = scx.open("s3://bucket/experiment.scx")    # cloud file (range reads)
+```
+
+### 12.6 Optimization 5: Obs Metadata Colocation
+
+For predicate-pushdown queries from cloud, the reader needs both the catalog
+(for shard statistics) and the obs metadata (for predicate evaluation). If these
+are far apart in the file, that is two sequential reads.
+
+The **cloud-ready layout** (§12.2) places them close together:
+
+```
+Bytes 0–256:           Header
+Bytes 256–4352:        Root catalog
+Bytes 4352–~70KB:      Front catalog
+Bytes ~70KB–~5MB:      Obs metadata (Arrow IPC)
+Bytes ~5MB–~5.1MB:     Var metadata (Arrow IPC)
+Bytes ~5.1MB–...:      CSR shards
+```
+
+A single initial read of the first 5 MB captures header + catalogs + obs + var
+metadata. This is within S3's optimal read size and gives the reader everything
+needed to plan shard access. For small-to-medium datasets where obs metadata
+is <1 MB, a 1 MB initial read suffices.
+
+**Implementation:** `scx convert --cloud-ready` writes obs and var metadata
+immediately after the front catalog, before CSR shards. This is a section
+ordering convention, not a format change — the catalog's offset/length entries
+point to wherever sections are physically located.
+
+### 12.7 Cloud Performance Model
+
+Estimated latencies for common operations on S3 (standard, same-region EC2):
+
+| Operation | Unoptimized | Cloud-ready (.scx) | Exploded (.scxd) |
+|-----------|-------------|---------------------|-------------------|
+| Open (catalog only) | 300 ms (3 reads) | **100 ms** (1 read) | **100 ms** (1 GET) |
+| Open + obs metadata | 400 ms (4 reads) | **100 ms** (1 read¹) | **200 ms** (2 GETs) |
+| Read 1 shard | 500 ms (open + 1) | **200 ms** (open + 1) | **300 ms** (open + 1 GET) |
+| Read 10 shards (parallel) | 500 ms | **200 ms** | **300 ms** |
+| Read 100 shards (parallel) | 500 ms² | **200 ms²** | **300 ms²** |
+| Full scan (1000 shards) | ~600 ms + BW | ~200 ms + BW | ~300 ms + BW |
+
+¹ With obs metadata colocated (§12.6), a single 1–5 MB read captures
+  header + catalog + obs + var.
+² Parallel shard reads are bounded by S3 concurrency limits (~5,500
+  requests/sec/prefix), not by the number of shards.
+
+**Comparison with Zarr v3 (sharded):** 2 reads per chunk (index + data), so
+reading 10 chunks = 2 reads (index is shared) + 10 data reads = ~200 ms.
+Cloud-ready SCX is comparable. Exploded SCX matches Zarr's 1-GET-per-chunk
+pattern exactly.
+
+**Comparison with TileDB-SOMA on S3:** TileDB reads fragment metadata + tile
+data, typically 2–5 reads per query. SCX cloud-ready is comparable for
+selective queries. TileDB's advantage is consolidation and MVCC, not raw
+read latency.
+
+### 12.8 What This Does Not Change
+
+These optimizations are **additive** — they do not modify any existing SCX
+behavior:
+
+- **Local performance is identical.** Local readers ignore front catalogs and
+  use mmap/pread as before. No extra I/O, no overhead.
+- **The packed `.scx` format is unchanged.** All fields, sections, codecs,
+  and catalogs work exactly as specified. Cloud-ready is an optional layout
+  convention, not a format version change.
+- **Append, delete, compact, rollback work as before.** The front catalog is
+  a convenience copy that can be regenerated. It does not participate in the
+  fragment/manifest model.
+- **GDS, training loader, query engine are unaffected.** These operate on
+  local files and never use cloud I/O paths.
+- **Single-file portability is preserved.** A cloud-ready `.scx` is still one
+  file that can be `cp`/`scp`/`rsync`'d. The exploded `.scxd` is a separate
+  deployment option for users who need it.
+
+---
+
+## 13. Rust Crate Architecture
 
 ```
 scx/
@@ -1273,9 +1669,9 @@ scx/
 
 ---
 
-## 13. Conformance and Testing
+## 14. Conformance and Testing
 
-### 13.1 Conformance Test Suite
+### 14.1 Conformance Test Suite
 
 A set of reference `.scx` files and expected outputs:
 
@@ -1292,7 +1688,7 @@ A set of reference `.scx` files and expected outputs:
   on any input file. Fuzz targets for the shard decoder, catalog parser, and Arrow
   IPC reader are included in the test suite and run in CI.
 
-### 13.2 Reference Implementation
+### 14.2 Reference Implementation
 
 The Rust implementation in the `scx-format` and `scx-codec` crates is the normative
 reference. In case of ambiguity between this specification document and the Rust
@@ -1300,70 +1696,356 @@ code, the Rust code takes precedence for encoding/decoding behavior.
 
 ---
 
-## 14. Comparison with Existing Formats
+## 15. Comparison with Existing Formats
 
-| Feature | h5ad | Zarr v3 | TileDB-SOMA | **SCX** |
-|---------|------|---------|-------------|---------|
-| Single file | Yes | No (folder) | No (database) | **Yes** |
-| Sparse-native | CSR as 3 arrays | CSR as 3 arrays | Native sparse | **Native CSR** |
-| Domain-specific codec | No | No | No | **Yes (Rice)** |
-| Metadata predicate pushdown | No | No | Yes | **Yes** |
-| HPC friendly | Good | Poor (many files) | Poor (database) | **Best** |
-| Cloud-native | Poor | **Excellent** | **Excellent** | Adequate (range reads) |
-| ML data loader | N/A | N/A | Slow (Python) | **Rust, fast** |
-| Operation fusion | No | No | No | **Yes** |
-| GPU zero-copy (GDS) | No | No | No | **Yes** |
-| Multimodal support | No (MuData) | No (MuData) | Partial | **Extensible** |
-| Append without rewrite | No | Yes | Yes (MVCC) | **Yes (fragment/manifest)** |
-| Ecosystem maturity | Excellent | Good | Growing | **New** |
+### 15.1 Format-by-Format Analysis
+
+#### h5ad (AnnData / HDF5)
+
+The de facto standard for single-cell Python analysis. A single HDF5 file with a
+well-defined hierarchical schema (`obs`, `var`, `X`, `layers`, `obsm`, `obsp`, `uns`).
+
+**Strengths:** Dominant ecosystem — nearly every scRNA-seq paper publishes h5ad.
+Single-file portability. Mature, well-tested I/O in scanpy/anndata. R support via
+`anndataR` (stable, Bioconductor-integrated). Every tool in the scverse reads h5ad.
+
+**Weaknesses:** No domain-specific compression — generic gzip/lz4 achieves ~4.5
+bits/value vs. the ~2.0-bit Shannon entropy of UMI counts. Cloud-hostile — HDF5's
+metadata-tree structure requires many small reads via `ros3`, incurring high latency
+on S3/GCS. No concurrent write access (file-level locking). Begins to struggle above
+~5–10M cells because the object model assumes in-memory `AnnData`. No streaming/lazy
+iteration for ML training. Full-file rewrite on any modification. Backed (on-disk)
+mode exists but is slow for random access.
+
+#### Zarr v3
+
+Directory-of-files (or sharded files in v3) format. AnnData can write to Zarr using
+the same logical schema as h5ad. Zarr v3 (zarr-python 3, released January 2025) adds
+sharding, async I/O, and a modular codec pipeline.
+
+**Strengths:** Excellent cloud-native access — each chunk is a separate object, enabling
+efficient S3/GCS parallel reads. Configurable codec pipeline (Blosc/LZ4/Zstd,
+composable in v3). Individual chunks can be overwritten independently. Growing
+cross-language support (Python, R via pizzarr, Rust via zarrs, Julia via Zarr.jl).
+Dask integration for larger-than-memory datasets.
+
+**Weaknesses:** Directory-of-files is unwieldy to manage and transfer (thousands of
+small files; `cp`/`rsync` is slow vs. a single file). No domain-specific single-cell
+compression. AnnData-on-Zarr is less mature than h5ad I/O. Sparse matrices are still
+stored as three separate arrays (data, indices, indptr) with no first-class sparse
+treatment. No built-in ML data loader or GPU path. R support is limited. HPC parallel
+filesystems (GPFS, Lustre) suffer with many-small-file patterns.
+
+#### TileDB-SOMA
+
+Directory-based TileDB array groups. The SOMA `Experiment` model mirrors AnnData
+(`obs`, `ms`, `X`, `var`, `obsm`). Fragment-based architecture with MVCC semantics.
+Backed by CZI for the CellxGENE Census.
+
+**Strengths:** Production-proven at 125M+ unique cells (CellxGENE Census) — the
+largest demonstrated scale of any single-cell format. Cloud-native (S3, GCS, Azure
+are first-class backends). First-class sparse arrays with efficient predicate-filtered
+slicing. Append-friendly fragment architecture with time-travel queries. Good Python
+and R APIs with Arrow interop. `tiledbsoma-ml` provides a PyTorch
+`ExperimentDataset` with 4-stage pipeline (partition → shuffle-chunk → IO-batch →
+mini-batch) and DDP-aware distributed training support.
+
+**Weaknesses:** Complex directory structure — not a single portable file. Significant
+dependency footprint. ML data loader is still alpha (released March 2025) with
+constraints (no native PyTorch sampler, manual epoch management). Data flows through
+CPU memory — no GPU-direct I/O (GDS). No domain-specific UMI compression. TileDB is
+a commercial company — open-source core is MIT but the cloud platform is proprietary.
+Learning curve for the SOMA data model. Not widely used for day-to-day single-lab
+analysis outside the Census context.
+
+#### 10x Genomics HDF5 (.h5)
+
+Single HDF5 file output by Cell Ranger. Contains CSC sparse matrix, barcodes, and
+features in a flat hierarchy.
+
+**Strengths:** Universal read support across all tools. Simple, flat structure. Fast
+to read with standard HDF5 libraries.
+
+**Weaknesses:** CSC (gene-major) orientation is suboptimal for cell-major analysis.
+Limited metadata schema — only barcodes and features, no embeddings, graphs, or
+annotations. Write-once format from Cell Ranger. Same HDF5 cloud limitations. Not
+designed for atlas-scale datasets.
+
+#### Loom (.loom)
+
+Single HDF5 file with genes × cells matrix, layers, row/column attributes, and
+graphs. Developed by the Linnarsson lab.
+
+**Strengths:** Single-file portability. Simple, symmetric schema. Was historically
+adopted by the Human Cell Atlas.
+
+**Weaknesses:** Expression matrix is stored **dense** — prohibitively wasteful for
+scRNA-seq where >90% of values are zero. Genes × cells orientation (transposed from
+most tools). Declining community support — largely superseded by h5ad. No
+domain-specific compression. Same HDF5 cloud/concurrency limitations.
+
+#### Seurat RDS (.rds)
+
+R's native serialization of a Seurat object. Seurat v5 introduced layers within
+assays and BPCells integration for on-disk bitpacked sparse matrices.
+
+**Strengths:** Dominant in R single-cell analysis (Seurat is one of the most-cited
+single-cell tools). BPCells integration enables impressive scale: 1.3M cells
+normalized + PCA in 4 min / 2GB RAM; 44M cells full PCA in 6 hours on a laptop.
+Sketch-based workflows enable interactive analysis of very large datasets.
+
+**Weaknesses:** R-only — opaque binary format unreadable without R. Interop with
+Python requires conversion via `SeuratDisk` (experimental) or `anndataR`. Full
+rewrite on save. No cloud support. No ML training pipeline or GPU path.
+
+#### MEX/MTX (Market Exchange Format)
+
+Cell Ranger output: three files (`matrix.mtx.gz`, `barcodes.tsv.gz`,
+`features.tsv.gz`) with the sparse matrix in text-based COO format.
+
+**Strengths:** Universally readable — any language can parse text COO. No library
+dependencies required. Common lowest-denominator interchange format.
+
+**Weaknesses:** Text-based format is 2–5× larger than binary equivalents and slow to
+parse. COO requires conversion to CSR/CSC for computation. Three separate files to
+manage. No metadata beyond barcodes and features. 1-indexed (a recurring source of
+bugs).
+
+### 15.2 Summary Comparison
+
+| Feature | h5ad | Zarr v3 | TileDB-SOMA | 10x HDF5 | Loom | Seurat RDS | MEX | **SCX** |
+|---------|------|---------|-------------|-----------|------|------------|-----|---------|
+| File structure | Single | Directory | Directory | Single | Single | Single | 3 files | **Single** |
+| Sparse-native | 3 arrays | 3 arrays | Native | CSC only | Dense | dgCMatrix | COO text | **Native CSR** |
+| Domain codec | No | No | No | No | No | BPCells¹ | No | **Yes (Rice)** |
+| Compression (bits/val) | ~4.5 | ~4.5 | ~4.5 | ~4.5 | N/A² | ~3³ | ~6+ | **~2.2** |
+| Predicate pushdown | No | No | Yes | No | No | No | No | **Yes** |
+| Operation fusion | No | No | No | No | No | No | No | **Yes** |
+| HPC friendly | Good | Poor⁴ | Poor⁵ | Good | Good | Good | Fair | **Best** |
+| Cloud-native | Poor | **Best** | **Excellent** | Poor | Poor | Poor | Poor | Good⁶ |
+| ML data loader | No | No | Alpha⁷ | No | No | No | No | **Yes** |
+| GPU zero-copy (GDS) | No | No | No | No | No | No | No | **Yes** |
+| Append w/o rewrite | No | Partial⁸ | **Yes** | No | Limited | No | No | **Yes** |
+| Max proven scale | ~10M | ~10M | **125M+** | ~100K | ~1M | 44M⁹ | ~100K | TBD |
+| Python ecosystem | **Excellent** | Good | Good | Good | Declining | Via conversion | Good | New |
+| R ecosystem | Good | Limited | Good | Good | Limited | **Excellent** | Good | New |
+| Maturity | **Excellent** | Growing | Growing | High | Declining | **Excellent** | High | **New** |
+
+¹ BPCells uses bitpacking, not UMI-distribution-aware coding.
+² Loom stores the expression matrix dense; compression ratio is poor by construction.
+³ BPCells bitpacking; not directly comparable as it's an in-memory/on-disk hybrid.
+⁴ Many-small-file patterns perform poorly on GPFS/Lustre.
+⁵ Database overhead; not a simple file on a parallel filesystem.
+⁶ With cloud-ready layout (§12.2) or exploded directory (§12.5), comparable to Zarr v3.
+⁷ `tiledbsoma-ml` released March 2025, still alpha.
+⁸ Individual chunks can be overwritten; row-append requires careful chunk management.
+⁹ With BPCells on-disk backend; standard RDS is RAM-limited.
+
+### 15.3 SCX Advantages (Pros)
+
+**1. Domain-specific compression approaching the entropy limit.**
+No existing format exploits the near-geometric UMI count distribution. Generic codecs
+(gzip, lz4, zstd) achieve ~4.5 bits/value. SCX's adaptive Rice codec targets ~2.2
+bits/value — a ~2× reduction in compressed size for the expression matrix. This
+translates directly to faster I/O, lower storage costs, and higher effective memory
+bandwidth.
+
+**2. Single-file portability with high performance.**
+h5ad is single-file but slow at scale and cloud-hostile. TileDB-SOMA is fast but
+directory-based. No existing format is simultaneously a single portable file AND
+high-performance for large datasets. SCX's shard-based layout within a single file
+achieves both: `cp`/`rsync`/`scp` one file, then compute at full speed.
+
+**3. Integrated ML training data loader.**
+The triple-buffered Rust pipeline (decode → transfer → train) is designed to saturate
+GPUs during foundation model training. No existing format provides a built-in data
+loader at this level of integration. TileDB-SOMA-ML exists but is alpha, Python-only,
+and CPU-mediated. SCX's loader operates below the GIL with direct shard-to-GPU paths.
+
+**4. GPU-direct I/O (GDS) support.**
+SCX's shard layout aligns with cuSPARSE CSR, enabling NVIDIA GPUDirect Storage to
+bypass CPU memory entirely. No existing single-cell format supports GDS. For
+GPU-intensive workloads (PCA, kNN, training), this eliminates a major bottleneck.
+
+**5. CSR-first orientation matching dominant access patterns.**
+Cell-major (CSR) operations — QC, normalization, PCA, ML training — account for
+60–80% of analysis runtime (§2.4). Most formats store CSC (10x HDF5, Seurat) or
+treat sparse as an afterthought. SCX stores CSR as the primary representation with
+CSC as an opt-in addition, matching actual workload priorities.
+
+**6. Query engine with predicate pushdown and operation fusion.**
+SCX fuses chained operations (filter → normalize → PCA) into a single shard-streaming
+pass, avoiding materialization of intermediate matrices. Combined with predicate
+indexes on metadata, this enables efficient subset queries without full-data scans.
+Only TileDB-SOMA offers predicate pushdown among existing formats; none offer
+operation fusion.
+
+**7. Append-friendly without full-file rewrite.**
+The fragment/manifest model (§3.6) supports appending new cells, logical deletion via
+deletion vectors, and compaction — all without rewriting existing data. h5ad requires
+full rewrites. Zarr allows chunk-level updates but has no first-class append
+semantics for sparse matrices.
+
+**8. Cross-language Rust core.**
+A single Rust implementation with Python and R bindings ensures consistent behavior
+and performance across languages. The existing ecosystem is fragmented: h5ad is
+Python-first, Seurat is R-only, and cross-language interop requires lossy conversion.
+
+### 15.4 SCX Disadvantages (Cons)
+
+**1. Zero ecosystem maturity.**
+SCX is a new, unproven format. h5ad is the lingua franca of single-cell Python
+analysis — nearly every scRNA-seq paper publishes h5ad, every tool reads it, and every
+tutorial teaches it. Zarr and TileDB-SOMA have years of production use and active
+communities. SCX has none of this. Users will need to convert to/from h5ad for any
+tool that doesn't natively support SCX, which is initially all of them.
+
+**2. Adoption chicken-and-egg problem.**
+A format is only useful if tools read it. Until scanpy, Seurat, scVI, cellxgene, and
+other ecosystem tools support SCX natively, users face a conversion tax on every
+workflow. The `to_anndata()`/`from_anndata()` bridge mitigates this but does not
+eliminate it — the bridge itself becomes a performance bottleneck and a source of
+edge-case bugs.
+
+**3. Cloud story requires additional optimization.**
+SCX is HPC/local-first by design. For cloud-hosted atlases, Zarr v3 and TileDB-SOMA
+have fundamentally cloud-native architectures (one object per chunk). SCX mitigates
+this with the cloud-ready layout (§12.2: front-of-file catalog eliminates round trips),
+shard coalescing (§12.3), parallel range reads (§12.4), and an optional exploded
+directory layout (§12.5: `.scxd` with one object per shard). With these optimizations,
+cloud access latency matches Zarr v3 sharding for selective queries. However, the
+"stage locally, then compute" model remains recommended for intensive workloads (GPU
+training, full-scan analysis), and the exploded layout loses single-file portability.
+
+**4. Unproven at atlas scale.**
+TileDB-SOMA has been production-tested at 125M+ cells in the CellxGENE Census. SCX
+has no equivalent validation. Theoretical performance projections (§8.8) are not
+benchmarks. Until SCX demonstrates atlas-scale performance on real, diverse datasets,
+its claims remain unverified.
+
+**5. Maintenance burden and contributor pool.**
+A Rust codebase requires Rust expertise. The scverse ecosystem is almost entirely
+Python; Seurat is R. Finding contributors who can work on a Rust core, Python
+bindings (PyO3), and R bindings simultaneously is harder than maintaining pure Python
+or R packages. Bus-factor risk is real for a specialized Rust project in a
+Python-dominated community.
+
+**6. Moving target — existing formats are improving.**
+AnnData is actively developing Zarr v3 support, lazy/Dask integration, and better
+out-of-core access. TileDB-SOMA-ML is iterating rapidly toward stable release.
+BPCells is pushing Seurat to 44M+ cells with bitpacked on-disk storage. The gaps SCX
+targets may narrow over the next 1–2 years as incumbents improve, reducing the
+incentive to adopt a new format.
+
+**7. Format fragmentation cost.**
+The single-cell community already suffers from format proliferation (h5ad, loom,
+Seurat RDS, 10x HDF5, MEX, Zarr, TileDB-SOMA). Adding another format increases the
+conversion tax for the community. The scverse ecosystem has been actively
+consolidating around h5ad/Zarr — SCX pushes against that consolidation effort.
+
+**8. Single-file trade-offs.**
+Single-file portability comes at a cost: partial updates require the fragment/manifest
+append model (§3.6), which adds internal complexity (deletion vectors, compaction,
+catalog versioning). Directory-based formats like Zarr and TileDB can update
+individual chunks or fragments independently with simpler semantics. The single-file
+design also means the entire file must be staged for computation, even if only a
+subset of cells is needed — cloud-native formats can fetch just the relevant chunks.
+
+**9. Compression claims need rigorous validation.**
+The ~2.2 bits/value claim for the Rice codec is based on the typical 10x Chromium UMI
+distribution. Performance may degrade on non-UMI protocols (Smart-seq2, VASA-seq),
+deeply sequenced datasets with higher count ranges, or multimodal data (CITE-seq
+protein counts, ATAC fragments). Benchmarks must cover diverse protocols and
+sequencing depths to be credible.
+
+**10. R ecosystem gap.**
+R bindings are deferred to Phase 4 (months 10–14). Seurat users — a large fraction of
+the community — cannot use SCX until then. By contrast, TileDB-SOMA already has
+stable R support, and `anndataR` provides direct R↔h5ad interop.
+
+### 15.5 Where Each Format Wins
+
+| Workload | Best format | Why |
+|----------|-------------|-----|
+| Day-to-day Python analysis | h5ad | Universal tool support, mature ecosystem |
+| Day-to-day R analysis | Seurat RDS | Native Seurat integration, BPCells scale |
+| Cloud-hosted atlas serving | TileDB-SOMA | 125M+ cell scale, cloud-native, predicate queries |
+| Cloud-native chunk access | Zarr v3 / **SCX .scxd** | Chunk-per-object; SCX exploded layout (§12.5) matches this pattern |
+| Cell Ranger output | 10x HDF5 / MEX | Universal interchange, no conversion needed |
+| HPC GPU training | **SCX** | GDS, triple-buffered loader, domain codec |
+| HPC batch analysis | **SCX** | Single-file staging, CSR-native, operation fusion |
+| Cross-language portability | **SCX** | Single Rust core, single file, no external deps |
 
 SCX does not claim to be superior in all dimensions. Its advantages are strongest
-for HPC, GPU, and training workloads. For cloud-native atlas hosting with
-low-latency random access, Zarr v3 or TileDB-SOMA remain more appropriate.
+for HPC, GPU training, and high-throughput batch analysis workloads. For cloud-native
+atlas hosting, Zarr v3 or TileDB-SOMA remain more appropriate. For day-to-day
+interactive analysis, h5ad and Seurat RDS have unmatched ecosystem depth. SCX's value
+proposition is clearest when I/O bandwidth, compression efficiency, or GPU saturation
+is the bottleneck.
 
 ---
 
-## 15. Implementation Roadmap
+## 16. Implementation Roadmap
 
-### Phase 0: Validate the Thesis (Months 1-2)
-- Build `scx-loader` that reads **existing h5ad files** via a Rust backend
-- Implement the triple-buffered pipeline with shard-like chunking on h5ad
-- Benchmark against TileDB-SOMA-ML on the same h5ad data
-- **Deliverable**: Reproducible proof that the Rust loader architecture saturates
-  GPUs, independent of the SCX file format. This validates the core performance
-  thesis before asking anyone to adopt a new format.
+> **Note**: The authoritative and detailed roadmap is maintained in
+> [ROADMAP.md](ROADMAP.md). This section is a summary for readers of the spec.
+> A detailed implementation plan for Phase 1 is in [Phase1.md](Phase1.md).
 
-### Phase 1: Core Format + Codec (Months 2-4)
-- `scx-format`: packed file reader/writer, dual catalog, atomic writes
-- `scx-codec`: Rice, FOR-BP, Delta-Golomb with conformance test vectors
-- `scx-cli`: convert from h5ad/10x, info, validate
-- `pyscx` minimal: `scx.open()`, `to_anndata()`, `from_anndata()`
-- **Deliverable**: `scx convert` works, round-trip tests pass, I/O benchmarks
-  published vs. h5ad/zarr on representative datasets.
+### Strategy: AnnData-First
+
+SCX does not need to reimplement scanpy, scVI, or any scverse analysis tool.
+`to_anndata()` produces a standard AnnData backed by zero-copy scipy CSR and
+Arrow-backed pandas DataFrames (§6.2), so every existing tool works unmodified.
+SCX builds the file format, codec, I/O layer, AnnData bridge, query engine,
+and ML training data loader — things no existing tool provides.
+
+### Phase 1: Format + Codec + AnnData Bridge (Months 1-4)
+
+- `scx-format`: packed file reader/writer, dual catalog (§3.2), atomic writes (§3.6.1)
+- `scx-codec`: Rice (§4.3), FOR-BP (§4.2), Delta-Golomb (§4.1) with conformance test vectors
+- `scx-sparse`: `ScxCsr` in-memory representation with scipy zero-copy (§6.1–6.2)
+- `scx-cli`: `convert` (h5ad/10x ↔ scx), `info`, `validate`
+- `pyscx`: `scx.open()`, `to_anndata()`, `from_anndata()`, layers/obsm/obsp/uns round-trip
+- **Go/No-Go Gate**: h5ad → scx → h5ad round-trip is bit-exact for integer counts;
+  SCX file < 60% the size of h5ad; `to_anndata()` → full scanpy pipeline works.
+- **Deliverable**: `scx convert` works end-to-end. Published compression and I/O
+  benchmarks show SCX files are smaller and faster to read than h5ad.
 
 ### Phase 2: Training Loader + Query Engine (Months 4-7)
-- `scx-loader`: full pipeline reading from `.scx` files
-- `scx-engine`: lazy evaluation, predicate pushdown, operation fusion
+
+- `scx-loader`: triple-buffered Rust pipeline (§8.2) reading native `.scx` files
+- `scx-engine`: lazy evaluation (§7.1), predicate pushdown (§7.2), operation fusion
+- Fragment/manifest operations: `append` (§3.6.2), `delete` (§3.6.3),
+  `compact` (§3.6.4), `rollback` (§3.6.5), `merge`
+- Predicate indexes (§3.5): categorical, numeric (B+ tree), high-cardinality hash
+- Fused normalize+log1p (§7.2)
 - scVI/scGPT DataModule integration
-- **Deliverable**: End-to-end training pipeline on atlas-scale data with published
-  throughput benchmarks.
+- **Go/No-Go Gate**: scVI trains on 10M-cell SCX dataset with GPU utilization >85%;
+  training throughput >2× TileDB-SOMA-ML; predicate pushdown skips >50% of shards.
+- **Deliverable**: Training loader with published throughput benchmarks. Query engine
+  filters and subsets data efficiently.
 
-### Phase 3: GPU Path (Months 7-10)
-- `scx-gpu`: CUDA codec decoders, GDS integration
-- GPU PCA, kNN, Leiden
-- **Deliverable**: Full GPU analysis pipeline benchmarked vs. rapids-singlecell.
+### Phase 3: GPU Path + Ecosystem (Months 7-10)
 
-### Phase 4: Ecosystem (Months 10-14)
-- `rscx`: R bindings, Seurat/SCE interop
-- `scx build-csc`, `scx merge`
-- Multimodal support (CITE-seq, spatial)
-- Detection bitmap layer
-- Conformance test suite and fuzz targets
-- **Deliverable**: Production-ready release.
+- `scx-gpu`: CUDA codec decoders (§4.4), cuSPARSE CSR interop, GDS (§8.6)
+- `rscx`: R bindings (extendr), `to_seurat()`, `to_sce()`
+- Multimodal support: CITE-seq (§11.1), spatial (§11.2), MuData interop
+- `scx build-csc`, `scx subset`, `scx benchmark`
+- SIMD codec optimizations (AVX2, NEON), detection bitmap (§5)
+- Full conformance test suite, fuzz targets, documentation
+- **Go/No-Go Gate**: Format spec frozen; R and Python bindings pass conformance suite;
+  GDS path >2× CPU path throughput on NVMe.
+- **Deliverable**: Production-ready v1.0 release.
+
+### Phase 4 (Optional): Rust-Native Analysis Accelerators
+
+Only if profiling shows scanpy is the bottleneck at scale (>1M cells):
+- PCA (randomized SVD), kNN (HNSW or GPU CAGRA/RAFT), UMAP
+- Exposed as optional accelerators that write results into standard AnnData slots
 
 ---
 
-## 16. Why This Wins
+## 17. Why This Wins
 
 scRNA-seq data is one of the most structured data types in computational biology.
 The value distribution is near-geometric. The sparsity is extreme and patterned.
@@ -1376,7 +2058,15 @@ engine that fuses operations, and loaded through a pipeline that keeps GPUs
 saturated.
 
 The strategic risk is real: replacing an entire stack simultaneously creates an
-adoption chicken-and-egg problem. The phased roadmap addresses this by delivering
+adoption chicken-and-egg problem, and the ecosystem advantages of h5ad and
+TileDB-SOMA are formidable (§15.4). The phased roadmap addresses this by delivering
 value incrementally — first a fast training loader (Phase 0, works with existing
 h5ad), then a format (Phase 1), then an analysis engine (Phase 2). Each phase
 stands on its own and provides concrete, measurable improvement over the status quo.
+
+SCX will succeed or fail based on whether its performance advantages are large enough
+to justify adoption costs. The compression, I/O, and GPU claims in this spec must be
+validated with rigorous, reproducible benchmarks across diverse datasets before asking
+the community to invest in a new format. If the benchmarks don't deliver, the honest
+answer is to contribute the codec and loader innovations back into existing formats
+rather than fragmenting the ecosystem further.
