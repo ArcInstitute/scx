@@ -361,7 +361,7 @@ impl ScxReader {
     /// Assemble multiple shard entries into a single ScxCsr.
     fn assemble_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
         if shards.is_empty() {
-            return Ok(ScxCsr::new(
+            return Ok(ScxCsr::new_unchecked(
                 (0, self.header.n_vars as usize),
                 vec![0],
                 vec![],
@@ -392,7 +392,7 @@ impl ScxReader {
         }
 
         let n_rows = merged_indptr.len().saturating_sub(1);
-        Ok(ScxCsr::new(
+        Ok(ScxCsr::new_unchecked(
             (n_rows, self.header.n_vars as usize),
             merged_indptr,
             merged_indices,

@@ -39,6 +39,9 @@ pub enum ScxError {
     #[error("shard index {index} out of bounds (count: {count})")]
     ShardIndexOutOfBounds { index: usize, count: usize },
 
+    #[error("CSR error: {0}")]
+    Csr(#[from] scx_sparse::CsrError),
+
     #[error("codec error: {0}")]
     Codec(#[from] scx_codec::CodecError),
 
