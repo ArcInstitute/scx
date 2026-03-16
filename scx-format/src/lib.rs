@@ -8,6 +8,10 @@ pub mod section;
 pub mod shard;
 pub mod writer;
 
+pub use catalog::{
+    FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry, ShardStats,
+    ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE,
+};
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use error::{Result, ScxError};
 pub use header::{FileHeader, HEADER_SIZE, MAGIC};

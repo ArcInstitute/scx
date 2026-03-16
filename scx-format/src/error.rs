@@ -27,6 +27,12 @@ pub enum ScxError {
     #[error("inconsistent CSR array lengths")]
     InconsistentCsr,
 
+    #[error("root catalog exceeds 4096 byte limit: {0} bytes")]
+    RootCatalogTooLarge(usize),
+
+    #[error("unknown section type: {0}")]
+    UnknownSectionType(u8),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
