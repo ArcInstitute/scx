@@ -9,3 +9,5 @@ pub mod shard;
 pub mod writer;
 
 pub use error::{Result, ScxError};
+pub use header::{FileHeader, HEADER_SIZE, MAGIC};
+pub use section::{align_to_8, SectionType};
