@@ -524,6 +524,7 @@ pub struct FileHeader {
                                   // bit 2: has_obsm, bit 3: has_obsp,
                                   // bit 4: has_modalities (§11),
                                   // bit 5: has_deletion_vectors (§3.6.3)
+                                  // bit 6: has_front_catalog (§12.2, Phase 2+)
     pub n_obs: u64,
     pub n_vars: u64,
     pub nnz: u64,
@@ -541,12 +542,14 @@ pub struct FileHeader {
     pub manifest_sequence: u64,   // monotonic, 0 for initial write
     pub prev_catalog_offset: u64, // 0 if first version
     pub file_checksum: u64,       // BLAKE3 truncated to 64 bits
-    pub reserved: [u8; 148],      // zeroed, future use
-    // Total: 4+2+2+4 + 8+8+8 + 4+4+4 + 1+1+1+1 + 8+8+8+8+8+8+8 + 148 = 256
+    pub front_catalog_offset: u64, // 0 in Phase 1 (cloud-ready, SPEC §12.2)
+    pub front_catalog_length: u64, // 0 in Phase 1 (cloud-ready, SPEC §12.2)
+    pub reserved: [u8; 132],      // zeroed, future use
+    // Total: 4+2+2+4 + 8+8+8 + 4+4+4 + 1+1+1+1 + 8+8+8+8+8+8+8 + 8+8 + 132 = 256
 }
 ```
 
-**Size verification**: Fields before `reserved` sum to 108 bytes. `108 + 148 = 256`.
+**Size verification**: Fields before `reserved` sum to 124 bytes. `124 + 132 = 256`.
 
 Methods:
 - `FileHeader::write_to(&self, writer: &mut impl Write) → Result<()>` — serialize
@@ -1637,20 +1640,19 @@ reader → conversion → pyscx → benchmarks.
 
 Issues found during plan review. Status as of March 2026:
 
-1. **FileHeader reserved field size**: ~~The SPEC §3.1 listed `reserved: [u8; 132]`
-   but the fields before it sum to 108 bytes, giving a total of 240.~~ **FIXED in
-   SPEC v0.5**: `reserved` is now `[u8; 148]` (108 + 148 = 256). A size accounting
-   note has been added to the spec.
+1. **FileHeader reserved field size**: The header now includes `front_catalog_offset`
+   and `front_catalog_length` fields (for cloud-ready layout, SPEC §12.2), bringing
+   the pre-reserved total to 124 bytes. With `reserved: [u8; 132]`, the total is
+   124 + 132 = 256 bytes. Phase 1 writes these fields as zero.
 
 2. **ShardHeader size**: The SPEC §3.3 diagram labels the shard header as
    "64 bytes" but the specified fields sum to 76 bytes. This plan implements the
    full field set (76 bytes) as listed. **SPEC v0.5 now includes a note** clarifying
    that implementations MUST use 76 bytes and the diagram label is incorrect.
 
-3. **SPEC §15 roadmap is outdated**: The in-spec roadmap still has the old
-   Phase 0 (validate thesis via h5ad loader). The authoritative roadmap is
-   [ROADMAP.md](ROADMAP.md) which was restructured to start directly with the
-   format implementation.
+3. **SPEC §16 roadmap**: ~~The in-spec roadmap had a stale Phase 0 reference.~~
+   **FIXED**: §16 and §17 now correctly reference Phases 1-3. The authoritative
+   roadmap is [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -1670,3 +1672,4 @@ Per [ROADMAP.md](ROADMAP.md) phasing:
 - CSC / build-csc (Phase 3, ROADMAP §3.2)
 - Multimodal (Phase 3, ROADMAP §3.4)
 - Detection bitmap (Phase 3, ROADMAP §3.5)
+- Cloud operations: pull/push/explode/pack/cloud-optimize (Phase 2+, SPEC §12)

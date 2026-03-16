@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-03-15
+**Last updated**: 2026-03-16
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -81,7 +81,8 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
   accepts for all standard operations (QC through DE)
 - [ ] Benchmark: compression ratio vs h5ad and Zarr
 - [ ] Benchmark: read throughput (time to `to_anndata()`) vs h5ad
-- [ ] Benchmark datasets: PBMC 3K, tabula sapiens subset, CELLxGENE Census subset
+- [ ] Benchmark datasets: PBMC 3K, tabula sapiens subset, CELLxGENE Census subset,
+  Smart-seq2 dataset (non-UMI protocol, validates codec on wider distributions)
 
 ### Deliverable
 `scx convert` works end-to-end. Round-trip tests pass. Users can convert
@@ -160,13 +161,22 @@ the lazy query engine for efficient subsetting.
 - [ ] Advisory `flock()` for concurrent append safety
 - [ ] Python API: `scx.open("file.scx", mode="append")`
 
-### 2.5 Fused Operations (performance, not analysis reimplementation)
+### 2.5 Cloud Operations (SPEC §12)
+- [ ] `scx cloud-optimize` — rewrite with front-of-file catalog (SPEC §12.2)
+- [ ] `scx explode` / `scx pack` — packed ↔ exploded directory (SPEC §12.5)
+- [ ] `scx pull` — streaming cloud → packed with on-the-fly repackaging (SPEC §12.8)
+- [ ] `scx push` — streaming packed → cloud with on-the-fly explode (SPEC §12.8)
+- [ ] `scx pull --filter` — selective pull with predicate pushdown (SPEC §12.8)
+- [ ] `object_store` integration (S3, GCS, Azure backends)
+- [ ] Python API: `scx.pull()`, `scx.push()`, `scx.open("s3://...")`
+
+### 2.6 Fused Operations (performance, not analysis reimplementation)
 - [ ] Fused normalize + log1p (single CSR row scan, Section 7.2)
 - [ ] HVG selection via CSR column aggregation (faster than scanpy for large data)
 - [ ] These run inside the SCX query pipeline; results are written into
   the AnnData so downstream scanpy operations see the expected slots
 
-### 2.6 Benchmarks
+### 2.7 Benchmarks
 - [ ] Benchmark dataset: 10M cells, 30K genes
 - [ ] Training throughput: batches/sec, GPU utilization, time-to-first-batch
 - [ ] Compare against TileDB-SOMA-ML (latest release, recommended config)
@@ -232,6 +242,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [ ] `scx build-csc input.scx output.scx` — streaming transpose
 - [ ] `scx benchmark experiment.scx` — I/O + pipeline benchmarks
 - [ ] `scx subset` — extract cell/gene subsets to new file
+- [ ] `scx upgrade input.scx output.scx` — rewrite to latest format version (SPEC §3.9)
 
 ### 3.3 rscx (R Bindings)
 - [ ] extendr-based R package
@@ -347,7 +358,7 @@ scx.accel.pca(adata, n_comps=50)
 
 | Component | Rust Crate / Library | Purpose |
 |-----------|---------------------|---------|
-| HDF5 reading | `hdf5-rust` | h5ad conversion |
+| HDF5 reading | `hdf5` (crates.io; repo: `aldanor/hdf5-rust`) | h5ad conversion |
 | Arrow IPC | `arrow-rs` | Metadata read/write |
 | Async I/O | `tokio` | Stage 1 of loader pipeline |
 | Parallelism | `rayon` | CPU-parallel shard processing |
@@ -356,6 +367,7 @@ scx.accel.pca(adata, n_comps=50)
 | Checksums | `blake3` | Integrity verification |
 | Roaring Bitmaps | `roaring-rs` | Deletion vectors, detection bitmap |
 | Compression | `zstd` | Fallback codec for float layers |
+| Cloud I/O | `object_store` | S3, GCS, Azure backends for pull/push/open |
 | CUDA | `cudarc` or raw FFI | GPU codec, cuSPARSE, GDS |
 
 ---
@@ -392,8 +404,8 @@ Key developments to monitor that affect SCX's value proposition:
 
 **Strategic implication**: SCX's highest-risk scenario is not that it fails technically,
 but that incumbents improve fast enough to close the gaps SCX targets. The phased
-roadmap mitigates this — Phase 0 validates with existing h5ad before committing to a
-new format. If Phase 1 benchmarks show only modest improvements over improving
+roadmap mitigates this — Phase 1 validates the format thesis before committing to
+the full ecosystem. If Phase 1 benchmarks show only modest improvements over improving
 incumbents, the honest response is to contribute the codec and loader innovations to
 existing tools (e.g., a Rice codec plugin for Zarr, a Rust training loader for
 AnnData/h5ad) rather than pushing full format adoption.

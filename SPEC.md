@@ -131,6 +131,7 @@ experiment.scx (single binary file)
 │     bit 3: has_obsp                                              │
 │     bit 4: has_modalities  (multimodal extension, §11)           │
 │     bit 5: has_deletion_vectors (§3.6.3)                         │
+│     bit 6: has_front_catalog (cloud-ready layout, §12.2)        │
 │   n_obs: u64                                                     │
 │   n_vars: u64                                                    │
 │   nnz: u64                                                       │
@@ -150,7 +151,12 @@ experiment.scx (single binary file)
 │   prev_catalog_offset: u64   (offset of previous full catalog,   │
 │                               0 if this is the first version)    │
 │   file_checksum: u64         (BLAKE3 truncated to 64 bits)       │
-│   reserved: [u8; 148]        (zeroed, future use)                │
+│   front_catalog_offset: u64  (offset of front catalog copy, 0   │
+│                               if has_front_catalog is not set;   │
+│                               see §12.2)                         │
+│   front_catalog_length: u64  (length of front catalog, 0 if     │
+│                               not present)                       │
+│   reserved: [u8; 132]        (zeroed, future use)                │
 ├──────────────────────────────────────────────────────────────────┤
 │ ROOT CATALOG (offset 256, max 4096 bytes)                        │
 │   Compact catalog with section count, summary stats, and         │
@@ -207,11 +213,9 @@ experiment.scx (single binary file)
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Header size accounting**: Fields before `reserved` sum to 108 bytes
-(4+2+2+4 + 8+8+8 + 4+4+4 + 1+1+1+1 + 8+8+8+8+8+8+8 = 108). With
-`reserved: [u8; 148]`, the total is 108 + 148 = 256 bytes. (Note: an earlier
-revision listed `reserved: [u8; 132]` which would give only 240 bytes — this was
-a bug in the spec.)
+**Header size accounting**: Fields before `reserved` sum to 124 bytes
+(4+2+2+4 + 8+8+8 + 4+4+4 + 1+1+1+1 + 8+8+8+8+8+8+8 + 8+8 = 124). With
+`reserved: [u8; 132]`, the total is 124 + 132 = 256 bytes.
 
 **Byte ordering**: All multi-byte integers in the file format are little-endian.
 The `endian` field exists for validation; readers MUST reject files with
@@ -315,7 +319,7 @@ Each CSR shard is a contiguous section within the packed file.
 ```
 CSR SHARD (contiguous bytes)
 ┌──────────────────────────────────────────────────────────────┐
-│ SHARD HEADER (64 bytes)                                      │
+│ SHARD HEADER (76 bytes)                                      │
 │   magic: [u8; 4] = b"SCXS"                                   │
 │   shard_format_version: u8  (1)                              │
 │   shard_type: u8            (0=CSR, 1=CSC)                   │
@@ -357,9 +361,13 @@ CSR SHARD (contiguous bytes)
 ```
 
 **Shard header size note**: The fields listed above sum to 76 bytes
-(4+1+1+1+1+1+3 + 4+4+8+8 + 4×8 + 8 = 76), not the 64 bytes shown in the diagram
-label. Implementations MUST use 76 bytes. The diagram label is incorrect and will be
-corrected in a future spec revision.
+(4+1+1+1+1+1+3 + 4+4+8+8 + 4×8 + 8 = 76). Implementations MUST use 76 bytes.
+
+**Block index vs catalog row types**: The block index uses `row_start: u32` because
+it addresses rows within a shard (max `shard_target_rows`, typically 10,000). The
+full catalog's shard statistics (§3.2) use `row_start: u64` / `row_end: u64` because
+they address rows in the global matrix (up to billions of cells). Both are correct
+for their respective scopes.
 
 **Index dtype**: With ≤65535 genes, `index_dtype=0` (uint16) halves index storage.
 Files with >65535 features use `index_dtype=1` (uint32). The value is set once per
@@ -625,7 +633,7 @@ format-level encryption, as this avoids the key management complexity.
 - **format_version**: Incremented for breaking changes (new required fields,
   changed section semantics). Readers MUST reject files with `format_version`
   higher than their supported maximum.
-- **Section types**: Unknown section types (≥12 for the current version) are
+- **Section types**: Unknown section types (≥13 for the current version) are
   skipped by the reader with a warning. This allows incremental format extension
   without breaking older readers.
 - **header_length field**: If a future version needs a larger header, it increments
@@ -1332,7 +1340,7 @@ model.
 
 ### 11.3 Reserved Section Types
 
-Section types 12-239 are reserved for future extensions. Types 240-254 are
+Section types 13-239 are reserved for future extensions. Types 240-254 are
 reserved for encrypted sections. Type 255 is reserved as a sentinel.
 
 ---
@@ -1381,10 +1389,10 @@ reads). The gap is 2–3 unnecessary round trips.
 The most impactful optimization: place a **copy of the full catalog at a known
 offset near the start of the file**, eliminating the `HEAD` + EOF round trips.
 
-**Mechanism:** A new header flag `bit 6: has_front_catalog` indicates that a copy
+**Mechanism:** The header flag `bit 6: has_front_catalog` indicates that a copy
 of the active full catalog is stored at a fixed offset immediately after the root
-catalog region. The `front_catalog_offset` field (repurposed from `reserved` bytes
-in the header) points to it.
+catalog region. The `front_catalog_offset` and `front_catalog_length` fields in the
+file header (§3.1) point to it.
 
 ```
 CLOUD-READY LAYOUT:
@@ -1392,8 +1400,8 @@ CLOUD-READY LAYOUT:
 │ FILE HEADER (256 bytes)                                       │
 │   ...                                                         │
 │   flags bit 6: has_front_catalog = 1                          │
-│   front_catalog_offset: u64    (within reserved region)       │
-│   front_catalog_length: u64    (within reserved region)       │
+│   front_catalog_offset: u64    (in file header, see §3.1)     │
+│   front_catalog_length: u64    (in file header, see §3.1)     │
 ├──────────────────────────────────────────────────────────────┤
 │ ROOT CATALOG (offset 256, ≤4096 bytes)                        │
 ├──────────────────────────────────────────────────────────────┤
@@ -2019,7 +2027,7 @@ bugs).
 ⁴ Many-small-file patterns perform poorly on GPFS/Lustre.
 ⁵ Database overhead; not a simple file on a parallel filesystem.
 ⁶ With cloud-ready layout (§12.2) or exploded directory (§12.5), comparable to Zarr v3.
-⁷ `tiledbsoma-ml` released March 2025, still alpha.
+⁷ `tiledbsoma-ml` released March 2025 as alpha; verify current status before benchmarking.
 ⁸ Individual chunks can be overwritten; row-append requires careful chunk management.
 ⁹ With BPCells on-disk backend; standard RDS is RAM-limited.
 
@@ -2041,8 +2049,8 @@ achieves both: `cp`/`rsync`/`scp` one file, then compute at full speed.
 **3. Integrated ML training data loader.**
 The triple-buffered Rust pipeline (decode → transfer → train) is designed to saturate
 GPUs during foundation model training. No existing format provides a built-in data
-loader at this level of integration. TileDB-SOMA-ML exists but is alpha, Python-only,
-and CPU-mediated. SCX's loader operates below the GIL with direct shard-to-GPU paths.
+loader at this level of integration. TileDB-SOMA-ML (alpha as of March 2025; check current release status) is
+Python-only and CPU-mediated. SCX's loader operates below the GIL with direct shard-to-GPU paths.
 
 **4. GPU-direct I/O (GDS) support.**
 SCX's shard layout aligns with cuSPARSE CSR, enabling NVIDIA GPUDirect Storage to
@@ -2141,7 +2149,7 @@ protein counts, ATAC fragments). Benchmarks must cover diverse protocols and
 sequencing depths to be credible.
 
 **10. R ecosystem gap.**
-R bindings are deferred to Phase 4 (months 10–14). Seurat users — a large fraction of
+R bindings are deferred to Phase 3 (months 7–10). Seurat users — a large fraction of
 the community — cannot use SCX until then. By contrast, TileDB-SOMA already has
 stable R support, and `anndataR` provides direct R↔h5ad interop.
 
@@ -2242,9 +2250,10 @@ saturated.
 The strategic risk is real: replacing an entire stack simultaneously creates an
 adoption chicken-and-egg problem, and the ecosystem advantages of h5ad and
 TileDB-SOMA are formidable (§15.4). The phased roadmap addresses this by delivering
-value incrementally — first a fast training loader (Phase 0, works with existing
-h5ad), then a format (Phase 1), then an analysis engine (Phase 2). Each phase
-stands on its own and provides concrete, measurable improvement over the status quo.
+value incrementally — first the format and AnnData bridge (Phase 1), then the
+training loader and query engine (Phase 2), then GPU paths and ecosystem bindings
+(Phase 3). Each phase stands on its own and provides concrete, measurable
+improvement over the status quo.
 
 SCX will succeed or fail based on whether its performance advantages are large enough
 to justify adoption costs. The compression, I/O, and GPU claims in this spec must be
