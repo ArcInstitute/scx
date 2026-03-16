@@ -1218,6 +1218,15 @@ scx query experiment.scx "cell_type == 'T cell'" --count
 scx compact experiment.scx -o out.scx  # reclaim space from appends/deletes
 scx rollback experiment.scx          # revert to previous manifest
 scx delete experiment.scx --filter "is_doublet == True"  # logical deletion
+
+# Cloud operations (§12)
+scx cloud-optimize experiment.scx -o cloud.scx  # add front catalog
+scx explode experiment.scx experiment.scxd/      # packed → directory
+scx pack experiment.scxd/ experiment.scx         # directory → packed
+scx pull gs://bucket/data.scxd/ local.scx        # streaming cloud → packed
+scx push local.scx gs://bucket/data.scxd/        # streaming packed → cloud
+scx pull gs://bucket/atlas.scxd/ t_cells.scx \
+    --filter "cell_type == 'T cell'"              # selective pull
 ```
 
 ### 10.4 Building CSC
@@ -1631,7 +1640,180 @@ data, typically 2–5 reads per query. SCX cloud-ready is comparable for
 selective queries. TileDB's advantage is consolidation and MVCC, not raw
 read latency.
 
-### 12.8 What This Does Not Change
+### 12.8 Streaming Pack/Explode: Fusing Transfer with Repackaging
+
+The naive workflow for moving data between cloud and HPC is wasteful:
+
+```
+# Naive pull: download all objects, then pack into single file
+gsutil -m cp -r gs://bucket/experiment.scxd/ /tmp/staging/
+scx pack /tmp/staging/experiment.scxd/ /scratch/experiment.scx
+rm -rf /tmp/staging/    # 2× disk I/O, 1× temporary storage
+```
+
+This doubles I/O (every byte is written to local disk twice) and requires
+temporary storage equal to the full dataset size. For a 50 GB atlas, that is
+100 GB of disk writes and 50 GB of temporary space.
+
+**The solution: fuse the transfer and repackaging into a single streaming
+operation.** Because shards are byte-identical between packed and exploded
+forms, the packer/exploder can consume input directly from the network and
+produce output directly to the final destination — no intermediate files.
+
+#### Streaming pull (cloud → HPC): `scx pull`
+
+```bash
+# Stream from GCS, pack on-the-fly, write single file to scratch
+scx pull gs://bucket/experiment.scxd/ /scratch/experiment.scx
+
+# Equivalent for S3
+scx pull s3://bucket/experiment.scxd/ /scratch/experiment.scx
+```
+
+**Internal pipeline:**
+
+```
+1. GET _catalog.bin + _header.bin       (single request, <300 KB)
+2. Parse catalog → know all section offsets, lengths, ordering
+3. Open output file, write header placeholder + root catalog placeholder
+4. GET obs.arrow → write directly into output file at correct offset
+5. GET var.arrow → write directly into output file at correct offset
+6. For each shard (parallel downloads, sequential writes):
+   a. GET X/{shard_id}.shard → write directly at next output offset
+   b. Record offset in catalog
+7. GET obsm/*, layers/*, uns.json → write each at next offset
+8. Write full catalog, root catalog, header (pwrite)
+9. fsync + rename
+```
+
+**Each downloaded byte is written exactly once.** No temporary directory, no
+intermediate files, no double I/O. Memory usage is bounded: one shard buffer
+(~30–60 MB) plus catalog overhead. Multiple shards can be downloaded in
+parallel by a pool of async tasks, each handing off to a single sequential
+writer thread (matching the triple-buffer architecture of the training loader).
+
+**Bandwidth saturation:** On a well-connected HPC node (25–100 Gbps to cloud),
+the bottleneck is either network bandwidth or local disk write speed. The
+streaming pipeline keeps both saturated:
+
+```
+Download pool (N=8 async tasks)    →    Writer thread (sequential)
+  GET shard 0 ─────────────────────┐
+  GET shard 1 ─────────────────────┤
+  GET shard 2 ─────────────────────├──→ write shard 0, 1, 2, 3, ...
+  GET shard 3 ─────────────────────┤    (in catalog order)
+  ...                              ┘
+```
+
+Shards arrive out of order from the parallel downloads. The writer uses a
+bounded reorder buffer (configurable, default 4 shard slots) that holds
+completed downloads until it can write the next shard in sequence. If the
+buffer fills (one shard is very slow), the downloader backpressures. This
+produces a correctly-ordered packed file without requiring all shards in
+memory.
+
+**Cloud-ready output:** `scx pull` produces a cloud-ready file by default
+(§12.2, front catalog included), so the file can later be pushed back to
+cloud without a separate `scx cloud-optimize` step.
+
+#### Streaming push (HPC → cloud): `scx push`
+
+```bash
+# Stream from packed file, explode on-the-fly, upload to GCS
+scx push /scratch/experiment.scx gs://bucket/experiment.scxd/
+
+# With prefix for organization
+scx push experiment.scx gs://bucket/atlas/v2/experiment.scxd/
+```
+
+**Internal pipeline:**
+
+```
+1. Open .scx, read header + full catalog (local, fast)
+2. For each section in the catalog (parallel uploads):
+   a. Read section bytes from the packed file (pread)
+   b. Upload directly as a named object:
+      - CSR shard 42 → PUT X/000042.shard
+      - obs metadata → PUT obs.arrow
+      - catalog     → PUT _catalog.bin (written last)
+```
+
+**Each source byte is read once and uploaded once.** No intermediate exploded
+directory on local disk. The packed file is read via `pread()` at the catalog
+offsets, so sections can be uploaded in any order (and in parallel). GCS/S3
+multipart upload is used for large shards (>8 MB) to maximize throughput.
+
+The catalog object (`_catalog.bin`) is uploaded last. Until it exists, the
+remote `.scxd` directory is not openable — this provides atomic-publish
+semantics analogous to the local rename (§3.6.1). A reader that lists the
+directory and finds no `_catalog.bin` knows the upload is in progress.
+
+#### Selective pull (subset from cloud)
+
+```bash
+# Pull only shards matching a predicate — don't download the whole atlas
+scx pull gs://bucket/atlas.scxd/ /scratch/t_cells.scx \
+    --filter "cell_type == 'T cell'"
+```
+
+**Pipeline:**
+
+1. GET `_catalog.bin` — parse shard statistics for predicate pruning
+2. GET `obs.arrow` — evaluate predicate, identify matching cell indices
+3. Map matching cells to shard IDs (from catalog row ranges)
+4. GET only the matching shard files (parallel)
+5. Stream-pack into output file, writing only matching shards
+6. Write filtered obs metadata (only matching rows)
+
+For a query matching 5% of cells in a 100-shard atlas, this downloads ~5
+shards instead of 100 — a 20× bandwidth reduction. The output `.scx` file
+contains only the matching data and is immediately usable for local analysis.
+
+**Deletion vectors alternative:** For queries where the user wants the full
+shard set but with some cells masked, `scx pull --filter` can instead download
+all shards and write deletion vectors (§3.6.3) marking non-matching cells.
+This avoids modifying shard data but downloads more bytes. Use `--filter-mode
+subset` (default, downloads only matching shards) or `--filter-mode mask`
+(downloads all, writes deletion vectors).
+
+#### Python API
+
+```python
+import scx
+
+# Streaming pull — no temporary files
+scx.pull("gs://bucket/experiment.scxd/", "/scratch/experiment.scx")
+
+# Streaming push
+scx.push("/scratch/experiment.scx", "gs://bucket/experiment.scxd/")
+
+# Selective pull with predicate
+scx.pull(
+    "gs://bucket/atlas.scxd/",
+    "/scratch/t_cells.scx",
+    filter="cell_type == 'T cell'",
+)
+
+# Direct open from cloud (no local copy — for metadata queries)
+exp = scx.open("gs://bucket/experiment.scxd/")
+print(exp.n_obs)  # reads only catalog
+```
+
+#### Performance model
+
+For a 50 GB atlas (1000 shards × 50 MB each) on a 25 Gbps link:
+
+| Operation | Naive (download + pack) | Streaming `scx pull` |
+|-----------|------------------------|---------------------|
+| Disk writes | 100 GB (2×) | **50 GB (1×)** |
+| Temp storage | 50 GB | **~240 MB** (buffer) |
+| Wall time | ~32s download + ~16s pack = **~48s** | **~16s** (network-bound) |
+| Memory | ~50 GB (exploded dir) | **~240 MB** (fixed) |
+
+The streaming approach is ~3× faster (eliminates the pack step entirely),
+uses ~200× less temporary storage, and produces identical output.
+
+### 12.9 What This Does Not Change
 
 These optimizations are **additive** — they do not modify any existing SCX
 behavior:
