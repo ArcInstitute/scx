@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
+use scx_format::header::FileHeader;
 
 fuzz_target!(|data: &[u8]| {
-    // TODO: fuzz FileHeader::read with arbitrary bytes
-    let _ = data;
+    let _ = FileHeader::read_from(&mut std::io::Cursor::new(data));
 });

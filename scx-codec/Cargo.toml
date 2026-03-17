@@ -10,3 +10,6 @@ authors.workspace = true
 byteorder = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

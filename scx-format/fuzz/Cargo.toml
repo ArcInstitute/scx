@@ -7,6 +7,8 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 scx-format = { path = ".." }
@@ -20,5 +22,11 @@ doc = false
 [[bin]]
 name = "fuzz_shard"
 path = "fuzz_targets/fuzz_shard.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_catalog"
+path = "fuzz_targets/fuzz_catalog.rs"
 test = false
 doc = false

@@ -26,6 +26,9 @@ indicatif = "0.17"
 # HDF5 — see Phase1.md note on crate risk
 hdf5 = "0.8"
 
+# Testing
+proptest = "1"
+
 # Python bindings
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"

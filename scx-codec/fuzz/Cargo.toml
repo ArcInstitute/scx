@@ -7,6 +7,8 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 scx-codec = { path = ".." }
@@ -20,5 +22,17 @@ doc = false
 [[bin]]
 name = "fuzz_rice"
 path = "fuzz_targets/fuzz_rice.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_forbp"
+path = "fuzz_targets/fuzz_forbp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_delta_golomb"
+path = "fuzz_targets/fuzz_delta_golomb.rs"
 test = false
 doc = false

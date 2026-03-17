@@ -5,8 +5,12 @@ tmp/
 
 # Rust
 /target/
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/
 **/*.rs.bk
 Cargo.lock
+**/debug/
 
 # Python
 __pycache__/
