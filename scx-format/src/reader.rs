@@ -287,7 +287,7 @@ impl ScxReader {
     // -----------------------------------------------------------------------
 
     /// Get the raw bytes for a catalog entry from the mmap.
-    fn section_bytes(&self, entry: &FullCatalogEntry) -> &[u8] {
+    pub fn section_bytes(&self, entry: &FullCatalogEntry) -> &[u8] {
         let start = entry.offset as usize;
         let end = start + entry.length as usize;
         &self.mmap[start..end]
