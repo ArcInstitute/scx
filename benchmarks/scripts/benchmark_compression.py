@@ -54,24 +54,28 @@ def benchmark_compression(h5ad_path):
             import scipy.sparse as sp
 
             zarr_path = os.path.join(tmpdir, "test.zarr")
-            compressor = numcodecs.Zstd(level=3)
-            store = zarr.DirectoryStore(zarr_path)
+
+            # Zarr v3 API
+            store = zarr.storage.LocalStore(zarr_path)
             root = zarr.group(store=store)
+            zstd = zarr.codecs.ZstdCodec(level=3)
 
             X = adata.X
             if sp.issparse(X):
                 X_csr = sp.csr_matrix(X)
-                root.create_dataset(
-                    "indptr", data=X_csr.indptr, compressor=compressor
+                root.create_array(
+                    "indptr", data=X_csr.indptr, compressors=zstd,
                 )
-                root.create_dataset(
-                    "indices", data=X_csr.indices, compressor=compressor
+                root.create_array(
+                    "indices", data=X_csr.indices, compressors=zstd,
                 )
-                root.create_dataset(
-                    "data", data=X_csr.data, compressor=compressor
+                root.create_array(
+                    "data", data=X_csr.data, compressors=zstd,
                 )
             else:
-                root.create_dataset("X", data=X, compressor=compressor)
+                root.create_array(
+                    "X", data=X, compressors=zstd,
+                )
 
             # Get total zarr size
             zarr_size = sum(
