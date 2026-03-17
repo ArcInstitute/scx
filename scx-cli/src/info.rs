@@ -122,6 +122,20 @@ pub fn run_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         println!("Flags: {}", flags.join(", "));
     }
 
+    // Provenance history
+    if let Ok(prov) = reader.read_provenance() {
+        if !prov.operations.is_empty() {
+            println!();
+            println!("Provenance:");
+            for op in &prov.operations {
+                println!("  {} | {} | {}", op.timestamp, op.action, op.tool);
+                if op.params_json != "{}" && !op.params_json.is_empty() {
+                    println!("    params: {}", op.params_json);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

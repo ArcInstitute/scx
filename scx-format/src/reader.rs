@@ -871,6 +871,83 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 16.8: Multi-operation provenance chain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_operation_provenance_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov_chain.scx");
+        let header = sample_header(4, 8, 8);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+
+        writer.write_obs(&sample_obs(4)).unwrap();
+        writer.write_var(&sample_var(8)).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data(4, 8);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // Write provenance with 3 chained operations
+        let entries = vec![
+            ProvenanceEntry {
+                timestamp: 1710000000,
+                action: "convert".to_string(),
+                tool: "scx-cli 0.1.0".to_string(),
+                params_json: r#"{"input":"raw.h5ad"}"#.to_string(),
+                input_checksums: vec![[0xAA; 32]],
+            },
+            ProvenanceEntry {
+                timestamp: 1710001000,
+                action: "subset".to_string(),
+                tool: "pyscx 0.1.0".to_string(),
+                params_json: r#"{"n_cells":1000}"#.to_string(),
+                input_checksums: vec![[0xBB; 32]],
+            },
+            ProvenanceEntry {
+                timestamp: 1710002000,
+                action: "normalize".to_string(),
+                tool: "pyscx 0.1.0".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![[0xCC; 32], [0xDD; 32]],
+            },
+        ];
+
+        writer.write_provenance(entries.clone()).unwrap();
+        writer.finish().unwrap();
+
+        // Read back and verify
+        let reader = ScxReader::open(&path).unwrap();
+        let prov = reader.read_provenance().unwrap();
+
+        assert_eq!(prov.version, 1);
+        assert_eq!(prov.operations.len(), 3);
+
+        // Verify ordering and content
+        assert_eq!(prov.operations[0].action, "convert");
+        assert_eq!(prov.operations[0].timestamp, 1710000000);
+        assert_eq!(prov.operations[0].input_checksums.len(), 1);
+
+        assert_eq!(prov.operations[1].action, "subset");
+        assert_eq!(prov.operations[1].timestamp, 1710001000);
+        assert_eq!(prov.operations[1].params_json, r#"{"n_cells":1000}"#);
+
+        assert_eq!(prov.operations[2].action, "normalize");
+        assert_eq!(prov.operations[2].timestamp, 1710002000);
+        assert_eq!(prov.operations[2].input_checksums.len(), 2);
+        assert_eq!(prov.operations[2].input_checksums[0], [0xCC; 32]);
+        assert_eq!(prov.operations[2].input_checksums[1], [0xDD; 32]);
+    }
+
     #[test]
     fn test_values_to_f32_uint8() {
         let raw = vec![1u8, 2, 255];
