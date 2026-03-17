@@ -40,6 +40,18 @@ impl ScxReader {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Check minimum file size (header + root catalog placeholder)
+        if mmap.len() < HEADER_SIZE {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file too small: {} bytes (minimum {})",
+                    mmap.len(),
+                    HEADER_SIZE
+                ),
+            )));
+        }
+
         // Read and validate file header
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
 
