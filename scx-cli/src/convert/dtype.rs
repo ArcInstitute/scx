@@ -1,6 +1,7 @@
 // Integer detection, value encoding selection, and raw byte conversion
 
 use scx_codec::{CodecId, ValueEncoding};
+use scx_format::select_codec;
 
 /// Check if all values in the data array are non-negative integers.
 pub fn is_integer_data(data: &[f32]) -> bool {
@@ -8,24 +9,45 @@ pub fn is_integer_data(data: &[f32]) -> bool {
         .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor())
 }
 
-/// Detect the best value encoding and codec for the data.
-pub fn detect_value_encoding(data: &[f32]) -> (ValueEncoding, CodecId) {
+/// Detect the best value encoding for the data.
+pub fn detect_value_encoding_only(data: &[f32]) -> ValueEncoding {
     if !is_integer_data(data) {
-        return (ValueEncoding::Float32, CodecId::Zstd);
+        return ValueEncoding::Float32;
     }
 
-    // Find max value
     let max_val = data.iter().map(|&v| v as u32).max().unwrap_or(0);
 
-    let encoding = if max_val <= 255 {
+    if max_val <= 255 {
         ValueEncoding::Uint8
     } else if max_val <= 65535 {
         ValueEncoding::Uint16
     } else {
         ValueEncoding::Uint32
+    }
+}
+
+/// Detect the best value encoding and auto-select codec for the data.
+/// When `explicit_codec` is Some, uses that codec (with Scx1→Zstd fallback for floats).
+/// When None, auto-selects based on value distribution.
+pub fn detect_value_encoding(
+    data: &[f32],
+    explicit_codec: Option<CodecId>,
+) -> (ValueEncoding, CodecId) {
+    let encoding = detect_value_encoding_only(data);
+    let raw_bytes = values_to_raw_bytes(data, encoding);
+
+    let codec = match explicit_codec {
+        Some(codec_id) => {
+            if codec_id == CodecId::Scx1 && !encoding.is_integer() {
+                CodecId::Zstd
+            } else {
+                codec_id
+            }
+        }
+        None => select_codec(&raw_bytes, encoding),
     };
 
-    (encoding, CodecId::Scx1)
+    (encoding, codec)
 }
 
 /// Convert f32 data to raw LE bytes according to the value encoding.

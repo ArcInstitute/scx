@@ -25,9 +25,13 @@ fn open(path: &str) -> PyResult<PyExperiment> {
 
 /// Convert an AnnData object to an SCX file.
 ///
+/// Codec defaults to "auto", which selects the best codec based on value
+/// distribution (Scx1 for small UMI counts, Zstd for large values or floats).
+/// Explicit options: "none", "scx1", "zstd".
+///
 /// Example:
 ///     pyscx.from_anndata(adata, "output.scx")
-///     pyscx.from_anndata(adata, "output.scx", codec="none", shard_size=8192)
+///     pyscx.from_anndata(adata, "output.scx", codec="scx1", shard_size=8192)
 #[pyfunction]
 #[pyo3(signature = (adata, path, codec=None, shard_size=None))]
 fn from_anndata(

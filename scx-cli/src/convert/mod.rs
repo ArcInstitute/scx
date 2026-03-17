@@ -59,12 +59,15 @@ mod pipeline {
 
     pub struct ConvertOptions {
         pub shard_target_rows: u32,
+        /// Explicit codec override. None = auto-select based on value distribution.
+        pub codec: Option<CodecId>,
     }
 
     impl Default for ConvertOptions {
         fn default() -> Self {
             ConvertOptions {
                 shard_target_rows: 16384,
+                codec: None,
             }
         }
     }
@@ -90,8 +93,8 @@ mod pipeline {
         let (indptr, indices, data, n_obs, n_vars) = read_x_matrix(&file, matrix_format)?;
         let nnz = *indptr.last().unwrap_or(&0) as u64;
 
-        // Detect encoding
-        let (value_encoding, codec_id) = detect_value_encoding(&data);
+        // Detect encoding and codec
+        let (value_encoding, codec_id) = detect_value_encoding(&data, opts.codec);
         let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
 
         // Build header
@@ -157,7 +160,7 @@ mod pipeline {
 
         if let Ok(layers) = read_layers(&file) {
             for (layer_name, (l_indptr, l_indices, l_data, l_nobs, l_nvars)) in &layers {
-                let (l_enc, l_codec) = detect_value_encoding(l_data);
+                let (l_enc, l_codec) = detect_value_encoding(l_data, opts.codec);
                 let l_index_dtype: u8 = if *l_nvars <= 65535 { 0 } else { 1 };
                 write_layer_shards(
                     &mut writer,
@@ -209,7 +212,7 @@ mod pipeline {
 
         let tenx = read_tenx_h5(&file)?;
         let nnz = *tenx.indptr.last().unwrap_or(&0) as u64;
-        let (value_encoding, codec_id) = detect_value_encoding(&tenx.data);
+        let (value_encoding, codec_id) = detect_value_encoding(&tenx.data, opts.codec);
         let index_dtype: u8 = if tenx.n_genes <= 65535 { 0 } else { 1 };
 
         let header = FileHeader {

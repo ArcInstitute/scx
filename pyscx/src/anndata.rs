@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::MAGIC;
-use scx_format::{FileHeader, ProvenanceEntry, ScxReader, ScxWriter};
+use scx_format::{select_codec, FileHeader, ProvenanceEntry, ScxReader, ScxWriter};
 
 use crate::to_pyerr;
 
@@ -227,14 +227,16 @@ fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
     }
 }
 
-/// Parse codec name string to CodecId.
-fn parse_codec(codec: Option<&str>) -> PyResult<CodecId> {
+/// Parse codec name string to Option<CodecId>.
+/// Returns None for auto mode (default), Some(id) for explicit codec.
+fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
     match codec {
-        None | Some("none") => Ok(CodecId::None),
-        Some("scx1") => Ok(CodecId::Scx1),
-        Some("zstd") => Ok(CodecId::Zstd),
+        None | Some("auto") => Ok(None),
+        Some("none") => Ok(Some(CodecId::None)),
+        Some("scx1") => Ok(Some(CodecId::Scx1)),
+        Some("zstd") => Ok(Some(CodecId::Zstd)),
         Some(other) => Err(PyRuntimeError::new_err(format!(
-            "Unknown codec: '{}'. Use 'none', 'scx1', or 'zstd'.",
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', or 'zstd'.",
             other
         ))),
     }
@@ -301,7 +303,7 @@ pub fn from_anndata_impl(
     codec: Option<&str>,
     shard_size: Option<u32>,
 ) -> PyResult<()> {
-    let codec_id = parse_codec(codec)?;
+    let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
 
     // Extract X as CSR
@@ -342,11 +344,20 @@ pub fn from_anndata_impl(
     // Detect value encoding
     let value_encoding = detect_value_encoding(data_slice);
 
-    // If codec is Scx1 but values are float, fall back to Zstd
-    let effective_codec = if codec_id == CodecId::Scx1 && !value_encoding.is_integer() {
-        CodecId::Zstd
-    } else {
-        codec_id
+    // Encode values to raw bytes
+    let values_bytes = encode_values(data_slice, value_encoding);
+
+    // Determine effective codec: auto-select or use explicit
+    let effective_codec = match explicit_codec {
+        Some(codec_id) => {
+            // Explicit codec — fall back to Zstd if Scx1 on floats
+            if codec_id == CodecId::Scx1 && !value_encoding.is_integer() {
+                CodecId::Zstd
+            } else {
+                codec_id
+            }
+        }
+        None => select_codec(&values_bytes, value_encoding),
     };
 
     // Determine index dtype
@@ -397,7 +408,6 @@ pub fn from_anndata_impl(
     }
 
     // Write CSR shards
-    let values_bytes = encode_values(data_slice, value_encoding);
     let n_obs_usize = n_obs as usize;
     let shard_rows = shard_target_rows as usize;
 
@@ -499,12 +509,17 @@ pub fn from_anndata_impl(
         let l_value_encoding = detect_value_encoding(l_data_slice);
         let l_values_bytes = encode_values(l_data_slice, l_value_encoding);
 
-        let l_effective_codec =
-            if effective_codec == CodecId::Scx1 && !l_value_encoding.is_integer() {
-                CodecId::Zstd
-            } else {
-                effective_codec
-            };
+        // Auto-select codec per layer independently, or use explicit
+        let l_effective_codec = match explicit_codec {
+            Some(codec_id) => {
+                if codec_id == CodecId::Scx1 && !l_value_encoding.is_integer() {
+                    CodecId::Zstd
+                } else {
+                    codec_id
+                }
+            }
+            None => select_codec(&l_values_bytes, l_value_encoding),
+        };
 
         let mut l_row_start: usize = 0;
         let mut shard_idx: u32 = 0;

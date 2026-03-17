@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod checksum;
+pub mod codec_select;
 pub mod error;
 pub mod header;
 pub mod provenance;
@@ -13,6 +14,7 @@ pub use catalog::{
     ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE,
 };
 pub use checksum::{blake3_hash, blake3_truncated_64};
+pub use codec_select::select_codec;
 pub use error::{Result, ScxError};
 pub use header::{FileHeader, HEADER_SIZE, MAGIC};
 pub use provenance::{Provenance, ProvenanceEntry};

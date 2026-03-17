@@ -30,6 +30,9 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value = "10000")]
         shard_size: u32,
+        /// Compression codec: auto (default), none, scx1, zstd
+        #[arg(long, default_value = "auto")]
+        codec: String,
     },
     /// Display SCX file information
     Info {
@@ -56,7 +59,15 @@ fn main() {
             from,
             to,
             shard_size,
-        } => run_convert(&input, &output, from.as_deref(), to.as_deref(), shard_size),
+            codec,
+        } => run_convert(
+            &input,
+            &output,
+            from.as_deref(),
+            to.as_deref(),
+            shard_size,
+            &codec,
+        ),
         Commands::Info { file } => info::run_info(&file),
         Commands::Validate { file, verbose } => match validate::run_validate(&file, verbose) {
             Ok(all_passed) => {
@@ -82,6 +93,7 @@ fn run_convert(
     from: Option<&str>,
     to: Option<&str>,
     shard_size: u32,
+    codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine conversion direction from explicit flags or file extensions
     let direction = match (from, to) {
@@ -99,7 +111,7 @@ fn run_convert(
         }
     };
 
-    dispatch_convert(direction, input, output, shard_size)
+    dispatch_convert(direction, input, output, shard_size, codec)
 }
 
 #[cfg(feature = "hdf5")]
@@ -108,12 +120,27 @@ fn dispatch_convert(
     input: &std::path::Path,
     output: &std::path::Path,
     shard_size: u32,
+    codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
+    use scx_codec::CodecId;
+
+    let explicit_codec = match codec {
+        "auto" => None,
+        "none" => Some(CodecId::None),
+        "scx1" => Some(CodecId::Scx1),
+        "zstd" => Some(CodecId::Zstd),
+        other => {
+            return Err(
+                format!("Unknown codec: '{}'. Use auto, none, scx1, or zstd.", other).into(),
+            )
+        }
+    };
 
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
+        codec: explicit_codec,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -148,6 +175,7 @@ fn dispatch_convert(
     _input: &std::path::Path,
     _output: &std::path::Path,
     _shard_size: u32,
+    _codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "Convert requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5"
