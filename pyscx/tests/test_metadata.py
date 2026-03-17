@@ -1,0 +1,98 @@
+"""Metadata tests: index and categorical round-trips (Tasks 15.14–15.15)."""
+
+import numpy as np
+import pandas as pd
+import pytest
+import scipy.sparse as sp
+
+
+def test_obs_var_index(tmp_dir):
+    """15.14: Verify DataFrame index set correctly after round-trip."""
+    import anndata
+    import pyscx
+
+    n_obs, n_vars = 20, 10
+    x = sp.random(n_obs, n_vars, density=0.3, format="csr", dtype=np.float32)
+    # Force integer values for bit-exact round-trip
+    x.data[:] = np.round(x.data * 100).astype(np.float32)
+
+    obs = pd.DataFrame(
+        {"cell_id": [f"cell_{i}" for i in range(n_obs)]},
+        index=[f"obs_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(
+        {"gene_id": [f"gene_{i}" for i in range(n_vars)]},
+        index=[f"var_{i}" for i in range(n_vars)],
+    )
+
+    adata = anndata.AnnData(X=x, obs=obs, var=var)
+    path = str(tmp_dir / "index.scx")
+    pyscx.from_anndata(adata, path)
+    adata2 = pyscx.open(path).to_anndata()
+
+    # obs columns should survive
+    assert "cell_id" in adata2.obs.columns
+    assert list(adata2.obs["cell_id"]) == list(adata.obs["cell_id"])
+
+    # var columns should survive
+    assert "gene_id" in adata2.var.columns
+    assert list(adata2.var["gene_id"]) == list(adata.var["gene_id"])
+
+
+def test_categorical_round_trip(tmp_dir):
+    """15.15: Categorical columns survive as pd.Categorical."""
+    import anndata
+    import pyscx
+
+    n_obs, n_vars = 30, 10
+    x = sp.random(n_obs, n_vars, density=0.3, format="csr", dtype=np.float32)
+    x.data[:] = np.round(x.data * 50).astype(np.float32)
+
+    obs = pd.DataFrame(
+        {
+            "batch": pd.Categorical(["A", "B", "C"] * 10),
+            "sample": pd.Categorical(
+                [f"s{i % 5}" for i in range(n_obs)]
+            ),
+        },
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+
+    adata = anndata.AnnData(X=x, obs=obs)
+    path = str(tmp_dir / "categorical.scx")
+    pyscx.from_anndata(adata, path)
+    adata2 = pyscx.open(path).to_anndata()
+
+    # Check values match
+    assert list(adata2.obs["batch"]) == list(adata.obs["batch"])
+    assert list(adata2.obs["sample"]) == list(adata.obs["sample"])
+
+
+def test_experiment_repr(synthetic_adata, tmp_dir):
+    """15.16: PyExperiment repr shows useful info."""
+    import pyscx
+
+    path = str(tmp_dir / "repr.scx")
+    pyscx.from_anndata(synthetic_adata, path)
+    exp = pyscx.open(path)
+
+    r = repr(exp)
+    assert "PyExperiment" in r
+    assert "n_obs=100" in r
+    assert "n_vars=50" in r
+
+
+def test_validate(synthetic_adata, tmp_dir):
+    """PyExperiment.validate() returns section results."""
+    import pyscx
+
+    path = str(tmp_dir / "validate.scx")
+    pyscx.from_anndata(synthetic_adata, path)
+    exp = pyscx.open(path)
+
+    results = exp.validate()
+    assert isinstance(results, list)
+    assert len(results) > 0
+    for name, passed in results:
+        assert isinstance(name, str)
+        assert passed is True

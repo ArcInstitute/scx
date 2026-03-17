@@ -33,8 +33,27 @@ cargo test --workspace          # run all tests
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 
-# Python bindings
-cd pyscx && maturin develop && pytest
+# Python bindings (use uv venv at project root)
+# First time setup:
+#   uv venv .venv
+#   uv pip install maturin numpy scipy pyarrow anndata pytest scanpy igraph leidenalg
+# Build and test:
+cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v
+```
+
+## Python Environment
+
+**Always use the uv venv** at `.venv/` for all Python work (installing packages, building pyscx, running tests). Do NOT use system Python or pip directly.
+
+```bash
+# Activate (optional, for interactive use):
+source .venv/bin/activate
+
+# Or prefix commands with the venv path:
+.venv/bin/python ...
+.venv/bin/maturin develop
+.venv/bin/pytest tests/ -v
+uv pip install <package>       # uv auto-detects the .venv
 ```
 
 ## Architecture

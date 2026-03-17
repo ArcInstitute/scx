@@ -13,5 +13,9 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { workspace = true }
 numpy = { workspace = true }
+arrow = { workspace = true }
 scx-format = { path = "../scx-format" }
+scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
