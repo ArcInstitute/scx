@@ -289,8 +289,7 @@ mod pipeline {
         codec_id: CodecId,
         index_dtype: u8,
     ) -> Result<(), ConvertError> {
-        let index_dtype_u16 = index_dtype == 0;
-        let _ = index_dtype_u16; // used indirectly via writer's header
+        let _ = index_dtype; // index dtype is set in the file header; writer reads it from there
 
         let mut row_start: usize = 0;
         while row_start < n_obs {

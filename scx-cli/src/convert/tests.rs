@@ -3,10 +3,8 @@
 
 use std::path::Path;
 
-use arrow::array::{
-    Array, AsArray, BooleanArray, DictionaryArray, Float32Array, Int32Array, StringArray,
-};
-use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+use arrow::array::Array;
+use arrow::datatypes::DataType;
 use hdf5::types::VarLenUnicode;
 
 /// Convert &str to VarLenUnicode.
@@ -15,11 +13,10 @@ fn vlu(s: &str) -> VarLenUnicode {
 }
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::reader::ScxReader;
-use std::sync::Arc;
 
 use super::csc_transpose::csc_to_csr;
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
-use super::dtype::{detect_value_encoding, is_integer_data, values_to_raw_bytes};
+use super::dtype::{detect_value_encoding, is_integer_data};
 use super::pipeline::{h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions};
 
 // -----------------------------------------------------------------------

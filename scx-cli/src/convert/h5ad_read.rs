@@ -54,9 +54,15 @@ fn read_sparse_matrix(
         // CSC shape is [n_obs, n_vars] but indptr length = n_vars + 1
         let (csr_indptr, csr_indices, csr_data) =
             csc_to_csr(&indptr, &indices, &data, n_obs, n_vars);
-        Ok((csr_indptr, csr_indices, csr_data, n_obs, n_vars))
+        Ok(drop_explicit_zeros(
+            csr_indptr,
+            csr_indices,
+            csr_data,
+            n_obs,
+            n_vars,
+        ))
     } else {
-        Ok((indptr, indices, data, n_obs, n_vars))
+        Ok(drop_explicit_zeros(indptr, indices, data, n_obs, n_vars))
     }
 }
 
@@ -64,6 +70,12 @@ fn read_sparse_matrix(
 fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays, ConvertError> {
     let ds = file.dataset(dataset_name)?;
     let shape = ds.shape();
+    if shape.len() != 2 {
+        return Err(ConvertError::Other(format!(
+            "dense matrix '{dataset_name}' must be 2D, got {}-D",
+            shape.len()
+        )));
+    }
     let n_obs = shape[0];
     let n_vars = shape[1];
 
@@ -184,7 +196,13 @@ pub fn read_dataframe_group(
         .and_then(|attr| attr.read_scalar::<hdf5::types::VarLenUnicode>().ok())
         .map(|v| v.to_string());
 
-    let member_names = group.member_names()?;
+    // Use column-order attribute if present (h5ad spec), otherwise fall back to member_names
+    let member_names: Vec<String> = if let Ok(attr) = group.attr("column-order") {
+        let ordered: Vec<hdf5::types::VarLenUnicode> = attr.read_1d()?.to_vec();
+        ordered.iter().map(|s| s.to_string()).collect()
+    } else {
+        group.member_names()?
+    };
 
     let mut fields: Vec<Field> = Vec::new();
     let mut arrays: Vec<ArrayRef> = Vec::new();
@@ -378,8 +396,14 @@ fn read_categorical_column(
         ));
     };
 
-    // Build a DictionaryArray
-    let keys = Int32Array::from(codes);
+    // Build a DictionaryArray.
+    // In h5ad, code = -1 means missing/NA. Convert to null entries.
+    let keys = Int32Array::from(
+        codes
+            .iter()
+            .map(|&c| if c < 0 { None } else { Some(c) })
+            .collect::<Vec<Option<i32>>>(),
+    );
     let values = StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))?;
 
@@ -390,6 +414,42 @@ fn read_categorical_column(
     );
 
     Ok((field, Arc::new(dict)))
+}
+
+/// Remove explicit zeros from a CSR matrix.
+///
+/// Some h5ad files store explicit zeros in their sparse representation.
+/// The SCX Rice codec requires values >= 1, so we must drop these entries.
+fn drop_explicit_zeros(
+    indptr: Vec<i64>,
+    indices: Vec<i32>,
+    data: Vec<f32>,
+    n_obs: usize,
+    n_vars: usize,
+) -> CsrArrays {
+    // Fast path: no zeros present
+    if data.iter().all(|&v| v != 0.0) {
+        return (indptr, indices, data, n_obs, n_vars);
+    }
+
+    let mut new_indptr = Vec::with_capacity(indptr.len());
+    let mut new_indices = Vec::new();
+    let mut new_data = Vec::new();
+    new_indptr.push(0i64);
+
+    for row in 0..n_obs {
+        let start = indptr[row] as usize;
+        let end = indptr[row + 1] as usize;
+        for i in start..end {
+            if data[i] != 0.0 {
+                new_indices.push(indices[i]);
+                new_data.push(data[i]);
+            }
+        }
+        new_indptr.push(new_data.len() as i64);
+    }
+
+    (new_indptr, new_indices, new_data, n_obs, n_vars)
 }
 
 /// Read obsm embeddings from h5ad file.
@@ -599,9 +659,15 @@ fn read_layer_entry(
         if is_csc {
             let (csr_indptr, csr_indices, csr_data) =
                 csc_to_csr(&indptr, &indices, &data, n_obs, n_vars);
-            Ok((csr_indptr, csr_indices, csr_data, n_obs, n_vars))
+            Ok(drop_explicit_zeros(
+                csr_indptr,
+                csr_indices,
+                csr_data,
+                n_obs,
+                n_vars,
+            ))
         } else {
-            Ok((indptr, indices, data, n_obs, n_vars))
+            Ok(drop_explicit_zeros(indptr, indices, data, n_obs, n_vars))
         }
     } else {
         // Dense dataset
