@@ -1,0 +1,22 @@
+[package]
+name = "scx-ops"
+version = "0.1.0"
+edition = "2021"
+description = "File lifecycle operations (append, delete, compact, rollback, merge) for SCX files"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+scx-format = { path = "../scx-format", features = ["deletion-vectors"] }
+scx-codec = { path = "../scx-codec" }
+scx-sparse = { path = "../scx-sparse" }
+roaring = { workspace = true }
+fs4 = { workspace = true }
+blake3 = { workspace = true }
+byteorder = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

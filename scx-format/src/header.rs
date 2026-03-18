@@ -187,6 +187,11 @@ impl FileHeader {
     pub fn has_deletion_vectors(&self) -> bool {
         self.flags & (1 << 5) != 0
     }
+
+    /// Set the deletion vectors flag (bit 5).
+    pub fn set_deletion_vectors(&mut self) {
+        self.flags |= 1 << 5;
+    }
 }
 
 #[cfg(test)]

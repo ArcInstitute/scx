@@ -2,6 +2,7 @@
 archive/
 tasks/
 tmp/
+data/*.h5ad
 
 # Rust
 /target/

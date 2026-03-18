@@ -495,7 +495,7 @@ impl Drop for ScxWriter {
 }
 
 /// Compute shard statistics from raw value bytes.
-fn compute_shard_stats(
+pub fn compute_shard_stats(
     values: &[u8],
     value_encoding: ValueEncoding,
     row_start: u64,

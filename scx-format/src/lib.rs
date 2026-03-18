@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod checksum;
 pub mod codec_select;
+#[cfg(feature = "deletion-vectors")]
+pub mod deletion_vectors;
 pub mod error;
 pub mod header;
 pub mod provenance;
@@ -15,6 +17,8 @@ pub use catalog::{
 };
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::select_codec;
+#[cfg(feature = "deletion-vectors")]
+pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use error::{Result, ScxError};
 pub use header::{FileHeader, HEADER_SIZE, MAGIC};
 pub use provenance::{Provenance, ProvenanceEntry};
@@ -24,4 +28,4 @@ pub use shard::{
     BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE, SHARD_HEADER_SIZE,
     SHARD_MAGIC,
 };
-pub use writer::{ScxWriter, SECTIONS_START_OFFSET};
+pub use writer::{compute_shard_stats, ScxWriter, SECTIONS_START_OFFSET};

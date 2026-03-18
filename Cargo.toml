@@ -1,5 +1,5 @@
 [workspace]
-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "pyscx"]
+members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "pyscx"]
 resolver = "2"
 
 [workspace.package]
@@ -26,6 +26,9 @@ indicatif = "0.17"
 
 # HDF5 — see Phase1.md note on crate risk
 hdf5 = "0.8"
+
+roaring = "0.10"
+fs4 = "0.12"
 
 # Testing
 proptest = "1"

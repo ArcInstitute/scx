@@ -275,6 +275,34 @@ impl ScxReader {
     }
 
     // -----------------------------------------------------------------------
+    // Deletion vectors
+    // -----------------------------------------------------------------------
+
+    /// Read deletion vectors if present. Returns `Ok(None)` if the file has no DV flag set.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_deletion_vectors(
+        &self,
+    ) -> Result<Option<crate::deletion_vectors::DeletionVectors>> {
+        if !self.header.has_deletion_vectors() {
+            return Ok(None);
+        }
+        let entry = self
+            .full_catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::DeletionVectors)
+            .ok_or_else(|| ScxError::SectionNotFound("deletion_vectors".to_string()))?;
+        let slice = self.section_bytes(entry);
+        let dv = crate::deletion_vectors::DeletionVectors::read_from(&mut Cursor::new(slice))?;
+        Ok(Some(dv))
+    }
+
+    /// Get access to the underlying mmap bytes.
+    pub fn mmap(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    // -----------------------------------------------------------------------
     // Validate (11.12)
     // -----------------------------------------------------------------------
 
@@ -323,7 +351,7 @@ impl ScxReader {
     }
 
     /// Read and decode a single shard from a catalog entry.
-    fn read_shard_from_entry(
+    pub fn read_shard_from_entry(
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {

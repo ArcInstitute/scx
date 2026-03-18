@@ -1,0 +1,34 @@
+use thiserror::Error;
+
+/// Errors produced by scx-ops operations.
+#[derive(Debug, Error)]
+pub enum OpsError {
+    #[error("format error: {0}")]
+    Format(#[from] scx_format::ScxError),
+
+    #[error("failed to acquire file lock: {0}")]
+    LockFailed(std::io::Error),
+
+    #[error("manifest sequence mismatch: expected {expected}, found {found}")]
+    ManifestMismatch { expected: u64, found: u64 },
+
+    #[error("rollback target sequence {0} not found in catalog chain")]
+    RollbackTargetNotFound(u64),
+
+    #[error("incompatible n_vars: expected {expected}, found {found}")]
+    IncompatibleVars { expected: u64, found: u64 },
+
+    #[error("no previous catalog available for rollback")]
+    NoPreviousCatalog,
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("codec error: {0}")]
+    Codec(#[from] scx_codec::CodecError),
+
+    #[error(transparent)]
+    Arrow(#[from] arrow::error::ArrowError),
+}
+
+pub type Result<T> = std::result::Result<T, OpsError>;
