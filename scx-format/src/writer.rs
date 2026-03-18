@@ -34,6 +34,9 @@ pub struct ScxWriter {
     header: FileHeader,
     entries: Vec<FullCatalogEntry>,
     csr_shard_count: u32,
+    total_nnz: u64,
+    has_obsm: bool,
+    has_obsp: bool,
 }
 
 impl ScxWriter {
@@ -69,6 +72,9 @@ impl ScxWriter {
             header,
             entries: Vec::new(),
             csr_shard_count: 0,
+            total_nnz: 0,
+            has_obsm: false,
+            has_obsp: false,
         })
     }
 
@@ -157,6 +163,7 @@ impl ScxWriter {
     /// Write an obsm embedding section (Arrow IPC).
     pub fn write_obsm(&mut self, name: &str, batch: &RecordBatch) -> Result<()> {
         let data = Self::write_arrow_ipc(batch)?;
+        self.has_obsm = true;
         self.write_section_bytes(
             format!("obsm/{name}"),
             SectionType::ObsmEmbedding,
@@ -195,6 +202,7 @@ impl ScxWriter {
     ) -> Result<()> {
         let shard_idx = self.csr_shard_count;
         let name = format!("X_shard_{shard_idx}");
+        let nnz = *indptr.last().unwrap_or(&0);
         self.write_shard_inner(
             indptr,
             indices,
@@ -206,6 +214,7 @@ impl ScxWriter {
             SectionType::CsrShard,
         )?;
         self.csr_shard_count += 1;
+        self.total_nnz += nnz;
         Ok(())
     }
 
@@ -248,6 +257,7 @@ impl ScxWriter {
         obsp_name: &str,
         shard_idx: u32,
     ) -> Result<()> {
+        self.has_obsp = true;
         let name = format!("obsp/{obsp_name}_shard_{shard_idx}");
         self.write_shard_inner(
             indptr,
@@ -448,7 +458,15 @@ impl ScxWriter {
         self.header.full_catalog_offset = full_catalog_offset;
         self.header.full_catalog_length = full_catalog_length;
         self.header.n_csr_shards = self.csr_shard_count;
+        self.header.nnz = self.total_nnz;
         self.header.file_checksum = 0; // placeholder for first write
+        // Auto-set flags based on what was written
+        if self.has_obsm {
+            self.header.flags |= 1 << 2; // has_obsm
+        }
+        if self.has_obsp {
+            self.header.flags |= 1 << 3; // has_obsp
+        }
 
         // 5. pwrite header at offset 0
         file.seek(SeekFrom::Start(0))?;

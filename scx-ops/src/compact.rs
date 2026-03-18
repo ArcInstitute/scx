@@ -6,6 +6,7 @@ use arrow::compute;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
+use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
@@ -45,7 +46,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
         magic: MAGIC,
         format_version: 1,
         header_length: 256,
-        flags: 0, // clean file, no DV
+        flags: in_header.flags & !(1 << 5), // carry all flags except has_deletion_vectors
         n_obs: new_n_obs as u64,
         n_vars,
         nnz: 0, // will be set by finish
@@ -93,7 +94,6 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     let value_encoding = ValueEncoding::from_u8(value_encoding_u8).unwrap_or(ValueEncoding::Uint8);
 
     // Decode all shards and filter rows
-    let mut global_row = 0u64;
     let shard_target = in_header.shard_target_rows;
 
     // Accumulate filtered CSR data
@@ -101,6 +101,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     let mut acc_indices: Vec<u32> = Vec::new();
     let mut acc_values: Vec<u8> = Vec::new();
     let mut acc_row_count = 0u64;
+    let mut emitted_rows = 0u64; // tracks output row numbering
 
     for shard_entry in &shards {
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
@@ -108,7 +109,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             .stats
             .as_ref()
             .map(|s| s.row_start)
-            .unwrap_or(global_row);
+            .unwrap_or(0);
         let shard_n_rows = indptr.len() - 1;
 
         for local_row in 0..shard_n_rows {
@@ -139,35 +140,34 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
 
             // Flush accumulated rows as a shard when hitting target
             if acc_row_count >= shard_target as u64 {
+                let shard_row_start = emitted_rows;
                 writer.write_csr_shard(
                     &acc_indptr,
                     &acc_indices,
                     &acc_values,
                     codec_id,
                     value_encoding,
-                    global_row - acc_row_count + 1, // approximate row_start
+                    shard_row_start,
                 )?;
+                emitted_rows += acc_row_count;
                 acc_indptr = vec![0];
                 acc_indices.clear();
                 acc_values.clear();
                 acc_row_count = 0;
             }
         }
-
-        global_row = shard_row_start + shard_n_rows as u64;
     }
 
     // Flush remaining accumulated rows
     if acc_row_count > 0 {
-        // Compute actual row_start for this final shard
-        let row_start = new_n_obs as u64 - acc_row_count;
+        let shard_row_start = emitted_rows;
         writer.write_csr_shard(
             &acc_indptr,
             &acc_indices,
             &acc_values,
             codec_id,
             value_encoding,
-            row_start,
+            shard_row_start,
         )?;
     }
 
@@ -193,6 +193,32 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     // Copy layers (row-filtered)
     let layer_names = reader.layer_names();
     for layer_name in &layer_names {
+        // Determine this layer's value encoding from its first shard header
+        let layer_prefix = format!("{layer_name}_shard_");
+        let layer_shard_entries: Vec<&scx_format::FullCatalogEntry> = reader.catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix))
+            .collect();
+        let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
+            let section = reader.section_bytes(first_entry);
+            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format::SHARD_HEADER_SIZE],
+            ))?;
+            ValueEncoding::from_u8(sh.value_encoding).unwrap_or(ValueEncoding::Uint8)
+        } else {
+            value_encoding
+        };
+        let layer_codec = if let Some(first_entry) = layer_shard_entries.first() {
+            let section = reader.section_bytes(first_entry);
+            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format::SHARD_HEADER_SIZE],
+            ))?;
+            CodecId::from_u8(sh.codec_id).unwrap_or(CodecId::None)
+        } else {
+            codec_id
+        };
+
         let layer = reader.read_layer(layer_name)?;
         // Filter and write layer shards
         let mut layer_indptr: Vec<u64> = vec![0];
@@ -200,6 +226,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
         let mut layer_values: Vec<u8> = Vec::new();
         let mut layer_row_count = 0u64;
         let mut layer_shard_idx = 0u32;
+        let mut emitted_layer_rows = 0u64;
 
         for row_idx in 0..layer.shape.0 {
             let deleted = keep_mask.as_ref().is_some_and(|mask| !mask[row_idx]);
@@ -211,7 +238,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             let row_end = layer.indptr[row_idx + 1] as usize;
             for j in row_start..row_end {
                 layer_indices.push(layer.indices[j] as u32);
-                encode_value(&mut layer_values, layer.data[j], value_encoding);
+                encode_value(&mut layer_values, layer.data[j], layer_value_encoding);
             }
             let prev = *layer_indptr.last().unwrap();
             layer_indptr.push(prev + (row_end - row_start) as u64);
@@ -222,12 +249,13 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
                     &layer_indptr,
                     &layer_indices,
                     &layer_values,
-                    codec_id,
-                    value_encoding,
-                    new_n_obs as u64 - layer_row_count,
+                    layer_codec,
+                    layer_value_encoding,
+                    emitted_layer_rows,
                     layer_name,
                     layer_shard_idx,
                 )?;
+                emitted_layer_rows += layer_row_count;
                 layer_indptr = vec![0];
                 layer_indices.clear();
                 layer_values.clear();
@@ -241,9 +269,9 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
                 &layer_indptr,
                 &layer_indices,
                 &layer_values,
-                codec_id,
-                value_encoding,
-                new_n_obs as u64 - layer_row_count,
+                layer_codec,
+                layer_value_encoding,
+                emitted_layer_rows,
                 layer_name,
                 layer_shard_idx,
             )?;

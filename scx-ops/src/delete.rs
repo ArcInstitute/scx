@@ -7,6 +7,7 @@ use roaring::RoaringBitmap;
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::blake3_hash;
 use scx_format::header::{FileHeader, HEADER_SIZE};
+use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::{DeletionVectors, ShardDeletion};
 
@@ -105,10 +106,24 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
 
     // Build new catalog: replace existing DV entry or add new one
     let old_catalog_offset = header.full_catalog_offset;
+
+    // Read existing provenance BEFORE consuming catalog entries
+    let existing_prov_ops = if let Some(prov_entry) = catalog.entries.iter()
+        .find(|e| e.section_type == SectionType::Provenance)
+    {
+        lock.seek(SeekFrom::Start(prov_entry.offset))?;
+        let mut prov_buf = vec![0u8; prov_entry.length as usize];
+        std::io::Read::read_exact(&mut lock, &mut prov_buf)?;
+        let prov = Provenance::read_from(&mut Cursor::new(&prov_buf))?;
+        prov.operations
+    } else {
+        Vec::new()
+    };
+
     let mut new_entries: Vec<FullCatalogEntry> = catalog
         .entries
         .into_iter()
-        .filter(|e| e.section_type != SectionType::DeletionVectors)
+        .filter(|e| e.section_type != SectionType::DeletionVectors && e.section_type != SectionType::Provenance)
         .collect();
 
     new_entries.push(FullCatalogEntry {
@@ -117,6 +132,46 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         length: dv_section_length,
         section_type: SectionType::DeletionVectors,
         checksum: dv_checksum,
+        stats: None,
+    });
+
+    // Write provenance section
+    let mut prov_ops = existing_prov_ops;
+    prov_ops.push(ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: "delete".to_string(),
+        tool: "scx-ops 0.1.0".to_string(),
+        params_json: format!("{{\"n_cells_deleted\":{}}}", cell_indices.len()),
+        input_checksums: vec![],
+    });
+    let prov = Provenance {
+        version: 1,
+        operations: prov_ops,
+    };
+    let mut prov_bytes = Vec::new();
+    prov.write_to(&mut prov_bytes)?;
+
+    lock.seek(SeekFrom::End(0))?;
+    let prov_write_offset = lock.stream_position()?;
+    let prov_aligned = align_to_8(prov_write_offset);
+    let prov_pad = (prov_aligned - prov_write_offset) as usize;
+    if prov_pad > 0 {
+        lock.write_all(&vec![0u8; prov_pad])?;
+    }
+    let prov_offset = prov_aligned;
+    lock.write_all(&prov_bytes)?;
+    let prov_length = prov_bytes.len() as u64;
+    let prov_checksum = blake3_hash(&prov_bytes);
+
+    new_entries.push(FullCatalogEntry {
+        name: "provenance".to_string(),
+        offset: prov_offset,
+        length: prov_length,
+        section_type: SectionType::Provenance,
+        checksum: prov_checksum,
         stats: None,
     });
 

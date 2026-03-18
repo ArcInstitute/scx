@@ -8,7 +8,7 @@ use crate::error::{OpsError, Result};
 
 /// Exclusive file lock. Releases on drop.
 pub struct FileLock {
-    file: File,
+    file: Option<File>,
 }
 
 impl FileLock {
@@ -20,59 +20,59 @@ impl FileLock {
             .write(true)
             .open(path)?;
         file.lock_exclusive().map_err(OpsError::LockFailed)?;
-        Ok(Self { file })
+        Ok(Self { file: Some(file) })
     }
 
     /// Return a reference to the inner file.
     pub fn file(&self) -> &File {
-        &self.file
+        self.file.as_ref().expect("FileLock already consumed")
     }
 
-    /// Consume the lock and return the inner file (lock remains held).
-    pub fn into_file(self) -> File {
-        // Prevent Drop from running (which would unlock)
-        let file = unsafe { std::ptr::read(&self.file) };
-        std::mem::forget(self);
-        file
+    /// Consume the lock and return the inner file (lock remains held
+    /// until the returned File is dropped).
+    pub fn into_file(mut self) -> File {
+        self.file.take().expect("FileLock already consumed")
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        if let Some(ref file) = self.file {
+            let _ = file.unlock();
+        }
     }
 }
 
 impl std::ops::Deref for FileLock {
     type Target = File;
     fn deref(&self) -> &File {
-        &self.file
+        self.file.as_ref().expect("FileLock already consumed")
     }
 }
 
 impl std::ops::DerefMut for FileLock {
     fn deref_mut(&mut self) -> &mut File {
-        &mut self.file
+        self.file.as_mut().expect("FileLock already consumed")
     }
 }
 
 impl std::io::Read for FileLock {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buf)
+        self.file.as_mut().expect("FileLock already consumed").read(buf)
     }
 }
 
 impl std::io::Write for FileLock {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buf)
+        self.file.as_mut().expect("FileLock already consumed").write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
+        self.file.as_mut().expect("FileLock already consumed").flush()
     }
 }
 
 impl std::io::Seek for FileLock {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.file.seek(pos)
+        self.file.as_mut().expect("FileLock already consumed").seek(pos)
     }
 }

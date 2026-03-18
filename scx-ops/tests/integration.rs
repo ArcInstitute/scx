@@ -421,3 +421,263 @@ fn test_flock_serializes_appends() {
     let reader = ScxReader::open(&*path).unwrap();
     assert_eq!(reader.n_obs(), 8); // 4 original + 2 + 2
 }
+
+// ---------------------------------------------------------------------------
+// New test suite: comprehensive coverage
+// ---------------------------------------------------------------------------
+
+/// Append should record provenance entry
+#[test]
+fn test_append_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "prov_a.scx", 6, 10, 1);
+
+    let new_obs = sample_obs(4);
+    let (indptr, indices, values) = sample_shard_data(4, 10);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let prov = reader.read_provenance().unwrap();
+    // Should have original "convert" + new "append"
+    assert_eq!(prov.operations.len(), 2);
+    assert_eq!(prov.operations[0].action, "convert");
+    assert_eq!(prov.operations[1].action, "append");
+    assert!(prov.operations[1].params_json.contains("n_new_rows"));
+}
+
+/// Delete should record provenance, and filtered read should exclude deleted rows
+#[test]
+fn test_delete_filtered_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "filt.scx", 6, 10, 1);
+
+    scx_ops::mark_deleted(&path, &[0, 3, 5]).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+
+    // Unfiltered read should still have all rows
+    let csr_all = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr_all.shape.0, 6);
+
+    // Filtered read should exclude deleted rows
+    let csr_filtered = reader.read_all_csr_shards_filtered().unwrap();
+    assert_eq!(csr_filtered.shape.0, 3); // 6 - 3 deleted
+
+    // Provenance should have delete entry
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert_eq!(last.action, "delete");
+}
+
+/// rollback_to specific sequence
+#[test]
+fn test_rollback_to_specific_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "rb_to.scx", 4, 10, 1);
+
+    // Record seq 1
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.header().manifest_sequence, 1);
+    drop(reader);
+
+    // Append twice → seq 2, 3
+    for _ in 0..2 {
+        let new_obs = sample_obs(2);
+        let (indptr, indices, values) = sample_shard_data(2, 10);
+        scx_ops::append(
+            &path,
+            &new_obs,
+            &indptr,
+            &indices,
+            &values,
+            ValueEncoding::Uint8,
+            CodecId::None,
+            16384,
+        )
+        .unwrap();
+    }
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.header().manifest_sequence, 3);
+    assert_eq!(reader.n_obs(), 8); // 4 + 2 + 2
+    drop(reader);
+
+    // Rollback to seq 1
+    scx_ops::rollback_to(&path, 1).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.header().manifest_sequence, 1);
+    assert_eq!(reader.n_obs(), 4); // back to original
+}
+
+/// Merge with incompatible n_vars should error
+#[test]
+fn test_merge_incompatible_nvars() {
+    let dir = tempfile::tempdir().unwrap();
+    let path1 = write_test_file(&dir, "n1.scx", 4, 10, 1);
+    let path2 = write_test_file(&dir, "n2.scx", 4, 20, 1);
+
+    let output = dir.path().join("bad_merge.scx");
+    let result = scx_ops::merge(&[path1.as_path(), path2.as_path()], &output);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        format!("{err}").contains("incompatible n_vars"),
+        "expected IncompatibleVars error, got: {err}"
+    );
+}
+
+/// Append data larger than shard_target_rows should create multiple shards
+#[test]
+fn test_append_multi_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "multi.scx", 4, 10, 1);
+
+    // Append 10 rows with shard_target_rows=3 → should create ~4 shards
+    let new_obs = sample_obs(10);
+    let (indptr, indices, values) = sample_shard_data(10, 10);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        3, // very small target
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.n_obs(), 14);
+    // Original 1 shard + at least 3 new shards (10/3 = 3.33 → 4 shards)
+    assert!(
+        reader.header().n_csr_shards >= 4,
+        "expected >= 4 shards, got {}",
+        reader.header().n_csr_shards
+    );
+
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 14);
+    assert_eq!(csr.nnz(), 28); // 14 rows * 2 nnz
+}
+
+/// Delete same cell twice should be idempotent
+#[test]
+fn test_delete_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "idemp.scx", 6, 10, 1);
+
+    let total1 = scx_ops::mark_deleted(&path, &[0, 3]).unwrap();
+    assert_eq!(total1, 2);
+
+    // Delete cell 0 again + new cell 4
+    let total2 = scx_ops::mark_deleted(&path, &[0, 4]).unwrap();
+    assert_eq!(total2, 3); // 0, 3, 4 — not 4 because 0 was already deleted
+
+    let reader = ScxReader::open(&path).unwrap();
+    let csr = reader.read_all_csr_shards_filtered().unwrap();
+    assert_eq!(csr.shape.0, 3); // 6 - 3 = 3
+}
+
+/// Compact should produce correct nnz in header
+#[test]
+fn test_compact_correct_nnz() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "nnz.scx", 6, 10, 1);
+
+    // Append → compact → verify nnz is correct
+    let new_obs = sample_obs(4);
+    let (indptr, indices, values) = sample_shard_data(4, 10);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+    )
+    .unwrap();
+
+    let compact_path = dir.path().join("nnz_compact.scx");
+    scx_ops::compact(&path, &compact_path).unwrap();
+
+    let reader = ScxReader::open(&compact_path).unwrap();
+    assert_eq!(reader.n_obs(), 10);
+
+    // Verify header nnz matches actual data
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(reader.header().nnz, csr.nnz() as u64);
+    assert_eq!(csr.nnz(), 20); // 10 rows * 2 nnz each
+}
+
+/// Data integrity: known values survive compact
+#[test]
+fn test_data_integrity_after_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "integ.scx", 6, 10, 1);
+
+    // Read original values
+    let reader = ScxReader::open(&path).unwrap();
+    let original_csr = reader.read_all_csr_shards().unwrap();
+    drop(reader);
+
+    // Delete row 2 and compact
+    scx_ops::mark_deleted(&path, &[2]).unwrap();
+    let compact_path = dir.path().join("integ_compact.scx");
+    scx_ops::compact(&path, &compact_path).unwrap();
+
+    let reader = ScxReader::open(&compact_path).unwrap();
+    let compacted_csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(compacted_csr.shape.0, 5); // 6 - 1
+
+    // Verify remaining rows have correct values
+    // Row 0 of compacted = row 0 of original
+    let orig_row0_start = original_csr.indptr[0] as usize;
+    let orig_row0_end = original_csr.indptr[1] as usize;
+    let comp_row0_start = compacted_csr.indptr[0] as usize;
+    let comp_row0_end = compacted_csr.indptr[1] as usize;
+    assert_eq!(
+        &original_csr.data[orig_row0_start..orig_row0_end],
+        &compacted_csr.data[comp_row0_start..comp_row0_end]
+    );
+}
+
+/// Merge preserves obs metadata in correct order
+#[test]
+fn test_merge_preserves_obs_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path1 = write_test_file(&dir, "mo1.scx", 3, 10, 1);
+    let path2 = write_test_file(&dir, "mo2.scx", 4, 10, 1);
+
+    let output = dir.path().join("merged_obs.scx");
+    scx_ops::merge(&[path1.as_path(), path2.as_path()], &output).unwrap();
+
+    let reader = ScxReader::open(&output).unwrap();
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 7); // 3 + 4
+
+    // Verify cell_ids are from both files in order
+    use arrow::array::StringArray;
+    let cell_ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(cell_ids.value(0), "cell_0"); // from file 1
+    assert_eq!(cell_ids.value(2), "cell_2"); // from file 1
+    assert_eq!(cell_ids.value(3), "cell_0"); // from file 2 (starts over)
+    assert_eq!(cell_ids.value(6), "cell_3"); // from file 2
+}

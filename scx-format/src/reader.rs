@@ -297,6 +297,64 @@ impl ScxReader {
         Ok(Some(dv))
     }
 
+    /// Read all CSR shards with deletion vectors applied.
+    /// Deleted rows are excluded from the returned ScxCsr.
+    /// If no deletion vectors are present, returns the same result as `read_all_csr_shards()`.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_all_csr_shards_filtered(&self) -> Result<ScxCsr> {
+        let dv_opt = self.read_deletion_vectors()?;
+
+        let csr = self.read_all_csr_shards()?;
+
+        let dv = match dv_opt {
+            Some(dv) if dv.total_deleted() > 0 => dv,
+            _ => return Ok(csr),
+        };
+
+        // Build a keep mask from deletion vectors
+        let n_obs = csr.shape.0;
+        let shards = self.full_catalog.shards_sorted();
+
+        let mut keep = vec![true; n_obs];
+        for (shard_idx, shard_entry) in shards.iter().enumerate() {
+            if let Some(ref stats) = shard_entry.stats {
+                if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
+                    for local_row in sd.bitmap.iter() {
+                        let global_row = stats.row_start + local_row as u64;
+                        if (global_row as usize) < n_obs {
+                            keep[global_row as usize] = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Filter CSR rows
+        let mut new_indptr = vec![0i64];
+        let mut new_indices = Vec::new();
+        let mut new_data = Vec::new();
+
+        for (row, &is_kept) in keep.iter().enumerate() {
+            if !is_kept {
+                continue;
+            }
+            let start = csr.indptr[row] as usize;
+            let end = csr.indptr[row + 1] as usize;
+            new_indices.extend_from_slice(&csr.indices[start..end]);
+            new_data.extend_from_slice(&csr.data[start..end]);
+            let prev = *new_indptr.last().unwrap();
+            new_indptr.push(prev + (end - start) as i64);
+        }
+
+        let new_n_rows = new_indptr.len() - 1;
+        Ok(ScxCsr::new_unchecked(
+            (new_n_rows, csr.shape.1),
+            new_indptr,
+            new_indices,
+            new_data,
+        ))
+    }
+
     /// Get access to the underlying mmap bytes.
     pub fn mmap(&self) -> &[u8] {
         &self.mmap

@@ -10,6 +10,7 @@ use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
+use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
 
@@ -253,13 +254,59 @@ pub fn append(
     lock.write_all(&obs_ipc_bytes)?;
     let new_obs_length = obs_ipc_bytes.len() as u64;
     let new_obs_checksum = blake3_hash(&obs_ipc_bytes);
-    write_offset += new_obs_length;
 
-    // Build new catalog: old entries (minus old obs) + new shards + new obs
+    // Write provenance section (read existing, append entry, write)
+    let prov_entries = {
+        let mut entries = if let Some(prov_entry) = old_catalog.entries.iter()
+            .find(|e| e.section_type == SectionType::Provenance)
+        {
+            lock.seek(SeekFrom::Start(prov_entry.offset))?;
+            let mut prov_buf = vec![0u8; prov_entry.length as usize];
+            std::io::Read::read_exact(&mut lock, &mut prov_buf)?;
+            let prov = Provenance::read_from(&mut Cursor::new(&prov_buf))?;
+            prov.operations
+        } else {
+            Vec::new()
+        };
+        entries.push(ProvenanceEntry {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            action: "append".to_string(),
+            tool: "scx-ops 0.1.0".to_string(),
+            params_json: format!("{{\"n_new_rows\":{n_new_rows}}}"),
+            input_checksums: vec![],
+        });
+        entries
+    };
+    let prov = Provenance {
+        version: 1,
+        operations: prov_entries,
+    };
+    let mut prov_bytes = Vec::new();
+    prov.write_to(&mut prov_bytes)?;
+
+    // Seek back to EOF to write provenance
+    lock.seek(SeekFrom::End(0))?;
+    write_offset = lock.stream_position()?;
+    let prov_aligned = align_to_8(write_offset);
+    let pad = (prov_aligned - write_offset) as usize;
+    if pad > 0 {
+        lock.write_all(&vec![0u8; pad])?;
+        write_offset = prov_aligned;
+    }
+    let prov_offset = write_offset;
+    lock.write_all(&prov_bytes)?;
+    let prov_length = prov_bytes.len() as u64;
+    let prov_checksum = blake3_hash(&prov_bytes);
+    write_offset += prov_length;
+
+    // Build new catalog: old entries (minus old obs, minus old provenance) + new shards + new obs + new provenance
     let mut new_entries: Vec<FullCatalogEntry> = old_catalog
         .entries
         .into_iter()
-        .filter(|e| e.section_type != SectionType::ObsMetadata)
+        .filter(|e| e.section_type != SectionType::ObsMetadata && e.section_type != SectionType::Provenance)
         .collect();
 
     new_entries.extend(new_shard_entries);
@@ -269,6 +316,14 @@ pub fn append(
         length: new_obs_length,
         section_type: SectionType::ObsMetadata,
         checksum: new_obs_checksum,
+        stats: None,
+    });
+    new_entries.push(FullCatalogEntry {
+        name: "provenance".to_string(),
+        offset: prov_offset,
+        length: prov_length,
+        section_type: SectionType::Provenance,
+        checksum: prov_checksum,
         stats: None,
     });
 
