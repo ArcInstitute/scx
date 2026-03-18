@@ -10,6 +10,9 @@ use memmap2::Mmap;
 use scx_codec::{CodecId, EncodedShard, ValueEncoding};
 use scx_sparse::ScxCsr;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::checksum::{blake3_hash, blake3_truncated_64};
 use crate::error::{Result, ScxError};
@@ -186,7 +189,14 @@ impl ScxReader {
     /// Read all CSR shards and assemble into a single ScxCsr.
     pub fn read_all_csr_shards(&self) -> Result<ScxCsr> {
         let shards = self.full_catalog.shards_sorted();
-        self.assemble_shards(&shards)
+        #[cfg(feature = "parallel")]
+        {
+            self.assemble_shards_parallel(&shards)
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.assemble_shards(&shards)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -226,7 +236,14 @@ impl ScxReader {
 
         // Sort by row_start
         shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-        self.assemble_shards(&shards)
+        #[cfg(feature = "parallel")]
+        {
+            self.assemble_shards_parallel(&shards)
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.assemble_shards(&shards)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -364,7 +381,59 @@ impl ScxReader {
         Ok((indptr, indices, data))
     }
 
-    /// Assemble multiple shard entries into a single ScxCsr.
+    /// Assemble multiple shard entries into a single ScxCsr using parallel decode.
+    #[cfg(feature = "parallel")]
+    fn assemble_shards_parallel(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
+        if shards.is_empty() {
+            return Ok(ScxCsr::new_unchecked(
+                (0, self.header.n_vars as usize),
+                vec![0],
+                vec![],
+                vec![],
+            ));
+        }
+
+        // Decode all shards in parallel
+        let decoded: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shards
+            .par_iter()
+            .map(|entry| self.read_shard_from_entry(entry))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Pre-compute total sizes for allocation
+        let total_indices: usize = decoded.iter().map(|(_, idx, _)| idx.len()).sum();
+        let total_data: usize = decoded.iter().map(|(_, _, d)| d.len()).sum();
+        let total_indptr: usize =
+            decoded.iter().map(|(ip, _, _)| ip.len()).sum::<usize>() - (decoded.len() - 1); // subtract duplicate leading zeros
+
+        let mut merged_indptr = Vec::with_capacity(total_indptr);
+        let mut merged_indices = Vec::with_capacity(total_indices);
+        let mut merged_data = Vec::with_capacity(total_data);
+        let mut cumulative_nnz: i64 = 0;
+
+        for (i, (indptr, indices, data)) in decoded.iter().enumerate() {
+            if i == 0 {
+                merged_indptr.extend_from_slice(indptr);
+            } else {
+                for &v in &indptr[1..] {
+                    merged_indptr.push(v + cumulative_nnz);
+                }
+            }
+            cumulative_nnz += *indptr.last().unwrap_or(&0);
+            merged_indices.extend_from_slice(indices);
+            merged_data.extend_from_slice(data);
+        }
+
+        let n_rows = merged_indptr.len().saturating_sub(1);
+        Ok(ScxCsr::new_unchecked(
+            (n_rows, self.header.n_vars as usize),
+            merged_indptr,
+            merged_indices,
+            merged_data,
+        ))
+    }
+
+    /// Assemble multiple shard entries into a single ScxCsr (sequential).
+    #[cfg(any(not(feature = "parallel"), test))]
     fn assemble_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
         if shards.is_empty() {
             return Ok(ScxCsr::new_unchecked(
@@ -958,6 +1027,62 @@ mod tests {
         assert_eq!(prov.operations[2].input_checksums.len(), 2);
         assert_eq!(prov.operations[2].input_checksums[0], [0xCC; 32]);
         assert_eq!(prov.operations[2].input_checksums[1], [0xDD; 32]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel shard decode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_matches_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "par_seq.scx", 12, 10, 4, false);
+
+        let reader = ScxReader::open(&path).unwrap();
+        let shards = reader.catalog().shards_sorted();
+
+        let sequential = reader.assemble_shards(&shards).unwrap();
+        let parallel = reader.assemble_shards_parallel(&shards).unwrap();
+
+        assert_eq!(sequential.shape, parallel.shape);
+        assert_eq!(sequential.indptr, parallel.indptr);
+        assert_eq!(sequential.indices, parallel.indices);
+        assert_eq!(sequential.data, parallel.data);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_single_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "par_single.scx", 6, 10, 1, false);
+
+        let reader = ScxReader::open(&path).unwrap();
+        let csr = reader.read_all_csr_shards().unwrap();
+
+        assert_eq!(csr.shape, (6, 10));
+        assert_eq!(csr.nnz(), 12);
+        assert_eq!(csr.indptr.len(), 7);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_thread_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "par_pool.scx", 12, 10, 4, false);
+
+        let reader = ScxReader::open(&path).unwrap();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+
+        let csr = pool.install(|| reader.read_all_csr_shards()).unwrap();
+
+        assert_eq!(csr.shape, (12, 10));
+        assert_eq!(csr.nnz(), 24);
+        assert_eq!(csr.indptr.len(), 13);
     }
 
     #[test]

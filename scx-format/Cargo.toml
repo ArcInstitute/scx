@@ -6,7 +6,12 @@ description = "File layout, header, catalog, and shard I/O for SCX format"
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["parallel"]
+parallel = ["rayon"]
+
 [dependencies]
+rayon = { workspace = true, optional = true }
 blake3 = { workspace = true }
 arrow = { workspace = true }
 zstd = { workspace = true }
