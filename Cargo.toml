@@ -27,6 +27,7 @@ indicatif = "0.17"
 # HDF5 — see Phase1.md note on crate risk
 hdf5 = "0.8"
 
+half = "2"
 roaring = "0.10"
 fs4 = "0.12"
 

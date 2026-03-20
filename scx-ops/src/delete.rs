@@ -108,7 +108,9 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     let old_catalog_offset = header.full_catalog_offset;
 
     // Read existing provenance BEFORE consuming catalog entries
-    let existing_prov_ops = if let Some(prov_entry) = catalog.entries.iter()
+    let existing_prov_ops = if let Some(prov_entry) = catalog
+        .entries
+        .iter()
         .find(|e| e.section_type == SectionType::Provenance)
     {
         lock.seek(SeekFrom::Start(prov_entry.offset))?;
@@ -123,7 +125,10 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     let mut new_entries: Vec<FullCatalogEntry> = catalog
         .entries
         .into_iter()
-        .filter(|e| e.section_type != SectionType::DeletionVectors && e.section_type != SectionType::Provenance)
+        .filter(|e| {
+            e.section_type != SectionType::DeletionVectors
+                && e.section_type != SectionType::Provenance
+        })
         .collect();
 
     new_entries.push(FullCatalogEntry {

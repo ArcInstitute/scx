@@ -186,7 +186,7 @@ pub fn append(
             n_major: shard_rows as u32,
             n_minor: file_n_vars as u32,
             nnz: shard_nnz,
-            global_offset: shard_global_offset,
+            global_offset: global_row_start,
             indptr_rel_offset,
             indptr_length,
             indices_rel_offset,
@@ -257,7 +257,9 @@ pub fn append(
 
     // Write provenance section (read existing, append entry, write)
     let prov_entries = {
-        let mut entries = if let Some(prov_entry) = old_catalog.entries.iter()
+        let mut entries = if let Some(prov_entry) = old_catalog
+            .entries
+            .iter()
             .find(|e| e.section_type == SectionType::Provenance)
         {
             lock.seek(SeekFrom::Start(prov_entry.offset))?;
@@ -306,7 +308,9 @@ pub fn append(
     let mut new_entries: Vec<FullCatalogEntry> = old_catalog
         .entries
         .into_iter()
-        .filter(|e| e.section_type != SectionType::ObsMetadata && e.section_type != SectionType::Provenance)
+        .filter(|e| {
+            e.section_type != SectionType::ObsMetadata && e.section_type != SectionType::Provenance
+        })
         .collect();
 
     new_entries.extend(new_shard_entries);

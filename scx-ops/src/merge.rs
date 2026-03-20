@@ -7,8 +7,9 @@ use arrow::compute::concat_batches;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
+use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::error::{OpsError, Result};
 
@@ -78,7 +79,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         root_catalog_length: 0,
         full_catalog_offset: 0,
         full_catalog_length: 0,
-        manifest_sequence: 1,
+        manifest_sequence: 0,
         prev_catalog_offset: 0,
         file_checksum: 0,
         front_catalog_offset: 0,
@@ -148,34 +149,92 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         writer.write_uns(&uns)?;
     }
 
-    // Merge layers
+    // Merge layers — read per-layer value encoding from shard headers
+    let shard_target = first_header.shard_target_rows;
     let layer_names = readers[0].layer_names();
     for layer_name in &layer_names {
-        let mut cumulative_layer_rows = 0u64;
-        let mut shard_idx = 0u32;
+        // Determine this layer's value encoding from its first shard header
+        let layer_prefix = format!("{layer_name}_shard_");
+        let layer_shard_entries: Vec<&scx_format::catalog::FullCatalogEntry> = readers[0]
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
+            })
+            .collect();
+        let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
+            let section = readers[0].section_bytes(first_entry);
+            let sh =
+                ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+            ValueEncoding::from_u8(sh.value_encoding).unwrap_or(ValueEncoding::Uint8)
+        } else {
+            value_encoding
+        };
+        let layer_codec = if let Some(first_entry) = layer_shard_entries.first() {
+            let section = readers[0].section_bytes(first_entry);
+            let sh =
+                ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+            CodecId::from_u8(sh.codec_id).unwrap_or(CodecId::None)
+        } else {
+            codec_id
+        };
+
+        // Accumulate and flush at shard_target_rows, matching compact.rs pattern
+        let mut layer_indptr: Vec<u64> = vec![0];
+        let mut layer_indices: Vec<u32> = Vec::new();
+        let mut layer_values: Vec<u8> = Vec::new();
+        let mut layer_row_count = 0u64;
+        let mut layer_shard_idx = 0u32;
+        let mut emitted_layer_rows = 0u64;
+
         for reader in &readers {
             if let Ok(layer) = reader.read_layer(layer_name) {
-                // Write as a single shard per input file
-                let indptr_u64: Vec<u64> = layer.indptr.iter().map(|&v| v as u64).collect();
-                let indices_u32: Vec<u32> = layer.indices.iter().map(|&v| v as u32).collect();
-                let mut values_bytes = Vec::new();
-                for &v in &layer.data {
-                    encode_value(&mut values_bytes, v, value_encoding);
-                }
+                for row_idx in 0..layer.shape.0 {
+                    let row_start = layer.indptr[row_idx] as usize;
+                    let row_end = layer.indptr[row_idx + 1] as usize;
+                    for j in row_start..row_end {
+                        layer_indices.push(layer.indices[j] as u32);
+                        encode_value(&mut layer_values, layer.data[j], layer_value_encoding);
+                    }
+                    let prev = *layer_indptr.last().unwrap();
+                    layer_indptr.push(prev + (row_end - row_start) as u64);
+                    layer_row_count += 1;
 
-                writer.write_layer_csr_shard(
-                    &indptr_u64,
-                    &indices_u32,
-                    &values_bytes,
-                    codec_id,
-                    value_encoding,
-                    cumulative_layer_rows,
-                    layer_name,
-                    shard_idx,
-                )?;
-                cumulative_layer_rows += layer.shape.0 as u64;
-                shard_idx += 1;
+                    if layer_row_count >= shard_target as u64 {
+                        writer.write_layer_csr_shard(
+                            &layer_indptr,
+                            &layer_indices,
+                            &layer_values,
+                            layer_codec,
+                            layer_value_encoding,
+                            emitted_layer_rows,
+                            layer_name,
+                            layer_shard_idx,
+                        )?;
+                        emitted_layer_rows += layer_row_count;
+                        layer_indptr = vec![0];
+                        layer_indices.clear();
+                        layer_values.clear();
+                        layer_row_count = 0;
+                        layer_shard_idx += 1;
+                    }
+                }
             }
+        }
+
+        // Flush remaining layer rows
+        if layer_row_count > 0 {
+            writer.write_layer_csr_shard(
+                &layer_indptr,
+                &layer_indices,
+                &layer_values,
+                layer_codec,
+                layer_value_encoding,
+                emitted_layer_rows,
+                layer_name,
+                layer_shard_idx,
+            )?;
         }
     }
 
@@ -215,6 +274,9 @@ fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) {
         ValueEncoding::Uint16 => buf.extend_from_slice(&(value as u16).to_le_bytes()),
         ValueEncoding::Uint32 => buf.extend_from_slice(&(value as u32).to_le_bytes()),
         ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
-        ValueEncoding::Float16 => buf.extend_from_slice(&(value as u16).to_le_bytes()),
+        ValueEncoding::Float16 => {
+            let f16_val = half::f16::from_f32(value);
+            buf.extend_from_slice(&f16_val.to_le_bytes());
+        }
     }
 }

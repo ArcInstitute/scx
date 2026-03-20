@@ -61,7 +61,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
         root_catalog_length: 0,
         full_catalog_offset: 0,
         full_catalog_length: 0,
-        manifest_sequence: 1,
+        manifest_sequence: 0,
         prev_catalog_offset: 0,
         file_checksum: 0,
         front_catalog_offset: 0,
@@ -105,11 +105,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
 
     for shard_entry in &shards {
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
-        let shard_row_start = shard_entry
-            .stats
-            .as_ref()
-            .map(|s| s.row_start)
-            .unwrap_or(0);
+        let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
         let shard_n_rows = indptr.len() - 1;
 
         for local_row in 0..shard_n_rows {
@@ -195,10 +191,13 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     for layer_name in &layer_names {
         // Determine this layer's value encoding from its first shard header
         let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format::FullCatalogEntry> = reader.catalog()
+        let layer_shard_entries: Vec<&scx_format::FullCatalogEntry> = reader
+            .catalog()
             .entries
             .iter()
-            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix))
+            .filter(|e| {
+                e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
+            })
             .collect();
         let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
             let section = reader.section_bytes(first_entry);
@@ -344,8 +343,8 @@ fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) {
         ValueEncoding::Uint32 => buf.extend_from_slice(&(value as u32).to_le_bytes()),
         ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
         ValueEncoding::Float16 => {
-            // Simplified: store as u16 bits
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
+            let f16_val = half::f16::from_f32(value);
+            buf.extend_from_slice(&f16_val.to_le_bytes());
         }
     }
 }

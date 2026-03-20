@@ -58,21 +58,33 @@ impl std::ops::DerefMut for FileLock {
 
 impl std::io::Read for FileLock {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.as_mut().expect("FileLock already consumed").read(buf)
+        self.file
+            .as_mut()
+            .expect("FileLock already consumed")
+            .read(buf)
     }
 }
 
 impl std::io::Write for FileLock {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.as_mut().expect("FileLock already consumed").write(buf)
+        self.file
+            .as_mut()
+            .expect("FileLock already consumed")
+            .write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.as_mut().expect("FileLock already consumed").flush()
+        self.file
+            .as_mut()
+            .expect("FileLock already consumed")
+            .flush()
     }
 }
 
 impl std::io::Seek for FileLock {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.file.as_mut().expect("FileLock already consumed").seek(pos)
+        self.file
+            .as_mut()
+            .expect("FileLock already consumed")
+            .seek(pos)
     }
 }

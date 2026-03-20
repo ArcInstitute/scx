@@ -578,10 +578,10 @@ fn values_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        ValueEncoding::Float16 => {
-            // Phase 1: Float16 not supported
-            unimplemented!("Float16 decoding not implemented in Phase 1")
-        }
+        ValueEncoding::Float16 => raw
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
     }
 }
 

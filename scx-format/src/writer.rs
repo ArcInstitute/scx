@@ -344,7 +344,7 @@ impl ScxWriter {
             n_major,
             n_minor: self.header.n_vars as u32,
             nnz,
-            global_offset: shard_global_offset,
+            global_offset: row_start,
             indptr_rel_offset,
             indptr_length,
             indices_rel_offset,
@@ -460,7 +460,7 @@ impl ScxWriter {
         self.header.n_csr_shards = self.csr_shard_count;
         self.header.nnz = self.total_nnz;
         self.header.file_checksum = 0; // placeholder for first write
-        // Auto-set flags based on what was written
+                                       // Auto-set flags based on what was written
         if self.has_obsm {
             self.header.flags |= 1 << 2; // has_obsm
         }
