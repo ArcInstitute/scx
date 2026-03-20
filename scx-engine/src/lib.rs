@@ -1,3 +1,4 @@
+pub mod collect;
 pub mod error;
 pub mod fused_ops;
 pub mod index;
@@ -6,6 +7,7 @@ pub mod predicate;
 pub mod projection;
 pub mod pushdown;
 
+pub use collect::filter_csr_rows;
 pub use error::{EngineError, Result};
 pub use fused_ops::{apply_fused_ops, fused_normalize_log1p, log1p_row, normalize_row};
 pub use index::{build_indexes, PredicateIndex};

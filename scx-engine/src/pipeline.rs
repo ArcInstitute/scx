@@ -12,7 +12,7 @@ use scx_sparse::ScxCsr;
 
 use scx_format::DeletionVectors;
 
-use crate::error::{EngineError, Result};
+use crate::error::Result;
 use crate::predicate::{parse_predicate, Predicate};
 
 /// Configuration for normalize-total operation.
@@ -63,7 +63,6 @@ pub struct QueryPipeline {
     normalize: Option<NormalizeConfig>,
     log1p: bool,
     limit: Option<usize>,
-    #[allow(dead_code)] // loaded at open(); used by Phase F execution
     deletion_vectors: Option<DeletionVectors>,
 }
 
@@ -160,14 +159,13 @@ impl QueryPipeline {
     /// Execute the pipeline and return the query result.
     ///
     /// This is where all I/O and computation occurs.
-    /// Currently a placeholder — full implementation in Phase F.
+    /// Delegates to `collect::execute()` which implements the full
+    /// pipeline: pushdown → decode → projection → filter → fused ops.
     pub fn collect(self) -> Result<QueryResult> {
-        // Phase F will implement the full execution pipeline.
-        // For now, return EmptyPipeline to indicate this is not yet implemented.
-        Err(EngineError::EmptyPipeline)
+        crate::collect::execute(self)
     }
 
-    // -- Accessors for testing --
+    // -- Accessors for testing and collect.rs --
 
     /// Access the cached obs schema.
     pub fn obs_schema(&self) -> &Schema {
@@ -193,11 +191,37 @@ impl QueryPipeline {
     pub fn reader(&self) -> &ScxReader {
         &self.reader
     }
+
+    /// Access the gene indices for projection.
+    pub(crate) fn gene_indices(&self) -> Option<&Vec<u32>> {
+        self.gene_indices.as_ref()
+    }
+
+    /// Access the normalize target sum.
+    pub(crate) fn normalize_target_sum(&self) -> Option<f64> {
+        self.normalize.as_ref().map(|n| n.target_sum)
+    }
+
+    /// Check if log1p is enabled.
+    pub(crate) fn log1p(&self) -> bool {
+        self.log1p
+    }
+
+    /// Access the limit value.
+    pub(crate) fn limit_value(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Access the loaded deletion vectors.
+    pub(crate) fn deletion_vectors(&self) -> &Option<DeletionVectors> {
+        &self.deletion_vectors
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::EngineError;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field};
     use scx_codec::{CodecId, ValueEncoding};
@@ -356,11 +380,12 @@ mod tests {
     }
 
     #[test]
-    fn collect_placeholder_returns_error() {
+    fn collect_returns_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_file(&dir, 10, 5);
         let pipeline = QueryPipeline::open(&path).unwrap();
-        let err = pipeline.collect().unwrap_err();
-        assert!(matches!(err, EngineError::EmptyPipeline));
+        let result = pipeline.collect().unwrap();
+        assert_eq!(result.x.n_rows(), 10);
+        assert_eq!(result.x.n_cols(), 5);
     }
 }
