@@ -501,6 +501,26 @@ impl ScxWriter {
 
         Ok(self.final_path.clone())
     }
+
+    /// Write the obs predicate index section (pre-serialized bytes).
+    pub fn write_obs_predicate_index(&mut self, data: &[u8]) -> Result<()> {
+        self.write_section_bytes(
+            "obs_predicate_index",
+            SectionType::ObsPredicateIndex,
+            data,
+            None,
+        )
+    }
+
+    /// Write the var predicate index section (pre-serialized bytes).
+    pub fn write_var_predicate_index(&mut self, data: &[u8]) -> Result<()> {
+        self.write_section_bytes(
+            "var_predicate_index",
+            SectionType::VarPredicateIndex,
+            data,
+            None,
+        )
+    }
 }
 
 impl Drop for ScxWriter {

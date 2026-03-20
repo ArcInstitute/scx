@@ -17,6 +17,8 @@ pub enum SectionType {
     UnsBlob = 10,
     Provenance = 11,
     DeletionVectors = 12,
+    ObsPredicateIndex = 13,
+    VarPredicateIndex = 14,
 }
 
 impl SectionType {
@@ -36,13 +38,15 @@ impl SectionType {
             10 => Some(Self::UnsBlob),
             11 => Some(Self::Provenance),
             12 => Some(Self::DeletionVectors),
+            13 => Some(Self::ObsPredicateIndex),
+            14 => Some(Self::VarPredicateIndex),
             _ => None,
         }
     }
 
-    /// Returns true if `v` is a known section type ID (0..=12).
+    /// Returns true if `v` is a known section type ID (0..=14).
     pub fn is_known(v: u8) -> bool {
-        v <= 12
+        v <= 14
     }
 }
 
@@ -60,20 +64,22 @@ mod tests {
         assert_eq!(SectionType::from_u8(0), Some(SectionType::ObsMetadata));
         assert_eq!(SectionType::from_u8(4), Some(SectionType::CsrShard));
         assert_eq!(SectionType::from_u8(12), Some(SectionType::DeletionVectors));
+        assert_eq!(SectionType::from_u8(13), Some(SectionType::ObsPredicateIndex));
+        assert_eq!(SectionType::from_u8(14), Some(SectionType::VarPredicateIndex));
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(13), None);
+        assert_eq!(SectionType::from_u8(15), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 
     #[test]
     fn section_type_is_known() {
-        for v in 0..=12 {
+        for v in 0..=14 {
             assert!(SectionType::is_known(v));
         }
-        assert!(!SectionType::is_known(13));
+        assert!(!SectionType::is_known(15));
         assert!(!SectionType::is_known(255));
     }
 

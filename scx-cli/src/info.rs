@@ -165,6 +165,8 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
         SectionType::UnsBlob => "uns".to_string(),
         SectionType::Provenance => "provenance".to_string(),
         SectionType::DeletionVectors => "deletion_vectors".to_string(),
+        SectionType::ObsPredicateIndex => "obs_predicate_index".to_string(),
+        SectionType::VarPredicateIndex => "var_predicate_index".to_string(),
     }
 }
 

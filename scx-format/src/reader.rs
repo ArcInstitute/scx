@@ -304,6 +304,38 @@ impl ScxReader {
     }
 
     // -----------------------------------------------------------------------
+    // Predicate indexes (SPEC §3.5, Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// Read the raw bytes of the obs predicate index section, if present.
+    /// Returns `Ok(None)` if the file contains no obs predicate index.
+    pub fn read_obs_predicate_index_bytes(&self) -> Result<Option<&[u8]>> {
+        let entry = self
+            .full_catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::ObsPredicateIndex);
+        match entry {
+            Some(e) => Ok(Some(self.section_bytes(e))),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the raw bytes of the var predicate index section, if present.
+    /// Returns `Ok(None)` if the file contains no var predicate index.
+    pub fn read_var_predicate_index_bytes(&self) -> Result<Option<&[u8]>> {
+        let entry = self
+            .full_catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::VarPredicateIndex);
+        match entry {
+            Some(e) => Ok(Some(self.section_bytes(e))),
+            None => Ok(None),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Deletion vectors
     // -----------------------------------------------------------------------
 
