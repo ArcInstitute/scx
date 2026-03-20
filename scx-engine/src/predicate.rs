@@ -12,9 +12,7 @@
 
 use std::fmt;
 
-use arrow::array::{
-    Array, AsArray, BooleanArray, RecordBatch,
-};
+use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::{DataType, Schema};
 
@@ -247,16 +245,20 @@ fn tokenize(expr: &str) -> Result<Vec<Token>> {
             }
             let num_str: String = chars[start..i].iter().collect();
             if is_float {
-                let v: f64 = num_str.parse().map_err(|_| EngineError::PredicateParseError {
-                    expr: expr.to_string(),
-                    reason: format!("invalid float literal: {num_str}"),
-                })?;
+                let v: f64 = num_str
+                    .parse()
+                    .map_err(|_| EngineError::PredicateParseError {
+                        expr: expr.to_string(),
+                        reason: format!("invalid float literal: {num_str}"),
+                    })?;
                 tokens.push(Token::FloatLit(v));
             } else {
-                let v: i64 = num_str.parse().map_err(|_| EngineError::PredicateParseError {
-                    expr: expr.to_string(),
-                    reason: format!("invalid integer literal: {num_str}"),
-                })?;
+                let v: i64 = num_str
+                    .parse()
+                    .map_err(|_| EngineError::PredicateParseError {
+                        expr: expr.to_string(),
+                        reason: format!("invalid integer literal: {num_str}"),
+                    })?;
                 tokens.push(Token::IntLit(v));
             }
             continue;
@@ -355,7 +357,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Check value–column type compatibility and coerce if necessary.
-    fn validate_type(&self, col: &str, col_type: &DataType, value: &ScalarValue) -> Result<ScalarValue> {
+    fn validate_type(
+        &self,
+        col: &str,
+        col_type: &DataType,
+        value: &ScalarValue,
+    ) -> Result<ScalarValue> {
         match (col_type, value) {
             // String columns accept string values
             (DataType::Utf8 | DataType::LargeUtf8, ScalarValue::Utf8(_)) => Ok(value.clone()),
@@ -366,19 +373,20 @@ impl<'a> Parser<'a> {
                 Ok(value.clone())
             }
             // String column with numeric literal → type mismatch
-            (DataType::Utf8 | DataType::LargeUtf8, ScalarValue::Int64(_) | ScalarValue::Float64(_)) => {
-                Err(EngineError::SchemaError {
-                    column: col.to_string(),
-                    reason: format!(
-                        "type mismatch: column is string but value is {}",
-                        match value {
-                            ScalarValue::Int64(_) => "integer",
-                            ScalarValue::Float64(_) => "float",
-                            _ => unreachable!(),
-                        }
-                    ),
-                })
-            }
+            (
+                DataType::Utf8 | DataType::LargeUtf8,
+                ScalarValue::Int64(_) | ScalarValue::Float64(_),
+            ) => Err(EngineError::SchemaError {
+                column: col.to_string(),
+                reason: format!(
+                    "type mismatch: column is string but value is {}",
+                    match value {
+                        ScalarValue::Int64(_) => "integer",
+                        ScalarValue::Float64(_) => "float",
+                        _ => unreachable!(),
+                    }
+                ),
+            }),
             // Numeric columns accept int/float values
             (
                 DataType::Int8
@@ -558,7 +566,13 @@ pub fn evaluate(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArr
     // Coalesce nulls to false at the top level
     if mask.null_count() > 0 {
         let result: BooleanArray = (0..mask.len())
-            .map(|i| Some(if mask.is_null(i) { false } else { mask.value(i) }))
+            .map(|i| {
+                Some(if mask.is_null(i) {
+                    false
+                } else {
+                    mask.value(i)
+                })
+            })
             .collect();
         Ok(result)
     } else {
@@ -633,16 +647,36 @@ fn eval_comparison(
     match dtype {
         DataType::Utf8 => eval_utf8(column.as_string::<i32>(), value, op),
         DataType::LargeUtf8 => eval_utf8(column.as_string::<i64>(), value, op),
-        DataType::Int8 => eval_numeric_array::<arrow::datatypes::Int8Type>(column.as_primitive(), value, op),
-        DataType::Int16 => eval_numeric_array::<arrow::datatypes::Int16Type>(column.as_primitive(), value, op),
-        DataType::Int32 => eval_numeric_array::<arrow::datatypes::Int32Type>(column.as_primitive(), value, op),
-        DataType::Int64 => eval_numeric_array::<arrow::datatypes::Int64Type>(column.as_primitive(), value, op),
-        DataType::UInt8 => eval_numeric_array::<arrow::datatypes::UInt8Type>(column.as_primitive(), value, op),
-        DataType::UInt16 => eval_numeric_array::<arrow::datatypes::UInt16Type>(column.as_primitive(), value, op),
-        DataType::UInt32 => eval_numeric_array::<arrow::datatypes::UInt32Type>(column.as_primitive(), value, op),
-        DataType::UInt64 => eval_numeric_array::<arrow::datatypes::UInt64Type>(column.as_primitive(), value, op),
-        DataType::Float32 => eval_numeric_array::<arrow::datatypes::Float32Type>(column.as_primitive(), value, op),
-        DataType::Float64 => eval_numeric_array::<arrow::datatypes::Float64Type>(column.as_primitive(), value, op),
+        DataType::Int8 => {
+            eval_numeric_array::<arrow::datatypes::Int8Type>(column.as_primitive(), value, op)
+        }
+        DataType::Int16 => {
+            eval_numeric_array::<arrow::datatypes::Int16Type>(column.as_primitive(), value, op)
+        }
+        DataType::Int32 => {
+            eval_numeric_array::<arrow::datatypes::Int32Type>(column.as_primitive(), value, op)
+        }
+        DataType::Int64 => {
+            eval_numeric_array::<arrow::datatypes::Int64Type>(column.as_primitive(), value, op)
+        }
+        DataType::UInt8 => {
+            eval_numeric_array::<arrow::datatypes::UInt8Type>(column.as_primitive(), value, op)
+        }
+        DataType::UInt16 => {
+            eval_numeric_array::<arrow::datatypes::UInt16Type>(column.as_primitive(), value, op)
+        }
+        DataType::UInt32 => {
+            eval_numeric_array::<arrow::datatypes::UInt32Type>(column.as_primitive(), value, op)
+        }
+        DataType::UInt64 => {
+            eval_numeric_array::<arrow::datatypes::UInt64Type>(column.as_primitive(), value, op)
+        }
+        DataType::Float32 => {
+            eval_numeric_array::<arrow::datatypes::Float32Type>(column.as_primitive(), value, op)
+        }
+        DataType::Float64 => {
+            eval_numeric_array::<arrow::datatypes::Float64Type>(column.as_primitive(), value, op)
+        }
         DataType::Boolean => eval_boolean(column.as_boolean(), value, op),
         DataType::Dictionary(_, value_type) => match value_type.as_ref() {
             DataType::Utf8 | DataType::LargeUtf8 => eval_dictionary_utf8(column, value, op),
@@ -752,26 +786,42 @@ fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> f64 {
     // This is only called for value comparisons, not hot-path data.
     use std::any::Any;
     let any_ref: &dyn Any = &v;
-    if let Some(&val) = any_ref.downcast_ref::<i8>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<i16>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<i32>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<i64>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<u8>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<u16>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<u32>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<u64>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<f32>() { return val as f64; }
-    if let Some(&val) = any_ref.downcast_ref::<f64>() { return val; }
+    if let Some(&val) = any_ref.downcast_ref::<i8>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<i16>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<i32>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<i64>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u8>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u16>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u32>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u64>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<f32>() {
+        return val as f64;
+    }
+    if let Some(&val) = any_ref.downcast_ref::<f64>() {
+        return val;
+    }
     // half::f16 is also possible but unlikely in predicate evaluation
     0.0 // unreachable for supported types
 }
 
 /// Evaluate comparison on a boolean array.
-fn eval_boolean(
-    array: &BooleanArray,
-    value: &ScalarValue,
-    op: CmpOp,
-) -> Result<BooleanArray> {
+fn eval_boolean(array: &BooleanArray, value: &ScalarValue, op: CmpOp) -> Result<BooleanArray> {
     let ScalarValue::Bool(cmp_val) = value else {
         return Err(EngineError::SchemaError {
             column: String::new(),
@@ -807,7 +857,6 @@ fn eval_dictionary_utf8(
     value: &ScalarValue,
     op: CmpOp,
 ) -> Result<BooleanArray> {
-
     let ScalarValue::Utf8(ref s) = value else {
         return Err(EngineError::SchemaError {
             column: String::new(),
@@ -817,25 +866,46 @@ fn eval_dictionary_utf8(
 
     // Try common dictionary key types: Int8, Int16, Int32
     // Arrow's DictionaryArray is parameterized by key type
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int8Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int8Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int16Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int16Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int64Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int64Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt8Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt8Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
-    if let Some(dict) = column.as_any().downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>() {
+    if let Some(dict) = column
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>()
+    {
         return eval_dict_typed(dict, s, op);
     }
 
@@ -1233,8 +1303,7 @@ mod tests {
         // Build a dictionary-encoded column
         let keys = Int32Array::from(vec![0, 1, 0, 2, 1]);
         let values = StringArray::from(vec!["T cell", "B cell", "NK cell"]);
-        let dict =
-            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "cell_type",

@@ -172,7 +172,6 @@ impl ScxReader {
         self.read_arrow_ipc(entry)
     }
 
-
     /// Read a named obsm embedding as an Arrow RecordBatch.
     pub fn read_obsm(&self, name: &str) -> Result<RecordBatch> {
         let key = format!("obsm/{name}");
@@ -849,7 +848,6 @@ mod tests {
         let var_batch = reader.read_var().unwrap();
         assert_eq!(&var_schema, var_batch.schema().as_ref());
     }
-
 
     // -----------------------------------------------------------------------
     // 11.16: Checksum corruption detection

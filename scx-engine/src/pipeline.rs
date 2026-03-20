@@ -201,8 +201,8 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::writer::ScxWriter;
     use scx_format::header::FileHeader;
+    use scx_format::writer::ScxWriter;
     use std::sync::Arc;
 
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {

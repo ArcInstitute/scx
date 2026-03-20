@@ -97,12 +97,112 @@ impl RootCatalog {
 }
 
 // ---------------------------------------------------------------------------
+// ColumnStat — per-column statistics for shard pruning (SPEC §3.2, Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Per-column statistic stored in ShardStats for predicate pushdown.
+///
+/// - `MinMax`: stat_type == 0 in SPEC §3.2. Stores numeric min/max.
+/// - `CategoryBitset`: stat_type == 1 in SPEC §3.2. Bit i set if dictionary index i is present.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnStat {
+    /// stat_type == 0 in SPEC §3.2
+    MinMax {
+        column_name_hash: u64, // BLAKE3 truncated hash of column name
+        min: f64,
+        max: f64,
+    },
+    /// stat_type == 1 in SPEC §3.2
+    CategoryBitset {
+        column_name_hash: u64,
+        bitset: Vec<u8>, // bit i set if dictionary index i present
+    },
+}
+
+impl ColumnStat {
+    /// Return the column name hash for this stat.
+    pub fn column_name_hash(&self) -> u64 {
+        match self {
+            ColumnStat::MinMax {
+                column_name_hash, ..
+            } => *column_name_hash,
+            ColumnStat::CategoryBitset {
+                column_name_hash, ..
+            } => *column_name_hash,
+        }
+    }
+
+    fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
+        match self {
+            ColumnStat::MinMax {
+                column_name_hash,
+                min,
+                max,
+            } => {
+                w.write_u8(0)?; // stat_type
+                w.write_u64::<LittleEndian>(*column_name_hash)?;
+                w.write_f64::<LittleEndian>(*min)?;
+                w.write_f64::<LittleEndian>(*max)?;
+            }
+            ColumnStat::CategoryBitset {
+                column_name_hash,
+                bitset,
+            } => {
+                w.write_u8(1)?; // stat_type
+                w.write_u64::<LittleEndian>(*column_name_hash)?;
+                w.write_u16::<LittleEndian>(bitset.len() as u16)?;
+                w.write_all(bitset)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+        let stat_type = r.read_u8()?;
+        match stat_type {
+            0 => {
+                let column_name_hash = r.read_u64::<LittleEndian>()?;
+                let min = r.read_f64::<LittleEndian>()?;
+                let max = r.read_f64::<LittleEndian>()?;
+                Ok(ColumnStat::MinMax {
+                    column_name_hash,
+                    min,
+                    max,
+                })
+            }
+            1 => {
+                let column_name_hash = r.read_u64::<LittleEndian>()?;
+                let bitset_len = r.read_u16::<LittleEndian>()? as usize;
+                let mut bitset = vec![0u8; bitset_len];
+                r.read_exact(&mut bitset)?;
+                Ok(ColumnStat::CategoryBitset {
+                    column_name_hash,
+                    bitset,
+                })
+            }
+            _ => Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown column stat type: {stat_type}"),
+            ))),
+        }
+    }
+}
+
+/// Compute a BLAKE3 truncated-64 hash of a column name.
+/// Used as the key for looking up column stats during pushdown.
+pub fn column_name_hash(name: &str) -> u64 {
+    let bytes = crate::checksum::blake3_truncated_64(name.as_bytes());
+    u64::from_le_bytes(bytes)
+}
+
+// ---------------------------------------------------------------------------
 // ShardStats
 // ---------------------------------------------------------------------------
 
 /// Per-shard statistics stored in FullCatalogEntry.
-/// Phase 1: n_indexed_columns is always 0 (per-column stats deferred to Phase 2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Phase 1: n_indexed_columns is always 0, column_stats is empty.
+/// Phase 2: column_stats may contain per-column MinMax or CategoryBitset entries.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShardStats {
     pub row_start: u64,
     pub row_end: u64,
@@ -111,6 +211,9 @@ pub struct ShardStats {
     pub value_max: u32,
     pub value_sum: u64,
     pub n_indexed_columns: u8,
+    /// Per-column statistics for predicate pushdown (Phase 2).
+    /// Length must equal `n_indexed_columns`.
+    pub column_stats: Vec<ColumnStat>,
 }
 
 /// Serialized size of ShardStats when n_indexed_columns == 0.
@@ -124,8 +227,10 @@ impl ShardStats {
         w.write_u32::<LittleEndian>(self.value_min)?;
         w.write_u32::<LittleEndian>(self.value_max)?;
         w.write_u64::<LittleEndian>(self.value_sum)?;
-        w.write_u8(self.n_indexed_columns)?;
-        // Phase 1: no per-column entries
+        w.write_u8(self.column_stats.len() as u8)?;
+        for cs in &self.column_stats {
+            cs.write_to(w)?;
+        }
         Ok(())
     }
 
@@ -137,8 +242,10 @@ impl ShardStats {
         let value_max = r.read_u32::<LittleEndian>()?;
         let value_sum = r.read_u64::<LittleEndian>()?;
         let n_indexed_columns = r.read_u8()?;
-        // Phase 2: if n_indexed_columns > 0, caller would need to skip those bytes.
-        // For Phase 1 we expect 0 always.
+        let mut column_stats = Vec::with_capacity(n_indexed_columns as usize);
+        for _ in 0..n_indexed_columns {
+            column_stats.push(ColumnStat::read_from(r)?);
+        }
         Ok(Self {
             row_start,
             row_end,
@@ -147,6 +254,7 @@ impl ShardStats {
             value_max,
             value_sum,
             n_indexed_columns,
+            column_stats,
         })
     }
 }
@@ -427,6 +535,7 @@ mod tests {
             value_max: 65535,
             value_sum: 50_000_000,
             n_indexed_columns: 0,
+            column_stats: vec![],
         }
     }
 
@@ -452,6 +561,7 @@ mod tests {
             value_max: u32::MAX,
             value_sum: u64::MAX,
             n_indexed_columns: 0,
+            column_stats: vec![],
         };
         let mut buf = Vec::new();
         stats.write_to(&mut buf).unwrap();
@@ -459,6 +569,62 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let decoded = ShardStats::read_from(&mut cursor).unwrap();
         assert_eq!(decoded, stats);
+    }
+
+    #[test]
+    fn shard_stats_with_column_stats_round_trip() {
+        let stats = ShardStats {
+            row_start: 0,
+            row_end: 1000,
+            nnz: 5000,
+            value_min: 1,
+            value_max: 255,
+            value_sum: 50000,
+            n_indexed_columns: 2,
+            column_stats: vec![
+                ColumnStat::MinMax {
+                    column_name_hash: column_name_hash("n_genes"),
+                    min: 100.0,
+                    max: 5000.0,
+                },
+                ColumnStat::CategoryBitset {
+                    column_name_hash: column_name_hash("cell_type"),
+                    bitset: vec![0b0000_0101, 0b0000_0010], // categories 0, 2, 9 present
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        stats.write_to(&mut buf).unwrap();
+        assert!(buf.len() > SHARD_STATS_BASE_SIZE); // larger than base
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = ShardStats::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.n_indexed_columns, 2);
+        assert_eq!(decoded.column_stats.len(), 2);
+        assert_eq!(decoded, stats);
+    }
+
+    #[test]
+    fn shard_stats_zero_indexed_backward_compat() {
+        // Phase 1 file: n_indexed_columns == 0, no column_stats
+        let stats = ShardStats {
+            row_start: 0,
+            row_end: 100,
+            nnz: 200,
+            value_min: 1,
+            value_max: 10,
+            value_sum: 500,
+            n_indexed_columns: 0,
+            column_stats: vec![],
+        };
+        let mut buf = Vec::new();
+        stats.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), SHARD_STATS_BASE_SIZE);
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = ShardStats::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded, stats);
+        assert!(decoded.column_stats.is_empty());
     }
 
     // -----------------------------------------------------------------------

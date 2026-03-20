@@ -582,6 +582,7 @@ pub fn compute_shard_stats(
         value_max,
         value_sum,
         n_indexed_columns: 0,
+        column_stats: vec![],
     }
 }
 

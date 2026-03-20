@@ -86,7 +86,12 @@ fn sample_shard_data(n_rows: usize, n_vars: usize) -> (Vec<u64>, Vec<u32>, Vec<u
     (indptr, indices, values)
 }
 
-fn write_bench_file(dir: &TempDir, filename: &str, n_obs: usize, n_vars: usize) -> std::path::PathBuf {
+fn write_bench_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+) -> std::path::PathBuf {
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, n_vars as u64);
     let mut writer = ScxWriter::new(&path, header).unwrap();
