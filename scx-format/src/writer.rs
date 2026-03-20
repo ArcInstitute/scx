@@ -521,6 +521,25 @@ impl ScxWriter {
             None,
         )
     }
+
+    /// Write the deletion vectors section.
+    ///
+    /// Automatically sets the deletion-vectors flag (bit 5) in the file header
+    /// so that `ScxReader::read_deletion_vectors()` will find the section.
+    pub fn write_deletion_vectors(
+        &mut self,
+        dv: &crate::deletion_vectors::DeletionVectors,
+    ) -> Result<()> {
+        self.header.set_deletion_vectors();
+        let mut data = Vec::new();
+        dv.write_to(&mut data)?;
+        self.write_section_bytes(
+            "deletion_vectors",
+            SectionType::DeletionVectors,
+            &data,
+            None,
+        )
+    }
 }
 
 impl Drop for ScxWriter {
