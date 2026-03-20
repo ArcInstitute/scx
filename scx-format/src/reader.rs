@@ -107,6 +107,15 @@ impl ScxReader {
     // Arrow IPC reading (11.5–11.8)
     // -----------------------------------------------------------------------
 
+    /// Read the Arrow IPC schema from a catalog entry without deserializing data.
+    /// This reads only the IPC footer (~KB) to extract field names and types.
+    fn read_arrow_ipc_schema(&self, entry: &FullCatalogEntry) -> Result<arrow::datatypes::Schema> {
+        let slice = self.section_bytes(entry);
+        let cursor = Cursor::new(slice);
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+        Ok(reader.schema().as_ref().clone())
+    }
+
     /// Read an Arrow IPC section from a catalog entry.
     fn read_arrow_ipc(&self, entry: &FullCatalogEntry) -> Result<RecordBatch> {
         let slice = self.section_bytes(entry);
@@ -123,6 +132,26 @@ impl ScxReader {
                 ))
             })?
             .map_err(ScxError::Arrow)
+    }
+
+    /// Read the obs schema without deserializing the full RecordBatch.
+    /// Uses the Arrow IPC footer to extract field names and types.
+    pub fn read_obs_schema(&self) -> Result<arrow::datatypes::Schema> {
+        let entry = self
+            .full_catalog
+            .get("obs")
+            .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+        self.read_arrow_ipc_schema(entry)
+    }
+
+    /// Read the var schema without deserializing the full RecordBatch.
+    /// Uses the Arrow IPC footer to extract field names and types.
+    pub fn read_var_schema(&self) -> Result<arrow::datatypes::Schema> {
+        let entry = self
+            .full_catalog
+            .get("var")
+            .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
+        self.read_arrow_ipc_schema(entry)
     }
 
     /// Read the obs (observation) metadata as an Arrow RecordBatch.
@@ -142,6 +171,7 @@ impl ScxReader {
             .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
         self.read_arrow_ipc(entry)
     }
+
 
     /// Read a named obsm embedding as an Arrow RecordBatch.
     pub fn read_obsm(&self, name: &str) -> Result<RecordBatch> {
@@ -804,6 +834,22 @@ mod tests {
         assert_eq!(prov.operations.len(), 1);
         assert_eq!(prov.operations[0].action, "convert");
     }
+
+    #[test]
+    fn test_read_obs_schema_matches_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "schema.scx", 6, 10, 2, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        let obs_schema = reader.read_obs_schema().unwrap();
+        let obs_batch = reader.read_obs().unwrap();
+        assert_eq!(&obs_schema, obs_batch.schema().as_ref());
+
+        let var_schema = reader.read_var_schema().unwrap();
+        let var_batch = reader.read_var().unwrap();
+        assert_eq!(&var_schema, var_batch.schema().as_ref());
+    }
+
 
     // -----------------------------------------------------------------------
     // 11.16: Checksum corruption detection

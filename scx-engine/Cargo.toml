@@ -1,0 +1,21 @@
+[package]
+name = "scx-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Lazy query engine for SCX files"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+scx-format = { path = "../scx-format", features = ["deletion-vectors"] }
+scx-sparse = { path = "../scx-sparse" }
+scx-codec = { path = "../scx-codec" }
+arrow = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+roaring = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
