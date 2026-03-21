@@ -187,8 +187,11 @@ fn shard_data(
     (indptr, indices, values)
 }
 
-/// Write the benchmark fixture file with predicate index.
+/// Write the benchmark fixture file with predicate index and per-shard column stats.
 fn write_bench_file(dir: &TempDir) -> PathBuf {
+    use scx_format::catalog::{column_name_hash, ColumnStat};
+    use std::collections::BTreeSet;
+
     let path = dir.path().join("bench_query.scx");
     let header = make_header(BENCH_CELLS as u64, BENCH_GENES as u64);
     let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -197,7 +200,16 @@ fn write_bench_file(dir: &TempDir) -> PathBuf {
     writer.write_obs(&obs).unwrap();
     writer.write_var(&build_var(BENCH_GENES)).unwrap();
 
-    // Write shards
+    // Collect the sorted set of all cell types for the global dictionary.
+    // Bit position i in the CategoryBitset = the i-th value in this sorted list.
+    let mut all_types: BTreeSet<&str> = BTreeSet::new();
+    for &ct in &CELL_TYPES {
+        all_types.insert(ct);
+    }
+    let sorted_types: Vec<&str> = all_types.into_iter().collect();
+    let cell_type_hash = column_name_hash("cell_type");
+
+    // Write shards, computing CategoryBitset column stats for each
     let mut row_start = 0usize;
     let mut shard_row_ranges: Vec<(u64, u64)> = Vec::new();
     while row_start < BENCH_CELLS {
@@ -213,6 +225,27 @@ fn write_bench_file(dir: &TempDir) -> PathBuf {
                 row_start as u64,
             )
             .unwrap();
+
+        // Compute which cell types are present in this shard's row range
+        let mut present: BTreeSet<&str> = BTreeSet::new();
+        for i in row_start..(row_start + shard_rows) {
+            present.insert(cell_type_for_row(i));
+        }
+
+        // Build the CategoryBitset: bit i set if sorted_types[i] is present
+        let n_bytes = (sorted_types.len() + 7) / 8;
+        let mut bitset = vec![0u8; n_bytes];
+        for (i, &ct) in sorted_types.iter().enumerate() {
+            if present.contains(ct) {
+                bitset[i / 8] |= 1 << (i % 8);
+            }
+        }
+
+        writer.set_shard_column_stats(vec![ColumnStat::CategoryBitset {
+            column_name_hash: cell_type_hash,
+            bitset,
+        }]);
+
         shard_row_ranges.push((row_start as u64, (row_start + shard_rows) as u64));
         row_start += shard_rows;
     }

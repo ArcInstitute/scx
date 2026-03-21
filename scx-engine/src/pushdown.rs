@@ -6,6 +6,7 @@
 // Level 2 (index-level): Use PredicateIndex (SPEC §3.5) to narrow row
 // ranges within shards. Implemented in Phase C.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use scx_format::catalog::{ColumnStat, FullCatalog};
@@ -13,6 +14,10 @@ use scx_format::column_name_hash;
 use scx_format::DeletionVectors;
 
 use crate::predicate::{Predicate, ScalarValue};
+
+/// Dictionary mapping column_name_hash → sorted list of category values.
+/// Used to resolve Utf8 predicate values to CategoryBitset bit positions.
+pub type CategoryDictionaries = HashMap<u64, Vec<String>>;
 
 /// A shard that *may* contain matching rows after catalog-level pruning.
 #[derive(Debug, Clone)]
@@ -36,6 +41,17 @@ pub fn prune_shards_by_catalog(
     catalog: &FullCatalog,
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
+) -> Vec<ShardCandidate> {
+    prune_shards_by_catalog_with_dict(catalog, predicates, deletion_vectors, None)
+}
+
+/// Like `prune_shards_by_catalog`, but accepts an optional category dictionary
+/// for resolving `Utf8` predicate values against `CategoryBitset` column stats.
+pub fn prune_shards_by_catalog_with_dict(
+    catalog: &FullCatalog,
+    predicates: &[Predicate],
+    deletion_vectors: Option<&DeletionVectors>,
+    category_dicts: Option<&CategoryDictionaries>,
 ) -> Vec<ShardCandidate> {
     let sorted_shards = catalog.shards_sorted();
 
@@ -70,7 +86,7 @@ pub fn prune_shards_by_catalog(
 
         if !stats.column_stats.is_empty() {
             for pred in predicates {
-                if can_exclude_shard(pred, &stats.column_stats) {
+                if can_exclude_shard(pred, &stats.column_stats, category_dicts) {
                     excluded = true;
                     break;
                 }
@@ -91,7 +107,11 @@ pub fn prune_shards_by_catalog(
 
 /// Check if a single predicate can definitively exclude a shard based on
 /// its column stats. Returns true if the shard can be skipped.
-fn can_exclude_shard(predicate: &Predicate, column_stats: &[ColumnStat]) -> bool {
+fn can_exclude_shard(
+    predicate: &Predicate,
+    column_stats: &[ColumnStat],
+    category_dicts: Option<&CategoryDictionaries>,
+) -> bool {
     match predicate {
         Predicate::Eq(col, val) => {
             let hash = column_name_hash(col);
@@ -108,15 +128,26 @@ fn can_exclude_shard(predicate: &Predicate, column_stats: &[ColumnStat]) -> bool
                             }
                         }
                     }
-                    ColumnStat::CategoryBitset { bitset, .. } => {
-                        // For string equality: we need the dictionary index, which
-                        // we don't have at this level. Category bitsets are based on
-                        // dictionary indices. For now, we can't prune on string
-                        // equality without the dictionary mapping.
-                        // This is a conservative choice — fall through to post-filter.
-                        if let ScalarValue::Int64(idx) = val {
-                            let byte_idx = (*idx as usize) / 8;
-                            let bit_idx = (*idx as usize) % 8;
+                    ColumnStat::CategoryBitset {
+                        column_name_hash: cnh,
+                        bitset,
+                    } => {
+                        // Resolve the predicate value to a bit index.
+                        let bit_index = match val {
+                            ScalarValue::Int64(idx) => Some(*idx as usize),
+                            ScalarValue::Utf8(s) => {
+                                // Look up string value in category dictionary
+                                category_dicts
+                                    .and_then(|dicts| dicts.get(cnh))
+                                    .and_then(|values| {
+                                        values.binary_search(s).ok()
+                                    })
+                            }
+                            _ => None,
+                        };
+                        if let Some(idx) = bit_index {
+                            let byte_idx = idx / 8;
+                            let bit_idx = idx % 8;
                             if byte_idx < bitset.len() {
                                 if bitset[byte_idx] & (1 << bit_idx) == 0 {
                                     return true; // Category not present in shard
@@ -197,19 +228,32 @@ fn can_exclude_shard(predicate: &Predicate, column_stats: &[ColumnStat]) -> bool
                             return true;
                         }
                     }
-                    ColumnStat::CategoryBitset { bitset, .. } => {
-                        // For category In: exclude if none of the indices have their bit set
+                    ColumnStat::CategoryBitset {
+                        column_name_hash: cnh,
+                        bitset,
+                    } => {
+                        // For category In: exclude if none of the values have their bit set
                         let all_absent = values.iter().all(|v| {
-                            if let ScalarValue::Int64(idx) = v {
-                                let byte_idx = (*idx as usize) / 8;
-                                let bit_idx = (*idx as usize) % 8;
-                                if byte_idx < bitset.len() {
-                                    bitset[byte_idx] & (1 << bit_idx) == 0
-                                } else {
-                                    true // out of range = absent
+                            let bit_index = match v {
+                                ScalarValue::Int64(idx) => Some(*idx as usize),
+                                ScalarValue::Utf8(s) => {
+                                    category_dicts
+                                        .and_then(|dicts| dicts.get(cnh))
+                                        .and_then(|vals| vals.binary_search(s).ok())
                                 }
-                            } else {
-                                false // can't check non-int → conservative
+                                _ => None,
+                            };
+                            match bit_index {
+                                Some(idx) => {
+                                    let byte_idx = idx / 8;
+                                    let bit_idx = idx % 8;
+                                    if byte_idx < bitset.len() {
+                                        bitset[byte_idx] & (1 << bit_idx) == 0
+                                    } else {
+                                        true // out of range = absent
+                                    }
+                                }
+                                None => false, // can't resolve → conservative
                             }
                         });
                         if all_absent {
@@ -222,17 +266,20 @@ fn can_exclude_shard(predicate: &Predicate, column_stats: &[ColumnStat]) -> bool
         }
         Predicate::And(left, right) => {
             // AND: if EITHER side excludes the shard, the whole AND excludes it
-            can_exclude_shard(left, column_stats) || can_exclude_shard(right, column_stats)
+            can_exclude_shard(left, column_stats, category_dicts)
+                || can_exclude_shard(right, column_stats, category_dicts)
         }
         Predicate::Or(left, right) => {
             // OR: both sides must exclude the shard to prune it
-            can_exclude_shard(left, column_stats) && can_exclude_shard(right, column_stats)
+            can_exclude_shard(left, column_stats, category_dicts)
+                && can_exclude_shard(right, column_stats, category_dicts)
         }
         Predicate::Not(inner) => {
             // NOT is hard to push down in general. Conservative: don't prune.
             // Exception: Not(Eq) on numeric with value == only value in range
             // is too niche. Just skip.
             let _ = inner;
+            let _ = category_dicts;
             false
         }
     }

@@ -386,6 +386,26 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Set per-column statistics on the last written shard entry.
+    ///
+    /// This must be called immediately after `write_csr_shard()` (or its
+    /// layer/obsp variants) to attach `CategoryBitset` or `MinMax` column
+    /// stats that enable catalog-level predicate pushdown (SPEC §3.2).
+    ///
+    /// If the last entry is not a shard (no stats), this is a no-op.
+    pub fn set_shard_column_stats(
+        &mut self,
+        column_stats: Vec<crate::catalog::ColumnStat>,
+    ) {
+        if let Some(entry) = self.entries.last_mut() {
+            if let Some(ref mut stats) = entry.stats {
+                stats.n_indexed_columns = column_stats.len() as u8;
+                stats.column_stats = column_stats;
+            }
+        }
+    }
+
+
     /// Finalize the file: write catalogs, header, fsync, atomic rename.
     ///
     /// Returns the final file path on success.

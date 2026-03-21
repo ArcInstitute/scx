@@ -1,5 +1,5 @@
 [workspace]
-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "pyscx"]
+members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "pyscx"]
 resolver = "2"
 
 [workspace.package]
@@ -19,6 +19,9 @@ serde_json = "1"
 tempfile = "3"
 ndarray = "0.15"
 rayon = "1"
+crossbeam-channel = "0.5"
+rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

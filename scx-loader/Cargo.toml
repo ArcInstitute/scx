@@ -1,0 +1,34 @@
+[package]
+name = "scx-loader"
+version = "0.1.0"
+edition = "2021"
+description = "ML training data loader for SCX files"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+scx-format = { path = "../scx-format", features = ["deletion-vectors"] }
+scx-codec = { path = "../scx-codec" }
+scx-sparse = { path = "../scx-sparse" }
+tokio = { workspace = true }
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+rand_chacha = "0.3"
+arrow = { workspace = true }
+
+[dependencies.pyo3]
+workspace = true
+optional = true
+
+[dependencies.numpy]
+workspace = true
+optional = true
+
+[features]
+python = ["pyo3", "numpy"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }

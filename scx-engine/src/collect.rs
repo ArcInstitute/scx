@@ -12,11 +12,13 @@ use scx_sparse::ScxCsr;
 
 use crate::error::Result;
 use crate::fused_ops::apply_fused_ops;
-use crate::index::PredicateIndex;
+use crate::index::{IndexedColumn, PredicateIndex};
 use crate::pipeline::{QueryPipeline, QueryResult};
 use crate::predicate::{evaluate, Predicate};
 use crate::projection::{decode_shard_projected, project_var};
-use crate::pushdown::{prune_shards_by_catalog, ShardCandidate};
+use crate::pushdown::{
+    prune_shards_by_catalog_with_dict, CategoryDictionaries, ShardCandidate,
+};
 
 use scx_format::DeletionVectors;
 
@@ -47,14 +49,7 @@ struct ExecutionPlan {
 fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     let catalog = pipeline.reader().catalog();
 
-    // Catalog-level shard pruning (B1)
-    let candidate_shards = prune_shards_by_catalog(
-        catalog,
-        pipeline.obs_predicates(),
-        pipeline.deletion_vectors().as_ref(),
-    );
-
-    // Load predicate indexes if present (C5)
+    // Load predicate indexes first (C5) — needed for category dictionaries
     let obs_predicate_index = match pipeline.reader().read_obs_predicate_index_bytes()? {
         Some(bytes) => Some(PredicateIndex::read_from(&mut Cursor::new(bytes))?),
         None => None,
@@ -64,6 +59,24 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
         Some(bytes) => Some(PredicateIndex::read_from(&mut Cursor::new(bytes))?),
         None => None,
     };
+
+    // Build category dictionaries from predicate index for catalog-level pruning.
+    // Maps column_name_hash → sorted list of category values, so Utf8 predicate
+    // values can be resolved to CategoryBitset bit positions.
+    let category_dicts = build_category_dicts(&obs_predicate_index);
+    let dicts_ref = if category_dicts.is_empty() {
+        None
+    } else {
+        Some(&category_dicts)
+    };
+
+    // Catalog-level shard pruning (B1), now with category dictionary support
+    let candidate_shards = prune_shards_by_catalog_with_dict(
+        catalog,
+        pipeline.obs_predicates(),
+        pipeline.deletion_vectors().as_ref(),
+        dicts_ref,
+    );
 
     Ok(ExecutionPlan {
         candidate_shards,
@@ -77,6 +90,28 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
         var_predicate_index,
         deletion_vectors: pipeline.deletion_vectors().clone(),
     })
+}
+
+/// Build category dictionaries from a predicate index.
+///
+/// For each categorical column in the index, creates a mapping from
+/// `column_name_hash` to the sorted list of category values. The position
+/// in this list corresponds to the bit position in `CategoryBitset`.
+fn build_category_dicts(index: &Option<PredicateIndex>) -> CategoryDictionaries {
+    let mut dicts = CategoryDictionaries::new();
+    let index = match index {
+        Some(idx) => idx,
+        None => return dicts,
+    };
+    for col in &index.columns {
+        if let IndexedColumn::Categorical(cat) = col {
+            let hash = scx_format::column_name_hash(&cat.column_name);
+            let values: Vec<String> = cat.entries.iter().map(|e| e.value.clone()).collect();
+            // CategoricalIndex entries are already sorted by BTreeMap in build_indexes
+            dicts.insert(hash, values);
+        }
+    }
+    dicts
 }
 
 // ============================================================================
