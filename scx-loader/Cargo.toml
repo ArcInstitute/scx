@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 rand_chacha = "0.3"
 arrow = { workspace = true }
+roaring = { workspace = true }
 
 [dependencies.pyo3]
 workspace = true

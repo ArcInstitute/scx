@@ -1,0 +1,1033 @@
+//! Decode Stage (Stage 2) — shuffle + decode + densify pipeline stage.
+//!
+//! Receives shard groups from the I/O stage, shuffles rows, projects HVG
+//! genes, scatters sparse→dense into batch buffers, applies fused
+//! normalize+log1p, extracts obs metadata columns, and sends completed
+//! `Batch`es downstream via bounded channel.
+//!
+//! See [SPEC.md §8.2](../SPEC.md#82-scx-training-loader-architecture),
+//! [SPEC.md §8.5](../SPEC.md#85-sparse-to-dense-direct-write), and
+//! [Phase2-Step5.md §D](../Phase2-Step5.md#phase-d--decode-stage-stage-2).
+
+use std::collections::HashMap;
+
+use arrow::array::{
+    Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    UInt64Array,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
+
+use crate::batch::{Batch, ObsColumn};
+use crate::error::{LoaderError, Result};
+use crate::io_stage::ShardGroup;
+use crate::normalize::fused_normalize_log1p_dense;
+use crate::pipeline::LoaderConfig;
+use crate::projection::{scatter_row_full, HvgProjection};
+use crate::shuffle::RowShuffler;
+
+// ---------------------------------------------------------------------------
+// D2: ShardGroupIndex — CSR row lookup index
+// ---------------------------------------------------------------------------
+
+/// Index for looking up a cell's CSR data from a pooled shard group.
+///
+/// Maps global cell indices to `(shard_index_in_group, local_row_index)` for
+/// efficient row extraction after row-level shuffling.
+struct ShardGroupIndex {
+    /// Maps global_cell_index → (shard_index_in_group, local_row_index).
+    cell_to_shard: HashMap<u64, (usize, usize)>,
+}
+
+impl ShardGroupIndex {
+    /// Build the index from all non-deleted cells in the shard group.
+    fn build(group: &ShardGroup) -> Self {
+        let mut cell_to_shard = HashMap::new();
+        for (shard_idx, shard) in group.shards.iter().enumerate() {
+            for local_row in 0..shard.n_rows as usize {
+                // Skip deleted rows
+                if let Some(ref deleted) = shard.deleted_rows {
+                    if deleted.contains(local_row as u32) {
+                        continue;
+                    }
+                }
+                let global_idx = shard.global_row_offset + local_row as u64;
+                cell_to_shard.insert(global_idx, (shard_idx, local_row));
+            }
+        }
+        ShardGroupIndex { cell_to_shard }
+    }
+
+    /// Look up a cell's CSR row data from the shard group.
+    ///
+    /// Returns `(csr_indices_slice, csr_data_slice)` for the given global
+    /// cell index.
+    fn get_row<'a>(
+        &self,
+        global_idx: u64,
+        group: &'a ShardGroup,
+    ) -> (&'a [i32], &'a [f32]) {
+        let &(shard_idx, local_row) = self
+            .cell_to_shard
+            .get(&global_idx)
+            .expect("global cell index not found in ShardGroupIndex");
+
+        let shard = &group.shards[shard_idx];
+        let start = shard.indptr[local_row] as usize;
+        let end = shard.indptr[local_row + 1] as usize;
+
+        (&shard.indices[start..end], &shard.data[start..end])
+    }
+
+    /// Collect all non-deleted global cell indices from the shard group.
+    fn cell_indices(&self) -> Vec<u64> {
+        self.cell_to_shard.keys().copied().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D3: Parallel row scatter with rayon
+// ---------------------------------------------------------------------------
+
+/// Fill a batch by scattering CSR rows into a dense matrix in parallel.
+///
+/// Each row in the batch is filled by an independent rayon thread via
+/// `par_chunks_mut`, providing safe non-overlapping mutable slices without
+/// `unsafe` code.
+fn fill_batch_parallel(
+    batch_cell_indices: &[u64],
+    group_index: &ShardGroupIndex,
+    group: &ShardGroup,
+    projection: Option<&HvgProjection>,
+    normalize: Option<f64>,
+    log1p: bool,
+    n_output_genes: usize,
+) -> Vec<f32> {
+    let n_rows = batch_cell_indices.len();
+    let mut x = vec![0.0f32; n_rows * n_output_genes];
+
+    if n_output_genes == 0 || n_rows == 0 {
+        return x;
+    }
+
+    // Split the output buffer into per-row chunks and process in parallel.
+    // Pair each row chunk with its corresponding cell index.
+    x.par_chunks_mut(n_output_genes)
+        .zip(batch_cell_indices.par_iter())
+        .for_each(|(output_row, &global_cell_idx)| {
+            let (csr_indices, csr_data) = group_index.get_row(global_cell_idx, group);
+
+            // Scatter CSR row into dense output row (with or without projection)
+            match projection {
+                Some(proj) => proj.scatter_row(csr_indices, csr_data, output_row),
+                None => scatter_row_full(csr_indices, csr_data, output_row),
+            }
+
+            // Apply fused normalize+log1p if configured
+            match (normalize, log1p) {
+                (Some(target_sum), true) => {
+                    fused_normalize_log1p_dense(output_row, target_sum);
+                }
+                (Some(target_sum), false) => {
+                    crate::normalize::normalize_dense_row(output_row, target_sum);
+                }
+                (None, true) => {
+                    crate::normalize::log1p_dense_row(output_row);
+                }
+                (None, false) => {} // no-op
+            }
+        });
+
+    x
+}
+
+// ---------------------------------------------------------------------------
+// D4: Obs metadata column extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the requested observation metadata columns for a batch.
+///
+/// For each requested column name, looks up the column in the `RecordBatch`
+/// and extracts values at the positions given by `cell_indices` (global row
+/// indices). Converts to the appropriate `ObsColumn` variant.
+///
+/// Returns an error if a requested column is not found in the RecordBatch.
+pub fn extract_obs_columns(
+    obs: &RecordBatch,
+    cell_indices: &[u64],
+    obs_columns: &[String],
+) -> Result<HashMap<String, ObsColumn>> {
+    let mut result = HashMap::with_capacity(obs_columns.len());
+
+    for col_name in obs_columns {
+        let col_idx = obs
+            .schema()
+            .index_of(col_name)
+            .map_err(|_| LoaderError::ConfigError {
+                reason: format!(
+                    "obs column '{}' not found in RecordBatch (available: {:?})",
+                    col_name,
+                    obs.schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect::<Vec<_>>()
+                ),
+            })?;
+
+        let array = obs.column(col_idx);
+        let obs_col = extract_single_column(array, cell_indices, col_name)?;
+        result.insert(col_name.clone(), obs_col);
+    }
+
+    Ok(result)
+}
+
+/// Extract a single Arrow column into an `ObsColumn` for the given cell indices.
+fn extract_single_column(
+    array: &dyn Array,
+    cell_indices: &[u64],
+    col_name: &str,
+) -> Result<ObsColumn> {
+    let dt = array.data_type();
+
+    match dt {
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected Int64Array"),
+                })?;
+            let values: Vec<i64> = cell_indices
+                .iter()
+                .map(|&idx| arr.value(idx as usize))
+                .collect();
+            Ok(ObsColumn::Int64(values))
+        }
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected Int32Array"),
+                })?;
+            let values: Vec<i64> = cell_indices
+                .iter()
+                .map(|&idx| arr.value(idx as usize) as i64)
+                .collect();
+            Ok(ObsColumn::Int64(values))
+        }
+        DataType::UInt32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected UInt32Array"),
+                })?;
+            let values: Vec<i64> = cell_indices
+                .iter()
+                .map(|&idx| arr.value(idx as usize) as i64)
+                .collect();
+            Ok(ObsColumn::Int64(values))
+        }
+        DataType::UInt64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected UInt64Array"),
+                })?;
+            let values: Vec<i64> = cell_indices
+                .iter()
+                .map(|&idx| arr.value(idx as usize) as i64)
+                .collect();
+            Ok(ObsColumn::Int64(values))
+        }
+        DataType::Float32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected Float32Array"),
+                })?;
+            let values: Vec<f64> = cell_indices
+                .iter()
+                .map(|&idx| arr.value(idx as usize) as f64)
+                .collect();
+            Ok(ObsColumn::Float64(values))
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected Float64Array"),
+                })?;
+            let values: Vec<f64> = cell_indices
+                .iter()
+                .map(|&idx| arr.value(idx as usize))
+                .collect();
+            Ok(ObsColumn::Float64(values))
+        }
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!("obs column '{col_name}': expected StringArray"),
+                })?;
+            // Treat string columns as categorical: build unique categories + codes.
+            let mut categories: Vec<String> = Vec::new();
+            let mut cat_map: HashMap<String, u32> = HashMap::new();
+            let mut codes: Vec<u32> = Vec::with_capacity(cell_indices.len());
+
+            for &idx in cell_indices {
+                let val = arr.value(idx as usize).to_string();
+                let code = if let Some(&existing) = cat_map.get(&val) {
+                    existing
+                } else {
+                    let code = categories.len() as u32;
+                    categories.push(val.clone());
+                    cat_map.insert(val, code);
+                    code
+                };
+                codes.push(code);
+            }
+            Ok(ObsColumn::Categorical(codes, categories))
+        }
+        DataType::Dictionary(key_type, _value_type) => {
+            // Arrow dictionary encoding → Categorical
+            match key_type.as_ref() {
+                DataType::Int32 => {
+                    let dict_arr = array.as_dictionary::<arrow::datatypes::Int32Type>();
+                    let keys = dict_arr.keys();
+                    let values_arr = dict_arr
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| LoaderError::ConfigError {
+                            reason: format!(
+                                "obs column '{col_name}': dictionary values are not Utf8"
+                            ),
+                        })?;
+
+                    let categories: Vec<String> =
+                        (0..values_arr.len()).map(|i| values_arr.value(i).to_string()).collect();
+                    let codes: Vec<u32> = cell_indices
+                        .iter()
+                        .map(|&idx| keys.value(idx as usize) as u32)
+                        .collect();
+                    Ok(ObsColumn::Categorical(codes, categories))
+                }
+                _ => Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "obs column '{col_name}': unsupported dictionary key type {:?}",
+                        key_type
+                    ),
+                }),
+            }
+        }
+        _ => Err(LoaderError::ConfigError {
+            reason: format!(
+                "obs column '{col_name}': unsupported data type {:?}",
+                dt
+            ),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D1: Decode stage coordinator
+// ---------------------------------------------------------------------------
+
+/// Run the decode stage (Stage 2).
+///
+/// Receives shard groups from the I/O stage via `rx`, processes each group by:
+/// 1. Building a `ShardGroupIndex` for efficient row lookup
+/// 2. Pooling all non-deleted cell indices
+/// 3. Shuffling rows (Fisher-Yates via seeded RNG)
+/// 4. Drawing mini-batches of `batch_size`
+/// 5. Parallel sparse→dense scatter with HVG projection
+/// 6. Fused normalize+log1p if configured
+/// 7. Obs metadata column extraction
+/// 8. Sending completed `Batch` via bounded channel
+///
+/// The last batch in a shard group may be shorter than `batch_size`.
+pub fn decode_stage(
+    mut rx: tokio::sync::mpsc::Receiver<ShardGroup>,
+    tx: crossbeam_channel::Sender<Batch>,
+    config: &LoaderConfig,
+    n_vars: u64,
+    projection: Option<HvgProjection>,
+    obs_metadata: &RecordBatch,
+) -> Result<()> {
+    let n_output_genes = match &projection {
+        Some(proj) => proj.n_output_cols(),
+        None => n_vars as usize,
+    };
+
+    let normalize_target = if config.normalize {
+        Some(config.target_sum)
+    } else {
+        None
+    };
+
+    // Create a seeded RNG for row-level shuffle (Level 2).
+    // The shard-level shuffle (Level 1) already happened in shuffle_epoch().
+    let mut rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(0xDEADBEEF));
+
+    // Receive shard groups from I/O stage via blocking_recv on the tokio channel.
+    // This function runs on a standard thread, not inside the tokio runtime.
+    while let Some(group) = rx.blocking_recv() {
+        // Step 1: Build index for efficient row lookup
+        let group_index = ShardGroupIndex::build(&group);
+
+        // Step 2: Pool all non-deleted cell indices
+        let mut cell_indices = group_index.cell_indices();
+
+        // Step 3: Shuffle rows (Level 2 — Fisher-Yates)
+        RowShuffler::shuffle_rows(&mut cell_indices, &mut rng);
+
+        // Step 4: Draw mini-batches
+        for batch_cells in cell_indices.chunks(config.batch_size) {
+            let n_rows = batch_cells.len();
+
+            // Step 5+6: Parallel scatter + normalize
+            let x = fill_batch_parallel(
+                batch_cells,
+                &group_index,
+                &group,
+                projection.as_ref(),
+                normalize_target,
+                config.log1p,
+                n_output_genes,
+            );
+
+            // Step 7: Extract obs metadata columns
+            let obs = if config.obs_columns.is_empty() {
+                HashMap::new()
+            } else {
+                extract_obs_columns(obs_metadata, batch_cells, &config.obs_columns)?
+            };
+
+            // Step 8: Build and send batch
+            let batch = Batch {
+                x,
+                x_shape: (n_rows, n_output_genes),
+                obs,
+                cell_indices: batch_cells.to_vec(),
+            };
+
+            tx.send(batch).map_err(|e| {
+                LoaderError::ChannelError(format!(
+                    "decode stage: failed to send batch: {e}"
+                ))
+            })?;
+        }
+    }
+
+    // Channel closed — I/O stage is done. Drop tx to signal end-of-epoch.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io_stage::ShardData;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// Helper: create a simple ShardData with known CSR data.
+    /// Each row has 2 nonzeros at known column positions.
+    fn make_shard_data(
+        n_rows: usize,
+        n_vars: usize,
+        global_offset: u64,
+        deleted: Option<roaring::RoaringBitmap>,
+    ) -> ShardData {
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for row in 0..n_rows {
+            let col0 = ((row * 2) % n_vars) as i32;
+            let col1 = ((row * 2 + 1) % n_vars) as i32;
+            indices.push(col0);
+            indices.push(col1);
+            data.push((row + 1) as f32);
+            data.push((row + 2) as f32);
+            indptr.push(*indptr.last().unwrap() + 2);
+        }
+        ShardData {
+            indptr,
+            indices,
+            data,
+            global_row_offset: global_offset,
+            n_rows: n_rows as u32,
+            deleted_rows: deleted,
+        }
+    }
+
+    /// Helper: create a simple obs RecordBatch with known columns.
+    fn make_obs(n: usize) -> RecordBatch {
+        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+        let counts: Vec<i64> = (0..n).map(|i| (i * 10) as i64).collect();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("count", DataType::Int64, false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(counts)),
+            ],
+        )
+        .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // D2 Tests: ShardGroupIndex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_index_all_cells_present() {
+        let shard0 = make_shard_data(5, 10, 0, None);
+        let shard1 = make_shard_data(3, 10, 5, None);
+        let group = ShardGroup {
+            shards: vec![shard0, shard1],
+        };
+
+        let index = ShardGroupIndex::build(&group);
+
+        // All 8 cells should be present
+        assert_eq!(index.cell_to_shard.len(), 8);
+        for i in 0..8u64 {
+            assert!(
+                index.cell_to_shard.contains_key(&i),
+                "cell {i} missing from index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_deleted_cells_excluded() {
+        let mut deleted = roaring::RoaringBitmap::new();
+        deleted.insert(1);
+        deleted.insert(3);
+
+        let shard0 = make_shard_data(5, 10, 0, Some(deleted));
+        let shard1 = make_shard_data(3, 10, 5, None);
+        let group = ShardGroup {
+            shards: vec![shard0, shard1],
+        };
+
+        let index = ShardGroupIndex::build(&group);
+
+        // 5 - 2 + 3 = 6 cells should be present
+        assert_eq!(index.cell_to_shard.len(), 6);
+        assert!(!index.cell_to_shard.contains_key(&1));
+        assert!(!index.cell_to_shard.contains_key(&3));
+        assert!(index.cell_to_shard.contains_key(&0));
+        assert!(index.cell_to_shard.contains_key(&2));
+        assert!(index.cell_to_shard.contains_key(&4));
+    }
+
+    #[test]
+    fn test_index_row_data_correct() {
+        let shard = make_shard_data(3, 10, 100, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+
+        let index = ShardGroupIndex::build(&group);
+
+        // Row 0 (global=100): indices=[0, 1], data=[1.0, 2.0]
+        let (idx, data) = index.get_row(100, &group);
+        assert_eq!(idx, &[0, 1]);
+        assert_eq!(data, &[1.0, 2.0]);
+
+        // Row 1 (global=101): indices=[2, 3], data=[2.0, 3.0]
+        let (idx, data) = index.get_row(101, &group);
+        assert_eq!(idx, &[2, 3]);
+        assert_eq!(data, &[2.0, 3.0]);
+
+        // Row 2 (global=102): indices=[4, 5], data=[3.0, 4.0]
+        let (idx, data) = index.get_row(102, &group);
+        assert_eq!(idx, &[4, 5]);
+        assert_eq!(data, &[3.0, 4.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // D3 Tests: Parallel row scatter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parallel_fill_matches_sequential() {
+        let shard = make_shard_data(4, 10, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+        let index = ShardGroupIndex::build(&group);
+        let cell_indices: Vec<u64> = vec![0, 1, 2, 3];
+        let n_genes = 10;
+
+        // Parallel fill
+        let parallel_x = fill_batch_parallel(
+            &cell_indices, &index, &group, None, None, false, n_genes,
+        );
+
+        // Sequential fill (manual)
+        let mut sequential_x = vec![0.0f32; 4 * n_genes];
+        for (row_idx, &global_idx) in cell_indices.iter().enumerate() {
+            let (csr_idx, csr_data) = index.get_row(global_idx, &group);
+            let row_slice = &mut sequential_x[row_idx * n_genes..(row_idx + 1) * n_genes];
+            scatter_row_full(csr_idx, csr_data, row_slice);
+        }
+
+        assert_eq!(parallel_x, sequential_x);
+    }
+
+    #[test]
+    fn test_parallel_fill_with_projection() {
+        let shard = make_shard_data(4, 10, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+        let index = ShardGroupIndex::build(&group);
+        let cell_indices: Vec<u64> = vec![0, 1, 2, 3];
+
+        // Project to genes [0, 1, 4, 5]
+        let proj = HvgProjection::new(vec![0, 1, 4, 5]);
+        let n_output = proj.n_output_cols();
+
+        let x = fill_batch_parallel(
+            &cell_indices, &index, &group, Some(&proj), None, false, n_output,
+        );
+
+        assert_eq!(x.len(), 4 * n_output);
+        // Row 0: CSR indices=[0,1], values=[1.0, 2.0]
+        // HVG [0,1,4,5] → output [0,1,2,3], gene 0→pos 0, gene 1→pos 1
+        assert_eq!(x[0], 1.0); // gene 0
+        assert_eq!(x[1], 2.0); // gene 1
+        assert_eq!(x[2], 0.0); // gene 4 (not in row)
+        assert_eq!(x[3], 0.0); // gene 5 (not in row)
+    }
+
+    #[test]
+    fn test_parallel_fill_zero_nnz_rows_stay_zero() {
+        // Create a shard where row 1 has 0 nnz
+        let shard = ShardData {
+            indptr: vec![0, 2, 2, 4], // row 1 has 0 nnz
+            indices: vec![0, 1, 3, 4],
+            data: vec![1.0, 2.0, 3.0, 4.0],
+            global_row_offset: 0,
+            n_rows: 3,
+            deleted_rows: None,
+        };
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+        let index = ShardGroupIndex::build(&group);
+        let cell_indices: Vec<u64> = vec![0, 1, 2];
+        let n_genes = 10;
+
+        let x = fill_batch_parallel(
+            &cell_indices, &index, &group, None, None, false, n_genes,
+        );
+
+        // Row 1 (offset 10..20) should be all zeros
+        let row1 = &x[n_genes..2 * n_genes];
+        assert!(row1.iter().all(|&v| v == 0.0), "zero-nnz row should be all zeros");
+
+        // Row 0 has values at [0, 1]
+        assert_eq!(x[0], 1.0);
+        assert_eq!(x[1], 2.0);
+    }
+
+    #[test]
+    fn test_parallel_fill_with_normalize_log1p() {
+        let shard = make_shard_data(2, 10, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+        let index = ShardGroupIndex::build(&group);
+        let cell_indices: Vec<u64> = vec![0, 1];
+        let n_genes = 10;
+        let target_sum = 1e4;
+
+        let x = fill_batch_parallel(
+            &cell_indices,
+            &index,
+            &group,
+            None,
+            Some(target_sum),
+            true,
+            n_genes,
+        );
+
+        // Row 0: values [1.0, 2.0] at cols [0, 1], sum=3.0
+        // After normalize: [1/3*1e4, 2/3*1e4]
+        // After log1p: [ln(1/3*1e4+1), ln(2/3*1e4+1)]
+        let expected_0 = ((1.0_f64 / 3.0 * target_sum) + 1.0).ln() as f32;
+        let expected_1 = ((2.0_f64 / 3.0 * target_sum) + 1.0).ln() as f32;
+
+        assert!(
+            (x[0] - expected_0).abs() < 1e-3,
+            "x[0]={} expected={}",
+            x[0],
+            expected_0
+        );
+        assert!(
+            (x[1] - expected_1).abs() < 1e-3,
+            "x[1]={} expected={}",
+            x[1],
+            expected_1
+        );
+        // Other columns should be ~0 (log1p(0) = 0)
+        assert!((x[2] - 0.0).abs() < 1e-7);
+    }
+
+    // -----------------------------------------------------------------------
+    // D4 Tests: Obs metadata extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_int_column() {
+        let obs = make_obs(10);
+        let cell_indices: Vec<u64> = vec![2, 5, 8];
+
+        let result =
+            extract_obs_columns(&obs, &cell_indices, &["count".to_string()]).unwrap();
+
+        let col = result.get("count").unwrap();
+        if let ObsColumn::Int64(values) = col {
+            assert_eq!(*values, vec![20, 50, 80]); // i * 10 for i in [2, 5, 8]
+        } else {
+            panic!("expected Int64 variant");
+        }
+    }
+
+    #[test]
+    fn test_extract_categorical_column() {
+        let obs = make_obs(5);
+        let cell_indices: Vec<u64> = vec![0, 1, 2];
+
+        let result =
+            extract_obs_columns(&obs, &cell_indices, &["cell_id".to_string()]).unwrap();
+
+        let col = result.get("cell_id").unwrap();
+        if let ObsColumn::Categorical(codes, categories) = col {
+            // Each cell_id is unique, so each gets its own category
+            assert_eq!(codes.len(), 3);
+            assert_eq!(categories.len(), 3);
+            assert_eq!(&categories[codes[0] as usize], "cell_0");
+            assert_eq!(&categories[codes[1] as usize], "cell_1");
+            assert_eq!(&categories[codes[2] as usize], "cell_2");
+        } else {
+            panic!("expected Categorical variant");
+        }
+    }
+
+    #[test]
+    fn test_extract_unknown_column_errors() {
+        let obs = make_obs(5);
+        let cell_indices: Vec<u64> = vec![0];
+
+        let result =
+            extract_obs_columns(&obs, &cell_indices, &["nonexistent".to_string()]);
+
+        assert!(result.is_err());
+        if let Err(LoaderError::ConfigError { reason }) = result {
+            assert!(reason.contains("nonexistent"));
+        } else {
+            panic!("expected ConfigError");
+        }
+    }
+
+    #[test]
+    fn test_extract_values_match_original() {
+        let obs = make_obs(10);
+        let cell_indices: Vec<u64> = vec![0, 3, 7];
+
+        let result = extract_obs_columns(
+            &obs,
+            &cell_indices,
+            &["count".to_string(), "cell_id".to_string()],
+        )
+        .unwrap();
+
+        // Verify count column
+        if let ObsColumn::Int64(values) = result.get("count").unwrap() {
+            assert_eq!(*values, vec![0, 30, 70]);
+        } else {
+            panic!("expected Int64");
+        }
+
+        // Verify cell_id column
+        if let ObsColumn::Categorical(codes, cats) = result.get("cell_id").unwrap() {
+            assert_eq!(&cats[codes[0] as usize], "cell_0");
+            assert_eq!(&cats[codes[1] as usize], "cell_3");
+            assert_eq!(&cats[codes[2] as usize], "cell_7");
+        } else {
+            panic!("expected Categorical");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // D1 Tests: Full decode stage coordinator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_all_cells_once() {
+        let n_vars = 10;
+        let shard0 = make_shard_data(5, n_vars, 0, None);
+        let shard1 = make_shard_data(5, n_vars, 5, None);
+        let group = ShardGroup {
+            shards: vec![shard0, shard1],
+        };
+
+        let config = LoaderConfig {
+            batch_size: 4,
+            normalize: false,
+            log1p: false,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(10);
+
+        // Send one group then close
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+            // Drop sender to close channel
+        });
+
+        let handle = std::thread::spawn(move || {
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+        });
+
+        // Collect all batches
+        let mut all_cells: Vec<u64> = Vec::new();
+        while let Ok(batch) = batch_rx.recv() {
+            assert_eq!(batch.x_shape.1, n_vars);
+            assert_eq!(batch.x.len(), batch.x_shape.0 * batch.x_shape.1);
+            all_cells.extend_from_slice(&batch.cell_indices);
+        }
+
+        handle.join().unwrap().unwrap();
+
+        // All 10 cells should appear exactly once
+        let cell_set: HashSet<u64> = all_cells.iter().copied().collect();
+        assert_eq!(cell_set.len(), 10, "all cells should be unique");
+        assert_eq!(all_cells.len(), 10, "all cells should appear exactly once");
+        for i in 0..10u64 {
+            assert!(cell_set.contains(&i), "cell {i} missing");
+        }
+    }
+
+    #[test]
+    fn test_decode_deleted_cells_excluded() {
+        let n_vars = 10;
+        let mut deleted = roaring::RoaringBitmap::new();
+        deleted.insert(1);
+        deleted.insert(3);
+
+        let shard0 = make_shard_data(5, n_vars, 0, Some(deleted));
+        let shard1 = make_shard_data(5, n_vars, 5, None);
+        let group = ShardGroup {
+            shards: vec![shard0, shard1],
+        };
+
+        let config = LoaderConfig {
+            batch_size: 100,
+            normalize: false,
+            log1p: false,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(10);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+        });
+
+        let handle = std::thread::spawn(move || {
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+        });
+
+        let mut all_cells: Vec<u64> = Vec::new();
+        while let Ok(batch) = batch_rx.recv() {
+            all_cells.extend_from_slice(&batch.cell_indices);
+        }
+
+        handle.join().unwrap().unwrap();
+
+        // 10 - 2 deleted = 8 cells
+        assert_eq!(all_cells.len(), 8);
+        let cell_set: HashSet<u64> = all_cells.iter().copied().collect();
+        assert!(!cell_set.contains(&1), "deleted cell 1 should be excluded");
+        assert!(!cell_set.contains(&3), "deleted cell 3 should be excluded");
+    }
+
+    #[test]
+    fn test_decode_batch_shapes() {
+        let n_vars = 10;
+        // 7 cells, batch_size=3 → batches of [3, 3, 1]
+        let shard = make_shard_data(7, n_vars, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+
+        let config = LoaderConfig {
+            batch_size: 3,
+            normalize: false,
+            log1p: false,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(7);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+        });
+
+        let handle = std::thread::spawn(move || {
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+        });
+
+        let mut batch_sizes: Vec<usize> = Vec::new();
+        while let Ok(batch) = batch_rx.recv() {
+            assert_eq!(batch.x_shape.1, n_vars);
+            assert_eq!(batch.x.len(), batch.x_shape.0 * batch.x_shape.1);
+            batch_sizes.push(batch.x_shape.0);
+        }
+
+        handle.join().unwrap().unwrap();
+
+        // Should have 3 batches: [3, 3, 1]
+        assert_eq!(batch_sizes.len(), 3);
+        batch_sizes.sort();
+        assert_eq!(batch_sizes, vec![1, 3, 3]);
+    }
+
+    #[test]
+    fn test_decode_hvg_projection() {
+        let n_vars = 10;
+        let shard = make_shard_data(3, n_vars, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+
+        let proj = HvgProjection::new(vec![0, 1, 4]);
+        let n_output = proj.n_output_cols();
+
+        let config = LoaderConfig {
+            batch_size: 10,
+            normalize: false,
+            log1p: false,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(3);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+        });
+
+        let handle = std::thread::spawn(move || {
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, Some(proj), &obs)
+        });
+
+        let batch = batch_rx.recv().unwrap();
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(batch.x_shape.1, n_output);
+        assert_eq!(batch.x_shape.1, 3);
+        assert_eq!(batch.x.len(), batch.x_shape.0 * 3);
+    }
+
+    #[test]
+    fn test_decode_normalize_log1p() {
+        let n_vars = 10;
+        let shard = make_shard_data(2, n_vars, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+
+        let config = LoaderConfig {
+            batch_size: 10,
+            normalize: true,
+            log1p: true,
+            target_sum: 1e4,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(2);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+        });
+
+        let handle = std::thread::spawn(move || {
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+        });
+
+        let batch = batch_rx.recv().unwrap();
+        handle.join().unwrap().unwrap();
+
+        // All values should have been normalized and log1p'd.
+        // Rows are shuffled, so use cell_indices to determine which global
+        // cell each output row corresponds to.
+        for (row_pos, &global_idx) in batch.cell_indices.iter().enumerate() {
+            let original_row = global_idx as usize;
+            let col0 = (original_row * 2) % n_vars;
+            let col1 = (original_row * 2 + 1) % n_vars;
+
+            for col in 0..n_vars {
+                let v = batch.x[row_pos * n_vars + col];
+                if col == col0 || col == col1 {
+                    assert!(
+                        v > 0.0,
+                        "global_cell={global_idx} col={col}: non-zero value should be positive after log1p, got {v}"
+                    );
+                } else {
+                    assert!(
+                        v.abs() < 1e-7,
+                        "global_cell={global_idx} col={col}: zero value should stay ~0 after fused, got {v}"
+                    );
+                }
+            }
+        }
+    }
+}
