@@ -149,10 +149,83 @@ with cellxgene_census.open_soma() as census:
     fi
 fi
 
+# --------------------------------------------------------------------------
+# 5. CELLxGENE Census 10M blood subset (~15 GB h5ad)
+# --------------------------------------------------------------------------
+CENSUS_10M_H5AD="$DATA_DIR/census_10m_blood.h5ad"
+if [ -f "$CENSUS_10M_H5AD" ]; then
+    echo "[SKIP] Census 10M blood already exists: $CENSUS_10M_H5AD"
+else
+    echo "[DOWNLOAD] CELLxGENE Census 10M blood subset..."
+    "$PYTHON" -c "
+import cellxgene_census
+import anndata
+import numpy as np
+
+print('  Opening CELLxGENE Census...')
+with cellxgene_census.open_soma() as census:
+    adata = cellxgene_census.get_anndata(
+        census,
+        organism='Homo sapiens',
+        obs_value_filter=\"tissue_general == 'blood'\",
+    )
+    print(f'  Raw query: {adata.n_obs} cells x {adata.n_vars} genes')
+    if adata.n_obs > 10_000_000:
+        np.random.seed(42)
+        idx = np.random.choice(adata.n_obs, 10_000_000, replace=False)
+        idx.sort()
+        adata = adata[idx].copy()
+    adata.write_h5ad('$CENSUS_10M_H5AD')
+    print(f'  Written: {adata.n_obs} cells x {adata.n_vars} genes')
+" || echo "[WARN] Census 10M download failed (requires cellxgene-census). Skipping."
+    if [ -f "$CENSUS_10M_H5AD" ]; then
+        echo "[DONE] Census 10M blood: $CENSUS_10M_H5AD"
+    fi
+fi
+
+# --------------------------------------------------------------------------
+# 6. Convert all h5ad datasets to .scx format
+# --------------------------------------------------------------------------
 echo ""
-echo "=== Download Summary ==="
+echo "=== Converting h5ad → SCX ==="
+for h5ad in "$DATA_DIR"/*.h5ad; do
+    if [ ! -f "$h5ad" ]; then
+        continue
+    fi
+    scx="${h5ad%.h5ad}.scx"
+    if [ -f "$scx" ]; then
+        echo "[SKIP] SCX already exists: $(basename "$scx")"
+    else
+        echo "[CONVERT] $(basename "$h5ad") → $(basename "$scx")..."
+        "$PYTHON" -c "
+import sys
+sys.path.insert(0, '$(cd "$(dirname "$0")/../.." && pwd)/pyscx')
+import pyscx
+import anndata
+
+adata = anndata.read_h5ad('$h5ad')
+pyscx.from_anndata(adata, '$scx')
+import os
+size_mb = os.path.getsize('$scx') / 1e6
+print(f'  Written: {adata.n_obs} cells x {adata.n_vars} genes ({size_mb:.1f} MB)')
+" || echo "[WARN] Conversion failed for $(basename "$h5ad"). Skipping."
+    fi
+done
+
+echo ""
+echo "=== Download & Conversion Summary ==="
 echo "Data directory: $DATA_DIR"
+echo ""
+echo "h5ad files:"
 for f in "$DATA_DIR"/*.h5ad; do
+    if [ -f "$f" ]; then
+        size=$(du -h "$f" | cut -f1)
+        echo "  $size  $(basename "$f")"
+    fi
+done
+echo ""
+echo "SCX files:"
+for f in "$DATA_DIR"/*.scx; do
     if [ -f "$f" ]; then
         size=$(du -h "$f" | cut -f1)
         echo "  $size  $(basename "$f")"
