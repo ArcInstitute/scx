@@ -83,8 +83,13 @@ impl ShardGroupIndex {
     }
 
     /// Collect all non-deleted global cell indices from the shard group.
+    ///
+    /// Returns indices in sorted order to ensure deterministic pre-shuffle
+    /// ordering (HashMap iteration order is non-deterministic).
     fn cell_indices(&self) -> Vec<u64> {
-        self.cell_to_shard.keys().copied().collect()
+        let mut indices: Vec<u64> = self.cell_to_shard.keys().copied().collect();
+        indices.sort_unstable();
+        indices
     }
 }
 
@@ -364,6 +369,7 @@ pub fn decode_stage(
     n_vars: u64,
     projection: Option<HvgProjection>,
     obs_metadata: &RecordBatch,
+    epoch: u64,
 ) -> Result<()> {
     let n_output_genes = match &projection {
         Some(proj) => proj.n_output_cols(),
@@ -378,7 +384,10 @@ pub fn decode_stage(
 
     // Create a seeded RNG for row-level shuffle (Level 2).
     // The shard-level shuffle (Level 1) already happened in shuffle_epoch().
-    let mut rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(0xDEADBEEF));
+    // Incorporate the epoch number so different epochs produce different row orderings.
+    let mut rng = ChaCha8Rng::seed_from_u64(
+        config.seed.wrapping_add(0xDEADBEEF).wrapping_add(epoch.wrapping_mul(0x9E3779B97F4A7C15)),
+    );
 
     // Receive shard groups from I/O stage via blocking_recv on the tokio channel.
     // This function runs on a standard thread, not inside the tokio runtime.
@@ -818,7 +827,7 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
         });
 
         // Collect all batches
@@ -871,7 +880,7 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
         });
 
         let mut all_cells: Vec<u64> = Vec::new();
@@ -915,7 +924,7 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
         });
 
         let mut batch_sizes: Vec<usize> = Vec::new();
@@ -962,7 +971,7 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, Some(proj), &obs)
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, Some(proj), &obs, 0)
         });
 
         let batch = batch_rx.recv().unwrap();
@@ -1000,7 +1009,7 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs)
+            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
         });
 
         let batch = batch_rx.recv().unwrap();

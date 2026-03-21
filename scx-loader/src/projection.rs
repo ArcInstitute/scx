@@ -16,6 +16,7 @@ use std::collections::HashMap;
 ///
 /// Maps original column indices to projected output positions. During scatter,
 /// only genes in the HVG set are written to the dense output row.
+#[derive(Clone)]
 pub struct HvgProjection {
     /// Sorted, deduplicated HVG gene indices (original column indices).
     gene_indices: Vec<u32>,

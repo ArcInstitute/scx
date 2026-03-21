@@ -12,6 +12,6 @@ pub use decode_stage::{decode_stage, extract_obs_columns};
 pub use error::{LoaderError, Result};
 pub use io_stage::{io_stage, ShardData, ShardGroup};
 pub use normalize::{fused_normalize_log1p_dense, log1p_dense_row, normalize_dense_row};
-pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget};
+pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPipeline};
 pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
