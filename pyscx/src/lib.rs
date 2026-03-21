@@ -67,5 +67,6 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_class::<PyExperiment>()?;
+    m.add_class::<scx_loader::TrainingDataset>()?;
     Ok(())
 }
