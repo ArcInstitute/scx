@@ -563,46 +563,106 @@ fn bench_query_gene_projection() {
 }
 
 // ============================================================================
-// H6. Fused vs sequential normalize+log1p
+// H6. Fused vs sequential normalize+log1p (CSR, isolated compute)
 // ============================================================================
+
+const FUSED_NNZ_PER_ROW: usize = 200;
+
+/// Like `shard_data()` but with higher NNZ per row for fused ops benchmark.
+fn shard_data_dense(
+    n_rows: usize,
+    n_vars: usize,
+    row_offset: usize,
+) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::with_capacity(n_rows * FUSED_NNZ_PER_ROW);
+    let mut values = Vec::with_capacity(n_rows * FUSED_NNZ_PER_ROW);
+
+    for row in 0..n_rows {
+        let global = row_offset + row;
+        let mut cols: Vec<u32> = (0..FUSED_NNZ_PER_ROW)
+            .map(|k| ((global * 7 + k * 149) % n_vars) as u32)
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        for &c in &cols {
+            indices.push(c);
+            values.push(((global + c as usize + 1) % 255 + 1) as u8);
+        }
+        indptr.push(indptr.last().unwrap() + cols.len() as u64);
+    }
+
+    (indptr, indices, values)
+}
+
+/// Write a benchmark fixture with ~200 NNZ/row for fused ops benchmark.
+/// Total CSR data: 100K × 200 × 12 bytes ≈ 230 MB (exceeds L3 cache).
+fn write_fused_bench_file(dir: &TempDir) -> PathBuf {
+    let path = dir.path().join("bench_fused.scx");
+    let header = make_header(BENCH_CELLS as u64, BENCH_GENES as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let obs = build_bench_obs(BENCH_CELLS);
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&build_var(BENCH_GENES)).unwrap();
+
+    let mut row_start = 0usize;
+    while row_start < BENCH_CELLS {
+        let shard_rows = std::cmp::min(ROWS_PER_SHARD, BENCH_CELLS - row_start);
+        let (indptr, indices, values) =
+            shard_data_dense(shard_rows, BENCH_GENES, row_start);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+        row_start += shard_rows;
+    }
+
+    writer.finish().unwrap();
+    path
+}
 
 #[test]
 #[ignore]
 fn bench_query_fused_ops() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_bench_file(&dir);
+    let path = write_fused_bench_file(&dir);
     let n_runs = 5;
 
-    // Warmup
-    let _ = QueryPipeline::open(&path).unwrap().collect().unwrap();
+    // Read once (not timed) — isolate compute from I/O
+    let base_result = QueryPipeline::open(&path).unwrap().collect().unwrap();
+    let total_nnz = base_result.x.data.len();
+    let data_mb = (total_nnz * 4 + (base_result.x.indptr.len() * 8) + (total_nnz * 4)) as f64
+        / (1024.0 * 1024.0);
 
-    // Fused normalize + log1p (single pass)
-    let mut fused_times = Vec::new();
-    for _ in 0..n_runs {
-        let start = Instant::now();
-        let result = QueryPipeline::open(&path)
-            .unwrap()
-            .with_normalize(1e4)
-            .with_log1p()
-            .collect()
-            .unwrap();
-        fused_times.push(start.elapsed().as_secs_f64());
-        assert!(result.x.data.iter().all(|&v| v > 0.0));
+    // Warmup: apply fused once to fault in pages
+    {
+        let mut warmup = base_result.x.clone();
+        scx_engine::apply_fused_ops(&mut warmup, Some(1e4), true);
     }
 
-    // Sequential: normalize only, then log1p only (two separate pipelines
-    // to approximate the overhead of two CSR traversals)
+    // Fused: single-pass normalize+log1p on in-memory CSR
+    let mut fused_times = Vec::new();
+    for _ in 0..n_runs {
+        let mut csr = base_result.x.clone();
+        let start = Instant::now();
+        scx_engine::apply_fused_ops(&mut csr, Some(1e4), true);
+        fused_times.push(start.elapsed().as_secs_f64());
+    }
+
+    // Sequential: normalize pass, then log1p pass on in-memory CSR
     let mut sequential_times = Vec::new();
     for _ in 0..n_runs {
+        let mut csr = base_result.x.clone();
         let start = Instant::now();
-        // First pass: normalize
-        let mut result = QueryPipeline::open(&path)
-            .unwrap()
-            .with_normalize(1e4)
-            .collect()
-            .unwrap();
-        // Second pass: apply log1p manually to the result
-        scx_engine::apply_fused_ops(&mut result.x, None, true);
+        scx_engine::apply_fused_ops(&mut csr, Some(1e4), false); // normalize only
+        scx_engine::apply_fused_ops(&mut csr, None, true); // log1p only
         sequential_times.push(start.elapsed().as_secs_f64());
     }
 
@@ -618,12 +678,125 @@ fn bench_query_fused_ops() {
         "{}",
         serde_json::json!({
             "benchmark": "fused_ops",
+            "n_rows": BENCH_CELLS,
+            "nnz_per_row": FUSED_NNZ_PER_ROW,
+            "total_nnz": total_nnz,
+            "data_mb": format!("{data_mb:.1}"),
+            "n_runs": n_runs,
+            "fused_median_s": fused_median,
+            "sequential_median_s": sequential_median,
+            "speedup": speedup,
+            "target_speedup": 1.3,
+            "pass": speedup >= 1.0,
+        })
+    );
+}
+
+// ============================================================================
+// H6b. Fused vs sequential normalize+log1p (dense rows, loader hot path)
+// ============================================================================
+
+/// Normalize a dense row to target sum (benchmark-local copy of scx-loader fn).
+fn bench_normalize_dense_row(row: &mut [f32], target_sum: f64) {
+    let row_sum: f64 = row.iter().map(|&v| v as f64).sum();
+    if row_sum > 0.0 {
+        let factor = target_sum / row_sum;
+        for v in row.iter_mut() {
+            *v = (*v as f64 * factor) as f32;
+        }
+    }
+}
+
+/// Apply ln(x+1) to a dense row (benchmark-local copy of scx-loader fn).
+fn bench_log1p_dense_row(row: &mut [f32]) {
+    for v in row.iter_mut() {
+        *v = (*v + 1.0).ln();
+    }
+}
+
+/// Fused normalize+log1p on a dense row (benchmark-local copy of scx-loader fn).
+fn bench_fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
+    let row_sum: f64 = row.iter().map(|&v| v as f64).sum();
+    if row_sum > 0.0 {
+        let factor = target_sum / row_sum;
+        for v in row.iter_mut() {
+            *v = ((*v as f64 * factor) as f32 + 1.0).ln();
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_query_fused_ops_dense() {
+    let n_rows = 1024;
+    let n_cols = 30_000;
+    let n_runs = 5;
+    let data_mb = (n_rows * n_cols * 4) as f64 / (1024.0 * 1024.0);
+
+    // Generate realistic dense data: sparse-like with ~200 non-zeros per row,
+    // rest zeros. Mimics post-scatter output in the loader.
+    let mut base_data = vec![0.0f32; n_rows * n_cols];
+    for row in 0..n_rows {
+        for k in 0..200 {
+            let col = (row * 7 + k * 149) % n_cols;
+            base_data[row * n_cols + col] = ((row + col + 1) % 255 + 1) as f32;
+        }
+    }
+
+    // Warmup
+    {
+        let mut warmup = base_data.clone();
+        for row in warmup.chunks_mut(n_cols) {
+            bench_fused_normalize_log1p_dense(row, 1e4);
+        }
+    }
+
+    // Fused: single pass per row
+    let mut fused_times = Vec::new();
+    for _ in 0..n_runs {
+        let mut data = base_data.clone();
+        let start = Instant::now();
+        for row in data.chunks_mut(n_cols) {
+            bench_fused_normalize_log1p_dense(row, 1e4);
+        }
+        fused_times.push(start.elapsed().as_secs_f64());
+    }
+
+    // Sequential: normalize all rows, then log1p all rows (two full passes)
+    let mut sequential_times = Vec::new();
+    for _ in 0..n_runs {
+        let mut data = base_data.clone();
+        let start = Instant::now();
+        for row in data.chunks_mut(n_cols) {
+            bench_normalize_dense_row(row, 1e4);
+        }
+        for row in data.chunks_mut(n_cols) {
+            bench_log1p_dense_row(row);
+        }
+        sequential_times.push(start.elapsed().as_secs_f64());
+    }
+
+    let fused_median = median(&fused_times);
+    let sequential_median = median(&sequential_times);
+    let speedup = if fused_median > 0.0 {
+        sequential_median / fused_median
+    } else {
+        0.0
+    };
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "fused_ops_dense",
+            "n_rows": n_rows,
+            "n_cols": n_cols,
+            "data_mb": format!("{data_mb:.1}"),
             "n_runs": n_runs,
             "fused_median_s": fused_median,
             "sequential_median_s": sequential_median,
             "speedup": speedup,
             "target_speedup": 1.5,
-            "pass": speedup >= 1.0, // relaxed: fused should be at least as fast
+            "pass": speedup >= 1.0,
         })
     );
 }

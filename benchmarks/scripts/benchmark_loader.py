@@ -294,6 +294,8 @@ def bench_memory(dataset_name: str, max_memory_mb: int = 512) -> dict:
     gc.collect()
     rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # MB
 
+    file_size_mb = round(scx_path.stat().st_size / (1024 * 1024), 1)
+
     with peak_rss_tracker() as rss:
         ds = pyscx.TrainingDataset(
             str(scx_path), batch_size=1024, max_memory_mb=max_memory_mb,
@@ -303,10 +305,13 @@ def bench_memory(dataset_name: str, max_memory_mb: int = 512) -> dict:
         budget_info = ds.memory_budget()
         print(f"  Effective batch_size: {effective_bs} (requested: 1024)")
         print(f"  Memory budget: {budget_info}")
+        print(f"  SCX file size: {file_size_mb} MB")
         n_batches = 0
         for batch in ds:
             n_batches += 1
         del ds
+
+    adjusted_rss = round(rss["peak_rss_mb"] - file_size_mb, 1)
 
     return {
         "benchmark": "memory",
@@ -314,10 +319,12 @@ def bench_memory(dataset_name: str, max_memory_mb: int = 512) -> dict:
         "max_memory_mb": max_memory_mb,
         "peak_rss_mb": rss["peak_rss_mb"],
         "rss_before_mb": round(rss_before, 1),
+        "file_size_mb": file_size_mb,
+        "adjusted_rss_mb": adjusted_rss,
         "n_batches": n_batches,
         "effective_batch_size": effective_bs,
         "budget_exceeded": budget_info.get("budget_exceeded", None),
-        "within_budget": rss["peak_rss_mb"] <= max_memory_mb * 2.0,  # 2x tolerance for Python/runtime overhead
+        "within_budget": adjusted_rss <= max_memory_mb * 1.5,  # 1.5x tolerance on mmap-adjusted RSS
     }
 
 

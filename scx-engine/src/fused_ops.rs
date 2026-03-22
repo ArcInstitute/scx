@@ -52,7 +52,9 @@ pub fn fused_normalize_log1p(
     if row_sum > 0.0 {
         let factor = target_sum / row_sum;
         for v in &mut data[start..end] {
-            *v = ((*v as f64 * factor) + 1.0).ln() as f32;
+            // Scale in f64 for precision, cast to f32, then f32 ln for speed.
+            // Numerically matches sequential normalize→log1p path.
+            *v = ((*v as f64 * factor) as f32 + 1.0).ln();
         }
     }
 }
