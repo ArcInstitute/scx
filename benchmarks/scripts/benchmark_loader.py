@@ -60,6 +60,13 @@ DATASETS = {
         "genes": 60000,
         "desc": "Tabula Sapiens 100K — primary throughput",
     },
+    "census_1m": {
+        "h5ad": DATA_DIR / "census_1m.h5ad",
+        "scx": DATA_DIR / "census_1m.scx",
+        "cells": 1000000,
+        "genes": 61497,
+        "desc": "CELLxGENE Census 1M blood — scale validation",
+    },
     "census_10m_blood": {
         "h5ad": DATA_DIR / "census_10m_blood.h5ad",
         "scx": DATA_DIR / "census_10m_blood.scx",
@@ -382,43 +389,51 @@ def bench_baseline_soma(dataset_name: str, batch_size: int = 1024) -> dict:
     """TileDB-SOMA-ML baseline."""
     try:
         import tiledbsoma
-        import tiledbsoma_ml
-    except ImportError:
-        return {"benchmark": "baseline_soma", "error": "tiledbsoma or tiledbsoma_ml not installed"}
+        from tiledbsoma import io as soma_io
+        from tiledbsoma_ml import ExperimentDataset
+        import torch
+    except ImportError as e:
+        return {"benchmark": "baseline_soma", "error": f"import failed: {e}"}
 
     # We need the h5ad converted to SOMA format first
     ds = DATASETS[dataset_name]
-    soma_uri = DATA_DIR / f"{dataset_name}.soma"
+    soma_uri = str(DATA_DIR / f"{dataset_name}.soma")
 
-    if not soma_uri.exists():
+    if not Path(soma_uri).exists():
         # Convert h5ad → SOMA experiment
         print(f"  Converting {dataset_name} to SOMA format...")
         try:
             import anndata
             adata = anndata.read_h5ad(str(ds["h5ad"]))
-            tiledbsoma.io.from_anndata(
-                str(soma_uri), adata,
+            soma_io.from_anndata(
+                soma_uri, adata,
                 measurement_name="RNA",
             )
+            del adata
+            gc.collect()
             print(f"  SOMA experiment created at {soma_uri}")
         except Exception as e:
             return {"benchmark": "baseline_soma", "error": f"SOMA conversion failed: {e}"}
 
+    query = None
+    exp = None
     try:
         gc.collect()
         with Timer() as t:
-            exp = tiledbsoma.Experiment.open(str(soma_uri))
-            dataset = tiledbsoma_ml.ExperimentDataset(
-                experiment=exp,
-                measurement_name="RNA",
-                X_name="data",
+            exp = tiledbsoma.Experiment.open(soma_uri)
+            query = exp.axis_query("RNA")
+            dataset = ExperimentDataset(
+                query=query,
+                layer_name="data",
                 batch_size=batch_size,
                 shuffle=True,
             )
+            loader = torch.utils.data.DataLoader(
+                dataset, batch_size=None, num_workers=0,
+            )
             n_batches = 0
-            for batch in dataset:
+            for batch in loader:
                 n_batches += 1
-            exp.close()
 
         return {
             "benchmark": "baseline_soma",
@@ -429,6 +444,11 @@ def bench_baseline_soma(dataset_name: str, batch_size: int = 1024) -> dict:
         }
     except Exception as e:
         return {"benchmark": "baseline_soma", "error": str(e)}
+    finally:
+        if query is not None:
+            query.close()
+        if exp is not None:
+            exp.close()
 
 
 def bench_baseline_scdataloader(dataset_name: str, batch_size: int = 1024) -> dict:
