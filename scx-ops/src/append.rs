@@ -232,8 +232,14 @@ pub fn append(
         row_offset += shard_rows;
     }
 
-    // Concatenate old + new obs and write as new obs section
-    let merged_obs = concat_batches(&old_obs.schema(), &[old_obs, new_obs.clone()])?;
+    // Concatenate old + new obs and write as new obs section.
+    // Both batches may have dictionary-encoded columns with overlapping
+    // categories. Unify both to non-dictionary types first, then concat.
+    let merged_obs = {
+        let old_unified = unify_dict_columns(&old_obs)?;
+        let new_unified = unify_dict_columns(new_obs)?;
+        concat_batches(&old_unified.schema(), &[old_unified, new_unified])?
+    };
     let obs_ipc_bytes = {
         let mut buf = Vec::new();
         let mut writer =
@@ -392,4 +398,53 @@ pub fn append(
 
     lock.sync_all()?;
     Ok(())
+}
+
+/// Cast dictionary-encoded columns to their value type to unify (deduplicate)
+/// dictionary entries after `concat_batches`.
+///
+/// Arrow's `concat_batches` concatenates dictionaries without deduplication,
+/// which produces invalid categoricals for pandas. Casting dictionary → value
+/// type (e.g. Utf8) removes duplicates. Arrow IPC will re-encode them as
+/// dictionaries on the next write.
+fn unify_dict_columns(batch: &RecordBatch) -> std::result::Result<RecordBatch, arrow::error::ArrowError> {
+    use arrow::datatypes::DataType;
+
+    let schema = batch.schema();
+    let mut needs_unify = false;
+
+    // Check if any columns are dictionary-encoded
+    for field in schema.fields() {
+        if matches!(field.data_type(), DataType::Dictionary(_, _)) {
+            needs_unify = true;
+            break;
+        }
+    }
+
+    if !needs_unify {
+        return Ok(batch.clone());
+    }
+
+    // Build new columns, casting dictionaries to their value type
+    let mut new_fields = Vec::with_capacity(schema.fields().len());
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        if let DataType::Dictionary(_, value_type) = field.data_type() {
+            let cast_col = arrow::compute::cast(col, value_type)?;
+            new_fields.push(arrow::datatypes::Field::new(
+                field.name(),
+                value_type.as_ref().clone(),
+                field.is_nullable(),
+            ));
+            new_columns.push(cast_col);
+        } else {
+            new_fields.push(field.as_ref().clone());
+            new_columns.push(col.clone());
+        }
+    }
+
+    let new_schema = arrow::datatypes::Schema::new(new_fields);
+    RecordBatch::try_new(std::sync::Arc::new(new_schema), new_columns)
 }

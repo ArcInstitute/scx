@@ -70,3 +70,56 @@ def synthetic_adata():
         X=x, obs=obs, var=var, obsm=obsm, uns=uns, layers=layers
     )
     return adata
+
+
+@pytest.fixture
+def query_adata():
+    """Create a synthetic AnnData with known obs metadata for query testing.
+
+    - 120 cells × 40 genes
+    - obs: cell_type (T cell / B cell / NK cell), tissue (lung / blood)
+    - X: sparse integer counts (uint8 range)
+    """
+    import anndata
+
+    np.random.seed(99)
+    n_obs, n_vars = 120, 40
+
+    # Sparse integer counts
+    dense = np.random.randint(0, 100, size=(n_obs, n_vars)).astype(np.float32)
+    mask = np.random.random((n_obs, n_vars)) > 0.3
+    dense[mask] = 0
+    x = sp.csr_matrix(dense)
+
+    # obs with cell_type and tissue columns
+    cell_types = (["T cell"] * 40) + (["B cell"] * 40) + (["NK cell"] * 40)
+    tissues = (["lung"] * 20 + ["blood"] * 20) * 3
+    obs = pd.DataFrame(
+        {
+            "cell_type": pd.Categorical(cell_types),
+            "tissue": pd.Categorical(tissues),
+        },
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+
+    # var metadata
+    var = pd.DataFrame(
+        {"gene_id": [f"gene_{i}" for i in range(n_vars)]},
+        index=[f"gene_{i}" for i in range(n_vars)],
+    )
+
+    return anndata.AnnData(X=x, obs=obs, var=var)
+
+
+@pytest.fixture
+def scx_from_adata(tmp_dir):
+    """Helper fixture: write an AnnData to a temp SCX file, return (path, adata)."""
+    import pyscx
+
+    def _write(adata, name="test.scx"):
+        path = str(tmp_dir / name)
+        pyscx.from_anndata(adata, path)
+        return path
+
+    return _write
+
