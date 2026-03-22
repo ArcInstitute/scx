@@ -90,6 +90,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(cloud::cloud_optimize, m)?)?;
         m.add_function(wrap_pyfunction!(cloud::explode, m)?)?;
         m.add_function(wrap_pyfunction!(cloud::pack, m)?)?;
+        m.add_function(wrap_pyfunction!(cloud::open_cloud, m)?)?;
+        m.add_class::<cloud::PyCloudExperiment>()?;
     }
 
     // Classes

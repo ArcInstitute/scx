@@ -151,3 +151,79 @@ pub fn pack(input: &str, output: &str) -> PyResult<()> {
     scx_cloud::pack(input_path, output_path)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
+
+/// A cloud-backed experiment handle for reading SCX data
+/// without downloading the entire file.
+///
+/// Provides metadata accessors (n_obs, n_vars, nnz, shard_count)
+/// and read methods for obs/var metadata.
+#[pyclass]
+pub struct PyCloudExperiment {
+    reader: scx_cloud::CloudReader,
+    rt: tokio::runtime::Runtime,
+}
+
+#[pymethods]
+impl PyCloudExperiment {
+    #[getter]
+    fn n_obs(&self) -> u64 {
+        self.reader.n_obs()
+    }
+
+    #[getter]
+    fn n_vars(&self) -> u64 {
+        self.reader.n_vars()
+    }
+
+    #[getter]
+    fn nnz(&self) -> u64 {
+        self.reader.nnz()
+    }
+
+    #[getter]
+    fn shard_count(&self) -> u32 {
+        self.reader.n_shards()
+    }
+
+    #[getter]
+    fn format_version(&self) -> u16 {
+        self.reader.header().format_version
+    }
+
+    #[getter]
+    fn codec_id(&self) -> u8 {
+        self.reader.header().codec_id
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyCloudExperiment(n_obs={}, n_vars={}, nnz={}, shards={})",
+            self.reader.n_obs(),
+            self.reader.n_vars(),
+            self.reader.nnz(),
+            self.reader.n_shards(),
+        )
+    }
+}
+
+/// Open an SCX file or exploded directory from cloud/local storage.
+///
+/// Detects layout automatically: exploded .scxd directories,
+/// cloud-ready packed .scx, or non-cloud-ready packed .scx.
+///
+/// Args:
+///     url: Source URL or local path (e.g., "gs://bucket/data.scxd/")
+///
+/// Returns:
+///     PyCloudExperiment handle with metadata accessors
+#[pyfunction]
+pub fn open_cloud(url: &str) -> PyResult<PyCloudExperiment> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
+
+    let reader = rt
+        .block_on(scx_cloud::open_cloud(url))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(PyCloudExperiment { reader, rt })
+}

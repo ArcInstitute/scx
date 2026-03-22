@@ -195,3 +195,55 @@ class TestPushPull:
             exp_pulled = pyscx.open(pulled_path)
             assert exp_orig.n_obs == exp_pulled.n_obs
             assert exp_orig.n_vars == exp_pulled.n_vars
+
+
+class TestCloudReader:
+    """Test: pyscx.open_cloud() reads header and catalog correctly."""
+
+    def test_open_cloud_exploded_reads_header(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            exp = pyscx.open_cloud(exploded_dir)
+            assert exp.n_obs == 100
+            assert exp.n_vars == 50
+
+    def test_open_cloud_n_obs_returns_correct_count(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path, n_obs=200, n_vars=75)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            exp = pyscx.open_cloud(exploded_dir)
+            assert exp.n_obs == 200
+            assert exp.n_vars == 75
+
+    def test_open_cloud_works_with_exploded_and_packed(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            # Exploded
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+            exp_exploded = pyscx.open_cloud(exploded_dir)
+
+            # Packed (non-cloud-ready)
+            exp_packed = pyscx.open_cloud(scx_path)
+
+            # Both should give same results
+            assert exp_exploded.n_obs == exp_packed.n_obs
+            assert exp_exploded.n_vars == exp_packed.n_vars
+            assert exp_exploded.shard_count == exp_packed.shard_count
