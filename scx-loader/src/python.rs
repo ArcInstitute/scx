@@ -177,6 +177,25 @@ impl TrainingDataset {
         self.pipeline.n_output_genes()
     }
 
+    /// Effective batch_size after memory budget auto-tuning.
+    /// May be less than the requested batch_size for large gene counts.
+    #[getter]
+    fn effective_batch_size(&self) -> usize {
+        self.pipeline.effective_batch_size()
+    }
+
+    /// Memory budget diagnostics as a dict.
+    fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        let mb = self.pipeline.memory_budget_info();
+        dict.set_item("shard_group_size", mb.shard_group_size)?;
+        dict.set_item("prefetch_batches", mb.prefetch_batches)?;
+        dict.set_item("batch_size", mb.batch_size)?;
+        dict.set_item("estimated_mb", mb.estimated_bytes / (1024 * 1024))?;
+        dict.set_item("budget_exceeded", mb.budget_exceeded)?;
+        Ok(dict)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "TrainingDataset(n_obs={}, n_vars={}, n_output_genes={})",

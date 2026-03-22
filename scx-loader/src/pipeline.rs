@@ -108,8 +108,12 @@ pub struct MemoryBudget {
     pub shard_group_size: usize,
     /// Effective prefetch_batches (may be reduced to fit budget).
     pub prefetch_batches: usize,
+    /// Effective batch_size (may be reduced to fit budget for large gene counts).
+    pub batch_size: usize,
     /// Estimated total memory in bytes.
     pub estimated_bytes: usize,
+    /// True if estimated memory exceeds the budget even at all minimums.
+    pub budget_exceeded: bool,
 }
 
 /// Compute the memory budget for the training pipeline.
@@ -117,14 +121,15 @@ pub struct MemoryBudget {
 /// Implements the memory model from [SPEC.md §8.8]:
 /// ```text
 /// n_output_genes     = hvg_indices.len() if present, else n_vars
-/// shard_group_buffer = shard_group_size × ~30 MB (compressed shard estimate)
-/// decoded_row_buffer = shard_group_size × shard_target_rows × avg_nnz × 6 bytes
-/// pinned_batch_ring  = prefetch_batches × batch_size × n_output_genes × 4 bytes
-/// overhead           = ~10 MB (indexes, metadata, obs RecordBatch)
+/// shard_buffer       = (shard_group_size + 1) × decoded_shard_bytes
+/// batch_buffer       = (max(prefetch_batches, 2) + 1) × batch_size × n_output_genes × 4
+/// overhead           = ~50 MB (Python interpreter, numpy, Arrow, thread stacks)
 /// ```
 ///
-/// If total exceeds `max_memory_mb`, reduces `prefetch_batches` first (to
-/// minimum 2), then `shard_group_size` (to minimum 1).
+/// If total exceeds `max_memory_mb`, reduces parameters in order:
+/// 1. `prefetch_batches` (minimum 2)
+/// 2. `shard_group_size` (minimum 1)
+/// 3. `batch_size` (halve each step, minimum 64)
 pub fn compute_memory_budget(
     config: &LoaderConfig,
     n_vars: u64,
@@ -140,12 +145,13 @@ pub fn compute_memory_budget(
 
     let mut shard_group_size = config.shard_group_size;
     let mut prefetch_batches = config.prefetch_batches;
+    let mut batch_size = config.batch_size;
 
     loop {
         let estimated = estimate_memory(
             shard_group_size,
             prefetch_batches,
-            config.batch_size,
+            batch_size,
             n_output_genes,
             shard_target_rows as usize,
             avg_nnz_per_cell,
@@ -155,7 +161,9 @@ pub fn compute_memory_budget(
             return MemoryBudget {
                 shard_group_size,
                 prefetch_batches,
+                batch_size,
                 estimated_bytes: estimated,
+                budget_exceeded: false,
             };
         }
 
@@ -171,16 +179,29 @@ pub fn compute_memory_budget(
             continue;
         }
 
-        // Both at minimums — return best-effort estimate
+        // Then halve batch_size (to minimum 64)
+        if batch_size > 64 {
+            batch_size = (batch_size / 2).max(64);
+            continue;
+        }
+
+        // All at minimums — return best-effort estimate with warning
         return MemoryBudget {
             shard_group_size,
             prefetch_batches,
+            batch_size,
             estimated_bytes: estimated,
+            budget_exceeded: true,
         };
     }
 }
 
 /// Estimate total memory usage for given parameters.
+///
+/// Uses a data-driven model that accounts for:
+/// - I/O-decode pipeline overlap (shard_group_size + 1 decoded shards live)
+/// - Batch channel + consumer (prefetch_batches.max(2) + 1 batches live)
+/// - Python/runtime overhead (~50 MB for interpreter, numpy, Arrow, threads)
 fn estimate_memory(
     shard_group_size: usize,
     prefetch_batches: usize,
@@ -189,16 +210,24 @@ fn estimate_memory(
     shard_target_rows: usize,
     avg_nnz_per_cell: f64,
 ) -> usize {
-    const COMPRESSED_SHARD_ESTIMATE: usize = 30 * 1024 * 1024; // ~30 MB
-    const OVERHEAD: usize = 10 * 1024 * 1024; // ~10 MB
-    const BYTES_PER_NNZ: usize = 6; // indptr contrib + index + value
+    // Decoded shard stores i64 indptr + i32 indices + f32 values = 12 bytes/nnz
+    const BYTES_PER_NNZ_DECODED: usize = 12;
+    // Python interpreter + numpy + Arrow RecordBatch + tokio/rayon stacks
+    const PYTHON_OVERHEAD: usize = 50 * 1024 * 1024;
 
-    let shard_group_buffer = shard_group_size * COMPRESSED_SHARD_ESTIMATE;
-    let decoded_row_buffer =
-        shard_group_size * shard_target_rows * (avg_nnz_per_cell as usize) * BYTES_PER_NNZ;
-    let pinned_batch_ring = prefetch_batches * batch_size * n_output_genes * 4; // f32
+    // Decoded shard size: CSR arrays
+    let decoded_shard_bytes = shard_target_rows * (avg_nnz_per_cell as usize) * BYTES_PER_NNZ_DECODED
+        + (shard_target_rows + 1) * 8; // indptr: (n_rows + 1) × i64
 
-    shard_group_buffer + decoded_row_buffer + pinned_batch_ring + OVERHEAD
+    // I/O pipeline overlap: shard_group_size in channel + 1 being decoded
+    let shard_buffer = (shard_group_size + 1) * decoded_shard_bytes;
+
+    // Batch ring: channel capacity + 1 being consumed by Python
+    let live_batches = prefetch_batches.max(2) + 1;
+    let batch_bytes = batch_size * n_output_genes * 4; // f32
+    let batch_buffer = live_batches * batch_bytes;
+
+    shard_buffer + batch_buffer + PYTHON_OVERHEAD
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +267,7 @@ impl TrainingPipeline {
     /// Opens the file, reads metadata and deletion vectors, computes the
     /// memory budget, and prepares the pipeline. Does NOT start any pipeline
     /// stages — call `start_epoch()` to begin iteration.
-    pub fn new(path: impl AsRef<Path>, config: LoaderConfig) -> Result<Self> {
+    pub fn new(path: impl AsRef<Path>, mut config: LoaderConfig) -> Result<Self> {
         let profile = profiling_enabled();
         let t_start = Instant::now();
 
@@ -279,6 +308,21 @@ impl TrainingPipeline {
             shard_target_rows,
             avg_nnz_per_cell,
         );
+
+        // Propagate effective batch_size back into config
+        config.batch_size = memory_budget.batch_size;
+
+        if memory_budget.budget_exceeded {
+            eprintln!(
+                "[scx-loader] WARNING: estimated memory ({} MB) exceeds budget ({} MB) \
+                 even at minimums (batch_size={}, shard_group_size=1, prefetch_batches=2). \
+                 Consider setting hvg_indices to reduce n_output_genes from {}.",
+                memory_budget.estimated_bytes / (1024 * 1024),
+                config.max_memory_mb,
+                memory_budget.batch_size,
+                n_vars,
+            );
+        }
 
         // Create HVG projection if configured
         let projection = config
@@ -416,6 +460,17 @@ impl TrainingPipeline {
             Some(proj) => proj.n_output_cols(),
             None => self.n_vars as usize,
         }
+    }
+
+    /// Effective batch_size after memory budget auto-tuning.
+    /// May be less than the configured batch_size for large gene counts.
+    pub fn effective_batch_size(&self) -> usize {
+        self.memory_budget.batch_size
+    }
+
+    /// Memory budget diagnostics.
+    pub fn memory_budget_info(&self) -> &MemoryBudget {
+        &self.memory_budget
     }
 
     /// Join the I/O and decode handles from a previous epoch, propagating errors.
@@ -708,6 +763,8 @@ mod tests {
         );
         assert_eq!(budget.shard_group_size, 8);
         assert_eq!(budget.prefetch_batches, 4);
+        assert_eq!(budget.batch_size, 1024);
+        assert!(!budget.budget_exceeded);
     }
 
     #[test]
@@ -718,6 +775,8 @@ mod tests {
         );
         assert!(budget.shard_group_size >= 1);
         assert!(budget.prefetch_batches >= 2);
+        assert!(budget.batch_size >= 64);
+        assert!(!budget.budget_exceeded);
     }
 
     #[test]
@@ -730,16 +789,17 @@ mod tests {
             &config, 30_000, 16_384, 10.0,
         );
         assert!(
-            budget.shard_group_size < 8 || budget.prefetch_batches < 4,
+            budget.shard_group_size < 8 || budget.prefetch_batches < 4 || budget.batch_size < 1024,
             "128 MB budget should reduce at least one parameter: \
-             shard_group_size={}, prefetch_batches={}",
+             shard_group_size={}, prefetch_batches={}, batch_size={}",
             budget.shard_group_size,
-            budget.prefetch_batches
+            budget.prefetch_batches,
+            budget.batch_size
         );
     }
 
     #[test]
-    fn test_memory_budget_64mb_both_minimums() {
+    fn test_memory_budget_64mb_all_minimums() {
         let config = LoaderConfig {
             max_memory_mb: 64,
             ..LoaderConfig::default()
@@ -754,6 +814,54 @@ mod tests {
         assert_eq!(
             budget.prefetch_batches, 2,
             "prefetch_batches should be at minimum 2"
+        );
+        assert!(
+            budget.batch_size <= 1024,
+            "batch_size should be reduced"
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_61k_genes_reduces_batch_size() {
+        // 61K genes without HVG projection — batch_size must be reduced
+        let config = LoaderConfig::default(); // 512 MB budget, no HVG
+        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0);
+        assert!(
+            budget.batch_size < 1024,
+            "61K genes should reduce batch_size from 1024, got {}",
+            budget.batch_size
+        );
+        assert!(budget.batch_size >= 64, "batch_size should not go below 64");
+        assert!(!budget.budget_exceeded, "512 MB budget should be achievable with reduced batch_size");
+    }
+
+    #[test]
+    fn test_memory_budget_61k_genes_tiny_budget_exceeded() {
+        // 61K genes with 64 MB budget — impossible to fit
+        let config = LoaderConfig {
+            max_memory_mb: 64,
+            ..LoaderConfig::default()
+        };
+        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0);
+        assert_eq!(budget.batch_size, 64);
+        assert_eq!(budget.shard_group_size, 1);
+        assert_eq!(budget.prefetch_batches, 2);
+        assert!(budget.budget_exceeded, "64 MB budget with 61K genes should exceed budget");
+    }
+
+    #[test]
+    fn test_memory_budget_batch_size_halving() {
+        // Verify batch_size halves (not decrements by 1)
+        let config = LoaderConfig {
+            max_memory_mb: 200,
+            ..LoaderConfig::default()
+        };
+        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0);
+        // batch_size should be a power-of-2 fraction of 1024
+        assert!(
+            budget.batch_size == 64 || budget.batch_size == 128 || budget.batch_size == 256 || budget.batch_size == 512,
+            "batch_size should be a power-of-2 reduction of 1024, got {}",
+            budget.batch_size
         );
     }
 

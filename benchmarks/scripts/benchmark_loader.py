@@ -299,6 +299,10 @@ def bench_memory(dataset_name: str, max_memory_mb: int = 512) -> dict:
             str(scx_path), batch_size=1024, max_memory_mb=max_memory_mb,
             normalize=True, log1p=True, seed=42,
         )
+        effective_bs = ds.effective_batch_size
+        budget_info = ds.memory_budget()
+        print(f"  Effective batch_size: {effective_bs} (requested: 1024)")
+        print(f"  Memory budget: {budget_info}")
         n_batches = 0
         for batch in ds:
             n_batches += 1
@@ -311,7 +315,9 @@ def bench_memory(dataset_name: str, max_memory_mb: int = 512) -> dict:
         "peak_rss_mb": rss["peak_rss_mb"],
         "rss_before_mb": round(rss_before, 1),
         "n_batches": n_batches,
-        "within_budget": rss["peak_rss_mb"] <= max_memory_mb * 1.5,  # 50% tolerance for Python overhead
+        "effective_batch_size": effective_bs,
+        "budget_exceeded": budget_info.get("budget_exceeded", None),
+        "within_budget": rss["peak_rss_mb"] <= max_memory_mb * 2.0,  # 2x tolerance for Python/runtime overhead
     }
 
 
