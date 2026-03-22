@@ -401,6 +401,421 @@ fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
     Ok(u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()))
 }
 
+/// Statistics from a selective pull operation.
+pub struct PullFilteredStats {
+    pub total_shards: usize,
+    pub downloaded_shards: usize,
+    pub skipped_shards: usize,
+    pub matching_cells: u64,
+    pub bytes_downloaded: u64,
+    pub bytes_saved: u64,
+    pub elapsed: std::time::Duration,
+}
+
+/// Selective pull: download only shards matching a predicate.
+///
+/// Pipeline:
+///   1. GET `_catalog.bin` → parse catalog, identify shard row ranges
+///   2. GET `obs.arrow` → evaluate predicate against obs metadata
+///   3. Map matching cells to shard IDs (from catalog row ranges)
+///   4. GET only matching shards (parallel) + var.arrow + other non-shard sections
+///   5. Write filtered obs (only matching rows) + matching shards
+///   6. Write catalog + header → fsync → rename
+pub async fn pull_filtered(
+    source: &str,
+    dest: &Path,
+    filter: &str,
+    options: PullOptions,
+) -> Result<PullFilteredStats> {
+    let start = Instant::now();
+
+    // 1. Parse location and create backend
+    let location = crate::backend::parse_location(source)?;
+    let backend = crate::backend::create_backend(&location).await?;
+
+    let make_path = build_path_fn(&location);
+
+    // 2. Download _catalog.bin and _header.bin
+    let catalog_path = make_path("_catalog.bin");
+    let catalog_data = backend.get(&catalog_path).await?.bytes().await?;
+    let catalog_bytes = catalog_data.to_vec();
+    let original_catalog =
+        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len())?;
+
+    let header_path = make_path("_header.bin");
+    let header_data = backend.get(&header_path).await?.bytes().await?;
+    let header = FileHeader::read_from(&mut Cursor::new(&header_data))?;
+
+    let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
+
+    // 3. Download obs.arrow and evaluate predicate
+    let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata);
+    let obs_obj_path = make_path(&obs_path_str);
+    let obs_data = backend.get(&obs_obj_path).await?.bytes().await?;
+    total_bytes_downloaded += obs_data.len() as u64;
+    let obs_bytes = obs_data.to_vec();
+
+    // Parse obs as Arrow IPC
+    let obs_cursor = Cursor::new(&obs_bytes);
+    let obs_reader = arrow::ipc::reader::FileReader::try_new(obs_cursor, None)
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let obs_schema = obs_reader.schema();
+    let obs_batch: arrow::array::RecordBatch = obs_reader
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CloudError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "obs Arrow IPC file contains no batches",
+            ))
+        })?
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+
+    // Parse and evaluate predicate
+    let predicate = scx_engine::parse_predicate(filter, &obs_schema).map_err(|e| {
+        CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("predicate parse error: {e}"),
+        ))
+    })?;
+    let mask = scx_engine::evaluate(&predicate, &obs_batch).map_err(|e| {
+        CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("predicate evaluation error: {e}"),
+        ))
+    })?;
+
+    // Collect matching row indices
+    let matching_rows: Vec<u64> = (0..mask.len())
+        .filter(|&i| mask.value(i))
+        .map(|i| i as u64)
+        .collect();
+    let matching_cells = matching_rows.len() as u64;
+
+    // 4. Map matching rows to shard IDs
+    let sorted_shards = original_catalog.shards_sorted();
+    let total_shards = sorted_shards.len();
+
+    let mut needed_shard_indices: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
+
+    for &row_idx in &matching_rows {
+        for (shard_idx, entry) in sorted_shards.iter().enumerate() {
+            if let Some(stats) = &entry.stats {
+                if row_idx >= stats.row_start && row_idx < stats.row_end {
+                    needed_shard_indices.insert(shard_idx);
+                    break;
+                }
+            }
+        }
+    }
+
+    let downloaded_shards = needed_shard_indices.len();
+    let skipped_shards = total_shards - downloaded_shards;
+
+    // Calculate bytes saved (estimate from skipped shards)
+    let bytes_saved: u64 = sorted_shards
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !needed_shard_indices.contains(i))
+        .map(|(_, e)| e.length)
+        .sum();
+
+    // 5. Determine which sections to download
+    let mut entries_to_download: Vec<&FullCatalogEntry> = Vec::new();
+    let mut shard_name_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for &si in &needed_shard_indices {
+        shard_name_set.insert(sorted_shards[si].name.clone());
+    }
+
+    for entry in &original_catalog.entries {
+        match entry.section_type {
+            SectionType::ObsMetadata => continue, // already downloaded
+            SectionType::CsrShard => {
+                if shard_name_set.contains(&entry.name) {
+                    entries_to_download.push(entry);
+                }
+            }
+            SectionType::VarMetadata | SectionType::VarIndex | SectionType::UnsBlob => {
+                entries_to_download.push(entry);
+            }
+            _ => {} // skip obsm, layers, obsp, etc.
+        }
+    }
+
+    // Download needed sections
+    let parallelism = options.parallelism.max(1);
+    let mut section_data_map: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+
+    let download_tasks: Vec<(String, String)> = entries_to_download
+        .iter()
+        .map(|entry| {
+            let rel_path = section_name_to_path(&entry.name, entry.section_type);
+            (entry.name.clone(), rel_path)
+        })
+        .collect();
+
+    for chunk in download_tasks.chunks(parallelism) {
+        let mut handles = Vec::with_capacity(chunk.len());
+
+        for (name, filename) in chunk {
+            let path = make_path(filename);
+            let name_clone = name.clone();
+            let backend_ref = &backend;
+            handles.push(async move {
+                let result = backend_ref.get(&path).await?.bytes().await?;
+                Ok::<(String, Vec<u8>), CloudError>((name_clone, result.to_vec()))
+            });
+        }
+
+        let results = futures::future::join_all(handles).await;
+        for result in results {
+            let (name, data) = result?;
+            total_bytes_downloaded += data.len() as u64;
+            section_data_map.insert(name, data);
+        }
+    }
+
+    // 6. Build filtered obs as Arrow IPC bytes
+    let filtered_obs = filter_record_batch(&obs_batch, &matching_rows)?;
+    let filtered_obs_bytes = record_batch_to_arrow_ipc(&filtered_obs)?;
+
+    // 7. Write packed output
+    let tmp_path = std::path::PathBuf::from(format!(
+        "{}.tmp.{}",
+        dest.display(),
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+
+    writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
+    let mut write_offset = SECTIONS_START_OFFSET;
+
+    let mut new_entries: Vec<FullCatalogEntry> = Vec::new();
+
+    // Write filtered obs first
+    {
+        let aligned = align_to_8(write_offset);
+        let pad = (aligned - write_offset) as usize;
+        if pad > 0 {
+            writer.write_all(&vec![0u8; pad])?;
+            write_offset = aligned;
+        }
+        let obs_checksum = blake3::hash(&filtered_obs_bytes);
+        writer.write_all(&filtered_obs_bytes)?;
+        new_entries.push(FullCatalogEntry {
+            name: "obs".to_string(),
+            offset: write_offset,
+            length: filtered_obs_bytes.len() as u64,
+            section_type: SectionType::ObsMetadata,
+            checksum: *obs_checksum.as_bytes(),
+            stats: None,
+        });
+        write_offset += filtered_obs_bytes.len() as u64;
+    }
+
+    // Write sections in order: var, shards (renumbered), uns
+    let section_write_order = [
+        SectionType::VarMetadata,
+        SectionType::VarIndex,
+        SectionType::CsrShard,
+        SectionType::UnsBlob,
+    ];
+
+    let mut new_row_offset: u64 = 0;
+
+    for &st in &section_write_order {
+        for entry in &entries_to_download {
+            if entry.section_type != st {
+                continue;
+            }
+            let data = match section_data_map.get(&entry.name) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let aligned = align_to_8(write_offset);
+            let pad = (aligned - write_offset) as usize;
+            if pad > 0 {
+                writer.write_all(&vec![0u8; pad])?;
+                write_offset = aligned;
+            }
+
+            let new_offset = write_offset;
+            writer.write_all(data)?;
+            write_offset += data.len() as u64;
+
+            let new_stats = if st == SectionType::CsrShard {
+                if let Some(old_stats) = &entry.stats {
+                    let shard_rows = old_stats.row_end - old_stats.row_start;
+                    let ns = scx_format::catalog::ShardStats {
+                        row_start: new_row_offset,
+                        row_end: new_row_offset + shard_rows,
+                        nnz: old_stats.nnz,
+                        value_min: old_stats.value_min,
+                        value_max: old_stats.value_max,
+                        value_sum: old_stats.value_sum,
+                        n_indexed_columns: old_stats.n_indexed_columns,
+                        column_stats: old_stats.column_stats.clone(),
+                    };
+                    new_row_offset += shard_rows;
+                    Some(ns)
+                } else {
+                    entry.stats.clone()
+                }
+            } else {
+                entry.stats.clone()
+            };
+
+            new_entries.push(FullCatalogEntry {
+                name: entry.name.clone(),
+                offset: new_offset,
+                length: data.len() as u64,
+                section_type: entry.section_type,
+                checksum: entry.checksum,
+                stats: new_stats,
+            });
+        }
+    }
+
+    // Write full catalog at EOF
+    let catalog_aligned = align_to_8(write_offset);
+    let pad = (catalog_aligned - write_offset) as usize;
+    if pad > 0 {
+        writer.write_all(&vec![0u8; pad])?;
+    }
+    let full_catalog_offset_new = catalog_aligned;
+
+    let new_full_catalog = FullCatalog {
+        catalog_version: original_catalog.catalog_version,
+        manifest_sequence: original_catalog.manifest_sequence + 1,
+        prev_catalog_offset: 0,
+        n_obs: matching_cells,
+        entries: new_entries,
+    };
+    let mut new_catalog_bytes = Vec::new();
+    new_full_catalog.write_to(&mut new_catalog_bytes)?;
+    let new_full_catalog_length = new_catalog_bytes.len() as u64;
+    writer.write_all(&new_catalog_bytes)?;
+
+    // Build and write root catalog
+    let root_catalog = build_root_catalog(&new_full_catalog);
+    let mut root_buf = Vec::new();
+    root_catalog.write_to(&mut root_buf)?;
+    let root_catalog_length = root_buf.len() as u64;
+    root_buf.resize(4096, 0);
+    writer.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+    writer.write_all(&root_buf)?;
+
+    // Write header
+    let mut new_header = header;
+    new_header.n_obs = matching_cells;
+    new_header.n_csr_shards = downloaded_shards as u32;
+    new_header.root_catalog_offset = HEADER_SIZE as u64;
+    new_header.root_catalog_length = root_catalog_length;
+    new_header.full_catalog_offset = full_catalog_offset_new;
+    new_header.full_catalog_length = new_full_catalog_length;
+    new_header.front_catalog_offset = 0;
+    new_header.front_catalog_length = 0;
+    new_header.clear_front_catalog();
+    new_header.file_checksum = 0;
+
+    writer.seek(SeekFrom::Start(0))?;
+    new_header.write_to(&mut writer)?;
+
+    writer.flush()?;
+    let mut file = writer.into_inner().map_err(std::io::Error::from)?;
+    let file_checksum = compute_file_checksum(&mut file)?;
+    new_header.file_checksum = file_checksum;
+    file.seek(SeekFrom::Start(0))?;
+    new_header.write_to(&mut file)?;
+
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, dest)?;
+
+    let elapsed = start.elapsed();
+
+    Ok(PullFilteredStats {
+        total_shards,
+        downloaded_shards,
+        skipped_shards,
+        matching_cells,
+        bytes_downloaded: total_bytes_downloaded,
+        bytes_saved,
+        elapsed,
+    })
+}
+
+/// Build a path-constructing closure from a parsed location.
+fn build_path_fn(location: &crate::backend::CloudLocation) -> Box<dyn Fn(&str) -> ObjPath + '_> {
+    match location {
+        crate::backend::CloudLocation::Local(_) => {
+            Box::new(|filename: &str| ObjPath::from(filename))
+        }
+        crate::backend::CloudLocation::Gcs { prefix, .. }
+        | crate::backend::CloudLocation::S3 { prefix, .. }
+        | crate::backend::CloudLocation::Azure { prefix, .. } => {
+            let prefix = prefix.clone();
+            Box::new(move |filename: &str| {
+                let full = if prefix.ends_with('/') {
+                    format!("{prefix}{filename}")
+                } else if prefix.is_empty() {
+                    filename.to_string()
+                } else {
+                    format!("{prefix}/{filename}")
+                };
+                ObjPath::from(full)
+            })
+        }
+    }
+}
+
+/// Filter a RecordBatch to only include rows at the given indices.
+fn filter_record_batch(
+    batch: &arrow::array::RecordBatch,
+    row_indices: &[u64],
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::UInt64Array;
+    let indices = UInt64Array::from(row_indices.to_vec());
+    let columns: Vec<arrow::array::ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let filtered = arrow::array::RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    Ok(filtered)
+}
+
+/// Serialize a RecordBatch to Arrow IPC bytes (File format).
+fn record_batch_to_arrow_ipc(batch: &arrow::array::RecordBatch) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut ipc_writer =
+            arrow::ipc::writer::FileWriter::try_new(&mut buf, &batch.schema())
+                .map_err(|e| {
+                    CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                })?;
+        ipc_writer.write(batch).map_err(|e| {
+            CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+        ipc_writer.finish().map_err(|e| {
+            CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +1052,200 @@ mod tests {
         assert!(hdr.has_front_catalog(), "pull output should be cloud-ready");
         assert!(hdr.front_catalog_offset > 0);
         assert!(hdr.front_catalog_length > 0);
+    }
+
+    // ===== pull_filtered tests =====
+
+    fn write_test_file_with_cell_type(
+        dir: &tempfile::TempDir,
+        n_obs: usize,
+        n_vars: usize,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join("input_filter.scx");
+        let header = sample_header(n_obs as u64, n_vars as u64);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+
+        let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let types: Vec<String> = (0..n_obs)
+            .map(|i| {
+                if i < n_obs / 2 {
+                    "typeA".to_string()
+                } else {
+                    "typeB".to_string()
+                }
+            })
+            .collect();
+        let obs_schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", DataType::Utf8, false),
+        ]);
+        let obs_batch = arrow::array::RecordBatch::try_new(
+            Arc::new(obs_schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        writer.write_obs(&obs_batch).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        let rows_per_shard = 50;
+        let mut row_offset = 0;
+        while row_offset < n_obs {
+            let shard_rows = std::cmp::min(rows_per_shard, n_obs - row_offset);
+            let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+            row_offset += shard_rows;
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_selective_pull_downloads_only_matching_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_cell_type(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded_filter.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let output = dir.path().join("filtered.scx");
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        let stats = pull_filtered(
+            &source,
+            &output,
+            "cell_type == 'typeA'",
+            PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.total_shards, 2);
+        assert_eq!(stats.downloaded_shards, 1);
+        assert_eq!(stats.skipped_shards, 1);
+        assert_eq!(stats.matching_cells, 50);
+        assert!(stats.bytes_saved > 0);
+    }
+
+    #[tokio::test]
+    async fn test_selective_pull_correct_cell_count_and_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_cell_type(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded_filter.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let output = dir.path().join("filtered.scx");
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        pull_filtered(
+            &source,
+            &output,
+            "cell_type == 'typeA'",
+            PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.n_obs(), 50);
+        assert_eq!(reader.n_vars(), 50);
+
+        let obs = reader.read_obs().unwrap();
+        assert_eq!(obs.num_rows(), 50);
+
+        let cell_type_col = obs
+            .column_by_name("cell_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..arrow::array::Array::len(cell_type_col) {
+            assert_eq!(cell_type_col.value(i), "typeA");
+        }
+
+        let var = reader.read_var().unwrap();
+        assert_eq!(var.num_rows(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_selective_pull_no_matching_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_cell_type(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded_filter.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let output = dir.path().join("filtered_empty.scx");
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        let stats = pull_filtered(
+            &source,
+            &output,
+            "cell_type == 'typeC'",
+            PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.matching_cells, 0);
+        assert_eq!(stats.downloaded_shards, 0);
+        assert_eq!(stats.skipped_shards, 2);
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.n_obs(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_selective_pull_all_cells_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_cell_type(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded_filter.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        let full_output = dir.path().join("full.scx");
+        pull(&source, &full_output, PullOptions::default())
+            .await
+            .unwrap();
+
+        let filtered_output = dir.path().join("filtered_all.scx");
+        let stats = pull_filtered(
+            &source,
+            &filtered_output,
+            "cell_type == 'typeA' or cell_type == 'typeB'",
+            PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.matching_cells, 100);
+        assert_eq!(stats.downloaded_shards, 2);
+        assert_eq!(stats.skipped_shards, 0);
+
+        let reader_full = ScxReader::open(&full_output).unwrap();
+        let reader_filt = ScxReader::open(&filtered_output).unwrap();
+
+        assert_eq!(reader_full.n_obs(), reader_filt.n_obs());
+        assert_eq!(reader_full.n_vars(), reader_filt.n_vars());
+
+        let csr_full = reader_full.read_all_csr_shards().unwrap();
+        let csr_filt = reader_filt.read_all_csr_shards().unwrap();
+        assert_eq!(csr_full.indptr, csr_filt.indptr);
+        assert_eq!(csr_full.indices, csr_filt.indices);
+        assert_eq!(csr_full.data, csr_filt.data);
     }
 }

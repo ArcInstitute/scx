@@ -201,6 +201,9 @@ enum Commands {
         /// Skip front catalog in output (not cloud-ready)
         #[arg(long)]
         no_cloud_ready: bool,
+        /// Predicate expression to selectively download matching shards
+        #[arg(long)]
+        filter: Option<String>,
     },
 }
 
@@ -297,7 +300,8 @@ fn main() {
             dest,
             parallelism,
             no_cloud_ready,
-        } => pull::run_pull(&source, &dest, parallelism, !no_cloud_ready),
+            filter,
+        } => pull::run_pull(&source, &dest, parallelism, !no_cloud_ready, filter.as_deref()),
     };
 
     if let Err(e) = result {
