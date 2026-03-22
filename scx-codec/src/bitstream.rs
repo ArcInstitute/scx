@@ -82,126 +82,177 @@ impl Default for BitWriter {
 }
 
 // ---------------------------------------------------------------------------
-// BitReader
+// BitReader — u64-buffered for high-throughput bit extraction
 // ---------------------------------------------------------------------------
 
 /// Reads bits in LSB-first order from a byte slice.
+///
+/// Uses a 64-bit buffer to extract multiple values per refill, eliminating
+/// per-value inner loops. The hot path (`read_bits`) is a single mask+shift
+/// when the buffer has enough bits.
 pub struct BitReader<'a> {
     data: &'a [u8],
+    /// Buffered bits, LSB-aligned. The lowest `bits_left` bits are valid.
+    bit_buf: u64,
+    /// Number of valid bits remaining in `bit_buf` (0–64).
+    bits_left: u8,
+    /// Next byte position to read from `data` into the buffer.
     byte_pos: usize,
-    bit_pos: u8, // 0–7: next bit position to read within data[byte_pos]
 }
 
 impl<'a> BitReader<'a> {
     /// Create a new `BitReader` over the given data.
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
+        let mut reader = Self {
             data,
+            bit_buf: 0,
+            bits_left: 0,
             byte_pos: 0,
-            bit_pos: 0,
+        };
+        reader.refill();
+        reader
+    }
+
+    /// Load bytes into `bit_buf` until we have at least 56 bits (or data is
+    /// exhausted). We keep a 56-bit threshold so that a single `read_bits`
+    /// call for up to 56 bits never needs a mid-read refill.
+    #[inline]
+    fn refill(&mut self) {
+        // Only refill when we have room for at least one byte
+        if self.bits_left > 56 {
+            return;
+        }
+        let remaining = self.data.len() - self.byte_pos;
+        if remaining == 0 {
+            return;
+        }
+        // Calculate how many whole bytes we can load (max space in buffer)
+        let space_bytes = ((64 - self.bits_left) / 8) as usize;
+        let to_load = remaining.min(space_bytes);
+
+        // Fast path: load via u64 when we have enough data and buffer space
+        if to_load >= 7 && self.bits_left == 0 {
+            // Buffer is empty, load 7 bytes (56 bits) directly
+            // This avoids overflowing the u64 while loading maximum data
+            let mut bytes = [0u8; 8];
+            bytes[..7].copy_from_slice(&self.data[self.byte_pos..self.byte_pos + 7]);
+            self.bit_buf = u64::from_le_bytes(bytes);
+            self.byte_pos += 7;
+            self.bits_left = 56;
+            return;
+        }
+
+        // General path: load bytes into buffer
+        for _ in 0..to_load {
+            let byte = self.data[self.byte_pos] as u64;
+            self.bit_buf |= byte << self.bits_left;
+            self.byte_pos += 1;
+            self.bits_left += 8;
         }
     }
 
     /// Read a single bit (LSB-first).
     #[inline]
     pub fn read_bit(&mut self) -> Result<bool, BitStreamError> {
-        if self.byte_pos >= self.data.len() {
-            return Err(BitStreamError);
+        if self.bits_left == 0 {
+            self.refill();
+            if self.bits_left == 0 {
+                return Err(BitStreamError);
+            }
         }
-        let bit = (self.data[self.byte_pos] >> self.bit_pos) & 1 != 0;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
+        let bit = self.bit_buf & 1 != 0;
+        self.bit_buf >>= 1;
+        self.bits_left -= 1;
         Ok(bit)
     }
 
     /// Read `n_bits` bits and return them as a `u64`, LSB first.
     ///
-    /// Uses batch extraction from the underlying byte stream instead of
-    /// per-bit reads. This is the hot path for FOR-BP and Rice decoders.
+    /// This is the hot path for FOR-BP and Rice decoders. With the u64 buffer,
+    /// this is a single mask+shift operation when the buffer has enough bits.
     #[inline]
     pub fn read_bits(&mut self, n_bits: u8) -> Result<u64, BitStreamError> {
         if n_bits == 0 {
             return Ok(0);
         }
-
-        let mut value: u64 = 0;
-        let mut bits_remaining = n_bits as usize;
-        let mut shift = 0usize;
-
-        while bits_remaining > 0 {
-            if self.byte_pos >= self.data.len() {
+        // Ensure we have enough bits in the buffer
+        if self.bits_left < n_bits {
+            self.refill();
+            if self.bits_left < n_bits {
                 return Err(BitStreamError);
             }
-
-            // How many bits available in the current byte?
-            let avail = (8 - self.bit_pos as usize).min(bits_remaining);
-
-            // Extract `avail` bits from current byte starting at bit_pos
-            let mask = ((1u16 << avail) - 1) as u8;
-            let bits = (self.data[self.byte_pos] >> self.bit_pos) & mask;
-            value |= (bits as u64) << shift;
-
-            shift += avail;
-            bits_remaining -= avail;
-            self.bit_pos += avail as u8;
-            if self.bit_pos >= 8 {
-                self.byte_pos += 1;
-                self.bit_pos = 0;
-            }
         }
-
+        // Extract n_bits from the buffer (single mask + shift)
+        let mask = if n_bits >= 64 { u64::MAX } else { (1u64 << n_bits) - 1 };
+        let value = self.bit_buf & mask;
+        if n_bits >= 64 {
+            self.bit_buf = 0;
+        } else {
+            self.bit_buf >>= n_bits;
+        }
+        self.bits_left -= n_bits;
         Ok(value)
     }
 
     /// Read a unary code: count ones until a zero is encountered.
     /// Returns the number of ones read.
     ///
-    /// Uses byte-level scanning to skip runs of 1-bits efficiently.
+    /// Uses `trailing_ones()` on the 64-bit buffer for fast scanning.
     #[inline]
     pub fn read_unary(&mut self) -> Result<u64, BitStreamError> {
         let mut count: u64 = 0;
         loop {
-            if self.byte_pos >= self.data.len() {
-                return Err(BitStreamError);
+            if self.bits_left == 0 {
+                self.refill();
+                if self.bits_left == 0 {
+                    return Err(BitStreamError);
+                }
             }
 
-            // Get remaining bits in current byte (from bit_pos to 7)
-            let byte = self.data[self.byte_pos] >> self.bit_pos;
-            let remaining_bits = 8 - self.bit_pos;
+            // If buffer is all zeros at this point with bits_left valid bits,
+            // we need to check only the valid portion. Mask out invalid bits.
+            // Since invalid high bits are already 0 (from shifts), trailing_ones
+            // on bit_buf correctly counts only valid 1-bits.
+            let ones = self.bit_buf.trailing_ones();
 
-            if byte == 0xFF >> self.bit_pos {
-                // All remaining bits in this byte are 1s — skip the whole byte
-                count += remaining_bits as u64;
-                self.byte_pos += 1;
-                self.bit_pos = 0;
-            } else {
-                // Find the first zero bit (trailing_ones counts consecutive 1s from LSB)
-                let ones = byte.trailing_ones();
+            if ones < self.bits_left as u32 {
+                // Found a zero bit within the valid portion
                 count += ones as u64;
-                // Advance past the ones and the terminating zero
-                self.bit_pos += ones as u8 + 1;
-                if self.bit_pos >= 8 {
-                    self.byte_pos += 1;
-                    self.bit_pos = 0;
-                }
+                // Skip past the ones and the terminating zero
+                let skip = ones + 1;
+                self.bit_buf >>= skip;
+                self.bits_left -= skip as u8;
                 return Ok(count);
+            } else {
+                // All valid bits in buffer are ones — consume them all and refill
+                count += self.bits_left as u64;
+                self.bit_buf = 0;
+                self.bits_left = 0;
             }
         }
     }
 
-    /// Return the current position in bits.
+    /// Return the current position in bits from the start of the data.
     pub fn position(&self) -> usize {
-        self.byte_pos * 8 + self.bit_pos as usize
+        self.byte_pos * 8 - self.bits_left as usize
     }
 
     /// Advance to the next byte boundary. If already aligned, this is a no-op.
     pub fn align_to_byte(&mut self) {
-        if self.bit_pos > 0 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
+        let pos = self.position();
+        let remainder = pos % 8;
+        if remainder > 0 {
+            let skip = 8 - remainder;
+            if skip as u8 <= self.bits_left {
+                self.bit_buf >>= skip;
+                self.bits_left -= skip as u8;
+            } else {
+                // Need more data — discard buffer and advance byte_pos
+                self.bit_buf = 0;
+                self.bits_left = 0;
+                // byte_pos is already past the buffered data, so position()
+                // is at a byte boundary after clearing the buffer
+            }
         }
     }
 }

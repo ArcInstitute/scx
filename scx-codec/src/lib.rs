@@ -5,5 +5,6 @@ pub mod forbp;
 pub mod rice;
 
 pub use dispatch::{
-    decode_shard, encode_shard, CodecError, CodecId, DecodedShard, EncodedShard, ValueEncoding,
+    decode_shard, decode_shard_ref, decode_shard_scipy, encode_shard, CodecError, CodecId,
+    DecodedShard, EncodedShard, EncodedShardRef, ScipyShard, ValueEncoding,
 };

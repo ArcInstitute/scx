@@ -150,8 +150,29 @@ pub fn forbp_decode(
     n_rows: usize,
     index_dtype_u16: bool,
 ) -> Result<(Vec<u32>, Vec<usize>), BitStreamError> {
-    let mut all_indices = Vec::new();
-    let mut all_row_lengths = Vec::new();
+    forbp_decode_inner(data, n_rows, 0, index_dtype_u16)
+}
+
+/// Decode FOR-BP encoded indices with an optional nnz hint for pre-allocation.
+///
+/// When `nnz_hint > 0`, pre-allocates the output vectors for better performance.
+pub fn forbp_decode_with_hint(
+    data: &[u8],
+    n_rows: usize,
+    nnz_hint: usize,
+    index_dtype_u16: bool,
+) -> Result<(Vec<u32>, Vec<usize>), BitStreamError> {
+    forbp_decode_inner(data, n_rows, nnz_hint, index_dtype_u16)
+}
+
+fn forbp_decode_inner(
+    data: &[u8],
+    n_rows: usize,
+    nnz_hint: usize,
+    index_dtype_u16: bool,
+) -> Result<(Vec<u32>, Vec<usize>), BitStreamError> {
+    let mut all_indices = Vec::with_capacity(nnz_hint);
+    let mut all_row_lengths = Vec::with_capacity(n_rows);
     let mut cursor = Cursor::new(data);
     let mut rows_remaining = n_rows;
 
@@ -176,7 +197,7 @@ pub fn forbp_decode(
         let varints_consumed = remaining_bytes.len() - varint_slice.len();
         cursor.set_position((pos + varints_consumed) as u64);
 
-        // Decode each row
+        // Decode each row — fused decode + prefix sum (no intermediate deltas Vec)
         for &nnz in &row_nnzs {
             all_row_lengths.push(nnz);
             if nnz == 0 {
@@ -197,10 +218,9 @@ pub fn forbp_decode(
             // Read frame_bits
             let frame_bits = cursor.read_u8().map_err(|_| BitStreamError)?;
 
-            // Read bit-packed deltas
-            let mut deltas = Vec::with_capacity(nnz);
+            // Fused: decode bit-packed deltas and reconstruct indices in one pass
+            let mut prev = frame_min;
             if frame_bits > 0 {
-                // Compute how many bytes the bit-packed deltas occupy
                 let total_bits = frame_bits as usize * nnz;
                 let total_bytes = total_bits.div_ceil(8);
 
@@ -211,20 +231,16 @@ pub fn forbp_decode(
                 let bit_data = &data[pos..pos + total_bytes];
                 let mut br = BitReader::new(bit_data);
                 for _ in 0..nnz {
-                    deltas.push(br.read_bits(frame_bits)? as u32);
+                    let d = br.read_bits(frame_bits)? as u32;
+                    prev += d;
+                    all_indices.push(prev);
                 }
                 cursor.set_position((pos + total_bytes) as u64);
             } else {
-                // frame_bits == 0: all deltas are 0
-                deltas.resize(nnz, 0);
-            }
-
-            // Reconstruct indices via prefix sum from frame_min + deltas
-            let mut prev = frame_min;
-            for &d in &deltas {
-                let idx = prev + d;
-                all_indices.push(idx);
-                prev = idx;
+                // frame_bits == 0: all indices equal frame_min
+                for _ in 0..nnz {
+                    all_indices.push(prev);
+                }
             }
         }
 

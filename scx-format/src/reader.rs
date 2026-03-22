@@ -7,7 +7,7 @@ use std::path::Path;
 
 use arrow::array::RecordBatch;
 use memmap2::Mmap;
-use scx_codec::{CodecId, EncodedShard, ValueEncoding};
+use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
 use scx_sparse::ScxCsr;
 
 #[cfg(feature = "parallel")]
@@ -526,14 +526,14 @@ impl ScxReader {
             .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
         let index_dtype_u16 = sh.index_dtype == 0;
 
-        // Build EncodedShard and decode
-        let encoded = EncodedShard {
-            indptr_bytes: indptr_bytes.to_vec(),
-            indices_bytes: indices_bytes.to_vec(),
-            values_bytes: values_bytes.to_vec(),
+        // Build EncodedShardRef (zero-copy from mmap) and decode directly to scipy types
+        let encoded = EncodedShardRef {
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
         };
 
-        let (indptr_u64, indices_u32, values_raw) = scx_codec::decode_shard(
+        let (indptr, indices, data) = scx_codec::decode_shard_scipy(
             &encoded,
             codec_id,
             value_encoding,
@@ -541,11 +541,6 @@ impl ScxReader {
             sh.nnz as usize,
             index_dtype_u16,
         )?;
-
-        // Convert to scipy-compatible types
-        let indptr: Vec<i64> = indptr_u64.iter().map(|&v| v as i64).collect();
-        let indices: Vec<i32> = indices_u32.iter().map(|&v| v as i32).collect();
-        let data = values_to_f32(&values_raw, value_encoding);
 
         Ok((indptr, indices, data))
     }
@@ -646,6 +641,7 @@ impl ScxReader {
 }
 
 /// Convert raw value bytes to f32 according to the value encoding.
+#[cfg(test)]
 fn values_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
     match encoding {
         ValueEncoding::Uint8 => raw.iter().map(|&b| b as f32).collect(),

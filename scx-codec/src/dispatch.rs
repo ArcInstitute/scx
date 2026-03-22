@@ -5,7 +5,7 @@ use std::io::Cursor;
 
 use crate::bitstream::BitStreamError;
 use crate::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
-use crate::forbp::{forbp_decode, forbp_encode};
+use crate::forbp::{forbp_decode_with_hint, forbp_encode};
 use crate::rice::{rice_decode, rice_encode, B_VAL};
 
 // ---------------------------------------------------------------------------
@@ -72,12 +72,20 @@ impl ValueEncoding {
     }
 }
 
-/// The encoded byte arrays for a single CSR shard.
+/// The encoded byte arrays for a single CSR shard (owned).
 #[derive(Debug)]
 pub struct EncodedShard {
     pub indptr_bytes: Vec<u8>,
     pub indices_bytes: Vec<u8>,
     pub values_bytes: Vec<u8>,
+}
+
+/// Borrowed reference to encoded shard byte arrays (zero-copy from mmap).
+#[derive(Debug)]
+pub struct EncodedShardRef<'a> {
+    pub indptr_bytes: &'a [u8],
+    pub indices_bytes: &'a [u8],
+    pub values_bytes: &'a [u8],
 }
 
 // ---------------------------------------------------------------------------
@@ -142,10 +150,101 @@ pub fn decode_shard(
     nnz: usize,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
+    let r = EncodedShardRef {
+        indptr_bytes: &encoded.indptr_bytes,
+        indices_bytes: &encoded.indices_bytes,
+        values_bytes: &encoded.values_bytes,
+    };
+    decode_shard_ref(&r, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)
+}
+
+/// Decode an `EncodedShardRef` (borrowed) back to `(indptr, indices, values_bytes)`.
+///
+/// Zero-copy variant that avoids cloning mmap slices into owned Vecs.
+pub fn decode_shard_ref(
+    encoded: &EncodedShardRef,
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+    n_rows: usize,
+    nnz: usize,
+    index_dtype_u16: bool,
+) -> Result<DecodedShard, CodecError> {
     match codec_id {
-        CodecId::None => decode_none(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
-        CodecId::Scx1 => decode_scx1(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
-        CodecId::Zstd => decode_zstd(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
+        CodecId::None => decode_none_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
+        CodecId::Scx1 => decode_scx1_ref(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
+        CodecId::Zstd => decode_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
+    }
+}
+
+/// Scipy-compatible decoded shard: `(indptr_i64, indices_i32, data_f32)`.
+///
+/// Eliminates intermediate type conversions by producing the final scipy
+/// types directly from the codec decoders.
+pub type ScipyShard = (Vec<i64>, Vec<i32>, Vec<f32>);
+
+/// Decode an `EncodedShardRef` directly to scipy-compatible types.
+///
+/// Returns `(Vec<i64>, Vec<i32>, Vec<f32>)` without intermediate raw byte
+/// conversions, saving 3 allocations per shard compared to `decode_shard_ref`
+/// + manual type conversion.
+pub fn decode_shard_scipy(
+    encoded: &EncodedShardRef,
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+    n_rows: usize,
+    nnz: usize,
+    index_dtype_u16: bool,
+) -> Result<ScipyShard, CodecError> {
+    // For Scx1, we can avoid the u32→raw_bytes→f32 chain for values
+    if codec_id == CodecId::Scx1 {
+        if !value_encoding.is_integer() {
+            return Err(CodecError::FloatWithScx1);
+        }
+        // indptr: delta_golomb → Vec<u64> → Vec<i64>
+        let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows + 1)?;
+        let indptr: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
+
+        // indices: forbp → Vec<u32> → Vec<i32>
+        let (indices_u32, _) =
+            forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
+        let indices: Vec<i32> = indices_u32.into_iter().map(|v| v as i32).collect();
+
+        // values: rice → Vec<u32> → Vec<f32> directly (skip raw bytes intermediate)
+        let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
+        let data: Vec<f32> = values_u32.into_iter().map(|v| v as f32).collect();
+
+        return Ok((indptr, indices, data));
+    }
+
+    // For None and Zstd: decode to raw types, then convert
+    let (indptr_u64, indices_u32, values_raw) =
+        decode_shard_ref(encoded, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)?;
+    let indptr: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
+    let indices: Vec<i32> = indices_u32.into_iter().map(|v| v as i32).collect();
+    let data = values_raw_to_f32(&values_raw, value_encoding);
+    Ok((indptr, indices, data))
+}
+
+/// Convert raw LE value bytes to f32 according to ValueEncoding.
+fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
+    match encoding {
+        ValueEncoding::Uint8 => raw.iter().map(|&b| b as f32).collect(),
+        ValueEncoding::Uint16 => raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
+            .collect(),
+        ValueEncoding::Uint32 => raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect(),
+        ValueEncoding::Float32 => raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        ValueEncoding::Float16 => raw
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
     }
 }
 
@@ -168,16 +267,15 @@ fn encode_none(
     })
 }
 
-fn decode_none(
-    encoded: &EncodedShard,
+fn decode_none_ref(
+    encoded: &EncodedShardRef,
     n_rows: usize,
     nnz: usize,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
-    let indptr = le_bytes_to_u64(&encoded.indptr_bytes, n_rows + 1)?;
-    let indices = le_bytes_to_indices(&encoded.indices_bytes, nnz, index_dtype_u16)?;
-    // Validate values length
+    let indptr = le_bytes_to_u64(encoded.indptr_bytes, n_rows + 1)?;
+    let indices = le_bytes_to_indices(encoded.indices_bytes, nnz, index_dtype_u16)?;
     let expected_len = nnz * value_encoding.byte_width();
     if encoded.values_bytes.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
@@ -189,7 +287,7 @@ fn decode_none(
             ),
         )));
     }
-    Ok((indptr, indices, encoded.values_bytes.clone()))
+    Ok((indptr, indices, encoded.values_bytes.to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -225,8 +323,8 @@ fn encode_scx1(
     })
 }
 
-fn decode_scx1(
-    encoded: &EncodedShard,
+fn decode_scx1_ref(
+    encoded: &EncodedShardRef,
     value_encoding: ValueEncoding,
     n_rows: usize,
     nnz: usize,
@@ -237,13 +335,14 @@ fn decode_scx1(
     }
 
     // indptr ← Delta-Golomb
-    let indptr = delta_golomb_decode(&encoded.indptr_bytes, n_rows + 1)?;
+    let indptr = delta_golomb_decode(encoded.indptr_bytes, n_rows + 1)?;
 
-    // indices ← FOR-BP
-    let (indices, _row_lengths) = forbp_decode(&encoded.indices_bytes, n_rows, index_dtype_u16)?;
+    // indices ← FOR-BP (with nnz hint for pre-allocation)
+    let (indices, _row_lengths) =
+        forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
 
     // values ← Rice decode, then convert u32 back to raw bytes
-    let values_u32 = rice_decode(&encoded.values_bytes, nnz, B_VAL)?;
+    let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
     let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding);
 
     Ok((indptr, indices, values_bytes))
@@ -273,16 +372,16 @@ fn encode_zstd(
     })
 }
 
-fn decode_zstd(
-    encoded: &EncodedShard,
+fn decode_zstd_ref(
+    encoded: &EncodedShardRef,
     n_rows: usize,
     nnz: usize,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
-    let indptr_raw = zstd::decode_all(encoded.indptr_bytes.as_slice())?;
-    let indices_raw = zstd::decode_all(encoded.indices_bytes.as_slice())?;
-    let values_raw = zstd::decode_all(encoded.values_bytes.as_slice())?;
+    let indptr_raw = zstd::decode_all(encoded.indptr_bytes)?;
+    let indices_raw = zstd::decode_all(encoded.indices_bytes)?;
+    let values_raw = zstd::decode_all(encoded.values_bytes)?;
 
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
