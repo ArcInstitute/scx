@@ -3,6 +3,7 @@ archive/
 tasks/
 tmp/
 data/*.h5ad
+benchmarks/logs/
 
 # Rust
 /target/

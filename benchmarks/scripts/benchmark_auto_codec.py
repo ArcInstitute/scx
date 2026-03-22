@@ -13,6 +13,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
+sys.path.insert(0, str(Path(__file__).parent))
+from build_release import ensure_release_build
 
 DATA_DIR = os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx")
 
@@ -235,4 +237,5 @@ def main():
 
 
 if __name__ == "__main__":
+    ensure_release_build()
     main()

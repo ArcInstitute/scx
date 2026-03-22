@@ -25,6 +25,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).parent))
+from build_release import ensure_release_build
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -379,9 +382,9 @@ def bench_baseline_soma(dataset_name: str, batch_size: int = 1024) -> dict:
     """TileDB-SOMA-ML baseline."""
     try:
         import tiledbsoma
-        import tiledbsoma.ml
+        import tiledbsoma_ml
     except ImportError:
-        return {"benchmark": "baseline_soma", "error": "tiledbsoma.ml not installed"}
+        return {"benchmark": "baseline_soma", "error": "tiledbsoma or tiledbsoma_ml not installed"}
 
     # We need the h5ad converted to SOMA format first
     ds = DATASETS[dataset_name]
@@ -405,15 +408,15 @@ def bench_baseline_soma(dataset_name: str, batch_size: int = 1024) -> dict:
         gc.collect()
         with Timer() as t:
             exp = tiledbsoma.Experiment.open(str(soma_uri))
-            datapipe = tiledbsoma.ml.ExperimentAxisQueryIterDataPipe(
+            dataset = tiledbsoma_ml.ExperimentDataset(
                 experiment=exp,
                 measurement_name="RNA",
-                X_name="X",
+                X_name="data",
                 batch_size=batch_size,
                 shuffle=True,
             )
             n_batches = 0
-            for batch in datapipe:
+            for batch in dataset:
                 n_batches += 1
             exp.close()
 
@@ -431,9 +434,10 @@ def bench_baseline_soma(dataset_name: str, batch_size: int = 1024) -> dict:
 def bench_baseline_scdataloader(dataset_name: str, batch_size: int = 1024) -> dict:
     """scDataLoader baseline."""
     try:
-        import scdataloader
+        from scdataloader import SimpleAnnDataset
+        from torch.utils.data import DataLoader
     except ImportError:
-        return {"benchmark": "baseline_scdataloader", "error": "scdataloader not installed"}
+        return {"benchmark": "baseline_scdataloader", "error": "scdataloader or torch not installed"}
 
     ds = DATASETS[dataset_name]
     h5ad_path = ds["h5ad"]
@@ -441,23 +445,28 @@ def bench_baseline_scdataloader(dataset_name: str, batch_size: int = 1024) -> di
         return {"benchmark": "baseline_scdataloader", "error": f"h5ad not found: {h5ad_path}"}
 
     try:
+        import anndata
+
         gc.collect()
-        with Timer() as t:
-            dataloader = scdataloader.DataLoader(
-                str(h5ad_path),
-                batch_size=batch_size,
-                shuffle=True,
-            )
+        with Timer() as t_load:
+            adata = anndata.read_h5ad(str(h5ad_path))
+
+        with Timer() as t_iter:
+            dataset = SimpleAnnDataset(adata)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
             n_batches = 0
-            for batch in dataloader:
+            for batch in loader:
                 n_batches += 1
 
+        total_time = t_load.elapsed + t_iter.elapsed
         return {
             "benchmark": "baseline_scdataloader",
             "dataset": dataset_name,
-            "total_time_s": round(t.elapsed, 3),
+            "load_time_s": round(t_load.elapsed, 3),
+            "iter_time_s": round(t_iter.elapsed, 3),
+            "total_time_s": round(total_time, 3),
             "n_batches": n_batches,
-            "batches_per_sec": round(n_batches / t.elapsed, 1) if t.elapsed > 0 else 0,
+            "batches_per_sec": round(n_batches / total_time, 1) if total_time > 0 else 0,
         }
     except Exception as e:
         return {"benchmark": "baseline_scdataloader", "error": str(e)}
@@ -1091,4 +1100,5 @@ def main():
 
 
 if __name__ == "__main__":
+    ensure_release_build()
     main()

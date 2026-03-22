@@ -28,6 +28,7 @@ RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
 SLURM_LOG_DIR = REPO_ROOT / "benchmarks" / "slurm_logs"
 
 sys.path.insert(0, str(Path(__file__).parent))
+from build_release import ensure_release_build
 import benchmark_loader  # noqa: E402 — must be after sys.path insert
 
 
@@ -92,6 +93,8 @@ def main():
     print(f"Smoke test: {args.smoke}")
     print(f"Local: {args.local}")
     print()
+
+    ensure_release_build()
 
     if args.local:
         # Run locally without SLURM
