@@ -13,6 +13,13 @@ mod query;
 mod rollback;
 mod validate;
 
+#[cfg(feature = "cloud")]
+mod cloud_optimize;
+#[cfg(feature = "cloud")]
+mod explode;
+#[cfg(feature = "cloud")]
+mod pack;
+
 #[derive(Parser)]
 #[command(name = "scx", about = "SCX file format tool")]
 struct Cli {
@@ -154,6 +161,31 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Rewrite file with front-of-file catalog for cloud access
+    #[cfg(feature = "cloud")]
+    CloudOptimize {
+        /// SCX file to optimize
+        input: PathBuf,
+        /// Output path (default: rewrite in-place via atomic rename)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Explode a packed .scx into an .scxd directory
+    #[cfg(feature = "cloud")]
+    Explode {
+        /// SCX file to explode
+        input: PathBuf,
+        /// Output directory (must end in .scxd)
+        output: PathBuf,
+    },
+    /// Pack an .scxd directory into a packed .scx file
+    #[cfg(feature = "cloud")]
+    Pack {
+        /// Input directory (.scxd)
+        input: PathBuf,
+        /// Output .scx file
+        output: PathBuf,
+    },
 }
 
 fn main() {
@@ -235,6 +267,14 @@ fn main() {
             runs,
             json,
         } => benchmark::run_benchmark(&file, compare_h5ad.as_deref(), runs, json),
+        #[cfg(feature = "cloud")]
+        Commands::CloudOptimize { input, output } => {
+            cloud_optimize::run_cloud_optimize(&input, output.as_deref())
+        }
+        #[cfg(feature = "cloud")]
+        Commands::Explode { input, output } => explode::run_explode(&input, &output),
+        #[cfg(feature = "cloud")]
+        Commands::Pack { input, output } => pack::run_pack(&input, &output),
     };
 
     if let Err(e) = result {

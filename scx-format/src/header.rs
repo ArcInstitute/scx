@@ -192,6 +192,21 @@ impl FileHeader {
     pub fn set_deletion_vectors(&mut self) {
         self.flags |= 1 << 5;
     }
+
+    /// Returns true if the has_front_catalog flag (bit 6) is set.
+    pub fn has_front_catalog(&self) -> bool {
+        self.flags & (1 << 6) != 0
+    }
+
+    /// Set the has_front_catalog flag (bit 6).
+    pub fn set_front_catalog(&mut self) {
+        self.flags |= 1 << 6;
+    }
+
+    /// Clear the has_front_catalog flag (bit 6).
+    pub fn clear_front_catalog(&mut self) {
+        self.flags &= !(1 << 6);
+    }
 }
 
 #[cfg(test)]

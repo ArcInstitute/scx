@@ -384,6 +384,11 @@ pub fn append(
     header.root_catalog_offset = HEADER_SIZE as u64;
     header.root_catalog_length = root_catalog_length;
 
+    // Clear front catalog flag (stale after append)
+    header.clear_front_catalog();
+    header.front_catalog_offset = 0;
+    header.front_catalog_length = 0;
+
     // Write header with zero checksum
     header.file_checksum = 0;
     lock.seek(SeekFrom::Start(0))?;
