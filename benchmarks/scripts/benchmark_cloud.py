@@ -408,16 +408,23 @@ def bench_streaming_vs_naive(binary, gcs_source, pull_result):
 
     # Naive: gsutil cp -r + pack
     naive_times = []
+    # Extract the directory name from GCS source (e.g., "tabula_sapiens_100k.scxd")
+    scxd_name = gcs_source.rstrip("/").split("/")[-1]
+
     for i in range(N_RUNS):
         with tempfile.TemporaryDirectory() as tmpdir:
-            local_scxd = os.path.join(tmpdir, "naive.scxd")
             packed = os.path.join(tmpdir, "naive.scx")
 
-            # gsutil cp -r
+            # gsutil -m cp -r copies gs://...scxd/ → tmpdir/scxd_name/
             t0 = time.perf_counter()
             _, _, t_gsutil = run_cmd([
-                "gsutil", "-m", "cp", "-r", gcs_source, local_scxd,
+                "gsutil", "-m", "cp", "-r",
+                gcs_source.rstrip("/"),
+                tmpdir + "/",
             ], timeout=600)
+
+            # The downloaded directory is tmpdir/scxd_name/
+            local_scxd = os.path.join(tmpdir, scxd_name)
 
             # pack
             _, _, t_pack = run_scx(binary, ["pack", local_scxd, packed], timeout=600)
@@ -462,6 +469,7 @@ def bench_metadata_latency(binary, scx_path, file_size):
             _, _, t_orig = run_scx(binary, ["info", str(scx_path), "--json"])
             orig_times.append(t_orig)
 
+        cr_file_size = os.path.getsize(optimized)
         print(f"  Cloud-ready info median: {_median(cr_times)*1000:.1f} ms")
         print(f"  Original info median:    {_median(orig_times)*1000:.1f} ms")
 
@@ -469,8 +477,7 @@ def bench_metadata_latency(binary, scx_path, file_size):
         "benchmark": "metadata_latency",
         "cloud_ready_median_ms": round(_median(cr_times) * 1000, 1),
         "original_median_ms": round(_median(orig_times) * 1000, 1),
-        "cloud_ready_file_size_mb": round(os.path.getsize(optimized) / 1e6, 1)
-        if os.path.exists(optimized) else round(file_size / 1e6, 1),
+        "cloud_ready_file_size_mb": round(cr_file_size / 1e6, 1),
     }
 
 

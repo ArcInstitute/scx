@@ -1,123 +1,270 @@
 # SCX — Sparse Cell eXpression System
 
-A purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
+A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-5× smaller files**, **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — while remaining fully compatible with scanpy, scVI, and the entire scverse ecosystem.
 
-**Phase 1 (Format + Codec + AnnData Bridge) is complete.** Phase 2 (Training Loader + Query Engine + Cloud Ops) is complete. The full pipeline works:
+```python
+import pyscx
 
-```
-h5ad -> scx convert -> scx.open().to_anndata() -> scanpy works
-```
+# Drop-in replacement for anndata.read_h5ad()
+adata = pyscx.open("experiment.scx").to_anndata()
 
-Plus: lazy query engine, ML training loader, file operations (append/delete/compact/merge), and cloud access (push/pull/explode/pack).
-
-## Repository Structure
-
-```
-scx/
-├── Cargo.toml              # workspace root (9 members)
-├── scx-format/             # file layout, header, catalog, shard I/O, provenance
-├── scx-codec/              # compression codecs (Rice, FOR-BP, Delta-Golomb, Zstd)
-├── scx-sparse/             # CSR operations (scipy-compatible dtypes)
-├── scx-ops/                # file operations (append, delete, compact, merge, rollback)
-├── scx-engine/             # lazy query engine (predicate pushdown, projection, fused ops)
-├── scx-loader/             # ML training data loader (triple-buffered: tokio I/O → rayon decode → GPU)
-├── scx-cloud/              # cloud access (push, pull, explode, pack, cloud-optimize, CloudReader)
-├── scx-cli/                # CLI tool (convert, info, validate, query, append, delete, compact, merge, ...)
-├── pyscx/                  # Python bindings (PyO3 + maturin)
-│   └── tests/              # Python test suite (15 test files)
-├── tests/                  # integration tests + reference files
-├── benchmarks/             # benchmark scripts + dataset downloader
-│   ├── scripts/            # 20 benchmark/helper scripts
-│   └── results/            # 25 benchmark result reports
-└── docs/                   # additional documentation
+# Everything just works — no code changes needed
+import scanpy as sc
+sc.pp.normalize_total(adata)
+sc.tl.pca(adata)
+sc.tl.leiden(adata)
 ```
 
-## Key Documents
+## Why SCX?
 
-- **SPEC.md** — Full format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
-- **ROADMAP.md** — Phased implementation plan (Phases 1-4).
-- **Phase1.md** — Phase 1 implementation plan (all tasks complete).
-- **Phase2.md** — Phase 2 implementation plan (Steps 1-5 complete).
-- **Phase2-CLOUD.md** — Phase 2 cloud operations specification (implemented).
-- **Phase3.md** — Phase 3 specification (GPU, R bindings, multimodal — future work).
-- **docs/api.md** — API reference for Rust, Python, and CLI interfaces.
-- **docs/architecture.md** — Crate architecture and data flow diagrams.
-- **docs/testing.md** — Test infrastructure and benchmarks.
+### Your h5ad files are bigger than they need to be
+
+h5ad stores integer UMI counts as 32-bit floats. SCX detects this and uses the narrowest
+integer type that fits (uint8/uint16), then applies domain-specific codecs designed for
+the statistical properties of count data. Result:
+
+| Dataset | Cells | h5ad | SCX | Compression |
+|---------|-------|------|-----|-------------|
+| PBMC 3K | 2,700 | 21.5 MB | 4.4 MB | **4.9×** |
+| Smart-seq2 | 50,000 | 1.07 GB | 370 MB | **2.9×** |
+| Tabula Sapiens | 100,000 | 1.59 GB | 428 MB | **3.7×** |
+| CELLxGENE Census | 1,000,000 | 11.4 GB | 2.47 GB | **4.6×** |
+
+### Your atlas doesn't fit in memory? SCX does.
+
+SCX uses memory-mapped I/O and zero-copy transfers. Peak memory is the size of the
+decompressed matrix, not the entire file. On a 1M-cell dataset:
+
+| | h5ad | SCX | Savings |
+|--|------|-----|---------|
+| Peak memory | 11.6 GB | 264 MB | **44×** |
+
+This means you can work with atlas-scale datasets on a laptop.
+
+### Your training loop is bottlenecked on data loading
+
+SCX includes a **triple-buffered Rust pipeline** (tokio I/O → rayon decode → GPU) that
+keeps your GPU fed. Zero Python on the hot path — all I/O, decompression, shuffling,
+sparse-to-dense conversion, and normalization happen in compiled Rust.
+
+| | SCX | AnnData | TileDB-SOMA-ML |
+|--|-----|---------|----------------|
+| 1M cells (batches/sec) | **38.4** | 17.6 | 14.2 |
+| vs SCX | — | 2.2× slower | 2.7× slower |
+
+```python
+# GPU-saturating training loader — no num_workers needed
+dataset = pyscx.TrainingDataset(
+    "atlas.scx",
+    batch_size=1024,
+    hvg_indices=hvg_array,   # decode only HVGs → 15× less data
+    normalize=True,
+    log1p=True,
+)
+for batch in dataset:
+    x = torch.from_numpy(batch["X"]).to(device)
+    # model.forward(), loss.backward(), ...
+```
+
+### You want to query without loading everything
+
+SCX includes a lazy query engine with two-level predicate pushdown. Filter by cell type,
+tissue, donor — SCX skips entire shards that can't match, reading only the data you need.
+
+```python
+result = (pyscx.open("atlas.scx")
+    .query()
+    .filter_obs("cell_type == 'T cell' and tissue == 'lung'")
+    .select_genes(hvg_indices)
+    .with_normalize(1e4)
+    .with_log1p()
+    .collect())
+
+adata = result.to_anndata()   # only matching cells, zero-copy
+print(f"Skipped {result.skipped_shards}/{result.total_shards} shards")
+```
+
+Average shard skip rate: **55%** on realistic queries. Selective query latency: **<5 ms**.
+
+### You need to update your dataset without rewriting it
+
+SCX supports append, delete, compact, merge, and rollback — no need to rewrite
+the entire file when adding new cells or removing doublets.
+
+```python
+# Append new cells (writes at EOF, O(new_cells) not O(total_cells))
+pyscx.append("atlas.scx", "new_batch.scx")
+
+# Logical deletion (instant, no data rewrite)
+pyscx.mark_deleted("atlas.scx", doublet_indices)
+
+# Reclaim space when convenient
+pyscx.compact("atlas.scx", "atlas_clean.scx")
+
+# Oops? Roll back to the previous version (header-only update)
+pyscx.rollback("atlas.scx")
+```
+
+### Your data lives in the cloud
+
+SCX provides streaming push/pull with S3, GCS, and Azure — no intermediate files.
+Selective pull downloads only matching shards, saving bandwidth on atlas-scale data.
+
+```python
+# Stream from GCS → local packed file (parallel downloads)
+pyscx.pull("gs://bucket/atlas.scxd/", "atlas.scx")
+
+# Selective pull — only download T cells
+pyscx.pull("gs://bucket/atlas.scxd/", "t_cells.scx",
+           filter="cell_type == 'T cell'")
+
+# Direct cloud reads (no full download needed)
+exp = pyscx.open_cloud("gs://bucket/atlas.scxd/")
+print(exp.n_obs, exp.n_vars)
+```
+
+## Installation
+
+### Python (recommended)
+
+```bash
+# Create a virtual environment
+uv venv .venv
+
+# Install pyscx and dependencies
+uv pip install maturin numpy scipy pyarrow anndata
+
+# Build from source
+cd pyscx && ../.venv/bin/maturin develop --release
+
+# With cloud support (S3/GCS/Azure):
+cd pyscx && ../.venv/bin/maturin develop --release --features cloud
+```
+
+### Rust CLI
+
+```bash
+# Build the CLI tool
+cargo build -p scx-cli --release
+
+# With h5ad conversion support:
+cargo build -p scx-cli --release --features hdf5
+
+# With cloud operations:
+cargo build -p scx-cli --release --features hdf5,cloud
+```
 
 ## Quick Start
 
-### Build and Test (Rust)
+### Convert from h5ad
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt --check
-
-# With cloud features:
-cargo test --workspace --features cloud
+scx convert experiment.h5ad experiment.scx
 ```
 
-### Python Bindings
+```python
+import pyscx
 
-**Always use the uv venv** at `.venv/` for all Python work. Do NOT use system Python or pip directly.
+# From AnnData object
+pyscx.from_anndata(adata, "experiment.scx")
+
+# From 10x HDF5
+pyscx.from_10x("filtered_feature_bc_matrix.h5", "experiment.scx")
+```
+
+### Read into AnnData
+
+```python
+adata = pyscx.open("experiment.scx").to_anndata()
+# → standard AnnData with X, obs, var, obsm, layers, uns
+```
+
+### Query and filter
+
+```python
+result = (pyscx.open("experiment.scx")
+    .query()
+    .filter_obs("cell_type == 'B cell'")
+    .collect())
+adata = result.to_anndata()
+```
+
+### CLI
 
 ```bash
-# First time setup:
-uv venv .venv
-uv pip install maturin numpy scipy pyarrow anndata pytest scanpy igraph leidenalg
-
-# Build and test:
-cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v
-
-# With cloud support:
-cd pyscx && ../.venv/bin/maturin develop --features cloud && ../.venv/bin/pytest tests/ -v
+scx info experiment.scx                  # file metadata
+scx validate experiment.scx              # verify checksums
+scx query experiment.scx "tissue == 'lung'" --count
+scx append atlas.scx --input batch2.scx
+scx merge batch1.scx batch2.scx --output atlas.scx
 ```
 
-```bash
-# Or prefix commands with the venv path (no activation needed):
-.venv/bin/python ...
-.venv/bin/maturin develop
-.venv/bin/pytest tests/ -v
-uv pip install <package>       # uv auto-detects the .venv
-```
+## Benchmarks
 
-## Phase 2 Summary
+All benchmarks on Intel Xeon Platinum 8468, 1 TB RAM. Full results in [`benchmarks/results/`](benchmarks/results/).
 
-### Training Loader (`scx-loader`)
-Triple-buffered Rust pipeline for GPU-saturating data loading:
-- Stage 1: tokio async I/O reads shard groups
-- Stage 2: rayon thread pool shuffles, projects HVGs, densifies, normalizes
-- Stage 3: Python `TrainingDataset` iterator hands dense batches to PyTorch
+### Compression
 
-### Query Engine (`scx-engine`)
-Lazy pipeline: `open → filter → select → normalize → collect`:
-- Two-level predicate pushdown (catalog shard pruning + index row pruning)
-- Gene projection, fused normalize+log1p
-- Parallel shard decode via rayon
+| Dataset | Cells | h5ad → SCX | vs Zarr+Zstd |
+|---------|-------|-----------|-------------|
+| PBMC 3K | 2,700 | **4.9×** smaller | 2% smaller |
+| Smart-seq2 | 50,000 | **2.9×** smaller | 5% smaller |
+| Tabula Sapiens | 100,000 | **3.7×** smaller | 10% smaller |
+| Census 1M | 1,000,000 | **4.6×** smaller | 6% smaller |
 
-### File Operations (`scx-ops`)
-- `append` — add cells without rewriting
-- `delete` — logical deletion via Roaring Bitmap
-- `compact` — reclaim space from deleted data
-- `merge` — streaming merge of multiple files
-- `rollback` — revert to previous manifest
+### Memory
 
-### Cloud Access (`scx-cloud`)
-- `push`/`pull` — streaming transfer between local and cloud (S3, GCS, Azure)
-- `explode`/`pack` — packed `.scx` ↔ exploded `.scxd` directory
-- `cloud-optimize` — front-of-file catalog for single-read cloud opens
-- `CloudReader` — direct cloud reads without full download
+| Dataset | h5ad Peak | SCX Peak | Reduction |
+|---------|-----------|----------|-----------|
+| PBMC 3K | 24 MB | 5.5 MB | **4×** |
+| Smart-seq2 | 1.1 GB | 32 MB | **33×** |
+| Tabula Sapiens | 1.6 GB | 42 MB | **38×** |
+| Census 1M | 11.6 GB | 264 MB | **44×** |
 
-## Go/No-Go Gates
+### Training Loader (batches/sec, batch_size=1024)
 
-### Phase 1 — PASSED
-- [x] h5ad → scx → h5ad round-trip is bit-exact for integer counts
-- [x] SCX file < 60% the size of h5ad for typical datasets
-- [x] `scx.open().to_anndata()` → full scanpy pipeline (QC → PCA → Leiden → DE) works
+| Dataset | SCX | AnnData | TileDB-SOMA-ML | SCX/SOMA |
+|---------|-----|---------|----------------|----------|
+| Census 1M | **38.4** | 17.6 | 14.2 | **2.7×** |
+| Tabula Sapiens | 19.9 | 13.9 | 20.8 | 1.0× |
+| Smart-seq2 | 19.7 | 8.7 | 19.6 | 1.0× |
 
-### Phase 2 — PASSED
-- [x] Predicate pushdown skips >50% of shards on filtered queries (55.1% average)
-- [x] Training loader benchmarked with published throughput results
+SCX's advantage grows with dataset size — at atlas scale (1M+ cells), the compressed-shard
+streaming pipeline outperforms random-access approaches.
+
+### Query Engine
+
+| Metric | Result |
+|--------|--------|
+| Shard skip rate | **55%** average |
+| Selective query | **4.2 ms** |
+| vs AnnData subsetting | **2.1×** faster |
+
+### File Operations
+
+| Operation | Speed |
+|-----------|-------|
+| Append 10K cells | **1 ms** |
+| Merge 3 files | **342 MB/s** |
+| Compact (after 3 appends) | 0.98× fresh-write size |
+
+## Architecture
+
+SCX is a Rust workspace with 9 crates:
+
+| Crate | Purpose |
+|-------|---------|
+| `scx-format` | File layout, reader/writer, catalog, checksums |
+| `scx-codec` | Domain-specific codecs: Rice, FOR-BP, Delta-Golomb, Zstd |
+| `scx-sparse` | CSR matrix type (scipy-compatible) |
+| `scx-ops` | Append, delete, compact, merge, rollback |
+| `scx-engine` | Lazy query engine with predicate pushdown |
+| `scx-loader` | Triple-buffered ML training data loader |
+| `scx-cloud` | Cloud access: push, pull, explode, pack, CloudReader |
+| `scx-cli` | CLI tool |
+| `pyscx` | Python bindings (PyO3) |
+
+For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/api.md`](docs/api.md), and [`SPEC.md`](SPEC.md).
 
 ## License
 
