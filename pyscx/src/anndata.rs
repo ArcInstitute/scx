@@ -19,7 +19,7 @@ use crate::to_pyerr;
 // ---------------------------------------------------------------------------
 
 /// Convert an Arrow RecordBatch to a pyarrow Table via IPC bytes.
-fn record_batch_to_pyarrow<'py>(
+pub(crate) fn record_batch_to_pyarrow<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -45,14 +45,14 @@ fn record_batch_to_pyarrow<'py>(
 }
 
 /// Convert a pyarrow Table to a pandas DataFrame.
-fn pyarrow_table_to_pandas<'py>(table: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn pyarrow_table_to_pandas<'py>(table: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let kwargs = pyo3::types::PyDict::new(table.py());
     kwargs.set_item("self_destruct", true)?;
     table.call_method("to_pandas", (), Some(&kwargs))
 }
 
 /// Convert an ScxCsr to a scipy.sparse.csr_matrix via zero-copy numpy arrays.
-fn csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<Bound<'py, PyAny>> {
     let shape = (csr.shape.0, csr.shape.1);
 
     // Zero-copy: moves Vec ownership to numpy

@@ -18,5 +18,7 @@ scx-format = { path = "../scx-format" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-loader = { path = "../scx-loader", features = ["python"] }
+scx-engine = { path = "../scx-engine" }
+scx-ops = { path = "../scx-ops" }
 serde_json = { workspace = true }
 byteorder = { workspace = true }

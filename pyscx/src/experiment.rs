@@ -1,9 +1,13 @@
 // PyExperiment — lazy handle for SCX files
 
+use std::path::PathBuf;
+
 use pyo3::prelude::*;
+use scx_engine::QueryPipeline;
 use scx_format::ScxReader;
 
 use crate::anndata;
+use crate::query::PyQueryPipeline;
 use crate::to_pyerr;
 
 /// A handle to an open SCX file.
@@ -12,12 +16,13 @@ use crate::to_pyerr;
 #[pyclass]
 pub struct PyExperiment {
     reader: ScxReader,
+    path: PathBuf,
 }
 
 impl PyExperiment {
-    /// Construct from an already-opened ScxReader (Rust-only).
-    pub fn from_reader(reader: ScxReader) -> Self {
-        Self { reader }
+    /// Construct from an already-opened ScxReader and its path (Rust-only).
+    pub fn new(reader: ScxReader, path: PathBuf) -> Self {
+        Self { reader, path }
     }
 }
 
@@ -63,6 +68,20 @@ impl PyExperiment {
     #[getter]
     fn layer_names(&self) -> Vec<String> {
         self.reader.layer_names()
+    }
+
+    /// Create a new query pipeline for this file.
+    ///
+    /// Returns a `PyQueryPipeline` builder — call `.filter_obs()`,
+    /// `.select_genes()`, etc., then `.collect()` to execute.
+    ///
+    /// Example:
+    ///     result = pyscx.open("data.scx").query().collect()
+    fn query(&self) -> PyResult<PyQueryPipeline> {
+        let pipeline = QueryPipeline::open(&self.path).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+        })?;
+        Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
 
     /// Convert this SCX file to an AnnData object.

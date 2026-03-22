@@ -1,10 +1,13 @@
 mod anndata;
 mod experiment;
+mod ops;
+mod query;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use experiment::PyExperiment;
+use query::{PyQueryPipeline, PyQueryResult};
 use scx_format::ScxError;
 
 /// Convert an ScxError into a Python RuntimeError.
@@ -20,7 +23,7 @@ fn to_pyerr(e: ScxError) -> PyErr {
 #[pyfunction]
 fn open(path: &str) -> PyResult<PyExperiment> {
     let reader = scx_format::ScxReader::open(path).map_err(to_pyerr)?;
-    Ok(PyExperiment::from_reader(reader))
+    Ok(PyExperiment::new(reader, std::path::PathBuf::from(path)))
 }
 
 /// Convert an AnnData object to an SCX file.
@@ -67,6 +70,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_class::<PyExperiment>()?;
+    m.add_class::<PyQueryPipeline>()?;
+    m.add_class::<PyQueryResult>()?;
     m.add_class::<scx_loader::TrainingDataset>()?;
     Ok(())
 }
