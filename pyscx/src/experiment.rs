@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 use scx_engine::QueryPipeline;
 use scx_format::ScxReader;
@@ -16,7 +17,7 @@ use crate::to_pyerr;
 #[pyclass]
 pub struct PyExperiment {
     reader: ScxReader,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 impl PyExperiment {
@@ -84,6 +85,33 @@ impl PyExperiment {
         Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
 
+    /// Mark cells as logically deleted using a boolean mask.
+    ///
+    /// The mask should be a boolean numpy array whose length matches n_obs.
+    /// Cells where the mask is True are marked as deleted.
+    /// Returns the total number of deleted cells (including previously deleted).
+    ///
+    /// Example:
+    ///     exp = pyscx.open("experiment.scx")
+    ///     adata = exp.to_anndata()
+    ///     total = exp.mark_deleted(adata.obs["is_doublet"] == True)
+    fn mark_deleted(&self, mask: PyReadonlyArray1<'_, bool>) -> PyResult<u64> {
+        let mask_slice = mask
+            .as_slice()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Collect indices where mask is True
+        let indices: Vec<u64> = mask_slice
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v)
+            .map(|(i, _)| i as u64)
+            .collect();
+
+        scx_ops::mark_deleted(&self.path, &indices)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Convert this SCX file to an AnnData object.
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
@@ -110,3 +138,4 @@ impl PyExperiment {
         )
     }
 }
+

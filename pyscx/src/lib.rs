@@ -66,9 +66,20 @@ fn from_10x(
 
 #[pymodule]
 fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
+
+    // File operations (scx-ops)
+    m.add_function(wrap_pyfunction!(ops::append, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::mark_deleted, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
+
+    // Classes
     m.add_class::<PyExperiment>()?;
     m.add_class::<PyQueryPipeline>()?;
     m.add_class::<PyQueryResult>()?;

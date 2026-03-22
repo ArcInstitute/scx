@@ -169,7 +169,7 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
 // ---------------------------------------------------------------------------
 
 /// Detect the best value encoding for f32 data.
-fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
+pub(crate) fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
     let mut all_integer = true;
     let mut max_val: f32 = 0.0;
 
@@ -197,7 +197,7 @@ fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
 }
 
 /// Encode f32 values to raw LE bytes according to a value encoding.
-fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
+pub(crate) fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
     match encoding {
         ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
         ValueEncoding::Uint16 => {
@@ -229,7 +229,7 @@ fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
 
 /// Parse codec name string to Option<CodecId>.
 /// Returns None for auto mode (default), Some(id) for explicit codec.
-fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
+pub(crate) fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
     match codec {
         None | Some("auto") => Ok(None),
         Some("none") => Ok(Some(CodecId::None)),
@@ -243,7 +243,7 @@ fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
 }
 
 /// Convert a pandas DataFrame to an Arrow RecordBatch via pyarrow IPC.
-fn pandas_to_record_batch(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+pub(crate) fn pandas_to_record_batch(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     let table = table_cls.call_method1("from_pandas", (df,))?;
@@ -273,7 +273,7 @@ fn pandas_to_record_batch(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<Rec
 }
 
 /// Ensure X is a CSR matrix; convert from dense or CSC if needed.
-fn ensure_csr<'py>(py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn ensure_csr<'py>(py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let is_sparse = scipy_sparse
         .call_method1("issparse", (x,))?
