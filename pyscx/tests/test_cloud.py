@@ -1,0 +1,197 @@
+"""Tests for pyscx cloud operations (pull, push, explode, pack, cloud_optimize).
+
+These tests use local filesystem paths only (no actual cloud access).
+Requires: maturin develop --features cloud
+"""
+
+import os
+import tempfile
+import numpy as np
+import pytest
+import scipy.sparse as sp
+
+
+def _create_test_scx(path: str, n_obs: int = 100, n_vars: int = 50):
+    """Create a test .scx file using pyscx.from_anndata."""
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(42)
+    X = sp.random(n_obs, n_vars, density=0.1, format="csr", dtype=np.float32,
+                   random_state=rng)
+    X.data = np.round(X.data * 10).astype(np.float32)
+
+    obs_data = {
+        "cell_id": [f"cell_{i}" for i in range(n_obs)],
+        "cell_type": [["T_cell", "B_cell", "Monocyte"][i % 3] for i in range(n_obs)],
+    }
+    var_data = {"gene_id": [f"gene_{i}" for i in range(n_vars)]}
+
+    adata = anndata.AnnData(
+        X=X,
+        obs=obs_data,
+        var=var_data,
+    )
+    pyscx.from_anndata(adata, path, codec="none")
+
+
+class TestPullFromLocalExploded:
+    """Test: Python pull from local exploded directory."""
+
+    def test_pull_returns_stats_dict(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            pulled_path = os.path.join(tmpdir, "pulled.scx")
+            stats = pyscx.pull(exploded_dir, pulled_path)
+
+            assert isinstance(stats, dict)
+            assert "bytes_downloaded" in stats
+            assert "sections_downloaded" in stats
+            assert "elapsed_secs" in stats
+            assert stats["bytes_downloaded"] > 0
+            assert stats["sections_downloaded"] > 0
+
+    def test_pulled_file_readable(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            pulled_path = os.path.join(tmpdir, "pulled.scx")
+            pyscx.pull(exploded_dir, pulled_path)
+
+            exp = pyscx.open(pulled_path)
+            assert exp.n_obs == 100
+            assert exp.n_vars == 50
+
+
+class TestExplodePackRoundtrip:
+    """Test: Python explode → pack round-trip."""
+
+    def test_roundtrip_preserves_data(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_path = os.path.join(tmpdir, "original.scx")
+            _create_test_scx(orig_path)
+
+            # Read original data
+            exp_orig = pyscx.open(orig_path)
+            adata_orig = exp_orig.to_anndata()
+
+            # Explode → pack
+            exploded_dir = os.path.join(tmpdir, "exploded.scxd")
+            pyscx.explode(orig_path, exploded_dir)
+
+            packed_path = os.path.join(tmpdir, "packed.scx")
+            pyscx.pack(exploded_dir, packed_path)
+
+            # Read round-tripped data
+            exp_rt = pyscx.open(packed_path)
+            adata_rt = exp_rt.to_anndata()
+
+            assert adata_orig.n_obs == adata_rt.n_obs
+            assert adata_orig.n_vars == adata_rt.n_vars
+
+    def test_exploded_directory_has_expected_files(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            assert os.path.exists(os.path.join(exploded_dir, "_catalog.bin"))
+            assert os.path.exists(os.path.join(exploded_dir, "_header.bin"))
+            assert os.path.exists(os.path.join(exploded_dir, "obs.arrow"))
+            assert os.path.exists(os.path.join(exploded_dir, "var.arrow"))
+            assert os.path.isdir(os.path.join(exploded_dir, "X"))
+
+
+class TestCloudOptimize:
+    """Test: Python cloud_optimize produces cloud-ready file."""
+
+    def test_cloud_optimize_with_output(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            optimized_path = os.path.join(tmpdir, "cloud_ready.scx")
+            pyscx.cloud_optimize(scx_path, optimized_path)
+
+            exp = pyscx.open(optimized_path)
+            assert exp.n_obs == 100
+            assert exp.n_vars == 50
+
+    def test_cloud_optimize_in_place(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            orig_size = os.path.getsize(scx_path)
+            pyscx.cloud_optimize(scx_path)
+
+            # File should still be readable after in-place optimize
+            exp = pyscx.open(scx_path)
+            assert exp.n_obs == 100
+            assert exp.n_vars == 50
+
+            # File should be larger due to front catalog
+            new_size = os.path.getsize(scx_path)
+            assert new_size >= orig_size
+
+
+class TestPushPull:
+    """Test: push → pull round-trip via Python bindings."""
+
+    def test_push_returns_stats(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            dest_dir = os.path.join(tmpdir, "pushed.scxd")
+            os.makedirs(dest_dir)
+            stats = pyscx.push(scx_path, dest_dir)
+
+            assert isinstance(stats, dict)
+            assert "bytes_uploaded" in stats
+            assert "sections_uploaded" in stats
+            assert stats["bytes_uploaded"] > 0
+
+    def test_push_pull_roundtrip(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path)
+
+            dest_dir = os.path.join(tmpdir, "pushed.scxd")
+            os.makedirs(dest_dir)
+            pyscx.push(scx_path, dest_dir)
+
+            pulled_path = os.path.join(tmpdir, "pulled.scx")
+            pyscx.pull(dest_dir, pulled_path)
+
+            exp_orig = pyscx.open(scx_path)
+            exp_pulled = pyscx.open(pulled_path)
+            assert exp_orig.n_obs == exp_pulled.n_obs
+            assert exp_orig.n_vars == exp_pulled.n_vars

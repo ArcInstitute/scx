@@ -3,6 +3,9 @@ mod experiment;
 mod ops;
 mod query;
 
+#[cfg(feature = "cloud")]
+mod cloud;
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -79,6 +82,16 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
 
+    // Cloud operations (optional, behind "cloud" feature)
+    #[cfg(feature = "cloud")]
+    {
+        m.add_function(wrap_pyfunction!(cloud::pull, m)?)?;
+        m.add_function(wrap_pyfunction!(cloud::push, m)?)?;
+        m.add_function(wrap_pyfunction!(cloud::cloud_optimize, m)?)?;
+        m.add_function(wrap_pyfunction!(cloud::explode, m)?)?;
+        m.add_function(wrap_pyfunction!(cloud::pack, m)?)?;
+    }
+
     // Classes
     m.add_class::<PyExperiment>()?;
     m.add_class::<PyQueryPipeline>()?;
@@ -86,3 +99,4 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::TrainingDataset>()?;
     Ok(())
 }
+

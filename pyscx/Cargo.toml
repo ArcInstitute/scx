@@ -20,5 +20,10 @@ scx-sparse = { path = "../scx-sparse" }
 scx-loader = { path = "../scx-loader", features = ["python"] }
 scx-engine = { path = "../scx-engine" }
 scx-ops = { path = "../scx-ops" }
+scx-cloud = { path = "../scx-cloud", optional = true }
+tokio = { workspace = true, optional = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
+
+[features]
+cloud = ["scx-cloud", "tokio"]
