@@ -10,6 +10,7 @@
 //! [Phase2-Step5.md §D](../Phase2-Step5.md#phase-d--decode-stage-stage-2).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use arrow::array::{
     Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
@@ -20,6 +21,12 @@ use arrow::record_batch::RecordBatch;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
+
+fn profiling_enabled() -> bool {
+    std::env::var("SCX_LOADER_PROFILE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
 
 use crate::batch::{Batch, ObsColumn};
 use crate::error::{LoaderError, Result};
@@ -389,23 +396,36 @@ pub fn decode_stage(
         config.seed.wrapping_add(0xDEADBEEF).wrapping_add(epoch.wrapping_mul(0x9E3779B97F4A7C15)),
     );
 
+    let profile = profiling_enabled();
+    let decode_start = Instant::now();
+    let mut group_count = 0usize;
+    let mut total_batches = 0usize;
+    let mut total_scatter_us = 0u128;
+
     // Receive shard groups from I/O stage via blocking_recv on the tokio channel.
     // This function runs on a standard thread, not inside the tokio runtime.
     while let Some(group) = rx.blocking_recv() {
+        let t_group = Instant::now();
+
         // Step 1: Build index for efficient row lookup
+        let t0 = Instant::now();
         let group_index = ShardGroupIndex::build(&group);
+        let index_time = t0.elapsed();
 
         // Step 2: Pool all non-deleted cell indices
         let mut cell_indices = group_index.cell_indices();
+        let n_cells = cell_indices.len();
 
         // Step 3: Shuffle rows (Level 2 — Fisher-Yates)
         RowShuffler::shuffle_rows(&mut cell_indices, &mut rng);
 
         // Step 4: Draw mini-batches
+        let mut group_batches = 0;
         for batch_cells in cell_indices.chunks(config.batch_size) {
             let n_rows = batch_cells.len();
 
             // Step 5+6: Parallel scatter + normalize
+            let t_scatter = Instant::now();
             let x = fill_batch_parallel(
                 batch_cells,
                 &group_index,
@@ -415,6 +435,7 @@ pub fn decode_stage(
                 config.log1p,
                 n_output_genes,
             );
+            total_scatter_us += t_scatter.elapsed().as_micros();
 
             // Step 7: Extract obs metadata columns
             let obs = if config.obs_columns.is_empty() {
@@ -436,7 +457,19 @@ pub fn decode_stage(
                     "decode stage: failed to send batch: {e}"
                 ))
             })?;
+            group_batches += 1;
         }
+        total_batches += group_batches;
+        if profile {
+            eprintln!("[scx-loader profile] decode_stage group {group_count}: {:?} ({n_cells} cells, {group_batches} batches, index={:?})",
+                t_group.elapsed(), index_time);
+        }
+        group_count += 1;
+    }
+
+    if profile {
+        eprintln!("[scx-loader profile] decode_stage total: {:?} ({total_batches} batches, {group_count} groups, scatter_total={total_scatter_us}µs)",
+            decode_start.elapsed());
     }
 
     // Channel closed — I/O stage is done. Drop tx to signal end-of-epoch.

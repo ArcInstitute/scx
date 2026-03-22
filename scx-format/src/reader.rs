@@ -474,6 +474,26 @@ impl ScxReader {
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        self.read_shard_from_entry_inner(entry, true)
+    }
+
+    /// Read and decode a single shard without verifying checksums.
+    ///
+    /// Used by the training data loader where throughput is critical and data
+    /// integrity was already verified at file open time. Skips the BLAKE3
+    /// checksum computation and the associated payload copy.
+    pub fn read_shard_from_entry_unchecked(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        self.read_shard_from_entry_inner(entry, false)
+    }
+
+    fn read_shard_from_entry_inner(
+        &self,
+        entry: &FullCatalogEntry,
+        verify_checksum: bool,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
         let section = self.section_bytes(entry);
 
         // Parse shard header
@@ -487,15 +507,17 @@ impl ScxReader {
         let block_index_bytes =
             &section[sh.block_index_rel_offset as usize..][..sh.block_index_length as usize];
 
-        // Verify shard checksum
-        let mut payload = Vec::new();
-        payload.extend_from_slice(indptr_bytes);
-        payload.extend_from_slice(indices_bytes);
-        payload.extend_from_slice(values_bytes);
-        payload.extend_from_slice(block_index_bytes);
-        let computed = blake3_truncated_64(&payload);
-        if computed != sh.checksum {
-            return Err(ScxError::ChecksumMismatch);
+        if verify_checksum {
+            // Verify shard checksum
+            let mut payload = Vec::new();
+            payload.extend_from_slice(indptr_bytes);
+            payload.extend_from_slice(indices_bytes);
+            payload.extend_from_slice(values_bytes);
+            payload.extend_from_slice(block_index_bytes);
+            let computed = blake3_truncated_64(&payload);
+            if computed != sh.checksum {
+                return Err(ScxError::ChecksumMismatch);
+            }
         }
 
         // Resolve codec and encoding from shard header (NOT file header)

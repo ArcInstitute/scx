@@ -118,26 +118,75 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n_bits` bits and return them as a `u64`, LSB first.
+    ///
+    /// Uses batch extraction from the underlying byte stream instead of
+    /// per-bit reads. This is the hot path for FOR-BP and Rice decoders.
     #[inline]
     pub fn read_bits(&mut self, n_bits: u8) -> Result<u64, BitStreamError> {
+        if n_bits == 0 {
+            return Ok(0);
+        }
+
         let mut value: u64 = 0;
-        for i in 0..n_bits {
-            if self.read_bit()? {
-                value |= 1u64 << i;
+        let mut bits_remaining = n_bits as usize;
+        let mut shift = 0usize;
+
+        while bits_remaining > 0 {
+            if self.byte_pos >= self.data.len() {
+                return Err(BitStreamError);
+            }
+
+            // How many bits available in the current byte?
+            let avail = (8 - self.bit_pos as usize).min(bits_remaining);
+
+            // Extract `avail` bits from current byte starting at bit_pos
+            let mask = ((1u16 << avail) - 1) as u8;
+            let bits = (self.data[self.byte_pos] >> self.bit_pos) & mask;
+            value |= (bits as u64) << shift;
+
+            shift += avail;
+            bits_remaining -= avail;
+            self.bit_pos += avail as u8;
+            if self.bit_pos >= 8 {
+                self.byte_pos += 1;
+                self.bit_pos = 0;
             }
         }
+
         Ok(value)
     }
 
     /// Read a unary code: count ones until a zero is encountered.
     /// Returns the number of ones read.
+    ///
+    /// Uses byte-level scanning to skip runs of 1-bits efficiently.
     #[inline]
     pub fn read_unary(&mut self) -> Result<u64, BitStreamError> {
         let mut count: u64 = 0;
         loop {
-            if self.read_bit()? {
-                count += 1;
+            if self.byte_pos >= self.data.len() {
+                return Err(BitStreamError);
+            }
+
+            // Get remaining bits in current byte (from bit_pos to 7)
+            let byte = self.data[self.byte_pos] >> self.bit_pos;
+            let remaining_bits = 8 - self.bit_pos;
+
+            if byte == 0xFF >> self.bit_pos {
+                // All remaining bits in this byte are 1s — skip the whole byte
+                count += remaining_bits as u64;
+                self.byte_pos += 1;
+                self.bit_pos = 0;
             } else {
+                // Find the first zero bit (trailing_ones counts consecutive 1s from LSB)
+                let ones = byte.trailing_ones();
+                count += ones as u64;
+                // Advance past the ones and the terminating zero
+                self.bit_pos += ones as u8 + 1;
+                if self.bit_pos >= 8 {
+                    self.byte_pos += 1;
+                    self.bit_pos = 0;
+                }
                 return Ok(count);
             }
         }

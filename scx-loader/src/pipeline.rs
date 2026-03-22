@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use scx_format::deletion_vectors::DeletionVectors;
@@ -11,6 +12,13 @@ use crate::error::{LoaderError, Result};
 use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
 use crate::shuffle::ShardShuffler;
+
+/// Returns true if SCX_LOADER_PROFILE env var is set to "1" or "true".
+fn profiling_enabled() -> bool {
+    std::env::var("SCX_LOADER_PROFILE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
 
 /// Configuration for the training data loader pipeline.
 ///
@@ -231,10 +239,15 @@ impl TrainingPipeline {
     /// memory budget, and prepares the pipeline. Does NOT start any pipeline
     /// stages — call `start_epoch()` to begin iteration.
     pub fn new(path: impl AsRef<Path>, config: LoaderConfig) -> Result<Self> {
+        let profile = profiling_enabled();
+        let t_start = Instant::now();
+
         config.validate()?;
 
         // Open SCX file
+        let t0 = Instant::now();
         let reader = Arc::new(ScxReader::open(path)?);
+        if profile { eprintln!("[scx-loader profile] open: {:?}", t0.elapsed()); }
 
         // Read header metadata
         let header = reader.header();
@@ -243,10 +256,14 @@ impl TrainingPipeline {
         let n_csr_shards = reader.catalog().shards_sorted().len();
 
         // Read obs metadata (full RecordBatch for column extraction)
+        let t0 = Instant::now();
         let obs_metadata = reader.read_obs()?;
+        if profile { eprintln!("[scx-loader profile] read_obs: {:?} ({} rows)", t0.elapsed(), obs_metadata.num_rows()); }
 
         // Load deletion vectors if present
+        let t0 = Instant::now();
         let deletion_vectors = reader.read_deletion_vectors()?;
+        if profile { eprintln!("[scx-loader profile] read_deletion_vectors: {:?}", t0.elapsed()); }
 
         // Compute average nnz per cell for memory budget estimation
         let avg_nnz_per_cell = if header.n_obs > 0 {
@@ -283,6 +300,13 @@ impl TrainingPipeline {
             .build()
             .map_err(|e| LoaderError::ShutdownError(format!("failed to create tokio runtime: {e}")))?;
 
+        if profile {
+            eprintln!("[scx-loader profile] TrainingPipeline::new total: {:?}", t_start.elapsed());
+            eprintln!("[scx-loader profile]   n_vars={n_vars}, n_shards={n_csr_shards}, shard_target_rows={shard_target_rows}");
+            eprintln!("[scx-loader profile]   memory_budget: shard_group_size={}, prefetch_batches={}, estimated_bytes={}",
+                memory_budget.shard_group_size, memory_budget.prefetch_batches, memory_budget.estimated_bytes);
+        }
+
         Ok(TrainingPipeline {
             config,
             reader,
@@ -316,13 +340,15 @@ impl TrainingPipeline {
         let shard_groups = self.shuffler.shuffle_epoch();
 
         // Create bounded channels
-        // I/O → Decode: tokio mpsc channel, capacity = shard_group_size
-        let (io_tx, io_rx) =
-            tokio::sync::mpsc::channel(self.memory_budget.shard_group_size.max(1));
+        // I/O → Decode: tokio mpsc channel. Use at least 2 to allow read-ahead
+        // (pipeline overlap between I/O and decode stages).
+        let io_channel_cap = self.memory_budget.shard_group_size.max(2);
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(io_channel_cap);
 
         // Decode → Consumer: crossbeam bounded channel, capacity = prefetch_batches
-        let (batch_tx, batch_rx) =
-            crossbeam_channel::bounded(self.memory_budget.prefetch_batches.max(1));
+        // Use at least 2 to allow decode to run ahead of consumer.
+        let batch_channel_cap = self.memory_budget.prefetch_batches.max(2);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(batch_channel_cap);
 
         // Spawn I/O stage as a tokio task
         let io_reader = Arc::clone(&self.reader);

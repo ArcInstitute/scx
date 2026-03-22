@@ -5,11 +5,18 @@
 // SPEC.md §8.2 (Triple-Buffered Pipeline).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use roaring::RoaringBitmap;
 use scx_format::reader::ScxReader;
 
 use crate::error::{LoaderError, Result};
+
+fn profiling_enabled() -> bool {
+    std::env::var("SCX_LOADER_PROFILE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
 
 // Compile-time assertion: ScxReader must be Send + Sync for Arc sharing
 // across tokio tasks and rayon threads.
@@ -87,13 +94,20 @@ pub async fn io_stage(
         None => std::collections::HashMap::new(),
     };
 
+    let profile = profiling_enabled();
+    let io_start = Instant::now();
+    let mut group_count = 0usize;
+
     for group_indices in shard_groups {
         // Clone Arc handles for the spawn_blocking closure.
         let reader = Arc::clone(&reader);
         let deletion_map = deletion_map.clone();
+        let group_num = group_count;
+        group_count += 1;
 
         // Perform blocking shard reads inside spawn_blocking.
         let group = tokio::task::spawn_blocking(move || -> Result<ShardGroup> {
+            let t0 = Instant::now();
             let sorted = reader.catalog().shards_sorted();
             let mut shards = Vec::with_capacity(group_indices.len());
 
@@ -132,8 +146,9 @@ pub async fn io_stage(
                     }
                 }
 
-                // Decode the shard CSR data.
-                let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
+                // Decode the shard CSR data (skip checksum for throughput —
+                // data integrity verified at file open or via explicit validate()).
+                let (indptr, indices, data) = reader.read_shard_from_entry_unchecked(entry)?;
 
                 shards.push(ShardData {
                     indptr,
@@ -145,16 +160,26 @@ pub async fn io_stage(
                 });
             }
 
+            let profile_inner = std::env::var("SCX_LOADER_PROFILE").map(|v| v == "1" || v == "true").unwrap_or(false);
+            if profile_inner {
+                let total_rows: u32 = shards.iter().map(|s| s.n_rows).sum();
+                eprintln!("[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows)", t0.elapsed(), shards.len(), total_rows);
+            }
+
             Ok(ShardGroup { shards })
         })
         .await
         .map_err(|e| LoaderError::ShutdownError(format!("I/O stage task panicked: {e}")))??;
 
         // Send the group via bounded channel (blocks if full = back-pressure).
+        let t_send = Instant::now();
         tx.send(group).await.map_err(|e| {
             LoaderError::ChannelError(format!("I/O stage: failed to send shard group: {e}"))
         })?;
+        if profile { eprintln!("[scx-loader profile] io_stage group {group_num} send wait: {:?}", t_send.elapsed()); }
     }
+
+    if profile { eprintln!("[scx-loader profile] io_stage total: {:?} ({group_count} groups)", io_start.elapsed()); }
 
     // Drop sender implicitly when function returns → signals end-of-epoch.
     Ok(())
