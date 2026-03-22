@@ -535,9 +535,10 @@ def bench_baseline_bpcells(dataset_name: str, batch_size: int = 1024) -> dict:
 # GPU benchmarks
 # ---------------------------------------------------------------------------
 def bench_gpu_utilization(dataset_name: str) -> dict:
-    """Measure GPU utilization during a training-like loop."""
+    """Measure GPU utilization during scVI-equivalent VAE training loop."""
     try:
         import torch
+        import torch.nn as nn
         if not torch.cuda.is_available():
             return {"benchmark": "gpu_utilization", "error": "CUDA not available"}
     except ImportError:
@@ -547,41 +548,82 @@ def bench_gpu_utilization(dataset_name: str) -> dict:
 
     scx_path = ensure_scx(dataset_name)
 
-    # Start nvidia-smi monitoring in background
-    smi_log = Path("/tmp/nvidia_smi_log.csv")
+    device = torch.device("cuda:0")
+    n_hvg = 2000
+
+    # Build scVI-equivalent VAE
+    class ScviVAE(nn.Module):
+        def __init__(self, n_input, n_latent=128, n_hidden=128):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(n_input, n_hidden), nn.BatchNorm1d(n_hidden),
+                nn.ReLU(), nn.Dropout(0.1),
+                nn.Linear(n_hidden, n_hidden), nn.BatchNorm1d(n_hidden),
+                nn.ReLU(), nn.Dropout(0.1),
+            )
+            self.z_mean = nn.Linear(n_hidden, n_latent)
+            self.z_var = nn.Linear(n_hidden, n_latent)
+            self.decoder = nn.Sequential(
+                nn.Linear(n_latent, n_hidden), nn.BatchNorm1d(n_hidden),
+                nn.ReLU(), nn.Dropout(0.1),
+                nn.Linear(n_hidden, n_hidden), nn.BatchNorm1d(n_hidden),
+                nn.ReLU(), nn.Dropout(0.1),
+            )
+            self.px_rate = nn.Linear(n_hidden, n_input)
+
+        def forward(self, x):
+            h = self.encoder(x)
+            mu, logvar = self.z_mean(h), self.z_var(h)
+            z = mu + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
+            rate = torch.exp(self.px_rate(self.decoder(z)))
+            recon = torch.mean(rate - x * torch.log(rate + 1e-8))
+            kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            return recon + kl
+
+    model = ScviVAE(n_hvg).to(device)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    ds = pyscx.TrainingDataset(
+        str(scx_path), batch_size=1024,
+        hvg_indices=list(range(n_hvg)),
+        normalize=True, log1p=True, seed=42,
+    )
+
+    # Warmup epoch (no monitoring)
+    for batch in ds:
+        X = torch.from_numpy(batch["X"]).to(device, non_blocking=True)
+        loss = model(X)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    # Start nvidia-smi monitoring
+    smi_log = Path(f"/tmp/nvidia_smi_log_{os.getpid()}.csv")
     smi_proc = subprocess.Popen(
         ["nvidia-smi", "dmon", "-s", "u", "-d", "1", "-f", str(smi_log)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    time.sleep(1)  # let nvidia-smi start
 
     try:
-        ds = pyscx.TrainingDataset(
-            str(scx_path),
-            batch_size=1024,
-            hvg_indices=list(range(2000)),
-            normalize=True, log1p=True, seed=42,
-        )
-
-        device = torch.device("cuda:0")
-
-        # Simple forward pass simulation (matrix multiply as proxy for model work)
-        # This tests whether the loader can keep the GPU busy
-        dummy_weight = torch.randn(2000, 256, device=device)
-
         n_batches = 0
         with Timer() as t:
             for batch in ds:
                 X = torch.from_numpy(batch["X"]).to(device, non_blocking=True)
-                # Simulate a forward pass
-                _ = X @ dummy_weight
-                torch.cuda.synchronize()
+                loss = model(X)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
                 n_batches += 1
 
-        del dummy_weight
-        torch.cuda.empty_cache()
+        time.sleep(2)  # final GPU samples
     finally:
         smi_proc.terminate()
         smi_proc.wait()
+
+    del model, optimizer
+    torch.cuda.empty_cache()
 
     # Parse nvidia-smi log for GPU utilization
     gpu_utils = []
@@ -595,10 +637,13 @@ def bench_gpu_utilization(dataset_name: str) -> dict:
                     pass
         smi_log.unlink(missing_ok=True)
 
-    avg_util = sum(gpu_utils) / len(gpu_utils) if gpu_utils else 0
+    # Trim startup/shutdown noise
+    trimmed = gpu_utils[1:-1] if len(gpu_utils) > 2 else gpu_utils
+    avg_util = sum(trimmed) / len(trimmed) if trimmed else 0
     return {
         "benchmark": "gpu_utilization",
         "dataset": dataset_name,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
         "n_batches": n_batches,
         "total_time_s": round(t.elapsed, 3),
         "batches_per_sec": round(n_batches / t.elapsed, 1) if t.elapsed > 0 else 0,
