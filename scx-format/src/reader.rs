@@ -43,6 +43,14 @@ impl ScxReader {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Hint the kernel that we read sequentially so it can prefetch ahead
+        // and reclaim already-read pages, reducing peak RSS for large files.
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            let _ = mmap.advise(Advice::Sequential);
+        }
+
         // Check minimum file size (header + root catalog placeholder)
         if mmap.len() < HEADER_SIZE {
             return Err(ScxError::Io(std::io::Error::new(

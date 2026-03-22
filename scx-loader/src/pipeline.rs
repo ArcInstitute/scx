@@ -110,8 +110,10 @@ pub struct MemoryBudget {
     pub prefetch_batches: usize,
     /// Effective batch_size (may be reduced to fit budget for large gene counts).
     pub batch_size: usize,
-    /// Estimated total memory in bytes.
+    /// Estimated total memory in bytes (includes mmap file size).
     pub estimated_bytes: usize,
+    /// Size of the mmap'd SCX file in bytes (included in estimated_bytes).
+    pub mmap_bytes: usize,
     /// True if estimated memory exceeds the budget even at all minimums.
     pub budget_exceeded: bool,
 }
@@ -123,6 +125,7 @@ pub struct MemoryBudget {
 /// n_output_genes     = hvg_indices.len() if present, else n_vars
 /// shard_buffer       = (shard_group_size + 1) × decoded_shard_bytes
 /// batch_buffer       = (max(prefetch_batches, 2) + 1) × batch_size × n_output_genes × 4
+/// mmap_resident      = file_size_bytes (entire file faulted into RSS during epoch)
 /// overhead           = ~50 MB (Python interpreter, numpy, Arrow, thread stacks)
 /// ```
 ///
@@ -135,6 +138,7 @@ pub fn compute_memory_budget(
     n_vars: u64,
     shard_target_rows: u32,
     avg_nnz_per_cell: f64,
+    file_size_bytes: usize,
 ) -> MemoryBudget {
     let n_output_genes = match &config.hvg_indices {
         Some(hvg) => hvg.len(),
@@ -155,6 +159,7 @@ pub fn compute_memory_budget(
             n_output_genes,
             shard_target_rows as usize,
             avg_nnz_per_cell,
+            file_size_bytes,
         );
 
         if estimated <= max_bytes {
@@ -163,6 +168,7 @@ pub fn compute_memory_budget(
                 prefetch_batches,
                 batch_size,
                 estimated_bytes: estimated,
+                mmap_bytes: file_size_bytes,
                 budget_exceeded: false,
             };
         }
@@ -191,6 +197,7 @@ pub fn compute_memory_budget(
             prefetch_batches,
             batch_size,
             estimated_bytes: estimated,
+            mmap_bytes: file_size_bytes,
             budget_exceeded: true,
         };
     }
@@ -201,6 +208,7 @@ pub fn compute_memory_budget(
 /// Uses a data-driven model that accounts for:
 /// - I/O-decode pipeline overlap (shard_group_size + 1 decoded shards live)
 /// - Batch channel + consumer (prefetch_batches.max(2) + 1 batches live)
+/// - Mmap'd file (entire file faulted into RSS during a full epoch)
 /// - Python/runtime overhead (~50 MB for interpreter, numpy, Arrow, threads)
 fn estimate_memory(
     shard_group_size: usize,
@@ -209,6 +217,7 @@ fn estimate_memory(
     n_output_genes: usize,
     shard_target_rows: usize,
     avg_nnz_per_cell: f64,
+    file_size_bytes: usize,
 ) -> usize {
     // Decoded shard stores i64 indptr + i32 indices + f32 values = 12 bytes/nnz
     const BYTES_PER_NNZ_DECODED: usize = 12;
@@ -227,7 +236,13 @@ fn estimate_memory(
     let batch_bytes = batch_size * n_output_genes * 4; // f32
     let batch_buffer = live_batches * batch_bytes;
 
-    shard_buffer + batch_buffer + PYTHON_OVERHEAD
+    // Mmap'd file: the OS faults pages into RSS as shards are read sequentially.
+    // During a full epoch, most of the file will be resident in page cache.
+    // With MADV_SEQUENTIAL the kernel may reclaim pages, but we conservatively
+    // include the full file size since ru_maxrss captures the high-water mark.
+    let mmap_resident = file_size_bytes;
+
+    shard_buffer + batch_buffer + mmap_resident + PYTHON_OVERHEAD
 }
 
 // ---------------------------------------------------------------------------
@@ -302,11 +317,13 @@ impl TrainingPipeline {
         };
 
         // Compute memory budget and auto-tune parameters
+        let file_size_bytes = reader.mmap().len();
         let memory_budget = compute_memory_budget(
             &config,
             n_vars,
             shard_target_rows,
             avg_nnz_per_cell,
+            file_size_bytes,
         );
 
         // Propagate effective batch_size back into config
@@ -754,7 +771,7 @@ mod tests {
             ..LoaderConfig::default()
         };
         let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0,
+            &config, 30_000, 16_384, 10.0, 0,
         );
         let budget_mb = budget.estimated_bytes / (1024 * 1024);
         assert!(
@@ -771,7 +788,7 @@ mod tests {
     fn test_memory_budget_30k_genes_auto_tuned() {
         let config = LoaderConfig::default();
         let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0,
+            &config, 30_000, 16_384, 10.0, 0,
         );
         assert!(budget.shard_group_size >= 1);
         assert!(budget.prefetch_batches >= 2);
@@ -786,7 +803,7 @@ mod tests {
             ..LoaderConfig::default()
         };
         let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0,
+            &config, 30_000, 16_384, 10.0, 0,
         );
         assert!(
             budget.shard_group_size < 8 || budget.prefetch_batches < 4 || budget.batch_size < 1024,
@@ -805,7 +822,7 @@ mod tests {
             ..LoaderConfig::default()
         };
         let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0,
+            &config, 30_000, 16_384, 10.0, 0,
         );
         assert_eq!(
             budget.shard_group_size, 1,
@@ -825,7 +842,7 @@ mod tests {
     fn test_memory_budget_61k_genes_reduces_batch_size() {
         // 61K genes without HVG projection — batch_size must be reduced
         let config = LoaderConfig::default(); // 512 MB budget, no HVG
-        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0);
+        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0, 0);
         assert!(
             budget.batch_size < 1024,
             "61K genes should reduce batch_size from 1024, got {}",
@@ -842,7 +859,7 @@ mod tests {
             max_memory_mb: 64,
             ..LoaderConfig::default()
         };
-        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0);
+        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0, 0);
         assert_eq!(budget.batch_size, 64);
         assert_eq!(budget.shard_group_size, 1);
         assert_eq!(budget.prefetch_batches, 2);
@@ -856,12 +873,45 @@ mod tests {
             max_memory_mb: 200,
             ..LoaderConfig::default()
         };
-        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0);
+        let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0, 0);
         // batch_size should be a power-of-2 fraction of 1024
         assert!(
             budget.batch_size == 64 || budget.batch_size == 128 || budget.batch_size == 256 || budget.batch_size == 512,
             "batch_size should be a power-of-2 reduction of 1024, got {}",
             budget.batch_size
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_includes_mmap_size() {
+        // A large file should increase the estimate proportionally
+        let config = LoaderConfig {
+            hvg_indices: Some((0..2000).collect()),
+            ..LoaderConfig::default()
+        };
+        let budget_no_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
+        let file_2gb = 2_500 * 1024 * 1024; // 2.5 GB
+        let budget_large_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
+
+        assert_eq!(budget_large_file.mmap_bytes, file_2gb);
+        assert!(
+            budget_large_file.estimated_bytes > budget_no_file.estimated_bytes + file_2gb / 2,
+            "large file should significantly increase estimate"
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_large_file_reduces_batch_size() {
+        // A 2.5 GB file with 2K HVG should force parameter reductions
+        let config = LoaderConfig {
+            hvg_indices: Some((0..2000).collect()),
+            ..LoaderConfig::default()
+        };
+        let file_2gb = 2_500 * 1024 * 1024;
+        let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
+        assert!(
+            budget.shard_group_size < 8 || budget.prefetch_batches < 4 || budget.batch_size < 1024,
+            "2.5 GB file should force parameter reduction even with 2K HVG"
         );
     }
 

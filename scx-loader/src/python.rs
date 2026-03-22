@@ -192,6 +192,7 @@ impl TrainingDataset {
         dict.set_item("prefetch_batches", mb.prefetch_batches)?;
         dict.set_item("batch_size", mb.batch_size)?;
         dict.set_item("estimated_mb", mb.estimated_bytes / (1024 * 1024))?;
+        dict.set_item("mmap_mb", mb.mmap_bytes / (1024 * 1024))?;
         dict.set_item("budget_exceeded", mb.budget_exceeded)?;
         Ok(dict)
     }
