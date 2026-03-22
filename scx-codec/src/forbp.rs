@@ -3,7 +3,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
 
-use crate::bitstream::{BitReader, BitStreamError, BitWriter};
+use crate::bitstream::{BitStreamError, BitWriter};
 
 /// Block size for FOR-BP coding of indices: 128 rows per block.
 pub const B_IDX: usize = 128;
@@ -138,6 +138,66 @@ pub fn forbp_encode(indices: &[u32], row_lengths: &[usize], index_dtype_u16: boo
 }
 
 // ---------------------------------------------------------------------------
+// Batch bit-unpacking (Option A from IMPROVE-FULL-READ.md §1)
+// ---------------------------------------------------------------------------
+
+/// Bulk-extract `count` fixed-width integers from a packed byte stream.
+///
+/// Reads u64 words from `src` starting at `bit_offset` bits, extracting
+/// `count` values of `bits` width each into `dst`. This replaces the
+/// per-value `BitReader::read_bits()` loop with word-at-a-time extraction,
+/// processing `floor(64 / bits)` values per u64 word.
+///
+/// # Safety / correctness
+/// - `dst.len()` must be `>= count`
+/// - `src` must contain enough bytes for `bit_offset + count * bits` bits
+/// - `bits` must be in 1..=32
+#[inline]
+fn unpack_fixed_width(src: &[u8], bit_offset: usize, count: usize, bits: u8, dst: &mut [u32]) {
+    debug_assert!((1..=32).contains(&bits));
+    debug_assert!(dst.len() >= count);
+
+    let mask: u64 = (1u64 << bits) - 1;
+    let mut bit_pos = bit_offset;
+    let mut i = 0;
+
+    // Main loop: process values by reading u64 words from the byte stream.
+    // Each word can yield multiple values, reducing loop iterations.
+    while i < count {
+        let byte_idx = bit_pos >> 3; // bit_pos / 8
+        let bit_idx = (bit_pos & 7) as u32; // bit_pos % 8
+
+        // Read up to 8 bytes starting at byte_idx as a LE u64.
+        // Handle the case where we're near the end of src.
+        let available = src.len() - byte_idx;
+        let word = if available >= 8 {
+            // Fast path: read 8 bytes directly
+            u64::from_le_bytes(src[byte_idx..byte_idx + 8].try_into().unwrap())
+        } else {
+            // Near end: read available bytes into a zero-padded u64
+            let mut buf = [0u8; 8];
+            buf[..available].copy_from_slice(&src[byte_idx..]);
+            u64::from_le_bytes(buf)
+        };
+
+        // Shift down to align the first value in this word
+        let mut w = word >> bit_idx;
+        // How many bits are available in this word after the initial offset
+        let bits_available = 64 - bit_idx;
+        // How many complete values fit in the remaining bits
+        let values_in_word = (bits_available / bits as u32) as usize;
+        let to_extract = (count - i).min(values_in_word);
+
+        for _ in 0..to_extract {
+            dst[i] = (w & mask) as u32;
+            w >>= bits;
+            i += 1;
+        }
+        bit_pos += to_extract * bits as usize;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Decoder (task 5.4)
 // ---------------------------------------------------------------------------
 
@@ -197,7 +257,7 @@ fn forbp_decode_inner(
         let varints_consumed = remaining_bytes.len() - varint_slice.len();
         cursor.set_position((pos + varints_consumed) as u64);
 
-        // Decode each row — fused decode + prefix sum (no intermediate deltas Vec)
+        // Decode each row: batch-extract deltas, then prefix-sum
         for &nnz in &row_nnzs {
             all_row_lengths.push(nnz);
             if nnz == 0 {
@@ -218,8 +278,6 @@ fn forbp_decode_inner(
             // Read frame_bits
             let frame_bits = cursor.read_u8().map_err(|_| BitStreamError)?;
 
-            // Fused: decode bit-packed deltas and reconstruct indices in one pass
-            let mut prev = frame_min;
             if frame_bits > 0 {
                 let total_bits = frame_bits as usize * nnz;
                 let total_bytes = total_bits.div_ceil(8);
@@ -229,17 +287,24 @@ fn forbp_decode_inner(
                     return Err(BitStreamError);
                 }
                 let bit_data = &data[pos..pos + total_bytes];
-                let mut br = BitReader::new(bit_data);
-                for _ in 0..nnz {
-                    let d = br.read_bits(frame_bits)? as u32;
-                    prev += d;
-                    all_indices.push(prev);
+
+                // Pass 1: Batch-extract all deltas into all_indices
+                let start = all_indices.len();
+                all_indices.resize(start + nnz, 0);
+                unpack_fixed_width(bit_data, 0, nnz, frame_bits, &mut all_indices[start..]);
+
+                // Pass 2: Prefix-sum to reconstruct absolute indices
+                let mut prev = frame_min;
+                for idx in &mut all_indices[start..start + nnz] {
+                    prev += *idx;
+                    *idx = prev;
                 }
+
                 cursor.set_position((pos + total_bytes) as u64);
             } else {
                 // frame_bits == 0: all indices equal frame_min
                 for _ in 0..nnz {
-                    all_indices.push(prev);
+                    all_indices.push(frame_min);
                 }
             }
         }
