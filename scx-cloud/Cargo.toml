@@ -1,0 +1,23 @@
+[package]
+name = "scx-cloud"
+version = "0.1.0"
+edition = "2021"
+description = "Cloud operations for SCX: pull, push, explode, pack, cloud-optimize"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+scx-format = { path = "../scx-format", features = ["deletion-vectors"] }
+scx-codec = { path = "../scx-codec" }
+scx-engine = { path = "../scx-engine" }
+object_store = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -9,6 +9,7 @@ authors.workspace = true
 [features]
 default = []
 hdf5 = ["dep:hdf5", "dep:ndarray"]
+cloud = ["dep:scx-cloud"]
 
 [dependencies]
 clap = { workspace = true }
@@ -24,6 +25,7 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-ops = { path = "../scx-ops" }
 scx-engine = { path = "../scx-engine" }
+scx-cloud = { path = "../scx-cloud", optional = true }
 chrono = "0.4"
 half = { workspace = true }
 

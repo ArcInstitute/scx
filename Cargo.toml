@@ -1,5 +1,5 @@
 [workspace]
-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "pyscx"]
+members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "pyscx"]
 resolver = "2"
 
 [workspace.package]
@@ -21,7 +21,7 @@ ndarray = "0.15"
 rayon = "1"
 crossbeam-channel = "0.5"
 rand = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "io-util"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -32,6 +32,9 @@ hdf5 = "0.8"
 
 half = "2"
 roaring = "0.10"
+object_store = { version = "0.12", features = ["gcp", "aws", "azure"] }
+url = "2"
+bytes = "1"
 fs4 = "0.12"
 
 # Testing
