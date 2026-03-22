@@ -21,6 +21,8 @@ mod explode;
 mod pack;
 #[cfg(feature = "cloud")]
 mod pull;
+#[cfg(feature = "cloud")]
+mod push;
 
 #[derive(Parser)]
 #[command(name = "scx", about = "SCX file format tool")]
@@ -205,6 +207,17 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Upload a local .scx file to cloud/local as exploded .scxd directory
+    #[cfg(feature = "cloud")]
+    Push {
+        /// Source .scx file path
+        source: PathBuf,
+        /// Destination URL or path (e.g. gs://bucket/experiment.scxd/)
+        dest: String,
+        /// Number of parallel upload tasks
+        #[arg(long, default_value = "8")]
+        parallelism: usize,
+    },
 }
 
 fn main() {
@@ -302,6 +315,12 @@ fn main() {
             no_cloud_ready,
             filter,
         } => pull::run_pull(&source, &dest, parallelism, !no_cloud_ready, filter.as_deref()),
+        #[cfg(feature = "cloud")]
+        Commands::Push {
+            source,
+            dest,
+            parallelism,
+        } => push::run_push(&source, &dest, parallelism),
     };
 
     if let Err(e) = result {

@@ -756,7 +756,7 @@ pub async fn pull_filtered(
 }
 
 /// Build a path-constructing closure from a parsed location.
-fn build_path_fn(location: &crate::backend::CloudLocation) -> Box<dyn Fn(&str) -> ObjPath + '_> {
+pub(crate) fn build_path_fn(location: &crate::backend::CloudLocation) -> Box<dyn Fn(&str) -> ObjPath + '_> {
     match location {
         crate::backend::CloudLocation::Local(_) => {
             Box::new(|filename: &str| ObjPath::from(filename))
