@@ -76,17 +76,21 @@ fn obsm_batch_to_numpy<'py>(py: Python<'py>, batch: &RecordBatch) -> PyResult<Bo
 }
 
 /// Build an AnnData object from an ScxReader.
+///
+/// When deletion vectors are present, deleted cells are excluded from
+/// both the CSR matrix and the obs metadata.
 pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py, PyAny>> {
     let anndata_mod = py.import("anndata")?;
 
-    // X — assemble all CSR shards
-    let csr = reader.read_all_csr_shards().map_err(to_pyerr)?;
+    // X — assemble all CSR shards (with deletion vector filtering)
+    let csr = reader.read_all_csr_shards_filtered().map_err(to_pyerr)?;
     let x = csr_to_scipy(py, csr)?;
 
-    // obs metadata
+    // obs metadata — filter by deletion vectors if present
     let obs = match reader.read_obs() {
         Ok(batch) => {
-            let table = record_batch_to_pyarrow(py, &batch)?;
+            let filtered_batch = filter_obs_by_deletion_vectors(reader, batch)?;
+            let table = record_batch_to_pyarrow(py, &filtered_batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
         Err(scx_format::ScxError::SectionNotFound(_)) => None,
@@ -164,6 +168,44 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
     Ok(adata)
 }
 
+/// Filter an obs RecordBatch to exclude deleted rows.
+///
+/// Builds a boolean keep-mask from the deletion vectors (same logic
+/// as `read_all_csr_shards_filtered`) and applies
+/// `arrow::compute::filter_record_batch`.
+fn filter_obs_by_deletion_vectors(
+    reader: &ScxReader,
+    obs: arrow::array::RecordBatch,
+) -> PyResult<arrow::array::RecordBatch> {
+    let dv_opt = reader.read_deletion_vectors().map_err(to_pyerr)?;
+    let dv = match dv_opt {
+        Some(dv) if dv.total_deleted() > 0 => dv,
+        _ => return Ok(obs), // No deletions — return as-is
+    };
+
+    let n_obs = obs.num_rows();
+    let shards = reader.catalog().shards_sorted();
+
+    // Build keep mask (same logic as reader.read_all_csr_shards_filtered)
+    let mut keep = vec![true; n_obs];
+    for (shard_idx, shard_entry) in shards.iter().enumerate() {
+        if let Some(ref stats) = shard_entry.stats {
+            if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
+                for local_row in sd.bitmap.iter() {
+                    let global_row = stats.row_start + local_row as u64;
+                    if (global_row as usize) < n_obs {
+                        keep[global_row as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+
+    let bool_array = arrow::array::BooleanArray::from(keep);
+    arrow::compute::filter_record_batch(&obs, &bool_array)
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to filter obs: {}", e)))
+}
+
 // ---------------------------------------------------------------------------
 // from_anndata: AnnData → SCX
 // ---------------------------------------------------------------------------
@@ -194,6 +236,48 @@ pub(crate) fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
     } else {
         ValueEncoding::Uint32
     }
+}
+
+// ---------------------------------------------------------------------------
+// Type conversion helpers (D2)
+// ---------------------------------------------------------------------------
+
+/// Convert i64 slice to Vec<u64> with overflow check.
+///
+/// Returns PyValueError if any element is negative.
+#[allow(dead_code)]
+pub(crate) fn i64_to_u64(v: &[i64]) -> PyResult<Vec<u64>> {
+    v.iter()
+        .map(|&val| {
+            if val < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative value {} cannot be converted to u64",
+                    val
+                )))
+            } else {
+                Ok(val as u64)
+            }
+        })
+        .collect()
+}
+
+/// Convert i32 slice to Vec<u32> with overflow check.
+///
+/// Returns PyValueError if any element is negative.
+#[allow(dead_code)]
+pub(crate) fn i32_to_u32(v: &[i32]) -> PyResult<Vec<u32>> {
+    v.iter()
+        .map(|&val| {
+            if val < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative value {} cannot be converted to u32",
+                    val
+                )))
+            } else {
+                Ok(val as u32)
+            }
+        })
+        .collect()
 }
 
 /// Encode f32 values to raw LE bytes according to a value encoding.
