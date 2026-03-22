@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 8 crates. Dependencies flow bottom-up:
+The workspace contains 9 crates. Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -20,17 +20,22 @@ The workspace contains 8 crates. Dependencies flow bottom-up:
                         └────┬─────┘
                              │ depends on all below
                         ┌────┴─────┐
-                        │ scx-cli  │  CLI tool (convert, info, validate)
+                        │ scx-cli  │  CLI tool
                         └────┬─────┘
                              │ depends on all below
-             ┌───────────────┼───────────────┐
-             │               │               │
-      ┌──────┴──────┐  ┌─────┴──────┐ ┌──────┴───────┐
-      │ scx-engine  │  │  scx-ops   │ │  scx-loader  │
-      │ query engine│  │ file ops   │ │ ML loader    │
-      └──────┬──────┘  └─────┬──────┘ └──────┬───────┘
-             │               │               │
-             └───────────────┼───────────────┘
+       ┌──────────────┬──────┼──────────────┐
+       │              │      │              │
+┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐
+│ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │
+│ query engine│ │ file ops │ │    │ cloud ops  │
+└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘
+       │              │      │              │
+       │    ┌─────────┘  ┌───┴────────┐     │
+       │    │            │ scx-loader │     │
+       │    │            │ ML loader  │     │
+       │    │            └───┬────────┘     │
+       │    │                │              │
+       └────┴────────────────┼──────────────┘
                              │
                       ┌──────┴──────┐
                       │ scx-format  │  File layout, header, catalog, reader/writer
@@ -52,14 +57,16 @@ The workspace contains 8 crates. Dependencies flow bottom-up:
 | **scx-format** | File layout, reading, and writing | `header`, `catalog`, `shard`, `reader`, `writer`, `codec_select`, `provenance`, `deletion_vectors` |
 | **scx-ops** | File lifecycle operations | `append`, `delete`, `compact`, `merge`, `rollback`, `flock` |
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
-| **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch` |
-| **scx-cli** | Command-line interface | `convert`, `info`, `validate` |
-| **pyscx** | Python bindings via PyO3 | `experiment` (`PyExperiment`), `anndata` (AnnData bridge) |
+| **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
+| **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
+| **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
+| **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud` |
 
 > [!NOTE]
 > `scx-loader` does **not** depend on `scx-engine` — it has its own streaming-optimized
 > gene projection and fused normalization, designed for the hot-path requirements
-> of ML training.
+> of ML training. `scx-cloud` does **not** depend on `scx-loader` — they are siblings.
+> `scx-cloud` reuses `scx-engine` for predicate parsing (selective pull).
 
 ---
 
@@ -358,23 +365,102 @@ CUDA fork deadlocks.
 
 ---
 
+## Cloud Operations (scx-cloud)
+
+The cloud crate provides cloud-native access to SCX data on S3, GCS, and Azure:
+
+### Operations
+
+| Operation | What it does | Direction |
+|-----------|-------------|----------|
+| **cloud-optimize** | Rewrite with front-of-file catalog | Local → local |
+| **explode** | Packed `.scx` → exploded `.scxd/` directory | Local → local |
+| **pack** | Exploded `.scxd/` → packed `.scx` | Local → local |
+| **pull** | Stream from cloud → local packed file | Cloud → local |
+| **push** | Stream from local → cloud exploded directory | Local → cloud |
+| **CloudReader** | Direct cloud reads without download | Cloud → memory |
+
+### Exploded Directory Layout
+
+```
+experiment.scxd/
+├── _catalog.bin              # Full catalog
+├── _header.bin               # 256-byte file header
+├── obs.arrow                 # Obs metadata (Arrow IPC)
+├── var.arrow                 # Var metadata
+├── X/
+│   ├── 000000.shard          # CSR shards (byte-identical to packed)
+│   └── ...
+├── obsm/                     # Optional
+├── layers/                   # Optional
+├── _provenance.bin           # Optional
+├── _deletion_vectors.bin     # Optional
+└── uns.json                  # Optional
+```
+
+`_catalog.bin` is uploaded last (atomic-publish semantics).
+
+### Pull Pipeline
+
+```
+1. GET _catalog.bin + _header.bin
+2. Parse catalog → know all sections
+3. Download shard files in parallel (N=8 async tasks)
+4. Reorder buffer → sequential writer thread
+5. Write full catalog + front catalog + header
+6. fsync + rename
+```
+
+**Selective pull**: `pull --filter "cell_type == 'T cell'"` downloads only matching
+shards using catalog-level pushdown, reducing bandwidth by up to 20×.
+
+### Authentication
+
+Relies on `object_store`'s built-in credential chains:
+- **GCS**: `GOOGLE_APPLICATION_CREDENTIALS` or instance metadata
+- **S3**: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or instance profile
+- **Azure**: `AZURE_STORAGE_ACCOUNT`/`AZURE_STORAGE_KEY` or managed identity
+
+---
+
 ## CLI (scx-cli)
 
-The CLI binary provides format conversion, inspection, and validation:
+The CLI binary provides format conversion, inspection, validation, query, file
+operations, and cloud access:
 
 ```bash
 # Convert h5ad/10x to SCX (requires --features hdf5)
 scx convert input.h5ad output.scx --codec auto --shard-size 10000
 
 # Inspect file metadata
-scx info experiment.scx
+scx info experiment.scx --json --history
 
 # Verify all checksums
 scx validate experiment.scx --verbose
+
+# Query engine
+scx query experiment.scx "cell_type == 'T cell'" --count
+scx query experiment.scx "tissue == 'lung'" --output subset.scx --normalize 1e4 --log1p
+
+# File operations
+scx append atlas.scx --input new_batch.scx
+scx delete experiment.scx --filter "is_doublet == True" --dry-run
+scx compact experiment.scx --output compacted.scx
+scx rollback experiment.scx --to-seq 3
+scx merge batch1.scx batch2.scx batch3.scx --output atlas.scx
+
+# Benchmarks
+scx benchmark experiment.scx --compare-h5ad data.h5ad --runs 5 --json
+
+# Cloud operations (requires --features cloud)
+scx cloud-optimize experiment.scx --output cloud_ready.scx
+scx explode experiment.scx experiment.scxd/
+scx pack experiment.scxd/ experiment.scx
+scx pull gs://bucket/experiment.scxd/ local.scx --filter "tissue == 'lung'"
+scx push experiment.scx gs://bucket/experiment.scxd/ --parallelism 16
 ```
 
-HDF5 support is behind an optional feature flag (`hdf5`) because the `hdf5-rust`
-crate has system library dependencies.
+Feature flags: `hdf5` (h5ad conversion, opt-in), `cloud` (cloud operations, opt-in).
 
 ---
 
@@ -474,6 +560,7 @@ Each crate defines its own error type via `thiserror`:
 | `scx-engine` | `EngineError` | Schema validation, predicate parsing, pipeline errors |
 | `scx-ops` | `OpsError` | Append/delete/compact/merge/rollback failures |
 | `scx-loader` | `LoaderError` | Pipeline errors, memory budget, configuration |
+| `scx-cloud` | `CloudError` | Object store errors, auth failures, missing sections |
 | `scx-sparse` | `CsrError` | Invalid CSR dimensions |
 
 Readers return errors (never panic) on malformed input, including bitstream
@@ -486,4 +573,7 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 - [SPEC.md](../SPEC.md) — Full binary format specification (v0.5)
 - [api.md](api.md) — API reference for Rust, Python, and CLI
 - [ROADMAP.md](../ROADMAP.md) — Phased implementation plan
+- [Phase2.md](../Phase2.md) — Phase 2 implementation plan
+- [Phase2-CLOUD.md](../Phase2-CLOUD.md) — Cloud operations specification
+- [Phase3.md](../Phase3.md) — Phase 3 specification (GPU, R, multimodal)
 - [testing.md](testing.md) — Test infrastructure and benchmarks
