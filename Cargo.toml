@@ -35,6 +35,7 @@ roaring = "0.10"
 object_store = { version = "0.12", features = ["gcp", "aws", "azure"] }
 url = "2"
 bytes = "1"
+futures = "0.3"
 fs4 = "0.12"
 
 # Testing

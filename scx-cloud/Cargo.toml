@@ -17,6 +17,7 @@ url = { workspace = true }
 arrow = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

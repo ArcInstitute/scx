@@ -19,6 +19,8 @@ mod cloud_optimize;
 mod explode;
 #[cfg(feature = "cloud")]
 mod pack;
+#[cfg(feature = "cloud")]
+mod pull;
 
 #[derive(Parser)]
 #[command(name = "scx", about = "SCX file format tool")]
@@ -186,6 +188,20 @@ enum Commands {
         /// Output .scx file
         output: PathBuf,
     },
+    /// Download from cloud/local exploded .scxd and pack into local .scx
+    #[cfg(feature = "cloud")]
+    Pull {
+        /// Source URL or path (e.g. gs://bucket/experiment.scxd/)
+        source: String,
+        /// Output .scx file path
+        dest: PathBuf,
+        /// Number of parallel download tasks
+        #[arg(long, default_value = "8")]
+        parallelism: usize,
+        /// Skip front catalog in output (not cloud-ready)
+        #[arg(long)]
+        no_cloud_ready: bool,
+    },
 }
 
 fn main() {
@@ -275,6 +291,13 @@ fn main() {
         Commands::Explode { input, output } => explode::run_explode(&input, &output),
         #[cfg(feature = "cloud")]
         Commands::Pack { input, output } => pack::run_pack(&input, &output),
+        #[cfg(feature = "cloud")]
+        Commands::Pull {
+            source,
+            dest,
+            parallelism,
+            no_cloud_ready,
+        } => pull::run_pull(&source, &dest, parallelism, !no_cloud_ready),
     };
 
     if let Err(e) = result {
