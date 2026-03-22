@@ -263,6 +263,13 @@ fn test_cli_help() {
     assert!(stdout.contains("convert"));
     assert!(stdout.contains("info"));
     assert!(stdout.contains("validate"));
+    assert!(stdout.contains("append"));
+    assert!(stdout.contains("delete"));
+    assert!(stdout.contains("compact"));
+    assert!(stdout.contains("rollback"));
+    assert!(stdout.contains("merge"));
+    assert!(stdout.contains("query"));
+    assert!(stdout.contains("benchmark"));
 }
 
 /// Test the info subcommand runs end-to-end via the binary.

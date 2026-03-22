@@ -22,6 +22,10 @@ thiserror = { workspace = true }
 scx-format = { path = "../scx-format" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+scx-ops = { path = "../scx-ops" }
+scx-engine = { path = "../scx-engine" }
+chrono = "0.4"
+half = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

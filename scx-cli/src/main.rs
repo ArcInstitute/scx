@@ -2,8 +2,15 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process;
 
+mod append;
+mod benchmark;
+mod compact;
 mod convert;
+mod delete;
 mod info;
+mod merge;
+mod query;
+mod rollback;
 mod validate;
 
 #[derive(Parser)]
@@ -38,6 +45,12 @@ enum Commands {
     Info {
         /// SCX file to inspect
         file: PathBuf,
+        /// Output all info as JSON
+        #[arg(long)]
+        json: bool,
+        /// Show manifest version history
+        #[arg(long)]
+        history: bool,
     },
     /// Validate SCX file checksums
     Validate {
@@ -46,6 +59,100 @@ enum Commands {
         /// Print checksum values
         #[arg(long)]
         verbose: bool,
+    },
+    /// Append cells from another SCX file
+    Append {
+        /// Target SCX file to append to
+        target: PathBuf,
+        /// Source SCX file containing cells to append
+        #[arg(long)]
+        input: PathBuf,
+        /// Compression codec for new shards: auto, none, scx1, zstd
+        #[arg(long, default_value = "auto")]
+        codec: String,
+        /// Target rows per shard
+        #[arg(long, default_value = "10000")]
+        shard_size: u32,
+    },
+    /// Logically delete cells matching a predicate
+    Delete {
+        /// SCX file to modify
+        file: PathBuf,
+        /// Predicate expression to select cells for deletion
+        #[arg(long)]
+        filter: String,
+        /// Show count of matching cells without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Rewrite file reclaiming space from deletions
+    Compact {
+        /// SCX file to compact
+        input: PathBuf,
+        /// Output path for compacted file
+        #[arg(long)]
+        output: PathBuf,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Revert to a previous manifest version
+    Rollback {
+        /// SCX file to roll back
+        file: PathBuf,
+        /// Target manifest sequence number (default: previous version)
+        #[arg(long)]
+        to_seq: Option<u64>,
+    },
+    /// Merge multiple SCX files into one
+    Merge {
+        /// Input SCX files to merge (at least 2)
+        inputs: Vec<PathBuf>,
+        /// Output path for merged file
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Query cells by predicate
+    Query {
+        /// SCX file to query
+        file: PathBuf,
+        /// Obs predicate expression
+        filter: String,
+        /// Print matching cell count only
+        #[arg(long)]
+        count: bool,
+        /// Write matching cells to a new SCX file
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// File containing gene indices for projection (one per line)
+        #[arg(long)]
+        select_genes: Option<PathBuf>,
+        /// Normalization target sum
+        #[arg(long)]
+        normalize: Option<f64>,
+        /// Apply log1p transformation
+        #[arg(long)]
+        log1p: bool,
+        /// Limit number of returned cells
+        #[arg(long)]
+        limit: Option<usize>,
+        /// JSON output (for --count)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run read/query benchmarks
+    Benchmark {
+        /// SCX file to benchmark
+        file: PathBuf,
+        /// Compare against h5ad read performance
+        #[arg(long)]
+        compare_h5ad: Option<PathBuf>,
+        /// Number of benchmark runs
+        #[arg(long, default_value = "5")]
+        runs: usize,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -68,7 +175,11 @@ fn main() {
             shard_size,
             &codec,
         ),
-        Commands::Info { file } => info::run_info(&file),
+        Commands::Info {
+            file,
+            json,
+            history,
+        } => info::run_info(&file, json, history),
         Commands::Validate { file, verbose } => match validate::run_validate(&file, verbose) {
             Ok(all_passed) => {
                 if all_passed {
@@ -79,6 +190,51 @@ fn main() {
             }
             Err(e) => Err(e),
         },
+        Commands::Append {
+            target,
+            input,
+            codec,
+            shard_size,
+        } => append::run_append(&target, &input, &codec, shard_size),
+        Commands::Delete {
+            file,
+            filter,
+            dry_run,
+        } => delete::run_delete(&file, &filter, dry_run),
+        Commands::Compact {
+            input,
+            output,
+            force,
+        } => compact::run_compact(&input, &output, force),
+        Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
+        Commands::Merge { inputs, output } => merge::run_merge(&inputs, &output),
+        Commands::Query {
+            file,
+            filter,
+            count,
+            output,
+            select_genes,
+            normalize,
+            log1p,
+            limit,
+            json,
+        } => query::run_query(
+            &file,
+            &filter,
+            count,
+            output.as_deref(),
+            select_genes.as_deref(),
+            normalize,
+            log1p,
+            limit,
+            json,
+        ),
+        Commands::Benchmark {
+            file,
+            compare_h5ad,
+            runs,
+            json,
+        } => benchmark::run_benchmark(&file, compare_h5ad.as_deref(), runs, json),
     };
 
     if let Err(e) = result {
