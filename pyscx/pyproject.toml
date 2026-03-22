@@ -23,6 +23,10 @@ dev = [
     "pytest",
     "scanpy",
 ]
+scvi = [
+    "scvi-tools",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+python-source = "python"
