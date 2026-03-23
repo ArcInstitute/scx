@@ -20,7 +20,7 @@ fn main() {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "cu") {
+            if path.extension().is_some_and(|ext| ext == "cu") {
                 Some(path)
             } else {
                 None
@@ -33,9 +33,7 @@ fn main() {
     }
 
     // Check if nvcc is available before attempting CUDA compilation
-    let nvcc_check = std::process::Command::new("nvcc")
-        .arg("--version")
-        .output();
+    let nvcc_check = std::process::Command::new("nvcc").arg("--version").output();
 
     if nvcc_check.is_err() {
         println!(
