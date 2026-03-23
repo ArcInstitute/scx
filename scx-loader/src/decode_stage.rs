@@ -10,6 +10,7 @@
 //! [Phase2-Step5.md §D](../Phase2-Step5.md#phase-d--decode-stage-stage-2).
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use arrow::array::{
@@ -76,17 +77,19 @@ impl ShardGroupIndex {
         &self,
         global_idx: u64,
         group: &'a ShardGroup,
-    ) -> (&'a [i32], &'a [f32]) {
+    ) -> Result<(&'a [i32], &'a [f32])> {
         let &(shard_idx, local_row) = self
             .cell_to_shard
             .get(&global_idx)
-            .expect("global cell index not found in ShardGroupIndex");
+            .ok_or_else(|| LoaderError::ShutdownError(
+                format!("global cell index {global_idx} not found in ShardGroupIndex"),
+            ))?;
 
         let shard = &group.shards[shard_idx];
         let start = shard.indptr[local_row] as usize;
         let end = shard.indptr[local_row + 1] as usize;
 
-        (&shard.indices[start..end], &shard.data[start..end])
+        Ok((&shard.indices[start..end], &shard.data[start..end]))
     }
 
     /// Collect all non-deleted global cell indices from the shard group.
@@ -117,20 +120,37 @@ fn fill_batch_parallel(
     normalize: Option<f64>,
     log1p: bool,
     n_output_genes: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     let n_rows = batch_cell_indices.len();
     let mut x = vec![0.0f32; n_rows * n_output_genes];
 
     if n_output_genes == 0 || n_rows == 0 {
-        return x;
+        return Ok(x);
     }
+
+    // Capture the first error from rayon threads (if any).
+    let first_error: Mutex<Option<LoaderError>> = Mutex::new(None);
 
     // Split the output buffer into per-row chunks and process in parallel.
     // Pair each row chunk with its corresponding cell index.
     x.par_chunks_mut(n_output_genes)
         .zip(batch_cell_indices.par_iter())
         .for_each(|(output_row, &global_cell_idx)| {
-            let (csr_indices, csr_data) = group_index.get_row(global_cell_idx, group);
+            // Skip work if a previous iteration already failed.
+            if first_error.lock().unwrap().is_some() {
+                return;
+            }
+
+            let (csr_indices, csr_data) = match group_index.get_row(global_cell_idx, group) {
+                Ok(row) => row,
+                Err(e) => {
+                    let mut guard = first_error.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(e);
+                    }
+                    return;
+                }
+            };
 
             // Scatter CSR row into dense output row (with or without projection)
             match projection {
@@ -153,7 +173,12 @@ fn fill_batch_parallel(
             }
         });
 
-    x
+    // Check if any rayon thread encountered an error.
+    if let Some(err) = first_error.into_inner().unwrap() {
+        return Err(err);
+    }
+
+    Ok(x)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +459,7 @@ pub fn decode_stage(
                 normalize_target,
                 config.log1p,
                 n_output_genes,
-            );
+            )?;
             total_scatter_us += t_scatter.elapsed().as_micros();
 
             // Step 7: Extract obs metadata columns
@@ -596,17 +621,17 @@ mod tests {
         let index = ShardGroupIndex::build(&group);
 
         // Row 0 (global=100): indices=[0, 1], data=[1.0, 2.0]
-        let (idx, data) = index.get_row(100, &group);
+        let (idx, data) = index.get_row(100, &group).unwrap();
         assert_eq!(idx, &[0, 1]);
         assert_eq!(data, &[1.0, 2.0]);
 
         // Row 1 (global=101): indices=[2, 3], data=[2.0, 3.0]
-        let (idx, data) = index.get_row(101, &group);
+        let (idx, data) = index.get_row(101, &group).unwrap();
         assert_eq!(idx, &[2, 3]);
         assert_eq!(data, &[2.0, 3.0]);
 
         // Row 2 (global=102): indices=[4, 5], data=[3.0, 4.0]
-        let (idx, data) = index.get_row(102, &group);
+        let (idx, data) = index.get_row(102, &group).unwrap();
         assert_eq!(idx, &[4, 5]);
         assert_eq!(data, &[3.0, 4.0]);
     }
@@ -628,12 +653,12 @@ mod tests {
         // Parallel fill
         let parallel_x = fill_batch_parallel(
             &cell_indices, &index, &group, None, None, false, n_genes,
-        );
+        ).unwrap();
 
         // Sequential fill (manual)
         let mut sequential_x = vec![0.0f32; 4 * n_genes];
         for (row_idx, &global_idx) in cell_indices.iter().enumerate() {
-            let (csr_idx, csr_data) = index.get_row(global_idx, &group);
+            let (csr_idx, csr_data) = index.get_row(global_idx, &group).unwrap();
             let row_slice = &mut sequential_x[row_idx * n_genes..(row_idx + 1) * n_genes];
             scatter_row_full(csr_idx, csr_data, row_slice);
         }
@@ -656,7 +681,7 @@ mod tests {
 
         let x = fill_batch_parallel(
             &cell_indices, &index, &group, Some(&proj), None, false, n_output,
-        );
+        ).unwrap();
 
         assert_eq!(x.len(), 4 * n_output);
         // Row 0: CSR indices=[0,1], values=[1.0, 2.0]
@@ -687,7 +712,7 @@ mod tests {
 
         let x = fill_batch_parallel(
             &cell_indices, &index, &group, None, None, false, n_genes,
-        );
+        ).unwrap();
 
         // Row 1 (offset 10..20) should be all zeros
         let row1 = &x[n_genes..2 * n_genes];
@@ -717,7 +742,7 @@ mod tests {
             Some(target_sum),
             true,
             n_genes,
-        );
+        ).unwrap();
 
         // Row 0: values [1.0, 2.0] at cols [0, 1], sum=3.0
         // After normalize: [1/3*1e4, 2/3*1e4]
