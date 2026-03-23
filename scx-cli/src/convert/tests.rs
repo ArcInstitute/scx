@@ -283,7 +283,7 @@ fn csr_to_csc(
     n_cols: usize,
 ) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
     // Use the same scatter algorithm but row↔col swapped
-    csc_to_csr(csr_indptr, csr_indices, csr_data, n_cols, n_rows)
+    csc_to_csr(csr_indptr, csr_indices, csr_data, n_cols, n_rows).unwrap()
 }
 
 fn create_test_tenx_h5(path: &Path, n_cells: usize, n_genes: usize) {
@@ -703,7 +703,7 @@ fn test_csc_to_csr_transpose() {
     let csc_data = vec![3.0f32, 1.0, 4.0, 5.0, 2.0];
 
     let (csr_indptr, csr_indices, csr_data) =
-        csc_to_csr(&csc_indptr, &csc_indices, &csc_data, 3, 4);
+        csc_to_csr(&csc_indptr, &csc_indices, &csc_data, 3, 4).unwrap();
 
     assert_eq!(csr_indptr, vec![0, 2, 3, 5]);
     assert_eq!(csr_indices, vec![1, 3, 0, 1, 2]);

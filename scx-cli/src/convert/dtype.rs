@@ -78,7 +78,13 @@ pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
             buf
         }
         ValueEncoding::Float16 => {
-            unimplemented!("Float16 encoding not supported in Phase 1")
+            // Float16 not yet supported — return empty to avoid panic (finding 8.12).
+            eprintln!("warning: Float16 encoding not supported, falling back to Float32");
+            let mut buf = Vec::with_capacity(data.len() * 4);
+            for &v in data {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            buf
         }
     }
 }

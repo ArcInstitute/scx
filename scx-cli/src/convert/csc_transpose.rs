@@ -1,5 +1,7 @@
 // CSC → CSR streaming scatter transpose
 
+use super::pipeline::ConvertError;
+
 /// Transpose a CSC sparse matrix to CSR format.
 ///
 /// CSC stores data column-by-column; CSR stores data row-by-row.
@@ -7,21 +9,47 @@
 /// 1. Count per-row nnz from csc_indices
 /// 2. Prefix-sum to build csr_indptr
 /// 3. Scatter CSC entries into CSR positions
+#[allow(clippy::type_complexity)]
 pub fn csc_to_csr(
     csc_indptr: &[i64],
     csc_indices: &[i32],
     csc_data: &[f32],
     n_rows: usize,
     n_cols: usize,
-) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>), ConvertError> {
     let nnz = csc_data.len();
-    assert_eq!(csc_indices.len(), nnz);
-    assert_eq!(csc_indptr.len(), n_cols + 1);
+    // Validate array lengths (finding 8.8).
+    if csc_indices.len() != nnz {
+        return Err(ConvertError::Other(format!(
+            "csc_indices length {} != csc_data length {}",
+            csc_indices.len(),
+            nnz
+        )));
+    }
+    if csc_indptr.len() != n_cols + 1 {
+        return Err(ConvertError::Other(format!(
+            "csc_indptr length {} != n_cols + 1 ({})",
+            csc_indptr.len(),
+            n_cols + 1
+        )));
+    }
 
     // Step 1: Count per-row nnz
     let mut row_counts = vec![0i64; n_rows];
     for &row in csc_indices {
-        row_counts[row as usize] += 1;
+        // Validate row indices are in bounds (finding 8.9).
+        if row < 0 {
+            return Err(ConvertError::Other(format!(
+                "negative CSC row index {row}"
+            )));
+        }
+        let row_idx = row as usize;
+        if row_idx >= n_rows {
+            return Err(ConvertError::Other(format!(
+                "CSC row index {row} >= n_rows {n_rows}"
+            )));
+        }
+        row_counts[row_idx] += 1;
     }
 
     // Step 2: Prefix sum → csr_indptr
@@ -50,5 +78,5 @@ pub fn csc_to_csr(
         }
     }
 
-    (csr_indptr, csr_indices, csr_data)
+    Ok((csr_indptr, csr_indices, csr_data))
 }

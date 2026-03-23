@@ -53,7 +53,7 @@ fn read_sparse_matrix(
     if is_csc {
         // CSC shape is [n_obs, n_vars] but indptr length = n_vars + 1
         let (csr_indptr, csr_indices, csr_data) =
-            csc_to_csr(&indptr, &indices, &data, n_obs, n_vars);
+            csc_to_csr(&indptr, &indices, &data, n_obs, n_vars)?;
         Ok(drop_explicit_zeros(
             csr_indptr,
             csr_indices,
@@ -676,7 +676,7 @@ fn read_layer_entry(
 
         if is_csc {
             let (csr_indptr, csr_indices, csr_data) =
-                csc_to_csr(&indptr, &indices, &data, n_obs, n_vars);
+                csc_to_csr(&indptr, &indices, &data, n_obs, n_vars)?;
             Ok(drop_explicit_zeros(
                 csr_indptr,
                 csr_indices,

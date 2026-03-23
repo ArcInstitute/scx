@@ -200,6 +200,12 @@ fn write_dataframe_group(
     Ok(())
 }
 
+fn downcast_err(name: &str, expected: &str) -> ConvertError {
+    ConvertError::Other(format!(
+        "column '{name}': expected {expected} array but downcast failed"
+    ))
+}
+
 fn write_column_to_hdf5(
     group: &hdf5::Group,
     name: &str,
@@ -208,7 +214,8 @@ fn write_column_to_hdf5(
 ) -> Result<(), ConvertError> {
     match dtype {
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(name, "Int32"))?;
             let values: Vec<i32> = arr.iter().map(|v| v.unwrap_or(0)).collect();
             group
                 .new_dataset::<i32>()
@@ -217,7 +224,8 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(name, "Int64"))?;
             let values: Vec<i64> = arr.iter().map(|v| v.unwrap_or(0)).collect();
             group
                 .new_dataset::<i64>()
@@ -226,7 +234,8 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(name, "Float32"))?;
             let values: Vec<f32> = arr.iter().map(|v| v.unwrap_or(0.0)).collect();
             group
                 .new_dataset::<f32>()
@@ -235,7 +244,8 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(name, "Float64"))?;
             let values: Vec<f64> = arr.iter().map(|v| v.unwrap_or(0.0)).collect();
             group
                 .new_dataset::<f64>()
@@ -247,7 +257,7 @@ fn write_column_to_hdf5(
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-                .unwrap();
+                .ok_or_else(|| downcast_err(name, "Utf8"))?;
             let values: Vec<VarLenUnicode> = arr.iter().map(|v| vlu(v.unwrap_or(""))).collect();
             group
                 .new_dataset::<VarLenUnicode>()
@@ -256,7 +266,8 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(name, "Boolean"))?;
             let values: Vec<u8> = arr
                 .iter()
                 .map(|v| if v.unwrap_or(false) { 1u8 } else { 0u8 })
@@ -277,7 +288,7 @@ fn write_column_to_hdf5(
             let dict = array
                 .as_any()
                 .downcast_ref::<DictionaryArray<Int32Type>>()
-                .unwrap();
+                .ok_or_else(|| downcast_err(name, "Dictionary<Int32, Utf8>"))?;
 
             // Write codes
             let keys = dict.keys();
@@ -319,16 +330,23 @@ fn write_obsm_entry(
     let n_rows = batch.num_rows();
     let n_cols = batch.num_columns();
 
-    // Flatten to 2D f32 array
+    // Flatten to 2D f32 array (finding 8.11: handle non-Float32 columns).
     let mut flat = vec![0.0f32; n_rows * n_cols];
     for col_idx in 0..n_cols {
-        let arr = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap();
-        for row_idx in 0..n_rows {
-            flat[row_idx * n_cols + col_idx] = arr.value(row_idx);
+        let col = batch.column(col_idx);
+        if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
+            for row_idx in 0..n_rows {
+                flat[row_idx * n_cols + col_idx] = arr.value(row_idx);
+            }
+        } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            for row_idx in 0..n_rows {
+                flat[row_idx * n_cols + col_idx] = arr.value(row_idx) as f32;
+            }
+        } else {
+            return Err(ConvertError::Other(format!(
+                "obsm '{name}' column {col_idx}: expected Float32 or Float64 array, got {:?}",
+                col.data_type()
+            )));
         }
     }
 
