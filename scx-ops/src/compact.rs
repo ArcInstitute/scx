@@ -78,7 +78,8 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
 
     // Process CSR shards: decode, filter deleted rows, re-shard
     let shards = reader.catalog().shards_sorted();
-    let codec_id = CodecId::from_u8(in_header.codec_id).unwrap_or(CodecId::None);
+    let codec_id = CodecId::from_u8(in_header.codec_id)
+        .ok_or(crate::error::OpsError::UnknownCodec(in_header.codec_id))?;
     let value_encoding_u8 = {
         // Read from first shard header to get value encoding
         if !shards.is_empty() {
@@ -91,7 +92,8 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             0 // default to uint8
         }
     };
-    let value_encoding = ValueEncoding::from_u8(value_encoding_u8).unwrap_or(ValueEncoding::Uint8);
+    let value_encoding = ValueEncoding::from_u8(value_encoding_u8)
+        .ok_or(crate::error::OpsError::UnknownValueEncoding(value_encoding_u8))?;
 
     // Decode all shards and filter rows
     let shard_target = in_header.shard_target_rows;
@@ -204,7 +206,8 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
-            ValueEncoding::from_u8(sh.value_encoding).unwrap_or(ValueEncoding::Uint8)
+            ValueEncoding::from_u8(sh.value_encoding)
+                .ok_or(crate::error::OpsError::UnknownValueEncoding(sh.value_encoding))?
         } else {
             value_encoding
         };
@@ -213,7 +216,8 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
-            CodecId::from_u8(sh.codec_id).unwrap_or(CodecId::None)
+            CodecId::from_u8(sh.codec_id)
+                .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?
         } else {
             codec_id
         };

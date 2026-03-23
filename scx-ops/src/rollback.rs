@@ -68,64 +68,93 @@ fn read_header(file: &mut (impl Read + Seek)) -> Result<FileHeader> {
 }
 
 /// Read a FullCatalog at a given offset. Returns (catalog, byte_length).
+///
+/// Instead of reading from offset to EOF (which could be gigabytes for files
+/// with many appends), we first read the fixed catalog header to learn n_entries,
+/// then scan entry headers to compute the exact catalog size, reading only
+/// what's needed.
 fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCatalog, u64)> {
-    // We need to figure out the catalog length. The catalog is self-delimiting
-    // via its trailing checksum, but we need the length to parse. We can read
-    // from offset to EOF.
-    file.seek(SeekFrom::Start(offset))?;
     let file_len = file.seek(SeekFrom::End(0))?;
-    let catalog_len = file_len - offset;
+    let max_available = file_len.saturating_sub(offset);
+
+    // Catalog header: version(2) + manifest_sequence(8) + prev_catalog_offset(8)
+    //                 + n_obs(8) + n_entries(4) = 30 bytes
+    // Minimum catalog = 30 + 32 (trailing checksum) = 62 bytes
+    const CATALOG_HEADER_SIZE: usize = 2 + 8 + 8 + 8 + 4;
+    const TRAILING_CHECKSUM: usize = 32;
+    let min_size = CATALOG_HEADER_SIZE + TRAILING_CHECKSUM;
+
+    if (max_available as usize) < min_size {
+        return Err(OpsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "catalog truncated: not enough bytes for catalog header",
+        )));
+    }
+
+    // Step 1: Read just the fixed catalog header to learn n_entries
     file.seek(SeekFrom::Start(offset))?;
+    let mut header_buf = [0u8; CATALOG_HEADER_SIZE];
+    file.read_exact(&mut header_buf)?;
 
-    let mut buf = vec![0u8; catalog_len as usize];
-    file.read_exact(&mut buf)?;
-
-    // The catalog might not extend to EOF if there are later catalogs.
-    // Try progressively smaller sizes. The minimum catalog is the header fields
-    // (2+8+8+8+4 = 30 bytes) + checksum (32) = 62 bytes.
-    // But for the current catalog (at prev offset), it extends until the next
-    // thing was written after it. We'll try the full remaining length first.
-    // If that fails, we need a smarter approach.
-    //
-    // Actually, the full_catalog_length in the header only tracks the *current*
-    // catalog. For previous catalogs, we can use the fact that the next catalog
-    // or sections start right after. Let's try: if this catalog was at `offset`,
-    // find the next known offset after it.
-    //
-    // Simpler approach: read the header fields to get n_entries, compute
-    // expected size, then re-read exactly that.
-    let mut cursor = Cursor::new(&buf);
+    let mut cursor = Cursor::new(&header_buf[..]);
     let _catalog_version = cursor.read_u16::<LittleEndian>()?;
     let _manifest_sequence = cursor.read_u64::<LittleEndian>()?;
     let _prev_catalog_offset = cursor.read_u64::<LittleEndian>()?;
     let _n_obs = cursor.read_u64::<LittleEndian>()?;
     let n_entries = cursor.read_u32::<LittleEndian>()? as usize;
 
-    // Compute expected payload size by scanning through entries
-    let header_size = 2 + 8 + 8 + 8 + 4; // catalog header fields
-    let mut entry_cursor_pos = cursor.position() as usize;
+    // Step 2: Scan entry headers to compute total catalog size.
+    // Each entry: name_len(2) + name(variable) + offset(8) + length(8)
+    //             + type(1) + checksum(32) + stats_len(2) + stats(variable)
+    // We read entries incrementally, one at a time, to avoid loading to EOF.
+    let mut entries_size: usize = 0;
+    for i in 0..n_entries {
+        let entry_start = offset + CATALOG_HEADER_SIZE as u64 + entries_size as u64;
 
-    for _ in 0..n_entries {
-        if entry_cursor_pos + 2 > buf.len() {
+        // Read name_len (2 bytes)
+        if entry_start + 2 > file_len {
             return Err(OpsError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "catalog truncated",
+                format!("catalog truncated at entry {i}: cannot read name_len"),
             )));
         }
-        let name_len =
-            u16::from_le_bytes([buf[entry_cursor_pos], buf[entry_cursor_pos + 1]]) as usize;
-        entry_cursor_pos += 2 + name_len; // name_len + name bytes
-        entry_cursor_pos += 8 + 8 + 1 + 32; // offset + length + type + checksum
-        let stats_len =
-            u16::from_le_bytes([buf[entry_cursor_pos], buf[entry_cursor_pos + 1]]) as usize;
-        entry_cursor_pos += 2 + stats_len;
+        file.seek(SeekFrom::Start(entry_start))?;
+        let mut name_len_buf = [0u8; 2];
+        file.read_exact(&mut name_len_buf)?;
+        let name_len = u16::from_le_bytes(name_len_buf) as usize;
+
+        // Fixed fields after name: offset(8) + length(8) + type(1) + checksum(32) = 49
+        let fixed_after_name = 8 + 8 + 1 + 32;
+        let stats_len_pos = entry_start + 2 + name_len as u64 + fixed_after_name as u64;
+
+        if stats_len_pos + 2 > file_len {
+            return Err(OpsError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("catalog truncated at entry {i}: cannot read stats_len"),
+            )));
+        }
+        file.seek(SeekFrom::Start(stats_len_pos))?;
+        let mut stats_len_buf = [0u8; 2];
+        file.read_exact(&mut stats_len_buf)?;
+        let stats_len = u16::from_le_bytes(stats_len_buf) as usize;
+
+        entries_size += 2 + name_len + fixed_after_name + 2 + stats_len;
     }
-    let entry_bytes = entry_cursor_pos - header_size;
 
-    let total_catalog_len = header_size + entry_bytes + 32; // +32 for trailing checksum
-    let catalog_buf = &buf[..total_catalog_len];
-    let catalog = FullCatalog::read_from(&mut Cursor::new(catalog_buf), total_catalog_len)?;
+    // Step 3: Now read the entire catalog in one go (header + entries + checksum)
+    let total_catalog_len = CATALOG_HEADER_SIZE + entries_size + TRAILING_CHECKSUM;
+    if offset + total_catalog_len as u64 > file_len {
+        return Err(OpsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "catalog truncated: computed size exceeds file",
+        )));
+    }
 
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; total_catalog_len];
+    file.read_exact(&mut buf)?;
+
+    let catalog = FullCatalog::read_from(&mut Cursor::new(&buf), total_catalog_len)?;
     Ok((catalog, total_catalog_len as u64))
 }
 
@@ -170,6 +199,12 @@ fn apply_catalog_at(
     } else {
         header.flags &= !(1 << 5);
     }
+
+    // Clear front catalog — it references offsets from a cloud-optimized layout
+    // that may not match the catalog we're rolling back to. (Finding 4.8)
+    header.front_catalog_offset = 0;
+    header.front_catalog_length = 0;
+    header.clear_front_catalog();
 
     // Rebuild root catalog
     let root_catalog = build_root_catalog(&catalog);

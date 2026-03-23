@@ -414,7 +414,7 @@ pub fn append(
 /// which produces invalid categoricals for pandas. Casting dictionary → value
 /// type (e.g. Utf8) removes duplicates. Arrow IPC will re-encode them as
 /// dictionaries on the next write.
-fn unify_dict_columns(batch: &RecordBatch) -> std::result::Result<RecordBatch, arrow::error::ArrowError> {
+pub(crate) fn unify_dict_columns(batch: &RecordBatch) -> std::result::Result<RecordBatch, arrow::error::ArrowError> {
     use arrow::datatypes::DataType;
 
     let schema = batch.schema();

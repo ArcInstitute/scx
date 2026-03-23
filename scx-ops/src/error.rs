@@ -21,6 +21,15 @@ pub enum OpsError {
     #[error("no previous catalog available for rollback")]
     NoPreviousCatalog,
 
+    #[error("unknown codec ID: {0}")]
+    UnknownCodec(u8),
+
+    #[error("unknown value encoding: {0}")]
+    UnknownValueEncoding(u8),
+
+    #[error("layer '{name}' missing in input file {file_index}")]
+    LayerMissing { name: String, file_index: usize },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

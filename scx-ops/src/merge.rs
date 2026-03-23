@@ -11,6 +11,7 @@ use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 
+use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 
 /// Merge multiple SCX files into a single output file.
@@ -44,7 +45,8 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 
     // Get codec and encoding info from first file's first shard
     let first_header = readers[0].header();
-    let codec_id = CodecId::from_u8(first_header.codec_id).unwrap_or(CodecId::None);
+    let codec_id = CodecId::from_u8(first_header.codec_id)
+        .ok_or(OpsError::UnknownCodec(first_header.codec_id))?;
     let value_encoding_u8 = {
         let shards = readers[0].catalog().shards_sorted();
         if !shards.is_empty() {
@@ -57,7 +59,8 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             0
         }
     };
-    let value_encoding = ValueEncoding::from_u8(value_encoding_u8).unwrap_or(ValueEncoding::Uint8);
+    let value_encoding = ValueEncoding::from_u8(value_encoding_u8)
+        .ok_or(OpsError::UnknownValueEncoding(value_encoding_u8))?;
 
     // Build output header
     let out_header = FileHeader {
@@ -89,12 +92,17 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
 
-    // Concatenate obs across all inputs
+    // Concatenate obs across all inputs, unifying dictionary-encoded columns
+    // to avoid corrupt categoricals when merging files with different dictionaries.
     let obs_batches: Vec<RecordBatch> = readers
         .iter()
         .map(|r| r.read_obs())
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let merged_obs = concat_batches(&obs_batches[0].schema(), &obs_batches)?;
+    let unified_batches: Vec<RecordBatch> = obs_batches
+        .iter()
+        .map(unify_dict_columns)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
     writer.write_obs(&merged_obs)?;
 
     // Write var from first input
@@ -167,7 +175,8 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             let section = readers[0].section_bytes(first_entry)?;
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
-            ValueEncoding::from_u8(sh.value_encoding).unwrap_or(ValueEncoding::Uint8)
+            ValueEncoding::from_u8(sh.value_encoding)
+                .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?
         } else {
             value_encoding
         };
@@ -175,7 +184,8 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             let section = readers[0].section_bytes(first_entry)?;
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
-            CodecId::from_u8(sh.codec_id).unwrap_or(CodecId::None)
+            CodecId::from_u8(sh.codec_id)
+                .ok_or(OpsError::UnknownCodec(sh.codec_id))?
         } else {
             codec_id
         };
@@ -188,9 +198,12 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         let mut layer_shard_idx = 0u32;
         let mut emitted_layer_rows = 0u64;
 
-        for reader in &readers {
-            if let Ok(layer) = reader.read_layer(layer_name) {
-                for row_idx in 0..layer.shape.0 {
+        for (file_idx, reader) in readers.iter().enumerate() {
+            let layer = reader.read_layer(layer_name).map_err(|_| OpsError::LayerMissing {
+                name: layer_name.clone(),
+                file_index: file_idx,
+            })?;
+            for row_idx in 0..layer.shape.0 {
                     let row_start = layer.indptr[row_idx] as usize;
                     let row_end = layer.indptr[row_idx + 1] as usize;
                     for j in row_start..row_end {
@@ -220,7 +233,6 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
                         layer_shard_idx += 1;
                     }
                 }
-            }
         }
 
         // Flush remaining layer rows
