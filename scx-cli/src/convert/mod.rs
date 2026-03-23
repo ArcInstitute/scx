@@ -301,18 +301,39 @@ mod pipeline {
             // Slice indptr for this shard
             let shard_indptr_slice = &indptr[row_start..=row_end];
             let base = shard_indptr_slice[0];
+            // Validate indptr values are non-negative and >= base (finding 8.6).
             let shard_indptr: Vec<u64> = shard_indptr_slice
                 .iter()
-                .map(|&v| (v - base) as u64)
-                .collect();
+                .map(|&v| {
+                    if v < base {
+                        Err(ConvertError::Other(format!(
+                            "indptr value {v} less than base {base}"
+                        )))
+                    } else {
+                        Ok((v - base) as u64)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             // Slice indices and data
-            let nnz_start = base as usize;
-            let nnz_end = *shard_indptr_slice.last().unwrap() as usize;
+            let nnz_start = usize::try_from(base).map_err(|_| {
+                ConvertError::Other(format!("negative indptr base {base}"))
+            })?;
+            let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
+                ConvertError::Other(format!(
+                    "negative indptr value {}",
+                    shard_indptr_slice.last().unwrap()
+                ))
+            })?;
+            // Validate indices are non-negative before casting to u32 (finding 8.5).
             let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
                 .iter()
-                .map(|&v| v as u32)
-                .collect();
+                .map(|&v| {
+                    u32::try_from(v).map_err(|_| {
+                        ConvertError::Other(format!("negative column index {v}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let shard_data = &data[nnz_start..nnz_end];
             let raw_values = values_to_raw_bytes(shard_data, value_encoding);
 
@@ -352,17 +373,38 @@ mod pipeline {
 
             let shard_indptr_slice = &indptr[row_start..=row_end];
             let base = shard_indptr_slice[0];
+            // Validate indptr values are non-negative and >= base (finding 8.6).
             let shard_indptr: Vec<u64> = shard_indptr_slice
                 .iter()
-                .map(|&v| (v - base) as u64)
-                .collect();
+                .map(|&v| {
+                    if v < base {
+                        Err(ConvertError::Other(format!(
+                            "indptr value {v} less than base {base}"
+                        )))
+                    } else {
+                        Ok((v - base) as u64)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-            let nnz_start = base as usize;
-            let nnz_end = *shard_indptr_slice.last().unwrap() as usize;
+            let nnz_start = usize::try_from(base).map_err(|_| {
+                ConvertError::Other(format!("negative indptr base {base}"))
+            })?;
+            let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
+                ConvertError::Other(format!(
+                    "negative indptr value {}",
+                    shard_indptr_slice.last().unwrap()
+                ))
+            })?;
+            // Validate indices are non-negative before casting to u32 (finding 8.5).
             let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
                 .iter()
-                .map(|&v| v as u32)
-                .collect();
+                .map(|&v| {
+                    u32::try_from(v).map_err(|_| {
+                        ConvertError::Other(format!("negative column index {v}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let shard_data = &data[nnz_start..nnz_end];
             let raw_values = values_to_raw_bytes(shard_data, value_encoding);
 

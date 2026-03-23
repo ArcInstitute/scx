@@ -114,6 +114,12 @@ pub(super) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertEr
             }
             hdf5::types::IntSize::U8 => {
                 let data: Vec<u64> = ds.read_1d()?.to_vec();
+                // Validate no values exceed i64::MAX (finding 8.4).
+                if let Some(&v) = data.iter().find(|&&v| v > i64::MAX as u64) {
+                    return Err(ConvertError::Other(format!(
+                        "u64 indptr value {v} exceeds i64::MAX"
+                    )));
+                }
                 Ok(data.iter().map(|&v| v as i64).collect())
             }
             _ => {
@@ -140,6 +146,12 @@ pub(super) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertEr
             }
             hdf5::types::IntSize::U8 => {
                 let data: Vec<i64> = ds.read_1d()?.to_vec();
+                // Validate no values overflow i32 (finding 8.3).
+                if let Some(&v) = data.iter().find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64) {
+                    return Err(ConvertError::Other(format!(
+                        "i64 index value {v} out of i32 range"
+                    )));
+                }
                 Ok(data.iter().map(|&v| v as i32).collect())
             }
             _ => {
@@ -149,6 +161,12 @@ pub(super) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertEr
         },
         TypeDescriptor::Unsigned(hdf5::types::IntSize::U4) => {
             let data: Vec<u32> = ds.read_1d()?.to_vec();
+            // Validate no values exceed i32::MAX (finding 8.3).
+            if let Some(&v) = data.iter().find(|&&v| v > i32::MAX as u32) {
+                return Err(ConvertError::Other(format!(
+                    "u32 index value {v} exceeds i32::MAX"
+                )));
+            }
             Ok(data.iter().map(|&v| v as i32).collect())
         }
         _ => {

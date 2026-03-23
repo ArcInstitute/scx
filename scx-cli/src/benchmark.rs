@@ -32,7 +32,7 @@ pub fn run_benchmark(
         let elapsed = start.elapsed();
         read_times_ms.push(elapsed.as_secs_f64() * 1000.0);
     }
-    read_times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    read_times_ms.sort_by(|a, b| a.total_cmp(b));
     let read_median = read_times_ms[read_times_ms.len() / 2];
     let read_min = read_times_ms[0];
     let read_max = *read_times_ms.last().unwrap();
@@ -77,7 +77,7 @@ pub fn run_benchmark(
                                 result.skipped_shards as f64 / result.total_shards as f64 * 100.0;
                         }
                     }
-                    query_times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    query_times_ms.sort_by(|a, b| a.total_cmp(b));
                     query_median_ms = Some(query_times_ms[query_times_ms.len() / 2]);
                     query_skip_rate = Some(skip_rate);
                 }
