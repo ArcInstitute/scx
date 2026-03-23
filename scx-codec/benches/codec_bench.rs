@@ -70,7 +70,7 @@ fn bench_forbp_decode(c: &mut Criterion) {
     ] {
         let (indptr, indices, _, n_rows_actual, _) = generate_shard(n_rows, avg_nnz, 30000);
         let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
-        let encoded = forbp_encode(&indices, &row_lengths, true);
+        let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
 
         group.bench_with_input(BenchmarkId::new("u16", label), &encoded, |b, enc| {
             b.iter(|| {

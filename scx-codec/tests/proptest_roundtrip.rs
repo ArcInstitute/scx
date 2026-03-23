@@ -163,7 +163,7 @@ proptest! {
             row_lengths.push(nnz);
         }
 
-        let encoded = forbp_encode(&indices, &row_lengths, true);
+        let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
         let (dec_indices, dec_row_lengths) = forbp_decode(&encoded, n_rows, true).unwrap();
         prop_assert_eq!(dec_indices, indices);
         prop_assert_eq!(dec_row_lengths, row_lengths);

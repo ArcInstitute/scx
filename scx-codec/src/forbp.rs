@@ -71,13 +71,22 @@ fn bits_needed(max_val: u32) -> u8 {
 /// `indices` is the flat array of column indices (sorted within each row).
 /// `row_lengths` gives the number of non-zero entries per row.
 /// `index_dtype_u16` is true when n_vars <= 65535 (frame_min written as u16).
-pub fn forbp_encode(indices: &[u32], row_lengths: &[usize], index_dtype_u16: bool) -> Vec<u8> {
+pub fn forbp_encode(
+    indices: &[u32],
+    row_lengths: &[usize],
+    index_dtype_u16: bool,
+) -> Result<Vec<u8>, BitStreamError> {
     let mut output = Vec::new();
     let mut idx_offset: usize = 0;
 
     for block_rows in row_lengths.chunks(B_IDX) {
         let n_rows_in_block = block_rows.len();
         let block_nnz: usize = block_rows.iter().sum();
+
+        // Validate block_nnz fits in u32
+        if block_nnz > u32::MAX as usize {
+            return Err(BitStreamError);
+        }
 
         // Write block header
         output.write_u32::<LittleEndian>(block_nnz as u32).unwrap();
@@ -113,6 +122,9 @@ pub fn forbp_encode(indices: &[u32], row_lengths: &[usize], index_dtype_u16: boo
 
             // Write frame_min
             if index_dtype_u16 {
+                if frame_min > u16::MAX as u32 {
+                    return Err(BitStreamError);
+                }
                 output.write_u16::<LittleEndian>(frame_min as u16).unwrap();
             } else {
                 output.write_u32::<LittleEndian>(frame_min).unwrap();
@@ -134,7 +146,7 @@ pub fn forbp_encode(indices: &[u32], row_lengths: &[usize], index_dtype_u16: boo
         }
     }
 
-    output
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +321,9 @@ fn forbp_decode_inner(
             }
         }
 
+        if n_rows_in_block > rows_remaining {
+            return Err(BitStreamError);
+        }
         rows_remaining -= n_rows_in_block;
     }
 
@@ -332,7 +347,7 @@ mod tests {
 
     fn round_trip(rows: &[Vec<u32>], index_dtype_u16: bool) {
         let (indices, row_lengths) = flatten(rows);
-        let encoded = forbp_encode(&indices, &row_lengths, index_dtype_u16);
+        let encoded = forbp_encode(&indices, &row_lengths, index_dtype_u16).unwrap();
         let (dec_indices, dec_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), index_dtype_u16).unwrap();
         assert_eq!(dec_indices, indices);
@@ -489,7 +504,7 @@ mod tests {
             vec![0, 100, 200, 300],
         ];
         let (indices, row_lengths) = flatten(&rows);
-        let encoded = forbp_encode(&indices, &row_lengths, true);
+        let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
 
         // Parse the first (and only) block header to verify
         let mut cursor = Cursor::new(&encoded);
@@ -570,5 +585,32 @@ mod tests {
             }
         }
         round_trip(&rows, true);
+    }
+
+    #[test]
+    fn decode_malformed_n_rows_in_block() {
+        // Craft a block header where n_rows_in_block (5) > expected n_rows (1)
+        let mut data = Vec::new();
+        data.write_u32::<LittleEndian>(0).unwrap(); // block_nnz = 0
+        data.write_u16::<LittleEndian>(5).unwrap(); // n_rows_in_block = 5 (but we say n_rows=1)
+        // 5 varint zeros for the row nnz counts
+        for _ in 0..5 {
+            data.push(0x00);
+        }
+        let result = forbp_decode(&data, 1, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_rejects_u16_overflow() {
+        // index 70000 > u16::MAX when index_dtype_u16=true
+        let indices = vec![70000u32];
+        let row_lengths = vec![1usize];
+        let result = forbp_encode(&indices, &row_lengths, true);
+        assert!(result.is_err());
+
+        // Same index with u32 mode should succeed
+        let result = forbp_encode(&indices, &row_lengths, false);
+        assert!(result.is_ok());
     }
 }

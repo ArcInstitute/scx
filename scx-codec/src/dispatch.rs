@@ -202,12 +202,12 @@ pub fn decode_shard_scipy(
         }
         // indptr: delta_golomb → Vec<u64> → Vec<i64>
         let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows + 1)?;
-        let indptr: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
+        let indptr = u64_vec_to_i64(indptr_u64)?;
 
         // indices: forbp → Vec<u32> → Vec<i32>
         let (indices_u32, _) =
             forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
-        let indices: Vec<i32> = indices_u32.into_iter().map(|v| v as i32).collect();
+        let indices = u32_vec_to_i32(indices_u32)?;
 
         // values: rice → Vec<u32> → Vec<f32> directly (skip raw bytes intermediate)
         let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
@@ -219,10 +219,38 @@ pub fn decode_shard_scipy(
     // For None and Zstd: decode to raw types, then convert
     let (indptr_u64, indices_u32, values_raw) =
         decode_shard_ref(encoded, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)?;
-    let indptr: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
-    let indices: Vec<i32> = indices_u32.into_iter().map(|v| v as i32).collect();
+    let indptr = u64_vec_to_i64(indptr_u64)?;
+    let indices = u32_vec_to_i32(indices_u32)?;
     let data = values_raw_to_f32(&values_raw, value_encoding);
     Ok((indptr, indices, data))
+}
+
+/// Convert Vec<u64> to Vec<i64>, returning an error if any value exceeds i64::MAX.
+fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
+    data.into_iter()
+        .map(|v| {
+            i64::try_from(v).map_err(|_| {
+                CodecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("indptr value {} exceeds i64::MAX", v),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Convert Vec<u32> to Vec<i32>, returning an error if any value exceeds i32::MAX.
+fn u32_vec_to_i32(data: Vec<u32>) -> Result<Vec<i32>, CodecError> {
+    data.into_iter()
+        .map(|v| {
+            i32::try_from(v).map_err(|_| {
+                CodecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("index value {} exceeds i32::MAX", v),
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Convert raw LE value bytes to f32 according to ValueEncoding.
@@ -259,7 +287,7 @@ fn encode_none(
     index_dtype_u16: bool,
 ) -> Result<EncodedShard, CodecError> {
     let indptr_bytes = u64_slice_to_le_bytes(indptr);
-    let indices_bytes = indices_to_le_bytes(indices, index_dtype_u16);
+    let indices_bytes = indices_to_le_bytes(indices, index_dtype_u16)?;
     Ok(EncodedShard {
         indptr_bytes,
         indices_bytes,
@@ -310,7 +338,7 @@ fn encode_scx1(
 
     // indices → FOR-BP (needs row_lengths from indptr)
     let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
-    let indices_bytes = forbp_encode(indices, &row_lengths, index_dtype_u16);
+    let indices_bytes = forbp_encode(indices, &row_lengths, index_dtype_u16)?;
 
     // values → reinterpret to u32, then Rice encode
     let values_u32 = raw_bytes_to_u32(values, value_encoding);
@@ -343,7 +371,7 @@ fn decode_scx1_ref(
 
     // values ← Rice decode, then convert u32 back to raw bytes
     let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
-    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding);
+    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
 
     Ok((indptr, indices, values_bytes))
 }
@@ -359,7 +387,7 @@ fn encode_zstd(
     index_dtype_u16: bool,
 ) -> Result<EncodedShard, CodecError> {
     let indptr_raw = u64_slice_to_le_bytes(indptr);
-    let indices_raw = indices_to_le_bytes(indices, index_dtype_u16);
+    let indices_raw = indices_to_le_bytes(indices, index_dtype_u16)?;
 
     let indptr_bytes = zstd::encode_all(indptr_raw.as_slice(), 3)?;
     let indices_bytes = zstd::encode_all(indices_raw.as_slice(), 3)?;
@@ -372,6 +400,27 @@ fn encode_zstd(
     })
 }
 
+/// Decompress Zstd data with an upper bound on decompressed size.
+fn zstd_decode_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, CodecError> {
+    use std::io::Read;
+    let decoder = zstd::Decoder::new(data)?;
+    // Cap initial allocation to avoid huge alloc from untrusted max_bytes
+    let mut output = Vec::with_capacity(max_bytes.min(1 << 20));
+    let mut limited = decoder.take(max_bytes as u64 + 1);
+    limited.read_to_end(&mut output)?;
+    if output.len() > max_bytes {
+        return Err(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed size {} exceeds limit {}",
+                output.len(),
+                max_bytes
+            ),
+        )));
+    }
+    Ok(output)
+}
+
 fn decode_zstd_ref(
     encoded: &EncodedShardRef,
     n_rows: usize,
@@ -379,9 +428,13 @@ fn decode_zstd_ref(
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
-    let indptr_raw = zstd::decode_all(encoded.indptr_bytes)?;
-    let indices_raw = zstd::decode_all(encoded.indices_bytes)?;
-    let values_raw = zstd::decode_all(encoded.values_bytes)?;
+    let indptr_max = (n_rows + 1) * 8;
+    let indices_max = nnz * (if index_dtype_u16 { 2 } else { 4 });
+    let values_max = nnz * value_encoding.byte_width();
+
+    let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
+    let indices_raw = zstd_decode_bounded(encoded.indices_bytes, indices_max)?;
+    let values_raw = zstd_decode_bounded(encoded.values_bytes, values_max)?;
 
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
@@ -432,19 +485,25 @@ fn le_bytes_to_u64(data: &[u8], count: usize) -> Result<Vec<u64>, CodecError> {
     Ok(result)
 }
 
-fn indices_to_le_bytes(indices: &[u32], index_dtype_u16: bool) -> Vec<u8> {
+fn indices_to_le_bytes(indices: &[u32], index_dtype_u16: bool) -> Result<Vec<u8>, CodecError> {
     if index_dtype_u16 {
         let mut buf = Vec::with_capacity(indices.len() * 2);
         for &v in indices {
+            if v > u16::MAX as u32 {
+                return Err(CodecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("index {} exceeds u16 range", v),
+                )));
+            }
             buf.write_u16::<LittleEndian>(v as u16).unwrap();
         }
-        buf
+        Ok(buf)
     } else {
         let mut buf = Vec::with_capacity(indices.len() * 4);
         for &v in indices {
             buf.write_u32::<LittleEndian>(v).unwrap();
         }
-        buf
+        Ok(buf)
     }
 }
 
@@ -509,22 +568,40 @@ fn raw_bytes_to_u32(data: &[u8], encoding: ValueEncoding) -> Vec<u32> {
 }
 
 /// Convert `Vec<u32>` back to raw LE bytes according to `ValueEncoding`.
-fn u32_to_raw_bytes(data: &[u32], encoding: ValueEncoding) -> Vec<u8> {
+fn u32_to_raw_bytes(data: &[u32], encoding: ValueEncoding) -> Result<Vec<u8>, CodecError> {
     match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
+        ValueEncoding::Uint8 => {
+            let mut out = Vec::with_capacity(data.len());
+            for &v in data {
+                if v > u8::MAX as u32 {
+                    return Err(CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("decoded value {} exceeds u8 range", v),
+                    )));
+                }
+                out.push(v as u8);
+            }
+            Ok(out)
+        }
         ValueEncoding::Uint16 => {
             let mut buf = Vec::with_capacity(data.len() * 2);
             for &v in data {
+                if v > u16::MAX as u32 {
+                    return Err(CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("decoded value {} exceeds u16 range", v),
+                    )));
+                }
                 buf.write_u16::<LittleEndian>(v as u16).unwrap();
             }
-            buf
+            Ok(buf)
         }
         ValueEncoding::Uint32 => {
             let mut buf = Vec::with_capacity(data.len() * 4);
             for &v in data {
                 buf.write_u32::<LittleEndian>(v).unwrap();
             }
-            buf
+            Ok(buf)
         }
         ValueEncoding::Float32 | ValueEncoding::Float16 => {
             unreachable!("u32_to_raw_bytes called with float encoding")
@@ -746,5 +823,64 @@ mod tests {
         assert_eq!(ValueEncoding::Float32.byte_width(), 4);
         assert!(ValueEncoding::Uint32.is_integer());
         assert!(!ValueEncoding::Float32.is_integer());
+    }
+
+    #[test]
+    fn test_u32_to_raw_bytes_rejects_overflow() {
+        // u8 overflow
+        let data = vec![256u32];
+        assert!(u32_to_raw_bytes(&data, ValueEncoding::Uint8).is_err());
+
+        // u16 overflow
+        let data = vec![65536u32];
+        assert!(u32_to_raw_bytes(&data, ValueEncoding::Uint16).is_err());
+
+        // u32 should accept any value
+        let data = vec![u32::MAX];
+        assert!(u32_to_raw_bytes(&data, ValueEncoding::Uint32).is_ok());
+    }
+
+    #[test]
+    fn test_indices_to_le_bytes_rejects_overflow() {
+        // u16 overflow with index_dtype_u16=true
+        let indices = vec![70000u32];
+        assert!(indices_to_le_bytes(&indices, true).is_err());
+
+        // Same index with u32 mode should succeed
+        assert!(indices_to_le_bytes(&indices, false).is_ok());
+    }
+
+    #[test]
+    fn test_u64_to_i64_rejects_overflow() {
+        let data = vec![0u64, 100, u64::MAX];
+        assert!(u64_vec_to_i64(data).is_err());
+
+        let data = vec![0u64, 100, i64::MAX as u64];
+        assert!(u64_vec_to_i64(data).is_ok());
+    }
+
+    #[test]
+    fn test_u32_to_i32_rejects_overflow() {
+        let data = vec![0u32, 100, u32::MAX];
+        assert!(u32_vec_to_i32(data).is_err());
+
+        let data = vec![0u32, 100, i32::MAX as u32];
+        assert!(u32_vec_to_i32(data).is_ok());
+    }
+
+    #[test]
+    fn test_zstd_decode_bounded_rejects_oversized() {
+        // Compress data that's larger than we'll allow
+        let raw_data = vec![0u8; 1000];
+        let compressed = zstd::encode_all(raw_data.as_slice(), 3).unwrap();
+
+        // Allow only 100 bytes decompressed — should fail
+        let result = zstd_decode_bounded(&compressed, 100);
+        assert!(result.is_err());
+
+        // Allow 1000 bytes — should succeed
+        let result = zstd_decode_bounded(&compressed, 1000);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1000);
     }
 }

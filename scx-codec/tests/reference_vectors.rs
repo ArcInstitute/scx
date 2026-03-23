@@ -80,7 +80,7 @@ fn forbp_ref_single_row_u16() {
     // Bit-packed deltas (3 bits each, LSB-first): 000 101 101 = 9 bits → 2 bytes
     let indices = vec![0u32, 5, 10];
     let row_lengths = vec![3usize];
-    let encoded = forbp_encode(&indices, &row_lengths, true);
+    let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
 
     // Verify round-trip
     let (dec_idx, dec_rl) = forbp_decode(&encoded, 1, true).unwrap();
@@ -100,7 +100,7 @@ fn forbp_ref_empty_row() {
     // One empty row followed by one row with data
     let indices = vec![42u32];
     let row_lengths = vec![0usize, 1];
-    let encoded = forbp_encode(&indices, &row_lengths, true);
+    let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
     let (dec_idx, dec_rl) = forbp_decode(&encoded, 2, true).unwrap();
     assert_eq!(dec_idx, indices);
     assert_eq!(dec_rl, row_lengths);
