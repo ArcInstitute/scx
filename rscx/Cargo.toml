@@ -1,0 +1,19 @@
+[package]
+name = "rscx"
+version = "0.1.0"
+edition = "2021"
+description = "R bindings for SCX via extendr"
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+scx-format = { path = "../scx-format" }
+scx-codec = { path = "../scx-codec" }
+scx-sparse = { path = "../scx-sparse" }
+scx-engine = { path = "../scx-engine" }
+scx-ops = { path = "../scx-ops" }
+extendr-api = { version = "0.8", features = ["non-api"] }
+thiserror = { workspace = true }
