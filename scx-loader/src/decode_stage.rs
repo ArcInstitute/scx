@@ -155,7 +155,15 @@ fn fill_batch_parallel(
             // Scatter CSR row into dense output row (with or without projection)
             match projection {
                 Some(proj) => proj.scatter_row(csr_indices, csr_data, output_row),
-                None => scatter_row_full(csr_indices, csr_data, output_row),
+                None => {
+                    if let Err(e) = scatter_row_full(csr_indices, csr_data, output_row) {
+                        let mut guard = first_error.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some(e);
+                        }
+                        return;
+                    }
+                }
             }
 
             // Apply fused normalize+log1p if configured
@@ -660,7 +668,7 @@ mod tests {
         for (row_idx, &global_idx) in cell_indices.iter().enumerate() {
             let (csr_idx, csr_data) = index.get_row(global_idx, &group).unwrap();
             let row_slice = &mut sequential_x[row_idx * n_genes..(row_idx + 1) * n_genes];
-            scatter_row_full(csr_idx, csr_data, row_slice);
+            scatter_row_full(csr_idx, csr_data, row_slice).unwrap();
         }
 
         assert_eq!(parallel_x, sequential_x);

@@ -106,10 +106,29 @@ impl HvgProjection {
 /// - `csr_indices`: Column indices from the CSR row (i32 per scipy).
 /// - `csr_data`: Values from the CSR row (parallel to `csr_indices`).
 /// - `output_row`: Pre-zeroed dense output row of length `n_vars`.
-pub fn scatter_row_full(csr_indices: &[i32], csr_data: &[f32], output_row: &mut [f32]) {
+pub fn scatter_row_full(
+    csr_indices: &[i32],
+    csr_data: &[f32],
+    output_row: &mut [f32],
+) -> Result<(), crate::error::LoaderError> {
     for (&col_idx, &value) in csr_indices.iter().zip(csr_data.iter()) {
-        output_row[col_idx as usize] = value;
+        if col_idx < 0 {
+            return Err(crate::error::LoaderError::ConfigError {
+                reason: format!("negative CSR column index {col_idx}"),
+            });
+        }
+        let idx = col_idx as usize;
+        if idx >= output_row.len() {
+            return Err(crate::error::LoaderError::ConfigError {
+                reason: format!(
+                    "CSR column index {idx} out of bounds for output row of length {}",
+                    output_row.len()
+                ),
+            });
+        }
+        output_row[idx] = value;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -165,7 +184,7 @@ mod tests {
         let csr_data: Vec<f32> = vec![2.0, 4.0, 6.0];
         let mut output = vec![0.0f32; 10];
 
-        scatter_row_full(&csr_indices, &csr_data, &mut output);
+        scatter_row_full(&csr_indices, &csr_data, &mut output).unwrap();
 
         assert_eq!(output[0], 0.0);
         assert_eq!(output[1], 2.0);
@@ -233,8 +252,32 @@ mod tests {
         let csr_data: Vec<f32> = vec![];
         let mut output = vec![0.0f32; 5];
 
-        scatter_row_full(&csr_indices, &csr_data, &mut output);
+        scatter_row_full(&csr_indices, &csr_data, &mut output).unwrap();
 
         assert!(output.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_scatter_row_full_negative_index_returns_error() {
+        let csr_indices: Vec<i32> = vec![1, -5, 3];
+        let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut output = vec![0.0f32; 10];
+
+        let result = scatter_row_full(&csr_indices, &csr_data, &mut output);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("negative"), "expected 'negative' in: {msg}");
+    }
+
+    #[test]
+    fn test_scatter_row_full_oob_index_returns_error() {
+        let csr_indices: Vec<i32> = vec![1, 3, 100];
+        let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut output = vec![0.0f32; 10];
+
+        let result = scatter_row_full(&csr_indices, &csr_data, &mut output);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("out of bounds"), "expected 'out of bounds' in: {msg}");
     }
 }

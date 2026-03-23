@@ -133,7 +133,22 @@ pub async fn io_stage(
                 })?;
 
                 let global_row_offset = stats.row_start;
-                let n_rows = (stats.row_end - stats.row_start) as u32;
+                let n_rows = if stats.row_end < stats.row_start {
+                    return Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "shard '{}' has row_end ({}) < row_start ({})",
+                            entry.name, stats.row_end, stats.row_start
+                        ),
+                    });
+                } else {
+                    let n = stats.row_end - stats.row_start;
+                    u32::try_from(n).map_err(|_| LoaderError::ConfigError {
+                        reason: format!(
+                            "shard '{}' row count {} exceeds u32::MAX",
+                            entry.name, n
+                        ),
+                    })?
+                };
 
                 // Check deletion status.
                 let deleted_bitmap = deletion_map.get(&shard_idx).cloned();
