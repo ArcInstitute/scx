@@ -35,8 +35,22 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
     // Read full catalog
     let fc_offset = header.full_catalog_offset as usize;
     let fc_length = header.full_catalog_length as usize;
+    let fc_end = fc_offset.checked_add(fc_length).ok_or_else(|| {
+        crate::error::CloudError::SliceBoundsExceeded {
+            offset: fc_offset,
+            length: fc_length,
+            data_len: input_data.len(),
+        }
+    })?;
+    if fc_end > input_data.len() {
+        return Err(crate::error::CloudError::SliceBoundsExceeded {
+            offset: fc_offset,
+            length: fc_length,
+            data_len: input_data.len(),
+        });
+    }
     let full_catalog = FullCatalog::read_from(
-        &mut Cursor::new(&input_data[fc_offset..fc_offset + fc_length]),
+        &mut Cursor::new(&input_data[fc_offset..fc_end]),
         fc_length,
     )?;
 
@@ -58,7 +72,21 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
 
         // Copy section bytes verbatim
         let src_start = entry.offset as usize;
-        let src_end = src_start + entry.length as usize;
+        let src_len = entry.length as usize;
+        let src_end = src_start.checked_add(src_len).ok_or_else(|| {
+            crate::error::CloudError::SliceBoundsExceeded {
+                offset: src_start,
+                length: src_len,
+                data_len: input_data.len(),
+            }
+        })?;
+        if src_end > input_data.len() {
+            return Err(crate::error::CloudError::SliceBoundsExceeded {
+                offset: src_start,
+                length: src_len,
+                data_len: input_data.len(),
+            });
+        }
         std::fs::write(&file_path, &input_data[src_start..src_end])?;
     }
 

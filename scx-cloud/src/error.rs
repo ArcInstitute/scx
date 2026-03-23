@@ -29,6 +29,13 @@ pub enum CloudError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("slice bounds out of range: offset {offset} + length {length} exceeds data size {data_len}")]
+    SliceBoundsExceeded {
+        offset: usize,
+        length: usize,
+        data_len: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, CloudError>;

@@ -94,18 +94,29 @@ pub async fn push(
     let mut total_bytes_uploaded: u64 = 0;
     let parallelism = options.parallelism.max(1);
 
-    // 3. Build upload tasks for each section
-    let upload_tasks: Vec<(String, Vec<u8>)> = full_catalog
-        .entries
-        .iter()
-        .map(|entry| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type);
-            let src_start = entry.offset as usize;
-            let src_end = src_start + entry.length as usize;
-            let data = file_data[src_start..src_end].to_vec();
-            (rel_path, data)
-        })
-        .collect();
+    // 3. Build upload tasks for each section (validate bounds first)
+    let mut upload_tasks: Vec<(String, Vec<u8>)> = Vec::with_capacity(full_catalog.entries.len());
+    for entry in &full_catalog.entries {
+        let rel_path = section_name_to_path(&entry.name, entry.section_type);
+        let src_start = entry.offset as usize;
+        let src_len = entry.length as usize;
+        let src_end = src_start.checked_add(src_len).ok_or_else(|| {
+            CloudError::SliceBoundsExceeded {
+                offset: src_start,
+                length: src_len,
+                data_len: file_data.len(),
+            }
+        })?;
+        if src_end > file_data.len() {
+            return Err(CloudError::SliceBoundsExceeded {
+                offset: src_start,
+                length: src_len,
+                data_len: file_data.len(),
+            });
+        }
+        let data = file_data[src_start..src_end].to_vec();
+        upload_tasks.push((rel_path, data));
+    }
 
     // 4. Upload sections in parallel batches
     for chunk in upload_tasks.chunks(parallelism) {
