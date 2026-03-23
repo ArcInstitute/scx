@@ -314,7 +314,7 @@ fn encode_scx1(
 
     // values → reinterpret to u32, then Rice encode
     let values_u32 = raw_bytes_to_u32(values, value_encoding);
-    let values_bytes = rice_encode(&values_u32, B_VAL);
+    let values_bytes = rice_encode(&values_u32, B_VAL)?;
 
     Ok(EncodedShard {
         indptr_bytes,

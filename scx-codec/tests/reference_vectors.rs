@@ -20,7 +20,7 @@ fn rice_ref_all_ones_4() {
     // Each value: unary(0) = single 0-bit → 4 zero bits
     // Body: 0000 padded to byte = 0x00
     let values = vec![1u32; 4];
-    let encoded = rice_encode(&values, B_VAL);
+    let encoded = rice_encode(&values, B_VAL).unwrap();
     assert_eq!(encoded, vec![0x00, 0x00]);
     let decoded = rice_decode(&encoded, 4, B_VAL).unwrap();
     assert_eq!(decoded, values);
@@ -34,7 +34,7 @@ fn rice_ref_one_two() {
     // val 1: shifted=1, q=1, unary(1) = 1,0  (LSB-first: bits are 1 then 0)
     // Bits in LSB-first order: 0 | 1 0 = 010 → padded = 0b00000010 = 0x02
     let values = vec![1u32, 2];
-    let encoded = rice_encode(&values, B_VAL);
+    let encoded = rice_encode(&values, B_VAL).unwrap();
     assert_eq!(encoded, vec![0x00, 0x02]);
     let decoded = rice_decode(&encoded, 2, B_VAL).unwrap();
     assert_eq!(decoded, values);
@@ -59,7 +59,7 @@ fn rice_ref_larger_k() {
     // Byte 2: bits 8-15: 1 0 1 1 1 1 0 0 = LSB-first = 0b00111101 = 0x3D
     // Byte 3: bits 16-18: 0 + padding = 0b00000000 = 0x00
     let values = vec![4u32, 5, 6, 7];
-    let encoded = rice_encode(&values, B_VAL);
+    let encoded = rice_encode(&values, B_VAL).unwrap();
     // 19 bits → 3 bytes (header + 2 body bytes with padding in last byte)
     assert_eq!(encoded, vec![0x01, 0x9D, 0x3D]);
     let decoded = rice_decode(&encoded, 4, B_VAL).unwrap();

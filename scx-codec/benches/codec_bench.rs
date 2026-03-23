@@ -106,7 +106,7 @@ fn bench_rice_decode(c: &mut Criterion) {
                 }
             })
             .collect();
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
 
         group.bench_with_input(BenchmarkId::new("umi", label), &(encoded.clone(), n_values), |b, (enc, n)| {
             b.iter(|| {

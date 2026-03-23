@@ -108,7 +108,7 @@ proptest! {
 
     #[test]
     fn rice_roundtrip(values in prop::collection::vec(1..10000u32, 1..500)) {
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, values.len(), B_VAL).unwrap();
         prop_assert_eq!(decoded, values);
     }

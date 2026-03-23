@@ -40,11 +40,10 @@ fn compute_k(median: u32) -> u8 {
 ///
 /// All values must be >= 1 (non-zero counts). They are shifted by -1 before encoding.
 /// The output is a byte vector containing the encoded bitstream.
-pub fn rice_encode(values: &[u32], block_size: usize) -> Vec<u8> {
-    debug_assert!(
-        values.iter().all(|&v| v >= 1),
-        "Rice encoder requires all values >= 1"
-    );
+pub fn rice_encode(values: &[u32], block_size: usize) -> Result<Vec<u8>, BitStreamError> {
+    if values.contains(&0) {
+        return Err(BitStreamError);
+    }
 
     let mut writer = BitWriter::new();
 
@@ -73,7 +72,7 @@ pub fn rice_encode(values: &[u32], block_size: usize) -> Vec<u8> {
         writer.pad_to_byte();
     }
 
-    writer.flush()
+    Ok(writer.flush())
 }
 
 /// Decode Rice-encoded values.
@@ -163,7 +162,7 @@ mod tests {
     #[test]
     fn round_trip_all_ones() {
         let values = vec![1u32; 256];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, 256, B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -172,7 +171,7 @@ mod tests {
     #[test]
     fn round_trip_typical_umi() {
         let values = vec![1, 1, 1, 2, 2, 3];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, values.len(), B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -186,7 +185,7 @@ mod tests {
         assert_eq!(floor_median(&shifted), 3);
         assert_eq!(compute_k(3), 1);
 
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, values.len(), B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -195,7 +194,7 @@ mod tests {
     #[test]
     fn round_trip_outlier() {
         let values = vec![1, 1, 1, 500];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, values.len(), B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -204,7 +203,7 @@ mod tests {
     #[test]
     fn round_trip_single_value() {
         let values = vec![42u32];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, 1, B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -212,7 +211,7 @@ mod tests {
     #[test]
     fn round_trip_exact_block() {
         let values: Vec<u32> = (1..=256).collect();
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, 256, B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -221,7 +220,7 @@ mod tests {
     fn round_trip_two_blocks() {
         // 257 values → two blocks: 256 + 1
         let values: Vec<u32> = (1..=257).collect();
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, 257, B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -240,7 +239,7 @@ mod tests {
             })
             .collect();
 
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, values.len(), B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -251,7 +250,7 @@ mod tests {
         // Encode multi-block input, verify we can decode correctly
         // (which implicitly verifies byte alignment between blocks)
         let values: Vec<u32> = vec![1; 300]; // 256 + 44 = two blocks
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, 300, B_VAL).unwrap();
         assert_eq!(decoded, values);
     }
@@ -265,7 +264,7 @@ mod tests {
         // Total: 1 header byte + ceil(4 bits / 8) = 1 body byte
         // Body bits: 0000 → padded to byte = 0x00
         let values = vec![1u32; 4];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         assert_eq!(encoded, vec![0x00, 0x00]);
 
         let decoded = rice_decode(&encoded, 4, B_VAL).unwrap();
@@ -280,7 +279,7 @@ mod tests {
         // val 1: shifted=1, q=1, unary(1)=1,0
         // Bits: 0 | 1 0 = 010 → padded to byte = 0b00000010 = 0x02
         let values = vec![1u32, 2];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         assert_eq!(encoded, vec![0x00, 0x02]);
 
         let decoded = rice_decode(&encoded, 2, B_VAL).unwrap();
@@ -298,7 +297,7 @@ mod tests {
     #[test]
     fn round_trip_empty() {
         let values: Vec<u32> = vec![];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         assert!(encoded.is_empty());
         let decoded = rice_decode(&encoded, 0, B_VAL).unwrap();
         assert!(decoded.is_empty());
@@ -308,8 +307,21 @@ mod tests {
     #[test]
     fn round_trip_large_values() {
         let values = vec![1_000_000u32, 500_000, 100, 1];
-        let encoded = rice_encode(&values, B_VAL);
+        let encoded = rice_encode(&values, B_VAL).unwrap();
         let decoded = rice_decode(&encoded, values.len(), B_VAL).unwrap();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn rice_encode_rejects_zero_values() {
+        let values = vec![1, 0, 2, 3];
+        let result = rice_encode(&values, B_VAL);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rice_encode_rejects_single_zero() {
+        let result = rice_encode(&[0], B_VAL);
+        assert!(result.is_err());
     }
 }
