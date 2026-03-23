@@ -72,64 +72,88 @@ impl PyQueryPipeline {
     ///
     /// The predicate is validated against the obs schema immediately.
     /// Multiple calls accumulate predicates with AND semantics.
+    /// Returns self for method chaining (finding 9.5).
     ///
     /// Example:
-    ///     pipeline.filter_obs("cell_type == 'T cell' and tissue == 'lung'")
-    fn filter_obs(&mut self, expr: &str) -> PyResult<()> {
-        let p = self.take_pipeline()?;
-        let p = p.filter_obs(expr).map_err(engine_to_pyerr)?;
-        self.put_pipeline(p);
-        Ok(())
+    ///     pipeline.filter_obs("cell_type == 'T cell' and tissue == 'lung'").collect()
+    fn filter_obs<'py>(slf: Bound<'py, Self>, expr: &str) -> PyResult<Bound<'py, Self>> {
+        {
+            let mut inner = slf.borrow_mut();
+            let p = inner.take_pipeline()?;
+            let p = p.filter_obs(expr).map_err(engine_to_pyerr)?;
+            inner.put_pipeline(p);
+        }
+        Ok(slf)
     }
 
     /// Filter variables (genes) by a predicate expression.
     ///
     /// The predicate is validated against the var schema immediately.
     /// Multiple calls accumulate predicates with AND semantics.
-    fn filter_var(&mut self, expr: &str) -> PyResult<()> {
-        let p = self.take_pipeline()?;
-        let p = p.filter_var(expr).map_err(engine_to_pyerr)?;
-        self.put_pipeline(p);
-        Ok(())
+    /// Returns self for method chaining (finding 9.5).
+    fn filter_var<'py>(slf: Bound<'py, Self>, expr: &str) -> PyResult<Bound<'py, Self>> {
+        {
+            let mut inner = slf.borrow_mut();
+            let p = inner.take_pipeline()?;
+            let p = p.filter_var(expr).map_err(engine_to_pyerr)?;
+            inner.put_pipeline(p);
+        }
+        Ok(slf)
     }
 
     /// Select specific gene indices for projection.
+    /// Returns self for method chaining (finding 9.5).
     ///
     /// Example:
-    ///     pipeline.select_genes([0, 1, 2, 100, 200])
-    fn select_genes(&mut self, indices: Vec<u32>) -> PyResult<()> {
-        let p = self.take_pipeline()?;
-        let p = p.select_genes(indices);
-        self.put_pipeline(p);
-        Ok(())
+    ///     pipeline.select_genes([0, 1, 2, 100, 200]).collect()
+    fn select_genes(slf: Bound<'_, Self>, indices: Vec<u32>) -> PyResult<Bound<'_, Self>> {
+        {
+            let mut inner = slf.borrow_mut();
+            let p = inner.take_pipeline()?;
+            let p = p.select_genes(indices);
+            inner.put_pipeline(p);
+        }
+        Ok(slf)
     }
 
     /// Enable total-count normalization with the given target sum.
+    /// Returns self for method chaining (finding 9.5).
     ///
     /// Example:
-    ///     pipeline.with_normalize(target_sum=1e4)
+    ///     pipeline.with_normalize(target_sum=1e4).with_log1p().collect()
     #[pyo3(signature = (target_sum=1e4))]
-    fn with_normalize(&mut self, target_sum: f64) -> PyResult<()> {
-        let p = self.take_pipeline()?;
-        let p = p.with_normalize(target_sum);
-        self.put_pipeline(p);
-        Ok(())
+    fn with_normalize(slf: Bound<'_, Self>, target_sum: f64) -> PyResult<Bound<'_, Self>> {
+        {
+            let mut inner = slf.borrow_mut();
+            let p = inner.take_pipeline()?;
+            let p = p.with_normalize(target_sum);
+            inner.put_pipeline(p);
+        }
+        Ok(slf)
     }
 
     /// Enable log1p transformation.
-    fn with_log1p(&mut self) -> PyResult<()> {
-        let p = self.take_pipeline()?;
-        let p = p.with_log1p();
-        self.put_pipeline(p);
-        Ok(())
+    /// Returns self for method chaining (finding 9.5).
+    fn with_log1p(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
+        {
+            let mut inner = slf.borrow_mut();
+            let p = inner.take_pipeline()?;
+            let p = p.with_log1p();
+            inner.put_pipeline(p);
+        }
+        Ok(slf)
     }
 
     /// Limit the number of returned cells.
-    fn limit(&mut self, n: usize) -> PyResult<()> {
-        let p = self.take_pipeline()?;
-        let p = p.limit(n);
-        self.put_pipeline(p);
-        Ok(())
+    /// Returns self for method chaining (finding 9.5).
+    fn limit(slf: Bound<'_, Self>, n: usize) -> PyResult<Bound<'_, Self>> {
+        {
+            let mut inner = slf.borrow_mut();
+            let p = inner.take_pipeline()?;
+            let p = p.limit(n);
+            inner.put_pipeline(p);
+        }
+        Ok(slf)
     }
 
     /// Execute the pipeline and return a `PyQueryResult`.

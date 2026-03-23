@@ -95,7 +95,7 @@ impl PyExperiment {
     ///     exp = pyscx.open("experiment.scx")
     ///     adata = exp.to_anndata()
     ///     total = exp.mark_deleted(adata.obs["is_doublet"] == True)
-    fn mark_deleted(&self, mask: PyReadonlyArray1<'_, bool>) -> PyResult<u64> {
+    fn mark_deleted(&mut self, mask: PyReadonlyArray1<'_, bool>) -> PyResult<u64> {
         let mask_slice = mask
             .as_slice()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -108,8 +108,14 @@ impl PyExperiment {
             .map(|(i, _)| i as u64)
             .collect();
 
-        scx_ops::mark_deleted(&self.path, &indices)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        let total = scx_ops::mark_deleted(&self.path, &indices)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Re-open reader so subsequent reads see the updated file (finding 9.6).
+        self.reader = ScxReader::open(&self.path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(total)
     }
 
     /// Convert this SCX file to an AnnData object.

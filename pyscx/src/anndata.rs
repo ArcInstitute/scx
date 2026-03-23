@@ -482,19 +482,15 @@ pub fn from_anndata_impl(
 
     let mut writer = ScxWriter::new(path, header).map_err(to_pyerr)?;
 
-    // Write obs
+    // Write obs — always write even for 0-cell datasets to preserve column schema (finding 9.7).
     let obs_df = adata.getattr("obs")?;
-    if obs_df.call_method0("__len__")?.extract::<usize>()? > 0 {
-        let obs_batch = pandas_to_record_batch(py, &obs_df)?;
-        writer.write_obs(&obs_batch).map_err(to_pyerr)?;
-    }
+    let obs_batch = pandas_to_record_batch(py, &obs_df)?;
+    writer.write_obs(&obs_batch).map_err(to_pyerr)?;
 
-    // Write var
+    // Write var — always write even for 0-gene datasets to preserve column schema (finding 9.7).
     let var_df = adata.getattr("var")?;
-    if var_df.call_method0("__len__")?.extract::<usize>()? > 0 {
-        let var_batch = pandas_to_record_batch(py, &var_df)?;
-        writer.write_var(&var_batch).map_err(to_pyerr)?;
-    }
+    let var_batch = pandas_to_record_batch(py, &var_df)?;
+    writer.write_var(&var_batch).map_err(to_pyerr)?;
 
     // Write CSR shards
     let n_obs_usize = n_obs as usize;
