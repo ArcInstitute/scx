@@ -123,6 +123,33 @@ exp = pyscx.open_cloud("gs://bucket/atlas.scxd/")
 print(exp.n_obs, exp.n_vars)
 ```
 
+### No more file locking headaches
+
+HDF5 acquires **mandatory POSIX file locks** on every open — even for reads. On shared
+and network filesystems (NFS, Lustre, GPFS) this causes the dreaded:
+
+```
+OSError: Unable to open file (unable to lock file, errno = 37, error message = 'No locks available')
+```
+
+Common workarounds (`HDF5_USE_FILE_LOCKING=FALSE`, rebuilding with `--disable-file-locking`)
+disable data integrity checks entirely. Jupyter notebooks that hold an h5ad open will
+block other processes from reading the same file.
+
+SCX takes a different approach:
+
+| | h5ad (HDF5) | SCX |
+|--|-------------|-----|
+| Read locking | Mandatory — blocks other readers/writers | **None** — reads never lock |
+| Write locking | Mandatory — blocks all other access | **Advisory** `flock()` — only during append/delete/compact |
+| Concurrent reads | ❌ Blocked if any writer is active | ✅ Always allowed, even during writes |
+| Network filesystems | Frequently broken (`errno 37`) | Works — advisory locks degrade gracefully |
+| Workaround needed? | `HDF5_USE_FILE_LOCKING=FALSE` | No workaround needed |
+
+SCX's immutable-fragment design (append-only sections + atomic header update) means readers
+always see a consistent snapshot without any locking. Multiple notebooks, pipeline stages,
+or training jobs can read the same `.scx` file simultaneously — no coordination required.
+
 ## Installation
 
 ### Python (recommended)
