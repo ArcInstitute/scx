@@ -24,6 +24,15 @@ pub enum CsrError {
         n_cols: usize,
         position: usize,
     },
+
+    #[error("dimension overflow: {rows} * {cols} exceeds usize")]
+    DimensionOverflow { rows: usize, cols: usize },
+
+    #[error("dense array length {got} != expected {expected} (n_rows * n_cols)")]
+    DenseLengthMismatch { got: usize, expected: usize },
+
+    #[error("n_cols {0} exceeds i32::MAX, cannot represent as i32 column indices")]
+    ColumnOverflow(usize),
 }
 
 /// A CSR sparse matrix with scipy-compatible dtypes.
@@ -158,9 +167,13 @@ impl ScxCsr {
     }
 
     /// Convert to a dense row-major matrix.
-    pub fn to_dense(&self) -> Vec<f32> {
+    pub fn to_dense(&self) -> Result<Vec<f32>, CsrError> {
         let (n_rows, n_cols) = self.shape;
-        let mut dense = vec![0.0f32; n_rows * n_cols];
+        let total = n_rows.checked_mul(n_cols).ok_or(CsrError::DimensionOverflow {
+            rows: n_rows,
+            cols: n_cols,
+        })?;
+        let mut dense = vec![0.0f32; total];
         for row in 0..n_rows {
             let start = self.indptr[row] as usize;
             let end = self.indptr[row + 1] as usize;
@@ -169,7 +182,7 @@ impl ScxCsr {
                 dense[row * n_cols + col] = self.data[j];
             }
         }
-        dense
+        Ok(dense)
     }
 }
 
@@ -242,7 +255,7 @@ mod tests {
     #[test]
     fn to_dense_known() {
         let csr = sample_csr();
-        let dense = csr.to_dense();
+        let dense = csr.to_dense().unwrap();
         #[rustfmt::skip]
         let expected = vec![
             0.0, 5.0, 0.0, 10.0, 0.0,
@@ -259,7 +272,7 @@ mod tests {
         assert_eq!(csr.n_rows(), 5);
         assert_eq!(csr.n_cols(), 10);
         assert_eq!(csr.nnz(), 0);
-        let dense = csr.to_dense();
+        let dense = csr.to_dense().unwrap();
         assert_eq!(dense.len(), 50);
         assert!(dense.iter().all(|&v| v == 0.0));
     }
@@ -268,13 +281,13 @@ mod tests {
     #[test]
     fn single_row_matrix() {
         let csr = ScxCsr::new((1, 4), vec![0, 2], vec![1, 3], vec![5.0, 9.0]).unwrap();
-        assert_eq!(csr.to_dense(), vec![0.0, 5.0, 0.0, 9.0]);
+        assert_eq!(csr.to_dense().unwrap(), vec![0.0, 5.0, 0.0, 9.0]);
     }
 
     #[test]
     fn single_column_matrix() {
         let csr = ScxCsr::new((3, 1), vec![0, 1, 1, 1], vec![0], vec![7.0]).unwrap();
-        assert_eq!(csr.to_dense(), vec![7.0, 0.0, 0.0]);
+        assert_eq!(csr.to_dense().unwrap(), vec![7.0, 0.0, 0.0]);
     }
 
     // 12.11: mismatched lengths
@@ -363,5 +376,14 @@ mod tests {
     fn error_negative_index() {
         let err = ScxCsr::new((1, 5), vec![0, 1], vec![-1], vec![1.0]).unwrap_err();
         assert!(matches!(err, CsrError::IndexOutOfRange { index: -1, .. }));
+    }
+
+    #[test]
+    fn test_to_dense_dimension_overflow() {
+        // Create a CSR with dimensions that overflow usize when multiplied
+        let huge = usize::MAX / 2 + 1;
+        let csr = ScxCsr::new_unchecked((huge, 2), vec![], vec![], vec![]);
+        let err = csr.to_dense().unwrap_err();
+        assert!(matches!(err, CsrError::DimensionOverflow { .. }));
     }
 }
