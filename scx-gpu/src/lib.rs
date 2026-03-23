@@ -18,12 +18,14 @@ pub mod device;
 pub mod error;
 pub mod forbp_gpu;
 pub mod rice_gpu;
+pub mod shard_decode;
 
 // Re-export primary types for convenience.
 pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use rice_gpu::rice_decode_gpu;
+pub use shard_decode::{decode_shard_gpu, GpuCsr};
 
 // Re-export cudarc types used in public API signatures.
 pub use cudarc::driver::safe::{CudaModule, CudaSlice, CudaStream};
