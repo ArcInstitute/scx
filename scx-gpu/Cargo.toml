@@ -12,9 +12,7 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 cudarc = { workspace = true }
 thiserror = { workspace = true }
-
-[build-dependencies]
-cc = "1"
+byteorder = { workspace = true }
 
 [features]
 default = []

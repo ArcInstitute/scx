@@ -1,15 +1,15 @@
-// CUDA kernel compilation via `cc` crate.
+// CUDA kernel compilation to PTX via nvcc.
 //
-// Compiles kernels/*.cu into a static library linked via Rust FFI.
-// Target compute capabilities:
-//   - sm_90 (H100, primary target)
-//   - sm_70 (Volta/Ampere fallback)
+// Compiles kernels/*.cu into PTX files in OUT_DIR for runtime loading
+// via cudarc's CudaContext::load_module(Ptx::from_src(...)).
 //
-// The cc crate's Build::cuda(true) method uses nvcc under the hood.
-// If nvcc is not available, compilation is skipped gracefully.
+// Target compute capability: compute_70 (Volta+, compatible with H100).
+// PTX is forward-compatible, so compute_70 PTX runs on sm_90 (H100).
+//
+// If nvcc is not available, compilation is skipped gracefully and a
+// fallback empty PTX marker is written so include_str!() doesn't fail.
 
 fn main() {
-    // Collect all .cu files in the kernels/ directory
     let kernel_dir = std::path::Path::new("kernels");
     if !kernel_dir.exists() {
         return;
@@ -32,35 +32,53 @@ fn main() {
         return;
     }
 
-    // Check if nvcc is available before attempting CUDA compilation
-    let nvcc_check = std::process::Command::new("nvcc").arg("--version").output();
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+    let out_path = std::path::Path::new(&out_dir);
 
-    if nvcc_check.is_err() {
+    // Check if nvcc is available
+    let nvcc_available = std::process::Command::new("nvcc")
+        .arg("--version")
+        .output()
+        .is_ok();
+
+    if !nvcc_available {
         println!(
-            "cargo:warning=nvcc not found — skipping CUDA kernel compilation. \
+            "cargo:warning=nvcc not found — writing empty PTX stubs. \
              GPU kernels will not be available until built on a machine with the CUDA toolkit."
         );
-        return;
+        // Write empty marker files so include_str!() doesn't fail at compile time
+        for cu_file in &cu_files {
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let ptx_path = out_path.join(format!("{stem}.ptx"));
+            std::fs::write(&ptx_path, "// nvcc not available — empty PTX stub\n")
+                .expect("failed to write PTX stub");
+        }
+    } else {
+        // Compile each .cu file to PTX
+        for cu_file in &cu_files {
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let ptx_path = out_path.join(format!("{stem}.ptx"));
+
+            let status = std::process::Command::new("nvcc")
+                .arg("--ptx")
+                .arg("-O3")
+                .arg("--use_fast_math")
+                .arg("-arch=compute_70") // PTX is forward-compatible (runs on sm_90)
+                .arg("-o")
+                .arg(&ptx_path)
+                .arg(cu_file)
+                .status()
+                .expect("failed to run nvcc");
+
+            if !status.success() {
+                panic!(
+                    "nvcc failed to compile {} to PTX (exit code: {:?})",
+                    cu_file.display(),
+                    status.code()
+                );
+            }
+        }
     }
-
-    let mut build = cc::Build::new();
-    build.cuda(true);
-
-    // Optimization flags
-    build.flag("-O3");
-
-    // Target compute capabilities: sm_70 (Volta+) and sm_90 (H100)
-    build.flag("-gencode=arch=compute_70,code=sm_70");
-    build.flag("-gencode=arch=compute_90,code=sm_90");
-
-    // Enable fast math optimizations
-    build.flag("--use_fast_math");
-
-    for cu_file in &cu_files {
-        build.file(cu_file);
-    }
-
-    build.compile("scx_gpu_kernels");
 
     // Re-run build if any kernel file changes
     for cu_file in &cu_files {
