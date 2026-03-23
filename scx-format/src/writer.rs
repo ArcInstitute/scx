@@ -303,14 +303,7 @@ impl ScxWriter {
 
         // Build block index (Phase 1: single entry covering entire shard)
         let block_index = BlockIndex {
-            entries: vec![BlockIndexEntry {
-                row_start: 0,
-                n_rows: n_major as u16,
-                indptr_byte_offset: 0,
-                indices_byte_offset: 0,
-                values_byte_offset: 0,
-                nnz_in_block: nnz as u32,
-            }],
+            entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz)?],
         };
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;

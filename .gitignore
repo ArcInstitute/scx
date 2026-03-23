@@ -2,6 +2,7 @@
 archive/
 tasks/
 tmp/
+learn/
 data/*.h5ad
 benchmarks/logs/
 

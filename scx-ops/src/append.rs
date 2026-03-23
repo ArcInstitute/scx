@@ -145,14 +145,7 @@ pub fn append(
 
         // Block index (single block)
         let block_index = BlockIndex {
-            entries: vec![BlockIndexEntry {
-                row_start: 0,
-                n_rows: shard_rows as u16,
-                indptr_byte_offset: 0,
-                indices_byte_offset: 0,
-                values_byte_offset: 0,
-                nnz_in_block: shard_nnz as u32,
-            }],
+            entries: vec![BlockIndexEntry::new(0, shard_rows as u32, 0, 0, 0, shard_nnz)?],
         };
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;

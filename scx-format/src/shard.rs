@@ -161,6 +161,34 @@ pub struct BlockIndexEntry {
 }
 
 impl BlockIndexEntry {
+    /// Create a new BlockIndexEntry with validation against truncation.
+    ///
+    /// Returns `ScxError::BlockRowsOverflow` if `n_rows > u16::MAX`,
+    /// or `ScxError::BlockNnzOverflow` if `nnz_in_block > u32::MAX`.
+    pub fn new(
+        row_start: u32,
+        n_rows: u32,
+        indptr_byte_offset: u32,
+        indices_byte_offset: u32,
+        values_byte_offset: u32,
+        nnz_in_block: u64,
+    ) -> Result<Self> {
+        if n_rows > u16::MAX as u32 {
+            return Err(crate::ScxError::BlockRowsOverflow(n_rows));
+        }
+        if nnz_in_block > u32::MAX as u64 {
+            return Err(crate::ScxError::BlockNnzOverflow(nnz_in_block));
+        }
+        Ok(Self {
+            row_start,
+            n_rows: n_rows as u16,
+            indptr_byte_offset,
+            indices_byte_offset,
+            values_byte_offset,
+            nnz_in_block: nnz_in_block as u32,
+        })
+    }
+
     fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u32::<LittleEndian>(self.row_start)?;
         w.write_u16::<LittleEndian>(self.n_rows)?;
@@ -336,6 +364,25 @@ mod tests {
 
         assert_eq!(decoded.entries.len(), 3);
         assert_eq!(decoded.entries, index.entries);
+    }
+
+    #[test]
+    fn block_index_entry_new_valid() {
+        let entry = BlockIndexEntry::new(0, 128, 0, 0, 0, 50_000).unwrap();
+        assert_eq!(entry.n_rows, 128);
+        assert_eq!(entry.nnz_in_block, 50_000);
+    }
+
+    #[test]
+    fn block_index_entry_rejects_large_n_rows() {
+        let err = BlockIndexEntry::new(0, 65536, 0, 0, 0, 100).unwrap_err();
+        assert!(matches!(err, ScxError::BlockRowsOverflow(65536)));
+    }
+
+    #[test]
+    fn block_index_entry_rejects_large_nnz() {
+        let err = BlockIndexEntry::new(0, 128, 0, 0, 0, u32::MAX as u64 + 1).unwrap_err();
+        assert!(matches!(err, ScxError::BlockNnzOverflow(_)));
     }
 
     #[test]
