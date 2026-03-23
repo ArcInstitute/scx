@@ -39,14 +39,19 @@ pub fn pull(
 
     let dest_path = std::path::PathBuf::from(dest);
 
+    // Release the GIL during blocking cloud I/O (finding 9.3).
     if let Some(filter_expr) = filter {
-        let stats = rt
-            .block_on(scx_cloud::pull_filtered(
-                source,
-                &dest_path,
-                filter_expr,
-                opts,
-            ))
+        let source = source.to_string();
+        let filter_expr = filter_expr.to_string();
+        let stats = py
+            .allow_threads(|| {
+                rt.block_on(scx_cloud::pull_filtered(
+                    &source,
+                    &dest_path,
+                    &filter_expr,
+                    opts,
+                ))
+            })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let dict = PyDict::new(py);
@@ -59,8 +64,9 @@ pub fn pull(
         dict.set_item("elapsed_secs", stats.elapsed.as_secs_f64())?;
         Ok(dict.into())
     } else {
-        let stats = rt
-            .block_on(scx_cloud::pull(source, &dest_path, opts))
+        let source = source.to_string();
+        let stats = py
+            .allow_threads(|| rt.block_on(scx_cloud::pull(&source, &dest_path, opts)))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let dict = PyDict::new(py);
@@ -98,8 +104,10 @@ pub fn push(
         .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
 
     let source_path = std::path::PathBuf::from(source);
-    let stats = rt
-        .block_on(scx_cloud::push(&source_path, dest, opts))
+    let dest = dest.to_string();
+    // Release the GIL during blocking cloud I/O (finding 9.3).
+    let stats = py
+        .allow_threads(|| rt.block_on(scx_cloud::push(&source_path, &dest, opts)))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let dict = PyDict::new(py);
@@ -160,6 +168,7 @@ pub fn pack(input: &str, output: &str) -> PyResult<()> {
 #[pyclass]
 pub struct PyCloudExperiment {
     reader: scx_cloud::CloudReader,
+    #[allow(dead_code)] // Kept alive to own the tokio runtime for the reader's lifetime.
     rt: tokio::runtime::Runtime,
 }
 
@@ -217,12 +226,14 @@ impl PyCloudExperiment {
 /// Returns:
 ///     PyCloudExperiment handle with metadata accessors
 #[pyfunction]
-pub fn open_cloud(url: &str) -> PyResult<PyCloudExperiment> {
+pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
 
-    let reader = rt
-        .block_on(scx_cloud::open_cloud(url))
+    // Release the GIL during blocking cloud I/O (finding 9.3).
+    let url = url.to_string();
+    let reader = py
+        .allow_threads(|| rt.block_on(scx_cloud::open_cloud(&url)))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(PyCloudExperiment { reader, rt })

@@ -96,19 +96,35 @@ pub fn append(
         ));
     };
 
-    // Convert i64 → u64 indptr
+    // Convert i64 → u64 indptr (finding 9.2: validate non-negative).
     let indptr: Vec<u64> = csr
         .indptr
         .iter()
-        .map(|&v| v as u64)
-        .collect();
+        .map(|&v| {
+            if v < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative indptr value {v}"
+                )))
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect::<PyResult<Vec<u64>>>()?;
 
-    // Convert i32 → u32 indices
+    // Convert i32 → u32 indices (finding 9.2: validate non-negative).
     let indices: Vec<u32> = csr
         .indices
         .iter()
-        .map(|&v| v as u32)
-        .collect();
+        .map(|&v| {
+            if v < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative CSR index {v}"
+                )))
+            } else {
+                Ok(v as u32)
+            }
+        })
+        .collect::<PyResult<Vec<u32>>>()?;
 
     // Encode f32 → raw LE bytes
     let values_bytes = anndata::encode_values(&csr.data, value_encoding);
@@ -216,9 +232,31 @@ pub fn append_from_anndata(
     let value_encoding = anndata::detect_value_encoding(data_slice);
     let values_bytes = anndata::encode_values(data_slice, value_encoding);
 
-    // Convert indptr/indices to on-disk types
-    let indptr: Vec<u64> = indptr_slice.iter().map(|&v| v as u64).collect();
-    let indices: Vec<u32> = indices_slice.iter().map(|&v| v as u32).collect();
+    // Convert indptr/indices to on-disk types (finding 9.2: validate non-negative).
+    let indptr: Vec<u64> = indptr_slice
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative indptr value {v}"
+                )))
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect::<PyResult<Vec<u64>>>()?;
+    let indices: Vec<u32> = indices_slice
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative CSR index {v}"
+                )))
+            } else {
+                Ok(v as u32)
+            }
+        })
+        .collect::<PyResult<Vec<u32>>>()?;
 
     // Read obs from AnnData
     let obs_df = adata.getattr("obs")?;

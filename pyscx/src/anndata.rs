@@ -211,23 +211,22 @@ fn filter_obs_by_deletion_vectors(
 // ---------------------------------------------------------------------------
 
 /// Detect the best value encoding for f32 data.
+///
+/// Checks `is_finite()` so that Infinity/NaN fall through to Float32
+/// (finding 9.4). Compares max as f64 to avoid precision loss for
+/// values > 2^24 (finding 9.1).
 pub(crate) fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
-    let mut all_integer = true;
-    let mut max_val: f32 = 0.0;
-
-    for &v in data {
-        if v != v.floor() || v < 0.0 {
-            all_integer = false;
-            break;
-        }
-        if v > max_val {
-            max_val = v;
-        }
-    }
+    let all_integer = data
+        .iter()
+        .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
 
     if !all_integer {
         return ValueEncoding::Float32;
     }
+
+    // Compare as f64 to avoid precision loss for values > 2^24 and
+    // saturation for values > u32::MAX (finding 9.1).
+    let max_val: f64 = data.iter().map(|&v| v as f64).fold(0.0f64, f64::max);
 
     if max_val <= 255.0 {
         ValueEncoding::Uint8
@@ -306,7 +305,13 @@ pub(crate) fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
             buf
         }
         ValueEncoding::Float16 => {
-            unimplemented!("Float16 encoding not supported in Phase 1")
+            // Float16 not yet supported — fall back to Float32 (finding 9.1).
+            eprintln!("warning: Float16 encoding not supported, falling back to Float32");
+            let mut buf = Vec::with_capacity(data.len() * 4);
+            for &v in data {
+                buf.write_f32::<LittleEndian>(v).unwrap();
+            }
+            buf
         }
     }
 }
@@ -499,21 +504,42 @@ pub fn from_anndata_impl(
     while row_start < n_obs_usize {
         let row_end = (row_start + shard_rows).min(n_obs_usize);
 
-        // Rebase indptr for this shard
+        // Rebase indptr for this shard (finding 9.2: validate non-negative).
         let base = indptr_slice[row_start];
+        if base < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "negative indptr value {base} at row {row_start}"
+            )));
+        }
         let shard_indptr: Vec<u64> = indptr_slice[row_start..=row_end]
             .iter()
-            .map(|&v| (v - base) as u64)
-            .collect();
+            .map(|&v| {
+                if v < base {
+                    Err(PyRuntimeError::new_err(format!(
+                        "indptr value {v} < base {base} (non-monotonic)"
+                    )))
+                } else {
+                    Ok((v - base) as u64)
+                }
+            })
+            .collect::<PyResult<Vec<u64>>>()?;
 
         let nnz_start = base as usize;
         let nnz_end = indptr_slice[row_end] as usize;
 
-        // Convert indices from i32 to u32
+        // Convert indices from i32 to u32 (finding 9.2: validate non-negative).
         let shard_indices: Vec<u32> = indices_slice[nnz_start..nnz_end]
             .iter()
-            .map(|&v| v as u32)
-            .collect();
+            .map(|&v| {
+                if v < 0 {
+                    Err(PyRuntimeError::new_err(format!(
+                        "negative CSR index {v}"
+                    )))
+                } else {
+                    Ok(v as u32)
+                }
+            })
+            .collect::<PyResult<Vec<u32>>>()?;
 
         // Slice values bytes
         let bw = value_encoding.byte_width();
@@ -611,18 +637,39 @@ pub fn from_anndata_impl(
             let l_row_end = (l_row_start + shard_rows).min(n_obs_usize);
 
             let l_base = l_indptr_slice[l_row_start];
+            if l_base < 0 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "layer '{layer_name}': negative indptr value {l_base} at row {l_row_start}"
+                )));
+            }
             let l_shard_indptr: Vec<u64> = l_indptr_slice[l_row_start..=l_row_end]
                 .iter()
-                .map(|&v| (v - l_base) as u64)
-                .collect();
+                .map(|&v| {
+                    if v < l_base {
+                        Err(PyRuntimeError::new_err(format!(
+                            "layer '{layer_name}': indptr value {v} < base {l_base} (non-monotonic)"
+                        )))
+                    } else {
+                        Ok((v - l_base) as u64)
+                    }
+                })
+                .collect::<PyResult<Vec<u64>>>()?;
 
             let l_nnz_start = l_base as usize;
             let l_nnz_end = l_indptr_slice[l_row_end] as usize;
 
             let l_shard_indices: Vec<u32> = l_indices_slice[l_nnz_start..l_nnz_end]
                 .iter()
-                .map(|&v| v as u32)
-                .collect();
+                .map(|&v| {
+                    if v < 0 {
+                        Err(PyRuntimeError::new_err(format!(
+                            "layer '{layer_name}': negative CSR index {v}"
+                        )))
+                    } else {
+                        Ok(v as u32)
+                    }
+                })
+                .collect::<PyResult<Vec<u32>>>()?;
 
             let l_bw = l_value_encoding.byte_width();
             let l_shard_values = &l_values_bytes[l_nnz_start * l_bw..l_nnz_end * l_bw];
