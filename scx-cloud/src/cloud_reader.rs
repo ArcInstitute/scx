@@ -92,8 +92,14 @@ impl CloudReader {
                 Ok(data.to_vec())
             }
             ReaderLayout::Packed(file_path) => {
-                let range = entry.offset..entry.offset + entry.length;
-                let data = self.backend.get_range(file_path, range).await?;
+                let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
+                    CloudError::SliceBoundsExceeded {
+                        offset: entry.offset as usize,
+                        length: entry.length as usize,
+                        data_len: 0, // remote file; actual size unknown
+                    }
+                })?;
+                let data = self.backend.get_range(file_path, entry.offset..end).await?;
                 Ok(data.to_vec())
             }
         }
@@ -141,11 +147,12 @@ impl CloudReader {
 
     /// Read multiple shard sections in parallel.
     pub async fn read_shards(&self, shard_names: &[&str]) -> Result<Vec<Vec<u8>>> {
-        let mut results = Vec::with_capacity(shard_names.len());
-        for name in shard_names {
-            results.push(self.read_section(name).await?);
-        }
-        Ok(results)
+        let handles: Vec<_> = shard_names
+            .iter()
+            .map(|name| self.read_section(name))
+            .collect();
+        let results = futures::future::join_all(handles).await;
+        results.into_iter().collect()
     }
 }
 
@@ -228,7 +235,13 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             {
                 // Cloud-ready: front catalog is at start of file
                 let fc_offset = header.front_catalog_offset;
-                let fc_end = fc_offset + header.front_catalog_length;
+                let fc_end = fc_offset.checked_add(header.front_catalog_length).ok_or_else(|| {
+                    CloudError::SliceBoundsExceeded {
+                        offset: fc_offset as usize,
+                        length: header.front_catalog_length as usize,
+                        data_len: 0,
+                    }
+                })?;
 
                 let fc_bytes = if (fc_end as usize) <= first_bytes.len() {
                     first_bytes[fc_offset as usize..fc_end as usize].to_vec()
@@ -253,7 +266,13 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             } else {
                 // Not cloud-ready: read full catalog at EOF
                 let fc_offset = header.full_catalog_offset;
-                let fc_end = fc_offset + header.full_catalog_length;
+                let fc_end = fc_offset.checked_add(header.full_catalog_length).ok_or_else(|| {
+                    CloudError::SliceBoundsExceeded {
+                        offset: fc_offset as usize,
+                        length: header.full_catalog_length as usize,
+                        data_len: 0,
+                    }
+                })?;
 
                 let fc_bytes = backend
                     .get_range(&file_path, fc_offset..fc_end)

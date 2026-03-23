@@ -485,7 +485,7 @@ pub async fn pull_filtered(
         ))
     })?;
 
-    // Collect matching row indices
+    // Collect matching row indices (used to identify needed shards)
     let matching_rows: Vec<u64> = (0..mask.len())
         .filter(|&i| mask.value(i))
         .map(|i| i as u64)
@@ -512,6 +512,21 @@ pub async fn pull_filtered(
 
     let downloaded_shards = needed_shard_indices.len();
     let skipped_shards = total_shards - downloaded_shards;
+
+    // Collect ALL row indices from downloaded shards (not just predicate-matching
+    // rows). Shards are copied verbatim so the output file must include obs rows
+    // for every row in those shards, otherwise n_obs disagrees with shard data.
+    let shard_row_indices: Vec<u64> = needed_shard_indices
+        .iter()
+        .flat_map(|&si| {
+            if let Some(stats) = &sorted_shards[si].stats {
+                (stats.row_start..stats.row_end).collect::<Vec<u64>>()
+            } else {
+                vec![]
+            }
+        })
+        .collect();
+    let shard_total_rows = shard_row_indices.len() as u64;
 
     // Calculate bytes saved (estimate from skipped shards)
     let bytes_saved: u64 = sorted_shards
@@ -578,8 +593,9 @@ pub async fn pull_filtered(
         }
     }
 
-    // 6. Build filtered obs as Arrow IPC bytes
-    let filtered_obs = filter_record_batch(&obs_batch, &matching_rows)?;
+    // 6. Build obs for all rows in downloaded shards (not just predicate-matching
+    //    rows) so that obs row count matches shard data.
+    let filtered_obs = filter_record_batch(&obs_batch, &shard_row_indices)?;
     let filtered_obs_bytes = record_batch_to_arrow_ipc(&filtered_obs)?;
 
     // 7. Write packed output
@@ -698,7 +714,7 @@ pub async fn pull_filtered(
         catalog_version: original_catalog.catalog_version,
         manifest_sequence: original_catalog.manifest_sequence + 1,
         prev_catalog_offset: 0,
-        n_obs: matching_cells,
+        n_obs: shard_total_rows,
         entries: new_entries,
     };
     let mut new_catalog_bytes = Vec::new();
@@ -717,7 +733,7 @@ pub async fn pull_filtered(
 
     // Write header
     let mut new_header = header;
-    new_header.n_obs = matching_cells;
+    new_header.n_obs = shard_total_rows;
     new_header.n_csr_shards = downloaded_shards as u32;
     new_header.root_catalog_offset = HEADER_SIZE as u64;
     new_header.root_catalog_length = root_catalog_length;

@@ -67,10 +67,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         fc_length,
     )?;
 
-    // Serialize the catalog to get its exact bytes (this is the front catalog content)
-    let mut catalog_bytes = Vec::new();
-    full_catalog.write_to(&mut catalog_bytes)?;
-    let front_catalog_size = catalog_bytes.len() as u64;
+    // We'll write the front catalog after we know the new section offsets.
+    // First, estimate its size from the original catalog so we can reserve space.
+    let mut orig_catalog_bytes = Vec::new();
+    full_catalog.write_to(&mut orig_catalog_bytes)?;
+    let front_catalog_reserved_size = orig_catalog_bytes.len() as u64;
 
     // 2. Determine section ordering for the output file
     //    Order: obs → var → CsrShard → LayerCsrShard → ObsmEmbedding → ObspCsrShard
@@ -126,10 +127,10 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
     let mut write_offset = SECTIONS_START_OFFSET;
 
-    // 4. Write front catalog
+    // 4. Reserve space for front catalog (placeholder; written later with correct offsets)
     let front_catalog_offset = write_offset;
-    writer.write_all(&catalog_bytes)?;
-    write_offset += front_catalog_size;
+    writer.write_all(&vec![0u8; front_catalog_reserved_size as usize])?;
+    write_offset += front_catalog_reserved_size;
 
     // Pad to 8-byte alignment after front catalog
     let aligned = align_to_8(write_offset);
@@ -204,6 +205,25 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     new_full_catalog.write_to(&mut new_catalog_bytes)?;
     writer.write_all(&new_catalog_bytes)?;
     let new_full_catalog_length = new_catalog_bytes.len() as u64;
+
+    // 6b. Write front catalog with correct (new) offsets by seeking back
+    //     to the reserved space. The front catalog has the same entries as
+    //     the full catalog (with new offsets), so it is byte-identical.
+    let front_catalog_size = new_catalog_bytes.len() as u64;
+    assert!(
+        front_catalog_size <= front_catalog_reserved_size,
+        "front catalog size {front_catalog_size} exceeds reserved {front_catalog_reserved_size}"
+    );
+    writer.seek(SeekFrom::Start(front_catalog_offset))?;
+    writer.write_all(&new_catalog_bytes)?;
+    // Zero-fill any remaining reserved bytes (entries are the same so sizes
+    // should match, but be safe)
+    let remaining = (front_catalog_reserved_size - front_catalog_size) as usize;
+    if remaining > 0 {
+        writer.write_all(&vec![0u8; remaining])?;
+    }
+    // Seek back to where the full catalog ended
+    writer.seek(SeekFrom::Start(full_catalog_offset_new + new_full_catalog_length))?;
 
     // 7. Build and write root catalog at offset 256
     let root_catalog = build_root_catalog(&new_full_catalog);
@@ -451,8 +471,16 @@ mod tests {
         assert_eq!(front_catalog.n_obs, full_catalog.n_obs);
         assert_eq!(front_catalog.manifest_sequence, full_catalog.manifest_sequence);
 
-        // Full catalog entries have new offsets; front catalog has old (INPUT) offsets.
-        // The FULL catalog at EOF is the authoritative one with correct offsets.
+        // Front catalog should now have identical offsets to the full catalog
+        for (fc_entry, full_entry) in front_catalog.entries.iter().zip(full_catalog.entries.iter()) {
+            assert_eq!(fc_entry.name, full_entry.name);
+            assert_eq!(
+                fc_entry.offset, full_entry.offset,
+                "front catalog offset for '{}' should match full catalog",
+                fc_entry.name
+            );
+            assert_eq!(fc_entry.length, full_entry.length);
+        }
     }
 
     #[test]
