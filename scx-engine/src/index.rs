@@ -422,7 +422,10 @@ pub fn build_numeric_index(
     // Each leaf entry covers a contiguous value range within one shard.
     let mut leaf_entries: Vec<NumericLeafEntry> = Vec::new();
     for &(val, global_row) in &value_rows {
-        let (shard_id, local_row) = global_row_to_shard(global_row, shard_row_ranges);
+        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges)
+        else {
+            continue; // row doesn't belong to any shard — skip
+        };
         // Try to extend the last entry if same shard and adjacent row
         if let Some(last) = leaf_entries.last_mut() {
             if last.shard_id == shard_id && local_row == last.row_end {
@@ -688,7 +691,10 @@ fn rows_to_shard_ranges(rows: &[u64], shard_row_ranges: &[(u64, u64)]) -> Vec<Sh
     let mut ranges: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
 
     for &global_row in rows {
-        let (shard_id, local_row) = global_row_to_shard(global_row, shard_row_ranges);
+        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges)
+        else {
+            continue; // row doesn't belong to any shard — skip
+        };
         let shard_ranges = ranges.entry(shard_id).or_default();
         // Try to extend the last range
         if let Some(last) = shard_ranges.last_mut() {
@@ -714,16 +720,15 @@ fn rows_to_shard_ranges(rows: &[u64], shard_row_ranges: &[(u64, u64)]) -> Vec<Sh
 }
 
 /// Find which shard a global row belongs to, returning (shard_id, local_row).
-fn global_row_to_shard(global_row: u64, shard_row_ranges: &[(u64, u64)]) -> (u32, u32) {
+/// Returns `None` if the global row falls in a gap between shards or is out of range,
+/// rather than silently computing a garbage local_row via underflow.
+fn global_row_to_shard(global_row: u64, shard_row_ranges: &[(u64, u64)]) -> Option<(u32, u32)> {
     for (i, &(start, end)) in shard_row_ranges.iter().enumerate() {
         if global_row >= start && global_row < end {
-            return (i as u32, (global_row - start) as u32);
+            return Some((i as u32, (global_row - start) as u32));
         }
     }
-    // Fallback: last shard
-    let last = shard_row_ranges.len().saturating_sub(1);
-    let start = shard_row_ranges.get(last).map_or(0, |r| r.0);
-    (last as u32, (global_row - start) as u32)
+    None
 }
 
 // ============================================================================

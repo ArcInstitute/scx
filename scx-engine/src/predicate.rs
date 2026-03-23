@@ -753,8 +753,9 @@ where
                 // Use as_usize for ArrowNativeType, then cast to f64.
                 // This handles all numeric types: i8-i64, u8-u64, f32, f64.
                 let native = array.value(i);
-                let v = native_to_f64(native);
-                Some(match op {
+                // Unrecognized native types yield None (treated as null)
+                // rather than silently returning 0.0 which would give wrong results.
+                native_to_f64(native).map(|v| match op {
                     CmpOp::Eq => v == cmp_val,
                     CmpOp::Ne => v != cmp_val,
                     CmpOp::Lt => v < cmp_val,
@@ -770,7 +771,9 @@ where
 
 /// Convert any ArrowNativeType to f64 using byte reinterpretation.
 /// This handles all integer types (i8–i64, u8–u64) and float types (f32, f64).
-fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> f64 {
+/// Returns `None` for unrecognized types rather than silently returning 0.0,
+/// which would produce wrong query results.
+fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> Option<f64> {
     // ArrowNativeType doesn't directly provide a to_f64 method.
     // Use the fact that all Arrow integer types implement Into<i128> or similar.
     // The cleanest approach: use the Debug trait to convert via string.
@@ -787,37 +790,38 @@ fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> f64 {
     use std::any::Any;
     let any_ref: &dyn Any = &v;
     if let Some(&val) = any_ref.downcast_ref::<i8>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<i16>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<i32>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<i64>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<u8>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<u16>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<u32>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<u64>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<f32>() {
-        return val as f64;
+        return Some(val as f64);
     }
     if let Some(&val) = any_ref.downcast_ref::<f64>() {
-        return val;
+        return Some(val);
     }
-    // half::f16 is also possible but unlikely in predicate evaluation
-    0.0 // unreachable for supported types
+    // Unrecognized type (e.g. half::f16) — return None so callers
+    // treat this as null rather than silently using 0.0
+    None
 }
 
 /// Evaluate comparison on a boolean array.
