@@ -20,6 +20,9 @@ pub enum EngineError {
 
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+
+    #[error(transparent)]
+    CsrError(#[from] scx_sparse::CsrError),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

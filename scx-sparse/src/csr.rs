@@ -9,8 +9,8 @@ pub enum CsrError {
     #[error("indptr is not monotonically non-decreasing at index {index}")]
     IndptrNotMonotonic { index: usize },
 
-    #[error("indptr[0] must be >= 0, got {0}")]
-    IndptrNegativeStart(i64),
+    #[error("indptr[0] must be 0, got {0}")]
+    IndptrNonZeroStart(i64),
 
     #[error("indices.len() ({indices}) != data.len() ({data})")]
     IndicesDataMismatch { indices: usize, data: usize },
@@ -33,6 +33,13 @@ pub enum CsrError {
 
     #[error("n_cols {0} exceeds i32::MAX, cannot represent as i32 column indices")]
     ColumnOverflow(usize),
+
+    #[error("row_slice bounds invalid: start={start}, end={end}, n_rows={n_rows}")]
+    RowSliceOutOfBounds {
+        start: usize,
+        end: usize,
+        n_rows: usize,
+    },
 }
 
 /// A CSR sparse matrix with scipy-compatible dtypes.
@@ -68,9 +75,9 @@ impl ScxCsr {
             });
         }
 
-        // 2. indptr[0] >= 0
-        if indptr[0] < 0 {
-            return Err(CsrError::IndptrNegativeStart(indptr[0]));
+        // 2. indptr[0] == 0 (scipy convention)
+        if indptr[0] != 0 {
+            return Err(CsrError::IndptrNonZeroStart(indptr[0]));
         }
 
         // 3. monotonically non-decreasing
@@ -149,10 +156,14 @@ impl ScxCsr {
     }
 
     /// Extract a contiguous slice of rows `[start..end)` as a new ScxCsr.
-    ///
-    /// Panics if `start > end` or `end > n_rows`.
-    pub fn row_slice(&self, start: usize, end: usize) -> ScxCsr {
-        assert!(start <= end && end <= self.n_rows());
+    pub fn row_slice(&self, start: usize, end: usize) -> Result<ScxCsr, CsrError> {
+        if start > end || end > self.n_rows() {
+            return Err(CsrError::RowSliceOutOfBounds {
+                start,
+                end,
+                n_rows: self.n_rows(),
+            });
+        }
 
         let nnz_start = self.indptr[start] as usize;
         let nnz_end = self.indptr[end] as usize;
@@ -163,7 +174,7 @@ impl ScxCsr {
         let indices = self.indices[nnz_start..nnz_end].to_vec();
         let data = self.data[nnz_start..nnz_end].to_vec();
 
-        ScxCsr::new_unchecked((end - start, self.shape.1), indptr, indices, data)
+        Ok(ScxCsr::new_unchecked((end - start, self.shape.1), indptr, indices, data))
     }
 
     /// Convert to a dense row-major matrix.
@@ -225,7 +236,7 @@ mod tests {
     #[test]
     fn row_slice_middle_rows() {
         let csr = sample_csr();
-        let sliced = csr.row_slice(1, 3);
+        let sliced = csr.row_slice(1, 3).unwrap();
         assert_eq!(sliced.shape, (2, 5));
         assert_eq!(sliced.indptr, vec![0, 3, 4]);
         assert_eq!(sliced.indices, vec![0, 2, 4, 2]);
@@ -235,7 +246,7 @@ mod tests {
     #[test]
     fn row_slice_single_row() {
         let csr = sample_csr();
-        let sliced = csr.row_slice(0, 1);
+        let sliced = csr.row_slice(0, 1).unwrap();
         assert_eq!(sliced.shape, (1, 5));
         assert_eq!(sliced.indptr, vec![0, 2]);
         assert_eq!(sliced.indices, vec![1, 3]);
@@ -245,7 +256,7 @@ mod tests {
     #[test]
     fn row_slice_empty() {
         let csr = sample_csr();
-        let sliced = csr.row_slice(1, 1);
+        let sliced = csr.row_slice(1, 1).unwrap();
         assert_eq!(sliced.shape, (0, 5));
         assert_eq!(sliced.indptr, vec![0]);
         assert_eq!(sliced.nnz(), 0);
@@ -349,7 +360,13 @@ mod tests {
     #[test]
     fn error_indptr_negative_start() {
         let err = ScxCsr::new((1, 5), vec![-1, 0], vec![], vec![]).unwrap_err();
-        assert!(matches!(err, CsrError::IndptrNegativeStart(-1)));
+        assert!(matches!(err, CsrError::IndptrNonZeroStart(-1)));
+    }
+
+    #[test]
+    fn error_indptr_nonzero_start() {
+        let err = ScxCsr::new((1, 5), vec![5, 7], vec![1, 3], vec![1.0, 2.0]).unwrap_err();
+        assert!(matches!(err, CsrError::IndptrNonZeroStart(5)));
     }
 
     // 12.13: out-of-range index
@@ -376,6 +393,34 @@ mod tests {
     fn error_negative_index() {
         let err = ScxCsr::new((1, 5), vec![0, 1], vec![-1], vec![1.0]).unwrap_err();
         assert!(matches!(err, CsrError::IndexOutOfRange { index: -1, .. }));
+    }
+
+    #[test]
+    fn error_row_slice_start_greater_than_end() {
+        let csr = sample_csr();
+        let err = csr.row_slice(2, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            CsrError::RowSliceOutOfBounds {
+                start: 2,
+                end: 1,
+                n_rows: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn error_row_slice_end_exceeds_n_rows() {
+        let csr = sample_csr();
+        let err = csr.row_slice(0, 4).unwrap_err();
+        assert!(matches!(
+            err,
+            CsrError::RowSliceOutOfBounds {
+                start: 0,
+                end: 4,
+                n_rows: 3
+            }
+        ));
     }
 
     #[test]

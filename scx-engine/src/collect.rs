@@ -364,7 +364,7 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     // Step 10: Apply limit
     if let Some(limit) = plan.limit {
         if limit < csr.n_rows() {
-            csr = csr.row_slice(0, limit);
+            csr = csr.row_slice(0, limit)?;
         }
     }
 
