@@ -102,9 +102,16 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     }
 
     // Build ordered list of entries following section_order
+    let known_types: std::collections::HashSet<u8> = section_order.iter().map(|&st| st as u8).collect();
     let mut ordered_entries: Vec<&FullCatalogEntry> = Vec::with_capacity(full_catalog.entries.len());
     for &st in section_order {
         if let Some(entries) = grouped.get(&(st as u8)) {
+            ordered_entries.extend(entries);
+        }
+    }
+    // Include any section types not in section_order (unknown/future types)
+    for (&group_type, entries) in &grouped {
+        if !known_types.contains(&group_type) {
             ordered_entries.extend(entries);
         }
     }

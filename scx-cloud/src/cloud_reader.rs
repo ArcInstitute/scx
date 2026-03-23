@@ -86,7 +86,8 @@ impl CloudReader {
         match &self.layout {
             ReaderLayout::Exploded(location) => {
                 let make_path = crate::pull::build_path_fn(location);
-                let rel_path = section_name_to_path(&entry.name, entry.section_type);
+                let rel_path = section_name_to_path(&entry.name, entry.section_type)
+                    .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
                 let obj_path = make_path(&rel_path);
                 let data = self.backend.get(&obj_path).await?.bytes().await?;
                 Ok(data.to_vec())
@@ -195,7 +196,13 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 catalog,
             })
         }
-        Err(_) => {
+        Err(e) => {
+            // Only fall through to packed-file path for NotFound errors.
+            // Auth, network, and other errors should propagate immediately.
+            if !matches!(e, object_store::Error::NotFound { .. }) {
+                return Err(CloudError::ObjectStore(e));
+            }
+
             // Packed file — build the object path for range reads
             let file_path = match &location {
                 CloudLocation::Local(p) => {

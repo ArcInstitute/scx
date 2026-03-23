@@ -97,7 +97,8 @@ pub async fn push(
     // 3. Build upload tasks for each section (validate bounds first)
     let mut upload_tasks: Vec<(String, Vec<u8>)> = Vec::with_capacity(full_catalog.entries.len());
     for entry in &full_catalog.entries {
-        let rel_path = section_name_to_path(&entry.name, entry.section_type);
+        let rel_path = section_name_to_path(&entry.name, entry.section_type)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let src_start = entry.offset as usize;
         let src_len = entry.length as usize;
         let src_end = src_start.checked_add(src_len).ok_or_else(|| {
@@ -118,17 +119,22 @@ pub async fn push(
         upload_tasks.push((rel_path, data));
     }
 
-    // 4. Upload sections in parallel batches
-    for chunk in upload_tasks.chunks(parallelism) {
+    // 4. Upload sections in parallel batches (consume upload_tasks to avoid cloning)
+    let sections_uploaded = upload_tasks.len();
+    let mut remaining = upload_tasks;
+    while !remaining.is_empty() {
+        let chunk_size = remaining.len().min(parallelism);
+        let chunk: Vec<_> = remaining.drain(..chunk_size).collect();
         let mut handles = Vec::with_capacity(chunk.len());
 
         for (rel_path, data) in chunk {
-            let obj_path = make_path(rel_path);
-            let bytes = bytes::Bytes::from(data.clone());
+            let obj_path = make_path(&rel_path);
+            let len = data.len() as u64;
+            let bytes = bytes::Bytes::from(data);
             let backend_ref = &backend;
             handles.push(async move {
                 backend_ref.put(&obj_path, bytes.into()).await?;
-                Ok::<u64, CloudError>(data.len() as u64)
+                Ok::<u64, CloudError>(len)
             });
         }
 
@@ -137,8 +143,6 @@ pub async fn push(
             total_bytes_uploaded += result?;
         }
     }
-
-    let sections_uploaded = upload_tasks.len();
 
     // 5. Upload _header.bin
     {
@@ -373,7 +377,7 @@ mod tests {
 
         // All section files referenced by catalog should exist
         for entry in &catalog.entries {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type);
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).unwrap();
             let file_path = dest_dir.join(&rel_path);
             assert!(
                 file_path.exists(),

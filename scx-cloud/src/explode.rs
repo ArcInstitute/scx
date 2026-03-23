@@ -62,7 +62,8 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
 
     // Write each section to its mapped file path
     for entry in &full_catalog.entries {
-        let rel_path = section_name_to_path(&entry.name, entry.section_type);
+        let rel_path = section_name_to_path(&entry.name, entry.section_type)
+            .map_err(|e| crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let file_path = output_dir.join(&rel_path);
 
         // Create parent directories
@@ -99,33 +100,37 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
 }
 
 /// Map a catalog entry's section name + type to a relative file path.
-pub(crate) fn section_name_to_path(name: &str, section_type: SectionType) -> String {
+///
+/// Returns an error if a shard index cannot be parsed from the section name.
+pub(crate) fn section_name_to_path(name: &str, section_type: SectionType) -> std::result::Result<String, String> {
     match section_type {
-        SectionType::ObsMetadata => "obs.arrow".to_string(),
-        SectionType::ObsIndex => "obs_index.arrow".to_string(),
-        SectionType::VarMetadata => "var.arrow".to_string(),
-        SectionType::VarIndex => "var_index.arrow".to_string(),
+        SectionType::ObsMetadata => Ok("obs.arrow".to_string()),
+        SectionType::ObsIndex => Ok("obs_index.arrow".to_string()),
+        SectionType::VarMetadata => Ok("var.arrow".to_string()),
+        SectionType::VarIndex => Ok("var_index.arrow".to_string()),
         SectionType::CsrShard => {
             // "X_shard_N" → "X/NNNNNN.shard"
-            let idx = name
+            let idx: u32 = name
                 .strip_prefix("X_shard_")
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
-            format!("X/{idx:06}.shard")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| format!("invalid CsrShard name: expected 'X_shard_N', got '{name}'"))?;
+            Ok(format!("X/{idx:06}.shard"))
         }
         SectionType::ObsmEmbedding => {
             // "obsm/{name}" → "obsm/{name}.arrow"
             let obsm_name = name.strip_prefix("obsm/").unwrap_or(name);
-            format!("obsm/{obsm_name}.arrow")
+            Ok(format!("obsm/{obsm_name}.arrow"))
         }
         SectionType::LayerCsrShard => {
             // "{layer_name}_shard_N" → "layers/{layer_name}/NNNNNN.shard"
             if let Some(pos) = name.rfind("_shard_") {
                 let layer_name = &name[..pos];
-                let idx: u32 = name[pos + 7..].parse().unwrap_or(0);
-                format!("layers/{layer_name}/{idx:06}.shard")
+                let idx: u32 = name[pos + 7..].parse().map_err(|_| {
+                    format!("invalid LayerCsrShard name: cannot parse shard index from '{name}'")
+                })?;
+                Ok(format!("layers/{layer_name}/{idx:06}.shard"))
             } else {
-                format!("layers/{name}.bin")
+                Ok(format!("layers/{name}.bin"))
             }
         }
         SectionType::ObspCsrShard => {
@@ -133,18 +138,20 @@ pub(crate) fn section_name_to_path(name: &str, section_type: SectionType) -> Str
             let inner = name.strip_prefix("obsp/").unwrap_or(name);
             if let Some(pos) = inner.rfind("_shard_") {
                 let obsp_name = &inner[..pos];
-                let idx: u32 = inner[pos + 7..].parse().unwrap_or(0);
-                format!("obsp/{obsp_name}/{idx:06}.shard")
+                let idx: u32 = inner[pos + 7..].parse().map_err(|_| {
+                    format!("invalid ObspCsrShard name: cannot parse shard index from '{name}'")
+                })?;
+                Ok(format!("obsp/{obsp_name}/{idx:06}.shard"))
             } else {
-                format!("obsp/{inner}.bin")
+                Ok(format!("obsp/{inner}.bin"))
             }
         }
-        SectionType::UnsBlob => "uns.json".to_string(),
-        SectionType::Provenance => "_provenance.bin".to_string(),
-        SectionType::DeletionVectors => "_deletion_vectors.bin".to_string(),
-        SectionType::ObsPredicateIndex => "_obs_predicate_index.bin".to_string(),
-        SectionType::VarPredicateIndex => "_var_predicate_index.bin".to_string(),
-        _ => format!("{name}.bin"),
+        SectionType::UnsBlob => Ok("uns.json".to_string()),
+        SectionType::Provenance => Ok("_provenance.bin".to_string()),
+        SectionType::DeletionVectors => Ok("_deletion_vectors.bin".to_string()),
+        SectionType::ObsPredicateIndex => Ok("_obs_predicate_index.bin".to_string()),
+        SectionType::VarPredicateIndex => Ok("_var_predicate_index.bin".to_string()),
+        _ => Ok(format!("{name}.bin")),
     }
 }
 
@@ -173,7 +180,7 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
                 .unwrap()
                 .strip_suffix(".shard")
                 .unwrap();
-            let idx: u32 = idx_str.parse().unwrap_or(0);
+            let idx: u32 = idx_str.parse().ok()?;
             Some((format!("X_shard_{idx}"), SectionType::CsrShard))
         }
         _ if rel_path.starts_with("obsm/") && rel_path.ends_with(".arrow") => {
@@ -190,8 +197,8 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
             let parts: Vec<&str> = inner.splitn(2, '/').collect();
             if parts.len() == 2 {
                 let layer_name = parts[0];
-                let idx_str = parts[1].strip_suffix(".shard").unwrap_or("0");
-                let idx: u32 = idx_str.parse().unwrap_or(0);
+                let idx_str = parts[1].strip_suffix(".shard")?;
+                let idx: u32 = idx_str.parse().ok()?;
                 Some((
                     format!("{layer_name}_shard_{idx}"),
                     SectionType::LayerCsrShard,
@@ -206,8 +213,8 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
             let parts: Vec<&str> = inner.splitn(2, '/').collect();
             if parts.len() == 2 {
                 let obsp_name = parts[0];
-                let idx_str = parts[1].strip_suffix(".shard").unwrap_or("0");
-                let idx: u32 = idx_str.parse().unwrap_or(0);
+                let idx_str = parts[1].strip_suffix(".shard")?;
+                let idx: u32 = idx_str.parse().ok()?;
                 Some((
                     format!("obsp/{obsp_name}_shard_{idx}"),
                     SectionType::ObspCsrShard,
@@ -227,49 +234,58 @@ mod tests {
     #[test]
     fn test_section_name_to_path_mapping() {
         assert_eq!(
-            section_name_to_path("obs", SectionType::ObsMetadata),
+            section_name_to_path("obs", SectionType::ObsMetadata).unwrap(),
             "obs.arrow"
         );
         assert_eq!(
-            section_name_to_path("var", SectionType::VarMetadata),
+            section_name_to_path("var", SectionType::VarMetadata).unwrap(),
             "var.arrow"
         );
         assert_eq!(
-            section_name_to_path("X_shard_0", SectionType::CsrShard),
+            section_name_to_path("X_shard_0", SectionType::CsrShard).unwrap(),
             "X/000000.shard"
         );
         assert_eq!(
-            section_name_to_path("X_shard_42", SectionType::CsrShard),
+            section_name_to_path("X_shard_42", SectionType::CsrShard).unwrap(),
             "X/000042.shard"
         );
         assert_eq!(
-            section_name_to_path("obsm/X_pca", SectionType::ObsmEmbedding),
+            section_name_to_path("obsm/X_pca", SectionType::ObsmEmbedding).unwrap(),
             "obsm/X_pca.arrow"
         );
         assert_eq!(
-            section_name_to_path("raw_counts_shard_0", SectionType::LayerCsrShard),
+            section_name_to_path("raw_counts_shard_0", SectionType::LayerCsrShard).unwrap(),
             "layers/raw_counts/000000.shard"
         );
         assert_eq!(
-            section_name_to_path("obsp/distances_shard_3", SectionType::ObspCsrShard),
+            section_name_to_path("obsp/distances_shard_3", SectionType::ObspCsrShard).unwrap(),
             "obsp/distances/000003.shard"
         );
         assert_eq!(
-            section_name_to_path("uns", SectionType::UnsBlob),
+            section_name_to_path("uns", SectionType::UnsBlob).unwrap(),
             "uns.json"
         );
         assert_eq!(
-            section_name_to_path("provenance", SectionType::Provenance),
+            section_name_to_path("provenance", SectionType::Provenance).unwrap(),
             "_provenance.bin"
         );
         assert_eq!(
-            section_name_to_path("deletion_vectors", SectionType::DeletionVectors),
+            section_name_to_path("deletion_vectors", SectionType::DeletionVectors).unwrap(),
             "_deletion_vectors.bin"
         );
         assert_eq!(
-            section_name_to_path("obs_predicate_index", SectionType::ObsPredicateIndex),
+            section_name_to_path("obs_predicate_index", SectionType::ObsPredicateIndex).unwrap(),
             "_obs_predicate_index.bin"
         );
+    }
+
+    #[test]
+    fn test_section_name_to_path_rejects_invalid_shard_index() {
+        assert!(section_name_to_path("X_shard_abc", SectionType::CsrShard).is_err());
+        assert!(section_name_to_path("X_shard_", SectionType::CsrShard).is_err());
+        assert!(section_name_to_path("bad_name", SectionType::CsrShard).is_err());
+        assert!(section_name_to_path("raw_counts_shard_xyz", SectionType::LayerCsrShard).is_err());
+        assert!(section_name_to_path("obsp/dist_shard_xyz", SectionType::ObspCsrShard).is_err());
     }
 
     #[test]
@@ -288,7 +304,7 @@ mod tests {
         ];
 
         for (name, st) in cases {
-            let path = section_name_to_path(name, st);
+            let path = section_name_to_path(name, st).unwrap();
             let (recovered_name, recovered_type) =
                 path_to_section_name(&path).unwrap_or_else(|| {
                     panic!("path_to_section_name failed for path: {path}")

@@ -60,10 +60,17 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
             .push(entry);
     }
 
+    let known_types: std::collections::HashSet<u8> = section_order.iter().map(|&st| st as u8).collect();
     let mut ordered_entries: Vec<&FullCatalogEntry> =
         Vec::with_capacity(original_catalog.entries.len());
     for &st in section_order {
         if let Some(entries) = grouped.get(&(st as u8)) {
+            ordered_entries.extend(entries);
+        }
+    }
+    // Include any section types not in section_order (unknown/future types)
+    for (&group_type, entries) in &grouped {
+        if !known_types.contains(&group_type) {
             ordered_entries.extend(entries);
         }
     }
@@ -116,18 +123,23 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
         let new_offset = write_offset;
 
         // Read section file from exploded directory
-        let rel_path = section_name_to_path(&entry.name, entry.section_type);
+        let rel_path = section_name_to_path(&entry.name, entry.section_type)
+            .map_err(|e| crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let file_path = input_dir.join(&rel_path);
         let section_data = std::fs::read(&file_path)?;
         writer.write_all(&section_data)?;
         write_offset += section_data.len() as u64;
+
+        // Recompute checksum from actual section data (may differ from
+        // original if section files were modified on disk)
+        let checksum = scx_format::blake3_hash(&section_data);
 
         new_entries.push(FullCatalogEntry {
             name: entry.name.clone(),
             offset: new_offset,
             length: section_data.len() as u64,
             section_type: entry.section_type,
-            checksum: entry.checksum,
+            checksum,
             stats: entry.stats.clone(),
         });
     }
@@ -501,7 +513,7 @@ mod tests {
 
         for entry in &catalog.entries {
             if entry.section_type == SectionType::CsrShard {
-                let rel_path = crate::explode::section_name_to_path(&entry.name, entry.section_type);
+                let rel_path = crate::explode::section_name_to_path(&entry.name, entry.section_type).unwrap();
                 let shard_file = exploded_dir.join(&rel_path);
                 let shard_bytes = std::fs::read(&shard_file).unwrap();
                 let original_bytes =

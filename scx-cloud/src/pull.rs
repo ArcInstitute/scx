@@ -146,10 +146,17 @@ pub async fn pull(
             .push(entry);
     }
 
+    let known_types: std::collections::HashSet<u8> = section_order.iter().map(|&st| st as u8).collect();
     let mut ordered_entries: Vec<&FullCatalogEntry> =
         Vec::with_capacity(original_catalog.entries.len());
     for &st in section_order {
         if let Some(entries) = grouped.get(&(st as u8)) {
+            ordered_entries.extend(entries);
+        }
+    }
+    // Include any section types not in section_order (unknown/future types)
+    for (&group_type, entries) in &grouped {
+        if !known_types.contains(&group_type) {
             ordered_entries.extend(entries);
         }
     }
@@ -163,10 +170,11 @@ pub async fn pull(
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type);
-            (i, rel_path)
+            let rel_path = section_name_to_path(&entry.name, entry.section_type)
+                .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            Ok((i, rel_path))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     // Download in batches of `parallelism`
     for chunk in download_tasks.chunks(parallelism) {
@@ -449,7 +457,8 @@ pub async fn pull_filtered(
     let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
 
     // 3. Download obs.arrow and evaluate predicate
-    let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata);
+    let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata)
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     let obs_obj_path = make_path(&obs_path_str);
     let obs_data = backend.get(&obs_obj_path).await?.bytes().await?;
     total_bytes_downloaded += obs_data.len() as u64;
@@ -567,10 +576,11 @@ pub async fn pull_filtered(
     let download_tasks: Vec<(String, String)> = entries_to_download
         .iter()
         .map(|entry| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type);
-            (entry.name.clone(), rel_path)
+            let rel_path = section_name_to_path(&entry.name, entry.section_type)
+                .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            Ok((entry.name.clone(), rel_path))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     for chunk in download_tasks.chunks(parallelism) {
         let mut handles = Vec::with_capacity(chunk.len());
