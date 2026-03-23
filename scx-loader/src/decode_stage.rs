@@ -345,10 +345,12 @@ fn extract_single_column(
             Ok(ObsColumn::Categorical(codes, categories))
         }
         DataType::Dictionary(key_type, _value_type) => {
-            // Arrow dictionary encoding → Categorical
-            match key_type.as_ref() {
-                DataType::Int32 => {
-                    let dict_arr = array.as_dictionary::<arrow::datatypes::Int32Type>();
+            // Arrow dictionary encoding → Categorical.
+            // Extract categories from the dictionary values (must be Utf8).
+            // Support common Arrow key types: Int8, Int16, Int32, UInt8, UInt16, UInt32.
+            macro_rules! decode_dict {
+                ($key_ty:ty) => {{
+                    let dict_arr = array.as_dictionary::<$key_ty>();
                     let keys = dict_arr.keys();
                     let values_arr = dict_arr
                         .values()
@@ -359,7 +361,6 @@ fn extract_single_column(
                                 "obs column '{col_name}': dictionary values are not Utf8"
                             ),
                         })?;
-
                     let categories: Vec<String> =
                         (0..values_arr.len()).map(|i| values_arr.value(i).to_string()).collect();
                     let codes: Vec<u32> = cell_indices
@@ -367,7 +368,15 @@ fn extract_single_column(
                         .map(|&idx| keys.value(idx as usize) as u32)
                         .collect();
                     Ok(ObsColumn::Categorical(codes, categories))
-                }
+                }};
+            }
+            match key_type.as_ref() {
+                DataType::Int8 => decode_dict!(arrow::datatypes::Int8Type),
+                DataType::Int16 => decode_dict!(arrow::datatypes::Int16Type),
+                DataType::Int32 => decode_dict!(arrow::datatypes::Int32Type),
+                DataType::UInt8 => decode_dict!(arrow::datatypes::UInt8Type),
+                DataType::UInt16 => decode_dict!(arrow::datatypes::UInt16Type),
+                DataType::UInt32 => decode_dict!(arrow::datatypes::UInt32Type),
                 _ => Err(LoaderError::ConfigError {
                     reason: format!(
                         "obs column '{col_name}': unsupported dictionary key type {:?}",

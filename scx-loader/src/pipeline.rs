@@ -352,7 +352,7 @@ impl TrainingPipeline {
             n_csr_shards,
             memory_budget.shard_group_size,
             config.seed,
-        );
+        )?;
 
         // Create tokio runtime for async I/O
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -401,10 +401,11 @@ impl TrainingPipeline {
         let shard_groups = self.shuffler.shuffle_epoch();
 
         // Create bounded channels
-        // I/O → Decode: tokio mpsc channel. Use at least 2 to allow read-ahead
-        // (pipeline overlap between I/O and decode stages).
-        let io_channel_cap = self.memory_budget.shard_group_size.max(2);
-        let (io_tx, io_rx) = tokio::sync::mpsc::channel(io_channel_cap);
+        // I/O → Decode: tokio mpsc channel. Each item is a ShardGroup containing
+        // shard_group_size decoded shards. Cap at 2 for pipeline overlap (one
+        // being decoded + one read-ahead), not shard_group_size which would allow
+        // shard_group_size * shard_group_size decoded shards in flight.
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(2);
 
         // Decode → Consumer: crossbeam bounded channel, capacity = prefetch_batches
         // Use at least 2 to allow decode to run ahead of consumer.

@@ -16,6 +16,7 @@ use rand_chacha::ChaCha8Rng;
 ///
 /// Uses a deterministic RNG seeded from `(seed, epoch)` so that the same
 /// seed and epoch always produce the identical shard ordering.
+#[derive(Debug)]
 pub struct ShardShuffler {
     n_shards: usize,
     shard_group_size: usize,
@@ -28,15 +29,20 @@ impl ShardShuffler {
     ///
     /// # Arguments
     /// - `n_shards`: Total number of CSR shards in the file.
-    /// - `shard_group_size`: Number of shards per I/O group.
+    /// - `shard_group_size`: Number of shards per I/O group (must be >= 1).
     /// - `seed`: RNG seed for reproducibility.
-    pub fn new(n_shards: usize, shard_group_size: usize, seed: u64) -> Self {
-        ShardShuffler {
+    pub fn new(n_shards: usize, shard_group_size: usize, seed: u64) -> crate::error::Result<Self> {
+        if shard_group_size == 0 {
+            return Err(crate::error::LoaderError::ConfigError {
+                reason: "shard_group_size must be >= 1".to_string(),
+            });
+        }
+        Ok(ShardShuffler {
             n_shards,
             shard_group_size,
             rng_seed: seed,
             epoch: 0,
-        }
+        })
     }
 
     /// Generate shuffled shard groups for this epoch.
@@ -89,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_different_epochs_different_orderings() {
-        let mut shuffler = ShardShuffler::new(20, 4, 42);
+        let mut shuffler = ShardShuffler::new(20, 4, 42).unwrap();
         let epoch0 = shuffler.shuffle_epoch();
         let epoch1 = shuffler.shuffle_epoch();
 
@@ -102,8 +108,8 @@ mod tests {
 
     #[test]
     fn test_same_seed_same_epoch_identical() {
-        let mut shuffler1 = ShardShuffler::new(20, 4, 42);
-        let mut shuffler2 = ShardShuffler::new(20, 4, 42);
+        let mut shuffler1 = ShardShuffler::new(20, 4, 42).unwrap();
+        let mut shuffler2 = ShardShuffler::new(20, 4, 42).unwrap();
 
         let groups1 = shuffler1.shuffle_epoch();
         let groups2 = shuffler2.shuffle_epoch();
@@ -114,7 +120,7 @@ mod tests {
     #[test]
     fn test_all_shard_indices_present() {
         let n_shards = 17;
-        let mut shuffler = ShardShuffler::new(n_shards, 5, 123);
+        let mut shuffler = ShardShuffler::new(n_shards, 5, 123).unwrap();
 
         for _ in 0..3 {
             let groups = shuffler.shuffle_epoch();
@@ -132,7 +138,7 @@ mod tests {
     #[test]
     fn test_group_sizes_correct() {
         // 17 shards, group_size=5 → 4 groups: [5, 5, 5, 2]
-        let mut shuffler = ShardShuffler::new(17, 5, 99);
+        let mut shuffler = ShardShuffler::new(17, 5, 99).unwrap();
         let groups = shuffler.shuffle_epoch();
 
         assert_eq!(groups.len(), 4);
@@ -142,7 +148,7 @@ mod tests {
         assert_eq!(groups[3].len(), 2); // last group is smaller
 
         // Exact divisible case: 20 shards, group_size=5 → 4 groups all size 5
-        let mut shuffler2 = ShardShuffler::new(20, 5, 99);
+        let mut shuffler2 = ShardShuffler::new(20, 5, 99).unwrap();
         let groups2 = shuffler2.shuffle_epoch();
         assert_eq!(groups2.len(), 4);
         for g in &groups2 {
@@ -152,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_single_shard() {
-        let mut shuffler = ShardShuffler::new(1, 8, 42);
+        let mut shuffler = ShardShuffler::new(1, 8, 42).unwrap();
         let groups = shuffler.shuffle_epoch();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0], vec![0]);
@@ -161,7 +167,7 @@ mod tests {
     #[test]
     fn test_group_size_larger_than_n_shards() {
         // group_size > n_shards → single group
-        let mut shuffler = ShardShuffler::new(3, 10, 42);
+        let mut shuffler = ShardShuffler::new(3, 10, 42).unwrap();
         let groups = shuffler.shuffle_epoch();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 3);
@@ -169,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_epoch_counter_increments() {
-        let mut shuffler = ShardShuffler::new(10, 4, 42);
+        let mut shuffler = ShardShuffler::new(10, 4, 42).unwrap();
         assert_eq!(shuffler.epoch(), 0);
         shuffler.shuffle_epoch();
         assert_eq!(shuffler.epoch(), 1);
@@ -212,5 +218,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         RowShuffler::shuffle_rows(&mut indices, &mut rng);
         assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_zero_shard_group_size_returns_error() {
+        let result = ShardShuffler::new(10, 0, 42);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("shard_group_size"), "expected 'shard_group_size' in: {msg}");
     }
 }

@@ -80,7 +80,7 @@ pub async fn io_stage(
 
     // Pre-compute per-shard deletion bitmaps for O(1) lookup.
     // Map: shard_index (position in sorted list) → RoaringBitmap of deleted local rows.
-    let deletion_map: std::collections::HashMap<usize, RoaringBitmap> = match &deletion_vectors {
+    let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> = Arc::new(match &deletion_vectors {
         Some(dv) => {
             let mut map = std::collections::HashMap::new();
             for sd in &dv.shards {
@@ -92,7 +92,7 @@ pub async fn io_stage(
             map
         }
         None => std::collections::HashMap::new(),
-    };
+    });
 
     let profile = profiling_enabled();
     let io_start = Instant::now();
@@ -101,7 +101,7 @@ pub async fn io_stage(
     for group_indices in shard_groups {
         // Clone Arc handles for the spawn_blocking closure.
         let reader = Arc::clone(&reader);
-        let deletion_map = deletion_map.clone();
+        let deletion_map = Arc::clone(&deletion_map);
         let group_num = group_count;
         group_count += 1;
 
