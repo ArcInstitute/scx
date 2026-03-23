@@ -14,6 +14,7 @@
 //!
 //! The [`GpuDevice`] struct wraps both into a single ergonomic handle.
 
+pub mod cusparse;
 pub mod device;
 pub mod error;
 pub mod forbp_gpu;
@@ -21,6 +22,7 @@ pub mod rice_gpu;
 pub mod shard_decode;
 
 // Re-export primary types for convenience.
+pub use cusparse::{CusparseHandle, CusparseSpMatDescr, GpuCsrPointers};
 pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
