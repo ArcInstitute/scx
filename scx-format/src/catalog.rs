@@ -386,16 +386,10 @@ impl FullCatalog {
                 None
             };
 
-            // Skip unknown section types with a warning instead of erroring
+            // Skip unknown section types (forward-compatibility)
             let section_type = match SectionType::from_u8(section_type_raw) {
                 Some(st) => st,
-                None => {
-                    eprintln!(
-                        "warning: skipping unknown section type {} for entry '{}'",
-                        section_type_raw, name
-                    );
-                    continue;
-                }
+                None => continue,
             };
 
             entries.push(FullCatalogEntry {

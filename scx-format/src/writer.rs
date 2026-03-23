@@ -82,9 +82,9 @@ impl ScxWriter {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Get a mutable reference to the inner writer, panicking if finish() was already called.
-    fn writer(&mut self) -> &mut BufWriter<File> {
-        self.file.as_mut().expect("ScxWriter already finished")
+    /// Get a mutable reference to the inner writer.
+    fn writer(&mut self) -> Result<&mut BufWriter<File>> {
+        self.file.as_mut().ok_or(ScxError::WriterAlreadyFinished)
     }
 
     /// Write zero-byte padding to reach 8-byte alignment.
@@ -92,7 +92,7 @@ impl ScxWriter {
         let aligned = align_to_8(self.current_offset);
         let pad = (aligned - self.current_offset) as usize;
         if pad > 0 {
-            self.writer().write_all(&vec![0u8; pad])?;
+            self.writer()?.write_all(&vec![0u8; pad])?;
             self.current_offset = aligned;
         }
         Ok(())
@@ -112,7 +112,7 @@ impl ScxWriter {
         let length = data.len() as u64;
         let checksum = blake3_hash(data);
 
-        self.writer().write_all(data)?;
+        self.writer()?.write_all(data)?;
         self.current_offset += length;
 
         self.entries.push(FullCatalogEntry {
@@ -287,6 +287,9 @@ impl ScxWriter {
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
+        if indptr.is_empty() {
+            return Err(ScxError::EmptyIndptr);
+        }
         let n_major = (indptr.len() - 1) as u32;
         let nnz = *indptr.last().unwrap_or(&0);
         let index_dtype_u16 = self.header.index_dtype == 0;
@@ -366,7 +369,7 @@ impl ScxWriter {
         let section_length = section_data.len() as u64;
 
         // Write to file
-        self.writer().write_all(&section_data)?;
+        self.writer()?.write_all(&section_data)?;
         self.current_offset += section_length;
 
         // Compute shard stats from raw values
@@ -394,13 +397,17 @@ impl ScxWriter {
     pub fn set_shard_column_stats(
         &mut self,
         column_stats: Vec<crate::catalog::ColumnStat>,
-    ) {
+    ) -> Result<()> {
+        if column_stats.len() > u8::MAX as usize {
+            return Err(ScxError::ColumnStatsOverflow(column_stats.len()));
+        }
         if let Some(entry) = self.entries.last_mut() {
             if let Some(ref mut stats) = entry.stats {
                 stats.n_indexed_columns = column_stats.len() as u8;
                 stats.column_stats = column_stats;
             }
         }
+        Ok(())
     }
 
 
@@ -409,7 +416,7 @@ impl ScxWriter {
     /// Returns the final file path on success.
     pub fn finish(mut self) -> Result<PathBuf> {
         // Flush BufWriter and take inner File
-        let buf_writer = self.file.take().expect("ScxWriter already finished");
+        let buf_writer = self.file.take().ok_or(ScxError::WriterAlreadyFinished)?;
         let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
 
         // 1. Write full catalog at EOF
@@ -445,7 +452,13 @@ impl ScxWriter {
         let mut root_entries = Vec::new();
         for (&group_type, entries) in &groups {
             let first_offset = entries.iter().map(|e| e.offset).min().unwrap_or(0);
-            let total_length: u64 = entries.iter().map(|e| e.length).sum();
+            // Compute span from first section start to end of last section (includes padding)
+            let last_end = entries
+                .iter()
+                .map(|e| e.offset + e.length)
+                .max()
+                .unwrap_or(0);
+            let total_length: u64 = last_end.saturating_sub(first_offset);
             let n_sections = entries.len() as u32;
             root_entries.push(RootCatalogEntry {
                 group_type,

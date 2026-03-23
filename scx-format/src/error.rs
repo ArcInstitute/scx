@@ -55,6 +55,15 @@ pub enum ScxError {
         file_size: usize,
     },
 
+    #[error("writer has already been finished")]
+    WriterAlreadyFinished,
+
+    #[error("empty indptr array")]
+    EmptyIndptr,
+
+    #[error("column_stats count {0} exceeds u8::MAX (255)")]
+    ColumnStatsOverflow(usize),
+
     #[error("CSR error: {0}")]
     Csr(#[from] scx_sparse::CsrError),
 

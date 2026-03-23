@@ -244,7 +244,7 @@ fn write_bench_file(dir: &TempDir) -> PathBuf {
         writer.set_shard_column_stats(vec![ColumnStat::CategoryBitset {
             column_name_hash: cell_type_hash,
             bitset,
-        }]);
+        }]).unwrap();
 
         shard_row_ranges.push((row_start as u64, (row_start + shard_rows) as u64));
         row_start += shard_rows;

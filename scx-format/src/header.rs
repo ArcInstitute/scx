@@ -103,7 +103,7 @@ impl FileHeader {
         }
 
         let format_version = r.read_u16::<LittleEndian>()?;
-        if format_version > 1 {
+        if format_version == 0 || format_version > 1 {
             return Err(ScxError::UnsupportedVersion);
         }
 
