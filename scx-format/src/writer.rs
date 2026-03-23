@@ -11,7 +11,7 @@ use scx_codec::{CodecId, ValueEncoding};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry, ShardStats};
 use crate::checksum::{blake3_hash, blake3_truncated_64};
-use crate::error::Result;
+use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::section::{align_to_8, SectionType};
 use crate::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE};
@@ -335,7 +335,12 @@ impl ScxWriter {
             index_dtype: self.header.index_dtype,
             reserved_flags: [0; 3],
             n_major,
-            n_minor: self.header.n_vars as u32,
+            n_minor: {
+                if self.header.n_vars > u32::MAX as u64 {
+                    return Err(ScxError::NVarsOverflow(self.header.n_vars));
+                }
+                self.header.n_vars as u32
+            },
             nnz,
             global_offset: row_start,
             indptr_rel_offset,
@@ -539,6 +544,7 @@ impl ScxWriter {
     ///
     /// Automatically sets the deletion-vectors flag (bit 5) in the file header
     /// so that `ScxReader::read_deletion_vectors()` will find the section.
+    #[cfg(feature = "deletion-vectors")]
     pub fn write_deletion_vectors(
         &mut self,
         dv: &crate::deletion_vectors::DeletionVectors,

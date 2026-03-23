@@ -82,7 +82,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     let value_encoding_u8 = {
         // Read from first shard header to get value encoding
         if !shards.is_empty() {
-            let section = reader.section_bytes(shards[0]);
+            let section = reader.section_bytes(shards[0])?;
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
@@ -200,7 +200,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             })
             .collect();
         let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first_entry);
+            let section = reader.section_bytes(first_entry)?;
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
@@ -209,7 +209,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             value_encoding
         };
         let layer_codec = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first_entry);
+            let section = reader.section_bytes(first_entry)?;
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;

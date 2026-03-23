@@ -41,7 +41,7 @@ pub fn run_append(
     // Detect ValueEncoding from the input file's first CSR shard header
     let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
     let value_encoding = if let Some(first_shard) = csr_entries.first() {
-        let bytes = input_reader.section_bytes(first_shard);
+        let bytes = input_reader.section_bytes(first_shard)?;
         if bytes.len() >= SHARD_HEADER_SIZE {
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE]))?;

@@ -80,7 +80,8 @@ pub fn append(
     // Detect value encoding from first shard header
     let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
     let value_encoding = if let Some(first_entry) = csr_entries.first() {
-        let bytes = input_reader.section_bytes(first_entry);
+        let bytes = input_reader.section_bytes(first_entry)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sh = ShardHeader::read_from(&mut Cursor::new(&bytes[..SHARD_HEADER_SIZE]))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         ValueEncoding::from_u8(sh.value_encoding).ok_or_else(|| {

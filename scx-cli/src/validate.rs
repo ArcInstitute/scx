@@ -11,7 +11,7 @@ pub fn run_validate(path: &Path, verbose: bool) -> Result<bool, Box<dyn std::err
     let mut all_passed = true;
 
     for entry in &catalog.entries {
-        let bytes = reader.section_bytes(entry);
+        let bytes = reader.section_bytes(entry)?;
         let computed = blake3_hash(bytes);
         let passed = computed == entry.checksum;
 

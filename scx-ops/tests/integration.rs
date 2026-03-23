@@ -745,13 +745,13 @@ fn test_shard_header_global_offset_is_row_index() {
     assert_eq!(shards.len(), 2);
 
     // First shard: global_offset should be 0 (starts at row 0)
-    let s0_bytes = reader.section_bytes(shards[0]);
+    let s0_bytes = reader.section_bytes(shards[0]).unwrap();
     let sh0 =
         ShardHeader::read_from(&mut std::io::Cursor::new(&s0_bytes[..SHARD_HEADER_SIZE])).unwrap();
     assert_eq!(sh0.global_offset, 0, "first shard should start at row 0");
 
     // Second shard (appended): global_offset should be 6 (original n_obs)
-    let s1_bytes = reader.section_bytes(shards[1]);
+    let s1_bytes = reader.section_bytes(shards[1]).unwrap();
     let sh1 =
         ShardHeader::read_from(&mut std::io::Cursor::new(&s1_bytes[..SHARD_HEADER_SIZE])).unwrap();
     assert_eq!(sh1.global_offset, 6, "appended shard should start at row 6");

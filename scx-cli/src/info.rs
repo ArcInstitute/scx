@@ -54,7 +54,7 @@ pub fn run_info(
     // Value encoding: read from first CSR shard header
     let csr_shards = catalog.shards(SectionType::CsrShard);
     let value_enc_name = if let Some(first_shard) = csr_shards.first() {
-        let bytes = reader.section_bytes(first_shard);
+        let bytes = reader.section_bytes(first_shard)?;
         if bytes.len() >= SHARD_HEADER_SIZE {
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE]))?;

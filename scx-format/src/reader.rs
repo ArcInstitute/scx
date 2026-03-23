@@ -72,7 +72,21 @@ impl ScxReader {
         // Read full catalog using header's offset and length
         let fc_offset = header.full_catalog_offset as usize;
         let fc_length = header.full_catalog_length as usize;
-        let fc_slice = &mmap[fc_offset..fc_offset + fc_length];
+        let fc_end = fc_offset.checked_add(fc_length).ok_or(
+            ScxError::SectionOutOfBounds {
+                offset: header.full_catalog_offset,
+                length: header.full_catalog_length,
+                file_size: mmap.len(),
+            },
+        )?;
+        if fc_end > mmap.len() {
+            return Err(ScxError::SectionOutOfBounds {
+                offset: header.full_catalog_offset,
+                length: header.full_catalog_length,
+                file_size: mmap.len(),
+            });
+        }
+        let fc_slice = &mmap[fc_offset..fc_end];
         let full_catalog = FullCatalog::read_from(&mut Cursor::new(fc_slice), fc_length)?;
 
         Ok(ScxReader {
@@ -118,7 +132,7 @@ impl ScxReader {
     /// Read the Arrow IPC schema from a catalog entry without deserializing data.
     /// This reads only the IPC footer (~KB) to extract field names and types.
     fn read_arrow_ipc_schema(&self, entry: &FullCatalogEntry) -> Result<arrow::datatypes::Schema> {
-        let slice = self.section_bytes(entry);
+        let slice = self.section_bytes(entry)?;
         let cursor = Cursor::new(slice);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
         Ok(reader.schema().as_ref().clone())
@@ -126,7 +140,7 @@ impl ScxReader {
 
     /// Read an Arrow IPC section from a catalog entry.
     fn read_arrow_ipc(&self, entry: &FullCatalogEntry) -> Result<RecordBatch> {
-        let slice = self.section_bytes(entry);
+        let slice = self.section_bytes(entry)?;
         let cursor = Cursor::new(slice);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
         // Read the first (and typically only) batch
@@ -293,7 +307,7 @@ impl ScxReader {
             .full_catalog
             .get("uns")
             .ok_or_else(|| ScxError::SectionNotFound("uns".to_string()))?;
-        let slice = self.section_bytes(entry);
+        let slice = self.section_bytes(entry)?;
         Ok(serde_json::from_slice(slice)?)
     }
 
@@ -307,7 +321,7 @@ impl ScxReader {
             .full_catalog
             .get("provenance")
             .ok_or_else(|| ScxError::SectionNotFound("provenance".to_string()))?;
-        let slice = self.section_bytes(entry);
+        let slice = self.section_bytes(entry)?;
         Provenance::read_from(&mut Cursor::new(slice))
     }
 
@@ -324,7 +338,7 @@ impl ScxReader {
             .iter()
             .find(|e| e.section_type == SectionType::ObsPredicateIndex);
         match entry {
-            Some(e) => Ok(Some(self.section_bytes(e))),
+            Some(e) => Ok(Some(self.section_bytes(e)?)),
             None => Ok(None),
         }
     }
@@ -338,7 +352,7 @@ impl ScxReader {
             .iter()
             .find(|e| e.section_type == SectionType::VarPredicateIndex);
         match entry {
-            Some(e) => Ok(Some(self.section_bytes(e))),
+            Some(e) => Ok(Some(self.section_bytes(e)?)),
             None => Ok(None),
         }
     }
@@ -361,7 +375,7 @@ impl ScxReader {
             .iter()
             .find(|e| e.section_type == SectionType::DeletionVectors)
             .ok_or_else(|| ScxError::SectionNotFound("deletion_vectors".to_string()))?;
-        let slice = self.section_bytes(entry);
+        let slice = self.section_bytes(entry)?;
         let dv = crate::deletion_vectors::DeletionVectors::read_from(&mut Cursor::new(slice))?;
         Ok(Some(dv))
     }
@@ -442,7 +456,7 @@ impl ScxReader {
         let mut essential_failed = false;
 
         for entry in &self.full_catalog.entries {
-            let slice = self.section_bytes(entry);
+            let slice = self.section_bytes(entry)?;
             let computed = blake3_hash(slice);
             let passed = computed == entry.checksum;
 
@@ -471,10 +485,23 @@ impl ScxReader {
     // -----------------------------------------------------------------------
 
     /// Get the raw bytes for a catalog entry from the mmap.
-    pub fn section_bytes(&self, entry: &FullCatalogEntry) -> &[u8] {
+    pub fn section_bytes(&self, entry: &FullCatalogEntry) -> Result<&[u8]> {
         let start = entry.offset as usize;
-        let end = start + entry.length as usize;
-        &self.mmap[start..end]
+        let end = start.checked_add(entry.length as usize).ok_or(
+            ScxError::SectionOutOfBounds {
+                offset: entry.offset,
+                length: entry.length,
+                file_size: self.mmap.len(),
+            },
+        )?;
+        if end > self.mmap.len() {
+            return Err(ScxError::SectionOutOfBounds {
+                offset: entry.offset,
+                length: entry.length,
+                file_size: self.mmap.len(),
+            });
+        }
+        Ok(&self.mmap[start..end])
     }
 
     /// Read and decode a single shard from a catalog entry.
@@ -502,7 +529,7 @@ impl ScxReader {
         entry: &FullCatalogEntry,
         verify_checksum: bool,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
-        let section = self.section_bytes(entry);
+        let section = self.section_bytes(entry)?;
 
         // Parse shard header
         let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
@@ -1022,11 +1049,11 @@ mod tests {
 
         // Verify obs and var sections can be sliced at their catalog offsets
         let obs_entry = catalog.get("obs").unwrap();
-        let obs_bytes = reader.section_bytes(obs_entry);
+        let obs_bytes = reader.section_bytes(obs_entry).unwrap();
         assert_eq!(obs_bytes.len(), obs_entry.length as usize);
 
         let var_entry = catalog.get("var").unwrap();
-        let var_bytes = reader.section_bytes(var_entry);
+        let var_bytes = reader.section_bytes(var_entry).unwrap();
         assert_eq!(var_bytes.len(), var_entry.length as usize);
 
         // Verify checksum of raw bytes matches catalog checksum

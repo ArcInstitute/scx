@@ -48,7 +48,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     let value_encoding_u8 = {
         let shards = readers[0].catalog().shards_sorted();
         if !shards.is_empty() {
-            let section = readers[0].section_bytes(shards[0]);
+            let section = readers[0].section_bytes(shards[0])?;
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
@@ -164,7 +164,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             })
             .collect();
         let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = readers[0].section_bytes(first_entry);
+            let section = readers[0].section_bytes(first_entry)?;
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
             ValueEncoding::from_u8(sh.value_encoding).unwrap_or(ValueEncoding::Uint8)
@@ -172,7 +172,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             value_encoding
         };
         let layer_codec = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = readers[0].section_bytes(first_entry);
+            let section = readers[0].section_bytes(first_entry)?;
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
             CodecId::from_u8(sh.codec_id).unwrap_or(CodecId::None)

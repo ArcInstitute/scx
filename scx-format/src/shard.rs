@@ -37,7 +37,7 @@ pub struct ShardHeader {
     pub n_minor: u32,
     /// Total non-zeros in this shard
     pub nnz: u64,
-    /// Global byte offset of this shard in the file
+    /// Global row index of the first row in this shard (not a byte offset)
     pub global_offset: u64,
     /// Relative offset to indptr data (from shard start)
     pub indptr_rel_offset: u32,

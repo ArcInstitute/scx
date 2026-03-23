@@ -45,6 +45,16 @@ pub enum ScxError {
     #[error("block nnz {0} exceeds u32::MAX")]
     BlockNnzOverflow(u64),
 
+    #[error("n_vars {0} exceeds u32::MAX, cannot fit in shard header n_minor field")]
+    NVarsOverflow(u64),
+
+    #[error("section bytes out of bounds: offset {offset} + length {length} exceeds file size {file_size}")]
+    SectionOutOfBounds {
+        offset: u64,
+        length: u64,
+        file_size: usize,
+    },
+
     #[error("CSR error: {0}")]
     Csr(#[from] scx_sparse::CsrError),
 

@@ -196,7 +196,7 @@ fn test_validate_passes_clean_file() {
 
     // Manually validate all checksums (same logic as validate command)
     for entry in &catalog.entries {
-        let bytes = reader.section_bytes(entry);
+        let bytes = reader.section_bytes(entry).unwrap();
         let computed = scx_format::blake3_hash(bytes);
         assert_eq!(
             computed, entry.checksum,
@@ -229,7 +229,7 @@ fn test_validate_detects_corruption() {
 
     let mut any_failed = false;
     for entry in &catalog.entries {
-        let bytes = reader.section_bytes(entry);
+        let bytes = reader.section_bytes(entry).unwrap();
         let computed = scx_format::blake3_hash(bytes);
         if computed != entry.checksum {
             any_failed = true;

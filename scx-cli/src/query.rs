@@ -141,7 +141,7 @@ fn detect_value_encoding(path: &Path) -> Result<ValueEncoding, Box<dyn std::erro
     let csr_entries = reader.catalog().shards(SectionType::CsrShard);
 
     if let Some(first) = csr_entries.first() {
-        let bytes = reader.section_bytes(first);
+        let bytes = reader.section_bytes(first)?;
         if bytes.len() >= SHARD_HEADER_SIZE {
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE]))?;
