@@ -200,6 +200,15 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     lock.write_all(&catalog_buf)?;
     let new_catalog_length = catalog_buf.len() as u64;
 
+    // --- Crash safety barrier ---
+    // Flush and fsync all appended data (DV section, provenance, catalog)
+    // to durable storage BEFORE updating the header and root catalog.
+    // If the process crashes after this point, the old header still points
+    // to the old full catalog, so the file remains valid (new data at EOF
+    // is harmless orphaned bytes recoverable via prev_catalog_offset chain).
+    lock.flush()?;
+    lock.sync_all()?;
+
     // Rebuild root catalog
     let root_catalog = build_root_catalog_from_full(&new_catalog);
     let mut root_buf = Vec::new();
