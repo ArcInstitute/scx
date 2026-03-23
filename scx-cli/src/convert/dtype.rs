@@ -15,11 +15,13 @@ pub fn detect_value_encoding_only(data: &[f32]) -> ValueEncoding {
         return ValueEncoding::Float32;
     }
 
-    let max_val = data.iter().map(|&v| v as u32).max().unwrap_or(0);
+    // Compare as f64 to avoid precision loss for values > 2^24 and
+    // saturation for values > u32::MAX (finding 8.1).
+    let max_val: f64 = data.iter().map(|&v| v as f64).fold(0.0f64, f64::max);
 
-    if max_val <= 255 {
+    if max_val <= 255.0 {
         ValueEncoding::Uint8
-    } else if max_val <= 65535 {
+    } else if max_val <= 65535.0 {
         ValueEncoding::Uint16
     } else {
         ValueEncoding::Uint32

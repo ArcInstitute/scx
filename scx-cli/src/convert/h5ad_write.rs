@@ -9,10 +9,14 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type};
 use hdf5::types::VarLenUnicode;
 
-/// Convert &str to VarLenUnicode (infallible for non-NUL strings).
+/// Convert &str to VarLenUnicode, validating no NUL bytes are present.
 fn vlu(s: &str) -> VarLenUnicode {
-    // Safety: our strings never contain NUL bytes
-    unsafe { VarLenUnicode::from_str_unchecked(s) }
+    s.parse::<VarLenUnicode>()
+        .unwrap_or_else(|_| {
+            // Strip NUL bytes rather than panicking (finding 8.2).
+            let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
+            cleaned.parse::<VarLenUnicode>().expect("cleaned string should have no NUL bytes")
+        })
 }
 
 use scx_format::reader::ScxReader;
