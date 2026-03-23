@@ -1,5 +1,5 @@
 [workspace]
-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "pyscx"]
+members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "pyscx"]
 resolver = "2"
 
 [workspace.package]
@@ -37,6 +37,9 @@ url = "2"
 bytes = "1"
 futures = "0.3"
 fs4 = "0.12"
+
+# GPU
+cudarc = { version = "0.19", features = ["cuda-12020"] }
 
 # Testing
 proptest = "1"
