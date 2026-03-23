@@ -50,6 +50,9 @@ pub fn append(
         FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize)?
     };
 
+    if new_indptr.is_empty() {
+        return Ok(());
+    }
     let n_new_rows = new_indptr.len() - 1;
     if n_new_rows == 0 {
         return Ok(());

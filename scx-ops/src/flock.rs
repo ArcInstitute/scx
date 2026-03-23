@@ -35,6 +35,28 @@ impl FileLock {
     }
 }
 
+/// Shared (read) file lock. Releases on drop.
+/// Prevents exclusive access by other processes while held.
+pub struct SharedFileLock {
+    file: File,
+}
+
+impl SharedFileLock {
+    /// Acquire a shared lock on the file at `path`.
+    /// Opens the file for read-only access.
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        file.lock_shared().map_err(OpsError::LockFailed)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SharedFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 impl Drop for FileLock {
     fn drop(&mut self) {
         if let Some(ref file) = self.file {

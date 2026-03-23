@@ -56,7 +56,11 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         DeletionVectors::new()
     };
 
-    // Get shard stats sorted by row_start to map global indices -> (shard_id, local_row)
+    // Get shard stats sorted by row_start to map global indices -> (shard_id, local_row).
+    // Use the sort-order index as shard_id. This is safe because deletion vectors are
+    // always stored in the same catalog as the shards they reference, and shards_sorted()
+    // is deterministic (sorted by row_start). The compact operation reads DVs and shards
+    // from the same catalog, so the mapping is consistent.
     let shards = catalog.shards_sorted();
     let shard_ranges: Vec<(u32, u64, u64)> = shards
         .iter()

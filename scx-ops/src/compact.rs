@@ -11,10 +11,14 @@ use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
 use crate::error::Result;
+use crate::flock::SharedFileLock;
 
 /// Compact an SCX file: removes deleted rows, stale catalogs, and produces
 /// a clean single-catalog file.
 pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
+    // Acquire shared lock to prevent concurrent writers from modifying the
+    // file while we read it. The lock is held until `_lock` is dropped.
+    let _lock = SharedFileLock::acquire(input_path)?;
     let reader = ScxReader::open(input_path)?;
     let in_header = reader.header();
 
@@ -129,7 +133,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             for j in row_start_nnz..row_end_nnz {
                 acc_indices.push(indices[j] as u32);
                 // Convert f32 back to raw bytes per value_encoding
-                encode_value(&mut acc_values, data[j], value_encoding);
+                encode_value(&mut acc_values, data[j], value_encoding)?;
             }
 
             let prev = *acc_indptr.last().unwrap();
@@ -241,7 +245,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             let row_end = layer.indptr[row_idx + 1] as usize;
             for j in row_start..row_end {
                 layer_indices.push(layer.indices[j] as u32);
-                encode_value(&mut layer_values, layer.data[j], layer_value_encoding);
+                encode_value(&mut layer_values, layer.data[j], layer_value_encoding)?;
             }
             let prev = *layer_indptr.last().unwrap();
             layer_indptr.push(prev + (row_end - row_start) as u64);
@@ -316,14 +320,12 @@ fn build_keep_mask(
 
     let mut mask = vec![true; n_obs];
 
-    // Get shard ranges
+    // Map shard_id (sort-order index from shards_sorted()) to deletion bitmaps.
+    // This is consistent with delete.rs which uses the same sort-order index.
     let shards = catalog.shards_sorted();
-    for shard_entry in &shards {
+    for (shard_idx, shard_entry) in shards.iter().enumerate() {
         if let Some(ref stats) = shard_entry.stats {
-            let shard_idx = shards
-                .iter()
-                .position(|s| s.offset == shard_entry.offset)
-                .unwrap_or(0) as u32;
+            let shard_idx = shard_idx as u32;
 
             if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx) {
                 for local_row in sd.bitmap.iter() {
@@ -340,15 +342,48 @@ fn build_keep_mask(
 }
 
 /// Encode a single f32 value back to raw bytes according to the value encoding.
-fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) {
+/// Returns an error if the value is out of range for integer encodings.
+fn encode_value(
+    buf: &mut Vec<u8>,
+    value: f32,
+    encoding: ValueEncoding,
+) -> crate::error::Result<()> {
     match encoding {
-        ValueEncoding::Uint8 => buf.push(value as u8),
-        ValueEncoding::Uint16 => buf.extend_from_slice(&(value as u16).to_le_bytes()),
-        ValueEncoding::Uint32 => buf.extend_from_slice(&(value as u32).to_le_bytes()),
+        ValueEncoding::Uint8 => {
+            if value < 0.0 || value > u8::MAX as f32 {
+                return Err(crate::error::OpsError::ValueOutOfRange {
+                    value,
+                    encoding: "Uint8",
+                    max: u8::MAX as f32,
+                });
+            }
+            buf.push(value as u8);
+        }
+        ValueEncoding::Uint16 => {
+            if value < 0.0 || value > u16::MAX as f32 {
+                return Err(crate::error::OpsError::ValueOutOfRange {
+                    value,
+                    encoding: "Uint16",
+                    max: u16::MAX as f32,
+                });
+            }
+            buf.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        ValueEncoding::Uint32 => {
+            if value < 0.0 || value > u32::MAX as f32 {
+                return Err(crate::error::OpsError::ValueOutOfRange {
+                    value,
+                    encoding: "Uint32",
+                    max: u32::MAX as f32,
+                });
+            }
+            buf.extend_from_slice(&(value as u32).to_le_bytes());
+        }
         ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
         ValueEncoding::Float16 => {
             let f16_val = half::f16::from_f32(value);
             buf.extend_from_slice(&f16_val.to_le_bytes());
         }
     }
+    Ok(())
 }

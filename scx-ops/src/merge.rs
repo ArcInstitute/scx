@@ -13,6 +13,7 @@ use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
+use crate::flock::SharedFileLock;
 
 /// Merge multiple SCX files into a single output file.
 /// All inputs must have the same n_vars.
@@ -23,6 +24,13 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             "no input files provided",
         )));
     }
+
+    // Acquire shared locks on all inputs to prevent concurrent writers
+    // from modifying files while we read them. Locks held until `_locks` dropped.
+    let _locks: Vec<SharedFileLock> = input_paths
+        .iter()
+        .map(|p| SharedFileLock::acquire(p))
+        .collect::<Result<Vec<_>>>()?;
 
     // Open all inputs
     let readers: Vec<ScxReader> = input_paths
@@ -122,7 +130,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
             let mut values_bytes = Vec::new();
             for &v in &data {
-                encode_value(&mut values_bytes, v, value_encoding);
+                encode_value(&mut values_bytes, v, value_encoding)?;
             }
 
             writer.write_csr_shard(
@@ -157,9 +165,18 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         writer.write_uns(&uns)?;
     }
 
-    // Merge layers — read per-layer value encoding from shard headers
+    // Merge layers — collect layer names from ALL inputs, not just the first,
+    // so layers present only in subsequent inputs are not silently dropped.
     let shard_target = first_header.shard_target_rows;
-    let layer_names = readers[0].layer_names();
+    let layer_names = {
+        let mut all_names: Vec<String> = readers
+            .iter()
+            .flat_map(|r| r.layer_names())
+            .collect();
+        all_names.sort();
+        all_names.dedup();
+        all_names
+    };
     for layer_name in &layer_names {
         // Determine this layer's value encoding from its first shard header
         let layer_prefix = format!("{layer_name}_shard_");
@@ -208,7 +225,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
                     let row_end = layer.indptr[row_idx + 1] as usize;
                     for j in row_start..row_end {
                         layer_indices.push(layer.indices[j] as u32);
-                        encode_value(&mut layer_values, layer.data[j], layer_value_encoding);
+                        encode_value(&mut layer_values, layer.data[j], layer_value_encoding)?;
                     }
                     let prev = *layer_indptr.last().unwrap();
                     layer_indptr.push(prev + (row_end - row_start) as u64);
@@ -280,15 +297,43 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) {
+fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) -> Result<()> {
     match encoding {
-        ValueEncoding::Uint8 => buf.push(value as u8),
-        ValueEncoding::Uint16 => buf.extend_from_slice(&(value as u16).to_le_bytes()),
-        ValueEncoding::Uint32 => buf.extend_from_slice(&(value as u32).to_le_bytes()),
+        ValueEncoding::Uint8 => {
+            if value < 0.0 || value > u8::MAX as f32 {
+                return Err(OpsError::ValueOutOfRange {
+                    value,
+                    encoding: "Uint8",
+                    max: u8::MAX as f32,
+                });
+            }
+            buf.push(value as u8);
+        }
+        ValueEncoding::Uint16 => {
+            if value < 0.0 || value > u16::MAX as f32 {
+                return Err(OpsError::ValueOutOfRange {
+                    value,
+                    encoding: "Uint16",
+                    max: u16::MAX as f32,
+                });
+            }
+            buf.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        ValueEncoding::Uint32 => {
+            if value < 0.0 || value > u32::MAX as f32 {
+                return Err(OpsError::ValueOutOfRange {
+                    value,
+                    encoding: "Uint32",
+                    max: u32::MAX as f32,
+                });
+            }
+            buf.extend_from_slice(&(value as u32).to_le_bytes());
+        }
         ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
         ValueEncoding::Float16 => {
             let f16_val = half::f16::from_f32(value);
             buf.extend_from_slice(&f16_val.to_le_bytes());
         }
     }
+    Ok(())
 }

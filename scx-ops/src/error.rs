@@ -30,6 +30,13 @@ pub enum OpsError {
     #[error("layer '{name}' missing in input file {file_index}")]
     LayerMissing { name: String, file_index: usize },
 
+    #[error("f32 value {value} out of range for {encoding} encoding (max {max})")]
+    ValueOutOfRange {
+        value: f32,
+        encoding: &'static str,
+        max: f32,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
