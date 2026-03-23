@@ -734,6 +734,12 @@ where
     T: arrow::datatypes::ArrowPrimitiveType,
     T::Native: arrow::datatypes::ArrowNativeTypeOp,
 {
+    // For integer comparisons, use i128 when possible to avoid f64 precision loss
+    // for values > 2^53. Fall back to f64 for float comparisons.
+    let cmp_i128: Option<i128> = match value {
+        ScalarValue::Int64(v) => Some(*v as i128),
+        _ => None,
+    };
     let cmp_val: f64 = match value {
         ScalarValue::Int64(v) => *v as f64,
         ScalarValue::Float64(v) => *v,
@@ -750,9 +756,22 @@ where
             if array.is_null(i) {
                 None // null → propagate null
             } else {
-                // Use as_usize for ArrowNativeType, then cast to f64.
-                // This handles all numeric types: i8-i64, u8-u64, f32, f64.
                 let native = array.value(i);
+                // If both sides are integers, compare via i128 to avoid f64
+                // precision loss for values > 2^53.
+                if let Some(cmp_int) = cmp_i128 {
+                    if let Some(native_int) = native_to_i128(native) {
+                        return Some(match op {
+                            CmpOp::Eq => native_int == cmp_int,
+                            CmpOp::Ne => native_int != cmp_int,
+                            CmpOp::Lt => native_int < cmp_int,
+                            CmpOp::Gt => native_int > cmp_int,
+                            CmpOp::Le => native_int <= cmp_int,
+                            CmpOp::Ge => native_int >= cmp_int,
+                        });
+                    }
+                }
+                // Fall back to f64 comparison for float columns or unrecognized types.
                 // Unrecognized native types yield None (treated as null)
                 // rather than silently returning 0.0 which would give wrong results.
                 native_to_f64(native).map(|v| match op {
@@ -821,6 +840,40 @@ fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> Option<f64> {
     }
     // Unrecognized type (e.g. half::f16) — return None so callers
     // treat this as null rather than silently using 0.0
+    None
+}
+
+/// Convert an integer ArrowNativeType to i128 for lossless integer comparison.
+/// Returns `None` for float types or unrecognized types — callers should fall
+/// back to f64 comparison in that case.
+fn native_to_i128<N: arrow::datatypes::ArrowNativeType>(v: N) -> Option<i128> {
+    use std::any::Any;
+    let any_ref: &dyn Any = &v;
+    if let Some(&val) = any_ref.downcast_ref::<i8>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<i16>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<i32>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<i64>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u8>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u16>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u32>() {
+        return Some(val as i128);
+    }
+    if let Some(&val) = any_ref.downcast_ref::<u64>() {
+        return Some(val as i128);
+    }
+    // Float types and unrecognized types — not integer, return None
     None
 }
 
