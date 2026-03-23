@@ -90,7 +90,10 @@ pub fn project_csr(csr: &ScxCsr, gene_indices: &[u32]) -> ScxCsr {
 ///
 /// Uses `arrow::compute::take()` for efficient row selection.
 pub fn project_var(var: &RecordBatch, gene_indices: &[u32]) -> Result<RecordBatch> {
-    let take_indices = UInt32Array::from(gene_indices.to_vec());
+    let mut sorted_indices: Vec<u32> = gene_indices.to_vec();
+    sorted_indices.sort_unstable();
+    sorted_indices.dedup();
+    let take_indices = UInt32Array::from(sorted_indices);
     let columns: Vec<_> = var
         .columns()
         .iter()

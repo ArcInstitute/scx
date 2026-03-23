@@ -129,6 +129,13 @@ pub fn filter_csr_rows(
     keep_mask: &[bool],
 ) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
     let n_rows = indptr.len().saturating_sub(1);
+    debug_assert_eq!(
+        keep_mask.len(),
+        n_rows,
+        "filter_csr_rows: keep_mask length ({}) != CSR row count ({})",
+        keep_mask.len(),
+        n_rows,
+    );
     let mask_len = keep_mask.len().min(n_rows);
 
     let mut new_indptr = Vec::with_capacity(mask_len + 1);

@@ -31,7 +31,7 @@ pub fn log1p_row(data: &mut [f32], indptr: &[i64], row_idx: usize) {
     let start = indptr[row_idx] as usize;
     let end = indptr[row_idx + 1] as usize;
     for v in &mut data[start..end] {
-        *v = (*v + 1.0).ln();
+        *v = v.ln_1p();
     }
 }
 
@@ -54,7 +54,7 @@ pub fn fused_normalize_log1p(
         for v in &mut data[start..end] {
             // Scale in f64 for precision, cast to f32, then f32 ln for speed.
             // Numerically matches sequential normalize→log1p path.
-            *v = ((*v as f64 * factor) as f32 + 1.0).ln();
+            *v = ((*v as f64 * factor) as f32).ln_1p();
         }
     }
 }
@@ -153,8 +153,8 @@ mod tests {
 
         log1p_row(&mut csr.data, &csr.indptr, 0);
 
-        let expected_0 = (5.0_f32 + 1.0).ln();
-        let expected_1 = (10.0_f32 + 1.0).ln();
+        let expected_0 = 5.0_f32.ln_1p();
+        let expected_1 = 10.0_f32.ln_1p();
         assert!((csr.data[0] - expected_0).abs() < 1e-6);
         assert!((csr.data[1] - expected_1).abs() < 1e-6);
 
@@ -171,7 +171,7 @@ mod tests {
         // All values should be ln(original + 1)
         let original = vec![5.0_f32, 10.0, 1.0, 3.0, 7.0, 2.0];
         for (i, &orig) in original.iter().enumerate() {
-            let expected = (orig + 1.0).ln();
+            let expected = orig.ln_1p();
             assert!(
                 (csr.data[i] - expected).abs() < 1e-6,
                 "data[{}] = {}, expected {}",
@@ -298,7 +298,7 @@ mod tests {
         let original_data = csr.data.clone();
         apply_fused_ops(&mut csr, None, true);
         for (i, &orig) in original_data.iter().enumerate() {
-            let expected = (orig + 1.0).ln();
+            let expected = orig.ln_1p();
             assert!(
                 (csr.data[i] - expected).abs() < 1e-6,
                 "data[{}] = {}, expected {}",

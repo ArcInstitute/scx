@@ -107,7 +107,7 @@ impl PredicateIndex {
     /// Serialize the predicate index per SPEC §3.5.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u8(self.version)?;
-        w.write_u8(self.columns.len() as u8)?;
+        w.write_u16::<LittleEndian>(self.columns.len() as u16)?;
         for col in &self.columns {
             match col {
                 IndexedColumn::Categorical(cat) => {
@@ -161,7 +161,7 @@ impl PredicateIndex {
                     }
                     // Leaf pages
                     for page in &num.leaf_pages {
-                        w.write_u16::<LittleEndian>(page.entries.len() as u16)?;
+                        w.write_u32::<LittleEndian>(page.entries.len() as u32)?;
                         for entry in &page.entries {
                             w.write_f64::<LittleEndian>(entry.min_value)?;
                             w.write_f64::<LittleEndian>(entry.max_value)?;
@@ -179,7 +179,7 @@ impl PredicateIndex {
     /// Deserialize a predicate index from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
         let version = r.read_u8()?;
-        let n_columns = r.read_u8()?;
+        let n_columns = r.read_u16::<LittleEndian>()?;
         let mut columns = Vec::with_capacity(n_columns as usize);
 
         for _ in 0..n_columns {
@@ -254,7 +254,7 @@ impl PredicateIndex {
 
                     let mut leaf_pages = Vec::with_capacity(n_leaf_pages);
                     for _ in 0..n_leaf_pages {
-                        let n_leaf_entries = r.read_u16::<LittleEndian>()? as usize;
+                        let n_leaf_entries = r.read_u32::<LittleEndian>()? as usize;
                         let mut entries = Vec::with_capacity(n_leaf_entries);
                         for _ in 0..n_leaf_entries {
                             entries.push(NumericLeafEntry {
