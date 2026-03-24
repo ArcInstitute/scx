@@ -1,18 +1,28 @@
 # SCX — Sparse Cell eXpression System
 
-A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-5× smaller files**, **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — while remaining fully compatible with scanpy, scVI, and the entire scverse ecosystem.
+A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-5× smaller files**, **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
+
+**Python** — works with scanpy, scVI, and any scverse tool:
 
 ```python
 import pyscx
 
-# Drop-in replacement for anndata.read_h5ad()
 adata = pyscx.open("experiment.scx").to_anndata()
 
-# Everything just works — no code changes needed
 import scanpy as sc
 sc.pp.normalize_total(adata)
 sc.tl.pca(adata)
 sc.tl.leiden(adata)
+```
+
+**R** — works with Seurat v5 and SingleCellExperiment:
+
+```r
+library(rscx)
+
+exp <- scx_open("experiment.scx")
+seurat_obj <- exp$to_seurat()    # Seurat v5 assay
+sce <- exp$to_sce()              # SingleCellExperiment
 ```
 
 ## Why SCX?
@@ -181,6 +191,26 @@ cargo build -p scx-cli --release --features hdf5
 cargo build -p scx-cli --release --features hdf5,cloud
 ```
 
+### R (rscx)
+
+Requires a Rust toolchain (`rustc` ≥ 1.78 and `cargo`). Install via [rustup](https://rustup.rs/).
+
+```bash
+# From the repository root:
+R CMD INSTALL rscx/
+
+# Or, from within R:
+devtools::install_local("rscx/")
+```
+
+The package compiles the Rust workspace during installation (handled by `src/Makevars`).
+No pre-built binaries are distributed — Cargo builds all SCX crates from source.
+
+**System requirements:**
+- Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- R ≥ 4.2.0
+- R packages: `Matrix`, `methods` (required); `Seurat` ≥ 5.0, `SingleCellExperiment` (optional)
+
 ## Quick Start
 
 ### Convert from h5ad
@@ -290,6 +320,7 @@ SCX is a Rust workspace with 9 crates:
 | `scx-cloud` | Cloud access: push, pull, explode, pack, CloudReader |
 | `scx-cli` | CLI tool |
 | `pyscx` | Python bindings (PyO3) |
+| `rscx` | R bindings (extendr) |
 
 For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/api.md`](docs/api.md), and [`SPEC.md`](SPEC.md).
 
