@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 scx-format = { path = "../scx-format" }

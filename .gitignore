@@ -48,3 +48,6 @@ benchmarks/results/
 
 # HDF5 build artifacts
 *.hdf5
+
+# R
+**/.fingerprint/

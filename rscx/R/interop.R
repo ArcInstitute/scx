@@ -1,4 +1,8 @@
 #' @title SCX interop with Seurat v5 and SingleCellExperiment
+#' @name rscx-interop
+#' @useDynLib rscx, .registration = TRUE
+#' @importFrom methods new
+#' @importFrom Matrix t
 #' @description
 #' Convert between SCX and R single-cell data structures.
 #'

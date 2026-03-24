@@ -88,34 +88,4 @@ scx_merge <- function(inputs, output) {
   invisible(.Call(wrap__scx_merge, inputs, output))
 }
 
-#' Get SCX file information
-#'
-#' Returns a named list with file metadata.
-#'
-#' @param path Path to the SCX file.
-#' @return Named list with n_obs, n_vars, nnz, format_version, n_shards.
-#' @export
-#' @examples
-#' \dontrun{
-#' info <- scx_info("experiment.scx")
-#' info$n_obs
-#' }
-scx_info <- function(path) {
-  .Call(wrap__scx_info, path)
-}
 
-#' Validate an SCX file
-#'
-#' Checks all section checksums. Returns TRUE if valid, raises an error
-#' listing failed sections otherwise.
-#'
-#' @param path Path to the SCX file.
-#' @return TRUE if all checksums pass.
-#' @export
-#' @examples
-#' \dontrun{
-#' scx_validate("experiment.scx")
-#' }
-scx_validate <- function(path) {
-  .Call(wrap__scx_validate, path)
-}

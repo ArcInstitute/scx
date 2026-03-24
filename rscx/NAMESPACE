@@ -2,14 +2,18 @@
 
 useDynLib(rscx, .registration = TRUE)
 
+export(ScxExperiment)
+export(RQueryPipeline)
+export(RQueryResult)
 export(scx_open)
+export(scx_query)
 export(scx_info)
 export(scx_validate)
 export(scx_append)
-export(scx_delete)
 export(scx_compact)
-export(scx_rollback)
+export(scx_delete)
 export(scx_merge)
+export(scx_rollback)
 
-importFrom(methods, new)
 importFrom(Matrix, t)
+importFrom(methods, new)
