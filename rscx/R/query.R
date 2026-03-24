@@ -14,4 +14,17 @@
 #' dgc <- result$to_dgcmatrix()
 #' seu <- result$to_seurat()
 #' sce <- result$to_sce()
-NULL
+#'
+#' # Metadata getters work even after conversion:
+#' result$n_obs()
+#' result$n_vars()
+#' result$skipped_shards()
+
+#' Start a query pipeline from an ScxExperiment
+#'
+#' @param exp An ScxExperiment object (from scx_open())
+#' @return An RQueryPipeline object
+#' @export
+scx_query <- function(exp) {
+  exp$query()
+}

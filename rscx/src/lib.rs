@@ -4,6 +4,9 @@ use extendr_api::prelude::*;
 use scx_format::ScxReader;
 
 mod interop;
+mod query;
+
+pub use query::{RQueryPipeline, RQueryResult};
 
 // ── Phase B: Core Reader ────────────────────────────────────────
 
@@ -115,29 +118,10 @@ impl ScxExperiment {
 
     /// Start a query pipeline. Returns an RQueryPipeline.
     /// Re-opens the file (QueryPipeline::open creates its own ScxReader).
-    fn query(&self) -> Robj {
-        // Phase C stub — RQueryPipeline not yet implemented
-        panic!("query pipeline not yet implemented (Phase C)")
+    fn query(&self) -> Result<RQueryPipeline> {
+        RQueryPipeline::from_path(self.path.to_str().unwrap_or(""))
     }
 }
-
-// ── Phase C: Query Pipeline ─────────────────────────────────────
-
-/// R query pipeline — pipe-friendly with |>.
-pub struct RQueryPipeline {
-    // Will hold Option<QueryPipeline> in Phase C
-}
-
-#[extendr]
-impl RQueryPipeline {}
-
-/// Result from executing a query pipeline.
-pub struct RQueryResult {
-    // Will hold Option<QueryResult> + cached stats in Phase C
-}
-
-#[extendr]
-impl RQueryResult {}
 
 // ── Phase E: File Operations ────────────────────────────────────
 
@@ -187,9 +171,8 @@ fn scx_validate(_path: &str) -> bool {
 
 extendr_module! {
     mod rscx;
+    use query;
     impl ScxExperiment;
-    impl RQueryPipeline;
-    impl RQueryResult;
     fn scx_append;
     fn scx_delete;
     fn scx_compact;
