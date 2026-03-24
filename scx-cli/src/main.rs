@@ -4,6 +4,7 @@ use std::process;
 
 mod append;
 mod benchmark;
+mod build_csc;
 mod compact;
 mod convert;
 mod delete;
@@ -11,6 +12,8 @@ mod info;
 mod merge;
 mod query;
 mod rollback;
+mod subset;
+mod upgrade;
 mod validate;
 
 #[cfg(feature = "cloud")]
@@ -218,6 +221,53 @@ enum Commands {
         #[arg(long, default_value = "8")]
         parallelism: usize,
     },
+    /// Build CSC (column-major) shards from existing CSR data
+    BuildCsc {
+        /// Input SCX file (must have CSR shards)
+        input: PathBuf,
+        /// Output SCX file (will contain both CSR and CSC shards)
+        output: PathBuf,
+        /// Maximum memory for transpose working set (default: 4G)
+        /// Accepts suffixes: K, M, G (e.g., "100M", "4G")
+        #[arg(long, default_value = "4G")]
+        memory_limit: String,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Extract a subset of cells and/or genes into a new SCX file
+    Subset {
+        /// Input SCX file
+        input: PathBuf,
+        /// Output SCX file path
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Obs predicate expression to filter cells
+        #[arg(long)]
+        filter: Option<String>,
+        /// File containing gene indices (one per line) for column projection
+        #[arg(long)]
+        genes: Option<PathBuf>,
+        /// Show matching count without writing output
+        #[arg(long)]
+        dry_run: bool,
+        /// Target rows per shard in the output file
+        #[arg(long, default_value = "10000")]
+        shard_size: u32,
+        /// Compression codec for output: auto, none, scx1, zstd
+        #[arg(long, default_value = "auto")]
+        codec: String,
+    },
+    /// Upgrade an SCX file to the latest format version
+    Upgrade {
+        /// Input SCX file
+        input: PathBuf,
+        /// Output SCX file path (default: separate output)
+        output: Option<PathBuf>,
+        /// Upgrade in-place via atomic rename
+        #[arg(long)]
+        in_place: bool,
+    },
 }
 
 fn main() {
@@ -299,6 +349,34 @@ fn main() {
             runs,
             json,
         } => benchmark::run_benchmark(&file, compare_h5ad.as_deref(), runs, json),
+        Commands::BuildCsc {
+            input,
+            output,
+            memory_limit,
+            force,
+        } => build_csc::run_build_csc(&input, &output, &memory_limit, force),
+        Commands::Subset {
+            input,
+            output,
+            filter,
+            genes,
+            dry_run,
+            shard_size,
+            codec,
+        } => subset::run_subset(
+            &input,
+            output.as_deref(),
+            filter.as_deref(),
+            genes.as_deref(),
+            dry_run,
+            shard_size,
+            &codec,
+        ),
+        Commands::Upgrade {
+            input,
+            output,
+            in_place,
+        } => upgrade::run_upgrade(&input, output.as_deref(), in_place),
         #[cfg(feature = "cloud")]
         Commands::CloudOptimize { input, output } => {
             cloud_optimize::run_cloud_optimize(&input, output.as_deref())
