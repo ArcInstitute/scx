@@ -6,15 +6,11 @@
 use std::path::Path;
 
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::FileHeader;
+use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
-
-/// Current format version produced by ScxWriter.
-/// The writer hardcodes format_version=1 in finish().
-const CURRENT_FORMAT_VERSION: u16 = 1;
 
 pub fn run_upgrade(
     input: &Path,

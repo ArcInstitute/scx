@@ -11,6 +11,12 @@ pub const HEADER_SIZE: usize = 256;
 /// Magic bytes identifying an SCX file.
 pub const MAGIC: [u8; 4] = *b"SCX\x01";
 
+/// Current format version produced by ScxWriter.
+///
+/// Readers accept versions 1..=CURRENT_FORMAT_VERSION.
+/// The writer stamps this value in `finish()`.
+pub const CURRENT_FORMAT_VERSION: u16 = 1;
+
 /// The 256-byte file header that starts every SCX file.
 #[derive(Debug, Clone)]
 pub struct FileHeader {
@@ -103,7 +109,7 @@ impl FileHeader {
         }
 
         let format_version = r.read_u16::<LittleEndian>()?;
-        if format_version == 0 || format_version > 1 {
+        if format_version == 0 || format_version > CURRENT_FORMAT_VERSION {
             return Err(ScxError::UnsupportedVersion);
         }
 
