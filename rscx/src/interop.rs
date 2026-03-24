@@ -367,10 +367,451 @@ pub fn csr_to_dgcmatrix(csr: &ScxCsr) -> Result<Robj> {
     .map_err(|e| Error::Other(format!("dgCMatrix construction failed: {}", e)))
 }
 
-// ─── Phase D stubs (Seurat/SCE interop) ──────────────────────────────────────
-// These will be implemented in Phase D once Phase B is verified.
+// ─── Phase D: Seurat v5 & SingleCellExperiment Interop ───────────────────────
 
-// pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> { ... }
-// pub fn to_sce(result: &QueryResult) -> Result<Robj> { ... }
-// pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> { ... }
-// pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> { ... }
+use scx_engine::pipeline::QueryResult;
+
+/// Create a Seurat v5 object from SCX query results.
+///
+/// ScxCsr → dgCMatrix (CSR→CSC, cells × genes) → t(dgCMatrix) (genes × cells).
+/// obs → Seurat meta.data (R data.frame).
+/// var → Seurat feature metadata.
+///
+/// Orientation chain:
+///   SCX CSR: cells × genes (n_obs rows, n_vars cols)
+///   csr_to_dgcmatrix(): CSC, still cells × genes (n_obs rows, n_vars cols)
+///   Matrix::t(): CSC, genes × cells (n_vars rows, n_obs cols) ← Seurat expects this
+///
+/// Requires: Seurat >= 5.0.0 (listed in Suggests)
+pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
+    let dgc = csr_to_dgcmatrix(&result.x)?;
+    let obs_df = record_batch_to_dataframe(&result.obs)?;
+    let _var_df = record_batch_to_dataframe(&result.var)?;
+
+    // Factor complex R logic into a helper to avoid R!() limitations.
+    // R!() interpolation with {{}} only works for simple expressions.
+    R!("
+        if (!requireNamespace('Seurat', quietly = TRUE))
+            stop('Seurat >= 5.0.0 is required for to_seurat()')
+        counts_t <- Matrix::t({{dgc}})
+        seu <- Seurat::CreateSeuratObject(counts = counts_t)
+        seu@meta.data <- {{obs_df}}
+        seu
+    ")
+    .map_err(|e| Error::Other(format!("Seurat construction failed: {}", e)))
+}
+
+/// Create a SingleCellExperiment from SCX query results.
+///
+/// Same dgCMatrix construction + transpose as to_seurat_v5.
+/// SCE expects assay matrices as genes × cells (rows × cols).
+/// obs → colData (columns = cells)
+/// var → rowData (rows = genes)
+///
+/// Requires: SingleCellExperiment (listed in Suggests)
+pub fn to_sce(result: &QueryResult) -> Result<Robj> {
+    let dgc = csr_to_dgcmatrix(&result.x)?;
+    let obs_df = record_batch_to_dataframe(&result.obs)?;
+    let var_df = record_batch_to_dataframe(&result.var)?;
+
+    R!("
+        if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
+            stop('SingleCellExperiment is required for to_sce()')
+        counts_t <- Matrix::t({{dgc}})
+        SingleCellExperiment::SingleCellExperiment(
+            assays = list(counts = counts_t),
+            colData = S4Vectors::DataFrame({{obs_df}}),
+            rowData = S4Vectors::DataFrame({{var_df}})
+        )
+    ")
+    .map_err(|e| Error::Other(format!("SCE construction failed: {}", e)))
+}
+
+// ─── CSC (dgCMatrix) → CSR transpose ────────────────────────────────────────
+
+/// Extract dgCMatrix slots and transpose CSC → CSR.
+///
+/// dgCMatrix is an S4 object with slots:
+///   @i  — integer (0-based row indices)
+///   @p  — integer (column pointers, length n_cols + 1)
+///   @x  — double (values)
+///   @Dim — integer[2] (n_rows, n_cols)
+///
+/// Returns (indptr_csr as Vec<u64>, indices_csr as Vec<u32>, values_bytes as Vec<u8>)
+/// after transposing CSC → CSR, where:
+///   - CSC "rows" (dimension 0) become CSR rows
+///   - CSC "columns" (dimension 1) become CSR columns
+///
+/// Since Seurat/SCE store genes × cells, we transpose to get cells × genes (SCX layout).
+fn dgcmatrix_to_csr(dgc: &Robj) -> Result<(Vec<u64>, Vec<u32>, Vec<u8>, usize, usize)> {
+    // Extract dgCMatrix slots via R
+    let dim_robj = R!("{{dgc}}@Dim")
+        .map_err(|e| Error::Other(format!("failed to get Dim: {}", e)))?;
+    let dim: Vec<i32> = dim_robj.as_integer_slice()
+        .ok_or_else(|| Error::Other("Dim is not integer".into()))?
+        .to_vec();
+    if dim.len() != 2 {
+        return Err(Error::Other(format!("Dim has {} elements, expected 2", dim.len())));
+    }
+    let n_rows = dim[0] as usize; // genes in Seurat/SCE (becomes cells after transpose)
+    let n_cols = dim[1] as usize; // cells in Seurat/SCE (becomes genes after transpose)
+
+    let indices_robj = R!("{{dgc}}@i")
+        .map_err(|e| Error::Other(format!("failed to get @i: {}", e)))?;
+    let csc_indices: Vec<i32> = indices_robj.as_integer_slice()
+        .ok_or_else(|| Error::Other("@i is not integer".into()))?
+        .to_vec();
+
+    let indptr_robj = R!("{{dgc}}@p")
+        .map_err(|e| Error::Other(format!("failed to get @p: {}", e)))?;
+    let csc_indptr: Vec<i32> = indptr_robj.as_integer_slice()
+        .ok_or_else(|| Error::Other("@p is not integer".into()))?
+        .to_vec();
+
+    let values_robj = R!("{{dgc}}@x")
+        .map_err(|e| Error::Other(format!("failed to get @x: {}", e)))?;
+    let csc_values: Vec<f64> = values_robj.as_real_slice()
+        .ok_or_else(|| Error::Other("@x is not double".into()))?
+        .to_vec();
+
+    let nnz = csc_values.len();
+
+    // Transpose CSC (genes × cells) → CSR (cells × genes)
+    // In the transposed layout: rows = cells (n_cols), cols = genes (n_rows)
+    let csr_n_rows = n_cols; // cells
+    let csr_n_cols = n_rows; // genes
+
+    // Count nnz per row in CSR (= per column index in CSC, which is the row index @i)
+    let mut row_counts = vec![0u64; csr_n_rows];
+    // In CSC→CSR transpose: CSC columns become CSR columns (genes), CSC row indices become CSR row indices (cells)
+    // Actually no: CSC(genes×cells) has columns=cells, rows=genes.
+    // Transposing gives us CSR(cells×genes) where rows=cells, cols=genes.
+    // In CSC format: column j (cell j) has entries at rows csc_indices[csc_indptr[j]..csc_indptr[j+1]].
+    // In CSR format: row j (cell j) has entries at columns = the gene indices.
+    // So CSC column j becomes CSR row j. For each entry in CSC column j at row i,
+    // we get CSR row j, column i.
+
+    // Count entries per CSR row (= per CSC column)
+    for j in 0..n_cols {
+        let start = csc_indptr[j] as usize;
+        let end = csc_indptr[j + 1] as usize;
+        row_counts[j] = (end - start) as u64;
+    }
+
+    // Build CSR indptr
+    let mut csr_indptr = vec![0u64; csr_n_rows + 1];
+    for i in 0..csr_n_rows {
+        csr_indptr[i + 1] = csr_indptr[i] + row_counts[i];
+    }
+
+    // Scatter values into CSR arrays
+    let mut csr_indices = vec![0u32; nnz];
+    let mut csr_values_f64 = vec![0.0f64; nnz];
+    let mut write_pos: Vec<u64> = csr_indptr[..csr_n_rows].to_vec();
+
+    for j in 0..n_cols {
+        // CSC column j → CSR row j
+        let start = csc_indptr[j] as usize;
+        let end = csc_indptr[j + 1] as usize;
+        for k in start..end {
+            let gene_idx = csc_indices[k] as u32; // CSC row index = gene
+            let pos = write_pos[j] as usize;
+            csr_indices[pos] = gene_idx;
+            csr_values_f64[pos] = csc_values[k];
+            write_pos[j] += 1;
+        }
+    }
+
+    // Convert f64 values to u8 byte representation
+    // Detect if values are integer-like (common for counts)
+    let all_integer = csr_values_f64.iter().all(|&v| v == v.floor() && v >= 0.0 && v <= 255.0);
+
+    let values_bytes = if all_integer {
+        // Store as uint8
+        csr_values_f64.iter().map(|&v| v as u8).collect()
+    } else {
+        // Store as float32
+        csr_values_f64.iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect()
+    };
+
+    Ok((csr_indptr, csr_indices, values_bytes, csr_n_rows, csr_n_cols))
+}
+
+/// Convert an R data.frame to an Arrow RecordBatch for writing obs/var.
+///
+/// This is the reverse of `record_batch_to_dataframe`.
+/// Extracts column names and values, creating Utf8 columns for character vectors
+/// and Float64 columns for numeric vectors.
+fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let names_robj = R!("names({{df}})")
+        .map_err(|e| Error::Other(format!("failed to get names: {}", e)))?;
+    let col_names: Vec<String> = names_robj.as_str_iter()
+        .ok_or_else(|| Error::Other("names not character".into()))?
+        .map(|s| s.to_string())
+        .collect();
+
+    let n_cols = col_names.len();
+    let mut fields = Vec::with_capacity(n_cols);
+    let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::with_capacity(n_cols);
+
+    for (i, name) in col_names.iter().enumerate() {
+        let col_idx = (i + 1) as i32; // R is 1-based
+        let col_robj = R!("{{df}}[[{{col_idx}}]]")
+            .map_err(|e| Error::Other(format!("failed to get column {}: {}", name, e)))?;
+
+        let is_char = R!("is.character({{df}}[[{{col_idx}}]])")
+            .map_err(|e| Error::Other(format!("is.character check failed: {}", e)))?;
+        let is_character = is_char.as_logical_slice()
+            .and_then(|s| s.first().map(|&b| b.is_true()))
+            .unwrap_or(false);
+
+        let is_fac = R!("is.factor({{df}}[[{{col_idx}}]])")
+            .map_err(|e| Error::Other(format!("is.factor check failed: {}", e)))?;
+        let is_factor = is_fac.as_logical_slice()
+            .and_then(|s| s.first().map(|&b| b.is_true()))
+            .unwrap_or(false);
+
+        if is_character || is_factor {
+            // Convert to character vector (handles factors too)
+            let char_robj = R!("as.character({{df}}[[{{col_idx}}]])")
+                .map_err(|e| Error::Other(format!("as.character failed: {}", e)))?;
+            let strings: Vec<Option<String>> = char_robj.as_str_iter()
+                .ok_or_else(|| Error::Other(format!("column {} not iterable as str", name)))?
+                .map(|s| Some(s.to_string()))
+                .collect();
+            let arr = StringArray::from(
+                strings.iter().map(|s| s.as_deref()).collect::<Vec<_>>()
+            );
+            fields.push(Field::new(name, DataType::Utf8, true));
+            arrays.push(Arc::new(arr));
+        } else {
+            // Numeric → f64 array
+            let vals: Vec<Option<f64>> = col_robj.as_real_slice()
+                .ok_or_else(|| Error::Other(format!("column {} not numeric", name)))?
+                .iter()
+                .map(|&v| if v.is_nan() { None } else { Some(v) })
+                .collect();
+            let arr = Float64Array::from(vals);
+            fields.push(Field::new(name, DataType::Float64, true));
+            arrays.push(Arc::new(arr));
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    arrow::array::RecordBatch::try_new(schema, arrays)
+        .map_err(|e| Error::Other(format!("RecordBatch construction failed: {}", e)))
+}
+
+// ─── Import from Seurat/SCE ─────────────────────────────────────────────────
+
+/// Import a Seurat object to an SCX file.
+///
+/// Extracts the counts dgCMatrix (CSC, genes × cells), transposes to CSR
+/// (cells × genes), and writes via ScxWriter.
+/// Extracts meta.data → obs, feature metadata → var.
+pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format::header::FileHeader;
+    use scx_format::writer::ScxWriter;
+
+    // Clone Robj before each R!() call — the macro moves the value
+    let seu1 = seurat_obj.clone();
+    let seu2 = seurat_obj.clone();
+    let seu3 = seurat_obj.clone();
+    let seu4 = seurat_obj;
+
+    // 1. Extract counts matrix: GetAssayData(seu, layer = "counts")
+    let counts = R!("
+        if (!requireNamespace('Seurat', quietly = TRUE))
+            stop('Seurat >= 5.0.0 is required for from_seurat()')
+        Seurat::GetAssayData({{seu1}}, layer = 'counts')
+    ")
+    .map_err(|e| Error::Other(format!("failed to extract counts: {}", e)))?;
+
+    // 2. Extract meta.data → obs
+    let obs_df = R!("{{seu2}}@meta.data")
+        .map_err(|e| Error::Other(format!("failed to extract meta.data: {}", e)))?;
+
+    // 3. Extract feature/var metadata
+    // Try RNA assay meta.data first, fall back to rownames
+    let var_df_attempt = R!("{{seu3}}[['RNA']]@meta.data");
+    let var_df = match var_df_attempt {
+        Ok(v) if !v.is_null() => v,
+        _ => R!("data.frame(gene_id = rownames({{seu4}}))")
+            .map_err(|e| Error::Other(format!("failed to extract var metadata: {}", e)))?,
+    };
+
+    // 4. Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
+    let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars) =
+        dgcmatrix_to_csr(&counts)?;
+
+    let nnz = *csr_indptr.last().unwrap_or(&0);
+
+    // 5. Convert obs/var dataframes to RecordBatch
+    let obs_batch = dataframe_to_record_batch(&obs_df)?;
+    let var_batch = dataframe_to_record_batch(&var_df)?;
+
+    // 6. Determine value encoding and build header
+    let all_u8 = values_bytes.len() == nnz as usize;
+    let value_encoding = if all_u8 {
+        ValueEncoding::Uint8
+    } else {
+        ValueEncoding::Float32
+    };
+
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: 1,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs as u64,
+        n_vars: n_vars as u64,
+        nnz,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: 16384,
+        codec_id: CodecId::None as u8,
+        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        reserved: [0u8; 132],
+    };
+
+    // 7. Write SCX file
+    let mut writer = ScxWriter::new(output_path, header)
+        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
+
+    writer.write_obs(&obs_batch)
+        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
+    writer.write_var(&var_batch)
+        .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
+
+    // Convert indices to u32 (already u32) and write shard
+    writer.write_csr_shard(
+        &csr_indptr,
+        &csr_indices,
+        &values_bytes,
+        CodecId::None,
+        value_encoding,
+        0, // row_start
+    )
+    .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+
+    writer.finish()
+        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// Import a SingleCellExperiment to an SCX file.
+/// Same CSC→CSR transpose as from_seurat.
+pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format::header::FileHeader;
+    use scx_format::writer::ScxWriter;
+
+    // Clone Robj before each R!() call — the macro moves the value
+    let sce1 = sce_obj.clone();
+    let sce2 = sce_obj.clone();
+    let sce3 = sce_obj;
+
+    // 1. Extract counts assay (genes × cells dgCMatrix)
+    let counts = R!("
+        if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
+            stop('SingleCellExperiment is required for from_sce()')
+        SummarizedExperiment::assay({{sce1}}, 'counts')
+    ")
+    .map_err(|e| Error::Other(format!("failed to extract counts assay: {}", e)))?;
+
+    // 2. Extract colData → obs (cells)
+    let obs_df = R!("as.data.frame(SummarizedExperiment::colData({{sce2}}))")
+        .map_err(|e| Error::Other(format!("failed to extract colData: {}", e)))?;
+
+    // 3. Extract rowData → var (genes)
+    let var_df = R!("as.data.frame(SummarizedExperiment::rowData({{sce3}}))")
+        .map_err(|e| Error::Other(format!("failed to extract rowData: {}", e)))?;
+
+    // 4. Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
+    let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars) =
+        dgcmatrix_to_csr(&counts)?;
+
+    let nnz = *csr_indptr.last().unwrap_or(&0);
+
+    // 5. Convert obs/var dataframes to RecordBatch
+    let obs_batch = dataframe_to_record_batch(&obs_df)?;
+    let var_batch = dataframe_to_record_batch(&var_df)?;
+
+    // 6. Determine value encoding
+    let all_u8 = values_bytes.len() == nnz as usize;
+    let value_encoding = if all_u8 {
+        ValueEncoding::Uint8
+    } else {
+        ValueEncoding::Float32
+    };
+
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: 1,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs as u64,
+        n_vars: n_vars as u64,
+        nnz,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: 16384,
+        codec_id: CodecId::None as u8,
+        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        reserved: [0u8; 132],
+    };
+
+    // 7. Write SCX file
+    let mut writer = ScxWriter::new(output_path, header)
+        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
+
+    writer.write_obs(&obs_batch)
+        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
+    writer.write_var(&var_batch)
+        .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
+
+    writer.write_csr_shard(
+        &csr_indptr,
+        &csr_indices,
+        &values_bytes,
+        CodecId::None,
+        value_encoding,
+        0,
+    )
+    .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+
+    writer.finish()
+        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
+
+    Ok(())
+}

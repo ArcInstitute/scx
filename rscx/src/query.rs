@@ -177,21 +177,17 @@ impl RQueryResult {
     }
 
     /// Convert to a Seurat v5 object.
-    /// Consumes the inner data — stub for Phase D.
+    /// Consumes the inner data — requires Seurat >= 5.0.0.
     fn to_seurat(&mut self) -> Result<Robj> {
-        let _r = self.take_result()?;
-        Err(Error::Other(
-            "to_seurat() not yet implemented (Phase D)".into(),
-        ))
+        let r = self.take_result()?;
+        crate::interop::to_seurat_v5(&r)
     }
 
     /// Convert to a SingleCellExperiment object.
-    /// Consumes the inner data — stub for Phase D.
+    /// Consumes the inner data — requires SingleCellExperiment package.
     fn to_sce(&mut self) -> Result<Robj> {
-        let _r = self.take_result()?;
-        Err(Error::Other(
-            "to_sce() not yet implemented (Phase D)".into(),
-        ))
+        let r = self.take_result()?;
+        crate::interop::to_sce(&r)
     }
 
     /// Read obs metadata as an R data.frame from the query result.
