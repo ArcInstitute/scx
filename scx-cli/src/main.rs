@@ -12,6 +12,7 @@ mod info;
 mod merge;
 mod query;
 mod rollback;
+mod subset;
 mod validate;
 
 #[cfg(feature = "cloud")]
@@ -233,6 +234,29 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Extract a subset of cells and/or genes into a new SCX file
+    Subset {
+        /// Input SCX file
+        input: PathBuf,
+        /// Output SCX file path
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Obs predicate expression to filter cells
+        #[arg(long)]
+        filter: Option<String>,
+        /// File containing gene indices (one per line) for column projection
+        #[arg(long)]
+        genes: Option<PathBuf>,
+        /// Show matching count without writing output
+        #[arg(long)]
+        dry_run: bool,
+        /// Target rows per shard in the output file
+        #[arg(long, default_value = "10000")]
+        shard_size: u32,
+        /// Compression codec for output: auto, none, scx1, zstd
+        #[arg(long, default_value = "auto")]
+        codec: String,
+    },
 }
 
 fn main() {
@@ -320,6 +344,23 @@ fn main() {
             memory_limit,
             force,
         } => build_csc::run_build_csc(&input, &output, &memory_limit, force),
+        Commands::Subset {
+            input,
+            output,
+            filter,
+            genes,
+            dry_run,
+            shard_size,
+            codec,
+        } => subset::run_subset(
+            &input,
+            output.as_deref(),
+            filter.as_deref(),
+            genes.as_deref(),
+            dry_run,
+            shard_size,
+            &codec,
+        ),
         #[cfg(feature = "cloud")]
         Commands::CloudOptimize { input, output } => {
             cloud_optimize::run_cloud_optimize(&input, output.as_deref())
