@@ -3,9 +3,7 @@
 // This module provides the minimum viable interop functions needed by Phase B
 // (reader.rs). Full Seurat/SCE conversion will be added in Phase D.
 
-use arrow::array::{
-    Array, AsArray, RecordBatch,
-};
+use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::DataType;
 use extendr_api::prelude::*;
 use scx_codec::ValueEncoding;
@@ -65,10 +63,7 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
                 })
                 .collect();
             // Convert to R character vector, mapping None → NA
-            let rvec: Vec<Option<&str>> = strings
-                .iter()
-                .map(|s| s.as_deref())
-                .collect();
+            let rvec: Vec<Option<&str>> = strings.iter().map(|s| s.as_deref()).collect();
             Ok(rvec.into_robj())
         }
         DataType::LargeUtf8 => {
@@ -82,10 +77,7 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
                     }
                 })
                 .collect();
-            let rvec: Vec<Option<&str>> = strings
-                .iter()
-                .map(|s| s.as_deref())
-                .collect();
+            let rvec: Vec<Option<&str>> = strings.iter().map(|s| s.as_deref()).collect();
             Ok(rvec.into_robj())
         }
 
@@ -99,7 +91,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::Int8Type>();
             let vals: Vec<Option<i32>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as i32) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i32)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -108,7 +104,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::Int16Type>();
             let vals: Vec<Option<i32>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as i32) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i32)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -117,7 +117,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::Int32Type>();
             let vals: Vec<Option<i32>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i)) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -127,7 +131,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::Int64Type>();
             let vals: Vec<Option<f64>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as f64) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as f64)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -138,7 +146,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::UInt8Type>();
             let vals: Vec<Option<i32>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as i32) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i32)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -147,7 +159,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::UInt16Type>();
             let vals: Vec<Option<i32>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as i32) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i32)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -157,7 +173,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::UInt32Type>();
             let vals: Vec<Option<f64>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as f64) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as f64)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -166,7 +186,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::UInt64Type>();
             let vals: Vec<Option<f64>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as f64) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as f64)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -177,7 +201,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::Float32Type>();
             let vals: Vec<Option<f64>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i) as f64) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as f64)
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -186,7 +214,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_primitive::<arrow::datatypes::Float64Type>();
             let vals: Vec<Option<f64>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i)) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -197,7 +229,11 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
             let arr = col.as_boolean();
             let vals: Vec<Option<bool>> = (0..arr.len())
                 .map(|i| {
-                    if arr.is_null(i) { None } else { Some(arr.value(i)) }
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
                 })
                 .collect();
             Ok(vals.into_robj())
@@ -229,9 +265,7 @@ fn dictionary_to_factor(
 ) -> Result<Robj> {
     // We support Dictionary<Int8/16/32, Utf8> which is the common h5ad categorical pattern
     match (key_type, value_type) {
-        (DataType::Int8, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int8Type>(col)
-        }
+        (DataType::Int8, DataType::Utf8) => typed_dict_to_factor::<arrow::datatypes::Int8Type>(col),
         (DataType::Int16, DataType::Utf8) => {
             typed_dict_to_factor::<arrow::datatypes::Int16Type>(col)
         }
@@ -449,32 +483,39 @@ type CsrData = (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize, ValueEncoding);
 
 fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
     // Extract dgCMatrix slots via R
-    let dim_robj = R!("{{dgc}}@Dim")
-        .map_err(|e| Error::Other(format!("failed to get Dim: {}", e)))?;
-    let dim: Vec<i32> = dim_robj.as_integer_slice()
+    let dim_robj =
+        R!("{{dgc}}@Dim").map_err(|e| Error::Other(format!("failed to get Dim: {}", e)))?;
+    let dim: Vec<i32> = dim_robj
+        .as_integer_slice()
         .ok_or_else(|| Error::Other("Dim is not integer".into()))?
         .to_vec();
     if dim.len() != 2 {
-        return Err(Error::Other(format!("Dim has {} elements, expected 2", dim.len())));
+        return Err(Error::Other(format!(
+            "Dim has {} elements, expected 2",
+            dim.len()
+        )));
     }
     let n_rows = dim[0] as usize; // genes in Seurat/SCE (becomes cells after transpose)
     let n_cols = dim[1] as usize; // cells in Seurat/SCE (becomes genes after transpose)
 
-    let indices_robj = R!("{{dgc}}@i")
-        .map_err(|e| Error::Other(format!("failed to get @i: {}", e)))?;
-    let csc_indices: Vec<i32> = indices_robj.as_integer_slice()
+    let indices_robj =
+        R!("{{dgc}}@i").map_err(|e| Error::Other(format!("failed to get @i: {}", e)))?;
+    let csc_indices: Vec<i32> = indices_robj
+        .as_integer_slice()
         .ok_or_else(|| Error::Other("@i is not integer".into()))?
         .to_vec();
 
-    let indptr_robj = R!("{{dgc}}@p")
-        .map_err(|e| Error::Other(format!("failed to get @p: {}", e)))?;
-    let csc_indptr: Vec<i32> = indptr_robj.as_integer_slice()
+    let indptr_robj =
+        R!("{{dgc}}@p").map_err(|e| Error::Other(format!("failed to get @p: {}", e)))?;
+    let csc_indptr: Vec<i32> = indptr_robj
+        .as_integer_slice()
         .ok_or_else(|| Error::Other("@p is not integer".into()))?
         .to_vec();
 
-    let values_robj = R!("{{dgc}}@x")
-        .map_err(|e| Error::Other(format!("failed to get @x: {}", e)))?;
-    let csc_values: Vec<f64> = values_robj.as_real_slice()
+    let values_robj =
+        R!("{{dgc}}@x").map_err(|e| Error::Other(format!("failed to get @x: {}", e)))?;
+    let csc_values: Vec<f64> = values_robj
+        .as_real_slice()
         .ok_or_else(|| Error::Other("@x is not double".into()))?
         .to_vec();
 
@@ -528,12 +569,17 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
 
     // Detect value encoding: integer-like values get uint8/uint16/uint32,
     // otherwise fall back to float32. Mirrors scx-cli detect_value_encoding_only().
-    let all_integer = csr_values_f64.iter().all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
+    let all_integer = csr_values_f64
+        .iter()
+        .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
 
     let (values_bytes, value_encoding) = if all_integer {
         let max_val: f64 = csr_values_f64.iter().copied().fold(0.0f64, f64::max);
         if max_val <= 255.0 {
-            (csr_values_f64.iter().map(|&v| v as u8).collect(), ValueEncoding::Uint8)
+            (
+                csr_values_f64.iter().map(|&v| v as u8).collect(),
+                ValueEncoding::Uint8,
+            )
         } else if max_val <= 65535.0 {
             let mut buf = Vec::with_capacity(csr_values_f64.len() * 2);
             for &v in &csr_values_f64 {
@@ -555,7 +601,14 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
         (buf, ValueEncoding::Float32)
     };
 
-    Ok((csr_indptr, csr_indices, values_bytes, csr_n_rows, csr_n_cols, value_encoding))
+    Ok((
+        csr_indptr,
+        csr_indices,
+        values_bytes,
+        csr_n_rows,
+        csr_n_cols,
+        value_encoding,
+    ))
 }
 
 /// Convert an R data.frame to an Arrow RecordBatch for writing obs/var.
@@ -568,9 +621,10 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    let names_robj = R!("names({{df}})")
-        .map_err(|e| Error::Other(format!("failed to get names: {}", e)))?;
-    let col_names: Vec<String> = names_robj.as_str_iter()
+    let names_robj =
+        R!("names({{df}})").map_err(|e| Error::Other(format!("failed to get names: {}", e)))?;
+    let col_names: Vec<String> = names_robj
+        .as_str_iter()
         .ok_or_else(|| Error::Other("names not character".into()))?
         .map(|s| s.to_string())
         .collect();
@@ -586,13 +640,15 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
 
         let is_char = R!("is.character({{df}}[[{{col_idx}}]])")
             .map_err(|e| Error::Other(format!("is.character check failed: {}", e)))?;
-        let is_character = is_char.as_logical_slice()
+        let is_character = is_char
+            .as_logical_slice()
             .and_then(|s| s.first().map(|&b| b.is_true()))
             .unwrap_or(false);
 
         let is_fac = R!("is.factor({{df}}[[{{col_idx}}]])")
             .map_err(|e| Error::Other(format!("is.factor check failed: {}", e)))?;
-        let is_factor = is_fac.as_logical_slice()
+        let is_factor = is_fac
+            .as_logical_slice()
             .and_then(|s| s.first().map(|&b| b.is_true()))
             .unwrap_or(false);
 
@@ -600,18 +656,18 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
             // Convert to character vector (handles factors too)
             let char_robj = R!("as.character({{df}}[[{{col_idx}}]])")
                 .map_err(|e| Error::Other(format!("as.character failed: {}", e)))?;
-            let strings: Vec<Option<String>> = char_robj.as_str_iter()
+            let strings: Vec<Option<String>> = char_robj
+                .as_str_iter()
                 .ok_or_else(|| Error::Other(format!("column {} not iterable as str", name)))?
                 .map(|s| Some(s.to_string()))
                 .collect();
-            let arr = StringArray::from(
-                strings.iter().map(|s| s.as_deref()).collect::<Vec<_>>()
-            );
+            let arr = StringArray::from(strings.iter().map(|s| s.as_deref()).collect::<Vec<_>>());
             fields.push(Field::new(name, DataType::Utf8, true));
             arrays.push(Arc::new(arr));
         } else {
             // Numeric → f64 array
-            let vals: Vec<Option<f64>> = col_robj.as_real_slice()
+            let vals: Vec<Option<f64>> = col_robj
+                .as_real_slice()
                 .ok_or_else(|| Error::Other(format!("column {} not numeric", name)))?
                 .iter()
                 .map(|&v| if v.is_nan() { None } else { Some(v) })
@@ -627,6 +683,109 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
         .map_err(|e| Error::Other(format!("RecordBatch construction failed: {}", e)))
 }
 
+// ─── Shared SCX writer helper ────────────────────────────────────────────────
+
+/// Write CSR data to an SCX file with multi-shard splitting and auto-codec.
+///
+/// Shared by `from_seurat` and `from_sce` — both extract R objects into
+/// the same (indptr, indices, values_bytes) representation, then delegate here.
+#[allow(clippy::too_many_arguments)]
+fn write_csr_to_scx(
+    output_path: &str,
+    csr_indptr: &[u64],
+    csr_indices: &[u32],
+    values_bytes: &[u8],
+    value_encoding: ValueEncoding,
+    n_obs: usize,
+    n_vars: usize,
+    obs_batch: &RecordBatch,
+    var_batch: &RecordBatch,
+) -> Result<()> {
+    use scx_codec::CodecId;
+    use scx_format::header::FileHeader;
+    use scx_format::select_codec;
+    use scx_format::writer::ScxWriter;
+
+    let nnz = *csr_indptr.last().unwrap_or(&0);
+    let shard_target_rows: usize = 16384;
+    let n_shards = (n_obs + shard_target_rows - 1) / shard_target_rows.max(1);
+
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: 1,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs as u64,
+        n_vars: n_vars as u64,
+        nnz,
+        n_csr_shards: n_shards as u32,
+        n_csc_shards: 0,
+        shard_target_rows: shard_target_rows as u32,
+        codec_id: CodecId::None as u8,
+        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        reserved: [0u8; 132],
+    };
+
+    let mut writer = ScxWriter::new(output_path, header)
+        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
+
+    writer
+        .write_obs(obs_batch)
+        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
+    writer
+        .write_var(var_batch)
+        .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
+
+    let bw = value_encoding.byte_width();
+    let mut row_start: usize = 0;
+    while row_start < n_obs {
+        let row_end = (row_start + shard_target_rows).min(n_obs);
+
+        let base = csr_indptr[row_start];
+        let shard_indptr: Vec<u64> = csr_indptr[row_start..=row_end]
+            .iter()
+            .map(|&v| v - base)
+            .collect();
+
+        let nnz_start = base as usize;
+        let nnz_end = csr_indptr[row_end] as usize;
+        let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
+        let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
+
+        let codec = select_codec(shard_values, value_encoding);
+
+        writer
+            .write_csr_shard(
+                &shard_indptr,
+                &shard_indices,
+                shard_values,
+                codec,
+                value_encoding,
+                row_start as u64,
+            )
+            .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+
+        row_start = row_end;
+    }
+
+    writer
+        .finish()
+        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
+
+    Ok(())
+}
+
 // ─── Import from Seurat/SCE ─────────────────────────────────────────────────
 
 /// Import a Seurat object to an SCX file.
@@ -637,11 +796,6 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
 /// @export
 #[extendr]
 pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
-    use scx_codec::CodecId;
-    use scx_format::header::FileHeader;
-    use scx_format::select_codec;
-    use scx_format::writer::ScxWriter;
-
     // Clone Robj before each R!() call — the macro moves the value
     let seu1 = seurat_obj.clone();
     let seu2 = seurat_obj.clone();
@@ -661,7 +815,6 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
         .map_err(|e| Error::Other(format!("failed to extract meta.data: {}", e)))?;
 
     // 3. Extract feature/var metadata
-    // Try RNA assay meta.data first, fall back to rownames
     let var_df_attempt = R!("{{seu3}}[['RNA']]@meta.data");
     let var_df = match var_df_attempt {
         Ok(v) if !v.is_null() => v,
@@ -673,90 +826,22 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
     let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
         dgcmatrix_to_csr(&counts)?;
 
-    let nnz = *csr_indptr.last().unwrap_or(&0);
-
     // 5. Convert obs/var dataframes to RecordBatch
     let obs_batch = dataframe_to_record_batch(&obs_df)?;
     let var_batch = dataframe_to_record_batch(&var_df)?;
 
-    // 6. Build header — codec_id set to first shard's codec (updated below)
-    let shard_target_rows: usize = 16384;
-    let n_shards = (n_obs + shard_target_rows - 1) / shard_target_rows.max(1);
-
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: 1,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
-        nnz,
-        n_csr_shards: n_shards as u32,
-        n_csc_shards: 0,
-        shard_target_rows: shard_target_rows as u32,
-        codec_id: CodecId::None as u8, // placeholder, per-shard codec used
-        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        reserved: [0u8; 132],
-    };
-
-    // 7. Write SCX file with multi-shard splitting + auto-codec
-    let mut writer = ScxWriter::new(output_path, header)
-        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
-
-    writer.write_obs(&obs_batch)
-        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
-    writer.write_var(&var_batch)
-        .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
-
-    let bw = value_encoding.byte_width();
-    let mut row_start: usize = 0;
-    while row_start < n_obs {
-        let row_end = (row_start + shard_target_rows).min(n_obs);
-
-        // Rebase indptr for this shard
-        let base = csr_indptr[row_start];
-        let shard_indptr: Vec<u64> = csr_indptr[row_start..=row_end]
-            .iter()
-            .map(|&v| v - base)
-            .collect();
-
-        // Slice indices and values
-        let nnz_start = base as usize;
-        let nnz_end = csr_indptr[row_end] as usize;
-        let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
-        let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
-
-        // Auto-select codec per shard
-        let codec = select_codec(shard_values, value_encoding);
-
-        writer.write_csr_shard(
-            &shard_indptr,
-            &shard_indices,
-            shard_values,
-            codec,
-            value_encoding,
-            row_start as u64,
-        )
-        .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
-
-        row_start = row_end;
-    }
-
-    writer.finish()
-        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
-
-    Ok(())
+    // 6. Write SCX file
+    write_csr_to_scx(
+        output_path,
+        &csr_indptr,
+        &csr_indices,
+        &values_bytes,
+        value_encoding,
+        n_obs,
+        n_vars,
+        &obs_batch,
+        &var_batch,
+    )
 }
 
 /// Import a SingleCellExperiment to an SCX file.
@@ -764,11 +849,6 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
 /// @export
 #[extendr]
 pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
-    use scx_codec::CodecId;
-    use scx_format::header::FileHeader;
-    use scx_format::select_codec;
-    use scx_format::writer::ScxWriter;
-
     // Clone Robj before each R!() call — the macro moves the value
     let sce1 = sce_obj.clone();
     let sce2 = sce_obj.clone();
@@ -794,90 +874,22 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
     let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
         dgcmatrix_to_csr(&counts)?;
 
-    let nnz = *csr_indptr.last().unwrap_or(&0);
-
     // 5. Convert obs/var dataframes to RecordBatch
     let obs_batch = dataframe_to_record_batch(&obs_df)?;
     let var_batch = dataframe_to_record_batch(&var_df)?;
 
-    // 6. Build header with shard count
-    let shard_target_rows: usize = 16384;
-    let n_shards = (n_obs + shard_target_rows - 1) / shard_target_rows.max(1);
-
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: 1,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
-        nnz,
-        n_csr_shards: n_shards as u32,
-        n_csc_shards: 0,
-        shard_target_rows: shard_target_rows as u32,
-        codec_id: CodecId::None as u8, // placeholder, per-shard codec used
-        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        reserved: [0u8; 132],
-    };
-
-    // 7. Write SCX file with multi-shard splitting + auto-codec
-    let mut writer = ScxWriter::new(output_path, header)
-        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
-
-    writer.write_obs(&obs_batch)
-        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
-    writer.write_var(&var_batch)
-        .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
-
-    let bw = value_encoding.byte_width();
-    let mut row_start: usize = 0;
-    while row_start < n_obs {
-        let row_end = (row_start + shard_target_rows).min(n_obs);
-
-        // Rebase indptr for this shard
-        let base = csr_indptr[row_start];
-        let shard_indptr: Vec<u64> = csr_indptr[row_start..=row_end]
-            .iter()
-            .map(|&v| v - base)
-            .collect();
-
-        // Slice indices and values
-        let nnz_start = base as usize;
-        let nnz_end = csr_indptr[row_end] as usize;
-        let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
-        let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
-
-        // Auto-select codec per shard
-        let codec = select_codec(shard_values, value_encoding);
-
-        writer.write_csr_shard(
-            &shard_indptr,
-            &shard_indices,
-            shard_values,
-            codec,
-            value_encoding,
-            row_start as u64,
-        )
-        .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
-
-        row_start = row_end;
-    }
-
-    writer.finish()
-        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
-
-    Ok(())
+    // 6. Write SCX file
+    write_csr_to_scx(
+        output_path,
+        &csr_indptr,
+        &csr_indices,
+        &values_bytes,
+        value_encoding,
+        n_obs,
+        n_vars,
+        &obs_batch,
+        &var_batch,
+    )
 }
 
 // ─── Module Registration ─────────────────────────────────────────────────────

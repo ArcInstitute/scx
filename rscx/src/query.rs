@@ -7,6 +7,7 @@
 // and returns a new RQueryPipeline. After collect() the pipeline
 // is consumed and further calls return an error.
 
+use arrow::array::RecordBatch;
 use extendr_api::prelude::*;
 use scx_engine::pipeline::{QueryPipeline, QueryResult};
 
@@ -30,8 +31,7 @@ pub struct RQueryPipeline {
 impl RQueryPipeline {
     /// Create from a file path (called by ScxExperiment$query()).
     pub fn from_path(path: &str) -> Result<Self> {
-        let pipeline = QueryPipeline::open(path)
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let pipeline = QueryPipeline::open(path).map_err(|e| Error::Other(e.to_string()))?;
         Ok(Self {
             inner: Some(pipeline),
         })
@@ -39,9 +39,9 @@ impl RQueryPipeline {
 
     /// Take the inner pipeline, returning an error if already consumed.
     fn take_inner(&mut self) -> Result<QueryPipeline> {
-        self.inner.take().ok_or_else(|| {
-            Error::Other("Pipeline already consumed by collect()".into())
-        })
+        self.inner
+            .take()
+            .ok_or_else(|| Error::Other("Pipeline already consumed by collect()".into()))
     }
 }
 
@@ -120,9 +120,7 @@ impl RQueryPipeline {
     /// The pipeline is consumed — further calls will error.
     fn collect(&mut self) -> Result<RQueryResult> {
         let p = self.take_inner()?;
-        let result = p
-            .collect()
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let result = p.collect().map_err(|e| Error::Other(e.to_string()))?;
         Ok(RQueryResult::from_result(result))
     }
 }
@@ -138,6 +136,8 @@ impl RQueryPipeline {
 #[extendr]
 pub struct RQueryResult {
     result: Option<QueryResult>,
+    cached_obs: RecordBatch,
+    cached_var: RecordBatch,
     cached_n_obs: usize,
     cached_n_vars: usize,
     cached_nnz: usize,
@@ -146,9 +146,11 @@ pub struct RQueryResult {
 }
 
 impl RQueryResult {
-    /// Construct from a QueryResult, caching dimension values.
+    /// Construct from a QueryResult, caching metadata and dimension values.
     pub fn from_result(r: QueryResult) -> Self {
         Self {
+            cached_obs: r.obs.clone(),
+            cached_var: r.var.clone(),
             cached_n_obs: r.x.n_rows(),
             cached_n_vars: r.x.n_cols(),
             cached_nnz: r.x.nnz(),
@@ -160,9 +162,9 @@ impl RQueryResult {
 
     /// Take the inner result, returning an error if already consumed.
     fn take_result(&mut self) -> Result<QueryResult> {
-        self.result.take().ok_or_else(|| {
-            Error::Other("QueryResult already consumed".into())
-        })
+        self.result
+            .take()
+            .ok_or_else(|| Error::Other("QueryResult already consumed".into()))
     }
 }
 
@@ -191,21 +193,15 @@ impl RQueryResult {
     }
 
     /// Read obs metadata as an R data.frame from the query result.
-    fn obs(&mut self) -> Result<Robj> {
-        let r = self
-            .result
-            .as_ref()
-            .ok_or_else(|| Error::Other("QueryResult already consumed".into()))?;
-        crate::interop::record_batch_to_dataframe(&r.obs)
+    /// Accessible even after to_dgcmatrix()/to_seurat()/to_sce() consume the matrix data.
+    fn obs(&self) -> Result<Robj> {
+        crate::interop::record_batch_to_dataframe(&self.cached_obs)
     }
 
     /// Read var metadata as an R data.frame from the query result.
-    fn var(&mut self) -> Result<Robj> {
-        let r = self
-            .result
-            .as_ref()
-            .ok_or_else(|| Error::Other("QueryResult already consumed".into()))?;
-        crate::interop::record_batch_to_dataframe(&r.var)
+    /// Accessible even after to_dgcmatrix()/to_seurat()/to_sce() consume the matrix data.
+    fn var(&self) -> Result<Robj> {
+        crate::interop::record_batch_to_dataframe(&self.cached_var)
     }
 
     /// Use f64 for n_obs/n_vars/nnz to avoid i32 overflow on large datasets.

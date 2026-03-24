@@ -29,14 +29,14 @@ impl std::fmt::Debug for ScxExperiment {
 #[extendr]
 impl ScxExperiment {
     /// Open an SCX file. Returns a lazy handle (no data read yet).
-    fn new(path: &str) -> Self {
+    fn new(path: &str) -> Result<Self> {
         let path_buf = PathBuf::from(path);
         let reader = ScxReader::open(&path_buf)
-            .unwrap_or_else(|e| panic!("failed to open SCX file '{}': {}", path, e));
-        Self {
+            .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
+        Ok(Self {
             reader,
             path: path_buf,
-        }
+        })
     }
 
     /// Number of observations (cells).

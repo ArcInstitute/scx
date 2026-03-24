@@ -32,8 +32,8 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
         ScxReader::open(input).map_err(|e| Error::Other(format!("failed to open input: {e}")))?;
 
     // Validate n_vars match
-    let target_reader = ScxReader::open(target)
-        .map_err(|e| Error::Other(format!("failed to open target: {e}")))?;
+    let target_reader =
+        ScxReader::open(target).map_err(|e| Error::Other(format!("failed to open target: {e}")))?;
     if target_reader.n_vars() != input_reader.n_vars() {
         return Err(Error::Other(format!(
             "n_vars mismatch: target has {}, input has {}",
@@ -124,9 +124,9 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
 ///
 /// @param path Path to the SCX file.
 /// @param cell_indices Integer vector of 0-based cell indices to delete.
-/// @return Total number of deleted cells as integer.
+/// @return Total number of deleted cells as numeric (f64 to avoid i32 overflow).
 #[extendr]
-fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Result<i32> {
+fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Result<Robj> {
     let indices: Vec<u64> = cell_indices
         .into_iter()
         .map(|i| {
@@ -140,7 +140,7 @@ fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Result<i32> {
 
     let p = Path::new(path);
     let total = scx_ops::mark_deleted(p, &indices).map_err(|e| Error::Other(e.to_string()))?;
-    Ok(total as i32)
+    Ok(Robj::from(total as f64))
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +153,7 @@ fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Result<i32> {
 /// @param output Path for the compacted output file.
 #[extendr]
 fn scx_compact(input: &str, output: &str) -> Result<()> {
-    scx_ops::compact(Path::new(input), Path::new(output))
-        .map_err(|e| Error::Other(e.to_string()))
+    scx_ops::compact(Path::new(input), Path::new(output)).map_err(|e| Error::Other(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -193,9 +192,7 @@ fn scx_rollback(path: &str, to_seq: Nullable<i32>) -> Result<()> {
 #[extendr]
 fn scx_merge(inputs: Vec<String>, output: &str) -> Result<()> {
     if inputs.len() < 2 {
-        return Err(Error::Other(
-            "merge requires at least 2 input files".into(),
-        ));
+        return Err(Error::Other("merge requires at least 2 input files".into()));
     }
     let input_paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
     let input_refs: Vec<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
@@ -213,8 +210,7 @@ fn scx_merge(inputs: Vec<String>, output: &str) -> Result<()> {
 /// @return Named list with n_obs, n_vars, nnz, format_version, n_shards.
 #[extendr]
 fn scx_info(path: &str) -> Result<Robj> {
-    let reader =
-        ScxReader::open(path).map_err(|e| Error::Other(format!("failed to open: {e}")))?;
+    let reader = ScxReader::open(path).map_err(|e| Error::Other(format!("failed to open: {e}")))?;
     // Extract to local variables for R!() interpolation
     let n_obs = reader.n_obs() as f64;
     let n_vars = reader.n_vars() as f64;
@@ -241,11 +237,8 @@ fn scx_info(path: &str) -> Result<Robj> {
 /// @return TRUE if all checksums pass.
 #[extendr]
 fn scx_validate(path: &str) -> Result<bool> {
-    let reader =
-        ScxReader::open(path).map_err(|e| Error::Other(format!("failed to open: {e}")))?;
-    let checks = reader
-        .validate()
-        .map_err(|e| Error::Other(e.to_string()))?;
+    let reader = ScxReader::open(path).map_err(|e| Error::Other(format!("failed to open: {e}")))?;
+    let checks = reader.validate().map_err(|e| Error::Other(e.to_string()))?;
     let all_passed = checks.iter().all(|(_, ok)| *ok);
     if !all_passed {
         let failures: Vec<String> = checks
