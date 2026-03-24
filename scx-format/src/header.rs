@@ -168,6 +168,11 @@ impl FileHeader {
         self.flags & (1 << 0) != 0
     }
 
+    /// Set the CSC flag (bit 0).
+    pub fn set_csc(&mut self) {
+        self.flags |= 1 << 0;
+    }
+
     /// Returns true if the bitmap flag (bit 1) is set.
     pub fn has_bitmap(&self) -> bool {
         self.flags & (1 << 1) != 0

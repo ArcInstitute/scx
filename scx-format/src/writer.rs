@@ -34,6 +34,7 @@ pub struct ScxWriter {
     header: FileHeader,
     entries: Vec<FullCatalogEntry>,
     csr_shard_count: u32,
+    csc_shard_count: u32,
     total_nnz: u64,
     has_obsm: bool,
     has_obsp: bool,
@@ -72,6 +73,7 @@ impl ScxWriter {
             header,
             entries: Vec::new(),
             csr_shard_count: 0,
+            csc_shard_count: 0,
             total_nnz: 0,
             has_obsm: false,
             has_obsp: false,
@@ -215,6 +217,40 @@ impl ScxWriter {
         )?;
         self.csr_shard_count += 1;
         self.total_nnz += nnz;
+        Ok(())
+    }
+
+    /// Write a CSC shard (column-major sparse matrix).
+    ///
+    /// Structurally identical to a CSR shard but uses `SectionType::CscShard (5)`.
+    /// - `indptr`: the column pointer array (length = n_cols_in_shard + 1), on-disk u64 values.
+    /// - `indices`: row indices (length = nnz), as u32.
+    /// - `values`: raw LE bytes of the value array.
+    /// - `codec_id`: compression codec to use.
+    /// - `value_encoding`: how values are encoded.
+    /// - `col_start`: global column index where this shard begins.
+    pub fn write_csc_shard(
+        &mut self,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        col_start: u64,
+    ) -> Result<()> {
+        let shard_idx = self.csc_shard_count;
+        let name = format!("X_csc_shard_{shard_idx}");
+        self.write_shard_inner(
+            indptr,
+            indices,
+            values,
+            codec_id,
+            value_encoding,
+            col_start,
+            &name,
+            SectionType::CscShard,
+        )?;
+        self.csc_shard_count += 1;
         Ok(())
     }
 
@@ -488,9 +524,13 @@ impl ScxWriter {
         self.header.full_catalog_offset = full_catalog_offset;
         self.header.full_catalog_length = full_catalog_length;
         self.header.n_csr_shards = self.csr_shard_count;
+        self.header.n_csc_shards = self.csc_shard_count;
         self.header.nnz = self.total_nnz;
         self.header.file_checksum = 0; // placeholder for first write
                                        // Auto-set flags based on what was written
+        if self.csc_shard_count > 0 {
+            self.header.set_csc(); // has_csc (bit 0)
+        }
         if self.has_obsm {
             self.header.flags |= 1 << 2; // has_obsm
         }
@@ -1043,5 +1083,172 @@ mod tests {
         assert_eq!(stats.value_min, 1);
         assert_eq!(stats.value_max, 10);
         assert_eq!(stats.value_sum, 28); // 5+10+1+3+7+2
+    }
+
+    /// P3: Write CSR + CSC shards → verify CSC section in catalog and correct data
+    #[test]
+    fn test_csc_shard_write_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with_csc.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+
+        // Write a CSR shard (row-major)
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // Write a CSC shard (column-major) with the same data
+        // In a real scenario the indptr/indices represent column pointers/row indices
+        writer
+            .write_csc_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0, // col_start
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+
+        // Read back and verify
+        let data = std::fs::read(&final_path).unwrap();
+        let mut cursor = std::io::Cursor::new(&data);
+        let hdr = FileHeader::read_from(&mut cursor).unwrap();
+
+        // Verify shard counts
+        assert_eq!(hdr.n_csr_shards, 1);
+        assert_eq!(hdr.n_csc_shards, 1);
+
+        // Verify catalog has both shard types
+        let fc_start = hdr.full_catalog_offset as usize;
+        let fc_end = fc_start + hdr.full_catalog_length as usize;
+        let mut fc_cursor = std::io::Cursor::new(&data[fc_start..fc_end]);
+        let catalog =
+            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize).unwrap();
+
+        // obs + var + 1 CSR shard + 1 CSC shard = 4 entries
+        assert_eq!(catalog.entries.len(), 4);
+
+        let csr_entries: Vec<_> = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard)
+            .collect();
+        assert_eq!(csr_entries.len(), 1);
+        assert_eq!(csr_entries[0].name, "X_shard_0");
+
+        let csc_entries: Vec<_> = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .collect();
+        assert_eq!(csc_entries.len(), 1);
+        assert_eq!(csc_entries[0].name, "X_csc_shard_0");
+
+        // CSC shard should have stats (computed from values)
+        let csc_stats = csc_entries[0].stats.as_ref().unwrap();
+        assert_eq!(csc_stats.nnz, 6);
+
+        // All sections should be 8-byte aligned
+        for entry in &catalog.entries {
+            assert_eq!(
+                entry.offset % 8,
+                0,
+                "section '{}' offset {} not 8-byte aligned",
+                entry.name,
+                entry.offset
+            );
+        }
+    }
+
+    /// P3: has_csc flag (bit 0) is auto-set when CSC shards are written
+    #[test]
+    fn test_has_csc_flag_set() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // File WITHOUT CSC shards: flag should NOT be set
+        {
+            let path = dir.path().join("no_csc.scx");
+            let header = sample_header();
+            let mut writer = ScxWriter::new(&path, header).unwrap();
+            writer.write_obs(&sample_obs()).unwrap();
+            writer.write_var(&sample_var()).unwrap();
+            let (indptr, indices, values) = sample_shard_data();
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+            writer.finish().unwrap();
+
+            let data = std::fs::read(&path).unwrap();
+            let mut cursor = std::io::Cursor::new(&data);
+            let hdr = FileHeader::read_from(&mut cursor).unwrap();
+            assert!(
+                !hdr.has_csc(),
+                "has_csc should be false when no CSC shards written"
+            );
+            assert_eq!(hdr.n_csc_shards, 0);
+        }
+
+        // File WITH CSC shards: flag SHOULD be set
+        {
+            let path = dir.path().join("with_csc.scx");
+            let header = sample_header();
+            let mut writer = ScxWriter::new(&path, header).unwrap();
+            writer.write_obs(&sample_obs()).unwrap();
+            writer.write_var(&sample_var()).unwrap();
+            let (indptr, indices, values) = sample_shard_data();
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+            writer
+                .write_csc_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+            writer.finish().unwrap();
+
+            let data = std::fs::read(&path).unwrap();
+            let mut cursor = std::io::Cursor::new(&data);
+            let hdr = FileHeader::read_from(&mut cursor).unwrap();
+            assert!(
+                hdr.has_csc(),
+                "has_csc should be true when CSC shards written"
+            );
+            assert_eq!(hdr.n_csc_shards, 1);
+        }
     }
 }
