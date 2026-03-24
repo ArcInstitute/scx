@@ -13,6 +13,7 @@ mod merge;
 mod query;
 mod rollback;
 mod subset;
+mod upgrade;
 mod validate;
 
 #[cfg(feature = "cloud")]
@@ -257,6 +258,16 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         codec: String,
     },
+    /// Upgrade an SCX file to the latest format version
+    Upgrade {
+        /// Input SCX file
+        input: PathBuf,
+        /// Output SCX file path (default: separate output)
+        output: Option<PathBuf>,
+        /// Upgrade in-place via atomic rename
+        #[arg(long)]
+        in_place: bool,
+    },
 }
 
 fn main() {
@@ -361,6 +372,11 @@ fn main() {
             shard_size,
             &codec,
         ),
+        Commands::Upgrade {
+            input,
+            output,
+            in_place,
+        } => upgrade::run_upgrade(&input, output.as_deref(), in_place),
         #[cfg(feature = "cloud")]
         Commands::CloudOptimize { input, output } => {
             cloud_optimize::run_cloud_optimize(&input, output.as_deref())
