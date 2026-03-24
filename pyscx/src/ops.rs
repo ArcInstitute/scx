@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
-use scx_format::{select_codec, ScxReader};
+use scx_format::ScxReader;
 
 use scx_ops::OpsError;
 
@@ -143,7 +143,7 @@ pub fn append(
                 codec_id
             }
         }
-        None => select_codec(&values_bytes, value_encoding),
+        None => CodecId::None, // auto-select per shard inside append
     };
 
     let target_path = PathBuf::from(target);
@@ -271,7 +271,7 @@ pub fn append_from_anndata(
                 codec_id
             }
         }
-        None => select_codec(&values_bytes, value_encoding),
+        None => CodecId::None, // auto-select per shard inside append
     };
 
     let target_path = PathBuf::from(target);

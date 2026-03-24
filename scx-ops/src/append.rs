@@ -27,7 +27,7 @@ pub fn append(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
-    codec_id: CodecId,
+    _codec_id: CodecId,
     shard_target_rows: u32,
 ) -> Result<()> {
     let mut lock = FileLock::acquire_exclusive(target_path)?;
@@ -122,6 +122,9 @@ pub fn append(
         let val_end = idx_end * value_byte_size;
         let shard_values = &new_values[val_start..val_end];
 
+        // Per-shard codec selection (auto-select optimal codec for this shard's data)
+        let shard_codec = scx_format::select_codec(shard_values, value_encoding);
+
         let shard_idx = old_n_csr_shards + new_shard_entries.len() as u32;
         let shard_name = format!("X_shard_{shard_idx}");
         let global_row_start = old_n_obs + row_offset as u64;
@@ -141,7 +144,7 @@ pub fn append(
             &shard_indptr,
             shard_indices,
             shard_values,
-            codec_id,
+            shard_codec,
             value_encoding,
             index_dtype_u16,
         )?;
@@ -175,7 +178,7 @@ pub fn append(
             magic: SHARD_MAGIC,
             shard_format_version: 1,
             shard_type: 0,
-            codec_id: codec_id as u8,
+            codec_id: shard_codec as u8,
             value_encoding: value_encoding as u8,
             index_dtype: header.index_dtype,
             reserved_flags: [0; 3],

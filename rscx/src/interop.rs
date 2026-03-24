@@ -47,39 +47,48 @@ pub fn record_batch_to_dataframe(batch: &RecordBatch) -> Result<Robj> {
         .map_err(|e| Error::Other(format!("data.frame construction failed: {}", e)))
 }
 
+/// Helper: convert an Arrow primitive column to an R vector with null handling.
+fn primitive_to_robj<T, R>(col: &dyn Array, convert: impl Fn(T::Native) -> R) -> Result<Robj>
+where
+    T: arrow::datatypes::ArrowPrimitiveType,
+    Vec<Option<R>>: IntoRobj,
+{
+    let arr = col.as_primitive::<T>();
+    let vals: Vec<Option<R>> = (0..arr.len())
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(convert(arr.value(i)))
+            }
+        })
+        .collect();
+    Ok(vals.into_robj())
+}
+
+/// Helper: convert an Arrow string column to an R character vector with null handling.
+fn string_to_robj<O: arrow::array::OffsetSizeTrait>(col: &dyn Array) -> Result<Robj> {
+    let arr = col.as_string::<O>();
+    let strings: Vec<Option<String>> = (0..arr.len())
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i).to_string())
+            }
+        })
+        .collect();
+    let rvec: Vec<Option<&str>> = strings.iter().map(|s| s.as_deref()).collect();
+    Ok(rvec.into_robj())
+}
+
 /// Convert a single Arrow array column to an R vector.
 fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
+    use arrow::datatypes::*;
     match dtype {
         // String types → character vector
-        DataType::Utf8 => {
-            let arr = col.as_string::<i32>();
-            let strings: Vec<Option<String>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                })
-                .collect();
-            // Convert to R character vector, mapping None → NA
-            let rvec: Vec<Option<&str>> = strings.iter().map(|s| s.as_deref()).collect();
-            Ok(rvec.into_robj())
-        }
-        DataType::LargeUtf8 => {
-            let arr = col.as_string::<i64>();
-            let strings: Vec<Option<String>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                })
-                .collect();
-            let rvec: Vec<Option<&str>> = strings.iter().map(|s| s.as_deref()).collect();
-            Ok(rvec.into_robj())
-        }
+        DataType::Utf8 => string_to_robj::<i32>(col),
+        DataType::LargeUtf8 => string_to_robj::<i64>(col),
 
         // Dictionary → R factor
         DataType::Dictionary(key_type, value_type) => {
@@ -87,162 +96,35 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
         }
 
         // Integer types → R integer (i32)
-        DataType::Int8 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int8Type>();
-            let vals: Vec<Option<i32>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as i32)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
-        DataType::Int16 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int16Type>();
-            let vals: Vec<Option<i32>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as i32)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
-        DataType::Int32 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int32Type>();
-            let vals: Vec<Option<i32>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
+        DataType::Int8 => primitive_to_robj::<Int8Type, i32>(col, |v| v as i32),
+        DataType::Int16 => primitive_to_robj::<Int16Type, i32>(col, |v| v as i32),
+        DataType::Int32 => primitive_to_robj::<Int32Type, i32>(col, |v| v),
         // Int64 → R double (R has no native i64)
-        DataType::Int64 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int64Type>();
-            let vals: Vec<Option<f64>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as f64)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
+        DataType::Int64 => primitive_to_robj::<Int64Type, f64>(col, |v| v as f64),
 
-        // Unsigned integer types → R integer (safe range for u8/u16; u32 may overflow)
-        DataType::UInt8 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt8Type>();
-            let vals: Vec<Option<i32>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as i32)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
-        DataType::UInt16 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt16Type>();
-            let vals: Vec<Option<i32>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as i32)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
-        DataType::UInt32 => {
-            // u32 can exceed i32::MAX; use f64 to be safe
-            let arr = col.as_primitive::<arrow::datatypes::UInt32Type>();
-            let vals: Vec<Option<f64>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as f64)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
-        DataType::UInt64 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt64Type>();
-            let vals: Vec<Option<f64>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as f64)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
+        // Unsigned integer types → R integer (safe range for u8/u16)
+        DataType::UInt8 => primitive_to_robj::<UInt8Type, i32>(col, |v| v as i32),
+        DataType::UInt16 => primitive_to_robj::<UInt16Type, i32>(col, |v| v as i32),
+        // u32 can exceed i32::MAX; use f64 to be safe
+        DataType::UInt32 => primitive_to_robj::<UInt32Type, f64>(col, |v| v as f64),
+        DataType::UInt64 => primitive_to_robj::<UInt64Type, f64>(col, |v| v as f64),
 
         // Float types → R double
-        DataType::Float32 => {
-            let arr = col.as_primitive::<arrow::datatypes::Float32Type>();
-            let vals: Vec<Option<f64>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as f64)
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
-        DataType::Float64 => {
-            let arr = col.as_primitive::<arrow::datatypes::Float64Type>();
-            let vals: Vec<Option<f64>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-                .collect();
-            Ok(vals.into_robj())
-        }
+        DataType::Float32 => primitive_to_robj::<Float32Type, f64>(col, |v| v as f64),
+        DataType::Float64 => primitive_to_robj::<Float64Type, f64>(col, |v| v),
 
         // Boolean → R logical
         DataType::Boolean => {
             let arr = col.as_boolean();
             let vals: Vec<Option<bool>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
+                .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
                 .collect();
             Ok(vals.into_robj())
         }
 
         // Null → NA vector
         DataType::Null => {
-            let n = col.len();
-            let vals: Vec<Option<bool>> = vec![None; n];
+            let vals: Vec<Option<bool>> = vec![None; col.len()];
             Ok(vals.into_robj())
         }
 
@@ -796,41 +678,39 @@ fn write_csr_to_scx(
 /// @export
 #[extendr]
 pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
-    // Clone Robj before each R!() call — the macro moves the value
-    let seu1 = seurat_obj.clone();
-    let seu2 = seurat_obj.clone();
-    let seu3 = seurat_obj.clone();
-    let seu4 = seurat_obj;
-
-    // 1. Extract counts matrix: GetAssayData(seu, layer = "counts")
-    let counts = R!("
+    // Single R!() call — moves seurat_obj once, returns a lightweight list
+    let parts = R!("
         if (!requireNamespace('Seurat', quietly = TRUE))
             stop('Seurat >= 5.0.0 is required for from_seurat()')
-        Seurat::GetAssayData({{seu1}}, layer = 'counts')
+        seu <- {{seurat_obj}}
+        counts <- Seurat::GetAssayData(seu, layer = 'counts')
+        obs_df <- seu@meta.data
+        var_df <- tryCatch(seu[['RNA']]@meta.data,
+            error = function(e) data.frame(gene_id = rownames(seu)))
+        list(counts = counts, obs = obs_df, var = var_df)
     ")
-    .map_err(|e| Error::Other(format!("failed to extract counts: {}", e)))?;
+    .map_err(|e| Error::Other(format!("failed to extract Seurat data: {}", e)))?;
 
-    // 2. Extract meta.data → obs
-    let obs_df = R!("{{seu2}}@meta.data")
-        .map_err(|e| Error::Other(format!("failed to extract meta.data: {}", e)))?;
+    // Unpack via Robj::dollar() — no additional R!() calls or clones
+    let counts = parts
+        .dollar("counts")
+        .map_err(|e| Error::Other(format!("failed to get counts: {}", e)))?;
+    let obs_df = parts
+        .dollar("obs")
+        .map_err(|e| Error::Other(format!("failed to get obs: {}", e)))?;
+    let var_df = parts
+        .dollar("var")
+        .map_err(|e| Error::Other(format!("failed to get var: {}", e)))?;
 
-    // 3. Extract feature/var metadata
-    let var_df_attempt = R!("{{seu3}}[['RNA']]@meta.data");
-    let var_df = match var_df_attempt {
-        Ok(v) if !v.is_null() => v,
-        _ => R!("data.frame(gene_id = rownames({{seu4}}))")
-            .map_err(|e| Error::Other(format!("failed to extract var metadata: {}", e)))?,
-    };
-
-    // 4. Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
+    // Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
     let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
         dgcmatrix_to_csr(&counts)?;
 
-    // 5. Convert obs/var dataframes to RecordBatch
+    // Convert obs/var dataframes to RecordBatch
     let obs_batch = dataframe_to_record_batch(&obs_df)?;
     let var_batch = dataframe_to_record_batch(&var_df)?;
 
-    // 6. Write SCX file
+    // Write SCX file
     write_csr_to_scx(
         output_path,
         &csr_indptr,
@@ -849,36 +729,38 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
 /// @export
 #[extendr]
 pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
-    // Clone Robj before each R!() call — the macro moves the value
-    let sce1 = sce_obj.clone();
-    let sce2 = sce_obj.clone();
-    let sce3 = sce_obj;
-
-    // 1. Extract counts assay (genes × cells dgCMatrix)
-    let counts = R!("
+    // Single R!() call — moves sce_obj once, returns a lightweight list
+    let parts = R!("
         if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
             stop('SingleCellExperiment is required for from_sce()')
-        SummarizedExperiment::assay({{sce1}}, 'counts')
+        sce <- {{sce_obj}}
+        counts <- SummarizedExperiment::assay(sce, 'counts')
+        obs_df <- as.data.frame(SummarizedExperiment::colData(sce))
+        var_df <- as.data.frame(SummarizedExperiment::rowData(sce))
+        list(counts = counts, obs = obs_df, var = var_df)
     ")
-    .map_err(|e| Error::Other(format!("failed to extract counts assay: {}", e)))?;
+    .map_err(|e| Error::Other(format!("failed to extract SCE data: {}", e)))?;
 
-    // 2. Extract colData → obs (cells)
-    let obs_df = R!("as.data.frame(SummarizedExperiment::colData({{sce2}}))")
-        .map_err(|e| Error::Other(format!("failed to extract colData: {}", e)))?;
+    // Unpack via Robj::dollar() — no additional R!() calls or clones
+    let counts = parts
+        .dollar("counts")
+        .map_err(|e| Error::Other(format!("failed to get counts: {}", e)))?;
+    let obs_df = parts
+        .dollar("obs")
+        .map_err(|e| Error::Other(format!("failed to get obs: {}", e)))?;
+    let var_df = parts
+        .dollar("var")
+        .map_err(|e| Error::Other(format!("failed to get var: {}", e)))?;
 
-    // 3. Extract rowData → var (genes)
-    let var_df = R!("as.data.frame(SummarizedExperiment::rowData({{sce3}}))")
-        .map_err(|e| Error::Other(format!("failed to extract rowData: {}", e)))?;
-
-    // 4. Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
+    // Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
     let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
         dgcmatrix_to_csr(&counts)?;
 
-    // 5. Convert obs/var dataframes to RecordBatch
+    // Convert obs/var dataframes to RecordBatch
     let obs_batch = dataframe_to_record_batch(&obs_df)?;
     let var_batch = dataframe_to_record_batch(&var_df)?;
 
-    // 6. Write SCX file
+    // Write SCX file
     write_csr_to_scx(
         output_path,
         &csr_indptr,

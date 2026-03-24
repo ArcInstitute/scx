@@ -12,7 +12,8 @@ use extendr_api::prelude::*;
 use scx_codec::ValueEncoding;
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
-use scx_format::{select_codec, ScxReader};
+use scx_codec::CodecId;
+use scx_format::ScxReader;
 
 // ---------------------------------------------------------------------------
 // Append
@@ -96,9 +97,7 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
         .read_obs()
         .map_err(|e| Error::Other(format!("failed to read obs: {e}")))?;
 
-    // Auto-select codec
-    let effective_codec = select_codec(&values_bytes, value_encoding);
-
+    // Codec is auto-selected per shard inside scx_ops::append
     let target_path = PathBuf::from(target);
     scx_ops::append(
         &target_path,
@@ -107,8 +106,8 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
         &indices,
         &values_bytes,
         value_encoding,
-        effective_codec,
-        16384, // default shard target rows
+        CodecId::None, // placeholder — append auto-selects per shard
+        16384,         // default shard target rows
     )
     .map_err(|e| Error::Other(e.to_string()))
 }
