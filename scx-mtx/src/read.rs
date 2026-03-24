@@ -190,10 +190,8 @@ fn parse_mtx_file(
         .parse()
         .map_err(|_| MtxError::Parse(format!("invalid nnz count: {}", size_parts[2])))?;
 
-    // Read COO triplets
-    let mut coo_rows = Vec::with_capacity(nnz);
-    let mut coo_cols = Vec::with_capacity(nnz);
-    let mut coo_vals = Vec::with_capacity(nnz);
+    // Read COO triplets into a single vec for cache-friendly sorting
+    let mut entries: Vec<(usize, usize, f32)> = Vec::with_capacity(nnz);
 
     for line_result in lines {
         let line = line_result?;
@@ -220,36 +218,28 @@ fn parse_mtx_file(
             .parse()
             .map_err(|_| MtxError::Parse(format!("invalid value: {}", parts[2])))?;
 
-        coo_rows.push(row);
-        coo_cols.push(col);
-        coo_vals.push(val);
+        entries.push((row, col, val));
     }
 
-    if coo_rows.len() != nnz {
+    if entries.len() != nnz {
         return Err(MtxError::Parse(format!(
             "expected {} entries, read {}",
             nnz,
-            coo_rows.len()
+            entries.len()
         )));
     }
 
-    // Convert COO to CSR: sort by (row, col), then build indptr
-    let mut order: Vec<usize> = (0..nnz).collect();
-    order.sort_by(|&a, &b| {
-        coo_rows[a]
-            .cmp(&coo_rows[b])
-            .then(coo_cols[a].cmp(&coo_cols[b]))
-    });
+    // Sort COO entries in-place by (row, col), then build CSR directly
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     let mut indptr = vec![0i64; n_rows + 1];
     let mut indices = Vec::with_capacity(nnz);
     let mut data = Vec::with_capacity(nnz);
 
-    for &idx in &order {
-        let row = coo_rows[idx];
+    for &(row, col, val) in &entries {
         indptr[row + 1] += 1;
-        indices.push(coo_cols[idx] as i32);
-        data.push(coo_vals[idx]);
+        indices.push(col as i32);
+        data.push(val);
     }
 
     // Cumulative sum for indptr

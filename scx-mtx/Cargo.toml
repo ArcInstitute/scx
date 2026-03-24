@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 arrow = { workspace = true }
 flate2 = "1"
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 scx-format = { path = "../scx-format" }
 scx-codec = { path = "../scx-codec" }

@@ -19,6 +19,9 @@ pub enum MtxError {
     #[error("missing required file: {0}")]
     MissingFile(String),
 
+    #[error("invalid codec: {0}")]
+    InvalidCodec(String),
+
     #[error("{0}")]
     Other(String),
 }
