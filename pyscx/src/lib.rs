@@ -67,12 +67,54 @@ fn from_10x(
     anndata::from_anndata_impl(py, &adata, scx_path, codec, shard_size)
 }
 
+/// Convert a Cell Ranger MTX directory to SCX.
+///
+/// Reads the MTX directory (matrix.mtx[.gz], barcodes.tsv[.gz], features.tsv[.gz])
+/// and writes an SCX file.
+///
+/// Example:
+///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
+#[pyfunction]
+#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None))]
+fn from_mtx(
+    mtx_dir: &str,
+    scx_path: &str,
+    codec: Option<&str>,
+    shard_size: Option<u32>,
+) -> PyResult<()> {
+    scx_mtx::mtx_to_scx(
+        std::path::Path::new(mtx_dir),
+        std::path::Path::new(scx_path),
+        shard_size.unwrap_or(16384),
+        codec.unwrap_or("auto"),
+        "pyscx",
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Convert an SCX file to a Cell Ranger–style MTX directory.
+///
+/// Output directory will contain: matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz
+///
+/// Example:
+///     pyscx.to_mtx("data.scx", "/path/to/output_dir")
+#[pyfunction]
+fn to_mtx(scx_path: &str, output_dir: &str) -> PyResult<()> {
+    scx_mtx::write_scx_to_mtx(
+        std::path::Path::new(scx_path),
+        std::path::Path::new(output_dir),
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
+    m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
+    m.add_function(wrap_pyfunction!(to_mtx, m)?)?;
 
     // File operations (scx-ops)
     m.add_function(wrap_pyfunction!(ops::append, m)?)?;
