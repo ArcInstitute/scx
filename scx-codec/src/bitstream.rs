@@ -183,7 +183,11 @@ impl<'a> BitReader<'a> {
             }
         }
         // Extract n_bits from the buffer (single mask + shift)
-        let mask = if n_bits >= 64 { u64::MAX } else { (1u64 << n_bits) - 1 };
+        let mask = if n_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << n_bits) - 1
+        };
         let value = self.bit_buf & mask;
         if n_bits >= 64 {
             self.bit_buf = 0;

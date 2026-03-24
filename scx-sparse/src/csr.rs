@@ -174,16 +174,23 @@ impl ScxCsr {
         let indices = self.indices[nnz_start..nnz_end].to_vec();
         let data = self.data[nnz_start..nnz_end].to_vec();
 
-        Ok(ScxCsr::new_unchecked((end - start, self.shape.1), indptr, indices, data))
+        Ok(ScxCsr::new_unchecked(
+            (end - start, self.shape.1),
+            indptr,
+            indices,
+            data,
+        ))
     }
 
     /// Convert to a dense row-major matrix.
     pub fn to_dense(&self) -> Result<Vec<f32>, CsrError> {
         let (n_rows, n_cols) = self.shape;
-        let total = n_rows.checked_mul(n_cols).ok_or(CsrError::DimensionOverflow {
-            rows: n_rows,
-            cols: n_cols,
-        })?;
+        let total = n_rows
+            .checked_mul(n_cols)
+            .ok_or(CsrError::DimensionOverflow {
+                rows: n_rows,
+                cols: n_cols,
+            })?;
         let mut dense = vec![0.0f32; total];
         for row in 0..n_rows {
             let start = self.indptr[row] as usize;

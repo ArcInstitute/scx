@@ -79,9 +79,8 @@ impl PyExperiment {
     /// Example:
     ///     result = pyscx.open("data.scx").query().collect()
     fn query(&self) -> PyResult<PyQueryPipeline> {
-        let pipeline = QueryPipeline::open(&self.path).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-        })?;
+        let pipeline = QueryPipeline::open(&self.path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
 
@@ -144,4 +143,3 @@ impl PyExperiment {
         )
     }
 }
-

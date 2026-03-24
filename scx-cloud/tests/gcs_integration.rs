@@ -172,7 +172,11 @@ async fn setup_gcs_test_data() {
     let reader = ScxReader::open(&pulled).unwrap();
     assert_eq!(reader.n_obs(), 3000);
     assert_eq!(reader.n_vars(), 500);
-    eprintln!("Verified pbmc3k pull: {} obs, {} vars", reader.n_obs(), reader.n_vars());
+    eprintln!(
+        "Verified pbmc3k pull: {} obs, {} vars",
+        reader.n_obs(),
+        reader.n_vars()
+    );
 }
 
 // ============================================================
@@ -292,8 +296,11 @@ async fn test_gcs_selective_pull_with_predicate() {
     .unwrap();
 
     assert_eq!(stats.matching_cells, 1000);
-    assert!(stats.skipped_shards > 0 || stats.downloaded_shards < stats.total_shards
-        || stats.downloaded_shards == stats.total_shards);
+    assert!(
+        stats.skipped_shards > 0
+            || stats.downloaded_shards < stats.total_shards
+            || stats.downloaded_shards == stats.total_shards
+    );
 
     let reader = ScxReader::open(&output).unwrap();
     assert_eq!(reader.n_obs(), 1000);
@@ -334,10 +341,8 @@ async fn test_gcs_pulled_file_info_correct() {
 
     // Verify header is valid
     let data = std::fs::read(&output).unwrap();
-    let hdr = FileHeader::read_from(&mut Cursor::new(
-        &data[..scx_format::header::HEADER_SIZE],
-    ))
-    .unwrap();
+    let hdr =
+        FileHeader::read_from(&mut Cursor::new(&data[..scx_format::header::HEADER_SIZE])).unwrap();
     assert_eq!(hdr.magic, MAGIC);
     assert_eq!(hdr.n_obs, 3000);
     assert_eq!(hdr.n_vars, 500);

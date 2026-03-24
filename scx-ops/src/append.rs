@@ -151,7 +151,14 @@ pub fn append(
 
         // Block index (single block)
         let block_index = BlockIndex {
-            entries: vec![BlockIndexEntry::new(0, shard_rows as u32, 0, 0, 0, shard_nnz)?],
+            entries: vec![BlockIndexEntry::new(
+                0,
+                shard_rows as u32,
+                0,
+                0,
+                0,
+                shard_nnz,
+            )?],
         };
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;
@@ -420,7 +427,9 @@ pub fn append(
 /// which produces invalid categoricals for pandas. Casting dictionary → value
 /// type (e.g. Utf8) removes duplicates. Arrow IPC will re-encode them as
 /// dictionaries on the next write.
-pub(crate) fn unify_dict_columns(batch: &RecordBatch) -> std::result::Result<RecordBatch, arrow::error::ArrowError> {
+pub(crate) fn unify_dict_columns(
+    batch: &RecordBatch,
+) -> std::result::Result<RecordBatch, arrow::error::ArrowError> {
     use arrow::datatypes::DataType;
 
     let schema = batch.schema();

@@ -60,7 +60,8 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
             .push(entry);
     }
 
-    let known_types: std::collections::HashSet<u8> = section_order.iter().map(|&st| st as u8).collect();
+    let known_types: std::collections::HashSet<u8> =
+        section_order.iter().map(|&st| st as u8).collect();
     let mut ordered_entries: Vec<&FullCatalogEntry> =
         Vec::with_capacity(original_catalog.entries.len());
     for &st in section_order {
@@ -76,11 +77,8 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
     }
 
     // 4. Create output via atomic temp file
-    let tmp_path = std::path::PathBuf::from(format!(
-        "{}.tmp.{}",
-        output.display(),
-        std::process::id()
-    ));
+    let tmp_path =
+        std::path::PathBuf::from(format!("{}.tmp.{}", output.display(), std::process::id()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -123,8 +121,9 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
         let new_offset = write_offset;
 
         // Read section file from exploded directory
-        let rel_path = section_name_to_path(&entry.name, entry.section_type)
-            .map_err(|e| crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+            crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
         let file_path = input_dir.join(&rel_path);
         let section_data = std::fs::read(&file_path)?;
         writer.write_all(&section_data)?;
@@ -234,7 +233,7 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
 /// Generous upper bound to avoid two-pass writes.
 fn estimate_catalog_size(n_entries: usize) -> usize {
     let size = 30 + n_entries * 100 + 32; // +32 for trailing checksum
-    // Round up to 8-byte alignment
+                                          // Round up to 8-byte alignment
     (size + 7) & !7
 }
 
@@ -513,7 +512,8 @@ mod tests {
 
         for entry in &catalog.entries {
             if entry.section_type == SectionType::CsrShard {
-                let rel_path = crate::explode::section_name_to_path(&entry.name, entry.section_type).unwrap();
+                let rel_path =
+                    crate::explode::section_name_to_path(&entry.name, entry.section_type).unwrap();
                 let shard_file = exploded_dir.join(&rel_path);
                 let shard_bytes = std::fs::read(&shard_file).unwrap();
                 let original_bytes =

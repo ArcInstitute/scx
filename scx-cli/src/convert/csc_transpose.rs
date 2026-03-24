@@ -39,9 +39,7 @@ pub fn csc_to_csr(
     for &row in csc_indices {
         // Validate row indices are in bounds (finding 8.9).
         if row < 0 {
-            return Err(ConvertError::Other(format!(
-                "negative CSC row index {row}"
-            )));
+            return Err(ConvertError::Other(format!("negative CSC row index {row}")));
         }
         let row_idx = row as usize;
         if row_idx >= n_rows {

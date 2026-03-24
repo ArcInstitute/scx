@@ -5,7 +5,6 @@
 ///
 /// Each test prints a JSON line with benchmark results that the Python
 /// script (`benchmarks/scripts/benchmark_query.py`) parses into a report.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -160,11 +159,7 @@ fn build_var(n: usize) -> RecordBatch {
     .unwrap()
 }
 
-fn shard_data(
-    n_rows: usize,
-    n_vars: usize,
-    row_offset: usize,
-) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+fn shard_data(n_rows: usize, n_vars: usize, row_offset: usize) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
     let mut indptr = vec![0u64];
     let mut indices = Vec::with_capacity(n_rows * NNZ_PER_ROW);
     let mut values = Vec::with_capacity(n_rows * NNZ_PER_ROW);
@@ -241,18 +236,19 @@ fn write_bench_file(dir: &TempDir) -> PathBuf {
             }
         }
 
-        writer.set_shard_column_stats(vec![ColumnStat::CategoryBitset {
-            column_name_hash: cell_type_hash,
-            bitset,
-        }]).unwrap();
+        writer
+            .set_shard_column_stats(vec![ColumnStat::CategoryBitset {
+                column_name_hash: cell_type_hash,
+                bitset,
+            }])
+            .unwrap();
 
         shard_row_ranges.push((row_start as u64, (row_start + shard_rows) as u64));
         row_start += shard_rows;
     }
 
     // Build and write predicate index on cell_type
-    let pred_index =
-        build_indexes(&obs, &shard_row_ranges, &["cell_type".to_string()]).unwrap();
+    let pred_index = build_indexes(&obs, &shard_row_ranges, &["cell_type".to_string()]).unwrap();
     let mut index_bytes = Vec::new();
     pred_index.write_to(&mut index_bytes).unwrap();
     writer.write_obs_predicate_index(&index_bytes).unwrap();
@@ -609,8 +605,7 @@ fn write_fused_bench_file(dir: &TempDir) -> PathBuf {
     let mut row_start = 0usize;
     while row_start < BENCH_CELLS {
         let shard_rows = std::cmp::min(ROWS_PER_SHARD, BENCH_CELLS - row_start);
-        let (indptr, indices, values) =
-            shard_data_dense(shard_rows, BENCH_GENES, row_start);
+        let (indptr, indices, values) = shard_data_dense(shard_rows, BENCH_GENES, row_start);
         writer
             .write_csr_shard(
                 &indptr,

@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 
 use extendr_api::prelude::*;
 
+use scx_codec::CodecId;
 use scx_codec::ValueEncoding;
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
-use scx_codec::CodecId;
 use scx_format::ScxReader;
 
 // ---------------------------------------------------------------------------

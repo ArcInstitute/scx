@@ -593,7 +593,7 @@ mod tests {
         let mut data = Vec::new();
         data.write_u32::<LittleEndian>(0).unwrap(); // block_nnz = 0
         data.write_u16::<LittleEndian>(5).unwrap(); // n_rows_in_block = 5 (but we say n_rows=1)
-        // 5 varint zeros for the row nnz counts
+                                                    // 5 varint zeros for the row nnz counts
         for _ in 0..5 {
             data.push(0x00);
         }

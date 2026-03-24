@@ -73,20 +73,14 @@ mod tests {
     fn test_large_gap_not_merged() {
         // Gap of 2000 bytes, threshold 1024
         let ranges = vec![(0, 100), (2100, 200)];
-        assert_eq!(
-            coalesce_ranges(&ranges, 1024),
-            vec![(0, 100), (2100, 200)]
-        );
+        assert_eq!(coalesce_ranges(&ranges, 1024), vec![(0, 100), (2100, 200)]);
     }
 
     #[test]
     fn test_mixed_gaps() {
         // Three ranges: first two close, third far
         let ranges = vec![(0, 100), (150, 100), (10000, 200)];
-        assert_eq!(
-            coalesce_ranges(&ranges, 1024),
-            vec![(0, 250), (10000, 200)]
-        );
+        assert_eq!(coalesce_ranges(&ranges, 1024), vec![(0, 250), (10000, 200)]);
     }
 
     #[test]
@@ -99,9 +93,6 @@ mod tests {
     fn test_zero_threshold() {
         // Only truly adjacent ranges merge
         let ranges = vec![(0, 100), (100, 100), (300, 100)];
-        assert_eq!(
-            coalesce_ranges(&ranges, 0),
-            vec![(0, 200), (300, 100)]
-        );
+        assert_eq!(coalesce_ranges(&ranges, 0), vec![(0, 200), (300, 100)]);
     }
 }

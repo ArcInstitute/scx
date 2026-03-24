@@ -45,14 +45,19 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 }
 
 /// Convert a pyarrow Table to a pandas DataFrame.
-pub(crate) fn pyarrow_table_to_pandas<'py>(table: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn pyarrow_table_to_pandas<'py>(
+    table: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
     let kwargs = pyo3::types::PyDict::new(table.py());
     kwargs.set_item("self_destruct", true)?;
     table.call_method("to_pandas", (), Some(&kwargs))
 }
 
 /// Convert an ScxCsr to a scipy.sparse.csr_matrix via zero-copy numpy arrays.
-pub(crate) fn csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn csr_to_scipy<'py>(
+    py: Python<'py>,
+    csr: scx_sparse::ScxCsr,
+) -> PyResult<Bound<'py, PyAny>> {
     let shape = (csr.shape.0, csr.shape.1);
 
     // Zero-copy: moves Vec ownership to numpy
@@ -332,7 +337,10 @@ pub(crate) fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
 }
 
 /// Convert a pandas DataFrame to an Arrow RecordBatch via pyarrow IPC.
-pub(crate) fn pandas_to_record_batch(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+pub(crate) fn pandas_to_record_batch(
+    py: Python<'_>,
+    df: &Bound<'_, PyAny>,
+) -> PyResult<RecordBatch> {
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     let table = table_cls.call_method1("from_pandas", (df,))?;
@@ -362,7 +370,10 @@ pub(crate) fn pandas_to_record_batch(py: Python<'_>, df: &Bound<'_, PyAny>) -> P
 }
 
 /// Ensure X is a CSR matrix; convert from dense or CSC if needed.
-pub(crate) fn ensure_csr<'py>(py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn ensure_csr<'py>(
+    py: Python<'py>,
+    x: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let is_sparse = scipy_sparse
         .call_method1("issparse", (x,))?
@@ -528,9 +539,7 @@ pub fn from_anndata_impl(
             .iter()
             .map(|&v| {
                 if v < 0 {
-                    Err(PyRuntimeError::new_err(format!(
-                        "negative CSR index {v}"
-                    )))
+                    Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
                 } else {
                     Ok(v as u32)
                 }

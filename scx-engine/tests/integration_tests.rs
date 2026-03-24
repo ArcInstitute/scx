@@ -154,7 +154,11 @@ fn shard_data(n_rows: usize, n_vars: usize, row_offset: usize) -> (Vec<u64>, Vec
         } else {
             // Make sure indices are distinct
             let alt = (col0 + 1) % n_vars;
-            if col0 < alt { (col0, alt) } else { (alt, col0) }
+            if col0 < alt {
+                (col0, alt)
+            } else {
+                (alt, col0)
+            }
         };
         indices.push(c0 as u32);
         indices.push(c1 as u32);
@@ -356,7 +360,9 @@ fn e2e_filter_cell_type() {
         .unwrap();
 
     // Count expected T cells from our distribution
-    let expected: usize = (0..1000).filter(|&i| cell_type_for_row(i) == "T cell").count();
+    let expected: usize = (0..1000)
+        .filter(|&i| cell_type_for_row(i) == "T cell")
+        .count();
     assert_eq!(result.x.n_rows(), expected);
     assert_eq!(result.obs.num_rows(), expected);
 
@@ -482,7 +488,9 @@ fn e2e_full_pipeline() {
         .collect()
         .unwrap();
 
-    let expected_rows: usize = (0..1000).filter(|&i| cell_type_for_row(i) == "T cell").count();
+    let expected_rows: usize = (0..1000)
+        .filter(|&i| cell_type_for_row(i) == "T cell")
+        .count();
     assert_eq!(result.x.n_rows(), expected_rows);
     assert_eq!(result.x.n_cols(), 5);
     assert_eq!(result.obs.num_rows(), expected_rows);
@@ -490,7 +498,10 @@ fn e2e_full_pipeline() {
 
     // Values should be positive and reasonable (log1p of normalized)
     for i in 0..result.x.data.len() {
-        assert!(result.x.data[i] > 0.0, "data[{i}] should be positive after fused ops");
+        assert!(
+            result.x.data[i] > 0.0,
+            "data[{i}] should be positive after fused ops"
+        );
         assert!(
             result.x.data[i] < 20.0,
             "data[{i}] = {} is unreasonably large",
@@ -516,7 +527,9 @@ fn e2e_pushdown_skips_shards() {
     // where T cell doesn't appear. Shard 1 has no T cells.
     // Note: this depends on catalog-level pushdown reading category bitsets.
     // Even if catalog pushdown doesn't skip, the result must still be correct.
-    let expected: usize = (0..1000).filter(|&i| cell_type_for_row(i) == "T cell").count();
+    let expected: usize = (0..1000)
+        .filter(|&i| cell_type_for_row(i) == "T cell")
+        .count();
     assert_eq!(result.x.n_rows(), expected);
     // We verify the result is correct regardless of skip optimization
     assert!(result.total_shards == 5);

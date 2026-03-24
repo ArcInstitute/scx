@@ -117,7 +117,13 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
         DataType::Boolean => {
             let arr = col.as_boolean();
             let vals: Vec<Option<bool>> = (0..arr.len())
-                .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
+                })
                 .collect();
             Ok(vals.into_robj())
         }

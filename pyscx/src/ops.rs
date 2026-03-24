@@ -58,7 +58,8 @@ pub fn append(
     let shard_target_rows = shard_size.unwrap_or(16384);
 
     // Open input file
-    let input_reader = ScxReader::open(input).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let input_reader =
+        ScxReader::open(input).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Validate n_vars match
     let target_reader =
@@ -80,20 +81,16 @@ pub fn append(
     // Detect value encoding from first shard header
     let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
     let value_encoding = if let Some(first_entry) = csr_entries.first() {
-        let bytes = input_reader.section_bytes(first_entry)
+        let bytes = input_reader
+            .section_bytes(first_entry)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sh = ShardHeader::read_from(&mut Cursor::new(&bytes[..SHARD_HEADER_SIZE]))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         ValueEncoding::from_u8(sh.value_encoding).ok_or_else(|| {
-            PyRuntimeError::new_err(format!(
-                "unknown value encoding: {}",
-                sh.value_encoding
-            ))
+            PyRuntimeError::new_err(format!("unknown value encoding: {}", sh.value_encoding))
         })?
     } else {
-        return Err(PyRuntimeError::new_err(
-            "input file has no CSR shards",
-        ));
+        return Err(PyRuntimeError::new_err("input file has no CSR shards"));
     };
 
     // Convert i64 → u64 indptr (finding 9.2: validate non-negative).
@@ -117,9 +114,7 @@ pub fn append(
         .iter()
         .map(|&v| {
             if v < 0 {
-                Err(PyRuntimeError::new_err(format!(
-                    "negative CSR index {v}"
-                )))
+                Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
             } else {
                 Ok(v as u32)
             }
@@ -249,9 +244,7 @@ pub fn append_from_anndata(
         .iter()
         .map(|&v| {
             if v < 0 {
-                Err(PyRuntimeError::new_err(format!(
-                    "negative CSR index {v}"
-                )))
+                Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
             } else {
                 Ok(v as u32)
             }

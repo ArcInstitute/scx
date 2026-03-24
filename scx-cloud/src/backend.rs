@@ -54,9 +54,7 @@ pub fn parse_location(url: &str) -> Result<CloudLocation> {
             "az" => {
                 let container = parsed
                     .host_str()
-                    .ok_or_else(|| {
-                        CloudError::InvalidUrl(format!("missing container in: {url}"))
-                    })?
+                    .ok_or_else(|| CloudError::InvalidUrl(format!("missing container in: {url}")))?
                     .to_string();
                 let prefix = parsed.path().trim_start_matches('/').to_string();
                 Ok(CloudLocation::Azure { container, prefix })
@@ -98,8 +96,8 @@ pub async fn create_backend(location: &CloudLocation) -> Result<Box<dyn ObjectSt
             Ok(Box::new(store))
         }
         CloudLocation::Azure { container, .. } => {
-            let mut builder = object_store::azure::MicrosoftAzureBuilder::new()
-                .with_container_name(container);
+            let mut builder =
+                object_store::azure::MicrosoftAzureBuilder::new().with_container_name(container);
             if let Ok(account) = std::env::var("AZURE_STORAGE_ACCOUNT") {
                 builder = builder.with_account(account);
             }

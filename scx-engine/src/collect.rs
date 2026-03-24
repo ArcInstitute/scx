@@ -16,9 +16,7 @@ use crate::index::{IndexedColumn, PredicateIndex};
 use crate::pipeline::{QueryPipeline, QueryResult};
 use crate::predicate::{evaluate, Predicate};
 use crate::projection::{decode_shard_projected, project_var};
-use crate::pushdown::{
-    prune_shards_by_catalog_with_dict, CategoryDictionaries, ShardCandidate,
-};
+use crate::pushdown::{prune_shards_by_catalog_with_dict, CategoryDictionaries, ShardCandidate};
 
 use scx_format::DeletionVectors;
 
@@ -223,11 +221,8 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     // Step 5: Map matching cells to shards
     // Build per-shard keep masks (local row indices)
     let sorted_shards = reader.catalog().shards_sorted();
-    let _candidate_set: std::collections::HashSet<usize> = plan
-        .candidate_shards
-        .iter()
-        .map(|c| c.shard_idx)
-        .collect();
+    let _candidate_set: std::collections::HashSet<usize> =
+        plan.candidate_shards.iter().map(|c| c.shard_idx).collect();
 
     // Build shard row ranges from stats
     struct ShardInfo {
@@ -294,7 +289,10 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
             Some(explicit) => {
                 let var_set: std::collections::HashSet<u32> =
                     var_gene_indices.iter().copied().collect();
-                explicit.into_iter().filter(|g| var_set.contains(g)).collect()
+                explicit
+                    .into_iter()
+                    .filter(|g| var_set.contains(g))
+                    .collect()
             }
             None => var_gene_indices,
         });
@@ -662,8 +660,14 @@ mod tests {
             let start = result.x.indptr[row] as usize;
             let end = result.x.indptr[row + 1] as usize;
             for i in start..end {
-                assert!(result.x.data[i] > 0.0, "fused ops should produce positive values");
-                assert!(result.x.data[i] < 20.0, "ln(10001) ≈ 9.21, values should be reasonable");
+                assert!(
+                    result.x.data[i] > 0.0,
+                    "fused ops should produce positive values"
+                );
+                assert!(
+                    result.x.data[i] < 20.0,
+                    "ln(10001) ≈ 9.21, values should be reasonable"
+                );
             }
         }
     }
