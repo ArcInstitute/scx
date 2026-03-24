@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 9 crates. Dependencies flow bottom-up:
+The workspace contains 10 crates. Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -23,19 +23,19 @@ The workspace contains 9 crates. Dependencies flow bottom-up:
                         │ scx-cli  │  CLI tool
                         └────┬─────┘
                              │ depends on all below
-       ┌──────────────┬──────┼──────────────┐
-       │              │      │              │
-┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐
-│ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │
-│ query engine│ │ file ops │ │    │ cloud ops  │
-└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘
-       │              │      │              │
-       │    ┌─────────┘  ┌───┴────────┐     │
-       │    │            │ scx-loader │     │
-       │    │            │ ML loader  │     │
-       │    │            └───┬────────┘     │
-       │    │                │              │
-       └────┴────────────────┼──────────────┘
+       ┌──────────────┬──────┼──────────────┬──────────────┐
+       │              │      │              │              │
+┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐   ┌──────┴──────┐
+│ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │   │  scx-mtx    │
+│ query engine│ │ file ops │ │    │ cloud ops  │   │ MTX I/O     │
+└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘
+       │              │      │              │              │
+       │    ┌─────────┘  ┌───┴────────┐     │              │
+       │    │            │ scx-loader │     │              │
+       │    │            │ ML loader  │     │              │
+       │    │            └───┬────────┘     │              │
+       │    │                │              │              │
+       └────┴────────────────┼──────────────┴──────────────┘
                              │
                       ┌──────┴──────┐
                       │ scx-format  │  File layout, header, catalog, reader/writer
@@ -59,6 +59,7 @@ The workspace contains 9 crates. Dependencies flow bottom-up:
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
+| **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud` |
 
@@ -67,6 +68,8 @@ The workspace contains 9 crates. Dependencies flow bottom-up:
 > gene projection and fused normalization, designed for the hot-path requirements
 > of ML training. `scx-cloud` does **not** depend on `scx-loader` — they are siblings.
 > `scx-cloud` reuses `scx-engine` for predicate parsing (selective pull).
+> `scx-mtx` is **always-on** (no feature gate) since MTX is pure text I/O with no
+> HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
 
 ---
 
@@ -337,6 +340,10 @@ adata = exp.to_anndata()              # → AnnData (zero-copy CSR + Arrow→pan
 # Write
 pyscx.from_anndata(adata, "output.scx", codec="auto")
 pyscx.from_10x("matrix.h5", "output.scx")
+pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
+
+# Export to Cell Ranger MTX directory
+pyscx.to_mtx("output.scx", "/path/to/mtx_dir")
 ```
 
 The `to_anndata()` path is **zero-copy** for the expression matrix — `ScxCsr`'s
@@ -431,6 +438,11 @@ operations, and cloud access:
 ```bash
 # Convert h5ad/10x to SCX (requires --features hdf5)
 scx convert input.h5ad output.scx --codec auto --shard-size 10000
+scx convert --to h5ad output.scx output.h5ad
+
+# Convert Cell Ranger MTX ↔ SCX (always available, no feature flag)
+scx convert /path/to/filtered_feature_bc_matrix/ output.scx
+scx convert --to mtx output.scx /path/to/mtx_output/
 
 # Inspect file metadata
 scx info experiment.scx --json --history
@@ -460,7 +472,8 @@ scx pull gs://bucket/experiment.scxd/ local.scx --filter "tissue == 'lung'"
 scx push experiment.scx gs://bucket/experiment.scxd/ --parallelism 16
 ```
 
-Feature flags: `hdf5` (h5ad conversion, opt-in), `cloud` (cloud operations, opt-in).
+Feature flags: `hdf5` (h5ad/10x conversion, opt-in), `cloud` (cloud operations, opt-in).
+MTX conversion is **always available** — no feature flag required.
 
 ---
 
@@ -488,6 +501,23 @@ Feature flags: `hdf5` (h5ad conversion, opt-in), `cloud` (cloud operations, opt-
       │
       ▼
   experiment.scx
+```
+
+### Conversion: MTX ↔ SCX
+
+Cell Ranger MTX conversion uses the `scx-mtx` crate (always-on, no HDF5 dependency):
+
+```
+  filtered_feature_bc_matrix/
+  ├── matrix.mtx[.gz]             MTX → SCX
+  ├── barcodes.tsv[.gz]     ────────────────▶  experiment.scx
+  └── features.tsv[.gz]     scx-mtx::read       scx-mtx::write
+                            COO→CSR, gzip       CSR→COO, gzip
+                                                   │
+  output_dir/                                      │
+  ├── matrix.mtx.gz        ◀────────────────       │
+  ├── barcodes.tsv.gz           SCX → MTX          │
+  └── features.tsv.gz      ◀───────────────────────┘
 ```
 
 ### Query: filter → collect
@@ -561,6 +591,7 @@ Each crate defines its own error type via `thiserror`:
 | `scx-ops` | `OpsError` | Append/delete/compact/merge/rollback failures |
 | `scx-loader` | `LoaderError` | Pipeline errors, memory budget, configuration |
 | `scx-cloud` | `CloudError` | Object store errors, auth failures, missing sections |
+| `scx-mtx` | `MtxError` | MTX parse errors, missing sidecar files, I/O |
 | `scx-sparse` | `CsrError` | Invalid CSR dimensions |
 
 Readers return errors (never panic) on malformed input, including bitstream

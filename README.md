@@ -213,10 +213,22 @@ No pre-built binaries are distributed — Cargo builds all SCX crates from sourc
 
 ## Quick Start
 
-### Convert from h5ad
+### Convert your data to SCX
+
+SCX supports **roundtrip conversion** with h5ad, 10x HDF5, and Cell Ranger MTX formats —
+convert in, work with SCX, convert back out.
 
 ```bash
+# h5ad ↔ SCX (roundtrip)
 scx convert experiment.h5ad experiment.scx
+scx convert --to h5ad experiment.scx experiment.h5ad
+
+# Cell Ranger MTX ↔ SCX (roundtrip)
+scx convert /path/to/filtered_feature_bc_matrix/ experiment.scx
+scx convert --to mtx experiment.scx /path/to/output_dir/
+
+# 10x HDF5 → SCX
+scx convert filtered_feature_bc_matrix.h5 experiment.scx
 ```
 
 ```python
@@ -227,6 +239,12 @@ pyscx.from_anndata(adata, "experiment.scx")
 
 # From 10x HDF5
 pyscx.from_10x("filtered_feature_bc_matrix.h5", "experiment.scx")
+
+# From Cell Ranger MTX directory
+pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "experiment.scx")
+
+# Export back to MTX
+pyscx.to_mtx("experiment.scx", "/path/to/output_dir")
 ```
 
 ### Read into AnnData
@@ -307,7 +325,7 @@ streaming pipeline outperforms random-access approaches.
 
 ## Architecture
 
-SCX is a Rust workspace with 9 crates:
+SCX is a Rust workspace with 10 crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -318,6 +336,7 @@ SCX is a Rust workspace with 9 crates:
 | `scx-engine` | Lazy query engine with predicate pushdown |
 | `scx-loader` | Triple-buffered ML training data loader |
 | `scx-cloud` | Cloud access: push, pull, explode, pack, CloudReader |
+| `scx-mtx` | Matrix Market (MTX) I/O: Cell Ranger directory read/write |
 | `scx-cli` | CLI tool |
 | `pyscx` | Python bindings (PyO3) |
 | `rscx` | R bindings (extendr) |
