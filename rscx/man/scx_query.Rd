@@ -2,20 +2,21 @@
 % Please edit documentation in R/query.R
 \name{scx_query}
 \alias{scx_query}
-\title{Pipe-friendly SCX query API}
+\title{Start a query pipeline from an ScxExperiment}
 \usage{
 scx_query(exp)
 }
 \arguments{
-\item{exp}{An ScxExperiment object (from scx_open())}
+\item{exp}{An ScxExperiment object (from \code{scx_open()}).}
 }
 \value{
-An RQueryPipeline object
+An RQueryPipeline object.
 }
 \description{
-Build lazy queries using R's native pipe operator (|>).
+Start a query pipeline from an ScxExperiment
 }
 \examples{
+\dontrun{
 result <- scx_open("experiment.scx") |>
   scx_query() |>
   filter_obs("tissue == 'lung'") |>
@@ -27,11 +28,5 @@ result <- scx_open("experiment.scx") |>
 dgc <- result$to_dgcmatrix()
 seu <- result$to_seurat()
 sce <- result$to_sce()
-
-# Metadata getters work even after conversion:
-result$n_obs()
-result$n_vars()
-result$skipped_shards()
-Start a query pipeline from an ScxExperiment
-
+}
 }
