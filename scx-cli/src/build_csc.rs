@@ -4,7 +4,7 @@ use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
@@ -61,30 +61,39 @@ pub fn run_build_csc(
     ));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // 6. Determine value encoding and codec from first CSR shard header
+    // 6. Read CSR shard entries and determine default codec from first shard
     let csr_entries = reader.catalog().shards_sorted();
-    let (value_encoding, shard_codec) = {
-        let section = reader.section_bytes(csr_entries[0])?;
-        let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-            &section[..scx_format::SHARD_HEADER_SIZE],
-        ))?;
-        let ve = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
-        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
-        (ve, ci)
-    };
+    let first_sh = reader.read_shard_header(csr_entries[0])?;
+    let csc_value_encoding = ValueEncoding::from_u8(first_sh.value_encoding).ok_or(format!(
+        "unknown value encoding: {}",
+        first_sh.value_encoding
+    ))?;
+    let csc_codec = CodecId::from_u8(first_sh.codec_id)
+        .ok_or(format!("unknown codec: {}", first_sh.codec_id))?;
 
-    // 7. Read all CSR shards and assemble into ScxCsr for transpose
-    let csr = reader.read_all_csr_shards()?;
+    // 7. Read CSR shards individually (preserves shard boundaries for streaming transpose)
+    let csr_shards: Vec<scx_sparse::ScxCsr> = csr_entries
+        .iter()
+        .map(|entry| {
+            let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
+            let n_shard_rows = indptr.len() - 1;
+            Ok(scx_sparse::ScxCsr::new(
+                (n_shard_rows, n_cols),
+                indptr,
+                indices,
+                data,
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
     // 8. Perform streaming transpose
     pb.set_message("Transposing CSR → CSC...");
-    let csc = scx_sparse::transpose::streaming_csr_to_csc(&[csr], n_rows, n_cols, max_bytes)?;
+    let csc = scx_sparse::transpose::streaming_csr_to_csc(&csr_shards, n_rows, n_cols, max_bytes)?;
 
     // 9. Set up output header
     let out_header = FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: in_header.flags,
         n_obs: in_header.n_obs,
@@ -119,49 +128,49 @@ pub fn run_build_csc(
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
-    // 12. Re-write CSR shards from input (decode + re-encode, preserving data)
+    // 12. Re-write CSR shards from input (decode + re-encode, per-shard codec)
     for shard_entry in &csr_entries {
+        let sh = reader.read_shard_header(shard_entry)?;
+        let ve = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
         let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
 
-        // Convert indices (i32) to u32 for writer
         let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
-
-        // Convert indptr (i64) to u64 for writer
         let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
 
-        // Encode values back to raw bytes
         let mut raw_values = Vec::new();
         for &v in &data {
-            encode_value(&mut raw_values, v, value_encoding)?;
+            encode_value(&mut raw_values, v, ve)?;
         }
 
         writer.write_csr_shard(
             &indptr_u64,
             &indices_u32,
             &raw_values,
-            shard_codec,
-            value_encoding,
+            ci,
+            ve,
             shard_row_start,
         )?;
     }
 
     // 13. Write CSC shard(s) from transpose result
-    //     CSC indptr (i64) → u64, CSC indices (i32) → u32
     let csc_indptr_u64: Vec<u64> = csc.indptr.iter().map(|&v| v as u64).collect();
     let csc_indices_u32: Vec<u32> = csc.indices.iter().map(|&i| i as u32).collect();
 
     let mut csc_raw_values = Vec::new();
     for &v in &csc.data {
-        encode_value(&mut csc_raw_values, v, value_encoding)?;
+        encode_value(&mut csc_raw_values, v, csc_value_encoding)?;
     }
 
     writer.write_csc_shard(
         &csc_indptr_u64,
         &csc_indices_u32,
         &csc_raw_values,
-        shard_codec,
-        value_encoding,
+        csc_codec,
+        csc_value_encoding,
         0, // col_start = 0 (single CSC shard covering all columns)
     )?;
 
@@ -178,43 +187,30 @@ pub fn run_build_csc(
             })
             .collect();
 
-        let layer_ve = if let Some(first) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            ValueEncoding::from_u8(sh.value_encoding).unwrap_or(value_encoding)
-        } else {
-            value_encoding
-        };
-        let layer_codec = if let Some(first) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            CodecId::from_u8(sh.codec_id).unwrap_or(shard_codec)
-        } else {
-            shard_codec
-        };
-
         let mut sorted_entries = layer_shard_entries;
         sorted_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
 
         for (shard_idx, entry) in sorted_entries.iter().enumerate() {
+            let sh = reader.read_shard_header(entry)?;
+            let ve = ValueEncoding::from_u8(sh.value_encoding)
+                .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+            let ci =
+                CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+
             let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
             let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
             let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
             let mut raw_values = Vec::new();
             for &v in &data {
-                encode_value(&mut raw_values, v, layer_ve)?;
+                encode_value(&mut raw_values, v, ve)?;
             }
             writer.write_layer_csr_shard(
                 &indptr_u64,
                 &indices_u32,
                 &raw_values,
-                layer_codec,
-                layer_ve,
+                ci,
+                ve,
                 row_start,
                 layer_name,
                 shard_idx as u32,
@@ -296,13 +292,27 @@ fn encode_value(
     encoding: ValueEncoding,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match encoding {
-        ValueEncoding::Uint8 => buf.push(value as u8),
-        ValueEncoding::Uint16 => buf.extend_from_slice(&(value as u16).to_le_bytes()),
-        ValueEncoding::Uint32 => buf.extend_from_slice(&(value as u32).to_le_bytes()),
+        ValueEncoding::Uint8 => {
+            if !(0.0..=255.0).contains(&value) {
+                return Err(format!("value {value} out of range for uint8 (0..255)").into());
+            }
+            buf.push(value as u8);
+        }
+        ValueEncoding::Uint16 => {
+            if !(0.0..=65535.0).contains(&value) {
+                return Err(format!("value {value} out of range for uint16 (0..65535)").into());
+            }
+            buf.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        ValueEncoding::Uint32 => {
+            if !(0.0..=u32::MAX as f32).contains(&value) {
+                return Err(format!("value {value} out of range for uint32").into());
+            }
+            buf.extend_from_slice(&(value as u32).to_le_bytes());
+        }
         ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
         ValueEncoding::Float16 => {
-            let f16_val = half::f16::from_f32(value);
-            buf.extend_from_slice(&f16_val.to_le_bytes());
+            buf.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
         }
     }
     Ok(())

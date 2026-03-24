@@ -5,7 +5,7 @@ use std::path::Path;
 
 use scx_codec::ValueEncoding;
 use scx_engine::QueryPipeline;
-use scx_format::header::FileHeader;
+use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
@@ -174,7 +174,7 @@ fn write_subset_scx(
 
     let header = FileHeader {
         magic: scx_format::MAGIC,
-        format_version: 1,
+        format_version: CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -208,7 +208,7 @@ fn write_subset_scx(
     // Convert from in-memory types (i64/i32/f32) to on-disk types (u64/u32/u8-raw)
     let indptr: Vec<u64> = result.x.indptr.iter().map(|&v| v as u64).collect();
     let indices: Vec<u32> = result.x.indices.iter().map(|&v| v as u32).collect();
-    let raw_values = f32_to_raw_values(&result.x.data, value_encoding);
+    let raw_values = f32_to_raw_values(&result.x.data, value_encoding)?;
 
     // Shard the data
     let shard_target = shard_size as usize;
@@ -291,38 +291,48 @@ fn write_subset_scx(
 }
 
 /// Convert f32 data to raw LE bytes matching the given ValueEncoding.
-fn f32_to_raw_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
+fn f32_to_raw_values(
+    data: &[f32],
+    encoding: ValueEncoding,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::with_capacity(data.len() * encoding.byte_width());
     match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => {
-            let mut bytes = Vec::with_capacity(data.len() * 2);
+        ValueEncoding::Uint8 => {
             for &v in data {
+                if !(0.0..=255.0).contains(&v) {
+                    return Err(format!("value {v} out of range for uint8 (0..255)").into());
+                }
+                bytes.push(v as u8);
+            }
+        }
+        ValueEncoding::Uint16 => {
+            for &v in data {
+                if !(0.0..=65535.0).contains(&v) {
+                    return Err(format!("value {v} out of range for uint16 (0..65535)").into());
+                }
                 bytes.extend_from_slice(&(v as u16).to_le_bytes());
             }
-            bytes
         }
         ValueEncoding::Uint32 => {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
             for &v in data {
+                if !(0.0..=u32::MAX as f32).contains(&v) {
+                    return Err(format!("value {v} out of range for uint32").into());
+                }
                 bytes.extend_from_slice(&(v as u32).to_le_bytes());
             }
-            bytes
         }
         ValueEncoding::Float32 => {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
             for &v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            bytes
         }
         ValueEncoding::Float16 => {
-            let mut bytes = Vec::with_capacity(data.len() * 2);
             for &v in data {
                 bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
             }
-            bytes
         }
     }
+    Ok(bytes)
 }
 
 #[cfg(test)]
