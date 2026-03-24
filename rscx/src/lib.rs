@@ -4,6 +4,7 @@ use extendr_api::prelude::*;
 use scx_format::ScxReader;
 
 mod interop;
+mod ops;
 mod query;
 
 pub use query::{RQueryPipeline, RQueryResult};
@@ -123,61 +124,11 @@ impl ScxExperiment {
     }
 }
 
-// ── Phase E: File Operations ────────────────────────────────────
-
-/// Append cells from one SCX file to another.
-#[extendr]
-fn scx_append(_target: &str, _input: &str) {
-    todo!("scx_append implementation in Phase E")
-}
-
-/// Mark specific cell indices as logically deleted.
-#[extendr]
-fn scx_delete(_path: &str, _cell_indices: Vec<i32>) -> i32 {
-    todo!("scx_delete implementation in Phase E")
-}
-
-/// Rewrite an SCX file reclaiming deleted/orphaned space.
-#[extendr]
-fn scx_compact(_input: &str, _output: &str) {
-    todo!("scx_compact implementation in Phase E")
-}
-
-/// Roll back to a previous manifest version.
-#[extendr]
-fn scx_rollback(_path: &str) {
-    todo!("scx_rollback implementation in Phase E")
-}
-
-/// Merge multiple SCX files into one.
-#[extendr]
-fn scx_merge(_inputs: Vec<String>, _output: &str) {
-    todo!("scx_merge implementation in Phase E")
-}
-
-/// Return file information as a named list.
-#[extendr]
-fn scx_info(_path: &str) -> Robj {
-    todo!("scx_info implementation in Phase E")
-}
-
-/// Validate an SCX file. Returns TRUE if valid, otherwise raises an error.
-#[extendr]
-fn scx_validate(_path: &str) -> bool {
-    todo!("scx_validate implementation in Phase E")
-}
-
 // ── Module Registration ─────────────────────────────────────────
 
 extendr_module! {
     mod rscx;
     use query;
+    use ops;
     impl ScxExperiment;
-    fn scx_append;
-    fn scx_delete;
-    fn scx_compact;
-    fn scx_rollback;
-    fn scx_merge;
-    fn scx_info;
-    fn scx_validate;
 }

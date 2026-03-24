@@ -18,3 +18,4 @@ scx-ops = { path = "../scx-ops" }
 extendr-api = { version = "0.8", features = ["non-api"] }
 arrow = { workspace = true }
 thiserror = { workspace = true }
+half = { workspace = true }

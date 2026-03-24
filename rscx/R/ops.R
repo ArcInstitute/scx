@@ -2,20 +2,120 @@
 #'
 #' @description
 #' Append, delete, compact, rollback, and merge SCX files from R.
+#' Info and validation utilities.
+
+#' Append cells from one SCX file to another
 #'
+#' Reads all CSR shards and obs metadata from the input file and appends
+#' them to the target file. Both files must have the same number of variables.
+#'
+#' @param target Path to the target SCX file (modified in-place).
+#' @param input Path to the input SCX file to append from.
+#' @export
 #' @examples
-#' # Append new cells
+#' \dontrun{
 #' scx_append("atlas.scx", "new_batch.scx")
+#' }
+scx_append <- function(target, input) {
+  invisible(.Call(wrap__scx_append, target, input))
+}
+
+#' Mark cells as logically deleted
 #'
-#' # Delete specific cells
-#' scx_delete("experiment.scx", c(0L, 5L, 10L, 42L))
+#' Marks the specified cell indices as deleted using deletion vectors.
+#' Deleted cells are excluded from queries but remain on disk until
+#' compaction.
 #'
-#' # Compact to reclaim space
+#' @param path Path to the SCX file.
+#' @param cell_indices Integer vector of 0-based cell indices to delete.
+#' @return Total number of deleted cells (including previously deleted).
+#' @export
+#' @examples
+#' \dontrun{
+#' total <- scx_delete("experiment.scx", c(0L, 5L, 10L, 42L))
+#' }
+scx_delete <- function(path, cell_indices) {
+  .Call(wrap__scx_delete, path, as.integer(cell_indices))
+}
+
+#' Compact an SCX file
+#'
+#' Rewrites the file, removing deleted rows and reclaiming space from
+#' orphaned sections and stale catalogs.
+#'
+#' @param input Path to the input SCX file.
+#' @param output Path for the compacted output file.
+#' @export
+#' @examples
+#' \dontrun{
 #' scx_compact("experiment.scx", "compacted.scx")
+#' }
+scx_compact <- function(input, output) {
+  invisible(.Call(wrap__scx_compact, input, output))
+}
+
+#' Roll back to a previous manifest version
 #'
-#' # Roll back one version
+#' Reverts the SCX file to a previous state. If \code{to_seq} is NULL,
+#' rolls back one version. If specified, rolls back to that manifest
+#' sequence number.
+#'
+#' @param path Path to the SCX file.
+#' @param to_seq Optional manifest sequence number (integer or NULL).
+#' @export
+#' @examples
+#' \dontrun{
 #' scx_rollback("experiment.scx")
+#' scx_rollback("experiment.scx", to_seq = 3L)
+#' }
+scx_rollback <- function(path, to_seq = NULL) {
+  invisible(.Call(wrap__scx_rollback, path, to_seq))
+}
+
+#' Merge multiple SCX files
 #'
-#' # Merge multiple files
+#' Combines two or more SCX files into a single output file.
+#' All input files must have the same number of variables (genes).
+#'
+#' @param inputs Character vector of input file paths (>= 2).
+#' @param output Path for the merged output file.
+#' @export
+#' @examples
+#' \dontrun{
 #' scx_merge(c("batch1.scx", "batch2.scx"), "atlas.scx")
-NULL
+#' }
+scx_merge <- function(inputs, output) {
+  invisible(.Call(wrap__scx_merge, inputs, output))
+}
+
+#' Get SCX file information
+#'
+#' Returns a named list with file metadata.
+#'
+#' @param path Path to the SCX file.
+#' @return Named list with n_obs, n_vars, nnz, format_version, n_shards.
+#' @export
+#' @examples
+#' \dontrun{
+#' info <- scx_info("experiment.scx")
+#' info$n_obs
+#' }
+scx_info <- function(path) {
+  .Call(wrap__scx_info, path)
+}
+
+#' Validate an SCX file
+#'
+#' Checks all section checksums. Returns TRUE if valid, raises an error
+#' listing failed sections otherwise.
+#'
+#' @param path Path to the SCX file.
+#' @return TRUE if all checksums pass.
+#' @export
+#' @examples
+#' \dontrun{
+#' scx_validate("experiment.scx")
+#' }
+scx_validate <- function(path) {
+  .Call(wrap__scx_validate, path)
+}
