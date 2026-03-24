@@ -217,8 +217,14 @@ pub fn decode_shard_scipy(
     }
 
     // For None and Zstd: decode to raw types, then convert
-    let (indptr_u64, indices_u32, values_raw) =
-        decode_shard_ref(encoded, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)?;
+    let (indptr_u64, indices_u32, values_raw) = decode_shard_ref(
+        encoded,
+        codec_id,
+        value_encoding,
+        n_rows,
+        nnz,
+        index_dtype_u16,
+    )?;
     let indptr = u64_vec_to_i64(indptr_u64)?;
     let indices = u32_vec_to_i32(indices_u32)?;
     let data = values_raw_to_f32(&values_raw, value_encoding);

@@ -84,33 +84,29 @@ pub fn decode_shard_gpu(dev: &GpuDevice, shard_bytes: &[u8]) -> Result<GpuCsr, G
 
     // 3. Dispatch on codec
     match codec_id {
-        CodecId::Scx1 => {
-            decode_scx1_gpu(
-                dev,
-                indptr_bytes,
-                indices_bytes,
-                values_bytes,
-                value_encoding,
-                index_dtype_u16,
-                n_rows,
-                n_cols,
-                nnz,
-            )
-        }
-        CodecId::None | CodecId::Zstd => {
-            decode_cpu_fallback(
-                dev,
-                indptr_bytes,
-                indices_bytes,
-                values_bytes,
-                codec_id,
-                value_encoding,
-                index_dtype_u16,
-                n_rows,
-                n_cols,
-                nnz,
-            )
-        }
+        CodecId::Scx1 => decode_scx1_gpu(
+            dev,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            value_encoding,
+            index_dtype_u16,
+            n_rows,
+            n_cols,
+            nnz,
+        ),
+        CodecId::None | CodecId::Zstd => decode_cpu_fallback(
+            dev,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            codec_id,
+            value_encoding,
+            index_dtype_u16,
+            n_rows,
+            n_cols,
+            nnz,
+        ),
     }
 }
 
@@ -156,22 +152,16 @@ fn decode_scx1_gpu(
     }
 
     // indptr: Delta-Golomb on CPU → Vec<u64> → Vec<i64> → upload
-    let indptr_u64 = delta_golomb_decode(indptr_bytes, n_rows + 1)
-        .map_err(scx_codec::CodecError::from)?;
-    let indptr_i64: Vec<i64> = indptr_u64
-        .into_iter()
-        .map(|v| v as i64)
-        .collect();
+    let indptr_u64 =
+        delta_golomb_decode(indptr_bytes, n_rows + 1).map_err(scx_codec::CodecError::from)?;
+    let indptr_i64: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
     let d_indptr = dev.htod_copy(&indptr_i64)?;
 
     // indices: FOR-BP on GPU → dtoh → u32→i32 → upload
     let (d_indices_u32, _row_lengths) =
         forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
     let indices_u32 = dev.dtoh_copy(&d_indices_u32)?;
-    let indices_i32: Vec<i32> = indices_u32
-        .into_iter()
-        .map(|v| v as i32)
-        .collect();
+    let indices_i32: Vec<i32> = indices_u32.into_iter().map(|v| v as i32).collect();
     let d_indices = dev.htod_copy(&indices_i32)?;
 
     // values: Rice on GPU → dtoh → u32→f32 → upload
@@ -263,9 +253,15 @@ mod tests {
         let nnz = *indptr.last().unwrap();
         let index_dtype_u16 = n_cols <= 65535;
 
-        let encoded =
-            encode_shard(indptr, indices, values_raw, codec_id, value_encoding, index_dtype_u16)
-                .expect("encode_shard failed");
+        let encoded = encode_shard(
+            indptr,
+            indices,
+            values_raw,
+            codec_id,
+            value_encoding,
+            index_dtype_u16,
+        )
+        .expect("encode_shard failed");
 
         // Layout: header (76 bytes) | indptr | indices | values
         let indptr_rel_offset = SHARD_HEADER_SIZE as u32;

@@ -62,10 +62,8 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
             data_len: input_data.len(),
         });
     }
-    let full_catalog = FullCatalog::read_from(
-        &mut Cursor::new(&input_data[fc_offset..fc_end]),
-        fc_length,
-    )?;
+    let full_catalog =
+        FullCatalog::read_from(&mut Cursor::new(&input_data[fc_offset..fc_end]), fc_length)?;
 
     // We'll write the front catalog after we know the new section offsets.
     // First, estimate its size from the original catalog so we can reserve space.
@@ -102,8 +100,10 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     }
 
     // Build ordered list of entries following section_order
-    let known_types: std::collections::HashSet<u8> = section_order.iter().map(|&st| st as u8).collect();
-    let mut ordered_entries: Vec<&FullCatalogEntry> = Vec::with_capacity(full_catalog.entries.len());
+    let known_types: std::collections::HashSet<u8> =
+        section_order.iter().map(|&st| st as u8).collect();
+    let mut ordered_entries: Vec<&FullCatalogEntry> =
+        Vec::with_capacity(full_catalog.entries.len());
     for &st in section_order {
         if let Some(entries) = grouped.get(&(st as u8)) {
             ordered_entries.extend(entries);
@@ -117,11 +117,8 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     }
 
     // 3. Create output file (atomic temp path)
-    let tmp_path = std::path::PathBuf::from(format!(
-        "{}.tmp.{}",
-        output.display(),
-        std::process::id()
-    ));
+    let tmp_path =
+        std::path::PathBuf::from(format!("{}.tmp.{}", output.display(), std::process::id()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -230,7 +227,9 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         writer.write_all(&vec![0u8; remaining])?;
     }
     // Seek back to where the full catalog ended
-    writer.seek(SeekFrom::Start(full_catalog_offset_new + new_full_catalog_length))?;
+    writer.seek(SeekFrom::Start(
+        full_catalog_offset_new + new_full_catalog_length,
+    ))?;
 
     // 7. Build and write root catalog at offset 256
     let root_catalog = build_root_catalog(&new_full_catalog);
@@ -440,8 +439,14 @@ mod tests {
         let hdr = FileHeader::read_from(&mut Cursor::new(&data[..HEADER_SIZE])).unwrap();
 
         assert!(hdr.has_front_catalog(), "front_catalog flag should be set");
-        assert!(hdr.front_catalog_offset > 0, "front_catalog_offset should be non-zero");
-        assert!(hdr.front_catalog_length > 0, "front_catalog_length should be non-zero");
+        assert!(
+            hdr.front_catalog_offset > 0,
+            "front_catalog_offset should be non-zero"
+        );
+        assert!(
+            hdr.front_catalog_length > 0,
+            "front_catalog_length should be non-zero"
+        );
         assert_eq!(
             hdr.front_catalog_offset, SECTIONS_START_OFFSET,
             "front catalog should start right after root catalog"
@@ -476,10 +481,17 @@ mod tests {
 
         assert_eq!(front_catalog.entries.len(), full_catalog.entries.len());
         assert_eq!(front_catalog.n_obs, full_catalog.n_obs);
-        assert_eq!(front_catalog.manifest_sequence, full_catalog.manifest_sequence);
+        assert_eq!(
+            front_catalog.manifest_sequence,
+            full_catalog.manifest_sequence
+        );
 
         // Front catalog should now have identical offsets to the full catalog
-        for (fc_entry, full_entry) in front_catalog.entries.iter().zip(full_catalog.entries.iter()) {
+        for (fc_entry, full_entry) in front_catalog
+            .entries
+            .iter()
+            .zip(full_catalog.entries.iter())
+        {
             assert_eq!(fc_entry.name, full_entry.name);
             assert_eq!(
                 fc_entry.offset, full_entry.offset,
@@ -535,7 +547,10 @@ mod tests {
         cloud_optimize(&first_output, &second_output).unwrap();
         let second_data = std::fs::read(&second_output).unwrap();
 
-        assert_eq!(first_data, second_data, "idempotent cloud-optimize should produce identical output");
+        assert_eq!(
+            first_data, second_data,
+            "idempotent cloud-optimize should produce identical output"
+        );
     }
 
     #[test]

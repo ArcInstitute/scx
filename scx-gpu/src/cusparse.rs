@@ -250,7 +250,10 @@ mod tests {
         let desc = gpu_csr.to_cusparse_csr(dev.stream()).unwrap();
 
         // The descriptor should be non-null
-        assert!(!desc.raw().is_null(), "cuSPARSE descriptor should be non-null");
+        assert!(
+            !desc.raw().is_null(),
+            "cuSPARSE descriptor should be non-null"
+        );
 
         // Verify shape
         assert_eq!(gpu_csr.shape, (5, 100));
@@ -269,8 +272,14 @@ mod tests {
         let ptrs = gpu_csr.device_pointers(dev.stream());
 
         // Device pointers should be non-zero (allocated on GPU)
-        assert_ne!(ptrs.indptr_ptr, 0, "indptr device pointer should be non-zero");
-        assert_ne!(ptrs.indices_ptr, 0, "indices device pointer should be non-zero");
+        assert_ne!(
+            ptrs.indptr_ptr, 0,
+            "indptr device pointer should be non-zero"
+        );
+        assert_ne!(
+            ptrs.indices_ptr, 0,
+            "indices device pointer should be non-zero"
+        );
         assert_ne!(ptrs.data_ptr, 0, "data device pointer should be non-zero");
 
         // All pointers should be distinct

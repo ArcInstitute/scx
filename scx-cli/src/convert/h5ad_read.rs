@@ -147,7 +147,10 @@ pub(super) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertEr
             hdf5::types::IntSize::U8 => {
                 let data: Vec<i64> = ds.read_1d()?.to_vec();
                 // Validate no values overflow i32 (finding 8.3).
-                if let Some(&v) = data.iter().find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64) {
+                if let Some(&v) = data
+                    .iter()
+                    .find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64)
+                {
                     return Err(ConvertError::Other(format!(
                         "i64 index value {v} out of i32 range"
                     )));

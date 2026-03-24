@@ -9,10 +9,12 @@ pub fn dense_to_csr(dense: &[f32], n_rows: usize, n_cols: usize) -> Result<ScxCs
     if n_cols > i32::MAX as usize {
         return Err(CsrError::ColumnOverflow(n_cols));
     }
-    let expected_len = n_rows.checked_mul(n_cols).ok_or(CsrError::DimensionOverflow {
-        rows: n_rows,
-        cols: n_cols,
-    })?;
+    let expected_len = n_rows
+        .checked_mul(n_cols)
+        .ok_or(CsrError::DimensionOverflow {
+            rows: n_rows,
+            cols: n_cols,
+        })?;
     if dense.len() != expected_len {
         return Err(CsrError::DenseLengthMismatch {
             got: dense.len(),

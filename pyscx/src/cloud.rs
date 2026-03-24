@@ -127,9 +127,7 @@ pub fn push(
 #[pyo3(signature = (input, output=None))]
 pub fn cloud_optimize(input: &str, output: Option<&str>) -> PyResult<()> {
     let input_path = std::path::Path::new(input);
-    let output_path = output
-        .map(std::path::Path::new)
-        .unwrap_or(input_path);
+    let output_path = output.map(std::path::Path::new).unwrap_or(input_path);
     scx_cloud::cloud_optimize(input_path, output_path)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -143,8 +141,7 @@ pub fn cloud_optimize(input: &str, output: Option<&str>) -> PyResult<()> {
 pub fn explode(input: &str, output: &str) -> PyResult<()> {
     let input_path = std::path::Path::new(input);
     let output_path = std::path::Path::new(output);
-    scx_cloud::explode(input_path, output_path)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    scx_cloud::explode(input_path, output_path).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Pack an exploded .scxd directory back into a single .scx file.
@@ -156,8 +153,7 @@ pub fn explode(input: &str, output: &str) -> PyResult<()> {
 pub fn pack(input: &str, output: &str) -> PyResult<()> {
     let input_path = std::path::Path::new(input);
     let output_path = std::path::Path::new(output);
-    scx_cloud::pack(input_path, output_path)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    scx_cloud::pack(input_path, output_path).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// A cloud-backed experiment handle for reading SCX data

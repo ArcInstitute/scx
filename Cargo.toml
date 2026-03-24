@@ -1,5 +1,5 @@
 [workspace]
-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "pyscx"]
+members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "pyscx", "rscx"]
 resolver = "2"
 
 [workspace.package]

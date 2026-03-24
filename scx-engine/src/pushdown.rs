@@ -139,9 +139,7 @@ fn can_exclude_shard(
                                 // Look up string value in category dictionary
                                 category_dicts
                                     .and_then(|dicts| dicts.get(cnh))
-                                    .and_then(|values| {
-                                        values.binary_search(s).ok()
-                                    })
+                                    .and_then(|values| values.binary_search(s).ok())
                             }
                             _ => None,
                         };
@@ -236,11 +234,9 @@ fn can_exclude_shard(
                         let all_absent = values.iter().all(|v| {
                             let bit_index = match v {
                                 ScalarValue::Int64(idx) => Some(*idx as usize),
-                                ScalarValue::Utf8(s) => {
-                                    category_dicts
-                                        .and_then(|dicts| dicts.get(cnh))
-                                        .and_then(|vals| vals.binary_search(s).ok())
-                                }
+                                ScalarValue::Utf8(s) => category_dicts
+                                    .and_then(|dicts| dicts.get(cnh))
+                                    .and_then(|vals| vals.binary_search(s).ok()),
                                 _ => None,
                             };
                             match bit_index {
@@ -334,10 +330,8 @@ pub fn prune_rows_by_index(
             }
             Predicate::Ne(..) => None, // can't narrow with Ne
             Predicate::And(left, right) => {
-                let left_ranges =
-                    prune_rows_by_index(index, &[*left.clone()], shard_idx);
-                let right_ranges =
-                    prune_rows_by_index(index, &[*right.clone()], shard_idx);
+                let left_ranges = prune_rows_by_index(index, &[*left.clone()], shard_idx);
+                let right_ranges = prune_rows_by_index(index, &[*right.clone()], shard_idx);
                 match (left_ranges, right_ranges) {
                     (Some(l), Some(r)) => Some(intersect_ranges(&l, &r)),
                     (Some(l), None) => Some(l),
@@ -346,10 +340,8 @@ pub fn prune_rows_by_index(
                 }
             }
             Predicate::Or(left, right) => {
-                let left_ranges =
-                    prune_rows_by_index(index, &[*left.clone()], shard_idx);
-                let right_ranges =
-                    prune_rows_by_index(index, &[*right.clone()], shard_idx);
+                let left_ranges = prune_rows_by_index(index, &[*left.clone()], shard_idx);
+                let right_ranges = prune_rows_by_index(index, &[*right.clone()], shard_idx);
                 match (left_ranges, right_ranges) {
                     (Some(l), Some(r)) => Some(union_ranges(&l, &r)),
                     _ => None,
@@ -825,22 +817,46 @@ mod tests {
                     CategoricalEntry {
                         value: "B cell".to_string(),
                         shard_ranges: vec![
-                            ShardRange { shard_id: 0, row_start: 10, row_end: 20 },
-                            ShardRange { shard_id: 1, row_start: 5, row_end: 15 },
+                            ShardRange {
+                                shard_id: 0,
+                                row_start: 10,
+                                row_end: 20,
+                            },
+                            ShardRange {
+                                shard_id: 1,
+                                row_start: 5,
+                                row_end: 15,
+                            },
                         ],
                     },
                     CategoricalEntry {
                         value: "NK cell".to_string(),
                         shard_ranges: vec![
-                            ShardRange { shard_id: 0, row_start: 30, row_end: 50 },
-                            ShardRange { shard_id: 2, row_start: 0, row_end: 20 },
+                            ShardRange {
+                                shard_id: 0,
+                                row_start: 30,
+                                row_end: 50,
+                            },
+                            ShardRange {
+                                shard_id: 2,
+                                row_start: 0,
+                                row_end: 20,
+                            },
                         ],
                     },
                     CategoricalEntry {
                         value: "T cell".to_string(),
                         shard_ranges: vec![
-                            ShardRange { shard_id: 0, row_start: 0, row_end: 10 },
-                            ShardRange { shard_id: 1, row_start: 0, row_end: 5 },
+                            ShardRange {
+                                shard_id: 0,
+                                row_start: 0,
+                                row_end: 10,
+                            },
+                            ShardRange {
+                                shard_id: 1,
+                                row_start: 0,
+                                row_end: 5,
+                            },
                         ],
                     },
                 ],
@@ -857,10 +873,34 @@ mod tests {
                 internal_pages: vec![],
                 leaf_pages: vec![LeafPage {
                     entries: vec![
-                        NumericLeafEntry { min_value: 100.0, max_value: 200.0, shard_id: 0, row_start: 0, row_end: 30 },
-                        NumericLeafEntry { min_value: 200.0, max_value: 500.0, shard_id: 0, row_start: 30, row_end: 80 },
-                        NumericLeafEntry { min_value: 100.0, max_value: 300.0, shard_id: 1, row_start: 0, row_end: 50 },
-                        NumericLeafEntry { min_value: 500.0, max_value: 1000.0, shard_id: 1, row_start: 50, row_end: 100 },
+                        NumericLeafEntry {
+                            min_value: 100.0,
+                            max_value: 200.0,
+                            shard_id: 0,
+                            row_start: 0,
+                            row_end: 30,
+                        },
+                        NumericLeafEntry {
+                            min_value: 200.0,
+                            max_value: 500.0,
+                            shard_id: 0,
+                            row_start: 30,
+                            row_end: 80,
+                        },
+                        NumericLeafEntry {
+                            min_value: 100.0,
+                            max_value: 300.0,
+                            shard_id: 1,
+                            row_start: 0,
+                            row_end: 50,
+                        },
+                        NumericLeafEntry {
+                            min_value: 500.0,
+                            max_value: 1000.0,
+                            shard_id: 1,
+                            row_start: 50,
+                            row_end: 100,
+                        },
                     ],
                 }],
             })],

@@ -55,9 +55,9 @@ impl PyQueryPipeline {
 
     /// Take the inner pipeline, returning an error if already consumed.
     fn take_pipeline(&mut self) -> PyResult<QueryPipeline> {
-        self.pipeline.take().ok_or_else(|| {
-            PyRuntimeError::new_err("Pipeline already consumed by collect()")
-        })
+        self.pipeline
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("Pipeline already consumed by collect()"))
     }
 
     /// Store a pipeline back after a builder step.
@@ -224,9 +224,7 @@ impl PyQueryResult {
     /// Take the inner result, returning an error if already consumed.
     fn take_result(&mut self) -> PyResult<QueryResult> {
         self.result.take().ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "QueryResult already consumed by to_anndata() or to_csr()",
-            )
+            PyRuntimeError::new_err("QueryResult already consumed by to_anndata() or to_csr()")
         })
     }
 }

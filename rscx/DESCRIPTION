@@ -1,0 +1,23 @@
+Package: rscx
+Title: SCX File Format for Single-Cell RNA-seq
+Version: 0.1.0
+Authors@R:
+    person("Arc Institute", role = c("aut", "cre"),
+           email = "scx@arcinstitute.org")
+Description: R bindings for the SCX (Sparse Cell eXpression) binary file
+    format. Provides fast reading, writing, and querying of single-cell
+    RNA-seq data with native Seurat v5 and SingleCellExperiment interop.
+License: MIT + file LICENSE
+SystemRequirements: Cargo (Rust's package manager), rustc (>= 1.78)
+Depends: R (>= 4.2.0)
+Imports: Matrix, methods
+Suggests:
+    Seurat (>= 5.0.0),
+    SingleCellExperiment,
+    SummarizedExperiment,
+    S4Vectors,
+    testthat (>= 3.0.0)
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Config/rextendr/version: 0.3.1

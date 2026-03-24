@@ -72,13 +72,13 @@ impl ScxReader {
         // Read full catalog using header's offset and length
         let fc_offset = header.full_catalog_offset as usize;
         let fc_length = header.full_catalog_length as usize;
-        let fc_end = fc_offset.checked_add(fc_length).ok_or(
-            ScxError::SectionOutOfBounds {
+        let fc_end = fc_offset
+            .checked_add(fc_length)
+            .ok_or(ScxError::SectionOutOfBounds {
                 offset: header.full_catalog_offset,
                 length: header.full_catalog_length,
                 file_size: mmap.len(),
-            },
-        )?;
+            })?;
         if fc_end > mmap.len() {
             return Err(ScxError::SectionOutOfBounds {
                 offset: header.full_catalog_offset,
@@ -487,13 +487,13 @@ impl ScxReader {
     /// Get the raw bytes for a catalog entry from the mmap.
     pub fn section_bytes(&self, entry: &FullCatalogEntry) -> Result<&[u8]> {
         let start = entry.offset as usize;
-        let end = start.checked_add(entry.length as usize).ok_or(
-            ScxError::SectionOutOfBounds {
+        let end = start
+            .checked_add(entry.length as usize)
+            .ok_or(ScxError::SectionOutOfBounds {
                 offset: entry.offset,
                 length: entry.length,
                 file_size: self.mmap.len(),
-            },
-        )?;
+            })?;
         if end > self.mmap.len() {
             return Err(ScxError::SectionOutOfBounds {
                 offset: entry.offset,

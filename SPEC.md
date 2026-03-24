@@ -834,6 +834,20 @@ counts in X, float32 normalized values in a layer).
 Rice coding (codec_id=1) applies only to integer value encodings (0-2). Float layers
 use Zstd (codec_id=2) because float values do not follow the geometric distribution.
 
+**Automatic codec selection**: Writers SHOULD implement automatic codec selection
+based on the value distribution of each shard. Phase 1 benchmarks demonstrated that
+Rice coding (Scx1) increases file size for non-UMI data (Smart-seq2: 0.852× h5ad
+vs 0.746× with no codec), while Zstd achieves 0.345×. The recommended heuristic:
+
+- Float values → Zstd (always)
+- Integer values with floor median ≤ 8 → Scx1 (Rice)
+- Integer values with floor median > 8 → Zstd
+
+This per-shard decision uses the same median calculation as Rice parameter
+selection (§4.3), applied to a sample of up to 10,000 non-zero values from the
+shard. Writers that implement `codec="auto"` use this heuristic; the `codec_id`
+in each shard header records the actual codec used.
+
 ### 4.6 Codec Limitations and Pitfalls
 
 **Rice coding assumes near-geometric distributions.** The ~2.2 bits/value projection
@@ -1173,13 +1187,40 @@ release with recommended configuration. The SCX figures are engineering projecti
 based on component throughputs (NVMe bandwidth, Rust decode speed, CUDA kernel
 launch rates) and will be validated with reproducible benchmarks before publication.
 
-**Memory footprint model**: At `shard_group_size=8`, `prefetch_batches=4`,
-`batch_size=1024`, `n_hvg=2000`:
-- Shard group buffer: 8 shards × ~30 MB compressed = ~240 MB
-- Decoded row buffer: 80K cells × 100 nnz/cell × 6 bytes = ~48 MB
-- Pinned batch ring: 4 batches × 1024 × 2000 × 4 bytes = 32 MB
-- Overhead (indexes, metadata): ~10 MB
-- **Total: ~330 MB** (constant regardless of total dataset size)
+**Memory footprint model**: The auto-tuner estimates memory using a data-driven model:
+
+```text
+decoded_shard_bytes = shard_target_rows × avg_nnz_per_cell × 12 + (shard_target_rows + 1) × 8
+shard_buffer        = (shard_group_size + 1) × decoded_shard_bytes
+batch_buffer        = (max(prefetch_batches, 2) + 1) × batch_size × n_output_genes × 4
+mmap_resident       = file_size_bytes (entire SCX file faulted into RSS during epoch)
+overhead            = ~50 MB (Python interpreter, numpy, Arrow, thread stacks)
+total               = shard_buffer + batch_buffer + mmap_resident + overhead
+```
+
+The `+1` terms account for I/O-decode pipeline overlap (one extra shard group live)
+and the batch being consumed by Python (one extra batch beyond the channel capacity).
+The `mmap_resident` term accounts for the OS faulting mmap'd pages into RSS as shards
+are read sequentially. `MADV_SEQUENTIAL` is applied to hint the kernel to reclaim
+already-read pages, but the full file size is used conservatively since `ru_maxrss`
+captures the high-water mark.
+
+**Auto-tuning order**: If the estimate exceeds `max_memory_mb`, the auto-tuner
+reduces parameters in this order:
+1. `prefetch_batches` (decrement by 1, minimum 2)
+2. `shard_group_size` (decrement by 1, minimum 1)
+3. `batch_size` (halve, minimum 64)
+
+If the budget is still exceeded at all minimums, the pipeline proceeds with a
+warning suggesting HVG projection to reduce `n_output_genes`.
+
+**Example** — `shard_group_size=8`, `prefetch_batches=4`, `batch_size=1024`,
+`n_hvg=2000`, `shard_target_rows=16384`, `avg_nnz=100`, file_size=4.4 MB:
+- Shard buffer: (8+1) × (16384 × 100 × 12 + 16385 × 8) ≈ 178 MB
+- Batch buffer: (4+1) × 1024 × 2000 × 4 = 40 MB
+- Mmap resident: 4.4 MB
+- Overhead: 50 MB
+- **Total: ~272 MB** (well within default 512 MB budget)
 
 ---
 

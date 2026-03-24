@@ -69,7 +69,7 @@ pub struct NumericIndex {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InternalPage {
     pub n_keys: u16,
-    pub keys: Vec<f64>,    // split values
+    pub keys: Vec<f64>,     // split values
     pub children: Vec<u32>, // page indices, length = n_keys + 1
 }
 
@@ -422,8 +422,7 @@ pub fn build_numeric_index(
     // Each leaf entry covers a contiguous value range within one shard.
     let mut leaf_entries: Vec<NumericLeafEntry> = Vec::new();
     for &(val, global_row) in &value_rows {
-        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges)
-        else {
+        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges) else {
             continue; // row doesn't belong to any shard — skip
         };
         // Try to extend the last entry if same shard and adjacent row
@@ -474,11 +473,7 @@ fn build_internal_pages(leaf_pages: &[LeafPage], fanout: u16) -> Vec<InternalPag
     // Extract the first key from each leaf page for split keys
     let mut current_keys: Vec<f64> = leaf_pages
         .iter()
-        .map(|lp| {
-            lp.entries
-                .first()
-                .map_or(f64::NAN, |e| e.min_value)
-        })
+        .map(|lp| lp.entries.first().map_or(f64::NAN, |e| e.min_value))
         .collect();
 
     loop {
@@ -588,9 +583,7 @@ fn estimate_unique_values(col: &ArrayRef) -> usize {
 fn is_categorical_type(dt: &DataType) -> bool {
     matches!(
         dt,
-        DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Dictionary(_, _)
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _)
     )
 }
 
@@ -671,16 +664,46 @@ fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
         return None;
     }
     match col.data_type() {
-        DataType::Int8 => col.as_any().downcast_ref::<Int8Array>().map(|a| a.value(row) as f64),
-        DataType::Int16 => col.as_any().downcast_ref::<Int16Array>().map(|a| a.value(row) as f64),
-        DataType::Int32 => col.as_any().downcast_ref::<Int32Array>().map(|a| a.value(row) as f64),
-        DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().map(|a| a.value(row) as f64),
-        DataType::UInt8 => col.as_any().downcast_ref::<UInt8Array>().map(|a| a.value(row) as f64),
-        DataType::UInt16 => col.as_any().downcast_ref::<UInt16Array>().map(|a| a.value(row) as f64),
-        DataType::UInt32 => col.as_any().downcast_ref::<UInt32Array>().map(|a| a.value(row) as f64),
-        DataType::UInt64 => col.as_any().downcast_ref::<UInt64Array>().map(|a| a.value(row) as f64),
-        DataType::Float32 => col.as_any().downcast_ref::<Float32Array>().map(|a| a.value(row) as f64),
-        DataType::Float64 => col.as_any().downcast_ref::<Float64Array>().map(|a| a.value(row)),
+        DataType::Int8 => col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::Int16 => col
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::UInt8 => col
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::UInt16 => col
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::UInt32 => col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::UInt64 => col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|a| a.value(row) as f64),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| a.value(row)),
         _ => None,
     }
 }
@@ -691,8 +714,7 @@ fn rows_to_shard_ranges(rows: &[u64], shard_row_ranges: &[(u64, u64)]) -> Vec<Sh
     let mut ranges: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
 
     for &global_row in rows {
-        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges)
-        else {
+        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges) else {
             continue; // row doesn't belong to any shard — skip
         };
         let shard_ranges = ranges.entry(shard_id).or_default();
@@ -770,24 +792,56 @@ mod tests {
                     CategoricalEntry {
                         value: "B cell".to_string(),
                         shard_ranges: vec![
-                            ShardRange { shard_id: 0, row_start: 10, row_end: 20 },
-                            ShardRange { shard_id: 2, row_start: 0, row_end: 15 },
+                            ShardRange {
+                                shard_id: 0,
+                                row_start: 10,
+                                row_end: 20,
+                            },
+                            ShardRange {
+                                shard_id: 2,
+                                row_start: 0,
+                                row_end: 15,
+                            },
                         ],
                     },
                     CategoricalEntry {
                         value: "NK cell".to_string(),
                         shard_ranges: vec![
-                            ShardRange { shard_id: 1, row_start: 5, row_end: 30 },
-                            ShardRange { shard_id: 3, row_start: 0, row_end: 50 },
-                            ShardRange { shard_id: 4, row_start: 10, row_end: 40 },
+                            ShardRange {
+                                shard_id: 1,
+                                row_start: 5,
+                                row_end: 30,
+                            },
+                            ShardRange {
+                                shard_id: 3,
+                                row_start: 0,
+                                row_end: 50,
+                            },
+                            ShardRange {
+                                shard_id: 4,
+                                row_start: 10,
+                                row_end: 40,
+                            },
                         ],
                     },
                     CategoricalEntry {
                         value: "T cell".to_string(),
                         shard_ranges: vec![
-                            ShardRange { shard_id: 0, row_start: 0, row_end: 10 },
-                            ShardRange { shard_id: 1, row_start: 0, row_end: 5 },
-                            ShardRange { shard_id: 2, row_start: 15, row_end: 50 },
+                            ShardRange {
+                                shard_id: 0,
+                                row_start: 0,
+                                row_end: 10,
+                            },
+                            ShardRange {
+                                shard_id: 1,
+                                row_start: 0,
+                                row_end: 5,
+                            },
+                            ShardRange {
+                                shard_id: 2,
+                                row_start: 15,
+                                row_end: 50,
+                            },
                         ],
                     },
                 ],
@@ -815,14 +869,38 @@ mod tests {
                 leaf_pages: vec![
                     LeafPage {
                         entries: vec![
-                            NumericLeafEntry { min_value: 100.0, max_value: 200.0, shard_id: 0, row_start: 0, row_end: 50 },
-                            NumericLeafEntry { min_value: 200.0, max_value: 500.0, shard_id: 1, row_start: 0, row_end: 100 },
+                            NumericLeafEntry {
+                                min_value: 100.0,
+                                max_value: 200.0,
+                                shard_id: 0,
+                                row_start: 0,
+                                row_end: 50,
+                            },
+                            NumericLeafEntry {
+                                min_value: 200.0,
+                                max_value: 500.0,
+                                shard_id: 1,
+                                row_start: 0,
+                                row_end: 100,
+                            },
                         ],
                     },
                     LeafPage {
                         entries: vec![
-                            NumericLeafEntry { min_value: 500.0, max_value: 800.0, shard_id: 2, row_start: 0, row_end: 80 },
-                            NumericLeafEntry { min_value: 800.0, max_value: 5000.0, shard_id: 3, row_start: 0, row_end: 200 },
+                            NumericLeafEntry {
+                                min_value: 500.0,
+                                max_value: 800.0,
+                                shard_id: 2,
+                                row_start: 0,
+                                row_end: 80,
+                            },
+                            NumericLeafEntry {
+                                min_value: 800.0,
+                                max_value: 5000.0,
+                                shard_id: 3,
+                                row_start: 0,
+                                row_end: 200,
+                            },
                         ],
                     },
                 ],
@@ -844,7 +922,11 @@ mod tests {
                     column_name: "cell_type".to_string(),
                     entries: vec![CategoricalEntry {
                         value: "T cell".to_string(),
-                        shard_ranges: vec![ShardRange { shard_id: 0, row_start: 0, row_end: 10 }],
+                        shard_ranges: vec![ShardRange {
+                            shard_id: 0,
+                            row_start: 0,
+                            row_end: 10,
+                        }],
                     }],
                 }),
                 IndexedColumn::Numeric(NumericIndex {
@@ -880,12 +962,11 @@ mod tests {
             Field::new("n_genes", DataType::Int32, false),
         ]);
         let cell_types = StringArray::from(vec![
-            "T cell", "B cell", "T cell", "NK cell", "B cell", "T cell",
-            "NK cell", "T cell", "B cell", "NK cell", "NK cell", "T cell",
+            "T cell", "B cell", "T cell", "NK cell", "B cell", "T cell", "NK cell", "T cell",
+            "B cell", "NK cell", "NK cell", "T cell",
         ]);
         let n_genes = Int32Array::from(vec![
-            200, 300, 150, 450, 500, 250,
-            600, 100, 350, 700, 800, 400,
+            200, 300, 150, 450, 500, 250, 600, 100, 350, 700, 800, 400,
         ]);
         RecordBatch::try_new(
             Arc::new(schema),
@@ -949,11 +1030,7 @@ mod tests {
         let n = 11_000;
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
         let ids = Int32Array::from((0..n).collect::<Vec<i32>>());
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(ids)],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ids)]).unwrap();
         let shard_ranges = vec![(0u64, n as u64)];
 
         let index = build_indexes(&batch, &shard_ranges, &["id".to_string()]).unwrap();
@@ -969,10 +1046,13 @@ mod tests {
 
         let index = build_indexes(&batch, &shard_ranges, &[]).unwrap();
         // Empty batch auto-detect should produce empty or index with empty entries
-        assert!(index.columns.is_empty() || index.columns.iter().all(|c| match c {
-            IndexedColumn::Categorical(cat) => cat.entries.is_empty(),
-            IndexedColumn::Numeric(num) => num.leaf_pages.is_empty(),
-        }));
+        assert!(
+            index.columns.is_empty()
+                || index.columns.iter().all(|c| match c {
+                    IndexedColumn::Categorical(cat) => cat.entries.is_empty(),
+                    IndexedColumn::Numeric(num) => num.leaf_pages.is_empty(),
+                })
+        );
     }
 
     #[test]

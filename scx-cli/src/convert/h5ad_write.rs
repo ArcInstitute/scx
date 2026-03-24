@@ -11,12 +11,13 @@ use hdf5::types::VarLenUnicode;
 
 /// Convert &str to VarLenUnicode, validating no NUL bytes are present.
 fn vlu(s: &str) -> VarLenUnicode {
-    s.parse::<VarLenUnicode>()
-        .unwrap_or_else(|_| {
-            // Strip NUL bytes rather than panicking (finding 8.2).
-            let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
-            cleaned.parse::<VarLenUnicode>().expect("cleaned string should have no NUL bytes")
-        })
+    s.parse::<VarLenUnicode>().unwrap_or_else(|_| {
+        // Strip NUL bytes rather than panicking (finding 8.2).
+        let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
+        cleaned
+            .parse::<VarLenUnicode>()
+            .expect("cleaned string should have no NUL bytes")
+    })
 }
 
 use scx_format::reader::ScxReader;
@@ -214,7 +215,9 @@ fn write_column_to_hdf5(
 ) -> Result<(), ConvertError> {
     match dtype {
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>()
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(name, "Int32"))?;
             let values: Vec<i32> = arr.iter().map(|v| v.unwrap_or(0)).collect();
             group
@@ -224,7 +227,9 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>()
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(name, "Int64"))?;
             let values: Vec<i64> = arr.iter().map(|v| v.unwrap_or(0)).collect();
             group
@@ -234,7 +239,9 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>()
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(name, "Float32"))?;
             let values: Vec<f32> = arr.iter().map(|v| v.unwrap_or(0.0)).collect();
             group
@@ -244,7 +251,9 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>()
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(name, "Float64"))?;
             let values: Vec<f64> = arr.iter().map(|v| v.unwrap_or(0.0)).collect();
             group
@@ -266,7 +275,9 @@ fn write_column_to_hdf5(
                 .write(&values)?;
         }
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>()
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| downcast_err(name, "Boolean"))?;
             let values: Vec<u8> = arr
                 .iter()

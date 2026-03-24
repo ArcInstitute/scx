@@ -9,7 +9,11 @@ use scx_codec::{decode_shard, encode_shard, CodecId, ValueEncoding};
 
 /// Generate realistic CSR data for benchmarking.
 /// Returns (indptr, indices, values_u8, n_rows, nnz).
-fn generate_shard(n_rows: usize, avg_nnz_per_row: usize, n_vars: u32) -> (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize) {
+fn generate_shard(
+    n_rows: usize,
+    avg_nnz_per_row: usize,
+    n_vars: u32,
+) -> (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize) {
     let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
     let mut next = || -> u64 {
         state ^= state << 13;
@@ -85,11 +89,7 @@ fn bench_forbp_decode(c: &mut Criterion) {
 fn bench_rice_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("rice_decode");
 
-    for &(n_values, label) in &[
-        (1000, "1K"),
-        (100_000, "100K"),
-        (1_000_000, "1M"),
-    ] {
+    for &(n_values, label) in &[(1000, "1K"), (100_000, "100K"), (1_000_000, "1M")] {
         // Generate UMI-like values (1-based)
         let mut state: u64 = 0xCAFE_BABE_1234_5678;
         let values: Vec<u32> = (0..n_values)
@@ -108,11 +108,13 @@ fn bench_rice_decode(c: &mut Criterion) {
             .collect();
         let encoded = rice_encode(&values, B_VAL).unwrap();
 
-        group.bench_with_input(BenchmarkId::new("umi", label), &(encoded.clone(), n_values), |b, (enc, n)| {
-            b.iter(|| {
-                rice_decode(black_box(enc), black_box(*n), black_box(B_VAL)).unwrap()
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("umi", label),
+            &(encoded.clone(), n_values),
+            |b, (enc, n)| {
+                b.iter(|| rice_decode(black_box(enc), black_box(*n), black_box(B_VAL)).unwrap())
+            },
+        );
     }
 
     group.finish();
@@ -121,10 +123,8 @@ fn bench_rice_decode(c: &mut Criterion) {
 fn bench_decode_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_shard");
 
-    for &(n_rows, avg_nnz, label) in &[
-        (2048, 500, "2048r_500nnz"),
-        (16384, 2000, "16384r_2000nnz"),
-    ] {
+    for &(n_rows, avg_nnz, label) in &[(2048, 500, "2048r_500nnz"), (16384, 2000, "16384r_2000nnz")]
+    {
         let (indptr, indices, values, n_rows_actual, nnz) = generate_shard(n_rows, avg_nnz, 30000);
         let index_dtype_u16 = true;
 
@@ -156,5 +156,10 @@ fn bench_decode_shard(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_forbp_decode, bench_rice_decode, bench_decode_shard);
+criterion_group!(
+    benches,
+    bench_forbp_decode,
+    bench_rice_decode,
+    bench_decode_shard
+);
 criterion_main!(benches);

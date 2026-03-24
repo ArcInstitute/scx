@@ -53,9 +53,8 @@ fn preparse_forbp(
             .map_err(|e| GpuError::InvalidShard(format!("FOR-BP prescan: block header: {e}")))?;
         let n_rows_in_block = cursor
             .read_u16::<LittleEndian>()
-            .map_err(|e| {
-                GpuError::InvalidShard(format!("FOR-BP prescan: n_rows_in_block: {e}"))
-            })? as usize;
+            .map_err(|e| GpuError::InvalidShard(format!("FOR-BP prescan: n_rows_in_block: {e}")))?
+            as usize;
 
         // Read per-row nnz as LEB128 varints
         let pos = cursor.position() as usize;
@@ -80,11 +79,9 @@ fn preparse_forbp(
 
             // Read frame_min
             let frame_min = if index_dtype_u16 {
-                cursor
-                    .read_u16::<LittleEndian>()
-                    .map_err(|e| {
-                        GpuError::InvalidShard(format!("FOR-BP prescan: frame_min: {e}"))
-                    })? as u32
+                cursor.read_u16::<LittleEndian>().map_err(|e| {
+                    GpuError::InvalidShard(format!("FOR-BP prescan: frame_min: {e}"))
+                })? as u32
             } else {
                 cursor.read_u32::<LittleEndian>().map_err(|e| {
                     GpuError::InvalidShard(format!("FOR-BP prescan: frame_min: {e}"))
@@ -94,9 +91,7 @@ fn preparse_forbp(
             // Read frame_bits
             let frame_bits = cursor
                 .read_u8()
-                .map_err(|e| {
-                    GpuError::InvalidShard(format!("FOR-BP prescan: frame_bits: {e}"))
-                })?;
+                .map_err(|e| GpuError::InvalidShard(format!("FOR-BP prescan: frame_bits: {e}")))?;
 
             // Record the bit offset where packed deltas start
             let bit_offset = (cursor.position() as u32) * 8;

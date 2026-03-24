@@ -54,7 +54,9 @@ impl ShardShuffler {
     /// Increments `self.epoch` after generating groups.
     pub fn shuffle_epoch(&mut self) -> Vec<Vec<usize>> {
         // Derive a unique RNG from (seed, epoch) for reproducibility
-        let combined_seed = self.rng_seed.wrapping_add(self.epoch.wrapping_mul(0x9E3779B97F4A7C15));
+        let combined_seed = self
+            .rng_seed
+            .wrapping_add(self.epoch.wrapping_mul(0x9E3779B97F4A7C15));
         let mut rng = ChaCha8Rng::seed_from_u64(combined_seed);
 
         // Permute shard indices
@@ -103,7 +105,10 @@ mod tests {
         let flat0: Vec<usize> = epoch0.into_iter().flatten().collect();
         let flat1: Vec<usize> = epoch1.into_iter().flatten().collect();
 
-        assert_ne!(flat0, flat1, "different epochs should produce different orderings");
+        assert_ne!(
+            flat0, flat1,
+            "different epochs should produce different orderings"
+        );
     }
 
     #[test]
@@ -195,7 +200,10 @@ mod tests {
         assert_ne!(indices, original, "shuffle should change order");
         let mut sorted = indices.clone();
         sorted.sort();
-        assert_eq!(sorted, original, "all indices must be present after shuffle");
+        assert_eq!(
+            sorted, original,
+            "all indices must be present after shuffle"
+        );
     }
 
     #[test]
@@ -225,6 +233,9 @@ mod tests {
         let result = ShardShuffler::new(10, 0, 42);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("shard_group_size"), "expected 'shard_group_size' in: {msg}");
+        assert!(
+            msg.contains("shard_group_size"),
+            "expected 'shard_group_size' in: {msg}"
+        );
     }
 }

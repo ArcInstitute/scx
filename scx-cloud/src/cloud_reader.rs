@@ -86,8 +86,10 @@ impl CloudReader {
         match &self.layout {
             ReaderLayout::Exploded(location) => {
                 let make_path = crate::pull::build_path_fn(location);
-                let rel_path = section_name_to_path(&entry.name, entry.section_type)
-                    .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                let rel_path =
+                    section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                        CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    })?;
                 let obj_path = make_path(&rel_path);
                 let data = self.backend.get(&obj_path).await?.bytes().await?;
                 Ok(data.to_vec())
@@ -110,9 +112,8 @@ impl CloudReader {
     pub async fn read_obs(&self) -> Result<RecordBatch> {
         let obs_data = self.read_section("obs").await?;
         let cursor = Cursor::new(&obs_data);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None).map_err(|e| {
-            CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let batch = reader
             .into_iter()
             .next()
@@ -130,9 +131,8 @@ impl CloudReader {
     pub async fn read_var(&self) -> Result<RecordBatch> {
         let var_data = self.read_section("var").await?;
         let cursor = Cursor::new(&var_data);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None).map_err(|e| {
-            CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let batch = reader
             .into_iter()
             .next()
@@ -164,8 +164,7 @@ impl CloudReader {
 ///   - Otherwise → packed file (auto-detects cloud-ready vs not)
 pub async fn open_cloud(url: &str) -> Result<CloudReader> {
     let location = crate::backend::parse_location(url)?;
-    let backend: Arc<dyn ObjectStore> =
-        Arc::from(crate::backend::create_backend(&location).await?);
+    let backend: Arc<dyn ObjectStore> = Arc::from(crate::backend::create_backend(&location).await?);
 
     // Try exploded layout first: look for _catalog.bin
     let catalog_path = {
@@ -177,10 +176,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
         Ok(get_result) => {
             // Exploded directory
             let catalog_bytes = get_result.bytes().await?.to_vec();
-            let catalog = FullCatalog::read_from(
-                &mut Cursor::new(&catalog_bytes),
-                catalog_bytes.len(),
-            )?;
+            let catalog =
+                FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len())?;
 
             let header_path = {
                 let f = crate::pull::build_path_fn(&location);
@@ -221,9 +218,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             };
 
             let first_chunk_size = (HEADER_SIZE + 4096) as u64;
-            let data = backend
-                .get_range(&file_path, 0..first_chunk_size)
-                .await?;
+            let data = backend.get_range(&file_path, 0..first_chunk_size).await?;
             let first_bytes = data.to_vec();
 
             if first_bytes.len() < HEADER_SIZE {
@@ -233,8 +228,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 )));
             }
 
-            let header =
-                FileHeader::read_from(&mut Cursor::new(&first_bytes[..HEADER_SIZE]))?;
+            let header = FileHeader::read_from(&mut Cursor::new(&first_bytes[..HEADER_SIZE]))?;
 
             if header.has_front_catalog()
                 && header.front_catalog_offset > 0
@@ -242,13 +236,13 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             {
                 // Cloud-ready: front catalog is at start of file
                 let fc_offset = header.front_catalog_offset;
-                let fc_end = fc_offset.checked_add(header.front_catalog_length).ok_or_else(|| {
-                    CloudError::SliceBoundsExceeded {
+                let fc_end = fc_offset
+                    .checked_add(header.front_catalog_length)
+                    .ok_or_else(|| CloudError::SliceBoundsExceeded {
                         offset: fc_offset as usize,
                         length: header.front_catalog_length as usize,
                         data_len: 0,
-                    }
-                })?;
+                    })?;
 
                 let fc_bytes = if (fc_end as usize) <= first_bytes.len() {
                     first_bytes[fc_offset as usize..fc_end as usize].to_vec()
@@ -259,10 +253,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                         .to_vec()
                 };
 
-                let catalog = FullCatalog::read_from(
-                    &mut Cursor::new(&fc_bytes),
-                    fc_bytes.len(),
-                )?;
+                let catalog = FullCatalog::read_from(&mut Cursor::new(&fc_bytes), fc_bytes.len())?;
 
                 Ok(CloudReader {
                     backend,
@@ -273,23 +264,20 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             } else {
                 // Not cloud-ready: read full catalog at EOF
                 let fc_offset = header.full_catalog_offset;
-                let fc_end = fc_offset.checked_add(header.full_catalog_length).ok_or_else(|| {
-                    CloudError::SliceBoundsExceeded {
+                let fc_end = fc_offset
+                    .checked_add(header.full_catalog_length)
+                    .ok_or_else(|| CloudError::SliceBoundsExceeded {
                         offset: fc_offset as usize,
                         length: header.full_catalog_length as usize,
                         data_len: 0,
-                    }
-                })?;
+                    })?;
 
                 let fc_bytes = backend
                     .get_range(&file_path, fc_offset..fc_end)
                     .await?
                     .to_vec();
 
-                let catalog = FullCatalog::read_from(
-                    &mut Cursor::new(&fc_bytes),
-                    fc_bytes.len(),
-                )?;
+                let catalog = FullCatalog::read_from(&mut Cursor::new(&fc_bytes), fc_bytes.len())?;
 
                 Ok(CloudReader {
                     backend,
@@ -397,11 +385,7 @@ mod tests {
         (indptr, indices, values)
     }
 
-    fn write_test_file(
-        dir: &tempfile::TempDir,
-        n_obs: usize,
-        n_vars: usize,
-    ) -> std::path::PathBuf {
+    fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> std::path::PathBuf {
         let path = dir.path().join("test.scx");
         let header = sample_header(n_obs as u64, n_vars as u64);
         let mut writer = ScxWriter::new(&path, header).unwrap();
