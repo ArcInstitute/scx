@@ -14,6 +14,8 @@ export(scx_compact)
 export(scx_delete)
 export(scx_merge)
 export(scx_rollback)
+export(from_seurat)
+export(from_sce)
 
 importFrom(Matrix, t)
 importFrom(methods, new)

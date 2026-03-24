@@ -68,4 +68,15 @@ RQueryResult$.wrap <- function(ptr) {
 }
 class(RQueryResult) <- "RQueryResult__class"
 
+# ── Import functions (interop module) ──────────────────────────
+#' @export
+from_seurat <- function(seurat_obj, output_path) {
+  invisible(.Call(wrap__from_seurat, seurat_obj, output_path))
+}
+
+#' @export
+from_sce <- function(sce_obj, output_path) {
+  invisible(.Call(wrap__from_sce, sce_obj, output_path))
+}
+
 # nolint end

@@ -130,5 +130,6 @@ extendr_module! {
     mod rscx;
     use query;
     use ops;
+    use interop;
     impl ScxExperiment;
 }

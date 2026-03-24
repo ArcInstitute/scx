@@ -8,6 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use extendr_api::prelude::*;
+use scx_codec::ValueEncoding;
 use scx_sparse::ScxCsr;
 
 // ─── Arrow RecordBatch → R data.frame ────────────────────────────────────────
@@ -386,16 +387,15 @@ use scx_engine::pipeline::QueryResult;
 pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
     let dgc = csr_to_dgcmatrix(&result.x)?;
     let obs_df = record_batch_to_dataframe(&result.obs)?;
-    let _var_df = record_batch_to_dataframe(&result.var)?;
+    let var_df = record_batch_to_dataframe(&result.var)?;
 
-    // Factor complex R logic into a helper to avoid R!() limitations.
-    // R!() interpolation with {{}} only works for simple expressions.
     R!("
         if (!requireNamespace('Seurat', quietly = TRUE))
             stop('Seurat >= 5.0.0 is required for to_seurat()')
         counts_t <- Matrix::t({{dgc}})
         seu <- Seurat::CreateSeuratObject(counts = counts_t)
         seu@meta.data <- {{obs_df}}
+        seu[['RNA']]@meta.data <- {{var_df}}
         seu
     ")
     .map_err(|e| Error::Other(format!("Seurat construction failed: {}", e)))
@@ -443,7 +443,11 @@ pub fn to_sce(result: &QueryResult) -> Result<Robj> {
 ///   - CSC "columns" (dimension 1) become CSR columns
 ///
 /// Since Seurat/SCE store genes × cells, we transpose to get cells × genes (SCX layout).
-fn dgcmatrix_to_csr(dgc: &Robj) -> Result<(Vec<u64>, Vec<u32>, Vec<u8>, usize, usize)> {
+///
+/// Returns (indptr, indices, value_bytes, n_rows, n_cols, encoding).
+type CsrData = (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize, ValueEncoding);
+
+fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
     // Extract dgCMatrix slots via R
     let dim_robj = R!("{{dgc}}@Dim")
         .map_err(|e| Error::Other(format!("failed to get Dim: {}", e)))?;
@@ -522,21 +526,36 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<(Vec<u64>, Vec<u32>, Vec<u8>, usize, u
         }
     }
 
-    // Convert f64 values to u8 byte representation
-    // Detect if values are integer-like (common for counts)
-    let all_integer = csr_values_f64.iter().all(|&v| v == v.floor() && v >= 0.0 && v <= 255.0);
+    // Detect value encoding: integer-like values get uint8/uint16/uint32,
+    // otherwise fall back to float32. Mirrors scx-cli detect_value_encoding_only().
+    let all_integer = csr_values_f64.iter().all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
 
-    let values_bytes = if all_integer {
-        // Store as uint8
-        csr_values_f64.iter().map(|&v| v as u8).collect()
+    let (values_bytes, value_encoding) = if all_integer {
+        let max_val: f64 = csr_values_f64.iter().copied().fold(0.0f64, f64::max);
+        if max_val <= 255.0 {
+            (csr_values_f64.iter().map(|&v| v as u8).collect(), ValueEncoding::Uint8)
+        } else if max_val <= 65535.0 {
+            let mut buf = Vec::with_capacity(csr_values_f64.len() * 2);
+            for &v in &csr_values_f64 {
+                buf.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+            (buf, ValueEncoding::Uint16)
+        } else {
+            let mut buf = Vec::with_capacity(csr_values_f64.len() * 4);
+            for &v in &csr_values_f64 {
+                buf.extend_from_slice(&(v as u32).to_le_bytes());
+            }
+            (buf, ValueEncoding::Uint32)
+        }
     } else {
-        // Store as float32
-        csr_values_f64.iter()
-            .flat_map(|&v| (v as f32).to_le_bytes())
-            .collect()
+        let mut buf = Vec::with_capacity(csr_values_f64.len() * 4);
+        for &v in &csr_values_f64 {
+            buf.extend_from_slice(&(v as f32).to_le_bytes());
+        }
+        (buf, ValueEncoding::Float32)
     };
 
-    Ok((csr_indptr, csr_indices, values_bytes, csr_n_rows, csr_n_cols))
+    Ok((csr_indptr, csr_indices, values_bytes, csr_n_rows, csr_n_cols, value_encoding))
 }
 
 /// Convert an R data.frame to an Arrow RecordBatch for writing obs/var.
@@ -615,9 +634,12 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
 /// Extracts the counts dgCMatrix (CSC, genes × cells), transposes to CSR
 /// (cells × genes), and writes via ScxWriter.
 /// Extracts meta.data → obs, feature metadata → var.
+/// @export
+#[extendr]
 pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
-    use scx_codec::{CodecId, ValueEncoding};
+    use scx_codec::CodecId;
     use scx_format::header::FileHeader;
+    use scx_format::select_codec;
     use scx_format::writer::ScxWriter;
 
     // Clone Robj before each R!() call — the macro moves the value
@@ -648,7 +670,7 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
     };
 
     // 4. Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
-    let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars) =
+    let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
         dgcmatrix_to_csr(&counts)?;
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
@@ -657,13 +679,9 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
     let obs_batch = dataframe_to_record_batch(&obs_df)?;
     let var_batch = dataframe_to_record_batch(&var_df)?;
 
-    // 6. Determine value encoding and build header
-    let all_u8 = values_bytes.len() == nnz as usize;
-    let value_encoding = if all_u8 {
-        ValueEncoding::Uint8
-    } else {
-        ValueEncoding::Float32
-    };
+    // 6. Build header — codec_id set to first shard's codec (updated below)
+    let shard_target_rows: usize = 16384;
+    let n_shards = (n_obs + shard_target_rows - 1) / shard_target_rows.max(1);
 
     let header = FileHeader {
         magic: scx_format::MAGIC,
@@ -673,10 +691,10 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
         n_obs: n_obs as u64,
         n_vars: n_vars as u64,
         nnz,
-        n_csr_shards: 0,
+        n_csr_shards: n_shards as u32,
         n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: CodecId::None as u8,
+        shard_target_rows: shard_target_rows as u32,
+        codec_id: CodecId::None as u8, // placeholder, per-shard codec used
         index_dtype: if n_vars <= 65535 { 0 } else { 1 },
         endian: 0,
         reserved_padding: 0,
@@ -692,7 +710,7 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
         reserved: [0u8; 132],
     };
 
-    // 7. Write SCX file
+    // 7. Write SCX file with multi-shard splitting + auto-codec
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
 
@@ -701,16 +719,39 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
     writer.write_var(&var_batch)
         .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
 
-    // Convert indices to u32 (already u32) and write shard
-    writer.write_csr_shard(
-        &csr_indptr,
-        &csr_indices,
-        &values_bytes,
-        CodecId::None,
-        value_encoding,
-        0, // row_start
-    )
-    .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+    let bw = value_encoding.byte_width();
+    let mut row_start: usize = 0;
+    while row_start < n_obs {
+        let row_end = (row_start + shard_target_rows).min(n_obs);
+
+        // Rebase indptr for this shard
+        let base = csr_indptr[row_start];
+        let shard_indptr: Vec<u64> = csr_indptr[row_start..=row_end]
+            .iter()
+            .map(|&v| v - base)
+            .collect();
+
+        // Slice indices and values
+        let nnz_start = base as usize;
+        let nnz_end = csr_indptr[row_end] as usize;
+        let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
+        let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
+
+        // Auto-select codec per shard
+        let codec = select_codec(shard_values, value_encoding);
+
+        writer.write_csr_shard(
+            &shard_indptr,
+            &shard_indices,
+            shard_values,
+            codec,
+            value_encoding,
+            row_start as u64,
+        )
+        .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+
+        row_start = row_end;
+    }
 
     writer.finish()
         .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
@@ -720,9 +761,12 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
 
 /// Import a SingleCellExperiment to an SCX file.
 /// Same CSC→CSR transpose as from_seurat.
+/// @export
+#[extendr]
 pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
-    use scx_codec::{CodecId, ValueEncoding};
+    use scx_codec::CodecId;
     use scx_format::header::FileHeader;
+    use scx_format::select_codec;
     use scx_format::writer::ScxWriter;
 
     // Clone Robj before each R!() call — the macro moves the value
@@ -747,7 +791,7 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
         .map_err(|e| Error::Other(format!("failed to extract rowData: {}", e)))?;
 
     // 4. Transpose dgCMatrix (CSC, genes × cells) → CSR (cells × genes)
-    let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars) =
+    let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
         dgcmatrix_to_csr(&counts)?;
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
@@ -756,13 +800,9 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
     let obs_batch = dataframe_to_record_batch(&obs_df)?;
     let var_batch = dataframe_to_record_batch(&var_df)?;
 
-    // 6. Determine value encoding
-    let all_u8 = values_bytes.len() == nnz as usize;
-    let value_encoding = if all_u8 {
-        ValueEncoding::Uint8
-    } else {
-        ValueEncoding::Float32
-    };
+    // 6. Build header with shard count
+    let shard_target_rows: usize = 16384;
+    let n_shards = (n_obs + shard_target_rows - 1) / shard_target_rows.max(1);
 
     let header = FileHeader {
         magic: scx_format::MAGIC,
@@ -772,10 +812,10 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
         n_obs: n_obs as u64,
         n_vars: n_vars as u64,
         nnz,
-        n_csr_shards: 0,
+        n_csr_shards: n_shards as u32,
         n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: CodecId::None as u8,
+        shard_target_rows: shard_target_rows as u32,
+        codec_id: CodecId::None as u8, // placeholder, per-shard codec used
         index_dtype: if n_vars <= 65535 { 0 } else { 1 },
         endian: 0,
         reserved_padding: 0,
@@ -791,7 +831,7 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
         reserved: [0u8; 132],
     };
 
-    // 7. Write SCX file
+    // 7. Write SCX file with multi-shard splitting + auto-codec
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
 
@@ -800,18 +840,50 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
     writer.write_var(&var_batch)
         .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
 
-    writer.write_csr_shard(
-        &csr_indptr,
-        &csr_indices,
-        &values_bytes,
-        CodecId::None,
-        value_encoding,
-        0,
-    )
-    .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+    let bw = value_encoding.byte_width();
+    let mut row_start: usize = 0;
+    while row_start < n_obs {
+        let row_end = (row_start + shard_target_rows).min(n_obs);
+
+        // Rebase indptr for this shard
+        let base = csr_indptr[row_start];
+        let shard_indptr: Vec<u64> = csr_indptr[row_start..=row_end]
+            .iter()
+            .map(|&v| v - base)
+            .collect();
+
+        // Slice indices and values
+        let nnz_start = base as usize;
+        let nnz_end = csr_indptr[row_end] as usize;
+        let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
+        let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
+
+        // Auto-select codec per shard
+        let codec = select_codec(shard_values, value_encoding);
+
+        writer.write_csr_shard(
+            &shard_indptr,
+            &shard_indices,
+            shard_values,
+            codec,
+            value_encoding,
+            row_start as u64,
+        )
+        .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
+
+        row_start = row_end;
+    }
 
     writer.finish()
         .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
 
     Ok(())
+}
+
+// ─── Module Registration ─────────────────────────────────────────────────────
+
+extendr_module! {
+    mod interop;
+    fn from_seurat;
+    fn from_sce;
 }
