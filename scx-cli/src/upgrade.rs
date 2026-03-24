@@ -45,7 +45,12 @@ pub fn run_upgrade(
     };
 
     // 4. Re-read and re-write using current writer
-    rewrite_with_current_version(&reader, &output_path)?;
+    let rewrite_result = rewrite_with_current_version(&reader, &output_path);
+    if rewrite_result.is_err() && in_place {
+        // Clean up orphaned temp file on failure
+        let _ = std::fs::remove_file(&output_path);
+    }
+    rewrite_result?;
 
     let new_reader = ScxReader::open(&output_path)?;
     let new_version = new_reader.header().format_version;
@@ -81,25 +86,12 @@ fn rewrite_with_current_version(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let in_header = reader.header();
 
-    // Determine value encoding & codec from first CSR shard header (if any)
     let csr_entries = reader.catalog().shards_sorted();
-    let (value_encoding, shard_codec) = if !csr_entries.is_empty() {
-        let section = reader.section_bytes(csr_entries[0])?;
-        let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-            &section[..scx_format::SHARD_HEADER_SIZE],
-        ))?;
-        let ve = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
-        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
-        (ve, ci)
-    } else {
-        (ValueEncoding::Uint16, CodecId::None)
-    };
 
-    // Set up output header (writer will stamp format_version in finish())
+    // Set up output header
     let out_header = FileHeader {
         magic: scx_format::MAGIC,
-        format_version: 1, // overwritten by finish()
+        format_version: CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: in_header.flags,
         n_obs: in_header.n_obs,
@@ -133,8 +125,13 @@ fn rewrite_with_current_version(
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
-    // Re-write CSR shards
+    // Re-write CSR shards (per-shard codec)
     for shard_entry in &csr_entries {
+        let sh = reader.read_shard_header(shard_entry)?;
+        let ve = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
         let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
 
@@ -143,20 +140,20 @@ fn rewrite_with_current_version(
 
         let mut raw_values = Vec::new();
         for &v in &data {
-            encode_value(&mut raw_values, v, value_encoding)?;
+            encode_value(&mut raw_values, v, ve)?;
         }
 
         writer.write_csr_shard(
             &indptr_u64,
             &indices_u32,
             &raw_values,
-            shard_codec,
-            value_encoding,
+            ci,
+            ve,
             shard_row_start,
         )?;
     }
 
-    // Re-write CSC shards (if present)
+    // Re-write CSC shards (if present, per-shard codec)
     let csc_entries: Vec<&scx_format::FullCatalogEntry> = reader
         .catalog()
         .entries
@@ -165,36 +162,23 @@ fn rewrite_with_current_version(
         .collect();
 
     for csc_entry in &csc_entries {
+        let sh = reader.read_shard_header(csc_entry)?;
+        let ve = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+
         let (indptr, indices, data) = reader.read_shard_from_entry(csc_entry)?;
         let col_start = csc_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
 
         let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
         let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
 
-        // Determine CSC-specific encoding if available
-        let (csc_ve, csc_codec) = {
-            let section = reader.section_bytes(csc_entry)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            let ve = ValueEncoding::from_u8(sh.value_encoding).unwrap_or(value_encoding);
-            let ci = CodecId::from_u8(sh.codec_id).unwrap_or(shard_codec);
-            (ve, ci)
-        };
-
         let mut raw_values = Vec::new();
         for &v in &data {
-            encode_value(&mut raw_values, v, csc_ve)?;
+            encode_value(&mut raw_values, v, ve)?;
         }
 
-        writer.write_csc_shard(
-            &indptr_u64,
-            &indices_u32,
-            &raw_values,
-            csc_codec,
-            csc_ve,
-            col_start,
-        )?;
+        writer.write_csc_shard(&indptr_u64, &indices_u32, &raw_values, ci, ve, col_start)?;
     }
 
     // Re-write layers
@@ -210,43 +194,30 @@ fn rewrite_with_current_version(
             })
             .collect();
 
-        let layer_ve = if let Some(first) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            ValueEncoding::from_u8(sh.value_encoding).unwrap_or(value_encoding)
-        } else {
-            value_encoding
-        };
-        let layer_codec = if let Some(first) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            CodecId::from_u8(sh.codec_id).unwrap_or(shard_codec)
-        } else {
-            shard_codec
-        };
-
         let mut sorted_entries = layer_shard_entries;
         sorted_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
 
         for (shard_idx, entry) in sorted_entries.iter().enumerate() {
+            let sh = reader.read_shard_header(entry)?;
+            let ve = ValueEncoding::from_u8(sh.value_encoding)
+                .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+            let ci =
+                CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+
             let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
             let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
             let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
             let mut raw_values = Vec::new();
             for &v in &data {
-                encode_value(&mut raw_values, v, layer_ve)?;
+                encode_value(&mut raw_values, v, ve)?;
             }
             writer.write_layer_csr_shard(
                 &indptr_u64,
                 &indices_u32,
                 &raw_values,
-                layer_codec,
-                layer_ve,
+                ci,
+                ve,
                 row_start,
                 layer_name,
                 shard_idx as u32,
@@ -304,13 +275,27 @@ fn encode_value(
     encoding: ValueEncoding,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match encoding {
-        ValueEncoding::Uint8 => buf.push(value as u8),
-        ValueEncoding::Uint16 => buf.extend_from_slice(&(value as u16).to_le_bytes()),
-        ValueEncoding::Uint32 => buf.extend_from_slice(&(value as u32).to_le_bytes()),
+        ValueEncoding::Uint8 => {
+            if !(0.0..=255.0).contains(&value) {
+                return Err(format!("value {value} out of range for uint8 (0..255)").into());
+            }
+            buf.push(value as u8);
+        }
+        ValueEncoding::Uint16 => {
+            if !(0.0..=65535.0).contains(&value) {
+                return Err(format!("value {value} out of range for uint16 (0..65535)").into());
+            }
+            buf.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        ValueEncoding::Uint32 => {
+            if !(0.0..=u32::MAX as f32).contains(&value) {
+                return Err(format!("value {value} out of range for uint32").into());
+            }
+            buf.extend_from_slice(&(value as u32).to_le_bytes());
+        }
         ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
         ValueEncoding::Float16 => {
-            let f16_val = half::f16::from_f32(value);
-            buf.extend_from_slice(&f16_val.to_le_bytes());
+            buf.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
         }
     }
     Ok(())
