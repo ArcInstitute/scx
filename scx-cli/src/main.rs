@@ -4,6 +4,7 @@ use std::process;
 
 mod append;
 mod benchmark;
+mod build_csc;
 mod compact;
 mod convert;
 mod delete;
@@ -218,6 +219,20 @@ enum Commands {
         #[arg(long, default_value = "8")]
         parallelism: usize,
     },
+    /// Build CSC (column-major) shards from existing CSR data
+    BuildCsc {
+        /// Input SCX file (must have CSR shards)
+        input: PathBuf,
+        /// Output SCX file (will contain both CSR and CSC shards)
+        output: PathBuf,
+        /// Maximum memory for transpose working set (default: 4G)
+        /// Accepts suffixes: K, M, G (e.g., "100M", "4G")
+        #[arg(long, default_value = "4G")]
+        memory_limit: String,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -299,6 +314,12 @@ fn main() {
             runs,
             json,
         } => benchmark::run_benchmark(&file, compare_h5ad.as_deref(), runs, json),
+        Commands::BuildCsc {
+            input,
+            output,
+            memory_limit,
+            force,
+        } => build_csc::run_build_csc(&input, &output, &memory_limit, force),
         #[cfg(feature = "cloud")]
         Commands::CloudOptimize { input, output } => {
             cloud_optimize::run_cloud_optimize(&input, output.as_deref())
