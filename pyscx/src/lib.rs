@@ -101,4 +101,3 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::TrainingDataset>()?;
     Ok(())
 }
-

@@ -64,8 +64,14 @@ mod tests {
         assert_eq!(SectionType::from_u8(0), Some(SectionType::ObsMetadata));
         assert_eq!(SectionType::from_u8(4), Some(SectionType::CsrShard));
         assert_eq!(SectionType::from_u8(12), Some(SectionType::DeletionVectors));
-        assert_eq!(SectionType::from_u8(13), Some(SectionType::ObsPredicateIndex));
-        assert_eq!(SectionType::from_u8(14), Some(SectionType::VarPredicateIndex));
+        assert_eq!(
+            SectionType::from_u8(13),
+            Some(SectionType::ObsPredicateIndex)
+        );
+        assert_eq!(
+            SectionType::from_u8(14),
+            Some(SectionType::VarPredicateIndex)
+        );
     }
 
     #[test]

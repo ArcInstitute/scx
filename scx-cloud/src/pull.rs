@@ -62,11 +62,7 @@ pub struct PullStats {
 ///
 /// The source can be a local directory path or a cloud URL pointing to an
 /// exploded `.scxd` directory.
-pub async fn pull(
-    source: &str,
-    dest: &Path,
-    options: PullOptions,
-) -> Result<PullStats> {
+pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<PullStats> {
     let start = Instant::now();
 
     // 1. Parse location and create backend
@@ -146,7 +142,8 @@ pub async fn pull(
             .push(entry);
     }
 
-    let known_types: std::collections::HashSet<u8> = section_order.iter().map(|&st| st as u8).collect();
+    let known_types: std::collections::HashSet<u8> =
+        section_order.iter().map(|&st| st as u8).collect();
     let mut ordered_entries: Vec<&FullCatalogEntry> =
         Vec::with_capacity(original_catalog.entries.len());
     for &st in section_order {
@@ -170,8 +167,9 @@ pub async fn pull(
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type)
-                .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             Ok((i, rel_path))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -201,11 +199,8 @@ pub async fn pull(
     downloaded_sections.sort_by_key(|(idx, _)| *idx);
 
     // 5. Write packed output file
-    let tmp_path = std::path::PathBuf::from(format!(
-        "{}.tmp.{}",
-        dest.display(),
-        std::process::id()
-    ));
+    let tmp_path =
+        std::path::PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -576,8 +571,9 @@ pub async fn pull_filtered(
     let download_tasks: Vec<(String, String)> = entries_to_download
         .iter()
         .map(|entry| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type)
-                .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             Ok((entry.name.clone(), rel_path))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -609,11 +605,8 @@ pub async fn pull_filtered(
     let filtered_obs_bytes = record_batch_to_arrow_ipc(&filtered_obs)?;
 
     // 7. Write packed output
-    let tmp_path = std::path::PathBuf::from(format!(
-        "{}.tmp.{}",
-        dest.display(),
-        std::process::id()
-    ));
+    let tmp_path =
+        std::path::PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -782,7 +775,9 @@ pub async fn pull_filtered(
 }
 
 /// Build a path-constructing closure from a parsed location.
-pub(crate) fn build_path_fn(location: &crate::backend::CloudLocation) -> Box<dyn Fn(&str) -> ObjPath + '_> {
+pub(crate) fn build_path_fn(
+    location: &crate::backend::CloudLocation,
+) -> Box<dyn Fn(&str) -> ObjPath + '_> {
     match location {
         crate::backend::CloudLocation::Local(_) => {
             Box::new(|filename: &str| ObjPath::from(filename))
@@ -827,17 +822,14 @@ fn filter_record_batch(
 fn record_batch_to_arrow_ipc(batch: &arrow::array::RecordBatch) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
-        let mut ipc_writer =
-            arrow::ipc::writer::FileWriter::try_new(&mut buf, &batch.schema())
-                .map_err(|e| {
-                    CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                })?;
-        ipc_writer.write(batch).map_err(|e| {
-            CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
-        ipc_writer.finish().map_err(|e| {
-            CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
+        let mut ipc_writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &batch.schema())
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        ipc_writer
+            .write(batch)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        ipc_writer
+            .finish()
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     }
     Ok(buf)
 }

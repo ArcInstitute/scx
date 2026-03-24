@@ -149,9 +149,9 @@ mod tests {
         proj.scatter_row(&csr_indices, &csr_data, &mut output);
 
         // Only the 3 HVG genes should have values
-        assert_eq!(output[0], 2.0);  // gene 100 → output position 0
-        assert_eq!(output[1], 4.0);  // gene 500 → output position 1
-        assert_eq!(output[2], 6.0);  // gene 29999 → output position 2
+        assert_eq!(output[0], 2.0); // gene 100 → output position 0
+        assert_eq!(output[1], 4.0); // gene 500 → output position 1
+        assert_eq!(output[2], 6.0); // gene 29999 → output position 2
     }
 
     #[test]
@@ -163,8 +163,8 @@ mod tests {
 
         proj.scatter_row(&csr_indices, &csr_data, &mut output);
 
-        assert_eq!(output[0], 3.0);  // gene 5 → position 0
-        assert_eq!(output[1], 5.0);  // gene 10 → position 1
+        assert_eq!(output[0], 3.0); // gene 5 → position 0
+        assert_eq!(output[1], 5.0); // gene 10 → position 1
     }
 
     #[test]
@@ -278,6 +278,9 @@ mod tests {
         let result = scatter_row_full(&csr_indices, &csr_data, &mut output);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("out of bounds"), "expected 'out of bounds' in: {msg}");
+        assert!(
+            msg.contains("out of bounds"),
+            "expected 'out of bounds' in: {msg}"
+        );
     }
 }

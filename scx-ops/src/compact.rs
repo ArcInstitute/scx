@@ -96,8 +96,9 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             0 // default to uint8
         }
     };
-    let value_encoding = ValueEncoding::from_u8(value_encoding_u8)
-        .ok_or(crate::error::OpsError::UnknownValueEncoding(value_encoding_u8))?;
+    let value_encoding = ValueEncoding::from_u8(value_encoding_u8).ok_or(
+        crate::error::OpsError::UnknownValueEncoding(value_encoding_u8),
+    )?;
 
     // Decode all shards and filter rows
     let shard_target = in_header.shard_target_rows;
@@ -210,8 +211,9 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
-            ValueEncoding::from_u8(sh.value_encoding)
-                .ok_or(crate::error::OpsError::UnknownValueEncoding(sh.value_encoding))?
+            ValueEncoding::from_u8(sh.value_encoding).ok_or(
+                crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
+            )?
         } else {
             value_encoding
         };

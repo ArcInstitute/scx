@@ -80,19 +80,20 @@ pub async fn io_stage(
 
     // Pre-compute per-shard deletion bitmaps for O(1) lookup.
     // Map: shard_index (position in sorted list) → RoaringBitmap of deleted local rows.
-    let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> = Arc::new(match &deletion_vectors {
-        Some(dv) => {
-            let mut map = std::collections::HashMap::new();
-            for sd in &dv.shards {
-                let shard_idx = sd.shard_id as usize;
-                if shard_idx < n_shards && !sd.bitmap.is_empty() {
-                    map.insert(shard_idx, sd.bitmap.clone());
+    let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> =
+        Arc::new(match &deletion_vectors {
+            Some(dv) => {
+                let mut map = std::collections::HashMap::new();
+                for sd in &dv.shards {
+                    let shard_idx = sd.shard_id as usize;
+                    if shard_idx < n_shards && !sd.bitmap.is_empty() {
+                        map.insert(shard_idx, sd.bitmap.clone());
+                    }
                 }
+                map
             }
-            map
-        }
-        None => std::collections::HashMap::new(),
-    });
+            None => std::collections::HashMap::new(),
+        });
 
     let profile = profiling_enabled();
     let io_start = Instant::now();
@@ -125,12 +126,15 @@ pub async fn io_stage(
                 let entry = sorted[shard_idx];
 
                 // Extract row metadata from catalog stats.
-                let stats = entry.stats.as_ref().ok_or_else(|| LoaderError::ConfigError {
-                    reason: format!(
-                        "shard '{}' has no stats (row_start/row_end unavailable)",
-                        entry.name
-                    ),
-                })?;
+                let stats = entry
+                    .stats
+                    .as_ref()
+                    .ok_or_else(|| LoaderError::ConfigError {
+                        reason: format!(
+                            "shard '{}' has no stats (row_start/row_end unavailable)",
+                            entry.name
+                        ),
+                    })?;
 
                 let global_row_offset = stats.row_start;
                 let n_rows = if stats.row_end < stats.row_start {
@@ -143,10 +147,7 @@ pub async fn io_stage(
                 } else {
                     let n = stats.row_end - stats.row_start;
                     u32::try_from(n).map_err(|_| LoaderError::ConfigError {
-                        reason: format!(
-                            "shard '{}' row count {} exceeds u32::MAX",
-                            entry.name, n
-                        ),
+                        reason: format!("shard '{}' row count {} exceeds u32::MAX", entry.name, n),
                     })?
                 };
 
@@ -175,10 +176,17 @@ pub async fn io_stage(
                 });
             }
 
-            let profile_inner = std::env::var("SCX_LOADER_PROFILE").map(|v| v == "1" || v == "true").unwrap_or(false);
+            let profile_inner = std::env::var("SCX_LOADER_PROFILE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false);
             if profile_inner {
                 let total_rows: u32 = shards.iter().map(|s| s.n_rows).sum();
-                eprintln!("[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows)", t0.elapsed(), shards.len(), total_rows);
+                eprintln!(
+                    "[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows)",
+                    t0.elapsed(),
+                    shards.len(),
+                    total_rows
+                );
             }
 
             Ok(ShardGroup { shards })
@@ -191,10 +199,20 @@ pub async fn io_stage(
         tx.send(group).await.map_err(|e| {
             LoaderError::ChannelError(format!("I/O stage: failed to send shard group: {e}"))
         })?;
-        if profile { eprintln!("[scx-loader profile] io_stage group {group_num} send wait: {:?}", t_send.elapsed()); }
+        if profile {
+            eprintln!(
+                "[scx-loader profile] io_stage group {group_num} send wait: {:?}",
+                t_send.elapsed()
+            );
+        }
     }
 
-    if profile { eprintln!("[scx-loader profile] io_stage total: {:?} ({group_count} groups)", io_start.elapsed()); }
+    if profile {
+        eprintln!(
+            "[scx-loader profile] io_stage total: {:?} ({group_count} groups)",
+            io_start.elapsed()
+        );
+    }
 
     // Drop sender implicitly when function returns → signals end-of-epoch.
     Ok(())
@@ -330,34 +348,34 @@ mod tests {
     fn test_io_stage_sends_all_groups() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_test_file(&dir, "test.scx", 30, 10, 3);
-        let reader = Arc::new(ScxReader::open(&path).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "test.scx", 30, 10, 3);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
 
-        // 3 shards, group_size=2 → groups: [0,1], [2]
-        let shard_groups = vec![vec![0, 1], vec![2]];
+            // 3 shards, group_size=2 → groups: [0,1], [2]
+            let shard_groups = vec![vec![0, 1], vec![2]];
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
 
-        let mut received_groups = Vec::new();
-        while let Some(group) = rx.recv().await {
-            received_groups.push(group);
-        }
+            let mut received_groups = Vec::new();
+            while let Some(group) = rx.recv().await {
+                received_groups.push(group);
+            }
 
-        handle.await.unwrap().unwrap();
+            handle.await.unwrap().unwrap();
 
-        assert_eq!(received_groups.len(), 2);
-        assert_eq!(received_groups[0].shards.len(), 2);
-        assert_eq!(received_groups[1].shards.len(), 1);
+            assert_eq!(received_groups.len(), 2);
+            assert_eq!(received_groups[0].shards.len(), 2);
+            assert_eq!(received_groups[1].shards.len(), 1);
 
-        // Verify all shards' total rows match n_obs
-        let total_rows: u32 = received_groups
-            .iter()
-            .flat_map(|g| g.shards.iter())
-            .map(|s| s.n_rows)
-            .sum();
-        assert_eq!(total_rows, 30);
+            // Verify all shards' total rows match n_obs
+            let total_rows: u32 = received_groups
+                .iter()
+                .flat_map(|g| g.shards.iter())
+                .map(|s| s.n_rows)
+                .sum();
+            assert_eq!(total_rows, 30);
         });
     }
 
@@ -365,32 +383,32 @@ mod tests {
     fn test_shard_data_correct() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_test_file(&dir, "test.scx", 10, 5, 1);
-        let reader = Arc::new(ScxReader::open(&path).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "test.scx", 10, 5, 1);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
 
-        // Read via io_stage
-        let shard_groups = vec![vec![0]];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let r2 = Arc::clone(&reader);
-        let handle = tokio::spawn(io_stage(r2, shard_groups, None, tx));
+            // Read via io_stage
+            let shard_groups = vec![vec![0]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let r2 = Arc::clone(&reader);
+            let handle = tokio::spawn(io_stage(r2, shard_groups, None, tx));
 
-        let group = rx.recv().await.unwrap();
-        handle.await.unwrap().unwrap();
+            let group = rx.recv().await.unwrap();
+            handle.await.unwrap().unwrap();
 
-        assert_eq!(group.shards.len(), 1);
-        let shard = &group.shards[0];
+            assert_eq!(group.shards.len(), 1);
+            let shard = &group.shards[0];
 
-        // Read directly via ScxReader for comparison
-        let (expected_indptr, expected_indices, expected_data) =
-            reader.read_csr_shard(0).unwrap();
+            // Read directly via ScxReader for comparison
+            let (expected_indptr, expected_indices, expected_data) =
+                reader.read_csr_shard(0).unwrap();
 
-        assert_eq!(shard.indptr, expected_indptr);
-        assert_eq!(shard.indices, expected_indices);
-        assert_eq!(shard.data, expected_data);
-        assert_eq!(shard.global_row_offset, 0);
-        assert_eq!(shard.n_rows, 10);
-        assert!(shard.deleted_rows.is_none());
+            assert_eq!(shard.indptr, expected_indptr);
+            assert_eq!(shard.indices, expected_indices);
+            assert_eq!(shard.data, expected_data);
+            assert_eq!(shard.global_row_offset, 0);
+            assert_eq!(shard.n_rows, 10);
+            assert!(shard.deleted_rows.is_none());
         });
     }
 
@@ -398,24 +416,24 @@ mod tests {
     fn test_backpressure() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        // Channel capacity of 1: I/O stage must block until consumed.
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_test_file(&dir, "test.scx", 30, 10, 3);
-        let reader = Arc::new(ScxReader::open(&path).unwrap());
+            // Channel capacity of 1: I/O stage must block until consumed.
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "test.scx", 30, 10, 3);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
 
-        let shard_groups = vec![vec![0], vec![1], vec![2]];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let shard_groups = vec![vec![0], vec![1], vec![2]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-        let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
 
-        // Consume one at a time
-        let mut count = 0;
-        while let Some(_group) = rx.recv().await {
-            count += 1;
-        }
+            // Consume one at a time
+            let mut count = 0;
+            while let Some(_group) = rx.recv().await {
+                count += 1;
+            }
 
-        handle.await.unwrap().unwrap();
-        assert_eq!(count, 3);
+            handle.await.unwrap().unwrap();
+            assert_eq!(count, 3);
         });
     }
 
@@ -423,21 +441,21 @@ mod tests {
     fn test_single_shard_file() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_test_file(&dir, "single.scx", 5, 3, 1);
-        let reader = Arc::new(ScxReader::open(&path).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "single.scx", 5, 3, 1);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
 
-        let shard_groups = vec![vec![0]];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let shard_groups = vec![vec![0]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
 
-        let group = rx.recv().await.unwrap();
-        assert_eq!(group.shards.len(), 1);
-        assert_eq!(group.shards[0].n_rows, 5);
+            let group = rx.recv().await.unwrap();
+            assert_eq!(group.shards.len(), 1);
+            assert_eq!(group.shards[0].n_rows, 5);
 
-        // Channel should close after all groups sent
-        assert!(rx.recv().await.is_none());
-        handle.await.unwrap().unwrap();
+            // Channel should close after all groups sent
+            assert!(rx.recv().await.is_none());
+            handle.await.unwrap().unwrap();
         });
     }
 
@@ -445,34 +463,34 @@ mod tests {
     fn test_fully_deleted_shard_excluded() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        // 2 shards with 5 rows each
-        let path = write_test_file(&dir, "del.scx", 10, 5, 2);
-        let reader = Arc::new(ScxReader::open(&path).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            // 2 shards with 5 rows each
+            let path = write_test_file(&dir, "del.scx", 10, 5, 2);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
 
-        // Delete ALL rows in shard 0 (local rows 0..5)
-        let mut dv = scx_format::deletion_vectors::DeletionVectors::new();
-        let mut bm = RoaringBitmap::new();
-        for i in 0..5u32 {
-            bm.insert(i);
-        }
-        dv.shards.push(scx_format::deletion_vectors::ShardDeletion {
-            shard_id: 0,
-            bitmap: bm,
-        });
+            // Delete ALL rows in shard 0 (local rows 0..5)
+            let mut dv = scx_format::deletion_vectors::DeletionVectors::new();
+            let mut bm = RoaringBitmap::new();
+            for i in 0..5u32 {
+                bm.insert(i);
+            }
+            dv.shards.push(scx_format::deletion_vectors::ShardDeletion {
+                shard_id: 0,
+                bitmap: bm,
+            });
 
-        let shard_groups = vec![vec![0, 1]];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), tx));
+            let shard_groups = vec![vec![0, 1]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), tx));
 
-        let group = rx.recv().await.unwrap();
-        handle.await.unwrap().unwrap();
+            let group = rx.recv().await.unwrap();
+            handle.await.unwrap().unwrap();
 
-        // Shard 0 should be excluded (fully deleted), only shard 1 remains
-        assert_eq!(group.shards.len(), 1);
-        assert_eq!(group.shards[0].global_row_offset, 5); // shard 1 starts at row 5
-        assert_eq!(group.shards[0].n_rows, 5);
-        assert!(group.shards[0].deleted_rows.is_none());
+            // Shard 0 should be excluded (fully deleted), only shard 1 remains
+            assert_eq!(group.shards.len(), 1);
+            assert_eq!(group.shards[0].global_row_offset, 5); // shard 1 starts at row 5
+            assert_eq!(group.shards[0].n_rows, 5);
+            assert!(group.shards[0].deleted_rows.is_none());
         });
     }
 
@@ -480,43 +498,43 @@ mod tests {
     fn test_partial_deletion_bitmap() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_test_file(&dir, "partial.scx", 10, 5, 2);
-        let reader = Arc::new(ScxReader::open(&path).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "partial.scx", 10, 5, 2);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
 
-        // Delete rows 1 and 3 (local) from shard 0
-        let mut dv = scx_format::deletion_vectors::DeletionVectors::new();
-        let mut bm = RoaringBitmap::new();
-        bm.insert(1);
-        bm.insert(3);
-        dv.shards.push(scx_format::deletion_vectors::ShardDeletion {
-            shard_id: 0,
-            bitmap: bm,
-        });
+            // Delete rows 1 and 3 (local) from shard 0
+            let mut dv = scx_format::deletion_vectors::DeletionVectors::new();
+            let mut bm = RoaringBitmap::new();
+            bm.insert(1);
+            bm.insert(3);
+            dv.shards.push(scx_format::deletion_vectors::ShardDeletion {
+                shard_id: 0,
+                bitmap: bm,
+            });
 
-        let shard_groups = vec![vec![0, 1]];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), tx));
+            let shard_groups = vec![vec![0, 1]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), tx));
 
-        let group = rx.recv().await.unwrap();
-        handle.await.unwrap().unwrap();
+            let group = rx.recv().await.unwrap();
+            handle.await.unwrap().unwrap();
 
-        // Both shards should be present
-        assert_eq!(group.shards.len(), 2);
+            // Both shards should be present
+            assert_eq!(group.shards.len(), 2);
 
-        // Shard 0 should have the deletion bitmap
-        let s0 = &group.shards[0];
-        assert_eq!(s0.global_row_offset, 0);
-        assert!(s0.deleted_rows.is_some());
-        let bm = s0.deleted_rows.as_ref().unwrap();
-        assert!(bm.contains(1));
-        assert!(bm.contains(3));
-        assert!(!bm.contains(0));
-        assert!(!bm.contains(2));
-        assert_eq!(bm.len(), 2);
+            // Shard 0 should have the deletion bitmap
+            let s0 = &group.shards[0];
+            assert_eq!(s0.global_row_offset, 0);
+            assert!(s0.deleted_rows.is_some());
+            let bm = s0.deleted_rows.as_ref().unwrap();
+            assert!(bm.contains(1));
+            assert!(bm.contains(3));
+            assert!(!bm.contains(0));
+            assert!(!bm.contains(2));
+            assert_eq!(bm.len(), 2);
 
-        // Shard 1 should have no deletions
-        assert!(group.shards[1].deleted_rows.is_none());
+            // Shard 1 should have no deletions
+            assert!(group.shards[1].deleted_rows.is_none());
         });
     }
 

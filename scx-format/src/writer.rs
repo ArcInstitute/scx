@@ -410,7 +410,6 @@ impl ScxWriter {
         Ok(())
     }
 
-
     /// Finalize the file: write catalogs, header, fsync, atomic rename.
     ///
     /// Returns the final file path on success.

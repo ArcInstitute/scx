@@ -9,11 +9,12 @@ use hdf5::types::VarLenUnicode;
 
 /// Convert &str to VarLenUnicode, stripping NUL bytes if present.
 fn vlu(s: &str) -> VarLenUnicode {
-    s.parse::<VarLenUnicode>()
-        .unwrap_or_else(|_| {
-            let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
-            cleaned.parse::<VarLenUnicode>().expect("cleaned string should have no NUL bytes")
-        })
+    s.parse::<VarLenUnicode>().unwrap_or_else(|_| {
+        let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
+        cleaned
+            .parse::<VarLenUnicode>()
+            .expect("cleaned string should have no NUL bytes")
+    })
 }
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::reader::ScxReader;

@@ -239,8 +239,9 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: Batch) -> PyResult<Bound<'py, PyDi
                 let codes_arr = PyArray1::from_vec(py, codes_i32);
                 cat_dict.set_item("codes", codes_arr)?;
                 // Categories as Python list of strings
-                let cat_list = PyList::new(py, &categories)
-                    .map_err(|e| PyRuntimeError::new_err(format!("failed to create category list: {e}")))?;
+                let cat_list = PyList::new(py, &categories).map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create category list: {e}"))
+                })?;
                 cat_dict.set_item("categories", cat_list)?;
                 obs_dict.set_item(&name, cat_dict)?;
             }

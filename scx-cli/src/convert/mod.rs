@@ -316,9 +316,8 @@ mod pipeline {
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Slice indices and data
-            let nnz_start = usize::try_from(base).map_err(|_| {
-                ConvertError::Other(format!("negative indptr base {base}"))
-            })?;
+            let nnz_start = usize::try_from(base)
+                .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
             let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
                 ConvertError::Other(format!(
                     "negative indptr value {}",
@@ -329,9 +328,8 @@ mod pipeline {
             let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
                 .iter()
                 .map(|&v| {
-                    u32::try_from(v).map_err(|_| {
-                        ConvertError::Other(format!("negative column index {v}"))
-                    })
+                    u32::try_from(v)
+                        .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let shard_data = &data[nnz_start..nnz_end];
@@ -387,9 +385,8 @@ mod pipeline {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let nnz_start = usize::try_from(base).map_err(|_| {
-                ConvertError::Other(format!("negative indptr base {base}"))
-            })?;
+            let nnz_start = usize::try_from(base)
+                .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
             let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
                 ConvertError::Other(format!(
                     "negative indptr value {}",
@@ -400,9 +397,8 @@ mod pipeline {
             let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
                 .iter()
                 .map(|&v| {
-                    u32::try_from(v).map_err(|_| {
-                        ConvertError::Other(format!("negative column index {v}"))
-                    })
+                    u32::try_from(v)
+                        .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let shard_data = &data[nnz_start..nnz_end];

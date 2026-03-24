@@ -78,12 +78,11 @@ impl ShardGroupIndex {
         global_idx: u64,
         group: &'a ShardGroup,
     ) -> Result<(&'a [i32], &'a [f32])> {
-        let &(shard_idx, local_row) = self
-            .cell_to_shard
-            .get(&global_idx)
-            .ok_or_else(|| LoaderError::ShutdownError(
-                format!("global cell index {global_idx} not found in ShardGroupIndex"),
-            ))?;
+        let &(shard_idx, local_row) = self.cell_to_shard.get(&global_idx).ok_or_else(|| {
+            LoaderError::ShutdownError(format!(
+                "global cell index {global_idx} not found in ShardGroupIndex"
+            ))
+        })?;
 
         let shard = &group.shards[shard_idx];
         let start = shard.indptr[local_row] as usize;
@@ -241,12 +240,11 @@ fn extract_single_column(
 
     match dt {
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| LoaderError::ConfigError {
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                LoaderError::ConfigError {
                     reason: format!("obs column '{col_name}': expected Int64Array"),
-                })?;
+                }
+            })?;
             let values: Vec<i64> = cell_indices
                 .iter()
                 .map(|&idx| arr.value(idx as usize))
@@ -254,12 +252,11 @@ fn extract_single_column(
             Ok(ObsColumn::Int64(values))
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| LoaderError::ConfigError {
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                LoaderError::ConfigError {
                     reason: format!("obs column '{col_name}': expected Int32Array"),
-                })?;
+                }
+            })?;
             let values: Vec<i64> = cell_indices
                 .iter()
                 .map(|&idx| arr.value(idx as usize) as i64)
@@ -361,8 +358,9 @@ fn extract_single_column(
                                 "obs column '{col_name}': dictionary values are not Utf8"
                             ),
                         })?;
-                    let categories: Vec<String> =
-                        (0..values_arr.len()).map(|i| values_arr.value(i).to_string()).collect();
+                    let categories: Vec<String> = (0..values_arr.len())
+                        .map(|i| values_arr.value(i).to_string())
+                        .collect();
                     let codes: Vec<u32> = cell_indices
                         .iter()
                         .map(|&idx| keys.value(idx as usize) as u32)
@@ -386,10 +384,7 @@ fn extract_single_column(
             }
         }
         _ => Err(LoaderError::ConfigError {
-            reason: format!(
-                "obs column '{col_name}': unsupported data type {:?}",
-                dt
-            ),
+            reason: format!("obs column '{col_name}': unsupported data type {:?}", dt),
         }),
     }
 }
@@ -435,7 +430,10 @@ pub fn decode_stage(
     // The shard-level shuffle (Level 1) already happened in shuffle_epoch().
     // Incorporate the epoch number so different epochs produce different row orderings.
     let mut rng = ChaCha8Rng::seed_from_u64(
-        config.seed.wrapping_add(0xDEADBEEF).wrapping_add(epoch.wrapping_mul(0x9E3779B97F4A7C15)),
+        config
+            .seed
+            .wrapping_add(0xDEADBEEF)
+            .wrapping_add(epoch.wrapping_mul(0x9E3779B97F4A7C15)),
     );
 
     let profile = profiling_enabled();
@@ -495,9 +493,7 @@ pub fn decode_stage(
             };
 
             tx.send(batch).map_err(|e| {
-                LoaderError::ChannelError(format!(
-                    "decode stage: failed to send batch: {e}"
-                ))
+                LoaderError::ChannelError(format!("decode stage: failed to send batch: {e}"))
             })?;
             group_batches += 1;
         }
@@ -668,9 +664,8 @@ mod tests {
         let n_genes = 10;
 
         // Parallel fill
-        let parallel_x = fill_batch_parallel(
-            &cell_indices, &index, &group, None, None, false, n_genes,
-        ).unwrap();
+        let parallel_x =
+            fill_batch_parallel(&cell_indices, &index, &group, None, None, false, n_genes).unwrap();
 
         // Sequential fill (manual)
         let mut sequential_x = vec![0.0f32; 4 * n_genes];
@@ -697,8 +692,15 @@ mod tests {
         let n_output = proj.n_output_cols();
 
         let x = fill_batch_parallel(
-            &cell_indices, &index, &group, Some(&proj), None, false, n_output,
-        ).unwrap();
+            &cell_indices,
+            &index,
+            &group,
+            Some(&proj),
+            None,
+            false,
+            n_output,
+        )
+        .unwrap();
 
         assert_eq!(x.len(), 4 * n_output);
         // Row 0: CSR indices=[0,1], values=[1.0, 2.0]
@@ -727,13 +729,15 @@ mod tests {
         let cell_indices: Vec<u64> = vec![0, 1, 2];
         let n_genes = 10;
 
-        let x = fill_batch_parallel(
-            &cell_indices, &index, &group, None, None, false, n_genes,
-        ).unwrap();
+        let x =
+            fill_batch_parallel(&cell_indices, &index, &group, None, None, false, n_genes).unwrap();
 
         // Row 1 (offset 10..20) should be all zeros
         let row1 = &x[n_genes..2 * n_genes];
-        assert!(row1.iter().all(|&v| v == 0.0), "zero-nnz row should be all zeros");
+        assert!(
+            row1.iter().all(|&v| v == 0.0),
+            "zero-nnz row should be all zeros"
+        );
 
         // Row 0 has values at [0, 1]
         assert_eq!(x[0], 1.0);
@@ -759,7 +763,8 @@ mod tests {
             Some(target_sum),
             true,
             n_genes,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Row 0: values [1.0, 2.0] at cols [0, 1], sum=3.0
         // After normalize: [1/3*1e4, 2/3*1e4]
@@ -792,8 +797,7 @@ mod tests {
         let obs = make_obs(10);
         let cell_indices: Vec<u64> = vec![2, 5, 8];
 
-        let result =
-            extract_obs_columns(&obs, &cell_indices, &["count".to_string()]).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &["count".to_string()]).unwrap();
 
         let col = result.get("count").unwrap();
         if let ObsColumn::Int64(values) = col {
@@ -808,8 +812,7 @@ mod tests {
         let obs = make_obs(5);
         let cell_indices: Vec<u64> = vec![0, 1, 2];
 
-        let result =
-            extract_obs_columns(&obs, &cell_indices, &["cell_id".to_string()]).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &["cell_id".to_string()]).unwrap();
 
         let col = result.get("cell_id").unwrap();
         if let ObsColumn::Categorical(codes, categories) = col {
@@ -829,8 +832,7 @@ mod tests {
         let obs = make_obs(5);
         let cell_indices: Vec<u64> = vec![0];
 
-        let result =
-            extract_obs_columns(&obs, &cell_indices, &["nonexistent".to_string()]);
+        let result = extract_obs_columns(&obs, &cell_indices, &["nonexistent".to_string()]);
 
         assert!(result.is_err());
         if let Err(LoaderError::ConfigError { reason }) = result {

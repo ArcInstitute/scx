@@ -314,7 +314,13 @@ fn main() {
             parallelism,
             no_cloud_ready,
             filter,
-        } => pull::run_pull(&source, &dest, parallelism, !no_cloud_ready, filter.as_deref()),
+        } => pull::run_pull(
+            &source,
+            &dest,
+            parallelism,
+            !no_cloud_ready,
+            filter.as_deref(),
+        ),
         #[cfg(feature = "cloud")]
         Commands::Push {
             source,

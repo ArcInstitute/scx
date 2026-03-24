@@ -13,7 +13,6 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
 
-
 use object_store::ObjectStore;
 
 use scx_format::catalog::FullCatalog;
@@ -53,11 +52,7 @@ pub struct PushStats {
 ///
 /// The catalog object is uploaded last. Until it exists, the remote
 /// `.scxd` directory is not openable — providing atomic-publish semantics.
-pub async fn push(
-    source: &Path,
-    dest: &str,
-    options: PushOptions,
-) -> Result<PushStats> {
+pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<PushStats> {
     let start = Instant::now();
 
     // 1. Read the entire source file
@@ -101,13 +96,14 @@ pub async fn push(
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let src_start = entry.offset as usize;
         let src_len = entry.length as usize;
-        let src_end = src_start.checked_add(src_len).ok_or_else(|| {
-            CloudError::SliceBoundsExceeded {
-                offset: src_start,
-                length: src_len,
-                data_len: file_data.len(),
-            }
-        })?;
+        let src_end =
+            src_start
+                .checked_add(src_len)
+                .ok_or_else(|| CloudError::SliceBoundsExceeded {
+                    offset: src_start,
+                    length: src_len,
+                    data_len: file_data.len(),
+                })?;
         if src_end > file_data.len() {
             return Err(CloudError::SliceBoundsExceeded {
                 offset: src_start,
@@ -369,11 +365,8 @@ mod tests {
 
         // Read and validate _catalog.bin
         let catalog_data = std::fs::read(dest_dir.join("_catalog.bin")).unwrap();
-        let catalog = FullCatalog::read_from(
-            &mut Cursor::new(&catalog_data),
-            catalog_data.len(),
-        )
-        .unwrap();
+        let catalog =
+            FullCatalog::read_from(&mut Cursor::new(&catalog_data), catalog_data.len()).unwrap();
 
         // All section files referenced by catalog should exist
         for entry in &catalog.entries {

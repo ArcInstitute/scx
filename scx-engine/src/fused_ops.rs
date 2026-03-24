@@ -40,12 +40,7 @@ pub fn log1p_row(data: &mut [f32], indptr: &[i64], row_idx: usize) {
 /// Computes `ln(x / row_sum * target_sum + 1)` in a single pass, avoiding
 /// an intermediate materialized array. Numerically equivalent to calling
 /// `normalize_row` then `log1p_row` (within f32 rounding).
-pub fn fused_normalize_log1p(
-    data: &mut [f32],
-    indptr: &[i64],
-    row_idx: usize,
-    target_sum: f64,
-) {
+pub fn fused_normalize_log1p(data: &mut [f32], indptr: &[i64], row_idx: usize, target_sum: f64) {
     let start = indptr[row_idx] as usize;
     let end = indptr[row_idx + 1] as usize;
     let row_sum: f64 = data[start..end].iter().map(|&v| v as f64).sum();
@@ -73,9 +68,7 @@ pub fn apply_fused_ops(csr: &mut ScxCsr, normalize: Option<f64>, log1p: bool) {
             (Some(target_sum), true) => {
                 fused_normalize_log1p(&mut csr.data, &csr.indptr, row, target_sum)
             }
-            (Some(target_sum), false) => {
-                normalize_row(&mut csr.data, &csr.indptr, row, target_sum)
-            }
+            (Some(target_sum), false) => normalize_row(&mut csr.data, &csr.indptr, row, target_sum),
             (None, true) => log1p_row(&mut csr.data, &csr.indptr, row),
             (None, false) => {}
         }
@@ -249,13 +242,7 @@ mod tests {
     #[test]
     fn single_nonzero_normalize() {
         // Row with a single non-zero value: after normalize, it should equal target_sum.
-        let mut csr = ScxCsr::new(
-            (1, 5),
-            vec![0, 1],
-            vec![2],
-            vec![42.0],
-        )
-        .unwrap();
+        let mut csr = ScxCsr::new((1, 5), vec![0, 1], vec![2], vec![42.0]).unwrap();
 
         normalize_row(&mut csr.data, &csr.indptr, 0, 10_000.0);
         // 42 / 42 * 10000 = 10000
@@ -264,13 +251,7 @@ mod tests {
 
     #[test]
     fn single_nonzero_fused() {
-        let mut csr = ScxCsr::new(
-            (1, 5),
-            vec![0, 1],
-            vec![2],
-            vec![42.0],
-        )
-        .unwrap();
+        let mut csr = ScxCsr::new((1, 5), vec![0, 1], vec![2], vec![42.0]).unwrap();
 
         fused_normalize_log1p(&mut csr.data, &csr.indptr, 0, 10_000.0);
         // ln(42/42 * 10000 + 1) = ln(10001)

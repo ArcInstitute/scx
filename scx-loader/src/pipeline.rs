@@ -225,8 +225,9 @@ fn estimate_memory(
     const PYTHON_OVERHEAD: usize = 50 * 1024 * 1024;
 
     // Decoded shard size: CSR arrays
-    let decoded_shard_bytes = shard_target_rows * (avg_nnz_per_cell as usize) * BYTES_PER_NNZ_DECODED
-        + (shard_target_rows + 1) * 8; // indptr: (n_rows + 1) × i64
+    let decoded_shard_bytes =
+        shard_target_rows * (avg_nnz_per_cell as usize) * BYTES_PER_NNZ_DECODED
+            + (shard_target_rows + 1) * 8; // indptr: (n_rows + 1) × i64
 
     // I/O pipeline overlap: shard_group_size in channel + 1 being decoded
     let shard_buffer = (shard_group_size + 1) * decoded_shard_bytes;
@@ -291,7 +292,9 @@ impl TrainingPipeline {
         // Open SCX file
         let t0 = Instant::now();
         let reader = Arc::new(ScxReader::open(path)?);
-        if profile { eprintln!("[scx-loader profile] open: {:?}", t0.elapsed()); }
+        if profile {
+            eprintln!("[scx-loader profile] open: {:?}", t0.elapsed());
+        }
 
         // Read header metadata
         let header = reader.header();
@@ -302,12 +305,23 @@ impl TrainingPipeline {
         // Read obs metadata (full RecordBatch for column extraction)
         let t0 = Instant::now();
         let obs_metadata = reader.read_obs()?;
-        if profile { eprintln!("[scx-loader profile] read_obs: {:?} ({} rows)", t0.elapsed(), obs_metadata.num_rows()); }
+        if profile {
+            eprintln!(
+                "[scx-loader profile] read_obs: {:?} ({} rows)",
+                t0.elapsed(),
+                obs_metadata.num_rows()
+            );
+        }
 
         // Load deletion vectors if present
         let t0 = Instant::now();
         let deletion_vectors = reader.read_deletion_vectors()?;
-        if profile { eprintln!("[scx-loader profile] read_deletion_vectors: {:?}", t0.elapsed()); }
+        if profile {
+            eprintln!(
+                "[scx-loader profile] read_deletion_vectors: {:?}",
+                t0.elapsed()
+            );
+        }
 
         // Compute average nnz per cell for memory budget estimation
         let avg_nnz_per_cell = if header.n_obs > 0 {
@@ -348,21 +362,23 @@ impl TrainingPipeline {
             .map(|indices| HvgProjection::new(indices.clone()));
 
         // Create shard shuffler
-        let shuffler = ShardShuffler::new(
-            n_csr_shards,
-            memory_budget.shard_group_size,
-            config.seed,
-        )?;
+        let shuffler =
+            ShardShuffler::new(n_csr_shards, memory_budget.shard_group_size, config.seed)?;
 
         // Create tokio runtime for async I/O
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .map_err(|e| LoaderError::ShutdownError(format!("failed to create tokio runtime: {e}")))?;
+            .map_err(|e| {
+                LoaderError::ShutdownError(format!("failed to create tokio runtime: {e}"))
+            })?;
 
         if profile {
-            eprintln!("[scx-loader profile] TrainingPipeline::new total: {:?}", t_start.elapsed());
+            eprintln!(
+                "[scx-loader profile] TrainingPipeline::new total: {:?}",
+                t_start.elapsed()
+            );
             eprintln!("[scx-loader profile]   n_vars={n_vars}, n_shards={n_csr_shards}, shard_target_rows={shard_target_rows}");
             eprintln!("[scx-loader profile]   memory_budget: shard_group_size={}, prefetch_batches={}, estimated_bytes={}",
                 memory_budget.shard_group_size, memory_budget.prefetch_batches, memory_budget.estimated_bytes);
@@ -415,9 +431,9 @@ impl TrainingPipeline {
         // Spawn I/O stage as a tokio task
         let io_reader = Arc::clone(&self.reader);
         let io_dv = self.deletion_vectors.clone();
-        let io_handle = self.runtime.spawn(async move {
-            io_stage(io_reader, shard_groups, io_dv, io_tx).await
-        });
+        let io_handle = self
+            .runtime
+            .spawn(async move { io_stage(io_reader, shard_groups, io_dv, io_tx).await });
 
         // Spawn decode stage as a standard thread (CPU-bound work)
         let decode_config = self.config.clone();
@@ -428,9 +444,19 @@ impl TrainingPipeline {
         let decode_handle = std::thread::Builder::new()
             .name("scx-decode".to_string())
             .spawn(move || {
-                decode_stage(io_rx, batch_tx, &decode_config, decode_n_vars, decode_projection, &decode_obs, decode_epoch)
+                decode_stage(
+                    io_rx,
+                    batch_tx,
+                    &decode_config,
+                    decode_n_vars,
+                    decode_projection,
+                    &decode_obs,
+                    decode_epoch,
+                )
             })
-            .map_err(|e| LoaderError::ShutdownError(format!("failed to spawn decode thread: {e}")))?;
+            .map_err(|e| {
+                LoaderError::ShutdownError(format!("failed to spawn decode thread: {e}"))
+            })?;
 
         self.batch_rx = Some(batch_rx);
         self.io_handle = Some(io_handle);
@@ -504,14 +530,12 @@ impl TrainingPipeline {
             match self.runtime.block_on(handle) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    return Err(LoaderError::ShutdownError(
-                        format!("I/O stage error: {e}"),
-                    ));
+                    return Err(LoaderError::ShutdownError(format!("I/O stage error: {e}")));
                 }
                 Err(e) => {
-                    return Err(LoaderError::ShutdownError(
-                        format!("I/O stage panicked: {e}"),
-                    ));
+                    return Err(LoaderError::ShutdownError(format!(
+                        "I/O stage panicked: {e}"
+                    )));
                 }
             }
         }
@@ -521,9 +545,9 @@ impl TrainingPipeline {
             match handle.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    return Err(LoaderError::ShutdownError(
-                        format!("decode stage error: {e}"),
-                    ));
+                    return Err(LoaderError::ShutdownError(format!(
+                        "decode stage error: {e}"
+                    )));
                 }
                 Err(_) => {
                     return Err(LoaderError::ShutdownError(
@@ -771,9 +795,7 @@ mod tests {
             hvg_indices: Some((0..2000).collect()),
             ..LoaderConfig::default()
         };
-        let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0, 0,
-        );
+        let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
         let budget_mb = budget.estimated_bytes / (1024 * 1024);
         assert!(
             budget_mb <= 512,
@@ -788,9 +810,7 @@ mod tests {
     #[test]
     fn test_memory_budget_30k_genes_auto_tuned() {
         let config = LoaderConfig::default();
-        let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0, 0,
-        );
+        let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
         assert!(budget.shard_group_size >= 1);
         assert!(budget.prefetch_batches >= 2);
         assert!(budget.batch_size >= 64);
@@ -803,9 +823,7 @@ mod tests {
             max_memory_mb: 128,
             ..LoaderConfig::default()
         };
-        let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0, 0,
-        );
+        let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
         assert!(
             budget.shard_group_size < 8 || budget.prefetch_batches < 4 || budget.batch_size < 1024,
             "128 MB budget should reduce at least one parameter: \
@@ -822,9 +840,7 @@ mod tests {
             max_memory_mb: 64,
             ..LoaderConfig::default()
         };
-        let budget = compute_memory_budget(
-            &config, 30_000, 16_384, 10.0, 0,
-        );
+        let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
         assert_eq!(
             budget.shard_group_size, 1,
             "shard_group_size should be at minimum 1"
@@ -833,10 +849,7 @@ mod tests {
             budget.prefetch_batches, 2,
             "prefetch_batches should be at minimum 2"
         );
-        assert!(
-            budget.batch_size <= 1024,
-            "batch_size should be reduced"
-        );
+        assert!(budget.batch_size <= 1024, "batch_size should be reduced");
     }
 
     #[test]
@@ -850,7 +863,10 @@ mod tests {
             budget.batch_size
         );
         assert!(budget.batch_size >= 64, "batch_size should not go below 64");
-        assert!(!budget.budget_exceeded, "512 MB budget should be achievable with reduced batch_size");
+        assert!(
+            !budget.budget_exceeded,
+            "512 MB budget should be achievable with reduced batch_size"
+        );
     }
 
     #[test]
@@ -864,7 +880,10 @@ mod tests {
         assert_eq!(budget.batch_size, 64);
         assert_eq!(budget.shard_group_size, 1);
         assert_eq!(budget.prefetch_batches, 2);
-        assert!(budget.budget_exceeded, "64 MB budget with 61K genes should exceed budget");
+        assert!(
+            budget.budget_exceeded,
+            "64 MB budget with 61K genes should exceed budget"
+        );
     }
 
     #[test]
@@ -877,7 +896,10 @@ mod tests {
         let budget = compute_memory_budget(&config, 61_497, 16_384, 10.0, 0);
         // batch_size should be a power-of-2 fraction of 1024
         assert!(
-            budget.batch_size == 64 || budget.batch_size == 128 || budget.batch_size == 256 || budget.batch_size == 512,
+            budget.batch_size == 64
+                || budget.batch_size == 128
+                || budget.batch_size == 256
+                || budget.batch_size == 512,
             "batch_size should be a power-of-2 reduction of 1024, got {}",
             budget.batch_size
         );
@@ -965,7 +987,11 @@ mod tests {
         // All cells appear exactly once
         let cell_set: std::collections::HashSet<u64> = all_cells.iter().copied().collect();
         assert_eq!(cell_set.len(), n_obs, "all cells should be unique");
-        assert_eq!(all_cells.len(), n_obs, "all cells should appear exactly once");
+        assert_eq!(
+            all_cells.len(),
+            n_obs,
+            "all cells should appear exactly once"
+        );
         for i in 0..n_obs as u64 {
             assert!(cell_set.contains(&i), "cell {i} missing");
         }
@@ -1100,11 +1126,7 @@ mod tests {
                 cells.extend_from_slice(&batch.cell_indices);
             }
             let set: std::collections::HashSet<u64> = cells.iter().copied().collect();
-            assert_eq!(
-                set.len(),
-                n_obs,
-                "epoch {epoch}: all cells should appear"
-            );
+            assert_eq!(set.len(), n_obs, "epoch {epoch}: all cells should appear");
             assert_eq!(
                 cells.len(),
                 n_obs,

@@ -153,7 +153,10 @@ mod tests {
 
         // normalize: row_sum=0 → no change
         normalize_dense_row(&mut row, 10_000.0);
-        assert!(row.iter().all(|&v| v == 0.0), "normalize should leave zeros unchanged");
+        assert!(
+            row.iter().all(|&v| v == 0.0),
+            "normalize should leave zeros unchanged"
+        );
 
         // log1p: ln(0+1)=0
         log1p_dense_row(&mut row);
@@ -162,7 +165,10 @@ mod tests {
         // fused: row_sum=0 → no change
         let mut row2 = vec![0.0, 0.0, 0.0];
         fused_normalize_log1p_dense(&mut row2, 10_000.0);
-        assert!(row2.iter().all(|&v| v == 0.0), "fused should leave zeros unchanged");
+        assert!(
+            row2.iter().all(|&v| v == 0.0),
+            "fused should leave zeros unchanged"
+        );
     }
 
     #[test]
@@ -171,7 +177,10 @@ mod tests {
         let mut row = vec![0.0, 0.0, 42.0, 0.0];
         normalize_dense_row(&mut row, 10_000.0);
 
-        assert!((row[2] - 10_000.0).abs() < 1e-3, "single value should become target_sum");
+        assert!(
+            (row[2] - 10_000.0).abs() < 1e-3,
+            "single value should become target_sum"
+        );
         assert_eq!(row[0], 0.0);
         assert_eq!(row[1], 0.0);
         assert_eq!(row[3], 0.0);

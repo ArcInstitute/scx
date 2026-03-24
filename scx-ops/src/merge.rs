@@ -169,10 +169,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     // so layers present only in subsequent inputs are not silently dropped.
     let shard_target = first_header.shard_target_rows;
     let layer_names = {
-        let mut all_names: Vec<String> = readers
-            .iter()
-            .flat_map(|r| r.layer_names())
-            .collect();
+        let mut all_names: Vec<String> = readers.iter().flat_map(|r| r.layer_names()).collect();
         all_names.sort();
         all_names.dedup();
         all_names
@@ -201,8 +198,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             let section = readers[0].section_bytes(first_entry)?;
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
-            CodecId::from_u8(sh.codec_id)
-                .ok_or(OpsError::UnknownCodec(sh.codec_id))?
+            CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?
         } else {
             codec_id
         };
@@ -216,40 +212,42 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         let mut emitted_layer_rows = 0u64;
 
         for (file_idx, reader) in readers.iter().enumerate() {
-            let layer = reader.read_layer(layer_name).map_err(|_| OpsError::LayerMissing {
-                name: layer_name.clone(),
-                file_index: file_idx,
-            })?;
+            let layer = reader
+                .read_layer(layer_name)
+                .map_err(|_| OpsError::LayerMissing {
+                    name: layer_name.clone(),
+                    file_index: file_idx,
+                })?;
             for row_idx in 0..layer.shape.0 {
-                    let row_start = layer.indptr[row_idx] as usize;
-                    let row_end = layer.indptr[row_idx + 1] as usize;
-                    for j in row_start..row_end {
-                        layer_indices.push(layer.indices[j] as u32);
-                        encode_value(&mut layer_values, layer.data[j], layer_value_encoding)?;
-                    }
-                    let prev = *layer_indptr.last().unwrap();
-                    layer_indptr.push(prev + (row_end - row_start) as u64);
-                    layer_row_count += 1;
-
-                    if layer_row_count >= shard_target as u64 {
-                        writer.write_layer_csr_shard(
-                            &layer_indptr,
-                            &layer_indices,
-                            &layer_values,
-                            layer_codec,
-                            layer_value_encoding,
-                            emitted_layer_rows,
-                            layer_name,
-                            layer_shard_idx,
-                        )?;
-                        emitted_layer_rows += layer_row_count;
-                        layer_indptr = vec![0];
-                        layer_indices.clear();
-                        layer_values.clear();
-                        layer_row_count = 0;
-                        layer_shard_idx += 1;
-                    }
+                let row_start = layer.indptr[row_idx] as usize;
+                let row_end = layer.indptr[row_idx + 1] as usize;
+                for j in row_start..row_end {
+                    layer_indices.push(layer.indices[j] as u32);
+                    encode_value(&mut layer_values, layer.data[j], layer_value_encoding)?;
                 }
+                let prev = *layer_indptr.last().unwrap();
+                layer_indptr.push(prev + (row_end - row_start) as u64);
+                layer_row_count += 1;
+
+                if layer_row_count >= shard_target as u64 {
+                    writer.write_layer_csr_shard(
+                        &layer_indptr,
+                        &layer_indices,
+                        &layer_values,
+                        layer_codec,
+                        layer_value_encoding,
+                        emitted_layer_rows,
+                        layer_name,
+                        layer_shard_idx,
+                    )?;
+                    emitted_layer_rows += layer_row_count;
+                    layer_indptr = vec![0];
+                    layer_indices.clear();
+                    layer_values.clear();
+                    layer_row_count = 0;
+                    layer_shard_idx += 1;
+                }
+            }
         }
 
         // Flush remaining layer rows

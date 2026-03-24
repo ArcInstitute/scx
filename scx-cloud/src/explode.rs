@@ -49,10 +49,8 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
             data_len: input_data.len(),
         });
     }
-    let full_catalog = FullCatalog::read_from(
-        &mut Cursor::new(&input_data[fc_offset..fc_end]),
-        fc_length,
-    )?;
+    let full_catalog =
+        FullCatalog::read_from(&mut Cursor::new(&input_data[fc_offset..fc_end]), fc_length)?;
 
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
@@ -62,8 +60,9 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
 
     // Write each section to its mapped file path
     for entry in &full_catalog.entries {
-        let rel_path = section_name_to_path(&entry.name, entry.section_type)
-            .map_err(|e| crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+            crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
         let file_path = output_dir.join(&rel_path);
 
         // Create parent directories
@@ -102,7 +101,10 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
 /// Map a catalog entry's section name + type to a relative file path.
 ///
 /// Returns an error if a shard index cannot be parsed from the section name.
-pub(crate) fn section_name_to_path(name: &str, section_type: SectionType) -> std::result::Result<String, String> {
+pub(crate) fn section_name_to_path(
+    name: &str,
+    section_type: SectionType,
+) -> std::result::Result<String, String> {
     match section_type {
         SectionType::ObsMetadata => Ok("obs.arrow".to_string()),
         SectionType::ObsIndex => Ok("obs_index.arrow".to_string()),
@@ -113,7 +115,9 @@ pub(crate) fn section_name_to_path(name: &str, section_type: SectionType) -> std
             let idx: u32 = name
                 .strip_prefix("X_shard_")
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("invalid CsrShard name: expected 'X_shard_N', got '{name}'"))?;
+                .ok_or_else(|| {
+                    format!("invalid CsrShard name: expected 'X_shard_N', got '{name}'")
+                })?;
             Ok(format!("X/{idx:06}.shard"))
         }
         SectionType::ObsmEmbedding => {
@@ -168,12 +172,14 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
         "_deletion_vectors.bin" => {
             Some(("deletion_vectors".to_string(), SectionType::DeletionVectors))
         }
-        "_obs_predicate_index.bin" => {
-            Some(("obs_predicate_index".to_string(), SectionType::ObsPredicateIndex))
-        }
-        "_var_predicate_index.bin" => {
-            Some(("var_predicate_index".to_string(), SectionType::VarPredicateIndex))
-        }
+        "_obs_predicate_index.bin" => Some((
+            "obs_predicate_index".to_string(),
+            SectionType::ObsPredicateIndex,
+        )),
+        "_var_predicate_index.bin" => Some((
+            "var_predicate_index".to_string(),
+            SectionType::VarPredicateIndex,
+        )),
         _ if rel_path.starts_with("X/") && rel_path.ends_with(".shard") => {
             let idx_str = rel_path
                 .strip_prefix("X/")
@@ -305,10 +311,8 @@ mod tests {
 
         for (name, st) in cases {
             let path = section_name_to_path(name, st).unwrap();
-            let (recovered_name, recovered_type) =
-                path_to_section_name(&path).unwrap_or_else(|| {
-                    panic!("path_to_section_name failed for path: {path}")
-                });
+            let (recovered_name, recovered_type) = path_to_section_name(&path)
+                .unwrap_or_else(|| panic!("path_to_section_name failed for path: {path}"));
             assert_eq!(recovered_name, name, "name roundtrip failed for {path}");
             assert_eq!(recovered_type, st, "type roundtrip failed for {path}");
         }

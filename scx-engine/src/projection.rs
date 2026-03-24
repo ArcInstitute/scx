@@ -20,11 +20,7 @@ use crate::error::Result;
 ///
 /// Returns `(projected_indices, projected_data)` where indices are
 /// remapped to `0..gene_set.len()` (position in gene_set).
-pub fn project_csr_row(
-    indices: &[i32],
-    data: &[f32],
-    gene_set: &[u32],
-) -> (Vec<i32>, Vec<f32>) {
+pub fn project_csr_row(indices: &[i32], data: &[f32], gene_set: &[u32]) -> (Vec<i32>, Vec<f32>) {
     let mut out_indices = Vec::new();
     let mut out_data = Vec::new();
 
@@ -74,8 +70,11 @@ pub fn project_csr(csr: &ScxCsr, gene_indices: &[u32]) -> ScxCsr {
         let start = csr.indptr[row] as usize;
         let end = csr.indptr[row + 1] as usize;
 
-        let (row_indices, row_data) =
-            project_csr_row(&csr.indices[start..end], &csr.data[start..end], &sorted_genes);
+        let (row_indices, row_data) = project_csr_row(
+            &csr.indices[start..end],
+            &csr.data[start..end],
+            &sorted_genes,
+        );
 
         new_indices.extend_from_slice(&row_indices);
         new_data.extend_from_slice(&row_data);
@@ -440,11 +439,7 @@ mod tests {
         .unwrap()
     }
 
-    fn write_test_file(
-        dir: &tempfile::TempDir,
-        n_obs: usize,
-        n_vars: usize,
-    ) -> std::path::PathBuf {
+    fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> std::path::PathBuf {
         let path = dir.path().join("test.scx");
         let header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
         let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -499,12 +494,7 @@ mod tests {
         let shards = reader.catalog().shards_sorted();
         let entry = shards[0];
         let (indptr1, indices1, data1) = reader.read_shard_from_entry(entry).unwrap();
-        let full_csr = ScxCsr::new_unchecked(
-            (n_obs, n_vars),
-            indptr1,
-            indices1,
-            data1,
-        );
+        let full_csr = ScxCsr::new_unchecked((n_obs, n_vars), indptr1, indices1, data1);
         let projected = project_csr(&full_csr, &gene_indices);
 
         // Method 2: decode_shard_projected
@@ -525,8 +515,7 @@ mod tests {
 
         let shards = reader.catalog().shards_sorted();
         let entry = shards[0];
-        let (indptr, indices, data) =
-            decode_shard_projected(&reader, entry, &[]).unwrap();
+        let (indptr, indices, data) = decode_shard_projected(&reader, entry, &[]).unwrap();
 
         assert_eq!(indptr.len(), 6); // 5 rows + 1
         assert!(indices.is_empty());
