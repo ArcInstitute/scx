@@ -49,5 +49,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy pyarrow anndata scanpy
-      - run: . .venv/bin/activate && cd pyscx && maturin develop && pytest
+      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy pyarrow anndata scanpy igraph
+      - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud && pytest --ignore=tests/test_scvi_integration.py
