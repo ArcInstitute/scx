@@ -25,6 +25,7 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-ops = { path = "../scx-ops" }
 scx-engine = { path = "../scx-engine" }
+scx-mtx = { path = "../scx-mtx" }
 scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 chrono = "0.4"
@@ -32,3 +33,4 @@ half = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+flate2 = "1"

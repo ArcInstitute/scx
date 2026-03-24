@@ -33,16 +33,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Convert between h5ad/10x and SCX formats
+    /// Convert between h5ad/10x/mtx and SCX formats
     Convert {
         /// Input file path
         input: PathBuf,
         /// Output file path
         output: PathBuf,
-        /// Input format: h5ad, 10x
+        /// Input format: h5ad, 10x, mtx
         #[arg(long)]
         from: Option<String>,
-        /// Output format: h5ad
+        /// Output format: h5ad, mtx
         #[arg(long)]
         to: Option<String>,
         /// Target rows per shard
@@ -345,6 +345,12 @@ fn run_convert(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine conversion direction from explicit flags or file extensions
     let direction = match (from, to) {
+        // MTX conversions (always available, no hdf5 feature needed)
+        (Some("mtx"), _) => "mtx_to_scx",
+        (_, Some("mtx")) => "scx_to_mtx",
+        // Auto-detect: input is a directory → MTX
+        (None, None) if input.is_dir() => "mtx_to_scx",
+        // HDF5-based conversions
         (Some("h5ad"), _) | (None, None) if input.extension().is_some_and(|e| e == "h5ad") => {
             "h5ad_to_scx"
         }
@@ -358,6 +364,13 @@ fn run_convert(
             return Err("Cannot determine conversion direction. Use --from/--to flags.".into());
         }
     };
+
+    // MTX conversions are always available (no hdf5 feature needed)
+    match direction {
+        "mtx_to_scx" => return dispatch_mtx_to_scx(input, output, shard_size, codec),
+        "scx_to_mtx" => return dispatch_scx_to_mtx(input, output),
+        _ => {}
+    }
 
     dispatch_convert(direction, input, output, shard_size, codec)
 }
@@ -426,7 +439,55 @@ fn dispatch_convert(
     _codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
-        "Convert requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5"
+        "h5ad/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
+         Note: MTX conversion is always available (use --from mtx or --to mtx)."
             .into(),
     )
+}
+
+/// MTX → SCX conversion (always available, no hdf5 feature needed).
+fn dispatch_mtx_to_scx(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    shard_size: u32,
+    codec: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use convert::mtx_pipeline;
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .expect("valid template"),
+    );
+    pb.set_message(format!("Converting MTX {}...", input.display()));
+
+    mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
+
+    pb.finish_and_clear();
+    println!("Converted {} -> {}", input.display(), output.display());
+    Ok(())
+}
+
+/// SCX → MTX conversion (always available, no hdf5 feature needed).
+fn dispatch_scx_to_mtx(
+    input: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .expect("valid template"),
+    );
+    pb.set_message(format!("Converting to MTX {}...", output.display()));
+
+    scx_mtx::write_scx_to_mtx(input, output)?;
+
+    pb.finish_and_clear();
+    println!("Converted {} -> {}", input.display(), output.display());
+    Ok(())
 }
