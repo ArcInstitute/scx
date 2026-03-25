@@ -160,6 +160,38 @@ SCX's immutable-fragment design (append-only sections + atomic header update) me
 always see a consistent snapshot without any locking. Multiple notebooks, pipeline stages,
 or training jobs can read the same `.scx` file simultaneously — no coordination required.
 
+### Sharding for parallel I/O and selective access
+
+SCX splits the expression matrix into **CSR shards** — fixed-size, independently
+decompressible chunks of rows (default: 10,000–16,384 cells per shard). Sharding
+enables parallel decoding, memory-bounded reads, shard-level predicate pushdown,
+append-without-rewrite, and selective cloud downloads. Control shard size via
+`--shard-size` (CLI) or `shard_size=` (Python/R).
+
+See [`docs/sharding.md`](docs/sharding.md) for a full guide including sizing
+guidelines, CLI/Python/R commands, and how sharding powers each SCX feature.
+
+### Multithreading for parallel decode and overlapped I/O
+
+SCX exploits multicore CPUs at every stage. Rayon decodes shards in parallel
+during reads and queries. The training loader runs a triple-buffered pipeline
+(tokio I/O → rayon decode → Python/GPU) so that I/O, decompression, and GPU
+transfer all overlap. Cloud downloads run as concurrent async tasks. File
+mutations are serialized with advisory `flock()` locks — reads never lock.
+
+| Component | Threading model | Runtime |
+|-----------|----------------|---------|
+| Shard decode | Data parallelism | Rayon `par_iter` |
+| Query engine | Parallel shard decode + filter | Rayon |
+| Training loader | Triple-buffered pipeline | tokio + rayon + std::thread |
+| Cloud I/O | Parallel async downloads/uploads | tokio |
+| File mutations | Advisory file locks | `fs4` `flock()` |
+| GPU decode | Massively parallel kernels | CUDA |
+
+See [`docs/multithreading.md`](docs/multithreading.md) for a full guide
+including pipeline architecture, thread safety of key types, and how to
+control parallelism.
+
 ## Installation
 
 ### Python (recommended)
@@ -359,7 +391,7 @@ SCX is a Rust workspace with 12 crates:
 | `pyscx` | Python bindings (PyO3) |
 | `rscx` | R bindings (extendr) |
 
-For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/api.md`](docs/api.md), and [`SPEC.md`](SPEC.md).
+For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), and [`SPEC.md`](SPEC.md).
 
 ## License
 
