@@ -7,10 +7,11 @@ use std::path::Path;
 
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
-use scx_format::provenance::ProvenanceEntry;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
+
+use crate::rewrite_helpers;
 
 pub fn run_upgrade(
     input: &Path,
@@ -137,11 +138,7 @@ fn rewrite_with_current_version(
 
         let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
         let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-
-        let mut raw_values = Vec::new();
-        for &v in &data {
-            encode_value(&mut raw_values, v, ve)?;
-        }
+        let raw_values = ve.encode_f32_batch(&data)?;
 
         writer.write_csr_shard(
             &indptr_u64,
@@ -172,230 +169,23 @@ fn rewrite_with_current_version(
 
         let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
         let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-
-        let mut raw_values = Vec::new();
-        for &v in &data {
-            encode_value(&mut raw_values, v, ve)?;
-        }
+        let raw_values = ve.encode_f32_batch(&data)?;
 
         writer.write_csc_shard(&indptr_u64, &indices_u32, &raw_values, ci, ve, col_start)?;
     }
 
-    // Re-write layers
-    let layer_names = reader.layer_names();
-    for layer_name in &layer_names {
-        let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format::FullCatalogEntry> = reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| {
-                e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
-            })
-            .collect();
-
-        let mut sorted_entries = layer_shard_entries;
-        sorted_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-
-        for (shard_idx, entry) in sorted_entries.iter().enumerate() {
-            let sh = reader.read_shard_header(entry)?;
-            let ve = ValueEncoding::from_u8(sh.value_encoding)
-                .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
-            let ci =
-                CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
-
-            let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
-            let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
-            let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-            let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
-            let mut raw_values = Vec::new();
-            for &v in &data {
-                encode_value(&mut raw_values, v, ve)?;
-            }
-            writer.write_layer_csr_shard(
-                &indptr_u64,
-                &indices_u32,
-                &raw_values,
-                ci,
-                ve,
-                row_start,
-                layer_name,
-                shard_idx as u32,
-            )?;
-        }
-    }
-
-    // Re-write obsm
-    if in_header.has_obsm() {
-        let all_obsm = reader.read_all_obsm()?;
-        for (name, batch) in &all_obsm {
-            writer.write_obsm(name, batch)?;
-        }
-    }
-
-    // Re-write uns
-    if let Ok(uns) = reader.read_uns() {
-        writer.write_uns(&uns)?;
-    }
-
-    // Re-write predicate indices
-    if let Ok(Some(data)) = reader.read_obs_predicate_index_bytes() {
-        writer.write_obs_predicate_index(data)?;
-    }
-    if let Ok(Some(data)) = reader.read_var_predicate_index_bytes() {
-        writer.write_var_predicate_index(data)?;
-    }
-
-    // Add provenance
-    let mut prov_entries = if let Ok(prov) = reader.read_provenance() {
-        prov.operations
-    } else {
-        Vec::new()
-    };
-    prov_entries.push(ProvenanceEntry {
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        action: "upgrade".to_string(),
-        tool: "scx-cli 0.1.0".to_string(),
-        params_json: "{}".to_string(),
-        input_checksums: vec![],
-    });
-    writer.write_provenance(prov_entries)?;
+    // Copy auxiliary sections (layers, obsm, uns, predicate indices, provenance)
+    rewrite_helpers::copy_auxiliary_sections(reader, &mut writer, "upgrade", "{}")?;
 
     writer.finish()?;
-    Ok(())
-}
-
-/// Encode a single f32 value back to raw bytes according to the value encoding.
-fn encode_value(
-    buf: &mut Vec<u8>,
-    value: f32,
-    encoding: ValueEncoding,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match encoding {
-        ValueEncoding::Uint8 => {
-            if !(0.0..=255.0).contains(&value) {
-                return Err(format!("value {value} out of range for uint8 (0..255)").into());
-            }
-            buf.push(value as u8);
-        }
-        ValueEncoding::Uint16 => {
-            if !(0.0..=65535.0).contains(&value) {
-                return Err(format!("value {value} out of range for uint16 (0..65535)").into());
-            }
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
-        }
-        ValueEncoding::Uint32 => {
-            if !(0.0..=u32::MAX as f32).contains(&value) {
-                return Err(format!("value {value} out of range for uint32").into());
-            }
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
-        ValueEncoding::Float16 => {
-            buf.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
-        }
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StringArray;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use scx_format::header::MAGIC;
-    use std::sync::Arc;
-
-    fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
-        FileHeader {
-            magic: MAGIC,
-            format_version: 1,
-            header_length: 256,
-            flags: 0,
-            n_obs,
-            n_vars,
-            nnz: 0,
-            n_csr_shards: 0,
-            n_csc_shards: 0,
-            shard_target_rows: 10000,
-            codec_id: 0,
-            index_dtype: 0,
-            endian: 0,
-            reserved_padding: 0,
-            root_catalog_offset: 0,
-            root_catalog_length: 0,
-            full_catalog_offset: 0,
-            full_catalog_length: 0,
-            manifest_sequence: 1,
-            prev_catalog_offset: 0,
-            file_checksum: 0,
-            front_catalog_offset: 0,
-            front_catalog_length: 0,
-            reserved: [0u8; 132],
-        }
-    }
-
-    fn sample_obs(n: usize) -> arrow::array::RecordBatch {
-        let schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
-        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
-        arrow::array::RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(StringArray::from(
-                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            ))],
-        )
-        .unwrap()
-    }
-
-    fn sample_var(n: usize) -> arrow::array::RecordBatch {
-        let schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
-        let ids: Vec<String> = (0..n).map(|i| format!("gene_{i}")).collect();
-        arrow::array::RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(StringArray::from(
-                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            ))],
-        )
-        .unwrap()
-    }
-
-    fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> std::path::PathBuf {
-        let path = dir.path().join("test.scx");
-        let header = sample_header(n_obs as u64, n_vars as u64);
-        let mut writer = ScxWriter::new(&path, header).unwrap();
-        writer.write_obs(&sample_obs(n_obs)).unwrap();
-        writer.write_var(&sample_var(n_vars)).unwrap();
-
-        let mut indptr = vec![0u64];
-        let mut indices = Vec::new();
-        let mut values = Vec::new();
-        for row in 0..n_obs {
-            let col0 = (row * 2) % n_vars;
-            let col1 = (row * 2 + 1) % n_vars;
-            indices.push(col0 as u32);
-            indices.push(col1 as u32);
-            values.push(((row + 1) % 256) as u8);
-            values.push(((row + 2) % 256) as u8);
-            indptr.push(indptr.last().unwrap() + 2);
-        }
-
-        writer
-            .write_csr_shard(
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
-
-        writer.finish().unwrap();
-        path
-    }
+    use crate::test_utils::{sample_header, write_test_file};
+    use scx_codec::{CodecId, ValueEncoding};
 
     #[test]
     fn test_upgrade_preserves_data() {

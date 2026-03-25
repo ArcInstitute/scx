@@ -11,10 +11,14 @@ mod delete;
 mod info;
 mod merge;
 mod query;
+mod rewrite_helpers;
 mod rollback;
 mod subset;
 mod upgrade;
 mod validate;
+
+#[cfg(test)]
+mod test_utils;
 
 #[cfg(feature = "cloud")]
 mod cloud_optimize;
@@ -245,7 +249,7 @@ enum Commands {
         /// Obs predicate expression to filter cells
         #[arg(long)]
         filter: Option<String>,
-        /// File containing gene indices (one per line) for column projection
+        /// File containing gene names or numeric indices (one per line) for column projection
         #[arg(long)]
         genes: Option<PathBuf>,
         /// Show matching count without writing output
