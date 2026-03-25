@@ -8,7 +8,7 @@
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
 use scx_format::writer::ScxWriter;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use std::sync::Arc;
 pub fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
