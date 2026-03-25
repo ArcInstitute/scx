@@ -119,6 +119,13 @@ impl GpuDevice {
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
+
+    /// Synchronize the default stream, blocking until all queued GPU work completes.
+    pub fn synchronize(&self) -> Result<(), GpuError> {
+        self.stream
+            .synchronize()
+            .map_err(|e| GpuError::CudaError(format!("stream synchronize: {e}")))
+    }
 }
 
 #[cfg(test)]

@@ -307,6 +307,23 @@ All benchmarks on Intel Xeon Platinum 8468, 1 TB RAM. Full results in [`benchmar
 SCX's advantage grows with dataset size — at atlas scale (1M+ cells), the compressed-shard
 streaming pipeline outperforms random-access approaches.
 
+### GPU Acceleration (NVIDIA H100)
+
+The `scx-gpu` crate provides CUDA-accelerated codec decoding and sparse-to-dense
+conversion. Benchmarked on H100 80GB HBM3 with synthetic shards (Scx1 codec):
+
+| Operation | Size | CPU (μs) | GPU (μs) | Speedup |
+|-----------|------|----------|----------|---------|
+| FOR-BP index decode | 16K rows, 33M nnz | 102,900 | 4,133 | **24.9×** |
+| Sparse → dense | 16K rows × 30K cols | 433,252 | 7,711 | **56.2×** |
+| Sparse → dense (HVG 2K) | 16K rows × 2K output | 110,416 | 897 | **123.1×** |
+
+The sparse-to-dense conversion — the dominant cost in the training loop — runs
+56–123× faster on GPU. The warp-cooperative kernel particularly excels with HVG
+gene projection, where the reduced output width maximizes memory bandwidth utilization.
+
+Full GPU benchmark details in [`benchmarks/results/gpu_benchmark.md`](benchmarks/results/gpu_benchmark.md).
+
 ### Query Engine
 
 | Metric | Result |
@@ -325,7 +342,7 @@ streaming pipeline outperforms random-access approaches.
 
 ## Architecture
 
-SCX is a Rust workspace with 10 crates:
+SCX is a Rust workspace with 12 crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -335,6 +352,7 @@ SCX is a Rust workspace with 10 crates:
 | `scx-ops` | Append, delete, compact, merge, rollback |
 | `scx-engine` | Lazy query engine with predicate pushdown |
 | `scx-loader` | Triple-buffered ML training data loader |
+| `scx-gpu` | CUDA-accelerated codec decoding, cuSPARSE interop, GPU sparse-to-dense |
 | `scx-cloud` | Cloud access: push, pull, explode, pack, CloudReader |
 | `scx-mtx` | Matrix Market (MTX) I/O: Cell Ranger directory read/write |
 | `scx-cli` | CLI tool |
