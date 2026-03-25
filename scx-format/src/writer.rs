@@ -532,10 +532,10 @@ impl ScxWriter {
             self.header.set_csc(); // has_csc (bit 0)
         }
         if self.has_obsm {
-            self.header.flags |= 1 << 2; // has_obsm
+            self.header.set_obsm();
         }
         if self.has_obsp {
-            self.header.flags |= 1 << 3; // has_obsp
+            self.header.set_obsp();
         }
 
         // 5. pwrite header at offset 0
