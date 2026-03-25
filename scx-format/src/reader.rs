@@ -504,6 +504,15 @@ impl ScxReader {
         Ok(&self.mmap[start..end])
     }
 
+    /// Read the shard header from a catalog entry without decoding the shard data.
+    ///
+    /// Useful when callers need per-shard codec/encoding info before or alongside
+    /// `read_shard_from_entry`.
+    pub fn read_shard_header(&self, entry: &FullCatalogEntry) -> Result<ShardHeader> {
+        let section = self.section_bytes(entry)?;
+        ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))
+    }
+
     /// Read and decode a single shard from a catalog entry.
     pub fn read_shard_from_entry(
         &self,
