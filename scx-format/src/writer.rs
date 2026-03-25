@@ -26,6 +26,30 @@ pub const SECTIONS_START_OFFSET: u64 = 4352;
 /// Writes sections sequentially to a temp file starting at offset 4352,
 /// accumulates catalog entries, then finalizes: full catalog at EOF,
 /// root catalog at 256, header at 0, fsync, atomic rename.
+///
+/// # Section-Ordering Convention
+///
+/// The writer accepts sections in **any order**, but callers should follow
+/// the canonical layout described in SPEC §3.1 for maximum compatibility
+/// with inspection tools and downstream readers:
+///
+/// 1. `write_obs` — cell metadata (Arrow IPC)
+/// 2. `write_obs_predicate_index` — obs predicate indexes
+/// 3. `write_var` — gene metadata (Arrow IPC)
+/// 4. `write_var_predicate_index` — var predicate indexes
+/// 5. `write_csr_shard` (repeated) — X matrix CSR shards
+/// 6. `write_csc_shard` (repeated, optional) — X matrix CSC shards
+/// 7. `write_layer_csr_shard` (repeated, optional) — layer shards
+/// 8. `write_obsm` (repeated, optional) — embeddings
+/// 9. `write_obsp_shard` (repeated, optional) — pairwise graphs
+/// 10. `write_uns` (optional) — unstructured metadata (JSON)
+/// 11. `write_provenance` (optional) — provenance chain
+/// 12. `write_deletion_vectors` (optional) — logical deletions
+///
+/// This ordering is **not enforced** — `finish()` will produce a valid
+/// file regardless of write order. However, deviating from it may produce
+/// non-standard layouts that confuse inspection tools or yield sub-optimal
+/// sequential read performance.
 pub struct ScxWriter {
     final_path: PathBuf,
     tmp_path: PathBuf,
@@ -46,6 +70,9 @@ impl ScxWriter {
     /// A temporary file is created alongside the final path. The header
     /// template is used for metadata (n_obs, n_vars, codec_id, etc.) but
     /// catalog offsets and shard count are filled in during `finish()`.
+    ///
+    /// See [`ScxWriter`] struct-level docs for the recommended section
+    /// write order.
     pub fn new(path: impl AsRef<Path>, header: FileHeader) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let tmp_path = PathBuf::from(format!(
