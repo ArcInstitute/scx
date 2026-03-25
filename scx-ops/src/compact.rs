@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use arrow::compute;
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::ValueEncoding;
+use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
@@ -57,7 +58,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
         n_csr_shards: 0,
         n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
-        codec_id: in_header.codec_id,
+        codec_id: 0,
         index_dtype: in_header.index_dtype,
         endian: 0,
         reserved_padding: 0,
@@ -80,27 +81,22 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     writer.write_obs(&filtered_obs)?;
     writer.write_var(&var)?;
 
-    // Process CSR shards: decode, filter deleted rows, re-shard
+    // Process CSR shards: decode, filter deleted rows, re-shard.
+    // Read value_encoding from first shard header for the main X matrix.
     let shards = reader.catalog().shards_sorted();
-    let codec_id = CodecId::from_u8(in_header.codec_id)
-        .ok_or(crate::error::OpsError::UnknownCodec(in_header.codec_id))?;
-    let value_encoding_u8 = {
-        // Read from first shard header to get value encoding
+    let value_encoding = {
         if !shards.is_empty() {
             let section = reader.section_bytes(shards[0])?;
             let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
                 &section[..scx_format::SHARD_HEADER_SIZE],
             ))?;
-            sh.value_encoding
+            ValueEncoding::from_u8(sh.value_encoding).ok_or(
+                crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
+            )?
         } else {
-            0 // default to uint8
+            ValueEncoding::Uint8
         }
     };
-    let value_encoding = ValueEncoding::from_u8(value_encoding_u8).ok_or(
-        crate::error::OpsError::UnknownValueEncoding(value_encoding_u8),
-    )?;
-
-    // Decode all shards and filter rows
     let shard_target = in_header.shard_target_rows;
 
     // Accumulate filtered CSR data
@@ -144,11 +140,13 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             // Flush accumulated rows as a shard when hitting target
             if acc_row_count >= shard_target as u64 {
                 let shard_row_start = emitted_rows;
+                // Auto-select optimal codec for this shard's data
+                let shard_codec = select_codec(&acc_values, value_encoding);
                 writer.write_csr_shard(
                     &acc_indptr,
                     &acc_indices,
                     &acc_values,
-                    codec_id,
+                    shard_codec,
                     value_encoding,
                     shard_row_start,
                 )?;
@@ -164,11 +162,13 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     // Flush remaining accumulated rows
     if acc_row_count > 0 {
         let shard_row_start = emitted_rows;
+        // Auto-select optimal codec for remaining shard
+        let shard_codec = select_codec(&acc_values, value_encoding);
         writer.write_csr_shard(
             &acc_indptr,
             &acc_indices,
             &acc_values,
-            codec_id,
+            shard_codec,
             value_encoding,
             shard_row_start,
         )?;
@@ -215,17 +215,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
                 crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
             )?
         } else {
-            value_encoding
-        };
-        let layer_codec = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first_entry)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            CodecId::from_u8(sh.codec_id)
-                .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?
-        } else {
-            codec_id
+            ValueEncoding::Uint8
         };
 
         let layer = reader.read_layer(layer_name)?;
@@ -254,11 +244,12 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             layer_row_count += 1;
 
             if layer_row_count >= shard_target as u64 {
+                let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
                 writer.write_layer_csr_shard(
                     &layer_indptr,
                     &layer_indices,
                     &layer_values,
-                    layer_codec,
+                    layer_shard_codec,
                     layer_value_encoding,
                     emitted_layer_rows,
                     layer_name,
@@ -274,11 +265,12 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
         }
 
         if layer_row_count > 0 {
+            let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
             writer.write_layer_csr_shard(
                 &layer_indptr,
                 &layer_indices,
                 &layer_values,
-                layer_codec,
+                layer_shard_codec,
                 layer_value_encoding,
                 emitted_layer_rows,
                 layer_name,
