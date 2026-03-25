@@ -6,7 +6,6 @@
 
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
-use cudarc::nvrtc::Ptx;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -89,9 +88,8 @@ pub fn rice_decode_gpu(
         return dev.alloc_zeros::<u32>(0);
     }
 
-    // Load PTX module and get kernel function
-    let ptx = Ptx::from_src(RICE_PTX);
-    let module = dev.load_module(ptx)?;
+    // Load PTX module (cached) and get kernel function
+    let module = dev.load_module_cached(RICE_PTX)?;
     let kernel = module
         .load_function("rice_decode_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("load rice_decode_kernel: {e}")))?;

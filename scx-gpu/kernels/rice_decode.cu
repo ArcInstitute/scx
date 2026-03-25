@@ -32,12 +32,22 @@ extern "C" __global__ void rice_decode_kernel(
     const unsigned char* bs = bitstream + block_offsets[block_id];
     unsigned int bit_pos = 0;
 
+    // Maximum readable byte index relative to `bs`. All byte reads must
+    // check against this to prevent out-of-bounds access on malformed data.
+    unsigned int block_start = block_offsets[block_id];
+    unsigned int max_byte = (block_start < bitstream_len) ? (bitstream_len - block_start) : 0;
+
     for (unsigned int i = 0; i < n_vals; i++) {
         // Read unary quotient: count 1-bits until 0-bit (LSB-first within each byte)
         unsigned int q = 0;
         while (1) {
             unsigned int byte_idx = bit_pos >> 3;
             unsigned int bit_idx = bit_pos & 7;
+            if (byte_idx >= max_byte) {
+                // Bitstream exhausted — treat as terminator
+                bit_pos++;
+                break;
+            }
             if ((bs[byte_idx] >> bit_idx) & 1) {
                 q++;
                 bit_pos++;
@@ -55,9 +65,9 @@ extern "C" __global__ void rice_decode_kernel(
             unsigned int bit_idx = bit_pos & 7;
 
             // Read up to 5 bytes to get enough bits (bit_idx + k <= 40)
-            // Clamp reads to bitstream_len to prevent out-of-bounds access
+            // Clamp reads to max_byte to prevent out-of-bounds access
             unsigned long long word = 0;
-            for (unsigned int b = 0; b < 5 && (byte_idx + b) < bitstream_len; b++) {
+            for (unsigned int b = 0; b < 5 && (byte_idx + b) < max_byte; b++) {
                 word |= ((unsigned long long)bs[byte_idx + b]) << (b * 8);
             }
             word >>= bit_idx;

@@ -10,7 +10,6 @@ use std::io::Cursor;
 use byteorder::{LittleEndian, ReadBytesExt};
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
-use cudarc::nvrtc::Ptx;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -150,9 +149,8 @@ pub fn forbp_decode_gpu(
         return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths));
     }
 
-    // Load PTX module and get kernel function
-    let ptx = Ptx::from_src(FORBP_PTX);
-    let module = dev.load_module(ptx)?;
+    // Load PTX module (cached) and get kernel function
+    let module = dev.load_module_cached(FORBP_PTX)?;
     let kernel = module
         .load_function("forbp_decode_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("load forbp_decode_kernel: {e}")))?;

@@ -21,12 +21,12 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 echo ""
 
 echo "=== Building scx-gpu in release mode ==="
-cargo build --release -p scx-gpu --bin gpu_bench 2>&1
+cargo build --release -p scx-gpu --features bench --bin gpu_bench 2>&1
 echo ""
 
 echo "=== Running GPU microbenchmarks ==="
 # stdout → JSON file, stderr → SLURM log (progress messages)
-cargo run --release -p scx-gpu --bin gpu_bench \
+cargo run --release -p scx-gpu --features bench --bin gpu_bench \
     > benchmarks/results/gpu_bench_json.txt
 echo ""
 

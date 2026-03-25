@@ -16,7 +16,7 @@ use serde::Serialize;
 use scx_codec::forbp::{forbp_decode, forbp_encode};
 use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
 use scx_codec::{encode_shard, CodecId, EncodedShardRef, ValueEncoding};
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_gpu::test_utils::build_test_shard;
 use scx_gpu::{
     decode_shard_gpu, forbp_decode_gpu, rice_decode_gpu, sparse_to_dense_gpu, GpuDevice,
 };
@@ -147,67 +147,6 @@ fn generate_umi_values(n: usize) -> Vec<u32> {
             _ => 8 + (xorshift(&mut state) % 20) as u32,
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Shard builder (from scx-gpu/src/shard_decode.rs tests)
-// ---------------------------------------------------------------------------
-
-fn build_test_shard(
-    indptr: &[u64],
-    indices: &[u32],
-    values_raw: &[u8],
-    codec_id: CodecId,
-    value_encoding: ValueEncoding,
-    n_cols: u32,
-) -> Vec<u8> {
-    let n_rows = (indptr.len() - 1) as u32;
-    let nnz = *indptr.last().unwrap();
-    let index_dtype_u16 = n_cols <= 65535;
-
-    let encoded = encode_shard(
-        indptr,
-        indices,
-        values_raw,
-        codec_id,
-        value_encoding,
-        index_dtype_u16,
-    )
-    .expect("encode_shard failed");
-
-    let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-    let indices_rel_offset = indptr_rel_offset + encoded.indptr_bytes.len() as u32;
-    let values_rel_offset = indices_rel_offset + encoded.indices_bytes.len() as u32;
-
-    let header = ShardHeader {
-        magic: *b"SCXS",
-        shard_format_version: 1,
-        shard_type: 0,
-        codec_id: codec_id as u8,
-        value_encoding: value_encoding as u8,
-        index_dtype: if index_dtype_u16 { 0 } else { 1 },
-        reserved_flags: [0; 3],
-        n_major: n_rows,
-        n_minor: n_cols,
-        nnz,
-        global_offset: 0,
-        indptr_rel_offset,
-        indptr_length: encoded.indptr_bytes.len() as u32,
-        indices_rel_offset,
-        indices_length: encoded.indices_bytes.len() as u32,
-        values_rel_offset,
-        values_length: encoded.values_bytes.len() as u32,
-        block_index_rel_offset: 0,
-        block_index_length: 0,
-        checksum: [0; 8],
-    };
-
-    let mut buf = Vec::new();
-    header.write_to(&mut buf).expect("write header");
-    buf.extend_from_slice(&encoded.indptr_bytes);
-    buf.extend_from_slice(&encoded.indices_bytes);
-    buf.extend_from_slice(&encoded.values_bytes);
-    buf
 }
 
 /// CPU sparse-to-dense conversion (single-threaded row scatter).

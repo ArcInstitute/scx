@@ -179,8 +179,8 @@ mod tests {
     use super::*;
     use crate::device::GpuDevice;
     use crate::shard_decode::decode_shard_gpu;
-    use scx_codec::{encode_shard, CodecId, ValueEncoding};
-    use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+    use crate::test_utils::build_test_shard;
+    use scx_codec::{CodecId, ValueEncoding};
 
     macro_rules! require_gpu {
         () => {
@@ -196,7 +196,6 @@ mod tests {
 
     /// Build a small test shard for cuSPARSE tests.
     fn build_small_shard() -> Vec<u8> {
-        let n_cols: u32 = 100;
         let indptr = vec![0u64, 3, 5, 5, 8, 12];
         let indices = vec![
             0u32, 10, 50, // row 0
@@ -208,50 +207,14 @@ mod tests {
         let values_u16: Vec<u16> = (1..=12).collect();
         let values_raw: Vec<u8> = values_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        let index_dtype_u16 = n_cols <= 65535;
-        let encoded = encode_shard(
+        build_test_shard(
             &indptr,
             &indices,
             &values_raw,
             CodecId::Scx1,
             ValueEncoding::Uint16,
-            index_dtype_u16,
+            100,
         )
-        .expect("encode_shard failed");
-
-        let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-        let indices_rel_offset = indptr_rel_offset + encoded.indptr_bytes.len() as u32;
-        let values_rel_offset = indices_rel_offset + encoded.indices_bytes.len() as u32;
-
-        let header = ShardHeader {
-            magic: *b"SCXS",
-            shard_format_version: 1,
-            shard_type: 0,
-            codec_id: CodecId::Scx1 as u8,
-            value_encoding: ValueEncoding::Uint16 as u8,
-            index_dtype: if index_dtype_u16 { 0 } else { 1 },
-            reserved_flags: [0; 3],
-            n_major: 5,
-            n_minor: n_cols,
-            nnz: *indptr.last().unwrap(),
-            global_offset: 0,
-            indptr_rel_offset,
-            indptr_length: encoded.indptr_bytes.len() as u32,
-            indices_rel_offset,
-            indices_length: encoded.indices_bytes.len() as u32,
-            values_rel_offset,
-            values_length: encoded.values_bytes.len() as u32,
-            block_index_rel_offset: 0,
-            block_index_length: 0,
-            checksum: [0; 8],
-        };
-
-        let mut buf = Vec::new();
-        header.write_to(&mut buf).expect("write header");
-        buf.extend_from_slice(&encoded.indptr_bytes);
-        buf.extend_from_slice(&encoded.indices_bytes);
-        buf.extend_from_slice(&encoded.values_bytes);
-        buf
     }
 
     #[test]

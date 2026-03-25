@@ -4,6 +4,8 @@
 //! CUDA driver API, handling context creation, stream management, memory
 //! operations, and module loading. All CUDA errors are mapped to [`GpuError`].
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::safe::{
@@ -22,6 +24,9 @@ use crate::error::GpuError;
 pub struct GpuDevice {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    /// Cache of loaded PTX modules, keyed by PTX source string pointer.
+    /// Avoids re-parsing and re-loading the same PTX on every kernel call.
+    module_cache: RefCell<HashMap<*const str, Arc<CudaModule>>>,
 }
 
 impl GpuDevice {
@@ -52,7 +57,11 @@ impl GpuDevice {
         })?;
         let stream = ctx.default_stream();
 
-        Ok(Self { ctx, stream })
+        Ok(Self {
+            ctx,
+            stream,
+            module_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     /// Number of available CUDA devices.
@@ -108,6 +117,25 @@ impl GpuDevice {
         self.ctx
             .load_module(ptx)
             .map_err(|e| GpuError::ModuleLoadError(format!("{e}")))
+    }
+
+    /// Load a PTX module, returning a cached copy if the same source was loaded before.
+    ///
+    /// The cache key is the pointer identity of the `&'static str` PTX source,
+    /// so this works correctly with `include_str!()` constants (each constant has
+    /// a unique address). Repeated calls with the same PTX source skip the
+    /// CUDA JIT compilation entirely.
+    pub fn load_module_cached(&self, ptx_src: &'static str) -> Result<Arc<CudaModule>, GpuError> {
+        let key = ptx_src as *const str;
+        if let Some(module) = self.module_cache.borrow().get(&key) {
+            return Ok(Arc::clone(module));
+        }
+        let ptx = Ptx::from_src(ptx_src);
+        let module = self.load_module(ptx)?;
+        self.module_cache
+            .borrow_mut()
+            .insert(key, Arc::clone(&module));
+        Ok(module)
     }
 
     /// Access the underlying [`CudaContext`].

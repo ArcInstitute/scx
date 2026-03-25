@@ -14,6 +14,10 @@
 //!
 //! The [`GpuDevice`] struct wraps both into a single ergonomic handle.
 
+#[cfg(any(test, feature = "bench"))]
+pub mod test_utils;
+
+pub mod cast_gpu;
 pub mod cusparse;
 pub mod device;
 pub mod error;

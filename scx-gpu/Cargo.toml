@@ -18,8 +18,10 @@ serde_json = { workspace = true }
 
 [features]
 default = []
-gds = []  # opt-in GDS support (requires nvidia-fs drivers)
+gds = []    # opt-in GDS support (requires nvidia-fs drivers)
+bench = []  # enables test_utils for benchmark binaries
 
 [[bin]]
 name = "gpu_bench"
 path = "src/bin/gpu_bench.rs"
+required-features = ["bench"]

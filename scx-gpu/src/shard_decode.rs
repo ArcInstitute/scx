@@ -13,6 +13,7 @@ use scx_codec::rice::B_VAL;
 use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
+use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::forbp_gpu::forbp_decode_gpu;
@@ -135,8 +136,8 @@ fn extract_slice<'a>(
 /// GPU-accelerated Scx1 decode path.
 ///
 /// - indptr: Delta-Golomb on CPU (small array, not worth GPU overhead)
-/// - indices: FOR-BP on GPU → round-trip to CPU for u32→i32 conversion
-/// - values: Rice on GPU → round-trip to CPU for u32→f32 conversion
+/// - indices: FOR-BP on GPU → on-device u32→i32 cast
+/// - values: Rice on GPU → on-device u32→f32 cast
 #[allow(clippy::too_many_arguments)]
 fn decode_scx1_gpu(
     dev: &GpuDevice,
@@ -161,18 +162,14 @@ fn decode_scx1_gpu(
     let indptr_i64: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
     let d_indptr = dev.htod_copy(&indptr_i64)?;
 
-    // indices: FOR-BP on GPU → dtoh → u32→i32 → upload
+    // indices: FOR-BP on GPU → on-device u32→i32 cast (no host round-trip)
     let (d_indices_u32, _row_lengths) =
         forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
-    let indices_u32 = dev.dtoh_copy(&d_indices_u32)?;
-    let indices_i32: Vec<i32> = indices_u32.into_iter().map(|v| v as i32).collect();
-    let d_indices = dev.htod_copy(&indices_i32)?;
+    let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
 
-    // values: Rice on GPU → dtoh → u32→f32 → upload
+    // values: Rice on GPU → on-device u32→f32 cast (no host round-trip)
     let d_values_u32 = rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?;
-    let values_u32 = dev.dtoh_copy(&d_values_u32)?;
-    let data_f32: Vec<f32> = values_u32.into_iter().map(|v| v as f32).collect();
-    let d_data = dev.htod_copy(&data_f32)?;
+    let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
 
     Ok(GpuCsr {
         indptr: d_indptr,
@@ -225,10 +222,10 @@ fn decode_cpu_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::build_test_shard;
     use scx_codec::{decode_shard_scipy, encode_shard};
     use scx_format::shard::ShardHeader;
 
-    /// Try to get a GPU device, skip test if unavailable.
     macro_rules! require_gpu {
         () => {
             match GpuDevice::new(0) {
@@ -239,68 +236,6 @@ mod tests {
                 }
             }
         };
-    }
-
-    /// Build a complete shard byte buffer from raw CSR arrays.
-    ///
-    /// Encodes with the specified codec, builds a ShardHeader with correct
-    /// offsets, and serializes header + encoded data into a single buffer.
-    fn build_test_shard(
-        indptr: &[u64],
-        indices: &[u32],
-        values_raw: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
-        n_cols: u32,
-    ) -> Vec<u8> {
-        let n_rows = (indptr.len() - 1) as u32;
-        let nnz = *indptr.last().unwrap();
-        let index_dtype_u16 = n_cols <= 65535;
-
-        let encoded = encode_shard(
-            indptr,
-            indices,
-            values_raw,
-            codec_id,
-            value_encoding,
-            index_dtype_u16,
-        )
-        .expect("encode_shard failed");
-
-        // Layout: header (76 bytes) | indptr | indices | values
-        let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-        let indices_rel_offset = indptr_rel_offset + encoded.indptr_bytes.len() as u32;
-        let values_rel_offset = indices_rel_offset + encoded.indices_bytes.len() as u32;
-
-        let header = ShardHeader {
-            magic: *b"SCXS",
-            shard_format_version: 1,
-            shard_type: 0, // CSR
-            codec_id: codec_id as u8,
-            value_encoding: value_encoding as u8,
-            index_dtype: if index_dtype_u16 { 0 } else { 1 },
-            reserved_flags: [0; 3],
-            n_major: n_rows,
-            n_minor: n_cols,
-            nnz,
-            global_offset: 0,
-            indptr_rel_offset,
-            indptr_length: encoded.indptr_bytes.len() as u32,
-            indices_rel_offset,
-            indices_length: encoded.indices_bytes.len() as u32,
-            values_rel_offset,
-            values_length: encoded.values_bytes.len() as u32,
-            block_index_rel_offset: 0,
-            block_index_length: 0,
-            checksum: [0; 8],
-        };
-
-        let mut buf = Vec::new();
-        header.write_to(&mut buf).expect("write header");
-        buf.extend_from_slice(&encoded.indptr_bytes);
-        buf.extend_from_slice(&encoded.indices_bytes);
-        buf.extend_from_slice(&encoded.values_bytes);
-        buf
     }
 
     /// CPU reference decode for comparison.
