@@ -20,6 +20,7 @@ pub mod error;
 pub mod forbp_gpu;
 pub mod rice_gpu;
 pub mod shard_decode;
+pub mod sparse_dense;
 
 // Re-export primary types for convenience.
 pub use cusparse::{CusparseHandle, CusparseSpMatDescr, GpuCsrPointers};
@@ -28,6 +29,7 @@ pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
+pub use sparse_dense::sparse_to_dense_gpu;
 
 // Re-export cudarc types used in public API signatures.
 pub use cudarc::driver::safe::{CudaModule, CudaSlice, CudaStream};
