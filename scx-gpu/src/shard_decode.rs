@@ -223,7 +223,7 @@ fn decode_cpu_fallback(
 mod tests {
     use super::*;
     use crate::test_utils::build_test_shard;
-    use scx_codec::{decode_shard_scipy, encode_shard};
+    use scx_codec::decode_shard_scipy;
     use scx_format::shard::ShardHeader;
 
     macro_rules! require_gpu {

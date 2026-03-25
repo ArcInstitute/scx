@@ -29,6 +29,16 @@ pub struct GpuDevice {
     module_cache: RefCell<HashMap<*const str, Arc<CudaModule>>>,
 }
 
+/// Safely initialize the CUDA driver, catching panics from cudarc when
+/// `libcuda.so` is not available (e.g., on CI runners without a GPU).
+fn safe_cuda_init() -> Result<(), GpuError> {
+    std::panic::catch_unwind(cudarc::driver::result::init)
+        .map_err(|_| {
+            GpuError::CudaError("CUDA driver not available (libcuda.so not found)".into())
+        })?
+        .map_err(|e| GpuError::CudaError(format!("CUDA driver init failed: {e}")))
+}
+
 impl GpuDevice {
     /// Create a new `GpuDevice` for the given device ordinal.
     ///
@@ -40,9 +50,7 @@ impl GpuDevice {
     /// Returns [`GpuError::DeviceNotFound`] if the ordinal exceeds the number
     /// of available devices, or [`GpuError::CudaError`] on other CUDA failures.
     pub fn new(device_id: usize) -> Result<Self, GpuError> {
-        // Ensure CUDA driver is initialized.
-        cudarc::driver::result::init()
-            .map_err(|e| GpuError::CudaError(format!("CUDA driver init failed: {e}")))?;
+        safe_cuda_init()?;
 
         // Check that the requested device exists.
         let count = Self::count()?;
@@ -50,11 +58,17 @@ impl GpuDevice {
             return Err(GpuError::DeviceNotFound(device_id));
         }
 
-        let ctx = CudaContext::new(device_id).map_err(|e| {
-            GpuError::CudaError(format!(
-                "failed to create CUDA context on device {device_id}: {e}"
-            ))
-        })?;
+        let ctx = std::panic::catch_unwind(|| CudaContext::new(device_id))
+            .map_err(|_| {
+                GpuError::CudaError(format!(
+                    "CUDA context creation panicked on device {device_id}"
+                ))
+            })?
+            .map_err(|e| {
+                GpuError::CudaError(format!(
+                    "failed to create CUDA context on device {device_id}: {e}"
+                ))
+            })?;
         let stream = ctx.default_stream();
 
         Ok(Self {
@@ -69,8 +83,7 @@ impl GpuDevice {
     /// Initializes the CUDA driver if needed. Returns 0 on machines without
     /// a CUDA-capable GPU (rather than erroring).
     pub fn count() -> Result<usize, GpuError> {
-        cudarc::driver::result::init()
-            .map_err(|e| GpuError::CudaError(format!("CUDA driver init failed: {e}")))?;
+        safe_cuda_init()?;
 
         let n = cudarc::driver::result::device::get_count()
             .map_err(|e| GpuError::CudaError(format!("cuDeviceGetCount failed: {e}")))?;
