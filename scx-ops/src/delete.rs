@@ -68,11 +68,16 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         .filter_map(|(i, e)| e.stats.as_ref().map(|s| (i as u32, s.row_start, s.row_end)))
         .collect();
 
-    // Map cell indices to per-shard bitmaps
+    // Map cell indices to per-shard bitmaps.
+    // shard_ranges is sorted by row_start, so use binary search (O(n log m))
+    // instead of linear scan (O(n × m)).
     let mut new_dv = DeletionVectors::new();
     for &global_idx in cell_indices {
-        for &(shard_id, row_start, row_end) in &shard_ranges {
-            if global_idx >= row_start && global_idx < row_end {
+        // Find the first shard whose row_end > global_idx
+        let shard_idx = shard_ranges.partition_point(|&(_, _, end)| end <= global_idx);
+        if shard_idx < shard_ranges.len() {
+            let (shard_id, row_start, _) = shard_ranges[shard_idx];
+            if global_idx >= row_start {
                 let local_row = (global_idx - row_start) as u32;
                 if let Some(sd) = new_dv.shards.iter_mut().find(|sd| sd.shard_id == shard_id) {
                     sd.bitmap.insert(local_row);
@@ -84,7 +89,6 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
                         bitmap: bm,
                     });
                 }
-                break;
             }
         }
     }

@@ -680,7 +680,9 @@ pub fn compute_shard_stats(
                 (min, max, sum)
             }
         }
-        // Float types: Phase 1 integer focus — zero stats
+        // Float types: value_min/value_max are u32 and value_sum is u64, which
+        // cannot represent float statistics. Return zeros; these fields are
+        // documented as undefined for float value encodings (see SPEC §3.2).
         ValueEncoding::Float32 | ValueEncoding::Float16 => (0, 0, 0),
     };
 
@@ -1083,6 +1085,35 @@ mod tests {
         assert_eq!(stats.value_min, 1);
         assert_eq!(stats.value_max, 10);
         assert_eq!(stats.value_sum, 28); // 5+10+1+3+7+2
+    }
+
+    /// Test compute_shard_stats for Float32 returns zero stats
+    #[test]
+    fn test_compute_shard_stats_float32() {
+        // Float32: 3 values as LE bytes (1.0f32, 2.5f32, 0.5f32)
+        let mut values = Vec::new();
+        values.extend_from_slice(&1.0f32.to_le_bytes());
+        values.extend_from_slice(&2.5f32.to_le_bytes());
+        values.extend_from_slice(&0.5f32.to_le_bytes());
+        let stats = compute_shard_stats(&values, ValueEncoding::Float32, 0, 2, 3);
+        assert_eq!(stats.value_min, 0, "float32 value_min must be zero");
+        assert_eq!(stats.value_max, 0, "float32 value_max must be zero");
+        assert_eq!(stats.value_sum, 0, "float32 value_sum must be zero");
+        assert_eq!(stats.row_start, 0);
+        assert_eq!(stats.row_end, 2);
+        assert_eq!(stats.nnz, 3);
+    }
+
+    /// Test compute_shard_stats for Float16 returns zero stats
+    #[test]
+    fn test_compute_shard_stats_float16() {
+        let values = vec![0u8; 6]; // 3 × 2-byte float16 values
+        let stats = compute_shard_stats(&values, ValueEncoding::Float16, 10, 5, 3);
+        assert_eq!(stats.value_min, 0, "float16 value_min must be zero");
+        assert_eq!(stats.value_max, 0, "float16 value_max must be zero");
+        assert_eq!(stats.value_sum, 0, "float16 value_sum must be zero");
+        assert_eq!(stats.row_start, 10);
+        assert_eq!(stats.row_end, 15);
     }
 
     /// P3: Write CSR + CSC shards → verify CSC section in catalog and correct data
