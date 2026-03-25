@@ -4,7 +4,8 @@ use std::path::Path;
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::ValueEncoding;
+use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
@@ -51,26 +52,10 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
 
-    // Get codec and encoding info from first file's first shard
     let first_header = readers[0].header();
-    let codec_id = CodecId::from_u8(first_header.codec_id)
-        .ok_or(OpsError::UnknownCodec(first_header.codec_id))?;
-    let value_encoding_u8 = {
-        let shards = readers[0].catalog().shards_sorted();
-        if !shards.is_empty() {
-            let section = readers[0].section_bytes(shards[0])?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
-            ))?;
-            sh.value_encoding
-        } else {
-            0
-        }
-    };
-    let value_encoding = ValueEncoding::from_u8(value_encoding_u8)
-        .ok_or(OpsError::UnknownValueEncoding(value_encoding_u8))?;
 
-    // Build output header
+    // Build output header. codec_id is 0 (None) because actual codec is
+    // selected per-shard via select_codec().
     let out_header = FileHeader {
         magic: MAGIC,
         format_version: 1,
@@ -82,7 +67,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         n_csr_shards: 0,
         n_csc_shards: 0,
         shard_target_rows: first_header.shard_target_rows,
-        codec_id: first_header.codec_id,
+        codec_id: 0,
         index_dtype: first_header.index_dtype,
         endian: 0,
         reserved_padding: 0,
@@ -117,28 +102,41 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     let var = readers[0].read_var()?;
     writer.write_var(&var)?;
 
-    // For each input: decode CSR shards and write to output with adjusted row_start
+    // For each input: decode CSR shards and write to output with adjusted row_start.
+    // Per-shard codec is auto-selected via select_codec() on the re-encoded values,
+    // and value_encoding is read from each shard's header for correctness.
     let mut cumulative_rows = 0u64;
     for reader in &readers {
         let shards = reader.catalog().shards_sorted();
         for shard_entry in &shards {
+            // Read this shard's value_encoding from its header
+            let shard_section = reader.section_bytes(shard_entry)?;
+            let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
+                &shard_section[..SHARD_HEADER_SIZE],
+            ))?;
+            let shard_value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+                .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
+
             let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
             let n_rows = indptr.len() - 1;
 
-            // Convert back to on-disk format
+            // Convert back to on-disk format using the shard's own value encoding
             let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
             let mut values_bytes = Vec::new();
             for &v in &data {
-                encode_value(&mut values_bytes, v, value_encoding)?;
+                encode_value(&mut values_bytes, v, shard_value_encoding)?;
             }
+
+            // Auto-select optimal codec for this shard's data
+            let shard_codec = select_codec(&values_bytes, shard_value_encoding);
 
             writer.write_csr_shard(
                 &indptr_u64,
                 &indices_u32,
                 &values_bytes,
-                codec_id,
-                value_encoding,
+                shard_codec,
+                shard_value_encoding,
                 cumulative_rows,
             )?;
             cumulative_rows += n_rows as u64;
@@ -192,15 +190,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             ValueEncoding::from_u8(sh.value_encoding)
                 .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?
         } else {
-            value_encoding
-        };
-        let layer_codec = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = readers[0].section_bytes(first_entry)?;
-            let sh =
-                ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
-            CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?
-        } else {
-            codec_id
+            ValueEncoding::Uint8
         };
 
         // Accumulate and flush at shard_target_rows, matching compact.rs pattern
@@ -230,11 +220,13 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
                 layer_row_count += 1;
 
                 if layer_row_count >= shard_target as u64 {
+                    // Auto-select codec per layer shard
+                    let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
                     writer.write_layer_csr_shard(
                         &layer_indptr,
                         &layer_indices,
                         &layer_values,
-                        layer_codec,
+                        layer_shard_codec,
                         layer_value_encoding,
                         emitted_layer_rows,
                         layer_name,
@@ -252,11 +244,13 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 
         // Flush remaining layer rows
         if layer_row_count > 0 {
+            // Auto-select codec for remaining layer shard
+            let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
             writer.write_layer_csr_shard(
                 &layer_indptr,
                 &layer_indices,
                 &layer_values,
-                layer_codec,
+                layer_shard_codec,
                 layer_value_encoding,
                 emitted_layer_rows,
                 layer_name,
