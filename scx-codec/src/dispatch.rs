@@ -70,6 +70,57 @@ impl ValueEncoding {
     pub fn is_integer(&self) -> bool {
         matches!(self, Self::Uint8 | Self::Uint16 | Self::Uint32)
     }
+
+    /// Encode a single f32 value to raw LE bytes, with range checking.
+    ///
+    /// This is the inverse of `values_raw_to_f32` for one element.
+    pub fn encode_f32(&self, buf: &mut Vec<u8>, value: f32) -> Result<(), CodecError> {
+        match self {
+            Self::Uint8 => {
+                if !(0.0..=255.0).contains(&value) {
+                    return Err(CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("value {value} out of range for uint8 (0..255)"),
+                    )));
+                }
+                buf.push(value as u8);
+            }
+            Self::Uint16 => {
+                if !(0.0..=65535.0).contains(&value) {
+                    return Err(CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("value {value} out of range for uint16 (0..65535)"),
+                    )));
+                }
+                buf.extend_from_slice(&(value as u16).to_le_bytes());
+            }
+            Self::Uint32 => {
+                if !(0.0..=u32::MAX as f32).contains(&value) {
+                    return Err(CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("value {value} out of range for uint32"),
+                    )));
+                }
+                buf.extend_from_slice(&(value as u32).to_le_bytes());
+            }
+            Self::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
+            Self::Float16 => {
+                buf.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    /// Batch-encode a slice of f32 values to raw LE bytes.
+    ///
+    /// This is the inverse of `values_raw_to_f32`.
+    pub fn encode_f32_batch(&self, data: &[f32]) -> Result<Vec<u8>, CodecError> {
+        let mut bytes = Vec::with_capacity(data.len() * self.byte_width());
+        for &v in data {
+            self.encode_f32(&mut bytes, v)?;
+        }
+        Ok(bytes)
+    }
 }
 
 /// The encoded byte arrays for a single CSR shard (owned).
