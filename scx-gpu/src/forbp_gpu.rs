@@ -158,6 +158,7 @@ pub fn forbp_decode_gpu(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("load forbp_decode_kernel: {e}")))?;
 
     let n_nonempty = metas.len() as u32;
+    let bitstream_len = data.len() as u32;
 
     // Build struct-of-arrays from metas
     let bit_offsets: Vec<u32> = metas.iter().map(|m| m.bit_offset).collect();
@@ -195,6 +196,7 @@ pub fn forbp_decode_gpu(
             .arg(&d_out_offsets)
             .arg(&mut d_output)
             .arg(&n_nonempty)
+            .arg(&bitstream_len)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("forbp_decode_kernel: {e}")))?;

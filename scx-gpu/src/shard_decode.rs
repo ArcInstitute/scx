@@ -23,9 +23,13 @@ use crate::rice_gpu::rice_decode_gpu;
 /// Type layout matches scipy CSR conventions: i64 indptr, i32 indices, f32 data.
 /// Binary-compatible with cuSPARSE and cupy `__cuda_array_interface__`.
 pub struct GpuCsr {
+    /// Compressed row pointer array (`n_rows + 1` elements, i64).
     pub indptr: CudaSlice<i64>,
+    /// Column indices array (`nnz` elements, i32).
     pub indices: CudaSlice<i32>,
+    /// Non-zero values array (`nnz` elements, f32).
     pub data: CudaSlice<f32>,
+    /// Matrix dimensions `(n_rows, n_cols)`.
     pub shape: (usize, usize),
 }
 

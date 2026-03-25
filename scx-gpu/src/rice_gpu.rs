@@ -108,6 +108,7 @@ pub fn rice_decode_gpu(
         }
     } as u32;
     let block_size_u32 = block_size as u32;
+    let bitstream_len = data.len() as u32;
 
     // Upload to GPU
     let d_bitstream = dev.htod_copy(data)?;
@@ -134,6 +135,7 @@ pub fn rice_decode_gpu(
             .arg(&n_blocks)
             .arg(&block_size_u32)
             .arg(&last_block_len)
+            .arg(&bitstream_len)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("rice_decode_kernel: {e}")))?;

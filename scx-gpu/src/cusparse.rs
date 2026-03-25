@@ -49,6 +49,11 @@ impl Drop for CusparseHandle {
     }
 }
 
+// SAFETY: cuSPARSE handles are thread-safe per NVIDIA documentation.
+// The handle internally synchronizes access to shared state.
+unsafe impl Send for CusparseHandle {}
+unsafe impl Sync for CusparseHandle {}
+
 /// RAII wrapper around a cuSPARSE sparse matrix descriptor (`cusparseSpMatDescr_t`).
 ///
 /// Created from [`GpuCsr::to_cusparse_csr`]. The descriptor is a lightweight
@@ -72,6 +77,11 @@ impl Drop for CusparseSpMatDescr {
         }
     }
 }
+
+// SAFETY: cusparseSpMatDescr_t is a lightweight handle that references GPU
+// memory. It can safely be sent between threads (the underlying GPU buffers
+// handle synchronization via CUDA events).
+unsafe impl Send for CusparseSpMatDescr {}
 
 /// Raw device pointers for cupy `__cuda_array_interface__` interop.
 ///
@@ -142,6 +152,13 @@ impl GpuCsr {
     ///
     /// Returns device pointer addresses (u64) that can be passed to Python
     /// via PyO3 for zero-copy access from cupy/torch.
+    ///
+    /// # Lifetime
+    ///
+    /// The returned pointer values (`u64`) are valid only while `self` is alive.
+    /// The caller must ensure the `GpuCsr` outlives any use of these pointers.
+    /// The `SyncOnDrop` guards from `device_ptr()` are dropped at the end of
+    /// this method, recording read events for synchronization tracking.
     pub fn device_pointers(&self, stream: &CudaStream) -> GpuCsrPointers {
         let (indptr_ptr, _g1) = self.indptr.device_ptr(stream);
         let (indices_ptr, _g2) = self.indices.device_ptr(stream);

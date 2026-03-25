@@ -7,6 +7,8 @@
 // Bitstream format (LSB-first):
 //   Per row: frame_bits-wide packed deltas, delta[0]=0, delta[j]=idx[j]-idx[j-1]
 //   Reconstruction: idx[0] = frame_min + delta[0], idx[j] = idx[j-1] + delta[j]
+//
+// Safety: `bitstream_len` bounds all byte reads to prevent out-of-bounds access.
 
 extern "C" __global__ void forbp_decode_kernel(
     const unsigned char* __restrict__ bitstream,          // full encoded data
@@ -16,7 +18,8 @@ extern "C" __global__ void forbp_decode_kernel(
     const unsigned int*  __restrict__ row_nnz,             // nnz per row
     const unsigned int*  __restrict__ row_output_offset,   // start index in output for each row
     unsigned int*        __restrict__ output,              // flat output indices
-    unsigned int n_rows                                    // number of non-empty rows
+    unsigned int n_rows,                                   // number of non-empty rows
+    unsigned int bitstream_len                             // total length of bitstream in bytes
 ) {
     unsigned int row_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (row_id >= n_rows) return;
@@ -42,8 +45,9 @@ extern "C" __global__ void forbp_decode_kernel(
             unsigned int bit_idx = cur_bit & 7;
 
             // Optimized: read up to 5 bytes as a word to extract the delta at once
+            // Clamp reads to bitstream_len to prevent out-of-bounds access
             unsigned long long word = 0;
-            for (unsigned int b = 0; b < 5; b++) {
+            for (unsigned int b = 0; b < 5 && (byte_idx + b) < bitstream_len; b++) {
                 word |= ((unsigned long long)bitstream[byte_idx + b]) << (b * 8);
             }
             word >>= bit_idx;

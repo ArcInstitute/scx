@@ -7,6 +7,9 @@
 // Bitstream format (LSB-first):
 //   Per value: unary quotient (q ones + 0 bit) + k-bit remainder (LSB-first)
 //   Reconstruction: output = ((q << k) | r) + 1
+//
+// Safety: `bitstream_len` bounds all byte reads to prevent out-of-bounds
+// access at the end of the buffer.
 
 extern "C" __global__ void rice_decode_kernel(
     const unsigned char* __restrict__ bitstream,      // full encoded bitstream
@@ -15,7 +18,8 @@ extern "C" __global__ void rice_decode_kernel(
     unsigned int*        __restrict__ output,          // decoded values (all >= 1)
     unsigned int n_blocks,
     unsigned int block_size,       // 256
-    unsigned int last_block_len    // values in the last (potentially partial) block
+    unsigned int last_block_len,   // values in the last (potentially partial) block
+    unsigned int bitstream_len     // total length of bitstream in bytes (for bounds checking)
 ) {
     unsigned int block_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (block_id >= n_blocks) return;
@@ -51,8 +55,9 @@ extern "C" __global__ void rice_decode_kernel(
             unsigned int bit_idx = bit_pos & 7;
 
             // Read up to 5 bytes to get enough bits (bit_idx + k <= 40)
+            // Clamp reads to bitstream_len to prevent out-of-bounds access
             unsigned long long word = 0;
-            for (unsigned int b = 0; b < 5 && (byte_idx + b) < 0xFFFFFFFF; b++) {
+            for (unsigned int b = 0; b < 5 && (byte_idx + b) < bitstream_len; b++) {
                 word |= ((unsigned long long)bs[byte_idx + b]) << (b * 8);
             }
             word >>= bit_idx;
