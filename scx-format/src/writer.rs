@@ -26,6 +26,30 @@ pub const SECTIONS_START_OFFSET: u64 = 4352;
 /// Writes sections sequentially to a temp file starting at offset 4352,
 /// accumulates catalog entries, then finalizes: full catalog at EOF,
 /// root catalog at 256, header at 0, fsync, atomic rename.
+///
+/// # Section-Ordering Convention
+///
+/// The writer accepts sections in **any order**, but callers should follow
+/// the canonical layout described in SPEC §3.1 for maximum compatibility
+/// with inspection tools and downstream readers:
+///
+/// 1. `write_obs` — cell metadata (Arrow IPC)
+/// 2. `write_obs_predicate_index` — obs predicate indexes
+/// 3. `write_var` — gene metadata (Arrow IPC)
+/// 4. `write_var_predicate_index` — var predicate indexes
+/// 5. `write_csr_shard` (repeated) — X matrix CSR shards
+/// 6. `write_csc_shard` (repeated, optional) — X matrix CSC shards
+/// 7. `write_layer_csr_shard` (repeated, optional) — layer shards
+/// 8. `write_obsm` (repeated, optional) — embeddings
+/// 9. `write_obsp_shard` (repeated, optional) — pairwise graphs
+/// 10. `write_uns` (optional) — unstructured metadata (JSON)
+/// 11. `write_provenance` (optional) — provenance chain
+/// 12. `write_deletion_vectors` (optional) — logical deletions
+///
+/// This ordering is **not enforced** — `finish()` will produce a valid
+/// file regardless of write order. However, deviating from it may produce
+/// non-standard layouts that confuse inspection tools or yield sub-optimal
+/// sequential read performance.
 pub struct ScxWriter {
     final_path: PathBuf,
     tmp_path: PathBuf,
@@ -46,6 +70,9 @@ impl ScxWriter {
     /// A temporary file is created alongside the final path. The header
     /// template is used for metadata (n_obs, n_vars, codec_id, etc.) but
     /// catalog offsets and shard count are filled in during `finish()`.
+    ///
+    /// See [`ScxWriter`] struct-level docs for the recommended section
+    /// write order.
     pub fn new(path: impl AsRef<Path>, header: FileHeader) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let tmp_path = PathBuf::from(format!(
@@ -532,10 +559,10 @@ impl ScxWriter {
             self.header.set_csc(); // has_csc (bit 0)
         }
         if self.has_obsm {
-            self.header.flags |= 1 << 2; // has_obsm
+            self.header.set_obsm();
         }
         if self.has_obsp {
-            self.header.flags |= 1 << 3; // has_obsp
+            self.header.set_obsp();
         }
 
         // 5. pwrite header at offset 0
@@ -680,7 +707,9 @@ pub fn compute_shard_stats(
                 (min, max, sum)
             }
         }
-        // Float types: Phase 1 integer focus — zero stats
+        // Float types: value_min/value_max are u32 and value_sum is u64, which
+        // cannot represent float statistics. Return zeros; these fields are
+        // documented as undefined for float value encodings (see SPEC §3.2).
         ValueEncoding::Float32 | ValueEncoding::Float16 => (0, 0, 0),
     };
 
@@ -1083,6 +1112,35 @@ mod tests {
         assert_eq!(stats.value_min, 1);
         assert_eq!(stats.value_max, 10);
         assert_eq!(stats.value_sum, 28); // 5+10+1+3+7+2
+    }
+
+    /// Test compute_shard_stats for Float32 returns zero stats
+    #[test]
+    fn test_compute_shard_stats_float32() {
+        // Float32: 3 values as LE bytes (1.0f32, 2.5f32, 0.5f32)
+        let mut values = Vec::new();
+        values.extend_from_slice(&1.0f32.to_le_bytes());
+        values.extend_from_slice(&2.5f32.to_le_bytes());
+        values.extend_from_slice(&0.5f32.to_le_bytes());
+        let stats = compute_shard_stats(&values, ValueEncoding::Float32, 0, 2, 3);
+        assert_eq!(stats.value_min, 0, "float32 value_min must be zero");
+        assert_eq!(stats.value_max, 0, "float32 value_max must be zero");
+        assert_eq!(stats.value_sum, 0, "float32 value_sum must be zero");
+        assert_eq!(stats.row_start, 0);
+        assert_eq!(stats.row_end, 2);
+        assert_eq!(stats.nnz, 3);
+    }
+
+    /// Test compute_shard_stats for Float16 returns zero stats
+    #[test]
+    fn test_compute_shard_stats_float16() {
+        let values = vec![0u8; 6]; // 3 × 2-byte float16 values
+        let stats = compute_shard_stats(&values, ValueEncoding::Float16, 10, 5, 3);
+        assert_eq!(stats.value_min, 0, "float16 value_min must be zero");
+        assert_eq!(stats.value_max, 0, "float16 value_max must be zero");
+        assert_eq!(stats.value_sum, 0, "float16 value_sum must be zero");
+        assert_eq!(stats.row_start, 10);
+        assert_eq!(stats.row_end, 15);
     }
 
     /// P3: Write CSR + CSC shards → verify CSC section in catalog and correct data

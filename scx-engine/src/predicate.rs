@@ -788,24 +788,17 @@ where
     Ok(result)
 }
 
-/// Convert any ArrowNativeType to f64 using byte reinterpretation.
+/// Convert any ArrowNativeType to f64 via monomorphized type dispatch.
 /// This handles all integer types (i8–i64, u8–u64) and float types (f32, f64).
 /// Returns `None` for unrecognized types rather than silently returning 0.0,
 /// which would produce wrong query results.
 fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> Option<f64> {
-    // ArrowNativeType doesn't directly provide a to_f64 method.
-    // Use the fact that all Arrow integer types implement Into<i128> or similar.
-    // The cleanest approach: use the Debug trait to convert via string.
-    // Actually, use std::mem::size_of + byte casting for performance.
-    // But the simplest and most correct approach: each ArrowPrimitiveType's
-    // Native has a known set of possible types. We handle them at the call
-    // site via monomorphization — each concrete type will compile to a
-    // direct cast. We use `as` for this at the eval_numeric_array dispatch
-    // site instead.
-    //
-    // Fallback: since ArrowNativeType: Copy + Debug, and we know the
-    // concrete types are all numeric primitives, we parse from Debug output.
-    // This is only called for value comparisons, not hot-path data.
+    // The downcast_ref chain below looks like runtime type dispatch, but
+    // it is fully optimized away by LLVM. Since eval_numeric_array is
+    // generic over T: ArrowPrimitiveType, each call site monomorphizes
+    // this function for a concrete N. LLVM resolves all TypeId comparisons
+    // at compile time and eliminates dead branches — e.g., native_to_f64::<i32>
+    // compiles to a single cvtsi2sd instruction.
     use std::any::Any;
     let any_ref: &dyn Any = &v;
     if let Some(&val) = any_ref.downcast_ref::<i8>() {
@@ -846,6 +839,9 @@ fn native_to_f64<N: arrow::datatypes::ArrowNativeType>(v: N) -> Option<f64> {
 /// Convert an integer ArrowNativeType to i128 for lossless integer comparison.
 /// Returns `None` for float types or unrecognized types — callers should fall
 /// back to f64 comparison in that case.
+///
+/// Like `native_to_f64`, the downcast_ref chain is fully optimized away by
+/// LLVM via monomorphization — see that function's doc comment for details.
 fn native_to_i128<N: arrow::datatypes::ArrowNativeType>(v: N) -> Option<i128> {
     use std::any::Any;
     let any_ref: &dyn Any = &v;

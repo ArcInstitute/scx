@@ -184,14 +184,29 @@ impl FileHeader {
         self.flags & (1 << 1) != 0
     }
 
+    /// Set the bitmap flag (bit 1).
+    pub fn set_bitmap(&mut self) {
+        self.flags |= 1 << 1;
+    }
+
     /// Returns true if the obsm flag (bit 2) is set.
     pub fn has_obsm(&self) -> bool {
         self.flags & (1 << 2) != 0
     }
 
+    /// Set the obsm flag (bit 2).
+    pub fn set_obsm(&mut self) {
+        self.flags |= 1 << 2;
+    }
+
     /// Returns true if the obsp flag (bit 3) is set.
     pub fn has_obsp(&self) -> bool {
         self.flags & (1 << 3) != 0
+    }
+
+    /// Set the obsp flag (bit 3).
+    pub fn set_obsp(&mut self) {
+        self.flags |= 1 << 3;
     }
 
     /// Returns true if the deletion vectors flag (bit 5) is set.
@@ -353,30 +368,39 @@ mod tests {
         assert!(!header.has_obsp());
         assert!(!header.has_deletion_vectors());
 
-        // Set bit 0 (CSC)
-        header.flags = 1 << 0;
+        // Set bit 0 (CSC) via setter
+        header.set_csc();
         assert!(header.has_csc());
         assert!(!header.has_bitmap());
 
-        // Set bit 1 (bitmap)
-        header.flags = 1 << 1;
+        // Set bit 1 (bitmap) via setter
+        header.flags = 0;
+        header.set_bitmap();
         assert!(!header.has_csc());
         assert!(header.has_bitmap());
 
-        // Set bit 2 (obsm)
-        header.flags = 1 << 2;
+        // Set bit 2 (obsm) via setter
+        header.flags = 0;
+        header.set_obsm();
         assert!(header.has_obsm());
+        assert!(!header.has_obsp());
 
-        // Set bit 3 (obsp)
-        header.flags = 1 << 3;
+        // Set bit 3 (obsp) via setter
+        header.flags = 0;
+        header.set_obsp();
         assert!(header.has_obsp());
+        assert!(!header.has_obsm());
 
-        // Set bit 5 (deletion vectors)
-        header.flags = 1 << 5;
+        // Set bit 5 (deletion vectors) via setter
+        header.flags = 0;
+        header.set_deletion_vectors();
         assert!(header.has_deletion_vectors());
 
-        // Multiple flags
-        header.flags = (1 << 0) | (1 << 2) | (1 << 5);
+        // Multiple flags via setters
+        header.flags = 0;
+        header.set_csc();
+        header.set_obsm();
+        header.set_deletion_vectors();
         assert!(header.has_csc());
         assert!(!header.has_bitmap());
         assert!(header.has_obsm());

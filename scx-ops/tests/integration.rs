@@ -1067,3 +1067,39 @@ fn test_append_empty_rows() {
     assert_eq!(reader.n_obs(), 6);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), original_size);
 }
+
+/// Issue 2.4: append should reject indices >= n_vars
+#[test]
+fn test_append_rejects_oob_indices() {
+    let dir = tempfile::tempdir().unwrap();
+    let n_vars = 10;
+    let path = write_test_file(&dir, "oob.scx", 4, n_vars, 1);
+
+    let new_obs = sample_obs(2);
+    // Create indices with one value == n_vars (out of bounds)
+    let indptr = vec![0u64, 2, 4];
+    let indices = vec![0u32, n_vars as u32, 1, 3]; // index 10 is OOB for n_vars=10
+    let values = vec![1u8, 2, 3, 4];
+
+    let result = scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+    );
+
+    assert!(result.is_err(), "append should reject OOB indices");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("out of bounds"),
+        "expected IndexOutOfBounds error, got: {err}"
+    );
+
+    // File should be unchanged (error before any writes)
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.n_obs(), 4);
+}

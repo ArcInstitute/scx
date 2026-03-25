@@ -283,6 +283,10 @@ SHARD STATISTICS (present when section_type is csr_shard, csc_shard,
   value_min: u32                   (minimum non-zero value)
   value_max: u32                   (maximum non-zero value)
   value_sum: u64                   (sum of all values in shard)
+  NOTE: value_min, value_max, and value_sum are meaningful only for integer
+  value encodings (Uint8, Uint16, Uint32). For float value encodings
+  (Float32, Float16), these fields are set to zero and MUST NOT be used
+  for data analysis or pushdown filtering.
   n_indexed_columns: u8            (number of per-column stat entries)
   For each indexed column:
     column_name_hash: u64          (BLAKE3 truncated hash of column name)

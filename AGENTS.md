@@ -60,7 +60,7 @@ scx-codec (standalone)
             └─> rscx (depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
 ```
 
-12 workspace members total. See [docs/architecture.md](docs/architecture.md) for detailed crate descriptions.
+13 workspace members total. See [docs/architecture.md](docs/architecture.md) for detailed crate descriptions.
 
 Key isolation rules:
 - `scx-loader` does NOT depend on `scx-engine` — it has its own streaming-optimized gene projection and fused ops.

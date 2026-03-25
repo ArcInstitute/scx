@@ -58,10 +58,16 @@ pub fn append(
         return Ok(());
     }
 
-    // Validate n_vars match
+    // Validate indices are within [0, n_vars)
     let file_n_vars = header.n_vars;
-    // We can't directly check n_vars from the data, but we trust the caller
-    // provides consistent indices.
+    if let Some(&max_idx) = new_indices.iter().max() {
+        if max_idx as u64 >= file_n_vars {
+            return Err(OpsError::IndexOutOfBounds {
+                index: max_idx,
+                n_vars: file_n_vars,
+            });
+        }
+    }
 
     let old_n_obs = header.n_obs;
     let old_n_csr_shards = header.n_csr_shards;
