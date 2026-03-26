@@ -1,3 +1,4 @@
+pub mod backed;
 pub mod catalog;
 pub mod checksum;
 pub mod codec_select;
@@ -11,6 +12,7 @@ pub mod section;
 pub mod shard;
 pub mod writer;
 
+pub use backed::{concatenate_csr, BackedCsrIndex, BackedCsrReader};
 pub use catalog::{
     column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry,
     ShardStats, ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE,
