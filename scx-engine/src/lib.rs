@@ -9,7 +9,10 @@ pub mod pushdown;
 
 pub use collect::filter_csr_rows;
 pub use error::{EngineError, Result};
-pub use fused_ops::{apply_fused_ops, fused_normalize_log1p, log1p_row, normalize_row};
+pub use fused_ops::{
+    apply_fused_ops, fused_normalize_log1p, log1p_row, normalize_row, streaming_preprocess,
+    streaming_save_layer, PreprocessConfig,
+};
 pub use index::{build_indexes, PredicateIndex};
 pub use pipeline::{NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};
