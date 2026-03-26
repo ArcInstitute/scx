@@ -84,6 +84,66 @@ pub struct PreprocessConfig {
     pub log1p: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers for streaming_preprocess / streaming_save_layer
+// ---------------------------------------------------------------------------
+
+/// Build an output `FileHeader` from a source header, overriding `codec_id`.
+///
+/// All dynamic fields (nnz, catalog offsets, checksum) are zeroed — the writer
+/// populates them during `finish()`.
+fn build_output_header(src: &scx_format::FileHeader, codec_id: u8) -> scx_format::FileHeader {
+    scx_format::FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: src.format_version,
+        header_length: 256,
+        flags: 0,
+        n_obs: src.n_obs,
+        n_vars: src.n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: src.shard_target_rows,
+        codec_id,
+        index_dtype: src.index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: src.manifest_sequence + 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        reserved: [0u8; 132],
+    }
+}
+
+/// Write a provenance entry recording a preprocessing action.
+fn write_preprocess_provenance(
+    writer: &mut scx_format::ScxWriter,
+    action: &str,
+    params: &str,
+) -> crate::Result<()> {
+    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: action.to_string(),
+        tool: "scx-engine".to_string(),
+        params_json: params.to_string(),
+        input_checksums: vec![],
+    }])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public streaming pipelines
+// ---------------------------------------------------------------------------
+
 /// Streaming shard-by-shard preprocessing pipeline.
 ///
 /// Reads the source SCX file one shard at a time, applies fused
@@ -111,50 +171,18 @@ pub fn streaming_preprocess(
 ) -> crate::Result<usize> {
     use byteorder::{LittleEndian, WriteBytesExt};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::{FileHeader, ProvenanceEntry, ScxReader, ScxWriter};
+    use scx_format::{ScxReader, ScxWriter};
 
     let reader = ScxReader::open(source_path)?;
-
-    // Build output header from source — same dimensions, but codec/encoding will
-    // be Float32+Zstd since normalization produces float values
-    let src_header = reader.header();
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: src_header.format_version,
-        header_length: 256,
-        flags: 0,
-        n_obs: src_header.n_obs,
-        n_vars: src_header.n_vars,
-        nnz: 0, // will be computed by writer
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: src_header.shard_target_rows,
-        codec_id: CodecId::Zstd as u8,
-        index_dtype: src_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: src_header.manifest_sequence + 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        reserved: [0u8; 132],
-    };
-
+    let header = build_output_header(reader.header(), CodecId::Zstd as u8);
     let mut writer = ScxWriter::new(target_path, header)?;
 
-    // Copy obs metadata
+    // Copy obs + var (before shards, matching original section order)
     match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
-
-    // Copy var metadata
     match reader.read_var() {
         Ok(batch) => writer.write_var(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
@@ -169,13 +197,11 @@ pub fn streaming_preprocess(
     for shard_entry in shards.iter() {
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
 
-        // Build a mutable ScxCsr and apply fused ops
         let n_rows = indptr.len().saturating_sub(1);
         let n_vars = reader.n_vars() as usize;
         let mut csr = ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
         apply_fused_ops(&mut csr, config.normalize_target_sum, config.log1p);
 
-        // Encode the transformed data for writing
         let out_indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
         let out_indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
         let mut out_values = Vec::with_capacity(csr.data.len() * 4);
@@ -197,7 +223,7 @@ pub fn streaming_preprocess(
 
     let n_shards = shards.len();
 
-    // Copy obsm embeddings
+    // Copy obsm + uns (after shards)
     match reader.read_all_obsm() {
         Ok(map) => {
             for (name, batch) in &map {
@@ -207,15 +233,13 @@ pub fn streaming_preprocess(
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
-
-    // Copy uns
     match reader.read_uns() {
         Ok(json) => writer.write_uns(&json)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
 
-    // Write provenance
+    // Provenance
     let ops_desc = format!(
         "preprocess(normalize={}, log1p={})",
         config
@@ -223,16 +247,11 @@ pub fn streaming_preprocess(
             .map_or("none".to_string(), |v| v.to_string()),
         config.log1p
     );
-    writer.write_provenance(vec![ProvenanceEntry {
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        action: "streaming_preprocess".to_string(),
-        tool: "scx-engine".to_string(),
-        params_json: format!("{{\"ops\":\"{ops_desc}\"}}"),
-        input_checksums: vec![],
-    }])?;
+    write_preprocess_provenance(
+        &mut writer,
+        "streaming_preprocess",
+        &format!("{{\"ops\":\"{ops_desc}\"}}"),
+    )?;
 
     writer.finish()?;
 
@@ -260,48 +279,18 @@ pub fn streaming_save_layer(
     config: &PreprocessConfig,
 ) -> crate::Result<usize> {
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::{FileHeader, ProvenanceEntry, ScxReader, ScxWriter};
+    use scx_format::{ScxReader, ScxWriter};
 
     let reader = ScxReader::open(source_path)?;
-
-    let src_header = reader.header();
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: src_header.format_version,
-        header_length: 256,
-        flags: 0,
-        n_obs: src_header.n_obs,
-        n_vars: src_header.n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: src_header.shard_target_rows,
-        codec_id: src_header.codec_id,
-        index_dtype: src_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: src_header.manifest_sequence + 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        reserved: [0u8; 132],
-    };
-
+    let header = build_output_header(reader.header(), reader.header().codec_id);
     let mut writer = ScxWriter::new(target_path, header)?;
 
-    // Copy obs
+    // Copy obs + var
     match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
-
-    // Copy var
     match reader.read_var() {
         Ok(batch) => writer.write_var(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
@@ -357,7 +346,7 @@ pub fn streaming_save_layer(
 
     let n_shards = shards.len();
 
-    // Copy obsm
+    // Copy obsm + uns
     match reader.read_all_obsm() {
         Ok(map) => {
             for (name, batch) in &map {
@@ -367,25 +356,18 @@ pub fn streaming_save_layer(
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
-
-    // Copy uns
     match reader.read_uns() {
         Ok(json) => writer.write_uns(&json)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
 
-    // Write provenance
-    writer.write_provenance(vec![ProvenanceEntry {
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        action: "streaming_save_layer".to_string(),
-        tool: "scx-engine".to_string(),
-        params_json: format!("{{\"layer_name\":\"{layer_name}\"}}"),
-        input_checksums: vec![],
-    }])?;
+    // Provenance
+    write_preprocess_provenance(
+        &mut writer,
+        "streaming_save_layer",
+        &format!("{{\"layer_name\":\"{layer_name}\"}}"),
+    )?;
 
     writer.finish()?;
 
