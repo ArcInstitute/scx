@@ -506,6 +506,56 @@ impl ScxBackedSparseDataset {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Number of CSR shards in the backing file.
+    #[getter]
+    fn n_shards(&self) -> usize {
+        self.n_shards
+    }
+
+    /// Return shard boundaries as a list of (row_start, row_end) tuples.
+    ///
+    /// When deletion vectors are present, the boundaries are remapped to
+    /// user-visible row space (i.e., deleted rows are excluded from counts).
+    /// Each tuple represents a contiguous chunk of user-visible rows that
+    /// came from one on-disk shard.
+    fn shard_boundaries(&self) -> Vec<(usize, usize)> {
+        let n_shards = self.n_shards;
+        match &self.kept_to_global {
+            None => {
+                // No deletions — shard boundaries map directly
+                (0..n_shards)
+                    .filter_map(|i| {
+                        self.backed
+                            .index()
+                            .shard_range(i)
+                            .map(|(s, e)| (s as usize, e as usize))
+                    })
+                    .collect()
+            }
+            Some(kept) => {
+                // With deletions: for each shard, find which user-visible
+                // rows fall into that shard's global row range.
+                let mut boundaries = Vec::with_capacity(n_shards);
+                let mut user_row = 0usize;
+                for shard_idx in 0..n_shards {
+                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let chunk_start = user_row;
+                    // Count how many kept rows fall in [s_start, s_end)
+                    while user_row < kept.len() && kept[user_row] < s_end {
+                        user_row += 1;
+                    }
+                    if user_row > chunk_start {
+                        boundaries.push((chunk_start, user_row));
+                    }
+                }
+                boundaries
+            }
+        }
+    }
+
     /// Maximum element along an axis without materializing the full matrix.
     ///
     /// Uses native Rust shard-streaming max. Respects deletion vectors
@@ -1104,6 +1154,15 @@ impl ScxBackedLayerDataset {
     #[getter]
     fn nnz(&self) -> PyResult<usize> {
         self.inner.nnz()
+    }
+
+    #[getter]
+    fn n_shards(&self) -> usize {
+        self.inner.n_shards
+    }
+
+    fn shard_boundaries(&self) -> Vec<(usize, usize)> {
+        self.inner.shard_boundaries()
     }
 
     #[pyo3(signature = (axis=None))]
