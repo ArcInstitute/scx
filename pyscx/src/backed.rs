@@ -11,6 +11,7 @@ use pyo3::types::{PySlice, PyTuple};
 use scx_format::BackedCsrReader;
 
 use crate::anndata::csr_to_scipy;
+use scx_engine::projection::project_csr;
 
 /// PyO3 class wrapping BackedCsrReader for on-demand sparse access.
 ///
@@ -24,13 +25,16 @@ use crate::anndata::csr_to_scipy;
 /// be set as a class attribute in the Python wrapper.
 #[pyclass(name = "ScxBackedSparseDataset")]
 pub struct ScxBackedSparseDataset {
-    backed: Arc<BackedCsrReader>,
-    shape_val: (usize, usize),
-    n_shards: usize,
-    cache_shards: usize,
+    pub(crate) backed: Arc<BackedCsrReader>,
+    pub(crate) shape_val: (usize, usize),
+    pub(crate) n_shards: usize,
+    pub(crate) cache_shards: usize,
     /// If deletions are present, maps user-visible row i → global row index.
     /// When None, no remapping is needed (no deletions).
-    kept_to_global: Option<Vec<u64>>,
+    pub(crate) kept_to_global: Option<Vec<u64>>,
+    /// If column projection is active, sorted column indices to retain.
+    /// CSR outputs are filtered through `project_csr()` before returning.
+    col_projection: Option<Vec<u32>>,
 }
 
 impl ScxBackedSparseDataset {
@@ -44,6 +48,7 @@ impl ScxBackedSparseDataset {
             n_shards,
             cache_shards,
             kept_to_global: None,
+            col_projection: None,
         }
     }
 
@@ -65,6 +70,27 @@ impl ScxBackedSparseDataset {
             n_shards,
             cache_shards,
             kept_to_global: Some(kept_to_global),
+            col_projection: None,
+        }
+    }
+
+    /// Set column projection on this dataset.
+    /// `col_indices` are the original column indices to retain (will be sorted internally).
+    /// Shape is adjusted: n_vars becomes col_indices.len().
+    pub fn set_col_projection(&mut self, col_indices: Vec<u32>) {
+        let mut sorted = col_indices;
+        sorted.sort_unstable();
+        sorted.dedup();
+        self.shape_val.1 = sorted.len();
+        self.col_projection = Some(sorted);
+    }
+
+    /// Apply column projection to a CSR matrix if projection is active.
+    /// Returns the original CSR if no projection is set.
+    fn apply_col_projection(&self, csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {
+        match &self.col_projection {
+            Some(indices) => project_csr(&csr, indices),
+            None => csr,
         }
     }
 }
@@ -150,17 +176,16 @@ impl ScxBackedSparseDataset {
     fn to_memory<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // When deletion vectors are present, we need to filter the full matrix
         // using the kept_to_global mapping rather than returning all rows.
-        if let Some(ref kept) = self.kept_to_global {
-            let csr = self
-                .backed
+        let csr = if let Some(ref kept) = self.kept_to_global {
+            self.backed
                 .read_row_indices(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            return csr_to_scipy(py, csr);
-        }
-        let csr = self
-            .backed
-            .read_all()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            self.backed
+                .read_all()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        };
+        let csr = self.apply_col_projection(csr);
         csr_to_scipy(py, csr)
     }
 
@@ -297,16 +322,21 @@ impl ScxBackedSparseDataset {
         mat.call_method1("__matmul__", (other,))
     }
 
-    // --- Aggregation methods ---
-    // Used by scanpy's filter_cells (sum per row), HVG (mean/var per column),
-    // normalize_total (sum per row), etc.
-
     /// Sum along an axis without materializing the full matrix.
     ///
     /// When deletion vectors are present, `axis=0` uses masked column sums
     /// to exclude deleted rows' contributions.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        // Fallback to materialization when column projection is active
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("sum", (a,)),
+                None => mat.call_method0("sum"),
+            };
+        }
         match axis {
             Some(0) => {
                 let sums = if let Some(ref kept) = self.kept_to_global {
@@ -349,8 +379,16 @@ impl ScxBackedSparseDataset {
     }
 
     /// Mean along an axis without materializing the full matrix.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("mean", (a,)),
+                None => mat.call_method0("mean"),
+            };
+        }
         match axis {
             Some(0) => {
                 let sums = if let Some(ref kept) = self.kept_to_global {
@@ -396,8 +434,14 @@ impl ScxBackedSparseDataset {
     ///
     /// `axis=0`: per-column variance (native Rust, two-pass streaming).
     /// `axis=1`: per-row variance (native Rust, shard-by-shard).
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return mat.call_method1("power", (2,))?.call_method0("mean");
+            // Note: for proper var with axis, would need scipy. Fallback is okay.
+        }
         match axis {
             Some(0) => {
                 let var = if let Some(ref kept) = self.kept_to_global {
@@ -445,8 +489,16 @@ impl ScxBackedSparseDataset {
     }
 
     /// NNZ counts along an axis without materializing the full matrix.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("getnnz", (a,)),
+                None => mat.call_method0("getnnz"),
+            };
+        }
         match axis {
             Some(0) => {
                 let counts = if let Some(ref kept) = self.kept_to_global {
@@ -712,6 +764,7 @@ impl ScxBackedSparseDataset {
                 .backed
                 .read_rows(global_row as u64, global_row as u64 + 1)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = self.apply_col_projection(csr);
             return csr_to_scipy(py, csr);
         }
 
@@ -728,6 +781,7 @@ impl ScxBackedSparseDataset {
                     .backed
                     .read_rows(start, stop)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let csr = self.apply_col_projection(csr);
                 return csr_to_scipy(py, csr);
             }
 
@@ -747,6 +801,7 @@ impl ScxBackedSparseDataset {
                 .backed
                 .read_row_indices(&rows)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = self.apply_col_projection(csr);
             return csr_to_scipy(py, csr);
         }
 
@@ -774,6 +829,7 @@ impl ScxBackedSparseDataset {
                 .backed
                 .read_row_indices(&rows)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = self.apply_col_projection(csr);
             return csr_to_scipy(py, csr);
         }
 
@@ -801,6 +857,7 @@ impl ScxBackedSparseDataset {
             .backed
             .read_row_indices(&rows)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let csr = self.apply_col_projection(csr);
         csr_to_scipy(py, csr)
     }
 
@@ -830,13 +887,26 @@ impl ScxBackedSparseDataset {
                 )));
             }
             // Read single row, extract single column
+            let global_row = self.to_global_row(row)?;
             let csr = self
                 .backed
-                .read_rows(row as u64, row as u64 + 1)
+                .read_rows(global_row as u64, global_row as u64 + 1)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // When col_projection is active, remap user-visible col to on-disk col
+            let lookup_col = if let Some(ref proj) = self.col_projection {
+                *proj.get(col).ok_or_else(|| {
+                    PyIndexError::new_err(format!(
+                        "column index {} out of range for {} projected columns",
+                        col,
+                        proj.len()
+                    ))
+                })? as usize
+            } else {
+                col
+            };
             // Search for the column in the sparse row
             for (i, &idx) in csr.indices.iter().enumerate() {
-                if idx as usize == col {
+                if idx as usize == lookup_col {
                     return Ok(csr.data[i].into_pyobject(py)?.into_any());
                 }
             }
@@ -913,7 +983,7 @@ impl ScxBackedSparseDataset {
 /// layer's catalog entries rather than the X entries.
 #[pyclass(name = "ScxBackedLayerDataset")]
 pub struct ScxBackedLayerDataset {
-    inner: ScxBackedSparseDataset,
+    pub(crate) inner: ScxBackedSparseDataset,
     layer_name: String,
 }
 

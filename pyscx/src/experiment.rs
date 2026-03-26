@@ -143,13 +143,14 @@ impl PyExperiment {
         layers: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if backed {
-            if var_names.is_some() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "var_names is not supported with backed=True. \
-                     Use the query pipeline instead: pyscx.open(path).query().select_genes([...]).collect()"
-                ));
-            }
-            anndata::to_anndata_backed(py, &self.path, cache_shards, obs_filter, layers.as_deref())
+            anndata::to_anndata_backed(
+                py,
+                &self.path,
+                cache_shards,
+                var_names.as_deref(),
+                obs_filter,
+                layers.as_deref(),
+            )
         } else {
             anndata::to_anndata_filtered(
                 py,

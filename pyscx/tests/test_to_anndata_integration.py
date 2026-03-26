@@ -10,7 +10,6 @@ Validates:
 
 import numpy as np
 import pytest
-import scipy.sparse as sp
 
 
 def test_var_names_projects_genes(synthetic_adata, scx_from_adata):
@@ -147,14 +146,60 @@ def test_obs_filter_backed(query_adata, scx_from_adata):
     assert x_dense.shape == (40, 40)
 
 
-def test_var_names_backed_raises(synthetic_adata, scx_from_adata):
-    """var_names with backed=True raises ValueError."""
+def test_var_names_backed(synthetic_adata, scx_from_adata):
+    """backed=True + var_names produces correct shape and var."""
     import pyscx
 
     path = scx_from_adata(synthetic_adata, "varnames_backed.scx")
+    target_genes = ["gene_0", "gene_5", "gene_10"]
+    adata = pyscx.open(path).to_anndata(backed=True, var_names=target_genes)
 
-    with pytest.raises(ValueError, match="var_names is not supported"):
-        pyscx.open(path).to_anndata(backed=True, var_names=["gene_0"])
+    assert adata.n_vars == len(target_genes)
+    assert adata.n_obs == synthetic_adata.n_obs
+    for gene in target_genes:
+        assert gene in adata.var.index.tolist()
+
+    # X should be a ScxBackedSparseDataset
+    assert isinstance(adata.X, pyscx.ScxBackedSparseDataset)
+    assert adata.X.shape == (synthetic_adata.n_obs, len(target_genes))
+
+    # Materialize and check shape
+    x_mat = adata.X.to_memory()
+    assert x_mat.shape == (synthetic_adata.n_obs, len(target_genes))
+
+
+def test_var_names_backed_data_matches_nonbacked(synthetic_adata, scx_from_adata):
+    """backed + var_names produces same data as non-backed + var_names."""
+    import pyscx
+
+    path = scx_from_adata(synthetic_adata, "varnames_backed_match.scx")
+    target_genes = ["gene_0", "gene_1"]
+
+    # Non-backed
+    eager = pyscx.open(path).to_anndata(var_names=target_genes)
+    # Backed
+    backed = pyscx.open(path).to_anndata(backed=True, var_names=target_genes)
+    backed_x = backed.X.to_memory()
+
+    np.testing.assert_array_equal(backed_x.toarray(), eager.X.toarray())
+
+
+def test_var_names_backed_combined_obs_filter(query_adata, scx_from_adata):
+    """backed + var_names + obs_filter work together."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "backed_combined.scx")
+    adata = pyscx.open(path).to_anndata(
+        backed=True,
+        var_names=["gene_0", "gene_1", "gene_2"],
+        obs_filter="cell_type == 'T cell'",
+    )
+
+    assert adata.n_obs == 40
+    assert adata.n_vars == 3
+    assert all(adata.obs["cell_type"] == "T cell")
+    assert isinstance(adata.X, pyscx.ScxBackedSparseDataset)
+    assert adata.X.shape == (40, 3)
 
 
 def test_var_names_none_found_raises(synthetic_adata, scx_from_adata):

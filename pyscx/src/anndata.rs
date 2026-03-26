@@ -351,6 +351,7 @@ pub fn to_anndata_backed<'py>(
     py: Python<'py>,
     path: &std::path::Path,
     cache_shards: usize,
+    var_names: Option<&[String]>,
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -420,10 +421,17 @@ pub fn to_anndata_backed<'py>(
         obs
     };
 
+    // --- Resolve var_names to column indices ---
+    let col_indices = if let Some(names) = var_names {
+        Some(resolve_var_names_to_indices(&reader, names)?)
+    } else {
+        None
+    };
+
     // --- X: backed ---
     let x_reader = ScxReader::open(path).map_err(to_pyerr)?;
     let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
-    let x_dataset = match &kept_to_global {
+    let mut x_dataset = match &kept_to_global {
         Some(mapping) => ScxBackedSparseDataset::from_reader_with_deletions(
             Arc::clone(&x_backed),
             cache_shards,
@@ -431,12 +439,26 @@ pub fn to_anndata_backed<'py>(
         ),
         None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed), cache_shards),
     };
+    if let Some(ref indices) = col_indices {
+        x_dataset.set_col_projection(indices.clone());
+    }
 
-    // --- var (eager) ---
+    // --- var (eager, optionally filtered by var_names) ---
     let var = match reader.read_var() {
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
-            Some(pyarrow_table_to_pandas(&table)?)
+            let df = pyarrow_table_to_pandas(&table)?;
+            if let Some(names) = var_names {
+                // Slice var DataFrame to only the projected genes
+                let py_names = pyo3::types::PyList::new(py, names)?;
+                let var_index = df.getattr("index")?;
+                let isin = var_index.call_method1("isin", (py_names,))?;
+                let loc = df.getattr("loc")?;
+                let filtered = loc.get_item(isin)?;
+                Some(filtered)
+            } else {
+                Some(df)
+            }
         }
         Err(scx_format::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
@@ -512,7 +534,7 @@ pub fn to_anndata_backed<'py>(
         }
         let l_reader = ScxReader::open(path).map_err(to_pyerr)?;
         let l_backed = Arc::new(BackedCsrReader::new_for_layer(l_reader, name, cache_shards));
-        let l_dataset = match &kept_to_global {
+        let mut l_dataset = match &kept_to_global {
             Some(mapping) => ScxBackedLayerDataset::from_reader_with_deletions(
                 l_backed,
                 cache_shards,
@@ -521,6 +543,9 @@ pub fn to_anndata_backed<'py>(
             ),
             None => ScxBackedLayerDataset::from_reader(l_backed, cache_shards, name.clone()),
         };
+        if let Some(ref indices) = col_indices {
+            l_dataset.inner.set_col_projection(indices.clone());
+        }
         let l_py = l_dataset.into_pyobject(py)?;
         layers_dict.set_item(name, l_py)?;
     }
