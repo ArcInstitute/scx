@@ -308,29 +308,21 @@ pub fn streaming_save_layer(
         Err(e) => return Err(e.into()),
     }
 
-    // Copy original X shards unchanged
+    // Copy original X shards unchanged (raw byte copy — no decode/re-encode)
     let shards = reader.catalog().shards_sorted();
-    for shard_entry in &shards {
-        let sh = reader.read_shard_header(shard_entry)?;
-        let codec_id = scx_codec::CodecId::from_u8(sh.codec_id)
-            .ok_or_else(|| scx_format::ScxError::UnknownCodec(sh.codec_id))?;
-        let value_encoding = scx_codec::ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or_else(|| scx_format::ScxError::UnknownValueEncoding(sh.value_encoding))?;
-
-        let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
-
-        let out_indptr: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-        let out_indices: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
-        let out_values = encode_f32_values(&data, value_encoding);
-
-        let row_start = shard_entry.stats.as_ref().map_or(0u64, |s| s.row_start);
-        writer.write_csr_shard(
-            &out_indptr,
-            &out_indices,
-            &out_values,
-            codec_id,
-            value_encoding,
-            row_start,
+    for (shard_idx, shard_entry) in shards.iter().enumerate() {
+        let raw = reader.read_raw_shard_bytes(shard_entry)?;
+        let stats = shard_entry
+            .stats
+            .clone()
+            .ok_or_else(|| scx_format::ScxError::SectionNotFound("shard stats".into()))?;
+        let nnz = stats.nnz;
+        writer.write_raw_shard(
+            raw,
+            scx_format::SectionType::CsrShard,
+            &format!("X_shard_{shard_idx}"),
+            stats,
+            nnz,
         )?;
     }
 
@@ -427,12 +419,12 @@ fn encode_f32_values(data: &[f32], encoding: scx_codec::ValueEncoding) -> Vec<u8
             buf
         }
         scx_codec::ValueEncoding::Float16 => {
-            // Fall back to Float32. Float16 encoding is not yet supported.
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.write_f32::<LittleEndian>(v).unwrap();
-            }
-            buf
+            // Float16 encoding is not yet supported. Callers should transcode
+            // to Float32 and update the encoding flag before reaching this point.
+            panic!(
+                "Float16 value encoding is not yet supported in encode_f32_values. \
+                 Transcode to Float32 before calling."
+            );
         }
     }
 }

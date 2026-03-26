@@ -748,13 +748,12 @@ pub(crate) fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
             buf
         }
         ValueEncoding::Float16 => {
-            // Float16 not yet supported — fall back to Float32 (finding 9.1).
-            eprintln!("warning: Float16 encoding not supported, falling back to Float32");
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.write_f32::<LittleEndian>(v).unwrap();
-            }
-            buf
+            // Float16 encoding is not yet supported. Callers should transcode
+            // to Float32 and update the encoding flag before reaching this point.
+            panic!(
+                "Float16 value encoding is not yet supported in encode_values. \
+                 Transcode to Float32 before calling."
+            );
         }
     }
 }

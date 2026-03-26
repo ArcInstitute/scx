@@ -450,6 +450,50 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Write a pre-encoded shard section verbatim (no encode/compress).
+    ///
+    /// The provided `raw_bytes` must be a complete shard section (76-byte
+    /// header + encoded payload) as returned by `ScxReader::read_raw_shard_bytes`.
+    /// Used for fast shard copying where the data does not need transformation.
+    ///
+    /// The section-level BLAKE3 checksum is recomputed from the raw bytes for
+    /// the catalog entry. The inner shard-level checksum (in the 76-byte
+    /// header) is preserved as-is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_raw_shard(
+        &mut self,
+        raw_bytes: &[u8],
+        section_type: SectionType,
+        name: &str,
+        stats: ShardStats,
+        nnz: u64,
+    ) -> Result<()> {
+        self.write_padding()?;
+
+        let shard_global_offset = self.current_offset;
+        let section_length = raw_bytes.len() as u64;
+        let section_checksum = blake3_hash(raw_bytes);
+
+        self.writer()?.write_all(raw_bytes)?;
+        self.current_offset += section_length;
+
+        self.entries.push(FullCatalogEntry {
+            name: name.to_string(),
+            offset: shard_global_offset,
+            length: section_length,
+            section_type,
+            checksum: section_checksum,
+            stats: Some(stats),
+        });
+
+        if section_type == SectionType::CsrShard {
+            self.csr_shard_count += 1;
+            self.total_nnz += nnz;
+        }
+
+        Ok(())
+    }
+
     /// Set per-column statistics on the last written shard entry.
     ///
     /// This must be called immediately after `write_csr_shard()` (or its
