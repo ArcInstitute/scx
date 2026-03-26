@@ -189,6 +189,191 @@ impl ScxBackedSparseDataset {
     fn A<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.toarray(py)
     }
+
+    /// Copy — materializes the full matrix. Required by AnnData .copy().
+    fn copy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method0("copy")
+    }
+
+    // --- Comparison operators (materialize + delegate to scipy) ---
+    // These are used by scanpy's filter_cells (X > 0), filter_genes, etc.
+
+    fn __gt__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__gt__", (other,))
+    }
+
+    fn __ge__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__ge__", (other,))
+    }
+
+    fn __lt__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__lt__", (other,))
+    }
+
+    fn __le__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__le__", (other,))
+    }
+
+    fn __eq__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__eq__", (other,))
+    }
+
+    fn __ne__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__ne__", (other,))
+    }
+
+    // --- Arithmetic operators ---
+    // Used by scanpy's normalize_total (multiply), scale, etc.
+
+    fn __add__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.add(other)
+    }
+
+    fn __sub__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.sub(other)
+    }
+
+    fn __mul__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.mul(other)
+    }
+
+    fn __truediv__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__truediv__", (other,))
+    }
+
+    fn __matmul__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("__matmul__", (other,))
+    }
+
+    // --- Aggregation methods ---
+    // Used by scanpy's filter_cells (sum per row), HVG (mean/var per column),
+    // normalize_total (sum per row), etc.
+
+    #[pyo3(signature = (axis=None))]
+    fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        match axis {
+            Some(a) => mat.call_method1("sum", (a,)),
+            None => mat.call_method0("sum"),
+        }
+    }
+
+    #[pyo3(signature = (axis=None))]
+    fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        match axis {
+            Some(a) => mat.call_method1("mean", (a,)),
+            None => mat.call_method0("mean"),
+        }
+    }
+
+    #[pyo3(signature = (axis=None))]
+    fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        match axis {
+            Some(a) => mat.call_method1("getnnz", (a,)),
+            None => mat.call_method0("getnnz"),
+        }
+    }
+
+    /// Element-wise multiply (Hadamard product). Used by normalize_total.
+    fn multiply<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("multiply", (other,))
+    }
+
+    /// Element-wise power. Used by HVG variance computation.
+    fn power<'py>(&self, py: Python<'py>, n: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.call_method1("power", (n,))
+    }
+
+    /// Number of stored values (nonzeros).
+    #[getter]
+    fn nnz<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        mat.getattr("nnz")
+    }
+
+    /// Maximum element along an axis.
+    #[pyo3(signature = (axis=None))]
+    fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        match axis {
+            Some(a) => mat.call_method1("max", (a,)),
+            None => mat.call_method0("max"),
+        }
+    }
+
+    /// Minimum element along an axis.
+    #[pyo3(signature = (axis=None))]
+    fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.to_memory(py)?;
+        match axis {
+            Some(a) => mat.call_method1("min", (a,)),
+            None => mat.call_method0("min"),
+        }
+    }
 }
 
 impl ScxBackedSparseDataset {
@@ -493,5 +678,145 @@ impl ScxBackedLayerDataset {
     #[allow(non_snake_case)]
     fn A<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.A(py)
+    }
+
+    fn copy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.copy(py)
+    }
+
+    // --- Comparison operators ---
+
+    fn __gt__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__gt__(py, other)
+    }
+
+    fn __ge__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__ge__(py, other)
+    }
+
+    fn __lt__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__lt__(py, other)
+    }
+
+    fn __le__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__le__(py, other)
+    }
+
+    fn __eq__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__eq__(py, other)
+    }
+
+    fn __ne__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__ne__(py, other)
+    }
+
+    // --- Arithmetic operators ---
+
+    fn __add__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__add__(py, other)
+    }
+
+    fn __sub__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__sub__(py, other)
+    }
+
+    fn __mul__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__mul__(py, other)
+    }
+
+    fn __truediv__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__truediv__(py, other)
+    }
+
+    fn __matmul__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.__matmul__(py, other)
+    }
+
+    // --- Aggregation methods ---
+
+    #[pyo3(signature = (axis=None))]
+    fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.sum(py, axis)
+    }
+
+    #[pyo3(signature = (axis=None))]
+    fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.mean(py, axis)
+    }
+
+    #[pyo3(signature = (axis=None))]
+    fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.getnnz(py, axis)
+    }
+
+    fn multiply<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.multiply(py, other)
+    }
+
+    fn power<'py>(&self, py: Python<'py>, n: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.power(py, n)
+    }
+
+    #[getter]
+    fn nnz<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.nnz(py)
+    }
+
+    #[pyo3(signature = (axis=None))]
+    fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.max(py, axis)
+    }
+
+    #[pyo3(signature = (axis=None))]
+    fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.min(py, axis)
     }
 }
