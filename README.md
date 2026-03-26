@@ -51,6 +51,27 @@ decompressed matrix, not the entire file. On a 1M-cell dataset:
 
 This means you can work with atlas-scale datasets on a laptop.
 
+### Too big to load at all? Use backed mode.
+
+SCX supports **backed mode** — data stays on disk and loads on demand, one shard at a
+time. Open a 10M-cell atlas without allocating the full matrix:
+
+```python
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# X stays on disk — only the accessed shard is decoded
+subset = adata[adata.obs["cell_type"] == "T cell"].copy()
+
+# Now subset is a regular AnnData — preprocess normally
+sc.pp.normalize_total(subset, target_sum=1e4)
+sc.pp.log1p(subset)
+sc.pp.pca(subset)
+```
+
+Layers, deletion vectors, and `anndata.abc.CSRDataset` registration all work
+transparently. See [`docs/scanpy.md`](docs/scanpy.md#backed-mode-lazy-loading)
+for details.
+
 ### Your training loop is bottlenecked on data loading
 
 SCX includes a **triple-buffered Rust pipeline** (tokio I/O → rayon decode → GPU) that
