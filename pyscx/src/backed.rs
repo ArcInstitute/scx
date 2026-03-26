@@ -632,8 +632,16 @@ impl ScxBackedSparseDataset {
     ///
     /// Uses native Rust shard-streaming max. Respects deletion vectors
     /// for both axis=0 (column max) and axis=1 (row max).
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("max", (a,)),
+                None => mat.call_method0("max"),
+            };
+        }
         match axis {
             Some(0) => {
                 let maxes = if let Some(ref kept) = self.kept_to_global {
@@ -678,8 +686,16 @@ impl ScxBackedSparseDataset {
     /// Minimum element along an axis without materializing the full matrix.
     ///
     /// Uses native Rust shard-streaming min. Respects deletion vectors.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("min", (a,)),
+                None => mat.call_method0("min"),
+            };
+        }
         match axis {
             Some(0) => {
                 let mins = if let Some(ref kept) = self.kept_to_global {
