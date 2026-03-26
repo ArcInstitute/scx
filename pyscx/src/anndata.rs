@@ -120,7 +120,8 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
     };
     let obsm_dict = pyo3::types::PyDict::new(py);
     for (name, batch) in &obsm_map {
-        let np_arr = obsm_batch_to_numpy(py, batch)?;
+        let filtered = filter_obs_by_deletion_vectors(reader, batch.clone())?;
+        let np_arr = obsm_batch_to_numpy(py, &filtered)?;
         obsm_dict.set_item(name, np_arr)?;
     }
 
@@ -230,7 +231,7 @@ pub fn to_anndata_backed<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // --- obsm (eager) ---
+    // --- obsm (eager, filtered by deletion vectors) ---
     let obsm_map = match reader.read_all_obsm() {
         Ok(map) => map,
         Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
@@ -238,7 +239,8 @@ pub fn to_anndata_backed<'py>(
     };
     let obsm_dict = pyo3::types::PyDict::new(py);
     for (name, batch) in &obsm_map {
-        let np_arr = obsm_batch_to_numpy(py, batch)?;
+        let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
+        let np_arr = obsm_batch_to_numpy(py, &filtered)?;
         obsm_dict.set_item(name, np_arr)?;
     }
 

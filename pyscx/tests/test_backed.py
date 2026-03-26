@@ -138,8 +138,6 @@ def test_backed_with_deletions(tmp_dir):
     import anndata
     import pyscx
 
-    # Create a minimal AnnData without obsm (obsm + deletion vectors
-    # have a known shape mismatch issue; that's a separate fix)
     np.random.seed(99)
     n_obs, n_vars = 100, 30
     dense = np.random.randint(0, 200, size=(n_obs, n_vars)).astype(np.float32)
@@ -173,6 +171,50 @@ def test_backed_with_deletions(tmp_dir):
     backed_full = adata_backed.X[:]
     np.testing.assert_array_equal(
         backed_full.toarray(), adata_full.X.toarray()
+    )
+
+
+def test_backed_obsm_with_deletions(tmp_dir):
+    """obsm arrays are filtered by deletion vectors (shape matches obs)."""
+    import anndata
+    import pyscx
+
+    np.random.seed(42)
+    n_obs, n_vars = 100, 30
+    dense = np.random.randint(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+    mask = np.random.random((n_obs, n_vars)) > 0.3
+    dense[mask] = 0
+    x = sp.csr_matrix(dense)
+    obsm = {"X_pca": np.random.randn(n_obs, 10).astype(np.float32)}
+    adata = anndata.AnnData(X=x, obsm=obsm)
+
+    path = str(tmp_dir / "backed_obsm_del.scx")
+    pyscx.from_anndata(adata, path)
+
+    # Mark some cells as deleted
+    delete_mask = np.zeros(n_obs, dtype=bool)
+    delete_mask[0] = True
+    delete_mask[5] = True
+    delete_mask[n_obs - 1] = True
+    n_deleted = int(delete_mask.sum())
+    n_kept = n_obs - n_deleted
+
+    exp = pyscx.open(path)
+    exp.mark_deleted(delete_mask)
+
+    # Non-backed: obs and obsm should have matching shapes
+    adata_full = pyscx.open(path).to_anndata()
+    assert adata_full.n_obs == n_kept
+    assert adata_full.obsm["X_pca"].shape[0] == n_kept
+
+    # Backed: obs and obsm should also have matching shapes
+    adata_backed = pyscx.open(path).to_anndata(backed=True)
+    assert adata_backed.n_obs == n_kept
+    assert adata_backed.obsm["X_pca"].shape[0] == n_kept
+
+    # obsm values should match between backed and non-backed
+    np.testing.assert_array_equal(
+        adata_backed.obsm["X_pca"], adata_full.obsm["X_pca"]
     )
 
 

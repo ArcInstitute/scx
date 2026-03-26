@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use lru::LruCache;
 use scx_sparse::ScxCsr;
 
-use crate::catalog::FullCatalog;
+use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::error::{Result, ScxError};
 use crate::reader::ScxReader;
 use crate::section::SectionType;
@@ -177,6 +177,8 @@ pub struct BackedCsrReader {
     n_obs: usize,
     /// If set, this reader targets a specific layer rather than X.
     layer_name: Option<String>,
+    /// Pre-sorted catalog entries for layer shards (empty for X shards).
+    sorted_entries: Vec<FullCatalogEntry>,
     cache: Option<Mutex<LruCache<usize, ScxCsr>>>,
 }
 
@@ -195,6 +197,7 @@ impl BackedCsrReader {
             n_vars,
             n_obs,
             layer_name: None,
+            sorted_entries: Vec::new(),
             cache,
         }
     }
@@ -209,12 +212,25 @@ impl BackedCsrReader {
         // n_obs for layers is the same as for X — layer shards cover the same rows.
         let n_obs = reader.n_obs() as usize;
         let cache = Self::make_cache(cache_shards);
+
+        // Pre-compute sorted layer shard entries to avoid re-scanning catalog on every access
+        let prefix = format!("{layer_name}_shard_");
+        let mut sorted_entries: Vec<FullCatalogEntry> = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix))
+            .cloned()
+            .collect();
+        sorted_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
+
         BackedCsrReader {
             reader,
             index,
             n_vars,
             n_obs,
             layer_name: Some(layer_name.to_string()),
+            sorted_entries,
             cache,
         }
     }
@@ -379,24 +395,14 @@ impl BackedCsrReader {
         // the standard read_csr_shard path.
         let (indptr, indices, data) = match &self.layer_name {
             None => self.reader.read_csr_shard(shard_idx)?,
-            Some(name) => {
-                let prefix = format!("{name}_shard_");
-                let mut entries: Vec<_> = self
-                    .reader
-                    .catalog()
-                    .entries
-                    .iter()
-                    .filter(|e| {
-                        e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix)
-                    })
-                    .collect();
-                entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-                let entry = entries
-                    .get(shard_idx)
-                    .ok_or(ScxError::ShardIndexOutOfBounds {
-                        index: shard_idx,
-                        count: entries.len(),
-                    })?;
+            Some(_) => {
+                let entry =
+                    self.sorted_entries
+                        .get(shard_idx)
+                        .ok_or(ScxError::ShardIndexOutOfBounds {
+                            index: shard_idx,
+                            count: self.sorted_entries.len(),
+                        })?;
                 self.reader.read_shard_from_entry(entry)?
             }
         };
