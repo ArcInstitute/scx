@@ -53,6 +53,13 @@ def test_var_axis1(adata_backed, adata_non_backed):
     np.testing.assert_allclose(backed_var, scipy_var, rtol=1e-5)
 
 
+def test_var_no_axis(adata_backed, adata_non_backed):
+    """var() (scalar) on backed matches numpy dense var()."""
+    backed_var = adata_backed.X.var()
+    numpy_var = adata_non_backed.X.toarray().var()
+    np.testing.assert_allclose(backed_var, numpy_var, rtol=1e-5)
+
+
 # --- Max tests ---
 
 
@@ -172,6 +179,22 @@ def test_var_with_deletions(tmp_dir):
 
     backed_var = np.asarray(adata_backed.X.var(axis=0)).flatten()
     full_var = np.asarray(adata_full.X.toarray().var(axis=0)).flatten()
+
+    np.testing.assert_allclose(backed_var, full_var, rtol=1e-5)
+
+
+
+def test_var_no_axis_with_deletions(tmp_dir):
+    """var() (scalar) with deletions matches materialized subset .var()."""
+    import pyscx
+
+    path, delete_mask = _make_deleted_file(tmp_dir, "del_var_scalar.scx")
+
+    adata_backed = pyscx.open(path).to_anndata(backed=True)
+    adata_full = pyscx.open(path).to_anndata()
+
+    backed_var = adata_backed.X.var()
+    full_var = adata_full.X.toarray().var()
 
     np.testing.assert_allclose(backed_var, full_var, rtol=1e-5)
 

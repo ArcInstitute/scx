@@ -473,23 +473,36 @@ impl ScxBackedSparseDataset {
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                // Total variance: mean of all elements' squared deviations
-                // Compute via per-column variances and average
-                let col_var = if let Some(ref kept) = self.kept_to_global {
-                    self.backed
-                        .col_var_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .col_var()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
-                // For overall variance: not simply the mean of column variances
-                // (that would be correct only if columns have the same mean).
-                // Correct approach: var = E[X²] - E[X]²
-                // Fallback to materialization for the scalar case
-                let mat = self.to_memory(py)?;
-                mat.call_method0("var")
+                // Total scalar variance via Var(X) = E[X²] - (E[X])²
+                // Both sums are computed shard-by-shard without materialization.
+                let n_obs = self.shape_val.0;
+                let n_vars = self.shape_val.1;
+                let n_total = (n_obs as f64) * (n_vars as f64);
+                if n_total == 0.0 {
+                    return Ok(0.0f64.into_pyobject(py)?.into_any());
+                }
+
+                // E[X] = total_sum / n_total
+                let all_sums = self
+                    .backed
+                    .row_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered_sums = self.filter_row_results(&all_sums);
+                let total_sum: f64 = filtered_sums.iter().sum();
+                let mean = total_sum / n_total;
+
+                // E[X²] = total_sum_sq / n_total
+                let all_sq = self
+                    .backed
+                    .row_sum_of_squares()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered_sq = self.filter_row_results(&all_sq);
+                let total_sq: f64 = filtered_sq.iter().sum();
+                let mean_sq = total_sq / n_total;
+
+                // Var = E[X²] - (E[X])²
+                let variance = mean_sq - mean * mean;
+                Ok(variance.into_pyobject(py)?.into_any())
             }
             Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }

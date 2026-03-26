@@ -246,6 +246,27 @@ impl ScxCsr {
         counts
     }
 
+    /// Compute per-row sum of squared values: `sum(val² for val in row)`.
+    ///
+    /// Only stored (non-zero) entries contribute — implicit zeros add 0² = 0.
+    /// Returns `f64` for precision when squaring and summing `f32` values.
+    pub fn row_sum_of_squares(&self) -> Vec<f64> {
+        let mut sums = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            let start = self.indptr[r] as usize;
+            let end = self.indptr[r + 1] as usize;
+            let s: f64 = self.data[start..end]
+                .iter()
+                .map(|&v| {
+                    let v64 = v as f64;
+                    v64 * v64
+                })
+                .sum();
+            sums.push(s);
+        }
+        sums
+    }
+
     // --- Variance helpers ---
 
     /// Compute per-row variance (population variance, ddof=0).
@@ -708,6 +729,17 @@ mod tests {
         let csr = sample_csr();
         let nnz = csr.col_nnz();
         assert_eq!(nnz, vec![1, 1, 2, 1, 1]);
+    }
+    // --- Sum of squares tests ---
+
+    #[test]
+    fn test_row_sum_of_squares() {
+        let csr = sample_csr();
+        // row 0: [0, 5, 0, 10, 0] → 5² + 10² = 25 + 100 = 125
+        // row 1: [1, 0, 3, 0, 7]  → 1² + 3² + 7² = 1 + 9 + 49 = 59
+        // row 2: [0, 0, 2, 0, 0]  → 2² = 4
+        let sq = csr.row_sum_of_squares();
+        assert_eq!(sq, vec![125.0, 59.0, 4.0]);
     }
 
     // --- Variance tests ---

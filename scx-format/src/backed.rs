@@ -503,6 +503,21 @@ impl BackedCsrReader {
         Ok(total)
     }
 
+    /// Compute per-row sum of squared values without materializing the full matrix.
+    ///
+    /// Iterates shards in order, computes row sum-of-squares from each shard's
+    /// CSR arrays, and concatenates the results. Used for scalar variance:
+    /// `Var(X) = E[X²] - (E[X])²`.
+    pub fn row_sum_of_squares(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_sq = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_sq.extend(csr.row_sum_of_squares());
+        }
+        Ok(all_sq)
+    }
+
     // --- Variance ---
 
     /// Streaming per-row variance without materializing the full matrix.
