@@ -202,6 +202,49 @@ impl ScxCsr {
         }
         Ok(dense)
     }
+
+    // --- Aggregation helpers (used by backed mode) ---
+
+    /// Compute per-row sums: `data[indptr[r]..indptr[r+1]].sum()` for each row.
+    ///
+    /// Returns `f64` for precision when summing many `f32` values.
+    pub fn row_sums(&self) -> Vec<f64> {
+        let mut sums = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            let start = self.indptr[r] as usize;
+            let end = self.indptr[r + 1] as usize;
+            let s: f64 = self.data[start..end].iter().map(|&v| v as f64).sum();
+            sums.push(s);
+        }
+        sums
+    }
+
+    /// Compute per-column sums, accumulated into a `n_cols`-length vector.
+    pub fn col_sums(&self) -> Vec<f64> {
+        let mut sums = vec![0.0f64; self.shape.1];
+        for (&col, &val) in self.indices.iter().zip(self.data.iter()) {
+            sums[col as usize] += val as f64;
+        }
+        sums
+    }
+
+    /// Compute per-row NNZ counts: `indptr[r+1] - indptr[r]` for each row.
+    pub fn row_nnz(&self) -> Vec<i64> {
+        let mut counts = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            counts.push(self.indptr[r + 1] - self.indptr[r]);
+        }
+        counts
+    }
+
+    /// Compute per-column NNZ counts.
+    pub fn col_nnz(&self) -> Vec<i64> {
+        let mut counts = vec![0i64; self.shape.1];
+        for &col in &self.indices {
+            counts[col as usize] += 1;
+        }
+        counts
+    }
 }
 
 #[cfg(test)]

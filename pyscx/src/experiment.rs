@@ -119,10 +119,26 @@ impl PyExperiment {
 
     /// Convert this SCX file to an AnnData object.
     ///
+    /// Args:
+    ///     backed: If True, X and layers are wrapped in ScxBackedSparseDataset
+    ///             for on-demand shard decoding (read-only).
+    ///     cache_shards: Number of decoded shards to LRU-cache (default 4).
+    ///                   Only used when backed=True.
+    ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    fn to_anndata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        anndata::to_anndata(py, &self.reader)
+    #[pyo3(signature = (backed=false, cache_shards=4))]
+    fn to_anndata<'py>(
+        &self,
+        py: Python<'py>,
+        backed: bool,
+        cache_shards: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if backed {
+            anndata::to_anndata_backed(py, &self.path, cache_shards)
+        } else {
+            anndata::to_anndata(py, &self.reader)
+        }
     }
 
     /// Validate all section checksums.

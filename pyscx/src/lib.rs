@@ -1,4 +1,5 @@
 mod anndata;
+pub(crate) mod backed;
 mod experiment;
 mod ops;
 mod query;
@@ -141,5 +142,19 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQueryPipeline>()?;
     m.add_class::<PyQueryResult>()?;
     m.add_class::<scx_loader::TrainingDataset>()?;
+    m.add_class::<backed::ScxBackedSparseDataset>()?;
+    m.add_class::<backed::ScxBackedLayerDataset>()?;
+
+    // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
+    // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.
+    // Best-effort: if anndata isn't installed, skip silently.
+    let py = m.py();
+    if let Ok(abc) = py.import("anndata.abc") {
+        if let Ok(csr_dataset) = abc.getattr("CSRDataset") {
+            let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedSparseDataset")?,));
+            let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedLayerDataset")?,));
+        }
+    }
+
     Ok(())
 }

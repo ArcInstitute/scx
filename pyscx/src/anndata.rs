@@ -120,7 +120,8 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
     };
     let obsm_dict = pyo3::types::PyDict::new(py);
     for (name, batch) in &obsm_map {
-        let np_arr = obsm_batch_to_numpy(py, batch)?;
+        let filtered = filter_obs_by_deletion_vectors(reader, batch.clone())?;
+        let np_arr = obsm_batch_to_numpy(py, &filtered)?;
         obsm_dict.set_item(name, np_arr)?;
     }
 
@@ -171,6 +172,170 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
     Ok(adata)
+}
+
+/// Build an AnnData object with backed (on-demand) X and layers.
+///
+/// Opens a new ScxReader (independent mmap) so the backed dataset can
+/// outlive the PyExperiment that created it. obs/var/obsm/uns are loaded
+/// eagerly (same as non-backed mode).
+///
+/// When deletion vectors are present, a `kept_to_global` mapping is
+/// computed and passed to `ScxBackedSparseDataset` so that user-visible
+/// row indices exclude deleted rows (matching non-backed behavior).
+pub fn to_anndata_backed<'py>(
+    py: Python<'py>,
+    path: &std::path::Path,
+    cache_shards: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
+    use scx_format::BackedCsrReader;
+    use std::sync::Arc;
+
+    let anndata_mod = py.import("anndata")?;
+    let reader = ScxReader::open(path).map_err(to_pyerr)?;
+
+    // --- Compute kept_to_global from deletion vectors (if present) ---
+    let kept_to_global = compute_kept_to_global(&reader)?;
+
+    // --- X: backed ---
+    let x_reader = ScxReader::open(path).map_err(to_pyerr)?;
+    let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
+    let x_dataset = match &kept_to_global {
+        Some(mapping) => ScxBackedSparseDataset::from_reader_with_deletions(
+            Arc::clone(&x_backed),
+            cache_shards,
+            mapping.clone(),
+        ),
+        None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed), cache_shards),
+    };
+
+    // --- obs (eager, filtered by deletion vectors) ---
+    let obs = match reader.read_obs() {
+        Ok(batch) => {
+            let filtered_batch = filter_obs_by_deletion_vectors(&reader, batch)?;
+            let table = record_batch_to_pyarrow(py, &filtered_batch)?;
+            Some(pyarrow_table_to_pandas(&table)?)
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(e) => return Err(to_pyerr(e)),
+    };
+
+    // --- var (eager) ---
+    let var = match reader.read_var() {
+        Ok(batch) => {
+            let table = record_batch_to_pyarrow(py, &batch)?;
+            Some(pyarrow_table_to_pandas(&table)?)
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(e) => return Err(to_pyerr(e)),
+    };
+
+    // --- obsm (eager, filtered by deletion vectors) ---
+    let obsm_map = match reader.read_all_obsm() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let obsm_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &obsm_map {
+        let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
+        let np_arr = obsm_batch_to_numpy(py, &filtered)?;
+        obsm_dict.set_item(name, np_arr)?;
+    }
+
+    // --- uns (eager) ---
+    let uns_dict = match reader.read_uns() {
+        Ok(json_val) => {
+            let json_str = serde_json::to_string(&json_val)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let json_mod = py.import("json")?;
+            Some(json_mod.call_method1("loads", (json_str,))?)
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(e) => return Err(to_pyerr(e)),
+    };
+
+    // --- layers (backed) ---
+    let layer_names = reader.layer_names();
+    let layers_dict = pyo3::types::PyDict::new(py);
+    for name in &layer_names {
+        let l_reader = ScxReader::open(path).map_err(to_pyerr)?;
+        let l_backed = Arc::new(BackedCsrReader::new_for_layer(l_reader, name, cache_shards));
+        let l_dataset = match &kept_to_global {
+            Some(mapping) => ScxBackedLayerDataset::from_reader_with_deletions(
+                l_backed,
+                cache_shards,
+                name.clone(),
+                mapping.clone(),
+            ),
+            None => ScxBackedLayerDataset::from_reader(l_backed, cache_shards, name.clone()),
+        };
+        let l_py = l_dataset.into_pyobject(py)?;
+        layers_dict.set_item(name, l_py)?;
+    }
+
+    // Build AnnData kwargs
+    let kwargs = pyo3::types::PyDict::new(py);
+    let x_py = x_dataset.into_pyobject(py)?;
+    kwargs.set_item("X", x_py)?;
+    if let Some(obs) = obs {
+        kwargs.set_item("obs", obs)?;
+    }
+    if let Some(var) = var {
+        kwargs.set_item("var", var)?;
+    }
+    if !obsm_dict.is_empty() {
+        kwargs.set_item("obsm", obsm_dict)?;
+    }
+    if let Some(uns) = uns_dict {
+        kwargs.set_item("uns", uns)?;
+    }
+    if !layers_dict.is_empty() {
+        kwargs.set_item("layers", layers_dict)?;
+    }
+
+    let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
+    Ok(adata)
+}
+
+/// Compute `kept_to_global` mapping from deletion vectors.
+///
+/// Returns `None` if there are no deletions. Otherwise returns a Vec
+/// where `kept_to_global[i]` is the global (file-level) row index for
+/// user-visible row `i`.
+fn compute_kept_to_global(reader: &ScxReader) -> PyResult<Option<Vec<u64>>> {
+    let dv_opt = reader.read_deletion_vectors().map_err(to_pyerr)?;
+    let dv = match dv_opt {
+        Some(dv) if dv.total_deleted() > 0 => dv,
+        _ => return Ok(None),
+    };
+
+    let n_obs = reader.n_obs() as usize;
+    let shards = reader.catalog().shards_sorted();
+
+    // Build a deleted-rows set
+    let mut deleted = vec![false; n_obs];
+    for (shard_idx, shard_entry) in shards.iter().enumerate() {
+        if let Some(ref stats) = shard_entry.stats {
+            if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
+                for local_row in sd.bitmap.iter() {
+                    let global_row = stats.row_start + local_row as u64;
+                    if (global_row as usize) < n_obs {
+                        deleted[global_row as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Build mapping: user-visible row i → global row
+    let kept: Vec<u64> = (0..n_obs)
+        .filter(|&i| !deleted[i])
+        .map(|i| i as u64)
+        .collect();
+
+    Ok(Some(kept))
 }
 
 /// Filter an obs RecordBatch to exclude deleted rows.

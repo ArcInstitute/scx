@@ -32,6 +32,7 @@ hdf5 = "0.8"
 
 half = "2"
 roaring = "0.10"
+lru = "0.12"
 object_store = { version = "0.12", features = ["gcp", "aws", "azure"] }
 url = "2"
 bytes = "1"

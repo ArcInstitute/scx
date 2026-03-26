@@ -25,6 +25,7 @@ roaring = { workspace = true, optional = true }
 half = { workspace = true }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
