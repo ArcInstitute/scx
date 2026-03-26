@@ -475,29 +475,27 @@ pub fn to_anndata_backed<'py>(
     if obs_filter.is_some() {
         // When obs_filter is present, obsm must be sliced to match kept_to_global
         if let Some(ref kept) = kept_to_global {
+            // Pre-compute dv_kept and positions once for all obsm entries
+            // (these are loop-invariant — they depend only on kept and deletion vectors)
+            let dv_kept = compute_kept_to_global(&reader)?;
+            let positions: Vec<i64> = match &dv_kept {
+                Some(dv_mapping) => {
+                    // Find position of each kept global row in dv_mapping
+                    kept.iter()
+                        .filter_map(|&g| {
+                            dv_mapping.iter().position(|&dv| dv == g).map(|p| p as i64)
+                        })
+                        .collect()
+                }
+                None => kept.iter().map(|&g| g as i64).collect(),
+            };
+
             for (name, batch) in &obsm_map {
                 // First filter by deletion vectors
                 let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
                 let np_arr = obsm_batch_to_numpy(py, &filtered)?;
-                // Then slice to the obs_filter rows (kept indices into the
-                // deletion-filtered array)
-                // We need the positional indices relative to the deletion-filtered obs.
-                // kept_to_global maps to global rows, but obsm was already deletion-filtered.
-                // Re-compute: the obs_filter positions in the deletion-filtered order.
-                let dv_kept = compute_kept_to_global(&reader)?;
-                let positions: Vec<i64> = match &dv_kept {
-                    Some(dv_mapping) => {
-                        // Find position of each kept global row in dv_mapping
-                        kept.iter()
-                            .filter_map(|&g| {
-                                dv_mapping.iter().position(|&dv| dv == g).map(|p| p as i64)
-                            })
-                            .collect()
-                    }
-                    None => kept.iter().map(|&g| g as i64).collect(),
-                };
-                let np_mod = py.import("numpy")?;
-                let idx_arr = numpy::PyArray1::from_vec(py, positions);
+                // Slice to the obs_filter rows using pre-computed positions
+                let idx_arr = numpy::PyArray1::from_slice(py, &positions);
                 let sliced = np_arr.call_method1("__getitem__", (idx_arr,))?;
                 obsm_dict.set_item(name, sliced)?;
             }

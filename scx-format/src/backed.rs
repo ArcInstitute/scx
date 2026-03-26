@@ -701,18 +701,19 @@ impl BackedCsrReader {
                 None => continue,
             };
 
-            // Find kept rows that fall in this shard
-            for &global_row in kept_rows {
-                if global_row >= s_start && global_row < s_end {
-                    let local_row = (global_row - s_start) as usize;
-                    let row_start = csr.indptr[local_row] as usize;
-                    let row_end = csr.indptr[local_row + 1] as usize;
-                    for j in row_start..row_end {
-                        let c = csr.indices[j] as usize;
-                        let diff = csr.data[j] as f64 - col_means[c];
-                        sq_devs[c] += diff * diff;
-                        col_nnz[c] += 1;
-                    }
+            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
+            // kept_rows is sorted by construction (see compute_kept_to_global).
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let row_start = csr.indptr[local_row] as usize;
+                let row_end = csr.indptr[local_row + 1] as usize;
+                for j in row_start..row_end {
+                    let c = csr.indices[j] as usize;
+                    let diff = csr.data[j] as f64 - col_means[c];
+                    sq_devs[c] += diff * diff;
+                    col_nnz[c] += 1;
                 }
             }
         }
@@ -745,22 +746,24 @@ impl BackedCsrReader {
                 None => continue,
             };
 
-            for &global_row in kept_rows {
-                if global_row >= s_start && global_row < s_end {
-                    let local_row = (global_row - s_start) as usize;
-                    let row_start = csr.indptr[local_row] as usize;
-                    let row_end = csr.indptr[local_row + 1] as usize;
-                    for j in row_start..row_end {
-                        let c = csr.indices[j] as usize;
-                        let v = csr.data[j] as f64;
-                        match op {
-                            AggOp::Sum => result[c] += v,
-                            AggOp::Nnz => result[c] += 1.0,
-                            AggOp::Max => result[c] = result[c].max(v),
-                            AggOp::Min => result[c] = result[c].min(v),
-                        }
-                        col_nnz[c] += 1;
+            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
+            // kept_rows is sorted by construction (see compute_kept_to_global).
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let row_start = csr.indptr[local_row] as usize;
+                let row_end = csr.indptr[local_row + 1] as usize;
+                for j in row_start..row_end {
+                    let c = csr.indices[j] as usize;
+                    let v = csr.data[j] as f64;
+                    match op {
+                        AggOp::Sum => result[c] += v,
+                        AggOp::Nnz => result[c] += 1.0,
+                        AggOp::Max => result[c] = result[c].max(v),
+                        AggOp::Min => result[c] = result[c].min(v),
                     }
+                    col_nnz[c] += 1;
                 }
             }
         }

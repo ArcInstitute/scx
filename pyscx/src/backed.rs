@@ -35,6 +35,11 @@ pub struct ScxBackedSparseDataset {
     /// If column projection is active, sorted column indices to retain.
     /// CSR outputs are filtered through `project_csr()` before returning.
     col_projection: Option<Vec<u32>>,
+    /// Whether the data is known to be non-negative. Defaults to `true`
+    /// (raw UMI counts, normalized, log1p). Set to `false` after operations
+    /// that produce negative values (e.g., `sc.pp.scale()`), which disables
+    /// the `(X > 0).sum() → getnnz()` short-circuit optimization.
+    non_negative: bool,
 }
 
 impl ScxBackedSparseDataset {
@@ -49,6 +54,7 @@ impl ScxBackedSparseDataset {
             cache_shards,
             kept_to_global: None,
             col_projection: None,
+            non_negative: true,
         }
     }
 
@@ -71,6 +77,7 @@ impl ScxBackedSparseDataset {
             cache_shards,
             kept_to_global: Some(kept_to_global),
             col_projection: None,
+            non_negative: true,
         }
     }
 
@@ -732,6 +739,7 @@ impl ScxBackedSparseDataset {
                 op: op.to_string(),
                 threshold,
                 kept_to_global: self.kept_to_global.clone(),
+                non_negative: self.non_negative,
             };
             Ok(Bound::new(py, result)?.into_any())
         } else {
@@ -1264,6 +1272,8 @@ pub struct ScxComparisonResult {
     op: String,
     threshold: f64,
     kept_to_global: Option<Vec<u64>>,
+    /// Inherited from the parent dataset — gates the getnnz short-circuit.
+    non_negative: bool,
 }
 
 impl ScxComparisonResult {
@@ -1293,12 +1303,23 @@ impl ScxComparisonResult {
         mat.call_method1(method, (self.threshold,))
     }
 
-    /// Check if this comparison can be short-circuited for .sum().
+    /// Check if this comparison can be short-circuited for `.sum()`.
     ///
     /// `(X > 0).sum(axis)` == `getnnz(axis)` for non-negative data.
     /// This is the standard scanpy pattern for QC metrics.
+    ///
+    /// # Correctness assumption
+    ///
+    /// This short-circuit is only correct for **non-negative** data (e.g.,
+    /// raw UMI counts, normalized counts, log1p-transformed data). For data
+    /// that may contain negative values (e.g., after `sc.pp.scale()` which
+    /// centers to zero-mean), `getnnz` overcounts because it includes
+    /// stored negative entries.
+    ///
+    /// The `non_negative` flag is inherited from the parent
+    /// `ScxBackedSparseDataset` and gates this optimization at runtime.
     fn can_shortcircuit_sum(&self) -> bool {
-        self.op == "gt" && self.threshold == 0.0
+        self.non_negative && self.op == "gt" && self.threshold == 0.0
     }
 }
 
@@ -1336,6 +1357,9 @@ impl ScxComparisonResult {
     /// **Optimization:** For `(X > 0).sum(axis=...)`, this returns
     /// `getnnz(axis=...)` without materializing the full matrix.
     /// This is the critical path for `sc.pp.calculate_qc_metrics`.
+    ///
+    /// **Note:** The `getnnz` short-circuit assumes non-negative data.
+    /// See [`can_shortcircuit_sum`] for details on this assumption.
     #[pyo3(signature = (axis=None))]
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         if self.can_shortcircuit_sum() {
