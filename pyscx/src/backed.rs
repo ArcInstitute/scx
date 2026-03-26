@@ -305,30 +305,115 @@ impl ScxBackedSparseDataset {
     // Used by scanpy's filter_cells (sum per row), HVG (mean/var per column),
     // normalize_total (sum per row), etc.
 
+    /// Sum along an axis without materializing the full matrix.
+    ///
+    /// Iterates shards in Rust, computing partial sums. For `axis=1`
+    /// (row sums), deletion vectors are handled via `kept_to_global`.
     #[pyo3(signature = (axis=None))]
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
         match axis {
-            Some(a) => mat.call_method1("sum", (a,)),
-            None => mat.call_method0("sum"),
+            Some(0) => {
+                // Column sums — deletion vectors don't affect columns
+                let sums = self
+                    .backed
+                    .col_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let arr = numpy::PyArray::from_vec(py, sums);
+                // Return as (1, n_vars) matrix to match scipy convention
+                arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+            }
+            Some(1) => {
+                // Row sums
+                let all_sums = self
+                    .backed
+                    .row_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // Apply deletion vector remapping if present
+                let filtered = self.filter_row_results(&all_sums);
+                let arr = numpy::PyArray::from_vec(py, filtered);
+                // Return as (n_obs, 1) matrix to match scipy convention
+                arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+            }
+            None => {
+                // Total sum
+                let all_sums = self
+                    .backed
+                    .row_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_sums);
+                let total: f64 = filtered.iter().sum();
+                Ok(total.into_pyobject(py)?.into_any())
+            }
+            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
     }
 
+    /// Mean along an axis without materializing the full matrix.
     #[pyo3(signature = (axis=None))]
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
         match axis {
-            Some(a) => mat.call_method1("mean", (a,)),
-            None => mat.call_method0("mean"),
+            Some(0) => {
+                let sums = self
+                    .backed
+                    .col_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let n = self.shape_val.0 as f64;
+                let means: Vec<f64> = sums.iter().map(|&s| s / n).collect();
+                let arr = numpy::PyArray::from_vec(py, means);
+                arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+            }
+            Some(1) => {
+                let all_sums = self
+                    .backed
+                    .row_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_sums);
+                let n = self.shape_val.1 as f64;
+                let means: Vec<f64> = filtered.iter().map(|&s| s / n).collect();
+                let arr = numpy::PyArray::from_vec(py, means);
+                arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+            }
+            None => {
+                let all_sums = self
+                    .backed
+                    .row_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_sums);
+                let total: f64 = filtered.iter().sum();
+                let n = (self.shape_val.0 as f64) * (self.shape_val.1 as f64);
+                Ok((total / n).into_pyobject(py)?.into_any())
+            }
+            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
     }
 
+    /// NNZ counts along an axis without materializing the full matrix.
     #[pyo3(signature = (axis=None))]
     fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
         match axis {
-            Some(a) => mat.call_method1("getnnz", (a,)),
-            None => mat.call_method0("getnnz"),
+            Some(0) => {
+                let counts = self
+                    .backed
+                    .col_nnz()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(numpy::PyArray::from_vec(py, counts).into_any())
+            }
+            Some(1) => {
+                let all_nnz = self
+                    .backed
+                    .row_nnz()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_nnz);
+                Ok(numpy::PyArray::from_vec(py, filtered).into_any())
+            }
+            None => {
+                let total = self
+                    .backed
+                    .total_nnz()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(total.into_pyobject(py)?.into_any())
+            }
+            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
     }
 
@@ -348,11 +433,12 @@ impl ScxBackedSparseDataset {
         mat.call_method1("power", (n,))
     }
 
-    /// Number of stored values (nonzeros).
+    /// Number of stored values (nonzeros) — without materializing.
     #[getter]
-    fn nnz<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.getattr("nnz")
+    fn nnz(&self) -> PyResult<usize> {
+        self.backed
+            .total_nnz()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Maximum element along an axis.
@@ -377,6 +463,17 @@ impl ScxBackedSparseDataset {
 }
 
 impl ScxBackedSparseDataset {
+    /// Filter row-level results through deletion vector remapping.
+    ///
+    /// When `kept_to_global` is present, extracts only the values at global
+    /// indices corresponding to kept rows. Otherwise returns the input as-is.
+    fn filter_row_results<T: Copy>(&self, all_values: &[T]) -> Vec<T> {
+        match &self.kept_to_global {
+            Some(mapping) => mapping.iter().map(|&g| all_values[g as usize]).collect(),
+            None => all_values.to_vec(),
+        }
+    }
+
     /// Handle 1D row indexing (slice, int, bool mask, fancy index).
     fn getitem_rows<'py>(
         &self,
@@ -386,7 +483,7 @@ impl ScxBackedSparseDataset {
         // Integer index → single row
         if let Ok(i) = row_idx.extract::<i64>() {
             let row = self.normalize_row_index(i)?;
-            let global_row = self.to_global_row(row);
+            let global_row = self.to_global_row(row)?;
             let csr = self
                 .backed
                 .read_rows(global_row as u64, global_row as u64 + 1)
@@ -415,7 +512,7 @@ impl ScxBackedSparseDataset {
             let mut i = indices.start;
             while (step > 0 && i < indices.stop) || (step < 0 && i > indices.stop) {
                 if i >= 0 && (i as usize) < self.shape_val.0 {
-                    rows.push(self.to_global_row(i as usize) as u64);
+                    rows.push(self.to_global_row(i as usize)? as u64);
                 }
                 i += step;
             }
@@ -447,8 +544,8 @@ impl ScxBackedSparseDataset {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let rows: Vec<u64> = slice
                 .iter()
-                .map(|&v| self.to_global_row(v as usize) as u64)
-                .collect();
+                .map(|&v| self.to_global_row(v as usize).map(|g| g as u64))
+                .collect::<PyResult<Vec<u64>>>()?;
             let csr = self
                 .backed
                 .read_row_indices(&rows)
@@ -462,17 +559,20 @@ impl ScxBackedSparseDataset {
         let slice = readonly
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let n = self.shape_val.0 as i64;
         let rows: Vec<u64> = slice
             .iter()
             .map(|&v| {
-                let normalized = if v < 0 {
-                    self.shape_val.0 as i64 + v
-                } else {
-                    v
-                };
-                self.to_global_row(normalized as usize) as u64
+                let normalized = if v < 0 { n + v } else { v };
+                if normalized < 0 || normalized >= n {
+                    return Err(PyIndexError::new_err(format!(
+                        "row index {} out of range for {} rows",
+                        v, self.shape_val.0
+                    )));
+                }
+                self.to_global_row(normalized as usize).map(|g| g as u64)
             })
-            .collect();
+            .collect::<PyResult<Vec<u64>>>()?;
         let csr = self
             .backed
             .read_row_indices(&rows)
@@ -557,10 +657,27 @@ impl ScxBackedSparseDataset {
 
     /// Map a user-visible row index to the global (file-level) row index.
     /// If no deletion vectors are present, this is the identity function.
-    fn to_global_row(&self, user_row: usize) -> usize {
+    ///
+    /// Returns `PyIndexError` if `user_row` is out of bounds.
+    fn to_global_row(&self, user_row: usize) -> PyResult<usize> {
         match &self.kept_to_global {
-            Some(mapping) => mapping[user_row] as usize,
-            None => user_row,
+            Some(mapping) => mapping.get(user_row).map(|&g| g as usize).ok_or_else(|| {
+                PyIndexError::new_err(format!(
+                    "row index {} out of range for {} rows",
+                    user_row,
+                    mapping.len()
+                ))
+            }),
+            None => {
+                if user_row >= self.shape_val.0 {
+                    Err(PyIndexError::new_err(format!(
+                        "row index {} out of range for {} rows",
+                        user_row, self.shape_val.0
+                    )))
+                } else {
+                    Ok(user_row)
+                }
+            }
         }
     }
 }
@@ -806,8 +923,8 @@ impl ScxBackedLayerDataset {
     }
 
     #[getter]
-    fn nnz<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.inner.nnz(py)
+    fn nnz(&self) -> PyResult<usize> {
+        self.inner.nnz()
     }
 
     #[pyo3(signature = (axis=None))]

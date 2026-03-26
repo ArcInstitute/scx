@@ -146,10 +146,12 @@ impl BackedCsrIndex {
     }
 
     /// Get the shard range `(row_start, row_end)` for a given shard index.
+    ///
+    /// O(1) — shard indices are assigned sequentially during construction,
+    /// so `shard_idx` is the position in the sorted `shard_ranges` vec.
     pub fn shard_range(&self, shard_idx: usize) -> Option<(u64, u64)> {
         self.shard_ranges
-            .iter()
-            .find(|&&(_, _, idx)| idx == shard_idx)
+            .get(shard_idx)
             .map(|&(rs, re, _)| (rs, re))
     }
 }
@@ -408,6 +410,78 @@ impl BackedCsrReader {
         }
 
         Ok(csr)
+    }
+
+    // --- Native shard-by-shard aggregation ---
+    //
+    // These methods compute statistics without materializing the full
+    // concatenated CSR. Peak memory = one decoded shard at a time
+    // (plus the output vector).
+
+    /// Compute per-row sums without materializing the full matrix.
+    ///
+    /// Iterates shards in order, computes row sums from each shard's
+    /// CSR arrays, and concatenates the results.
+    pub fn row_sums(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_sums = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_sums.extend(csr.row_sums());
+        }
+        Ok(all_sums)
+    }
+
+    /// Compute per-column sums without materializing the full matrix.
+    ///
+    /// Iterates shards, accumulates column sums into a single `n_vars`-length vector.
+    pub fn col_sums(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut sums = vec![0.0f64; self.n_vars];
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            let partial = csr.col_sums();
+            for (s, p) in sums.iter_mut().zip(partial.iter()) {
+                *s += p;
+            }
+        }
+        Ok(sums)
+    }
+
+    /// Compute per-row NNZ counts without materializing the full matrix.
+    pub fn row_nnz(&self) -> Result<Vec<i64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_nnz = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_nnz.extend(csr.row_nnz());
+        }
+        Ok(all_nnz)
+    }
+
+    /// Compute per-column NNZ counts without materializing the full matrix.
+    pub fn col_nnz(&self) -> Result<Vec<i64>> {
+        let n_shards = self.index.n_shards();
+        let mut counts = vec![0i64; self.n_vars];
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            let partial = csr.col_nnz();
+            for (c, p) in counts.iter_mut().zip(partial.iter()) {
+                *c += p;
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Total NNZ across all shards without materializing.
+    pub fn total_nnz(&self) -> Result<usize> {
+        let n_shards = self.index.n_shards();
+        let mut total = 0usize;
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            total += csr.nnz();
+        }
+        Ok(total)
     }
 }
 
