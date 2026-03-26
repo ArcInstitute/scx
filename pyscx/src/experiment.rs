@@ -124,20 +124,41 @@ impl PyExperiment {
     ///             for on-demand shard decoding (read-only).
     ///     cache_shards: Number of decoded shards to LRU-cache (default 4).
     ///                   Only used when backed=True.
+    ///     var_names: Optional list of gene names to project to at load time.
+    ///                Only loads the specified genes. Not supported with backed=True.
+    ///     obs_filter: Optional predicate expression (e.g., "cell_type == 'T cell'")
+    ///                 to filter observations. Uses predicate pushdown for shard skipping.
+    ///     layers: Optional list of layer names to load. If None, all layers are loaded.
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None))]
     fn to_anndata<'py>(
         &self,
         py: Python<'py>,
         backed: bool,
         cache_shards: usize,
+        var_names: Option<Vec<String>>,
+        obs_filter: Option<&str>,
+        layers: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if backed {
-            anndata::to_anndata_backed(py, &self.path, cache_shards)
+            if var_names.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "var_names is not supported with backed=True. \
+                     Use the query pipeline instead: pyscx.open(path).query().select_genes([...]).collect()"
+                ));
+            }
+            anndata::to_anndata_backed(py, &self.path, cache_shards, obs_filter, layers.as_deref())
         } else {
-            anndata::to_anndata(py, &self.reader)
+            anndata::to_anndata_filtered(
+                py,
+                &self.path,
+                &self.reader,
+                var_names.as_deref(),
+                obs_filter,
+                layers.as_deref(),
+            )
         }
     }
 

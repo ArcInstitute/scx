@@ -85,6 +85,15 @@ fn obsm_batch_to_numpy<'py>(py: Python<'py>, batch: &RecordBatch) -> PyResult<Bo
 /// When deletion vectors are present, deleted cells are excluded from
 /// both the CSR matrix and the obs metadata.
 pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py, PyAny>> {
+    to_anndata_with_layers(py, reader, None)
+}
+
+/// Build an AnnData object from an ScxReader with optional layer filtering.
+fn to_anndata_with_layers<'py>(
+    py: Python<'py>,
+    reader: &ScxReader,
+    layer_filter: Option<&[String]>,
+) -> PyResult<Bound<'py, PyAny>> {
     let anndata_mod = py.import("anndata")?;
 
     // X — assemble all CSR shards (with deletion vector filtering)
@@ -137,10 +146,16 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // layers
-    let layer_names = reader.layer_names();
+    // layers (with optional filtering)
+    let all_layer_names = reader.layer_names();
     let layers_dict = pyo3::types::PyDict::new(py);
-    for name in &layer_names {
+    for name in &all_layer_names {
+        // Skip layers not in the filter list (if specified)
+        if let Some(filter) = layer_filter {
+            if !filter.iter().any(|f| f == name) {
+                continue;
+            }
+        }
         match reader.read_layer(name) {
             Ok(layer_csr) => {
                 let scipy_mat = csr_to_scipy(py, layer_csr)?;
@@ -174,6 +189,155 @@ pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'p
     Ok(adata)
 }
 
+/// Build an AnnData with optional var_names projection, obs_filter, and layers selection.
+///
+/// For obs_filter: delegates to the QueryPipeline for predicate pushdown.
+/// For var_names: resolves gene names to column indices and applies column slicing.
+/// For layers: filters which layers are loaded.
+pub fn to_anndata_filtered<'py>(
+    py: Python<'py>,
+    path: &std::path::Path,
+    reader: &ScxReader,
+    var_names: Option<&[String]>,
+    obs_filter: Option<&str>,
+    layer_filter: Option<&[String]>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // Fast path: no filtering → use existing implementation
+    if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
+        return to_anndata(py, reader);
+    }
+
+    // If obs_filter is specified, use the query engine for predicate pushdown
+    if let Some(expr) = obs_filter {
+        use scx_engine::QueryPipeline;
+
+        let mut pipeline =
+            QueryPipeline::open(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        pipeline = pipeline
+            .filter_obs(expr)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // If var_names is also specified, resolve to gene indices
+        if let Some(names) = var_names {
+            let gene_indices = resolve_var_names_to_indices(reader, names)?;
+            pipeline = pipeline.select_genes(gene_indices);
+        }
+
+        let result = pipeline
+            .collect()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let anndata_mod = py.import("anndata")?;
+        let x = csr_to_scipy(py, result.x)?;
+        let obs_table = record_batch_to_pyarrow(py, &result.obs)?;
+        let obs_df = pyarrow_table_to_pandas(&obs_table)?;
+        let var_table = record_batch_to_pyarrow(py, &result.var)?;
+        let var_df = pyarrow_table_to_pandas(&var_table)?;
+
+        // uns (still loaded from reader)
+        let uns_dict = match reader.read_uns() {
+            Ok(json_val) => {
+                let json_str = serde_json::to_string(&json_val)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let json_mod = py.import("json")?;
+                Some(json_mod.call_method1("loads", (json_str,))?)
+            }
+            Err(scx_format::ScxError::SectionNotFound(_)) => None,
+            Err(e) => return Err(to_pyerr(e)),
+        };
+
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("X", x)?;
+        kwargs.set_item("obs", obs_df)?;
+        kwargs.set_item("var", var_df)?;
+        if let Some(uns) = uns_dict {
+            kwargs.set_item("uns", uns)?;
+        }
+        // Note: obsm and layers are not loaded via the query engine path
+        // (QueryResult doesn't include them). Users can re-load with
+        // separate calls if needed.
+
+        let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
+        return Ok(adata);
+    }
+
+    // No obs_filter but var_names and/or layers specified
+    // Load normally, then apply var_names column projection
+    let adata = to_anndata_with_layers(py, reader, layer_filter)?;
+
+    if let Some(names) = var_names {
+        // Apply var_names column projection via AnnData slicing
+        let pd = py.import("pandas")?;
+        let var_df = adata.getattr("var")?;
+        let var_index = var_df.getattr("index")?;
+
+        // Build a boolean mask of which genes to keep
+        let py_names = pyo3::types::PyList::new(py, names)?;
+        let isin = var_index.call_method1("isin", (py_names,))?;
+
+        // Check for names not found
+        let np = py.import("numpy")?;
+        let n_found: usize = np.call_method1("sum", (&isin,))?.extract()?;
+        if n_found == 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "None of the requested var_names were found. \
+                 Available gene names can be seen via exp.to_anndata().var.index"
+            )));
+        }
+
+        // Slice AnnData: adata[:, mask]
+        let builtins = py.import("builtins")?;
+        let slice_all = builtins.call_method1("slice", (py.None(),))?;
+        let idx = pyo3::types::PyTuple::new(py, &[slice_all.unbind(), isin.unbind()])?;
+        let sliced = adata.get_item(idx)?;
+        let copied = sliced.call_method0("copy")?;
+        return Ok(copied);
+    }
+
+    Ok(adata)
+}
+
+/// Resolve gene names to column indices using the var metadata.
+fn resolve_var_names_to_indices(reader: &ScxReader, names: &[String]) -> PyResult<Vec<u32>> {
+    use arrow::array::AsArray;
+
+    let var_batch = reader.read_var().map_err(to_pyerr)?;
+
+    // Try to find gene names in the var DataFrame index.
+    // The index column is typically the first column (or named "gene_id").
+    // We check all string columns.
+    let mut name_to_idx: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+
+    for col_idx in 0..var_batch.num_columns() {
+        let col = var_batch.column(col_idx);
+        if let Some(str_arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+            for (row, val) in str_arr.iter().enumerate() {
+                if let Some(v) = val {
+                    name_to_idx.entry(v).or_insert(row as u32);
+                }
+            }
+        }
+    }
+
+    let mut indices = Vec::with_capacity(names.len());
+    let mut not_found = Vec::new();
+    for name in names {
+        match name_to_idx.get(name.as_str()) {
+            Some(&idx) => indices.push(idx),
+            None => not_found.push(name.as_str()),
+        }
+    }
+
+    if indices.is_empty() {
+        return Err(PyRuntimeError::new_err(format!(
+            "None of the requested var_names were found in the var metadata: {:?}",
+            not_found
+        )));
+    }
+
+    Ok(indices)
+}
+
 /// Build an AnnData object with backed (on-demand) X and layers.
 ///
 /// Opens a new ScxReader (independent mmap) so the backed dataset can
@@ -187,6 +351,8 @@ pub fn to_anndata_backed<'py>(
     py: Python<'py>,
     path: &std::path::Path,
     cache_shards: usize,
+    obs_filter: Option<&str>,
+    layer_filter: Option<&[String]>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
     use scx_format::BackedCsrReader;
@@ -196,7 +362,63 @@ pub fn to_anndata_backed<'py>(
     let reader = ScxReader::open(path).map_err(to_pyerr)?;
 
     // --- Compute kept_to_global from deletion vectors (if present) ---
-    let kept_to_global = compute_kept_to_global(&reader)?;
+    let mut kept_to_global = compute_kept_to_global(&reader)?;
+
+    // --- obs (eager, filtered by deletion vectors) ---
+    let obs = match reader.read_obs() {
+        Ok(batch) => {
+            let filtered_batch = filter_obs_by_deletion_vectors(&reader, batch)?;
+            let table = record_batch_to_pyarrow(py, &filtered_batch)?;
+            Some(pyarrow_table_to_pandas(&table)?)
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(e) => return Err(to_pyerr(e)),
+    };
+
+    // --- Apply obs_filter if specified ---
+    // Evaluate the predicate on the obs DataFrame and further restrict kept_to_global
+    let obs = if let Some(expr) = obs_filter {
+        if let Some(obs_df) = obs {
+            // Use pandas query to filter
+            let filtered = obs_df.call_method1("query", (expr,))?;
+            let original_idx = obs_df.getattr("index")?;
+            let filtered_idx = filtered.getattr("index")?;
+
+            // Get positional indices of kept rows in the (already deletion-filtered) obs
+            let np = py.import("numpy")?;
+            let isin_mask = original_idx.call_method1("isin", (&filtered_idx,))?;
+            let where_result = np.call_method1("where", (&isin_mask,))?;
+            // np.where returns a tuple; first element is array of indices
+            let pos_indices = where_result.get_item(0)?;
+            let pos_arr: numpy::PyReadonlyArray1<'_, i64> = pos_indices
+                .call_method1("astype", (np.getattr("int64")?,))?
+                .extract()?;
+            let pos_slice = pos_arr
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // Update kept_to_global to reflect the obs_filter
+            match &kept_to_global {
+                Some(existing) => {
+                    // existing maps user-visible → global. Now further filter.
+                    let new_kept: Vec<u64> =
+                        pos_slice.iter().map(|&i| existing[i as usize]).collect();
+                    kept_to_global = Some(new_kept);
+                }
+                None => {
+                    // No prior deletions. pos_slice maps directly to global.
+                    let new_kept: Vec<u64> = pos_slice.iter().map(|&i| i as u64).collect();
+                    kept_to_global = Some(new_kept);
+                }
+            }
+
+            Some(filtered)
+        } else {
+            None
+        }
+    } else {
+        obs
+    };
 
     // --- X: backed ---
     let x_reader = ScxReader::open(path).map_err(to_pyerr)?;
@@ -210,17 +432,6 @@ pub fn to_anndata_backed<'py>(
         None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed), cache_shards),
     };
 
-    // --- obs (eager, filtered by deletion vectors) ---
-    let obs = match reader.read_obs() {
-        Ok(batch) => {
-            let filtered_batch = filter_obs_by_deletion_vectors(&reader, batch)?;
-            let table = record_batch_to_pyarrow(py, &filtered_batch)?;
-            Some(pyarrow_table_to_pandas(&table)?)
-        }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
-        Err(e) => return Err(to_pyerr(e)),
-    };
-
     // --- var (eager) ---
     let var = match reader.read_var() {
         Ok(batch) => {
@@ -231,17 +442,50 @@ pub fn to_anndata_backed<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // --- obsm (eager, filtered by deletion vectors) ---
+    // --- obsm (eager, filtered by deletion vectors + obs_filter) ---
+    // When obs_filter is used, obsm must also be filtered to match obs rows.
     let obsm_map = match reader.read_all_obsm() {
         Ok(map) => map,
         Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
         Err(e) => return Err(to_pyerr(e)),
     };
     let obsm_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &obsm_map {
-        let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
-        let np_arr = obsm_batch_to_numpy(py, &filtered)?;
-        obsm_dict.set_item(name, np_arr)?;
+    if obs_filter.is_some() {
+        // When obs_filter is present, obsm must be sliced to match kept_to_global
+        if let Some(ref kept) = kept_to_global {
+            for (name, batch) in &obsm_map {
+                // First filter by deletion vectors
+                let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
+                let np_arr = obsm_batch_to_numpy(py, &filtered)?;
+                // Then slice to the obs_filter rows (kept indices into the
+                // deletion-filtered array)
+                // We need the positional indices relative to the deletion-filtered obs.
+                // kept_to_global maps to global rows, but obsm was already deletion-filtered.
+                // Re-compute: the obs_filter positions in the deletion-filtered order.
+                let dv_kept = compute_kept_to_global(&reader)?;
+                let positions: Vec<i64> = match &dv_kept {
+                    Some(dv_mapping) => {
+                        // Find position of each kept global row in dv_mapping
+                        kept.iter()
+                            .filter_map(|&g| {
+                                dv_mapping.iter().position(|&dv| dv == g).map(|p| p as i64)
+                            })
+                            .collect()
+                    }
+                    None => kept.iter().map(|&g| g as i64).collect(),
+                };
+                let np_mod = py.import("numpy")?;
+                let idx_arr = numpy::PyArray1::from_vec(py, positions);
+                let sliced = np_arr.call_method1("__getitem__", (idx_arr,))?;
+                obsm_dict.set_item(name, sliced)?;
+            }
+        }
+    } else {
+        for (name, batch) in &obsm_map {
+            let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
+            let np_arr = obsm_batch_to_numpy(py, &filtered)?;
+            obsm_dict.set_item(name, np_arr)?;
+        }
     }
 
     // --- uns (eager) ---
@@ -256,10 +500,16 @@ pub fn to_anndata_backed<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // --- layers (backed) ---
-    let layer_names = reader.layer_names();
+    // --- layers (backed, with optional filtering) ---
+    let all_layer_names = reader.layer_names();
     let layers_dict = pyo3::types::PyDict::new(py);
-    for name in &layer_names {
+    for name in &all_layer_names {
+        // Skip layers not in the filter list (if specified)
+        if let Some(filter) = layer_filter {
+            if !filter.iter().any(|f| f == name) {
+                continue;
+            }
+        }
         let l_reader = ScxReader::open(path).map_err(to_pyerr)?;
         let l_backed = Arc::new(BackedCsrReader::new_for_layer(l_reader, name, cache_shards));
         let l_dataset = match &kept_to_global {
