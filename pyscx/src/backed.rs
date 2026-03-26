@@ -196,16 +196,17 @@ impl ScxBackedSparseDataset {
         mat.call_method0("copy")
     }
 
-    // --- Comparison operators (materialize + delegate to scipy) ---
-    // These are used by scanpy's filter_cells (X > 0), filter_genes, etc.
+    // --- Comparison operators (lazy, with fused optimization) ---
+    // These return a _ComparisonResult wrapper that short-circuits
+    // `.sum()` → `getnnz()` for the `(X > 0).sum(axis=1)` pattern
+    // used by scanpy's calculate_qc_metrics, filter_cells, filter_genes.
 
     fn __gt__<'py>(
         &self,
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__gt__", (other,))
+        self.make_comparison_result(py, "gt", other)
     }
 
     fn __ge__<'py>(
@@ -213,8 +214,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__ge__", (other,))
+        self.make_comparison_result(py, "ge", other)
     }
 
     fn __lt__<'py>(
@@ -222,8 +222,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__lt__", (other,))
+        self.make_comparison_result(py, "lt", other)
     }
 
     fn __le__<'py>(
@@ -231,8 +230,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__le__", (other,))
+        self.make_comparison_result(py, "le", other)
     }
 
     fn __eq__<'py>(
@@ -240,8 +238,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__eq__", (other,))
+        self.make_comparison_result(py, "eq", other)
     }
 
     fn __ne__<'py>(
@@ -249,8 +246,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__ne__", (other,))
+        self.make_comparison_result(py, "ne", other)
     }
 
     // --- Arithmetic operators ---
@@ -612,6 +608,43 @@ impl ScxBackedSparseDataset {
         match &self.kept_to_global {
             Some(mapping) => mapping.iter().map(|&g| all_values[g as usize]).collect(),
             None => all_values.to_vec(),
+        }
+    }
+
+    /// Create a lazy comparison result wrapper.
+    ///
+    /// If the threshold can be extracted as a numeric f64, returns a
+    /// `ScxComparisonResult` that can short-circuit `.sum()` → `getnnz()`.
+    /// Otherwise falls back to immediate materialization.
+    fn make_comparison_result<'py>(
+        &self,
+        py: Python<'py>,
+        op: &str,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Try to extract threshold as f64
+        if let Ok(threshold) = other.extract::<f64>() {
+            let result = ScxComparisonResult {
+                backed: Arc::clone(&self.backed),
+                shape_val: self.shape_val,
+                op: op.to_string(),
+                threshold,
+                kept_to_global: self.kept_to_global.clone(),
+            };
+            Ok(Bound::new(py, result)?.into_any())
+        } else {
+            // Non-numeric comparison — materialize immediately
+            let mat = self.to_memory(py)?;
+            let method = match op {
+                "gt" => "__gt__",
+                "ge" => "__ge__",
+                "lt" => "__lt__",
+                "le" => "__le__",
+                "eq" => "__eq__",
+                "ne" => "__ne__",
+                _ => "__gt__",
+            };
+            mat.call_method1(method, (other,))
         }
     }
 
@@ -1081,5 +1114,226 @@ impl ScxBackedLayerDataset {
     #[pyo3(signature = (axis=None))]
     fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.min(py, axis)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScxComparisonResult — lazy comparison wrapper for fused optimization
+// ---------------------------------------------------------------------------
+
+/// Lazy comparison result returned by __gt__, __lt__, etc.
+///
+/// Short-circuits common patterns:
+/// - `(X > 0).sum(axis=1)` → `getnnz(axis=1)` (no materialization)
+/// - `(X > 0).sum(axis=0)` → `getnnz(axis=0)` (no materialization)
+///
+/// Falls back to full materialization + scipy for any other operation.
+#[pyclass(name = "_ComparisonResult")]
+pub struct ScxComparisonResult {
+    backed: Arc<BackedCsrReader>,
+    shape_val: (usize, usize),
+    op: String,
+    threshold: f64,
+    kept_to_global: Option<Vec<u64>>,
+}
+
+impl ScxComparisonResult {
+    /// Materialize the comparison result as a scipy sparse matrix.
+    fn materialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        // Read the backing data through the dataset
+        let csr = if let Some(ref kept) = self.kept_to_global {
+            self.backed
+                .read_row_indices(kept)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            self.backed
+                .read_all()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        };
+        let mat = csr_to_scipy(py, csr)?;
+        // Apply the comparison operator
+        let method = match self.op.as_str() {
+            "gt" => "__gt__",
+            "ge" => "__ge__",
+            "lt" => "__lt__",
+            "le" => "__le__",
+            "eq" => "__eq__",
+            "ne" => "__ne__",
+            _ => "__gt__",
+        };
+        mat.call_method1(method, (self.threshold,))
+    }
+
+    /// Check if this comparison can be short-circuited for .sum().
+    ///
+    /// `(X > 0).sum(axis)` == `getnnz(axis)` for non-negative data.
+    /// This is the standard scanpy pattern for QC metrics.
+    fn can_shortcircuit_sum(&self) -> bool {
+        self.op == "gt" && self.threshold == 0.0
+    }
+}
+
+#[pymethods]
+impl ScxComparisonResult {
+    #[getter]
+    fn shape(&self) -> (usize, usize) {
+        self.shape_val
+    }
+
+    #[getter]
+    fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let np = py.import("numpy")?;
+        np.call_method1("dtype", ("bool",))
+    }
+
+    #[getter]
+    fn ndim(&self) -> usize {
+        2
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "_ComparisonResult(op='{}', threshold={}, shape=({}, {}), shortcircuit={})",
+            self.op,
+            self.threshold,
+            self.shape_val.0,
+            self.shape_val.1,
+            self.can_shortcircuit_sum()
+        )
+    }
+
+    /// Sum of comparison result along an axis.
+    ///
+    /// **Optimization:** For `(X > 0).sum(axis=...)`, this returns
+    /// `getnnz(axis=...)` without materializing the full matrix.
+    /// This is the critical path for `sc.pp.calculate_qc_metrics`.
+    #[pyo3(signature = (axis=None))]
+    fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.can_shortcircuit_sum() {
+            // Short-circuit: (X > 0).sum(axis) == getnnz(axis)
+            // getnnz counts stored entries, which for non-negative data
+            // (UMI counts) is exactly the number of entries > 0.
+            match axis {
+                Some(0) => {
+                    let counts = if let Some(ref kept) = self.kept_to_global {
+                        let f_counts = self
+                            .backed
+                            .col_nnz_masked(kept)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        f_counts.iter().map(|&v| v as i64).collect::<Vec<i64>>()
+                    } else {
+                        self.backed
+                            .col_nnz()
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                    };
+                    let arr = numpy::PyArray::from_vec(py, counts);
+                    arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+                }
+                Some(1) => {
+                    let all_nnz = self
+                        .backed
+                        .row_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let filtered = match &self.kept_to_global {
+                        Some(mapping) => mapping.iter().map(|&g| all_nnz[g as usize]).collect(),
+                        None => all_nnz,
+                    };
+                    let arr = numpy::PyArray::from_vec(py, filtered);
+                    arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+                }
+                None => {
+                    let total = self
+                        .backed
+                        .total_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    Ok((total as i64).into_pyobject(py)?.into_any())
+                }
+                Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            }
+        } else {
+            // Fallback: materialize and sum
+            let mat = self.materialize(py)?;
+            match axis {
+                Some(a) => mat.call_method1("sum", (a,)),
+                None => mat.call_method0("sum"),
+            }
+        }
+    }
+
+    /// NNZ counts of comparison result.
+    #[pyo3(signature = (axis=None))]
+    fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("getnnz", (a,)),
+            None => mat.call_method0("getnnz"),
+        }
+    }
+
+    /// Materialize as dense numpy array.
+    fn toarray<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.call_method0("toarray")
+    }
+
+    /// Materialize as scipy CSR matrix.
+    fn tocsr<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.materialize(py)
+    }
+
+    /// Materialize as scipy CSC matrix.
+    fn tocsc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.call_method0("tocsc")
+    }
+
+    /// Support indexing on the comparison result.
+    fn __getitem__<'py>(
+        &self,
+        py: Python<'py>,
+        index: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.get_item(index)
+    }
+
+    /// Multiply — materializes and delegates.
+    fn multiply<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.call_method1("multiply", (other,))
+    }
+
+    /// Mean — materializes and delegates.
+    #[pyo3(signature = (axis=None))]
+    fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("mean", (a,)),
+            None => mat.call_method0("mean"),
+        }
+    }
+
+    /// Max — materializes and delegates.
+    #[pyo3(signature = (axis=None))]
+    fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("max", (a,)),
+            None => mat.call_method0("max"),
+        }
+    }
+
+    /// Min — materializes and delegates.
+    #[pyo3(signature = (axis=None))]
+    fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("min", (a,)),
+            None => mat.call_method0("min"),
+        }
     }
 }
