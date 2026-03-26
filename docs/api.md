@@ -147,6 +147,9 @@ Direct cloud reads without full download. Supports `.scxd/`, cloud-ready `.scx`,
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
 - `pyscx.from_anndata(adata, path, codec=None, shard_size=None)` — Write AnnData to SCX
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
+- `pyscx.iter_chunks(adata, chunk_size="shard")` — Shard-aligned or fixed-size chunk iterator
+- `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing
+- `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
 
 ### File operations
 - `pyscx.append(target, input, codec=None, shard_size=None)` — Append from SCX file
@@ -166,7 +169,11 @@ Direct cloud reads without full download. Supports `.scxd/`, cloud-ready `.scx`,
 
 ### PyExperiment
 
-- `to_anndata()` — Convert to AnnData (zero-copy where possible)
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None)` — Convert to AnnData
+  - `var_names`: list of gene names to project (column subset)
+  - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
+  - `layers`: list of layer names to load (default: all)
+  - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
 - `query() -> PyQueryPipeline` — Start lazy query pipeline
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`
