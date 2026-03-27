@@ -10,7 +10,9 @@ pub mod neighbors;
 pub mod pca;
 pub mod umap;
 
-pub use diffexp::{wilcoxon_rank_sum, DiffExpResult};
+pub use diffexp::{
+    merge_diff_exp_results, wilcoxon_rank_sum, wilcoxon_rank_sum_streaming, DiffExpResult,
+};
 pub use error::{AccelError, Result};
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{randomized_pca, randomized_pca_inmemory, PcaResult};

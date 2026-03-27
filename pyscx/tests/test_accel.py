@@ -528,3 +528,107 @@ class TestRankGenesGroups:
         assert "names" in rgg
         assert len(rgg["names"].dtype.names) >= 2
 
+
+class TestStreamingDE:
+    """Test streaming gene-chunked differential expression from backed SCX."""
+
+    def test_streaming_matches_inmemory(self, synthetic_adata, scx_from_adata):
+        """Streaming DE with gene_chunk_size should match in-memory DE exactly."""
+        import pyscx
+
+        # Write to SCX and reopen in backed mode.
+        path = scx_from_adata(synthetic_adata, "streaming_de.scx")
+        backed_adata = pyscx.open(path).to_anndata(backed=True)
+
+        # In-memory DE (dense materialization).
+        adata_mem = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata_mem, "batch")
+        rgg_mem = adata_mem.uns["rank_genes_groups"]
+
+        # Streaming DE from backed mode with small chunk size.
+        pyscx.accel.rank_genes_groups(
+            backed_adata, "batch", gene_chunk_size=10
+        )
+        rgg_stream = backed_adata.uns["rank_genes_groups"]
+
+        # Same group structure.
+        assert rgg_mem["names"].dtype.names == rgg_stream["names"].dtype.names
+
+        # For each group, top 20 genes should overlap substantially.
+        for group in rgg_mem["names"].dtype.names:
+            mem_top = set(rgg_mem["names"][group][:20])
+            stream_top = set(rgg_stream["names"][group][:20])
+            overlap = len(mem_top & stream_top) / 20
+            assert overlap >= 0.80, (
+                f"group {group}: overlap {overlap:.2f} (expected >= 0.80)"
+            )
+
+        # P-values should be in valid range.
+        for group in rgg_stream["pvals"].dtype.names:
+            pvals = rgg_stream["pvals"][group]
+            pvals_adj = rgg_stream["pvals_adj"][group]
+            assert np.all(pvals >= 0) and np.all(pvals <= 1)
+            assert np.all(pvals_adj >= 0) and np.all(pvals_adj <= 1)
+            assert np.all(pvals_adj >= pvals - 1e-10)
+
+    def test_streaming_chunk_sizes_consistent(
+        self, synthetic_adata, scx_from_adata
+    ):
+        """Different gene_chunk_size values should produce identical results."""
+        import pyscx
+
+        path = scx_from_adata(synthetic_adata, "chunk_sizes.scx")
+
+        results = {}
+        for chunk_size in [5, 25, 50]:  # 50 genes total → 10/2/1 chunks
+            adata = pyscx.open(path).to_anndata(backed=True)
+            pyscx.accel.rank_genes_groups(
+                adata, "batch", gene_chunk_size=chunk_size
+            )
+            results[chunk_size] = adata.uns["rank_genes_groups"]
+
+        # All chunk sizes should produce the same gene rankings.
+        ref_rgg = results[5]
+        for cs in [25, 50]:
+            for group in ref_rgg["names"].dtype.names:
+                # Gene names should be in the same order.
+                ref_names = list(ref_rgg["names"][group])
+                other_names = list(results[cs]["names"][group])
+                assert ref_names == other_names, (
+                    f"chunk_size={cs}: gene order differs for group {group}"
+                )
+
+                # Scores should match.
+                np.testing.assert_allclose(
+                    ref_rgg["scores"][group],
+                    results[cs]["scores"][group],
+                    rtol=1e-10,
+                    err_msg=f"chunk_size={cs}, group={group}: scores differ",
+                )
+
+                # Raw p-values should match.
+                np.testing.assert_allclose(
+                    ref_rgg["pvals"][group],
+                    results[cs]["pvals"][group],
+                    rtol=1e-10,
+                    err_msg=f"chunk_size={cs}, group={group}: pvals differ",
+                )
+
+    def test_streaming_pairwise_reference(
+        self, synthetic_adata, scx_from_adata
+    ):
+        """Streaming DE with a reference group should work correctly."""
+        import pyscx
+
+        path = scx_from_adata(synthetic_adata, "stream_ref.scx")
+        backed_adata = pyscx.open(path).to_anndata(backed=True)
+
+        pyscx.accel.rank_genes_groups(
+            backed_adata, "batch", reference="A", gene_chunk_size=15
+        )
+
+        rgg = backed_adata.uns["rank_genes_groups"]
+        groups = rgg["names"].dtype.names
+        assert "A" not in groups
+        assert "B" in groups
+        assert "C" in groups

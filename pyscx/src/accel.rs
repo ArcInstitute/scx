@@ -418,8 +418,11 @@ fn write_umap_to_adata(
 ///     reference: Group name to compare against (default: "rest" = 1-vs-rest)
 ///     n_genes: Number of top genes to report per group (default: all genes)
 ///     method: Statistical method (currently only "wilcoxon")
+///     gene_chunk_size: When set and X is backed by SCX, uses streaming
+///         gene-chunked DE to avoid full matrix materialization. Specifies
+///         the number of genes to process per chunk (default: None = full in-memory).
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon"))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -428,6 +431,7 @@ pub fn rank_genes_groups(
     reference: &str,
     n_genes: Option<usize>,
     method: &str,
+    gene_chunk_size: Option<usize>,
 ) -> PyResult<()> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
@@ -484,48 +488,65 @@ pub fn rank_genes_groups(
         })?)
     };
 
-    // Extract X as dense f32 array (row-major: [n_obs × n_vars]).
-    let x = adata.getattr("X")?;
-    let is_sparse = scipy_sparse
-        .call_method1("issparse", (&x,))?
-        .extract::<bool>()?;
-
-    let dense = if is_sparse {
-        x.call_method0("toarray")?
-    } else if x.hasattr("toarray")? {
-        // Backed dataset with toarray method — materialize fully.
-        x.call_method0("toarray")?
-    } else {
-        numpy
-            .call_method1("asarray", (&x,))?
-            .call_method1("astype", ("float32",))?
-    };
-
-    let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
-    let (n_obs, n_vars) = shape;
-
-    // Flatten to Vec<f32>.
-    let flat = dense
-        .call_method1("astype", ("float32",))?
-        .call_method0("ravel")?;
-    let data: Vec<f32> = flat.extract()?;
-
     // Get gene names.
     let var = adata.getattr("var")?;
     let var_names = var.getattr("index")?;
     let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
 
-    // Run Wilcoxon rank-sum DE.
-    let result = scx_accel::wilcoxon_rank_sum(
-        &data,
-        n_obs,
-        n_vars,
-        &gene_names,
-        &groups,
-        &unique_groups,
-        ref_idx,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // Check if X is a ScxBackedSparseDataset for streaming path.
+    let x = adata.getattr("X")?;
+    let result = if let (Some(chunk_size), Ok(backed)) = (
+        gene_chunk_size,
+        x.extract::<PyRef<ScxBackedSparseDataset>>(),
+    ) {
+        // Streaming gene-chunked DE from backed mode.
+        scx_accel::wilcoxon_rank_sum_streaming(
+            &backed.backed,
+            &gene_names,
+            &groups,
+            &unique_groups,
+            ref_idx,
+            chunk_size,
+        )
+        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+    } else {
+        // Dense materialization path (in-memory or non-backed).
+        let is_sparse = scipy_sparse
+            .call_method1("issparse", (&x,))?
+            .extract::<bool>()?;
+
+        let dense = if is_sparse {
+            x.call_method0("toarray")?
+        } else if x.hasattr("toarray")? {
+            // Backed dataset with toarray method — materialize fully.
+            x.call_method0("toarray")?
+        } else {
+            numpy
+                .call_method1("asarray", (&x,))?
+                .call_method1("astype", ("float32",))?
+        };
+
+        let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
+        let (n_obs, n_vars) = shape;
+
+        // Flatten to Vec<f32>.
+        let flat = dense
+            .call_method1("astype", ("float32",))?
+            .call_method0("ravel")?;
+        let data: Vec<f32> = flat.extract()?;
+
+        // Run Wilcoxon rank-sum DE.
+        scx_accel::wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &unique_groups,
+            ref_idx,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    };
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
     write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;

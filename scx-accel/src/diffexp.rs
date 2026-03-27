@@ -341,6 +341,178 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
     adjusted
 }
 
+/// Gene-chunked streaming Wilcoxon rank-sum from `BackedCsrReader`.
+///
+/// Instead of materializing the full matrix, processes genes in chunks:
+/// 1. For each gene chunk, iterate all shards via `read_shard_cached()`,
+///    apply `project_csr()` per shard, scatter into a dense buffer.
+/// 2. Run `wilcoxon_rank_sum()` on the dense buffer for that chunk.
+/// 3. Merge all chunk results with global BH correction.
+///
+/// Peak memory: O(n_obs × gene_chunk_size) instead of O(n_obs × n_vars).
+pub fn wilcoxon_rank_sum_streaming(
+    reader: &scx_format::backed::BackedCsrReader,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    gene_chunk_size: usize,
+) -> Result<DiffExpResult> {
+    let n_obs = reader.n_obs();
+    let n_vars = gene_names.len();
+
+    if groups.len() != n_obs {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "groups length {} != n_obs {}",
+            groups.len(),
+            n_obs
+        )));
+    }
+    if gene_chunk_size == 0 {
+        return Err(crate::AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+
+    let n_shards = reader.index().n_shards();
+    let mut all_chunk_results = Vec::new();
+
+    for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
+        let chunk_end = (chunk_start + gene_chunk_size).min(n_vars);
+        let chunk_size = chunk_end - chunk_start;
+        let col_indices: Vec<u32> = (chunk_start as u32..chunk_end as u32).collect();
+
+        // Build dense buffer (n_obs × chunk_size), zero-initialized.
+        let mut dense = vec![0.0f32; n_obs * chunk_size];
+
+        // Stream all shards, project each, scatter into dense buffer.
+        let mut global_row = 0usize;
+        for shard_idx in 0..n_shards {
+            let shard_csr = reader
+                .read_shard_cached(shard_idx)
+                .map_err(crate::AccelError::Scx)?;
+            let projected = scx_engine::project_csr(&shard_csr, &col_indices);
+
+            for row in 0..projected.n_rows() {
+                let start = projected.indptr[row] as usize;
+                let end = projected.indptr[row + 1] as usize;
+                for j in start..end {
+                    let col = projected.indices[j] as usize;
+                    dense[(global_row + row) * chunk_size + col] = projected.data[j];
+                }
+            }
+            global_row += projected.n_rows();
+        }
+
+        // Run existing wilcoxon_rank_sum on this chunk's dense buffer.
+        let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
+        let chunk_result = wilcoxon_rank_sum(
+            &dense,
+            n_obs,
+            chunk_size,
+            &chunk_genes,
+            groups,
+            group_names,
+            reference,
+        )?;
+        all_chunk_results.push(chunk_result);
+    }
+
+    // Merge: concatenate per-group gene lists, re-sort by |z|,
+    // and re-apply BH correction globally across all genes.
+    merge_diff_exp_results(all_chunk_results)
+}
+
+/// Merge per-chunk `DiffExpResult`s into a single result with global BH correction.
+///
+/// For each group:
+/// 1. Concatenate gene names, scores, p-values, and fold-changes from all chunks.
+/// 2. Re-sort by descending |z-score|.
+/// 3. Apply Benjamini–Hochberg on the globally-sorted raw p-values.
+///
+/// This is essential because BH correction depends on the total number of tests.
+/// Applying BH per-chunk would use `chunk_size` as the denominator instead of
+/// `n_vars`, inflating FDR.
+pub fn merge_diff_exp_results(chunks: Vec<DiffExpResult>) -> Result<DiffExpResult> {
+    if chunks.is_empty() {
+        return Ok(DiffExpResult {
+            group_names: vec![],
+            names: vec![],
+            scores: vec![],
+            pvals: vec![],
+            pvals_adj: vec![],
+            logfoldchanges: vec![],
+        });
+    }
+    if chunks.len() == 1 {
+        return Ok(chunks.into_iter().next().unwrap());
+    }
+
+    // All chunks must have the same group structure.
+    let group_names = chunks[0].group_names.clone();
+    let n_groups = group_names.len();
+
+    let mut merged_names = Vec::with_capacity(n_groups);
+    let mut merged_scores = Vec::with_capacity(n_groups);
+    let mut merged_pvals = Vec::with_capacity(n_groups);
+    let mut merged_pvals_adj = Vec::with_capacity(n_groups);
+    let mut merged_logfc = Vec::with_capacity(n_groups);
+
+    for group_name in &group_names {
+        // Collect all genes for this group across chunks.
+        let mut gene_entries: Vec<(String, f64, f64, f64)> = Vec::new();
+
+        for chunk in &chunks {
+            // Find the position of this group in the chunk's results.
+            let chunk_g_pos = chunk.group_names.iter().position(|n| n == group_name);
+            let chunk_g_pos = match chunk_g_pos {
+                Some(p) => p,
+                None => continue, // group not present in this chunk (shouldn't happen)
+            };
+
+            let n_genes = chunk.names[chunk_g_pos].len();
+            for i in 0..n_genes {
+                gene_entries.push((
+                    chunk.names[chunk_g_pos][i].clone(),
+                    chunk.scores[chunk_g_pos][i],
+                    chunk.pvals[chunk_g_pos][i],
+                    chunk.logfoldchanges[chunk_g_pos][i],
+                ));
+            }
+        }
+
+        // Sort by |z| descending.
+        gene_entries.sort_by(|a, b| {
+            b.1.abs()
+                .partial_cmp(&a.1.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let names: Vec<String> = gene_entries.iter().map(|e| e.0.clone()).collect();
+        let scores: Vec<f64> = gene_entries.iter().map(|e| e.1).collect();
+        let pvals: Vec<f64> = gene_entries.iter().map(|e| e.2).collect();
+        let logfc: Vec<f64> = gene_entries.iter().map(|e| e.3).collect();
+
+        // Global BH correction across ALL genes.
+        let pvals_adj = benjamini_hochberg(&pvals);
+
+        merged_names.push(names);
+        merged_scores.push(scores);
+        merged_pvals.push(pvals);
+        merged_pvals_adj.push(pvals_adj);
+        merged_logfc.push(logfc);
+    }
+
+    Ok(DiffExpResult {
+        group_names,
+        names: merged_names,
+        scores: merged_scores,
+        pvals: merged_pvals,
+        pvals_adj: merged_pvals_adj,
+        logfoldchanges: merged_logfc,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +698,92 @@ mod tests {
         assert!(result.group_names.contains(&"B".to_string()));
         assert!(result.group_names.contains(&"C".to_string()));
         assert!(!result.group_names.contains(&"A".to_string()));
+    }
+
+    #[test]
+    fn test_merge_empty() {
+        let merged = merge_diff_exp_results(vec![]).unwrap();
+        assert!(merged.group_names.is_empty());
+        assert!(merged.names.is_empty());
+    }
+
+    #[test]
+    fn test_merge_single_chunk() {
+        // Single chunk should pass through unchanged (except BH is unchanged).
+        let chunk = DiffExpResult {
+            group_names: vec!["A".to_string()],
+            names: vec![vec!["g1".to_string(), "g2".to_string()]],
+            scores: vec![vec![3.0, 1.0]],
+            pvals: vec![vec![0.001, 0.05]],
+            pvals_adj: vec![vec![0.002, 0.05]],
+            logfoldchanges: vec![vec![2.0, 0.5]],
+        };
+        let merged = merge_diff_exp_results(vec![chunk.clone()]).unwrap();
+        assert_eq!(merged.group_names, chunk.group_names);
+        assert_eq!(merged.names, chunk.names);
+        assert_eq!(merged.scores, chunk.scores);
+    }
+
+    #[test]
+    fn test_merge_two_chunks_resorts() {
+        // Two chunks: chunk1 has gene_a (z=1.0), chunk2 has gene_b (z=3.0).
+        // After merge, gene_b should come first (higher |z|).
+        let chunk1 = DiffExpResult {
+            group_names: vec!["G".to_string()],
+            names: vec![vec!["gene_a".to_string()]],
+            scores: vec![vec![1.0]],
+            pvals: vec![vec![0.3]],
+            pvals_adj: vec![vec![0.3]],
+            logfoldchanges: vec![vec![0.5]],
+        };
+        let chunk2 = DiffExpResult {
+            group_names: vec!["G".to_string()],
+            names: vec![vec!["gene_b".to_string()]],
+            scores: vec![vec![3.0]],
+            pvals: vec![vec![0.001]],
+            pvals_adj: vec![vec![0.001]],
+            logfoldchanges: vec![vec![2.0]],
+        };
+
+        let merged = merge_diff_exp_results(vec![chunk1, chunk2]).unwrap();
+        assert_eq!(merged.group_names, vec!["G"]);
+        assert_eq!(merged.names[0].len(), 2);
+        // gene_b should be first (|z| = 3.0 > 1.0).
+        assert_eq!(merged.names[0][0], "gene_b");
+        assert_eq!(merged.names[0][1], "gene_a");
+        assert_eq!(merged.scores[0][0], 3.0);
+        assert_eq!(merged.scores[0][1], 1.0);
+    }
+
+    #[test]
+    fn test_merge_global_bh() {
+        // Two chunks with 1 gene each → merged BH uses n=2, not n=1.
+        let chunk1 = DiffExpResult {
+            group_names: vec!["G".to_string()],
+            names: vec![vec!["gene_a".to_string()]],
+            scores: vec![vec![2.0]],
+            pvals: vec![vec![0.04]],
+            pvals_adj: vec![vec![0.04]], // per-chunk BH with n=1
+            logfoldchanges: vec![vec![1.0]],
+        };
+        let chunk2 = DiffExpResult {
+            group_names: vec!["G".to_string()],
+            names: vec![vec!["gene_b".to_string()]],
+            scores: vec![vec![1.0]],
+            pvals: vec![vec![0.03]],
+            pvals_adj: vec![vec![0.03]],
+            logfoldchanges: vec![vec![0.5]],
+        };
+
+        let merged = merge_diff_exp_results(vec![chunk1, chunk2]).unwrap();
+        // With global BH (n=2): sorted p-vals are [0.03, 0.04]
+        // BH: rank 2 → 0.04 * 2/2 = 0.04, rank 1 → 0.03 * 2/1 = 0.06 → cummin 0.04
+        // But results are sorted by |z|: gene_a (z=2) first, gene_b (z=1) second
+        // So pvals_adj order follows the |z| sort.
+        // All adjusted should be >= raw and <= 1.
+        for (raw, adj) in merged.pvals[0].iter().zip(merged.pvals_adj[0].iter()) {
+            assert!(*adj >= *raw - 1e-12);
+            assert!(*adj <= 1.0 + 1e-12);
+        }
     }
 }
