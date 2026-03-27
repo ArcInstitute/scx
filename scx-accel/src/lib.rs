@@ -5,7 +5,9 @@
 //! backed mode, avoiding full matrix materialization.
 
 pub mod error;
+pub mod neighbors;
 pub mod pca;
 
 pub use error::{AccelError, Result};
+pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{randomized_pca, randomized_pca_inmemory, PcaResult};

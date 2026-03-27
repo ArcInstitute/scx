@@ -155,6 +155,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Accelerators submodule
     let accel_module = PyModule::new(m.py(), "accel")?;
     accel_module.add_function(wrap_pyfunction!(accel::pca, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::neighbors, &accel_module)?)?;
     m.add_submodule(&accel_module)?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.

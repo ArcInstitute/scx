@@ -156,3 +156,147 @@ class TestPcaBacked:
         vr = backed_adata.uns["pca"]["variance_ratio"]
         assert all(v > 0 for v in ve)
         assert sum(vr) <= 1.0 + 1e-6
+
+
+class TestNeighbors:
+    """Test pyscx.accel.neighbors() — kNN graph construction."""
+
+    def test_basic_shapes(self, synthetic_adata):
+        """Neighbors writes correct shapes and keys to adata slots."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=5)
+
+        assert "distances" in adata.obsp
+        assert "connectivities" in adata.obsp
+        assert "neighbors" in adata.uns
+
+        # Distance matrix: n_obs × n_obs sparse
+        assert adata.obsp["distances"].shape == (100, 100)
+        assert adata.obsp["connectivities"].shape == (100, 100)
+
+    def test_distance_matrix_properties(self, synthetic_adata):
+        """Distance CSR should have non-negative values and k entries per row."""
+        import pyscx
+
+        k = 10
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=k)
+
+        dist = adata.obsp["distances"]
+
+        # All distances non-negative
+        assert (dist.data >= 0).all(), "distances should be non-negative"
+
+        # Each row has exactly k entries
+        for i in range(dist.shape[0]):
+            row_nnz = dist.indptr[i + 1] - dist.indptr[i]
+            assert row_nnz == k, f"row {i} has {row_nnz} entries, expected {k}"
+
+    def test_connectivities_properties(self, synthetic_adata):
+        """Connectivities should be in [0, 1] and have >= k entries per row (symmetrized)."""
+        import pyscx
+
+        k = 5
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=k)
+
+        conn = adata.obsp["connectivities"]
+
+        # All values in [0, 1]
+        assert (conn.data >= 0).all(), "connectivities should be >= 0"
+        assert (conn.data <= 1.0 + 1e-10).all(), "connectivities should be <= 1"
+
+        # Symmetrized: at least k entries per row
+        for i in range(conn.shape[0]):
+            row_nnz = conn.indptr[i + 1] - conn.indptr[i]
+            assert row_nnz >= k, f"row {i} has {row_nnz} entries, expected >= {k}"
+
+    def test_recall_vs_brute_force(self, synthetic_adata):
+        """HNSW recall@k should be >= 0.90 compared to exact brute-force kNN."""
+        import pyscx
+        from sklearn.neighbors import NearestNeighbors
+
+        k = 10
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+
+        X_pca = adata.obsm["X_pca"]
+
+        # Brute-force exact kNN
+        nn = NearestNeighbors(n_neighbors=k, algorithm="brute", metric="euclidean")
+        nn.fit(X_pca)
+        _, bf_indices = nn.kneighbors(X_pca)
+
+        # SCX HNSW kNN
+        pyscx.accel.neighbors(adata, n_neighbors=k)
+
+        # Extract SCX indices from the distance CSR matrix
+        dist = adata.obsp["distances"]
+        recalls = []
+        for i in range(adata.n_obs):
+            start, end = dist.indptr[i], dist.indptr[i + 1]
+            scx_neighbors = set(dist.indices[start:end])
+            bf_neighbors = set(bf_indices[i])
+            recall = len(scx_neighbors & bf_neighbors) / k
+            recalls.append(recall)
+
+        mean_recall = np.mean(recalls)
+        assert (
+            mean_recall >= 0.90
+        ), f"mean recall@{k} = {mean_recall:.3f} (expected >= 0.90)"
+
+    def test_uns_metadata(self, synthetic_adata):
+        """adata.uns['neighbors'] should have expected structure."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=15)
+
+        nb = adata.uns["neighbors"]
+        assert nb["connectivities_key"] == "connectivities"
+        assert nb["distances_key"] == "distances"
+        assert nb["params"]["n_neighbors"] == 15
+        assert nb["params"]["method"] == "hnsw"
+        assert nb["params"]["use_rep"] == "X_pca"
+
+    def test_leiden_on_scx_graph(self, synthetic_adata):
+        """Leiden clustering should work on SCX-built kNN graph."""
+        import pyscx
+
+        try:
+            import scanpy as sc
+        except ImportError:
+            pytest.skip("scanpy not available")
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+
+        # Leiden should work on our graph
+        sc.tl.leiden(adata, key_added="scx_leiden")
+        assert "scx_leiden" in adata.obs.columns
+        n_clusters = adata.obs["scx_leiden"].nunique()
+        assert n_clusters >= 2, f"expected >= 2 clusters, got {n_clusters}"
+
+    def test_backed_neighbors(self, pca_adata):
+        """kNN from backed mode should work (PCA → neighbors pipeline)."""
+        import pyscx
+
+        scx_path, _ = pca_adata
+        backed_adata = pyscx.open(scx_path).to_anndata(backed=True)
+
+        # PCA from backed mode
+        pyscx.accel.pca(backed_adata, n_comps=10)
+        # Neighbors from the PCA result
+        pyscx.accel.neighbors(backed_adata, n_neighbors=5)
+
+        assert "distances" in backed_adata.obsp
+        assert backed_adata.obsp["distances"].shape == (100, 100)
+        assert "connectivities" in backed_adata.obsp
+        assert backed_adata.obsp["connectivities"].shape == (100, 100)
