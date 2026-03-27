@@ -13,6 +13,9 @@
 | `scx-engine` | Unit tests | Predicate parsing, pipeline validation, pushdown, fused ops |
 | `scx-loader` | Unit tests | Pipeline lifecycle, batch format, shuffle, projection, normalize |
 | `scx-cloud` | `tests/` | Explode/pack round-trip, cloud-optimize, pull/push (local backend) |
+| `scx-accel` | Unit tests | PCA round-trip, kNN recall, UMAP trustworthiness, DE p-values, pseudobulk aggregation |
+| `scx-gpu` | Unit tests | CUDA Rice/FOR-BP decode, sparse-to-dense, GPU parity with CPU reference |
+| `rscx` | via `R CMD check` | Seurat/SCE round-trip, query, CSR transpose |
 
 ## Python Test Suite
 
@@ -36,6 +39,14 @@
 | `test_scvi_integration.py` | scVI DataModule integration |
 | `test_python_lifecycle.py` | Python object lifecycle (GC, refcount) |
 | `test_cloud.py` | Cloud operations (explode, pack, pull, push, cloud-optimize) |
+| `test_backed.py` | Backed mode indexing, slicing, layer access |
+| `test_backed_aggregation.py` | Backed mode streaming aggregation (sum, mean, var, max, min, nnz per axis) |
+| `test_comparison_optimization.py` | `(X > 0).sum()` → `getnnz()` short-circuit optimization |
+| `test_chunk_iterator.py` | Shard-aligned and fixed-size chunk iteration |
+| `test_preprocess.py` | Streaming preprocessing pipeline (normalize, log1p, save_layer) |
+| `test_to_anndata_integration.py` | Selective loading (var_names, obs_filter, layers) |
+| `test_h5ad_scx_equivalence.py` | h5ad ↔ SCX equivalence validation |
+| `test_accel.py` | Rust accelerators: PCA, kNN, UMAP, DE (Wilcoxon + streaming), pseudobulk, stratified DE |
 | `conftest.py` | Shared pytest fixtures |
 
 ## Benchmarks

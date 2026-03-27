@@ -4,21 +4,24 @@
 
 SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
 
-**Phase 1 complete.** Phase 2 complete. Phase 3 in progress (GPU, R bindings, CLI extensions). Phase 4a in progress (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). See [ROADMAP.md](ROADMAP.md) for the full phased plan, [Phase3.md](Phase3.md) for Phase 3 work, and [Phase4.md](Phase4.md) for Phase 4 work.
+**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c planned (GPU accelerators). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), and [Phase4-GPU.md](Phase4-GPU.md).
 
 ## Key Documents
 
 - **[SPEC.md](SPEC.md)** — Format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
 - **[ROADMAP.md](ROADMAP.md)** — Phased implementation plan (Phases 1–4).
-- **[Phase3.md](Phase3.md)** — Phase 3 implementation plan (GPU, R bindings, CLI extensions — in progress).
-- **[Phase4.md](Phase4.md)** — Phase 4 implementation plan (scanpy parity, Rust-native accelerators — Phase 4a in progress).
+- **[Phase3.md](Phase3.md)** — Phase 3 plan (GPU, R bindings, CLI extensions — partially done).
+- **[Phase4.md](Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
+- **[Phase4-GPU.md](Phase4-GPU.md)** — Phase 4c GPU accelerator spec (cuSPARSE, cuVS/CAGRA, cuML — planned).
+- **[Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md)** — Code review of Phase 4b accelerator implementations.
+- **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
+- **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
 - **[docs/testing.md](docs/testing.md)** — Test and benchmark details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
-- **[2026-03-25_CODE-REVIEW.md](2026-03-25_CODE-REVIEW.md)** — Latest codebase review with known issues and fix priorities.
-- **[tasks/](tasks/)** — Completed phase specs (Phase1.md, Phase2.md, Phase2-Step3–7.md, Phase2-CLOUD.md, Phase3-Step2–5.md).
+- **[tasks/](tasks/)** — Completed phase specs and code reviews.
 
 ## Build and Test
 
@@ -56,16 +59,18 @@ scx-codec (standalone)
             ├─> scx-loader (depends on scx-format, scx-codec, scx-sparse)
             ├─> scx-cloud (depends on scx-format, scx-codec, scx-engine)
             ├─> scx-gpu (depends on scx-format, scx-codec, scx-sparse)
+            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE)
             ├─> scx-cli (depends on all above)
             ├─> pyscx (depends on all above)
             └─> rscx (depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
 ```
 
-13 workspace members total. See [docs/architecture.md](docs/architecture.md) for detailed crate descriptions.
+14 workspace members total (including `scx-integration-tests`). See [docs/architecture.md](docs/architecture.md) for details.
 
 Key isolation rules:
 - `scx-loader` does NOT depend on `scx-engine` — it has its own streaming-optimized gene projection and fused ops.
 - `scx-cloud` does NOT depend on `scx-loader` — they are siblings.
+- `scx-accel` depends only on `scx-format` and `scx-sparse` — no engine/loader dependency.
 
 ### Feature Flags
 
@@ -86,8 +91,6 @@ See [SPEC.md](SPEC.md) §3 for full details.
 
 ### Codec System
 
-See [SPEC.md](SPEC.md) §4 for full codec specifications and parameters.
-
 - `None (0)` — Raw LE arrays
 - `Scx1 (1)` — Delta-Golomb (indptr) + FOR-BP (indices) + Rice (values). **Integer only.**
 - `Zstd (2)` — Zstd per-section. Fallback for float layers.
@@ -103,13 +106,14 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **Value encodings**: uint8 (0), uint16 (1), uint32 (2), float32 (3), float16 (4)
 - **Index dtype**: u16 if n_vars <= 65535, else u32
 
-### Phase 3 Status
+### Phase Status Summary
 
-- **Step 1 (SIMD)**: Skipped — scalar implementations benchmarked as near-optimal. See [Phase3.md](Phase3.md) §Step 1.
-- **Step 2 (scx-gpu)**: In progress — CUDA Rice/FOR-BP decoders, cuSPARSE interop, sparse-to-dense conversion implemented. GDS pending nvidia-fs module load.
-- **Step 3 (rscx)**: Implemented — R bindings via extendr with Seurat v5 and SingleCellExperiment interop, pipe-friendly query API.
-- **Step 4 (Multimodal)**: Planned — CITE-seq, spatial transcriptomics, h5mu conversion.
-- **Step 5 (CLI extensions)**: Partially done — `build-csc`, `subset`, `upgrade`, `benchmark`, `query` subcommands implemented.
+- **Phase 1 (Format + Codec + AnnData Bridge)**: Complete.
+- **Phase 2 (Training Loader + Query Engine)**: Complete.
+- **Phase 3**: Step 1 (SIMD) skipped. Step 2 (scx-gpu) in progress. Step 3 (rscx) complete. Steps 4–5 partially done.
+- **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
+- **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
+- **Phase 4c (GPU Accelerators)**: Planned — cuSPARSE SpMM, CAGRA kNN, cuML UMAP/Leiden.
 
 ## Coding Conventions
 
@@ -120,7 +124,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 
 ### Error Handling
 
-- Use `thiserror` for error enums: `ScxError` (scx-format), `EngineError` (scx-engine), `OpsError` (scx-ops), `LoaderError` (scx-loader), `CloudError` (scx-cloud), `GpuError` (scx-gpu).
+- Use `thiserror` for error enums: `ScxError` (scx-format), `EngineError` (scx-engine), `OpsError` (scx-ops), `LoaderError` (scx-loader), `CloudError` (scx-cloud), `GpuError` (scx-gpu), `AccelError` (scx-accel).
 - Readers must return errors (not panic) on malformed input, especially bitstream exhaustion.
 - Validate magic bytes, endianness, and format version on file/shard open.
 
@@ -143,6 +147,8 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - `PyArray::from_vec()` for zero-copy (moves Rust Vec to numpy)
 - ScxCsr `i64/i32/f32` matches scipy exactly — avoids copy
 - Arrow → pandas via pyarrow's `to_pandas()` for obs/var metadata
+- Accelerators exposed via `pyscx.accel.*` — results written to standard AnnData slots
+- Optional Python deps (`pydeseq2`) imported at runtime with clear `ImportError` if missing
 
 ### R Bindings (rscx)
 
@@ -157,13 +163,21 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - GPU decoders must produce bit-identical output to scalar CPU reference
 - GDS requires local NVMe + nvidia-fs drivers + ext4/XFS filesystem; always falls back to CPU path
 
+### Accelerators (scx-accel)
+
+- Uses `faer` for dense linear algebra (QR, SVD in PCA)
+- Uses `instant-distance` for HNSW-based approximate kNN
+- PCA streams from `BackedCsrReader` shard-by-shard — no full matrix materialization
+- DE supports gene-chunked streaming for out-of-core datasets
+- Pseudobulk aggregation streams via `BackedCsrReader`, statistical testing delegated to `pydeseq2`
+
 ## Known Risks and Pitfalls
 
 - **HDF5 crate (`hdf5-rust`)** is unmaintained. Only needed for conversion. Fallback: Python subprocess with h5py.
 - **h5ad files are messy**: missing encoding-type attrs, CSC instead of CSR, dense X, pickled uns. Handle gracefully.
-- **tokio + rayon interaction** (scx-loader): Keep tokio for I/O only, rayon for CPU work. Bounded channels for back-pressure. No shared mutable state between runtimes.
+- **tokio + rayon interaction** (scx-loader): Keep tokio for I/O only, rayon for CPU work. Bounded channels for back-pressure.
 - **Cloud auth**: `object_store` handles credentials via environment variables and instance metadata. No custom auth code.
-- **Known bugs**: See [2026-03-25_CODE-REVIEW.md](2026-03-25_CODE-REVIEW.md) for critical issues (merge/compact codec selection, encode_value duplication, missing bounds checks).
+- **Known bugs**: See [Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md) for latest issues and fix priorities.
 
 ## Known SPEC Discrepancies
 
@@ -174,4 +188,4 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 ## Out of Scope (Current Phase)
 
 - CSC as primary storage, multimodal (Phase 3, Steps 4–5 — planned)
-- Rust-native PCA/kNN/UMAP accelerators (Phase 4b — planned)
+- GPU-accelerated analysis via cuSPARSE/cuVS/cuML (Phase 4c — planned)
