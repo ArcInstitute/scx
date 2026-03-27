@@ -513,6 +513,15 @@ impl ScxReader {
         ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))
     }
 
+    /// Read raw shard bytes (header + compressed payload) without decoding.
+    ///
+    /// Returns the entire section as a byte slice from the mmap. Useful for
+    /// verbatim shard copying (e.g., `streaming_save_layer` copying X shards
+    /// unchanged) where decoding and re-encoding would be wasteful.
+    pub fn read_raw_shard_bytes(&self, entry: &FullCatalogEntry) -> Result<&[u8]> {
+        self.section_bytes(entry)
+    }
+
     /// Read and decode a single shard from a catalog entry.
     pub fn read_shard_from_entry(
         &self,

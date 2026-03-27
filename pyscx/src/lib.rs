@@ -2,6 +2,7 @@ mod anndata;
 pub(crate) mod backed;
 mod experiment;
 mod ops;
+mod preprocess;
 mod query;
 
 #[cfg(feature = "cloud")]
@@ -117,6 +118,10 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
     m.add_function(wrap_pyfunction!(to_mtx, m)?)?;
 
+    // Preprocessing pipeline
+    m.add_function(wrap_pyfunction!(preprocess::preprocess, m)?)?;
+    m.add_function(wrap_pyfunction!(preprocess::save_layer, m)?)?;
+
     // File operations (scx-ops)
     m.add_function(wrap_pyfunction!(ops::append, m)?)?;
     m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
@@ -144,6 +149,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::TrainingDataset>()?;
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
+    m.add_class::<backed::ScxComparisonResult>()?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.

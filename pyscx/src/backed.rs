@@ -11,6 +11,7 @@ use pyo3::types::{PySlice, PyTuple};
 use scx_format::BackedCsrReader;
 
 use crate::anndata::csr_to_scipy;
+use scx_engine::projection::project_csr;
 
 /// PyO3 class wrapping BackedCsrReader for on-demand sparse access.
 ///
@@ -24,13 +25,21 @@ use crate::anndata::csr_to_scipy;
 /// be set as a class attribute in the Python wrapper.
 #[pyclass(name = "ScxBackedSparseDataset")]
 pub struct ScxBackedSparseDataset {
-    backed: Arc<BackedCsrReader>,
-    shape_val: (usize, usize),
-    n_shards: usize,
-    cache_shards: usize,
+    pub(crate) backed: Arc<BackedCsrReader>,
+    pub(crate) shape_val: (usize, usize),
+    pub(crate) n_shards: usize,
+    pub(crate) cache_shards: usize,
     /// If deletions are present, maps user-visible row i → global row index.
     /// When None, no remapping is needed (no deletions).
-    kept_to_global: Option<Vec<u64>>,
+    pub(crate) kept_to_global: Option<Vec<u64>>,
+    /// If column projection is active, sorted column indices to retain.
+    /// CSR outputs are filtered through `project_csr()` before returning.
+    col_projection: Option<Vec<u32>>,
+    /// Whether the data is known to be non-negative. Defaults to `true`
+    /// (raw UMI counts, normalized, log1p). Set to `false` after operations
+    /// that produce negative values (e.g., `sc.pp.scale()`), which disables
+    /// the `(X > 0).sum() → getnnz()` short-circuit optimization.
+    non_negative: bool,
 }
 
 impl ScxBackedSparseDataset {
@@ -44,6 +53,8 @@ impl ScxBackedSparseDataset {
             n_shards,
             cache_shards,
             kept_to_global: None,
+            col_projection: None,
+            non_negative: true,
         }
     }
 
@@ -65,6 +76,28 @@ impl ScxBackedSparseDataset {
             n_shards,
             cache_shards,
             kept_to_global: Some(kept_to_global),
+            col_projection: None,
+            non_negative: true,
+        }
+    }
+
+    /// Set column projection on this dataset.
+    /// `col_indices` are the original column indices to retain (will be sorted internally).
+    /// Shape is adjusted: n_vars becomes col_indices.len().
+    pub fn set_col_projection(&mut self, col_indices: Vec<u32>) {
+        let mut sorted = col_indices;
+        sorted.sort_unstable();
+        sorted.dedup();
+        self.shape_val.1 = sorted.len();
+        self.col_projection = Some(sorted);
+    }
+
+    /// Apply column projection to a CSR matrix if projection is active.
+    /// Returns the original CSR if no projection is set.
+    fn apply_col_projection(&self, csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {
+        match &self.col_projection {
+            Some(indices) => project_csr(&csr, indices),
+            None => csr,
         }
     }
 }
@@ -150,17 +183,16 @@ impl ScxBackedSparseDataset {
     fn to_memory<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // When deletion vectors are present, we need to filter the full matrix
         // using the kept_to_global mapping rather than returning all rows.
-        if let Some(ref kept) = self.kept_to_global {
-            let csr = self
-                .backed
+        let csr = if let Some(ref kept) = self.kept_to_global {
+            self.backed
                 .read_row_indices(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            return csr_to_scipy(py, csr);
-        }
-        let csr = self
-            .backed
-            .read_all()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            self.backed
+                .read_all()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        };
+        let csr = self.apply_col_projection(csr);
         csr_to_scipy(py, csr)
     }
 
@@ -196,16 +228,17 @@ impl ScxBackedSparseDataset {
         mat.call_method0("copy")
     }
 
-    // --- Comparison operators (materialize + delegate to scipy) ---
-    // These are used by scanpy's filter_cells (X > 0), filter_genes, etc.
+    // --- Comparison operators (lazy, with fused optimization) ---
+    // These return a _ComparisonResult wrapper that short-circuits
+    // `.sum()` → `getnnz()` for the `(X > 0).sum(axis=1)` pattern
+    // used by scanpy's calculate_qc_metrics, filter_cells, filter_genes.
 
     fn __gt__<'py>(
         &self,
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__gt__", (other,))
+        self.make_comparison_result(py, "gt", other)
     }
 
     fn __ge__<'py>(
@@ -213,8 +246,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__ge__", (other,))
+        self.make_comparison_result(py, "ge", other)
     }
 
     fn __lt__<'py>(
@@ -222,8 +254,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__lt__", (other,))
+        self.make_comparison_result(py, "lt", other)
     }
 
     fn __le__<'py>(
@@ -231,8 +262,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__le__", (other,))
+        self.make_comparison_result(py, "le", other)
     }
 
     fn __eq__<'py>(
@@ -240,8 +270,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__eq__", (other,))
+        self.make_comparison_result(py, "eq", other)
     }
 
     fn __ne__<'py>(
@@ -249,8 +278,7 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        mat.call_method1("__ne__", (other,))
+        self.make_comparison_result(py, "ne", other)
     }
 
     // --- Arithmetic operators ---
@@ -301,23 +329,32 @@ impl ScxBackedSparseDataset {
         mat.call_method1("__matmul__", (other,))
     }
 
-    // --- Aggregation methods ---
-    // Used by scanpy's filter_cells (sum per row), HVG (mean/var per column),
-    // normalize_total (sum per row), etc.
-
     /// Sum along an axis without materializing the full matrix.
     ///
-    /// Iterates shards in Rust, computing partial sums. For `axis=1`
-    /// (row sums), deletion vectors are handled via `kept_to_global`.
+    /// When deletion vectors are present, `axis=0` uses masked column sums
+    /// to exclude deleted rows' contributions.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        // Fallback to materialization when column projection is active
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("sum", (a,)),
+                None => mat.call_method0("sum"),
+            };
+        }
         match axis {
             Some(0) => {
-                // Column sums — deletion vectors don't affect columns
-                let sums = self
-                    .backed
-                    .col_sums()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let sums = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_sums_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_sums()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
                 let arr = numpy::PyArray::from_vec(py, sums);
                 // Return as (1, n_vars) matrix to match scipy convention
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
@@ -335,7 +372,7 @@ impl ScxBackedSparseDataset {
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                // Total sum
+                // Total sum — use row sums + filter for correctness with deletions
                 let all_sums = self
                     .backed
                     .row_sums()
@@ -349,14 +386,27 @@ impl ScxBackedSparseDataset {
     }
 
     /// Mean along an axis without materializing the full matrix.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("mean", (a,)),
+                None => mat.call_method0("mean"),
+            };
+        }
         match axis {
             Some(0) => {
-                let sums = self
-                    .backed
-                    .col_sums()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let sums = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_sums_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_sums()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
                 let n = self.shape_val.0 as f64;
                 let means: Vec<f64> = sums.iter().map(|&s| s / n).collect();
                 let arr = numpy::PyArray::from_vec(py, means);
@@ -387,15 +437,116 @@ impl ScxBackedSparseDataset {
         }
     }
 
-    /// NNZ counts along an axis without materializing the full matrix.
+    /// Variance along an axis without materializing the full matrix.
+    ///
+    /// `axis=0`: per-column variance (native Rust, two-pass streaming).
+    /// `axis=1`: per-row variance (native Rust, shard-by-shard).
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
-    fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+    fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            // scipy sparse has no .var(), so compute Var(X) = E[X²] - (E[X])²
+            let mat = self.to_memory(py)?;
+            let np = py.import("numpy")?;
+            return match axis {
+                Some(a) => {
+                    let mean = mat.call_method1("mean", (a,))?;
+                    let mean_sq = mat
+                        .call_method1("power", (2,))?
+                        .call_method1("mean", (a,))?;
+                    np.call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?))
+                }
+                None => {
+                    let mean = mat.call_method0("mean")?;
+                    let mean_sq = mat.call_method1("power", (2,))?.call_method0("mean")?;
+                    np.call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?))
+                }
+            };
+        }
         match axis {
             Some(0) => {
-                let counts = self
+                let var = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_var_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_var()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
+                let arr = numpy::PyArray::from_vec(py, var);
+                arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+            }
+            Some(1) => {
+                let all_var = self
                     .backed
-                    .col_nnz()
+                    .row_var()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_var);
+                let arr = numpy::PyArray::from_vec(py, filtered);
+                arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+            }
+            None => {
+                // Total scalar variance via Var(X) = E[X²] - (E[X])²
+                // Both sums are computed shard-by-shard without materialization.
+                let n_obs = self.shape_val.0;
+                let n_vars = self.shape_val.1;
+                let n_total = (n_obs as f64) * (n_vars as f64);
+                if n_total == 0.0 {
+                    return Ok(0.0f64.into_pyobject(py)?.into_any());
+                }
+
+                // E[X] = total_sum / n_total
+                let all_sums = self
+                    .backed
+                    .row_sums()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered_sums = self.filter_row_results(&all_sums);
+                let total_sum: f64 = filtered_sums.iter().sum();
+                let mean = total_sum / n_total;
+
+                // E[X²] = total_sum_sq / n_total
+                let all_sq = self
+                    .backed
+                    .row_sum_of_squares()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered_sq = self.filter_row_results(&all_sq);
+                let total_sq: f64 = filtered_sq.iter().sum();
+                let mean_sq = total_sq / n_total;
+
+                // Var = E[X²] - (E[X])²
+                let variance = mean_sq - mean * mean;
+                Ok(variance.into_pyobject(py)?.into_any())
+            }
+            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+        }
+    }
+
+    /// NNZ counts along an axis without materializing the full matrix.
+    /// When column projection is active, falls back to materialization.
+    #[pyo3(signature = (axis=None))]
+    fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("getnnz", (a,)),
+                None => mat.call_method0("getnnz"),
+            };
+        }
+        match axis {
+            Some(0) => {
+                let counts = if let Some(ref kept) = self.kept_to_global {
+                    // Masked version returns Vec<f64>, convert to Vec<i64>
+                    let f_counts = self
+                        .backed
+                        .col_nnz_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    f_counts.iter().map(|&v| v as i64).collect::<Vec<i64>>()
+                } else {
+                    self.backed
+                        .col_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
                 Ok(numpy::PyArray::from_vec(py, counts).into_any())
             }
             Some(1) => {
@@ -441,23 +592,161 @@ impl ScxBackedSparseDataset {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Maximum element along an axis.
-    #[pyo3(signature = (axis=None))]
-    fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
-        match axis {
-            Some(a) => mat.call_method1("max", (a,)),
-            None => mat.call_method0("max"),
+    /// Number of CSR shards in the backing file.
+    #[getter]
+    fn n_shards(&self) -> usize {
+        self.n_shards
+    }
+
+    /// Return shard boundaries as a list of (row_start, row_end) tuples.
+    ///
+    /// When deletion vectors are present, the boundaries are remapped to
+    /// user-visible row space (i.e., deleted rows are excluded from counts).
+    /// Each tuple represents a contiguous chunk of user-visible rows that
+    /// came from one on-disk shard.
+    fn shard_boundaries(&self) -> Vec<(usize, usize)> {
+        let n_shards = self.n_shards;
+        match &self.kept_to_global {
+            None => {
+                // No deletions — shard boundaries map directly
+                (0..n_shards)
+                    .filter_map(|i| {
+                        self.backed
+                            .index()
+                            .shard_range(i)
+                            .map(|(s, e)| (s as usize, e as usize))
+                    })
+                    .collect()
+            }
+            Some(kept) => {
+                // With deletions: for each shard, find which user-visible
+                // rows fall into that shard's global row range.
+                let mut boundaries = Vec::with_capacity(n_shards);
+                let mut user_row = 0usize;
+                for shard_idx in 0..n_shards {
+                    let (_s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let chunk_start = user_row;
+                    // Count how many kept rows fall in [s_start, s_end)
+                    while user_row < kept.len() && kept[user_row] < s_end {
+                        user_row += 1;
+                    }
+                    if user_row > chunk_start {
+                        boundaries.push((chunk_start, user_row));
+                    }
+                }
+                boundaries
+            }
         }
     }
 
-    /// Minimum element along an axis.
+    /// Maximum element along an axis without materializing the full matrix.
+    ///
+    /// Uses native Rust shard-streaming max. Respects deletion vectors
+    /// for both axis=0 (column max) and axis=1 (row max).
+    /// When column projection is active, falls back to materialization.
+    #[pyo3(signature = (axis=None))]
+    fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("max", (a,)),
+                None => mat.call_method0("max"),
+            };
+        }
+        match axis {
+            Some(0) => {
+                let maxes = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_max_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_max()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
+                let arr = numpy::PyArray::from_vec(py, maxes);
+                arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+            }
+            Some(1) => {
+                let all_max = self
+                    .backed
+                    .row_max()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_max);
+                let arr = numpy::PyArray::from_vec(py, filtered);
+                arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+            }
+            None => {
+                // Scalar max — compute from column maxes
+                let maxes = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_max_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_max()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
+                let total_max = maxes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                Ok(total_max.into_pyobject(py)?.into_any())
+            }
+            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+        }
+    }
+
+    /// Minimum element along an axis without materializing the full matrix.
+    ///
+    /// Uses native Rust shard-streaming min. Respects deletion vectors.
+    /// When column projection is active, falls back to materialization.
     #[pyo3(signature = (axis=None))]
     fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
-        let mat = self.to_memory(py)?;
+        if self.col_projection.is_some() {
+            let mat = self.to_memory(py)?;
+            return match axis {
+                Some(a) => mat.call_method1("min", (a,)),
+                None => mat.call_method0("min"),
+            };
+        }
         match axis {
-            Some(a) => mat.call_method1("min", (a,)),
-            None => mat.call_method0("min"),
+            Some(0) => {
+                let mins = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_min_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_min()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
+                let arr = numpy::PyArray::from_vec(py, mins);
+                arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+            }
+            Some(1) => {
+                let all_min = self
+                    .backed
+                    .row_min()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let filtered = self.filter_row_results(&all_min);
+                let arr = numpy::PyArray::from_vec(py, filtered);
+                arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+            }
+            None => {
+                let mins = if let Some(ref kept) = self.kept_to_global {
+                    self.backed
+                        .col_min_masked(kept)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                } else {
+                    self.backed
+                        .col_min()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                };
+                let total_min = mins.iter().cloned().fold(f64::INFINITY, f64::min);
+                Ok(total_min.into_pyobject(py)?.into_any())
+            }
+            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
     }
 }
@@ -471,6 +760,44 @@ impl ScxBackedSparseDataset {
         match &self.kept_to_global {
             Some(mapping) => mapping.iter().map(|&g| all_values[g as usize]).collect(),
             None => all_values.to_vec(),
+        }
+    }
+
+    /// Create a lazy comparison result wrapper.
+    ///
+    /// If the threshold can be extracted as a numeric f64, returns a
+    /// `ScxComparisonResult` that can short-circuit `.sum()` → `getnnz()`.
+    /// Otherwise falls back to immediate materialization.
+    fn make_comparison_result<'py>(
+        &self,
+        py: Python<'py>,
+        op: &str,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Try to extract threshold as f64
+        if let Ok(threshold) = other.extract::<f64>() {
+            let result = ScxComparisonResult {
+                backed: Arc::clone(&self.backed),
+                shape_val: self.shape_val,
+                op: op.to_string(),
+                threshold,
+                kept_to_global: self.kept_to_global.clone(),
+                non_negative: self.non_negative,
+            };
+            Ok(Bound::new(py, result)?.into_any())
+        } else {
+            // Non-numeric comparison — materialize immediately
+            let mat = self.to_memory(py)?;
+            let method = match op {
+                "gt" => "__gt__",
+                "ge" => "__ge__",
+                "lt" => "__lt__",
+                "le" => "__le__",
+                "eq" => "__eq__",
+                "ne" => "__ne__",
+                _ => "__gt__",
+            };
+            mat.call_method1(method, (other,))
         }
     }
 
@@ -488,6 +815,7 @@ impl ScxBackedSparseDataset {
                 .backed
                 .read_rows(global_row as u64, global_row as u64 + 1)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = self.apply_col_projection(csr);
             return csr_to_scipy(py, csr);
         }
 
@@ -504,6 +832,7 @@ impl ScxBackedSparseDataset {
                     .backed
                     .read_rows(start, stop)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let csr = self.apply_col_projection(csr);
                 return csr_to_scipy(py, csr);
             }
 
@@ -523,6 +852,7 @@ impl ScxBackedSparseDataset {
                 .backed
                 .read_row_indices(&rows)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = self.apply_col_projection(csr);
             return csr_to_scipy(py, csr);
         }
 
@@ -550,6 +880,7 @@ impl ScxBackedSparseDataset {
                 .backed
                 .read_row_indices(&rows)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = self.apply_col_projection(csr);
             return csr_to_scipy(py, csr);
         }
 
@@ -577,6 +908,7 @@ impl ScxBackedSparseDataset {
             .backed
             .read_row_indices(&rows)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let csr = self.apply_col_projection(csr);
         csr_to_scipy(py, csr)
     }
 
@@ -606,13 +938,26 @@ impl ScxBackedSparseDataset {
                 )));
             }
             // Read single row, extract single column
+            let global_row = self.to_global_row(row)?;
             let csr = self
                 .backed
-                .read_rows(row as u64, row as u64 + 1)
+                .read_rows(global_row as u64, global_row as u64 + 1)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // When col_projection is active, remap user-visible col to on-disk col
+            let lookup_col = if let Some(ref proj) = self.col_projection {
+                *proj.get(col).ok_or_else(|| {
+                    PyIndexError::new_err(format!(
+                        "column index {} out of range for {} projected columns",
+                        col,
+                        proj.len()
+                    ))
+                })? as usize
+            } else {
+                col
+            };
             // Search for the column in the sparse row
             for (i, &idx) in csr.indices.iter().enumerate() {
-                if idx as usize == col {
+                if idx as usize == lookup_col {
                     return Ok(csr.data[i].into_pyobject(py)?.into_any());
                 }
             }
@@ -689,7 +1034,7 @@ impl ScxBackedSparseDataset {
 /// layer's catalog entries rather than the X entries.
 #[pyclass(name = "ScxBackedLayerDataset")]
 pub struct ScxBackedLayerDataset {
-    inner: ScxBackedSparseDataset,
+    pub(crate) inner: ScxBackedSparseDataset,
     layer_name: String,
 }
 
@@ -906,6 +1251,11 @@ impl ScxBackedLayerDataset {
     }
 
     #[pyo3(signature = (axis=None))]
+    fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.var(py, axis)
+    }
+
+    #[pyo3(signature = (axis=None))]
     fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.getnnz(py, axis)
     }
@@ -927,6 +1277,15 @@ impl ScxBackedLayerDataset {
         self.inner.nnz()
     }
 
+    #[getter]
+    fn n_shards(&self) -> usize {
+        self.inner.n_shards
+    }
+
+    fn shard_boundaries(&self) -> Vec<(usize, usize)> {
+        self.inner.shard_boundaries()
+    }
+
     #[pyo3(signature = (axis=None))]
     fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.max(py, axis)
@@ -935,5 +1294,242 @@ impl ScxBackedLayerDataset {
     #[pyo3(signature = (axis=None))]
     fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.min(py, axis)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScxComparisonResult — lazy comparison wrapper for fused optimization
+// ---------------------------------------------------------------------------
+
+/// Lazy comparison result returned by __gt__, __lt__, etc.
+///
+/// Short-circuits common patterns:
+/// - `(X > 0).sum(axis=1)` → `getnnz(axis=1)` (no materialization)
+/// - `(X > 0).sum(axis=0)` → `getnnz(axis=0)` (no materialization)
+///
+/// Falls back to full materialization + scipy for any other operation.
+#[pyclass(name = "_ComparisonResult")]
+pub struct ScxComparisonResult {
+    backed: Arc<BackedCsrReader>,
+    shape_val: (usize, usize),
+    op: String,
+    threshold: f64,
+    kept_to_global: Option<Vec<u64>>,
+    /// Inherited from the parent dataset — gates the getnnz short-circuit.
+    non_negative: bool,
+}
+
+impl ScxComparisonResult {
+    /// Materialize the comparison result as a scipy sparse matrix.
+    fn materialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        // Read the backing data through the dataset
+        let csr = if let Some(ref kept) = self.kept_to_global {
+            self.backed
+                .read_row_indices(kept)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            self.backed
+                .read_all()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        };
+        let mat = csr_to_scipy(py, csr)?;
+        // Apply the comparison operator
+        let method = match self.op.as_str() {
+            "gt" => "__gt__",
+            "ge" => "__ge__",
+            "lt" => "__lt__",
+            "le" => "__le__",
+            "eq" => "__eq__",
+            "ne" => "__ne__",
+            _ => "__gt__",
+        };
+        mat.call_method1(method, (self.threshold,))
+    }
+
+    /// Check if this comparison can be short-circuited for `.sum()`.
+    ///
+    /// `(X > 0).sum(axis)` == `getnnz(axis)` for non-negative data.
+    /// This is the standard scanpy pattern for QC metrics.
+    ///
+    /// # Correctness assumption
+    ///
+    /// This short-circuit is only correct for **non-negative** data (e.g.,
+    /// raw UMI counts, normalized counts, log1p-transformed data). For data
+    /// that may contain negative values (e.g., after `sc.pp.scale()` which
+    /// centers to zero-mean), `getnnz` overcounts because it includes
+    /// stored negative entries.
+    ///
+    /// The `non_negative` flag is inherited from the parent
+    /// `ScxBackedSparseDataset` and gates this optimization at runtime.
+    fn can_shortcircuit_sum(&self) -> bool {
+        self.non_negative && self.op == "gt" && self.threshold == 0.0
+    }
+}
+
+#[pymethods]
+impl ScxComparisonResult {
+    #[getter]
+    fn shape(&self) -> (usize, usize) {
+        self.shape_val
+    }
+
+    #[getter]
+    fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let np = py.import("numpy")?;
+        np.call_method1("dtype", ("bool",))
+    }
+
+    #[getter]
+    fn ndim(&self) -> usize {
+        2
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "_ComparisonResult(op='{}', threshold={}, shape=({}, {}), shortcircuit={})",
+            self.op,
+            self.threshold,
+            self.shape_val.0,
+            self.shape_val.1,
+            self.can_shortcircuit_sum()
+        )
+    }
+
+    /// Sum of comparison result along an axis.
+    ///
+    /// **Optimization:** For `(X > 0).sum(axis=...)`, this returns
+    /// `getnnz(axis=...)` without materializing the full matrix.
+    /// This is the critical path for `sc.pp.calculate_qc_metrics`.
+    ///
+    /// **Note:** The `getnnz` short-circuit assumes non-negative data.
+    /// See [`can_shortcircuit_sum`] for details on this assumption.
+    #[pyo3(signature = (axis=None))]
+    fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        if self.can_shortcircuit_sum() {
+            // Short-circuit: (X > 0).sum(axis) == getnnz(axis)
+            // getnnz counts stored entries, which for non-negative data
+            // (UMI counts) is exactly the number of entries > 0.
+            match axis {
+                Some(0) => {
+                    let counts = if let Some(ref kept) = self.kept_to_global {
+                        let f_counts = self
+                            .backed
+                            .col_nnz_masked(kept)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        f_counts.iter().map(|&v| v as i64).collect::<Vec<i64>>()
+                    } else {
+                        self.backed
+                            .col_nnz()
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                    };
+                    let arr = numpy::PyArray::from_vec(py, counts);
+                    arr.call_method1("reshape", ((1i32, self.shape_val.1),))
+                }
+                Some(1) => {
+                    let all_nnz = self
+                        .backed
+                        .row_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let filtered = match &self.kept_to_global {
+                        Some(mapping) => mapping.iter().map(|&g| all_nnz[g as usize]).collect(),
+                        None => all_nnz,
+                    };
+                    let arr = numpy::PyArray::from_vec(py, filtered);
+                    arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
+                }
+                None => {
+                    let total = self
+                        .backed
+                        .total_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    Ok((total as i64).into_pyobject(py)?.into_any())
+                }
+                Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            }
+        } else {
+            // Fallback: materialize and sum
+            let mat = self.materialize(py)?;
+            match axis {
+                Some(a) => mat.call_method1("sum", (a,)),
+                None => mat.call_method0("sum"),
+            }
+        }
+    }
+
+    /// NNZ counts of comparison result.
+    #[pyo3(signature = (axis=None))]
+    fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("getnnz", (a,)),
+            None => mat.call_method0("getnnz"),
+        }
+    }
+
+    /// Materialize as dense numpy array.
+    fn toarray<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.call_method0("toarray")
+    }
+
+    /// Materialize as scipy CSR matrix.
+    fn tocsr<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.materialize(py)
+    }
+
+    /// Materialize as scipy CSC matrix.
+    fn tocsc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.call_method0("tocsc")
+    }
+
+    /// Support indexing on the comparison result.
+    fn __getitem__<'py>(
+        &self,
+        py: Python<'py>,
+        index: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.get_item(index)
+    }
+
+    /// Multiply — materializes and delegates.
+    fn multiply<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        mat.call_method1("multiply", (other,))
+    }
+
+    /// Mean — materializes and delegates.
+    #[pyo3(signature = (axis=None))]
+    fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("mean", (a,)),
+            None => mat.call_method0("mean"),
+        }
+    }
+
+    /// Max — materializes and delegates.
+    #[pyo3(signature = (axis=None))]
+    fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("max", (a,)),
+            None => mat.call_method0("max"),
+        }
+    }
+
+    /// Min — materializes and delegates.
+    #[pyo3(signature = (axis=None))]
+    fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let mat = self.materialize(py)?;
+        match axis {
+            Some(a) => mat.call_method1("min", (a,)),
+            None => mat.call_method0("min"),
+        }
     }
 }

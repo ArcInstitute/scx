@@ -4,13 +4,14 @@
 
 SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
 
-**Phase 1 complete.** Phase 2 complete. Phase 3 in progress (GPU, R bindings, CLI extensions). See [ROADMAP.md](ROADMAP.md) for the full phased plan and [Phase3.md](Phase3.md) for current work.
+**Phase 1 complete.** Phase 2 complete. Phase 3 in progress (GPU, R bindings, CLI extensions). Phase 4a in progress (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). See [ROADMAP.md](ROADMAP.md) for the full phased plan, [Phase3.md](Phase3.md) for Phase 3 work, and [Phase4.md](Phase4.md) for Phase 4 work.
 
 ## Key Documents
 
 - **[SPEC.md](SPEC.md)** — Format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
 - **[ROADMAP.md](ROADMAP.md)** — Phased implementation plan (Phases 1–4).
-- **[Phase3.md](Phase3.md)** — Phase 3 implementation plan (GPU, R bindings, CLI extensions, multimodal — in progress).
+- **[Phase3.md](Phase3.md)** — Phase 3 implementation plan (GPU, R bindings, CLI extensions — in progress).
+- **[Phase4.md](Phase4.md)** — Phase 4 implementation plan (scanpy parity, Rust-native accelerators — Phase 4a in progress).
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/testing.md](docs/testing.md)** — Test and benchmark details.
@@ -173,4 +174,4 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 ## Out of Scope (Current Phase)
 
 - CSC as primary storage, multimodal (Phase 3, Steps 4–5 — planned)
-- Rust-native PCA/kNN/UMAP accelerators (Phase 4 — optional)
+- Rust-native PCA/kNN/UMAP accelerators (Phase 4b — planned)

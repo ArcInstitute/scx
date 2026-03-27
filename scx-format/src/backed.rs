@@ -157,6 +157,19 @@ impl BackedCsrIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregation operation enum (internal)
+// ---------------------------------------------------------------------------
+
+/// Internal enum for masked column aggregation dispatch.
+#[derive(Clone, Copy)]
+enum AggOp {
+    Sum,
+    Nnz,
+    Max,
+    Min,
+}
+
+// ---------------------------------------------------------------------------
 // BackedCsrReader
 // ---------------------------------------------------------------------------
 
@@ -488,6 +501,316 @@ impl BackedCsrReader {
             total += csr.nnz();
         }
         Ok(total)
+    }
+
+    /// Compute per-row sum of squared values without materializing the full matrix.
+    ///
+    /// Iterates shards in order, computes row sum-of-squares from each shard's
+    /// CSR arrays, and concatenates the results. Used for scalar variance:
+    /// `Var(X) = E[X²] - (E[X])²`.
+    pub fn row_sum_of_squares(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_sq = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_sq.extend(csr.row_sum_of_squares());
+        }
+        Ok(all_sq)
+    }
+
+    // --- Variance ---
+
+    /// Streaming per-row variance without materializing the full matrix.
+    ///
+    /// Each shard independently computes row variances (one row = one shard's row).
+    pub fn row_var(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_var = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_var.extend(csr.row_var());
+        }
+        Ok(all_var)
+    }
+
+    /// Streaming per-column variance (population variance, ddof=0).
+    ///
+    /// Two-pass algorithm:
+    ///   1. Compute column means via `col_sums() / n_obs`
+    ///   2. Stream shards, accumulating `(x - mean)²` for stored values
+    ///   3. Add zero-entry contributions: `(n_obs - col_nnz) * mean²`
+    pub fn col_var(&self) -> Result<Vec<f64>> {
+        let n_obs = self.n_obs;
+        if n_obs == 0 {
+            return Ok(vec![0.0f64; self.n_vars]);
+        }
+
+        // Pass 1: column means
+        let col_sums = self.col_sums()?;
+        let col_means: Vec<f64> = col_sums.iter().map(|&s| s / n_obs as f64).collect();
+
+        // Pass 2: accumulate (val - mean)² for stored entries
+        let n_shards = self.index.n_shards();
+        let mut sq_devs = vec![0.0f64; self.n_vars];
+        let mut col_nnz = vec![0usize; self.n_vars];
+
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            let partial = csr.col_var_partial(&col_means);
+            for (s, p) in sq_devs.iter_mut().zip(partial.iter()) {
+                *s += p;
+            }
+            let nnz = csr.col_nnz();
+            for (c, &n) in col_nnz.iter_mut().zip(nnz.iter()) {
+                *c += n as usize;
+            }
+        }
+
+        // Add contribution from implicit zeros: (n_obs - col_nnz[c]) * mean[c]²
+        let mut variances = vec![0.0f64; self.n_vars];
+        for c in 0..self.n_vars {
+            let n_zeros = n_obs - col_nnz[c];
+            let total_sq_dev = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
+            variances[c] = total_sq_dev / n_obs as f64;
+        }
+
+        Ok(variances)
+    }
+
+    // --- Max / Min ---
+
+    /// Streaming per-row max without materializing the full matrix.
+    pub fn row_max(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_max = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_max.extend(csr.row_max());
+        }
+        Ok(all_max)
+    }
+
+    /// Streaming per-column max without materializing the full matrix.
+    ///
+    /// Merges per-shard column maxes. Accounts for implicit zeros:
+    /// if any column has fewer stored entries than `n_obs`, the max is
+    /// at least 0.0.
+    pub fn col_max(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut maxes = vec![f64::NEG_INFINITY; self.n_vars];
+        let mut col_nnz = vec![0usize; self.n_vars];
+
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            // Get per-column max within this shard (using n_rows of shard, not global n_obs)
+            // We need the raw stored max, so we pass n_rows = shard.n_rows()
+            // But we want the global implicit-zero correction at the end,
+            // so we track NNZ ourselves and compute raw stored max.
+            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                let c = col as usize;
+                let v = val as f64;
+                maxes[c] = maxes[c].max(v);
+                col_nnz[c] += 1;
+            }
+        }
+
+        // Apply implicit-zero correction at the global level
+        for c in 0..self.n_vars {
+            if col_nnz[c] < self.n_obs {
+                if maxes[c] == f64::NEG_INFINITY {
+                    maxes[c] = 0.0;
+                } else {
+                    maxes[c] = maxes[c].max(0.0);
+                }
+            }
+        }
+        Ok(maxes)
+    }
+
+    /// Streaming per-row min without materializing the full matrix.
+    pub fn row_min(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut all_min = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            all_min.extend(csr.row_min());
+        }
+        Ok(all_min)
+    }
+
+    /// Streaming per-column min without materializing the full matrix.
+    pub fn col_min(&self) -> Result<Vec<f64>> {
+        let n_shards = self.index.n_shards();
+        let mut mins = vec![f64::INFINITY; self.n_vars];
+        let mut col_nnz = vec![0usize; self.n_vars];
+
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                let c = col as usize;
+                let v = val as f64;
+                mins[c] = mins[c].min(v);
+                col_nnz[c] += 1;
+            }
+        }
+
+        for c in 0..self.n_vars {
+            if col_nnz[c] < self.n_obs {
+                if mins[c] == f64::INFINITY {
+                    mins[c] = 0.0;
+                } else {
+                    mins[c] = mins[c].min(0.0);
+                }
+            }
+        }
+        Ok(mins)
+    }
+
+    // --- Masked column aggregation (deletion-vector aware) ---
+    //
+    // These variants accept a `kept_rows` set and only aggregate values from
+    // rows in that set. Used when deletion vectors are present.
+
+    /// Column sums considering only the kept rows.
+    ///
+    /// Iterates shards, intersects with the kept set, and accumulates.
+    pub fn col_sums_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
+        self.col_aggregate_masked(kept_rows, AggOp::Sum)
+    }
+
+    /// Column NNZ considering only the kept rows.
+    pub fn col_nnz_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
+        self.col_aggregate_masked(kept_rows, AggOp::Nnz)
+    }
+
+    /// Column max considering only the kept rows.
+    pub fn col_max_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
+        self.col_aggregate_masked(kept_rows, AggOp::Max)
+    }
+
+    /// Column min considering only the kept rows.
+    pub fn col_min_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
+        self.col_aggregate_masked(kept_rows, AggOp::Min)
+    }
+
+    /// Column variance considering only the kept rows.
+    pub fn col_var_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
+        let n_kept = kept_rows.len();
+        if n_kept == 0 {
+            return Ok(vec![0.0f64; self.n_vars]);
+        }
+
+        // Pass 1: column sums over kept rows → means
+        let col_sums = self.col_sums_masked(kept_rows)?;
+        let col_means: Vec<f64> = col_sums.iter().map(|&s| s / n_kept as f64).collect();
+
+        // Pass 2: accumulate (val - mean)² for stored entries in kept rows
+        let mut sq_devs = vec![0.0f64; self.n_vars];
+        let mut col_nnz = vec![0usize; self.n_vars];
+
+        let n_shards = self.index.n_shards();
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            let (s_start, s_end) = match self.index.shard_range(shard_idx) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
+            // kept_rows is sorted by construction (see compute_kept_to_global).
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let row_start = csr.indptr[local_row] as usize;
+                let row_end = csr.indptr[local_row + 1] as usize;
+                for j in row_start..row_end {
+                    let c = csr.indices[j] as usize;
+                    let diff = csr.data[j] as f64 - col_means[c];
+                    sq_devs[c] += diff * diff;
+                    col_nnz[c] += 1;
+                }
+            }
+        }
+
+        // Add zero-entry contributions
+        let mut variances = vec![0.0f64; self.n_vars];
+        for c in 0..self.n_vars {
+            let n_zeros = n_kept - col_nnz[c];
+            let total = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
+            variances[c] = total / n_kept as f64;
+        }
+        Ok(variances)
+    }
+
+    /// Internal: masked column aggregation over kept rows.
+    fn col_aggregate_masked(&self, kept_rows: &[u64], op: AggOp) -> Result<Vec<f64>> {
+        let n_kept = kept_rows.len();
+        let mut result = match op {
+            AggOp::Sum | AggOp::Nnz => vec![0.0f64; self.n_vars],
+            AggOp::Max => vec![f64::NEG_INFINITY; self.n_vars],
+            AggOp::Min => vec![f64::INFINITY; self.n_vars],
+        };
+        let mut col_nnz = vec![0usize; self.n_vars];
+
+        let n_shards = self.index.n_shards();
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            let (s_start, s_end) = match self.index.shard_range(shard_idx) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
+            // kept_rows is sorted by construction (see compute_kept_to_global).
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let row_start = csr.indptr[local_row] as usize;
+                let row_end = csr.indptr[local_row + 1] as usize;
+                for j in row_start..row_end {
+                    let c = csr.indices[j] as usize;
+                    let v = csr.data[j] as f64;
+                    match op {
+                        AggOp::Sum => result[c] += v,
+                        AggOp::Nnz => result[c] += 1.0,
+                        AggOp::Max => result[c] = result[c].max(v),
+                        AggOp::Min => result[c] = result[c].min(v),
+                    }
+                    col_nnz[c] += 1;
+                }
+            }
+        }
+
+        // Handle implicit zeros for max/min
+        match op {
+            AggOp::Max => {
+                for c in 0..self.n_vars {
+                    if col_nnz[c] < n_kept {
+                        if result[c] == f64::NEG_INFINITY {
+                            result[c] = 0.0;
+                        } else {
+                            result[c] = result[c].max(0.0);
+                        }
+                    }
+                }
+            }
+            AggOp::Min => {
+                for c in 0..self.n_vars {
+                    if col_nnz[c] < n_kept {
+                        if result[c] == f64::INFINITY {
+                            result[c] = 0.0;
+                        } else {
+                            result[c] = result[c].min(0.0);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(result)
     }
 }
 

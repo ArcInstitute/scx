@@ -75,6 +75,342 @@ pub fn apply_fused_ops(csr: &mut ScxCsr, normalize: Option<f64>, log1p: bool) {
     }
 }
 
+/// Configuration for the streaming preprocess pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct PreprocessConfig {
+    /// Target sum for normalize_total. None = skip normalization.
+    pub normalize_target_sum: Option<f64>,
+    /// Whether to apply log1p after normalization.
+    pub log1p: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for streaming_preprocess / streaming_save_layer
+// ---------------------------------------------------------------------------
+
+/// Build an output `FileHeader` from a source header, overriding `codec_id`.
+///
+/// All dynamic fields (nnz, catalog offsets, checksum) are zeroed — the writer
+/// populates them during `finish()`.
+fn build_output_header(src: &scx_format::FileHeader, codec_id: u8) -> scx_format::FileHeader {
+    scx_format::FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: src.format_version,
+        header_length: 256,
+        flags: 0,
+        n_obs: src.n_obs,
+        n_vars: src.n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: src.shard_target_rows,
+        codec_id,
+        index_dtype: src.index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: src.manifest_sequence + 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        reserved: [0u8; 132],
+    }
+}
+
+/// Write a provenance entry recording a preprocessing action.
+fn write_preprocess_provenance(
+    writer: &mut scx_format::ScxWriter,
+    action: &str,
+    params: &str,
+) -> crate::Result<()> {
+    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: action.to_string(),
+        tool: "scx-engine".to_string(),
+        params_json: params.to_string(),
+        input_checksums: vec![],
+    }])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public streaming pipelines
+// ---------------------------------------------------------------------------
+
+/// Streaming shard-by-shard preprocessing pipeline.
+///
+/// Reads the source SCX file one shard at a time, applies fused
+/// normalize+log1p operations, and writes the result to a new SCX file.
+/// Metadata sections (obs, var, obsm, uns) are copied verbatim from
+/// the source.
+///
+/// Post-transformation data is always Float32 + Zstd codec, since
+/// normalization produces float values that can't use the integer-only
+/// Scx1 codec.
+///
+/// # Arguments
+///
+/// * `source_path` — path to the input SCX file
+/// * `target_path` — path to write the output SCX file
+/// * `config` — preprocessing operations to apply
+///
+/// # Returns
+///
+/// The number of shards processed on success.
+pub fn streaming_preprocess(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    config: &PreprocessConfig,
+) -> crate::Result<usize> {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format::{ScxReader, ScxWriter};
+
+    let reader = ScxReader::open(source_path)?;
+    let header = build_output_header(reader.header(), CodecId::Zstd as u8);
+    let mut writer = ScxWriter::new(target_path, header)?;
+
+    // Copy obs + var (before shards, matching original section order)
+    match reader.read_obs() {
+        Ok(batch) => writer.write_obs(&batch)?,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match reader.read_var() {
+        Ok(batch) => writer.write_var(&batch)?,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Stream CSR shards: read → transform → write
+    let shards = reader.catalog().shards_sorted();
+    let value_encoding = ValueEncoding::Float32;
+    let codec_id = CodecId::Zstd;
+
+    for shard_entry in shards.iter() {
+        let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+
+        let n_rows = indptr.len().saturating_sub(1);
+        let n_vars = reader.n_vars() as usize;
+        let mut csr = ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
+        apply_fused_ops(&mut csr, config.normalize_target_sum, config.log1p);
+
+        let out_indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
+        let out_indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
+        let mut out_values = Vec::with_capacity(csr.data.len() * 4);
+        for &v in &csr.data {
+            out_values.write_f32::<LittleEndian>(v).unwrap();
+        }
+
+        let row_start = shard_entry.stats.as_ref().map_or(0u64, |s| s.row_start);
+
+        writer.write_csr_shard(
+            &out_indptr,
+            &out_indices,
+            &out_values,
+            codec_id,
+            value_encoding,
+            row_start,
+        )?;
+    }
+
+    let n_shards = shards.len();
+
+    // Copy obsm + uns (after shards)
+    match reader.read_all_obsm() {
+        Ok(map) => {
+            for (name, batch) in &map {
+                writer.write_obsm(name, batch)?;
+            }
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match reader.read_uns() {
+        Ok(json) => writer.write_uns(&json)?,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Provenance
+    let ops_desc = format!(
+        "preprocess(normalize={}, log1p={})",
+        config
+            .normalize_target_sum
+            .map_or("none".to_string(), |v| v.to_string()),
+        config.log1p
+    );
+    write_preprocess_provenance(
+        &mut writer,
+        "streaming_preprocess",
+        &format!("{{\"ops\":\"{ops_desc}\"}}"),
+    )?;
+
+    writer.finish()?;
+
+    Ok(n_shards)
+}
+
+/// Streaming shard-by-shard save-as-layer pipeline.
+///
+/// Copies all sections from the source SCX file to a new file, then adds
+/// the transformed X data as a named layer (`LayerCsrShard` entries).
+///
+/// This effectively creates a new SCX file that contains both the original
+/// X and a new layer with the preprocessed data.
+///
+/// # Arguments
+///
+/// * `source_path` — path to the input SCX file
+/// * `target_path` — path to write the output SCX file (must differ from source)
+/// * `layer_name` — name for the new layer (e.g., "normalized")
+/// * `config` — preprocessing operations to apply
+pub fn streaming_save_layer(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    layer_name: &str,
+    config: &PreprocessConfig,
+) -> crate::Result<usize> {
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format::{ScxReader, ScxWriter};
+
+    let reader = ScxReader::open(source_path)?;
+    let header = build_output_header(reader.header(), reader.header().codec_id);
+    let mut writer = ScxWriter::new(target_path, header)?;
+
+    // Copy obs + var
+    match reader.read_obs() {
+        Ok(batch) => writer.write_obs(&batch)?,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match reader.read_var() {
+        Ok(batch) => writer.write_var(&batch)?,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Copy original X shards unchanged (raw byte copy — no decode/re-encode)
+    let shards = reader.catalog().shards_sorted();
+    for (shard_idx, shard_entry) in shards.iter().enumerate() {
+        let raw = reader.read_raw_shard_bytes(shard_entry)?;
+        let stats = shard_entry
+            .stats
+            .clone()
+            .ok_or_else(|| scx_format::ScxError::SectionNotFound("shard stats".into()))?;
+        let nnz = stats.nnz;
+        writer.write_raw_shard(
+            raw,
+            scx_format::SectionType::CsrShard,
+            &format!("X_shard_{shard_idx}"),
+            stats,
+            nnz,
+        )?;
+    }
+
+    // Write the transformed layer shards
+    let layer_codec = CodecId::Zstd;
+    let layer_encoding = ValueEncoding::Float32;
+
+    for (shard_idx, shard_entry) in shards.iter().enumerate() {
+        let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+
+        let n_rows = indptr.len().saturating_sub(1);
+        let n_vars = reader.n_vars() as usize;
+        let mut csr = ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
+        apply_fused_ops(&mut csr, config.normalize_target_sum, config.log1p);
+
+        let out_indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
+        let out_indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
+        let out_values = encode_f32_values(&csr.data, layer_encoding);
+
+        let row_start = shard_entry.stats.as_ref().map_or(0u64, |s| s.row_start);
+        writer.write_layer_csr_shard(
+            &out_indptr,
+            &out_indices,
+            &out_values,
+            layer_codec,
+            layer_encoding,
+            row_start,
+            layer_name,
+            shard_idx as u32,
+        )?;
+    }
+
+    let n_shards = shards.len();
+
+    // Copy obsm + uns
+    match reader.read_all_obsm() {
+        Ok(map) => {
+            for (name, batch) in &map {
+                writer.write_obsm(name, batch)?;
+            }
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match reader.read_uns() {
+        Ok(json) => writer.write_uns(&json)?,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Provenance
+    write_preprocess_provenance(
+        &mut writer,
+        "streaming_save_layer",
+        &format!("{{\"layer_name\":\"{layer_name}\"}}"),
+    )?;
+
+    writer.finish()?;
+
+    Ok(n_shards)
+}
+
+/// Encode f32 values to raw LE bytes for the given value encoding.
+fn encode_f32_values(data: &[f32], encoding: scx_codec::ValueEncoding) -> Vec<u8> {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    match encoding {
+        scx_codec::ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
+        scx_codec::ValueEncoding::Uint16 => {
+            let mut buf = Vec::with_capacity(data.len() * 2);
+            for &v in data {
+                buf.write_u16::<LittleEndian>(v as u16).unwrap();
+            }
+            buf
+        }
+        scx_codec::ValueEncoding::Uint32 => {
+            let mut buf = Vec::with_capacity(data.len() * 4);
+            for &v in data {
+                buf.write_u32::<LittleEndian>(v as u32).unwrap();
+            }
+            buf
+        }
+        scx_codec::ValueEncoding::Float32 => {
+            let mut buf = Vec::with_capacity(data.len() * 4);
+            for &v in data {
+                buf.write_f32::<LittleEndian>(v).unwrap();
+            }
+            buf
+        }
+        scx_codec::ValueEncoding::Float16 => {
+            // Float16 encoding is not yet supported. Callers should transcode
+            // to Float32 and update the encoding flag before reaching this point.
+            panic!(
+                "Float16 value encoding is not yet supported in encode_f32_values. \
+                 Transcode to Float32 before calling."
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

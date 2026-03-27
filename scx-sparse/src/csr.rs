@@ -245,6 +245,224 @@ impl ScxCsr {
         }
         counts
     }
+
+    /// Compute per-row sum of squared values: `sum(val² for val in row)`.
+    ///
+    /// Only stored (non-zero) entries contribute — implicit zeros add 0² = 0.
+    /// Returns `f64` for precision when squaring and summing `f32` values.
+    pub fn row_sum_of_squares(&self) -> Vec<f64> {
+        let mut sums = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            let start = self.indptr[r] as usize;
+            let end = self.indptr[r + 1] as usize;
+            let s: f64 = self.data[start..end]
+                .iter()
+                .map(|&v| {
+                    let v64 = v as f64;
+                    v64 * v64
+                })
+                .sum();
+            sums.push(s);
+        }
+        sums
+    }
+
+    // --- Variance helpers ---
+
+    /// Compute per-row variance (population variance, ddof=0).
+    ///
+    /// For each row, computes `mean = sum(data) / n_cols`, then accumulates
+    /// `(val - mean)²` for stored entries and `n_zeros * mean²` for implicit zeros.
+    /// Returns `f64` for precision.
+    pub fn row_var(&self) -> Vec<f64> {
+        let n_cols = self.shape.1;
+        let mut variances = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            let start = self.indptr[r] as usize;
+            let end = self.indptr[r + 1] as usize;
+            let nnz = end - start;
+
+            if n_cols == 0 {
+                variances.push(0.0);
+                continue;
+            }
+
+            // Compute mean
+            let sum: f64 = self.data[start..end].iter().map(|&v| v as f64).sum();
+            let mean = sum / n_cols as f64;
+
+            // Accumulate (val - mean)² for stored entries
+            let mut var_sum: f64 = self.data[start..end]
+                .iter()
+                .map(|&v| {
+                    let diff = v as f64 - mean;
+                    diff * diff
+                })
+                .sum();
+
+            // Add contribution from implicit zeros: n_zeros * mean²
+            let n_zeros = n_cols - nnz;
+            var_sum += n_zeros as f64 * mean * mean;
+
+            variances.push(var_sum / n_cols as f64);
+        }
+        variances
+    }
+
+    /// Compute per-column sum-of-squared-deviations from given means.
+    ///
+    /// For each column, accumulates `(val - mean[col])²` for stored entries.
+    /// The caller must also account for implicit zeros: each zero contributes
+    /// `mean[col]²` (this is done at the `BackedCsrReader` level by tracking
+    /// per-column NNZ and total row count across shards).
+    ///
+    /// `col_means` must have length == `n_cols`.
+    pub fn col_var_partial(&self, col_means: &[f64]) -> Vec<f64> {
+        let mut sq_devs = vec![0.0f64; self.shape.1];
+        for (&col, &val) in self.indices.iter().zip(self.data.iter()) {
+            let c = col as usize;
+            let diff = val as f64 - col_means[c];
+            sq_devs[c] += diff * diff;
+        }
+        sq_devs
+    }
+
+    // --- Max/Min helpers ---
+
+    /// Compute per-row max, accounting for implicit zeros.
+    ///
+    /// When a row has fewer stored entries than `n_cols`, the max is
+    /// `max(stored_max, 0.0)`. For rows with no stored entries and `n_cols > 0`,
+    /// returns `0.0` (all entries are implicit zeros).
+    pub fn row_max(&self) -> Vec<f64> {
+        let n_cols = self.shape.1;
+        let mut maxes = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            let start = self.indptr[r] as usize;
+            let end = self.indptr[r + 1] as usize;
+            let nnz = end - start;
+
+            if n_cols == 0 {
+                maxes.push(f64::NEG_INFINITY);
+                continue;
+            }
+
+            if nnz == 0 {
+                // All entries are implicit zeros
+                maxes.push(0.0);
+                continue;
+            }
+
+            let stored_max = self.data[start..end]
+                .iter()
+                .map(|&v| v as f64)
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            if nnz < n_cols {
+                // Has implicit zeros
+                maxes.push(stored_max.max(0.0));
+            } else {
+                maxes.push(stored_max);
+            }
+        }
+        maxes
+    }
+
+    /// Compute per-column max, accounting for implicit zeros.
+    ///
+    /// `n_obs` is the total number of rows (needed to know if a column
+    /// has implicit zeros). When the column has fewer stored entries than
+    /// `n_obs`, returns `max(stored_max, 0.0)`.
+    pub fn col_max(&self, n_obs: usize) -> Vec<f64> {
+        let mut maxes = vec![f64::NEG_INFINITY; self.shape.1];
+        let mut col_counts = vec![0usize; self.shape.1];
+
+        for (&col, &val) in self.indices.iter().zip(self.data.iter()) {
+            let c = col as usize;
+            let v = val as f64;
+            maxes[c] = maxes[c].max(v);
+            col_counts[c] += 1;
+        }
+
+        for c in 0..self.shape.1 {
+            if col_counts[c] < n_obs {
+                // Has implicit zeros — max is at least 0.0
+                if maxes[c] == f64::NEG_INFINITY {
+                    maxes[c] = 0.0; // all entries in this shard contribute nothing
+                } else {
+                    maxes[c] = maxes[c].max(0.0);
+                }
+            }
+            // If col_counts[c] == n_obs, all entries are stored; keep stored_max
+            // If col_counts[c] == 0 and n_obs == 0, keep NEG_INFINITY (degenerate)
+        }
+        maxes
+    }
+
+    /// Compute per-row min, accounting for implicit zeros.
+    ///
+    /// When a row has fewer stored entries than `n_cols`, the min is
+    /// `min(stored_min, 0.0)`.
+    pub fn row_min(&self) -> Vec<f64> {
+        let n_cols = self.shape.1;
+        let mut mins = Vec::with_capacity(self.shape.0);
+        for r in 0..self.shape.0 {
+            let start = self.indptr[r] as usize;
+            let end = self.indptr[r + 1] as usize;
+            let nnz = end - start;
+
+            if n_cols == 0 {
+                mins.push(f64::INFINITY);
+                continue;
+            }
+
+            if nnz == 0 {
+                // All entries are implicit zeros
+                mins.push(0.0);
+                continue;
+            }
+
+            let stored_min = self.data[start..end]
+                .iter()
+                .map(|&v| v as f64)
+                .fold(f64::INFINITY, f64::min);
+
+            if nnz < n_cols {
+                // Has implicit zeros
+                mins.push(stored_min.min(0.0));
+            } else {
+                mins.push(stored_min);
+            }
+        }
+        mins
+    }
+
+    /// Compute per-column min, accounting for implicit zeros.
+    ///
+    /// `n_obs` is the total number of rows. When the column has fewer
+    /// stored entries than `n_obs`, returns `min(stored_min, 0.0)`.
+    pub fn col_min(&self, n_obs: usize) -> Vec<f64> {
+        let mut mins = vec![f64::INFINITY; self.shape.1];
+        let mut col_counts = vec![0usize; self.shape.1];
+
+        for (&col, &val) in self.indices.iter().zip(self.data.iter()) {
+            let c = col as usize;
+            let v = val as f64;
+            mins[c] = mins[c].min(v);
+            col_counts[c] += 1;
+        }
+
+        for c in 0..self.shape.1 {
+            if col_counts[c] < n_obs {
+                if mins[c] == f64::INFINITY {
+                    mins[c] = 0.0;
+                } else {
+                    mins[c] = mins[c].min(0.0);
+                }
+            }
+        }
+        mins
+    }
 }
 
 #[cfg(test)]
@@ -480,5 +698,159 @@ mod tests {
         let csr = ScxCsr::new_unchecked((huge, 2), vec![], vec![], vec![]);
         let err = csr.to_dense().unwrap_err();
         assert!(matches!(err, CsrError::DimensionOverflow { .. }));
+    }
+
+    // --- Aggregation tests: row_sums / col_sums / row_nnz / col_nnz ---
+
+    #[test]
+    fn test_row_sums() {
+        let csr = sample_csr();
+        let sums = csr.row_sums();
+        assert_eq!(sums, vec![15.0, 11.0, 2.0]);
+    }
+
+    #[test]
+    fn test_col_sums() {
+        let csr = sample_csr();
+        let sums = csr.col_sums();
+        // col 0: 1, col 1: 5, col 2: 3+2=5, col 3: 10, col 4: 7
+        assert_eq!(sums, vec![1.0, 5.0, 5.0, 10.0, 7.0]);
+    }
+
+    #[test]
+    fn test_row_nnz() {
+        let csr = sample_csr();
+        let nnz = csr.row_nnz();
+        assert_eq!(nnz, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_col_nnz() {
+        let csr = sample_csr();
+        let nnz = csr.col_nnz();
+        assert_eq!(nnz, vec![1, 1, 2, 1, 1]);
+    }
+    // --- Sum of squares tests ---
+
+    #[test]
+    fn test_row_sum_of_squares() {
+        let csr = sample_csr();
+        // row 0: [0, 5, 0, 10, 0] → 5² + 10² = 25 + 100 = 125
+        // row 1: [1, 0, 3, 0, 7]  → 1² + 3² + 7² = 1 + 9 + 49 = 59
+        // row 2: [0, 0, 2, 0, 0]  → 2² = 4
+        let sq = csr.row_sum_of_squares();
+        assert_eq!(sq, vec![125.0, 59.0, 4.0]);
+    }
+
+    // --- Variance tests ---
+
+    #[test]
+    fn test_row_var() {
+        let csr = sample_csr();
+        // row 0: [0, 5, 0, 10, 0] → mean=3.0, var = (9+4+9+49+9)/5 = 16.0
+        // row 1: [1, 0, 3, 0, 7]  → mean=2.2, var = (1.44+4.84+0.64+4.84+23.04)/5 = 6.96
+        // row 2: [0, 0, 2, 0, 0]  → mean=0.4, var = (0.16+0.16+2.56+0.16+0.16)/5 = 0.64
+        let var = csr.row_var();
+        assert!((var[0] - 16.0).abs() < 1e-10);
+        assert!((var[1] - 6.96).abs() < 1e-10);
+        assert!((var[2] - 0.64).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_col_var_partial() {
+        let csr = sample_csr();
+        // n_obs = 3
+        // col means: [1/3, 5/3, 5/3, 10/3, 7/3]
+        let col_sums = csr.col_sums();
+        let col_means: Vec<f64> = col_sums.iter().map(|&s| s / 3.0).collect();
+        let partial = csr.col_var_partial(&col_means);
+
+        // For col 0: stored entries: [1] at rows [1], implicit zeros at rows [0,2]
+        // partial only sums (val - mean)² for stored entries:
+        // (1 - 1/3)² = (2/3)² = 4/9 ≈ 0.4444
+        assert!((partial[0] - 4.0 / 9.0).abs() < 1e-10);
+    }
+
+    // --- Max tests ---
+
+    #[test]
+    fn test_row_max() {
+        let csr = sample_csr();
+        let maxes = csr.row_max();
+        // row 0: [0, 5, 0, 10, 0] → max = 10 (has zeros, max(10, 0) = 10)
+        // row 1: [1, 0, 3, 0, 7]  → max = 7  (has zeros, max(7, 0) = 7)
+        // row 2: [0, 0, 2, 0, 0]  → max = 2  (has zeros, max(2, 0) = 2)
+        assert_eq!(maxes, vec![10.0, 7.0, 2.0]);
+    }
+
+    #[test]
+    fn test_row_max_all_zeros() {
+        let csr = ScxCsr::new((1, 3), vec![0, 0], vec![], vec![]).unwrap();
+        let maxes = csr.row_max();
+        assert_eq!(maxes, vec![0.0]);
+    }
+
+    #[test]
+    fn test_col_max() {
+        let csr = sample_csr();
+        let maxes = csr.col_max(3);
+        // col 0: [0,1,0] → stored: [1], has zeros → max(1,0)=1
+        // col 1: [5,0,0] → stored: [5], has zeros → max(5,0)=5
+        // col 2: [0,3,2] → stored: [3,2], has zeros → max(3,0)=3
+        // col 3: [10,0,0] → stored: [10], has zeros → max(10,0)=10
+        // col 4: [0,7,0] → stored: [7], has zeros → max(7,0)=7
+        assert_eq!(maxes, vec![1.0, 5.0, 3.0, 10.0, 7.0]);
+    }
+
+    // --- Min tests ---
+
+    #[test]
+    fn test_row_min() {
+        let csr = sample_csr();
+        let mins = csr.row_min();
+        // All rows have implicit zeros, so min = min(stored_min, 0.0) = 0.0
+        assert_eq!(mins, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_row_min_all_zeros() {
+        let csr = ScxCsr::new((1, 3), vec![0, 0], vec![], vec![]).unwrap();
+        let mins = csr.row_min();
+        assert_eq!(mins, vec![0.0]);
+    }
+
+    #[test]
+    fn test_col_min() {
+        let csr = sample_csr();
+        let mins = csr.col_min(3);
+        // All columns have at least one implicit zero, so min = min(stored_min, 0.0) = 0.0
+        assert_eq!(mins, vec![0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_col_min_negative_values() {
+        // 2x3 matrix: row0=[−5, 0, 3], row1=[0, −2, 0]
+        let csr = ScxCsr::new((2, 3), vec![0, 2, 3], vec![0, 2, 1], vec![-5.0, 3.0, -2.0]).unwrap();
+        let mins = csr.col_min(2);
+        // col 0: [-5, 0] → min(-5, 0) = -5 (has implicit zero)
+        // col 1: [0, -2] → min(-2, 0) = -2 (has implicit zero)
+        // col 2: [3, 0]  → min(3, 0) = 0   (has implicit zero)
+        assert_eq!(mins, vec![-5.0, -2.0, 0.0]);
+    }
+
+    #[test]
+    fn test_col_max_negative_only() {
+        // 2x2 dense matrix (no implicit zeros): [[-1, -3], [-2, -4]]
+        let csr = ScxCsr::new(
+            (2, 2),
+            vec![0, 2, 4],
+            vec![0, 1, 0, 1],
+            vec![-1.0, -3.0, -2.0, -4.0],
+        )
+        .unwrap();
+        let maxes = csr.col_max(2);
+        // col 0: [-1, -2] → no implicit zeros → max = -1
+        // col 1: [-3, -4] → no implicit zeros → max = -3
+        assert_eq!(maxes, vec![-1.0, -3.0]);
     }
 }

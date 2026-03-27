@@ -66,6 +66,20 @@ pyscx.to_mtx("dataset.scx", "/path/to/output_dir")
 
 ## Understanding `to_anndata()`
 
+### Full signature
+
+```python
+exp.to_anndata(
+    backed=False,         # True for lazy loading (X stays on disk)
+    cache_shards=4,       # LRU cache size for backed mode
+    var_names=None,       # List of gene names to project (column subset)
+    obs_filter=None,      # Predicate string to filter cells (e.g. "cell_type == 'T cell'")
+    layers=None,          # List of layer names to load (default: all)
+)
+```
+
+### Default behavior (no extra params)
+
 Calling `to_anndata()` performs a **full read** of the SCX file. Here is
 exactly what happens:
 
@@ -98,9 +112,66 @@ The returned `anndata.AnnData` is fully populated:
 matrix into memory, peak memory equals the size of the sparse CSR
 representation (not the file size on disk). For a 1M-cell dataset this is
 typically ~264 MB — far less than h5ad's ~11.6 GB — but it is still a full
-materialization. If you only need a subset of cells or genes, use the
-[query pipeline](#querying-subsets-before-loading) instead to avoid loading
-data you don't need.
+materialization. If you only need a subset of cells or genes, use
+[selective loading](#selective-loading) or the
+[query pipeline](#querying-subsets-before-loading) instead.
+
+### Selective loading
+
+All selective loading parameters work in both non-backed and backed modes.
+
+#### Gene projection (`var_names`)
+
+Load only specific genes, reducing memory and computation:
+
+```python
+# Load only marker genes
+adata = pyscx.open("atlas.scx").to_anndata(
+    var_names=["CD3E", "CD4", "CD8A", "MS4A1", "NCAM1"]
+)
+print(adata.n_vars)  # 5
+```
+
+In non-backed mode, this applies column projection to the materialized CSR.
+In backed mode, projection is applied lazily — full rows are decoded from
+disk, but only the requested columns are retained in the returned CSR.
+
+#### Cell filtering (`obs_filter`)
+
+Filter cells using a predicate string. In non-backed mode, this leverages
+the query engine with predicate pushdown (shard skipping). In backed mode,
+it evaluates the predicate on the obs DataFrame:
+
+```python
+# Load only T cells from lung tissue
+adata = pyscx.open("atlas.scx").to_anndata(
+    obs_filter="cell_type == 'T cell' and tissue == 'lung'"
+)
+```
+
+#### Layer selection (`layers`)
+
+Load only specific layers instead of all:
+
+```python
+# Load raw counts layer only
+adata = pyscx.open("atlas.scx").to_anndata(layers=["raw_counts"])
+
+# Load no layers at all (X only)
+adata = pyscx.open("atlas.scx").to_anndata(layers=[])
+```
+
+#### Combining parameters
+
+All parameters can be combined:
+
+```python
+adata = pyscx.open("atlas.scx").to_anndata(
+    backed=True,
+    var_names=["CD3E", "CD4", "CD8A"],
+    obs_filter="cell_type == 'T cell'",
+    layers=["raw_counts"],
+)
 
 ## Backed mode (lazy loading)
 
@@ -151,9 +222,10 @@ cells touches ≤ 1 shard.
 
 | Operation | Works? | Notes |
 |-----------|--------|-------|
-| `sc.pp.filter_cells()` | ✅ | Row-wise sum, read-only |
-| `sc.pp.filter_genes()` | ✅ | Column-wise sum, read-only |
-| `sc.pp.highly_variable_genes()` | ✅ | Column statistics |
+| `sc.pp.filter_cells()` | ✅ | Native Rust row sums/NNZ |
+| `sc.pp.filter_genes()` | ✅ | Native Rust column sums/NNZ |
+| `sc.pp.calculate_qc_metrics()` | ✅ | `(X > 0).sum()` short-circuits to `getnnz()` |
+| `sc.pp.highly_variable_genes()` | ✅ | Native Rust column variance |
 | `adata[mask].copy()` | ✅ | Subset → materialize → preprocess |
 | `sc.pp.pca()` | ✅ | Forces materialization of HVG columns |
 | `sc.pp.normalize_total()` | ❌ | Modifies X in-place — materialize first |
@@ -275,6 +347,70 @@ normalization runs in compiled Rust — significantly faster than the Python
 equivalent on large datasets. The resulting AnnData is ready for downstream
 analysis (PCA, clustering, etc.) without calling `sc.pp.normalize_total()`
 or `sc.pp.log1p()` again.
+
+## Out-of-core chunk iteration
+
+For workflows that need to process data shard-by-shard without loading the
+entire matrix, use `iter_chunks()`:
+
+```python
+import pyscx
+import scanpy as sc
+
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# Iterate shard-aligned chunks (default)
+for chunk in pyscx.iter_chunks(adata):
+    print(f"Chunk: {chunk.n_obs} cells, {chunk.n_vars} genes")
+    # Each chunk is a fully materialized AnnData with obs/var/obsm sliced
+    sc.pp.normalize_total(chunk, target_sum=1e4)
+    sc.pp.log1p(chunk)
+    # ... accumulate results ...
+
+# Fixed-size chunks
+for chunk in pyscx.iter_chunks(adata, chunk_size=5000):
+    # Each chunk has at most 5000 cells
+    pass
+```
+
+Shard-aligned chunking (default) avoids decoding any shard twice. Each
+chunk's `obs`, `var`, and `obsm` are correctly sliced to match the rows
+in that chunk.
+
+## Preprocessing pipeline (write-back)
+
+For in-place modifications that need to persist, use the streaming
+preprocessing pipeline. This reads shards one at a time, applies fused
+operations in Rust, and writes the result to a new SCX file:
+
+```python
+import pyscx
+
+# Normalize + log1p → new file (no full materialization)
+pyscx.preprocess(
+    "raw.scx",
+    "preprocessed.scx",
+    ops=["normalize_total", "log1p"],
+    target_sum=1e4,
+)
+
+# Save as a named layer in an existing file
+pyscx.save_layer(
+    "experiment.scx",
+    "experiment_with_norm.scx",
+    layer_name="normalized",
+    ops=["normalize_total", "log1p"],
+    target_sum=1e4,
+)
+
+# Then use the preprocessed file
+adata = pyscx.open("preprocessed.scx").to_anndata()
+sc.pp.pca(adata)  # Already normalized — skip normalize/log1p
+```
+
+The preprocessing pipeline uses fused `normalize_total + log1p` in a
+single pass over each shard, which is faster than the equivalent scanpy
+calls on large datasets.
 
 ## Common scanpy workflows
 
