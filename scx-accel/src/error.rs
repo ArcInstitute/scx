@@ -11,6 +11,9 @@ pub enum AccelError {
 
     #[error("linear algebra error: {0}")]
     LinAlg(String),
+
+    #[error("statistics error: {0}")]
+    StatsError(String),
 }
 
 pub type Result<T> = std::result::Result<T, AccelError>;

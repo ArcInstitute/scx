@@ -361,3 +361,170 @@ class TestUmap:
         assert "X_umap" in backed_adata.obsm
         assert backed_adata.obsm["X_umap"].shape == (100, 2)
         assert np.all(np.isfinite(backed_adata.obsm["X_umap"]))
+
+
+class TestRankGenesGroups:
+    """Test pyscx.accel.rank_genes_groups() — Wilcoxon rank-sum DE."""
+
+    def test_basic_structure(self, synthetic_adata):
+        """DE writes correct keys to adata.uns['rank_genes_groups']."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+
+        assert "rank_genes_groups" in adata.uns
+        rgg = adata.uns["rank_genes_groups"]
+        assert "names" in rgg
+        assert "scores" in rgg
+        assert "pvals" in rgg
+        assert "pvals_adj" in rgg
+        assert "logfoldchanges" in rgg
+        assert "params" in rgg
+
+        # Params should contain correct metadata
+        assert rgg["params"]["groupby"] == "batch"
+        assert rgg["params"]["method"] == "wilcoxon"
+        assert rgg["params"]["reference"] == "rest"
+
+        # Names should be a structured array with group fields
+        names = rgg["names"]
+        assert hasattr(names, "dtype")
+        assert len(names.dtype.names) == 3  # A, B, C groups from conftest
+
+    def test_pvalues_in_range(self, synthetic_adata):
+        """All p-values should be in [0, 1], adjusted >= raw."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+
+        rgg = adata.uns["rank_genes_groups"]
+        for group in rgg["pvals"].dtype.names:
+            raw = rgg["pvals"][group]
+            adj = rgg["pvals_adj"][group]
+
+            assert np.all(raw >= 0), f"raw p-values for {group} should be >= 0"
+            assert np.all(raw <= 1), f"raw p-values for {group} should be <= 1"
+            assert np.all(adj >= 0), f"adj p-values for {group} should be >= 0"
+            assert np.all(adj <= 1), f"adj p-values for {group} should be <= 1"
+            assert np.all(
+                adj >= raw - 1e-10
+            ), f"adjusted p-values for {group} should be >= raw"
+
+    def test_overlap_with_scanpy(self, synthetic_adata):
+        """Top DE genes should substantially overlap with scanpy's output."""
+        try:
+            import scanpy as sc
+        except ImportError:
+            pytest.skip("scanpy not available")
+
+        import pyscx
+
+        n_top = 20
+
+        # scanpy DE
+        adata_sc = synthetic_adata.copy()
+        sc.tl.rank_genes_groups(adata_sc, "batch", method="wilcoxon")
+
+        # SCX DE
+        adata_scx = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata_scx, "batch")
+
+        rgg_sc = adata_sc.uns["rank_genes_groups"]
+        rgg_scx = adata_scx.uns["rank_genes_groups"]
+
+        for group in rgg_scx["names"].dtype.names:
+            sc_top = set(rgg_sc["names"][group][:n_top])
+            scx_top = set(rgg_scx["names"][group][:n_top])
+            overlap = len(sc_top & scx_top) / n_top
+            assert (
+                overlap >= 0.30
+            ), f"overlap for group {group} = {overlap:.2f} (expected >= 0.30)"
+
+    def test_pairwise_reference(self, synthetic_adata):
+        """With reference='A', only non-A groups should appear in results."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch", reference="A")
+
+        rgg = adata.uns["rank_genes_groups"]
+        groups = rgg["names"].dtype.names
+        assert "A" not in groups
+        assert "B" in groups
+        assert "C" in groups
+
+    def test_logfoldchanges_sign(self):
+        """For known upregulated genes, fold-change should be positive."""
+        import anndata
+        import pyscx
+
+        # Build simple 2-group data with known DE genes.
+        np.random.seed(123)
+        n_obs = 40
+        n_vars = 5
+        data = np.zeros((n_obs, n_vars), dtype=np.float32)
+        # Gene 0: high in group A, low in B
+        data[:20, 0] = np.random.uniform(10, 20, 20).astype(np.float32)
+        data[20:, 0] = np.random.uniform(0, 2, 20).astype(np.float32)
+        # Gene 1: high in group B, low in A
+        data[:20, 1] = np.random.uniform(0, 2, 20).astype(np.float32)
+        data[20:, 1] = np.random.uniform(10, 20, 20).astype(np.float32)
+        # Genes 2-4: no diff
+        data[:, 2:] = np.random.uniform(3, 7, (n_obs, 3)).astype(np.float32)
+
+        import pandas as pd
+
+        obs = pd.DataFrame(
+            {"group": pd.Categorical(["A"] * 20 + ["B"] * 20)},
+            index=[f"c{i}" for i in range(n_obs)],
+        )
+        var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_vars)])
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        pyscx.accel.rank_genes_groups(adata, "group")
+
+        rgg = adata.uns["rank_genes_groups"]
+
+        # Find gene_0 in group A results — should have positive logFC
+        names_a = list(rgg["names"]["A"])
+        idx_gene0 = names_a.index("gene_0")
+        assert (
+            rgg["logfoldchanges"]["A"][idx_gene0] > 0
+        ), "gene_0 should have positive logFC for group A"
+
+        # Find gene_1 in group B results — should have positive logFC
+        names_b = list(rgg["names"]["B"])
+        idx_gene1 = names_b.index("gene_1")
+        assert (
+            rgg["logfoldchanges"]["B"][idx_gene1] > 0
+        ), "gene_1 should have positive logFC for group B"
+
+    def test_backed_pipeline(self, pca_adata):
+        """Full pipeline from backed SCX: PCA → neighbors → leiden → DE."""
+        try:
+            import scanpy as sc
+        except ImportError:
+            pytest.skip("scanpy not available")
+
+        import pyscx
+
+        scx_path, _ = pca_adata
+        backed_adata = pyscx.open(scx_path).to_anndata(backed=True)
+
+        # PCA from backed mode
+        pyscx.accel.pca(backed_adata, n_comps=10)
+        pyscx.accel.neighbors(backed_adata, n_neighbors=5)
+
+        # Leiden clustering
+        sc.tl.leiden(backed_adata, key_added="leiden_groups")
+
+        # DE on cluster labels
+        pyscx.accel.rank_genes_groups(backed_adata, "leiden_groups")
+
+        assert "rank_genes_groups" in backed_adata.uns
+        rgg = backed_adata.uns["rank_genes_groups"]
+        assert "names" in rgg
+        assert len(rgg["names"].dtype.names) >= 2
+

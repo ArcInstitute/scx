@@ -497,7 +497,37 @@ pyscx.accel.umap(adata)
 | `learning_rate` | 1.0 | Initial learning rate |
 | `random_state` | 0 | Random seed |
 
-### Using accelerators with scanpy
+### Differential Expression (`pyscx.accel.rank_genes_groups`)
+
+Parallel Wilcoxon rank-sum test with rayon. Compares each cluster against
+the rest (or a specific reference group) and applies Benjamini–Hochberg
+correction. Results are written to the same `adata.uns["rank_genes_groups"]`
+format as scanpy, so `sc.pl.rank_genes_groups()` and
+`sc.get.rank_genes_groups_df()` work identically.
+
+```python
+pyscx.accel.rank_genes_groups(adata, "leiden")
+
+# Results written to:
+#   adata.uns["rank_genes_groups"]["names"]           — structured array
+#   adata.uns["rank_genes_groups"]["scores"]           — z-scores
+#   adata.uns["rank_genes_groups"]["pvals"]             — raw p-values
+#   adata.uns["rank_genes_groups"]["pvals_adj"]         — BH-adjusted
+#   adata.uns["rank_genes_groups"]["logfoldchanges"]    — log2 FC
+
+# Downstream scanpy works identically:
+sc.pl.rank_genes_groups(adata, n_genes=20)
+df = sc.get.rank_genes_groups_df(adata, group="0")
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `groupby` | (required) | Column in `adata.obs` to group cells by |
+| `reference` | `"rest"` | Compare against a specific group or `"rest"` (1-vs-rest) |
+| `n_genes` | all | Number of top genes to report per group |
+| `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
+
+
 
 The accelerators write to the same AnnData slots as scanpy, so they are
 fully interchangeable. You can mix and match:

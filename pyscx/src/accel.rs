@@ -404,3 +404,225 @@ fn write_umap_to_adata(
 
     Ok(())
 }
+
+/// Run Wilcoxon rank-sum differential expression analysis.
+///
+/// Compares each group against the rest (or a specific reference group)
+/// using parallel Wilcoxon rank-sum tests. Results are written to
+/// `adata.uns["rank_genes_groups"]` in the same format as scanpy's
+/// `sc.tl.rank_genes_groups(method="wilcoxon")`.
+///
+/// Args:
+///     adata: AnnData object with X and obs[groupby]
+///     groupby: Column in adata.obs to group cells by
+///     reference: Group name to compare against (default: "rest" = 1-vs-rest)
+///     n_genes: Number of top genes to report per group (default: all genes)
+///     method: Statistical method (currently only "wilcoxon")
+#[pyfunction]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon"))]
+#[allow(clippy::too_many_arguments)]
+pub fn rank_genes_groups(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    groupby: &str,
+    reference: &str,
+    n_genes: Option<usize>,
+    method: &str,
+) -> PyResult<()> {
+    if method != "wilcoxon" {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported method '{method}': only 'wilcoxon' is currently supported"
+        )));
+    }
+
+    let numpy = py.import("numpy")?;
+    let scipy_sparse = py.import("scipy.sparse")?;
+
+    // Extract group labels from adata.obs[groupby].
+    let obs = adata.getattr("obs")?;
+    let group_col = obs.get_item(groupby)?;
+    let group_labels: Vec<String> = group_col
+        .call_method1("astype", ("str",))?
+        .call_method0("tolist")?
+        .extract()?;
+
+    // Determine unique group names (sorted, matching scanpy's default).
+    let cat_attr = group_col.getattr("cat");
+    let unique_groups: Vec<String> = if let Ok(cat) = cat_attr {
+        // Categorical column — use category order.
+        cat.getattr("categories")?
+            .call_method0("tolist")?
+            .extract()?
+    } else {
+        // Non-categorical — sort unique values.
+        let mut unique: Vec<String> = group_labels.to_vec();
+        unique.sort();
+        unique.dedup();
+        unique
+    };
+
+    // Map labels → indices.
+    let group_name_to_idx: std::collections::HashMap<&str, usize> = unique_groups
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+
+    let groups: Vec<usize> = group_labels
+        .iter()
+        .map(|label| *group_name_to_idx.get(label.as_str()).unwrap_or(&0))
+        .collect();
+
+    // Resolve reference.
+    let ref_idx: Option<usize> = if reference == "rest" {
+        None
+    } else {
+        Some(*group_name_to_idx.get(reference).ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "reference group '{reference}' not found in adata.obs['{groupby}']"
+            ))
+        })?)
+    };
+
+    // Extract X as dense f32 array (row-major: [n_obs × n_vars]).
+    let x = adata.getattr("X")?;
+    let is_sparse = scipy_sparse
+        .call_method1("issparse", (&x,))?
+        .extract::<bool>()?;
+
+    let dense = if is_sparse {
+        x.call_method0("toarray")?
+    } else if x.hasattr("toarray")? {
+        // Backed dataset with toarray method — materialize fully.
+        x.call_method0("toarray")?
+    } else {
+        numpy
+            .call_method1("asarray", (&x,))?
+            .call_method1("astype", ("float32",))?
+    };
+
+    let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
+    let (n_obs, n_vars) = shape;
+
+    // Flatten to Vec<f32>.
+    let flat = dense
+        .call_method1("astype", ("float32",))?
+        .call_method0("ravel")?;
+    let data: Vec<f32> = flat.extract()?;
+
+    // Get gene names.
+    let var = adata.getattr("var")?;
+    let var_names = var.getattr("index")?;
+    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+
+    // Run Wilcoxon rank-sum DE.
+    let result = scx_accel::wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &unique_groups,
+        ref_idx,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // Write results to adata.uns["rank_genes_groups"] in scanpy format.
+    write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;
+
+    Ok(())
+}
+
+/// Write DE results to adata.uns["rank_genes_groups"] matching scanpy's format.
+///
+/// Scanpy stores results as numpy structured arrays (rec.arrays) with one
+/// field per group. Each field contains gene names/scores/p-values sorted
+/// by the test statistic.
+fn write_de_to_adata(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    result: &scx_accel::DiffExpResult,
+    groupby: &str,
+    reference: &str,
+    n_genes: Option<usize>,
+) -> PyResult<()> {
+    let numpy = py.import("numpy")?;
+    let n_groups = result.group_names.len();
+    let full_n_genes = if n_groups > 0 {
+        result.names[0].len()
+    } else {
+        0
+    };
+    let n_genes = n_genes.unwrap_or(full_n_genes).min(full_n_genes);
+
+    let rgg = PyDict::new(py);
+
+    // params dict
+    let params = PyDict::new(py);
+    params.set_item("groupby", groupby)?;
+    params.set_item("reference", reference)?;
+    params.set_item("method", "wilcoxon")?;
+    params.set_item("use_raw", false)?;
+
+    // Helper to build structured array (like scanpy's recarray format).
+    // Scanpy stores e.g. names as a structured array with dtype like:
+    //   [('group_A', 'O'), ('group_B', 'O')]
+    // Each row is one gene rank position.
+    let build_structured =
+        |field_data: &[Vec<String>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
+            // Build dtype: list of (group_name, 'U200') tuples.
+            let dt_list = pyo3::types::PyList::empty(py);
+            for gn in groups {
+                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "U200"])?;
+                dt_list.append(tup)?;
+            }
+            let dtype = numpy.call_method1("dtype", (dt_list,))?;
+
+            // Build empty structured array, then fill fields.
+            let arr = numpy.call_method1("empty", (n_genes,))?;
+            let arr = arr.call_method1("astype", (&dtype,))?;
+            for (i, gn) in groups.iter().enumerate() {
+                let vals = &field_data[i];
+                let col = pyo3::types::PyList::new(py, &vals[..n_genes])?;
+                arr.set_item(gn.as_str(), col)?;
+            }
+            Ok(arr.unbind().into_bound(py))
+        };
+
+    let build_structured_f64 =
+        |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
+            let dt_list = pyo3::types::PyList::empty(py);
+            for gn in groups {
+                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "f8"])?;
+                dt_list.append(tup)?;
+            }
+            let dtype = numpy.call_method1("dtype", (dt_list,))?;
+
+            let arr = numpy.call_method1("empty", (n_genes,))?;
+            let arr = arr.call_method1("astype", (&dtype,))?;
+            for (i, gn) in groups.iter().enumerate() {
+                let vals: Vec<f64> = field_data[i][..n_genes].to_vec();
+                let np_vals = numpy.call_method1("array", (vals,))?;
+                arr.set_item(gn.as_str(), np_vals)?;
+            }
+            Ok(arr.unbind().into_bound(py))
+        };
+
+    let names = build_structured(&result.names, &result.group_names)?;
+    let scores = build_structured_f64(&result.scores, &result.group_names)?;
+    let pvals = build_structured_f64(&result.pvals, &result.group_names)?;
+    let pvals_adj = build_structured_f64(&result.pvals_adj, &result.group_names)?;
+    let logfoldchanges = build_structured_f64(&result.logfoldchanges, &result.group_names)?;
+
+    rgg.set_item("params", params)?;
+    rgg.set_item("names", names)?;
+    rgg.set_item("scores", scores)?;
+    rgg.set_item("pvals", pvals)?;
+    rgg.set_item("pvals_adj", pvals_adj)?;
+    rgg.set_item("logfoldchanges", logfoldchanges)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item("rank_genes_groups", rgg)?;
+
+    Ok(())
+}
