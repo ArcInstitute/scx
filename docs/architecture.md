@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 10 crates. Dependencies flow bottom-up:
+The workspace contains 14 crates (including `scx-integration-tests`). Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -23,29 +23,31 @@ The workspace contains 10 crates. Dependencies flow bottom-up:
                         │ scx-cli  │  CLI tool
                         └────┬─────┘
                              │ depends on all below
-       ┌──────────────┬──────┼──────────────┬──────────────┐
-       │              │      │              │              │
-┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐   ┌──────┴──────┐
-│ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │   │  scx-mtx    │
-│ query engine│ │ file ops │ │    │ cloud ops  │   │ MTX I/O     │
-└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘
-       │              │      │              │              │
-       │    ┌─────────┘  ┌───┴────────┐     │              │
-       │    │            │ scx-loader │     │              │
-       │    │            │ ML loader  │     │              │
-       │    │            └───┬────────┘     │              │
-       │    │                │              │              │
-       └────┴────────────────┼──────────────┴──────────────┘
-                             │
-                      ┌──────┴──────┐
-                      │ scx-format  │  File layout, header, catalog, reader/writer
-                      └──────┬──────┘
-                  ┌──────────┼──────────┐
+       ┌──────────────┬──────┼──────────────┬─────────────┬────────────-─┐
+       │              │      │              │             │              │
+┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐   ┌──────┴──────┐  ┌────┴──────┐
+│ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │   │  scx-mtx    │  │ scx-accel │
+│ query engine│ │ file ops │ │    │ cloud ops  │   │ MTX I/O     │  │ PCA/kNN/  │
+└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘  │ UMAP/DE   │
+       │              │      │              │             │         └────┬──────┘
+       │    ┌─────────┘  ┌───┴────────┐     │             │              │
+       │    │            │ scx-loader │     │             │              │
+       │    │            │ ML loader  │     │             │              │
+       │    │            └───┬────────┘     │             │              │
+       │    │                │              │             │              │
+       └────┴────────────────┼──────────────┴─────────────┴──────────────┘
+                             │                        ┌──────────┐
+                      ┌──────┴──────┐                 │  scx-gpu │
+                      │ scx-format  │                 │ GPU codec│
+                      └──────┬──────┘                 └────┬─────┘
+                  ┌──────────┼─────────────────────────────┘
                   │                     │
            ┌──────┴──────┐        ┌─────┴──────┐
            │  scx-codec  │        │ scx-sparse │
            │ compression │        │ CSR types  │
            └─────────────┘        └────────────┘
+
+rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
 ```
 
 ### Crate Summary
@@ -60,8 +62,11 @@ The workspace contains 10 crates. Dependencies flow bottom-up:
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
+| **scx-accel** | Rust-native analysis accelerators | `pca` (randomized SVD), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon), `pseudobulk` |
+| **scx-gpu** | CUDA-accelerated codec decoding and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
-| **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud` |
+| **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess` |
+| **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
 
 > [!NOTE]
 > `scx-loader` does **not** depend on `scx-engine` — it has its own streaming-optimized
@@ -70,6 +75,8 @@ The workspace contains 10 crates. Dependencies flow bottom-up:
 > `scx-cloud` reuses `scx-engine` for predicate parsing (selective pull).
 > `scx-mtx` is **always-on** (no feature gate) since MTX is pure text I/O with no
 > HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
+> `scx-accel` depends only on `scx-format` and `scx-sparse` — no engine/loader
+> dependency. It uses `faer` for dense linear algebra and `instant-distance` for HNSW kNN.
 
 ---
 
@@ -592,6 +599,8 @@ Each crate defines its own error type via `thiserror`:
 | `scx-loader` | `LoaderError` | Pipeline errors, memory budget, configuration |
 | `scx-cloud` | `CloudError` | Object store errors, auth failures, missing sections |
 | `scx-mtx` | `MtxError` | MTX parse errors, missing sidecar files, I/O |
+| `scx-accel` | `AccelError` | PCA, kNN, UMAP, differential expression computation errors |
+| `scx-gpu` | `GpuError` | CUDA runtime errors, kernel launch failures, GDS errors |
 | `scx-sparse` | `CsrError` | Invalid CSR dimensions |
 
 Readers return errors (never panic) on malformed input, including bitstream
@@ -603,8 +612,9 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 
 - [SPEC.md](../SPEC.md) — Full binary format specification (v0.5)
 - [api.md](api.md) — API reference for Rust, Python, and CLI
+- [scanpy.md](scanpy.md) — Scanpy integration, backed mode, and accelerator usage
 - [ROADMAP.md](../ROADMAP.md) — Phased implementation plan
-- [Phase2.md](../Phase2.md) — Phase 2 implementation plan
-- [Phase2-CLOUD.md](../Phase2-CLOUD.md) — Cloud operations specification
+- [Phase4.md](../Phase4.md) — Phase 4 plan (scanpy parity + Rust-native accelerators)
+- [Phase4-GPU.md](../Phase4-GPU.md) — Phase 4c GPU accelerator specification
 - [Phase3.md](../Phase3.md) — Phase 3 specification (GPU, R, multimodal)
 - [testing.md](testing.md) — Test infrastructure and benchmarks

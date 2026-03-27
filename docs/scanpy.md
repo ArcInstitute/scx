@@ -412,6 +412,254 @@ The preprocessing pipeline uses fused `normalize_total + log1p` in a
 single pass over each shard, which is faster than the equivalent scanpy
 calls on large datasets.
 
+## Rust-native accelerators
+
+SCX includes optional Rust-native implementations of PCA, kNN graph
+construction, and UMAP embedding via `pyscx.accel`. These accelerators are
+2–10× faster than their scanpy equivalents at scale (>100K cells) while
+writing results to the same AnnData slots — so downstream scanpy functions
+(leiden, plotting, DE) work identically.
+
+### PCA (`pyscx.accel.pca`)
+
+Randomized SVD with streaming shard-by-shard SpMM. Can run directly on
+backed mode without materializing the full matrix.
+
+```python
+import pyscx
+
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+pyscx.accel.pca(adata, n_comps=50)
+
+# Results written to standard scanpy slots:
+#   adata.obsm["X_pca"]           — (n_obs × n_comps) float32
+#   adata.varm["PCs"]             — (n_vars × n_comps) float32
+#   adata.uns["pca"]["variance"]  — explained variance per PC
+#   adata.uns["pca"]["variance_ratio"]
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_comps` | 50 | Number of principal components |
+| `zero_center` | True | Mean-center data (True = standard PCA, False = TruncatedSVD) |
+| `random_state` | 0 | Random seed |
+| `n_oversamples` | 10 | Extra dimensions for accuracy |
+| `n_power_iterations` | 2 | Power iterations for spectral accuracy |
+
+**Key advantage:** In backed mode, PCA streams SpMM shard-by-shard. Peak
+memory is one shard (~16K × n_vars × 4 bytes) plus the output embeddings,
+enabling PCA on datasets larger than RAM.
+
+### kNN graph (`pyscx.accel.neighbors`)
+
+Approximate nearest neighbors via HNSW (Hierarchical Navigable Small
+World), followed by UMAP-style fuzzy set connectivities.
+
+```python
+pyscx.accel.neighbors(adata, n_neighbors=15)
+
+# Results written to standard scanpy slots:
+#   adata.obsp["distances"]        — sparse CSR (n_obs × n_obs)
+#   adata.obsp["connectivities"]   — sparse CSR (n_obs × n_obs)
+#   adata.uns["neighbors"]         — metadata dict
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_neighbors` | 15 | Number of nearest neighbors |
+| `use_rep` | `"X_pca"` | Key in `adata.obsm` to use as input |
+| `random_state` | 0 | Random seed |
+| `ef_construction` | 200 | HNSW build parameter (higher = more accurate) |
+| `ef_search` | 200 | HNSW search parameter (higher = more accurate) |
+
+The HNSW graph uses Euclidean distance and achieves recall@k > 0.90
+compared to brute-force exact kNN.
+
+### UMAP (`pyscx.accel.umap`)
+
+SGD-based UMAP embedding with spectral initialization and negative
+sampling. Takes the kNN connectivity graph as input.
+
+```python
+pyscx.accel.umap(adata)
+
+# Result written to:
+#   adata.obsm["X_umap"]  — (n_obs × 2) float32
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_components` | 2 | Output dimensions |
+| `n_epochs` | 200 | SGD epochs (more = better quality, slower) |
+| `min_dist` | 0.1 | Minimum distance in embedding |
+| `spread` | 1.0 | Spread of embedded points |
+| `negative_sample_rate` | 5 | Negative samples per positive edge |
+| `learning_rate` | 1.0 | Initial learning rate |
+| `random_state` | 0 | Random seed |
+
+### Differential Expression (`pyscx.accel.rank_genes_groups`)
+
+Parallel Wilcoxon rank-sum test with rayon. Compares each cluster against
+the rest (or a specific reference group) and applies Benjamini–Hochberg
+correction. Results are written to the same `adata.uns["rank_genes_groups"]`
+format as scanpy, so `sc.pl.rank_genes_groups()` and
+`sc.get.rank_genes_groups_df()` work identically.
+
+```python
+pyscx.accel.rank_genes_groups(adata, "leiden")
+
+# Results written to:
+#   adata.uns["rank_genes_groups"]["names"]           — structured array
+#   adata.uns["rank_genes_groups"]["scores"]           — z-scores
+#   adata.uns["rank_genes_groups"]["pvals"]             — raw p-values
+#   adata.uns["rank_genes_groups"]["pvals_adj"]         — BH-adjusted
+#   adata.uns["rank_genes_groups"]["logfoldchanges"]    — log2 FC
+
+# Downstream scanpy works identically:
+sc.pl.rank_genes_groups(adata, n_genes=20)
+df = sc.get.rank_genes_groups_df(adata, group="0")
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `groupby` | (required) | Column in `adata.obs` to group cells by |
+| `reference` | `"rest"` | Compare against a specific group or `"rest"` (1-vs-rest) |
+| `n_genes` | all | Number of top genes to report per group |
+| `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
+
+### Pseudobulk Differential Expression (`pyscx.accel.pseudobulk_dex`)
+
+Streaming pseudobulk aggregation in Rust + negative binomial GLM testing via
+[pydeseq2](https://pydeseq2.readthedocs.io/). Designed for perturbation
+sequencing (Perturb-seq) experiments with biological replicates.
+
+The aggregation phase streams shards from `BackedCsrReader` without
+materializing the full matrix — peak memory is one shard plus the pseudobulk
+count matrix (n_groups × n_vars).
+
+```python
+import pyscx
+
+adata = pyscx.open("perturb_seq.scx").to_anndata(backed=True)
+
+# Run pseudobulk DE: drug vs control, grouped by (perturbation, donor)
+result = pyscx.accel.pseudobulk_dex(
+    adata,
+    groupby=["perturbation", "donor"],
+    test_col="perturbation",
+    reference="control",
+)
+
+# result is a pandas DataFrame:
+#   gene | baseMean | log2FoldChange | lfcSE | stat | pvalue | padj | target | reference
+print(result.sort_values("padj").head(20))
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `groupby` | (required) | List of obs columns to group cells by |
+| `test_col` | (required) | Column in `groupby` containing the condition variable |
+| `reference` | (required) | Reference level in `test_col` (e.g., `"control"`) |
+| `design` | `"~ test_col"` | DESeq2 design formula (auto-generated if not specified) |
+| `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"` |
+| `min_cells_per_group` | 10 | Groups with fewer cells are excluded |
+
+### Stratified Differential Expression
+
+Both `rank_genes_groups()` and `pseudobulk_dex()` support automatic
+stratification via the `stratify_by` parameter. DE is run independently
+within each stratum and the results are concatenated into a single
+DataFrame with stratum columns appended.
+
+```python
+import pyscx
+
+adata = pyscx.open("perturb_seq.scx").to_anndata()
+
+# Single-cell DE stratified by cell type:
+result = pyscx.accel.rank_genes_groups(
+    adata, "perturbation",
+    stratify_by=["cell_type"],
+    min_cells_per_stratum=50,
+)
+# Returns a DataFrame with columns:
+#   gene | scores | pvals | pvals_adj | logfoldchanges | group | cell_type
+
+# Multi-column stratification (composite strata):
+result = pyscx.accel.rank_genes_groups(
+    adata, "perturbation",
+    stratify_by=["cell_type", "tissue"],
+    min_cells_per_stratum=30,
+)
+# Returns DataFrame with both cell_type and tissue columns
+
+# Pseudobulk DE stratified by cell type:
+result = pyscx.accel.pseudobulk_dex(
+    adata,
+    groupby=["perturbation", "donor"],
+    test_col="perturbation",
+    reference="control",
+    stratify_by=["cell_type"],
+    min_cells_per_stratum=50,
+)
+# Returns DataFrame with cell_type column added
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `stratify_by` | `None` | Column(s) in `adata.obs` to stratify by. Single string or list of strings. |
+| `min_cells_per_stratum` | 50 | Strata with fewer cells are skipped (with warning). |
+
+Strata with insufficient cells are skipped with a `UserWarning`. If all
+strata are filtered, a `ValueError` is raised. `stratify_by` columns must
+not collide with `groupby` or `test_col`.
+
+> [!NOTE]
+> When `stratify_by` is provided, `rank_genes_groups()` returns a pandas
+> DataFrame instead of writing to `adata.uns`. Without `stratify_by`, it
+> writes to `adata.uns["rank_genes_groups"]` as usual and returns `None`.
+
+> [!NOTE]
+> `pydeseq2` is an **optional** runtime dependency. Install with
+> `pip install pydeseq2` before calling `pseudobulk_dex()`.
+
+
+The accelerators write to the same AnnData slots as scanpy, so they are
+fully interchangeable. You can mix and match:
+
+```python
+import pyscx
+import scanpy as sc
+
+adata = pyscx.open("atlas.scx").to_anndata()
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+sc.pp.highly_variable_genes(adata)
+adata = adata[:, adata.var["highly_variable"]].copy()
+
+# Use SCX accelerators for compute-heavy steps
+pyscx.accel.pca(adata, n_comps=50)       # faster than sc.pp.pca
+pyscx.accel.neighbors(adata)              # faster than sc.pp.neighbors
+pyscx.accel.umap(adata)                   # faster than sc.tl.umap
+
+# Downstream scanpy works identically
+sc.tl.leiden(adata)                       # uses adata.obsp["connectivities"]
+sc.tl.rank_genes_groups(adata, "leiden")  # standard DE
+sc.pl.umap(adata, color="leiden")         # uses adata.obsm["X_umap"]
+```
+
+Or use scanpy for everything — no changes needed:
+
+```python
+sc.pp.pca(adata)        # works fine with SCX data
+sc.pp.neighbors(adata)  # uses pynndescent
+sc.tl.umap(adata)       # uses umap-learn
+```
+
+The choice is purely about performance. At <50K cells, the difference is
+negligible. At >100K cells, the Rust accelerators provide meaningful
+speedups.
+
 ## Common scanpy workflows
 
 ### Clustering and visualization
@@ -435,7 +683,7 @@ sc.pp.log1p(adata)
 sc.pp.highly_variable_genes(adata)
 adata = adata[:, adata.var["highly_variable"]].copy()
 
-# Dimensionality reduction and clustering
+# Dimensionality reduction and clustering (standard scanpy)
 sc.pp.pca(adata)
 sc.pp.neighbors(adata)
 sc.tl.umap(adata)
@@ -443,6 +691,40 @@ sc.tl.leiden(adata)
 
 # Visualization
 sc.pl.umap(adata, color=["leiden", "cell_type"])
+```
+
+### Accelerated pipeline for large datasets
+
+For datasets with >100K cells, use the Rust accelerators for the
+compute-heavy steps:
+
+```python
+import pyscx
+import scanpy as sc
+
+# Open in backed mode for memory-efficient QC
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# QC works natively in backed mode (no materialization)
+sc.pp.calculate_qc_metrics(adata, inplace=True)
+sc.pp.filter_cells(adata, min_genes=200)
+sc.pp.filter_genes(adata, min_cells=3)
+
+# HVG selection also works natively (streaming variance)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+
+# Subset to HVGs and materialize for preprocessing
+adata_sub = adata[:, adata.var["highly_variable"]].copy()
+sc.pp.normalize_total(adata_sub, target_sum=1e4)
+sc.pp.log1p(adata_sub)
+
+# Use Rust accelerators for speed
+pyscx.accel.pca(adata_sub, n_comps=50)
+pyscx.accel.neighbors(adata_sub, n_neighbors=15)
+pyscx.accel.umap(adata_sub)
+sc.tl.leiden(adata_sub)
+
+sc.pl.umap(adata_sub, color="leiden")
 ```
 
 ### Differential expression

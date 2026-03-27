@@ -21,6 +21,7 @@ scx-loader = { path = "../scx-loader", features = ["python"] }
 scx-engine = { path = "../scx-engine" }
 scx-mtx = { path = "../scx-mtx" }
 scx-ops = { path = "../scx-ops" }
+scx-accel = { path = "../scx-accel" }
 scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 serde_json = { workspace = true }

@@ -63,6 +63,7 @@ adata = pyscx.open("atlas.scx").to_anndata(backed=True)
 subset = adata[adata.obs["cell_type"] == "T cell"].copy()
 
 # Now subset is a regular AnnData — preprocess normally
+# Or use SCX accelerators for compute-heavy steps (3-10× faster at scale)
 sc.pp.normalize_total(subset, target_sum=1e4)
 sc.pp.log1p(subset)
 sc.pp.pca(subset)
@@ -395,7 +396,7 @@ Full GPU benchmark details in [`benchmarks/results/gpu_benchmark.md`](benchmarks
 
 ## Architecture
 
-SCX is a Rust workspace with 12 crates:
+SCX is a Rust workspace with 14 crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -405,6 +406,7 @@ SCX is a Rust workspace with 12 crates:
 | `scx-ops` | Append, delete, compact, merge, rollback |
 | `scx-engine` | Lazy query engine with predicate pushdown |
 | `scx-loader` | Triple-buffered ML training data loader |
+| `scx-accel` | Rust-native analysis accelerators: PCA, kNN, UMAP, DE, pseudobulk |
 | `scx-gpu` | CUDA-accelerated codec decoding, cuSPARSE interop, GPU sparse-to-dense |
 | `scx-cloud` | Cloud access: push, pull, explode, pack, CloudReader |
 | `scx-mtx` | Matrix Market (MTX) I/O: Cell Ranger directory read/write |

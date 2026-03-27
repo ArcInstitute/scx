@@ -195,6 +195,16 @@ Direct cloud reads without full download. Supports `.scxd/`, cloud-ready `.scx`,
 - `to_csr()` — Return just the scipy CSR matrix
 - Properties: `n_obs`, `n_vars`, `nnz`, `skipped_shards`, `total_shards`
 
+### pyscx.accel — Rust-Native Accelerators
+
+All accelerators write results to standard AnnData slots (same as scanpy), so downstream functions work identically.
+
+- `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2)` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`.
+- `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200)` — HNSW-based approximate kNN + UMAP-style connectivities. Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
+- `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0)` — Spectral-init SGD UMAP. Writes `obsm["X_umap"]`.
+- `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50)` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set.
+- `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency.
+
 ### TrainingDataset
 
 ```python

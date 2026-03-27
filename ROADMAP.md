@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-03-22
+**Last updated**: 2026-03-27
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -264,28 +264,28 @@ scGPT train end-to-end on atlas-scale SCX data.
 
 ---
 
-## Phase 3: GPU Path + Ecosystem (Months 7-10)
+## Phase 3: GPU Path + Ecosystem (Months 7-10) — PARTIALLY COMPLETE
 
 **Goal**: GPU-accelerated I/O, GDS, R bindings, and production polish.
 
-### 3.1 scx-gpu
-- [ ] CUDA codec decoders (Rice, FOR-BP) — warp-level parallel decode
-- [ ] cuSPARSE CSR interop (zero-copy from decoded shards)
+### 3.1 scx-gpu — IN PROGRESS
+- [x] CUDA codec decoders (Rice, FOR-BP) — warp-level parallel decode
+- [x] cuSPARSE CSR interop (zero-copy from decoded shards)
 - [ ] GDS path: NVMe → GPU VRAM bypass via `cuFileRead()`
-- [ ] GPU sparse-to-dense conversion for training batches
+- [x] GPU sparse-to-dense conversion for training batches
 
-### 3.2 scx-cli (extended)
-- [ ] `scx build-csc input.scx output.scx` — streaming transpose
-- [ ] `scx benchmark experiment.scx` — I/O + pipeline benchmarks
-- [ ] `scx subset` — extract cell/gene subsets to new file
-- [ ] `scx upgrade input.scx output.scx` — rewrite to latest format version (SPEC §3.9)
+### 3.2 scx-cli (extended) — PARTIALLY COMPLETE
+- [x] `scx build-csc input.scx output.scx` — streaming transpose
+- [x] `scx benchmark experiment.scx` — I/O + pipeline benchmarks
+- [x] `scx subset` — extract cell/gene subsets to new file
+- [x] `scx upgrade input.scx output.scx` — rewrite to latest format version (SPEC §3.9)
 
-### 3.3 rscx (R Bindings)
-- [ ] extendr-based R package
-- [ ] `scx_open()`, `to_seurat()`, `to_sce()`, `from_seurat()`, `from_sce()`
-- [ ] R pipe-friendly API: `scx_open() |> filter_obs() |> collect()`
-- [ ] Seurat v5 assay integration
-- [ ] SingleCellExperiment interop
+### 3.3 rscx (R Bindings) — COMPLETE
+- [x] extendr-based R package
+- [x] `scx_open()`, `to_seurat()`, `to_sce()`, `from_seurat()`, `from_sce()`
+- [x] R pipe-friendly API: `scx_open() |> filter_obs() |> collect()`
+- [x] Seurat v5 assay integration
+- [x] SingleCellExperiment interop
 
 ### 3.4 Multimodal Support
 - [ ] CITE-seq (RNA + protein): multi-feature-space layout (Section 11.1)
@@ -337,45 +337,36 @@ R bindings. Multimodal support. Full documentation.
 
 ---
 
-## Phase 4 (Optional): Rust-Native Analysis Accelerators
+## Phase 4: Rust-Native Analysis Accelerators — 4a/4b COMPLETE
+
+**Implementation plan**: [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md)
 
 **Goal**: For operations where scanpy is a bottleneck at scale, provide
 faster Rust implementations. These are **optional optimizations** — the
 full scverse pipeline works via AnnData from Phase 1.
 
-Only pursue these if profiling shows a specific scanpy operation is the
-bottleneck for SCX users at scale (>1M cells). Likely candidates:
+### Phase 4a: Scanpy Integration — COMPLETE
+- [x] Remaining backed mode aggregation ops (`var`, `max`, `min` per axis with deletion vectors)
+- [x] Comparison optimization (`(X > 0).sum()` → `getnnz()` short-circuit)
+- [x] Streaming preprocessing pipeline (`pyscx.preprocess`, `pyscx.save_layer`)
+- [x] Chunk iterator (`pyscx.iter_chunks`)
+- [x] Selective loading (`var_names`, `obs_filter`, `layers` parameters)
 
-### Likely Worth Building
-- [ ] **PCA** (randomized SVD): scanpy's PCA is slow on very large sparse
-  matrices. Rust SpMM with fused normalization could be 3-5x faster.
-- [ ] **kNN graph**: HNSW in Rust, or GPU kNN via CAGRA/RAFT
-- [ ] **UMAP**: Rust implementation or GPU via cuML
+### Phase 4b: Rust-Native Accelerators — COMPLETE
+- [x] **PCA** (randomized SVD): streaming SpMM from backed mode, `faer` for QR/SVD
+- [x] **kNN graph**: HNSW via `instant-distance`, UMAP-style connectivities
+- [x] **UMAP**: SGD embedding with spectral initialization
+- [x] **DE (Wilcoxon)**: parallel rank-sum with rayon, in-memory + gene-chunked streaming
+- [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + `pydeseq2`
+- [x] **Stratified DE**: per-stratum execution for both Wilcoxon and pseudobulk
 
-### Maybe Worth Building
-- [ ] **Leiden clustering**: Rust bindings to igraph, or GPU via cuGraph
-- [ ] **DE (Wilcoxon)**: parallel rank-sum with rayon; benefits from CSC
+### Phase 4c: GPU Accelerators — PLANNED
+- [ ] GPU SpMM for PCA (cuSPARSE)
+- [ ] GPU kNN via CAGRA/RAFT
+- [ ] GPU UMAP via cuML interop
+- [ ] GPU Leiden via cuGraph interop
 
-### Probably Not Worth Building (scverse does it fine)
-- Normalization (already fused in the query engine)
-- HVG selection (already fused in the query engine)
-- Batch correction (Harmony, BBKNN — Python implementations are adequate)
-- Trajectory analysis (DPT, PAGA — not compute-bottlenecked)
-- Cell type annotation (not compute-bottlenecked)
-- RNA velocity (scVelo works on AnnData)
-
-### API Pattern
-If built, these are exposed as optional accelerators that operate on
-AnnData and write results back into the standard slots:
-
-```python
-# Option A: use scanpy (always works)
-sc.tl.pca(adata)
-
-# Option B: use SCX accelerator (faster for large data)
-scx.accel.pca(adata, n_comps=50)
-# Result is identical: adata.obsm["X_pca"], adata.uns["pca"]
-```
+See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification.
 
 ---
 
@@ -386,7 +377,9 @@ scx.accel.pca(adata, n_comps=50)
 | **1** | 1-4 | **COMPLETE.** Convert to SCX for 50-80% smaller files and 4-38× lower memory. Run scanpy/scVI/everything as usual via `to_anndata()`. Read speed is slower than h5ad in Phase 1 (no parallelism, no codec auto-select). |
 | **2** | 4-7 | Auto-codec selection + parallel decode fix read performance. Fast training loader saturates GPUs. Query/filter large datasets without loading everything. Append/merge/delete without full rewrites. |
 | **3** | 7-10 | GPU-accelerated I/O via GDS. R support. Multimodal (CITE-seq, spatial). Production-ready v1.0. |
-| **4** | 10+ | Optional: faster PCA/kNN/UMAP for very large datasets. |
+| **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
+| **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
+| **4c** | 15+ | Optional: GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuML. |
 
 ---
 
