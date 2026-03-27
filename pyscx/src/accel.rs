@@ -109,8 +109,12 @@ fn extract_strata<'py>(
         }
         strata.push(Stratum { key: key.clone() });
 
-        // Build boolean mask.
-        let mask_vec: Vec<bool> = (0..n_obs).map(|i| indices.contains(&i)).collect();
+        // Build boolean mask. Use direct index setting (O(n_obs)) instead of
+        // Vec::contains per cell (which would be O(n_obs × stratum_size)).
+        let mut mask_vec = vec![false; n_obs];
+        for &idx in indices {
+            mask_vec[idx] = true;
+        }
         let mask = np.call_method1("array", (mask_vec,))?;
         masks.push(mask);
     }
