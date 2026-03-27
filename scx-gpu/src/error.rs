@@ -19,6 +19,10 @@ pub enum GpuError {
     CodecError(#[from] scx_codec::CodecError),
     #[error("cuSPARSE error: {0}")]
     CuSparseError(String),
+    #[error("cuSOLVER error: {0}")]
+    CuSolverError(String),
+    #[error("cuRAND error: {0}")]
+    CuRandError(String),
     #[error("stream error: {0}")]
     StreamError(String),
     #[error("GPU out of memory: {0}")]

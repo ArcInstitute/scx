@@ -150,8 +150,10 @@ fn extract_strata<'py>(
 ///     random_state: Random seed for reproducibility (default: 0)
 ///     n_oversamples: Extra dimensions for accuracy (default: 10)
 ///     n_power_iterations: Power iterations for spectral accuracy (default: 2)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
 #[pyfunction]
-#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2))]
+#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto"))]
+#[allow(clippy::too_many_arguments)]
 pub fn pca(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -160,13 +162,40 @@ pub fn pca(
     random_state: u64,
     n_oversamples: usize,
     n_power_iterations: usize,
+    device: &str,
 ) -> PyResult<()> {
+    // Determine effective device
+    let _use_gpu = resolve_device(device)?;
+    let backend: &str;
+
     // Extract X from adata
     let x = adata.getattr("X")?;
 
-    // Try to extract as ScxBackedSparseDataset for streaming PCA
+    // Try GPU path first if requested
+    #[cfg(feature = "gpu")]
+    if _use_gpu {
+        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            let reader = &backed.backed;
+            let result = scx_accel::randomized_pca_gpu(
+                0, // device_id = 0 (first GPU)
+                reader,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+
+            write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
+            return Ok(());
+        }
+    }
+
+    // CPU path (default or fallback)
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // Streaming PCA from backed mode
+        backend = "scx-accel-cpu";
         let reader = &backed.backed;
         scx_accel::randomized_pca(
             reader,
@@ -179,6 +208,7 @@ pub fn pca(
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         // Materialized: extract scipy CSR → ScxCsr → in-memory PCA
+        backend = "scx-accel-cpu";
         let scipy_sparse = py.import("scipy.sparse")?;
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
@@ -247,9 +277,52 @@ pub fn pca(
     };
 
     // Write results to AnnData slots
-    write_pca_to_adata(py, adata, &result)?;
+    write_pca_to_adata(py, adata, &result, backend)?;
 
     Ok(())
+}
+
+/// Resolve the device string to a boolean (true = GPU, false = CPU).
+///
+/// "auto" → GPU if available (feature enabled + device found), else CPU.
+/// "cpu" → always CPU.
+/// "gpu" / "gpu:N" → always GPU (errors if unavailable).
+fn resolve_device(device: &str) -> PyResult<bool> {
+    match device {
+        "cpu" => Ok(false),
+        "auto" => {
+            #[cfg(feature = "gpu")]
+            {
+                Ok(scx_accel::gpu_available())
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Ok(false)
+            }
+        }
+        d if d.starts_with("gpu") => {
+            #[cfg(feature = "gpu")]
+            {
+                if scx_accel::gpu_available() {
+                    Ok(true)
+                } else {
+                    Err(PyRuntimeError::new_err(
+                        "device='gpu' requested but no CUDA GPU found",
+                    ))
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Err(PyRuntimeError::new_err(
+                    "device='gpu' requested but pyscx was built without the 'gpu' feature",
+                ))
+            }
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown device: '{}'. Use 'auto', 'cpu', or 'gpu'",
+            device
+        ))),
+    }
 }
 
 /// Write PCA results to AnnData slots matching scanpy's format.
@@ -257,6 +330,7 @@ fn write_pca_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::PcaResult,
+    backend: &str,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
 
@@ -288,7 +362,7 @@ fn write_pca_to_adata(
     let varm = adata.getattr("varm")?;
     varm.set_item("PCs", pcs_arr)?;
 
-    // adata.uns["pca"] = dict with variance info
+    // adata.uns["pca"] = dict with variance info + backend
     let pca_dict = PyDict::new(py);
 
     let var_explained = numpy.call_method1("array", (result.variance_explained.clone(),))?;
@@ -296,6 +370,8 @@ fn write_pca_to_adata(
 
     let var_ratio = numpy.call_method1("array", (result.variance_ratio.clone(),))?;
     pca_dict.set_item("variance_ratio", var_ratio)?;
+
+    pca_dict.set_item("backend", backend)?;
 
     let uns = adata.getattr("uns")?;
     uns.set_item("pca", pca_dict)?;

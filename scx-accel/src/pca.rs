@@ -611,6 +611,77 @@ fn build_pca_result(
 }
 
 // ---------------------------------------------------------------------------
+// GPU PCA dispatch (behind "gpu" feature)
+// ---------------------------------------------------------------------------
+
+/// GPU-accelerated randomized PCA from a backed SCX reader.
+///
+/// Wraps [`scx_gpu::gpu_randomized_pca`] to stream data shard-by-shard on GPU
+/// (cuSPARSE SpMM, cuSOLVER QR) and returns a [`PcaResult`] with host-side
+/// data matching the CPU path's output format.
+///
+/// Requires the `gpu` feature to be enabled.
+///
+/// # Arguments
+///
+/// * `device_id` — CUDA device ordinal (0 for first GPU)
+/// * `reader` — Backed CSR reader (provides shard-by-shard access)
+/// * `n_components` — Number of principal components to compute
+/// * `n_oversamples` — Extra dimensions for accuracy (default: 10)
+/// * `n_power_iterations` — Power iterations for spectral accuracy (default: 2)
+/// * `zero_center` — Whether to mean-center the data (default: true)
+/// * `seed` — Random seed for reproducibility
+#[cfg(feature = "gpu")]
+pub fn randomized_pca_gpu(
+    device_id: usize,
+    reader: &BackedCsrReader,
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+) -> Result<PcaResult> {
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+    let gpu_result = scx_gpu::gpu_randomized_pca(
+        &dev,
+        reader,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
+
+    // Convert GpuPcaResult → PcaResult
+    // embeddings: f32 row-major → f64 row-major
+    let embeddings: Vec<f64> = gpu_result.embeddings.iter().map(|&v| v as f64).collect();
+    // components: f32 row-major → f64 row-major
+    let components: Vec<f64> = gpu_result.components.iter().map(|&v| v as f64).collect();
+
+    Ok(PcaResult {
+        embeddings,
+        components,
+        variance_explained: gpu_result.variance_explained,
+        variance_ratio: gpu_result.variance_ratio,
+        mean: gpu_result.mean,
+        n_components: gpu_result.n_components,
+        n_obs: gpu_result.n_obs,
+        n_vars: gpu_result.n_vars,
+    })
+}
+
+/// Check whether a GPU is available for GPU-accelerated PCA.
+///
+/// Returns `true` if at least one CUDA device is found.
+#[cfg(feature = "gpu")]
+pub fn gpu_available() -> bool {
+    scx_gpu::GpuDevice::count().map_or(false, |n| n > 0)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

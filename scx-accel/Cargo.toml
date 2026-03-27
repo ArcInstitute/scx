@@ -6,10 +6,15 @@ description = "Rust-native analysis accelerators for SCX (PCA, kNN, etc.)"
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+gpu = ["dep:scx-gpu"]
+
 [dependencies]
 scx-engine = { path = "../scx-engine" }
 scx-format = { path = "../scx-format" }
 scx-sparse = { path = "../scx-sparse" }
+scx-gpu = { path = "../scx-gpu", optional = true }
 faer = "0.24"
 rand = { workspace = true }
 rand_distr = "0.4"

@@ -1,11 +1,11 @@
-//! GPU-accelerated codec decoding, cuSPARSE interop, and GPUDirect Storage
-//! for SCX.
+//! GPU-accelerated codec decoding, cuSPARSE interop, cuSOLVER dense
+//! operations, and GPUDirect Storage for SCX.
 //!
 //! This crate provides CUDA-based decoding of SCX Scx1 codecs (Rice values,
 //! FOR-BP indices), cuSPARSE CSR matrix interop, GPU sparse-to-dense
 //! conversion with HVG projection, SpMM (sparse × dense matrix multiply)
-//! for GPU PCA, and optional GPUDirect Storage (GDS) for direct NVMe-to-GPU
-//! data transfer.
+//! for GPU PCA, cuSOLVER QR decomposition, cuRAND random matrix generation,
+//! and optional GPUDirect Storage (GDS) for direct NVMe-to-GPU data transfer.
 //!
 //! ## Architecture (cudarc 0.19)
 //!
@@ -19,6 +19,8 @@
 pub mod test_utils;
 
 pub mod cast_gpu;
+pub mod curand;
+pub mod cusolver;
 pub mod cusparse;
 pub mod device;
 pub mod error;
@@ -29,13 +31,15 @@ pub mod shard_decode;
 pub mod sparse_dense;
 
 // Re-export primary types for convenience.
+pub use curand::random_gaussian_gpu;
+pub use cusolver::{gpu_qr_q, CusolverHandle};
 pub use cusparse::{
     spmm_csr, spmm_csr_transpose, CusparseHandle, CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
 pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
-pub use gpu_pca::mean_correct_gpu;
+pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
 pub use sparse_dense::sparse_to_dense_gpu;
