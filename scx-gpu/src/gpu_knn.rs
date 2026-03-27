@@ -233,22 +233,89 @@ struct CuvsLibrary {
 unsafe impl Send for CuvsLibrary {}
 unsafe impl Sync for CuvsLibrary {}
 
+/// Find the first directory matching a simple `*` glob pattern.
+/// Only supports a single `*` wildcard in one path component.
+fn glob_first(pattern: &str) -> Result<std::path::PathBuf, String> {
+    // Split on the component containing `*`
+    let components: Vec<&str> = pattern.split('/').collect();
+    let star_idx = components
+        .iter()
+        .position(|c| c.contains('*'))
+        .ok_or("no wildcard in pattern")?;
+
+    let parent = components[..star_idx].join("/");
+    let glob_part = components[star_idx];
+    let suffix_parts = &components[star_idx + 1..];
+
+    // Read parent dir and find matching entries
+    let entries = std::fs::read_dir(&parent).map_err(|e| format!("read_dir {parent}: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Simple prefix/suffix match for patterns like "python*"
+        let prefix = glob_part.split('*').next().unwrap_or("");
+        let suffix_glob = glob_part.split('*').nth(1).unwrap_or("");
+        if name_str.starts_with(prefix) && name_str.ends_with(suffix_glob) {
+            let mut candidate = entry.path();
+            for part in suffix_parts {
+                candidate = candidate.join(part);
+            }
+            if candidate.is_dir() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!("no match for {pattern}"))
+}
+
 /// Global cached cuVS library. Loaded once on first use.
 static CUVS_LIB: OnceLock<Result<CuvsLibrary, String>> = OnceLock::new();
 
 fn load_cuvs_library() -> Result<CuvsLibrary, String> {
-    // Try common library names
+    // Try common library names via standard dlopen paths (LD_LIBRARY_PATH, etc.)
     let lib_names = ["libcuvs_c.so", "libcuvs.so"];
 
+    // Also probe pip/conda install locations where the .so may live
+    let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
+
+    // pip: .venv/lib/pythonX.Y/site-packages/libcuvs/lib64/
+    // conda: $CONDA_PREFIX/lib/
+    if let Ok(virtual_env) = std::env::var("VIRTUAL_ENV") {
+        // Glob for any python version in the venv
+        let site_pattern = format!("{virtual_env}/lib/python*/site-packages/libcuvs/lib64");
+        if let Ok(entries) = glob_first(&site_pattern) {
+            search_paths.push(entries);
+        }
+    }
+    if let Ok(conda_prefix) = std::env::var("CONDA_PREFIX") {
+        search_paths.push(std::path::PathBuf::from(format!("{conda_prefix}/lib")));
+    }
+
+    // Try standard dlopen first
     let lib = lib_names
         .iter()
         .find_map(|name| unsafe { libloading::Library::new(name).ok() })
+        // Then try explicit paths
+        .or_else(|| {
+            for dir in &search_paths {
+                for name in &lib_names {
+                    let full = dir.join(name);
+                    if full.exists() {
+                        if let Ok(l) = unsafe { libloading::Library::new(&full) } {
+                            return Some(l);
+                        }
+                    }
+                }
+            }
+            None
+        })
         .ok_or_else(|| {
             format!(
-                "cuVS library not found. Tried: {}. \
+                "cuVS library not found. Tried: {} (+ paths: {:?}). \
                  Install via: conda install -c rapidsai -c conda-forge libcuvs \
                  or pip install cuvs-cu12",
-                lib_names.join(", ")
+                lib_names.join(", "),
+                search_paths,
             )
         })?;
 
