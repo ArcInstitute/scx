@@ -8,6 +8,7 @@ pub mod diffexp;
 pub mod error;
 pub mod neighbors;
 pub mod pca;
+pub mod pseudobulk;
 pub mod umap;
 
 pub use diffexp::{
@@ -16,4 +17,7 @@ pub use diffexp::{
 pub use error::{AccelError, Result};
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{randomized_pca, randomized_pca_inmemory, PcaResult};
+pub use pseudobulk::{
+    pseudobulk_aggregate, pseudobulk_aggregate_inmemory, AggregationMethod, PseudobulkResult,
+};
 pub use umap::{compute_umap, UmapResult};

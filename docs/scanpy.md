@@ -527,6 +527,46 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
 
+### Pseudobulk Differential Expression (`pyscx.accel.pseudobulk_dex`)
+
+Streaming pseudobulk aggregation in Rust + negative binomial GLM testing via
+[pydeseq2](https://pydeseq2.readthedocs.io/). Designed for perturbation
+sequencing (Perturb-seq) experiments with biological replicates.
+
+The aggregation phase streams shards from `BackedCsrReader` without
+materializing the full matrix — peak memory is one shard plus the pseudobulk
+count matrix (n_groups × n_vars).
+
+```python
+import pyscx
+
+adata = pyscx.open("perturb_seq.scx").to_anndata(backed=True)
+
+# Run pseudobulk DE: drug vs control, grouped by (perturbation, donor)
+result = pyscx.accel.pseudobulk_dex(
+    adata,
+    groupby=["perturbation", "donor"],
+    test_col="perturbation",
+    reference="control",
+)
+
+# result is a pandas DataFrame:
+#   gene | baseMean | log2FoldChange | lfcSE | stat | pvalue | padj | target | reference
+print(result.sort_values("padj").head(20))
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `groupby` | (required) | List of obs columns to group cells by |
+| `test_col` | (required) | Column in `groupby` containing the condition variable |
+| `reference` | (required) | Reference level in `test_col` (e.g., `"control"`) |
+| `design` | `"~ test_col"` | DESeq2 design formula (auto-generated if not specified) |
+| `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"` |
+| `min_cells_per_group` | 10 | Groups with fewer cells are excluded |
+
+> [!NOTE]
+> `pydeseq2` is an **optional** runtime dependency. Install with
+> `pip install pydeseq2` before calling `pseudobulk_dex()`.
 
 
 The accelerators write to the same AnnData slots as scanpy, so they are
