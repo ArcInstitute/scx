@@ -260,40 +260,33 @@ fn write_pca_to_adata(
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
 
-    // adata.obsm["X_pca"] = embeddings (n_obs × n_components)
-    let embeddings_arr = PyArray2::<f64>::from_vec2(
+    // adata.obsm["X_pca"] = embeddings (n_obs × n_components) as float32
+    let embeddings_arr = PyArray2::<f32>::from_vec2(
         py,
         &(0..result.n_obs)
             .map(|i| {
                 (0..result.n_components)
-                    .map(|j| result.embeddings[i * result.n_components + j])
-                    .collect::<Vec<f64>>()
+                    .map(|j| result.embeddings[i * result.n_components + j] as f32)
+                    .collect::<Vec<f32>>()
             })
-            .collect::<Vec<Vec<f64>>>(),
+            .collect::<Vec<Vec<f32>>>(),
     )?;
-    // Convert to float32 for consistency with scanpy
-    let embeddings_f32 = embeddings_arr.call_method1("astype", ("float32",))?;
     let obsm = adata.getattr("obsm")?;
-    obsm.set_item("X_pca", embeddings_f32)?;
+    obsm.set_item("X_pca", embeddings_arr)?;
 
-    // adata.varm["PCs"] = components.T (n_vars × n_components)
-    let components_arr = PyArray2::<f64>::from_vec2(
+    // adata.varm["PCs"] = components transposed to (n_vars × n_components) as float32
+    let pcs_arr = PyArray2::<f32>::from_vec2(
         py,
-        &(0..result.n_components)
-            .map(|pc| {
-                (0..result.n_vars)
-                    .map(|v| result.components[pc * result.n_vars + v])
-                    .collect::<Vec<f64>>()
+        &(0..result.n_vars)
+            .map(|v| {
+                (0..result.n_components)
+                    .map(|pc| result.components[pc * result.n_vars + v] as f32)
+                    .collect::<Vec<f32>>()
             })
-            .collect::<Vec<Vec<f64>>>(),
+            .collect::<Vec<Vec<f32>>>(),
     )?;
-    // Transpose: scanpy stores PCs as (n_vars × n_components)
-    let pcs = components_arr
-        .getattr("T")?
-        .call_method1("astype", ("float32",))?
-        .call_method0("copy")?;
     let varm = adata.getattr("varm")?;
-    varm.set_item("PCs", pcs)?;
+    varm.set_item("PCs", pcs_arr)?;
 
     // adata.uns["pca"] = dict with variance info
     let pca_dict = PyDict::new(py);
@@ -514,20 +507,19 @@ fn write_umap_to_adata(
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::UmapResult,
 ) -> PyResult<()> {
-    let embeddings_arr = PyArray2::<f64>::from_vec2(
+    // Convert f64→f32 in Rust to avoid intermediate f64 numpy allocation
+    let embeddings_arr = PyArray2::<f32>::from_vec2(
         py,
         &(0..result.n_obs)
             .map(|i| {
                 (0..result.n_components)
-                    .map(|j| result.embeddings[i * result.n_components + j])
-                    .collect::<Vec<f64>>()
+                    .map(|j| result.embeddings[i * result.n_components + j] as f32)
+                    .collect::<Vec<f32>>()
             })
-            .collect::<Vec<Vec<f64>>>(),
+            .collect::<Vec<Vec<f32>>>(),
     )?;
-    // Convert to float32 for consistency with scanpy
-    let embeddings_f32 = embeddings_arr.call_method1("astype", ("float32",))?;
     let obsm = adata.getattr("obsm")?;
-    obsm.set_item("X_umap", embeddings_f32)?;
+    obsm.set_item("X_umap", embeddings_arr)?;
 
     Ok(())
 }
@@ -621,10 +613,9 @@ fn run_rank_genes_groups_inner(
 
     // Check if X is a ScxBackedSparseDataset for streaming path.
     let x = adata.getattr("X")?;
-    let result = if let (Some(chunk_size), Ok(backed)) = (
-        gene_chunk_size,
-        x.extract::<PyRef<ScxBackedSparseDataset>>(),
-    ) {
+    let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        // Backed mode: stream shards with gene-chunked DE.
+        let chunk_size = gene_chunk_size.unwrap_or(500);
         scx_accel::wilcoxon_rank_sum_streaming(
             &backed.backed,
             &gene_names,
@@ -640,33 +631,59 @@ fn run_rank_genes_groups_inner(
             .call_method1("issparse", (&x,))?
             .extract::<bool>()?;
 
-        let dense = if is_sparse || x.hasattr("toarray")? {
-            x.call_method0("toarray")?
-        } else {
-            numpy
-                .call_method1("asarray", (&x,))?
+        if is_sparse {
+            // Sparse in-memory: extract CSR arrays and use gene-chunked path
+            // to avoid O(n_obs × n_vars) dense materialization.
+            let csr_obj = scipy_sparse.call_method1("csr_matrix", (&x,))?;
+            let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
+            let np = py.import("numpy")?;
+            let indptr: Vec<i64> = np
+                .call_method1("asarray", (csr_obj.getattr("indptr")?,))?
+                .call_method1("astype", ("int64",))?
+                .extract::<Vec<i64>>()?;
+            let indices: Vec<i32> = np
+                .call_method1("asarray", (csr_obj.getattr("indices")?,))?
+                .call_method1("astype", ("int32",))?
+                .extract::<Vec<i32>>()?;
+            let data: Vec<f32> = np
+                .call_method1("asarray", (csr_obj.getattr("data")?,))?
                 .call_method1("astype", ("float32",))?
-        };
+                .extract::<Vec<f32>>()?;
 
-        let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
-        let (n_obs, n_vars) = shape;
+            let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
+            scx_accel::wilcoxon_rank_sum_sparse(
+                &csr,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                gene_chunk_size.unwrap_or(500),
+                log_transformed,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            // Dense numpy array: flatten and use direct wilcoxon_rank_sum
+            let dense = numpy
+                .call_method1("asarray", (&x,))?
+                .call_method1("astype", ("float32",))?;
+            let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
+            let (n_obs, n_vars) = shape;
 
-        let flat = dense
-            .call_method1("astype", ("float32",))?
-            .call_method0("ravel")?;
-        let data: Vec<f32> = flat.extract()?;
+            let flat = dense.call_method0("ravel")?;
+            let data: Vec<f32> = flat.extract()?;
 
-        scx_accel::wilcoxon_rank_sum(
-            &data,
-            n_obs,
-            n_vars,
-            &gene_names,
-            &groups,
-            &unique_groups,
-            ref_idx,
-            log_transformed,
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            scx_accel::wilcoxon_rank_sum(
+                &data,
+                n_obs,
+                n_vars,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                log_transformed,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        }
     };
 
     Ok((result, unique_groups))

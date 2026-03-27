@@ -12,7 +12,8 @@ pub mod pseudobulk;
 pub mod umap;
 
 pub use diffexp::{
-    merge_diff_exp_results, wilcoxon_rank_sum, wilcoxon_rank_sum_streaming, DiffExpResult,
+    merge_diff_exp_results, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse,
+    wilcoxon_rank_sum_streaming, DiffExpResult,
 };
 pub use error::{AccelError, Result};
 pub use neighbors::{build_knn_graph, KnnResult};

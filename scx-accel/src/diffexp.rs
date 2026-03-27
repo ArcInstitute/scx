@@ -439,6 +439,83 @@ pub fn wilcoxon_rank_sum_streaming(
     merge_diff_exp_results(all_chunk_results)
 }
 
+/// Gene-chunked Wilcoxon rank-sum from an in-memory `ScxCsr`.
+///
+/// Like `wilcoxon_rank_sum_streaming` but operates on a single in-memory CSR
+/// matrix instead of streaming shards from a `BackedCsrReader`. Avoids the
+/// O(n_obs × n_vars) dense materialization that `.toarray()` would require.
+///
+/// Peak memory: O(n_obs × gene_chunk_size) instead of O(n_obs × n_vars).
+pub fn wilcoxon_rank_sum_sparse(
+    csr: &scx_sparse::ScxCsr,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    gene_chunk_size: usize,
+    log_transformed: bool,
+) -> Result<DiffExpResult> {
+    let n_obs = csr.n_rows();
+    let n_vars = gene_names.len();
+
+    if groups.len() != n_obs {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "groups length {} != n_obs {}",
+            groups.len(),
+            n_obs
+        )));
+    }
+    if gene_chunk_size == 0 {
+        return Err(crate::AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+    if n_vars != csr.n_cols() {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "gene_names length {} != csr n_cols {}",
+            n_vars,
+            csr.n_cols()
+        )));
+    }
+
+    let mut all_chunk_results = Vec::new();
+
+    for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
+        let chunk_end = (chunk_start + gene_chunk_size).min(n_vars);
+        let chunk_size = chunk_end - chunk_start;
+        let col_indices: Vec<u32> = (chunk_start as u32..chunk_end as u32).collect();
+
+        // Project to only the genes in this chunk.
+        let projected = scx_engine::project_csr(csr, &col_indices);
+
+        // Scatter projected CSR into a dense buffer (n_obs × chunk_size).
+        let mut dense = vec![0.0f32; n_obs * chunk_size];
+        for row in 0..projected.n_rows() {
+            let start = projected.indptr[row] as usize;
+            let end = projected.indptr[row + 1] as usize;
+            for j in start..end {
+                let col = projected.indices[j] as usize;
+                dense[row * chunk_size + col] = projected.data[j];
+            }
+        }
+
+        let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
+        let chunk_result = wilcoxon_rank_sum(
+            &dense,
+            n_obs,
+            chunk_size,
+            &chunk_genes,
+            groups,
+            group_names,
+            reference,
+            log_transformed,
+        )?;
+        all_chunk_results.push(chunk_result);
+    }
+
+    merge_diff_exp_results(all_chunk_results)
+}
+
 /// Merge per-chunk `DiffExpResult`s into a single result with global BH correction.
 ///
 /// For each group:
@@ -877,6 +954,93 @@ mod tests {
         for (raw, adj) in merged.pvals[0].iter().zip(merged.pvals_adj[0].iter()) {
             assert!(*adj >= *raw - 1e-12);
             assert!(*adj <= 1.0 + 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_wilcoxon_sparse_matches_dense() {
+        // Build a small CSR and verify wilcoxon_rank_sum_sparse produces
+        // bit-identical results to wilcoxon_rank_sum on equivalent dense data.
+        let n_obs = 20;
+        let n_vars = 3;
+
+        let mut dense_data = vec![0.0f32; n_obs * n_vars];
+        let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
+
+        for i in 0..10 {
+            dense_data[i * n_vars + 0] = 10.0 + i as f32;
+            dense_data[i * n_vars + 1] = 5.0;
+            dense_data[i * n_vars + 2] = 1.0;
+        }
+        for i in 10..20 {
+            dense_data[i * n_vars + 0] = 1.0;
+            dense_data[i * n_vars + 1] = 5.0;
+            dense_data[i * n_vars + 2] = 10.0 + (i - 10) as f32;
+        }
+
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+        let group_names = vec!["A".to_string(), "B".to_string()];
+
+        // Dense path
+        let result_dense = wilcoxon_rank_sum(
+            &dense_data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Build ScxCsr from the same data
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = dense_data[r * n_vars + c];
+                if v != 0.0 {
+                    indices.push(c as i32);
+                    data.push(v);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, data);
+
+        // Sparse path with chunk_size=2 (forces 2 chunks for 3 genes)
+        let result_sparse =
+            wilcoxon_rank_sum_sparse(&csr, &gene_names, &groups, &group_names, None, 2, false)
+                .unwrap();
+
+        // Same group structure
+        assert_eq!(result_dense.group_names, result_sparse.group_names);
+
+        // Same gene names per group (same ordering by |z|)
+        for g in 0..result_dense.group_names.len() {
+            assert_eq!(result_dense.names[g], result_sparse.names[g]);
+            // Scores should match
+            for i in 0..result_dense.scores[g].len() {
+                assert!(
+                    (result_dense.scores[g][i] - result_sparse.scores[g][i]).abs() < 1e-10,
+                    "score mismatch at group {} gene {}: {} vs {}",
+                    g,
+                    i,
+                    result_dense.scores[g][i],
+                    result_sparse.scores[g][i],
+                );
+            }
+            // Raw p-values should match
+            for i in 0..result_dense.pvals[g].len() {
+                assert!(
+                    (result_dense.pvals[g][i] - result_sparse.pvals[g][i]).abs() < 1e-10,
+                    "pval mismatch at group {} gene {}",
+                    g,
+                    i,
+                );
+            }
         }
     }
 }
