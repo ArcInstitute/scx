@@ -13,6 +13,7 @@
 //! 4. Return distances and connectivities as sparse CSR triplets
 
 use instant_distance::{Hnsw, Point, Search};
+use rayon::prelude::*;
 
 use crate::error::{AccelError, Result};
 
@@ -119,8 +120,9 @@ pub fn build_knn_graph(
         )));
     }
 
-    // Build points
-    let points: Vec<EuclideanPoint> = (0..n_obs)
+    // Build query points (used for search; separate from HNSW build points
+    // because build_hnsw() consumes its input)
+    let query_points: Vec<EuclideanPoint> = (0..n_obs)
         .map(|i| {
             let start = i * n_vars;
             EuclideanPoint(data[start..start + n_vars].to_vec())
@@ -130,11 +132,12 @@ pub fn build_knn_graph(
     // Build HNSW index
     // build_hnsw() returns (Hnsw, Vec<PointId>) where the Vec maps
     // original_index -> internal PointId (points are shuffled internally)
+    let build_points: Vec<EuclideanPoint> = query_points.clone();
     let (hnsw, point_ids) = Hnsw::<EuclideanPoint>::builder()
         .ef_construction(ef_construction)
         .ef_search(ef_search)
         .seed(seed)
-        .build_hnsw(points);
+        .build_hnsw(build_points);
 
     // Build reverse mapping: internal PointId.0 -> original index
     let mut internal_to_original = vec![0usize; n_obs];
@@ -142,33 +145,34 @@ pub fn build_knn_graph(
         internal_to_original[pid.into_inner() as usize] = original_idx;
     }
 
-    // Query k-nearest neighbors for each point (sequential — each search
-    // needs a mutable Search state, and the HNSW borrow prevents parallelism)
-    let mut all_results: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n_obs);
+    // Query k-nearest neighbors for each point in parallel.
+    // Hnsw::search takes &self (shared ref) and Hnsw<P> is Sync when P: Sync,
+    // so concurrent searches are safe. Each thread creates its own Search struct
+    // which holds per-query mutable state.
+    let all_results: Vec<Vec<(usize, f64)>> = query_points
+        .par_iter()
+        .enumerate()
+        .map(|(i, query)| {
+            let mut search = Search::default();
 
-    for i in 0..n_obs {
-        let query = EuclideanPoint(data[i * n_vars..(i + 1) * n_vars].to_vec());
-        let mut search = Search::default();
-
-        // Query k+1 neighbors since the point itself will be in the results
-        let results: Vec<(usize, f64)> = hnsw
-            .search(&query, &mut search)
-            .take(n_neighbors + 1)
-            .filter_map(|item| {
-                let original_idx = internal_to_original[item.pid.into_inner() as usize];
-                if original_idx == i {
-                    None // skip self
-                } else {
-                    // instant-distance returns squared Euclidean distance;
-                    // take sqrt to get actual Euclidean distance
-                    let dist = (item.distance as f64).sqrt();
-                    Some((original_idx, dist))
-                }
-            })
-            .take(n_neighbors)
-            .collect();
-        all_results.push(results);
-    }
+            // Query k+1 neighbors since the point itself will be in the results
+            hnsw.search(query, &mut search)
+                .take(n_neighbors + 1)
+                .filter_map(|item| {
+                    let original_idx = internal_to_original[item.pid.into_inner() as usize];
+                    if original_idx == i {
+                        None // skip self
+                    } else {
+                        // instant-distance returns squared Euclidean distance;
+                        // take sqrt to get actual Euclidean distance
+                        let dist = (item.distance as f64).sqrt();
+                        Some((original_idx, dist))
+                    }
+                })
+                .take(n_neighbors)
+                .collect()
+        })
+        .collect();
 
     // Flatten into flat arrays
     let mut indices = vec![0usize; n_obs * n_neighbors];
