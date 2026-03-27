@@ -273,6 +273,10 @@ class TestNeighbors:
             import scanpy as sc
         except ImportError:
             pytest.skip("scanpy not available")
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
 
         adata = synthetic_adata.copy()
         pyscx.accel.pca(adata, n_comps=10)
@@ -570,6 +574,10 @@ class TestRankGenesGroups:
             import scanpy as sc
         except ImportError:
             pytest.skip("scanpy not available")
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
 
         import pyscx
 
