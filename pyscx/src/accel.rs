@@ -606,6 +606,15 @@ fn run_rank_genes_groups_inner(
     let var_names = var.getattr("index")?;
     let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
 
+    // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
+    // adata.uns["log1p"]). When true, logFC uses expm1 back-transform to
+    // match scanpy's formula.
+    let log_transformed = adata
+        .getattr("uns")?
+        .call_method1("get", ("log1p",))
+        .map(|v| !v.is_none())
+        .unwrap_or(false);
+
     // Check if X is a ScxBackedSparseDataset for streaming path.
     let x = adata.getattr("X")?;
     let result = if let (Some(chunk_size), Ok(backed)) = (
@@ -619,6 +628,7 @@ fn run_rank_genes_groups_inner(
             &unique_groups,
             ref_idx,
             chunk_size,
+            log_transformed,
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
@@ -650,6 +660,7 @@ fn run_rank_genes_groups_inner(
             &groups,
             &unique_groups,
             ref_idx,
+            log_transformed,
         )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     };

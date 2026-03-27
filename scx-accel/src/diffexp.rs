@@ -11,6 +11,10 @@
 use crate::Result;
 use rayon::prelude::*;
 
+/// Pseudocount added to group means before log2 fold-change computation.
+/// Matches scanpy's value in `_rank_genes_groups.py`.
+const LOGFC_PSEUDOCOUNT: f64 = 1e-9;
+
 /// Results from a differential expression analysis.
 ///
 /// Each field is indexed as `[group_idx][gene_rank]`, where genes are
@@ -52,6 +56,7 @@ struct GeneTestResult {
 /// * `group_names` — Unique group names, length `n_groups`.
 /// * `reference` — If `Some(idx)`, compare every other group against group `idx`.
 ///   If `None`, 1-vs-rest.
+#[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum(
     data: &[f32],
     n_obs: usize,
@@ -60,6 +65,7 @@ pub fn wilcoxon_rank_sum(
     groups: &[usize],
     group_names: &[String],
     reference: Option<usize>,
+    log_transformed: bool,
 ) -> Result<DiffExpResult> {
     let n_groups = group_names.len();
     if data.len() != n_obs * n_vars {
@@ -150,8 +156,16 @@ pub fn wilcoxon_rank_sum(
                 // Log2 fold-change with pseudocount.
                 let mean_group = group_vals.iter().sum::<f64>() / n1 as f64;
                 let mean_ref = ref_vals.iter().sum::<f64>() / n2 as f64;
-                let pseudocount = 1e-9;
-                let logfc = (mean_group + pseudocount).log2() - (mean_ref + pseudocount).log2();
+                let logfc = if log_transformed {
+                    // Match scanpy: back-transform from log-space (undo log1p)
+                    // before computing ratio. scanpy uses expm1(mean) + 1e-9.
+                    let expm1_group = mean_group.exp_m1();
+                    let expm1_ref = mean_ref.exp_m1();
+                    ((expm1_group + LOGFC_PSEUDOCOUNT) / (expm1_ref + LOGFC_PSEUDOCOUNT)).log2()
+                } else {
+                    // Raw counts: direct log2 ratio.
+                    (mean_group + LOGFC_PSEUDOCOUNT).log2() - (mean_ref + LOGFC_PSEUDOCOUNT).log2()
+                };
 
                 // Wilcoxon rank-sum test.
                 let (score, pval) = wilcoxon_test(&group_vals, &ref_vals);
@@ -357,6 +371,7 @@ pub fn wilcoxon_rank_sum_streaming(
     group_names: &[String],
     reference: Option<usize>,
     gene_chunk_size: usize,
+    log_transformed: bool,
 ) -> Result<DiffExpResult> {
     let n_obs = reader.n_obs();
     let n_vars = gene_names.len();
@@ -414,6 +429,7 @@ pub fn wilcoxon_rank_sum_streaming(
             groups,
             group_names,
             reference,
+            log_transformed,
         )?;
         all_chunk_results.push(chunk_result);
     }
@@ -617,6 +633,7 @@ mod tests {
             &groups,
             &group_names,
             None,
+            false,
         )
         .unwrap();
 
@@ -691,6 +708,7 @@ mod tests {
             &groups,
             &group_names,
             Some(0),
+            false,
         )
         .unwrap();
 
@@ -698,6 +716,81 @@ mod tests {
         assert!(result.group_names.contains(&"B".to_string()));
         assert!(result.group_names.contains(&"C".to_string()));
         assert!(!result.group_names.contains(&"A".to_string()));
+    }
+
+    #[test]
+    fn test_logfc_log_transformed() {
+        // When data is log1p-transformed, log_transformed=true should apply
+        // expm1 before computing the fold-change ratio, matching scanpy.
+        let n_obs = 20;
+        let n_vars = 2;
+        // Group 0: gene 0 has high raw expression (10.0), gene 1 low (1.0)
+        // Group 1: gene 0 has low raw expression (1.0), gene 1 high (10.0)
+        // We log1p-transform the values before passing to the function.
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
+
+        for i in 0..10 {
+            data[i * n_vars + 0] = (10.0f32 + 1.0).ln(); // ln(11) ≈ 2.397
+            data[i * n_vars + 1] = (1.0f32 + 1.0).ln(); // ln(2) ≈ 0.693
+        }
+        for i in 10..20 {
+            data[i * n_vars + 0] = (1.0f32 + 1.0).ln(); // ln(2) ≈ 0.693
+            data[i * n_vars + 1] = (10.0f32 + 1.0).ln(); // ln(11) ≈ 2.397
+        }
+
+        let gene_names = vec!["g0".to_string(), "g1".to_string()];
+        let group_names = vec!["A".to_string(), "B".to_string()];
+
+        // With log_transformed=true, logFC should be:
+        // log2((expm1(mean_group) + 1e-9) / (expm1(mean_ref) + 1e-9))
+        // For group A, gene 0: expm1(ln(11)) = 10.0, expm1(ln(2)) = 1.0
+        // → log2((10 + 1e-9) / (1 + 1e-9)) ≈ log2(10) ≈ 3.32
+        let result_log = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // With log_transformed=false, logFC operates on the ln-scale values directly.
+        let result_raw = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Find gene g0 in group A.
+        let g0_idx_log = result_log.names[0].iter().position(|n| n == "g0").unwrap();
+        let g0_idx_raw = result_raw.names[0].iter().position(|n| n == "g0").unwrap();
+
+        let logfc_log = result_log.logfoldchanges[0][g0_idx_log];
+        let logfc_raw = result_raw.logfoldchanges[0][g0_idx_raw];
+
+        // The expm1-based logFC should be ≈ log2(10) ≈ 3.32.
+        assert!(
+            (logfc_log - 10.0f64.log2()).abs() < 0.01,
+            "expected logFC ≈ {:.4}, got {:.4}",
+            10.0f64.log2(),
+            logfc_log
+        );
+
+        // The two should differ significantly (raw logFC is on the ln-scale).
+        assert!(
+            (logfc_log - logfc_raw).abs() > 0.1,
+            "log_transformed and raw logFC should differ, got log={logfc_log:.4} raw={logfc_raw:.4}"
+        );
     }
 
     #[test]

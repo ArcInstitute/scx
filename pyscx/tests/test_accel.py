@@ -501,6 +501,69 @@ class TestRankGenesGroups:
             rgg["logfoldchanges"]["B"][idx_gene1] > 0
         ), "gene_1 should have positive logFC for group B"
 
+    def test_logfc_matches_scanpy_log_transformed(self):
+        """logFC should match scanpy when data has been log1p-transformed."""
+        try:
+            import scanpy as sc
+        except ImportError:
+            pytest.skip("scanpy not available")
+
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(42)
+        n_obs, n_vars = 60, 10
+        data = np.random.randint(0, 50, size=(n_obs, n_vars)).astype(np.float32)
+        # Gene 0: strongly upregulated in group A
+        data[:30, 0] = np.random.randint(80, 120, 30).astype(np.float32)
+        data[30:, 0] = np.random.randint(1, 5, 30).astype(np.float32)
+
+        obs = pd.DataFrame(
+            {"group": pd.Categorical(["A"] * 30 + ["B"] * 30)},
+            index=[f"c{i}" for i in range(n_obs)],
+        )
+        var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_vars)])
+
+        # Apply log1p to both (sets adata.uns["log1p"])
+        adata_sc = anndata.AnnData(X=sp.csr_matrix(data.copy()), obs=obs.copy(), var=var.copy())
+        sc.pp.log1p(adata_sc)
+
+        adata_scx = anndata.AnnData(X=sp.csr_matrix(data.copy()), obs=obs.copy(), var=var.copy())
+        sc.pp.log1p(adata_scx)
+
+        # Run DE
+        sc.tl.rank_genes_groups(adata_sc, "group", method="wilcoxon")
+        pyscx.accel.rank_genes_groups(adata_scx, "group")
+
+        # Compare logfoldchanges for overlapping genes in group A
+        rgg_sc = adata_sc.uns["rank_genes_groups"]
+        rgg_scx = adata_scx.uns["rank_genes_groups"]
+
+        sc_names_a = list(rgg_sc["names"]["A"])
+        sc_logfc_a = list(rgg_sc["logfoldchanges"]["A"])
+        scx_names_a = list(rgg_scx["names"]["A"])
+        scx_logfc_a = list(rgg_scx["logfoldchanges"]["A"])
+
+        # Build name → logFC maps
+        sc_map = dict(zip(sc_names_a, sc_logfc_a))
+        scx_map = dict(zip(scx_names_a, scx_logfc_a))
+
+        # For every gene that appears in both, logFC should be close
+        for gene in sc_map:
+            if gene in scx_map:
+                sc_val = sc_map[gene]
+                scx_val = scx_map[gene]
+                assert abs(sc_val - scx_val) < 0.5, (
+                    f"logFC mismatch for {gene}: scanpy={sc_val:.4f}, scx={scx_val:.4f}"
+                )
+
+        # Gene 0 should have positive and similar logFC
+        assert "gene_0" in sc_map and "gene_0" in scx_map
+        assert abs(sc_map["gene_0"] - scx_map["gene_0"]) < 0.5, (
+            f"gene_0 logFC: scanpy={sc_map['gene_0']:.4f}, scx={scx_map['gene_0']:.4f}"
+        )
+
     def test_backed_pipeline(self, pca_adata):
         """Full pipeline from backed SCX: PCA → neighbors → leiden → DE."""
         try:
