@@ -22,6 +22,7 @@ use faer::Mat;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 
 use scx_format::backed::BackedCsrReader;
 use scx_sparse::ScxCsr;
@@ -424,7 +425,9 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Mat<
 }
 
 /// Shared SpMM-forward kernel: accumulates X_shard @ M into y[global_row*k..].
-#[allow(clippy::needless_range_loop)]
+///
+/// Uses rayon intra-shard parallelism when the workload is large enough
+/// (shard_rows × k > 10,000) since each output row is disjoint.
 fn spmm_forward_into(
     csr: &ScxCsr,
     m_data: &[f64], // n_vars × k, row-major
@@ -434,24 +437,47 @@ fn spmm_forward_into(
     mean_correction: Option<&[f64]>, // length k
 ) {
     let shard_rows = csr.n_rows();
-    for r in 0..shard_rows {
-        let start = csr.indptr[r] as usize;
-        let end = csr.indptr[r + 1] as usize;
-        let y_offset = (global_row + r) * k;
+    let y_chunk = &mut y[global_row * k..(global_row + shard_rows) * k];
 
-        for idx in start..end {
-            let col = csr.indices[idx] as usize;
-            let val = csr.data[idx] as f64;
-            let m_offset = col * k;
-            for j in 0..k {
-                y[y_offset + j] += val * m_data[m_offset + j];
-            }
+    // Threshold: only use rayon when work per shard is substantial
+    if shard_rows * k > 10_000 {
+        y_chunk
+            .par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(r, y_row)| {
+                spmm_forward_row(csr, m_data, k, y_row, r, mean_correction);
+            });
+    } else {
+        for (r, y_row) in y_chunk.chunks_mut(k).enumerate() {
+            spmm_forward_row(csr, m_data, k, y_row, r, mean_correction);
         }
+    }
+}
 
-        if let Some(mc) = mean_correction {
-            for j in 0..k {
-                y[y_offset + j] -= mc[j];
-            }
+/// Process one CSR row: y_row[j] += Σ val × M[col, j] − mc[j].
+#[inline]
+#[allow(clippy::needless_range_loop)]
+fn spmm_forward_row(
+    csr: &ScxCsr,
+    m_data: &[f64],
+    k: usize,
+    y_row: &mut [f64],
+    r: usize,
+    mean_correction: Option<&[f64]>,
+) {
+    let start = csr.indptr[r] as usize;
+    let end = csr.indptr[r + 1] as usize;
+    for idx in start..end {
+        let col = csr.indices[idx] as usize;
+        let val = csr.data[idx] as f64;
+        let m_offset = col * k;
+        for j in 0..k {
+            y_row[j] += val * m_data[m_offset + j];
+        }
+    }
+    if let Some(mc) = mean_correction {
+        for j in 0..k {
+            y_row[j] -= mc[j];
         }
     }
 }
