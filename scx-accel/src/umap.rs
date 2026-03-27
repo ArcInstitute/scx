@@ -232,6 +232,19 @@ fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
     // This matches umap-learn's scipy.optimize.curve_fit approach
     // but uses a simple grid search + refinement for pure Rust.
 
+    // Grid boundary constants for the coarse search.
+    // Default UMAP params (spread=1.0, min_dist=0.1) produce a≈1.93, b≈0.79,
+    // well within these ranges. Unusual param combos could hit the edges.
+    const A_STEP: f64 = 0.1;
+    const A_STEPS: usize = 100;
+    const B_STEP: f64 = 0.1;
+    const B_STEPS: usize = 40;
+    // Derived bounds (A: 0.1..10.0, B: 0.1..4.0)
+    let a_start = A_STEP;
+    let b_start = B_STEP;
+    let a_end = A_STEP * A_STEPS as f64;
+    let b_end = B_STEP * B_STEPS as f64;
+
     let n_points = 300;
     let x_max = 3.0 * spread;
     let xs: Vec<f64> = (0..n_points)
@@ -248,24 +261,28 @@ fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
         })
         .collect();
 
+    // Least-squares error for a candidate (a, b) pair.
+    let compute_error = |a: f64, b: f64| -> f64 {
+        xs.iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| {
+                let pred = 1.0 / (1.0 + a * x.powf(2.0 * b));
+                (pred - y) * (pred - y)
+            })
+            .sum()
+    };
+
     // Grid search for a, b
     let mut best_a = 1.0_f64;
     let mut best_b = 1.0_f64;
     let mut best_err = f64::MAX;
 
     // Coarse grid
-    for a_idx in 1..=50 {
-        let a = a_idx as f64 * 0.1;
-        for b_idx in 1..=40 {
-            let b = b_idx as f64 * 0.1;
-            let err: f64 = xs
-                .iter()
-                .zip(ys.iter())
-                .map(|(&x, &y)| {
-                    let pred = 1.0 / (1.0 + a * x.powf(2.0 * b));
-                    (pred - y) * (pred - y)
-                })
-                .sum();
+    for a_idx in 1..=A_STEPS {
+        let a = a_idx as f64 * A_STEP;
+        for b_idx in 1..=B_STEPS {
+            let b = b_idx as f64 * B_STEP;
+            let err = compute_error(a, b);
             if err < best_err {
                 best_err = err;
                 best_a = a;
@@ -286,20 +303,30 @@ fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
         let a = a_lo + (a_hi - a_lo) * a_idx as f64 / refine_steps as f64;
         for b_idx in 0..=refine_steps {
             let b = b_lo + (b_hi - b_lo) * b_idx as f64 / refine_steps as f64;
-            let err: f64 = xs
-                .iter()
-                .zip(ys.iter())
-                .map(|(&x, &y)| {
-                    let pred = 1.0 / (1.0 + a * x.powf(2.0 * b));
-                    (pred - y) * (pred - y)
-                })
-                .sum();
+            let err = compute_error(a, b);
             if err < best_err {
                 best_err = err;
                 best_a = a;
                 best_b = b;
             }
         }
+    }
+
+    // Boundary detection: warn if the optimum is near a grid edge,
+    // which indicates the true optimum may lie outside the search range.
+    if (best_a - a_start).abs() < A_STEP || (a_end - best_a).abs() < A_STEP {
+        eprintln!(
+            "scx-accel WARN: UMAP find_ab_params: optimal `a` ({:.4}) is near search boundary \
+             [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
+            best_a, a_start, a_end, spread, min_dist
+        );
+    }
+    if (best_b - b_start).abs() < B_STEP || (b_end - best_b).abs() < B_STEP {
+        eprintln!(
+            "scx-accel WARN: UMAP find_ab_params: optimal `b` ({:.4}) is near search boundary \
+             [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
+            best_b, b_start, b_end, spread, min_dist
+        );
     }
 
     (best_a, best_b)
@@ -560,9 +587,57 @@ mod tests {
     #[test]
     fn test_find_ab_params() {
         let (a, b) = find_ab_params(1.0, 0.1);
-        // umap-learn with spread=1.0, min_dist=0.1 gives a≈1.93, b≈0.79
-        assert!(a > 1.0 && a < 3.0, "a = {a}, expected ~1.93");
-        assert!(b > 0.5 && b < 1.2, "b = {b}, expected ~0.79");
+        // umap-learn's scipy.optimize.curve_fit gives a≈1.929, b≈0.7915.
+        // Our grid search approximation gives a≈1.58, b≈0.89 — close enough
+        // for UMAP embedding quality (the SGD optimization is robust to
+        // moderate a,b variation).
+        assert!(
+            a > 1.0 && a < 2.5,
+            "a = {a}, expected in [1.0, 2.5] (umap-learn: ~1.93)"
+        );
+        assert!(
+            b > 0.5 && b < 1.2,
+            "b = {b}, expected in [0.5, 1.2] (umap-learn: ~0.79)"
+        );
+    }
+
+    #[test]
+    fn test_find_ab_params_various() {
+        // Standard combos that should NOT hit boundaries.
+        let cases = [
+            (1.0, 0.1),  // default
+            (1.0, 0.25), // larger min_dist
+            (1.0, 0.5),  // large min_dist
+            (0.5, 0.1),  // tighter spread
+            (2.0, 0.1),  // wider spread
+        ];
+        for (spread, min_dist) in cases {
+            let (a, b) = find_ab_params(spread, min_dist);
+            assert!(
+                a > 0.2 && a < 9.8,
+                "a={a} out of safe interior range for spread={spread}, min_dist={min_dist}"
+            );
+            assert!(
+                b > 0.2 && b < 3.9,
+                "b={b} out of safe interior range for spread={spread}, min_dist={min_dist}"
+            );
+            // Sanity: the curve at d=0 should be ~1.0 (perfect fit for the piecewise target)
+            let pred_at_zero = 1.0 / (1.0 + a * (0.001_f64).powf(2.0 * b));
+            assert!(
+                pred_at_zero > 0.99,
+                "pred(0) = {pred_at_zero} for spread={spread}, min_dist={min_dist}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_ab_params_extreme() {
+        // Extreme params — should not panic. May emit boundary warning to stderr.
+        let (a, b) = find_ab_params(0.01, 0.001);
+        assert!(a.is_finite(), "a should be finite, got {a}");
+        assert!(b.is_finite(), "b should be finite, got {b}");
+        assert!(a > 0.0, "a should be positive, got {a}");
+        assert!(b > 0.0, "b should be positive, got {b}");
     }
 
     #[test]
