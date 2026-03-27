@@ -253,9 +253,32 @@ pub fn to_anndata_filtered<'py>(
         if let Some(uns) = uns_dict {
             kwargs.set_item("uns", uns)?;
         }
-        // Note: obsm and layers are not loaded via the query engine path
-        // (QueryResult doesn't include them). Users can re-load with
-        // separate calls if needed.
+        // obsm and layers are not available via QueryResult. Warn if the
+        // source file contains them so users know they're being dropped.
+        let has_obsm = reader
+            .read_all_obsm()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
+        let has_layers = !reader.layer_names().is_empty();
+        if has_obsm || has_layers {
+            let warnings = py.import("warnings")?;
+            let mut parts = Vec::new();
+            if has_obsm {
+                parts.push("obsm");
+            }
+            if has_layers {
+                parts.push("layers");
+            }
+            warnings.call_method1(
+                "warn",
+                (format!(
+                    "obs_filter with non-backed mode uses the query engine, which does not \
+                     load {}. Use backed=True with obs_filter to preserve these, or load \
+                     the full dataset and filter in Python.",
+                    parts.join(" or ")
+                ),),
+            )?;
+        }
 
         let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
         return Ok(adata);
@@ -267,7 +290,6 @@ pub fn to_anndata_filtered<'py>(
 
     if let Some(names) = var_names {
         // Apply var_names column projection via AnnData slicing
-        let pd = py.import("pandas")?;
         let var_df = adata.getattr("var")?;
         let var_index = var_df.getattr("index")?;
 
@@ -279,10 +301,11 @@ pub fn to_anndata_filtered<'py>(
         let np = py.import("numpy")?;
         let n_found: usize = np.call_method1("sum", (&isin,))?.extract()?;
         if n_found == 0 {
-            return Err(PyRuntimeError::new_err(format!(
+            return Err(PyRuntimeError::new_err(
                 "None of the requested var_names were found. \
                  Available gene names can be seen via exp.to_anndata().var.index"
-            )));
+                    .to_string(),
+            ));
         }
 
         // Slice AnnData: adata[:, mask]
@@ -299,8 +322,6 @@ pub fn to_anndata_filtered<'py>(
 
 /// Resolve gene names to column indices using the var metadata.
 fn resolve_var_names_to_indices(reader: &ScxReader, names: &[String]) -> PyResult<Vec<u32>> {
-    use arrow::array::AsArray;
-
     let var_batch = reader.read_var().map_err(to_pyerr)?;
 
     // Try to find gene names in the var DataFrame index.
@@ -363,7 +384,10 @@ pub fn to_anndata_backed<'py>(
     let reader = ScxReader::open(path).map_err(to_pyerr)?;
 
     // --- Compute kept_to_global from deletion vectors (if present) ---
-    let mut kept_to_global = compute_kept_to_global(&reader)?;
+    // Cache the deletion-vector-only mapping; obs_filter may mutate kept_to_global
+    // further, but obsm filtering needs the original DV-only version.
+    let dv_kept_to_global = compute_kept_to_global(&reader)?;
+    let mut kept_to_global = dv_kept_to_global.clone();
 
     // --- obs (eager, filtered by deletion vectors) ---
     let obs = match reader.read_obs() {
@@ -377,7 +401,10 @@ pub fn to_anndata_backed<'py>(
     };
 
     // --- Apply obs_filter if specified ---
-    // Evaluate the predicate on the obs DataFrame and further restrict kept_to_global
+    // Evaluate on the pandas DataFrame rather than QueryPipeline. In backed
+    // mode, shard-level pushdown has negligible benefit since X is lazy (only
+    // accessed shards are decoded). Pandas .query() is simpler and supports
+    // richer expressions.
     let obs = if let Some(expr) = obs_filter {
         if let Some(obs_df) = obs {
             // Use pandas query to filter
@@ -477,7 +504,7 @@ pub fn to_anndata_backed<'py>(
         if let Some(ref kept) = kept_to_global {
             // Pre-compute dv_kept and positions once for all obsm entries
             // (these are loop-invariant — they depend only on kept and deletion vectors)
-            let dv_kept = compute_kept_to_global(&reader)?;
+            let dv_kept = &dv_kept_to_global;
             let positions: Vec<i64> = match &dv_kept {
                 Some(dv_mapping) => {
                     // Find position of each kept global row in dv_mapping

@@ -445,9 +445,23 @@ impl ScxBackedSparseDataset {
     #[pyo3(signature = (axis=None))]
     fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         if self.col_projection.is_some() {
+            // scipy sparse has no .var(), so compute Var(X) = E[X²] - (E[X])²
             let mat = self.to_memory(py)?;
-            return mat.call_method1("power", (2,))?.call_method0("mean");
-            // Note: for proper var with axis, would need scipy. Fallback is okay.
+            let np = py.import("numpy")?;
+            return match axis {
+                Some(a) => {
+                    let mean = mat.call_method1("mean", (a,))?;
+                    let mean_sq = mat
+                        .call_method1("power", (2,))?
+                        .call_method1("mean", (a,))?;
+                    np.call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?))
+                }
+                None => {
+                    let mean = mat.call_method0("mean")?;
+                    let mean_sq = mat.call_method1("power", (2,))?.call_method0("mean")?;
+                    np.call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?))
+                }
+            };
         }
         match axis {
             Some(0) => {
@@ -610,7 +624,7 @@ impl ScxBackedSparseDataset {
                 let mut boundaries = Vec::with_capacity(n_shards);
                 let mut user_row = 0usize;
                 for shard_idx in 0..n_shards {
-                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                    let (_s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
                         Some(r) => r,
                         None => continue,
                     };
