@@ -300,3 +300,107 @@ fn write_neighbors_to_adata(
 
     Ok(())
 }
+
+/// Compute UMAP embedding from a kNN graph.
+///
+/// Reads `adata.obsp["connectivities"]` (from `pyscx.accel.neighbors()` or
+/// `sc.pp.neighbors()`) and computes a 2D embedding via SGD optimization.
+/// Results are written to `adata.obsm["X_umap"]`.
+///
+/// Args:
+///     adata: AnnData with obsp["connectivities"] (CSR, n_obs × n_obs)
+///     n_components: Output dimensions (default: 2)
+///     n_epochs: SGD epochs (default: 200)
+///     min_dist: Minimum distance in embedding (default: 0.1)
+///     spread: Spread of embedded points (default: 1.0)
+///     negative_sample_rate: Negative samples per positive edge (default: 5)
+///     learning_rate: Initial learning rate (default: 1.0)
+///     random_state: Random seed (default: 0)
+#[pyfunction]
+#[pyo3(signature = (adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0))]
+#[allow(clippy::too_many_arguments)]
+pub fn umap(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    n_components: usize,
+    n_epochs: usize,
+    min_dist: f64,
+    spread: f64,
+    negative_sample_rate: usize,
+    learning_rate: f64,
+    random_state: u64,
+) -> PyResult<()> {
+    let numpy = py.import("numpy")?;
+
+    // Extract connectivities CSR from adata.obsp["connectivities"]
+    let obsp = adata.getattr("obsp")?;
+    let conn = obsp.get_item("connectivities").map_err(|_| {
+        PyRuntimeError::new_err(
+            "'connectivities' not found in adata.obsp. Run neighbors first: \
+             pyscx.accel.neighbors(adata) or sc.pp.neighbors(adata)",
+        )
+    })?;
+
+    let shape: (usize, usize) = conn.getattr("shape")?.extract()?;
+    let n_obs = shape.0;
+
+    // Extract CSR components
+    let indptr: Vec<i64> = numpy
+        .call_method1("asarray", (conn.getattr("indptr")?,))?
+        .call_method1("astype", ("int64",))?
+        .extract::<Vec<i64>>()?;
+    let indices: Vec<i32> = numpy
+        .call_method1("asarray", (conn.getattr("indices")?,))?
+        .call_method1("astype", ("int32",))?
+        .extract::<Vec<i32>>()?;
+    let data: Vec<f64> = numpy
+        .call_method1("asarray", (conn.getattr("data")?,))?
+        .call_method1("astype", ("float64",))?
+        .extract::<Vec<f64>>()?;
+
+    // Compute UMAP
+    let result = scx_accel::compute_umap(
+        &indptr,
+        &indices,
+        &data,
+        n_obs,
+        n_components,
+        n_epochs,
+        min_dist,
+        spread,
+        negative_sample_rate,
+        learning_rate,
+        random_state,
+        None,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // Write results to adata.obsm["X_umap"]
+    write_umap_to_adata(py, adata, &result)?;
+
+    Ok(())
+}
+
+/// Write UMAP results to adata.obsm["X_umap"].
+fn write_umap_to_adata(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    result: &scx_accel::UmapResult,
+) -> PyResult<()> {
+    let embeddings_arr = PyArray2::<f64>::from_vec2(
+        py,
+        &(0..result.n_obs)
+            .map(|i| {
+                (0..result.n_components)
+                    .map(|j| result.embeddings[i * result.n_components + j])
+                    .collect::<Vec<f64>>()
+            })
+            .collect::<Vec<Vec<f64>>>(),
+    )?;
+    // Convert to float32 for consistency with scanpy
+    let embeddings_f32 = embeddings_arr.call_method1("astype", ("float32",))?;
+    let obsm = adata.getattr("obsm")?;
+    obsm.set_item("X_umap", embeddings_f32)?;
+
+    Ok(())
+}

@@ -412,6 +412,129 @@ The preprocessing pipeline uses fused `normalize_total + log1p` in a
 single pass over each shard, which is faster than the equivalent scanpy
 calls on large datasets.
 
+## Rust-native accelerators
+
+SCX includes optional Rust-native implementations of PCA, kNN graph
+construction, and UMAP embedding via `pyscx.accel`. These accelerators are
+2–10× faster than their scanpy equivalents at scale (>100K cells) while
+writing results to the same AnnData slots — so downstream scanpy functions
+(leiden, plotting, DE) work identically.
+
+### PCA (`pyscx.accel.pca`)
+
+Randomized SVD with streaming shard-by-shard SpMM. Can run directly on
+backed mode without materializing the full matrix.
+
+```python
+import pyscx
+
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+pyscx.accel.pca(adata, n_comps=50)
+
+# Results written to standard scanpy slots:
+#   adata.obsm["X_pca"]           — (n_obs × n_comps) float32
+#   adata.varm["PCs"]             — (n_vars × n_comps) float32
+#   adata.uns["pca"]["variance"]  — explained variance per PC
+#   adata.uns["pca"]["variance_ratio"]
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_comps` | 50 | Number of principal components |
+| `zero_center` | True | Mean-center data (True = standard PCA, False = TruncatedSVD) |
+| `random_state` | 0 | Random seed |
+| `n_oversamples` | 10 | Extra dimensions for accuracy |
+| `n_power_iterations` | 2 | Power iterations for spectral accuracy |
+
+**Key advantage:** In backed mode, PCA streams SpMM shard-by-shard. Peak
+memory is one shard (~16K × n_vars × 4 bytes) plus the output embeddings,
+enabling PCA on datasets larger than RAM.
+
+### kNN graph (`pyscx.accel.neighbors`)
+
+Approximate nearest neighbors via HNSW (Hierarchical Navigable Small
+World), followed by UMAP-style fuzzy set connectivities.
+
+```python
+pyscx.accel.neighbors(adata, n_neighbors=15)
+
+# Results written to standard scanpy slots:
+#   adata.obsp["distances"]        — sparse CSR (n_obs × n_obs)
+#   adata.obsp["connectivities"]   — sparse CSR (n_obs × n_obs)
+#   adata.uns["neighbors"]         — metadata dict
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_neighbors` | 15 | Number of nearest neighbors |
+| `use_rep` | `"X_pca"` | Key in `adata.obsm` to use as input |
+| `random_state` | 0 | Random seed |
+| `ef_construction` | 200 | HNSW build parameter (higher = more accurate) |
+| `ef_search` | 200 | HNSW search parameter (higher = more accurate) |
+
+The HNSW graph uses Euclidean distance and achieves recall@k > 0.90
+compared to brute-force exact kNN.
+
+### UMAP (`pyscx.accel.umap`)
+
+SGD-based UMAP embedding with spectral initialization and negative
+sampling. Takes the kNN connectivity graph as input.
+
+```python
+pyscx.accel.umap(adata)
+
+# Result written to:
+#   adata.obsm["X_umap"]  — (n_obs × 2) float32
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_components` | 2 | Output dimensions |
+| `n_epochs` | 200 | SGD epochs (more = better quality, slower) |
+| `min_dist` | 0.1 | Minimum distance in embedding |
+| `spread` | 1.0 | Spread of embedded points |
+| `negative_sample_rate` | 5 | Negative samples per positive edge |
+| `learning_rate` | 1.0 | Initial learning rate |
+| `random_state` | 0 | Random seed |
+
+### Using accelerators with scanpy
+
+The accelerators write to the same AnnData slots as scanpy, so they are
+fully interchangeable. You can mix and match:
+
+```python
+import pyscx
+import scanpy as sc
+
+adata = pyscx.open("atlas.scx").to_anndata()
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+sc.pp.highly_variable_genes(adata)
+adata = adata[:, adata.var["highly_variable"]].copy()
+
+# Use SCX accelerators for compute-heavy steps
+pyscx.accel.pca(adata, n_comps=50)       # faster than sc.pp.pca
+pyscx.accel.neighbors(adata)              # faster than sc.pp.neighbors
+pyscx.accel.umap(adata)                   # faster than sc.tl.umap
+
+# Downstream scanpy works identically
+sc.tl.leiden(adata)                       # uses adata.obsp["connectivities"]
+sc.tl.rank_genes_groups(adata, "leiden")  # standard DE
+sc.pl.umap(adata, color="leiden")         # uses adata.obsm["X_umap"]
+```
+
+Or use scanpy for everything — no changes needed:
+
+```python
+sc.pp.pca(adata)        # works fine with SCX data
+sc.pp.neighbors(adata)  # uses pynndescent
+sc.tl.umap(adata)       # uses umap-learn
+```
+
+The choice is purely about performance. At <50K cells, the difference is
+negligible. At >100K cells, the Rust accelerators provide meaningful
+speedups.
+
 ## Common scanpy workflows
 
 ### Clustering and visualization
@@ -435,7 +558,7 @@ sc.pp.log1p(adata)
 sc.pp.highly_variable_genes(adata)
 adata = adata[:, adata.var["highly_variable"]].copy()
 
-# Dimensionality reduction and clustering
+# Dimensionality reduction and clustering (standard scanpy)
 sc.pp.pca(adata)
 sc.pp.neighbors(adata)
 sc.tl.umap(adata)
@@ -443,6 +566,40 @@ sc.tl.leiden(adata)
 
 # Visualization
 sc.pl.umap(adata, color=["leiden", "cell_type"])
+```
+
+### Accelerated pipeline for large datasets
+
+For datasets with >100K cells, use the Rust accelerators for the
+compute-heavy steps:
+
+```python
+import pyscx
+import scanpy as sc
+
+# Open in backed mode for memory-efficient QC
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# QC works natively in backed mode (no materialization)
+sc.pp.calculate_qc_metrics(adata, inplace=True)
+sc.pp.filter_cells(adata, min_genes=200)
+sc.pp.filter_genes(adata, min_cells=3)
+
+# HVG selection also works natively (streaming variance)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+
+# Subset to HVGs and materialize for preprocessing
+adata_sub = adata[:, adata.var["highly_variable"]].copy()
+sc.pp.normalize_total(adata_sub, target_sum=1e4)
+sc.pp.log1p(adata_sub)
+
+# Use Rust accelerators for speed
+pyscx.accel.pca(adata_sub, n_comps=50)
+pyscx.accel.neighbors(adata_sub, n_neighbors=15)
+pyscx.accel.umap(adata_sub)
+sc.tl.leiden(adata_sub)
+
+sc.pl.umap(adata_sub, color="leiden")
 ```
 
 ### Differential expression

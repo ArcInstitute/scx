@@ -300,3 +300,64 @@ class TestNeighbors:
         assert backed_adata.obsp["distances"].shape == (100, 100)
         assert "connectivities" in backed_adata.obsp
         assert backed_adata.obsp["connectivities"].shape == (100, 100)
+
+
+class TestUmap:
+    """Test pyscx.accel.umap() — UMAP embedding."""
+
+    def test_basic_shapes(self, synthetic_adata):
+        """UMAP writes correct shapes to adata.obsm['X_umap']."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.umap(adata)
+
+        assert "X_umap" in adata.obsm
+        assert adata.obsm["X_umap"].shape == (100, 2)
+        assert adata.obsm["X_umap"].dtype == np.float32
+
+    def test_embeddings_finite(self, synthetic_adata):
+        """All embedding values should be finite and not all identical."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.umap(adata)
+
+        emb = adata.obsm["X_umap"]
+        assert np.all(np.isfinite(emb)), "all embedding values should be finite"
+        assert emb.std() > 0, "embeddings should not all be identical"
+
+    def test_trustworthiness(self, synthetic_adata):
+        """Trustworthiness metric should be > 0.75 (local neighborhoods preserved)."""
+        import pyscx
+        from sklearn.manifold import trustworthiness
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.umap(adata, n_epochs=500, random_state=42)
+
+        X_pca = adata.obsm["X_pca"]
+        X_umap = adata.obsm["X_umap"]
+
+        tw = trustworthiness(X_pca, X_umap, n_neighbors=10)
+        assert tw > 0.75, f"trustworthiness = {tw:.4f} (expected > 0.75)"
+
+    def test_backed_umap(self, pca_adata):
+        """Full pipeline from backed SCX: PCA → neighbors → UMAP."""
+        import pyscx
+
+        scx_path, _ = pca_adata
+        backed_adata = pyscx.open(scx_path).to_anndata(backed=True)
+
+        pyscx.accel.pca(backed_adata, n_comps=10)
+        pyscx.accel.neighbors(backed_adata, n_neighbors=5)
+        pyscx.accel.umap(backed_adata, n_epochs=100)
+
+        assert "X_umap" in backed_adata.obsm
+        assert backed_adata.obsm["X_umap"].shape == (100, 2)
+        assert np.all(np.isfinite(backed_adata.obsm["X_umap"]))

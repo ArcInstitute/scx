@@ -7,7 +7,9 @@
 pub mod error;
 pub mod neighbors;
 pub mod pca;
+pub mod umap;
 
 pub use error::{AccelError, Result};
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{randomized_pca, randomized_pca_inmemory, PcaResult};
+pub use umap::{compute_umap, UmapResult};
