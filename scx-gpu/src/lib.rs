@@ -1,5 +1,5 @@
 //! GPU-accelerated codec decoding, cuSPARSE interop, cuSOLVER dense
-//! operations, and GPUDirect Storage for SCX.
+//! operations, cuVS CAGRA kNN, and GPUDirect Storage for SCX.
 //!
 //! This crate provides CUDA-based decoding of SCX Scx1 codecs (Rice values,
 //! FOR-BP indices), cuSPARSE CSR matrix interop, GPU sparse-to-dense
@@ -25,6 +25,7 @@ pub mod cusparse;
 pub mod device;
 pub mod error;
 pub mod forbp_gpu;
+pub mod gpu_knn;
 pub mod gpu_pca;
 pub mod rice_gpu;
 pub mod shard_decode;
@@ -39,6 +40,7 @@ pub use cusparse::{
 pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
+pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
 pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};

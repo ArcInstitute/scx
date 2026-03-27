@@ -538,3 +538,104 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// GPU dispatch (behind "gpu" feature)
+// ---------------------------------------------------------------------------
+
+/// Check whether GPU kNN via cuVS CAGRA is available.
+///
+/// Returns `true` if the `gpu` feature is enabled, a CUDA GPU is detected,
+/// AND the cuVS library (`libcuvs_c.so`) is loadable at runtime.
+#[cfg(feature = "gpu")]
+pub fn cuvs_available() -> bool {
+    scx_gpu::cuvs_available()
+}
+
+/// Build a kNN graph using GPU-accelerated cuVS CAGRA.
+///
+/// Pipeline:
+/// 1. Upload embeddings to GPU
+/// 2. Build CAGRA graph index + search (GPU)
+/// 3. Download indices + distances to host
+/// 4. Compute fuzzy set connectivities (CPU — reuses existing logic)
+/// 5. Build distance CSR
+///
+/// Falls back with `AccelError` if cuVS is not available.
+///
+/// # Arguments
+///
+/// * `device_id` — CUDA device ordinal (typically 0)
+/// * `data` — Row-major dense matrix (n_obs × n_vars), f32
+/// * `n_obs` — Number of observations (rows)
+/// * `n_vars` — Number of variables (columns / PCA dimensions)
+/// * `n_neighbors` — Number of nearest neighbors (k)
+#[cfg(feature = "gpu")]
+pub fn build_knn_graph_gpu(
+    device_id: usize,
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    n_neighbors: usize,
+) -> Result<KnnResult> {
+    use crate::error::AccelError;
+
+    // Validate inputs
+    if n_obs == 0 || n_vars == 0 {
+        return Err(AccelError::InvalidInput(
+            "data must be non-empty".to_string(),
+        ));
+    }
+    if data.len() != n_obs * n_vars {
+        return Err(AccelError::InvalidInput(format!(
+            "data length ({}) does not match n_obs × n_vars ({} × {} = {})",
+            data.len(),
+            n_obs,
+            n_vars,
+            n_obs * n_vars
+        )));
+    }
+    if n_neighbors == 0 {
+        return Err(AccelError::InvalidInput(
+            "n_neighbors must be > 0".to_string(),
+        ));
+    }
+    if n_neighbors > n_obs {
+        return Err(AccelError::InvalidInput(format!(
+            "n_neighbors ({n_neighbors}) exceeds n_obs ({n_obs})"
+        )));
+    }
+
+    // Create GPU device
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| AccelError::InvalidInput(format!("GPU device {device_id}: {e}")))?;
+
+    // Run CAGRA kNN on GPU
+    let gpu_result = scx_gpu::gpu_knn_cagra(&dev, data, n_obs, n_vars, n_neighbors)
+        .map_err(|e| AccelError::InvalidInput(format!("GPU kNN (CAGRA): {e}")))?;
+
+    // Convert GPU result (i64 indices, f32 distances) to CPU format (usize, f64)
+    let indices: Vec<usize> = gpu_result.indices.iter().map(|&idx| idx as usize).collect();
+    let distances: Vec<f64> = gpu_result.distances.iter().map(|&d| d as f64).collect();
+
+    // Build distance CSR matrix (reuse existing CPU function)
+    let (dist_indptr, dist_indices, dist_data) =
+        build_knn_csr(&indices, &distances, n_obs, n_neighbors);
+
+    // Compute UMAP-style connectivities on CPU (reuse existing logic)
+    let (conn_indptr, conn_indices, conn_data) =
+        compute_connectivities(&indices, &distances, n_obs, n_neighbors);
+
+    Ok(KnnResult {
+        indices,
+        distances,
+        conn_indptr,
+        conn_indices,
+        conn_data,
+        dist_indptr,
+        dist_indices,
+        dist_data,
+        n_neighbors,
+        n_obs,
+    })
+}

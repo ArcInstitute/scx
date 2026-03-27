@@ -29,6 +29,10 @@ pub enum GpuError {
     OutOfMemory(String),
     #[error("module load error: {0}")]
     ModuleLoadError(String),
+    #[error("cuVS error: {0}")]
+    CuVsError(String),
+    #[error("library not found: {0}")]
+    LibraryNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, GpuError>;

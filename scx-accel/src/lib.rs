@@ -30,4 +30,6 @@ pub use umap::{compute_umap, UmapResult};
 
 // GPU-accelerated variants (behind "gpu" feature)
 #[cfg(feature = "gpu")]
+pub use neighbors::{build_knn_graph_gpu, cuvs_available};
+#[cfg(feature = "gpu")]
 pub use pca::{gpu_available, randomized_pca_gpu};

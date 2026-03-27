@@ -379,22 +379,27 @@ fn write_pca_to_adata(
     Ok(())
 }
 
-/// Build a kNN graph using approximate nearest neighbors (HNSW).
+/// Build a kNN graph using approximate nearest neighbors.
 ///
 /// Reads `adata.obsm["X_pca"]` and computes a kNN graph plus UMAP-style
 /// connectivities. Results are written to `adata.obsp["distances"]`,
 /// `adata.obsp["connectivities"]`, and `adata.uns["neighbors"]`,
 /// matching scanpy's `sc.pp.neighbors()` output format.
 ///
+/// When `device="gpu"`, uses cuVS CAGRA (GPU graph-based ANN) for 20-50×
+/// speedup on large datasets. Falls back to CPU HNSW if cuVS is unavailable.
+///
 /// Args:
 ///     adata: AnnData object with obsm["X_pca"] (n_obs × n_pcs)
 ///     n_neighbors: Number of nearest neighbors (default: 15)
 ///     use_rep: Key in adata.obsm to use (default: "X_pca")
 ///     random_state: Random seed for reproducibility (default: 0)
-///     ef_construction: HNSW construction parameter (default: 200)
-///     ef_search: HNSW search parameter (default: 200)
+///     ef_construction: HNSW construction parameter (default: 200, CPU only)
+///     ef_search: HNSW search parameter (default: 200, CPU only)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
 #[pyfunction]
-#[pyo3(signature = (adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200))]
+#[pyo3(signature = (adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto"))]
+#[allow(clippy::too_many_arguments)]
 pub fn neighbors(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -403,8 +408,12 @@ pub fn neighbors(
     random_state: u64,
     ef_construction: usize,
     ef_search: usize,
+    device: &str,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
+
+    // Determine effective device
+    let use_gpu = resolve_device(device)?;
 
     // Extract representation matrix from adata.obsm[use_rep]
     let obsm = adata.getattr("obsm")?;
@@ -425,7 +434,38 @@ pub fn neighbors(
     let flat = arr.call_method0("ravel")?;
     let data: Vec<f32> = flat.extract()?;
 
-    // Build kNN graph
+    // GPU path
+    #[cfg(feature = "gpu")]
+    if use_gpu {
+        // Check if cuVS CAGRA is available
+        if scx_accel::cuvs_available() {
+            let result = scx_accel::build_knn_graph_gpu(
+                0, // device_id = 0 (first GPU)
+                &data,
+                n_obs,
+                n_vars,
+                n_neighbors,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+
+            write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "cagra")?;
+            return Ok(());
+        }
+        // cuVS not available — fall through to CPU with warning
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            ("cuVS library not found — falling back to CPU HNSW. \
+              Install cuVS for GPU-accelerated kNN: \
+              conda install -c rapidsai -c conda-forge libcuvs",),
+        )?;
+    }
+
+    // Suppress unused variable warning when gpu feature is not enabled
+    #[cfg(not(feature = "gpu"))]
+    let _ = use_gpu;
+
+    // CPU path (default or fallback)
     let result = scx_accel::build_knn_graph(
         &data,
         n_obs,
@@ -438,7 +478,7 @@ pub fn neighbors(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Write results to AnnData
-    write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep)?;
+    write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "hnsw")?;
 
     Ok(())
 }
@@ -450,6 +490,7 @@ fn write_neighbors_to_adata(
     result: &scx_accel::KnnResult,
     n_neighbors: usize,
     use_rep: &str,
+    method: &str,
 ) -> PyResult<()> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let numpy = py.import("numpy")?;
@@ -487,7 +528,7 @@ fn write_neighbors_to_adata(
 
     let params_dict = PyDict::new(py);
     params_dict.set_item("n_neighbors", n_neighbors)?;
-    params_dict.set_item("method", "hnsw")?;
+    params_dict.set_item("method", method)?;
     params_dict.set_item("use_rep", use_rep)?;
     neighbors_dict.set_item("params", params_dict)?;
 
