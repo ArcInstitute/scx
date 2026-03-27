@@ -18,8 +18,6 @@
 //! Peak memory: O(n_obs × k + n_vars × k) where k = n_components + n_oversamples.
 //! One decoded shard (~16K × n_vars × 4 bytes) is held at a time.
 
-#![allow(clippy::needless_range_loop)]
-
 use faer::Mat;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -56,121 +54,54 @@ pub struct PcaResult {
 }
 
 // ---------------------------------------------------------------------------
-// Simple row-major dense matrix with shape tracking
+// faer::Mat helpers — convert between row-major Vec<f64> and column-major Mat
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct DenseMat {
-    data: Vec<f64>,
-    rows: usize,
-    cols: usize,
+/// Build a `faer::Mat<f64>` from a row-major `Vec<f64>`.
+fn dense_from_row_major(data: &[f64], rows: usize, cols: usize) -> Mat<f64> {
+    debug_assert_eq!(data.len(), rows * cols);
+    let mut mat = Mat::<f64>::zeros(rows, cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            mat[(r, c)] = data[r * cols + c];
+        }
+    }
+    mat
 }
 
-impl DenseMat {
-    fn from_data(data: Vec<f64>, rows: usize, cols: usize) -> Self {
-        debug_assert_eq!(data.len(), rows * cols);
-        Self { data, rows, cols }
+/// Extract a `faer::Mat<f64>` into a row-major `Vec<f64>`.
+fn mat_to_row_major(mat: &Mat<f64>) -> Vec<f64> {
+    let (rows, cols) = (mat.nrows(), mat.ncols());
+    let mut data = vec![0.0f64; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            data[r * cols + c] = mat[(r, c)];
+        }
     }
+    data
+}
 
-    fn get(&self, r: usize, c: usize) -> f64 {
-        self.data[r * self.cols + c]
-    }
+/// Economy QR: return Q with orthonormal columns.
+fn qr_thin_q(mat: &Mat<f64>) -> Mat<f64> {
+    let qr = mat.qr();
+    qr.compute_thin_Q()
+}
 
-    /// Economy QR: return Q with orthonormal columns.
-    fn qr_q(&self) -> Result<DenseMat> {
-        let mut mat = Mat::<f64>::zeros(self.rows, self.cols);
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                mat[(r, c)] = self.data[r * self.cols + c];
-            }
-        }
+/// Thin SVD: A = U Σ V^T. Returns (U, σ, V^T).
+fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
+    let svd = mat
+        .thin_svd()
+        .map_err(|e| AccelError::LinAlg(format!("SVD failed: {e:?}")))?;
+    let k = mat.nrows().min(mat.ncols());
 
-        let qr = mat.qr();
-        let q_thin = qr.compute_thin_Q();
+    let u = svd.U().to_owned();
 
-        let mut result = vec![0.0f64; self.rows * self.cols];
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                result[r * self.cols + c] = q_thin[(r, c)];
-            }
-        }
+    let s_col = svd.S().column_vector();
+    let sigma: Vec<f64> = (0..k).map(|i| s_col[i]).collect();
 
-        Ok(DenseMat::from_data(result, self.rows, self.cols))
-    }
+    let vt = svd.V().transpose().to_owned();
 
-    /// Thin SVD: A = U Σ V^T. Returns (U, σ, V^T).
-    fn thin_svd(&self) -> Result<(DenseMat, Vec<f64>, DenseMat)> {
-        let mut mat = Mat::<f64>::zeros(self.rows, self.cols);
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                mat[(r, c)] = self.data[r * self.cols + c];
-            }
-        }
-
-        let svd = mat
-            .thin_svd()
-            .map_err(|e| AccelError::LinAlg(format!("SVD failed: {e:?}")))?;
-        let k = self.rows.min(self.cols);
-
-        // U: rows × k
-        let u_mat = svd.U();
-        let mut u = vec![0.0f64; self.rows * k];
-        for r in 0..self.rows {
-            for c in 0..k {
-                u[r * k + c] = u_mat[(r, c)];
-            }
-        }
-
-        // Singular values
-        let s_col = svd.S().column_vector();
-        let sigma: Vec<f64> = (0..k).map(|i| s_col[i]).collect();
-
-        // V^T: k × cols
-        let v_mat = svd.V();
-        let vt_mat = v_mat.transpose();
-        let mut vt = vec![0.0f64; k * self.cols];
-        for r in 0..k {
-            for c in 0..self.cols {
-                vt[r * self.cols + c] = vt_mat[(r, c)];
-            }
-        }
-
-        Ok((
-            DenseMat::from_data(u, self.rows, k),
-            sigma,
-            DenseMat::from_data(vt, k, self.cols),
-        ))
-    }
-
-    fn transpose(&self) -> DenseMat {
-        let mut t = vec![0.0f64; self.rows * self.cols];
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                t[c * self.rows + r] = self.data[r * self.cols + c];
-            }
-        }
-        DenseMat::from_data(t, self.cols, self.rows)
-    }
-
-    fn mul(&self, other: &DenseMat) -> DenseMat {
-        debug_assert_eq!(self.cols, other.rows);
-        let m = self.rows;
-        let p = self.cols;
-        let n = other.cols;
-        let mut c = vec![0.0f64; m * n];
-        for i in 0..m {
-            for k in 0..p {
-                let a_ik = self.data[i * p + k];
-                if a_ik == 0.0 {
-                    continue;
-                }
-                for j in 0..n {
-                    c[i * n + j] += a_ik * other.data[k * n + j];
-                }
-            }
-        }
-        DenseMat::from_data(c, m, n)
-    }
+    Ok((u, sigma, vt))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,24 +130,24 @@ pub fn randomized_pca(
     seed: u64,
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = reader.shape();
-    validate_inputs(n_obs, n_vars, n_components, n_oversamples)?;
+    validate_inputs(n_obs, n_vars, n_components)?;
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
     let means = compute_means_if_needed(reader, zero_center)?;
     let means_ref = means.as_deref();
 
     // Step 2: Random Gaussian Ω (n_vars × k)
-    let omega = DenseMat::from_data(random_gaussian(n_vars, k, seed), n_vars, k);
+    let omega = dense_from_row_major(&random_gaussian(n_vars, k, seed), n_vars, k);
 
     // Step 3 + 4 + 5: Streaming SpMM → QR → power iteration
     let y = streaming_spmm_forward(reader, &omega, means_ref)?;
-    let mut q = y.qr_q()?;
+    let mut q = qr_thin_q(&y);
 
     for _ in 0..n_power_iterations {
         let b = streaming_spmm_transpose(reader, &q, means_ref)?;
-        let q_b = b.qr_q()?;
+        let q_b = qr_thin_q(&b);
         let y = streaming_spmm_forward(reader, &q_b, means_ref)?;
-        q = y.qr_q()?;
+        q = qr_thin_q(&y);
     }
 
     // Step 6: B = (X - μ)^T @ Q
@@ -224,7 +155,7 @@ pub fn randomized_pca(
 
     // Step 7 + 8: SVD of B, recover embeddings
     let total_var = compute_total_variance_streaming(reader, means_ref)?;
-    build_pca_result(&q, &b, &means, n_components, k, n_obs, n_vars, total_var)
+    build_pca_result(&q, &b, &means, n_components, n_obs, n_vars, total_var)
 }
 
 /// Compute randomized PCA from an in-memory ScxCsr matrix.
@@ -239,7 +170,7 @@ pub fn randomized_pca_inmemory(
     seed: u64,
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = (csr.n_rows(), csr.n_cols());
-    validate_inputs(n_obs, n_vars, n_components, n_oversamples)?;
+    validate_inputs(n_obs, n_vars, n_components)?;
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
@@ -251,32 +182,27 @@ pub fn randomized_pca_inmemory(
     };
     let means_ref = means.as_deref();
 
-    let omega = DenseMat::from_data(random_gaussian(n_vars, k, seed), n_vars, k);
+    let omega = dense_from_row_major(&random_gaussian(n_vars, k, seed), n_vars, k);
     let y = spmm_forward_csr(csr, &omega, means_ref);
-    let mut q = y.qr_q()?;
+    let mut q = qr_thin_q(&y);
 
     for _ in 0..n_power_iterations {
         let b = spmm_transpose_csr(csr, &q, means_ref);
-        let q_b = b.qr_q()?;
+        let q_b = qr_thin_q(&b);
         let y = spmm_forward_csr(csr, &q_b, means_ref);
-        q = y.qr_q()?;
+        q = qr_thin_q(&y);
     }
 
     let b = spmm_transpose_csr(csr, &q, means_ref);
     let total_var = compute_total_variance_inmemory(csr, means_ref);
-    build_pca_result(&q, &b, &means, n_components, k, n_obs, n_vars, total_var)
+    build_pca_result(&q, &b, &means, n_components, n_obs, n_vars, total_var)
 }
 
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
 
-fn validate_inputs(
-    n_obs: usize,
-    n_vars: usize,
-    n_components: usize,
-    _n_oversamples: usize,
-) -> Result<()> {
+fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<()> {
     if n_components == 0 {
         return Err(AccelError::InvalidInput(
             "n_components must be > 0".to_string(),
@@ -318,16 +244,19 @@ fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
 /// Streaming forward SpMM: Y = (X - μ) @ M, shard-by-shard.
 ///
 /// X is (n_obs × n_vars) stored as sharded CSR.
-/// M is DenseMat (n_vars × k).
-/// Returns DenseMat (n_obs × k).
+/// M is Mat<f64> (n_vars × k).
+/// Returns Mat<f64> (n_obs × k).
 fn streaming_spmm_forward(
     reader: &BackedCsrReader,
-    m: &DenseMat,
+    m: &Mat<f64>,
     means: Option<&[f64]>,
-) -> Result<DenseMat> {
+) -> Result<Mat<f64>> {
     let (n_obs, n_vars) = reader.shape();
-    let k = m.cols;
-    debug_assert_eq!(m.rows, n_vars);
+    let k = m.ncols();
+    debug_assert_eq!(m.nrows(), n_vars);
+
+    // Extract M to row-major for cache-friendly SpMM kernel access
+    let m_data = mat_to_row_major(m);
 
     let mut y = vec![0.0f64; n_obs * k];
 
@@ -336,7 +265,7 @@ fn streaming_spmm_forward(
         let mut mc = vec![0.0f64; k];
         for v in 0..n_vars {
             for j in 0..k {
-                mc[j] += mu[v] * m.data[v * k + j];
+                mc[j] += mu[v] * m_data[v * k + j];
             }
         }
         mc
@@ -351,7 +280,7 @@ fn streaming_spmm_forward(
 
         spmm_forward_into(
             &csr,
-            &m.data,
+            &m_data,
             k,
             &mut y,
             global_row,
@@ -360,21 +289,24 @@ fn streaming_spmm_forward(
         global_row += shard_rows;
     }
 
-    Ok(DenseMat::from_data(y, n_obs, k))
+    Ok(dense_from_row_major(&y, n_obs, k))
 }
 
 /// Streaming transpose SpMM: Z = (X - μ)^T @ Q, shard-by-shard.
 ///
-/// Q is DenseMat (n_obs × k).
-/// Returns DenseMat (n_vars × k).
+/// Q is Mat<f64> (n_obs × k).
+/// Returns Mat<f64> (n_vars × k).
 fn streaming_spmm_transpose(
     reader: &BackedCsrReader,
-    q: &DenseMat,
+    q: &Mat<f64>,
     means: Option<&[f64]>,
-) -> Result<DenseMat> {
+) -> Result<Mat<f64>> {
     let (n_obs, n_vars) = reader.shape();
-    let k = q.cols;
-    debug_assert_eq!(q.rows, n_obs);
+    let k = q.ncols();
+    debug_assert_eq!(q.nrows(), n_obs);
+
+    // Extract Q to row-major for cache-friendly access
+    let q_data = mat_to_row_major(q);
 
     let mut z = vec![0.0f64; n_vars * k];
 
@@ -386,6 +318,7 @@ fn streaming_spmm_transpose(
         let shard_rows = csr.n_rows();
 
         // Z[col, :] += X[row, col] * Q[row, :]
+        #[allow(clippy::needless_range_loop)]
         for r in 0..shard_rows {
             let start = csr.indptr[r] as usize;
             let end = csr.indptr[r + 1] as usize;
@@ -396,7 +329,7 @@ fn streaming_spmm_transpose(
                 let val = csr.data[idx] as f64;
                 let z_offset = col * k;
                 for j in 0..k {
-                    z[z_offset + j] += val * q.data[q_offset + j];
+                    z[z_offset + j] += val * q_data[q_offset + j];
                 }
             }
         }
@@ -407,11 +340,13 @@ fn streaming_spmm_transpose(
     // Mean centering correction: Z -= μ @ (1^T @ Q)
     if let Some(mu) = means {
         let mut sum_q = vec![0.0f64; k];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n_obs {
             for j in 0..k {
-                sum_q[j] += q.data[i * k + j];
+                sum_q[j] += q_data[i * k + j];
             }
         }
+        #[allow(clippy::needless_range_loop)]
         for v in 0..n_vars {
             for j in 0..k {
                 z[v * k + j] -= mu[v] * sum_q[j];
@@ -419,37 +354,41 @@ fn streaming_spmm_transpose(
         }
     }
 
-    Ok(DenseMat::from_data(z, n_vars, k))
+    Ok(dense_from_row_major(&z, n_vars, k))
 }
 
 /// In-memory forward SpMM: Y = (X - μ) @ M using a single CSR.
-fn spmm_forward_csr(csr: &ScxCsr, m: &DenseMat, means: Option<&[f64]>) -> DenseMat {
+fn spmm_forward_csr(csr: &ScxCsr, m: &Mat<f64>, means: Option<&[f64]>) -> Mat<f64> {
     let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
-    let k = m.cols;
+    let k = m.ncols();
+
+    let m_data = mat_to_row_major(m);
 
     let mean_correction: Option<Vec<f64>> = means.map(|mu| {
         let mut mc = vec![0.0f64; k];
         for v in 0..n_vars {
             for j in 0..k {
-                mc[j] += mu[v] * m.data[v * k + j];
+                mc[j] += mu[v] * m_data[v * k + j];
             }
         }
         mc
     });
 
     let mut y = vec![0.0f64; n_obs * k];
-    spmm_forward_into(csr, &m.data, k, &mut y, 0, mean_correction.as_deref());
-    DenseMat::from_data(y, n_obs, k)
+    spmm_forward_into(csr, &m_data, k, &mut y, 0, mean_correction.as_deref());
+    dense_from_row_major(&y, n_obs, k)
 }
 
 /// In-memory transpose SpMM: Z = (X - μ)^T @ Q using a single CSR.
-fn spmm_transpose_csr(csr: &ScxCsr, q: &DenseMat, means: Option<&[f64]>) -> DenseMat {
+fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Mat<f64> {
     let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
-    let k = q.cols;
+    let k = q.ncols();
+    let q_data = mat_to_row_major(q);
     let mut z = vec![0.0f64; n_vars * k];
 
+    #[allow(clippy::needless_range_loop)]
     for r in 0..n_obs {
         let start = csr.indptr[r] as usize;
         let end = csr.indptr[r + 1] as usize;
@@ -460,18 +399,20 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &DenseMat, means: Option<&[f64]>) -> Dens
             let val = csr.data[idx] as f64;
             let z_offset = col * k;
             for j in 0..k {
-                z[z_offset + j] += val * q.data[q_offset + j];
+                z[z_offset + j] += val * q_data[q_offset + j];
             }
         }
     }
 
     if let Some(mu) = means {
         let mut sum_q = vec![0.0f64; k];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n_obs {
             for j in 0..k {
-                sum_q[j] += q.data[i * k + j];
+                sum_q[j] += q_data[i * k + j];
             }
         }
+        #[allow(clippy::needless_range_loop)]
         for v in 0..n_vars {
             for j in 0..k {
                 z[v * k + j] -= mu[v] * sum_q[j];
@@ -479,10 +420,11 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &DenseMat, means: Option<&[f64]>) -> Dens
         }
     }
 
-    DenseMat::from_data(z, n_vars, k)
+    dense_from_row_major(&z, n_vars, k)
 }
 
 /// Shared SpMM-forward kernel: accumulates X_shard @ M into y[global_row*k..].
+#[allow(clippy::needless_range_loop)]
 fn spmm_forward_into(
     csr: &ScxCsr,
     m_data: &[f64], // n_vars × k, row-major
@@ -537,7 +479,6 @@ fn compute_total_variance_streaming(
     means: Option<&[f64]>,
 ) -> Result<f64> {
     let n_obs = reader.n_obs();
-    let _n_vars = reader.n_vars();
     let col_sum_sq = streaming_col_sum_of_squares(reader)?;
 
     let total = if let Some(mu) = means {
@@ -584,25 +525,24 @@ fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
 /// Build PcaResult from Q, B, and SVD.
 #[allow(clippy::too_many_arguments)]
 fn build_pca_result(
-    q: &DenseMat,
-    b: &DenseMat,
+    q: &Mat<f64>,
+    b: &Mat<f64>,
     means: &Option<Vec<f64>>,
     n_components: usize,
-    _k: usize,
     n_obs: usize,
     n_vars: usize,
     total_var: f64,
 ) -> Result<PcaResult> {
-    let (u_hat, sigma, vt) = b.thin_svd()?;
+    let (u_hat, sigma, vt) = thin_svd_decomp(b)?;
 
     // Embeddings = Q @ V * Σ (take first n_components columns)
-    let v = vt.transpose();
-    let embeddings_full = q.mul(&v); // n_obs × k
+    let v = vt.transpose().to_owned();
+    let embeddings_full: Mat<f64> = q * &v; // faer's optimized GEMM
 
     let mut scaled_embeddings = vec![0.0f64; n_obs * n_components];
     for i in 0..n_obs {
         for j in 0..n_components {
-            scaled_embeddings[i * n_components + j] = embeddings_full.get(i, j) * sigma[j];
+            scaled_embeddings[i * n_components + j] = embeddings_full[(i, j)] * sigma[j];
         }
     }
 
@@ -610,7 +550,7 @@ fn build_pca_result(
     let mut components = vec![0.0f64; n_components * n_vars];
     for pc in 0..n_components {
         for v in 0..n_vars {
-            components[pc * n_vars + v] = u_hat.get(v, pc);
+            components[pc * n_vars + v] = u_hat[(v, pc)];
         }
     }
 
@@ -744,24 +684,27 @@ mod tests {
         let n_vars = 5;
         let k = 3;
 
-        let m = DenseMat::from_data(random_gaussian(n_vars, k, 42), n_vars, k);
+        let m = dense_from_row_major(&random_gaussian(n_vars, k, 42), n_vars, k);
         let y_sparse = spmm_forward_csr(&csr, &m, None);
+        let y_sparse_data = mat_to_row_major(&y_sparse);
+        let m_data = mat_to_row_major(&m);
 
         // Dense matmul reference
         let mut y_dense = vec![0.0f64; n_obs * k];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n_obs {
             for j in 0..k {
                 for v in 0..n_vars {
-                    y_dense[i * k + j] += dense[i * n_vars + v] as f64 * m.data[v * k + j];
+                    y_dense[i * k + j] += dense[i * n_vars + v] as f64 * m_data[v * k + j];
                 }
             }
         }
 
         for i in 0..n_obs * k {
             assert!(
-                (y_sparse.data[i] - y_dense[i]).abs() < 1e-10,
+                (y_sparse_data[i] - y_dense[i]).abs() < 1e-10,
                 "mismatch at {i}: {} vs {}",
-                y_sparse.data[i],
+                y_sparse_data[i],
                 y_dense[i]
             );
         }
@@ -770,32 +713,32 @@ mod tests {
     #[test]
     fn test_qr_orthonormal() {
         let data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0];
-        let mat = DenseMat::from_data(data, 4, 2);
-        let q = mat.qr_q().unwrap();
+        let mat = dense_from_row_major(&data, 4, 2);
+        let q = qr_thin_q(&mat);
 
-        assert_eq!(q.rows, 4);
-        assert_eq!(q.cols, 2);
+        assert_eq!(q.nrows(), 4);
+        assert_eq!(q.ncols(), 2);
 
         for c in 0..2 {
-            let norm: f64 = (0..4).map(|r| q.get(r, c).powi(2)).sum();
+            let norm: f64 = (0..4).map(|r| q[(r, c)].powi(2)).sum();
             assert!((norm - 1.0).abs() < 1e-10, "col {c} norm = {norm}");
         }
 
-        let dot: f64 = (0..4).map(|r| q.get(r, 0) * q.get(r, 1)).sum();
+        let dot: f64 = (0..4).map(|r| q[(r, 0)] * q[(r, 1)]).sum();
         assert!(dot.abs() < 1e-10, "cols should be orthogonal, dot={dot}");
     }
 
     #[test]
     fn test_svd_basic() {
         let data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        let mat = DenseMat::from_data(data, 3, 2);
-        let (u, sigma, vt) = mat.thin_svd().unwrap();
+        let mat = dense_from_row_major(&data, 3, 2);
+        let (u, sigma, vt) = thin_svd_decomp(&mat).unwrap();
 
-        assert_eq!(u.rows, 3);
-        assert_eq!(u.cols, 2);
+        assert_eq!(u.nrows(), 3);
+        assert_eq!(u.ncols(), 2);
         assert_eq!(sigma.len(), 2);
-        assert_eq!(vt.rows, 2);
-        assert_eq!(vt.cols, 2);
+        assert_eq!(vt.nrows(), 2);
+        assert_eq!(vt.ncols(), 2);
         assert!(sigma[0] > 0.0);
         assert!(sigma[1] > 0.0);
         assert!(sigma[0] >= sigma[1]);
