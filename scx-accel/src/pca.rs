@@ -134,7 +134,8 @@ pub fn randomized_pca(
     validate_inputs(n_obs, n_vars, n_components)?;
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
-    let means = compute_means_if_needed(reader, zero_center)?;
+    // Fused pass: compute column means and sum-of-squares together (1 shard pass)
+    let (means, col_sum_sq) = compute_means_and_col_sq(reader, zero_center)?;
     let means_ref = means.as_deref();
 
     // Step 2: Random Gaussian Ω (n_vars × k)
@@ -154,8 +155,8 @@ pub fn randomized_pca(
     // Step 6: B = (X - μ)^T @ Q
     let b = streaming_spmm_transpose(reader, &q, means_ref)?;
 
-    // Step 7 + 8: SVD of B, recover embeddings
-    let total_var = compute_total_variance_streaming(reader, means_ref)?;
+    // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass)
+    let total_var = compute_total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
     build_pca_result(&q, &b, &means, n_components, n_obs, n_vars, total_var)
 }
 
@@ -223,16 +224,35 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
     Ok(())
 }
 
-fn compute_means_if_needed(
+/// Compute column means (if `zero_center`) and column sum-of-squares in a
+/// single pass over all shards. This fuses what were previously two separate
+/// shard iterations — eliminating one full data pass (12.5% I/O reduction).
+fn compute_means_and_col_sq(
     reader: &BackedCsrReader,
     zero_center: bool,
-) -> Result<Option<Vec<f64>>> {
-    if !zero_center {
-        return Ok(None);
+) -> Result<(Option<Vec<f64>>, Vec<f64>)> {
+    let n_vars = reader.n_vars();
+    let n_shards = reader.index().n_shards();
+    let mut col_sums = vec![0.0f64; n_vars];
+    let mut col_sum_sq = vec![0.0f64; n_vars];
+
+    for shard_idx in 0..n_shards {
+        let csr = reader.read_shard_cached(shard_idx)?;
+        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+            let v = val as f64;
+            col_sums[col as usize] += v;
+            col_sum_sq[col as usize] += v * v;
+        }
     }
-    let n_obs = reader.n_obs();
-    let col_sums = reader.col_sums()?;
-    Ok(Some(col_sums.iter().map(|&s| s / n_obs as f64).collect()))
+
+    let means = if zero_center {
+        let n_obs = reader.n_obs() as f64;
+        Some(col_sums.iter().map(|s| s / n_obs).collect())
+    } else {
+        None
+    };
+
+    Ok((means, col_sum_sq))
 }
 
 /// Generate a random Gaussian matrix (rows × cols), row-major.
@@ -482,31 +502,16 @@ fn spmm_forward_row(
     }
 }
 
-/// Streaming column sum-of-squares: Σ x_{ij}^2 per column.
-fn streaming_col_sum_of_squares(reader: &BackedCsrReader) -> Result<Vec<f64>> {
-    let n_vars = reader.n_vars();
-    let n_shards = reader.index().n_shards();
-    let mut sums = vec![0.0f64; n_vars];
-
-    for shard_idx in 0..n_shards {
-        let csr = reader.read_shard_cached(shard_idx)?;
-        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-            let v = val as f64;
-            sums[col as usize] += v * v;
-        }
-    }
-
-    Ok(sums)
-}
-
-/// Total variance (streaming, backed).
-fn compute_total_variance_streaming(
-    reader: &BackedCsrReader,
+/// Total variance from pre-computed column sum-of-squares.
+///
+/// Uses the identity: Var(X_j) = (Σ x²_j - n·μ_j²) / (n-1).
+/// The `col_sum_sq` is produced by `compute_means_and_col_sq` so no extra
+/// data pass is needed.
+fn compute_total_variance_from_col_sq(
+    col_sum_sq: &[f64],
     means: Option<&[f64]>,
-) -> Result<f64> {
-    let n_obs = reader.n_obs();
-    let col_sum_sq = streaming_col_sum_of_squares(reader)?;
-
+    n_obs: usize,
+) -> f64 {
     let total = if let Some(mu) = means {
         col_sum_sq
             .iter()
@@ -517,7 +522,7 @@ fn compute_total_variance_streaming(
         col_sum_sq.iter().sum::<f64>()
     };
 
-    Ok(total / (n_obs as f64 - 1.0).max(1.0))
+    total / (n_obs as f64 - 1.0).max(1.0)
 }
 
 /// Total variance (in-memory).
