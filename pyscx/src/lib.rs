@@ -1,3 +1,4 @@
+mod accel;
 mod anndata;
 pub(crate) mod backed;
 mod experiment;
@@ -150,6 +151,11 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
+
+    // Accelerators submodule
+    let accel_module = PyModule::new(m.py(), "accel")?;
+    accel_module.add_function(wrap_pyfunction!(accel::pca, &accel_module)?)?;
+    m.add_submodule(&accel_module)?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.

@@ -1,0 +1,19 @@
+[package]
+name = "scx-accel"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-native analysis accelerators for SCX (PCA, kNN, etc.)"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+scx-format = { path = "../scx-format" }
+scx-sparse = { path = "../scx-sparse" }
+faer = "0.24"
+rand = { workspace = true }
+rand_distr = "0.4"
+rayon = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -394,7 +394,10 @@ impl BackedCsrReader {
     }
 
     /// Read and optionally cache a single decoded shard.
-    fn read_shard_cached(&self, shard_idx: usize) -> Result<ScxCsr> {
+    ///
+    /// Public so that downstream crates (e.g. `scx-accel`) can iterate
+    /// shards directly for streaming operations like SpMM.
+    pub fn read_shard_cached(&self, shard_idx: usize) -> Result<ScxCsr> {
         // Check cache first
         if let Some(ref cache_mutex) = self.cache {
             let mut cache = cache_mutex.lock().unwrap();
