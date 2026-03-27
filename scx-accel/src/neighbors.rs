@@ -276,10 +276,14 @@ fn compute_connectivities(
         })
         .collect();
 
-    // Compute asymmetric membership strengths and collect into a hash map
-    // Using a simple Vec-of-Vecs approach for the sparse result
-    let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_obs];
+    // Compute asymmetric membership strengths and build O(1) lookup map.
+    // HashMap keyed by (i, j) → μ(i,j) replaces the previous O(k) linear scan
+    // per edge, reducing total symmetrization cost from O(n × k²) to O(n × k).
+    use std::collections::HashMap;
 
+    let mut mu_map: HashMap<(usize, usize), f64> = HashMap::with_capacity(n_obs * n_neighbors);
+
+    #[allow(clippy::needless_range_loop)] // i indexes sigmas, knn_indices, and knn_distances
     for i in 0..n_obs {
         let offset = i * n_neighbors;
         let rho = knn_distances[offset];
@@ -293,53 +297,39 @@ fn compute_connectivities(
             } else {
                 (-(d - rho) / sigma).exp()
             };
-            rows[i].push((j, strength));
+            mu_map.insert((i, j), strength);
         }
     }
 
     // Symmetrize: conn(i,j) = μ(i,j) + μ(j,i) - μ(i,j) * μ(j,i)
-    // First, build a lookup for fast access
+    // Use a HashSet to track processed edges so each (i,j)/(j,i) pair is
+    // computed exactly once — eliminates the previous dedup_by_key call that
+    // could silently drop values with different floating-point rounding.
     let mut sym: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_obs];
+    let mut seen = std::collections::HashSet::<(usize, usize)>::new();
 
-    // Collect all (i,j) pairs
-    for i in 0..n_obs {
-        for &(j, mu_ij) in &rows[i] {
-            // Find μ(j,i) if it exists
-            let mu_ji = rows[j]
-                .iter()
-                .find(|&&(col, _)| col == i)
-                .map(|&(_, v)| v)
-                .unwrap_or(0.0);
+    for &(i, j) in mu_map.keys() {
+        // Skip if we already processed this edge from the (j,i) direction
+        if !seen.insert((i, j)) {
+            continue;
+        }
+        seen.insert((j, i));
 
-            let conn = mu_ij + mu_ji - mu_ij * mu_ji;
-            if conn > 0.0 {
-                sym[i].push((j, conn));
+        let mu_ij = mu_map.get(&(i, j)).copied().unwrap_or(0.0);
+        let mu_ji = mu_map.get(&(j, i)).copied().unwrap_or(0.0);
+        let conn = mu_ij + mu_ji - mu_ij * mu_ji;
+
+        if conn > 0.0 {
+            sym[i].push((j, conn));
+            if i != j {
+                sym[j].push((i, conn));
             }
         }
     }
 
-    // Also add reverse edges that don't exist in the forward direction
-    for j in 0..n_obs {
-        for &(i, mu_ji) in &rows[j] {
-            let already_exists = sym[i].iter().any(|&(col, _)| col == j);
-            if !already_exists {
-                let mu_ij = rows[i]
-                    .iter()
-                    .find(|&&(col, _)| col == j)
-                    .map(|&(_, v)| v)
-                    .unwrap_or(0.0);
-                let conn = mu_ij + mu_ji - mu_ij * mu_ji;
-                if conn > 0.0 {
-                    sym[i].push((j, conn));
-                }
-            }
-        }
-    }
-
-    // Sort each row by column index and deduplicate
+    // Sort each row by column index (no dedup needed — seen set prevents duplicates)
     for row in &mut sym {
         row.sort_by_key(|&(col, _)| col);
-        row.dedup_by_key(|entry| entry.0);
     }
 
     // Convert to CSR
