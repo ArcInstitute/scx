@@ -865,3 +865,348 @@ class TestPseudobulkDex:
                 aggr_method="invalid",
             )
 
+
+class TestStratifiedDE:
+    """Test stratified differential expression for both single-cell and pseudobulk."""
+
+    def test_stratified_rank_genes_groups_matches_manual(self):
+        """Stratified single-cell DE should match manual per-stratum loop."""
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(42)
+        n_obs, n_vars = 120, 20
+        data = np.random.randint(1, 50, size=(n_obs, n_vars)).astype(np.float32)
+
+        # Two cell types (stratify_by), two conditions (groupby).
+        cell_types = ["T_cell"] * 60 + ["B_cell"] * 60
+        conditions = np.random.choice(["ctrl", "stim"], size=n_obs)
+
+        obs = pd.DataFrame({
+            "cell_type": pd.Categorical(cell_types),
+            "condition": pd.Categorical(conditions),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        # --- Stratified call ---
+        result = pyscx.accel.rank_genes_groups(
+            adata, "condition", stratify_by=["cell_type"],
+            min_cells_per_stratum=5,
+        )
+
+        assert hasattr(result, "columns"), "stratified DE should return DataFrame"
+        assert "gene" in result.columns
+        assert "group" in result.columns
+        assert "cell_type" in result.columns
+        assert "pvals" in result.columns
+        assert "pvals_adj" in result.columns
+
+        # --- Manual per-cell-type loop ---
+        manual_frames = []
+        for ct in sorted(adata.obs["cell_type"].unique()):
+            mask = adata.obs["cell_type"] == ct
+            sub = adata[mask.values].copy()
+            pyscx.accel.rank_genes_groups(sub, "condition")
+            rgg = sub.uns["rank_genes_groups"]
+            for group in rgg["names"].dtype.names:
+                n = len(rgg["names"][group])
+                df = pd.DataFrame({
+                    "gene": list(rgg["names"][group]),
+                    "scores": list(rgg["scores"][group]),
+                    "pvals": list(rgg["pvals"][group]),
+                    "pvals_adj": list(rgg["pvals_adj"][group]),
+                    "logfoldchanges": list(rgg["logfoldchanges"][group]),
+                    "group": [group] * n,
+                    "cell_type": [ct] * n,
+                })
+                manual_frames.append(df)
+        manual_result = pd.concat(manual_frames, ignore_index=True)
+
+        # Compare per cell_type: same number of rows.
+        for ct in sorted(adata.obs["cell_type"].unique()):
+            strat_sub = result[result["cell_type"] == ct]
+            manual_sub = manual_result[manual_result["cell_type"] == ct]
+            assert len(strat_sub) == len(manual_sub), (
+                f"cell_type={ct}: row count mismatch "
+                f"({len(strat_sub)} vs {len(manual_sub)})"
+            )
+
+    def test_stratified_returns_correct_type(self):
+        """stratify_by returns DataFrame; without returns None."""
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(99)
+        n_obs, n_vars = 80, 10
+        data = np.random.randint(1, 30, size=(n_obs, n_vars)).astype(np.float32)
+        obs = pd.DataFrame({
+            "cell_type": pd.Categorical(["T"] * 40 + ["B"] * 40),
+            "group": pd.Categorical(
+                np.random.choice(["A", "B"], size=n_obs)
+            ),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        # Non-stratified returns None.
+        ret = pyscx.accel.rank_genes_groups(adata, "group")
+        assert ret is None
+
+        # Stratified returns DataFrame.
+        ret = pyscx.accel.rank_genes_groups(
+            adata, "group", stratify_by=["cell_type"],
+            min_cells_per_stratum=5,
+        )
+        assert hasattr(ret, "columns")
+        assert "cell_type" in ret.columns
+
+    def test_multi_column_stratify(self):
+        """Stratification by multiple columns should create composite strata."""
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(99)
+        n_obs, n_vars = 120, 20
+        data = np.random.randint(1, 50, size=(n_obs, n_vars)).astype(np.float32)
+
+        # Create two metadata columns for stratification.
+        cell_types = (["T"] * 40 + ["B"] * 40 + ["NK"] * 40)
+        tissues = (["lung"] * 20 + ["blood"] * 20) * 3
+        groups = np.random.choice(["ctrl", "stim"], size=n_obs)
+
+        obs = pd.DataFrame({
+            "cell_type": pd.Categorical(cell_types),
+            "tissue": pd.Categorical(tissues),
+            "condition": pd.Categorical(groups),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        result = pyscx.accel.rank_genes_groups(
+            adata, "condition",
+            stratify_by=["cell_type", "tissue"],
+            min_cells_per_stratum=5,
+        )
+
+        assert hasattr(result, "columns")
+        assert "cell_type" in result.columns
+        assert "tissue" in result.columns
+        assert "gene" in result.columns
+
+        # Should have results for multiple composite strata.
+        unique_strata = result.groupby(["cell_type", "tissue"]).ngroups
+        assert unique_strata >= 2, f"expected >= 2 strata, got {unique_strata}"
+
+    def test_min_cells_per_stratum(self):
+        """Strata with too few cells should be skipped with a warning."""
+        import anndata
+        import pandas as pd
+        import pyscx
+        import warnings
+
+        np.random.seed(42)
+        n_obs, n_vars = 55, 10
+        data = np.random.randint(1, 20, size=(n_obs, n_vars)).astype(np.float32)
+
+        # Stratum "rare" has only 5 cells; "common" has 50.
+        cell_types = ["rare"] * 5 + ["common"] * 50
+        groups = np.random.choice(["A", "B"], size=n_obs)
+
+        obs = pd.DataFrame({
+            "cell_type": pd.Categorical(cell_types),
+            "group": pd.Categorical(groups),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = pyscx.accel.rank_genes_groups(
+                adata, "group",
+                stratify_by=["cell_type"],
+                min_cells_per_stratum=10,  # "rare" has only 5
+            )
+
+        # Should only have results for "common" stratum.
+        assert (result["cell_type"] == "common").all(), \
+            "only 'common' stratum should be present"
+
+        # Should have emitted a warning about skipped strata.
+        skip_warnings = [x for x in w if "Skipped" in str(x.message)]
+        assert len(skip_warnings) >= 1, "expected warning about skipped strata"
+
+    def test_all_strata_fail_raises(self):
+        """If all strata are filtered out, should raise ValueError."""
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(42)
+        n_obs, n_vars = 30, 10
+        data = np.random.randint(1, 20, size=(n_obs, n_vars)).astype(np.float32)
+        obs = pd.DataFrame({
+            "cell_type": pd.Categorical(["T"] * 15 + ["B"] * 15),
+            "group": pd.Categorical(
+                np.random.choice(["A", "B"], size=n_obs)
+            ),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        with pytest.raises(ValueError, match="all strata were filtered out"):
+            pyscx.accel.rank_genes_groups(
+                adata, "group",
+                stratify_by=["cell_type"],
+                min_cells_per_stratum=999999,  # impossibly high
+            )
+
+    def test_stratify_by_invalid_column(self, synthetic_adata):
+        """Non-existent stratify_by column should raise ValueError."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+
+        with pytest.raises(ValueError, match="not found in adata.obs"):
+            pyscx.accel.rank_genes_groups(
+                adata, "batch",
+                stratify_by=["nonexistent_column"],
+            )
+
+    def test_stratify_by_collision_with_groupby(self, synthetic_adata):
+        """stratify_by that collides with groupby should raise ValueError."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+
+        with pytest.raises(ValueError, match="collides with"):
+            pyscx.accel.rank_genes_groups(
+                adata, "batch",
+                stratify_by=["batch"],  # same as groupby
+                min_cells_per_stratum=5,
+            )
+
+    def test_stratify_by_collision_with_test_col(self):
+        """For pseudobulk DE, stratify_by should not collide with test_col."""
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(42)
+        n_obs, n_vars = 60, 10
+        data = np.random.randint(5, 15, size=(n_obs, n_vars)).astype(np.float32)
+        obs = pd.DataFrame({
+            "perturbation": pd.Categorical(["drug"] * 30 + ["control"] * 30),
+            "donor": pd.Categorical(
+                (["d1"] * 10 + ["d2"] * 10 + ["d3"] * 10) * 2
+            ),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        with pytest.raises(ValueError, match="collides with"):
+            pyscx.accel.pseudobulk_dex(
+                adata,
+                groupby=["perturbation", "donor"],
+                test_col="perturbation",
+                reference="control",
+                stratify_by=["perturbation"],  # collides with test_col
+            )
+
+    def test_stratified_pseudobulk_dex_matches_manual(self):
+        """Stratified pseudobulk DE should match manual per-cell-type loop."""
+        try:
+            import pydeseq2  # noqa: F401
+        except ImportError:
+            pytest.skip("pydeseq2 not installed")
+
+        import anndata
+        import pandas as pd
+        import pyscx
+
+        np.random.seed(42)
+        n_obs, n_vars = 120, 15
+
+        data = np.random.randint(5, 30, size=(n_obs, n_vars)).astype(np.float32)
+
+        # Known DE gene 0: high in drug, low in control (both cell types).
+        data[:30, 0] = np.random.randint(80, 150, 30).astype(np.float32)
+        data[30:60, 0] = np.random.randint(1, 10, 30).astype(np.float32)
+        data[60:90, 0] = np.random.randint(80, 150, 30).astype(np.float32)
+        data[90:, 0] = np.random.randint(1, 10, 30).astype(np.float32)
+
+        perturbations = (
+            ["drug"] * 30 + ["control"] * 30 +
+            ["drug"] * 30 + ["control"] * 30
+        )
+        donors = (["d1"] * 10 + ["d2"] * 10 + ["d3"] * 10) * 4
+        cell_types = ["T_cell"] * 60 + ["B_cell"] * 60
+
+        obs = pd.DataFrame({
+            "perturbation": pd.Categorical(perturbations),
+            "donor": pd.Categorical(donors),
+            "cell_type": pd.Categorical(cell_types),
+        }, index=[f"c{i}" for i in range(n_obs)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+
+        adata = anndata.AnnData(X=sp.csr_matrix(data), obs=obs, var=var)
+
+        # --- Stratified call ---
+        result = pyscx.accel.pseudobulk_dex(
+            adata,
+            groupby=["perturbation", "donor"],
+            test_col="perturbation",
+            reference="control",
+            min_cells_per_group=1,
+            stratify_by=["cell_type"],
+            min_cells_per_stratum=10,
+        )
+
+        assert "cell_type" in result.columns
+        assert "gene" in result.columns
+        assert "log2FoldChange" in result.columns
+
+        # Should have results for both cell types.
+        cell_types_in_result = sorted(result["cell_type"].unique())
+        assert cell_types_in_result == ["B_cell", "T_cell"], \
+            f"expected both cell types, got {cell_types_in_result}"
+
+        # --- Manual loop ---
+        manual_frames = []
+        for ct in ["B_cell", "T_cell"]:
+            mask = adata.obs["cell_type"] == ct
+            sub = adata[mask.values].copy()
+            df = pyscx.accel.pseudobulk_dex(
+                sub,
+                groupby=["perturbation", "donor"],
+                test_col="perturbation",
+                reference="control",
+                min_cells_per_group=1,
+            )
+            df["cell_type"] = ct
+            manual_frames.append(df)
+
+        manual_result = pd.concat(manual_frames, ignore_index=True)
+
+        # Compare log2FC for gene_0 in each cell type.
+        for ct in ["B_cell", "T_cell"]:
+            strat_g0 = result[
+                (result["cell_type"] == ct) & (result["gene"] == "g0")
+            ]
+            manual_g0 = manual_result[
+                (manual_result["cell_type"] == ct) &
+                (manual_result["gene"] == "g0")
+            ]
+
+            if len(strat_g0) > 0 and len(manual_g0) > 0:
+                np.testing.assert_allclose(
+                    strat_g0["log2FoldChange"].values[0],
+                    manual_g0["log2FoldChange"].values[0],
+                    rtol=1e-6,
+                    err_msg=f"log2FC mismatch for gene_0 in {ct}",
+                )
+

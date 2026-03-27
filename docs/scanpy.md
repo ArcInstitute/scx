@@ -564,6 +564,61 @@ print(result.sort_values("padj").head(20))
 | `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"` |
 | `min_cells_per_group` | 10 | Groups with fewer cells are excluded |
 
+### Stratified Differential Expression
+
+Both `rank_genes_groups()` and `pseudobulk_dex()` support automatic
+stratification via the `stratify_by` parameter. DE is run independently
+within each stratum and the results are concatenated into a single
+DataFrame with stratum columns appended.
+
+```python
+import pyscx
+
+adata = pyscx.open("perturb_seq.scx").to_anndata()
+
+# Single-cell DE stratified by cell type:
+result = pyscx.accel.rank_genes_groups(
+    adata, "perturbation",
+    stratify_by=["cell_type"],
+    min_cells_per_stratum=50,
+)
+# Returns a DataFrame with columns:
+#   gene | scores | pvals | pvals_adj | logfoldchanges | group | cell_type
+
+# Multi-column stratification (composite strata):
+result = pyscx.accel.rank_genes_groups(
+    adata, "perturbation",
+    stratify_by=["cell_type", "tissue"],
+    min_cells_per_stratum=30,
+)
+# Returns DataFrame with both cell_type and tissue columns
+
+# Pseudobulk DE stratified by cell type:
+result = pyscx.accel.pseudobulk_dex(
+    adata,
+    groupby=["perturbation", "donor"],
+    test_col="perturbation",
+    reference="control",
+    stratify_by=["cell_type"],
+    min_cells_per_stratum=50,
+)
+# Returns DataFrame with cell_type column added
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `stratify_by` | `None` | Column(s) in `adata.obs` to stratify by. Single string or list of strings. |
+| `min_cells_per_stratum` | 50 | Strata with fewer cells are skipped (with warning). |
+
+Strata with insufficient cells are skipped with a `UserWarning`. If all
+strata are filtered, a `ValueError` is raised. `stratify_by` columns must
+not collide with `groupby` or `test_col`.
+
+> [!NOTE]
+> When `stratify_by` is provided, `rank_genes_groups()` returns a pandas
+> DataFrame instead of writing to `adata.uns`. Without `stratify_by`, it
+> writes to `adata.uns["rank_genes_groups"]` as usual and returns `None`.
+
 > [!NOTE]
 > `pydeseq2` is an **optional** runtime dependency. Install with
 > `pip install pydeseq2` before calling `pseudobulk_dex()`.

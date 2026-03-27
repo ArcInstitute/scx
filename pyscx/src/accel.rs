@@ -5,11 +5,134 @@
 //! AnnData slots (obsm["X_pca"], varm["PCs"], uns["pca"]).
 
 use numpy::PyArray2;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
+
+/// A single stratum: the composite key values and a boolean mask over adata.obs.
+struct Stratum {
+    /// Key values for each stratify_by column.
+    key: Vec<String>,
+}
+
+/// Extract and validate strata from adata.obs.
+///
+/// Returns (strata, boolean_masks_as_py_arrays, stratify_col_names).
+/// Drops NaN rows with a logged warning. Filters by min_cells_per_stratum.
+fn extract_strata<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    stratify_by: &[String],
+    min_cells_per_stratum: usize,
+    forbidden_cols: &[&str],
+) -> PyResult<(Vec<Stratum>, Vec<Bound<'py, PyAny>>)> {
+    let obs = adata.getattr("obs")?;
+    let warnings = py.import("warnings")?;
+    let pd = py.import("pandas")?;
+    let np = py.import("numpy")?;
+
+    // Validate each stratify_by column exists and doesn't collide.
+    for col in stratify_by {
+        if !obs
+            .call_method1("__contains__", (col.as_str(),))?
+            .extract::<bool>()?
+        {
+            return Err(PyValueError::new_err(format!(
+                "stratify_by column '{}' not found in adata.obs",
+                col
+            )));
+        }
+        for forbidden in forbidden_cols {
+            if col.as_str() == *forbidden {
+                return Err(PyValueError::new_err(format!(
+                    "stratify_by column '{}' collides with '{}'",
+                    col, forbidden
+                )));
+            }
+        }
+    }
+
+    // Extract columns as string arrays.
+    let mut col_arrays: Vec<Vec<String>> = Vec::new();
+    let n_obs: usize = adata.getattr("n_obs")?.extract()?;
+    let mut nan_mask = vec![false; n_obs];
+
+    for col_name in stratify_by {
+        let col = obs.get_item(col_name.as_str())?;
+        // Check for NaN: convert to str, NaN becomes "nan"
+        let str_col = col.call_method1("astype", ("str",))?;
+        let labels: Vec<String> = str_col.call_method0("tolist")?.extract()?;
+
+        // Also check pandas isna
+        let isna = pd.call_method1("isna", (&col,))?;
+        let isna_list: Vec<bool> = isna.call_method0("tolist")?.extract()?;
+        for (i, is_na) in isna_list.iter().enumerate() {
+            if *is_na {
+                nan_mask[i] = true;
+            }
+        }
+
+        col_arrays.push(labels);
+    }
+
+    let nan_count = nan_mask.iter().filter(|&&x| x).count();
+    if nan_count > 0 {
+        let msg = format!(
+            "Dropped {} cells with NaN in stratify_by column(s) {:?}",
+            nan_count, stratify_by
+        );
+        warnings.call_method1("warn", (msg,))?;
+    }
+
+    // Build composite keys for each cell (excluding NaN rows).
+    let mut key_to_indices: std::collections::BTreeMap<Vec<String>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for i in 0..n_obs {
+        if nan_mask[i] {
+            continue;
+        }
+        let key: Vec<String> = col_arrays.iter().map(|c| c[i].clone()).collect();
+        key_to_indices.entry(key).or_default().push(i);
+    }
+
+    // Filter by min_cells_per_stratum and build results.
+    let mut strata = Vec::new();
+    let mut masks = Vec::new();
+    let mut skipped = 0usize;
+
+    for (key, indices) in &key_to_indices {
+        if indices.len() < min_cells_per_stratum {
+            skipped += 1;
+            continue;
+        }
+        strata.push(Stratum { key: key.clone() });
+
+        // Build boolean mask.
+        let mask_vec: Vec<bool> = (0..n_obs).map(|i| indices.contains(&i)).collect();
+        let mask = np.call_method1("array", (mask_vec,))?;
+        masks.push(mask);
+    }
+
+    if skipped > 0 {
+        let msg = format!(
+            "Skipped {} strata with fewer than {} cells",
+            skipped, min_cells_per_stratum
+        );
+        warnings.call_method1("warn", (msg,))?;
+    }
+
+    if strata.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "all strata were filtered out (min_cells_per_stratum={}). \
+             No strata had enough cells for DE analysis.",
+            min_cells_per_stratum
+        )));
+    }
+
+    Ok((strata, masks))
+}
 
 /// Run randomized PCA on an AnnData whose X is backed by SCX.
 ///
@@ -421,24 +544,16 @@ fn write_umap_to_adata(
 ///     gene_chunk_size: When set and X is backed by SCX, uses streaming
 ///         gene-chunked DE to avoid full matrix materialization. Specifies
 ///         the number of genes to process per chunk (default: None = full in-memory).
-#[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None))]
-#[allow(clippy::too_many_arguments)]
-pub fn rank_genes_groups(
+/// Run Wilcoxon rank-sum DE on a single adata (no stratification).
+///
+/// Returns the DiffExpResult from scx_accel.
+fn run_rank_genes_groups_inner(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     groupby: &str,
     reference: &str,
-    n_genes: Option<usize>,
-    method: &str,
     gene_chunk_size: Option<usize>,
-) -> PyResult<()> {
-    if method != "wilcoxon" {
-        return Err(PyRuntimeError::new_err(format!(
-            "unsupported method '{method}': only 'wilcoxon' is currently supported"
-        )));
-    }
-
+) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
 
@@ -453,12 +568,10 @@ pub fn rank_genes_groups(
     // Determine unique group names (sorted, matching scanpy's default).
     let cat_attr = group_col.getattr("cat");
     let unique_groups: Vec<String> = if let Ok(cat) = cat_attr {
-        // Categorical column — use category order.
         cat.getattr("categories")?
             .call_method0("tolist")?
             .extract()?
     } else {
-        // Non-categorical — sort unique values.
         let mut unique: Vec<String> = group_labels.to_vec();
         unique.sort();
         unique.dedup();
@@ -499,7 +612,6 @@ pub fn rank_genes_groups(
         gene_chunk_size,
         x.extract::<PyRef<ScxBackedSparseDataset>>(),
     ) {
-        // Streaming gene-chunked DE from backed mode.
         scx_accel::wilcoxon_rank_sum_streaming(
             &backed.backed,
             &gene_names,
@@ -510,15 +622,11 @@ pub fn rank_genes_groups(
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
-        // Dense materialization path (in-memory or non-backed).
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
             .extract::<bool>()?;
 
-        let dense = if is_sparse {
-            x.call_method0("toarray")?
-        } else if x.hasattr("toarray")? {
-            // Backed dataset with toarray method — materialize fully.
+        let dense = if is_sparse || x.hasattr("toarray")? {
             x.call_method0("toarray")?
         } else {
             numpy
@@ -529,13 +637,11 @@ pub fn rank_genes_groups(
         let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
         let (n_obs, n_vars) = shape;
 
-        // Flatten to Vec<f32>.
         let flat = dense
             .call_method1("astype", ("float32",))?
             .call_method0("ravel")?;
         let data: Vec<f32> = flat.extract()?;
 
-        // Run Wilcoxon rank-sum DE.
         scx_accel::wilcoxon_rank_sum(
             &data,
             n_obs,
@@ -548,10 +654,153 @@ pub fn rank_genes_groups(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     };
 
+    Ok((result, unique_groups))
+}
+
+/// Convert a DiffExpResult into a pandas DataFrame.
+///
+/// Each group's genes become rows with columns: gene, scores, pvals, pvals_adj,
+/// logfoldchanges, group.
+fn de_result_to_dataframe<'py>(
+    py: Python<'py>,
+    result: &scx_accel::DiffExpResult,
+    n_genes: Option<usize>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pd = py.import("pandas")?;
+    let mut all_frames: Vec<Bound<'py, PyAny>> = Vec::new();
+
+    for (i, group_name) in result.group_names.iter().enumerate() {
+        let full_n_genes = result.names[i].len();
+        let n = n_genes.unwrap_or(full_n_genes).min(full_n_genes);
+
+        let names_slice = &result.names[i][..n];
+        let scores_slice = &result.scores[i][..n];
+        let pvals_slice = &result.pvals[i][..n];
+        let pvals_adj_slice = &result.pvals_adj[i][..n];
+        let logfc_slice = &result.logfoldchanges[i][..n];
+
+        let dict = PyDict::new(py);
+        dict.set_item("gene", names_slice.to_vec())?;
+        dict.set_item("scores", scores_slice.to_vec())?;
+        dict.set_item("pvals", pvals_slice.to_vec())?;
+        dict.set_item("pvals_adj", pvals_adj_slice.to_vec())?;
+        dict.set_item("logfoldchanges", logfc_slice.to_vec())?;
+        dict.set_item("group", vec![group_name.clone(); n])?;
+
+        let df = pd.call_method1("DataFrame", (dict,))?;
+        all_frames.push(df);
+    }
+
+    if all_frames.is_empty() {
+        // Return empty DataFrame with the right columns.
+        let dict = PyDict::new(py);
+        for col in [
+            "gene",
+            "scores",
+            "pvals",
+            "pvals_adj",
+            "logfoldchanges",
+            "group",
+        ] {
+            dict.set_item(col, pyo3::types::PyList::empty(py))?;
+        }
+        return pd.call_method1("DataFrame", (dict,));
+    }
+
+    let frame_list = pyo3::types::PyList::new(py, &all_frames)?;
+    let combined = pd.call_method(
+        "concat",
+        (frame_list,),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("ignore_index", true)?;
+            kw
+        }),
+    )?;
+    Ok(combined)
+}
+
+#[pyfunction]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50))]
+#[allow(clippy::too_many_arguments)]
+pub fn rank_genes_groups(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    groupby: &str,
+    reference: &str,
+    n_genes: Option<usize>,
+    method: &str,
+    gene_chunk_size: Option<usize>,
+    stratify_by: Option<Vec<String>>,
+    min_cells_per_stratum: usize,
+) -> PyResult<PyObject> {
+    if method != "wilcoxon" {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported method '{method}': only 'wilcoxon' is currently supported"
+        )));
+    }
+
+    // --- Stratified path ---
+    if let Some(ref strat_cols) = stratify_by {
+        let forbidden = vec![groupby];
+        let (strata, masks) =
+            extract_strata(py, adata, strat_cols, min_cells_per_stratum, &forbidden)?;
+
+        let pd = py.import("pandas")?;
+        let warnings = py.import("warnings")?;
+        let mut all_frames: Vec<Bound<'_, PyAny>> = Vec::new();
+
+        for (stratum, mask) in strata.iter().zip(masks.iter()) {
+            // Subset adata by mask.
+            let sub_adata = adata.get_item(mask)?;
+            let sub_adata = sub_adata.call_method0("copy")?;
+
+            // Run DE on the subset.
+            match run_rank_genes_groups_inner(py, &sub_adata, groupby, reference, gene_chunk_size) {
+                Ok((result, _unique)) => {
+                    let df = de_result_to_dataframe(py, &result, n_genes)?;
+                    // Add stratum columns.
+                    for (j, col_name) in strat_cols.iter().enumerate() {
+                        df.set_item(col_name.as_str(), stratum.key[j].as_str())?;
+                    }
+                    all_frames.push(df);
+                }
+                Err(e) => {
+                    let key_str = stratum.key.join(", ");
+                    let msg = format!("DE failed for stratum [{}]: {}", key_str, e);
+                    warnings.call_method1("warn", (msg,))?;
+                }
+            }
+        }
+
+        if all_frames.is_empty() {
+            return Err(PyValueError::new_err(
+                "all strata failed during stratified DE analysis",
+            ));
+        }
+
+        let frame_list = pyo3::types::PyList::new(py, &all_frames)?;
+        let combined = pd.call_method(
+            "concat",
+            (frame_list,),
+            Some(&{
+                let kw = PyDict::new(py);
+                kw.set_item("ignore_index", true)?;
+                kw
+            }),
+        )?;
+
+        return Ok(combined.unbind());
+    }
+
+    // --- Non-stratified path (original behavior) ---
+    let (result, _unique_groups) =
+        run_rank_genes_groups_inner(py, adata, groupby, reference, gene_chunk_size)?;
+
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
     write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;
 
-    Ok(())
+    Ok(py.None())
 }
 
 /// Write DE results to adata.uns["rank_genes_groups"] matching scanpy's format.
@@ -667,7 +916,7 @@ fn write_de_to_adata(
 ///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
 ///     lfcSE, stat, pvalue, padj, target, reference
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10))]
+#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50))]
 #[allow(clippy::too_many_arguments)]
 pub fn pseudobulk_dex(
     py: Python<'_>,
@@ -678,7 +927,76 @@ pub fn pseudobulk_dex(
     design: Option<&str>,
     aggr_method: &str,
     min_cells_per_group: usize,
+    stratify_by: Option<Vec<String>>,
+    min_cells_per_stratum: usize,
 ) -> PyResult<PyObject> {
+    // --- Stratified path ---
+    if let Some(ref strat_cols) = stratify_by {
+        // Forbidden columns: test_col and all groupby columns.
+        let mut forbidden: Vec<&str> = groupby.iter().map(|s| s.as_str()).collect();
+        forbidden.push(test_col);
+        let (strata, masks) =
+            extract_strata(py, adata, strat_cols, min_cells_per_stratum, &forbidden)?;
+
+        let pd = py.import("pandas")?;
+        let warnings = py.import("warnings")?;
+        let mut all_frames: Vec<Bound<'_, PyAny>> = Vec::new();
+
+        for (stratum, mask) in strata.iter().zip(masks.iter()) {
+            // Subset adata by mask.
+            let sub_adata = adata.get_item(mask)?;
+            let sub_adata = sub_adata.call_method0("copy")?;
+
+            // Run pseudobulk_dex on the subset (recursive call without stratify).
+            match pseudobulk_dex(
+                py,
+                &sub_adata,
+                groupby.clone(),
+                test_col,
+                reference,
+                design,
+                aggr_method,
+                min_cells_per_group,
+                None, // no nested stratification
+                50,   // unused since stratify_by=None
+            ) {
+                Ok(result_obj) => {
+                    let result_df = result_obj.bind(py);
+                    // Add stratum columns.
+                    for (j, col_name) in strat_cols.iter().enumerate() {
+                        result_df.set_item(col_name.as_str(), stratum.key[j].as_str())?;
+                    }
+                    all_frames.push(result_df.clone());
+                }
+                Err(e) => {
+                    let key_str = stratum.key.join(", ");
+                    let msg = format!("Pseudobulk DE failed for stratum [{}]: {}", key_str, e);
+                    warnings.call_method1("warn", (msg,))?;
+                }
+            }
+        }
+
+        if all_frames.is_empty() {
+            return Err(PyValueError::new_err(
+                "all strata failed during stratified pseudobulk DE analysis",
+            ));
+        }
+
+        let frame_list = pyo3::types::PyList::new(py, &all_frames)?;
+        let combined = pd.call_method(
+            "concat",
+            (frame_list,),
+            Some(&{
+                let kw = PyDict::new(py);
+                kw.set_item("ignore_index", true)?;
+                kw
+            }),
+        )?;
+
+        return Ok(combined.unbind());
+    }
+
+    // --- Non-stratified path (original behavior) ---
     // Validate test_col is in groupby.
     if !groupby.contains(&test_col.to_string()) {
         return Err(PyRuntimeError::new_err(format!(
