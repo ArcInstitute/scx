@@ -1537,3 +1537,318 @@ pub fn pseudobulk_dex(
 
     Ok(combined.unbind())
 }
+
+/// Run Leiden community detection on a kNN graph.
+///
+/// Reads `adata.obsp["connectivities"]` (from `pyscx.accel.neighbors()` or
+/// `sc.pp.neighbors()`) and partitions the graph using the Leiden algorithm.
+/// Results are written to `adata.obs[key_added]` (cluster labels as strings)
+/// and `adata.uns["leiden"]` (parameters and backend metadata).
+///
+/// When `device="gpu"`, tries cuGraph Leiden (GPU-accelerated, up to 47×
+/// faster than igraph on million-cell datasets). Falls back to CPU leidenalg
+/// via igraph if cuGraph is unavailable.
+///
+/// Args:
+///     adata: AnnData with obsp["connectivities"] (CSR, n_obs × n_obs)
+///     resolution: Resolution parameter controlling cluster granularity (default: 1.0)
+///     key_added: Column name in adata.obs for cluster labels (default: "leiden")
+///     random_state: Random seed for reproducibility (default: 0)
+///     n_iterations: Maximum optimization iterations; -1 for until convergence (default: -1)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Notes:
+///     GPU and CPU Leiden may produce different partitions on the same graph
+///     due to algorithmic differences (cuGraph uses a different refinement
+///     strategy than leidenalg). Both produce valid, high-quality community
+///     structures. Compare results via ARI or NMI when switching backends.
+#[pyfunction]
+#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto"))]
+#[allow(clippy::too_many_arguments)]
+pub fn leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    n_iterations: i64,
+    device: &str,
+) -> PyResult<()> {
+    // Determine effective device
+    let use_gpu = resolve_device(device)?;
+
+    // Extract connectivities CSR from adata.obsp["connectivities"]
+    let obsp = adata.getattr("obsp")?;
+    let conn = obsp.get_item("connectivities").map_err(|_| {
+        PyRuntimeError::new_err(
+            "'connectivities' not found in adata.obsp. Run neighbors first: \
+             pyscx.accel.neighbors(adata) or sc.pp.neighbors(adata)",
+        )
+    })?;
+
+    // GPU path: try cuGraph Leiden
+    if use_gpu {
+        match try_cugraph_leiden(
+            py,
+            adata,
+            &conn,
+            resolution,
+            key_added,
+            random_state,
+            n_iterations,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // cuGraph not available or failed — fall through to CPU
+                let warnings = py.import("warnings")?;
+                warnings.call_method1(
+                    "warn",
+                    (format!(
+                        "GPU Leiden failed ({e}) — falling back to CPU leidenalg. \
+                         Install cuGraph for GPU acceleration: \
+                         conda install -c rapidsai -c conda-forge cugraph"
+                    ),),
+                )?;
+            }
+        }
+    }
+
+    // CPU path: leidenalg via igraph
+    run_cpu_leiden(
+        py,
+        adata,
+        &conn,
+        resolution,
+        key_added,
+        random_state,
+        n_iterations,
+    )
+}
+
+/// Try GPU Leiden via cuGraph Python import.
+///
+/// Converts the connectivities CSR matrix to a cuGraph Graph, runs
+/// `cugraph.leiden()`, and writes results to adata.
+fn try_cugraph_leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    conn: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    max_iter: i64,
+) -> PyResult<()> {
+    // Import cuGraph — if not installed, return error immediately
+    let cugraph = py
+        .import("cugraph")
+        .map_err(|_| PyRuntimeError::new_err("cugraph not available"))?;
+
+    let numpy = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Extract COO from connectivities CSR: cuGraph works with edge lists
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let coo = scipy_sparse
+        .call_method1("triu", (&conn,))?
+        .call_method0("tocoo")?;
+
+    let rows = numpy
+        .call_method1("asarray", (coo.getattr("row")?,))?
+        .call_method1("astype", ("int32",))?;
+    let cols = numpy
+        .call_method1("asarray", (coo.getattr("col")?,))?
+        .call_method1("astype", ("int32",))?;
+    let weights = numpy
+        .call_method1("asarray", (coo.getattr("data")?,))?
+        .call_method1("astype", ("float32",))?;
+
+    // Build edge list DataFrame for cuGraph
+    let edge_dict = PyDict::new(py);
+    edge_dict.set_item("src", &rows)?;
+    edge_dict.set_item("dst", &cols)?;
+    edge_dict.set_item("weight", &weights)?;
+    let edge_df = pd.call_method1("DataFrame", (edge_dict,))?;
+
+    // Try cudf for GPU acceleration, fall back to pandas
+    let cudf_available = py.import("cudf").is_ok();
+    let edge_df = if cudf_available {
+        let cudf = py.import("cudf")?;
+        cudf.call_method1("DataFrame", (&edge_df,))?
+    } else {
+        edge_df
+    };
+
+    // Create cuGraph Graph
+    let graph = cugraph.call_method0("Graph")?;
+    let from_cudf_kwargs = PyDict::new(py);
+    from_cudf_kwargs.set_item("source", "src")?;
+    from_cudf_kwargs.set_item("destination", "dst")?;
+    from_cudf_kwargs.set_item("edge_attr", "weight")?;
+    from_cudf_kwargs.set_item("renumber", true)?;
+    graph.call_method("from_cudf_edgelist", (&edge_df,), Some(&from_cudf_kwargs))?;
+
+    // Run Leiden
+    let leiden_kwargs = PyDict::new(py);
+    leiden_kwargs.set_item("resolution", resolution)?;
+    leiden_kwargs.set_item("random_state", random_state as i32)?;
+    if max_iter > 0 {
+        leiden_kwargs.set_item("max_iter", max_iter)?;
+    }
+
+    let leiden_result = cugraph.call_method("leiden", (&graph,), Some(&leiden_kwargs))?;
+
+    // leiden returns (partition_df, modularity) tuple
+    let parts_df = leiden_result.get_item(0)?;
+    let modularity: f64 = leiden_result.get_item(1)?.extract()?;
+
+    // Sort by vertex ID to align with adata.obs order
+    let parts_sorted = parts_df.call_method1("sort_values", ("vertex",))?;
+    let cluster_col = parts_sorted.get_item("partition")?;
+
+    // Convert to pandas if needed (cudf → pandas)
+    let cluster_labels = if cudf_available {
+        cluster_col
+            .call_method0("to_pandas")?
+            .call_method0("values")?
+    } else {
+        cluster_col.call_method0("values")?
+    };
+
+    // Convert to string labels (matching scanpy convention)
+    let labels_str = cluster_labels.call_method1("astype", ("str",))?;
+
+    // Write to adata.obs[key_added] as a Categorical
+    let obs = adata.getattr("obs")?;
+    let cat_labels = pd.call_method1("Categorical", (&labels_str,))?;
+    obs.set_item(key_added, cat_labels)?;
+
+    // Write metadata to adata.uns["leiden"]
+    let leiden_dict = PyDict::new(py);
+    let params_dict = PyDict::new(py);
+    params_dict.set_item("resolution", resolution)?;
+    params_dict.set_item("random_state", random_state)?;
+    params_dict.set_item("n_iterations", max_iter)?;
+    leiden_dict.set_item("params", params_dict)?;
+    leiden_dict.set_item("backend", "cugraph")?;
+    leiden_dict.set_item("modularity", modularity)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item(key_added, leiden_dict)?;
+
+    Ok(())
+}
+
+/// Run CPU Leiden clustering via leidenalg + igraph.
+///
+/// This mirrors scanpy's `sc.tl.leiden()` implementation: converts the
+/// connectivities CSR matrix to an igraph Graph and runs leidenalg's
+/// `find_partition()` with `RBConfigurationVertexPartition`.
+fn run_cpu_leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    conn: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    n_iterations: i64,
+) -> PyResult<()> {
+    // Import leidenalg + igraph
+    let leidenalg = py.import("leidenalg").map_err(|_| {
+        PyRuntimeError::new_err(
+            "leidenalg is required for CPU Leiden but is not installed.\n\
+             Install with: pip install leidenalg\n\
+             Or: conda install -c conda-forge leidenalg",
+        )
+    })?;
+
+    let igraph = py.import("igraph").map_err(|_| {
+        PyRuntimeError::new_err(
+            "igraph is required for CPU Leiden but is not installed.\n\
+             Install with: pip install igraph\n\
+             Or: conda install -c conda-forge python-igraph",
+        )
+    })?;
+
+    let numpy = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Convert connectivities CSR to COO for igraph edge list
+    let scipy_sparse = py.import("scipy.sparse")?;
+
+    // Upper-triangular to avoid double-counting edges (undirected graph)
+    let upper = scipy_sparse.call_method1("triu", (&conn,))?;
+    let coo = upper.call_method0("tocoo")?;
+
+    let shape: (usize, usize) = conn.getattr("shape")?.extract()?;
+    let n_obs = shape.0;
+
+    let rows = numpy
+        .call_method1("asarray", (coo.getattr("row")?,))?
+        .call_method0("tolist")?;
+    let cols = numpy
+        .call_method1("asarray", (coo.getattr("col")?,))?
+        .call_method0("tolist")?;
+    let weights = numpy
+        .call_method1("asarray", (coo.getattr("data")?,))?
+        .call_method0("tolist")?;
+
+    // Build igraph Graph
+    let graph = igraph.call_method1("Graph", (n_obs,))?;
+
+    // Build edge list as tuples
+    let rows_vec: Vec<i64> = rows.extract()?;
+    let cols_vec: Vec<i64> = cols.extract()?;
+    let edges: Vec<(i64, i64)> = rows_vec.into_iter().zip(cols_vec).collect();
+    let edge_list = pyo3::types::PyList::new(py, &edges)?;
+
+    graph.call_method1("add_edges", (&edge_list,))?;
+
+    // Set edge weights
+    let weights_list: Vec<f64> = weights.extract()?;
+    let py_weights = pyo3::types::PyList::new(py, &weights_list)?;
+    let es = graph.getattr("es")?;
+    es.set_item("weight", py_weights)?;
+
+    // Set random seed for reproducibility
+    // leidenalg uses a seed parameter in find_partition
+    let partition_type = leidenalg.getattr("RBConfigurationVertexPartition")?;
+
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("resolution_parameter", resolution)?;
+    kwargs.set_item("weights", "weight")?;
+    kwargs.set_item("seed", random_state)?;
+    if n_iterations > 0 {
+        kwargs.set_item("n_iterations", n_iterations)?;
+    }
+
+    let partition =
+        leidenalg.call_method("find_partition", (&graph, &partition_type), Some(&kwargs))?;
+
+    // Extract cluster assignments
+    let membership = partition.getattr("membership")?;
+    let membership_arr = numpy.call_method1("array", (&membership,))?;
+    let labels_str = membership_arr.call_method1("astype", ("str",))?;
+
+    // Write to adata.obs[key_added] as a Categorical
+    let obs = adata.getattr("obs")?;
+    let cat_labels = pd.call_method1("Categorical", (&labels_str,))?;
+    obs.set_item(key_added, cat_labels)?;
+
+    // Compute modularity for metadata
+    let modularity: f64 = partition.call_method0("quality")?.extract()?;
+
+    // Write metadata to adata.uns[key_added]
+    let leiden_dict = PyDict::new(py);
+    let params_dict = PyDict::new(py);
+    params_dict.set_item("resolution", resolution)?;
+    params_dict.set_item("random_state", random_state)?;
+    params_dict.set_item("n_iterations", n_iterations)?;
+    leiden_dict.set_item("params", params_dict)?;
+    leiden_dict.set_item("backend", "leidenalg")?;
+    leiden_dict.set_item("modularity", modularity)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item(key_added, leiden_dict)?;
+
+    Ok(())
+}
