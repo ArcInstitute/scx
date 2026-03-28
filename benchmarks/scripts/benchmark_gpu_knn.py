@@ -70,8 +70,14 @@ def load_adata_with_pca(dataset_name: str, n_comps: int = 50):
         print(f"  Running preprocessing + PCA (n_comps={n_comps})...")
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
-        sc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3",
-                                    subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0)
+        n_top = min(2000, adata.n_vars)
+        try:
+            sc.pp.highly_variable_genes(
+                adata, n_top_genes=n_top, flavor="seurat_v3",
+                subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0
+            )
+        except (ImportError, Exception):
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
         sc.pp.pca(adata, n_comps=n_comps)
 
     print(f"  Loaded: {adata.n_obs:,} cells, PCA shape {adata.obsm['X_pca'].shape}")

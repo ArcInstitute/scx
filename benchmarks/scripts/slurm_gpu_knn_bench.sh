@@ -20,6 +20,7 @@ CUVS_LIB_DIR=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib')
 RAPIDS_LIB_DIRS="${VIRTUAL_ENV}/lib/python3.13/site-packages/libcuvs/lib64"
 RAPIDS_LIB_DIRS="${RAPIDS_LIB_DIRS}:${VIRTUAL_ENV}/lib/python3.13/site-packages/libraft/lib64"
 RAPIDS_LIB_DIRS="${RAPIDS_LIB_DIRS}:${VIRTUAL_ENV}/lib/python3.13/site-packages/librmm/lib64"
+RAPIDS_LIB_DIRS="${RAPIDS_LIB_DIRS}:${VIRTUAL_ENV}/lib/python3.13/site-packages/rapids_logger/lib64"
 RAPIDS_LIB_DIRS="${RAPIDS_LIB_DIRS}:${VIRTUAL_ENV}/lib/python3.13/site-packages/nvidia/cublas/lib"
 RAPIDS_LIB_DIRS="${RAPIDS_LIB_DIRS}:${VIRTUAL_ENV}/lib/python3.13/site-packages/nvidia/cusparse/lib"
 RAPIDS_LIB_DIRS="${RAPIDS_LIB_DIRS}:${VIRTUAL_ENV}/lib/python3.13/site-packages/nvidia/cusolver/lib"

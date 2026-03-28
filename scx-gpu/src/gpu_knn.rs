@@ -114,8 +114,11 @@ type CuvsResources = usize; // cuvsResources_t is a pointer-sized handle
 type CuvsCagraIndex = usize; // opaque handle
 
 /// Check a cuVS return code and convert to GpuError.
+/// cuVS C API uses: CUVS_ERROR = 0, CUVS_SUCCESS = 1.
+const CUVS_SUCCESS: CuvsError = 1;
+
 fn check_cuvs(code: CuvsError, context: &str) -> Result<(), GpuError> {
-    if code == 0 {
+    if code == CUVS_SUCCESS {
         Ok(())
     } else {
         Err(GpuError::CuVsError(format!(
@@ -147,6 +150,15 @@ type FnCagraBuild = unsafe extern "C" fn(
     CuvsCagraIndex,
 ) -> CuvsError;
 
+/// cuvsFilter struct for search filtering (cuVS 26.02+).
+/// Pass `CuvsFilter { addr: 0, filter_type: 0 }` for no filtering.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct CuvsFilter {
+    addr: usize,      // uintptr_t — device pointer to filter data (0 = no filter)
+    filter_type: i32, // NO_FILTER=0, BITSET=1, BITMAP=2
+}
+
 type FnCagraSearch = unsafe extern "C" fn(
     CuvsResources,
     *const CagraSearchParams,
@@ -154,38 +166,39 @@ type FnCagraSearch = unsafe extern "C" fn(
     *mut DLManagedTensor, // queries
     *mut DLManagedTensor, // neighbors (output)
     *mut DLManagedTensor, // distances (output)
+    CuvsFilter,           // filter (pass NO_FILTER for unfiltered search)
 ) -> CuvsError;
 
 // ---------------------------------------------------------------------------
 // cuVS CAGRA parameter structs (repr(C) matching cuvs/c_api.h)
 // ---------------------------------------------------------------------------
 
-/// CAGRA build algorithm selection.
+/// CAGRA build algorithm selection (matches enum cuvsCagraGraphBuildAlgo in cuvs 26.02).
 #[repr(i32)]
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 enum CagraBuildAlgo {
-    IvfPq = 0,
-    NnDescent = 1,
+    AutoSelect = 0,
+    IvfPq = 1,
+    NnDescent = 2,
+    IterativeCagraSearch = 3,
 }
 
 /// CAGRA index build parameters.
 ///
-/// Fields match `cuvsCagraIndexParams` in cuvs/c_api.h.
-/// The struct is allocated by cuVS via `cuvsCagraIndexParamsCreate`; we only
-/// need the layout to set fields after creation.
-///
-/// Note: This struct is heap-allocated by cuVS. We receive a pointer and
-/// set the fields we care about. Fields we don't set keep their cuVS defaults.
+/// Layout matches `struct cuvsCagraIndexParams` in cuvs/neighbors/cagra.h (26.02).
+/// The struct is heap-allocated by cuVS via `cuvsCagraIndexParamsCreate` and
+/// initialized with defaults. We only modify specific fields after creation.
 #[repr(C)]
 #[allow(dead_code)]
 struct CagraIndexParams {
+    metric: i32, // cuvsDistanceType (L2InnerProduct=0, ...)
     intermediate_graph_degree: usize,
     graph_degree: usize,
     build_algo: CagraBuildAlgo,
     nn_descent_niter: usize,
-    // Additional fields exist in cuVS but we only set the above.
-    // cuVS allocates the struct with its own defaults for the rest.
+    compression: *mut std::ffi::c_void, // cuvsCagraCompressionParams_t (nullable)
+    graph_build_params: *mut std::ffi::c_void, // optional build params (nullable)
 }
 
 /// CAGRA search parameters.
@@ -285,6 +298,26 @@ fn load_cuvs_library() -> Result<CuvsLibrary, String> {
         let site_pattern = format!("{virtual_env}/lib/python*/site-packages/libcuvs/lib64");
         if let Ok(entries) = glob_first(&site_pattern) {
             search_paths.push(entries);
+        }
+        // libcuvs_c.so has transitive deps on librmm.so and librapids_logger.so
+        // which live in separate pip package directories. Add them to
+        // LD_LIBRARY_PATH so dlopen can resolve them.
+        let dep_dirs = ["librmm/lib64", "rapids_logger/lib64", "libraft/lib64"];
+        let mut extra_ld_paths = Vec::new();
+        for dep in &dep_dirs {
+            let pattern = format!("{virtual_env}/lib/python*/site-packages/{dep}");
+            if let Ok(p) = glob_first(&pattern) {
+                extra_ld_paths.push(p.to_string_lossy().to_string());
+            }
+        }
+        if !extra_ld_paths.is_empty() {
+            let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let new_val = if current.is_empty() {
+                extra_ld_paths.join(":")
+            } else {
+                format!("{}:{}", extra_ld_paths.join(":"), current)
+            };
+            std::env::set_var("LD_LIBRARY_PATH", &new_val);
         }
     }
     if let Ok(conda_prefix) = std::env::var("CONDA_PREFIX") {
@@ -514,6 +547,21 @@ pub fn gpu_knn_cagra(
 
     let cuvs = get_cuvs()?;
 
+    // cuVS internally uses the CUDA Runtime API (cudaSetDevice, cudaStreamCreate).
+    // cudarc uses the Driver API (cuCtxCreate). We must ensure the runtime is
+    // initialized on the correct device before calling cuvsResourcesCreate,
+    // which creates a RAFT handle that expects a valid runtime context.
+    // Calling cudaSetDevice bridges the driver ↔ runtime context gap.
+    unsafe {
+        let ordinal = dev.context().ordinal() as i32;
+        let rc = cudarc::runtime::sys::cudaSetDevice(ordinal);
+        if rc != cudarc::runtime::sys::cudaError_t::cudaSuccess {
+            return Err(GpuError::CudaError(format!(
+                "cudaSetDevice({ordinal}) failed: {rc:?}"
+            )));
+        }
+    }
+
     // Upload data to GPU
     let d_data = dev.htod_copy(data)?;
 
@@ -672,7 +720,11 @@ pub fn gpu_knn_cagra(
             deleter: None,
         };
 
-        // Execute CAGRA search
+        // Execute CAGRA search (no filtering)
+        let no_filter = CuvsFilter {
+            addr: 0,
+            filter_type: 0, // NO_FILTER
+        };
         unsafe {
             check_cuvs(
                 (cuvs.search)(
@@ -682,6 +734,7 @@ pub fn gpu_knn_cagra(
                     &mut queries_tensor,
                     &mut neighbors_tensor,
                     &mut distances_tensor,
+                    no_filter,
                 ),
                 "cuvsCagraSearch",
             )?;
