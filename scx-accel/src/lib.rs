@@ -33,3 +33,5 @@ pub use umap::{compute_umap, UmapResult};
 pub use neighbors::{build_knn_graph_gpu, cuvs_available};
 #[cfg(feature = "gpu")]
 pub use pca::{gpu_available, randomized_pca_gpu};
+#[cfg(feature = "gpu")]
+pub use umap::compute_umap_gpu;
