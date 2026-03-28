@@ -140,6 +140,83 @@ Streaming local → cloud exploded directory. Parallel uploads.
 ### `CloudReader::open_cloud(url) → Result<CloudReader>`
 Direct cloud reads without full download. Supports `.scxd/`, cloud-ready `.scx`, and non-cloud-ready `.scx`.
 
+## scx-gpu — GPU Analysis
+
+GPU-accelerated analysis APIs. Requires CUDA Toolkit ≥ 12.0 at build time.
+
+### cuSPARSE SpMM
+
+#### `spmm_csr(handle, stream, a, b, c, m, k, n, alpha, beta) → Result<(), GpuError>`
+Sparse × dense matrix multiply: C = α·A·B + β·C. A is GPU-resident CSR, B/C are dense column-major f32.
+
+#### `spmm_csr_transpose(handle, stream, a, b, c, m, k, n, alpha, beta) → Result<(), GpuError>`
+Transposed SpMM: C = α·A^T·B + β·C.
+
+### cuSOLVER Dense Operations
+
+#### `gpu_qr_q(handle, stream, a, m, n) → Result<CudaSlice<f32>, GpuError>`
+Economy QR decomposition on GPU: A = Q·R. Returns Q (m × n). Uses `cusolverDnSgeqrf` + `cusolverDnSorgqr`.
+
+### cuRAND
+
+#### `random_gaussian_gpu(stream, rows, cols, seed) → Result<CudaSlice<f32>, GpuError>`
+Generate a random Gaussian matrix directly on GPU via cuRAND XORWOW generator.
+
+### GPU PCA Pipeline
+
+#### `gpu_randomized_pca(dev, reader, n_components, n_oversamples, n_power_iterations, zero_center, seed) → Result<GpuPcaResult, GpuError>`
+Complete GPU-accelerated randomized PCA. Streams SpMM shard-by-shard via cuSPARSE, QR via cuSOLVER, SVD via CPU faer, final projection via GPU GEMM. Returns `GpuPcaResult { embeddings, components, variance_explained, variance_ratio, mean }`.
+
+#### `mean_correct_gpu(dev, y, mc, n_obs, k) → Result<(), GpuError>`
+Mean-centering correction kernel: Y[i,j] -= mc[j] for all rows.
+
+### GPU kNN
+
+#### `gpu_knn_cagra(dev, embeddings, n_obs, n_dims, n_neighbors) → Result<GpuKnnResult, GpuError>`
+Build kNN graph on GPU using NVIDIA CAGRA (cuVS). L2 distance, optimized for PCA embeddings. Returns `GpuKnnResult { indices, distances, n_obs, n_neighbors }`.
+
+#### `cuvs_available() → bool`
+Check if `libcuvs.so` is available at runtime.
+
+### GPU UMAP
+
+#### `gpu_umap_native(dev, knn, n_components, min_dist, spread, n_epochs, seed) → Result<GpuUmapResult, GpuError>`
+GPU UMAP via native CUDA SGD optimization kernel. Edge-parallel with `atomicAdd` for concurrent embedding updates.
+
+### GPU Preprocessing
+
+#### `gpu_normalize_log1p(dev, csr, target_sum) → Result<(), GpuError>`
+Fused per-row normalize_total + log1p on GPU-resident CSR (in-place).
+
+#### `gpu_normalize(dev, csr, target_sum) → Result<(), GpuError>`
+Per-row normalize_total on GPU-resident CSR (in-place).
+
+#### `gpu_log1p(dev, csr) → Result<(), GpuError>`
+Element-wise log1p on GPU-resident CSR (in-place).
+
+#### `gpu_apply_fused_ops(dev, csr, normalize, log1p, target_sum) → Result<(), GpuError>`
+Apply configurable fused preprocessing ops on GPU-resident CSR.
+
+### GpuError Variants
+
+| Variant | Description |
+|---------|-------------|
+| `CudaError(String)` | CUDA runtime/driver error |
+| `KernelLaunchFailed(String)` | Kernel launch failure |
+| `GdsUnavailable(String)` | GDS not available |
+| `DeviceNotFound(usize)` | GPU device not found |
+| `InvalidShard(String)` | Malformed shard data |
+| `ShapeMismatch { expected, got }` | Matrix dimension mismatch |
+| `CodecError(CodecError)` | Codec decode error |
+| `CuSparseError(String)` | cuSPARSE API error |
+| `CuSolverError(String)` | cuSOLVER QR/SVD error |
+| `CuRandError(String)` | cuRAND generation error |
+| `StreamError(String)` | CUDA stream error |
+| `OutOfMemory(String)` | GPU OOM |
+| `ModuleLoadError(String)` | PTX/CUDA module load failure |
+| `CuVsError(String)` | cuVS/CAGRA error |
+| `LibraryNotFound(String)` | Runtime library missing (libcuvs.so) |
+
 ## Python API (`pyscx`)
 
 ### Module-level functions
@@ -199,11 +276,13 @@ Direct cloud reads without full download. Supports `.scxd/`, cloud-ready `.scx`,
 
 All accelerators write results to standard AnnData slots (same as scanpy), so downstream functions work identically.
 
-- `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2)` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`.
-- `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200)` — HNSW-based approximate kNN + UMAP-style connectivities. Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
-- `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0)` — Spectral-init SGD UMAP. Writes `obsm["X_umap"]`.
+- `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. On GPU: cuSPARSE SpMM + cuSOLVER QR (f32).
+- `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — kNN graph + UMAP-style connectivities. CPU: HNSW. GPU: CAGRA (cuVS). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
+- `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — Spectral-init SGD UMAP. GPU: native CUDA kernel or cuML fallback. Writes `obsm["X_umap"]`.
 - `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50)` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set.
 - `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency.
+- `pyscx.accel.gpu_info() → dict` — Query GPU device info: `{'device': ..., 'total_vram_gb': ..., 'free_vram_gb': ...}`. Returns `None` if no GPU available.
+- `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU memory for an operation: `{'required_gb': ..., 'fits_in_vram': ...}`.
 
 ### TrainingDataset
 

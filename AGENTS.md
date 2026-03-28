@@ -59,7 +59,7 @@ scx-codec (standalone)
             ├─> scx-loader (depends on scx-format, scx-codec, scx-sparse)
             ├─> scx-cloud (depends on scx-format, scx-codec, scx-engine)
             ├─> scx-gpu (depends on scx-format, scx-codec, scx-sparse)
-            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE)
+            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE; optional gpu dep on scx-gpu)
             ├─> scx-cli (depends on all above)
             ├─> pyscx (depends on all above)
             └─> rscx (depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
@@ -75,9 +75,10 @@ Key isolation rules:
 ### Feature Flags
 
 - `scx-cli`: `hdf5` (h5ad conversion), `cloud` (cloud operations) — both opt-in
-- `pyscx`: `cloud` (cloud operations) — opt-in
+- `pyscx`: `cloud` (cloud operations), `gpu` (GPU-accelerated analysis) — both opt-in
 - `scx-gpu`: `gds` (GPUDirect Storage) — opt-in, requires nvidia-fs drivers
-- Build with: `cargo build --features hdf5,cloud` or `maturin develop --features cloud`
+- `scx-accel`: `gpu` (GPU dispatch via `scx-gpu`) — opt-in, requires CUDA Toolkit ≥ 12.0
+- Build with: `cargo build --features hdf5,cloud` or `maturin develop --features cloud,gpu`
 
 ### File Format Summary
 
@@ -113,7 +114,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **Phase 3**: Step 1 (SIMD) skipped. Step 2 (scx-gpu) in progress. Step 3 (rscx) complete. Steps 4–5 partially done.
 - **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
 - **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
-- **Phase 4c (GPU Accelerators)**: Planned — cuSPARSE SpMM, CAGRA kNN, cuML UMAP/Leiden.
+- **Phase 4c (GPU Accelerators)**: Implementation complete — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN), native CUDA UMAP SGD, cuGraph Leiden (Python-side), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Benchmarks pending.
 
 ## Coding Conventions
 
@@ -188,4 +189,4 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 ## Out of Scope (Current Phase)
 
 - CSC as primary storage, multimodal (Phase 3, Steps 4–5 — planned)
-- GPU-accelerated analysis via cuSPARSE/cuVS/cuML (Phase 4c — planned)
+- GPU-accelerated analysis benchmarks and validation (Phase 4c — benchmarks pending)
