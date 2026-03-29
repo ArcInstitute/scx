@@ -221,10 +221,10 @@ pub fn gpu_qr_q(
     }
 
     // A now contains Q (m × n, col-major). Return by taking ownership.
-    // We can't move out of &mut, so round-trip through host.
-    // Q is (m × n) which for PCA is n_obs × k — substantial but manageable.
-    let q_host = dev.dtoh_copy(a)?;
-    let q = dev.htod_copy(&q_host)?;
+    // Use std::mem::swap to transfer GPU allocation without any host round-trip.
+    // The caller's `a` is left with a zero-length dummy allocation.
+    let mut q = dev.alloc_zeros::<f32>(0)?;
+    std::mem::swap(a, &mut q);
 
     Ok(q)
 }

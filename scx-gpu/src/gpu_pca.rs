@@ -31,8 +31,11 @@ use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::shard_decode::GpuCsr;
 
-/// PTX source for the mean-correction kernel, compiled at build time.
+/// PTX source for the row-major mean-correction kernel, compiled at build time.
 const MEAN_CORRECT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/spmm_mean_correct.ptx"));
+
+/// PTX source for col-major scatter/gather/mean-correct/column-sum kernels.
+const COLMAJOR_OPS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/colmajor_ops.ptx"));
 
 /// Result of GPU-accelerated randomized PCA.
 pub struct GpuPcaResult {
@@ -356,13 +359,13 @@ fn streaming_gpu_spmm_forward(
             0.0,
         )?;
 
-        // Apply mean correction: Y_shard[r, j] -= mc[j]
+        // Apply mean correction on GPU: Y_shard[r, j] -= mc[j]
         if let Some(ref mc) = d_mc {
-            mean_correct_colmajor(dev, &mut d_y_shard, mc, shard_rows, k)?;
+            gpu_mean_correct_colmajor(dev, &mut d_y_shard, mc, shard_rows, k)?;
         }
 
-        // Scatter shard result into global Y (col-major)
-        scatter_shard_colmajor(dev, &d_y_shard, &mut d_y, shard_rows, k, global_row, n_obs)?;
+        // Scatter shard result into global Y on GPU (col-major)
+        gpu_scatter_colmajor(dev, &d_y_shard, &mut d_y, shard_rows, k, global_row, n_obs)?;
 
         global_row += shard_rows;
     }
@@ -402,10 +405,10 @@ fn streaming_gpu_spmm_transpose(
         let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
         let a_desc = gpu_csr.to_cusparse_csr(dev.stream())?;
 
-        // Extract Q_shard: Q[global_row..global_row+shard_rows, :]
+        // Extract Q_shard on GPU: Q[global_row..global_row+shard_rows, :]
         // col-major Q: Q[i, j] = d_q[j * n_obs + i]
         // Q_shard needs to be a contiguous (shard_rows × k) col-major matrix.
-        let d_q_shard = gather_shard_colmajor(dev, d_q, shard_rows, k, global_row, n_obs)?;
+        let d_q_shard = gpu_gather_colmajor(dev, d_q, shard_rows, k, global_row, n_obs)?;
 
         // Z += A^T @ Q_shard
         // A: (shard_rows × n_vars), A^T: (n_vars × shard_rows)
@@ -428,27 +431,14 @@ fn streaming_gpu_spmm_transpose(
         global_row += shard_rows;
     }
 
-    // Mean centering correction: Z -= μ @ (1^T @ Q)
-    // (1^T @ Q) = sum of Q rows = (1 × k)
+    // Mean centering correction on GPU: Z -= μ @ (1^T @ Q)
+    // (1^T @ Q) = column sums of Q = (1 × k)
     if let Some(d_mu) = d_means {
-        // Download Q to compute column sums (small relative to matrix)
-        let q_host = dev.dtoh_copy(d_q)?;
-        let mut sum_q = vec![0.0f32; k];
-        for j in 0..k {
-            for i in 0..n_obs {
-                sum_q[j] += q_host[j * n_obs + i];
-            }
-        }
+        // Compute column sums of Q entirely on GPU
+        let d_sum_q = gpu_column_sums(dev, d_q, n_obs, k)?;
 
-        // Z[v, j] -= means[v] * sum_q[j]
-        let mu_host = dev.dtoh_copy(d_mu)?;
-        let mut z_host = dev.dtoh_copy(&d_z)?;
-        for j in 0..k {
-            for v in 0..n_vars {
-                z_host[j * n_vars + v] -= mu_host[v] * sum_q[j];
-            }
-        }
-        d_z = dev.htod_copy(&z_host)?;
+        // Z[v, j] -= means[v] * sum_q[j] — outer product subtraction on GPU
+        gpu_outer_sub(dev, &mut d_z, d_mu, &d_sum_q, n_vars, k)?;
     }
 
     Ok(d_z)
@@ -472,41 +462,11 @@ fn upload_csr_to_gpu(dev: &GpuDevice, csr: &scx_sparse::ScxCsr) -> Result<GpuCsr
     })
 }
 
-/// Mean-correct a col-major matrix: Y[r, j] -= mc[j].
+/// Scatter a shard's col-major result into the global matrix — GPU kernel.
 ///
-/// Uses the same kernel as the existing mean_correct_gpu but adapted for
-/// col-major layout. We reuse the kernel by treating the matrix as row-major
-/// transposed: the kernel subtracts mc[col] from Y[row * k + col]. For col-major
-/// Y[r, j] = flat[j * m + r], we need a different indexing.
-///
-/// For simplicity, do this on CPU for now (shard-sized, fast).
-fn mean_correct_colmajor(
-    dev: &GpuDevice,
-    y: &mut CudaSlice<f32>,
-    mc: &CudaSlice<f32>,
-    m: usize, // rows
-    k: usize, // cols
-) -> Result<(), GpuError> {
-    let mut y_host = dev.dtoh_copy(y)?;
-    let mc_host = dev.dtoh_copy(mc)?;
-
-    // col-major: Y[r, j] = y_host[j * m + r]
-    for j in 0..k {
-        for r in 0..m {
-            y_host[j * m + r] -= mc_host[j];
-        }
-    }
-
-    *y = dev.htod_copy(&y_host)?;
-    Ok(())
-}
-
-/// Scatter a shard's col-major output into the global Y matrix.
-///
-/// Y_shard is (shard_rows × k) col-major.
-/// Y_global is (n_obs × k) col-major.
-/// Y_global[global_row + r, j] = Y_shard[r, j]
-fn scatter_shard_colmajor(
+/// Replaces the CPU round-trip version that downloaded the entire n_obs×k
+/// matrix to host per shard (240 MB for 1M cells × 60 PCs).
+fn gpu_scatter_colmajor(
     dev: &GpuDevice,
     src: &CudaSlice<f32>,     // (shard_rows × k) col-major
     dst: &mut CudaSlice<f32>, // (n_obs × k) col-major
@@ -515,28 +475,49 @@ fn scatter_shard_colmajor(
     global_row: usize,
     n_obs: usize,
 ) -> Result<(), GpuError> {
-    // For each column j, copy shard_rows contiguous elements from
-    // src[j * shard_rows .. (j+1) * shard_rows] to
-    // dst[j * n_obs + global_row .. j * n_obs + global_row + shard_rows]
-    let src_host = dev.dtoh_copy(src)?;
-    let mut dst_host = dev.dtoh_copy(dst)?;
-
-    for j in 0..k {
-        let src_start = j * shard_rows;
-        let dst_start = j * n_obs + global_row;
-        dst_host[dst_start..dst_start + shard_rows]
-            .copy_from_slice(&src_host[src_start..src_start + shard_rows]);
+    let total = shard_rows * k;
+    if total == 0 {
+        return Ok(());
     }
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("scatter_colmajor_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("scatter_colmajor: {e}")))?;
 
-    *dst = dev.htod_copy(&dst_host)?;
+    let shard_rows_i32 = shard_rows as i32;
+    let n_obs_i32 = n_obs as i32;
+    let k_i32 = k as i32;
+    let global_row_i32 = global_row as i32;
+
+    let threads: u32 = 256;
+    let blocks = (total as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(src)
+            .arg(dst)
+            .arg(&shard_rows_i32)
+            .arg(&n_obs_i32)
+            .arg(&k_i32)
+            .arg(&global_row_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("scatter_colmajor: {e}")))?;
+
     Ok(())
 }
 
-/// Gather a shard's rows from the global Q matrix (col-major).
+/// Gather shard rows from global col-major matrix — GPU kernel.
 ///
-/// Q_global is (n_obs × k) col-major.
-/// Returns Q_shard as (shard_rows × k) col-major.
-fn gather_shard_colmajor(
+/// Replaces the CPU round-trip version that downloaded the entire n_obs×k
+/// matrix to host per shard.
+fn gpu_gather_colmajor(
     dev: &GpuDevice,
     src: &CudaSlice<f32>, // (n_obs × k) col-major
     shard_rows: usize,
@@ -544,17 +525,177 @@ fn gather_shard_colmajor(
     global_row: usize,
     n_obs: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
-    let src_host = dev.dtoh_copy(src)?;
-    let mut shard_host = vec![0.0f32; shard_rows * k];
+    let total = shard_rows * k;
+    if total == 0 {
+        return dev.alloc_zeros::<f32>(0);
+    }
+    let mut dst = dev.alloc_zeros::<f32>(total)?;
 
-    for j in 0..k {
-        let src_start = j * n_obs + global_row;
-        let dst_start = j * shard_rows;
-        shard_host[dst_start..dst_start + shard_rows]
-            .copy_from_slice(&src_host[src_start..src_start + shard_rows]);
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("gather_colmajor_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("gather_colmajor: {e}")))?;
+
+    let shard_rows_i32 = shard_rows as i32;
+    let n_obs_i32 = n_obs as i32;
+    let k_i32 = k as i32;
+    let global_row_i32 = global_row as i32;
+
+    let threads: u32 = 256;
+    let blocks = (total as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(src)
+            .arg(&mut dst)
+            .arg(&shard_rows_i32)
+            .arg(&n_obs_i32)
+            .arg(&k_i32)
+            .arg(&global_row_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("gather_colmajor: {e}")))?;
+
+    Ok(dst)
+}
+
+/// Mean-correct a col-major matrix on GPU: Y[r, j] -= mc[j].
+///
+/// Replaces the CPU round-trip version that downloaded shard-sized data.
+fn gpu_mean_correct_colmajor(
+    dev: &GpuDevice,
+    y: &mut CudaSlice<f32>,
+    mc: &CudaSlice<f32>,
+    m: usize, // rows
+    k: usize, // cols
+) -> Result<(), GpuError> {
+    let total = m * k;
+    if total == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("mean_correct_colmajor_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_colmajor: {e}")))?;
+
+    let m_i32 = m as i32;
+    let k_i32 = k as i32;
+
+    let threads: u32 = 256;
+    let blocks = (total as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(y)
+            .arg(mc)
+            .arg(&m_i32)
+            .arg(&k_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_colmajor: {e}")))?;
+
+    Ok(())
+}
+
+/// Compute column sums of a col-major matrix on GPU.
+///
+/// Returns a vector of k column sums.
+fn gpu_column_sums(
+    dev: &GpuDevice,
+    x: &CudaSlice<f32>, // (m × k) col-major
+    m: usize,
+    k: usize,
+) -> Result<CudaSlice<f32>, GpuError> {
+    let mut out = dev.alloc_zeros::<f32>(k)?;
+    if m == 0 || k == 0 {
+        return Ok(out);
     }
 
-    dev.htod_copy(&shard_host)
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("column_sum_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum: {e}")))?;
+
+    let m_i32 = m as i32;
+    let k_i32 = k as i32;
+
+    // Launch: grid = (ceil(m/256), k), block = (256, 1)
+    let threads: u32 = 256;
+    let blocks_x = (m as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_x, k as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(x)
+            .arg(&mut out)
+            .arg(&m_i32)
+            .arg(&k_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum: {e}")))?;
+
+    Ok(out)
+}
+
+/// Outer product subtraction on GPU: Z[v, j] -= mu[v] * sum_q[j].
+fn gpu_outer_sub(
+    dev: &GpuDevice,
+    z: &mut CudaSlice<f32>, // (n_vars × k) col-major
+    mu: &CudaSlice<f32>,    // [n_vars]
+    sum_q: &CudaSlice<f32>, // [k]
+    n_vars: usize,
+    k: usize,
+) -> Result<(), GpuError> {
+    let total = n_vars * k;
+    if total == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("outer_sub_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("outer_sub: {e}")))?;
+
+    let n_vars_i32 = n_vars as i32;
+    let k_i32 = k as i32;
+
+    let threads: u32 = 256;
+    let blocks = (total as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(z)
+            .arg(mu)
+            .arg(sum_q)
+            .arg(&n_vars_i32)
+            .arg(&k_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("outer_sub: {e}")))?;
+
+    Ok(())
 }
 
 /// Compute column means and column sum-of-squares in one pass over all shards.
