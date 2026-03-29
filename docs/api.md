@@ -281,8 +281,50 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
 - `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — Spectral-init SGD UMAP. GPU: native CUDA kernel or cuML fallback. Writes `obsm["X_umap"]`.
 - `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50)` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set.
 - `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency.
+- `pyscx.accel.normalize_total(adata, target_sum=10000.0)` — Materialization-free row normalization. On `ScxBackedSparseDataset`: computes row sums via streaming, creates `ScxLazyTransformedDataset` wrapper. On `ScxLazyTransformedDataset`: appends `NormalizeTotal` transform to chain. On scipy CSR: delegates to `sc.pp.normalize_total()`.
+- `pyscx.accel.log1p(adata)` — Materialization-free log1p. On `ScxBackedSparseDataset`: creates `ScxLazyTransformedDataset` with `Log1p` transform. On `ScxLazyTransformedDataset`: appends `Log1p` to chain (fuses with preceding `NormalizeTotal` when possible). On scipy CSR: delegates to `sc.pp.log1p()`.
 - `pyscx.accel.gpu_info() → dict` — Query GPU device info: `{'device': ..., 'total_vram_gb': ..., 'free_vram_gb': ...}`. Returns `None` if no GPU available.
 - `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU memory for an operation: `{'required_gb': ..., 'fits_in_vram': ...}`.
+
+### ScxLazyTransformedDataset
+
+PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Created by `pyscx.accel.normalize_total()` and `pyscx.accel.log1p()`. Implements the same interface as `ScxBackedSparseDataset` and is registered with `anndata.abc.CSRDataset`.
+
+**Properties:**
+- `shape` `→ (int, int)` — `(n_obs, n_vars)`
+- `dtype` `→ numpy.dtype` — Always `float32`
+- `format` `→ str` — Always `"csr"`
+- `ndim` `→ int` — Always `2`
+- `backend` `→ str` — Always `"scx"`
+- `non_negative` `→ bool` — Whether the transformed data is non-negative
+
+**Slicing:**
+- `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, apply all transforms in order, return scipy CSR. Peak memory = 1 shard.
+- `__getitem__(row_slice, col_slice)` — Row decode + transform + column projection.
+
+**Aggregation (streaming through transforms):**
+- `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums of transformed data.
+- `mean(axis=0|1)` `→ numpy.ndarray` — Column or row means of transformed data.
+- `var(axis=0|1)` `→ numpy.ndarray` — Column or row variance (two-pass streaming).
+- `getnnz(axis=0|1)` `→ numpy.ndarray` — Non-zero counts (unchanged by normalize/log1p).
+- `max(axis=0|1)` `→ numpy.ndarray` — Column or row max of transformed data.
+- `min(axis=0|1)` `→ numpy.ndarray` — Column or row min of transformed data.
+
+**Materialization:**
+- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards + apply transforms → full CSR.
+- `copy()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()`.
+- `toarray()` `→ numpy.ndarray` — Dense array (via `to_memory().toarray()`).
+
+**Comparison operators:**
+- `__gt__`, `__ge__`, `__lt__`, `__le__`, `__eq__`, `__ne__` — Return `ScxComparisonResult` for lazy boolean operations.
+
+**Arithmetic (experimental):**
+- `__truediv__(other)` — If `other` is a per-row vector, appends `RowScale` transform (lazy). Otherwise materializes.
+- `__mul__(other)` — If `other` is a per-row vector, appends `RowScale` transform (lazy). Otherwise materializes.
+
+**Transform chain:**
+- Backed data → `NormalizeTotal` → `Log1p` is fused into `ln(x × target_sum / row_sum + 1)` in a single pass.
+- `repr()` shows the transform chain: `ScxLazyTransformedDataset(shape=(1000000, 33694), transforms=[NormalizeTotal, Log1p])`
 
 ### TrainingDataset
 

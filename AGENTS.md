@@ -4,7 +4,7 @@
 
 SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
 
-**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c complete (GPU accelerators — benchmarked, 3/4 Go/No-Go gates pass). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), and [Phase4-GPU.md](Phase4-GPU.md).
+**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c complete (GPU accelerators — benchmarked, 3/4 Go/No-Go gates pass). Phase 4d implementation complete (lazy preprocessing — materialization-free normalize_total/log1p, column-projected streaming aggregation). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md), and [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md).
 
 ## Key Documents
 
@@ -14,6 +14,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[Phase4.md](Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
 - **[Phase4-GPU.md](Phase4-GPU.md)** — Phase 4c GPU accelerator spec and benchmark results (cuSPARSE, cuVS/CAGRA, CUDA UMAP).
 - **[Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md)** — Code review of Phase 4b accelerator implementations.
+- **[Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)** — Phase 4d spec: materialization-free lazy preprocessing (ScxLazyTransformedDataset, column-projected streaming aggregation).
 - **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
@@ -116,6 +117,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
 - **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
 - **Phase 4c (GPU Accelerators)**: Implementation complete, benchmarked — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN, 9.4× standalone on 1M cells), native CUDA UMAP SGD (7.7× on 1M cells), cuGraph Leiden (16× on 1M cells), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Go/No-Go: 3/4 pass (PCA correctness, kNN recall, graceful fallback); 10× pipeline target not met (3.8× median, 8.8× best run). Requires `scx-gpu` conda env for RAPIDS compatibility. See `benchmarks/results/gpu_gonogo.json`.
+- **Phase 4d (Lazy Preprocessing)**: Implementation complete — `ScxLazyTransformedDataset` wraps backed reader with chained transforms (NormalizeTotal, Log1p, RowScale). `pyscx.accel.normalize_total()` and `pyscx.accel.log1p()` create/extend lazy wrappers. Column-projected streaming aggregation enables QC on gene subsets without materialization. Fused NormalizeTotal+Log1p optimization. Full out-of-core pipeline: open → QC → normalize → log1p → PCA → kNN → UMAP → Leiden with <500 MB peak RSS on 1M cells. See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md).
 
 ## Coding Conventions
 
