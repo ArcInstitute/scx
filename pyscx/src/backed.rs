@@ -604,19 +604,27 @@ impl ScxBackedSparseDataset {
                 let filtered = self.filter_row_results(&all_nnz);
                 Ok(numpy::PyArray::from_vec(py, filtered).into_any())
             }
-            None => {
-                if let Some(ref cols) = self.col_projection {
+            None => match (&self.col_projection, &self.kept_to_global) {
+                (Some(cols), Some(kept)) => {
+                    let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let total: i64 = nnz.iter().sum();
+                    Ok((total as usize).into_pyobject(py)?.into_any())
+                }
+                (Some(cols), None) => {
                     let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     let total: i64 = nnz.iter().sum();
-                    return Ok((total as usize).into_pyobject(py)?.into_any());
+                    Ok((total as usize).into_pyobject(py)?.into_any())
                 }
-                let total = self
-                    .backed
-                    .total_nnz()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(total.into_pyobject(py)?.into_any())
-            }
+                _ => {
+                    let total = self
+                        .backed
+                        .total_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    Ok(total.into_pyobject(py)?.into_any())
+                }
+            },
             Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
     }

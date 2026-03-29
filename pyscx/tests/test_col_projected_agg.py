@@ -369,6 +369,29 @@ def test_col_min_masked_projected(tmp_dir):
     np.testing.assert_array_equal(projected_min, expected_min)
 
 
+def test_total_nnz_masked_projected(tmp_dir):
+    """Total NNZ (no axis) with deletion + projection matches filtered materialized."""
+    import pyscx
+
+    path, delete_mask, orig_adata = _make_deleted_projected_file(
+        tmp_dir, "del_proj_total_nnz.scx"
+    )
+    col_subset = [0, 3, 7, 15, 20, 25]
+
+    adata_backed = pyscx.open(path).to_anndata(backed=True)
+    adata_full = pyscx.open(path).to_anndata()
+
+    backed_x = adata_backed.X
+    backed_x.set_col_projection([int(c) for c in col_subset])
+
+    projected_total_nnz = backed_x.getnnz()
+
+    full_x = sp.csr_matrix(adata_full.X)[:, col_subset]
+    expected_total_nnz = full_x.getnnz()
+
+    assert projected_total_nnz == expected_total_nnz
+
+
 # ---------------------------------------------------------------------------
 # QC metrics integration test
 # ---------------------------------------------------------------------------
