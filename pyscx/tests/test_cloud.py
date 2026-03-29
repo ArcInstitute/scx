@@ -10,6 +10,11 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
+# Skip all tests if pyscx was built without cloud features
+_pyscx = pytest.importorskip("pyscx")
+if not hasattr(_pyscx, "explode"):
+    pytest.skip("pyscx built without cloud features", allow_module_level=True)
+
 
 def _create_test_scx(path: str, n_obs: int = 100, n_vars: int = 50):
     """Create a test .scx file using pyscx.from_anndata."""
