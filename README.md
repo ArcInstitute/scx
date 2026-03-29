@@ -257,13 +257,78 @@ cd pyscx && ../.venv/bin/maturin develop --release
 
 # With cloud support (S3/GCS/Azure):
 cd pyscx && ../.venv/bin/maturin develop --release --features cloud
-
-# With GPU acceleration (requires CUDA Toolkit ≥ 12.0):
-cd pyscx && ../.venv/bin/maturin develop --release --features gpu
-
-# With both cloud and GPU:
-cd pyscx && ../.venv/bin/maturin develop --release --features cloud,gpu
 ```
+
+#### GPU acceleration
+
+GPU support requires the CUDA Toolkit (≥ 12.0) and, for kNN/Leiden, the
+RAPIDS libraries (cuVS, cuGraph). There are three ways to set this up —
+conda is recommended as it handles the full CUDA + RAPIDS dependency tree.
+
+**Option A: conda (recommended)** — resolves CUDA version matching automatically:
+
+```bash
+# Create a dedicated GPU environment
+conda create -n scx-gpu python=3.13
+conda activate scx-gpu
+
+# Install RAPIDS (cuVS for kNN, cuGraph for Leiden) — pin cuda-version to match your driver
+# Run `nvidia-smi` to check your driver's max CUDA version
+conda install -c rapidsai -c conda-forge cuvs cugraph cuda-version=12.2
+
+# Install Python deps + build pyscx with GPU support
+pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
+cd pyscx && maturin develop --release --features gpu
+```
+
+**Option B: system CUDA Toolkit** — if you only need PCA/UMAP (no cuVS kNN or cuGraph Leiden):
+
+```bash
+# 1. Install CUDA Toolkit ≥ 12.0
+#    Ubuntu/Debian:
+#      wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+#      sudo dpkg -i cuda-keyring_1.1-1_all.deb
+#      sudo apt update && sudo apt install cuda-toolkit-12-2
+#    Or see: https://developer.nvidia.com/cuda-downloads
+
+# 2. Ensure nvcc is on PATH
+export PATH=/usr/local/cuda/bin:$PATH
+nvcc --version  # should print CUDA 12.x
+
+# 3. Build pyscx with GPU support
+uv venv .venv
+uv pip install maturin numpy scipy pyarrow anndata
+cd pyscx && ../.venv/bin/maturin develop --release --features gpu
+```
+
+This gives you GPU-accelerated PCA (cuSPARSE SpMM) and UMAP (native CUDA SGD).
+kNN and Leiden will fall back to CPU since cuVS/cuGraph are not installed.
+
+**Option C: container** — for reproducible environments or CI:
+
+```bash
+# Use the NVIDIA RAPIDS base image (includes CUDA + cuVS + cuGraph)
+docker run --gpus all -it rapidsai/base:24.12-cuda12.2-py3.12
+
+# Inside the container:
+pip install maturin numpy scipy pyarrow anndata scanpy leidenalg
+cd pyscx && maturin develop --release --features gpu
+```
+
+**Verifying the installation:**
+
+```python
+import pyscx
+
+# Check GPU availability
+print(pyscx.accel.gpu_available())  # True if CUDA device found
+
+# Run with explicit GPU — warns and falls back to CPU if unavailable
+pyscx.accel.pca(adata, n_comps=50, device="gpu")
+```
+
+See [`docs/gpu-setup.md`](docs/gpu-setup.md) for troubleshooting, SLURM
+configuration, and driver compatibility details.
 
 ### Rust CLI
 

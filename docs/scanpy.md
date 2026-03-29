@@ -791,7 +791,9 @@ sc.pl.umap(adata_sub, color="leiden")
 ### GPU-accelerated analysis pipeline
 
 When a CUDA GPU is available, use `device="gpu"` for GPU-accelerated
-analysis (up to 16× per-op, 3.8× end-to-end on 1M cells):
+analysis (up to 16× per-op, 3.8× end-to-end on 1M cells). See
+[`docs/gpu-setup.md`](gpu-setup.md) for installation instructions (conda,
+system CUDA, or container).
 
 ```python
 import pyscx
