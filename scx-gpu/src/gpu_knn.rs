@@ -299,25 +299,30 @@ fn load_cuvs_library() -> Result<CuvsLibrary, String> {
         if let Ok(entries) = glob_first(&site_pattern) {
             search_paths.push(entries);
         }
-        // libcuvs_c.so has transitive deps on librmm.so and librapids_logger.so
-        // which live in separate pip package directories. Add them to
-        // LD_LIBRARY_PATH so dlopen can resolve them.
+        // libcuvs_c.so has transitive deps on librmm.so, librapids_logger.so,
+        // and libraft.so which live in separate pip package directories.
+        // Pre-load them so they are in the process link map when dlopen
+        // resolves DT_NEEDED entries for libcuvs_c.so.
+        //
+        // NOTE: We intentionally leak the Library handles (via std::mem::forget)
+        // so the shared objects stay loaded for the lifetime of the process.
+        // Setting LD_LIBRARY_PATH at runtime does NOT work — the dynamic linker
+        // caches it at process startup (see ld.so(8)).
         let dep_dirs = ["librmm/lib64", "rapids_logger/lib64", "libraft/lib64"];
-        let mut extra_ld_paths = Vec::new();
-        for dep in &dep_dirs {
-            let pattern = format!("{virtual_env}/lib/python*/site-packages/{dep}");
-            if let Ok(p) = glob_first(&pattern) {
-                extra_ld_paths.push(p.to_string_lossy().to_string());
+        let dep_lib_names = ["librmm.so", "librapids_logger.so", "libraft.so"];
+        for dep_dir in &dep_dirs {
+            let pattern = format!("{virtual_env}/lib/python*/site-packages/{dep_dir}");
+            if let Ok(dep_path) = glob_first(&pattern) {
+                for dep_name in &dep_lib_names {
+                    let full = dep_path.join(dep_name);
+                    if full.exists() {
+                        if let Ok(lib) = unsafe { libloading::Library::new(&full) } {
+                            // Leak the handle so the library stays loaded.
+                            std::mem::forget(lib);
+                        }
+                    }
+                }
             }
-        }
-        if !extra_ld_paths.is_empty() {
-            let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            let new_val = if current.is_empty() {
-                extra_ld_paths.join(":")
-            } else {
-                format!("{}:{}", extra_ld_paths.join(":"), current)
-            };
-            std::env::set_var("LD_LIBRARY_PATH", &new_val);
         }
     }
     if let Ok(conda_prefix) = std::env::var("CONDA_PREFIX") {
