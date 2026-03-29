@@ -1706,12 +1706,11 @@ fn try_cugraph_leiden(
     let cluster_col = parts_sorted.get_item("partition")?;
 
     // Convert to pandas if needed (cudf → pandas)
+    // Note: .values is a property (not a method) on both pandas and cudf Series
     let cluster_labels = if cudf_available {
-        cluster_col
-            .call_method0("to_pandas")?
-            .call_method0("values")?
+        cluster_col.call_method0("to_pandas")?.getattr("values")?
     } else {
-        cluster_col.call_method0("values")?
+        cluster_col.getattr("values")?
     };
 
     // Convert to string labels (matching scanpy convention)

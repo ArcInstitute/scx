@@ -454,8 +454,9 @@ pyscx.accel.pca(adata, n_comps=50)
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
 **Key advantage:** In backed mode, PCA streams SpMM shard-by-shard. On GPU,
-the pipeline uses cuSPARSE SpMM + cuSOLVER QR for 10–50× speedup over CPU
-at atlas scale (>1M cells). Peak memory is one shard plus working matrices.
+the pipeline uses cuSPARSE SpMM + cuSOLVER QR. Benchmarked at ~1× on 1M cells
+(GPU overhead offsets SpMM gains at this scale; larger datasets benefit more).
+Peak memory is one shard plus working matrices.
 
 ### kNN graph (`pyscx.accel.neighbors`)
 
@@ -481,7 +482,7 @@ pyscx.accel.neighbors(adata, n_neighbors=15)
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
 On CPU, uses HNSW (instant-distance) with Euclidean distance.
-On GPU, uses NVIDIA CAGRA (cuVS) for 20–50× faster index build and search.
+On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
 
 ### UMAP (`pyscx.accel.umap`)
 
@@ -789,8 +790,8 @@ sc.pl.umap(adata_sub, color="leiden")
 
 ### GPU-accelerated analysis pipeline
 
-When a CUDA GPU is available, use `device="gpu"` for 10–50× faster
-analysis at atlas scale:
+When a CUDA GPU is available, use `device="gpu"` for GPU-accelerated
+analysis (up to 16× per-op, 3.8× end-to-end on 1M cells):
 
 ```python
 import pyscx

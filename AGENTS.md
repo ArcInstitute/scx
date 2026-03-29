@@ -4,7 +4,7 @@
 
 SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
 
-**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c planned (GPU accelerators). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), and [Phase4-GPU.md](Phase4-GPU.md).
+**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c complete (GPU accelerators — benchmarked, 3/4 Go/No-Go gates pass). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), and [Phase4-GPU.md](Phase4-GPU.md).
 
 ## Key Documents
 
@@ -12,7 +12,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[ROADMAP.md](ROADMAP.md)** — Phased implementation plan (Phases 1–4).
 - **[Phase3.md](Phase3.md)** — Phase 3 plan (GPU, R bindings, CLI extensions — partially done).
 - **[Phase4.md](Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
-- **[Phase4-GPU.md](Phase4-GPU.md)** — Phase 4c GPU accelerator spec (cuSPARSE, cuVS/CAGRA, cuML — planned).
+- **[Phase4-GPU.md](Phase4-GPU.md)** — Phase 4c GPU accelerator spec and benchmark results (cuSPARSE, cuVS/CAGRA, CUDA UMAP).
 - **[Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md)** — Code review of Phase 4b accelerator implementations.
 - **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
@@ -114,7 +114,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **Phase 3**: Step 1 (SIMD) skipped. Step 2 (scx-gpu) in progress. Step 3 (rscx) complete. Steps 4–5 partially done.
 - **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
 - **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
-- **Phase 4c (GPU Accelerators)**: Implementation complete — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN), native CUDA UMAP SGD, cuGraph Leiden (Python-side), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Benchmarks pending.
+- **Phase 4c (GPU Accelerators)**: Implementation complete, benchmarked — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN, 9.4× standalone on 1M cells), native CUDA UMAP SGD (7.7× on 1M cells), cuGraph Leiden (16× on 1M cells), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Go/No-Go: 3/4 pass (PCA correctness, kNN recall, graceful fallback); 10× pipeline target not met (3.8× median, 8.8× best run). Requires `scx-gpu` conda env for RAPIDS compatibility. See `benchmarks/results/gpu_gonogo.json`.
 
 ## Coding Conventions
 
@@ -189,4 +189,4 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 ## Out of Scope (Current Phase)
 
 - CSC as primary storage, multimodal (Phase 3, Steps 4–5 — planned)
-- GPU-accelerated analysis benchmarks and validation (Phase 4c — benchmarks pending)
+- GPU-accelerated analysis: 10× pipeline target not met (3.8× achieved on 1M cells; kNN 9.4×, UMAP 7.6×, Leiden 16×)

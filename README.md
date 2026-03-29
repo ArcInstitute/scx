@@ -167,7 +167,7 @@ import pyscx
 
 adata = pyscx.open("atlas.scx").to_anndata(backed=True)
 
-# GPU-accelerated pipeline — 10-50× faster than CPU at atlas scale
+# GPU-accelerated pipeline — up to 16× faster per-op, 3.8× end-to-end on 1M cells
 pyscx.accel.pca(adata, n_comps=50, device="gpu")
 pyscx.accel.neighbors(adata, n_neighbors=15, device="gpu")
 pyscx.accel.umap(adata, device="gpu")
@@ -430,22 +430,24 @@ H100 80GB HBM3:
 
 #### GPU Analysis Pipeline (Phase 4c)
 
-GPU-accelerated analysis accelerators via cuSPARSE, cuSOLVER, cuVS CAGRA,
-and native CUDA kernels:
+GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuVS CAGRA,
+native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB
+with 1M cells (CELLxGENE Census):
 
-| Operation | Dataset | CPU | GPU | Speedup target |
-|-----------|---------|-----|-----|----------------|
-| PCA (50 PCs) | 5M cells × 2K HVGs | 30–60 s | 1–3 s | **10–50×** |
-| kNN (k=15) | 5M cells × 50 PCs | 60–120 s | 2–5 s | **20–50×** |
-| UMAP (2D) | 5M cells | 60–120 s | 3–10 s | **10–30×** |
-| Fused normalize+log1p | Per shard | baseline | in-pipeline | **zero CPU roundtrip** |
+| Operation | CPU (s) | GPU (s) | Speedup | Backend |
+|-----------|---------|---------|---------|---------|
+| kNN (k=15, 50 PCs) | 288 | 31 | **9.4×** | cuVS CAGRA |
+| UMAP (2D) | 560 | 74 | **7.6×** | native CUDA SGD |
+| Leiden | 45 | 3 | **16.0×** | cuGraph |
+| PCA (50 PCs, 2K HVGs) | 22 | 24 | 0.9× | cuSPARSE SpMM |
+| **End-to-end pipeline** | **1077** | **286** | **3.8×** | all above |
 
 The GPU PCA pipeline streams shards from disk → GPU SpMM shard-by-shard
 without materializing the full matrix — enabling PCA on datasets larger
-than VRAM. kNN uses NVIDIA's CAGRA algorithm (cuVS) for 20–50× throughput
-over CPU HNSW.
+than VRAM. kNN uses NVIDIA's CAGRA algorithm (cuVS) for up to 9.4×
+throughput over CPU HNSW on 1M cells.
 
-Full GPU benchmark details in [`benchmarks/results/gpu_benchmark.md`](benchmarks/results/gpu_benchmark.md).
+Full GPU benchmark details in [`benchmarks/results/gpu_pipeline_benchmark.md`](benchmarks/results/gpu_pipeline_benchmark.md).
 
 ### Query Engine
 
