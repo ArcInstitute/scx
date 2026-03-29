@@ -637,6 +637,37 @@ pub fn gpu_available() -> bool {
     scx_gpu::GpuDevice::count().map_or(false, |n| n > 0)
 }
 
+/// GPU device information returned by [`gpu_info`].
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    /// Human-readable device name (e.g. "NVIDIA A100-SXM4-80GB").
+    pub device_name: String,
+    /// Total VRAM in bytes.
+    pub total_vram_bytes: usize,
+    /// Free VRAM in bytes.
+    pub free_vram_bytes: usize,
+}
+
+/// Query GPU device information for device 0.
+///
+/// Returns `None` if no GPU is available or CUDA initialization fails.
+#[cfg(feature = "gpu")]
+pub fn gpu_info() -> Option<GpuInfo> {
+    let count = scx_gpu::GpuDevice::count().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let dev = scx_gpu::GpuDevice::new(0).ok()?;
+    let device_name = dev.name().unwrap_or_else(|_| "unknown".to_string());
+    let (free, total) = dev.free_memory().ok()?;
+    Some(GpuInfo {
+        device_name,
+        total_vram_bytes: total,
+        free_vram_bytes: free,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

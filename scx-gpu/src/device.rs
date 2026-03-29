@@ -171,6 +171,13 @@ impl GpuDevice {
         &self.stream
     }
 
+    /// Query the human-readable name of the GPU device (e.g. "NVIDIA A100-SXM4-80GB").
+    pub fn name(&self) -> Result<String, GpuError> {
+        self.ctx
+            .name()
+            .map_err(|e| GpuError::CudaError(format!("cuDeviceGetName failed: {e}")))
+    }
+
     /// Synchronize the default stream, blocking until all queued GPU work completes.
     pub fn synchronize(&self) -> Result<(), GpuError> {
         self.stream

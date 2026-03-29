@@ -16,6 +16,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md)** — Code review of Phase 4b accelerator implementations.
 - **[Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)** — Phase 4d spec: materialization-free lazy preprocessing (ScxLazyTransformedDataset, column-projected streaming aggregation).
 - **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
+- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.

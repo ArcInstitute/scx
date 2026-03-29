@@ -157,6 +157,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Accelerators submodule
     let accel_module = PyModule::new(m.py(), "accel")?;
+    accel_module.add_function(wrap_pyfunction!(accel::gpu_info, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::pca, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::neighbors, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::umap, &accel_module)?)?;

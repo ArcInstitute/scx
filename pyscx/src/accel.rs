@@ -15,6 +15,43 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::projected_agg;
 
+/// Query GPU device information.
+///
+/// Returns a dict with keys `device` (name string), `total_vram_gb` (f64),
+/// and `free_vram_gb` (f64). Returns `None` if no GPU is available or the
+/// `gpu` feature is disabled.
+///
+/// Example:
+///     info = pyscx.accel.gpu_info()
+///     if info is not None:
+///         print(f"GPU: {info['device']}, {info['free_vram_gb']:.1f} GB free")
+#[pyfunction]
+pub fn gpu_info(py: Python<'_>) -> PyResult<PyObject> {
+    #[cfg(feature = "gpu")]
+    {
+        match scx_accel::gpu_info() {
+            Some(info) => {
+                let dict = PyDict::new(py);
+                dict.set_item("device", info.device_name)?;
+                dict.set_item(
+                    "total_vram_gb",
+                    info.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                )?;
+                dict.set_item(
+                    "free_vram_gb",
+                    info.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                )?;
+                Ok(dict.into_any().unbind())
+            }
+            None => Ok(py.None()),
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Ok(py.None())
+    }
+}
+
 /// A single stratum: the composite key values and a boolean mask over adata.obs.
 struct Stratum {
     /// Key values for each stratify_by column.
