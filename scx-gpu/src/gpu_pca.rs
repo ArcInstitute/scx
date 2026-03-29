@@ -104,6 +104,27 @@ pub fn gpu_randomized_pca(
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
+    // Pre-flight GPU memory check: estimate peak usage and compare to free memory.
+    // Peak = Y(n_obs*k) + Q(n_obs*k) + Z(n_vars*k) + shard_buf + means, all f32.
+    {
+        let idx = reader.index();
+        let max_shard_rows = (0..idx.n_shards())
+            .filter_map(|i| idx.shard_range(i))
+            .map(|(s, e)| (e - s) as usize)
+            .max()
+            .unwrap_or(n_obs);
+        let peak_bytes = (2 * n_obs * k + n_vars * k + max_shard_rows * k + n_vars) * 4;
+        let peak_with_headroom = (peak_bytes as f64 * 1.1) as usize;
+        let (free, _total) = dev.free_memory()?;
+        if peak_with_headroom > free {
+            return Err(GpuError::OutOfMemory(format!(
+                "GPU PCA requires ~{} MB but only {} MB free on device",
+                peak_with_headroom / (1 << 20),
+                free / (1 << 20)
+            )));
+        }
+    }
+
     // Create handles
     let cusparse_handle = CusparseHandle::new()?;
     let cusolver_handle = CusolverHandle::new()?;
@@ -634,12 +655,15 @@ fn gpu_column_sums(
     let k_i32 = k as i32;
 
     // Launch: grid = (ceil(m/256), k), block = (256, 1)
+    // Shared memory: column_sum_kernel uses extern __shared__ float warp_sums[]
+    // which needs (blockDim.x / 32) floats = (256/32) * 4 = 32 bytes.
     let threads: u32 = 256;
     let blocks_x = (m as u32).div_ceil(threads);
+    let n_warps = threads.div_ceil(32);
     let cfg = LaunchConfig {
         grid_dim: (blocks_x, k as u32, 1),
         block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes: n_warps * std::mem::size_of::<f32>() as u32,
     };
 
     unsafe {

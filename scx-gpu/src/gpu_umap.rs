@@ -193,6 +193,15 @@ pub fn gpu_umap_native(
     let neg_rate_i32 = negative_sample_rate as i32;
 
     let block_size = 256u32;
+    // Validate edge count fits in CUDA grid dimensions.
+    // Max grid_dim.x is 2^31-1 (compute capability >= 3.0). With block_size=256,
+    // this supports ~549 billion edges — far beyond any real dataset.
+    if n_edges > u32::MAX as usize {
+        return Err(GpuError::KernelLaunchFailed(format!(
+            "UMAP edge count {} exceeds u32::MAX",
+            n_edges
+        )));
+    }
     let grid_size = (n_edges as u32).div_ceil(block_size);
     let cfg = LaunchConfig {
         grid_dim: (grid_size, 1, 1),

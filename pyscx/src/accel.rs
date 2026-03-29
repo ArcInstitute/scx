@@ -151,6 +151,9 @@ fn extract_strata<'py>(
 ///     n_oversamples: Extra dimensions for accuracy (default: 10)
 ///     n_power_iterations: Power iterations for spectral accuracy (default: 2)
 ///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Note: GPU mode uses f32 precision throughout (CPU uses f64 intermediates),
+/// producing slightly different but equally valid results. See docs/scanpy.md.
 #[pyfunction]
 #[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto"))]
 #[allow(clippy::too_many_arguments)]
@@ -397,6 +400,9 @@ fn write_pca_to_adata(
 ///     ef_construction: HNSW construction parameter (default: 200, CPU only)
 ///     ef_search: HNSW search parameter (default: 200, CPU only)
 ///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Note: GPU mode uses cuVS CAGRA (graph-based ANN) instead of HNSW. Both are
+/// approximate; neighbor sets may differ slightly. See docs/scanpy.md.
 #[pyfunction]
 #[pyo3(signature = (adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto"))]
 #[allow(clippy::too_many_arguments)]
@@ -557,6 +563,10 @@ fn write_neighbors_to_adata(
 ///     learning_rate: Initial learning rate (default: 1.0)
 ///     random_state: Random seed (default: 0)
 ///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Note: GPU UMAP is non-deterministic due to intentional atomicAdd race
+/// conditions on embedding updates (matches cuML). Embeddings will differ
+/// from CPU UMAP but preserve equivalent cluster structure.
 #[pyfunction]
 #[pyo3(signature = (adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto"))]
 #[allow(clippy::too_many_arguments)]

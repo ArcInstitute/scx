@@ -117,8 +117,12 @@ extern "C" __global__ void column_sum_kernel(
         local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
     }
 
-    // Block reduction via shared memory (one value per warp)
-    __shared__ float warp_sums[32]; // max 32 warps per block (1024 threads)
+    // Block reduction via shared memory (one value per warp).
+    // Uses dynamic shared memory (extern __shared__) so the host controls the
+    // allocation size, preventing silent overflow if block size changes.
+    // Caller must pass shared_mem_bytes >= (blockDim.x / warpSize) * sizeof(float).
+    assert(blockDim.x <= 1024 && "column_sum_kernel: block size must be <= 1024 threads");
+    extern __shared__ float warp_sums[];
     int lane = threadIdx.x % warpSize;
     int warp_id = threadIdx.x / warpSize;
 

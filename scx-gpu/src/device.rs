@@ -102,6 +102,16 @@ impl GpuDevice {
             .map_err(|e| GpuError::OutOfMemory(format!("alloc_zeros({n}) failed: {e}")))
     }
 
+    /// Query free and total GPU memory in bytes.
+    ///
+    /// Returns `(free, total)` via `cuMemGetInfo_v2`. Useful for pre-flight
+    /// checks before large allocations (e.g., GPU PCA).
+    pub fn free_memory(&self) -> Result<(usize, usize), GpuError> {
+        self.ctx
+            .mem_get_info()
+            .map_err(|e| GpuError::CudaError(format!("cuMemGetInfo failed: {e}")))
+    }
+
     /// Copy host data to device (synchronous).
     ///
     /// Allocates a new device buffer and copies all elements from the host

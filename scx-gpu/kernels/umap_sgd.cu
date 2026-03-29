@@ -46,8 +46,13 @@ extern "C" __global__ void umap_sgd_kernel(
     if (next_sample > (float)epoch) return;
 
     // Advance the schedule for this edge.
-    // Multiple advances may be needed if epochs_per_sample < 1 (very high-weight edge),
-    // but in practice epochs_per_sample >= 1.0 so one advance suffices.
+    // NOTE: This write is intentionally non-atomic. Each edge maps to exactly
+    // one thread (1:1 edge_idx → threadIdx), so no two threads write to the
+    // same slot in a given kernel launch. The only theoretical race is if
+    // epochs_per_sample < 1.0 (very high-weight edge), but in practice
+    // epochs_per_sample >= 1.0, so each edge fires at most once per epoch.
+    // This matches cuML's UMAP implementation. Using atomicExch here would
+    // add overhead with no practical benefit.
     epoch_of_next_sample[edge_idx] = next_sample + epochs_per_sample[edge_idx];
 
     int i = head[edge_idx];

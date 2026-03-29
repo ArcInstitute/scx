@@ -389,6 +389,28 @@ fn load_cuvs_library() -> Result<CuvsLibrary, String> {
             .get(b"cuvsCagraSearch\0")
             .map_err(|e| format!("cuvsCagraSearch: {e}"))?;
 
+        // Best-effort cuVS version check — warn if FFI struct layouts may differ.
+        // CagraIndexParams/CagraSearchParams are pinned to cuVS 26.02 C headers.
+        type FnCuvsVersion = unsafe extern "C" fn() -> *const std::ffi::c_char;
+        if let Ok(version_sym) = lib.get::<FnCuvsVersion>(b"cuvs_version\0") {
+            let version_ptr = (*version_sym)();
+            if !version_ptr.is_null() {
+                let version_str = std::ffi::CStr::from_ptr(version_ptr).to_string_lossy();
+                let parts: Vec<&str> = version_str.split('.').collect();
+                if parts.len() >= 2 {
+                    let major_minor = format!("{}.{}", parts[0], parts[1]);
+                    if major_minor != "26.02" {
+                        eprintln!(
+                            "scx-gpu: WARNING — cuVS {version_str} detected, but FFI struct \
+                             layouts are pinned to 26.02. kNN results may be incorrect if \
+                             CagraIndexParams/CagraSearchParams changed. \
+                             See scx-gpu/src/gpu_knn.rs."
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(CuvsLibrary {
             _lib: lib,
             resources_create,
@@ -426,7 +448,10 @@ struct CuvsResourcesGuard {
 impl Drop for CuvsResourcesGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = (self.destroy_fn)(self.handle);
+            let ret = (self.destroy_fn)(self.handle);
+            if ret != CUVS_SUCCESS {
+                eprintln!("scx-gpu: cuvsResourcesDestroy failed (error code {ret})");
+            }
         }
     }
 }
@@ -440,7 +465,10 @@ struct CuvsIndexGuard {
 impl Drop for CuvsIndexGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = (self.destroy_fn)(self.handle);
+            let ret = (self.destroy_fn)(self.handle);
+            if ret != CUVS_SUCCESS {
+                eprintln!("scx-gpu: cuvsCagraIndexDestroy failed (error code {ret})");
+            }
         }
     }
 }
@@ -455,7 +483,10 @@ impl Drop for CuvsIndexParamsGuard {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
-                let _ = (self.destroy_fn)(self.ptr);
+                let ret = (self.destroy_fn)(self.ptr);
+                if ret != CUVS_SUCCESS {
+                    eprintln!("scx-gpu: cuvsCagraIndexParamsDestroy failed (error code {ret})");
+                }
             }
         }
     }
@@ -471,7 +502,10 @@ impl Drop for CuvsSearchParamsGuard {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
-                let _ = (self.destroy_fn)(self.ptr);
+                let ret = (self.destroy_fn)(self.ptr);
+                if ret != CUVS_SUCCESS {
+                    eprintln!("scx-gpu: cuvsCagraSearchParamsDestroy failed (error code {ret})");
+                }
             }
         }
     }
