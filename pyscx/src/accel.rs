@@ -4,12 +4,15 @@
 //! streaming from SCX's backed mode and writes results to standard
 //! AnnData slots (obsm["X_pca"], varm["PCs"], uns["pca"]).
 
+use std::sync::Arc;
+
 use numpy::PyArray2;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
+use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
 /// A single stratum: the composite key values and a boolean mask over adata.obs.
 struct Stratum {
@@ -1859,5 +1862,78 @@ fn run_cpu_leiden(
     let uns = adata.getattr("uns")?;
     uns.set_item(key_added, leiden_dict)?;
 
+    Ok(())
+}
+
+/// Normalize total counts per cell without materialization.
+///
+/// Replaces `adata.X` with a lazy wrapper that applies row normalization
+/// during `__getitem__`. The row sums are precomputed via streaming and
+/// cached in the wrapper.
+///
+/// Three cases:
+/// 1. X is `ScxBackedSparseDataset` → create new `ScxLazyTransformedDataset`
+/// 2. X is `ScxLazyTransformedDataset` → append NormalizeTotal transform
+/// 3. X is scipy sparse/dense → delegate to `sc.pp.normalize_total()`
+///
+/// Args:
+///     adata: AnnData object
+///     target_sum: Target total counts per cell (default: 1e4)
+#[pyfunction]
+#[pyo3(signature = (adata, target_sum=10000.0))]
+pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64) -> PyResult<()> {
+    let x = adata.getattr("X")?;
+
+    // Case 1: X is ScxBackedSparseDataset — create new lazy wrapper
+    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+        let backed_ref = backed.borrow();
+
+        // Compute row sums via streaming (no materialization)
+        let all_row_sums = backed_ref
+            .backed
+            .row_sums()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Filter through deletion vector if present
+        let filtered_sums = backed_ref.filter_row_results(&all_row_sums);
+
+        let lazy = ScxLazyTransformedDataset::new(
+            Arc::clone(&backed_ref.backed),
+            backed_ref.shape_val,
+            backed_ref.kept_to_global.clone(),
+            // col_projection is not inherited for normalize_total:
+            // normalization is always over the full column set
+            None,
+            vec![Transform::NormalizeTotal {
+                row_sums: Arc::new(filtered_sums),
+                target_sum,
+            }],
+        );
+        // Drop the borrow before setattr to avoid RefCell borrow conflict
+        drop(backed_ref);
+        adata.setattr("X", Bound::new(py, lazy)?)?;
+        return Ok(());
+    }
+
+    // Case 2: X is already ScxLazyTransformedDataset — append transform
+    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+        let mut lazy_ref = lazy.borrow_mut();
+        // Compute row sums through existing transforms (streaming)
+        let sums = lazy_ref.streaming_row_sums()?;
+        // Filter through deletion vector
+        let filtered_sums = lazy_ref.filter_row_results(&sums);
+        lazy_ref.transforms.push(Transform::NormalizeTotal {
+            row_sums: Arc::new(filtered_sums),
+            target_sum,
+        });
+        return Ok(());
+    }
+
+    // Case 3: X is a regular scipy sparse or dense — delegate to scanpy
+    let sc = py.import("scanpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("target_sum", target_sum)?;
+    sc.getattr("pp")?
+        .call_method("normalize_total", (adata,), Some(&kwargs))?;
     Ok(())
 }

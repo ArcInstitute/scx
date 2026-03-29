@@ -858,7 +858,7 @@ impl ScxBackedSparseDataset {
     ///
     /// When `kept_to_global` is present, extracts only the values at global
     /// indices corresponding to kept rows. Otherwise returns the input as-is.
-    fn filter_row_results<T: Copy>(&self, all_values: &[T]) -> Vec<T> {
+    pub(crate) fn filter_row_results<T: Copy>(&self, all_values: &[T]) -> Vec<T> {
         match &self.kept_to_global {
             Some(mapping) => mapping.iter().map(|&g| all_values[g as usize]).collect(),
             None => all_values.to_vec(),
