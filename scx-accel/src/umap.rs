@@ -17,6 +17,15 @@ use rand::prelude::*;
 use rand_distr::Normal;
 
 use crate::error::{AccelError, Result};
+use scx_sparse::umap_math;
+
+// Re-export shared UMAP math helpers from scx-sparse.
+pub use umap_math::{compute_epochs_per_sample, find_ab_params};
+
+/// Random initialization (f64) — delegates to `scx_sparse::umap_math::random_init_f64`.
+fn random_init(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
+    umap_math::random_init_f64(n_obs, n_components, seed)
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -219,141 +228,6 @@ pub fn compute_umap(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Find the a, b parameters for the UMAP curve from min_dist and spread.
-///
-/// These parameters define the relationship between distances in the
-/// high-dimensional and low-dimensional spaces. The curve is:
-///   1 / (1 + a * d^(2b))
-///
-/// We fit this to the piecewise function:
-///   f(d) = 1 if d <= min_dist, else exp(-(d - min_dist) / spread)
-fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
-    // Numerical curve fitting via least-squares grid search.
-    // This matches umap-learn's scipy.optimize.curve_fit approach
-    // but uses a simple grid search + refinement for pure Rust.
-
-    // Grid boundary constants for the coarse search.
-    // Default UMAP params (spread=1.0, min_dist=0.1) produce a≈1.93, b≈0.79,
-    // well within these ranges. Unusual param combos could hit the edges.
-    const A_STEP: f64 = 0.1;
-    const A_STEPS: usize = 100;
-    const B_STEP: f64 = 0.1;
-    const B_STEPS: usize = 40;
-    // Derived bounds (A: 0.1..10.0, B: 0.1..4.0)
-    let a_start = A_STEP;
-    let b_start = B_STEP;
-    let a_end = A_STEP * A_STEPS as f64;
-    let b_end = B_STEP * B_STEPS as f64;
-
-    let n_points = 300;
-    let x_max = 3.0 * spread;
-    let xs: Vec<f64> = (0..n_points)
-        .map(|i| (i as f64 + 0.5) / n_points as f64 * x_max)
-        .collect();
-    let ys: Vec<f64> = xs
-        .iter()
-        .map(|&x| {
-            if x <= min_dist {
-                1.0
-            } else {
-                (-(x - min_dist) / spread).exp()
-            }
-        })
-        .collect();
-
-    // Least-squares error for a candidate (a, b) pair.
-    let compute_error = |a: f64, b: f64| -> f64 {
-        xs.iter()
-            .zip(ys.iter())
-            .map(|(&x, &y)| {
-                let pred = 1.0 / (1.0 + a * x.powf(2.0 * b));
-                (pred - y) * (pred - y)
-            })
-            .sum()
-    };
-
-    // Grid search for a, b
-    let mut best_a = 1.0_f64;
-    let mut best_b = 1.0_f64;
-    let mut best_err = f64::MAX;
-
-    // Coarse grid
-    for a_idx in 1..=A_STEPS {
-        let a = a_idx as f64 * A_STEP;
-        for b_idx in 1..=B_STEPS {
-            let b = b_idx as f64 * B_STEP;
-            let err = compute_error(a, b);
-            if err < best_err {
-                best_err = err;
-                best_a = a;
-                best_b = b;
-            }
-        }
-    }
-
-    // Fine refinement around best
-    let refine_range = 0.1;
-    let refine_steps = 20;
-    let a_lo = (best_a - refine_range).max(0.01);
-    let a_hi = best_a + refine_range;
-    let b_lo = (best_b - refine_range).max(0.01);
-    let b_hi = best_b + refine_range;
-
-    for a_idx in 0..=refine_steps {
-        let a = a_lo + (a_hi - a_lo) * a_idx as f64 / refine_steps as f64;
-        for b_idx in 0..=refine_steps {
-            let b = b_lo + (b_hi - b_lo) * b_idx as f64 / refine_steps as f64;
-            let err = compute_error(a, b);
-            if err < best_err {
-                best_err = err;
-                best_a = a;
-                best_b = b;
-            }
-        }
-    }
-
-    // Boundary detection: warn if the optimum is near a grid edge,
-    // which indicates the true optimum may lie outside the search range.
-    if (best_a - a_start).abs() < A_STEP || (a_end - best_a).abs() < A_STEP {
-        eprintln!(
-            "scx-accel WARN: UMAP find_ab_params: optimal `a` ({:.4}) is near search boundary \
-             [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
-            best_a, a_start, a_end, spread, min_dist
-        );
-    }
-    if (best_b - b_start).abs() < B_STEP || (b_end - best_b).abs() < B_STEP {
-        eprintln!(
-            "scx-accel WARN: UMAP find_ab_params: optimal `b` ({:.4}) is near search boundary \
-             [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
-            best_b, b_start, b_end, spread, min_dist
-        );
-    }
-
-    (best_a, best_b)
-}
-
-/// Compute per-edge sampling schedule.
-///
-/// Higher-weight edges are sampled more frequently. The max-weight edge
-/// is sampled every epoch; lower-weight edges less often.
-fn compute_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Vec<f64> {
-    let max_weight = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if max_weight <= 0.0 {
-        return vec![n_epochs as f64 + 1.0; weights.len()];
-    }
-
-    weights
-        .iter()
-        .map(|&w| {
-            if w <= 0.0 {
-                n_epochs as f64 + 1.0 // never sample
-            } else {
-                n_epochs as f64 / (w / max_weight * n_epochs as f64).max(1.0)
-            }
-        })
-        .collect()
-}
-
 /// Spectral initialization via power iteration on the normalized Laplacian.
 ///
 /// Computes the 2 (or n_components) smallest non-trivial eigenvectors of
@@ -534,14 +408,8 @@ fn spectral_init(
     Ok(embedding)
 }
 
-/// Random initialization: small Gaussian noise.
-fn random_init(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let normal = Normal::new(0.0_f64, 1e-4).unwrap();
-    (0..n_obs * n_components)
-        .map(|_| rng.sample(normal) * 10.0)
-        .collect()
-}
+// `random_init` is defined at the top of this file as a thin wrapper
+// around `scx_sparse::umap_math::random_init_f64`.
 
 // ---------------------------------------------------------------------------
 // Tests

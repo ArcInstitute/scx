@@ -8,3 +8,5 @@ authors.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+rand = { workspace = true }
+rand_distr = "0.4"
