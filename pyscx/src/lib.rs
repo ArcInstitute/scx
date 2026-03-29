@@ -4,6 +4,7 @@ pub(crate) mod backed;
 mod experiment;
 mod ops;
 mod preprocess;
+pub(crate) mod projected_agg;
 mod query;
 
 #[cfg(feature = "cloud")]
