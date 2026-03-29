@@ -226,18 +226,6 @@ mod tests {
     use scx_codec::decode_shard_scipy;
     use scx_format::shard::ShardHeader;
 
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
-
     /// CPU reference decode for comparison.
     fn cpu_decode(
         indptr_bytes: &[u8],

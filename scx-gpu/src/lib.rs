@@ -15,6 +15,31 @@
 //!
 //! The [`GpuDevice`] struct wraps both into a single ergonomic handle.
 
+// --- Test-only macro (must precede module declarations for textual scoping) ---
+
+/// Try to acquire a GPU device, skipping the test if CUDA is unavailable.
+///
+/// Usage in `#[cfg(test)]` modules:
+/// ```ignore
+/// let dev = require_gpu!();
+/// ```
+///
+/// Defined once here; used across all test modules in the crate.
+#[cfg(test)]
+macro_rules! require_gpu {
+    () => {
+        match $crate::device::GpuDevice::new(0) {
+            Ok(dev) => dev,
+            Err(_) => {
+                eprintln!("CUDA not available — skipping GPU test");
+                return;
+            }
+        }
+    };
+}
+
+// --- Module declarations ---
+
 #[cfg(any(test, feature = "bench"))]
 pub mod test_utils;
 

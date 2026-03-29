@@ -256,18 +256,6 @@ use scx_sparse::umap_math::{compute_epochs_per_sample, find_ab_params, random_in
 mod tests {
     use super::*;
 
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
-
     /// Build a simple kNN-like connectivity graph for testing.
     /// Two clusters of 25 points each with high intra-cluster connectivity.
     fn test_graph() -> (Vec<i64>, Vec<i32>, Vec<f64>, usize) {

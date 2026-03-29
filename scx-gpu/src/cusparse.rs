@@ -438,18 +438,6 @@ mod tests {
     use crate::test_utils::build_test_shard;
     use scx_codec::{CodecId, ValueEncoding};
 
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
-
     /// Build a small test shard for cuSPARSE tests.
     fn build_small_shard() -> Vec<u8> {
         let indptr = vec![0u64, 3, 5, 5, 8, 12];

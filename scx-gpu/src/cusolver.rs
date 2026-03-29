@@ -232,19 +232,6 @@ pub fn gpu_qr_q(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::GpuDevice;
-
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
 
     #[test]
     fn test_cusolver_handle() {
