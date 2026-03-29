@@ -11,6 +11,7 @@ use pyo3::types::{PySlice, PyTuple};
 use scx_format::BackedCsrReader;
 
 use crate::anndata::csr_to_scipy;
+use crate::lazy_transform::Transform;
 use scx_engine::projection::project_csr;
 
 use crate::projected_agg;
@@ -884,6 +885,7 @@ impl ScxBackedSparseDataset {
                 threshold,
                 kept_to_global: self.kept_to_global.clone(),
                 non_negative: self.non_negative,
+                transforms: None,
             };
             Ok(Bound::new(py, result)?.into_any())
         } else {
@@ -1418,12 +1420,62 @@ pub struct ScxComparisonResult {
     kept_to_global: Option<Vec<u64>>,
     /// Inherited from the parent dataset — gates the getnnz short-circuit.
     non_negative: bool,
+    /// When created from ScxLazyTransformedDataset, transforms to apply
+    /// before comparison during materialization.
+    transforms: Option<Vec<Transform>>,
 }
 
 impl ScxComparisonResult {
+    /// Create a comparison result from a lazy-transformed source.
+    ///
+    /// The transforms will be applied during materialization,
+    /// but the (X > 0).sum() → getnnz() short-circuit still works
+    /// since NormalizeTotal/Log1p/RowScale preserve sparsity patterns.
+    pub fn new_for_lazy(
+        backed: Arc<BackedCsrReader>,
+        shape_val: (usize, usize),
+        op: String,
+        threshold: f64,
+        kept_to_global: Option<Vec<u64>>,
+        non_negative: bool,
+        transforms: Vec<Transform>,
+    ) -> Self {
+        Self {
+            backed,
+            shape_val,
+            op,
+            threshold,
+            kept_to_global,
+            non_negative,
+            transforms: Some(transforms),
+        }
+    }
+
     /// Materialize the comparison result as a scipy sparse matrix.
     fn materialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        // Read the backing data through the dataset
+        if let Some(ref transforms) = self.transforms {
+            // Lazy-transform path: stream shards, apply transforms, materialize
+            let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
+                Arc::clone(&self.backed),
+                self.shape_val,
+                self.kept_to_global.clone(),
+                None,
+                transforms.clone(),
+            );
+            let mat = lazy.to_memory_py(py)?;
+            let method = match self.op.as_str() {
+                "gt" => "__gt__",
+                "ge" => "__ge__",
+                "lt" => "__lt__",
+                "le" => "__le__",
+                "eq" => "__eq__",
+                "ne" => "__ne__",
+                _ => "__gt__",
+            };
+            return mat.call_method1(method, (self.threshold,));
+        }
+
+        // Standard path: read raw data
         let csr = if let Some(ref kept) = self.kept_to_global {
             self.backed
                 .read_row_indices(kept)
@@ -1434,7 +1486,6 @@ impl ScxComparisonResult {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         };
         let mat = csr_to_scipy(py, csr)?;
-        // Apply the comparison operator
         let method = match self.op.as_str() {
             "gt" => "__gt__",
             "ge" => "__ge__",

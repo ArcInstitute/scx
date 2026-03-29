@@ -2,6 +2,7 @@ mod accel;
 mod anndata;
 pub(crate) mod backed;
 mod experiment;
+pub(crate) mod lazy_transform;
 mod ops;
 mod preprocess;
 pub(crate) mod projected_agg;
@@ -152,6 +153,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
+    m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
 
     // Accelerators submodule
     let accel_module = PyModule::new(m.py(), "accel")?;
@@ -171,6 +173,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
         if let Ok(csr_dataset) = abc.getattr("CSRDataset") {
             let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedSparseDataset")?,));
             let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedLayerDataset")?,));
+            let _ =
+                csr_dataset.call_method1("register", (m.getattr("ScxLazyTransformedDataset")?,));
         }
     }
 
