@@ -452,6 +452,11 @@ impl ScxLazyTransformedDataset {
         2
     }
 
+    #[getter]
+    fn non_negative(&self) -> bool {
+        self.non_negative
+    }
+
     fn __len__(&self) -> usize {
         self.shape_val.0
     }
