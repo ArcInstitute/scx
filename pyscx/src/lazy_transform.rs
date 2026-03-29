@@ -618,6 +618,30 @@ impl ScxLazyTransformedDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Try to express as a lazy RowScale (multiply by 1/factor).
+        // This intercepts scanpy's axis_mul_or_truediv path.
+        if let Some(row_factors) =
+            crate::backed::try_extract_row_factors(py, other, self.shape_val.0)?
+        {
+            let inv_factors: Vec<f64> = row_factors
+                .iter()
+                .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
+                .collect();
+            let mut new_transforms = self.transforms.clone();
+            new_transforms.push(Transform::RowScale {
+                factors: Arc::new(inv_factors),
+            });
+            let lazy = ScxLazyTransformedDataset::new(
+                Arc::clone(&self.backed),
+                self.shape_val,
+                self.kept_to_global.clone(),
+                self.col_projection.clone(),
+                new_transforms,
+            );
+            return Ok(Bound::new(py, lazy)?.into_any());
+        }
+
+        // Cannot be expressed as row scaling — fall back to materialization
         let mat = self.to_memory(py)?;
         mat.call_method1("__truediv__", (other,))
     }

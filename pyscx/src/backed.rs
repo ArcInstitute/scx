@@ -327,6 +327,30 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Try to extract a per-row scaling vector. If the divisor is a 1D or
+        // column array with length == n_obs, we can express the division as a
+        // lazy RowScale transform (multiplying by 1/factor) — avoiding full
+        // matrix materialization.  This is the code path scanpy's
+        // `axis_mul_or_truediv(..., op=truediv)` takes for normalize_total
+        // when the numba CSR path isn't available.
+        if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
+            let inv_factors: Vec<f64> = row_factors
+                .iter()
+                .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
+                .collect();
+            let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
+                Arc::clone(&self.backed),
+                self.shape_val,
+                self.kept_to_global.clone(),
+                self.col_projection.clone(),
+                vec![Transform::RowScale {
+                    factors: Arc::new(inv_factors),
+                }],
+            );
+            return Ok(Bound::new(py, lazy)?.into_any());
+        }
+
+        // Cannot be expressed as row scaling — fall back to materialization
         let mat = self.to_memory(py)?;
         mat.call_method1("__truediv__", (other,))
     }
@@ -1683,5 +1707,60 @@ impl ScxComparisonResult {
             Some(a) => mat.call_method1("min", (a,)),
             None => mat.call_method0("min"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Try to extract a float64 vector from a numpy array or scipy matrix.
+///
+/// This handles the shapes scanpy's `axis_mul_or_truediv` produces when
+/// performing row-wise normalization:
+///   - `(n_obs,)`     — 1D array from `np.ravel(row_sums)`
+///   - `(n_obs, 1)`   — column vector
+///   - `(1, n_obs)`   — row vector (transposed)
+///
+/// Returns `Ok(Some(vec))` if extraction succeeds and length == `n_obs`,
+/// returns `Ok(None)` if the shape doesn't match (triggers materialization fallback),
+/// returns `Err` only on actual Python errors.
+pub(crate) fn try_extract_row_factors(
+    py: Python<'_>,
+    other: &Bound<'_, PyAny>,
+    n_obs: usize,
+) -> PyResult<Option<Vec<f64>>> {
+    let np = py.import("numpy")?;
+
+    // Convert to numpy array, handling scipy matrices, lists, scalars, etc.
+    let arr = match np.call_method1("asarray", (other,)) {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+
+    // Flatten to 1D
+    let flat = match arr.call_method0("ravel") {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    // Cast to float64
+    let flat_f64 = match flat.call_method1("astype", (np.getattr("float64")?,)) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    let readonly: numpy::PyReadonlyArray1<'_, f64> = match flat_f64.extract() {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let slice = readonly
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    if slice.len() == n_obs {
+        Ok(Some(slice.to_vec()))
+    } else {
+        Ok(None)
     }
 }
