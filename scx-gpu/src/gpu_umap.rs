@@ -9,8 +9,8 @@
 //! 1. Compute UMAP curve parameters `(a, b)` on CPU via grid search
 //! 2. Build edge list + epoch schedule on CPU
 //! 3. Initialize embedding (spectral or random) on CPU
-//! 4. Upload embedding + edges to GPU
-//! 5. For each epoch: launch `umap_sgd_kernel` with active edges + decayed LR
+//! 4. Upload embedding, edges, and epoch schedule to GPU (once)
+//! 5. For each epoch: launch `umap_sgd_kernel` — kernel filters active edges on-device
 //! 6. Download final embedding to host
 //!
 //! # Non-determinism
@@ -162,6 +162,24 @@ pub fn gpu_umap_native(
     // --- Upload embedding to GPU ---
     let mut d_embedding = dev.htod_copy(&embedding_f32)?;
 
+    // --- Upload edge list + scheduling arrays to GPU (once) ---
+    // Edge filtering happens on-device: each thread checks its edge's
+    // epoch_of_next_sample and skips inactive edges. This eliminates
+    // per-epoch host→device edge list uploads (was 200 × O(n_edges) uploads).
+    let d_head = dev.htod_copy(&head)?;
+    let d_tail = dev.htod_copy(&tail)?;
+
+    // Convert scheduling arrays to f32 for GPU (f64 precision not needed
+    // for epoch scheduling — the comparison is epoch_of_next_sample <= epoch).
+    let epochs_per_sample_f32: Vec<f32> = epochs_per_sample.iter().map(|&x| x as f32).collect();
+    let epoch_of_next_sample_f32: Vec<f32> = epochs_per_sample
+        .clone()
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let d_epochs_per_sample = dev.htod_copy(&epochs_per_sample_f32)?;
+    let mut d_epoch_of_next_sample = dev.htod_copy(&epoch_of_next_sample_f32)?;
+
     // --- Load UMAP SGD kernel ---
     let module = dev.load_module_cached(UMAP_SGD_PTX)?;
     let func = module
@@ -169,55 +187,32 @@ pub fn gpu_umap_native(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("load umap_sgd_kernel: {e}")))?;
 
     // --- SGD optimization loop ---
-    let mut epoch_of_next_sample: Vec<f64> = epochs_per_sample.clone();
-
     let n_obs_i32 = n_obs as i32;
+    let n_edges_i32 = n_edges as i32;
     let n_components_i32 = n_components as i32;
     let neg_rate_i32 = negative_sample_rate as i32;
+
+    let block_size = 256u32;
+    let grid_size = (n_edges as u32).div_ceil(block_size);
+    let cfg = LaunchConfig {
+        grid_dim: (grid_size, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     for epoch in 0..n_epochs {
         let alpha = learning_rate * (1.0 - epoch as f32 / n_epochs as f32);
         let epoch_i32 = epoch as i32;
 
-        // Collect active edges for this epoch
-        let mut active_head = Vec::new();
-        let mut active_tail = Vec::new();
-
-        for edge_idx in 0..n_edges {
-            if epoch_of_next_sample[edge_idx] <= epoch as f64 {
-                active_head.push(head[edge_idx]);
-                active_tail.push(tail[edge_idx]);
-                epoch_of_next_sample[edge_idx] += epochs_per_sample[edge_idx];
-            }
-        }
-
-        let n_active = active_head.len();
-        if n_active == 0 {
-            continue;
-        }
-
-        // Upload active edges
-        let d_active_head = dev.htod_copy(&active_head)?;
-        let d_active_tail = dev.htod_copy(&active_tail)?;
-
-        // Launch kernel
-        let block_size = 256u32;
-        let grid_size = (n_active as u32).div_ceil(block_size);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_size, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let n_active_i32 = n_active as i32;
-
         unsafe {
             dev.stream()
                 .launch_builder(&func)
                 .arg(&mut d_embedding)
-                .arg(&d_active_head)
-                .arg(&d_active_tail)
-                .arg(&n_active_i32)
+                .arg(&d_head)
+                .arg(&d_tail)
+                .arg(&mut d_epoch_of_next_sample)
+                .arg(&d_epochs_per_sample)
+                .arg(&n_edges_i32)
                 .arg(&n_obs_i32)
                 .arg(&n_components_i32)
                 .arg(&a)

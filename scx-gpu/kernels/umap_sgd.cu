@@ -4,6 +4,10 @@
 // Uses atomicAdd for concurrent embedding updates (intentional — UMAP SGD is
 // stochastic and tolerant of noisy gradient updates, matching cuML's approach).
 //
+// Edge filtering is done on-device: each thread checks its edge's scheduling
+// state (epoch_of_next_sample) and skips inactive edges, eliminating per-epoch
+// host→device edge list uploads.
+//
 // Per-thread negative sampling uses a Philox-style hash function for
 // reproducible-per-thread (but globally stochastic due to atomicAdd races)
 // random number generation.
@@ -20,20 +24,31 @@ __device__ unsigned int gpu_hash(unsigned int x) {
 }
 
 extern "C" __global__ void umap_sgd_kernel(
-    float* __restrict__ embedding,          // [n_obs × n_components], row-major
-    const int* __restrict__ head,           // edge head indices [n_active_edges]
-    const int* __restrict__ tail,           // edge tail indices [n_active_edges]
-    int n_active_edges,
+    float* __restrict__ embedding,              // [n_obs × n_components], row-major
+    const int* __restrict__ head,               // edge head indices [n_edges] (all edges)
+    const int* __restrict__ tail,               // edge tail indices [n_edges] (all edges)
+    float* __restrict__ epoch_of_next_sample,   // per-edge scheduling state [n_edges] (mutable)
+    const float* __restrict__ epochs_per_sample, // per-edge sampling period [n_edges] (const)
+    int n_edges,
     int n_obs,
     int n_components,
-    float a, float b,                       // UMAP curve parameters
-    float alpha,                            // learning rate for this epoch
+    float a, float b,                           // UMAP curve parameters
+    float alpha,                                // learning rate for this epoch
     int negative_sample_rate,
     unsigned long long seed,
-    int epoch                               // current epoch (used for RNG seeding)
+    int epoch                                   // current epoch (used for RNG seeding + scheduling)
 ) {
     int edge_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (edge_idx >= n_active_edges) return;
+    if (edge_idx >= n_edges) return;
+
+    // --- Check if this edge is active in the current epoch ---
+    float next_sample = epoch_of_next_sample[edge_idx];
+    if (next_sample > (float)epoch) return;
+
+    // Advance the schedule for this edge.
+    // Multiple advances may be needed if epochs_per_sample < 1 (very high-weight edge),
+    // but in practice epochs_per_sample >= 1.0 so one advance suffices.
+    epoch_of_next_sample[edge_idx] = next_sample + epochs_per_sample[edge_idx];
 
     int i = head[edge_idx];
     int j = tail[edge_idx];
