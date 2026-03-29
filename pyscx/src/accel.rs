@@ -13,6 +13,7 @@ use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
+use crate::projected_agg;
 
 /// A single stratum: the composite key values and a boolean mask over adata.obs.
 struct Stratum {
@@ -205,6 +206,25 @@ pub fn pca(
         let reader = &backed.backed;
         scx_accel::randomized_pca(
             reader,
+            n_comps,
+            n_oversamples,
+            n_power_iterations,
+            zero_center,
+            random_state,
+        )
+        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+    } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        // PCA on lazy-transformed data: materialize to ScxCsr, then in-memory PCA.
+        // The materialization streams shards through transforms, so peak memory
+        // is the full transformed matrix (not 2x). This is a correctness-first
+        // approach; true streaming PCA through transforms would require adding a
+        // ShardIterator trait to scx-accel.
+        backend = "scx-accel-cpu";
+        let csr = lazy
+            .materialize_csr()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        scx_accel::randomized_pca_inmemory(
+            &csr,
             n_comps,
             n_oversamples,
             n_power_iterations,
@@ -1987,4 +2007,268 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
     let sc = py.import("scanpy")?;
     sc.getattr("pp")?.call_method1("log1p", (adata,))?;
     Ok(())
+}
+
+/// Calculate QC metrics natively using streaming aggregation.
+///
+/// Replacement for `sc.pp.calculate_qc_metrics()` that works on backed and
+/// lazy-transformed SCX data without materialization.  Falls back to scanpy
+/// for regular scipy/dense matrices.
+///
+/// Computes per-cell (obs) and per-gene (var) metrics and writes them to
+/// `adata.obs` / `adata.var` columns, matching scanpy's naming convention.
+///
+/// Args:
+///     adata: AnnData object
+///     qc_vars: list of boolean column names in `adata.var` identifying gene
+///              subsets (e.g. `["mt"]` for mitochondrial genes)
+///     log1p: if True, also add log1p-transformed versions of count metrics
+///     inplace: if True (default), write metrics to adata.obs/var;
+///              if False, return (obs_df, var_df)
+#[pyfunction]
+#[pyo3(signature = (adata, qc_vars=None, log1p=true, inplace=true))]
+pub fn calculate_qc_metrics<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    qc_vars: Option<Vec<String>>,
+    log1p: bool,
+    inplace: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let x = adata.getattr("X")?;
+    let qc_vars = qc_vars.unwrap_or_default();
+
+    // Detect backed or lazy-transformed SCX dataset
+    let is_backed = x.downcast::<ScxBackedSparseDataset>().is_ok();
+    let is_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
+
+    if !is_backed && !is_lazy {
+        // Delegate to scanpy for regular scipy/dense
+        let sc = py.import("scanpy")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("inplace", inplace)?;
+        kwargs.set_item("log1p", log1p)?;
+        if !qc_vars.is_empty() {
+            kwargs.set_item("qc_vars", &qc_vars)?;
+        }
+        return sc
+            .getattr("pp")?
+            .call_method("calculate_qc_metrics", (adata,), Some(&kwargs));
+    }
+
+    // --- Streaming path for SCX-backed / lazy data ---
+
+    let np = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Compute per-cell total_counts and n_genes_by_counts
+    let (total_counts, n_genes): (Vec<f64>, Vec<i64>) = if is_backed {
+        let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
+        let row_sums = backed
+            .backed
+            .row_sums()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let row_nnz = backed
+            .backed
+            .row_nnz()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        (
+            backed.filter_row_results(&row_sums),
+            backed.filter_row_results(&row_nnz),
+        )
+    } else {
+        let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+        let row_sums = lazy.streaming_row_sums()?;
+        let row_nnz = lazy
+            .backed
+            .row_nnz()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        (
+            lazy.filter_row_results(&row_sums),
+            lazy.filter_row_results(&row_nnz),
+        )
+    };
+
+    // Compute per-gene total_counts and n_cells_by_counts
+    let (gene_total_counts, n_cells): (Vec<f64>, Vec<i64>) = if is_backed {
+        let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
+        let col_sums = match &backed.kept_to_global {
+            Some(kept) => backed
+                .backed
+                .col_sums_masked(kept)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            None => backed
+                .backed
+                .col_sums()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        };
+        let col_nnz = match &backed.kept_to_global {
+            Some(kept) => backed
+                .backed
+                .col_nnz_masked(kept)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .iter()
+                .map(|&v| v as i64)
+                .collect(),
+            None => backed
+                .backed
+                .col_nnz()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        };
+        (col_sums, col_nnz)
+    } else {
+        let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+        let col_sums = lazy.streaming_col_sums()?;
+        let col_nnz = lazy
+            .backed
+            .col_nnz()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        (col_sums, col_nnz)
+    };
+
+    // Build obs DataFrame
+    let obs_dict = PyDict::new(py);
+    obs_dict.set_item("n_genes_by_counts", numpy::PyArray::from_vec(py, n_genes))?;
+    obs_dict.set_item(
+        "total_counts",
+        numpy::PyArray::from_vec(py, total_counts.clone()),
+    )?;
+    if log1p {
+        let log_total: Vec<f64> = total_counts.iter().map(|&v| (v + 1.0).ln()).collect();
+        obs_dict.set_item(
+            "log1p_total_counts",
+            numpy::PyArray::from_vec(py, log_total),
+        )?;
+    }
+
+    // Build var DataFrame
+    let var_dict = PyDict::new(py);
+    var_dict.set_item("n_cells_by_counts", numpy::PyArray::from_vec(py, n_cells))?;
+    var_dict.set_item(
+        "total_counts",
+        numpy::PyArray::from_vec(py, gene_total_counts.clone()),
+    )?;
+    if log1p {
+        let log_gene_total: Vec<f64> = gene_total_counts.iter().map(|&v| (v + 1.0).ln()).collect();
+        var_dict.set_item(
+            "log1p_total_counts",
+            numpy::PyArray::from_vec(py, log_gene_total),
+        )?;
+    }
+
+    // Compute qc_var metrics (per-cell counts for gene subsets)
+    for qc_var in &qc_vars {
+        let var_df = adata.getattr("var")?;
+        let mask_series = var_df.get_item(qc_var.as_str())?;
+        let mask_values = mask_series.getattr("values")?;
+        // Get column indices where mask is True
+        let col_indices_py = np.call_method1("where", (&mask_values,))?;
+        let col_indices_arr = col_indices_py.get_item(0)?;
+        let col_indices: Vec<u32> = col_indices_arr
+            .call_method1("astype", ("uint32",))?
+            .extract()?;
+
+        if col_indices.is_empty() {
+            // No genes in this qc_var — fill with zeros
+            let n_obs = total_counts.len();
+            let zeros = vec![0.0f64; n_obs];
+            obs_dict.set_item(
+                format!("total_counts_{qc_var}"),
+                numpy::PyArray::from_vec(py, zeros.clone()),
+            )?;
+            obs_dict.set_item(
+                format!("pct_counts_{qc_var}"),
+                numpy::PyArray::from_vec(py, zeros),
+            )?;
+            continue;
+        }
+
+        // Streaming projected row sums for the gene subset
+        let subset_sums = if is_backed {
+            let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
+            let all_sums = projected_agg::row_sums_projected(&backed.backed, &col_indices)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            backed.filter_row_results(&all_sums)
+        } else {
+            let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+            // For lazy data, streaming through transforms with projection
+            // is not yet supported. Fall back to the raw (pre-transform) sums
+            // since QC metrics are typically computed before normalization.
+            let all_sums = projected_agg::row_sums_projected(&lazy.backed, &col_indices)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            lazy.filter_row_results(&all_sums)
+        };
+
+        // pct_counts = subset_sum / total * 100
+        let pct_counts: Vec<f64> = subset_sums
+            .iter()
+            .zip(total_counts.iter())
+            .map(|(&s, &t)| if t > 0.0 { s / t * 100.0 } else { 0.0 })
+            .collect();
+
+        obs_dict.set_item(
+            format!("total_counts_{qc_var}"),
+            numpy::PyArray::from_vec(py, subset_sums),
+        )?;
+        obs_dict.set_item(
+            format!("pct_counts_{qc_var}"),
+            numpy::PyArray::from_vec(py, pct_counts),
+        )?;
+        if log1p {
+            let subset_sums_for_log: Vec<f64> = {
+                // Re-extract since we moved subset_sums
+                let raw = if is_backed {
+                    let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
+                    let all_sums = projected_agg::row_sums_projected(&backed.backed, &col_indices)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    backed.filter_row_results(&all_sums)
+                } else {
+                    let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+                    let all_sums = projected_agg::row_sums_projected(&lazy.backed, &col_indices)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    lazy.filter_row_results(&all_sums)
+                };
+                raw.iter().map(|&v| (v + 1.0).ln()).collect()
+            };
+            obs_dict.set_item(
+                format!("log1p_total_counts_{qc_var}"),
+                numpy::PyArray::from_vec(py, subset_sums_for_log),
+            )?;
+        }
+    }
+
+    // Create DataFrames
+    let obs_index = adata.getattr("obs")?.getattr("index")?;
+    let var_index = adata.getattr("var")?.getattr("index")?;
+    let obs_df = pd.call_method1("DataFrame", (obs_dict,))?;
+    obs_df.setattr("index", &obs_index)?;
+    let var_df = pd.call_method1("DataFrame", (var_dict,))?;
+    var_df.setattr("index", &var_index)?;
+
+    if inplace {
+        // Write columns to adata.obs / adata.var
+        let adata_obs = adata.getattr("obs")?;
+        let adata_var = adata.getattr("var")?;
+        // Iterate obs_df columns
+        let obs_columns: Vec<String> = obs_df
+            .getattr("columns")?
+            .call_method0("tolist")?
+            .extract()?;
+        for col in &obs_columns {
+            let values = obs_df.get_item(col.as_str())?;
+            adata_obs.set_item(col.as_str(), &values)?;
+        }
+        let var_columns: Vec<String> = var_df
+            .getattr("columns")?
+            .call_method0("tolist")?
+            .extract()?;
+        for col in &var_columns {
+            let values = var_df.get_item(col.as_str())?;
+            adata_var.set_item(col.as_str(), &values)?;
+        }
+        Ok(py.None().into_bound(py))
+    } else {
+        // Return (obs_df, var_df) tuple
+        let tuple = pyo3::types::PyTuple::new(py, &[obs_df, var_df])?;
+        Ok(tuple.into_any())
+    }
 }

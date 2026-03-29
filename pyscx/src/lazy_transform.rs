@@ -247,7 +247,7 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Stream all shards, apply transforms, compute per-column sums.
-    fn streaming_col_sums(&self) -> PyResult<Vec<f64>> {
+    pub(crate) fn streaming_col_sums(&self) -> PyResult<Vec<f64>> {
         let n_vars = self.backed.shape().1;
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;

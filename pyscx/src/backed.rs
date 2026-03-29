@@ -1579,8 +1579,20 @@ impl ScxComparisonResult {
     ///
     /// **Note:** The `getnnz` short-circuit assumes non-negative data.
     /// See [`can_shortcircuit_sum`] for details on this assumption.
-    #[pyo3(signature = (axis=None))]
-    fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+    /// Accept and ignore extra kwargs (`out`, `keepdims`, `initial`, `where`)
+    /// that NumPy passes when dispatching `np.sum()` on this object.
+    #[pyo3(signature = (axis=None, dtype=None, out=None, keepdims=false, initial=None, r#where=None))]
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn sum<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<i32>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+        initial: Option<&Bound<'py, PyAny>>,
+        r#where: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         if self.can_shortcircuit_sum() {
             // Short-circuit: (X > 0).sum(axis) == getnnz(axis)
             // getnnz counts stored entries, which for non-negative data
