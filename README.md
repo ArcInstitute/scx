@@ -307,12 +307,12 @@ kNN and Leiden will fall back to CPU since cuVS/cuGraph are not installed.
 **Option C: container** — for reproducible environments or CI:
 
 ```bash
-# Use the NVIDIA RAPIDS base image (includes CUDA + cuVS + cuGraph)
-docker run --gpus all -it rapidsai/base:24.12-cuda12.2-py3.12
+# Build the GPU image (multi-stage: compiles Rust + CUDA kernels, then slim runtime)
+docker build -f Dockerfile.gpu -t scx-gpu .
 
-# Inside the container:
-pip install maturin numpy scipy pyarrow anndata scanpy leidenalg
-cd pyscx && maturin develop --release --features gpu
+# Run with GPU access
+docker run --gpus all -it scx-gpu
+docker run --gpus all -v /data:/data scx-gpu python my_analysis.py
 ```
 
 **Verifying the installation:**

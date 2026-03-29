@@ -114,22 +114,32 @@ cd pyscx && ../.venv/bin/maturin develop --release --features gpu
 For reproducible builds, CI, or environments where you cannot install system
 packages.
 
-### Docker (RAPIDS base image)
+### Docker (full RAPIDS — recommended)
+
+The repository includes a multi-stage `Dockerfile.gpu` that compiles Rust +
+CUDA kernels in a builder stage, then produces a slim runtime image with pyscx,
+the `scx` CLI, and the full RAPIDS stack (cuVS, cuGraph).
 
 ```bash
-# RAPIDS image includes CUDA + cuVS + cuGraph + Python scientific stack
-docker run --gpus all -it rapidsai/base:24.12-cuda12.2-py3.12
+# Build the image (from the repository root)
+docker build -f Dockerfile.gpu -t scx-gpu .
 
-# Inside the container:
-pip install maturin numpy scipy pyarrow anndata scanpy leidenalg
-git clone <repo-url> scx && cd scx
-cd pyscx && maturin develop --release --features gpu
+# Run interactively with GPU access
+docker run --gpus all -it scx-gpu
+
+# Mount data and run a script
+docker run --gpus all -v /data:/data scx-gpu python /data/my_analysis.py
+
+# Use the CLI
+docker run --gpus all scx-gpu scx info /data/atlas.scx
 ```
 
 ### Docker (CUDA-only, no RAPIDS)
 
+For a lighter image with only GPU PCA and UMAP (kNN/Leiden fall back to CPU),
+use the NVIDIA CUDA devel base image directly:
+
 ```bash
-# Lighter image — GPU PCA and UMAP only, kNN/Leiden fall back to CPU
 docker run --gpus all -it nvidia/cuda:12.2.2-devel-ubuntu22.04
 
 # Inside the container:
@@ -143,7 +153,11 @@ cd pyscx && maturin develop --release --features gpu
 ### Apptainer / Singularity (HPC)
 
 ```bash
-# Build from RAPIDS Docker image
+# Build from the SCX GPU Docker image
+docker build -f Dockerfile.gpu -t scx-gpu .
+apptainer build scx-gpu.sif docker-daemon://scx-gpu:latest
+
+# Or build directly from RAPIDS base (requires manual pyscx install inside)
 apptainer build scx-gpu.sif docker://rapidsai/base:24.12-cuda12.2-py3.12
 
 # Run with GPU passthrough
