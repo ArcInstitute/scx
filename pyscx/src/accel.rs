@@ -1937,3 +1937,54 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
         .call_method("normalize_total", (adata,), Some(&kwargs))?;
     Ok(())
 }
+
+/// Apply log1p (ln(x + 1)) element-wise without materialization.
+///
+/// Replaces `adata.X` with a lazy wrapper that applies log1p during
+/// `__getitem__`. When chained after `normalize_total`, the fused
+/// optimization in `ScxLazyTransformedDataset` computes
+/// `ln(x * target_sum / row_sum + 1)` in a single pass.
+///
+/// Three cases:
+/// 1. X is `ScxBackedSparseDataset` → create new `ScxLazyTransformedDataset`
+/// 2. X is `ScxLazyTransformedDataset` → append Log1p transform
+/// 3. X is scipy sparse/dense → delegate to `sc.pp.log1p()`
+///
+/// Args:
+///     adata: AnnData object
+#[pyfunction]
+#[pyo3(signature = (adata,))]
+pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
+    let x = adata.getattr("X")?;
+
+    // Case 1: X is ScxBackedSparseDataset — create new lazy wrapper with Log1p
+    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+        let backed_ref = backed.borrow();
+
+        let lazy = ScxLazyTransformedDataset::new(
+            Arc::clone(&backed_ref.backed),
+            backed_ref.shape_val,
+            backed_ref.kept_to_global.clone(),
+            // col_projection is not inherited for log1p:
+            // log1p applies element-wise over the full column set
+            None,
+            vec![Transform::Log1p],
+        );
+        // Drop the borrow before setattr to avoid RefCell borrow conflict
+        drop(backed_ref);
+        adata.setattr("X", Bound::new(py, lazy)?)?;
+        return Ok(());
+    }
+
+    // Case 2: X is already ScxLazyTransformedDataset — append Log1p transform
+    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+        let mut lazy_ref = lazy.borrow_mut();
+        lazy_ref.transforms.push(Transform::Log1p);
+        return Ok(());
+    }
+
+    // Case 3: X is a regular scipy sparse or dense — delegate to scanpy
+    let sc = py.import("scanpy")?;
+    sc.getattr("pp")?.call_method1("log1p", (adata,))?;
+    Ok(())
+}

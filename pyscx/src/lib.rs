@@ -164,6 +164,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     accel_module.add_function(wrap_pyfunction!(accel::pseudobulk_dex, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::leiden, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::normalize_total, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::log1p, &accel_module)?)?;
     m.add_submodule(&accel_module)?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
