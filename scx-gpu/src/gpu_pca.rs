@@ -23,6 +23,7 @@ use cudarc::driver::PushKernelArg;
 use faer::Mat;
 
 use scx_format::backed::BackedCsrReader;
+use scx_format::total_variance_from_col_sq;
 
 use crate::curand::random_gaussian_gpu;
 use crate::cusolver::{gpu_qr_q, CusolverHandle};
@@ -108,8 +109,9 @@ pub fn gpu_randomized_pca(
     let cusolver_handle = CusolverHandle::new()?;
 
     // Step 1: Compute column means and sum-of-squares (CPU-side, 1 pass)
-    let (means, col_sum_sq) =
-        compute_means_and_col_sq(reader, zero_center).map_err(format_scx_error)?;
+    let (means, col_sum_sq) = reader
+        .col_means_and_sum_sq(zero_center)
+        .map_err(format_scx_error)?;
 
     // Upload means to GPU for mean correction (if centering)
     let d_means: Option<CudaSlice<f32>> = means
@@ -245,7 +247,7 @@ pub fn gpu_randomized_pca(
         .collect();
 
     // Total variance from pre-computed column sum-of-squares
-    let total_var = compute_total_variance_from_col_sq(&col_sum_sq, means.as_deref(), n_obs);
+    let total_var = total_variance_from_col_sq(&col_sum_sq, means.as_deref(), n_obs);
 
     let variance_ratio: Vec<f64> = if total_var > 0.0 {
         variance_explained.iter().map(|&v| v / total_var).collect()
@@ -698,56 +700,10 @@ fn gpu_outer_sub(
     Ok(())
 }
 
-/// Compute column means and column sum-of-squares in one pass over all shards.
-///
-/// Mirrors `scx_accel::pca::compute_means_and_col_sq` but returns f64 for
-/// the variance computation.
-fn compute_means_and_col_sq(
-    reader: &BackedCsrReader,
-    zero_center: bool,
-) -> std::result::Result<(Option<Vec<f64>>, Vec<f64>), scx_format::ScxError> {
-    let n_vars = reader.n_vars();
-    let n_shards = reader.index().n_shards();
-    let mut col_sums = vec![0.0f64; n_vars];
-    let mut col_sum_sq = vec![0.0f64; n_vars];
-
-    for shard_idx in 0..n_shards {
-        let csr = reader.read_shard_cached(shard_idx)?;
-        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-            let v = val as f64;
-            col_sums[col as usize] += v;
-            col_sum_sq[col as usize] += v * v;
-        }
-    }
-
-    let means = if zero_center {
-        let n_obs = reader.n_obs() as f64;
-        Some(col_sums.iter().map(|s| s / n_obs).collect())
-    } else {
-        None
-    };
-
-    Ok((means, col_sum_sq))
-}
-
-/// Total variance from pre-computed column sum-of-squares.
-/// Var(X_j) = (Σ x²_j - n·μ_j²) / (n-1)
-fn compute_total_variance_from_col_sq(
-    col_sum_sq: &[f64],
-    means: Option<&[f64]>,
-    n_obs: usize,
-) -> f64 {
-    let total = if let Some(mu) = means {
-        col_sum_sq
-            .iter()
-            .zip(mu.iter())
-            .map(|(&sq, &m)| sq - n_obs as f64 * m * m)
-            .sum::<f64>()
-    } else {
-        col_sum_sq.iter().sum::<f64>()
-    };
-    total / (n_obs as f64 - 1.0).max(1.0)
-}
+// NOTE: `compute_means_and_col_sq` has been replaced by
+// `BackedCsrReader::col_means_and_sum_sq()` in scx-format.
+// `compute_total_variance_from_col_sq` has been replaced by
+// `scx_format::total_variance_from_col_sq()`.
 
 /// Format ScxError as GpuError.
 fn format_scx_error(e: scx_format::ScxError) -> GpuError {
