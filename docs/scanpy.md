@@ -420,6 +420,12 @@ construction, and UMAP embedding via `pyscx.accel`. These accelerators are
 writing results to the same AnnData slots — so downstream scanpy functions
 (leiden, plotting, DE) work identically.
 
+All accelerators support a `device` parameter for GPU acceleration:
+- `device="auto"` (default) — use GPU if available, fall back to CPU
+- `device="cpu"` — force CPU
+- `device="gpu"` — force GPU (raises error if unavailable)
+- `device="gpu:1"` — select a specific GPU on multi-GPU systems
+
 ### PCA (`pyscx.accel.pca`)
 
 Randomized SVD with streaming shard-by-shard SpMM. Can run directly on
@@ -445,10 +451,12 @@ pyscx.accel.pca(adata, n_comps=50)
 | `random_state` | 0 | Random seed |
 | `n_oversamples` | 10 | Extra dimensions for accuracy |
 | `n_power_iterations` | 2 | Power iterations for spectral accuracy |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
-**Key advantage:** In backed mode, PCA streams SpMM shard-by-shard. Peak
-memory is one shard (~16K × n_vars × 4 bytes) plus the output embeddings,
-enabling PCA on datasets larger than RAM.
+**Key advantage:** In backed mode, PCA streams SpMM shard-by-shard. On GPU,
+the pipeline uses cuSPARSE SpMM + cuSOLVER QR. Benchmarked at ~1× on 1M cells
+(GPU overhead offsets SpMM gains at this scale; larger datasets benefit more).
+Peak memory is one shard plus working matrices.
 
 ### kNN graph (`pyscx.accel.neighbors`)
 
@@ -471,9 +479,10 @@ pyscx.accel.neighbors(adata, n_neighbors=15)
 | `random_state` | 0 | Random seed |
 | `ef_construction` | 200 | HNSW build parameter (higher = more accurate) |
 | `ef_search` | 200 | HNSW search parameter (higher = more accurate) |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
-The HNSW graph uses Euclidean distance and achieves recall@k > 0.90
-compared to brute-force exact kNN.
+On CPU, uses HNSW (instant-distance) with Euclidean distance.
+On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
 
 ### UMAP (`pyscx.accel.umap`)
 
@@ -496,6 +505,10 @@ pyscx.accel.umap(adata)
 | `negative_sample_rate` | 5 | Negative samples per positive edge |
 | `learning_rate` | 1.0 | Initial learning rate |
 | `random_state` | 0 | Random seed |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
+
+On GPU, uses a native CUDA SGD kernel (edge-parallel with `atomicAdd`).
+Falls back to cuML UMAP if available for maximum performance.
 
 ### Differential Expression (`pyscx.accel.rank_genes_groups`)
 
@@ -658,7 +671,55 @@ sc.tl.umap(adata)       # uses umap-learn
 
 The choice is purely about performance. At <50K cells, the difference is
 negligible. At >100K cells, the Rust accelerators provide meaningful
-speedups.
+speedups. At >1M cells, GPU acceleration (`device="gpu"`) transforms
+interactive exploration from "go get coffee" to "instant."
+
+### GPU helper functions
+
+```python
+# Query GPU availability and memory
+info = pyscx.accel.gpu_info()
+# {'device': 'NVIDIA A100-SXM4-80GB', 'total_vram_gb': 80.0, 'free_vram_gb': 72.3}
+
+# Estimate GPU memory requirements
+est = pyscx.accel.estimate_gpu_memory(adata, operation="pca", n_comps=50)
+# {'required_gb': 2.1, 'fits_in_vram': True}
+```
+
+### GPU vs CPU numerical differences
+
+GPU and CPU accelerators may produce slightly different results due to:
+
+| Factor | Impact | When it matters |
+|--------|--------|-----------------|
+| **PCA precision** | GPU uses f32 throughout; CPU uses f64 | Cosine similarity per PC > 0.99 — no biological impact |
+| **kNN algorithm** | GPU uses CAGRA (graph-based ANN); CPU uses HNSW | Both are approximate; recall@k > 0.95 |
+| **UMAP non-determinism** | GPU uses `atomicAdd` (race conditions are intentional) | Embedding coordinates differ; cluster structure preserved |
+| **Leiden** | cuGraph vs leidenalg may produce different partitions | ARI > 0.90; biological conclusions equivalent |
+
+For reproducibility notes and tolerance thresholds, see
+[Phase4-GPU.md §7](../Phase4-GPU.md).
+
+### Checking which backend was used
+
+All accelerators record the backend in `adata.uns`:
+
+```python
+pyscx.accel.pca(adata, device="gpu")
+print(adata.uns["pca"]["backend"])          # "scx-gpu-cusparse"
+print(adata.uns["pca"]["device"])           # "NVIDIA A100-SXM4-80GB"
+print(adata.uns["pca"]["gpu_time_ms"])      # 1234.5
+
+pyscx.accel.neighbors(adata, device="gpu")
+print(adata.uns["neighbors"]["backend"])    # "scx-gpu-cagra"
+
+pyscx.accel.umap(adata, device="gpu")
+print(adata.uns["umap"]["backend"])         # "scx-gpu-cuda" or "cuml"
+```
+
+If cuML or cuGraph are importable at runtime, they are used as optimized
+backends for UMAP and Leiden respectively. Otherwise, SCX's native CUDA
+kernels (UMAP) or CPU fallbacks (Leiden via leidenalg) are used.
 
 ## Common scanpy workflows
 
@@ -725,6 +786,45 @@ pyscx.accel.umap(adata_sub)
 sc.tl.leiden(adata_sub)
 
 sc.pl.umap(adata_sub, color="leiden")
+```
+
+### GPU-accelerated analysis pipeline
+
+When a CUDA GPU is available, use `device="gpu"` for GPU-accelerated
+analysis (up to 16× per-op, 3.8× end-to-end on 1M cells). See
+[`docs/gpu-setup.md`](gpu-setup.md) for installation instructions (conda,
+system CUDA, or container).
+
+```python
+import pyscx
+import scanpy as sc
+
+# Open in backed mode for memory-efficient QC
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# QC works natively in backed mode
+sc.pp.calculate_qc_metrics(adata, inplace=True)
+sc.pp.filter_cells(adata, min_genes=200)
+sc.pp.filter_genes(adata, min_cells=3)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+
+# Subset to HVGs and materialize
+adata_sub = adata[:, adata.var["highly_variable"]].copy()
+sc.pp.normalize_total(adata_sub, target_sum=1e4)
+sc.pp.log1p(adata_sub)
+
+# GPU-accelerated pipeline (falls back to CPU if no GPU)
+pyscx.accel.pca(adata_sub, n_comps=50, device="gpu")
+pyscx.accel.neighbors(adata_sub, n_neighbors=15, device="gpu")
+pyscx.accel.umap(adata_sub, device="gpu")
+sc.tl.leiden(adata_sub)  # CPU Leiden; use device="gpu" for cuGraph
+
+sc.pl.umap(adata_sub, color="leiden")
+
+# Check which backends were used
+print(adata_sub.uns["pca"]["backend"])       # "scx-gpu-cusparse"
+print(adata_sub.uns["neighbors"]["backend"]) # "scx-gpu-cagra"
+print(adata_sub.uns["umap"]["backend"])      # "scx-gpu-cuda"
 ```
 
 ### Differential expression

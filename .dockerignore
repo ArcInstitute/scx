@@ -1,0 +1,8 @@
+target/
+.venv/
+.git/
+*.scx
+*.h5ad
+*.h5
+benchmarks/results/
+benchmarks/data/

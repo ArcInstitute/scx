@@ -207,19 +207,6 @@ mod tests {
     use super::*;
     use scx_codec::forbp::{forbp_decode, forbp_encode};
 
-    /// Try to get a GPU device, skip test if unavailable.
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
-
     /// Helper to build flat indices and row_lengths from a Vec of Vec.
     fn flatten(rows: &[Vec<u32>]) -> (Vec<u32>, Vec<usize>) {
         let indices: Vec<u32> = rows.iter().flatten().copied().collect();

@@ -1281,3 +1281,269 @@ class TestStratifiedDE:
                     err_msg=f"log2FC mismatch for gene_0 in {ct}",
                 )
 
+
+class TestLeiden:
+    """Test pyscx.accel.leiden() — Leiden community detection."""
+
+    def test_basic_structure(self, synthetic_adata):
+        """Leiden writes cluster labels to adata.obs and metadata to adata.uns."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.leiden(adata)
+
+        # Check obs column
+        assert "leiden" in adata.obs.columns
+        assert len(adata.obs["leiden"]) == adata.n_obs
+
+        # All labels should be strings (matching scanpy convention)
+        assert adata.obs["leiden"].dtype.name == "category"
+
+        # Check uns metadata
+        assert "leiden" in adata.uns
+        assert "params" in adata.uns["leiden"]
+        assert adata.uns["leiden"]["params"]["resolution"] == 1.0
+        assert adata.uns["leiden"]["backend"] == "leidenalg"
+        assert "modularity" in adata.uns["leiden"]
+
+    def test_multiple_clusters(self, synthetic_adata):
+        """Leiden should find at least 2 clusters on synthetic data."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.leiden(adata)
+
+        n_clusters = adata.obs["leiden"].nunique()
+        assert n_clusters >= 2, f"expected >= 2 clusters, got {n_clusters}"
+
+    def test_resolution_parameter(self, synthetic_adata):
+        """Higher resolution should produce more clusters."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata_low = synthetic_adata.copy()
+        pyscx.accel.pca(adata_low, n_comps=10)
+        pyscx.accel.neighbors(adata_low, n_neighbors=10)
+        pyscx.accel.leiden(adata_low, resolution=0.1, key_added="leiden_low")
+
+        adata_high = synthetic_adata.copy()
+        pyscx.accel.pca(adata_high, n_comps=10)
+        pyscx.accel.neighbors(adata_high, n_neighbors=10)
+        pyscx.accel.leiden(adata_high, resolution=3.0, key_added="leiden_high")
+
+        n_low = adata_low.obs["leiden_low"].nunique()
+        n_high = adata_high.obs["leiden_high"].nunique()
+        assert n_high >= n_low, (
+            f"higher resolution ({n_high} clusters) should yield >= "
+            f"clusters than lower resolution ({n_low} clusters)"
+        )
+
+    def test_key_added(self, synthetic_adata):
+        """key_added parameter should control the obs column name."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.leiden(adata, key_added="my_clusters")
+
+        assert "my_clusters" in adata.obs.columns
+        assert "my_clusters" in adata.uns
+
+    def test_reproducibility(self, synthetic_adata):
+        """Same random_state should produce identical results."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata1 = synthetic_adata.copy()
+        pyscx.accel.pca(adata1, n_comps=10, random_state=42)
+        pyscx.accel.neighbors(adata1, n_neighbors=10, random_state=42)
+        pyscx.accel.leiden(adata1, random_state=42)
+
+        adata2 = synthetic_adata.copy()
+        pyscx.accel.pca(adata2, n_comps=10, random_state=42)
+        pyscx.accel.neighbors(adata2, n_neighbors=10, random_state=42)
+        pyscx.accel.leiden(adata2, random_state=42)
+
+        assert list(adata1.obs["leiden"]) == list(adata2.obs["leiden"])
+
+    def test_missing_connectivities_error(self, synthetic_adata):
+        """Leiden should raise an error if connectivities are missing."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+
+        with pytest.raises(RuntimeError, match="connectivities"):
+            pyscx.accel.leiden(adata)
+
+    def test_ari_vs_scanpy_leiden(self, synthetic_adata):
+        """ARI between SCX and scanpy Leiden should be > 0.80 on same graph."""
+        try:
+            import scanpy as sc
+        except ImportError:
+            pytest.skip("scanpy not available")
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+        from sklearn.metrics import adjusted_rand_score
+
+        import pyscx
+
+        # Build graph with SCX (shared between both)
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+
+        # SCX Leiden
+        pyscx.accel.leiden(adata, resolution=1.0, random_state=42, key_added="scx_leiden")
+
+        # scanpy Leiden (on the same graph)
+        sc.tl.leiden(adata, resolution=1.0, random_state=42, key_added="scanpy_leiden")
+
+        scx_labels = adata.obs["scx_leiden"].values
+        scanpy_labels = adata.obs["scanpy_leiden"].values
+
+        ari = adjusted_rand_score(scx_labels, scanpy_labels)
+        assert ari > 0.80, (
+            f"ARI between SCX and scanpy Leiden = {ari:.4f} (expected > 0.80)"
+        )
+
+    def test_backed_pipeline(self, pca_adata):
+        """Full pipeline from backed SCX: PCA → neighbors → Leiden."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        scx_path, _ = pca_adata
+        backed_adata = pyscx.open(scx_path).to_anndata(backed=True)
+
+        pyscx.accel.pca(backed_adata, n_comps=10)
+        pyscx.accel.neighbors(backed_adata, n_neighbors=5)
+        pyscx.accel.leiden(backed_adata)
+
+        assert "leiden" in backed_adata.obs.columns
+        n_clusters = backed_adata.obs["leiden"].nunique()
+        assert n_clusters >= 2, f"expected >= 2 clusters, got {n_clusters}"
+
+    def test_de_on_leiden_clusters(self, synthetic_adata):
+        """DE analysis should work on Leiden cluster labels."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.leiden(adata)
+
+        # DE on Leiden clusters
+        pyscx.accel.rank_genes_groups(adata, "leiden")
+        assert "rank_genes_groups" in adata.uns
+
+    def test_modularity_positive(self, synthetic_adata):
+        """Modularity should be positive for a reasonable partition."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.leiden(adata)
+
+        assert adata.uns["leiden"]["modularity"] > 0, (
+            "modularity should be positive for a meaningful partition"
+        )
+
+    def test_device_cpu_explicit(self, synthetic_adata):
+        """Explicitly requesting device='cpu' should use leidenalg."""
+        try:
+            import leidenalg  # noqa: F401
+        except ImportError:
+            pytest.skip("leidenalg not available")
+        try:
+            import igraph  # noqa: F401
+        except ImportError:
+            pytest.skip("igraph not available")
+
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca(adata, n_comps=10)
+        pyscx.accel.neighbors(adata, n_neighbors=10)
+        pyscx.accel.leiden(adata, device="cpu")
+
+        assert adata.uns["leiden"]["backend"] == "leidenalg"

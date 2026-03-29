@@ -815,6 +815,66 @@ impl BackedCsrReader {
 
         Ok(result)
     }
+
+    // --- PCA statistics ---
+
+    /// Compute column means and column sum-of-squares in a single pass.
+    ///
+    /// Streams through all shards once, accumulating per-column sums and
+    /// sum-of-squares. If `zero_center` is true, returns the column means
+    /// (sums / n_obs); otherwise returns `None` for means.
+    ///
+    /// Used by both CPU and GPU PCA to avoid a separate data pass for
+    /// variance computation.
+    ///
+    /// Returns `(means, col_sum_sq)` where:
+    /// - `means`: `Some(Vec<f64>)` of length `n_vars` if `zero_center`, else `None`
+    /// - `col_sum_sq`: `Vec<f64>` of length `n_vars` — per-column Σ x²
+    pub fn col_means_and_sum_sq(&self, zero_center: bool) -> Result<(Option<Vec<f64>>, Vec<f64>)> {
+        let n_vars = self.n_vars;
+        let n_shards = self.index.n_shards();
+        let mut col_sums = vec![0.0f64; n_vars];
+        let mut col_sum_sq = vec![0.0f64; n_vars];
+
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_cached(shard_idx)?;
+            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                let v = val as f64;
+                col_sums[col as usize] += v;
+                col_sum_sq[col as usize] += v * v;
+            }
+        }
+
+        let means = if zero_center {
+            let n_obs = self.n_obs as f64;
+            Some(col_sums.iter().map(|s| s / n_obs).collect())
+        } else {
+            None
+        };
+
+        Ok((means, col_sum_sq))
+    }
+}
+
+/// Total variance from pre-computed column sum-of-squares.
+///
+/// Uses the identity: `Var(X_j) = (Σ x²_j − n·μ_j²) / (n−1)`.
+/// Sums variance contributions across all columns to get total variance.
+///
+/// - `col_sum_sq`: per-column sum-of-squares (from [`BackedCsrReader::col_means_and_sum_sq`])
+/// - `means`: column means (if centering was applied)
+/// - `n_obs`: number of observations
+pub fn total_variance_from_col_sq(col_sum_sq: &[f64], means: Option<&[f64]>, n_obs: usize) -> f64 {
+    let total = if let Some(mu) = means {
+        col_sum_sq
+            .iter()
+            .zip(mu.iter())
+            .map(|(&sq, &m)| sq - n_obs as f64 * m * m)
+            .sum::<f64>()
+    } else {
+        col_sum_sq.iter().sum::<f64>()
+    };
+    total / (n_obs as f64 - 1.0).max(1.0)
 }
 
 // ---------------------------------------------------------------------------

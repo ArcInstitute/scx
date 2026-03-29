@@ -28,19 +28,19 @@ The workspace contains 14 crates (including `scx-integration-tests`). Dependenci
 ┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐   ┌──────┴──────┐  ┌────┴──────┐
 │ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │   │  scx-mtx    │  │ scx-accel │
 │ query engine│ │ file ops │ │    │ cloud ops  │   │ MTX I/O     │  │ PCA/kNN/  │
-└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘  │ UMAP/DE   │
-       │              │      │              │             │         └────┬──────┘
-       │    ┌─────────┘  ┌───┴────────┐     │             │              │
-       │    │            │ scx-loader │     │             │              │
-       │    │            │ ML loader  │     │             │              │
-       │    │            └───┬────────┘     │             │              │
-       │    │                │              │             │              │
-       └────┴────────────────┼──────────────┴─────────────┴──────────────┘
-                             │                        ┌──────────┐
-                      ┌──────┴──────┐                 │  scx-gpu │
-                      │ scx-format  │                 │ GPU codec│
-                      └──────┬──────┘                 └────┬─────┘
-                  ┌──────────┼─────────────────────────────┘
+└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘  └──┬─┬─────┘
+       │              │      │              │             │            │ │ [gpu]
+       │    ┌─────────┘  ┌───┴────────┐     │             │            │ │
+       │    │            │ scx-loader │     │             │            │ │
+       │    │            │ ML loader  │     │             │            │ │
+       │    │            └───┬────────┘     │             │            │ │
+       │    │                │              │             │            │ │
+       └────┴────────────────┼──────────────┴─────────────┴────────────┘ │
+                             │                        ┌──────────┐      │
+                       ┌──────┴──────┐                 │  scx-gpu │◀─────┘
+                       │ scx-format  │                 │ GPU codec│
+                       └──────┬──────┘                 │ + analysis│
+                   ┌──────────┼─────────────────────────┴────┬─────┘
                   │                     │
            ┌──────┴──────┐        ┌─────┴──────┐
            │  scx-codec  │        │ scx-sparse │
@@ -62,8 +62,8 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
-| **scx-accel** | Rust-native analysis accelerators | `pca` (randomized SVD), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon), `pseudobulk` |
-| **scx-gpu** | CUDA-accelerated codec decoding and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `gds` |
+| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (randomized SVD), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
+| **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA), `gpu_umap` (CUDA SGD), `gpu_preprocess` (fused normalize+log1p), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess` |
 | **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
@@ -77,6 +77,9 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 > HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
 > `scx-accel` depends only on `scx-format` and `scx-sparse` — no engine/loader
 > dependency. It uses `faer` for dense linear algebra and `instant-distance` for HNSW kNN.
+> With the `gpu` feature enabled, `scx-accel` gains an optional dependency on `scx-gpu`
+> for GPU-accelerated PCA (cuSPARSE SpMM + cuSOLVER QR), kNN (cuVS CAGRA), and
+> UMAP (native CUDA SGD kernel).
 
 ---
 
@@ -569,6 +572,41 @@ Cell Ranger MTX conversion uses the `scx-mtx` crate (always-on, no HDF5 dependen
       ▼
   PyTorch              batch["X"].to(device) → model.forward()
 ```
+
+### Analysis: SCX → GPU Accelerators
+
+When `device="gpu"` is set (or `device="auto"` with a CUDA GPU present),
+the analysis pipeline runs entirely on GPU:
+
+```
+  experiment.scx
+      │
+      ▼
+  BackedCsrReader      Read shard bytes from disk
+      │
+      ▼
+  GPU PCA (streaming)   For each shard:
+      │                   1. htod copy raw shard bytes
+      │                   2. decode_shard_gpu() → GpuCsr
+      │                   3. GpuCsr → CusparseSpMatDescr (zero-copy)
+      │                   4. cusparseSpMM: Y_shard += A_shard @ Ω
+      │                   5. mean_correct_kernel on Y_shard rows
+      │                 Then:
+      │                   cuSOLVER QR → Power iteration → CPU SVD → GPU GEMM
+      ▼
+  GPU kNN (CAGRA)       cuVS CAGRA index build + all-queries search
+      │                 on PCA embeddings (stays on GPU)
+      ▼
+  GPU UMAP              Native CUDA SGD kernel (edge-parallel)
+      │                 or cuML fallback if available
+      ▼
+  AnnData               dtoh copy embeddings, kNN graph, UMAP coords
+                        → adata.obsm["X_pca"], obsp, obsm["X_umap"]
+```
+
+Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices
+during PCA). kNN and UMAP operate on the (n_obs × n_components) dense
+embeddings, which are small relative to the full expression matrix.
 
 ---
 

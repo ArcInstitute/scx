@@ -14,7 +14,7 @@
 | `scx-loader` | Unit tests | Pipeline lifecycle, batch format, shuffle, projection, normalize |
 | `scx-cloud` | `tests/` | Explode/pack round-trip, cloud-optimize, pull/push (local backend) |
 | `scx-accel` | Unit tests | PCA round-trip, kNN recall, UMAP trustworthiness, DE p-values, pseudobulk aggregation |
-| `scx-gpu` | Unit tests | CUDA Rice/FOR-BP decode, sparse-to-dense, GPU parity with CPU reference |
+| `scx-gpu` | Unit tests | CUDA Rice/FOR-BP decode, sparse-to-dense, cuSPARSE SpMM, cuSOLVER QR, cuRAND, GPU PCA pipeline, GPU UMAP SGD, GPU preprocessing (normalize+log1p). GPU parity with CPU reference. |
 | `rscx` | via `R CMD check` | Seurat/SCE round-trip, query, CSR transpose |
 
 ## Python Test Suite
@@ -22,6 +22,7 @@
 **Location**: `pyscx/tests/`
 **Run**: `cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v`
 **With cloud**: `../.venv/bin/maturin develop --features cloud && ../.venv/bin/pytest tests/ -v`
+**With GPU**: `../.venv/bin/maturin develop --features gpu && ../.venv/bin/pytest tests/ -v`
 
 | Test file | Purpose |
 |-----------|---------|
@@ -107,3 +108,65 @@ python benchmarks/scripts/submit_benchmarks.py
 | Merge throughput | 424 MB/s |
 
 Full results in `benchmarks/results/*.md`.
+
+## GPU Tests
+
+### Running GPU Tests
+
+```bash
+# Rust-level GPU tests (require CUDA device)
+cargo test -p scx-gpu --features bench
+
+# Python-level GPU accelerator tests
+cd pyscx && ../.venv/bin/maturin develop --features gpu && \
+  ../.venv/bin/pytest tests/test_accel.py -v -k "gpu"
+```
+
+### GPU Test Skip Behavior
+
+All GPU tests use a `require_gpu!()` macro that gracefully skips when no CUDA
+device is available. This macro:
+
+1. Attempts to create a `GpuDevice` (CUDA context + stream)
+2. If CUDA initialization fails (no GPU, no driver, wrong CUDA version), the test returns `Ok(())` silently
+3. Tests run normally in CI environments with GPUs, and are safely skipped in CPU-only CI
+
+The macro is defined per-module (e.g., `cusparse.rs`, `cusolver.rs`, `gpu_pca.rs`,
+`gpu_umap.rs`, `gpu_preprocess.rs`) to avoid cross-module test coupling.
+
+### GPU Correctness Thresholds
+
+| Test | Metric | Threshold |
+|------|--------|-----------|
+| GPU SpMM vs CPU SpMM | Max relative error | < 1e-5 |
+| GPU PCA vs CPU PCA | Cosine similarity per PC | > 0.99 (sign-invariant) |
+| GPU kNN vs CPU HNSW | Recall@k | > 0.95 |
+| GPU UMAP | Trustworthiness | > 0.95 |
+| GPU Leiden vs CPU Leiden | ARI | > 0.90 |
+| GPU normalize+log1p | Match CPU reference | rtol=1e-7 |
+
+### GPU Benchmarks
+
+```bash
+# GPU analysis benchmarks (PCA, kNN, UMAP throughput)
+.venv/bin/python benchmarks/scripts/benchmark_gpu_analysis.py
+
+# GPU preprocessing benchmarks
+.venv/bin/python benchmarks/scripts/benchmark_gpu_preprocess.py
+```
+
+| Benchmark | Datasets | Compare against |
+|-----------|----------|----------------|
+| GPU PCA throughput | 100K, 1M, 5M cells × 2K HVGs | scx-accel CPU, scanpy, rapids-singlecell |
+| GPU kNN throughput | 100K, 1M, 5M cells × 50 PCs | scx-accel CPU, PyNNDescent, rapids |
+| GPU UMAP throughput | 100K, 1M cells | scx-accel CPU, umap-learn, rapids |
+| GPU memory footprint | 1M, 5M, 10M cells | Peak VRAM per operation |
+| End-to-end GPU pipeline | 1M cells | Full PCA → kNN → UMAP time |
+
+### Hardware Requirements
+
+| GPU | VRAM | Expected max dataset |
+|-----|------|---------------------|
+| RTX 3090 / 4090 | 24 GB | ~2M cells |
+| A100 / H100 (40 GB) | 40 GB | ~5M cells |
+| A100 / H100 (80 GB) | 80 GB | ~10M cells |

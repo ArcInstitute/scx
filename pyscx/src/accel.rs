@@ -150,8 +150,13 @@ fn extract_strata<'py>(
 ///     random_state: Random seed for reproducibility (default: 0)
 ///     n_oversamples: Extra dimensions for accuracy (default: 10)
 ///     n_power_iterations: Power iterations for spectral accuracy (default: 2)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Note: GPU mode uses f32 precision throughout (CPU uses f64 intermediates),
+/// producing slightly different but equally valid results. See docs/scanpy.md.
 #[pyfunction]
-#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2))]
+#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto"))]
+#[allow(clippy::too_many_arguments)]
 pub fn pca(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -160,13 +165,40 @@ pub fn pca(
     random_state: u64,
     n_oversamples: usize,
     n_power_iterations: usize,
+    device: &str,
 ) -> PyResult<()> {
+    // Determine effective device
+    let _use_gpu = resolve_device(device)?;
+    let backend: &str;
+
     // Extract X from adata
     let x = adata.getattr("X")?;
 
-    // Try to extract as ScxBackedSparseDataset for streaming PCA
+    // Try GPU path first if requested
+    #[cfg(feature = "gpu")]
+    if _use_gpu {
+        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            let reader = &backed.backed;
+            let result = scx_accel::randomized_pca_gpu(
+                0, // device_id = 0 (first GPU)
+                reader,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+
+            write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
+            return Ok(());
+        }
+    }
+
+    // CPU path (default or fallback)
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // Streaming PCA from backed mode
+        backend = "scx-accel-cpu";
         let reader = &backed.backed;
         scx_accel::randomized_pca(
             reader,
@@ -179,6 +211,7 @@ pub fn pca(
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         // Materialized: extract scipy CSR → ScxCsr → in-memory PCA
+        backend = "scx-accel-cpu";
         let scipy_sparse = py.import("scipy.sparse")?;
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
@@ -247,9 +280,52 @@ pub fn pca(
     };
 
     // Write results to AnnData slots
-    write_pca_to_adata(py, adata, &result)?;
+    write_pca_to_adata(py, adata, &result, backend)?;
 
     Ok(())
+}
+
+/// Resolve the device string to a boolean (true = GPU, false = CPU).
+///
+/// "auto" → GPU if available (feature enabled + device found), else CPU.
+/// "cpu" → always CPU.
+/// "gpu" / "gpu:N" → always GPU (errors if unavailable).
+fn resolve_device(device: &str) -> PyResult<bool> {
+    match device {
+        "cpu" => Ok(false),
+        "auto" => {
+            #[cfg(feature = "gpu")]
+            {
+                Ok(scx_accel::gpu_available())
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Ok(false)
+            }
+        }
+        d if d.starts_with("gpu") => {
+            #[cfg(feature = "gpu")]
+            {
+                if scx_accel::gpu_available() {
+                    Ok(true)
+                } else {
+                    Err(PyRuntimeError::new_err(
+                        "device='gpu' requested but no CUDA GPU found",
+                    ))
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Err(PyRuntimeError::new_err(
+                    "device='gpu' requested but pyscx was built without the 'gpu' feature",
+                ))
+            }
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown device: '{}'. Use 'auto', 'cpu', or 'gpu'",
+            device
+        ))),
+    }
 }
 
 /// Write PCA results to AnnData slots matching scanpy's format.
@@ -257,6 +333,7 @@ fn write_pca_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::PcaResult,
+    backend: &str,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
 
@@ -288,7 +365,7 @@ fn write_pca_to_adata(
     let varm = adata.getattr("varm")?;
     varm.set_item("PCs", pcs_arr)?;
 
-    // adata.uns["pca"] = dict with variance info
+    // adata.uns["pca"] = dict with variance info + backend
     let pca_dict = PyDict::new(py);
 
     let var_explained = numpy.call_method1("array", (result.variance_explained.clone(),))?;
@@ -297,28 +374,38 @@ fn write_pca_to_adata(
     let var_ratio = numpy.call_method1("array", (result.variance_ratio.clone(),))?;
     pca_dict.set_item("variance_ratio", var_ratio)?;
 
+    pca_dict.set_item("backend", backend)?;
+
     let uns = adata.getattr("uns")?;
     uns.set_item("pca", pca_dict)?;
 
     Ok(())
 }
 
-/// Build a kNN graph using approximate nearest neighbors (HNSW).
+/// Build a kNN graph using approximate nearest neighbors.
 ///
 /// Reads `adata.obsm["X_pca"]` and computes a kNN graph plus UMAP-style
 /// connectivities. Results are written to `adata.obsp["distances"]`,
 /// `adata.obsp["connectivities"]`, and `adata.uns["neighbors"]`,
 /// matching scanpy's `sc.pp.neighbors()` output format.
 ///
+/// When `device="gpu"`, uses cuVS CAGRA (GPU graph-based ANN) for 20-50×
+/// speedup on large datasets. Falls back to CPU HNSW if cuVS is unavailable.
+///
 /// Args:
 ///     adata: AnnData object with obsm["X_pca"] (n_obs × n_pcs)
 ///     n_neighbors: Number of nearest neighbors (default: 15)
 ///     use_rep: Key in adata.obsm to use (default: "X_pca")
 ///     random_state: Random seed for reproducibility (default: 0)
-///     ef_construction: HNSW construction parameter (default: 200)
-///     ef_search: HNSW search parameter (default: 200)
+///     ef_construction: HNSW construction parameter (default: 200, CPU only)
+///     ef_search: HNSW search parameter (default: 200, CPU only)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Note: GPU mode uses cuVS CAGRA (graph-based ANN) instead of HNSW. Both are
+/// approximate; neighbor sets may differ slightly. See docs/scanpy.md.
 #[pyfunction]
-#[pyo3(signature = (adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200))]
+#[pyo3(signature = (adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto"))]
+#[allow(clippy::too_many_arguments)]
 pub fn neighbors(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -327,8 +414,12 @@ pub fn neighbors(
     random_state: u64,
     ef_construction: usize,
     ef_search: usize,
+    device: &str,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
+
+    // Determine effective device
+    let use_gpu = resolve_device(device)?;
 
     // Extract representation matrix from adata.obsm[use_rep]
     let obsm = adata.getattr("obsm")?;
@@ -349,7 +440,38 @@ pub fn neighbors(
     let flat = arr.call_method0("ravel")?;
     let data: Vec<f32> = flat.extract()?;
 
-    // Build kNN graph
+    // GPU path
+    #[cfg(feature = "gpu")]
+    if use_gpu {
+        // Check if cuVS CAGRA is available
+        if scx_accel::cuvs_available() {
+            let result = scx_accel::build_knn_graph_gpu(
+                0, // device_id = 0 (first GPU)
+                &data,
+                n_obs,
+                n_vars,
+                n_neighbors,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+
+            write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "cagra")?;
+            return Ok(());
+        }
+        // cuVS not available — fall through to CPU with warning
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            ("cuVS library not found — falling back to CPU HNSW. \
+              Install cuVS for GPU-accelerated kNN: \
+              conda install -c rapidsai -c conda-forge libcuvs",),
+        )?;
+    }
+
+    // Suppress unused variable warning when gpu feature is not enabled
+    #[cfg(not(feature = "gpu"))]
+    let _ = use_gpu;
+
+    // CPU path (default or fallback)
     let result = scx_accel::build_knn_graph(
         &data,
         n_obs,
@@ -362,7 +484,7 @@ pub fn neighbors(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Write results to AnnData
-    write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep)?;
+    write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "hnsw")?;
 
     Ok(())
 }
@@ -374,6 +496,7 @@ fn write_neighbors_to_adata(
     result: &scx_accel::KnnResult,
     n_neighbors: usize,
     use_rep: &str,
+    method: &str,
 ) -> PyResult<()> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let numpy = py.import("numpy")?;
@@ -411,7 +534,7 @@ fn write_neighbors_to_adata(
 
     let params_dict = PyDict::new(py);
     params_dict.set_item("n_neighbors", n_neighbors)?;
-    params_dict.set_item("method", "hnsw")?;
+    params_dict.set_item("method", method)?;
     params_dict.set_item("use_rep", use_rep)?;
     neighbors_dict.set_item("params", params_dict)?;
 
@@ -427,6 +550,9 @@ fn write_neighbors_to_adata(
 /// `sc.pp.neighbors()`) and computes a 2D embedding via SGD optimization.
 /// Results are written to `adata.obsm["X_umap"]`.
 ///
+/// When `device="gpu"`, uses a native CUDA SGD kernel for 10–300× speedup
+/// on large datasets. Falls back to cuML UMAP (if importable) or CPU.
+///
 /// Args:
 ///     adata: AnnData with obsp["connectivities"] (CSR, n_obs × n_obs)
 ///     n_components: Output dimensions (default: 2)
@@ -436,8 +562,13 @@ fn write_neighbors_to_adata(
 ///     negative_sample_rate: Negative samples per positive edge (default: 5)
 ///     learning_rate: Initial learning rate (default: 1.0)
 ///     random_state: Random seed (default: 0)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Note: GPU UMAP is non-deterministic due to intentional atomicAdd race
+/// conditions on embedding updates (matches cuML). Embeddings will differ
+/// from CPU UMAP but preserve equivalent cluster structure.
 #[pyfunction]
-#[pyo3(signature = (adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0))]
+#[pyo3(signature = (adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn umap(
     py: Python<'_>,
@@ -449,8 +580,12 @@ pub fn umap(
     negative_sample_rate: usize,
     learning_rate: f64,
     random_state: u64,
+    device: &str,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
+
+    // Determine effective device
+    let use_gpu = resolve_device(device)?;
 
     // Extract connectivities CSR from adata.obsp["connectivities"]
     let obsp = adata.getattr("obsp")?;
@@ -478,7 +613,62 @@ pub fn umap(
         .call_method1("astype", ("float64",))?
         .extract::<Vec<f64>>()?;
 
-    // Compute UMAP
+    // GPU path
+    #[cfg(feature = "gpu")]
+    if use_gpu {
+        // Try native CUDA SGD kernel first
+        match scx_accel::compute_umap_gpu(
+            0, // device_id = 0
+            &indptr,
+            &indices,
+            &data,
+            n_obs,
+            n_components,
+            n_epochs,
+            min_dist,
+            spread,
+            negative_sample_rate,
+            learning_rate,
+            random_state,
+        ) {
+            Ok(result) => {
+                write_umap_to_adata(py, adata, &result)?;
+                write_umap_backend(py, adata, "scx-gpu-cuda")?;
+                return Ok(());
+            }
+            Err(e) => {
+                // Native CUDA failed — try cuML fallback
+                let cuml_ok = try_cuml_umap(
+                    py,
+                    adata,
+                    n_components,
+                    n_epochs,
+                    min_dist,
+                    spread,
+                    negative_sample_rate,
+                    learning_rate,
+                    random_state,
+                );
+                if cuml_ok.is_ok() {
+                    return Ok(());
+                }
+                // Both GPU paths failed — fall through to CPU with warning
+                let warnings = py.import("warnings")?;
+                warnings.call_method1(
+                    "warn",
+                    (format!(
+                        "GPU UMAP failed (native: {e}; cuML not available) — falling back to CPU"
+                    ),),
+                )?;
+            }
+        }
+    }
+
+    // Suppress unused variable warning when gpu feature is not enabled
+    #[cfg(not(feature = "gpu"))]
+    let _ = use_gpu;
+
+    // CPU path (default or fallback)
     let result = scx_accel::compute_umap(
         &indptr,
         &indices,
@@ -497,6 +687,69 @@ pub fn umap(
 
     // Write results to adata.obsm["X_umap"]
     write_umap_to_adata(py, adata, &result)?;
+    write_umap_backend(py, adata, "scx-accel-cpu")?;
+
+    Ok(())
+}
+
+/// Write UMAP backend metadata to adata.uns["umap"].
+fn write_umap_backend(py: Python<'_>, adata: &Bound<'_, PyAny>, backend: &str) -> PyResult<()> {
+    let uns = adata.getattr("uns")?;
+    let umap_dict = PyDict::new(py);
+    umap_dict.set_item("backend", backend)?;
+    uns.set_item("umap", umap_dict)?;
+    Ok(())
+}
+
+/// Try cuML UMAP as a fallback when native CUDA kernel is unavailable.
+///
+/// Attempts to import `cuml.manifold.UMAP` at runtime. If cuML is importable,
+/// runs UMAP via cuML's Python API and writes results to adata.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn try_cuml_umap(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    n_components: usize,
+    n_epochs: usize,
+    min_dist: f64,
+    spread: f64,
+    _negative_sample_rate: usize,
+    learning_rate: f64,
+    random_state: u64,
+) -> PyResult<()> {
+    // Try importing cuML
+    let cuml_umap = py
+        .import("cuml.manifold")
+        .map_err(|_| PyRuntimeError::new_err("cuML not available"))?;
+
+    let umap_cls = cuml_umap.getattr("UMAP")?;
+
+    // Create UMAP instance with parameters matching our API
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("n_components", n_components)?;
+    kwargs.set_item("n_epochs", n_epochs)?;
+    kwargs.set_item("min_dist", min_dist)?;
+    kwargs.set_item("spread", spread)?;
+    kwargs.set_item("learning_rate", learning_rate)?;
+    kwargs.set_item("random_state", random_state as i64)?;
+
+    // cuML UMAP expects the precomputed kNN graph via adata
+    // Use the "precomputed" metric with the connectivities matrix
+    kwargs.set_item("metric", "precomputed")?;
+    let model = umap_cls.call((), Some(&kwargs))?;
+
+    // Fit on the connectivities matrix
+    let obsp = adata.getattr("obsp")?;
+    let conn = obsp.get_item("connectivities")?;
+    let embedding = model.call_method1("fit_transform", (&conn,))?;
+
+    // Write to adata.obsm["X_umap"]
+    let obsm = adata.getattr("obsm")?;
+    obsm.set_item("X_umap", &embedding)?;
+
+    // Record backend
+    write_umap_backend(py, adata, "cuml")?;
 
     Ok(())
 }
@@ -1293,4 +1546,318 @@ pub fn pseudobulk_dex(
     )?;
 
     Ok(combined.unbind())
+}
+
+/// Run Leiden community detection on a kNN graph.
+///
+/// Reads `adata.obsp["connectivities"]` (from `pyscx.accel.neighbors()` or
+/// `sc.pp.neighbors()`) and partitions the graph using the Leiden algorithm.
+/// Results are written to `adata.obs[key_added]` (cluster labels as strings)
+/// and `adata.uns["leiden"]` (parameters and backend metadata).
+///
+/// When `device="gpu"`, tries cuGraph Leiden (GPU-accelerated, up to 47×
+/// faster than igraph on million-cell datasets). Falls back to CPU leidenalg
+/// via igraph if cuGraph is unavailable.
+///
+/// Args:
+///     adata: AnnData with obsp["connectivities"] (CSR, n_obs × n_obs)
+///     resolution: Resolution parameter controlling cluster granularity (default: 1.0)
+///     key_added: Column name in adata.obs for cluster labels (default: "leiden")
+///     random_state: Random seed for reproducibility (default: 0)
+///     n_iterations: Maximum optimization iterations; -1 for until convergence (default: -1)
+///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///
+/// Notes:
+///     GPU and CPU Leiden may produce different partitions on the same graph
+///     due to algorithmic differences (cuGraph uses a different refinement
+///     strategy than leidenalg). Both produce valid, high-quality community
+///     structures. Compare results via ARI or NMI when switching backends.
+#[pyfunction]
+#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto"))]
+#[allow(clippy::too_many_arguments)]
+pub fn leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    n_iterations: i64,
+    device: &str,
+) -> PyResult<()> {
+    // Determine effective device
+    let use_gpu = resolve_device(device)?;
+
+    // Extract connectivities CSR from adata.obsp["connectivities"]
+    let obsp = adata.getattr("obsp")?;
+    let conn = obsp.get_item("connectivities").map_err(|_| {
+        PyRuntimeError::new_err(
+            "'connectivities' not found in adata.obsp. Run neighbors first: \
+             pyscx.accel.neighbors(adata) or sc.pp.neighbors(adata)",
+        )
+    })?;
+
+    // GPU path: try cuGraph Leiden
+    if use_gpu {
+        match try_cugraph_leiden(
+            py,
+            adata,
+            &conn,
+            resolution,
+            key_added,
+            random_state,
+            n_iterations,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // cuGraph not available or failed — fall through to CPU
+                let warnings = py.import("warnings")?;
+                warnings.call_method1(
+                    "warn",
+                    (format!(
+                        "GPU Leiden failed ({e}) — falling back to CPU leidenalg. \
+                         Install cuGraph for GPU acceleration: \
+                         conda install -c rapidsai -c conda-forge cugraph"
+                    ),),
+                )?;
+            }
+        }
+    }
+
+    // CPU path: leidenalg via igraph
+    run_cpu_leiden(
+        py,
+        adata,
+        &conn,
+        resolution,
+        key_added,
+        random_state,
+        n_iterations,
+    )
+}
+
+/// Try GPU Leiden via cuGraph Python import.
+///
+/// Converts the connectivities CSR matrix to a cuGraph Graph, runs
+/// `cugraph.leiden()`, and writes results to adata.
+fn try_cugraph_leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    conn: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    max_iter: i64,
+) -> PyResult<()> {
+    // Import cuGraph — if not installed, return error immediately
+    let cugraph = py
+        .import("cugraph")
+        .map_err(|_| PyRuntimeError::new_err("cugraph not available"))?;
+
+    let numpy = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Extract COO from connectivities CSR: cuGraph works with edge lists
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let coo = scipy_sparse
+        .call_method1("triu", (&conn,))?
+        .call_method0("tocoo")?;
+
+    let rows = numpy
+        .call_method1("asarray", (coo.getattr("row")?,))?
+        .call_method1("astype", ("int32",))?;
+    let cols = numpy
+        .call_method1("asarray", (coo.getattr("col")?,))?
+        .call_method1("astype", ("int32",))?;
+    let weights = numpy
+        .call_method1("asarray", (coo.getattr("data")?,))?
+        .call_method1("astype", ("float32",))?;
+
+    // Build edge list DataFrame for cuGraph
+    let edge_dict = PyDict::new(py);
+    edge_dict.set_item("src", &rows)?;
+    edge_dict.set_item("dst", &cols)?;
+    edge_dict.set_item("weight", &weights)?;
+    let edge_df = pd.call_method1("DataFrame", (edge_dict,))?;
+
+    // Try cudf for GPU acceleration, fall back to pandas
+    let cudf_available = py.import("cudf").is_ok();
+    let edge_df = if cudf_available {
+        let cudf = py.import("cudf")?;
+        cudf.call_method1("DataFrame", (&edge_df,))?
+    } else {
+        edge_df
+    };
+
+    // Create cuGraph Graph
+    let graph = cugraph.call_method0("Graph")?;
+    let from_cudf_kwargs = PyDict::new(py);
+    from_cudf_kwargs.set_item("source", "src")?;
+    from_cudf_kwargs.set_item("destination", "dst")?;
+    from_cudf_kwargs.set_item("edge_attr", "weight")?;
+    from_cudf_kwargs.set_item("renumber", true)?;
+    graph.call_method("from_cudf_edgelist", (&edge_df,), Some(&from_cudf_kwargs))?;
+
+    // Run Leiden
+    let leiden_kwargs = PyDict::new(py);
+    leiden_kwargs.set_item("resolution", resolution)?;
+    leiden_kwargs.set_item("random_state", random_state as i32)?;
+    if max_iter > 0 {
+        leiden_kwargs.set_item("max_iter", max_iter)?;
+    }
+
+    let leiden_result = cugraph.call_method("leiden", (&graph,), Some(&leiden_kwargs))?;
+
+    // leiden returns (partition_df, modularity) tuple
+    let parts_df = leiden_result.get_item(0)?;
+    let modularity: f64 = leiden_result.get_item(1)?.extract()?;
+
+    // Sort by vertex ID to align with adata.obs order
+    let parts_sorted = parts_df.call_method1("sort_values", ("vertex",))?;
+    let cluster_col = parts_sorted.get_item("partition")?;
+
+    // Convert to pandas if needed (cudf → pandas)
+    // Note: .values is a property (not a method) on both pandas and cudf Series
+    let cluster_labels = if cudf_available {
+        cluster_col.call_method0("to_pandas")?.getattr("values")?
+    } else {
+        cluster_col.getattr("values")?
+    };
+
+    // Convert to string labels (matching scanpy convention)
+    let labels_str = cluster_labels.call_method1("astype", ("str",))?;
+
+    // Write to adata.obs[key_added] as a Categorical
+    let obs = adata.getattr("obs")?;
+    let cat_labels = pd.call_method1("Categorical", (&labels_str,))?;
+    obs.set_item(key_added, cat_labels)?;
+
+    // Write metadata to adata.uns["leiden"]
+    let leiden_dict = PyDict::new(py);
+    let params_dict = PyDict::new(py);
+    params_dict.set_item("resolution", resolution)?;
+    params_dict.set_item("random_state", random_state)?;
+    params_dict.set_item("n_iterations", max_iter)?;
+    leiden_dict.set_item("params", params_dict)?;
+    leiden_dict.set_item("backend", "cugraph")?;
+    leiden_dict.set_item("modularity", modularity)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item(key_added, leiden_dict)?;
+
+    Ok(())
+}
+
+/// Run CPU Leiden clustering via leidenalg + igraph.
+///
+/// This mirrors scanpy's `sc.tl.leiden()` implementation: converts the
+/// connectivities CSR matrix to an igraph Graph and runs leidenalg's
+/// `find_partition()` with `RBConfigurationVertexPartition`.
+fn run_cpu_leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    conn: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    n_iterations: i64,
+) -> PyResult<()> {
+    // Import leidenalg + igraph
+    let leidenalg = py.import("leidenalg").map_err(|_| {
+        PyRuntimeError::new_err(
+            "leidenalg is required for CPU Leiden but is not installed.\n\
+             Install with: pip install leidenalg\n\
+             Or: conda install -c conda-forge leidenalg",
+        )
+    })?;
+
+    let igraph = py.import("igraph").map_err(|_| {
+        PyRuntimeError::new_err(
+            "igraph is required for CPU Leiden but is not installed.\n\
+             Install with: pip install igraph\n\
+             Or: conda install -c conda-forge python-igraph",
+        )
+    })?;
+
+    let numpy = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Convert connectivities CSR to COO for igraph edge list
+    let scipy_sparse = py.import("scipy.sparse")?;
+
+    // Upper-triangular to avoid double-counting edges (undirected graph)
+    let upper = scipy_sparse.call_method1("triu", (&conn,))?;
+    let coo = upper.call_method0("tocoo")?;
+
+    let shape: (usize, usize) = conn.getattr("shape")?.extract()?;
+    let n_obs = shape.0;
+
+    let rows = numpy
+        .call_method1("asarray", (coo.getattr("row")?,))?
+        .call_method0("tolist")?;
+    let cols = numpy
+        .call_method1("asarray", (coo.getattr("col")?,))?
+        .call_method0("tolist")?;
+    let weights = numpy
+        .call_method1("asarray", (coo.getattr("data")?,))?
+        .call_method0("tolist")?;
+
+    // Build igraph Graph
+    let graph = igraph.call_method1("Graph", (n_obs,))?;
+
+    // Build edge list as tuples
+    let rows_vec: Vec<i64> = rows.extract()?;
+    let cols_vec: Vec<i64> = cols.extract()?;
+    let edges: Vec<(i64, i64)> = rows_vec.into_iter().zip(cols_vec).collect();
+    let edge_list = pyo3::types::PyList::new(py, &edges)?;
+
+    graph.call_method1("add_edges", (&edge_list,))?;
+
+    // Set edge weights
+    let weights_list: Vec<f64> = weights.extract()?;
+    let py_weights = pyo3::types::PyList::new(py, &weights_list)?;
+    let es = graph.getattr("es")?;
+    es.set_item("weight", py_weights)?;
+
+    // Set random seed for reproducibility
+    // leidenalg uses a seed parameter in find_partition
+    let partition_type = leidenalg.getattr("RBConfigurationVertexPartition")?;
+
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("resolution_parameter", resolution)?;
+    kwargs.set_item("weights", "weight")?;
+    kwargs.set_item("seed", random_state)?;
+    if n_iterations > 0 {
+        kwargs.set_item("n_iterations", n_iterations)?;
+    }
+
+    let partition =
+        leidenalg.call_method("find_partition", (&graph, &partition_type), Some(&kwargs))?;
+
+    // Extract cluster assignments
+    let membership = partition.getattr("membership")?;
+    let membership_arr = numpy.call_method1("array", (&membership,))?;
+    let labels_str = membership_arr.call_method1("astype", ("str",))?;
+
+    // Write to adata.obs[key_added] as a Categorical
+    let obs = adata.getattr("obs")?;
+    let cat_labels = pd.call_method1("Categorical", (&labels_str,))?;
+    obs.set_item(key_added, cat_labels)?;
+
+    // Compute modularity for metadata
+    let modularity: f64 = partition.call_method0("quality")?.extract()?;
+
+    // Write metadata to adata.uns[key_added]
+    let leiden_dict = PyDict::new(py);
+    let params_dict = PyDict::new(py);
+    params_dict.set_item("resolution", resolution)?;
+    params_dict.set_item("random_state", random_state)?;
+    params_dict.set_item("n_iterations", n_iterations)?;
+    leiden_dict.set_item("params", params_dict)?;
+    leiden_dict.set_item("backend", "leidenalg")?;
+    leiden_dict.set_item("modularity", modularity)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item(key_added, leiden_dict)?;
+
+    Ok(())
 }

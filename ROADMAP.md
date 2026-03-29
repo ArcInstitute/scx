@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-03-27
+**Last updated**: 2026-03-29
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -339,7 +339,7 @@ R bindings. Multimodal support. Full documentation.
 
 ## Phase 4: Rust-Native Analysis Accelerators — 4a/4b COMPLETE
 
-**Implementation plan**: [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md)
+**Implementation plan**: [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md), [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)
 
 **Goal**: For operations where scanpy is a bottleneck at scale, provide
 faster Rust implementations. These are **optional optimizations** — the
@@ -368,6 +368,16 @@ full scverse pipeline works via AnnData from Phase 1.
 
 See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification.
 
+### Phase 4d: Eliminating Materialization — PROPOSED
+- [ ] Column-projected streaming aggregation (`sum`, `var`, `nnz`, `max`, `min` with gene subsets)
+- [ ] Lazy transform wrappers (`ScxLazyTransformedDataset` for normalize_total + log1p)
+- [ ] `pyscx.accel.normalize_total()` — lazy, no materialization
+- [ ] `pyscx.accel.log1p()` — appends to lazy transform chain
+- [ ] Fused NormalizeTotal+Log1p optimization (single-pass per shard)
+- [ ] Optional `__truediv__` interception for scanpy compatibility
+
+See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md) for detailed specification.
+
 ---
 
 ## What Users Get at Each Phase
@@ -380,6 +390,7 @@ See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification.
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
 | **4c** | 15+ | Optional: GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuML. |
+| **4d** | 16+ | Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation. Full out-of-core pipeline from open → QC → preprocess → PCA with ~500 MB peak RSS at 1M cells. |
 
 ---
 

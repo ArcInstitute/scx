@@ -25,6 +25,7 @@ use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 use scx_format::backed::BackedCsrReader;
+use scx_format::total_variance_from_col_sq;
 use scx_sparse::ScxCsr;
 
 use crate::error::{AccelError, Result};
@@ -135,7 +136,7 @@ pub fn randomized_pca(
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
     // Fused pass: compute column means and sum-of-squares together (1 shard pass)
-    let (means, col_sum_sq) = compute_means_and_col_sq(reader, zero_center)?;
+    let (means, col_sum_sq) = reader.col_means_and_sum_sq(zero_center)?;
     let means_ref = means.as_deref();
 
     // Step 2: Random Gaussian Ω (n_vars × k)
@@ -156,7 +157,7 @@ pub fn randomized_pca(
     let b = streaming_spmm_transpose(reader, &q, means_ref)?;
 
     // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass)
-    let total_var = compute_total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
+    let total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
     build_pca_result(&q, &b, &means, n_components, n_obs, n_vars, total_var)
 }
 
@@ -224,36 +225,10 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
     Ok(())
 }
 
-/// Compute column means (if `zero_center`) and column sum-of-squares in a
-/// single pass over all shards. This fuses what were previously two separate
-/// shard iterations — eliminating one full data pass (12.5% I/O reduction).
-fn compute_means_and_col_sq(
-    reader: &BackedCsrReader,
-    zero_center: bool,
-) -> Result<(Option<Vec<f64>>, Vec<f64>)> {
-    let n_vars = reader.n_vars();
-    let n_shards = reader.index().n_shards();
-    let mut col_sums = vec![0.0f64; n_vars];
-    let mut col_sum_sq = vec![0.0f64; n_vars];
-
-    for shard_idx in 0..n_shards {
-        let csr = reader.read_shard_cached(shard_idx)?;
-        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-            let v = val as f64;
-            col_sums[col as usize] += v;
-            col_sum_sq[col as usize] += v * v;
-        }
-    }
-
-    let means = if zero_center {
-        let n_obs = reader.n_obs() as f64;
-        Some(col_sums.iter().map(|s| s / n_obs).collect())
-    } else {
-        None
-    };
-
-    Ok((means, col_sum_sq))
-}
+// NOTE: `compute_means_and_col_sq` has been replaced by
+// `BackedCsrReader::col_means_and_sum_sq()` in scx-format.
+// `compute_total_variance_from_col_sq` has been replaced by
+// `scx_format::total_variance_from_col_sq()`.
 
 /// Generate a random Gaussian matrix (rows × cols), row-major.
 fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
@@ -502,28 +477,9 @@ fn spmm_forward_row(
     }
 }
 
-/// Total variance from pre-computed column sum-of-squares.
-///
-/// Uses the identity: Var(X_j) = (Σ x²_j - n·μ_j²) / (n-1).
-/// The `col_sum_sq` is produced by `compute_means_and_col_sq` so no extra
-/// data pass is needed.
-fn compute_total_variance_from_col_sq(
-    col_sum_sq: &[f64],
-    means: Option<&[f64]>,
-    n_obs: usize,
-) -> f64 {
-    let total = if let Some(mu) = means {
-        col_sum_sq
-            .iter()
-            .zip(mu.iter())
-            .map(|(&sq, &m)| sq - n_obs as f64 * m * m)
-            .sum::<f64>()
-    } else {
-        col_sum_sq.iter().sum::<f64>()
-    };
-
-    total / (n_obs as f64 - 1.0).max(1.0)
-}
+// NOTE: `compute_total_variance_from_col_sq` has been moved to
+// `scx_format::backed::total_variance_from_col_sq()` (re-exported
+// from `scx_format::total_variance_from_col_sq`).
 
 /// Total variance (in-memory).
 fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
@@ -608,6 +564,77 @@ fn build_pca_result(
         n_obs,
         n_vars,
     })
+}
+
+// ---------------------------------------------------------------------------
+// GPU PCA dispatch (behind "gpu" feature)
+// ---------------------------------------------------------------------------
+
+/// GPU-accelerated randomized PCA from a backed SCX reader.
+///
+/// Wraps [`scx_gpu::gpu_randomized_pca`] to stream data shard-by-shard on GPU
+/// (cuSPARSE SpMM, cuSOLVER QR) and returns a [`PcaResult`] with host-side
+/// data matching the CPU path's output format.
+///
+/// Requires the `gpu` feature to be enabled.
+///
+/// # Arguments
+///
+/// * `device_id` — CUDA device ordinal (0 for first GPU)
+/// * `reader` — Backed CSR reader (provides shard-by-shard access)
+/// * `n_components` — Number of principal components to compute
+/// * `n_oversamples` — Extra dimensions for accuracy (default: 10)
+/// * `n_power_iterations` — Power iterations for spectral accuracy (default: 2)
+/// * `zero_center` — Whether to mean-center the data (default: true)
+/// * `seed` — Random seed for reproducibility
+#[cfg(feature = "gpu")]
+pub fn randomized_pca_gpu(
+    device_id: usize,
+    reader: &BackedCsrReader,
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+) -> Result<PcaResult> {
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+    let gpu_result = scx_gpu::gpu_randomized_pca(
+        &dev,
+        reader,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
+
+    // Convert GpuPcaResult → PcaResult
+    // embeddings: f32 row-major → f64 row-major
+    let embeddings: Vec<f64> = gpu_result.embeddings.iter().map(|&v| v as f64).collect();
+    // components: f32 row-major → f64 row-major
+    let components: Vec<f64> = gpu_result.components.iter().map(|&v| v as f64).collect();
+
+    Ok(PcaResult {
+        embeddings,
+        components,
+        variance_explained: gpu_result.variance_explained,
+        variance_ratio: gpu_result.variance_ratio,
+        mean: gpu_result.mean,
+        n_components: gpu_result.n_components,
+        n_obs: gpu_result.n_obs,
+        n_vars: gpu_result.n_vars,
+    })
+}
+
+/// Check whether a GPU is available for GPU-accelerated PCA.
+///
+/// Returns `true` if at least one CUDA device is found.
+#[cfg(feature = "gpu")]
+pub fn gpu_available() -> bool {
+    scx_gpu::GpuDevice::count().map_or(false, |n| n > 0)
 }
 
 // ---------------------------------------------------------------------------

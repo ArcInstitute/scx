@@ -19,12 +19,20 @@ pub enum GpuError {
     CodecError(#[from] scx_codec::CodecError),
     #[error("cuSPARSE error: {0}")]
     CuSparseError(String),
+    #[error("cuSOLVER error: {0}")]
+    CuSolverError(String),
+    #[error("cuRAND error: {0}")]
+    CuRandError(String),
     #[error("stream error: {0}")]
     StreamError(String),
     #[error("GPU out of memory: {0}")]
     OutOfMemory(String),
     #[error("module load error: {0}")]
     ModuleLoadError(String),
+    #[error("cuVS error: {0}")]
+    CuVsError(String),
+    #[error("library not found: {0}")]
+    LibraryNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, GpuError>;

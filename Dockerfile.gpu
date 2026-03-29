@@ -1,0 +1,87 @@
+# SCX GPU Dockerfile — full RAPIDS stack (cuVS, cuGraph) + CUDA Toolkit
+#
+# Provides GPU-accelerated PCA (cuSPARSE), kNN (cuVS CAGRA), UMAP (CUDA SGD),
+# Leiden (cuGraph), and fused preprocessing. All operations fall back to CPU
+# if no GPU is available at runtime.
+#
+# Build:
+#   docker build -f Dockerfile.gpu -t scx-gpu .
+#
+# Run:
+#   docker run --gpus all -it scx-gpu
+#   docker run --gpus all -v /data:/data scx-gpu python my_analysis.py
+#
+# Multi-stage build:
+#   Stage 1 (builder) — compiles Rust workspace + CUDA kernels (nvcc → PTX)
+#   Stage 2 (runtime) — slim image with compiled pyscx wheel + RAPIDS
+
+# ============================================================================
+# Stage 1: Build pyscx with GPU support
+# ============================================================================
+FROM rapidsai/base:24.12-cuda12.2-py3.12 AS builder
+
+# System dependencies for Rust compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install Python build dependencies
+RUN pip install --no-cache-dir maturin
+
+# Copy workspace source
+WORKDIR /build/scx
+COPY Cargo.toml Cargo.lock ./
+COPY scx-format/ scx-format/
+COPY scx-codec/ scx-codec/
+COPY scx-sparse/ scx-sparse/
+COPY scx-ops/ scx-ops/
+COPY scx-engine/ scx-engine/
+COPY scx-loader/ scx-loader/
+COPY scx-cloud/ scx-cloud/
+COPY scx-gpu/ scx-gpu/
+COPY scx-accel/ scx-accel/
+COPY scx-mtx/ scx-mtx/
+COPY scx-cli/ scx-cli/
+COPY pyscx/ pyscx/
+COPY rscx/ rscx/
+COPY tests/ tests/
+
+# Build the pyscx wheel with GPU features
+# nvcc is available from the RAPIDS base image
+RUN cd pyscx && maturin build --release --features gpu -o /build/wheels
+
+# Also build the CLI (without hdf5 to avoid the unmaintained crate dep)
+RUN cargo build -p scx-cli --release \
+    && cp target/release/scx /build/scx-cli-bin
+
+# ============================================================================
+# Stage 2: Runtime image
+# ============================================================================
+FROM rapidsai/base:24.12-cuda12.2-py3.12
+
+# Install the pyscx wheel and Python dependencies
+COPY --from=builder /build/wheels/*.whl /tmp/wheels/
+RUN pip install --no-cache-dir \
+        /tmp/wheels/*.whl \
+        numpy scipy pyarrow anndata scanpy scikit-learn leidenalg \
+    && rm -rf /tmp/wheels
+
+# Install the CLI
+COPY --from=builder /build/scx-cli-bin /usr/local/bin/scx
+
+# Verify installation
+RUN python -c "import pyscx; print('pyscx imported successfully')" \
+    && scx --help > /dev/null
+
+WORKDIR /data
+
+ENTRYPOINT ["python"]
+CMD ["--version"]

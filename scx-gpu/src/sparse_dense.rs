@@ -110,22 +110,9 @@ pub fn sparse_to_dense_gpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::GpuDevice;
     use crate::shard_decode::decode_shard_gpu;
     use crate::test_utils::build_test_shard;
     use scx_codec::{CodecId, ValueEncoding};
-
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
 
     /// CPU reference: scatter CSR arrays into a dense matrix.
     fn cpu_sparse_to_dense(

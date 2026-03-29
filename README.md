@@ -155,6 +155,33 @@ exp = pyscx.open_cloud("gs://bucket/atlas.scxd/")
 print(exp.n_obs, exp.n_vars)
 ```
 
+### Your analysis pipeline is too slow for atlas-scale
+
+At >1M cells, even optimized CPU code for PCA, kNN, and UMAP takes minutes.
+SCX provides GPU-accelerated analysis via CUDA — PCA through cuSPARSE SpMM +
+cuSOLVER QR, kNN through cuVS CAGRA, and UMAP through a native CUDA SGD kernel.
+All accessed through the same Python API with a single `device="gpu"` parameter:
+
+```python
+import pyscx
+
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# GPU-accelerated pipeline — up to 16× faster per-op, 3.8× end-to-end on 1M cells
+pyscx.accel.pca(adata, n_comps=50, device="gpu")
+pyscx.accel.neighbors(adata, n_neighbors=15, device="gpu")
+pyscx.accel.umap(adata, device="gpu")
+
+import scanpy as sc
+sc.tl.leiden(adata)  # downstream scanpy works identically
+sc.pl.umap(adata, color="leiden")
+```
+
+SCX streams shards from disk → GPU via cuSPARSE SpMM — no full matrix
+materialization in CPU memory. This enables GPU analysis on datasets larger
+than VRAM. When no GPU is available, every operation falls back to CPU
+automatically with a warning.
+
 ### No more file locking headaches
 
 HDF5 acquires **mandatory POSIX file locks** on every open — even for reads. On shared
@@ -232,6 +259,77 @@ cd pyscx && ../.venv/bin/maturin develop --release
 cd pyscx && ../.venv/bin/maturin develop --release --features cloud
 ```
 
+#### GPU acceleration
+
+GPU support requires the CUDA Toolkit (≥ 12.0) and, for kNN/Leiden, the
+RAPIDS libraries (cuVS, cuGraph). There are three ways to set this up —
+conda is recommended as it handles the full CUDA + RAPIDS dependency tree.
+
+**Option A: conda (recommended)** — resolves CUDA version matching automatically:
+
+```bash
+# Create a dedicated GPU environment
+conda create -n scx-gpu python=3.13
+conda activate scx-gpu
+
+# Install RAPIDS (cuVS for kNN, cuGraph for Leiden) — pin cuda-version to match your driver
+# Run `nvidia-smi` to check your driver's max CUDA version
+conda install -c rapidsai -c conda-forge cuvs cugraph cuda-version=12.2
+
+# Install Python deps + build pyscx with GPU support
+pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
+cd pyscx && maturin develop --release --features gpu
+```
+
+**Option B: system CUDA Toolkit** — if you only need PCA/UMAP (no cuVS kNN or cuGraph Leiden):
+
+```bash
+# 1. Install CUDA Toolkit ≥ 12.0
+#    Ubuntu/Debian:
+#      wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+#      sudo dpkg -i cuda-keyring_1.1-1_all.deb
+#      sudo apt update && sudo apt install cuda-toolkit-12-2
+#    Or see: https://developer.nvidia.com/cuda-downloads
+
+# 2. Ensure nvcc is on PATH
+export PATH=/usr/local/cuda/bin:$PATH
+nvcc --version  # should print CUDA 12.x
+
+# 3. Build pyscx with GPU support
+uv venv .venv
+uv pip install maturin numpy scipy pyarrow anndata
+cd pyscx && ../.venv/bin/maturin develop --release --features gpu
+```
+
+This gives you GPU-accelerated PCA (cuSPARSE SpMM) and UMAP (native CUDA SGD).
+kNN and Leiden will fall back to CPU since cuVS/cuGraph are not installed.
+
+**Option C: container** — for reproducible environments or CI:
+
+```bash
+# Build the GPU image (multi-stage: compiles Rust + CUDA kernels, then slim runtime)
+docker build -f Dockerfile.gpu -t scx-gpu .
+
+# Run with GPU access
+docker run --gpus all -it scx-gpu
+docker run --gpus all -v /data:/data scx-gpu python my_analysis.py
+```
+
+**Verifying the installation:**
+
+```python
+import pyscx
+
+# Check GPU availability
+print(pyscx.accel.gpu_available())  # True if CUDA device found
+
+# Run with explicit GPU — warns and falls back to CPU if unavailable
+pyscx.accel.pca(adata, n_comps=50, device="gpu")
+```
+
+See [`docs/gpu-setup.md`](docs/gpu-setup.md) for troubleshooting, SLURM
+configuration, and driver compatibility details.
+
 ### Rust CLI
 
 ```bash
@@ -308,6 +406,26 @@ adata = pyscx.open("experiment.scx").to_anndata()
 # → standard AnnData with X, obs, var, obsm, layers, uns
 ```
 
+### GPU-accelerated analysis
+
+```python
+import pyscx
+
+adata = pyscx.open("atlas.scx").to_anndata()
+
+# Auto-detect GPU (falls back to CPU if unavailable)
+pyscx.accel.pca(adata, n_comps=50)               # device="auto" by default
+pyscx.accel.neighbors(adata, n_neighbors=15)      # device="auto" by default
+pyscx.accel.umap(adata)                           # device="auto" by default
+
+# Force GPU
+pyscx.accel.pca(adata, n_comps=50, device="gpu")
+
+# Multi-GPU selection
+pyscx.accel.pca(adata, n_comps=50, device="gpu:1")
+# → standard AnnData with X, obs, var, obsm, layers, uns
+```
+
 ### Query and filter
 
 ```python
@@ -363,8 +481,11 @@ streaming pipeline outperforms random-access approaches.
 
 ### GPU Acceleration (NVIDIA H100)
 
-The `scx-gpu` crate provides CUDA-accelerated codec decoding and sparse-to-dense
-conversion. Benchmarked on H100 80GB HBM3 with synthetic shards (Scx1 codec):
+The `scx-gpu` crate provides CUDA-accelerated codec decoding, sparse-to-dense
+conversion, and a full GPU analysis pipeline (PCA, kNN, UMAP). Benchmarked on
+H100 80GB HBM3:
+
+#### Codec Decode & Training Pipeline
 
 | Operation | Size | CPU (μs) | GPU (μs) | Speedup |
 |-----------|------|----------|----------|---------|
@@ -372,11 +493,26 @@ conversion. Benchmarked on H100 80GB HBM3 with synthetic shards (Scx1 codec):
 | Sparse → dense | 16K rows × 30K cols | 433,252 | 7,711 | **56.2×** |
 | Sparse → dense (HVG 2K) | 16K rows × 2K output | 110,416 | 897 | **123.1×** |
 
-The sparse-to-dense conversion — the dominant cost in the training loop — runs
-56–123× faster on GPU. The warp-cooperative kernel particularly excels with HVG
-gene projection, where the reduced output width maximizes memory bandwidth utilization.
+#### GPU Analysis Pipeline (Phase 4c)
 
-Full GPU benchmark details in [`benchmarks/results/gpu_benchmark.md`](benchmarks/results/gpu_benchmark.md).
+GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuVS CAGRA,
+native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB
+with 1M cells (CELLxGENE Census):
+
+| Operation | CPU (s) | GPU (s) | Speedup | Backend |
+|-----------|---------|---------|---------|---------|
+| kNN (k=15, 50 PCs) | 288 | 31 | **9.4×** | cuVS CAGRA |
+| UMAP (2D) | 560 | 74 | **7.6×** | native CUDA SGD |
+| Leiden | 45 | 3 | **16.0×** | cuGraph |
+| PCA (50 PCs, 2K HVGs) | 22 | 24 | 0.9× | cuSPARSE SpMM |
+| **End-to-end pipeline** | **1077** | **286** | **3.8×** | all above |
+
+The GPU PCA pipeline streams shards from disk → GPU SpMM shard-by-shard
+without materializing the full matrix — enabling PCA on datasets larger
+than VRAM. kNN uses NVIDIA's CAGRA algorithm (cuVS) for up to 9.4×
+throughput over CPU HNSW on 1M cells.
+
+Full GPU benchmark details in [`benchmarks/results/gpu_pipeline_benchmark.md`](benchmarks/results/gpu_pipeline_benchmark.md).
 
 ### Query Engine
 

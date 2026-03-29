@@ -146,19 +146,6 @@ mod tests {
     use super::*;
     use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
 
-    /// Try to get a GPU device, skip test if unavailable.
-    macro_rules! require_gpu {
-        () => {
-            match GpuDevice::new(0) {
-                Ok(dev) => dev,
-                Err(_) => {
-                    eprintln!("CUDA not available — skipping GPU test");
-                    return;
-                }
-            }
-        };
-    }
-
     #[test]
     fn test_rice_gpu_vs_cpu_all_ones() {
         let dev = require_gpu!();
