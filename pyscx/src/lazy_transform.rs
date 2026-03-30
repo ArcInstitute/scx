@@ -576,9 +576,15 @@ impl ScxLazyTransformedDataset {
         if let Some(row_factors) =
             crate::backed::try_extract_row_factors(py, other, self.shape_val.0)?
         {
+            let global_factors = crate::backed::expand_to_global(
+                row_factors,
+                self.kept_to_global.as_deref(),
+                self.backed.shape().0,
+                1.0,
+            );
             let mut new_transforms = self.transforms.clone();
             new_transforms.push(Transform::RowScale {
-                factors: Arc::new(row_factors),
+                factors: Arc::new(global_factors),
             });
             let lazy = ScxLazyTransformedDataset::new(
                 Arc::clone(&self.backed),
@@ -609,9 +615,15 @@ impl ScxLazyTransformedDataset {
                 .iter()
                 .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
                 .collect();
+            let global_inv = crate::backed::expand_to_global(
+                inv_factors,
+                self.kept_to_global.as_deref(),
+                self.backed.shape().0,
+                1.0,
+            );
             let mut new_transforms = self.transforms.clone();
             new_transforms.push(Transform::RowScale {
-                factors: Arc::new(inv_factors),
+                factors: Arc::new(global_inv),
             });
             let lazy = ScxLazyTransformedDataset::new(
                 Arc::clone(&self.backed),

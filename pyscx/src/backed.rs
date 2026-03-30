@@ -343,13 +343,19 @@ impl ScxBackedSparseDataset {
         // a 1D or column array with length == n_obs, express as lazy
         // RowScale transform — mirroring __truediv__ (which inverts).
         if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
+            let global_factors = expand_to_global(
+                row_factors,
+                self.kept_to_global.as_deref(),
+                self.backed.shape().0,
+                1.0,
+            );
             let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
                 Arc::clone(&self.backed),
                 self.shape_val,
                 self.kept_to_global.clone(),
                 self.col_projection.clone(),
                 vec![Transform::RowScale {
-                    factors: Arc::new(row_factors),
+                    factors: Arc::new(global_factors),
                 }],
             );
             return Ok(Bound::new(py, lazy)?.into_any());
@@ -376,13 +382,19 @@ impl ScxBackedSparseDataset {
                 .iter()
                 .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
                 .collect();
+            let global_inv = expand_to_global(
+                inv_factors,
+                self.kept_to_global.as_deref(),
+                self.backed.shape().0,
+                1.0,
+            );
             let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
                 Arc::clone(&self.backed),
                 self.shape_val,
                 self.kept_to_global.clone(),
                 self.col_projection.clone(),
                 vec![Transform::RowScale {
-                    factors: Arc::new(inv_factors),
+                    factors: Arc::new(global_inv),
                 }],
             );
             return Ok(Bound::new(py, lazy)?.into_any());
@@ -1812,5 +1824,28 @@ pub(crate) fn try_extract_row_factors(
         Ok(Some(slice.to_vec()))
     } else {
         Ok(None)
+    }
+}
+
+/// Expand a kept-row-space vector to global-row-space.
+///
+/// When `kept_to_global` is `Some`, the input has length `n_kept` and the
+/// output has length `n_obs_global`, with `default` at deleted-row positions.
+/// When `kept_to_global` is `None`, returns the input unchanged.
+pub(crate) fn expand_to_global(
+    kept_values: Vec<f64>,
+    kept_to_global: Option<&[u64]>,
+    n_obs_global: usize,
+    default: f64,
+) -> Vec<f64> {
+    match kept_to_global {
+        Some(mapping) => {
+            let mut global = vec![default; n_obs_global];
+            for (kept_idx, &global_idx) in mapping.iter().enumerate() {
+                global[global_idx as usize] = kept_values[kept_idx];
+            }
+            global
+        }
+        None => kept_values,
     }
 }

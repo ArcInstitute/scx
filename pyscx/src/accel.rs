@@ -2099,24 +2099,23 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
 
-        // Compute row sums via streaming (no materialization)
+        // Compute row sums via streaming over ALL physical rows.
+        // Must be in physical-row space because transforms are applied
+        // per-shard before deletion vector filtering.
         let all_row_sums = backed_ref
             .backed
             .row_sums()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Filter through deletion vector if present
-        let filtered_sums = backed_ref.filter_row_results(&all_row_sums);
-
         let lazy = ScxLazyTransformedDataset::new(
             Arc::clone(&backed_ref.backed),
             backed_ref.shape_val,
             backed_ref.kept_to_global.clone(),
-            // col_projection is not inherited for normalize_total:
-            // normalization is always over the full column set
-            None,
+            // Inherit col_projection: transforms operate on full columns,
+            // projection is applied per-shard after transforms
+            backed_ref.col_projection().map(|c| c.to_vec()),
             vec![Transform::NormalizeTotal {
-                row_sums: Arc::new(filtered_sums),
+                row_sums: Arc::new(all_row_sums),
                 target_sum,
             }],
         );
@@ -2129,12 +2128,15 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
     // Case 2: X is already ScxLazyTransformedDataset — append transform
     if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
-        // Compute row sums through existing transforms (streaming)
+        // Compute row sums through existing transforms (streaming).
+        // streaming_row_sums() returns a global-length vector (n_obs_global),
+        // which is what apply_transforms_to_csr expects (indexes by global row).
+        // Do NOT filter through deletion vector — that would produce a
+        // kept-length vector causing index-out-of-bounds on datasets with
+        // active deletions.
         let sums = lazy_ref.streaming_row_sums()?;
-        // Filter through deletion vector
-        let filtered_sums = lazy_ref.filter_row_results(&sums);
         lazy_ref.transforms.push(Transform::NormalizeTotal {
-            row_sums: Arc::new(filtered_sums),
+            row_sums: Arc::new(sums),
             target_sum,
         });
         return Ok(());
@@ -2913,11 +2915,8 @@ pub fn filter_genes(
                 .collect(),
         };
 
-        backed
-            .borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-
-        // Slice var
+        // Slice var BEFORE updating col_projection (AnnData validates
+        // shape consistency on .var setter, so we use ._var to bypass).
         let mask_arr = numpy::PyArray::from_vec(py, keep);
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
@@ -2930,7 +2929,12 @@ pub fn filter_genes(
                 kw
             }),
         )?;
-        adata.setattr("var", filtered_var)?;
+        // Use _var to skip shape validation (X.shape changes next)
+        adata.setattr("_var", filtered_var)?;
+
+        backed
+            .borrow_mut()
+            .set_col_projection(new_col_indices.clone());
 
         update_layers_col_projection(adata, &new_col_indices)?;
         return Ok(());
@@ -3016,10 +3020,9 @@ pub fn filter_genes(
         };
 
         drop(lazy_ref);
-        lazy.borrow_mut()
-            .set_col_projection(new_col_indices.clone());
 
-        // Slice var
+        // Slice var BEFORE updating col_projection (AnnData validates
+        // shape consistency on .var setter, so we use ._var to bypass).
         let mask_arr = numpy::PyArray::from_vec(py, keep);
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
@@ -3032,7 +3035,10 @@ pub fn filter_genes(
                 kw
             }),
         )?;
-        adata.setattr("var", filtered_var)?;
+        adata.setattr("_var", filtered_var)?;
+
+        lazy.borrow_mut()
+            .set_col_projection(new_col_indices.clone());
 
         update_layers_col_projection(adata, &new_col_indices)?;
         return Ok(());
