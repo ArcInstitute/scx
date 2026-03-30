@@ -368,13 +368,17 @@ full scverse pipeline works via AnnData from Phase 1.
 
 See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification.
 
-### Phase 4d: Eliminating Materialization — PROPOSED
-- [ ] Column-projected streaming aggregation (`sum`, `var`, `nnz`, `max`, `min` with gene subsets)
-- [ ] Lazy transform wrappers (`ScxLazyTransformedDataset` for normalize_total + log1p)
-- [ ] `pyscx.accel.normalize_total()` — lazy, no materialization
-- [ ] `pyscx.accel.log1p()` — appends to lazy transform chain
-- [ ] Fused NormalizeTotal+Log1p optimization (single-pass per shard)
-- [ ] Optional `__truediv__` interception for scanpy compatibility
+### Phase 4d: Eliminating Materialization — COMPLETE
+- [x] Column-projected streaming aggregation (`sum`, `var`, `nnz`, `max`, `min` with gene subsets)
+- [x] Lazy transform wrappers (`ScxLazyTransformedDataset` for normalize_total + log1p)
+- [x] `pyscx.accel.normalize_total()` — lazy, no materialization
+- [x] `pyscx.accel.log1p()` — appends to lazy transform chain
+- [x] Fused NormalizeTotal+Log1p optimization (single-pass per shard)
+- [x] Optional `__truediv__` / `__mul__` interception for scanpy compatibility
+- [x] `ShardSource` trait + `LazyShardSource` for streaming PCA through transforms
+- [x] `pyscx.accel.filter_cells()` / `filter_genes()` — non-materializing QC filters
+- [x] `pyscx.accel.subset_obs()` — deletion vector construction from Python
+- [x] `pyscx.accel.calculate_qc_metrics()` — streaming QC metrics
 
 See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md) for detailed specification.
 
@@ -390,7 +394,7 @@ See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md) for detailed specification.
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
 | **4c** | 15+ | Optional: GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuML. |
-| **4d** | 16+ | Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation. Full out-of-core pipeline from open → QC → preprocess → PCA with ~3–5 GB peak RSS at 1M cells (vs ~8 GB materialized). |
+| **4d** | 16+ | **COMPLETE.** Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation, streaming PCA through transforms via `ShardSource` trait, non-materializing `filter_cells`/`filter_genes`. Full out-of-core pipeline from open → QC → preprocess → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS at 1M cells (vs ~38 GB materialized; 71% reduction). |
 
 ---
 
