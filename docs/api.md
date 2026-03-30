@@ -285,6 +285,19 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `to_csr()` — Return just the scipy CSR matrix
 - Properties: `n_obs`, `n_vars`, `nnz`, `skipped_shards`, `total_shards`
 
+### PyCloudExperiment
+
+Returned by `pyscx.open_cloud()`. Metadata-only handle for cloud-hosted SCX files.
+Does **not** support `to_anndata()`, `query()`, or `validate()` — use `pyscx.pull()` to
+download the file first for full data access.
+
+- `n_obs` `→ int` — Number of observations (cells)
+- `n_vars` `→ int` — Number of variables (genes)
+- `nnz` `→ int` — Total non-zero entries
+- `shard_count` `→ int` — Number of CSR shards in the file
+- `format_version` `→ int` — SCX format version
+- `codec_id` `→ int` — Default codec ID
+
 ### pyscx.accel — Rust-Native Accelerators
 
 All accelerators write results to standard AnnData slots (same as scanpy), so downstream functions work identically.
@@ -300,6 +313,59 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
 - `pyscx.accel.gpu_info() → dict` — Query GPU device info: `{'device': ..., 'total_vram_gb': ..., 'free_vram_gb': ...}`. Returns `None` if no GPU available.
 - `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU memory for an operation: `{'required_gb': ..., 'fits_in_vram': ...}`.
 - `pyscx.accel.calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True)` — Streaming QC metrics for backed/lazy data without materialization. Computes per-cell `n_genes_by_counts`, `total_counts` and per-gene `n_cells_by_counts`, `total_counts`. Supports `qc_vars` for gene subsets (e.g., `["mt"]` for mitochondrial percentage). When `inplace=True`, writes to `adata.obs`/`adata.var`; when `False`, returns `(obs_df, var_df)`. Falls back to `sc.pp.calculate_qc_metrics()` for scipy/dense.
+
+### ScxBackedSparseDataset
+
+PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`). Data stays on disk; only requested shards are decoded on access. Registered with `anndata.abc.CSRDataset`.
+
+**Properties:**
+- `shape` `→ (int, int)` — `(n_obs, n_vars)`, adjusted for deletion vectors and column projection
+- `dtype` `→ numpy.dtype` — Always `float32`
+- `format` `→ str` — Always `"csr"`
+- `backend` `→ str` — Always `"scx"`
+- `ndim` `→ int` — Always `2`
+- `non_negative` `→ bool` — Whether the data is known to be non-negative (enables `(X > 0).sum() → getnnz()` short-circuit)
+- `nnz` `→ int` — Total non-zero count
+- `n_shards` `→ int` — Number of CSR shards in the backing file
+
+**Column projection:**
+- `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` and streaming QC with gene subsets (`qc_vars`).
+
+**Slicing:**
+- `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, return scipy CSR.
+- `__getitem__(row_slice, col_slice)` — Row decode + column post-filter.
+- Supports integer, slice, boolean mask, and fancy indexing.
+
+**Aggregation (streaming, no materialization):**
+- `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums via native Rust streaming.
+- `mean(axis=0|1)` `→ numpy.ndarray` — Column or row means.
+- `var(axis=0|1)` `→ numpy.ndarray` — Column or row variance (two-pass).
+- `getnnz(axis=0|1)` `→ numpy.ndarray` — Non-zero counts per column or row.
+- `max(axis=0|1)` `→ numpy.ndarray` — Column or row max.
+- `min(axis=0|1)` `→ numpy.ndarray` — Column or row min.
+
+**Materialization:**
+- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards → full CSR.
+- `copy()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()`.
+- `toarray()` `→ numpy.ndarray` — Dense array.
+- `tocsr()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()` (scipy compat).
+- `tocsc()` `→ scipy.sparse.csc_matrix` — Materialize and convert to CSC.
+- `.A` `→ numpy.ndarray` — Dense array property (scipy compat).
+
+**Comparison operators:**
+- `__gt__`, `__ge__`, `__lt__`, `__le__`, `__eq__`, `__ne__` — Return `ScxComparisonResult` for lazy boolean operations.
+
+**Arithmetic:**
+- `__truediv__(other)` — If `other` is a per-row vector, returns `ScxLazyTransformedDataset` with `RowScale(1/factors)` (lazy). Otherwise materializes.
+- `__mul__(other)` — If `other` is a per-row vector, returns `ScxLazyTransformedDataset` with `RowScale(factors)` (lazy). Otherwise materializes.
+- `__add__(other)` — Materializes and adds.
+- `__sub__(other)` — Materializes and subtracts.
+- `__matmul__(other)` — Matrix multiply (materializes).
+- `multiply(other)` — Element-wise Hadamard product (materializes).
+- `power(n)` — Element-wise power (materializes).
+
+**Introspection:**
+- `shard_boundaries()` `→ list[(int, int)]` — List of `(row_start, row_end)` tuples per shard.
 
 ### ScxBackedLayerDataset
 
@@ -373,6 +439,32 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 **Transform chain:**
 - Backed data → `NormalizeTotal` → `Log1p` is fused into `ln(x × target_sum / row_sum + 1)` in a single pass.
 - `repr()` shows the transform chain: `ScxLazyTransformedDataset(shape=(1000000, 33694), transforms=[NormalizeTotal, Log1p])`
+
+### scVI Integration (`pyscx.scx_integrations.scvi`)
+
+Pure-Python PyTorch Lightning DataModule wrapping `TrainingDataset` for scVI model training. Requires `lightning` or `pytorch_lightning`.
+
+- `ScxDataModule(scx_path, batch_size=1024, hvg_indices=None, normalize=True, log1p=True, target_sum=1e4, seed=42, **kwargs)` — Creates a PyTorch Lightning `LightningDataModule`.
+  - `scx_path` — Path to the `.scx` file.
+  - `batch_size` — Mini-batch size (default: 1024).
+  - `hvg_indices` — Gene indices for HVG projection. `None` = all genes.
+  - `normalize` — Apply total-count normalization (default: `True`).
+  - `log1p` — Apply log1p transformation (default: `True`).
+  - `target_sum` — Normalization target sum (default: `1e4`).
+  - `seed` — RNG seed for reproducibility (default: `42`).
+  - `**kwargs` — Additional keyword arguments passed to `TrainingDataset`.
+- Properties: `n_obs`, `n_vars`, `n_output_genes`
+- `train_dataloader()` `→ DataLoader` — Uses `batch_size=None` and `num_workers=0` (Rust handles batching and threading internally).
+- `val_dataloader()` `→ None` — Validation not currently supported.
+
+```python
+from pyscx.scx_integrations.scvi import ScxDataModule
+import scvi
+
+dm = ScxDataModule("atlas.scx", batch_size=1024, hvg_indices=hvg_array)
+model = scvi.model.SCVI(dm.adata_manager)
+model.train(datamodule=dm)
+```
 
 ### TrainingDataset
 

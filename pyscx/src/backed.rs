@@ -144,6 +144,16 @@ impl ScxBackedSparseDataset {
         2
     }
 
+    /// Whether the data is known to be non-negative.
+    ///
+    /// Raw count data is always non-negative. This flag is used by
+    /// `ScxComparisonResult` to enable the `(X > 0).sum() → getnnz()`
+    /// short-circuit optimization.
+    #[getter]
+    fn non_negative(&self) -> bool {
+        self.non_negative
+    }
+
     fn __len__(&self) -> usize {
         self.shape_val.0
     }
@@ -318,8 +328,25 @@ impl ScxBackedSparseDataset {
         py: Python<'py>,
         other: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Try to extract a per-row scaling vector.  If the multiplier is
+        // a 1D or column array with length == n_obs, express as lazy
+        // RowScale transform — mirroring __truediv__ (which inverts).
+        if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
+            let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
+                Arc::clone(&self.backed),
+                self.shape_val,
+                self.kept_to_global.clone(),
+                self.col_projection.clone(),
+                vec![Transform::RowScale {
+                    factors: Arc::new(row_factors),
+                }],
+            );
+            return Ok(Bound::new(py, lazy)?.into_any());
+        }
+
+        // Cannot be expressed as row scaling — fall back to materialization
         let mat = self.to_memory(py)?;
-        mat.mul(other)
+        mat.call_method1("__mul__", (other,))
     }
 
     fn __truediv__<'py>(
