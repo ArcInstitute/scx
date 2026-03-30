@@ -389,3 +389,87 @@ class TestStreamingAggAfterLog1p:
             lazy_var, ref_var, rtol=1e-3,
             err_msg="streaming var(axis=0) after normalize+log1p mismatch"
         )
+
+
+class TestLog1pColProjectionRegression:
+    """Regression tests for B1: log1p must preserve col_projection from backed datasets.
+
+    Previously, log1p() passed None for col_projection when wrapping a backed
+    dataset in a lazy transform, causing the user-visible shape to jump back
+    to the full gene count after filter_genes() → log1p().
+    """
+
+    def test_filter_genes_then_log1p_preserves_shape(self, scx_file):
+        """filter_genes() → log1p() should not change shape."""
+        path, _ = scx_file
+        adata = pyscx.open(path).to_anndata(backed=True)
+        original_n_vars = adata.shape[1]
+
+        # filter_genes reduces columns
+        pyscx.accel.filter_genes(adata, min_cells=1)
+        filtered_shape = adata.shape
+        assert filtered_shape[1] <= original_n_vars
+
+        # log1p should NOT change the shape
+        pyscx.accel.log1p(adata)
+        assert adata.X.shape == filtered_shape, (
+            f"log1p changed shape from {filtered_shape} to {adata.X.shape} "
+            f"(B1 regression: col_projection was dropped)"
+        )
+
+    def test_filter_genes_then_log1p_shape_matches_var(self, scx_file):
+        """After filter_genes() → log1p(), X.shape[1] must equal len(adata.var)."""
+        path, _ = scx_file
+        adata = pyscx.open(path).to_anndata(backed=True)
+
+        pyscx.accel.filter_genes(adata, min_cells=1)
+        pyscx.accel.log1p(adata)
+
+        assert adata.X.shape[1] == len(adata.var), (
+            f"X.shape[1]={adata.X.shape[1]} != len(var)={len(adata.var)} "
+            f"(B1 regression: col_projection dropped by log1p)"
+        )
+
+    def test_filter_genes_then_log1p_values_correct(self, scx_file):
+        """Lazy filter_genes() → log1p() values should match materialized pipeline."""
+        import scanpy as sc
+        import anndata
+
+        path, X_ref = scx_file
+        n_obs, n_vars = X_ref.shape
+
+        # Lazy pipeline
+        adata = pyscx.open(path).to_anndata(backed=True)
+        pyscx.accel.filter_genes(adata, min_cells=1)
+        kept_genes = list(adata.var.index)
+        pyscx.accel.log1p(adata)
+        lazy_X = adata.X.to_memory()
+
+        # Reference: materialize, subset columns, then log1p
+        adata_ref = anndata.AnnData(X=X_ref.copy())
+        adata_ref.var_names = [f"gene_{i}" for i in range(n_vars)]
+        adata_ref = adata_ref[:, kept_genes].copy()
+        sc.pp.log1p(adata_ref)
+
+        np.testing.assert_allclose(
+            lazy_X.toarray(),
+            adata_ref.X.toarray(),
+            atol=1e-6,
+            err_msg="filter_genes + log1p: lazy vs materialized mismatch (B1 regression)"
+        )
+
+    def test_filter_genes_then_normalize_then_log1p(self, scx_file):
+        """Full pipeline: filter_genes → normalize_total → log1p preserves shape."""
+        path, _ = scx_file
+        adata = pyscx.open(path).to_anndata(backed=True)
+
+        pyscx.accel.filter_genes(adata, min_cells=1)
+        filtered_shape = adata.shape
+
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+        assert adata.X.shape == filtered_shape
+
+        pyscx.accel.log1p(adata)
+        assert adata.X.shape == filtered_shape, (
+            "Shape changed after log1p in filter→normalize→log1p pipeline"
+        )

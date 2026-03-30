@@ -2166,9 +2166,8 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
             Arc::clone(&backed_ref.backed),
             backed_ref.shape_val,
             backed_ref.kept_to_global.clone(),
-            // col_projection is not inherited for log1p:
-            // log1p applies element-wise over the full column set
-            None,
+            // Inherit col_projection so user-visible shape matches adata.var
+            backed_ref.col_projection().map(|c| c.to_vec()),
             vec![Transform::Log1p],
             non_negative,
         );
