@@ -180,7 +180,52 @@ impl ScxLazyTransformedDataset {
         }
     }
 
+    /// Project a physical-column-width vector down to the user-visible column subset.
+    ///
+    /// # Column Projection Design ("Option A: post-filtering")
+    ///
+    /// Streaming column aggregation methods (`streaming_col_sums`,
+    /// `streaming_col_sums_masked`, `streaming_col_var`) intentionally operate in
+    /// **physical column space** — they return vectors of length `backed.shape().1`
+    /// covering all on-disk columns. Callers then post-filter via this method to
+    /// extract only the projected columns, producing a result of length
+    /// `shape_val.1`.
+    ///
+    /// This design is correct because:
+    /// - Column statistics (sum, mean, variance) are independent per column.
+    ///   Computing them over all columns and subsetting is numerically equivalent
+    ///   to computing only over the subset.
+    /// - Transforms (especially `NormalizeTotal`) must see the **full-width** row
+    ///   to compute correct per-row scaling factors. Projecting columns before
+    ///   transforming would produce wrong normalization denominators.
+    ///
+    /// An alternative ("Option B") would integrate `project_csr` per-shard inside
+    /// each streaming method, skipping non-projected entries during accumulation.
+    /// This would reduce inner-loop iterations on heavily filtered datasets but
+    /// adds per-shard allocation overhead from `project_csr`. Option A is simpler
+    /// and sufficient for typical workloads.
+    ///
+    /// # Contract
+    ///
+    /// Every `sum(axis=0)`, `mean(axis=0)`, and `var(axis=0)` call site **must**
+    /// apply this method before reshaping to `(1, shape_val.1)`, otherwise the
+    /// numpy reshape will fail with a dimension mismatch when `col_projection`
+    /// is active.
+    fn apply_col_projection_to_vec(&self, values: Vec<f64>) -> Vec<f64> {
+        match &self.col_projection {
+            Some(cols) => cols.iter().map(|&c| values[c as usize]).collect(),
+            None => values,
+        }
+    }
+
     // --- Streaming aggregation through transforms ---
+    //
+    // These methods stream shard-by-shard, applying lazy transforms in-place,
+    // then accumulating per-column or per-row statistics. All column-axis
+    // methods return vectors in **physical column space** (length =
+    // backed.shape().1). Callers must post-filter via apply_col_projection_to_vec()
+    // when col_projection is active. See the doc comment on that method for
+    // rationale.
 
     /// Stream all shards, apply transforms, compute per-row sums.
     pub(crate) fn streaming_row_sums(&self) -> PyResult<Vec<f64>> {
@@ -205,8 +250,12 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Stream all shards, apply transforms, compute per-column sums.
+    ///
+    /// Returns a vector of length `backed.shape().1` (physical column count),
+    /// NOT `shape_val.1` (projected). Callers must apply
+    /// `apply_col_projection_to_vec()` before exposing to Python.
     pub(crate) fn streaming_col_sums(&self) -> PyResult<Vec<f64>> {
-        let n_vars = self.backed.shape().1;
+        let n_vars = self.backed.shape().1; // physical width, intentionally
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
 
@@ -227,8 +276,14 @@ impl ScxLazyTransformedDataset {
     /// Stream all shards, apply transforms, compute per-column variance (pop, ddof=0).
     ///
     /// Two-pass: first compute means via col_sums, then accumulate (x-mean)².
+    ///
+    /// Returns a vector of length `backed.shape().1` (physical column count).
+    /// Callers must apply `apply_col_projection_to_vec()` before exposing to
+    /// Python. This is correct because per-column variance is independent —
+    /// computing var for filtered-out columns is wasted work but doesn't affect
+    /// the values for kept columns.
     fn streaming_col_var(&self) -> PyResult<Vec<f64>> {
-        let n_vars = self.backed.shape().1;
+        let n_vars = self.backed.shape().1; // physical width, intentionally
         let n_obs = self.shape_val.0;
         if n_obs == 0 {
             return Ok(vec![0.0f64; n_vars]);
@@ -301,8 +356,11 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Stream all shards, apply transforms, compute masked column sums (deletion-aware).
+    ///
+    /// Like `streaming_col_sums()`, returns a vector of length `backed.shape().1`
+    /// (physical column count). Callers must apply `apply_col_projection_to_vec()`.
     pub(crate) fn streaming_col_sums_masked(&self) -> PyResult<Vec<f64>> {
-        let n_vars = self.backed.shape().1;
+        let n_vars = self.backed.shape().1; // physical width, intentionally
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
 
@@ -675,15 +733,23 @@ impl ScxLazyTransformedDataset {
     ///
     /// Decodes each shard, applies transforms, then aggregates.
     /// Peak memory = O(shard_size), not the full matrix.
+    ///
+    /// `axis=0` (column sums): streams in physical column space, then
+    /// post-filters to projected columns via `apply_col_projection_to_vec()`.
+    /// `axis=1` (row sums): streams over full-width rows (transforms need all
+    /// columns), then filters to kept rows via `filter_row_results()`.
     #[pyo3(signature = (axis=None))]
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
+                // Streaming col sums return physical-width vector;
+                // apply_col_projection_to_vec extracts projected subset.
                 let sums = if self.kept_to_global.is_some() {
                     self.streaming_col_sums_masked()?
                 } else {
                     self.streaming_col_sums()?
                 };
+                let sums = self.apply_col_projection_to_vec(sums);
                 let arr = numpy::PyArray::from_vec(py, sums);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
@@ -704,6 +770,9 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Mean along an axis, streaming through transforms.
+    ///
+    /// Same column projection strategy as `sum()`: axis=0 computes in physical
+    /// column space, then post-filters via `apply_col_projection_to_vec()`.
     #[pyo3(signature = (axis=None))]
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
@@ -713,6 +782,8 @@ impl ScxLazyTransformedDataset {
                 } else {
                     self.streaming_col_sums()?
                 };
+                // Post-filter to projected columns, then compute means.
+                let sums = self.apply_col_projection_to_vec(sums);
                 let n = self.shape_val.0 as f64;
                 let means: Vec<f64> = sums.iter().map(|&s| s / n).collect();
                 let arr = numpy::PyArray::from_vec(py, means);
@@ -739,12 +810,21 @@ impl ScxLazyTransformedDataset {
 
     /// Variance along an axis, streaming through transforms.
     ///
-    /// Two-pass: first computes means, then accumulates (x - mean)².
+    /// `axis=0`: Two-pass streaming in physical column space, then post-filtered
+    /// via `apply_col_projection_to_vec()`. Both passes (means and sq_devs) compute
+    /// over all physical columns; since per-column variance is independent, the
+    /// projected subset values are correct.
+    ///
+    /// `axis=1` / `None`: Falls back to materialization — per-row variance across
+    /// a column subset requires tracking which projected columns have stored
+    /// entries per row, which the current streaming architecture doesn't support.
     #[pyo3(signature = (axis=None))]
     fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
                 let var = self.streaming_col_var()?;
+                // Apply column projection: streaming_col_var returns physical-width
+                let var = self.apply_col_projection_to_vec(var);
                 let arr = numpy::PyArray::from_vec(py, var);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
