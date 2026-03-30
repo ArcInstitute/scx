@@ -86,14 +86,14 @@ impl ScxLazyTransformedDataset {
     /// Supports column projection: when active, `LazyShardSource` applies
     /// per-shard column filtering and reports `n_vars()` as the projected
     /// column count.
-    pub(crate) fn as_shard_source(&self) -> Option<LazyShardSource> {
-        Some(LazyShardSource {
+    pub(crate) fn as_shard_source(&self) -> LazyShardSource {
+        LazyShardSource {
             backed: Arc::clone(&self.backed),
             transforms: self.transforms.clone(),
             kept_to_global: self.kept_to_global.clone(),
             col_projection: self.col_projection.clone(),
             shape_val: self.shape_val,
-        })
+        }
     }
 
     /// Replace the deletion vector, adjusting shape.0.

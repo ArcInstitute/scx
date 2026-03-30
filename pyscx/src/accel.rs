@@ -397,32 +397,17 @@ pub fn pca(
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         backend = "scx-accel-cpu";
-        if let Some(source) = lazy.as_shard_source() {
-            // Streaming PCA through lazy transforms — no materialization
-            scx_accel::randomized_pca(
-                &source,
-                n_comps,
-                n_oversamples,
-                n_power_iterations,
-                zero_center,
-                random_state,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
-        } else {
-            // Column projection active — fall back to materialization
-            let csr = lazy
-                .materialize_csr()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            scx_accel::randomized_pca_inmemory(
-                &csr,
-                n_comps,
-                n_oversamples,
-                n_power_iterations,
-                zero_center,
-                random_state,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
-        }
+        // Streaming PCA through lazy transforms — no materialization
+        let source = lazy.as_shard_source();
+        scx_accel::randomized_pca(
+            &source,
+            n_comps,
+            n_oversamples,
+            n_power_iterations,
+            zero_center,
+            random_state,
+        )
+        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         // Materialized: extract scipy CSR → ScxCsr → in-memory PCA
         backend = "scx-accel-cpu";
@@ -3053,9 +3038,16 @@ pub fn filter_genes(
 ///     mask = adata.obs['doublet_score'] < 0.5
 ///     pyscx.accel.subset_obs(adata, mask)
 ///
-///     # Or with integer indices:
+///     # Or with integer indices (treated as set membership):
 ///     indices = [0, 5, 10, 15, 20]
 ///     pyscx.accel.subset_obs(adata, indices)
+///
+/// **Note:** Integer indices are converted to a boolean mask internally,
+/// so they behave as set membership rather than ordered selection:
+/// duplicate indices are silently collapsed, and the original order is
+/// not preserved (`[5, 0, 10]` produces the same result as `[0, 5, 10]`).
+/// This differs from NumPy fancy indexing. Use a boolean mask if you need
+/// exact control over which rows are kept.
 ///
 /// Falls back to standard numpy/pandas subsetting for non-SCX data
 /// (materializes X via `adata._X = adata.X[mask]`).
