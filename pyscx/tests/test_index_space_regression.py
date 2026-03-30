@@ -444,6 +444,13 @@ class TestQcMetricsWithDeletions:
 class TestIndexPreservation:
     """S2: filter_cells/filter_genes/subset_obs must preserve obs.index and var.index."""
 
+    def setup_method(self):
+        self._tmpdirs = []
+
+    def teardown_method(self):
+        for d in self._tmpdirs:
+            shutil.rmtree(d, ignore_errors=True)
+
     def _make_barcoded_scx(self, n_obs=30, n_vars=15, seed=99):
         """Create SCX with realistic barcode-style obs index and gene names."""
         rng = np.random.RandomState(seed)
@@ -460,6 +467,7 @@ class TestIndexPreservation:
         adata_mem = anndata.AnnData(X=X, obs=obs, var=var)
 
         tmpdir = tempfile.mkdtemp()
+        self._tmpdirs.append(tmpdir)
         path = os.path.join(tmpdir, "barcoded.scx")
         pyscx.from_anndata(adata_mem, path)
         return path, X, barcodes, gene_names
