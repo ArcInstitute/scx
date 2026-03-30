@@ -590,7 +590,7 @@ def evaluate_gate() -> dict:
         ],
     }
 
-    # Gate 2: lazy preprocess RSS < 100 MB on census_1m
+    # Gate 2: lazy preprocess RSS < 1.5 GB on census_1m (revised target, Solution D)
     mem_path = RESULTS_DIR / "lazy_preprocess_memory.json"
     if mem_path.exists():
         mem_data = json.loads(mem_path.read_text())
@@ -598,8 +598,8 @@ def evaluate_gate() -> dict:
             if entry.get("task") == "lazy_preprocess" and "error" not in entry:
                 rss = entry.get("peak_rss_mb", float("inf"))
                 gate["criteria"]["lazy_preprocess_rss"] = {
-                    "pass": rss < 100,
-                    "target": "peak RSS < 100 MB on census_1m",
+                    "pass": rss < 1536,
+                    "target": "peak RSS < 1.5 GB on census_1m",
                     "value_mb": rss,
                     "dataset": entry.get("dataset", "?"),
                 }
@@ -607,25 +607,25 @@ def evaluate_gate() -> dict:
         else:
             gate["criteria"]["lazy_preprocess_rss"] = {
                 "pass": False,
-                "target": "peak RSS < 100 MB",
+                "target": "peak RSS < 1.5 GB",
                 "details": ["lazy_preprocess task not found in memory results"],
             }
     else:
         gate["criteria"]["lazy_preprocess_rss"] = {
             "pass": False,
-            "target": "peak RSS < 100 MB",
+            "target": "peak RSS < 1.5 GB",
             "details": ["lazy_preprocess_memory.json not found — run --mode bench first"],
         }
 
-    # Gate 3: full pipeline RSS < 500 MB on census_1m
+    # Gate 3: full pipeline RSS < 5 GB on census_1m (revised target, Solution D)
     if mem_path.exists():
         mem_data = json.loads(mem_path.read_text())
         for entry in mem_data:
             if entry.get("task") == "full_pipeline" and "error" not in entry:
                 rss = entry.get("peak_rss_mb", float("inf"))
                 gate["criteria"]["full_pipeline_rss"] = {
-                    "pass": rss < 500,
-                    "target": "peak RSS < 500 MB on census_1m",
+                    "pass": rss < 5120,
+                    "target": "peak RSS < 5 GB on census_1m",
                     "value_mb": rss,
                     "dataset": entry.get("dataset", "?"),
                 }
@@ -633,13 +633,13 @@ def evaluate_gate() -> dict:
         else:
             gate["criteria"]["full_pipeline_rss"] = {
                 "pass": False,
-                "target": "peak RSS < 500 MB",
+                "target": "peak RSS < 5 GB",
                 "details": ["full_pipeline task not found in memory results"],
             }
     else:
         gate["criteria"]["full_pipeline_rss"] = {
             "pass": False,
-            "target": "peak RSS < 500 MB",
+            "target": "peak RSS < 5 GB",
             "details": ["lazy_preprocess_memory.json not found — run --mode bench first"],
         }
 

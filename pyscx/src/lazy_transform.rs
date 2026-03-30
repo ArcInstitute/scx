@@ -81,90 +81,49 @@ impl ScxLazyTransformedDataset {
         }
     }
 
+    /// Create a `LazyShardSource` for streaming algorithms (PCA).
+    ///
+    /// Returns `None` if column projection is active (PCA should operate
+    /// on the full variable space; column projection falls back to
+    /// materialization).
+    pub(crate) fn as_shard_source(&self) -> Option<LazyShardSource> {
+        if self.col_projection.is_some() {
+            return None;
+        }
+        Some(LazyShardSource {
+            backed: Arc::clone(&self.backed),
+            transforms: self.transforms.clone(),
+            kept_to_global: self.kept_to_global.clone(),
+            shape_val: self.shape_val,
+        })
+    }
+
+    /// Replace the deletion vector, adjusting shape.0.
+    pub(crate) fn set_kept_to_global(&mut self, kept: Vec<u64>) {
+        self.shape_val.0 = kept.len();
+        self.kept_to_global = Some(kept);
+    }
+
+    /// Set column projection on this dataset.
+    pub(crate) fn set_col_projection(&mut self, col_indices: Vec<u32>) {
+        let mut sorted = col_indices;
+        sorted.sort_unstable();
+        sorted.dedup();
+        self.shape_val.1 = sorted.len();
+        self.col_projection = Some(sorted);
+    }
+
+    /// Read access to col_projection (for composition in filter_genes).
+    pub(crate) fn col_projection(&self) -> Option<&[u32]> {
+        self.col_projection.as_deref()
+    }
+
     /// Apply all transforms in-place on a decoded CSR shard.
     ///
     /// `global_row_offset` is the starting global row index for this shard,
     /// used to look up per-row parameters (row_sums, factors).
     fn apply_transforms(&self, csr: &mut ScxCsr, global_row_offset: usize) {
-        // Detect fused NormalizeTotal + Log1p pattern for the first two transforms
-        if self.transforms.len() >= 2 {
-            if let (
-                Transform::NormalizeTotal {
-                    row_sums,
-                    target_sum,
-                },
-                Transform::Log1p,
-            ) = (&self.transforms[0], &self.transforms[1])
-            {
-                // Fused path: ln(x * target_sum / row_sum + 1) in one pass
-                for row in 0..csr.n_rows() {
-                    let g = global_row_offset + row;
-                    let sum = row_sums[g];
-                    if sum > 0.0 {
-                        let factor = *target_sum / sum;
-                        let start = csr.indptr[row] as usize;
-                        let end = csr.indptr[row + 1] as usize;
-                        for v in &mut csr.data[start..end] {
-                            *v = ((*v as f64 * factor) as f32).ln_1p();
-                        }
-                    }
-                }
-                // Apply remaining transforms (index 2+)
-                for transform in &self.transforms[2..] {
-                    self.apply_single_transform(csr, transform, global_row_offset);
-                }
-                return;
-            }
-        }
-
-        // General path: apply each transform sequentially
-        for transform in &self.transforms {
-            self.apply_single_transform(csr, transform, global_row_offset);
-        }
-    }
-
-    /// Apply a single transform in-place.
-    fn apply_single_transform(
-        &self,
-        csr: &mut ScxCsr,
-        transform: &Transform,
-        global_row_offset: usize,
-    ) {
-        match transform {
-            Transform::NormalizeTotal {
-                row_sums,
-                target_sum,
-            } => {
-                for row in 0..csr.n_rows() {
-                    let g = global_row_offset + row;
-                    let sum = row_sums[g];
-                    if sum > 0.0 {
-                        let factor = *target_sum / sum;
-                        let start = csr.indptr[row] as usize;
-                        let end = csr.indptr[row + 1] as usize;
-                        for v in &mut csr.data[start..end] {
-                            *v = (*v as f64 * factor) as f32;
-                        }
-                    }
-                }
-            }
-            Transform::Log1p => {
-                for v in &mut csr.data {
-                    *v = v.ln_1p();
-                }
-            }
-            Transform::RowScale { factors } => {
-                for row in 0..csr.n_rows() {
-                    let g = global_row_offset + row;
-                    let factor = factors[g] as f32;
-                    let start = csr.indptr[row] as usize;
-                    let end = csr.indptr[row + 1] as usize;
-                    for v in &mut csr.data[start..end] {
-                        *v *= factor;
-                    }
-                }
-            }
-        }
+        apply_transforms_to_csr(&self.transforms, csr, global_row_offset);
     }
 
     /// Apply column projection to a CSR matrix if projection is active.
@@ -233,7 +192,7 @@ impl ScxLazyTransformedDataset {
         for shard_idx in 0..self.backed.index().n_shards() {
             let mut csr = self
                 .backed
-                .read_shard_cached(shard_idx)
+                .read_shard_uncached(shard_idx)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             self.apply_transforms(&mut csr, global_row);
             for row in 0..csr.n_rows() {
@@ -255,7 +214,7 @@ impl ScxLazyTransformedDataset {
         for shard_idx in 0..self.backed.index().n_shards() {
             let mut csr = self
                 .backed
-                .read_shard_cached(shard_idx)
+                .read_shard_uncached(shard_idx)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             self.apply_transforms(&mut csr, global_row);
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
@@ -297,7 +256,7 @@ impl ScxLazyTransformedDataset {
         for shard_idx in 0..self.backed.index().n_shards() {
             let mut csr = self
                 .backed
-                .read_shard_cached(shard_idx)
+                .read_shard_uncached(shard_idx)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             self.apply_transforms(&mut csr, global_row);
 
@@ -345,7 +304,7 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Stream all shards, apply transforms, compute masked column sums (deletion-aware).
-    fn streaming_col_sums_masked(&self) -> PyResult<Vec<f64>> {
+    pub(crate) fn streaming_col_sums_masked(&self) -> PyResult<Vec<f64>> {
         let n_vars = self.backed.shape().1;
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
@@ -358,7 +317,7 @@ impl ScxLazyTransformedDataset {
         for shard_idx in 0..self.backed.index().n_shards() {
             let mut csr = self
                 .backed
-                .read_shard_cached(shard_idx)
+                .read_shard_uncached(shard_idx)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             self.apply_transforms(&mut csr, global_row);
 
@@ -395,7 +354,7 @@ impl ScxLazyTransformedDataset {
         for shard_idx in 0..self.backed.index().n_shards() {
             let mut csr = self
                 .backed
-                .read_shard_cached(shard_idx)
+                .read_shard_uncached(shard_idx)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             self.apply_transforms(&mut csr, global_row);
             global_row += csr.n_rows();
@@ -1243,6 +1202,176 @@ impl ScxLazyTransformedDataset {
             mat.call_method1(method, (other,))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free-standing transform application
+// ---------------------------------------------------------------------------
+
+/// Apply all transforms in-place on a decoded CSR shard.
+///
+/// `global_row_offset` is the starting global row index for this shard,
+/// used to look up per-row parameters (row_sums, factors).
+///
+/// Shared by both `ScxLazyTransformedDataset` and `LazyShardSource`.
+fn apply_transforms_to_csr(transforms: &[Transform], csr: &mut ScxCsr, global_row_offset: usize) {
+    // Detect fused NormalizeTotal + Log1p pattern for the first two transforms
+    if transforms.len() >= 2 {
+        if let (
+            Transform::NormalizeTotal {
+                row_sums,
+                target_sum,
+            },
+            Transform::Log1p,
+        ) = (&transforms[0], &transforms[1])
+        {
+            // Fused path: ln(x * target_sum / row_sum + 1) in one pass
+            for row in 0..csr.n_rows() {
+                let g = global_row_offset + row;
+                let sum = row_sums[g];
+                if sum > 0.0 {
+                    let factor = *target_sum / sum;
+                    let start = csr.indptr[row] as usize;
+                    let end = csr.indptr[row + 1] as usize;
+                    for v in &mut csr.data[start..end] {
+                        *v = ((*v as f64 * factor) as f32).ln_1p();
+                    }
+                }
+            }
+            // Apply remaining transforms (index 2+)
+            for transform in &transforms[2..] {
+                apply_single_transform(csr, transform, global_row_offset);
+            }
+            return;
+        }
+    }
+
+    // General path: apply each transform sequentially
+    for transform in transforms {
+        apply_single_transform(csr, transform, global_row_offset);
+    }
+}
+
+/// Apply a single transform in-place.
+fn apply_single_transform(csr: &mut ScxCsr, transform: &Transform, global_row_offset: usize) {
+    match transform {
+        Transform::NormalizeTotal {
+            row_sums,
+            target_sum,
+        } => {
+            for row in 0..csr.n_rows() {
+                let g = global_row_offset + row;
+                let sum = row_sums[g];
+                if sum > 0.0 {
+                    let factor = *target_sum / sum;
+                    let start = csr.indptr[row] as usize;
+                    let end = csr.indptr[row + 1] as usize;
+                    for v in &mut csr.data[start..end] {
+                        *v = (*v as f64 * factor) as f32;
+                    }
+                }
+            }
+        }
+        Transform::Log1p => {
+            for v in &mut csr.data {
+                *v = v.ln_1p();
+            }
+        }
+        Transform::RowScale { factors } => {
+            for row in 0..csr.n_rows() {
+                let g = global_row_offset + row;
+                let factor = factors[g] as f32;
+                let start = csr.indptr[row] as usize;
+                let end = csr.indptr[row + 1] as usize;
+                for v in &mut csr.data[start..end] {
+                    *v *= factor;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LazyShardSource — ShardSource impl for streaming PCA through transforms
+// ---------------------------------------------------------------------------
+
+/// Shard source that applies lazy transforms per-shard.
+///
+/// Enables streaming PCA (and other shard-by-shard algorithms) on
+/// lazy-transformed data without materializing the full matrix.
+pub(crate) struct LazyShardSource {
+    backed: Arc<BackedCsrReader>,
+    transforms: Vec<Transform>,
+    kept_to_global: Option<Vec<u64>>,
+    shape_val: (usize, usize),
+}
+
+impl scx_format::ShardSource for LazyShardSource {
+    fn n_shards(&self) -> usize {
+        self.backed.index().n_shards()
+    }
+
+    fn n_obs(&self) -> usize {
+        self.shape_val.0
+    }
+
+    fn n_vars(&self) -> usize {
+        self.shape_val.1
+    }
+
+    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        let (s_start, _) = self.backed.index().shard_range(shard_idx).ok_or_else(|| {
+            scx_format::ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: self.backed.index().n_shards(),
+            }
+        })?;
+        let global_row = s_start as usize;
+
+        let mut csr = self.backed.read_shard_uncached(shard_idx)?;
+        apply_transforms_to_csr(&self.transforms, &mut csr, global_row);
+
+        // Apply deletion vector: filter to only kept rows within this shard
+        if let Some(ref kept) = self.kept_to_global {
+            let (s_start, s_end) = self.backed.index().shard_range(shard_idx).unwrap();
+            let lo = kept.partition_point(|&r| r < s_start);
+            let hi = kept.partition_point(|&r| r < s_end);
+            if hi > lo {
+                let local_rows: Vec<usize> = kept[lo..hi]
+                    .iter()
+                    .map(|&g| (g - s_start) as usize)
+                    .collect();
+                csr = extract_local_rows(&csr, &local_rows);
+            } else {
+                // No kept rows in this shard — return empty
+                csr = ScxCsr::new_unchecked((0, self.shape_val.1), vec![0], vec![], vec![]);
+            }
+        }
+
+        Ok(csr)
+    }
+
+    // col_means_and_sum_sq: use the default trait impl which iterates
+    // read_shard() — transforms are applied per-shard so the result is correct.
+}
+
+/// Extract specific rows from a CSR by local (within-shard) row indices.
+fn extract_local_rows(csr: &ScxCsr, local_rows: &[usize]) -> ScxCsr {
+    let n_cols = csr.n_cols();
+    let mut indptr = Vec::with_capacity(local_rows.len() + 1);
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+
+    indptr.push(0i64);
+    for &local_row in local_rows {
+        let s = csr.indptr[local_row] as usize;
+        let e = csr.indptr[local_row + 1] as usize;
+        indices.extend_from_slice(&csr.indices[s..e]);
+        data.extend_from_slice(&csr.data[s..e]);
+        indptr.push(indices.len() as i64);
+    }
+
+    ScxCsr::new_unchecked((local_rows.len(), n_cols), indptr, indices, data)
 }
 
 // ---------------------------------------------------------------------------

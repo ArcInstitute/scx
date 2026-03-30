@@ -358,7 +358,7 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 /// Gene-chunked streaming Wilcoxon rank-sum from `BackedCsrReader`.
 ///
 /// Instead of materializing the full matrix, processes genes in chunks:
-/// 1. For each gene chunk, iterate all shards via `read_shard_cached()`,
+/// 1. For each gene chunk, iterate all shards via `read_shard_uncached()`,
 ///    apply `project_csr()` per shard, scatter into a dense buffer.
 /// 2. Run `wilcoxon_rank_sum()` on the dense buffer for that chunk.
 /// 3. Merge all chunk results with global BH correction.
@@ -404,7 +404,7 @@ pub fn wilcoxon_rank_sum_streaming(
         let mut global_row = 0usize;
         for shard_idx in 0..n_shards {
             let shard_csr = reader
-                .read_shard_cached(shard_idx)
+                .read_shard_uncached(shard_idx)
                 .map_err(crate::AccelError::Scx)?;
             let projected = scx_engine::project_csr(&shard_csr, &col_indices);
 

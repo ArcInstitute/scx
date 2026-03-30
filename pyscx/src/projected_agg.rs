@@ -1,6 +1,6 @@
 // Column-projected streaming aggregation functions.
 //
-// These compose BackedCsrReader::read_shard_cached() (scx-format)
+// These compose BackedCsrReader::read_shard_uncached() (scx-format)
 // with project_csr() (scx-engine) to support aggregation on column subsets
 // without materializing the full matrix.
 //
@@ -25,7 +25,7 @@ pub fn col_sums_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resu
     let mut sums = vec![0.0f64; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -44,7 +44,7 @@ pub fn col_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resul
     let mut counts = vec![0i64; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -70,7 +70,7 @@ pub fn col_max_projected(
     let mut col_nnz = vec![0usize; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -110,7 +110,7 @@ pub fn col_min_projected(
     let mut col_nnz = vec![0usize; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -161,7 +161,7 @@ pub fn col_var_projected(
     let mut col_nnz = vec![0usize; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -199,7 +199,7 @@ pub fn row_sums_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resu
     let mut global_row = 0usize;
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -218,7 +218,7 @@ pub fn row_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resul
     let mut global_row = 0usize;
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let projected = project_csr(&csr, col_indices);
         for row in 0..projected.n_rows() {
             let s = projected.indptr[row] as usize;
@@ -246,7 +246,7 @@ pub fn col_sums_masked_projected(
     let mut sums = vec![0.0f64; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
             Some(r) => r,
             None => continue,
@@ -279,7 +279,7 @@ pub fn col_nnz_masked_projected(
     let mut counts = vec![0i64; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
             Some(r) => r,
             None => continue,
@@ -313,7 +313,7 @@ pub fn col_max_masked_projected(
     let mut col_nnz = vec![0usize; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
             Some(r) => r,
             None => continue,
@@ -360,7 +360,7 @@ pub fn col_min_masked_projected(
     let mut col_nnz = vec![0usize; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
             Some(r) => r,
             None => continue,
@@ -416,7 +416,7 @@ pub fn col_var_masked_projected(
     let mut col_nnz = vec![0usize; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = reader.read_shard_uncached(shard_idx)?;
         let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
             Some(r) => r,
             None => continue,

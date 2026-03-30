@@ -95,6 +95,17 @@ impl ScxBackedSparseDataset {
         self.col_projection = Some(sorted);
     }
 
+    /// Replace the deletion vector, adjusting shape.0.
+    pub(crate) fn set_kept_to_global(&mut self, kept: Vec<u64>) {
+        self.shape_val.0 = kept.len();
+        self.kept_to_global = Some(kept);
+    }
+
+    /// Read access to col_projection (for composition in filter_genes).
+    pub(crate) fn col_projection(&self) -> Option<&[u32]> {
+        self.col_projection.as_deref()
+    }
+
     /// Apply column projection to a CSR matrix if projection is active.
     /// Returns the original CSR if no projection is set.
     fn apply_col_projection(&self, csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {

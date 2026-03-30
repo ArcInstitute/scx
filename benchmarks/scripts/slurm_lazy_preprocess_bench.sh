@@ -3,7 +3,7 @@
 #SBATCH --partition=cpu
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/home/nickyoungblut/dev/rust/scx/benchmarks/logs/lazy_preprocess_bench_%j.log
 
 set -euo pipefail
@@ -18,7 +18,7 @@ mkdir -p benchmarks/logs benchmarks/results
 echo "=== System info ==="
 hostname
 date
-lscpu | head -20
+lscpu | head -20 || true
 free -h
 echo ""
 

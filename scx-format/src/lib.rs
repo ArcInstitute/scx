@@ -10,6 +10,7 @@ pub mod provenance;
 pub mod reader;
 pub mod section;
 pub mod shard;
+pub mod shard_source;
 pub mod writer;
 
 pub use backed::{concatenate_csr, total_variance_from_col_sq, BackedCsrIndex, BackedCsrReader};
@@ -30,4 +31,5 @@ pub use shard::{
     BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE, SHARD_HEADER_SIZE,
     SHARD_MAGIC,
 };
+pub use shard_source::ShardSource;
 pub use writer::{compute_shard_stats, ScxWriter, SECTIONS_START_OFFSET};

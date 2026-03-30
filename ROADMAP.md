@@ -390,7 +390,7 @@ See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md) for detailed specification.
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
 | **4c** | 15+ | Optional: GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuML. |
-| **4d** | 16+ | Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation. Full out-of-core pipeline from open → QC → preprocess → PCA with ~500 MB peak RSS at 1M cells. |
+| **4d** | 16+ | Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation. Full out-of-core pipeline from open → QC → preprocess → PCA with ~3–5 GB peak RSS at 1M cells (vs ~8 GB materialized). |
 
 ---
 

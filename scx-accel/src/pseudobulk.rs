@@ -150,7 +150,7 @@ pub fn pseudobulk_aggregate(
 
     for shard_idx in 0..n_shards {
         let shard_csr = reader
-            .read_shard_cached(shard_idx)
+            .read_shard_uncached(shard_idx)
             .map_err(crate::AccelError::Scx)?;
 
         let shard_n_rows = shard_csr.n_rows();

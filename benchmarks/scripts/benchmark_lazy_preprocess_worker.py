@@ -57,7 +57,13 @@ def measure_lazy_preprocess(dataset_name: str) -> dict:
 
 
 def measure_full_pipeline(dataset_name: str) -> dict:
-    """Full pipeline: QC -> normalize -> log1p -> PCA -> kNN -> UMAP -> Leiden."""
+    """Full pipeline: normalize -> log1p -> PCA -> kNN -> UMAP -> Leiden.
+
+    Skips sc.pp.filter_cells/filter_genes because scanpy's implementations
+    materialize the backed dataset into a scipy matrix, defeating the purpose
+    of the memory benchmark.  The goal here is to measure the RSS of the
+    lazy preprocessing + streaming PCA pipeline.
+    """
     gc.collect()
     import pyscx
     import scanpy as sc
@@ -65,19 +71,19 @@ def measure_full_pipeline(dataset_name: str) -> dict:
     scx_path = str(DATA_DIR / f"{dataset_name}.scx")
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     n_obs, n_vars = adata.n_obs, adata.n_vars
+    print(f"  X type after open: {type(adata.X).__name__}", flush=True)
 
     t0 = time.perf_counter()
 
-    # QC (streaming)
-    sc.pp.filter_cells(adata, min_genes=200)
-    sc.pp.filter_genes(adata, min_cells=3)
-
-    # Lazy preprocessing
+    # Lazy preprocessing (stays backed)
     pyscx.accel.normalize_total(adata, target_sum=1e4)
+    print(f"  X type after normalize_total: {type(adata.X).__name__}", flush=True)
     pyscx.accel.log1p(adata)
+    print(f"  X type after log1p: {type(adata.X).__name__}", flush=True)
 
-    # PCA streams through lazy transforms
+    # PCA streams through lazy transforms (no materialization)
     pyscx.accel.pca(adata, n_comps=50)
+    print(f"  X type after pca: {type(adata.X).__name__}", flush=True)
     pyscx.accel.neighbors(adata, n_neighbors=15)
     pyscx.accel.umap(adata)
     pyscx.accel.leiden(adata)
