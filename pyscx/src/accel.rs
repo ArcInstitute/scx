@@ -2846,10 +2846,8 @@ pub fn filter_cells(
 ///
 /// Falls back to `sc.pp.filter_genes()` for regular scipy/dense matrices.
 ///
-/// **Note:** After `filter_genes`, column projection is active, which
-/// disables streaming PCA (`as_shard_source()` returns `None`). PCA
-/// will fall back to materialization. This is a known limitation (Gap 3
-/// in Phase4-ACC-ALL.md).
+/// **Note:** After `filter_genes`, column projection is active. Streaming
+/// PCA via `as_shard_source()` applies the projection per-shard.
 ///
 /// Args:
 ///     adata: AnnData object

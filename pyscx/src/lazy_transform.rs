@@ -83,17 +83,15 @@ impl ScxLazyTransformedDataset {
 
     /// Create a `LazyShardSource` for streaming algorithms (PCA).
     ///
-    /// Returns `None` if column projection is active (PCA should operate
-    /// on the full variable space; column projection falls back to
-    /// materialization).
+    /// Supports column projection: when active, `LazyShardSource` applies
+    /// per-shard column filtering and reports `n_vars()` as the projected
+    /// column count.
     pub(crate) fn as_shard_source(&self) -> Option<LazyShardSource> {
-        if self.col_projection.is_some() {
-            return None;
-        }
         Some(LazyShardSource {
             backed: Arc::clone(&self.backed),
             transforms: self.transforms.clone(),
             kept_to_global: self.kept_to_global.clone(),
+            col_projection: self.col_projection.clone(),
             shape_val: self.shape_val,
         })
     }
@@ -1303,6 +1301,7 @@ pub(crate) struct LazyShardSource {
     backed: Arc<BackedCsrReader>,
     transforms: Vec<Transform>,
     kept_to_global: Option<Vec<u64>>,
+    col_projection: Option<Vec<u32>>,
     shape_val: (usize, usize),
 }
 
@@ -1316,7 +1315,10 @@ impl scx_format::ShardSource for LazyShardSource {
     }
 
     fn n_vars(&self) -> usize {
-        self.shape_val.1
+        match &self.col_projection {
+            Some(cols) => cols.len(),
+            None => self.shape_val.1,
+        }
     }
 
     fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
@@ -1331,6 +1333,11 @@ impl scx_format::ShardSource for LazyShardSource {
         let mut csr = self.backed.read_shard_uncached(shard_idx)?;
         apply_transforms_to_csr(&self.transforms, &mut csr, global_row);
 
+        // Apply column projection (remap column indices to projected space)
+        if let Some(ref cols) = self.col_projection {
+            csr = scx_engine::projection::project_csr(&csr, cols);
+        }
+
         // Apply deletion vector: filter to only kept rows within this shard
         if let Some(ref kept) = self.kept_to_global {
             let (s_start, s_end) = self.backed.index().shard_range(shard_idx).unwrap();
@@ -1344,7 +1351,11 @@ impl scx_format::ShardSource for LazyShardSource {
                 csr = extract_local_rows(&csr, &local_rows);
             } else {
                 // No kept rows in this shard — return empty
-                csr = ScxCsr::new_unchecked((0, self.shape_val.1), vec![0], vec![], vec![]);
+                let n_projected = self
+                    .col_projection
+                    .as_ref()
+                    .map_or(self.shape_val.1, |c| c.len());
+                csr = ScxCsr::new_unchecked((0, n_projected), vec![0], vec![], vec![]);
             }
         }
 
@@ -1352,7 +1363,7 @@ impl scx_format::ShardSource for LazyShardSource {
     }
 
     // col_means_and_sum_sq: use the default trait impl which iterates
-    // read_shard() — transforms are applied per-shard so the result is correct.
+    // read_shard() — transforms and col_projection are applied per-shard.
 }
 
 /// Extract specific rows from a CSR by local (within-shard) row indices.
