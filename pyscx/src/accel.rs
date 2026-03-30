@@ -2632,21 +2632,11 @@ fn slice_obs_and_obsm<'py>(
     let np = py.import("numpy")?;
     let mask_arr = numpy::PyArray::from_vec(py, keep.to_vec());
 
-    // Slice obs
+    // Slice obs — use _obs to bypass anndata's shape validation
+    // (X.shape is already updated via set_kept_to_global before this call)
     let obs = adata.getattr("obs")?;
     let filtered_obs = obs.getattr("loc")?.get_item(&mask_arr)?;
-    // Reset index to avoid stale index values
-    let filtered_obs = filtered_obs.call_method(
-        "reset_index",
-        (),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("drop", true)?;
-            kw
-        }),
-    )?;
-    // Preserve the original index name — rebuild from filtered_obs
-    adata.setattr("obs", filtered_obs)?;
+    adata.setattr("_obs", filtered_obs)?;
 
     // Slice obsm entries
     let obsm = adata.getattr("obsm")?;
@@ -2932,15 +2922,6 @@ pub fn filter_genes(
         let mask_arr = numpy::PyArray::from_vec(py, keep);
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        let filtered_var = filtered_var.call_method(
-            "reset_index",
-            (),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("drop", true)?;
-                kw
-            }),
-        )?;
         // Use _var to skip shape validation (X.shape changes next)
         adata.setattr("_var", filtered_var)?;
 
@@ -3038,15 +3019,6 @@ pub fn filter_genes(
         let mask_arr = numpy::PyArray::from_vec(py, keep);
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        let filtered_var = filtered_var.call_method(
-            "reset_index",
-            (),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("drop", true)?;
-                kw
-            }),
-        )?;
         adata.setattr("_var", filtered_var)?;
 
         lazy.borrow_mut()

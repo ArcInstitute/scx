@@ -1,12 +1,9 @@
-"""Regression tests for C1: global-vs-kept row indexing bug.
+"""Regression tests for index-space bugs (C1, C2, S1, S2).
 
-These tests create datasets where some cells are filtered (activating the
-deletion vector), then verify that normalize_total, __mul__, and __truediv__
-don't panic from index-out-of-bounds.
-
-The bug was that transform parameter vectors (row_sums, factors) were
-stored in kept-row space (length n_kept) but indexed by global row
-offset in apply_transforms_to_csr.
+C1: Global-vs-kept row indexing in transform parameters.
+C2: nnz getter ignoring deletion vectors.
+S1: calculate_qc_metrics not using deletion-aware col sums.
+S2: slice_obs_and_obsm dropping cell barcode index.
 
 To work around anndata 0.12's strict obs/shape validation, we construct
 the backed dataset with a deletion vector and build an anndata with
@@ -440,3 +437,110 @@ class TestQcMetricsWithDeletions:
             n_cells, ref_n_cells,
             err_msg="backed qc n_cells_by_counts should exclude deleted rows",
         )
+
+
+class TestIndexPreservation:
+    """S2: filter_cells/filter_genes/subset_obs must preserve obs.index and var.index."""
+
+    def _make_barcoded_scx(self, n_obs=30, n_vars=15, seed=99):
+        """Create SCX with realistic barcode-style obs index and gene names."""
+        rng = np.random.RandomState(seed)
+        X = sp.random(n_obs, n_vars, density=0.4, random_state=seed,
+                      format='csr', dtype=np.float32)
+        X.data = np.ceil(X.data * 50).astype(np.float32)
+        X.eliminate_zeros()
+
+        barcodes = [f"ACGT{i:04d}-1" for i in range(n_obs)]
+        gene_names = [f"GeneSymbol_{i}" for i in range(n_vars)]
+
+        obs = pd.DataFrame(index=barcodes)
+        var = pd.DataFrame(index=gene_names)
+        adata_mem = anndata.AnnData(X=X, obs=obs, var=var)
+
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "barcoded.scx")
+        pyscx.from_anndata(adata_mem, path)
+        return path, X, barcodes, gene_names
+
+    def test_filter_cells_preserves_obs_index(self):
+        """obs.index should contain original barcodes after filter_cells."""
+        path, X, barcodes, _ = self._make_barcoded_scx()
+        adata = pyscx.open(path).to_anndata(backed=True)
+
+        # Verify original index
+        assert list(adata.obs.index) == barcodes
+
+        # min_genes=6 filters some cells (not all have >= 6 nonzero genes)
+        row_nnz = np.diff(X.indptr)
+        expected_kept = [bc for bc, nnz in zip(barcodes, row_nnz) if nnz >= 6]
+        assert len(expected_kept) < len(barcodes), "threshold should filter some cells"
+
+        pyscx.accel.filter_cells(adata, min_genes=6)
+
+        assert list(adata.obs.index) == expected_kept, \
+            "obs.index should be the barcodes of kept cells"
+
+    def test_filter_cells_lazy_preserves_obs_index(self):
+        """obs.index preserved on lazy dataset after filter_cells."""
+        path, X, barcodes, _ = self._make_barcoded_scx()
+        adata = pyscx.open(path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+
+        pyscx.accel.filter_cells(adata, min_genes=6)
+
+        for bc in adata.obs.index:
+            assert bc in barcodes
+
+    def test_filter_genes_preserves_var_index(self):
+        """var.index should contain original gene names after filter_genes."""
+        path, X, _, gene_names = self._make_barcoded_scx()
+        adata = pyscx.open(path).to_anndata(backed=True)
+
+        assert list(adata.var.index) == gene_names
+
+        pyscx.accel.filter_genes(adata, min_cells=1)
+
+        for gene in adata.var.index:
+            assert gene in gene_names, f"Gene {gene} not in original gene names"
+
+        assert not all(isinstance(idx, (int, np.integer)) for idx in adata.var.index), \
+            "var.index should be gene names, not integer range"
+
+    def test_filter_genes_lazy_preserves_var_index(self):
+        """var.index preserved on lazy dataset after filter_genes."""
+        path, X, _, gene_names = self._make_barcoded_scx()
+        adata = pyscx.open(path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+
+        pyscx.accel.filter_genes(adata, min_cells=1)
+
+        for gene in adata.var.index:
+            assert gene in gene_names
+
+    def test_subset_obs_preserves_obs_index(self):
+        """obs.index preserved after subset_obs with boolean mask."""
+        path, X, barcodes, _ = self._make_barcoded_scx()
+        adata = pyscx.open(path).to_anndata(backed=True)
+
+        mask = np.zeros(len(barcodes), dtype=bool)
+        mask[::2] = True  # keep every other cell
+        pyscx.accel.subset_obs(adata, mask)
+
+        expected_barcodes = [bc for bc, m in zip(barcodes, mask) if m]
+        assert list(adata.obs.index) == expected_barcodes
+
+    def test_filter_cells_index_matches_kept_rows(self):
+        """After filter_cells, obs.index must correspond to the correct kept cells."""
+        path, X, barcodes, _ = self._make_barcoded_scx()
+        adata = pyscx.open(path).to_anndata(backed=True)
+
+        # Compute expected keep mask manually — use threshold that filters cells
+        row_nnz = np.diff(X.indptr)
+        keep_mask = row_nnz >= 6
+        expected_barcodes = [bc for bc, k in zip(barcodes, keep_mask) if k]
+        assert len(expected_barcodes) < len(barcodes), "threshold should filter some cells"
+
+        pyscx.accel.filter_cells(adata, min_genes=6)
+
+        assert list(adata.obs.index) == expected_barcodes, \
+            "obs.index must match the barcodes of the kept cells"
