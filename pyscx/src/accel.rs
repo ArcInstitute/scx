@@ -2410,6 +2410,13 @@ pub fn calculate_qc_metrics<'py>(
             .map(|(&s, &t)| if t > 0.0 { s / t * 100.0 } else { 0.0 })
             .collect();
 
+        // Compute log1p before moving subset_sums
+        let log1p_subset_sums: Option<Vec<f64>> = if log1p {
+            Some(subset_sums.iter().map(|&v| (v + 1.0).ln()).collect())
+        } else {
+            None
+        };
+
         obs_dict.set_item(
             format!("total_counts_{qc_var}"),
             numpy::PyArray::from_vec(py, subset_sums),
@@ -2418,25 +2425,10 @@ pub fn calculate_qc_metrics<'py>(
             format!("pct_counts_{qc_var}"),
             numpy::PyArray::from_vec(py, pct_counts),
         )?;
-        if log1p {
-            let subset_sums_for_log: Vec<f64> = {
-                // Re-extract since we moved subset_sums
-                let raw = if is_backed {
-                    let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
-                    let all_sums = projected_agg::row_sums_projected(&backed.backed, &col_indices)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    backed.filter_row_results(&all_sums)
-                } else {
-                    let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-                    let all_sums = projected_agg::row_sums_projected(&lazy.backed, &col_indices)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    lazy.filter_row_results(&all_sums)
-                };
-                raw.iter().map(|&v| (v + 1.0).ln()).collect()
-            };
+        if let Some(log1p_sums) = log1p_subset_sums {
             obs_dict.set_item(
                 format!("log1p_total_counts_{qc_var}"),
-                numpy::PyArray::from_vec(py, subset_sums_for_log),
+                numpy::PyArray::from_vec(py, log1p_sums),
             )?;
         }
     }
