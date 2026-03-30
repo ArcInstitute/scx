@@ -638,6 +638,27 @@ impl ScxLazyTransformedDataset {
         mat.call_method1("__truediv__", (other,))
     }
 
+    fn __rmul__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Multiplication is commutative — delegate to __mul__.
+        self.__mul__(py, other)
+    }
+
+    fn __rtruediv__<'py>(
+        &self,
+        py: Python<'py>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // other / self — not expressible as a lazy row scale, materialize
+        // to dense (scipy sparse doesn't support scalar / sparse).
+        let mat = self.to_memory(py)?;
+        let dense = mat.call_method0("toarray")?;
+        other.div(&dense)
+    }
+
     fn __matmul__<'py>(
         &self,
         py: Python<'py>,
