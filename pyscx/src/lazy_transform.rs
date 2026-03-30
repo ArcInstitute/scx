@@ -234,12 +234,10 @@ impl ScxLazyTransformedDataset {
         }
 
         // Pass 1: column means through transforms
-        let col_sums = self.streaming_col_sums()?;
         let col_sums_filtered = if self.kept_to_global.is_some() {
-            // For col sums we need the masked version
             self.streaming_col_sums_masked()?
         } else {
-            col_sums
+            self.streaming_col_sums()?
         };
         let col_means: Vec<f64> = col_sums_filtered
             .iter()
