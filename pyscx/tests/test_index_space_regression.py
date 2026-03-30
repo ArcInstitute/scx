@@ -288,3 +288,79 @@ class TestMulDivAfterFilterCells:
         np.testing.assert_allclose(
             mat.toarray(), normalized.toarray(), rtol=1e-5,
         )
+
+
+class TestNnzWithDeletions:
+    """C2: nnz getter and getnnz(axis=None) must respect deletion vectors."""
+
+    def test_backed_nnz_with_deletions(self, sparse_scx):
+        """nnz property should reflect only kept rows after filter_cells."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+
+        # Expected NNZ: sum of per-row NNZ for kept rows only
+        kept_X = X_ref[keep_mask]
+        expected_nnz = kept_X.nnz
+
+        assert adata.X.nnz == expected_nnz, (
+            f"nnz should be {expected_nnz} (kept rows only), got {adata.X.nnz}"
+        )
+        # Must be less than full-file NNZ since some rows were deleted
+        assert adata.X.nnz < X_ref.nnz
+
+    def test_backed_getnnz_none_with_deletions(self, sparse_scx):
+        """getnnz(axis=None) should reflect only kept rows after filter_cells."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+
+        kept_X = X_ref[keep_mask]
+        expected_nnz = kept_X.nnz
+
+        result = adata.X.getnnz()
+        assert result == expected_nnz, (
+            f"getnnz(axis=None) should be {expected_nnz}, got {result}"
+        )
+
+    def test_lazy_nnz_with_deletions(self, sparse_scx):
+        """nnz on ScxLazyTransformedDataset should respect deletion vectors."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+
+        # NNZ is preserved by NormalizeTotal (no new zeros created)
+        kept_X = X_ref[keep_mask]
+        expected_nnz = kept_X.nnz
+
+        assert adata.X.nnz == expected_nnz, (
+            f"lazy nnz should be {expected_nnz}, got {adata.X.nnz}"
+        )
+
+    def test_lazy_getnnz_none_with_deletions(self, sparse_scx):
+        """getnnz(axis=None) on lazy dataset should respect deletion vectors."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+
+        kept_X = X_ref[keep_mask]
+        expected_nnz = kept_X.nnz
+
+        result = adata.X.getnnz()
+        assert result == expected_nnz
+
+    def test_getnnz_axis1_consistent_with_total(self, sparse_scx):
+        """sum(getnnz(axis=1)) should equal getnnz(axis=None)."""
+        path, _, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+
+        total = adata.X.getnnz()
+        per_row = adata.X.getnnz(axis=1)
+        assert np.array(per_row).sum() == total
+
+    def test_getnnz_axis0_consistent_with_total(self, sparse_scx):
+        """sum(getnnz(axis=0)) should equal getnnz(axis=None)."""
+        path, _, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+
+        total = adata.X.getnnz()
+        per_col = adata.X.getnnz(axis=0)
+        assert np.array(per_col).sum() == total

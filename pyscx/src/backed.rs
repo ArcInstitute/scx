@@ -692,7 +692,16 @@ impl ScxBackedSparseDataset {
                     let total: i64 = nnz.iter().sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
-                _ => {
+                (None, Some(kept)) => {
+                    // Sum row NNZ for kept rows only
+                    let all_nnz = self
+                        .backed
+                        .row_nnz()
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let total: i64 = kept.iter().map(|&g| all_nnz[g as usize]).sum();
+                    Ok((total as usize).into_pyobject(py)?.into_any())
+                }
+                (None, None) => {
                     let total = self
                         .backed
                         .total_nnz()
@@ -721,11 +730,32 @@ impl ScxBackedSparseDataset {
     }
 
     /// Number of stored values (nonzeros) — without materializing.
+    /// Respects deletion vectors and column projections.
     #[getter]
     fn nnz(&self) -> PyResult<usize> {
-        self.backed
-            .total_nnz()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(nnz.iter().sum::<i64>() as usize)
+            }
+            (Some(cols), None) => {
+                let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(nnz.iter().sum::<i64>() as usize)
+            }
+            (None, Some(kept)) => {
+                let all_nnz = self
+                    .backed
+                    .row_nnz()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(kept.iter().map(|&g| all_nnz[g as usize]).sum::<i64>() as usize)
+            }
+            (None, None) => self
+                .backed
+                .total_nnz()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+        }
     }
 
     /// Number of CSR shards in the backing file.
