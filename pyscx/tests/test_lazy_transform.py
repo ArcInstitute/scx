@@ -12,19 +12,19 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 import tempfile
+import shutil
 import os
 
 import pyscx
 
 
-def _make_test_scx(n_obs=100, n_vars=50, density=0.3, seed=42):
+def _make_test_scx(tmpdir, n_obs=100, n_vars=50, density=0.3, seed=42):
     """Create a temp SCX file with random integer sparse data."""
     X = sp.random(n_obs, n_vars, density=density, random_state=seed, format='csr', dtype=np.float32)
     # Make integer-valued (like UMI counts)
     X.data = np.ceil(X.data * 100).astype(np.float32)
     X.eliminate_zeros()
 
-    tmpdir = tempfile.mkdtemp()
     path = os.path.join(tmpdir, "test.scx")
 
     import anndata
@@ -41,8 +41,10 @@ def _make_test_scx(n_obs=100, n_vars=50, density=0.3, seed=42):
 @pytest.fixture
 def scx_file():
     """Create a test SCX file and return (path, reference_X)."""
-    path, X = _make_test_scx()
+    tmpdir = tempfile.mkdtemp()
+    path, X = _make_test_scx(tmpdir)
     yield path, X
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class TestLazyTransformConstruction:

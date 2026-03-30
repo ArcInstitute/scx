@@ -42,7 +42,7 @@ pub struct ScxBackedSparseDataset {
     /// (raw UMI counts, normalized, log1p). Set to `false` after operations
     /// that produce negative values (e.g., `sc.pp.scale()`), which disables
     /// the `(X > 0).sum() → getnnz()` short-circuit optimization.
-    non_negative: bool,
+    pub(crate) non_negative: bool,
 }
 
 impl ScxBackedSparseDataset {
@@ -357,6 +357,7 @@ impl ScxBackedSparseDataset {
                 vec![Transform::RowScale {
                     factors: Arc::new(global_factors),
                 }],
+                self.non_negative,
             );
             return Ok(Bound::new(py, lazy)?.into_any());
         }
@@ -396,6 +397,7 @@ impl ScxBackedSparseDataset {
                 vec![Transform::RowScale {
                     factors: Arc::new(global_inv),
                 }],
+                self.non_negative,
             );
             return Ok(Bound::new(py, lazy)?.into_any());
         }
@@ -1602,6 +1604,7 @@ impl ScxComparisonResult {
                 self.kept_to_global.clone(),
                 None,
                 transforms.clone(),
+                self.non_negative,
             );
             let mat = lazy.to_memory_py(py)?;
             let method = match self.op.as_str() {

@@ -75,6 +75,48 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - `scx info` displays full provenance history
 - Read/write via `ScxReader::read_provenance()` / `ScxWriter::write_provenance()`
 
+## BackedCsrReader (`scx-format/src/backed.rs`)
+
+- `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
+- `read_rows(start, end)` → `ScxCsr` — Decode and concatenate rows from relevant shards
+- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing)
+- `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
+- `read_shard_uncached(idx)` → `ScxCsr` — Read shard bypassing cache (preferred for streaming)
+- `row_sums()` / `col_sums()` — Streaming per-row/column sums
+- `row_nnz()` / `col_nnz()` — Streaming per-row/column NNZ
+- `row_var()` / `col_var()` — Streaming per-row/column variance
+- `row_max()` / `col_max()` / `row_min()` / `col_min()` — Streaming extrema
+- `total_nnz()` — Total NNZ across all shards
+- `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
+- Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`
+
+## ShardSource Trait (`scx-format/src/shard_source.rs`)
+
+A uniform interface for streaming CSR data shard-by-shard, enabling algorithms like PCA to process data without materializing the full matrix. Defined in `scx-format`, available to both `scx-accel` and `pyscx`.
+
+```rust
+pub trait ShardSource {
+    fn n_shards(&self) -> usize;
+    fn n_obs(&self) -> usize;
+    fn n_vars(&self) -> usize;
+    fn shape(&self) -> (usize, usize) { (self.n_obs(), self.n_vars()) }
+    fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr>;
+    fn col_means_and_sum_sq(&self, zero_center: bool)
+        -> Result<(Option<Vec<f64>>, Vec<f64>)>; // default impl provided
+}
+```
+
+**Implementations:**
+
+| Type | Crate | Behavior |
+|------|-------|---------|
+| `BackedCsrReader` | `scx-format` | Reads raw decoded shards via `read_shard_uncached()` |
+| `LazyShardSource` | `pyscx` (internal) | Applies per-shard transforms (NormalizeTotal, Log1p, RowScale), column projection (`project_csr`), and deletion vector filtering before returning |
+
+**Used by:** `scx-accel::randomized_pca()`, `streaming_spmm_forward()`, `streaming_spmm_transpose()` — all generic over `<S: ShardSource>` for zero-cost abstraction across the crate boundary.
+
+**Design note:** The trait is defined in `scx-format` (not `scx-accel`) so that `pyscx`'s `LazyShardSource` can implement it without creating a dependency on `scx-accel`. PCA functions in `scx-accel` are generic (`<S: ShardSource>`) rather than using `&dyn ShardSource` to allow monomorphization.
+
 ## scx-ops — File Operations
 
 ### `scx_ops::append(path, obs, indptr, indices, values, ...) → Result<()>`
@@ -311,8 +353,24 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
 - `pyscx.accel.normalize_total(adata, target_sum=10000.0)` — Materialization-free row normalization. On `ScxBackedSparseDataset`: computes row sums via streaming, creates `ScxLazyTransformedDataset` wrapper. On `ScxLazyTransformedDataset`: appends `NormalizeTotal` transform to chain. On scipy CSR: delegates to `sc.pp.normalize_total()`.
 - `pyscx.accel.log1p(adata)` — Materialization-free log1p. On `ScxBackedSparseDataset`: creates `ScxLazyTransformedDataset` with `Log1p` transform. On `ScxLazyTransformedDataset`: appends `Log1p` to chain (fuses with preceding `NormalizeTotal` when possible). On scipy CSR: delegates to `sc.pp.log1p()`.
 - `pyscx.accel.gpu_info() → dict` — Query GPU device info: `{'device': ..., 'total_vram_gb': ..., 'free_vram_gb': ...}`. Returns `None` if no GPU available.
-- `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU memory for an operation: `{'required_gb': ..., 'fits_in_vram': ...}`.
+- `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU VRAM required for an operation. Returns `{'required_gb': float, 'fits_in_vram': bool}`. Supported operations:
+  - `"pca"`: kwargs `n_components` (default 50), `n_oversamples` (default 10), `shard_size` (default 16384)
+  - `"knn"`: kwargs `n_neighbors` (default 15), `n_dims` (default 50)
+  - `"umap"`: kwargs `n_components` (default 2)
+  - `"leiden"`: no additional kwargs
+
+  Raises `ValueError` for unknown operations. Note: estimates are approximate — cuSOLVER QR workspace may be undercounted by ~1.5×.
 - `pyscx.accel.calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True)` — Streaming QC metrics for backed/lazy data without materialization. Computes per-cell `n_genes_by_counts`, `total_counts` and per-gene `n_cells_by_counts`, `total_counts`. Supports `qc_vars` for gene subsets (e.g., `["mt"]` for mitochondrial percentage). When `inplace=True`, writes to `adata.obs`/`adata.var`; when `False`, returns `(obs_df, var_df)`. Falls back to `sc.pp.calculate_qc_metrics()` for scipy/dense.
+- `pyscx.accel.filter_cells(adata, min_genes=None, max_genes=None, min_counts=None, max_counts=None)` — Non-materializing cell QC filter for backed/lazy data. Computes row NNZ and/or row sums via streaming, builds a boolean mask, and updates the deletion vector (`kept_to_global`) on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Also slices `adata.obs`, `adata.obsm`, and updates `adata.layers` with the new deletion vector. Falls back to `sc.pp.filter_cells()` for scipy/dense.
+- `pyscx.accel.filter_genes(adata, min_cells=None, max_cells=None, min_counts=None, max_counts=None)` — Non-materializing gene QC filter for backed/lazy data. Computes column NNZ and/or column sums via streaming, builds a boolean mask, and sets `col_projection` on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Slices `adata.var` to match. Composes with existing column projections. Falls back to `sc.pp.filter_genes()` for scipy/dense.
+- `pyscx.accel.subset_obs(adata, mask_or_indices)` — Subset observations (cells) without materializing. Accepts a **boolean numpy mask** or **integer index array**. Creates a new deletion vector (`kept_to_global`) on the backing dataset, slices `adata.obs` and `adata.obsm`, and updates `adata.layers`. Composes correctly with existing deletion vectors. Falls back to numpy slicing for non-SCX data.
+
+  > [!WARNING]
+  > **Integer index semantics differ from NumPy.** When `mask_or_indices` is an integer array, it is internally converted to a boolean mask. This means:
+  > - **Duplicate indices are silently collapsed** — `[0, 0, 5]` is equivalent to `[0, 5]`
+  > - **Order is not preserved** — `[5, 0, 10]` produces the same result as `[0, 5, 10]`
+  >
+  > This differs from NumPy's fancy indexing where `a[[5, 0, 10]]` returns rows in the order `[5, 0, 10]` with duplicates preserved. Use a boolean mask for unambiguous results.
 
 ### ScxBackedSparseDataset
 

@@ -70,6 +70,7 @@ impl ScxLazyTransformedDataset {
         kept_to_global: Option<Vec<u64>>,
         col_projection: Option<Vec<u32>>,
         transforms: Vec<Transform>,
+        non_negative: bool,
     ) -> Self {
         Self {
             backed,
@@ -77,7 +78,7 @@ impl ScxLazyTransformedDataset {
             transforms,
             kept_to_global,
             col_projection,
-            non_negative: true,
+            non_negative,
         }
     }
 
@@ -590,6 +591,7 @@ impl ScxLazyTransformedDataset {
                 self.kept_to_global.clone(),
                 self.col_projection.clone(),
                 new_transforms,
+                self.non_negative,
             );
             return Ok(Bound::new(py, lazy)?.into_any());
         }
@@ -629,6 +631,7 @@ impl ScxLazyTransformedDataset {
                 self.kept_to_global.clone(),
                 self.col_projection.clone(),
                 new_transforms,
+                self.non_negative,
             );
             return Ok(Bound::new(py, lazy)?.into_any());
         }

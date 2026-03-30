@@ -14,6 +14,7 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 import tempfile
+import shutil
 import os
 
 import anndata
@@ -66,7 +67,7 @@ def _make_scx_with_sparse_cells(n_obs=20, n_vars=10, n_sparse_cells=3, seed=42):
     tmpdir = tempfile.mkdtemp()
     path = os.path.join(tmpdir, "test_sparse.scx")
     pyscx.from_anndata(adata, path)
-    return path, X, keep_mask
+    return path, X, keep_mask  # tmpdir cleaned up by sparse_scx fixture
 
 
 def _open_backed_with_deletions(path, keep_mask):
@@ -141,6 +142,7 @@ def sparse_scx():
     """SCX file with 3 sparse cells (1 gene each) and 17 dense cells."""
     path, X, keep_mask = _make_scx_with_sparse_cells()
     yield path, X, keep_mask
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
 
 class TestNormalizeTotalAfterFilterCells:

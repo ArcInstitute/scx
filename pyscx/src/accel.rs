@@ -2092,6 +2092,7 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
             .row_sums()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
+        let non_negative = backed_ref.non_negative;
         let lazy = ScxLazyTransformedDataset::new(
             Arc::clone(&backed_ref.backed),
             backed_ref.shape_val,
@@ -2103,6 +2104,7 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
                 row_sums: Arc::new(all_row_sums),
                 target_sum,
             }],
+            non_negative,
         );
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
@@ -2159,6 +2161,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
 
+        let non_negative = backed_ref.non_negative;
         let lazy = ScxLazyTransformedDataset::new(
             Arc::clone(&backed_ref.backed),
             backed_ref.shape_val,
@@ -2167,6 +2170,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
             // log1p applies element-wise over the full column set
             None,
             vec![Transform::Log1p],
+            non_negative,
         );
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
