@@ -364,3 +364,79 @@ class TestNnzWithDeletions:
         total = adata.X.getnnz()
         per_col = adata.X.getnnz(axis=0)
         assert np.array(per_col).sum() == total
+
+
+class TestQcMetricsWithDeletions:
+    """S1: calculate_qc_metrics must use deletion-aware col sums for lazy data."""
+
+    def test_lazy_qc_gene_total_counts(self, sparse_scx):
+        """Per-gene total_counts should reflect only kept rows on lazy dataset."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+
+        pyscx.accel.calculate_qc_metrics(adata, inplace=True)
+
+        # Reference: col sums of kept rows after normalize_total
+        kept_X = X_ref[keep_mask].toarray().astype(np.float64)
+        row_sums = kept_X.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        normalized = kept_X / row_sums * 1e4
+        ref_gene_totals = normalized.sum(axis=0)
+
+        gene_totals = adata.var["total_counts"].values.astype(np.float64)
+        np.testing.assert_allclose(
+            gene_totals, ref_gene_totals, rtol=1e-4,
+            err_msg="lazy qc gene total_counts should exclude deleted rows",
+        )
+
+    def test_lazy_qc_n_cells_by_counts(self, sparse_scx):
+        """Per-gene n_cells_by_counts should reflect only kept rows on lazy dataset."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+
+        pyscx.accel.calculate_qc_metrics(adata, inplace=True)
+
+        # Reference: per-column NNZ of kept rows only (NNZ preserved by normalize)
+        kept_X = X_ref[keep_mask]
+        ref_n_cells = np.diff(kept_X.tocsc().indptr)
+
+        n_cells = adata.var["n_cells_by_counts"].values.astype(np.int64)
+        np.testing.assert_array_equal(
+            n_cells, ref_n_cells,
+            err_msg="lazy qc n_cells_by_counts should exclude deleted rows",
+        )
+
+    def test_backed_qc_gene_total_counts(self, sparse_scx):
+        """Per-gene total_counts should reflect only kept rows on backed dataset."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+
+        pyscx.accel.calculate_qc_metrics(adata, inplace=True)
+
+        # Reference: col sums of kept rows (raw, no transforms)
+        kept_X = X_ref[keep_mask]
+        ref_gene_totals = np.array(kept_X.sum(axis=0)).flatten().astype(np.float64)
+
+        gene_totals = adata.var["total_counts"].values.astype(np.float64)
+        np.testing.assert_allclose(
+            gene_totals, ref_gene_totals, rtol=1e-5,
+            err_msg="backed qc gene total_counts should exclude deleted rows",
+        )
+
+    def test_backed_qc_n_cells_by_counts(self, sparse_scx):
+        """Per-gene n_cells_by_counts should reflect only kept rows on backed dataset."""
+        path, X_ref, keep_mask = sparse_scx
+        adata = _open_backed_with_deletions(path, keep_mask)
+
+        pyscx.accel.calculate_qc_metrics(adata, inplace=True)
+
+        kept_X = X_ref[keep_mask]
+        ref_n_cells = np.diff(kept_X.tocsc().indptr)
+
+        n_cells = adata.var["n_cells_by_counts"].values.astype(np.int64)
+        np.testing.assert_array_equal(
+            n_cells, ref_n_cells,
+            err_msg="backed qc n_cells_by_counts should exclude deleted rows",
+        )

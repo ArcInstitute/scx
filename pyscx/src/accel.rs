@@ -2310,11 +2310,23 @@ pub fn calculate_qc_metrics<'py>(
         (col_sums, col_nnz)
     } else {
         let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-        let col_sums = lazy.streaming_col_sums()?;
-        let col_nnz = lazy
-            .backed
-            .col_nnz()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let col_sums = if lazy.kept_to_global.is_some() {
+            lazy.streaming_col_sums_masked()?
+        } else {
+            lazy.streaming_col_sums()?
+        };
+        let col_nnz = if let Some(ref kept) = lazy.kept_to_global {
+            lazy.backed
+                .col_nnz_masked(kept)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .iter()
+                .map(|&v| v as i64)
+                .collect()
+        } else {
+            lazy.backed
+                .col_nnz()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        };
         (col_sums, col_nnz)
     };
 
