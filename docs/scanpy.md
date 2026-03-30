@@ -497,7 +497,7 @@ csr = adata.X.copy()       # same as to_memory()
 
 ### Complete out-of-core pipeline
 
-This pipeline processes 1M+ cells with <500 MB peak RSS:
+This pipeline processes 1M+ cells with ~3–5 GB peak RSS (vs ~8 GB materialized):
 
 ```python
 import pyscx
@@ -967,9 +967,11 @@ sc.tl.leiden(adata)
 sc.pl.umap(adata, color="leiden")
 ```
 
-> [!NOTE]
-> Peak RSS for this pipeline on a 1M-cell dataset is ~500 MB (vs ~8 GB
-> with the traditional materialize-then-preprocess approach).
+> Peak RSS for this pipeline on a 1M-cell dataset is ~3–5 GB (vs ~8 GB
+> with the traditional materialize-then-preprocess approach). The savings
+> come from streaming shard-by-shard through lazy transforms instead of
+> loading the full matrix into RAM. The Python interpreter + library
+> baseline (~450 MB) is the irreducible minimum.
 
 ### GPU-accelerated analysis pipeline
 

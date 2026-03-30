@@ -3059,3 +3059,133 @@ pub fn filter_genes(
         .call_method("filter_genes", (adata,), Some(&kwargs))?;
     Ok(())
 }
+
+/// Subset observations (rows) without materializing backed data.
+///
+/// Accepts a boolean mask (numpy array or list of bool) or integer index
+/// array (numpy array or list of int) and updates the backed dataset's
+/// deletion vector in-place. Also slices `adata.obs`, `adata.obsm`, and
+/// updates all backed layers to match.
+///
+/// This is the general-purpose version of `filter_cells()` — use it for
+/// custom QC logic, cluster-based filtering, or any arbitrary subsetting:
+///
+///     mask = adata.obs['doublet_score'] < 0.5
+///     pyscx.accel.subset_obs(adata, mask)
+///
+///     # Or with integer indices:
+///     indices = [0, 5, 10, 15, 20]
+///     pyscx.accel.subset_obs(adata, indices)
+///
+/// Falls back to standard numpy/pandas subsetting for non-SCX data
+/// (materializes X via `adata._X = adata.X[mask]`).
+///
+/// Args:
+///     adata: AnnData object
+///     mask_or_indices: Boolean mask (length n_obs) or integer index array
+#[pyfunction]
+#[pyo3(signature = (adata, mask_or_indices))]
+pub fn subset_obs(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    mask_or_indices: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+
+    // Get n_obs from adata.shape[0]
+    let shape = adata.getattr("shape")?;
+    let n_obs: usize = shape.get_item(0)?.extract()?;
+
+    // Convert input to a numpy array to determine dtype
+    let arr = np.call_method1("asarray", (mask_or_indices,))?;
+    let dtype_str: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
+
+    // Build boolean keep mask
+    let keep: Vec<bool> = match dtype_str.as_str() {
+        // Boolean mask
+        "b" => {
+            let bool_arr: numpy::PyReadonlyArray1<'_, bool> = arr.extract()?;
+            let slice = bool_arr
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            if slice.len() != n_obs {
+                return Err(PyValueError::new_err(format!(
+                    "Boolean mask length ({}) does not match n_obs ({})",
+                    slice.len(),
+                    n_obs
+                )));
+            }
+            slice.to_vec()
+        }
+        // Integer indices
+        "i" | "u" => {
+            let idx_arr = arr.call_method1("astype", (np.getattr("int64")?,))?;
+            let idx_ro: numpy::PyReadonlyArray1<'_, i64> = idx_arr.extract()?;
+            let indices = idx_ro
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // Validate bounds
+            for &idx in indices {
+                if idx < 0 || (idx as usize) >= n_obs {
+                    return Err(PyValueError::new_err(format!(
+                        "Index {} is out of bounds for n_obs={}",
+                        idx, n_obs
+                    )));
+                }
+            }
+
+            // Build boolean mask from indices
+            let mut mask = vec![false; n_obs];
+            for &idx in indices {
+                mask[idx as usize] = true;
+            }
+            mask
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "mask_or_indices must be a boolean mask or integer index array",
+            ));
+        }
+    };
+
+    // Check if any rows are kept
+    let n_kept = keep.iter().filter(|&&k| k).count();
+    if n_kept == n_obs {
+        // All rows kept — nothing to do
+        return Ok(());
+    }
+
+    let x = adata.getattr("X")?;
+
+    // Case 1: X is ScxBackedSparseDataset
+    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+        let new_kept = compose_kept_to_global(&keep, backed.borrow().kept_to_global.as_deref());
+        backed.borrow_mut().set_kept_to_global(new_kept.clone());
+        slice_obs_and_obsm(py, adata, &keep)?;
+        update_layers_kept_to_global(adata, &new_kept)?;
+        return Ok(());
+    }
+
+    // Case 2: X is ScxLazyTransformedDataset
+    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+        let new_kept = compose_kept_to_global(&keep, lazy.borrow().kept_to_global.as_deref());
+        lazy.borrow_mut().set_kept_to_global(new_kept.clone());
+        slice_obs_and_obsm(py, adata, &keep)?;
+        update_layers_kept_to_global(adata, &new_kept)?;
+        return Ok(());
+    }
+
+    // Case 3: Fallback for non-SCX data — materialize subset
+    let mask_arr = numpy::PyArray::from_vec(py, keep.clone());
+    let np_mask = np.call_method1("array", (mask_arr,))?;
+
+    // Slice X
+    let x_sliced = x.get_item(&np_mask)?;
+    adata.setattr("_X", x_sliced)?;
+
+    // Slice obs and obsm
+    slice_obs_and_obsm(py, adata, &keep)?;
+
+    Ok(())
+}
