@@ -63,14 +63,14 @@ class ZarrRunner(FormatRunner):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _make_compressor(self) -> Any:
-        """Return a numcodecs compressor instance."""
-        import numcodecs
+    def _make_compressors(self) -> tuple:
+        """Return a tuple of zarr v3 codec instances."""
+        from zarr.codecs import BloscCodec, ZstdCodec
 
         if self.compressor == "zstd":
-            return numcodecs.Zstd(level=self.level)
+            return (ZstdCodec(level=self.level),)
         # lz4 via Blosc
-        return numcodecs.Blosc(cname="lz4", clevel=self.level)
+        return (BloscCodec(cname="lz4", clevel=self.level),)
 
     # ------------------------------------------------------------------
     # Core operations
@@ -86,7 +86,7 @@ class ZarrRunner(FormatRunner):
         h5ad_path = Path(h5ad_path)
         output_path = Path(output_path)
 
-        compressor = self._make_compressor()
+        compressors = self._make_compressors()
 
         def _convert() -> None:
             adata = anndata.read_h5ad(str(h5ad_path))
@@ -104,16 +104,16 @@ class ZarrRunner(FormatRunner):
             indices = np.asarray(X.indices)
             data = np.asarray(X.data)
 
-            # Write to zarr store (v2 API via numcodecs compressors)
+            # Write to zarr store (v3 API)
             store = zarr.open(str(output_path), mode="w")
-            store.create_dataset(
-                "indptr", data=indptr, chunks=(len(indptr),), compressor=compressor
+            store.create_array(
+                "indptr", data=indptr, chunks=(len(indptr),), compressors=compressors
             )
-            store.create_dataset(
-                "indices", data=indices, chunks=(min(len(indices), 1 << 20),), compressor=compressor
+            store.create_array(
+                "indices", data=indices, chunks=(min(len(indices), 1 << 20),), compressors=compressors
             )
-            store.create_dataset(
-                "data", data=data, chunks=(min(len(data), 1 << 20),), compressor=compressor
+            store.create_array(
+                "data", data=data, chunks=(min(len(data), 1 << 20),), compressors=compressors
             )
             store.attrs["shape"] = list(shape)
 
