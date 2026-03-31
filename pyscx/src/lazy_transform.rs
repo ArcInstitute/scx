@@ -387,6 +387,13 @@ impl ScxLazyTransformedDataset {
         // Add contribution from implicit zeros
         let mut variances = vec![0.0f64; n_vars];
         for c in 0..n_vars {
+            debug_assert!(
+                col_nnz[c] <= n_obs,
+                "col_nnz[{}] = {} exceeds n_obs = {}",
+                c,
+                col_nnz[c],
+                n_obs
+            );
             let n_zeros = n_obs - col_nnz[c];
             let total = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
             variances[c] = total / n_obs as f64;
@@ -1291,6 +1298,17 @@ impl ScxLazyTransformedDataset {
                         for v in &mut csr.data[start..end] {
                             *v = ((*v as f64 * factor) as f32).ln_1p();
                         }
+                    } else {
+                        // Zero-sum row: all stored values must be zero for CSR
+                        // from count data. In the unfused path, NormalizeTotal
+                        // skips the row and Log1p applies ln(0+1)=0, so both
+                        // paths produce identical results when this invariant
+                        // holds. Assert to catch upstream data corruption.
+                        debug_assert!(
+                            csr.data[start..end].iter().all(|&v| v == 0.0),
+                            "Fused NormalizeTotal+Log1p: zero-sum row {} has non-zero values",
+                            g
+                        );
                     }
                     // Apply remaining transforms (index 2+)
                     for transform in &self.transforms[2..] {
@@ -1416,6 +1434,19 @@ fn apply_transforms_to_csr(transforms: &[Transform], csr: &mut ScxCsr, global_ro
                     for v in &mut csr.data[start..end] {
                         *v = ((*v as f64 * factor) as f32).ln_1p();
                     }
+                } else {
+                    // Zero-sum row: all stored values must be zero for CSR
+                    // from count data. In the unfused path, NormalizeTotal
+                    // skips the row and Log1p applies ln(0+1)=0, so both
+                    // paths produce identical results when this invariant
+                    // holds. Assert to catch upstream data corruption.
+                    let start = csr.indptr[row] as usize;
+                    let end = csr.indptr[row + 1] as usize;
+                    debug_assert!(
+                        csr.data[start..end].iter().all(|&v| v == 0.0),
+                        "Fused NormalizeTotal+Log1p: zero-sum row {} has non-zero values",
+                        g
+                    );
                 }
             }
             // Apply remaining transforms (index 2+)
