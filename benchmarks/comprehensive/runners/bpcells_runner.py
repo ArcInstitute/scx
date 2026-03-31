@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,15 +22,29 @@ logger = logging.getLogger(__name__)
 # Path to the companion R script (resolved relative to project layout).
 _R_SCRIPT = Path(__file__).resolve().parents[2] / "r_scripts" / "benchmark_bpcells.R"
 
+# Conda environment containing R + BPCells.  Override via BPCELLS_CONDA_PREFIX.
+_CONDA_PREFIX = os.environ.get(
+    "BPCELLS_CONDA_PREFIX",
+    "/home/nickyoungblut/miniforge3/envs/rscx",
+)
+
+# Rscript binary inside the conda env.
+_RSCRIPT = os.path.join(_CONDA_PREFIX, "bin", "Rscript")
+
 
 class BPCellsRunner(FormatRunner):
-    """Benchmark runner for BPCells (R-native bitpacking format)."""
+    """Benchmark runner for BPCells (R-native bitpacking format).
+
+    Invokes Rscript from the ``rscx`` conda environment directly,
+    injecting the env's ``bin/`` into ``PATH`` so the compiler toolchain
+    is found.  Override the env prefix with ``BPCELLS_CONDA_PREFIX``.
+    """
 
     def __init__(self) -> None:
-        # Validate that Rscript is available on PATH.
-        if shutil.which("Rscript") is None:
+        if not Path(_RSCRIPT).exists():
             raise RuntimeError(
-                "Rscript not found on PATH. Install R to benchmark BPCells."
+                f"Rscript not found at {_RSCRIPT}. "
+                "Set BPCELLS_CONDA_PREFIX to the conda env containing R + BPCells."
             )
         if not _R_SCRIPT.exists():
             raise FileNotFoundError(
@@ -63,12 +78,21 @@ class BPCellsRunner(FormatRunner):
         config_json = json.dumps(config)
         logger.debug("BPCells R call: %s", config.get("operation"))
 
+        # Build an env that puts the conda env's bin/ on PATH so the
+        # compiler toolchain and shared libraries are found.
+        env = os.environ.copy()
+        conda_bin = os.path.join(_CONDA_PREFIX, "bin")
+        conda_lib = os.path.join(_CONDA_PREFIX, "lib")
+        env["PATH"] = conda_bin + os.pathsep + env.get("PATH", "")
+        env["LD_LIBRARY_PATH"] = conda_lib + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+
         proc = subprocess.run(
-            ["Rscript", "--vanilla", str(_R_SCRIPT)],
+            [_RSCRIPT, "--vanilla", str(_R_SCRIPT)],
             input=config_json,
             capture_output=True,
             text=True,
             timeout=3600,  # 1-hour timeout for large datasets
+            env=env,
         )
 
         if proc.returncode != 0:
