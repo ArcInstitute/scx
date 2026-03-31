@@ -56,7 +56,11 @@ pub trait ShardSource {
 
         let means = if zero_center {
             let n = self.n_obs() as f64;
-            Some(col_sums.iter().map(|s| s / n).collect())
+            if n == 0.0 {
+                Some(vec![0.0f64; n_vars])
+            } else {
+                Some(col_sums.iter().map(|s| s / n).collect())
+            }
         } else {
             None
         };
