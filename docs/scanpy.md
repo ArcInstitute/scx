@@ -5,13 +5,105 @@ SCX integrates directly with [scanpy](https://scanpy.readthedocs.io/) and the
 that returns data produces a standard `anndata.AnnData` object — so any scanpy
 function works out of the box with zero glue code.
 
-## Quick start
+## Choosing the right approach
+
+SCX offers three ways to work with data in Python. Each makes different
+trade-offs between memory usage, scanpy compatibility, and performance:
+
+### Decision tree
+
+```
+                         Is your dataset small enough
+                         to fit in memory (~500K cells)?
+                                    │
+                        ┌───yes─────┴──────no───┐
+                        ▼                       ▼
+                   In-memory              Do you need
+               (simplest, full           the full dataset?
+              scanpy compat)                    │
+                                    ┌───yes─────┴──────no───┐
+                                    ▼                       ▼
+                            Backed + lazy             Query pipeline
+                          (out-of-core with         (extract a subset,
+                          pyscx.accel.*)             then work in-memory)
+```
+
+### Feature comparison
+
+|  | In-memory | Backed + lazy | Query pipeline |
+|--|-----------|---------------|----------------|
+| **API** | `to_anndata()` + `sc.pp.*` | `to_anndata(backed=True)` + `pyscx.accel.*` | `.query().filter_obs().collect()` |
+| **When to use** | Small–medium datasets that fit in RAM | Atlas-scale datasets (500K–10M+ cells) | Extract a cell/gene subset from a large file |
+| **Peak memory** | Full matrix in RAM | ~1 shard working set (~128 MB) | Subset only |
+| **scanpy compatibility** | ✅ Full — every `sc.pp.*` / `sc.tl.*` works | ⚠️ Partial — use `pyscx.accel.*` for preprocessing; `sc.tl.*` and `sc.pl.*` work normally | ✅ Full — result is a regular AnnData |
+| **Parallel shard decode** | ✅ All shards decoded in parallel via rayon | ✅ Per-access shard decode (parallel for streaming ops) | ✅ Parallel decode of matching shards |
+| **GPU accelerators** | ✅ via `pyscx.accel.*(device="gpu")` | ✅ via `pyscx.accel.*(device="gpu")` | ❌ Preprocess in query pipeline runs on CPU; use accelerators after `.to_anndata()` |
+| **Predicate pushdown** | ❌ All data loaded | ❌ All data accessible (filtering via deletion vectors) | ✅ Skips non-matching shards entirely |
+| **Lazy normalize/log1p** | ❌ Materializes (standard scanpy) | ✅ `pyscx.accel.normalize_total()` / `log1p()` — zero materialization | ✅ `with_normalize()` / `with_log1p()` — applied in Rust during collect |
+| **Streaming PCA** | ❌ Requires full matrix | ✅ `pyscx.accel.pca()` streams through lazy transforms | ❌ PCA runs after materialization |
+| **Write-back** | ✅ In-place modification of X | ❌ Read-only (use `pyscx.preprocess()` for copy-on-write) | ❌ Read-only |
+| **Typical dataset size** | < 500K cells | 500K–10M+ cells | Any size (output is a subset) |
+
+### Pros and cons summary
+
+**In-memory** (`to_anndata()`):
+- ✅ Simplest — zero learning curve if you already know scanpy
+- ✅ Every scanpy function works without modification
+- ✅ Fastest for datasets that fit in RAM (no per-access overhead)
+- ❌ Full matrix must fit in memory (e.g., 1M cells × 30K genes at 5% density ≈ 6 GB)
+- ❌ No lazy preprocessing — `normalize_total()` and `log1p()` operate on the full matrix
+
+**Backed + lazy** (`to_anndata(backed=True)` + `pyscx.accel.*`):
+- ✅ Handles 10M+ cells on modest hardware (~16 GB RAM)
+- ✅ Lazy preprocessing keeps data on disk (normalize, log1p, filter)
+- ✅ Streaming PCA, kNN, UMAP through lazy transforms
+- ✅ GPU accelerators via `device="gpu"`
+- ⚠️ Must use `pyscx.accel.*` instead of `sc.pp.*` for preprocessing
+- ⚠️ Some scanpy functions still force materialization (see [compatibility table](#scanpy-operations-in-backed-mode))
+
+**Query pipeline** (`.query().filter_obs().collect()`):
+- ✅ Predicate pushdown skips non-matching shards (bandwidth savings up to 20×)
+- ✅ Normalize + log1p computed in Rust during collect (fast)
+- ✅ Result is a regular AnnData — full scanpy compatibility downstream
+- ❌ Only useful when you want a subset, not the full dataset
+- ❌ No streaming PCA or lazy transforms — analysis starts after materialization
+
+> [!TIP]
+> **Hybrid approach:** Use the query pipeline to extract a subset, then
+> work in-memory with standard scanpy:
+> ```python
+> adata = (pyscx.open("atlas.scx")
+>     .query()
+>     .filter_obs("tissue == 'lung'")
+>     .with_normalize(1e4)
+>     .with_log1p()
+>     .collect()
+>     .to_anndata())
+> sc.pp.pca(adata)  # regular scanpy from here
+> ```
+> The query pipeline always **materializes** the matching subset into
+> memory. If the subset is still too large to materialize, open in backed
+> mode with filtering instead — the data stays on disk:
+> ```python
+> adata = pyscx.open("atlas.scx").to_anndata(
+>     backed=True, obs_filter="tissue == 'lung'")
+> pyscx.accel.normalize_total(adata, target_sum=1e4)  # lazy
+> pyscx.accel.log1p(adata)                             # lazy
+> pyscx.accel.pca(adata, n_comps=50)                   # streaming
+> ```
+
+## Quick start: in-memory
+
+The simplest approach. `to_anndata()` loads the entire expression matrix into
+memory as a scipy CSR matrix (via **zero-copy** transfer from Rust). This is
+ideal for datasets that fit comfortably in RAM, since the full standard scanpy
+API works without modification.
 
 ```python
 import pyscx
 import scanpy as sc
 
-# Open an SCX file and convert to AnnData
+# Open an SCX file and load everything into memory
 adata = pyscx.open("experiment.scx").to_anndata()
 
 # Standard scanpy pipeline — nothing changes
@@ -26,6 +118,55 @@ sc.tl.umap(adata)
 sc.tl.leiden(adata)
 sc.pl.umap(adata, color="leiden")
 ```
+
+> [!IMPORTANT]
+> `to_anndata()` **materializes the full matrix** into a standard scipy CSR.
+> The resulting AnnData is identical in memory whether loaded from SCX or
+> h5ad — SCX's advantage is a smaller file on disk, not a smaller in-memory
+> object. For a 1M-cell dataset with 30K genes at 5% density, the scipy
+> CSR requires ~12 GB (see [memory formula](#default-behavior-no-extra-params)
+> below). If this exceeds your available memory, use
+> [backed mode](#backed-mode-lazy-loading) or the
+> [query pipeline](#querying-subsets-before-loading) instead.
+
+## Quick start: backed mode (out-of-core)
+
+For large datasets, backed mode keeps data on disk and preprocesses
+lazily — peak memory is one shard (~128 MB) rather than the full matrix:
+
+```python
+import pyscx
+import scanpy as sc
+
+# Open in backed mode — X stays on disk
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+
+# QC and filtering — fully streaming, no materialization
+pyscx.accel.filter_cells(adata, min_genes=200)
+pyscx.accel.filter_genes(adata, min_cells=3)
+
+# Preprocessing — lazy, data stays on disk
+pyscx.accel.normalize_total(adata, target_sum=1e4)
+pyscx.accel.log1p(adata)
+
+# Analysis — PCA streams through lazy transforms
+sc.pp.highly_variable_genes(adata)
+pyscx.accel.pca(adata, n_comps=50)
+pyscx.accel.neighbors(adata, n_neighbors=15)
+pyscx.accel.umap(adata)
+sc.tl.leiden(adata)
+sc.pl.umap(adata, color="leiden")
+```
+
+> [!NOTE]
+> In backed mode, use `pyscx.accel.*` for preprocessing functions
+> (`normalize_total`, `log1p`, `filter_cells`, `filter_genes`, `pca`,
+> `neighbors`, `umap`). These are designed for out-of-core data and avoid
+> materializing the full matrix. Standard `sc.pp.*` functions work for
+> operations that don't modify X (e.g., `highly_variable_genes`), but
+> `sc.pp.normalize_total()` and `sc.pp.log1p()` will force full
+> materialization. See the [compatibility table](#scanpy-operations-in-backed-mode)
+> for details.
 
 ## Converting existing data to SCX
 
@@ -74,7 +215,8 @@ exp.to_anndata(
     cache_shards=4,       # LRU cache size for backed mode
     var_names=None,       # List of gene names to project (column subset)
     obs_filter=None,      # Predicate string to filter cells (e.g. "cell_type == 'T cell'")
-    layers=None,          # List of layer names to load (default: all)
+    layers=None,          # None = load all layers; pass a list to select specific layers
+                          # (e.g. ["raw_counts"]), or [] to skip loading layers entirely
 )
 ```
 
@@ -108,13 +250,40 @@ The returned `anndata.AnnData` is fully populated:
 | `uns` | Uns section | dict (JSON round-tripped) |
 | `layers` | Layer shards | dict of `scipy.sparse.csr_matrix` |
 
-**Memory implications:** Because `to_anndata()` loads the entire decompressed
-matrix into memory, peak memory equals the size of the sparse CSR
-representation (not the file size on disk). For a 1M-cell dataset this is
-typically ~264 MB — far less than h5ad's ~11.6 GB — but it is still a full
-materialization. If you only need a subset of cells or genes, use
+**Memory implications:** Once materialized, the in-memory AnnData is
+**identical** whether the source was an `.scx` file or an `.h5ad` file —
+the same scipy CSR matrix with the same dtypes (`i64` indptr, `i32` indices,
+`f32` data). SCX's compression advantage applies only to the on-disk file
+(e.g., an SCX file may be 200 MB where the equivalent h5ad is 1.5 GB), but
+after `to_anndata()` both produce the same in-memory CSR.
+
+The CSR memory formula:
+```
+memory ≈ (n_obs + 1) × 8 bytes           # indptr (i64)
+       + nnz × 4 bytes                   # indices (i32)
+       + nnz × 4 bytes                   # data (f32)
+
+# Example: 1M cells × 30K genes × 5% density = 1.5B non-zeros
+# ≈ 8 MB + 5.6 GB + 5.6 GB ≈ 11.2 GB
+#
+# At 2% density (more typical for 10x Chromium):
+# nnz = 600M → ≈ 8 MB + 2.2 GB + 2.2 GB ≈ 4.5 GB
+```
+
+> [!WARNING]
+> The formula above covers only the CSR arrays for X. The **total** memory
+> footprint includes obs/var DataFrames, obsm embeddings, layers, and
+> Python/h5py overhead — which can be substantial. For example, a 10M-cell ×
+> 61K-gene dataset (176 GB h5ad) was OOM-killed during h5py streaming
+> metadata reads with 80 GB of RAM available. As a rule of thumb, budget
+> **2–3× the CSR size** for a comfortable working set, or use backed mode
+> for datasets over ~500K cells.
+
+If this exceeds your available memory, use
 [selective loading](#selective-loading) or the
-[query pipeline](#querying-subsets-before-loading) instead.
+[query pipeline](#querying-subsets-before-loading) to load only what you
+need. For fully out-of-core analysis, use
+[backed mode](#backed-mode-lazy-loading).
 
 ### Selective loading
 

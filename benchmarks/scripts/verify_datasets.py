@@ -163,14 +163,23 @@ def analyze_dataset(name, path):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Verify benchmark datasets")
+    parser.add_argument("--datasets", type=str, default=None,
+                        help="Comma-separated dataset names (default: all)")
+    args = parser.parse_args()
+
+    names = args.datasets.split(",") if args.datasets else list(DATASET_META.keys())
+
     print("=" * 80)
     print("   SCX Benchmark Dataset Verification")
     print("=" * 80)
     print(f"Datasets dir: {DATASETS_DIR}")
+    print(f"Datasets: {names}")
     print()
 
     results = []
-    for name in DATASET_META:
+    for name in names:
         path = os.path.join(DATASETS_DIR, f"{name}.h5ad")
         print(f"Analyzing {name}...", flush=True)
         result = analyze_dataset(name, path)
@@ -190,10 +199,19 @@ def main():
         print(f"     File size: {result.get('file_size_gb', 'N/A')} GB")
         print()
 
-    # Save results as JSON
+    # Save results as JSON — merge with any existing metadata
     output_json = os.path.join(DATASETS_DIR, "dataset_metadata.json")
+    existing = []
+    if os.path.exists(output_json):
+        with open(output_json) as f:
+            existing = json.load(f)
+    # Merge: update existing entries by name, append new ones
+    by_name = {r["name"]: r for r in existing}
+    for r in results:
+        by_name[r["name"]] = r
+    merged = sorted(by_name.values(), key=lambda r: r.get("id", "Z"))
     with open(output_json, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(merged, f, indent=2, default=str)
     print(f"Metadata saved to: {output_json}")
 
     # Summary table
