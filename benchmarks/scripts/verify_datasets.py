@@ -26,6 +26,70 @@ DATASET_META = {
 }
 
 
+def _analyze_large_h5ad(path, n_obs, n_vars):
+    """Stream NNZ and value distribution from a large h5ad via h5py.
+
+    Reads the CSR data array in chunks to avoid full materialization.
+    Returns a dict with nnz, sparsity, and value distribution stats.
+    """
+    import h5py
+
+    result = {}
+    with h5py.File(path, "r") as f:
+        x_group = f["X"]
+
+        if "data" in x_group:
+            # Sparse CSR/CSC stored as group with data/indices/indptr
+            data_ds = x_group["data"]
+            nnz = data_ds.shape[0]
+            result["nnz"] = int(nnz)
+            total = n_obs * n_vars
+            result["sparsity"] = round(1 - nnz / total, 6)
+
+            # Stream value distribution in chunks
+            chunk_size = 50_000_000  # 50M values at a time
+            max_val = 0.0
+            n_uint8 = 0
+            n_uint16 = 0
+            all_int = True
+            # For approximate median: collect a random sample
+            rng = np.random.RandomState(42)
+            sample_size = 1_000_000
+            # Pre-select which indices to sample
+            sample_indices = np.sort(rng.choice(nnz, size=min(sample_size, nnz), replace=False))
+            sample_values = np.empty(len(sample_indices), dtype=np.float32)
+            sample_ptr = 0  # next index into sample_indices to fill
+
+            for start in range(0, nnz, chunk_size):
+                end = min(start + chunk_size, nnz)
+                chunk = data_ds[start:end]
+                abs_chunk = np.abs(chunk).astype(np.float64)
+
+                max_val = max(max_val, float(abs_chunk.max()))
+                n_uint8 += int(np.sum(abs_chunk <= 255))
+                n_uint16 += int(np.sum(abs_chunk <= 65535))
+                if all_int:
+                    all_int = bool(np.all(chunk == chunk.astype(int)))
+
+                # Gather pre-selected sample values from this chunk
+                while sample_ptr < len(sample_indices) and sample_indices[sample_ptr] < end:
+                    local_idx = sample_indices[sample_ptr] - start
+                    sample_values[sample_ptr] = abs(float(chunk[local_idx]))
+                    sample_ptr += 1
+
+            result["median_nz"] = float(np.median(sample_values[:sample_ptr]))
+            result["max_nz"] = max_val
+            result["pct_uint8"] = round(n_uint8 / nnz * 100, 1)
+            result["pct_uint16"] = round(n_uint16 / nnz * 100, 1)
+            result["values_are_integer"] = all_int
+        else:
+            # Dense matrix — unlikely for large files but handle anyway
+            result["status"] = "OK (dense matrix — stats skipped for large file)"
+            result["nnz"] = "N/A (dense)"
+
+    return result
+
+
 def analyze_dataset(name, path):
     """Analyze a dataset and return metadata dict."""
     meta = DATASET_META.get(name, {})
@@ -51,46 +115,46 @@ def analyze_dataset(name, path):
         result["protocol"] = meta.get("protocol", "unknown")
         result["source"] = meta.get("source", "unknown")
 
-        # Need to load X to get NNZ and value distribution
-        # For very large files, just report shape
-        if file_size > 50e9:  # > 50 GB, don't load into memory
-            result["status"] = "OK (shape only — too large to fully load)"
-            result["nnz"] = "N/A (file too large)"
-            return result
-
-        adata = ad.read_h5ad(path)
-        X = adata.X
-        if sp.issparse(X):
-            X = X.tocsr()
-            nnz = X.nnz
-            data = X.data
+        # For very large files (>50 GB), stream NNZ and value stats via h5py
+        # to avoid loading the full matrix into memory.
+        if file_size > 50e9:
+            import h5py
+            result.update(_analyze_large_h5ad(path, adata.n_obs, adata.n_vars))
         else:
-            nnz = np.count_nonzero(X)
-            data = X[X != 0].ravel()
+            adata_full = ad.read_h5ad(path)
+            X = adata_full.X
+            if sp.issparse(X):
+                X = X.tocsr()
+                nnz = X.nnz
+                data = X.data
+            else:
+                nnz = np.count_nonzero(X)
+                data = X[X != 0].ravel()
 
-        total = adata.n_obs * adata.n_vars
-        sparsity = 1 - nnz / total
+            total = adata_full.n_obs * adata_full.n_vars
+            sparsity = 1 - nnz / total
 
-        result["nnz"] = int(nnz)
-        result["sparsity"] = round(sparsity, 6)
+            result["nnz"] = int(nnz)
+            result["sparsity"] = round(sparsity, 6)
 
-        # Value distribution
-        if len(data) > 0:
-            nz_vals = np.abs(data)
-            result["median_nz"] = float(np.median(nz_vals))
-            result["max_nz"] = float(np.max(nz_vals))
-            result["pct_uint8"] = round(float(np.mean(nz_vals <= 255)) * 100, 1)
-            result["pct_uint16"] = round(float(np.mean(nz_vals <= 65535)) * 100, 1)
+            # Value distribution
+            if len(data) > 0:
+                nz_vals = np.abs(data)
+                result["median_nz"] = float(np.median(nz_vals))
+                result["max_nz"] = float(np.max(nz_vals))
+                result["pct_uint8"] = round(float(np.mean(nz_vals <= 255)) * 100, 1)
+                result["pct_uint16"] = round(float(np.mean(nz_vals <= 65535)) * 100, 1)
 
-            # Check if values are integers
-            is_int = np.all(data == data.astype(int))
-            result["values_are_integer"] = bool(is_int)
-        else:
-            result["median_nz"] = 0
-            result["max_nz"] = 0
+                # Check if values are integers
+                is_int = np.all(data == data.astype(int))
+                result["values_are_integer"] = bool(is_int)
+            else:
+                result["median_nz"] = 0
+                result["max_nz"] = 0
+
+            del adata_full, X, data
 
         result["status"] = "OK"
-        del adata, X, data
 
     except Exception as e:
         result["status"] = f"ERROR: {e}"

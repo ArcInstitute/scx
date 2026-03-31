@@ -172,6 +172,7 @@ adata = pyscx.open("atlas.scx").to_anndata(
     obs_filter="cell_type == 'T cell'",
     layers=["raw_counts"],
 )
+```
 
 ## Backed mode (lazy loading)
 

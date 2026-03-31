@@ -99,15 +99,15 @@ DATASETS: dict[str, DatasetConfig] = {
     ),
     "pbmc10k": DatasetConfig(
         id="D2", name="pbmc10k",
-        n_obs=10_000, n_vars=33_538,
+        n_obs=11_769, n_vars=33_538,
         protocol="10x v3 (UMI)", source="10x Genomics",
-        approx_h5ad_mb=80, available=False,
+        approx_h5ad_mb=194, available=True,
     ),
     "smartseq2": DatasetConfig(
         id="D3", name="smartseq2",
-        n_obs=60_000, n_vars=61_497,
+        n_obs=50_000, n_vars=61_497,
         protocol="Smart-seq2", source="CELLxGENE Census",
-        approx_h5ad_mb=1_000, available=True,
+        approx_h5ad_mb=1_070, available=True,
     ),
     "tabula_sapiens_100k": DatasetConfig(
         id="D4", name="tabula_sapiens_100k",
@@ -117,9 +117,9 @@ DATASETS: dict[str, DatasetConfig] = {
     ),
     "census_500k": DatasetConfig(
         id="D5", name="census_500k",
-        n_obs=500_000, n_vars=60_000,
+        n_obs=500_000, n_vars=61_497,
         protocol="10x (UMI)", source="CELLxGENE Census (blood)",
-        approx_h5ad_mb=5_500, available=False,
+        approx_h5ad_mb=5_700, available=True,
     ),
     "census_1m": DatasetConfig(
         id="D6", name="census_1m",
@@ -129,15 +129,15 @@ DATASETS: dict[str, DatasetConfig] = {
     ),
     "census_5m": DatasetConfig(
         id="D7", name="census_5m",
-        n_obs=5_000_000, n_vars=60_000,
+        n_obs=5_000_000, n_vars=61_497,
         protocol="10x (UMI)", source="CELLxGENE Census (blood)",
-        approx_h5ad_mb=55_000, available=False,
+        approx_h5ad_mb=86_000, available=True,
     ),
     "census_10m": DatasetConfig(
         id="D8", name="census_10m",
-        n_obs=10_000_000, n_vars=60_000,
+        n_obs=10_000_000, n_vars=61_497,
         protocol="Mixed", source="CELLxGENE Census (blood)",
-        approx_h5ad_mb=120_000, available=False,
+        approx_h5ad_mb=176_000, available=True,
     ),
 }
 

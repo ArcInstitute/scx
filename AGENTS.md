@@ -181,7 +181,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **h5ad files are messy**: missing encoding-type attrs, CSC instead of CSR, dense X, pickled uns. Handle gracefully.
 - **tokio + rayon interaction** (scx-loader): Keep tokio for I/O only, rayon for CPU work. Bounded channels for back-pressure.
 - **Cloud auth**: `object_store` handles credentials via environment variables and instance metadata. No custom auth code.
-- **Known bugs**: See [Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md) for latest issues and fix priorities.
+- **Known bugs**: See [Phase4_CODE-REVIEW.md](tasks/Phase4_CODE-REVIEW.md) for latest issues and fix priorities.
 
 ## Known SPEC Discrepancies
 

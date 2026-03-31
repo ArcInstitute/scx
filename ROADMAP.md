@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-03-29
+**Last updated**: 2026-03-30
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -360,13 +360,15 @@ full scverse pipeline works via AnnData from Phase 1.
 - [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + `pydeseq2`
 - [x] **Stratified DE**: per-stratum execution for both Wilcoxon and pseudobulk
 
-### Phase 4c: GPU Accelerators — PLANNED
-- [ ] GPU SpMM for PCA (cuSPARSE)
-- [ ] GPU kNN via CAGRA/RAFT
-- [ ] GPU UMAP via cuML interop
-- [ ] GPU Leiden via cuGraph interop
+### Phase 4c: GPU Accelerators — COMPLETE (benchmarked, 3/4 Go/No-Go gates pass)
+- [x] GPU SpMM for PCA (cuSPARSE + cuSOLVER QR + cuRAND)
+- [x] GPU kNN via CAGRA (cuVS) — 9.4× on 1M cells
+- [x] GPU UMAP via native CUDA SGD kernel — 7.7× on 1M cells
+- [x] GPU Leiden via cuGraph — 16× on 1M cells
+- [x] Fused GPU preprocessing (normalize+log1p)
+- [x] Graceful fallback to CPU when GPU unavailable
 
-See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification.
+See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification and benchmark results.
 
 ### Phase 4d: Eliminating Materialization — COMPLETE
 - [x] Column-projected streaming aggregation (`sum`, `var`, `nnz`, `max`, `min` with gene subsets)
@@ -393,7 +395,7 @@ See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md) for detailed specification.
 | **3** | 7-10 | GPU-accelerated I/O via GDS. R support. Multimodal (CITE-seq, spatial). Production-ready v1.0. |
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
-| **4c** | 15+ | Optional: GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuML. |
+| **4c** | 15+ | **COMPLETE (benchmarked).** GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuGraph. Per-op speedups: kNN 9.4×, UMAP 7.7×, Leiden 16×. 3.8× end-to-end on 1M cells. |
 | **4d** | 16+ | **COMPLETE.** Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation, streaming PCA through transforms via `ShardSource` trait, non-materializing `filter_cells`/`filter_genes`. Full out-of-core pipeline from open → QC → preprocess → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS at 1M cells (vs ~38 GB materialized; 71% reduction). |
 
 ---
