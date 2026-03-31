@@ -252,6 +252,41 @@ impl ScxLazyTransformedDataset {
         Ok(sums)
     }
 
+    /// Stream all shards, apply transforms, compute per-row NNZ and sums in a single pass.
+    ///
+    /// Avoids the double I/O of calling `row_nnz()` + `streaming_row_sums()` separately.
+    /// NNZ is computed pre-transform (from indptr, which transforms don't change) while
+    /// sums are computed post-transform. Both use the same decoded shard.
+    ///
+    /// Used by `filter_cells` when both `min_genes` and `min_counts` are specified.
+    /// Returns global-length vectors (NOT filtered through deletion vectors).
+    pub(crate) fn streaming_row_nnz_and_sums(&self) -> PyResult<(Vec<i64>, Vec<f64>)> {
+        let n_obs_global = self.backed.shape().0;
+        let mut all_nnz = vec![0i64; n_obs_global];
+        let mut all_sums = vec![0.0f64; n_obs_global];
+        let mut global_row = 0usize;
+
+        for shard_idx in 0..self.backed.index().n_shards() {
+            let mut csr = self
+                .backed
+                .read_shard_uncached(shard_idx)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // NNZ from indptr before transforms (transforms preserve sparsity pattern)
+            for row in 0..csr.n_rows() {
+                all_nnz[global_row + row] = csr.indptr[row + 1] - csr.indptr[row];
+            }
+            // Apply transforms then compute sums
+            self.apply_transforms(&mut csr, global_row);
+            for row in 0..csr.n_rows() {
+                let s = csr.indptr[row] as usize;
+                let e = csr.indptr[row + 1] as usize;
+                all_sums[global_row + row] = csr.data[s..e].iter().map(|&v| v as f64).sum();
+            }
+            global_row += csr.n_rows();
+        }
+        Ok((all_nnz, all_sums))
+    }
+
     /// Stream all shards, apply transforms, project to visible columns, compute per-row sums.
     ///
     /// **Scanpy compatibility:** After `filter_genes()`, scanpy's `normalize_total`

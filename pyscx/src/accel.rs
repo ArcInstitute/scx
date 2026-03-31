@@ -2497,6 +2497,26 @@ fn backed_row_sums(backed: &ScxBackedSparseDataset) -> PyResult<Vec<f64>> {
     Ok(backed.filter_row_results(&all_sums))
 }
 
+/// Helper: compute row NNZ and sums in a single shard scan (fused).
+///
+/// Avoids the double I/O of `backed_row_nnz()` + `backed_row_sums()` when
+/// `filter_cells` needs both `min_genes` and `min_counts`.
+fn backed_row_nnz_and_sums(backed: &ScxBackedSparseDataset) -> PyResult<(Vec<i64>, Vec<f64>)> {
+    let (all_nnz, all_sums) = if let Some(cols) = backed.col_projection() {
+        projected_agg::row_nnz_and_sums_projected(&backed.backed, cols)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    } else {
+        backed
+            .backed
+            .row_nnz_and_sums()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    };
+    Ok((
+        backed.filter_row_results(&all_nnz),
+        backed.filter_row_results(&all_sums),
+    ))
+}
+
 /// Helper: compute col NNZ for a backed dataset (4-way dispatch).
 fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<i64>> {
     let counts = match (backed.col_projection(), &backed.kept_to_global) {
@@ -2737,15 +2757,23 @@ pub fn filter_cells(
     // Case 1: X is ScxBackedSparseDataset
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
         let n_obs = backed.borrow().shape_val.0;
-        let row_nnz = if need_nnz {
-            Some(backed_row_nnz(&backed.borrow())?)
+        // Fused: compute both NNZ and sums in a single shard scan when both are needed
+        let (row_nnz, row_sums) = if need_nnz && need_sums {
+            let (nnz, sums) = backed_row_nnz_and_sums(&backed.borrow())?;
+            (Some(nnz), Some(sums))
         } else {
-            None
-        };
-        let row_sums = if need_sums {
-            Some(backed_row_sums(&backed.borrow())?)
-        } else {
-            None
+            (
+                if need_nnz {
+                    Some(backed_row_nnz(&backed.borrow())?)
+                } else {
+                    None
+                },
+                if need_sums {
+                    Some(backed_row_sums(&backed.borrow())?)
+                } else {
+                    None
+                },
+            )
         };
 
         let keep = build_keep_mask(
@@ -2778,22 +2806,32 @@ pub fn filter_cells(
         let lazy_ref = lazy.borrow();
         let n_obs = lazy_ref.shape_val.0;
 
-        // NNZ is transform-invariant: use underlying backed reader
-        let row_nnz = if need_nnz {
-            let all_nnz = lazy_ref
-                .backed
-                .row_nnz()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Some(lazy_ref.filter_row_results(&all_nnz))
+        // Fused: when both NNZ and sums are needed, compute them in a single
+        // shard scan. NNZ is transform-invariant but we compute it from the
+        // same decoded shard to avoid double I/O.
+        let (row_nnz, row_sums) = if need_nnz && need_sums {
+            let (all_nnz, all_sums) = lazy_ref.streaming_row_nnz_and_sums()?;
+            (
+                Some(lazy_ref.filter_row_results(&all_nnz)),
+                Some(lazy_ref.filter_row_results(&all_sums)),
+            )
         } else {
-            None
-        };
-
-        let row_sums = if need_sums {
-            let all_sums = lazy_ref.streaming_row_sums()?;
-            Some(lazy_ref.filter_row_results(&all_sums))
-        } else {
-            None
+            let nnz = if need_nnz {
+                let all_nnz = lazy_ref
+                    .backed
+                    .row_nnz()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Some(lazy_ref.filter_row_results(&all_nnz))
+            } else {
+                None
+            };
+            let sums = if need_sums {
+                let all_sums = lazy_ref.streaming_row_sums()?;
+                Some(lazy_ref.filter_row_results(&all_sums))
+            } else {
+                None
+            };
+            (nnz, sums)
         };
 
         let keep = build_keep_mask(

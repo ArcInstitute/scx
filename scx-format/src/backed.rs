@@ -510,6 +510,26 @@ impl BackedCsrReader {
         Ok(all_nnz)
     }
 
+    /// Compute per-row NNZ and sums in a single shard scan.
+    ///
+    /// Avoids the double I/O of calling `row_nnz()` + `row_sums()` separately.
+    /// Used by `filter_cells` when both `min_genes` and `min_counts` are specified.
+    pub fn row_nnz_and_sums(&self) -> Result<(Vec<i64>, Vec<f64>)> {
+        let n_shards = self.index.n_shards();
+        let mut all_nnz = Vec::with_capacity(self.n_obs);
+        let mut all_sums = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_uncached(shard_idx)?;
+            for row in 0..csr.n_rows() {
+                let start = csr.indptr[row] as usize;
+                let end = csr.indptr[row + 1] as usize;
+                all_nnz.push((end - start) as i64);
+                all_sums.push(csr.data[start..end].iter().map(|&v| v as f64).sum());
+            }
+        }
+        Ok((all_nnz, all_sums))
+    }
+
     /// Compute per-column NNZ counts without materializing the full matrix.
     pub fn col_nnz(&self) -> Result<Vec<i64>> {
         let n_shards = self.index.n_shards();

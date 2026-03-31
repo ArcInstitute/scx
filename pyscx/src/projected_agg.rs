@@ -237,6 +237,35 @@ pub fn row_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resul
     Ok(counts)
 }
 
+/// Fused row NNZ + sums restricted to a subset of columns.
+///
+/// Computes both row NNZ and row sums in a single shard scan, avoiding the
+/// double I/O of calling `row_nnz_projected()` + `row_sums_projected()`.
+/// Used by `filter_cells` when both `min_genes` and `min_counts` are specified
+/// and a column projection is active.
+pub fn row_nnz_and_sums_projected(
+    reader: &BackedCsrReader,
+    col_indices: &[u32],
+) -> Result<(Vec<i64>, Vec<f64>)> {
+    let n_obs = reader.shape().0;
+    let mut counts = vec![0i64; n_obs];
+    let mut sums = vec![0.0f64; n_obs];
+    let mut global_row = 0usize;
+
+    for shard_idx in 0..reader.index().n_shards() {
+        let csr = reader.read_shard_uncached(shard_idx)?;
+        let projected = project_csr(&csr, col_indices);
+        for row in 0..projected.n_rows() {
+            let s = projected.indptr[row] as usize;
+            let e = projected.indptr[row + 1] as usize;
+            counts[global_row + row] = (e - s) as i64;
+            sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
+        }
+        global_row += csr.n_rows();
+    }
+    Ok((counts, sums))
+}
+
 // ---------------------------------------------------------------------------
 // Masked + projected aggregation (deletion vector + column subset)
 // ---------------------------------------------------------------------------
