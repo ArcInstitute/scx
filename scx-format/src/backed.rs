@@ -393,6 +393,35 @@ impl BackedCsrReader {
         }
     }
 
+    /// Read a single decoded shard without caching.
+    ///
+    /// Use this for sequential streaming workloads (aggregation, col_sums,
+    /// row_sums, etc.) where each shard is visited exactly once.  Avoids
+    /// the ~640 MB-per-shard LRU cache overhead that is dead weight during
+    /// sequential access.
+    pub fn read_shard_uncached(&self, shard_idx: usize) -> Result<ScxCsr> {
+        let (indptr, indices, data) = match &self.layer_name {
+            None => self.reader.read_csr_shard(shard_idx)?,
+            Some(_) => {
+                let entry =
+                    self.sorted_entries
+                        .get(shard_idx)
+                        .ok_or(ScxError::ShardIndexOutOfBounds {
+                            index: shard_idx,
+                            count: self.sorted_entries.len(),
+                        })?;
+                self.reader.read_shard_from_entry(entry)?
+            }
+        };
+        let n_rows = indptr.len().saturating_sub(1);
+        Ok(ScxCsr::new_unchecked(
+            (n_rows, self.n_vars),
+            indptr,
+            indices,
+            data,
+        ))
+    }
+
     /// Read and optionally cache a single decoded shard.
     ///
     /// Public so that downstream crates (e.g. `scx-accel`) can iterate
@@ -448,7 +477,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut all_sums = Vec::with_capacity(self.n_obs);
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             all_sums.extend(csr.row_sums());
         }
         Ok(all_sums)
@@ -461,7 +490,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut sums = vec![0.0f64; self.n_vars];
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             let partial = csr.col_sums();
             for (s, p) in sums.iter_mut().zip(partial.iter()) {
                 *s += p;
@@ -475,10 +504,30 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut all_nnz = Vec::with_capacity(self.n_obs);
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             all_nnz.extend(csr.row_nnz());
         }
         Ok(all_nnz)
+    }
+
+    /// Compute per-row NNZ and sums in a single shard scan.
+    ///
+    /// Avoids the double I/O of calling `row_nnz()` + `row_sums()` separately.
+    /// Used by `filter_cells` when both `min_genes` and `min_counts` are specified.
+    pub fn row_nnz_and_sums(&self) -> Result<(Vec<i64>, Vec<f64>)> {
+        let n_shards = self.index.n_shards();
+        let mut all_nnz = Vec::with_capacity(self.n_obs);
+        let mut all_sums = Vec::with_capacity(self.n_obs);
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_uncached(shard_idx)?;
+            for row in 0..csr.n_rows() {
+                let start = csr.indptr[row] as usize;
+                let end = csr.indptr[row + 1] as usize;
+                all_nnz.push((end - start) as i64);
+                all_sums.push(csr.data[start..end].iter().map(|&v| v as f64).sum());
+            }
+        }
+        Ok((all_nnz, all_sums))
     }
 
     /// Compute per-column NNZ counts without materializing the full matrix.
@@ -486,7 +535,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut counts = vec![0i64; self.n_vars];
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             let partial = csr.col_nnz();
             for (c, p) in counts.iter_mut().zip(partial.iter()) {
                 *c += p;
@@ -500,7 +549,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut total = 0usize;
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             total += csr.nnz();
         }
         Ok(total)
@@ -515,7 +564,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut all_sq = Vec::with_capacity(self.n_obs);
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             all_sq.extend(csr.row_sum_of_squares());
         }
         Ok(all_sq)
@@ -530,7 +579,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut all_var = Vec::with_capacity(self.n_obs);
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             all_var.extend(csr.row_var());
         }
         Ok(all_var)
@@ -558,7 +607,7 @@ impl BackedCsrReader {
         let mut col_nnz = vec![0usize; self.n_vars];
 
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             let partial = csr.col_var_partial(&col_means);
             for (s, p) in sq_devs.iter_mut().zip(partial.iter()) {
                 *s += p;
@@ -587,7 +636,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut all_max = Vec::with_capacity(self.n_obs);
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             all_max.extend(csr.row_max());
         }
         Ok(all_max)
@@ -604,7 +653,7 @@ impl BackedCsrReader {
         let mut col_nnz = vec![0usize; self.n_vars];
 
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             // Get per-column max within this shard (using n_rows of shard, not global n_obs)
             // We need the raw stored max, so we pass n_rows = shard.n_rows()
             // But we want the global implicit-zero correction at the end,
@@ -635,7 +684,7 @@ impl BackedCsrReader {
         let n_shards = self.index.n_shards();
         let mut all_min = Vec::with_capacity(self.n_obs);
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             all_min.extend(csr.row_min());
         }
         Ok(all_min)
@@ -648,7 +697,7 @@ impl BackedCsrReader {
         let mut col_nnz = vec![0usize; self.n_vars];
 
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 let c = col as usize;
                 let v = val as f64;
@@ -713,7 +762,7 @@ impl BackedCsrReader {
 
         let n_shards = self.index.n_shards();
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             let (s_start, s_end) = match self.index.shard_range(shard_idx) {
                 Some(r) => r,
                 None => continue,
@@ -758,7 +807,7 @@ impl BackedCsrReader {
 
         let n_shards = self.index.n_shards();
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             let (s_start, s_end) = match self.index.shard_range(shard_idx) {
                 Some(r) => r,
                 None => continue,
@@ -837,7 +886,7 @@ impl BackedCsrReader {
         let mut col_sum_sq = vec![0.0f64; n_vars];
 
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_cached(shard_idx)?;
+            let csr = self.read_shard_uncached(shard_idx)?;
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 let v = val as f64;
                 col_sums[col as usize] += v;
@@ -854,6 +903,31 @@ impl BackedCsrReader {
 
         Ok((means, col_sum_sq))
     }
+}
+
+// ---------------------------------------------------------------------------
+// ShardSource impl
+// ---------------------------------------------------------------------------
+
+impl crate::shard_source::ShardSource for BackedCsrReader {
+    fn n_shards(&self) -> usize {
+        self.index.n_shards()
+    }
+
+    fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+
+    fn n_vars(&self) -> usize {
+        self.n_vars
+    }
+
+    fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr> {
+        self.read_shard_uncached(shard_idx)
+    }
+
+    // col_means_and_sum_sq: use the default trait impl which iterates
+    // read_shard() — functionally identical to the inherent method above.
 }
 
 /// Total variance from pre-computed column sum-of-squares.

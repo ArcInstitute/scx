@@ -2,8 +2,10 @@ mod accel;
 mod anndata;
 pub(crate) mod backed;
 mod experiment;
+pub(crate) mod lazy_transform;
 mod ops;
 mod preprocess;
+pub(crate) mod projected_agg;
 mod query;
 
 #[cfg(feature = "cloud")]
@@ -151,15 +153,27 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
+    m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
 
     // Accelerators submodule
     let accel_module = PyModule::new(m.py(), "accel")?;
+    accel_module.add_function(wrap_pyfunction!(accel::gpu_info, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::estimate_gpu_memory, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::pca, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::neighbors, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::umap, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::rank_genes_groups, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::pseudobulk_dex, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::leiden, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::normalize_total, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::log1p, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::calculate_qc_metrics,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::filter_cells, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::filter_genes, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::subset_obs, &accel_module)?)?;
     m.add_submodule(&accel_module)?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
@@ -170,6 +184,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
         if let Ok(csr_dataset) = abc.getattr("CSRDataset") {
             let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedSparseDataset")?,));
             let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedLayerDataset")?,));
+            let _ =
+                csr_dataset.call_method1("register", (m.getattr("ScxLazyTransformedDataset")?,));
         }
     }
 

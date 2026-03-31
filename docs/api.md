@@ -37,6 +37,12 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - `read_provenance()` — Operation history
 - `validate()` — Check all section BLAKE3 checksums
 - `section_bytes(entry)` — Direct byte access to a section
+- `read_obs_schema()` / `read_var_schema()` — Arrow schema (without data)
+- `read_obs_predicate_index_bytes()` / `read_var_predicate_index_bytes()` — Predicate index raw bytes
+- `read_deletion_vectors()` — Roaring Bitmap deletion vectors
+- `read_all_csr_shards_filtered()` — Full matrix with deletion vector filtering
+- `read_shard_header()` / `read_raw_shard_bytes()` / `read_shard_from_entry()` — Low-level shard access
+- `mmap()` — Direct mmap access to the underlying file
 
 ## ScxWriter (`scx-format/src/writer.rs`)
 
@@ -48,6 +54,11 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - `write_obsm(name, batch)` — Embeddings
 - `write_uns(json)` — JSON metadata
 - `write_provenance(operations)` — Operation history
+- `write_csc_shard(...)` — CSC (column-major) expression data
+- `write_obs_predicate_index(data)` / `write_var_predicate_index(data)` — Predicate indexes for pushdown
+- `write_deletion_vectors(dv)` — Roaring Bitmap deletion vectors
+- `write_raw_shard(raw_bytes, section_type, name, stats, nnz)` — Pre-encoded shard passthrough
+- `set_shard_column_stats(column_stats)` — Per-column shard statistics for catalog
 - `finish()` — Atomic write: full catalog at EOF -> pwrite root catalog -> pwrite header -> fsync -> rename
 
 ## Codec Selection (`scx-format/src/codec_select.rs`)
@@ -63,6 +74,48 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - Auto-populated on `ScxWriter::finish()` with operation info
 - `scx info` displays full provenance history
 - Read/write via `ScxReader::read_provenance()` / `ScxWriter::write_provenance()`
+
+## BackedCsrReader (`scx-format/src/backed.rs`)
+
+- `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
+- `read_rows(start, end)` → `ScxCsr` — Decode and concatenate rows from relevant shards
+- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing)
+- `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
+- `read_shard_uncached(idx)` → `ScxCsr` — Read shard bypassing cache (preferred for streaming)
+- `row_sums()` / `col_sums()` — Streaming per-row/column sums
+- `row_nnz()` / `col_nnz()` — Streaming per-row/column NNZ
+- `row_var()` / `col_var()` — Streaming per-row/column variance
+- `row_max()` / `col_max()` / `row_min()` / `col_min()` — Streaming extrema
+- `total_nnz()` — Total NNZ across all shards
+- `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
+- Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`
+
+## ShardSource Trait (`scx-format/src/shard_source.rs`)
+
+A uniform interface for streaming CSR data shard-by-shard, enabling algorithms like PCA to process data without materializing the full matrix. Defined in `scx-format`, available to both `scx-accel` and `pyscx`.
+
+```rust
+pub trait ShardSource {
+    fn n_shards(&self) -> usize;
+    fn n_obs(&self) -> usize;
+    fn n_vars(&self) -> usize;
+    fn shape(&self) -> (usize, usize) { (self.n_obs(), self.n_vars()) }
+    fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr>;
+    fn col_means_and_sum_sq(&self, zero_center: bool)
+        -> Result<(Option<Vec<f64>>, Vec<f64>)>; // default impl provided
+}
+```
+
+**Implementations:**
+
+| Type | Crate | Behavior |
+|------|-------|---------|
+| `BackedCsrReader` | `scx-format` | Reads raw decoded shards via `read_shard_uncached()` |
+| `LazyShardSource` | `pyscx` (internal) | Applies per-shard transforms (NormalizeTotal, Log1p, RowScale), column projection (`project_csr`), and deletion vector filtering before returning |
+
+**Used by:** `scx-accel::randomized_pca()`, `streaming_spmm_forward()`, `streaming_spmm_transpose()` — all generic over `<S: ShardSource>` for zero-cost abstraction across the crate boundary.
+
+**Design note:** The trait is defined in `scx-format` (not `scx-accel`) so that `pyscx`'s `LazyShardSource` can implement it without creating a dependency on `scx-accel`. PCA functions in `scx-accel` are generic (`<S: ShardSource>`) rather than using `&dyn ShardSource` to allow monomorphization.
 
 ## scx-ops — File Operations
 
@@ -224,6 +277,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
 - `pyscx.from_anndata(adata, path, codec=None, shard_size=None)` — Write AnnData to SCX
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
+- `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
+- `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
 - `pyscx.iter_chunks(adata, chunk_size="shard")` — Shard-aligned or fixed-size chunk iterator
 - `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
@@ -272,6 +327,19 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `to_csr()` — Return just the scipy CSR matrix
 - Properties: `n_obs`, `n_vars`, `nnz`, `skipped_shards`, `total_shards`
 
+### PyCloudExperiment
+
+Returned by `pyscx.open_cloud()`. Metadata-only handle for cloud-hosted SCX files.
+Does **not** support `to_anndata()`, `query()`, or `validate()` — use `pyscx.pull()` to
+download the file first for full data access.
+
+- `n_obs` `→ int` — Number of observations (cells)
+- `n_vars` `→ int` — Number of variables (genes)
+- `nnz` `→ int` — Total non-zero entries
+- `shard_count` `→ int` — Number of CSR shards in the file
+- `format_version` `→ int` — SCX format version
+- `codec_id` `→ int` — Default codec ID
+
 ### pyscx.accel — Rust-Native Accelerators
 
 All accelerators write results to standard AnnData slots (same as scanpy), so downstream functions work identically.
@@ -281,8 +349,180 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
 - `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — Spectral-init SGD UMAP. GPU: native CUDA kernel or cuML fallback. Writes `obsm["X_umap"]`.
 - `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50)` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set.
 - `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency.
+- `pyscx.accel.leiden(adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto")` — Leiden community detection on kNN graph. Reads `obsp["connectivities"]` (from `neighbors()`). GPU: cuGraph Leiden (up to 47× faster). CPU fallback: leidenalg via igraph. Writes `adata.obs[key_added]` (categorical) and `adata.uns["leiden"]` (params + backend metadata). GPU and CPU may produce different partitions due to algorithmic differences; compare via ARI/NMI.
+- `pyscx.accel.normalize_total(adata, target_sum=10000.0)` — Materialization-free row normalization. On `ScxBackedSparseDataset`: computes row sums via streaming, creates `ScxLazyTransformedDataset` wrapper. On `ScxLazyTransformedDataset`: appends `NormalizeTotal` transform to chain. On scipy CSR: delegates to `sc.pp.normalize_total()`.
+- `pyscx.accel.log1p(adata)` — Materialization-free log1p. On `ScxBackedSparseDataset`: creates `ScxLazyTransformedDataset` with `Log1p` transform. On `ScxLazyTransformedDataset`: appends `Log1p` to chain (fuses with preceding `NormalizeTotal` when possible). On scipy CSR: delegates to `sc.pp.log1p()`.
 - `pyscx.accel.gpu_info() → dict` — Query GPU device info: `{'device': ..., 'total_vram_gb': ..., 'free_vram_gb': ...}`. Returns `None` if no GPU available.
-- `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU memory for an operation: `{'required_gb': ..., 'fits_in_vram': ...}`.
+- `pyscx.accel.estimate_gpu_memory(adata, operation, **kwargs) → dict` — Estimate GPU VRAM required for an operation. Returns `{'required_gb': float, 'fits_in_vram': bool}`. Supported operations:
+  - `"pca"`: kwargs `n_components` (default 50), `n_oversamples` (default 10), `shard_size` (default 16384)
+  - `"knn"`: kwargs `n_neighbors` (default 15), `n_dims` (default 50)
+  - `"umap"`: kwargs `n_components` (default 2)
+  - `"leiden"`: no additional kwargs
+
+  Raises `ValueError` for unknown operations. Note: estimates are approximate — cuSOLVER QR workspace may be undercounted by ~1.5×.
+- `pyscx.accel.calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True)` — Streaming QC metrics for backed/lazy data without materialization. Computes per-cell `n_genes_by_counts`, `total_counts` and per-gene `n_cells_by_counts`, `total_counts`. Supports `qc_vars` for gene subsets (e.g., `["mt"]` for mitochondrial percentage). When `inplace=True`, writes to `adata.obs`/`adata.var`; when `False`, returns `(obs_df, var_df)`. Falls back to `sc.pp.calculate_qc_metrics()` for scipy/dense.
+- `pyscx.accel.filter_cells(adata, min_genes=None, max_genes=None, min_counts=None, max_counts=None)` — Non-materializing cell QC filter for backed/lazy data. Computes row NNZ and/or row sums via streaming, builds a boolean mask, and updates the deletion vector (`kept_to_global`) on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Also slices `adata.obs`, `adata.obsm`, and updates `adata.layers` with the new deletion vector. Falls back to `sc.pp.filter_cells()` for scipy/dense.
+- `pyscx.accel.filter_genes(adata, min_cells=None, max_cells=None, min_counts=None, max_counts=None)` — Non-materializing gene QC filter for backed/lazy data. Computes column NNZ and/or column sums via streaming, builds a boolean mask, and sets `col_projection` on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Slices `adata.var` to match. Composes with existing column projections. Falls back to `sc.pp.filter_genes()` for scipy/dense.
+- `pyscx.accel.subset_obs(adata, mask_or_indices)` — Subset observations (cells) without materializing. Accepts a **boolean numpy mask** or **integer index array**. Creates a new deletion vector (`kept_to_global`) on the backing dataset, slices `adata.obs` and `adata.obsm`, and updates `adata.layers`. Composes correctly with existing deletion vectors. Falls back to numpy slicing for non-SCX data.
+
+  > [!WARNING]
+  > **Integer index semantics differ from NumPy.** When `mask_or_indices` is an integer array, it is internally converted to a boolean mask. This means:
+  > - **Duplicate indices are silently collapsed** — `[0, 0, 5]` is equivalent to `[0, 5]`
+  > - **Order is not preserved** — `[5, 0, 10]` produces the same result as `[0, 5, 10]`
+  >
+  > This differs from NumPy's fancy indexing where `a[[5, 0, 10]]` returns rows in the order `[5, 0, 10]` with duplicates preserved. Use a boolean mask for unambiguous results.
+
+### ScxBackedSparseDataset
+
+PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`). Data stays on disk; only requested shards are decoded on access. Registered with `anndata.abc.CSRDataset`.
+
+**Properties:**
+- `shape` `→ (int, int)` — `(n_obs, n_vars)`, adjusted for deletion vectors and column projection
+- `dtype` `→ numpy.dtype` — Always `float32`
+- `format` `→ str` — Always `"csr"`
+- `backend` `→ str` — Always `"scx"`
+- `ndim` `→ int` — Always `2`
+- `non_negative` `→ bool` — Whether the data is known to be non-negative (enables `(X > 0).sum() → getnnz()` short-circuit)
+- `nnz` `→ int` — Total non-zero count
+- `n_shards` `→ int` — Number of CSR shards in the backing file
+
+**Column projection:**
+- `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` and streaming QC with gene subsets (`qc_vars`).
+
+**Slicing:**
+- `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, return scipy CSR.
+- `__getitem__(row_slice, col_slice)` — Row decode + column post-filter.
+- Supports integer, slice, boolean mask, and fancy indexing.
+
+**Aggregation (streaming, no materialization):**
+- `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums via native Rust streaming.
+- `mean(axis=0|1)` `→ numpy.ndarray` — Column or row means.
+- `var(axis=0|1)` `→ numpy.ndarray` — Column or row variance (two-pass).
+- `getnnz(axis=0|1)` `→ numpy.ndarray` — Non-zero counts per column or row.
+- `max(axis=0|1)` `→ numpy.ndarray` — Column or row max.
+- `min(axis=0|1)` `→ numpy.ndarray` — Column or row min.
+
+**Materialization:**
+- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards → full CSR.
+- `copy()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()`.
+- `toarray()` `→ numpy.ndarray` — Dense array.
+- `tocsr()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()` (scipy compat).
+- `tocsc()` `→ scipy.sparse.csc_matrix` — Materialize and convert to CSC.
+- `.A` `→ numpy.ndarray` — Dense array property (scipy compat).
+
+**Comparison operators:**
+- `__gt__`, `__ge__`, `__lt__`, `__le__`, `__eq__`, `__ne__` — Return `ScxComparisonResult` for lazy boolean operations.
+
+**Arithmetic:**
+- `__truediv__(other)` — If `other` is a per-row vector, returns `ScxLazyTransformedDataset` with `RowScale(1/factors)` (lazy). Otherwise materializes.
+- `__mul__(other)` — If `other` is a per-row vector, returns `ScxLazyTransformedDataset` with `RowScale(factors)` (lazy). Otherwise materializes.
+- `__add__(other)` — Materializes and adds.
+- `__sub__(other)` — Materializes and subtracts.
+- `__matmul__(other)` — Matrix multiply (materializes).
+- `multiply(other)` — Element-wise Hadamard product (materializes).
+- `power(n)` — Element-wise power (materializes).
+
+**Introspection:**
+- `shard_boundaries()` `→ list[(int, int)]` — List of `(row_start, row_end)` tuples per shard.
+
+### ScxBackedLayerDataset
+
+PyO3 class for backed-mode layer access (e.g., `adata.layers["raw_counts"]`). Wraps a `ScxBackedSparseDataset` for a named layer. Registered with `anndata.abc.CSRDataset`.
+
+- Same interface as `ScxBackedSparseDataset` (`shape`, `dtype`, `format`, `backend`, `ndim`, `__getitem__`, `to_memory`, `toarray`, `tocsr`, `tocsc`, `copy`, `sum`, `mean`, `var`, `getnnz`, `max`, `min`)
+- `layer_name` `→ str` — Name of the backing layer
+
+### ScxComparisonResult
+
+Lazy comparison result returned by `__gt__`, `__ge__`, `__lt__`, `__le__`, `__eq__`, `__ne__` on `ScxBackedSparseDataset` and `ScxLazyTransformedDataset`. Exposed as `_ComparisonResult` in Python.
+
+**Key optimization:** `(X > 0).sum(axis)` short-circuits to `getnnz(axis)` without materializing the full boolean matrix. This is the critical path for `sc.pp.calculate_qc_metrics()`, `sc.pp.filter_cells()`, and `sc.pp.filter_genes()`. The short-circuit only activates for non-negative data (raw counts, normalized, log1p).
+
+- `shape` `→ (int, int)`, `dtype` `→ numpy.dtype` (bool), `ndim` `→ int` (2)
+- `sum(axis=None)` — Short-circuits `(X > 0).sum()` → `getnnz()` for non-negative data; otherwise materializes.
+- `getnnz(axis=None)`, `mean(axis=None)` — Materialize and delegate.
+- `toarray()`, `tocsr()`, `tocsc()` — Materialize to dense/sparse.
+- `multiply(other)` — Element-wise product (materializes).
+- `.A` `→ numpy.ndarray` — Dense array property.
+
+### ScxLazyTransformedDataset
+
+PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Created by `pyscx.accel.normalize_total()` and `pyscx.accel.log1p()`. Implements the same interface as `ScxBackedSparseDataset` and is registered with `anndata.abc.CSRDataset`.
+
+**Properties:**
+- `shape` `→ (int, int)` — `(n_obs, n_vars)`
+- `dtype` `→ numpy.dtype` — Always `float32`
+- `format` `→ str` — Always `"csr"`
+- `ndim` `→ int` — Always `2`
+- `backend` `→ str` — Always `"scx-lazy"` (distinguishes from `ScxBackedSparseDataset.backend` which is `"scx"`)
+- `non_negative` `→ bool` — Whether the transformed data is non-negative
+
+**Slicing:**
+- `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, apply all transforms in order, return scipy CSR. Peak memory = 1 shard.
+- `__getitem__(row_slice, col_slice)` — Row decode + transform + column projection.
+
+**Aggregation (streaming through transforms):**
+- `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums of transformed data.
+- `mean(axis=0|1)` `→ numpy.ndarray` — Column or row means of transformed data.
+- `var(axis=0|1)` `→ numpy.ndarray` — Column or row variance (two-pass streaming).
+- `getnnz(axis=0|1)` `→ numpy.ndarray` — Non-zero counts (unchanged by normalize/log1p).
+- `max(axis=0|1)` `→ numpy.ndarray` — Column or row max of transformed data.
+- `min(axis=0|1)` `→ numpy.ndarray` — Column or row min of transformed data.
+
+**Materialization:**
+- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards + apply transforms → full CSR.
+- `copy()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()`.
+- `toarray()` `→ numpy.ndarray` — Dense array (via `to_memory().toarray()`).
+- `tocsr()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()` (scipy compat).
+- `tocsc()` `→ scipy.sparse.csc_matrix` — Materialize and convert to CSC.
+- `.A` `→ numpy.ndarray` — Dense array property (scipy compat, same as `toarray()`).
+
+**Comparison operators:**
+- `__gt__`, `__ge__`, `__lt__`, `__le__`, `__eq__`, `__ne__` — Return `ScxComparisonResult` for lazy boolean operations.
+
+**Arithmetic:**
+- `__truediv__(other)` — If `other` is a per-row vector, appends `RowScale` transform (lazy). Otherwise materializes.
+- `__mul__(other)` — If `other` is a per-row vector, appends `RowScale` transform (lazy). Otherwise materializes.
+- `__add__(other)` — Materializes and adds.
+- `__sub__(other)` — Materializes and subtracts.
+- `__matmul__(other)` — Matrix multiply (materializes).
+- `multiply(other)` — Element-wise Hadamard product (materializes).
+- `power(n)` — Element-wise power (materializes).
+
+**Introspection:**
+- `nnz` `→ int` — Total non-zero count in backing file.
+- `n_shards` `→ int` — Number of CSR shards in backing file.
+- `shard_boundaries()` `→ list[(int, int)]` — List of `(row_start, row_end)` tuples per shard.
+
+**Transform chain:**
+- Backed data → `NormalizeTotal` → `Log1p` is fused into `ln(x × target_sum / row_sum + 1)` in a single pass.
+- `repr()` shows the transform chain: `ScxLazyTransformedDataset(shape=(1000000, 33694), transforms=[NormalizeTotal, Log1p])`
+
+### scVI Integration (`pyscx.scx_integrations.scvi`)
+
+Pure-Python PyTorch Lightning DataModule wrapping `TrainingDataset` for scVI model training. Requires `lightning` or `pytorch_lightning`.
+
+- `ScxDataModule(scx_path, batch_size=1024, hvg_indices=None, normalize=True, log1p=True, target_sum=1e4, seed=42, **kwargs)` — Creates a PyTorch Lightning `LightningDataModule`.
+  - `scx_path` — Path to the `.scx` file.
+  - `batch_size` — Mini-batch size (default: 1024).
+  - `hvg_indices` — Gene indices for HVG projection. `None` = all genes.
+  - `normalize` — Apply total-count normalization (default: `True`).
+  - `log1p` — Apply log1p transformation (default: `True`).
+  - `target_sum` — Normalization target sum (default: `1e4`).
+  - `seed` — RNG seed for reproducibility (default: `42`).
+  - `**kwargs` — Additional keyword arguments passed to `TrainingDataset`.
+- Properties: `n_obs`, `n_vars`, `n_output_genes`
+- `train_dataloader()` `→ DataLoader` — Uses `batch_size=None` and `num_workers=0` (Rust handles batching and threading internally).
+- `val_dataloader()` `→ None` — Validation not currently supported.
+
+```python
+from pyscx.scx_integrations.scvi import ScxDataModule
+import scvi
+
+dm = ScxDataModule("atlas.scx", batch_size=1024, hvg_indices=hvg_array)
+model = scvi.model.SCVI(dm.adata_manager)
+model.train(datamodule=dm)
+```
 
 ### TrainingDataset
 
@@ -309,6 +549,9 @@ for batch in dataset:
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path>`
 - `scx query <file> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]`
+- `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd]` — Extract a subset of cells and/or genes into a new SCX file
+- `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
+- `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
 
 ### Cloud operations (`--features cloud`)
 - `scx cloud-optimize <input> [--output <path>]`

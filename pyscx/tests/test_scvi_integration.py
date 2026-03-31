@@ -2,6 +2,10 @@
 
 import pytest
 
+torch = pytest.importorskip(
+    "torch", reason="torch not available or broken", exc_type=ImportError
+)
+
 
 def test_scx_datamodule_train_dataloader(query_adata, scx_from_adata):
     """ScxDataModule.train_dataloader() returns a working DataLoader."""

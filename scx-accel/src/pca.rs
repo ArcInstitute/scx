@@ -1,7 +1,7 @@
 //! Randomized PCA for sparse CSR matrices with streaming SpMM.
 //!
 //! Implements the randomized SVD algorithm (Halko, Martinsson, Tropp 2011)
-//! with shard-by-shard streaming over [`BackedCsrReader`], enabling PCA on
+//! with shard-by-shard streaming over [`ShardSource`], enabling PCA on
 //! datasets larger than RAM.
 //!
 //! # Algorithm
@@ -24,8 +24,11 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
-use scx_format::backed::BackedCsrReader;
 use scx_format::total_variance_from_col_sq;
+use scx_format::ShardSource;
+
+#[cfg(feature = "gpu")]
+use scx_format::BackedCsrReader;
 use scx_sparse::ScxCsr;
 
 use crate::error::{AccelError, Result};
@@ -107,7 +110,7 @@ fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
 }
 
 // ---------------------------------------------------------------------------
-// Public API — streaming from BackedCsrReader
+// Public API — streaming from ShardSource
 // ---------------------------------------------------------------------------
 
 /// Compute randomized PCA from a backed SCX reader.
@@ -117,44 +120,44 @@ fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
 ///
 /// # Arguments
 ///
-/// * `reader` — Backed CSR reader (provides shard-by-shard access)
+/// * `source` — Shard source (provides shard-by-shard access)
 /// * `n_components` — Number of principal components to compute
 /// * `n_oversamples` — Extra dimensions for accuracy (default: 10)
 /// * `n_power_iterations` — Power iterations for spectral accuracy (default: 2)
 /// * `zero_center` — Whether to mean-center the data (default: true)
 /// * `seed` — Random seed for reproducibility
-pub fn randomized_pca(
-    reader: &BackedCsrReader,
+pub fn randomized_pca<S: ShardSource>(
+    source: &S,
     n_components: usize,
     n_oversamples: usize,
     n_power_iterations: usize,
     zero_center: bool,
     seed: u64,
 ) -> Result<PcaResult> {
-    let (n_obs, n_vars) = reader.shape();
+    let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
     // Fused pass: compute column means and sum-of-squares together (1 shard pass)
-    let (means, col_sum_sq) = reader.col_means_and_sum_sq(zero_center)?;
+    let (means, col_sum_sq) = source.col_means_and_sum_sq(zero_center)?;
     let means_ref = means.as_deref();
 
     // Step 2: Random Gaussian Ω (n_vars × k)
     let omega = dense_from_row_major(&random_gaussian(n_vars, k, seed), n_vars, k);
 
     // Step 3 + 4 + 5: Streaming SpMM → QR → power iteration
-    let y = streaming_spmm_forward(reader, &omega, means_ref)?;
+    let y = streaming_spmm_forward(source, &omega, means_ref)?;
     let mut q = qr_thin_q(&y);
 
     for _ in 0..n_power_iterations {
-        let b = streaming_spmm_transpose(reader, &q, means_ref)?;
+        let b = streaming_spmm_transpose(source, &q, means_ref)?;
         let q_b = qr_thin_q(&b);
-        let y = streaming_spmm_forward(reader, &q_b, means_ref)?;
+        let y = streaming_spmm_forward(source, &q_b, means_ref)?;
         q = qr_thin_q(&y);
     }
 
     // Step 6: B = (X - μ)^T @ Q
-    let b = streaming_spmm_transpose(reader, &q, means_ref)?;
+    let b = streaming_spmm_transpose(source, &q, means_ref)?;
 
     // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass)
     let total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
@@ -226,7 +229,7 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
 }
 
 // NOTE: `compute_means_and_col_sq` has been replaced by
-// `BackedCsrReader::col_means_and_sum_sq()` in scx-format.
+// `ShardSource::col_means_and_sum_sq()` in scx-format.
 // `compute_total_variance_from_col_sq` has been replaced by
 // `scx_format::total_variance_from_col_sq()`.
 
@@ -242,12 +245,12 @@ fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
 /// X is (n_obs × n_vars) stored as sharded CSR.
 /// M is Mat<f64> (n_vars × k).
 /// Returns Mat<f64> (n_obs × k).
-fn streaming_spmm_forward(
-    reader: &BackedCsrReader,
+fn streaming_spmm_forward<S: ShardSource>(
+    source: &S,
     m: &Mat<f64>,
     means: Option<&[f64]>,
 ) -> Result<Mat<f64>> {
-    let (n_obs, n_vars) = reader.shape();
+    let (n_obs, n_vars) = source.shape();
     let k = m.ncols();
     debug_assert_eq!(m.nrows(), n_vars);
 
@@ -267,11 +270,11 @@ fn streaming_spmm_forward(
         mc
     });
 
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = source.read_shard(shard_idx)?;
         let shard_rows = csr.n_rows();
 
         spmm_forward_into(
@@ -292,12 +295,12 @@ fn streaming_spmm_forward(
 ///
 /// Q is Mat<f64> (n_obs × k).
 /// Returns Mat<f64> (n_vars × k).
-fn streaming_spmm_transpose(
-    reader: &BackedCsrReader,
+fn streaming_spmm_transpose<S: ShardSource>(
+    source: &S,
     q: &Mat<f64>,
     means: Option<&[f64]>,
 ) -> Result<Mat<f64>> {
-    let (n_obs, n_vars) = reader.shape();
+    let (n_obs, n_vars) = source.shape();
     let k = q.ncols();
     debug_assert_eq!(q.nrows(), n_obs);
 
@@ -306,11 +309,11 @@ fn streaming_spmm_transpose(
 
     let mut z = vec![0.0f64; n_vars * k];
 
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = reader.read_shard_cached(shard_idx)?;
+        let csr = source.read_shard(shard_idx)?;
         let shard_rows = csr.n_rows();
 
         // Z[col, :] += X[row, col] * Q[row, :]
@@ -635,6 +638,37 @@ pub fn randomized_pca_gpu(
 #[cfg(feature = "gpu")]
 pub fn gpu_available() -> bool {
     scx_gpu::GpuDevice::count().map_or(false, |n| n > 0)
+}
+
+/// GPU device information returned by [`gpu_info`].
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    /// Human-readable device name (e.g. "NVIDIA A100-SXM4-80GB").
+    pub device_name: String,
+    /// Total VRAM in bytes.
+    pub total_vram_bytes: usize,
+    /// Free VRAM in bytes.
+    pub free_vram_bytes: usize,
+}
+
+/// Query GPU device information for device 0.
+///
+/// Returns `None` if no GPU is available or CUDA initialization fails.
+#[cfg(feature = "gpu")]
+pub fn gpu_info() -> Option<GpuInfo> {
+    let count = scx_gpu::GpuDevice::count().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let dev = scx_gpu::GpuDevice::new(0).ok()?;
+    let device_name = dev.name().unwrap_or_else(|_| "unknown".to_string());
+    let (free, total) = dev.free_memory().ok()?;
+    Some(GpuInfo {
+        device_name,
+        total_vram_bytes: total,
+        free_vram_bytes: free,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@
 
 SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
 
-**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c complete (GPU accelerators — benchmarked, 3/4 Go/No-Go gates pass). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), and [Phase4-GPU.md](Phase4-GPU.md).
+**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c complete (GPU accelerators — benchmarked, 3/4 Go/No-Go gates pass). Phase 4d complete (lazy preprocessing — materialization-free normalize_total/log1p, streaming PCA via ShardSource trait, non-materializing filter_cells/filter_genes; 71% RSS reduction on 1M cells). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md), and [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md).
 
 ## Key Documents
 
@@ -14,7 +14,9 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[Phase4.md](Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
 - **[Phase4-GPU.md](Phase4-GPU.md)** — Phase 4c GPU accelerator spec and benchmark results (cuSPARSE, cuVS/CAGRA, CUDA UMAP).
 - **[Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md)** — Code review of Phase 4b accelerator implementations.
+- **[Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)** — Phase 4d spec: materialization-free lazy preprocessing (ScxLazyTransformedDataset, column-projected streaming aggregation).
 - **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
+- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
@@ -116,6 +118,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
 - **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
 - **Phase 4c (GPU Accelerators)**: Implementation complete, benchmarked — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN, 9.4× standalone on 1M cells), native CUDA UMAP SGD (7.7× on 1M cells), cuGraph Leiden (16× on 1M cells), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Go/No-Go: 3/4 pass (PCA correctness, kNN recall, graceful fallback); 10× pipeline target not met (3.8× median, 8.8× best run). Requires `scx-gpu` conda env for RAPIDS compatibility. See `benchmarks/results/gpu_gonogo.json`.
+- **Phase 4d (Lazy Preprocessing)**: Complete — `ScxLazyTransformedDataset` wraps backed reader with chained transforms (NormalizeTotal, Log1p, RowScale). `ShardSource` trait enables streaming PCA through transforms without materialization. `pyscx.accel.normalize_total()`, `log1p()`, `filter_cells()`, `filter_genes()`, `subset_obs()`, `calculate_qc_metrics()` all work without materializing. Fused NormalizeTotal+Log1p optimization. Full out-of-core pipeline: open → QC filter → normalize → log1p → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS on 1M cells (71% reduction from 38 GB materialized baseline). Benchmarked on census_1m (SLURM job 1935465). See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md).
 
 ## Coding Conventions
 

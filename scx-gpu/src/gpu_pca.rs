@@ -340,7 +340,7 @@ fn streaming_gpu_spmm_forward(
 
     for shard_idx in 0..n_shards {
         let csr = reader
-            .read_shard_cached(shard_idx)
+            .read_shard_uncached(shard_idx)
             .map_err(format_scx_error)?;
         let shard_rows = csr.n_rows();
 
@@ -416,7 +416,7 @@ fn streaming_gpu_spmm_transpose(
 
     for shard_idx in 0..n_shards {
         let csr = reader
-            .read_shard_cached(shard_idx)
+            .read_shard_uncached(shard_idx)
             .map_err(format_scx_error)?;
         let shard_rows = csr.n_rows();
 
