@@ -249,6 +249,45 @@ impl ScxLazyTransformedDataset {
         Ok(sums)
     }
 
+    /// Stream all shards, apply transforms, project to visible columns, compute per-row sums.
+    ///
+    /// **Scanpy compatibility:** After `filter_genes()`, scanpy's `normalize_total`
+    /// sums only over the visible (kept) gene set because `adata.X` is already sliced.
+    /// In SCX backed mode, `adata.X` is still the full-width matrix with a
+    /// `col_projection` mask. This method applies transforms to the full-width shard
+    /// first (so prior `NormalizeTotal` transforms divide by the correct whole-row
+    /// denominator), then calls `project_csr` to restrict to the projected gene subset
+    /// before summing each row.
+    ///
+    /// Falls back to `streaming_row_sums()` when no `col_projection` is active.
+    ///
+    /// Returns a global-length vector (`n_obs_global`), NOT filtered through
+    /// deletion vectors.
+    pub(crate) fn streaming_row_sums_projected(&self) -> PyResult<Vec<f64>> {
+        let cols = match &self.col_projection {
+            Some(c) => c,
+            None => return self.streaming_row_sums(),
+        };
+        let n_obs_global = self.backed.shape().0;
+        let mut sums = vec![0.0f64; n_obs_global];
+        let mut global_row = 0usize;
+        for shard_idx in 0..self.backed.index().n_shards() {
+            let mut csr = self
+                .backed
+                .read_shard_uncached(shard_idx)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            self.apply_transforms(&mut csr, global_row);
+            let projected = scx_engine::projection::project_csr(&csr, cols);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
+            }
+            global_row += csr.n_rows();
+        }
+        Ok(sums)
+    }
+
     /// Stream all shards, apply transforms, compute per-column sums.
     ///
     /// Returns a vector of length `backed.shape().1` (physical column count),

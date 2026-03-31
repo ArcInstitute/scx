@@ -2084,13 +2084,20 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
 
-        // Compute row sums via streaming over ALL physical rows.
+        // Scanpy compat: sum only over projected (user-visible) genes.
+        // After filter_genes(), col_projection restricts to kept genes.
+        // Without col_projection, this sums all columns (same as before).
         // Must be in physical-row space because transforms are applied
         // per-shard before deletion vector filtering.
-        let all_row_sums = backed_ref
-            .backed
-            .row_sums()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let all_row_sums = if let Some(cols) = backed_ref.col_projection() {
+            projected_agg::row_sums_projected(&backed_ref.backed, cols)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            backed_ref
+                .backed
+                .row_sums()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        };
 
         let non_negative = backed_ref.non_negative;
         let lazy = ScxLazyTransformedDataset::new(
@@ -2115,13 +2122,13 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
     // Case 2: X is already ScxLazyTransformedDataset — append transform
     if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
-        // Compute row sums through existing transforms (streaming).
-        // streaming_row_sums() returns a global-length vector (n_obs_global),
-        // which is what apply_transforms_to_csr expects (indexes by global row).
-        // Do NOT filter through deletion vector — that would produce a
-        // kept-length vector causing index-out-of-bounds on datasets with
-        // active deletions.
-        let sums = lazy_ref.streaming_row_sums()?;
+        // Scanpy compat: sum only over projected (user-visible) genes.
+        // streaming_row_sums_projected() applies transforms to the full-width
+        // shard first (so prior NormalizeTotal sees correct denominator),
+        // then project_csr restricts to projected genes before summing.
+        // Returns a global-length vector (n_obs_global), which is what
+        // apply_transforms_to_csr expects (indexes by global row).
+        let sums = lazy_ref.streaming_row_sums_projected()?;
         lazy_ref.transforms.push(Transform::NormalizeTotal {
             row_sums: Arc::new(sums),
             target_sum,
