@@ -1,0 +1,70 @@
+# SCX Comprehensive Benchmark Suite — GPU Environment
+#
+# Extends the CPU benchmark env with CUDA + RAPIDS (cuVS, cuGraph) for
+# GPU-accelerated PCA, kNN, UMAP, Leiden, and fused preprocessing benchmarks.
+#
+# Create:   conda env create -f benchmarks/comprehensive/envs/scx-bench-gpu.yml
+# Activate: conda activate scx-bench-gpu
+# Build pyscx: cd pyscx && maturin develop --release --features gpu && cd ..
+#
+# IMPORTANT: Pin cuda-version to match your NVIDIA driver's max CUDA version.
+#   Driver 535.x → cuda-version=12.2
+#   Driver 550.x → cuda-version=12.4
+#   Driver 560.x → cuda-version=12.6
+# Check with: nvidia-smi (look for "CUDA Version: 12.x" in top-right corner)
+#
+# NOTE: pyscx is built from source inside the env with --features gpu.
+
+name: scx-bench-gpu
+channels:
+  - rapidsai
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.13
+
+  # Core single-cell stack (same versions as CPU env)
+  - anndata=0.12.7
+  - scanpy=1.12
+  - scipy=1.16.3
+  - numpy=2.2.0
+  - pandas=2.3.3
+  - h5py=3.16.0
+
+  # Format-specific
+  - zarr=3.1.5
+  - pyarrow=23.0.1
+  - tiledbsoma=2.3.0
+
+  # Analysis
+  - scikit-learn=1.8.0
+  - umap-learn=0.5.11
+  - leidenalg=0.11.0
+  - python-igraph=1.0.0
+
+  # Visualization
+  - matplotlib=3.10.8
+  - seaborn=0.13.2
+
+  # System monitoring
+  - psutil=7.2.2
+
+  # Build tooling
+  - maturin>=1.5.0
+
+  # CUDA + RAPIDS — the reason this env exists
+  # Adjust cuda-version to match your driver (see header comment)
+  - cuda-version=12.2
+  - cuvs>=24.10
+  - cugraph>=24.10
+
+  # PyTorch with CUDA (for GPU ML loader benchmarks)
+  - pytorch>=2.0
+  - pytorch-cuda=12.1
+
+  # pip-only packages
+  - pip:
+    - submitit>=1.5.0
+    - tiledbsoma-ml>=0.1.0

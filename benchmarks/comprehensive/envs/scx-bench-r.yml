@@ -1,0 +1,33 @@
+# SCX Comprehensive Benchmark Suite — R Environment (BPCells)
+#
+# Isolated R environment for BPCells benchmarks. BPCells is the strongest
+# competitor for compression + streaming speed and is R-only.
+#
+# Create:   conda env create -f benchmarks/comprehensive/envs/scx-bench-r.yml
+# Activate: conda activate scx-bench-r
+# Install BPCells:
+#   Rscript -e 'install.packages("remotes"); remotes::install_github("bnprks/BPCells/r")'
+#
+# The Python benchmark runner calls BPCells via `Rscript` subprocess,
+# so the Python environment (scx-bench) does not need R packages.
+
+name: scx-bench-r
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # R and essential packages
+  - r-base>=4.3
+  - r-matrix
+  - r-rcpp
+  - r-bh
+  - r-jsonlite      # For structured JSON output from R benchmark scripts
+  - r-hdf5r         # For reading h5ad files in R
+
+  # System libraries needed by BPCells
+  - hdf5
+  - zlib
+
+  # Python (minimal — only for the orchestrator to call Rscript)
+  - python=3.13
