@@ -55,8 +55,11 @@ pub struct ScxLazyTransformedDataset {
     pub(crate) backed: Arc<BackedCsrReader>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) transforms: Vec<Transform>,
-    pub(crate) kept_to_global: Option<Vec<u64>>,
-    pub(crate) col_projection: Option<Vec<u32>>,
+    /// Arc-wrapped to avoid O(n) deep clones when constructing new lazy
+    /// datasets via __mul__ / __truediv__ / comparison operators.
+    pub(crate) kept_to_global: Option<Arc<Vec<u64>>>,
+    /// Arc-wrapped for the same reason as `kept_to_global`.
+    pub(crate) col_projection: Option<Arc<Vec<u32>>>,
     /// Whether the data is known to be non-negative after transforms.
     /// NormalizeTotal and Log1p preserve non-negativity.
     pub(crate) non_negative: bool,
@@ -67,8 +70,8 @@ impl ScxLazyTransformedDataset {
     pub fn new(
         backed: Arc<BackedCsrReader>,
         shape_val: (usize, usize),
-        kept_to_global: Option<Vec<u64>>,
-        col_projection: Option<Vec<u32>>,
+        kept_to_global: Option<Arc<Vec<u64>>>,
+        col_projection: Option<Arc<Vec<u32>>>,
         transforms: Vec<Transform>,
         non_negative: bool,
     ) -> Self {
@@ -100,7 +103,7 @@ impl ScxLazyTransformedDataset {
     /// Replace the deletion vector, adjusting shape.0.
     pub(crate) fn set_kept_to_global(&mut self, kept: Vec<u64>) {
         self.shape_val.0 = kept.len();
-        self.kept_to_global = Some(kept);
+        self.kept_to_global = Some(Arc::new(kept));
     }
 
     /// Set column projection on this dataset.
@@ -109,12 +112,12 @@ impl ScxLazyTransformedDataset {
         sorted.sort_unstable();
         sorted.dedup();
         self.shape_val.1 = sorted.len();
-        self.col_projection = Some(sorted);
+        self.col_projection = Some(Arc::new(sorted));
     }
 
     /// Read access to col_projection (for composition in filter_genes).
     pub(crate) fn col_projection(&self) -> Option<&[u32]> {
-        self.col_projection.as_deref()
+        self.col_projection.as_ref().map(|v| v.as_slice())
     }
 
     /// Apply all transforms in-place on a decoded CSR shard.
@@ -681,7 +684,7 @@ impl ScxLazyTransformedDataset {
         {
             let global_factors = crate::backed::expand_to_global(
                 row_factors,
-                self.kept_to_global.as_deref(),
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
                 self.backed.shape().0,
                 1.0,
             );
@@ -721,7 +724,7 @@ impl ScxLazyTransformedDataset {
                 .collect();
             let global_inv = crate::backed::expand_to_global(
                 inv_factors,
-                self.kept_to_global.as_deref(),
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
                 self.backed.shape().0,
                 1.0,
             );
@@ -1513,8 +1516,8 @@ fn apply_single_transform(csr: &mut ScxCsr, transform: &Transform, global_row_of
 pub(crate) struct LazyShardSource {
     backed: Arc<BackedCsrReader>,
     transforms: Vec<Transform>,
-    kept_to_global: Option<Vec<u64>>,
-    col_projection: Option<Vec<u32>>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
+    col_projection: Option<Arc<Vec<u32>>>,
     shape_val: (usize, usize),
 }
 

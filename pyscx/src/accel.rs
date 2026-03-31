@@ -2106,7 +2106,7 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
             backed_ref.kept_to_global.clone(),
             // Inherit col_projection: transforms operate on full columns,
             // projection is applied per-shard after transforms
-            backed_ref.col_projection().map(|c| c.to_vec()),
+            backed_ref.col_projection_arc(),
             vec![Transform::NormalizeTotal {
                 row_sums: Arc::new(all_row_sums),
                 target_sum,
@@ -2174,7 +2174,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
             backed_ref.shape_val,
             backed_ref.kept_to_global.clone(),
             // Inherit col_projection so user-visible shape matches adata.var
-            backed_ref.col_projection().map(|c| c.to_vec()),
+            backed_ref.col_projection_arc(),
             vec![Transform::Log1p],
             non_negative,
         );
@@ -2758,7 +2758,14 @@ pub fn filter_cells(
             max_counts,
         );
 
-        let new_kept = compose_kept_to_global(&keep, backed.borrow().kept_to_global.as_deref());
+        let new_kept = compose_kept_to_global(
+            &keep,
+            backed
+                .borrow()
+                .kept_to_global
+                .as_ref()
+                .map(|v| v.as_slice()),
+        );
 
         backed.borrow_mut().set_kept_to_global(new_kept.clone());
         slice_obs_and_obsm(py, adata, &keep)?;
@@ -2799,7 +2806,10 @@ pub fn filter_cells(
             max_counts,
         );
 
-        let new_kept = compose_kept_to_global(&keep, lazy_ref.kept_to_global.as_deref());
+        let new_kept = compose_kept_to_global(
+            &keep,
+            lazy_ref.kept_to_global.as_ref().map(|v| v.as_slice()),
+        );
 
         drop(lazy_ref);
         lazy.borrow_mut().set_kept_to_global(new_kept.clone());
@@ -3142,7 +3152,14 @@ pub fn subset_obs(
 
     // Case 1: X is ScxBackedSparseDataset
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
-        let new_kept = compose_kept_to_global(&keep, backed.borrow().kept_to_global.as_deref());
+        let new_kept = compose_kept_to_global(
+            &keep,
+            backed
+                .borrow()
+                .kept_to_global
+                .as_ref()
+                .map(|v| v.as_slice()),
+        );
         backed.borrow_mut().set_kept_to_global(new_kept.clone());
         slice_obs_and_obsm(py, adata, &keep)?;
         update_layers_kept_to_global(adata, &new_kept)?;
@@ -3151,7 +3168,10 @@ pub fn subset_obs(
 
     // Case 2: X is ScxLazyTransformedDataset
     if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
-        let new_kept = compose_kept_to_global(&keep, lazy.borrow().kept_to_global.as_deref());
+        let new_kept = compose_kept_to_global(
+            &keep,
+            lazy.borrow().kept_to_global.as_ref().map(|v| v.as_slice()),
+        );
         lazy.borrow_mut().set_kept_to_global(new_kept.clone());
         slice_obs_and_obsm(py, adata, &keep)?;
         update_layers_kept_to_global(adata, &new_kept)?;

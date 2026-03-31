@@ -34,10 +34,12 @@ pub struct ScxBackedSparseDataset {
     pub(crate) cache_shards: usize,
     /// If deletions are present, maps user-visible row i → global row index.
     /// When None, no remapping is needed (no deletions).
-    pub(crate) kept_to_global: Option<Vec<u64>>,
+    /// Arc-wrapped to avoid O(n) deep clones when creating lazy datasets.
+    pub(crate) kept_to_global: Option<Arc<Vec<u64>>>,
     /// If column projection is active, sorted column indices to retain.
     /// CSR outputs are filtered through `project_csr()` before returning.
-    col_projection: Option<Vec<u32>>,
+    /// Arc-wrapped to avoid O(n) deep clones when creating lazy datasets.
+    col_projection: Option<Arc<Vec<u32>>>,
     /// Whether the data is known to be non-negative. Defaults to `true`
     /// (raw UMI counts, normalized, log1p). Set to `false` after operations
     /// that produce negative values (e.g., `sc.pp.scale()`), which disables
@@ -78,7 +80,7 @@ impl ScxBackedSparseDataset {
             shape_val: (n_kept, n_vars),
             n_shards,
             cache_shards,
-            kept_to_global: Some(kept_to_global),
+            kept_to_global: Some(Arc::new(kept_to_global)),
             col_projection: None,
             non_negative: true,
         }
@@ -92,18 +94,23 @@ impl ScxBackedSparseDataset {
         sorted.sort_unstable();
         sorted.dedup();
         self.shape_val.1 = sorted.len();
-        self.col_projection = Some(sorted);
+        self.col_projection = Some(Arc::new(sorted));
     }
 
     /// Replace the deletion vector, adjusting shape.0.
     pub(crate) fn set_kept_to_global(&mut self, kept: Vec<u64>) {
         self.shape_val.0 = kept.len();
-        self.kept_to_global = Some(kept);
+        self.kept_to_global = Some(Arc::new(kept));
     }
 
     /// Read access to col_projection (for composition in filter_genes).
     pub(crate) fn col_projection(&self) -> Option<&[u32]> {
-        self.col_projection.as_deref()
+        self.col_projection.as_ref().map(|v| v.as_slice())
+    }
+
+    /// Clone the col_projection Arc (O(1) ref-count increment).
+    pub(crate) fn col_projection_arc(&self) -> Option<Arc<Vec<u32>>> {
+        self.col_projection.clone()
     }
 
     /// Apply column projection to a CSR matrix if projection is active.
@@ -345,7 +352,7 @@ impl ScxBackedSparseDataset {
         if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
             let global_factors = expand_to_global(
                 row_factors,
-                self.kept_to_global.as_deref(),
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
                 self.backed.shape().0,
                 1.0,
             );
@@ -385,7 +392,7 @@ impl ScxBackedSparseDataset {
                 .collect();
             let global_inv = expand_to_global(
                 inv_factors,
-                self.kept_to_global.as_deref(),
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
                 self.backed.shape().0,
                 1.0,
             );
@@ -1560,7 +1567,7 @@ pub struct ScxComparisonResult {
     shape_val: (usize, usize),
     op: String,
     threshold: f64,
-    kept_to_global: Option<Vec<u64>>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
     /// Inherited from the parent dataset — gates the getnnz short-circuit.
     non_negative: bool,
     /// When created from ScxLazyTransformedDataset, transforms to apply
@@ -1579,7 +1586,7 @@ impl ScxComparisonResult {
         shape_val: (usize, usize),
         op: String,
         threshold: f64,
-        kept_to_global: Option<Vec<u64>>,
+        kept_to_global: Option<Arc<Vec<u64>>>,
         non_negative: bool,
         transforms: Vec<Transform>,
     ) -> Self {
