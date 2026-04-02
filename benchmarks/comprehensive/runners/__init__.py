@@ -18,4 +18,21 @@ __all__ = [
     "ScxRunner",
     "BPCellsRunner",
     "ParquetRunner",
+    "make_runner",
 ]
+
+
+_RUNNER_MAP = {
+    "h5ad_runner": H5adRunner,
+    "zarr_runner": ZarrRunner,
+    "tiledb_runner": TileDBRunner,
+    "scx_runner": ScxRunner,
+    "bpcells_runner": BPCellsRunner,
+    "parquet_runner": ParquetRunner,
+}
+
+
+def make_runner(fmt) -> FormatRunner:
+    """Instantiate a FormatRunner from a FormatVariant."""
+    cls = _RUNNER_MAP[fmt.runner]
+    return cls(**fmt.params)

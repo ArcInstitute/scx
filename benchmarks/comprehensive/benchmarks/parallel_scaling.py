@@ -24,42 +24,19 @@ from benchmarks.comprehensive.config import (
     THREAD_COUNTS,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.runners.base import FormatRunner
+from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
-# Formats that are inherently single-threaded — skip thread counts > 1
 _SINGLE_THREADED_RUNNERS = {"h5ad_runner"}
 
-# Environment variables controlling thread pools for various libraries
 _THREAD_ENV_VARS = [
-    "RAYON_NUM_THREADS",       # Rust rayon (SCX)
-    "OMP_NUM_THREADS",         # OpenMP (used by some HDF5/NumPy backends)
-    "OPENBLAS_NUM_THREADS",    # OpenBLAS
-    "MKL_NUM_THREADS",         # Intel MKL
-    "NUMEXPR_MAX_THREADS",     # numexpr
+    "RAYON_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
 ]
-
-
-def _make_runner(fmt: FormatVariant) -> FormatRunner:
-    """Instantiate the appropriate runner for a format variant."""
-    from benchmarks.comprehensive.runners.h5ad_runner import H5adRunner
-    from benchmarks.comprehensive.runners.zarr_runner import ZarrRunner
-    from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
-    from benchmarks.comprehensive.runners.scx_runner import ScxRunner
-    from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
-    from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
-
-    runners: dict[str, type[FormatRunner]] = {
-        "h5ad_runner": H5adRunner,
-        "zarr_runner": ZarrRunner,
-        "tiledb_runner": TileDBRunner,
-        "scx_runner": ScxRunner,
-        "bpcells_runner": BPCellsRunner,
-        "parquet_runner": ParquetRunner,
-    }
-    cls = runners[fmt.runner]
-    return cls(**fmt.params)
 
 
 def _set_thread_count(thread_count: int) -> dict[str, str | None]:
@@ -89,6 +66,7 @@ def run(
     format_variant: FormatVariant,
     n_runs: int,
     cold_cache: bool = False,
+    converted_path: Path | None = None,
 ) -> BenchmarkResult:
     """Execute the parallel read scaling benchmark.
 
@@ -109,7 +87,7 @@ def run(
         Structured result with per-run timings tagged by thread count,
         plus metadata containing scaling summary, speedup, and efficiency.
     """
-    runner = _make_runner(format_variant)
+    runner = make_runner(format_variant)
     h5ad_path = dataset.h5ad_path
 
     if not h5ad_path.exists():
@@ -133,86 +111,56 @@ def run(
         },
     )
 
-    with tempfile.TemporaryDirectory(prefix=f"scx_bench_{dataset.name}_") as tmp_dir:
-        converted_path = Path(tmp_dir) / f"{dataset.name}.{format_variant.key}"
-
-        # -- Convert h5ad to target format --
+    # Use pre-converted file if available, otherwise convert to temp dir.
+    _cleanup = None
+    if converted_path is not None and Path(converted_path).exists():
+        _converted = Path(converted_path)
+    else:
+        _cleanup = tempfile.TemporaryDirectory(prefix=f"scx_bench_{dataset.name}_")
+        _converted = Path(_cleanup.name) / f"{dataset.name}.{format_variant.key}"
         logger.info(
             "Converting %s -> %s (%s)",
             h5ad_path.name,
             format_variant.name,
-            converted_path,
+            _converted,
         )
-        runner.convert_from_h5ad(h5ad_path, converted_path)
+        runner.convert_from_h5ad(h5ad_path, _converted)
 
-        # -- Record file size --
-        result.file_size_bytes = runner.file_size(converted_path)
-        logger.info(
-            "Converted file size: %.2f MB",
-            result.file_size_bytes / (1024 * 1024),
-        )
-
-        # Per-thread-count median timings for the scaling summary
+    result.file_size_bytes = runner.file_size(_converted)
+    try:
         scaling_summary: dict[str, float] = {}
 
         for thread_count in thread_counts:
             logger.info(
                 "--- Thread count: %d (format: %s, dataset: %s) ---",
-                thread_count,
-                format_variant.key,
-                dataset.name,
+                thread_count, format_variant.key, dataset.name,
             )
 
             prev_env = _set_thread_count(thread_count)
             try:
-                # -- Warm-up run(s) --
                 for i in range(N_WARMUP_RUNS):
-                    logger.info(
-                        "  Warm-up run %d/%d (threads=%d)",
-                        i + 1, N_WARMUP_RUNS, thread_count,
-                    )
-                    runner.read_full(converted_path)
+                    runner.read_full(_converted)
                     gc.collect()
 
-                # -- Timed runs --
                 wall_times: list[float] = []
                 for i in range(n_runs):
                     if cold_cache:
                         runner._drop_caches()
-
                     gc.collect()
 
-                    logger.info(
-                        "  Timed run %d/%d (threads=%d)",
-                        i + 1, n_runs, thread_count,
-                    )
-                    timing = runner.read_full(converted_path)
-
+                    timing = runner.read_full(_converted)
                     result.add_run(
-                        wall_s=timing.wall_s,
-                        user_s=timing.user_s,
-                        sys_s=timing.sys_s,
-                        peak_rss_mb=timing.peak_rss_mb,
+                        wall_s=timing.wall_s, user_s=timing.user_s,
+                        sys_s=timing.sys_s, peak_rss_mb=timing.peak_rss_mb,
                         threads=thread_count,
                     )
                     wall_times.append(timing.wall_s)
-                    logger.info(
-                        "    wall=%.3fs  rss=%.1fMB",
-                        timing.wall_s,
-                        timing.peak_rss_mb,
-                    )
 
                 median_wall = statistics.median(wall_times)
                 scaling_summary[str(thread_count)] = round(median_wall, 6)
-                logger.info(
-                    "  Median wall time (threads=%d): %.3fs",
-                    thread_count,
-                    median_wall,
-                )
             finally:
                 _restore_thread_env(prev_env)
 
-        # -- Compute speedup and parallel efficiency --
         baseline = scaling_summary.get("1")
         speedup: dict[str, float] = {}
         efficiency: dict[str, float] = {}
@@ -227,19 +175,8 @@ def run(
         result.metadata["scaling_wall_s"] = scaling_summary
         result.metadata["speedup"] = speedup
         result.metadata["efficiency"] = efficiency
-
-        logger.info(
-            "Parallel scaling complete: %s / %s",
-            format_variant.key,
-            dataset.name,
-        )
-        if speedup:
-            max_tc = max(scaling_summary.keys(), key=int)
-            logger.info(
-                "  Speedup at %s threads: %.2fx  (efficiency: %.1f%%)",
-                max_tc,
-                speedup.get(max_tc, 0.0),
-                efficiency.get(max_tc, 0.0) * 100,
-            )
+    finally:
+        if _cleanup is not None:
+            _cleanup.cleanup()
 
     return result

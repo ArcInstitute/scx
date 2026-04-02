@@ -29,36 +29,10 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
-
-if TYPE_CHECKING:
-    from benchmarks.comprehensive.runners.base import FormatRunner
+from benchmarks.comprehensive.runners import make_runner
+from benchmarks.comprehensive.runners.base import FormatRunner
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_runner(fmt: FormatVariant) -> FormatRunner:
-    """Instantiate the appropriate FormatRunner from a FormatVariant."""
-    from benchmarks.comprehensive.runners.h5ad_runner import H5adRunner
-    from benchmarks.comprehensive.runners.zarr_runner import ZarrRunner
-    from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
-    from benchmarks.comprehensive.runners.scx_runner import ScxRunner
-    from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
-    from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
-
-    runners: dict[str, type[FormatRunner]] = {
-        "h5ad_runner": H5adRunner,
-        "zarr_runner": ZarrRunner,
-        "tiledb_runner": TileDBRunner,
-        "scx_runner": ScxRunner,
-        "bpcells_runner": BPCellsRunner,
-        "parquet_runner": ParquetRunner,
-    }
-    cls = runners[fmt.runner]
-    return cls(**fmt.params)
 
 
 def _generate_indices(
@@ -97,6 +71,7 @@ def run(
     format_variant: FormatVariant,
     n_runs: int,
     cold_cache: bool = False,
+    converted_path: Path | None = None,
 ) -> BenchmarkResult:
     """Run the S3.4 selective-read benchmark.
 
@@ -115,7 +90,7 @@ def run(
     -------
     BenchmarkResult with benchmark="read_selective".
     """
-    runner = _make_runner(format_variant)
+    runner = make_runner(format_variant)
     h5ad_path = dataset.h5ad_path
     if not h5ad_path.exists():
         raise FileNotFoundError(f"Source h5ad not found: {h5ad_path}")
@@ -145,22 +120,25 @@ def run(
         },
     )
 
-    # Define the sub-benchmark scenarios.
     scenarios: list[tuple[str, np.ndarray | None, np.ndarray | None]] = [
         ("row_slice", cell_idx, None),
         ("col_projection", None, gene_idx),
         ("combined", cell_idx, gene_idx),
     ]
 
-    with tempfile.TemporaryDirectory(prefix="scx_selread_bench_") as tmpdir:
-        output_path = Path(tmpdir) / f"converted.{format_variant.key}"
-
-        # Convert h5ad to the target format once.
+    # Use pre-converted file if available, otherwise convert to temp dir.
+    _cleanup = None
+    if converted_path is not None and Path(converted_path).exists():
+        output_path = Path(converted_path)
+        result.file_size_bytes = runner.file_size(output_path)
+    else:
+        _cleanup = tempfile.TemporaryDirectory(prefix="scx_selread_bench_")
+        output_path = Path(_cleanup.name) / f"converted.{format_variant.key}"
         logger.info("  converting %s -> %s ...", h5ad_path, output_path)
         convert_result = runner.convert_from_h5ad(h5ad_path, output_path)
         result.file_size_bytes = convert_result.output_size_bytes
 
-        # Run each scenario.
+    try:
         scenario_times: dict[str, list[float]] = {}
 
         for scenario_name, c_idx, g_idx in scenarios:
@@ -169,30 +147,17 @@ def run(
                 if cold_cache:
                     FormatRunner._drop_caches()
 
-                logger.info(
-                    "  %s run %d/%d",
-                    scenario_name,
-                    i + 1,
-                    n_runs,
-                )
+                logger.info("  %s run %d/%d", scenario_name, i + 1, n_runs)
                 tr = runner.read_subset(
-                    output_path,
-                    cell_indices=c_idx,
-                    gene_indices=g_idx,
+                    output_path, cell_indices=c_idx, gene_indices=g_idx,
                 )
 
                 scenario_times[scenario_name].append(tr.wall_s)
                 result.add_run(
-                    wall_s=tr.wall_s,
-                    user_s=tr.user_s,
-                    sys_s=tr.sys_s,
-                    peak_rss_mb=tr.peak_rss_mb,
-                    scenario=scenario_name,
+                    wall_s=tr.wall_s, user_s=tr.user_s, sys_s=tr.sys_s,
+                    peak_rss_mb=tr.peak_rss_mb, scenario=scenario_name,
                 )
 
-        # Attempt the optional filtered-query scenario.
-        # This is format-specific; skip if the runner raises
-        # NotImplementedError or AttributeError.
         try:
             read_filtered = getattr(runner, "read_filtered_query", None)
             if read_filtered is not None:
@@ -200,27 +165,20 @@ def run(
                 for i in range(n_runs):
                     if cold_cache:
                         FormatRunner._drop_caches()
-
-                    logger.info(
-                        "  filtered_query run %d/%d",
-                        i + 1,
-                        n_runs,
-                    )
+                    logger.info("  filtered_query run %d/%d", i + 1, n_runs)
                     tr = read_filtered(
-                        output_path,
-                        cell_indices=cell_idx,
-                        gene_indices=gene_idx,
+                        output_path, cell_indices=cell_idx, gene_indices=gene_idx,
                     )
                     scenario_times["filtered_query"].append(tr.wall_s)
                     result.add_run(
-                        wall_s=tr.wall_s,
-                        user_s=tr.user_s,
-                        sys_s=tr.sys_s,
-                        peak_rss_mb=tr.peak_rss_mb,
-                        scenario="filtered_query",
+                        wall_s=tr.wall_s, user_s=tr.user_s, sys_s=tr.sys_s,
+                        peak_rss_mb=tr.peak_rss_mb, scenario="filtered_query",
                     )
         except (NotImplementedError, TypeError):
             logger.info("  filtered_query not supported for %s, skipping", format_variant.key)
+    finally:
+        if _cleanup is not None:
+            _cleanup.cleanup()
 
     # Add per-scenario summary statistics to metadata.
     scenario_summary: dict[str, dict[str, float]] = {}

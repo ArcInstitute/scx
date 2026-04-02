@@ -28,7 +28,7 @@ echo "CPUs: $(nproc)"
 echo "Memory: $(free -h | grep Mem | awk '{print $2}')"
 echo ""
 
-DATASETS="census_500k,census_1m,census_5m,census_10m"
+DATASETS="census_500k,census_1m,census_5m"
 BENCHMARKS="compression write read_full read_selective parallel_scaling memory"
 
 echo "--- Running benchmarks: ${BENCHMARKS} ---"

@@ -18,36 +18,12 @@ from typing import TYPE_CHECKING
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.runners import make_runner
 
 if TYPE_CHECKING:
-    from benchmarks.comprehensive.runners.base import FormatRunner
+    pass
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_runner(fmt: FormatVariant) -> FormatRunner:
-    """Instantiate the appropriate FormatRunner from a FormatVariant."""
-    from benchmarks.comprehensive.runners.h5ad_runner import H5adRunner
-    from benchmarks.comprehensive.runners.zarr_runner import ZarrRunner
-    from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
-    from benchmarks.comprehensive.runners.scx_runner import ScxRunner
-    from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
-    from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
-
-    runners: dict[str, type] = {
-        "h5ad_runner": H5adRunner,
-        "zarr_runner": ZarrRunner,
-        "tiledb_runner": TileDBRunner,
-        "scx_runner": ScxRunner,
-        "bpcells_runner": BPCellsRunner,
-        "parquet_runner": ParquetRunner,
-    }
-    cls = runners[fmt.runner]
-    return cls(**fmt.params)
 
 
 def _estimate_nnz(h5ad_path: Path) -> int:
@@ -76,6 +52,7 @@ def run(
     format_variant: FormatVariant,
     n_runs: int,
     cold_cache: bool = False,
+    converted_path: Path | None = None,
 ) -> BenchmarkResult:
     """Run the §3.1 compression benchmark for a single format variant.
 
@@ -101,7 +78,7 @@ def run(
         raise FileNotFoundError(f"Source h5ad not found: {h5ad_path}")
 
     source_bytes = h5ad_path.stat().st_size
-    runner = _make_runner(format_variant)
+    runner = make_runner(format_variant)
 
     log.info(
         "Compression benchmark: dataset=%s format=%s source=%.1f MB",
@@ -110,11 +87,14 @@ def run(
         source_bytes / 1e6,
     )
 
-    # Convert into a temporary directory and measure output size.
-    with tempfile.TemporaryDirectory(prefix="scx_bench_comp_") as tmp:
-        out_path = Path(tmp) / f"converted.{format_variant.key}"
-        convert_result = runner.convert_from_h5ad(h5ad_path, out_path)
-        converted_bytes = convert_result.output_size_bytes
+    # Use pre-converted file if available, otherwise convert to temp dir.
+    if converted_path is not None and Path(converted_path).exists():
+        converted_bytes = runner.file_size(converted_path)
+    else:
+        with tempfile.TemporaryDirectory(prefix="scx_bench_comp_") as tmp:
+            out_path = Path(tmp) / f"converted.{format_variant.key}"
+            convert_result = runner.convert_from_h5ad(h5ad_path, out_path)
+            converted_bytes = convert_result.output_size_bytes
 
     # Estimate NNZ from the source h5ad.
     nnz = _estimate_nnz(h5ad_path)

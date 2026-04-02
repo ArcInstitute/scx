@@ -12,6 +12,7 @@ from benchmarks.comprehensive.runners.base import ConvertResult, FormatRunner, T
 
 try:
     import tiledbsoma
+    import tiledbsoma.io  # noqa: F401 — ensure submodule is loaded
 except ImportError:
     tiledbsoma = None
 

@@ -128,15 +128,21 @@ class ScxRunner(FormatRunner):
 
         def _read_subset():
             ds = pyscx.open(str(path))
-            q = ds.query()
             if cell_indices is not None:
-                q = q.filter_obs_indices(cell_indices)
-            if gene_indices is not None:
-                q = q.select_genes(gene_indices)
-            q.collect().to_csr()
+                # Use backed mode for arbitrary cell index subsetting
+                adata = ds.to_anndata(backed=True)
+                X = adata.X[cell_indices]
+                if gene_indices is not None:
+                    X = X[:, gene_indices]
+            elif gene_indices is not None:
+                # Gene-only selection via query API
+                q = ds.query().select_genes(gene_indices)
+                X = q.collect().to_csr()
+            else:
+                X = ds.query().collect().to_csr()
 
         _, timing = self.timed_run(_read_subset)
-        timing.extra = {"query_approach": "filter_obs_indices+select_genes"}
+        timing.extra = {"query_approach": "backed_index+select_genes"}
         return timing
 
     def file_size(self, path: str | Path) -> int:

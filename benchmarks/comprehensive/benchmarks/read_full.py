@@ -14,30 +14,9 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant, N_WARMUP_RUNS
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.runners.base import FormatRunner
+from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
-
-
-def _make_runner(fmt: FormatVariant) -> FormatRunner:
-    """Instantiate the appropriate runner for a format variant."""
-    from benchmarks.comprehensive.runners.h5ad_runner import H5adRunner
-    from benchmarks.comprehensive.runners.zarr_runner import ZarrRunner
-    from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
-    from benchmarks.comprehensive.runners.scx_runner import ScxRunner
-    from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
-    from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
-
-    runners: dict[str, type[FormatRunner]] = {
-        "h5ad_runner": H5adRunner,
-        "zarr_runner": ZarrRunner,
-        "tiledb_runner": TileDBRunner,
-        "scx_runner": ScxRunner,
-        "bpcells_runner": BPCellsRunner,
-        "parquet_runner": ParquetRunner,
-    }
-    cls = runners[fmt.runner]
-    return cls(**fmt.params)
 
 
 def run(
@@ -45,6 +24,7 @@ def run(
     format_variant: FormatVariant,
     n_runs: int,
     cold_cache: bool = False,
+    converted_path: Path | None = None,
 ) -> BenchmarkResult:
     """Execute the full-file read benchmark.
 
@@ -64,7 +44,7 @@ def run(
     BenchmarkResult
         Structured result with per-run timings, file size, and metadata.
     """
-    runner = _make_runner(format_variant)
+    runner = make_runner(format_variant)
     h5ad_path = dataset.h5ad_path
 
     if not h5ad_path.exists():
@@ -83,29 +63,32 @@ def run(
         },
     )
 
-    with tempfile.TemporaryDirectory(prefix=f"scx_bench_{dataset.name}_") as tmp_dir:
-        converted_path = Path(tmp_dir) / f"{dataset.name}.{format_variant.key}"
-
-        # -- Convert h5ad to target format --
+    # Use pre-converted file if available, otherwise convert to temp dir.
+    _cleanup = None
+    if converted_path is not None and Path(converted_path).exists():
+        _converted = Path(converted_path)
+    else:
+        _cleanup = tempfile.TemporaryDirectory(prefix=f"scx_bench_{dataset.name}_")
+        _converted = Path(_cleanup.name) / f"{dataset.name}.{format_variant.key}"
         logger.info(
             "Converting %s -> %s (%s)",
             h5ad_path.name,
             format_variant.name,
-            converted_path,
+            _converted,
         )
-        runner.convert_from_h5ad(h5ad_path, converted_path)
+        runner.convert_from_h5ad(h5ad_path, _converted)
 
-        # -- Record file size --
-        result.file_size_bytes = runner.file_size(converted_path)
+    try:
+        result.file_size_bytes = runner.file_size(_converted)
         logger.info(
-            "Converted file size: %.2f MB",
+            "File size: %.2f MB",
             result.file_size_bytes / (1024 * 1024),
         )
 
         # -- Warm-up run(s) --
         for i in range(N_WARMUP_RUNS):
             logger.info("Warm-up run %d/%d", i + 1, N_WARMUP_RUNS)
-            runner.read_full(converted_path)
+            runner.read_full(_converted)
             gc.collect()
 
         # -- Timed runs --
@@ -116,7 +99,7 @@ def run(
             gc.collect()
 
             logger.info("Timed run %d/%d", i + 1, n_runs)
-            timing = runner.read_full(converted_path)
+            timing = runner.read_full(_converted)
 
             result.add_run(
                 wall_s=timing.wall_s,
@@ -129,6 +112,9 @@ def run(
                 timing.wall_s,
                 timing.peak_rss_mb,
             )
+    finally:
+        if _cleanup is not None:
+            _cleanup.cleanup()
 
     logger.info(
         "Benchmark complete: %s / %s — median %.3fs",

@@ -89,6 +89,46 @@ class DatasetConfig:
     def parquet_path(self) -> Path:
         return DATA_DIR / f"{self.name}.parquet"
 
+    # Per-codec SCX paths for benchmark isolation
+    @property
+    def scx_auto_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_auto.scx"
+
+    @property
+    def scx_scx1_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_scx1.scx"
+
+    @property
+    def scx_zstd_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_zstd.scx"
+
+    @property
+    def scx_none_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_none.scx"
+
+    def path_for_format(self, format_key: str) -> Path:
+        """Return the persistent on-disk path for a given format key."""
+        prop = _FORMAT_KEY_TO_PROP.get(format_key)
+        if prop is None:
+            raise ValueError(f"No persistent path for format key {format_key!r}")
+        return getattr(self, prop)
+
+
+_FORMAT_KEY_TO_PROP: dict[str, str] = {
+    "h5ad_none": "h5ad_path",
+    "h5ad_gzip": "h5ad_gzip_path",
+    "h5ad_lzf": "h5ad_lzf_path",
+    "zarr_zstd": "zarr_zstd_path",
+    "zarr_lz4": "zarr_lz4_path",
+    "tiledb_soma": "soma_path",
+    "scx_auto": "scx_auto_path",
+    "scx_scx1": "scx_scx1_path",
+    "scx_zstd": "scx_zstd_path",
+    "scx_none": "scx_none_path",
+    "bpcells": "bpcells_path",
+    "parquet_zstd": "parquet_path",
+}
+
 
 DATASETS: dict[str, DatasetConfig] = {
     "pbmc3k": DatasetConfig(
