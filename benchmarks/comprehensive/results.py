@@ -1,0 +1,177 @@
+"""
+Benchmark result schema and JSON writer utilities.
+
+All benchmark results are structured as JSON matching the schema defined in
+COMPREHENSIVE-BENCHMARKING.md §5.3. This module provides:
+
+  - ``BenchmarkResult``: dataclass for a single benchmark result
+  - ``write_result()``: write a result to the raw results directory
+  - ``load_result()``: load a result JSON file
+  - ``load_all_results()``: load all results for a given benchmark type
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import statistics
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from benchmarks.comprehensive.config import RAW_RESULTS_DIR
+from benchmarks.comprehensive.sysinfo import collect_system_info
+
+
+@dataclass
+class RunRecord:
+    """A single benchmark run measurement."""
+    wall_s: float
+    user_s: float = 0.0
+    sys_s: float = 0.0
+    peak_rss_mb: float = 0.0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BenchmarkResult:
+    """Structured benchmark result matching JSON schema from §5.3.
+
+    Example JSON output::
+
+        {
+          "benchmark": "read_full",
+          "format": "scx_auto",
+          "dataset": "census_1m",
+          "timestamp": "2026-03-25T10:00:00",
+          "system": { "hostname": "...", "cpu": "...", "ram_gb": 2113 },
+          "runs": [
+            { "wall_s": 12.491, "user_s": 11.2, "sys_s": 1.1, "peak_rss_mb": 264.2 },
+            ...
+          ],
+          "median_wall_s": 12.491,
+          "file_size_bytes": 2470000000
+        }
+    """
+    benchmark: str                         # Which benchmark (e.g. "read_full")
+    format: str                            # Format key (e.g. "scx_auto")
+    dataset: str                           # Dataset name (e.g. "census_1m")
+    runs: list[RunRecord] = field(default_factory=list)
+    file_size_bytes: int | None = None
+    timestamp: str = ""
+    system: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.timestamp:
+            self.timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+        if not self.system:
+            self.system = collect_system_info()
+
+    @property
+    def median_wall_s(self) -> float | None:
+        """Median wall-clock time across runs."""
+        if not self.runs:
+            return None
+        return statistics.median(r.wall_s for r in self.runs)
+
+    @property
+    def median_rss_mb(self) -> float | None:
+        """Median peak RSS across runs."""
+        if not self.runs:
+            return None
+        return statistics.median(r.peak_rss_mb for r in self.runs)
+
+    def add_run(
+        self,
+        wall_s: float,
+        user_s: float = 0.0,
+        sys_s: float = 0.0,
+        peak_rss_mb: float = 0.0,
+        **extra: Any,
+    ) -> None:
+        """Add a run measurement."""
+        self.runs.append(RunRecord(
+            wall_s=wall_s, user_s=user_s, sys_s=sys_s,
+            peak_rss_mb=peak_rss_mb, extra=extra,
+        ))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-compatible dict."""
+        d: dict[str, Any] = {
+            "benchmark": self.benchmark,
+            "format": self.format,
+            "dataset": self.dataset,
+            "timestamp": self.timestamp,
+            "system": self.system,
+            "runs": [asdict(r) for r in self.runs],
+            "median_wall_s": self.median_wall_s,
+        }
+        if self.file_size_bytes is not None:
+            d["file_size_bytes"] = self.file_size_bytes
+        if self.metadata:
+            d["metadata"] = self.metadata
+        return d
+
+
+def _result_filename(benchmark: str, format_key: str, dataset: str) -> str:
+    """Generate a consistent filename for a result JSON."""
+    return f"{benchmark}__{format_key}__{dataset}.json"
+
+
+def write_result(result: BenchmarkResult) -> Path:
+    """Write a BenchmarkResult to the raw results directory.
+
+    Returns the path to the written JSON file.
+    """
+    RAW_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = _result_filename(result.benchmark, result.format, result.dataset)
+    path = RAW_RESULTS_DIR / filename
+    with open(path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2, default=str)
+    return path
+
+
+def load_result(path: str | Path) -> dict[str, Any]:
+    """Load a single result JSON file."""
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_all_results(
+    benchmark: str | None = None,
+    format_key: str | None = None,
+    dataset: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load all matching result JSON files from the raw results directory.
+
+    Parameters
+    ----------
+    benchmark : filter to a specific benchmark type (e.g. "read_full")
+    format_key : filter to a specific format (e.g. "scx_auto")
+    dataset : filter to a specific dataset (e.g. "census_1m")
+
+    Returns
+    -------
+    List of result dicts, sorted by timestamp.
+    """
+    results = []
+    if not RAW_RESULTS_DIR.exists():
+        return results
+
+    for path in sorted(RAW_RESULTS_DIR.glob("*.json")):
+        try:
+            data = load_result(path)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if benchmark and data.get("benchmark") != benchmark:
+            continue
+        if format_key and data.get("format") != format_key:
+            continue
+        if dataset and data.get("dataset") != dataset:
+            continue
+
+        results.append(data)
+
+    return sorted(results, key=lambda d: d.get("timestamp", ""))

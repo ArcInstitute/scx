@@ -1,0 +1,57 @@
+# SCX Comprehensive Benchmark Suite — CPU Environment
+#
+# All CPU benchmarks: format comparisons, accelerators, lazy preprocessing,
+# correctness validation, ML data loaders.
+#
+# Create:   conda env create -f benchmarks/comprehensive/envs/scx-bench.yml
+# Activate: conda activate scx-bench
+# Build pyscx: cd pyscx && maturin develop --release && cd ..
+#
+# NOTE: pyscx is built from source inside the env; it is not a conda package.
+
+name: scx-bench
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.13
+
+  # Core single-cell stack
+  - anndata=0.12.7
+  - scanpy=1.12
+  - scipy=1.16.3
+  - numpy=2.2.0
+  - pandas=2.3.3
+  - h5py=3.16.0
+
+  # Format-specific
+  - zarr=3.1.5
+  - pyarrow=23.0.1
+  - tiledbsoma=2.3.0
+
+  # Analysis (for accelerator comparisons against scanpy)
+  - scikit-learn=1.8.0
+  - umap-learn=0.5.11
+  - leidenalg=0.11.0
+  - python-igraph=1.0.0
+
+  # Visualization
+  - matplotlib=3.10.8
+  - seaborn=0.13.2
+
+  # System monitoring
+  - psutil=7.2.2
+
+  # Build tooling (for pyscx from source)
+  - maturin>=1.5.0
+
+  # PyTorch (CPU-only — for ML data loader benchmarks)
+  - pytorch-cpu>=2.0
+
+  # pip-only packages
+  - pip:
+    - submitit>=1.5.0
+    # TileDB-SOMA-ML (separate package, not on conda-forge)
+    - tiledbsoma-ml>=0.1.0

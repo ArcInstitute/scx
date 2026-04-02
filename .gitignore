@@ -5,6 +5,7 @@ tmp/
 learn/
 data/*.h5ad
 benchmarks/logs/
+benchmarks/comprehensive/results/raw/
 
 # Rust
 /target/

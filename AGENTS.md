@@ -11,10 +11,9 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[SPEC.md](SPEC.md)** — Format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
 - **[ROADMAP.md](ROADMAP.md)** — Phased implementation plan (Phases 1–4).
 - **[Phase3.md](Phase3.md)** — Phase 3 plan (GPU, R bindings, CLI extensions — partially done).
-- **[Phase4.md](Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
-- **[Phase4-GPU.md](Phase4-GPU.md)** — Phase 4c GPU accelerator spec and benchmark results (cuSPARSE, cuVS/CAGRA, CUDA UMAP).
-- **[Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md)** — Code review of Phase 4b accelerator implementations.
-- **[Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)** — Phase 4d spec: materialization-free lazy preprocessing (ScxLazyTransformedDataset, column-projected streaming aggregation).
+- **[Phase4.md](./tasks/Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
+- **[Phase4-GPU.md](./tasks/Phase4-GPU.md)** — Phase 4c GPU accelerator spec and benchmark results (cuSPARSE, cuVS/CAGRA, CUDA UMAP).
+- **[Phase4-ACC-ALL.md](./tasks/Phase4-ACC-ALL.md)** — Phase 4d spec: materialization-free lazy preprocessing (ScxLazyTransformedDataset, column-projected streaming aggregation).
 - **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
@@ -182,7 +181,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **h5ad files are messy**: missing encoding-type attrs, CSC instead of CSR, dense X, pickled uns. Handle gracefully.
 - **tokio + rayon interaction** (scx-loader): Keep tokio for I/O only, rayon for CPU work. Bounded channels for back-pressure.
 - **Cloud auth**: `object_store` handles credentials via environment variables and instance metadata. No custom auth code.
-- **Known bugs**: See [Phase4_CODE-REVIEW.md](Phase4_CODE-REVIEW.md) for latest issues and fix priorities.
+- **Known bugs**: See [Phase4_CODE-REVIEW.md](tasks/Phase4_CODE-REVIEW.md) for latest issues and fix priorities.
 
 ## Known SPEC Discrepancies
 

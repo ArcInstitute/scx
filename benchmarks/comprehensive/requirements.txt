@@ -1,0 +1,49 @@
+# SCX Comprehensive Benchmark Suite — Pinned Dependencies
+# Generated from the project's .venv/ on 2026-03-30
+# Install: pip install -r requirements.txt
+#
+# NOTE: pyscx is built from source via `maturin develop --release`
+#       and is NOT listed here. See install_dependencies.sh.
+
+# Core single-cell stack
+anndata==0.12.7
+scanpy==1.12
+scipy==1.16.3
+numpy==2.2.0
+pandas==2.3.3
+h5py==3.16.0
+
+# Format-specific
+zarr==3.1.5
+pyarrow==23.0.1
+tiledbsoma==2.3.0
+
+# ML / training loader
+# torch==2.6.0+cu124 — installed separately (system-specific CUDA build); see install_dependencies.sh
+
+# Analysis dependencies (for accelerator comparisons)
+scikit-learn==1.8.0
+umap-learn==0.5.11
+leidenalg==0.11.0
+python-igraph==1.0.0
+
+# Visualization
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# System monitoring
+psutil==7.2.2
+
+# SLURM submission (optional — for programmatic job submission)
+submitit>=1.5.0
+
+# TileDB-SOMA ML loader (separate package)
+# tiledbsoma-ml==0.1.0
+# NOTE: Install separately if needed: pip install tiledbsoma-ml
+
+# scDataLoader (optional ML baseline)
+# scdataloader>=0.2.0
+# NOTE: Install separately if needed: pip install scdataloader
+
+# Build tooling
+maturin>=1.5.0

@@ -48,6 +48,15 @@
 | `test_to_anndata_integration.py` | Selective loading (var_names, obs_filter, layers) |
 | `test_h5ad_scx_equivalence.py` | h5ad ↔ SCX equivalence validation |
 | `test_accel.py` | Rust accelerators: PCA, kNN, UMAP, DE (Wilcoxon + streaming), pseudobulk, stratified DE |
+| `test_lazy_transform.py` | Lazy transform wrapper: slicing, aggregation through transforms, chaining |
+| `test_normalize_total.py` | `pyscx.accel.normalize_total()` correctness vs scanpy |
+| `test_log1p.py` | `pyscx.accel.log1p()` correctness vs scanpy |
+| `test_normalize_col_projection.py` | NormalizeTotal with column projection active |
+| `test_truediv_interception.py` | `__truediv__` lazy RowScale interception for backed/lazy datasets |
+| `test_mul_interception.py` | `__mul__` lazy RowScale interception |
+| `test_col_projected_agg.py` | Column-projected streaming aggregation (sum, nnz, var, max, min) |
+| `test_index_space_regression.py` | Deletion vector + transform index space correctness regression |
+| `test_b2_col_projection.py` | Column projection bug regression (streaming col aggregation) |
 | `conftest.py` | Shared pytest fixtures |
 
 ## Benchmarks

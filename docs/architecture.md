@@ -28,7 +28,7 @@ The workspace contains 14 crates (including `scx-integration-tests`). Dependenci
 ┌──────┴──────┐ ┌─────┴────┐ │    ┌─────────┴──┐   ┌──────┴──────┐  ┌────┴──────┐
 │ scx-engine  │ │ scx-ops  │ │    │ scx-cloud  │   │  scx-mtx    │  │ scx-accel │
 │ query engine│ │ file ops │ │    │ cloud ops  │   │ MTX I/O     │  │ PCA/kNN/  │
-└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘  └──┬─┬─────┘
+└──────┬──────┘ └─────┬────┘ │    └─────────┬──┘   └──────┬──────┘  └──┬─┬──────┘
        │              │      │              │             │            │ │ [gpu]
        │    ┌─────────┘  ┌───┴────────┐     │             │            │ │
        │    │            │ scx-loader │     │             │            │ │
@@ -36,11 +36,11 @@ The workspace contains 14 crates (including `scx-integration-tests`). Dependenci
        │    │            └───┬────────┘     │             │            │ │
        │    │                │              │             │            │ │
        └────┴────────────────┼──────────────┴─────────────┴────────────┘ │
-                             │                        ┌──────────┐      │
-                       ┌──────┴──────┐                 │  scx-gpu │◀─────┘
-                       │ scx-format  │                 │ GPU codec│
+                             │                         ┌───────────┐     │
+                       ┌──────┴──────┐                 │  scx-gpu  │◀────┘
+                       │ scx-format  │                 │ GPU codec │
                        └──────┬──────┘                 │ + analysis│
-                   ┌──────────┼─────────────────────────┴────┬─────┘
+                  ┌───────────┼────────────────────────┴────┬──────┘
                   │                     │
            ┌──────┴──────┐        ┌─────┴──────┐
            │  scx-codec  │        │ scx-sparse │
@@ -65,7 +65,7 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (randomized SVD), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
 | **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA), `gpu_umap` (CUDA SGD), `gpu_preprocess` (fused normalize+log1p), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
-| **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess` |
+| **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess`, `lazy_transform`, `projected_agg` |
 | **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
 
 > [!NOTE]
@@ -652,7 +652,8 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 - [api.md](api.md) — API reference for Rust, Python, and CLI
 - [scanpy.md](scanpy.md) — Scanpy integration, backed mode, and accelerator usage
 - [ROADMAP.md](../ROADMAP.md) — Phased implementation plan
-- [Phase4.md](../Phase4.md) — Phase 4 plan (scanpy parity + Rust-native accelerators)
-- [Phase4-GPU.md](../Phase4-GPU.md) — Phase 4c GPU accelerator specification
+- [Phase4.md](../tasks/Phase4.md) — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete)
+- [Phase4-GPU.md](../tasks/Phase4-GPU.md) — Phase 4c GPU accelerator specification and benchmark results
+- [Phase4-ACC-ALL.md](../tasks/Phase4-ACC-ALL.md) — Phase 4d spec: lazy preprocessing, streaming PCA, non-materializing filters
 - [Phase3.md](../Phase3.md) — Phase 3 specification (GPU, R, multimodal)
 - [testing.md](testing.md) — Test infrastructure and benchmarks
