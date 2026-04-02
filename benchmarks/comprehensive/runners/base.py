@@ -8,6 +8,7 @@ this interface so the orchestrator can treat them uniformly.
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import resource
 import time
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -186,9 +189,20 @@ class FormatRunner(ABC):
 
     @staticmethod
     def _get_rss_mb() -> float:
-        """Current max RSS in MB (Linux only)."""
-        # ru_maxrss is in KB on Linux
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        """Current RSS in MB (Linux: /proc/self/statm, fallback: ru_maxrss).
+
+        Uses /proc/self/statm to get the *current* resident set size rather
+        than the process-lifetime high-water mark (ru_maxrss), so that
+        per-operation measurements are not inflated by earlier operations.
+        """
+        try:
+            with open("/proc/self/statm") as f:
+                # Field 1 is resident pages
+                pages = int(f.read().split()[1])
+            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        except (OSError, IndexError, ValueError):
+            # Fallback for non-Linux platforms
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
     @staticmethod
     def _get_cpu_times() -> tuple[float, float]:
@@ -196,11 +210,13 @@ class FormatRunner(ABC):
         r = resource.getrusage(resource.RUSAGE_SELF)
         return r.ru_utime, r.ru_stime
 
-    @staticmethod
-    def _drop_caches() -> bool:
+    _drop_caches_warned = False
+
+    @classmethod
+    def _drop_caches(cls) -> bool:
         """Attempt to drop OS page caches (requires root/sudo).
 
-        Returns True if successful.
+        Returns True if successful.  Logs a warning on the first failure.
         """
         try:
             os.system("sync")
@@ -208,6 +224,12 @@ class FormatRunner(ABC):
                 f.write("3\n")
             return True
         except (PermissionError, OSError):
+            if not cls._drop_caches_warned:
+                logger.warning(
+                    "Failed to drop page caches (requires root). "
+                    "Cold-cache benchmark results may be unreliable."
+                )
+                cls._drop_caches_warned = True
             return False
 
     @staticmethod
@@ -230,8 +252,11 @@ class FormatRunner(ABC):
         """Run ``fn(*args, **kwargs)`` and return (result, TimingResult).
 
         Measures wall-clock time, user+sys CPU time, and peak RSS.
+        RSS is sampled before and after the operation; the maximum of the
+        two is reported as the peak for this operation.
         """
         self._gc_collect()
+        rss_before = self._get_rss_mb()
         u0, s0 = self._get_cpu_times()
         t0 = time.perf_counter()
 
@@ -239,13 +264,13 @@ class FormatRunner(ABC):
 
         wall = time.perf_counter() - t0
         u1, s1 = self._get_cpu_times()
-        rss = self._get_rss_mb()
+        rss_after = self._get_rss_mb()
 
         return result, TimingResult(
             wall_s=wall,
             user_s=u1 - u0,
             sys_s=s1 - s0,
-            peak_rss_mb=rss,
+            peak_rss_mb=max(rss_before, rss_after),
         )
 
     def __repr__(self) -> str:

@@ -13,17 +13,18 @@ BenchmarkResult with per-run ``extra`` dicts tagging the scenario name.
 
 from __future__ import annotations
 
+import gc
 import logging
 import statistics
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 
 from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
+    N_WARMUP_RUNS,
     QUERY_N_CELLS,
     QUERY_N_HVGS,
     RANDOM_SEED,
@@ -139,6 +140,12 @@ def run(
         result.file_size_bytes = convert_result.output_size_bytes
 
     try:
+        # -- Warm-up run(s) --
+        for i in range(N_WARMUP_RUNS):
+            logger.info("Warm-up run %d/%d", i + 1, N_WARMUP_RUNS)
+            runner.read_subset(output_path, cell_indices=cell_idx, gene_indices=gene_idx)
+            gc.collect()
+
         scenario_times: dict[str, list[float]] = {}
 
         for scenario_name, c_idx, g_idx in scenarios:

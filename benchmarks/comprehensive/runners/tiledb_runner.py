@@ -79,10 +79,8 @@ class TileDBRunner(FormatRunner):
             with tiledbsoma.Experiment.open(str(path)) as exp:
                 query = exp.axis_query("RNA")
                 adata = query.to_anndata(X_name="data")
-                # Force materialization of the sparse matrix
-                X = adata.X
-                if hasattr(X, "toarray"):
-                    X.toarray()
+                # Access X to force materialization into memory
+                _ = adata.X
 
         _, timing = self.timed_run(_read)
         return timing

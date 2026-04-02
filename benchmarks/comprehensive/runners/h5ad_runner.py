@@ -70,11 +70,8 @@ class H5adRunner(FormatRunner):
     def read_full(self, path: str | Path) -> TimingResult:
         def _read():
             adata = anndata.read_h5ad(str(path))
-            X = adata.X
-            if sp.issparse(X):
-                X.toarray()
-            else:
-                _ = X.shape
+            # Access X to force full read into memory (CSR or dense)
+            _ = adata.X
 
         _, timing = self.timed_run(_read)
         return timing

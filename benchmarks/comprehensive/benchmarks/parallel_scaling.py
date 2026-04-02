@@ -6,15 +6,22 @@ support parallel I/O (primarily SCX via rayon). For each thread count in
 THREAD_COUNTS, performs n_runs full-file reads and records wall time,
 then computes speedup and parallel efficiency relative to single-threaded
 performance.
+
+Each thread count is run in a **separate subprocess** so that thread pools
+(rayon, OpenBLAS, etc.) are created fresh with the correct thread count.
+Setting env vars in-process has no effect once these pools are initialized.
 """
 
 from __future__ import annotations
 
-import gc
+import json
 import logging
 import os
 import statistics
+import subprocess
+import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 from benchmarks.comprehensive.config import (
@@ -38,27 +45,97 @@ _THREAD_ENV_VARS = [
     "NUMEXPR_MAX_THREADS",
 ]
 
+# Inline worker script executed in a subprocess for each thread count.
+# Reads from the converted file, performs warm-up + timed runs, and
+# prints JSON timing results to stdout.
+_WORKER_SCRIPT = textwrap.dedent("""\
+    import gc
+    import json
+    import sys
 
-def _set_thread_count(thread_count: int) -> dict[str, str | None]:
-    """Set thread-pool environment variables and return the previous values.
+    n_warmup = int(sys.argv[1])
+    n_runs = int(sys.argv[2])
+    converted_path = sys.argv[3]
+    runner_name = sys.argv[4]
+    runner_params_json = sys.argv[5]
+    cold_cache = sys.argv[6] == "true"
 
-    Returns a dict mapping env var name to its previous value (or None if
-    it was unset), so the caller can restore them later.
+    runner_params = json.loads(runner_params_json)
+
+    from benchmarks.comprehensive.runners import make_runner
+    from benchmarks.comprehensive.config import FormatVariant
+
+    # Build a minimal FormatVariant just to instantiate the runner.
+    fmt = FormatVariant(
+        name="worker", key="worker", runner=runner_name, params=runner_params,
+    )
+    runner = make_runner(fmt)
+
+    # Warm-up
+    for _ in range(n_warmup):
+        runner.read_full(converted_path)
+        gc.collect()
+
+    # Timed runs
+    results = []
+    for _ in range(n_runs):
+        if cold_cache:
+            runner._drop_caches()
+        gc.collect()
+        timing = runner.read_full(converted_path)
+        results.append(timing.to_dict())
+
+    print(json.dumps(results))
+""")
+
+
+def _run_with_thread_count(
+    thread_count: int,
+    n_warmup: int,
+    n_runs: int,
+    converted_path: Path,
+    format_variant: FormatVariant,
+    cold_cache: bool,
+) -> list[dict]:
+    """Run read_full in a subprocess with the given thread count.
+
+    Returns a list of TimingResult dicts (one per timed run).
     """
-    prev: dict[str, str | None] = {}
+    env = os.environ.copy()
     for var in _THREAD_ENV_VARS:
-        prev[var] = os.environ.get(var)
-        os.environ[var] = str(thread_count)
-    return prev
+        env[var] = str(thread_count)
 
+    proc = subprocess.run(
+        [
+            sys.executable, "-c", _WORKER_SCRIPT,
+            str(n_warmup),
+            str(n_runs),
+            str(converted_path),
+            format_variant.runner,
+            json.dumps(format_variant.params),
+            "true" if cold_cache else "false",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=3600,
+    )
 
-def _restore_thread_env(prev: dict[str, str | None]) -> None:
-    """Restore environment variables to their previous values."""
-    for var, val in prev.items():
-        if val is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = val
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Parallel scaling worker failed (threads={thread_count}, "
+            f"exit={proc.returncode}).\n"
+            f"--- stderr ---\n{proc.stderr}\n"
+            f"--- stdout ---\n{proc.stdout}"
+        )
+
+    try:
+        return json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse worker JSON output: {exc}\n"
+            f"--- stdout ---\n{proc.stdout}"
+        ) from exc
 
 
 def run(
@@ -136,30 +213,27 @@ def run(
                 thread_count, format_variant.key, dataset.name,
             )
 
-            prev_env = _set_thread_count(thread_count)
-            try:
-                for i in range(N_WARMUP_RUNS):
-                    runner.read_full(_converted)
-                    gc.collect()
+            timing_dicts = _run_with_thread_count(
+                thread_count=thread_count,
+                n_warmup=N_WARMUP_RUNS,
+                n_runs=n_runs,
+                converted_path=_converted,
+                format_variant=format_variant,
+                cold_cache=cold_cache,
+            )
 
-                wall_times: list[float] = []
-                for i in range(n_runs):
-                    if cold_cache:
-                        runner._drop_caches()
-                    gc.collect()
+            wall_times: list[float] = []
+            for td in timing_dicts:
+                result.add_run(
+                    wall_s=td["wall_s"], user_s=td.get("user_s", 0.0),
+                    sys_s=td.get("sys_s", 0.0),
+                    peak_rss_mb=td.get("peak_rss_mb", 0.0),
+                    threads=thread_count,
+                )
+                wall_times.append(td["wall_s"])
 
-                    timing = runner.read_full(_converted)
-                    result.add_run(
-                        wall_s=timing.wall_s, user_s=timing.user_s,
-                        sys_s=timing.sys_s, peak_rss_mb=timing.peak_rss_mb,
-                        threads=thread_count,
-                    )
-                    wall_times.append(timing.wall_s)
-
-                median_wall = statistics.median(wall_times)
-                scaling_summary[str(thread_count)] = round(median_wall, 6)
-            finally:
-                _restore_thread_env(prev_env)
+            median_wall = statistics.median(wall_times)
+            scaling_summary[str(thread_count)] = round(median_wall, 6)
 
         baseline = scaling_summary.get("1")
         speedup: dict[str, float] = {}

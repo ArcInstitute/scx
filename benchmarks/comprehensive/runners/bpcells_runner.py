@@ -107,13 +107,14 @@ class BPCellsRunner(FormatRunner):
         stdout = proc.stdout.strip()
         # Find the last JSON object in case R prints warnings before it.
         brace_start = stdout.rfind("{")
-        if brace_start == -1:
+        brace_end = stdout.rfind("}")
+        if brace_start == -1 or brace_end == -1 or brace_end < brace_start:
             raise RuntimeError(
                 f"BPCells R script produced no JSON output.\n"
                 f"--- stdout ---\n{stdout}\n"
                 f"--- stderr ---\n{proc.stderr}"
             )
-        json_str = stdout[brace_start:]
+        json_str = stdout[brace_start:brace_end + 1]
 
         try:
             return json.loads(json_str)

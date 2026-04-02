@@ -126,9 +126,7 @@ class ParquetRunner(FormatRunner):
 
     def read_full(self, path: str | Path) -> TimingResult:
         def _read():
-            csr = self._read_csr(path)
-            # Force materialization
-            csr.toarray()
+            self._read_csr(path)
 
         _, timing = self.timed_run(_read)
         return timing

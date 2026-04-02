@@ -14,14 +14,10 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
-
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.runners import make_runner
 
-if TYPE_CHECKING:
-    pass
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +84,7 @@ def run(
     )
 
     # Use pre-converted file if available, otherwise convert to temp dir.
+    convert_result = None
     if converted_path is not None and Path(converted_path).exists():
         converted_bytes = runner.file_size(converted_path)
     else:
@@ -125,8 +122,9 @@ def run(
         },
     )
     # Add a single "run" recording the conversion time for reference.
-    result.add_run(
-        wall_s=convert_result.wall_s,
-        peak_rss_mb=convert_result.peak_rss_mb,
-    )
+    if convert_result is not None:
+        result.add_run(
+            wall_s=convert_result.wall_s,
+            peak_rss_mb=convert_result.peak_rss_mb,
+        )
     return result

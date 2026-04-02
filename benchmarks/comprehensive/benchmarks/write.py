@@ -14,30 +14,10 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.runners import make_runner
 from benchmarks.comprehensive.runners.base import FormatRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _make_runner(fmt: FormatVariant) -> FormatRunner:
-    """Instantiate the runner for *fmt*."""
-    from benchmarks.comprehensive.runners.h5ad_runner import H5adRunner
-    from benchmarks.comprehensive.runners.zarr_runner import ZarrRunner
-    from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
-    from benchmarks.comprehensive.runners.scx_runner import ScxRunner
-    from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
-    from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
-
-    runners: dict[str, type[FormatRunner]] = {
-        "h5ad_runner": H5adRunner,
-        "zarr_runner": ZarrRunner,
-        "tiledb_runner": TileDBRunner,
-        "scx_runner": ScxRunner,
-        "bpcells_runner": BPCellsRunner,
-        "parquet_runner": ParquetRunner,
-    }
-    cls = runners[fmt.runner]
-    return cls(**fmt.params)
 
 
 def run(
@@ -63,7 +43,7 @@ def run(
     -------
     BenchmarkResult with benchmark="write".
     """
-    runner = _make_runner(format_variant)
+    runner = make_runner(format_variant)
     h5ad_path = dataset.h5ad_path
     source_h5ad_bytes = os.path.getsize(h5ad_path)
 
