@@ -12,3 +12,6 @@ scx-engine = { path = "../../scx-engine" }
 scx-sparse = { path = "../../scx-sparse" }
 tempfile = { workspace = true }
 arrow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }

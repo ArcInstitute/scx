@@ -136,6 +136,10 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 | Script | Partition | Resources | Time | Purpose |
 |--------|-----------|-----------|------|---------|
 | `run_benchmarks_slurm.sh` | `cpu` | 16 CPUs, 80 GB | 4 h | All-in-one (compression + write + read + ops + query + ML loader; submits 3 sub-jobs) |
+| `slurm_phase0_baseline.sh` | `cpu` | 32 CPUs, 80 GB | 2 h/job | Phase 0 regression baseline D1–D4 (submits 24 parallel jobs + archival) |
+| `slurm_phase0_baseline_large.sh` | varies | 32 CPUs, 80–500 GB | 2–4 h/job | Phase 0 regression baseline D5–D7 (submits 18 parallel jobs + archival) |
+| `slurm_phase3_small.sh` | `cpu` | 32 CPUs, 80 GB | 6 h | Phase 3 benchmarks D1–D4 (sequential, single job) |
+| `slurm_phase3_large.sh` | `cpu_high_mem` | 32 CPUs, 500 GB | 12 h | Phase 3 benchmarks D5–D7 (sequential, single job) |
 | `slurm_fused_bench.sh` | `cpu` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
 | `slurm_lazy_preprocess_bench.sh` | `cpu` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
 
@@ -170,6 +174,9 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 ---
 
 ## Submitting SLURM Jobs
+
+> [!IMPORTANT]
+> **Always prefer parallel job submission over sequential single-job scripts.** Each independent (benchmark, dataset) combination should be submitted as a separate SLURM job so they run concurrently across cluster nodes. This dramatically reduces wall-clock time (e.g., 24 parallel jobs finishing in ~2h vs one sequential job taking ~4h). Use `--dependency=afterok:$JOB1:$JOB2:...` for any post-processing that must wait for all benchmarks to complete (e.g., archiving results). Scale memory per dataset — not every job needs the largest allocation. See `slurm_phase0_baseline.sh` and `slurm_phase0_baseline_large.sh` for the reference pattern.
 
 ### Basic submission
 
