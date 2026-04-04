@@ -10,7 +10,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use scx_codec::{CodecId, ValueEncoding};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry, ShardStats};
-use crate::checksum::{blake3_hash, blake3_truncated_64};
+use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::section::{align_to_8, SectionType};
@@ -374,13 +374,15 @@ impl ScxWriter {
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;
 
-        // Compute shard-level checksum: blake3 of (indptr + indices + values + block_index), truncated to 8 bytes
-        let mut payload_for_checksum = Vec::new();
-        payload_for_checksum.extend_from_slice(&encoded.indptr_bytes);
-        payload_for_checksum.extend_from_slice(&encoded.indices_bytes);
-        payload_for_checksum.extend_from_slice(&encoded.values_bytes);
-        payload_for_checksum.extend_from_slice(&block_index_bytes);
-        let shard_checksum = blake3_truncated_64(&payload_for_checksum);
+        // Compute shard-level checksum: streaming blake3 of (indptr + indices + values + block_index), truncated to 8 bytes
+        let mut shard_hasher = blake3::Hasher::new();
+        shard_hasher.update(&encoded.indptr_bytes);
+        shard_hasher.update(&encoded.indices_bytes);
+        shard_hasher.update(&encoded.values_bytes);
+        shard_hasher.update(&block_index_bytes);
+        let shard_hash = shard_hasher.finalize();
+        let mut shard_checksum = [0u8; 8];
+        shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
 
         // Build shard header with relative offsets
         let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
@@ -424,15 +426,30 @@ impl ScxWriter {
         let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
         shard_header.write_to(&mut header_buf)?;
 
-        // Compute section-level BLAKE3 (full 32-byte) of all written bytes
-        let mut section_data = Vec::new();
-        section_data.extend_from_slice(&header_buf);
-        section_data.extend_from_slice(&payload_for_checksum);
-        let section_checksum = blake3_hash(&section_data);
-        let section_length = section_data.len() as u64;
+        // Compute section-level BLAKE3 (full 32-byte) via streaming hasher — no section_data Vec needed
+        let mut section_hasher = blake3::Hasher::new();
 
-        // Write to file
-        self.writer()?.write_all(&section_data)?;
+        section_hasher.update(&header_buf);
+        self.writer()?.write_all(&header_buf)?;
+
+        section_hasher.update(&encoded.indptr_bytes);
+        self.writer()?.write_all(&encoded.indptr_bytes)?;
+
+        section_hasher.update(&encoded.indices_bytes);
+        self.writer()?.write_all(&encoded.indices_bytes)?;
+
+        section_hasher.update(&encoded.values_bytes);
+        self.writer()?.write_all(&encoded.values_bytes)?;
+
+        section_hasher.update(&block_index_bytes);
+        self.writer()?.write_all(&block_index_bytes)?;
+
+        let section_checksum = *section_hasher.finalize().as_bytes();
+        let section_length = (header_buf.len()
+            + encoded.indptr_bytes.len()
+            + encoded.indices_bytes.len()
+            + encoded.values_bytes.len()
+            + block_index_bytes.len()) as u64;
         self.current_offset += section_length;
 
         // Compute shard stats from raw values
@@ -585,11 +602,7 @@ impl ScxWriter {
         // Pad to 4096 bytes
         root_buf.resize(4096, 0);
 
-        // 3. pwrite root catalog at offset 256
-        file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
-        file.write_all(&root_buf)?;
-
-        // 4. Update header fields
+        // 3. Update header fields (checksum=0 placeholder for hashing)
         self.header.root_catalog_offset = HEADER_SIZE as u64;
         self.header.root_catalog_length = root_catalog_length;
         self.header.full_catalog_offset = full_catalog_offset;
@@ -597,10 +610,9 @@ impl ScxWriter {
         self.header.n_csr_shards = self.csr_shard_count;
         self.header.n_csc_shards = self.csc_shard_count;
         self.header.nnz = self.total_nnz;
-        self.header.file_checksum = 0; // placeholder for first write
-                                       // Auto-set flags based on what was written
+        self.header.file_checksum = 0;
         if self.csc_shard_count > 0 {
-            self.header.set_csc(); // has_csc (bit 0)
+            self.header.set_csc();
         }
         if self.has_obsm {
             self.header.set_obsm();
@@ -609,30 +621,42 @@ impl ScxWriter {
             self.header.set_obsp();
         }
 
-        // 5. pwrite header at offset 0
-        file.seek(SeekFrom::Start(0))?;
-        self.header.write_to(&mut file)?;
+        // 4. Compute file checksum: hash header + root catalog from memory,
+        //    re-read only section bytes from file, hash full catalog from memory.
+        //    This avoids re-reading the entire file and writes the header only once.
+        let mut header_bytes = Vec::with_capacity(HEADER_SIZE);
+        self.header.write_to(&mut header_bytes)?;
 
-        // 6. Compute file checksum: stream entire file through blake3
+        let mut final_hasher = blake3::Hasher::new();
+        final_hasher.update(&header_bytes); // 256 bytes from memory
+        final_hasher.update(&root_buf); // 4096 bytes (padded) from memory
+
+        // Re-read section bytes (offset 4352 to full_catalog_offset) from file
         file.flush()?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut hasher = blake3::Hasher::new();
+        file.seek(SeekFrom::Start(SECTIONS_START_OFFSET))?;
+        let mut remaining = (full_catalog_offset - SECTIONS_START_OFFSET) as usize;
         let mut chunk = [0u8; 65536];
-        loop {
+        while remaining > 0 {
             use std::io::Read;
-            let n = file.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&chunk[..n]);
+            let to_read = remaining.min(chunk.len());
+            file.read_exact(&mut chunk[..to_read])?;
+            final_hasher.update(&chunk[..to_read]);
+            remaining -= to_read;
         }
-        let file_hash = hasher.finalize();
+
+        final_hasher.update(&catalog_buf); // full catalog from memory
+
+        let file_hash = final_hasher.finalize();
         let file_checksum = u64::from_le_bytes(file_hash.as_bytes()[..8].try_into().unwrap());
 
-        // 7. Rewrite header with computed checksum
+        // 5. Write header with correct checksum (written only once)
         self.header.file_checksum = file_checksum;
         file.seek(SeekFrom::Start(0))?;
         self.header.write_to(&mut file)?;
+
+        // 6. Write root catalog at offset 256
+        file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        file.write_all(&root_buf)?;
 
         // 8. fsync
         file.sync_all()?;

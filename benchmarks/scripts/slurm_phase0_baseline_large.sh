@@ -27,10 +27,12 @@ echo ""
 BENCHMARKS=(compression write read_full read_selective parallel_scaling memory)
 
 # Per-dataset resource configuration: "dataset:partition:memory:time"
+# census_5m is excluded — requires too many resources for routine baseline runs.
+# To include it, uncomment the census_5m line below.
 DATASET_CONFIGS=(
     "census_500k:cpu:80G:4:00:00"
     "census_1m:cpu:160G:8:00:00"
-    "census_5m:cpu_high_mem:500G:12:00:00"
+    # "census_5m:cpu_high_mem:500G:12:00:00"
 )
 
 JOB_IDS=()

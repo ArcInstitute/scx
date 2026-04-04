@@ -905,27 +905,30 @@ pub fn from_anndata_impl(
 
     let nnz = data_slice.len() as u64;
 
-    // Detect value encoding
-    let value_encoding = detect_value_encoding(data_slice);
+    // Determine index dtype
+    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
 
-    // Encode values to raw bytes
-    let values_bytes = encode_values(data_slice, value_encoding);
-
-    // Determine effective codec: auto-select or use explicit
-    let effective_codec = match explicit_codec {
+    // Peek at first shard's data to set file header codec_id (informational only;
+    // readers use the per-shard header). Per-shard encoding/codec selection
+    // happens inside the shard loop below.
+    let first_shard_nnz_end = if n_obs as usize > 0 {
+        indptr_slice[(shard_target_rows as usize).min(n_obs as usize)] as usize
+    } else {
+        0
+    };
+    let first_shard_data = &data_slice[..first_shard_nnz_end];
+    let first_encoding = detect_value_encoding(first_shard_data);
+    let first_values = encode_values(first_shard_data, first_encoding);
+    let header_codec = match explicit_codec {
         Some(codec_id) => {
-            // Explicit codec — fall back to Zstd if Scx1 on floats
-            if codec_id == CodecId::Scx1 && !value_encoding.is_integer() {
+            if codec_id == CodecId::Scx1 && !first_encoding.is_integer() {
                 CodecId::Zstd
             } else {
                 codec_id
             }
         }
-        None => select_codec(&values_bytes, value_encoding),
+        None => select_codec(&first_values, first_encoding),
     };
-
-    // Determine index dtype
-    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
 
     // Build FileHeader
     let header = FileHeader {
@@ -939,7 +942,7 @@ pub fn from_anndata_impl(
         n_csr_shards: 0,
         n_csc_shards: 0,
         shard_target_rows,
-        codec_id: effective_codec as u8,
+        codec_id: header_codec as u8,
         index_dtype,
         endian: 0,
         reserved_padding: 0,
@@ -1010,17 +1013,30 @@ pub fn from_anndata_impl(
             })
             .collect::<PyResult<Vec<u32>>>()?;
 
-        // Slice values bytes
-        let bw = value_encoding.byte_width();
-        let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
+        // Per-shard value encoding detection and byte conversion
+        let shard_data = &data_slice[nnz_start..nnz_end];
+        let shard_value_encoding = detect_value_encoding(shard_data);
+        let shard_values_bytes = encode_values(shard_data, shard_value_encoding);
+
+        // Per-shard codec selection
+        let shard_codec = match explicit_codec {
+            Some(codec_id) => {
+                if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
+                    CodecId::Zstd
+                } else {
+                    codec_id
+                }
+            }
+            None => select_codec(&shard_values_bytes, shard_value_encoding),
+        };
 
         writer
             .write_csr_shard(
                 &shard_indptr,
                 &shard_indices,
-                shard_values,
-                effective_codec,
-                value_encoding,
+                &shard_values_bytes,
+                shard_codec,
+                shard_value_encoding,
                 row_start as u64,
             )
             .map_err(to_pyerr)?;
@@ -1085,21 +1101,6 @@ pub fn from_anndata_impl(
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let l_value_encoding = detect_value_encoding(l_data_slice);
-        let l_values_bytes = encode_values(l_data_slice, l_value_encoding);
-
-        // Auto-select codec per layer independently, or use explicit
-        let l_effective_codec = match explicit_codec {
-            Some(codec_id) => {
-                if codec_id == CodecId::Scx1 && !l_value_encoding.is_integer() {
-                    CodecId::Zstd
-                } else {
-                    codec_id
-                }
-            }
-            None => select_codec(&l_values_bytes, l_value_encoding),
-        };
-
         let mut l_row_start: usize = 0;
         let mut shard_idx: u32 = 0;
         while l_row_start < n_obs_usize {
@@ -1140,16 +1141,30 @@ pub fn from_anndata_impl(
                 })
                 .collect::<PyResult<Vec<u32>>>()?;
 
-            let l_bw = l_value_encoding.byte_width();
-            let l_shard_values = &l_values_bytes[l_nnz_start * l_bw..l_nnz_end * l_bw];
+            // Per-shard value encoding detection and byte conversion
+            let l_shard_data = &l_data_slice[l_nnz_start..l_nnz_end];
+            let l_shard_encoding = detect_value_encoding(l_shard_data);
+            let l_shard_values_bytes = encode_values(l_shard_data, l_shard_encoding);
+
+            // Per-shard codec selection
+            let l_shard_codec = match explicit_codec {
+                Some(codec_id) => {
+                    if codec_id == CodecId::Scx1 && !l_shard_encoding.is_integer() {
+                        CodecId::Zstd
+                    } else {
+                        codec_id
+                    }
+                }
+                None => select_codec(&l_shard_values_bytes, l_shard_encoding),
+            };
 
             writer
                 .write_layer_csr_shard(
                     &l_shard_indptr,
                     &l_shard_indices,
-                    l_shard_values,
-                    l_effective_codec,
-                    l_value_encoding,
+                    &l_shard_values_bytes,
+                    l_shard_codec,
+                    l_shard_encoding,
                     l_row_start as u64,
                     layer_name,
                     shard_idx,
