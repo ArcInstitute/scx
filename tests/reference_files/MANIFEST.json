@@ -1,0 +1,16 @@
+{
+  "algorithm": "blake3",
+  "files": {
+    "golden_none_f32.scx": "1ecf5345c9b1e692ffd40334e9417967180ba14dfe44aa30e50ef7d9ba76c4df",
+    "golden_none_u16.scx": "27765581a844f0fcc563bc36a60381332d2fecb3a84d65431152a2eda2b1e621",
+    "golden_none_u32.scx": "ff1c8bb2641500a2dd31d19b804acca509d9f4b7e905b5fc9942561908b5f089",
+    "golden_none_u8.scx": "d2661121b99282c65feabb58dd8e53e20c7bb393a8e516346216d39b81da1ffe",
+    "golden_scx1_u16.scx": "c0ec40e00a1455abf831bee26336d2c8ffd083b9172dd927f33b6a0f343e897a",
+    "golden_scx1_u32.scx": "db5b0bf618d531f17f1011f59b235ce8ab2732dff881a8c13f38000508ea1f6c",
+    "golden_scx1_u8.scx": "5417faff5872bbbee5527563a806f55067d4f9c435c6e36c1cd1bcfd6905c6cd",
+    "golden_zstd_f32.scx": "ee400e96795bdcfdaf5f6585954c41dab5e719fee87c35d5f4ea3d75b9b5813c",
+    "golden_zstd_u16.scx": "93d54468220d5df37702046ecfc9a00f308d85e6f98118a6d4d3b22718e50155",
+    "golden_zstd_u32.scx": "88229a255bedc16054c312080d564671138c9148b5ef2523f66d00fa5d34ec0b",
+    "golden_zstd_u8.scx": "30c215a6f68a41ce3b79741009a6de88fb9c9b34cd1a1a1ea2b0ce4fd8104aa6"
+  }
+}

@@ -26,6 +26,8 @@ scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
+rayon = { workspace = true }
+blake3 = { workspace = true }
 
 [features]
 cloud = ["scx-cloud", "tokio"]

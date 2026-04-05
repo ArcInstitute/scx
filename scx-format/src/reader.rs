@@ -14,7 +14,7 @@ use scx_sparse::ScxCsr;
 use rayon::prelude::*;
 
 use crate::catalog::{FullCatalog, FullCatalogEntry};
-use crate::checksum::{blake3_hash, blake3_truncated_64};
+use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::provenance::Provenance;
@@ -561,13 +561,15 @@ impl ScxReader {
             &section[sh.block_index_rel_offset as usize..][..sh.block_index_length as usize];
 
         if verify_checksum {
-            // Verify shard checksum
-            let mut payload = Vec::new();
-            payload.extend_from_slice(indptr_bytes);
-            payload.extend_from_slice(indices_bytes);
-            payload.extend_from_slice(values_bytes);
-            payload.extend_from_slice(block_index_bytes);
-            let computed = blake3_truncated_64(&payload);
+            // Verify shard checksum via streaming hasher (no payload Vec allocation)
+            let mut shard_hasher = blake3::Hasher::new();
+            shard_hasher.update(indptr_bytes);
+            shard_hasher.update(indices_bytes);
+            shard_hasher.update(values_bytes);
+            shard_hasher.update(block_index_bytes);
+            let hash = shard_hasher.finalize();
+            let mut computed = [0u8; 8];
+            computed.copy_from_slice(&hash.as_bytes()[..8]);
             if computed != sh.checksum {
                 return Err(ScxError::ChecksumMismatch);
             }

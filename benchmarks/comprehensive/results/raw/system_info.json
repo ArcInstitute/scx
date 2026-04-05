@@ -1,11 +1,11 @@
 {
-  "hostname": "GPU104C",
+  "hostname": "GPU3694",
   "os": "Linux 5.15.0-164-generic",
   "arch": "x86_64",
   "python_version": "3.13.3",
   "cpu": "Intel(R) Xeon(R) Platinum 8468",
   "cpu_cores_physical": 192,
-  "ram_gb": 2015,
+  "ram_gb": 1007,
   "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
   "library_versions": {
     "anndata": "0.12.7",

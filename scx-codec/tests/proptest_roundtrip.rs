@@ -224,4 +224,50 @@ proptest! {
         prop_assert_eq!(&d_ix, &indices);
         prop_assert_eq!(&d_v, &values);
     }
+
+    /// Regression guard for Phase 1B: mixed per-shard encodings through
+    /// the full encode→decode roundtrip. Shard 1 uses uint8, shard 2 uses
+    /// uint16 — both with Scx1 codec.
+    #[test]
+    fn dispatch_scx1_mixed_u8_u16_roundtrip(
+        data_u8 in arb_csr(25, 20, ValueEncoding::Uint8),
+        data_u16 in arb_csr(25, 20, ValueEncoding::Uint16),
+    ) {
+        // Shard 1: uint8 encoding
+        let (ip1, ix1, v1, nr1, nnz1, u16_1) = data_u8;
+        let enc1 = encode_shard(&ip1, &ix1, &v1, CodecId::Scx1, ValueEncoding::Uint8, u16_1).unwrap();
+        let (d_ip1, d_ix1, d_v1) = decode_shard(&enc1, CodecId::Scx1, ValueEncoding::Uint8, nr1, nnz1, u16_1).unwrap();
+        prop_assert_eq!(&d_ip1, &ip1);
+        prop_assert_eq!(&d_ix1, &ix1);
+        prop_assert_eq!(&d_v1, &v1);
+
+        // Shard 2: uint16 encoding
+        let (ip2, ix2, v2, nr2, nnz2, u16_2) = data_u16;
+        let enc2 = encode_shard(&ip2, &ix2, &v2, CodecId::Scx1, ValueEncoding::Uint16, u16_2).unwrap();
+        let (d_ip2, d_ix2, d_v2) = decode_shard(&enc2, CodecId::Scx1, ValueEncoding::Uint16, nr2, nnz2, u16_2).unwrap();
+        prop_assert_eq!(&d_ip2, &ip2);
+        prop_assert_eq!(&d_ix2, &ix2);
+        prop_assert_eq!(&d_v2, &v2);
+    }
+
+    /// Mixed encoding with Zstd codec (uint8 + uint32).
+    #[test]
+    fn dispatch_zstd_mixed_u8_u32_roundtrip(
+        data_u8 in arb_csr(25, 20, ValueEncoding::Uint8),
+        data_u32 in arb_csr(25, 20, ValueEncoding::Uint32),
+    ) {
+        let (ip1, ix1, v1, nr1, nnz1, u16_1) = data_u8;
+        let enc1 = encode_shard(&ip1, &ix1, &v1, CodecId::Zstd, ValueEncoding::Uint8, u16_1).unwrap();
+        let (d_ip1, d_ix1, d_v1) = decode_shard(&enc1, CodecId::Zstd, ValueEncoding::Uint8, nr1, nnz1, u16_1).unwrap();
+        prop_assert_eq!(&d_ip1, &ip1);
+        prop_assert_eq!(&d_ix1, &ix1);
+        prop_assert_eq!(&d_v1, &v1);
+
+        let (ip2, ix2, v2, nr2, nnz2, u16_2) = data_u32;
+        let enc2 = encode_shard(&ip2, &ix2, &v2, CodecId::Zstd, ValueEncoding::Uint32, u16_2).unwrap();
+        let (d_ip2, d_ix2, d_v2) = decode_shard(&enc2, CodecId::Zstd, ValueEncoding::Uint32, nr2, nnz2, u16_2).unwrap();
+        prop_assert_eq!(&d_ip2, &ip2);
+        prop_assert_eq!(&d_ix2, &ix2);
+        prop_assert_eq!(&d_v2, &v2);
+    }
 }

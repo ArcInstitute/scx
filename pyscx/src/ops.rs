@@ -182,7 +182,7 @@ pub fn append_from_anndata(
 
     // Extract CSR from adata.X
     let x = adata.getattr("X")?;
-    let x_csr = anndata::ensure_csr(py, &x)?;
+    let (x_csr, _csr_validated) = anndata::ensure_csr(py, &x)?;
 
     // Get shape and validate n_vars match
     let shape: (u64, u64) = x_csr.getattr("shape")?.extract()?;

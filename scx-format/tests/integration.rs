@@ -901,3 +901,103 @@ fn test_18_8_u32_index_dtype() {
     let expected_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
     assert_eq!(csr.indices, expected_indices);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1B: Mixed per-shard value encoding round-trip
+// ---------------------------------------------------------------------------
+
+/// Write a file with two shards using different value encodings (Uint8 and
+/// Uint16) and verify the reader correctly decodes both shards.
+#[test]
+fn test_mixed_value_encoding_shards() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mixed_encoding.scx");
+
+    let n_rows_per_shard = 100;
+    let n_obs = n_rows_per_shard * 2;
+    let n_vars = 500;
+
+    // Shard 1: values in [1, 200] → Uint8
+    let mut indptr1 = vec![0u64];
+    let mut indices1 = Vec::new();
+    let mut values1_u8 = Vec::new();
+    for row in 0..n_rows_per_shard {
+        let col0 = (row * 2) % n_vars;
+        let col1 = (row * 2 + 1) % n_vars;
+        indices1.push(col0 as u32);
+        indices1.push(col1 as u32);
+        values1_u8.push(((row % 200) + 1) as u8);
+        values1_u8.push(((row % 200) + 2) as u8);
+        indptr1.push(indptr1.last().unwrap() + 2);
+    }
+
+    // Shard 2: values in [256, 60000] → Uint16
+    let mut indptr2 = vec![0u64];
+    let mut indices2 = Vec::new();
+    let mut values2_u16_bytes = Vec::new();
+    let mut expected_values2_f32 = Vec::new();
+    for row in 0..n_rows_per_shard {
+        let col0 = (row * 2) % n_vars;
+        let col1 = (row * 2 + 1) % n_vars;
+        indices2.push(col0 as u32);
+        indices2.push(col1 as u32);
+        let v0 = (row * 100 + 256) as u16;
+        let v1 = (row * 100 + 356) as u16;
+        values2_u16_bytes.extend_from_slice(&v0.to_le_bytes());
+        values2_u16_bytes.extend_from_slice(&v1.to_le_bytes());
+        expected_values2_f32.push(v0 as f32);
+        expected_values2_f32.push(v1 as f32);
+        indptr2.push(indptr2.last().unwrap() + 2);
+    }
+
+    let total_nnz = (n_obs * 2) as u64;
+    let header = sample_header(n_obs as u64, n_vars as u64, total_nnz);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // Write shard 1 as Uint8
+    writer
+        .write_csr_shard(
+            &indptr1,
+            &indices1,
+            &values1_u8,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Write shard 2 as Uint16
+    writer
+        .write_csr_shard(
+            &indptr2,
+            &indices2,
+            &values2_u16_bytes,
+            CodecId::Scx1,
+            ValueEncoding::Uint16,
+            n_rows_per_shard as u64,
+        )
+        .unwrap();
+
+    writer.finish().unwrap();
+
+    // Read back and verify
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.header().file_checksum != 0,
+        "file checksum should be non-zero"
+    );
+
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape, (n_obs, n_vars));
+    assert_eq!(csr.data.len(), n_obs * 2);
+
+    // Verify shard 1 values (uint8 range)
+    let expected1: Vec<f32> = values1_u8.iter().map(|&v| v as f32).collect();
+    assert_eq!(&csr.data[..n_rows_per_shard * 2], &expected1[..]);
+
+    // Verify shard 2 values (uint16 range)
+    assert_eq!(&csr.data[n_rows_per_shard * 2..], &expected_values2_f32[..]);
+}
