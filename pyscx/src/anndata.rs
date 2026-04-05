@@ -922,9 +922,8 @@ fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult
         }
     }
 
-    let n_vars_i32 = n_vars as i32;
     for (i, &idx) in indices.iter().enumerate() {
-        if idx < 0 || idx >= n_vars_i32 {
+        if idx < 0 || (idx as u64) >= n_vars {
             return Err(PyRuntimeError::new_err(format!(
                 "CSR index {} out of valid range [0, {}) at position {}",
                 idx, n_vars, i
@@ -1176,6 +1175,13 @@ pub fn from_anndata_impl(
     let n_obs = shape.0;
     let n_vars = shape.1;
 
+    if n_vars > u32::MAX as u64 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n_vars ({n_vars}) exceeds u32::MAX; SCX format requires n_vars <= {}",
+            u32::MAX
+        )));
+    }
+
     // Extract CSR arrays — skip .astype() when dtypes already match (1C.1)
     let np = py.import("numpy")?;
 
@@ -1291,6 +1297,11 @@ pub fn from_anndata_impl(
         while row_start < n_obs_usize {
             let row_end = (row_start + shard_rows).min(n_obs_usize);
             let base = indptr_slice[row_start];
+            if !csr_validated && base < 0 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "negative indptr value {base} at row {row_start}"
+                )));
+            }
             boundaries.push(ShardBoundary {
                 row_start,
                 row_end,
@@ -1409,6 +1420,11 @@ pub fn from_anndata_impl(
             while l_row_start < n_obs_usize {
                 let l_row_end = (l_row_start + shard_rows).min(n_obs_usize);
                 let l_base = l_indptr_slice[l_row_start];
+                if !l_csr_validated && l_base < 0 {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "layer '{layer_name}': negative indptr value {l_base} at row {l_row_start}"
+                    )));
+                }
                 l_boundaries.push(ShardBoundary {
                     row_start: l_row_start,
                     row_end: l_row_end,
