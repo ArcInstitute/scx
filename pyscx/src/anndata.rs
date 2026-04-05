@@ -7,10 +7,17 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::io::Cursor;
+use std::sync::Arc;
 
+use rayon::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::MAGIC;
-use scx_format::{select_codec, FileHeader, ProvenanceEntry, ScxReader, ScxWriter};
+use scx_format::section::SectionType;
+use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
+use scx_format::{
+    compute_shard_stats, select_codec, FileHeader, PreEncodedSection, ProvenanceEntry, ScxReader,
+    ScxWriter,
+};
 
 use crate::to_pyerr;
 
@@ -834,29 +841,319 @@ pub(crate) fn pandas_to_record_batch(
 }
 
 /// Ensure X is a CSR matrix; convert from dense or CSC if needed.
+/// Extract a matrix as CSR, avoiding unnecessary copies when possible (1C.1/1C.5).
+///
+/// Returns `(csr, pre_validated)`:
+/// - `csr`: A `scipy.sparse.csr_matrix` with sorted indices
+/// - `pre_validated`: If true, the input was already CSR and the caller can
+///   skip per-element validation in the shard loop (after calling
+///   [`validate_csr_arrays`]).
 pub(crate) fn ensure_csr<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let is_sparse = scipy_sparse
         .call_method1("issparse", (x,))?
         .extract::<bool>()?;
 
     if !is_sparse {
-        // Dense → CSR
-        return scipy_sparse.call_method1("csr_matrix", (x,));
+        // Dense → CSR (no bypass)
+        let csr = scipy_sparse.call_method1("csr_matrix", (x,))?;
+        return Ok((csr, false));
     }
 
     let format: String = x.getattr("format")?.extract()?;
-    if format == "csr" {
-        // Already CSR, ensure canonical form
-        let result = x.call_method0("sorted_indices")?;
-        Ok(result)
-    } else {
-        // CSC or other → CSR
-        x.call_method0("tocsr")
+    if format != "csr" {
+        // CSC or other → CSR (no bypass)
+        let csr = x.call_method0("tocsr")?;
+        return Ok((csr, false));
     }
+
+    // Already CSR — ensure sorted indices without copying.
+    // .sort_indices() sorts in-place (no copy) vs .sorted_indices() which
+    // creates a full copy of the sparse matrix.
+    let has_sorted: bool = x.getattr("has_sorted_indices")?.extract()?;
+    if !has_sorted {
+        x.call_method0("sort_indices")?;
+    }
+
+    Ok((x.clone(), true))
+}
+
+/// Call `.astype(target_dtype)` only if the array's dtype doesn't already match.
+/// Avoids Python call overhead when dtype is already correct (common for h5ad CSR).
+fn astype_if_needed<'py>(
+    arr: &Bound<'py, PyAny>,
+    np: &Bound<'py, PyModule>,
+    target_dtype: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dtype_name: String = arr.getattr("dtype")?.getattr("name")?.extract()?;
+    if dtype_name == target_dtype {
+        Ok(arr.clone())
+    } else {
+        arr.call_method1("astype", (np.getattr(target_dtype)?,))
+    }
+}
+
+/// Fast upfront validation of CSR arrays (1C.2).
+///
+/// Single O(nnz) pass checking:
+/// - indptr is monotonically non-decreasing with indptr\[0\] >= 0
+/// - All indices are non-negative and < n_vars
+///
+/// When this passes, the shard loop can skip per-element validation.
+fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult<()> {
+    if !indptr.is_empty() && indptr[0] < 0 {
+        return Err(PyRuntimeError::new_err(format!(
+            "negative indptr value {} at position 0",
+            indptr[0]
+        )));
+    }
+    for i in 1..indptr.len() {
+        if indptr[i] < indptr[i - 1] {
+            return Err(PyRuntimeError::new_err(format!(
+                "non-monotonic indptr: value {} at position {} < {} at position {}",
+                indptr[i],
+                i,
+                indptr[i - 1],
+                i - 1
+            )));
+        }
+    }
+
+    let n_vars_i32 = n_vars as i32;
+    for (i, &idx) in indices.iter().enumerate() {
+        if idx < 0 || idx >= n_vars_i32 {
+            return Err(PyRuntimeError::new_err(format!(
+                "CSR index {} out of valid range [0, {}) at position {}",
+                idx, n_vars, i
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 1D: Parallel shard encoding helpers
+// ---------------------------------------------------------------------------
+
+/// Shard boundary computed sequentially before parallel encoding.
+struct ShardBoundary {
+    row_start: usize,
+    row_end: usize,
+    nnz_start: usize,
+    nnz_end: usize,
+    indptr_base: i64,
+    shard_idx: u32,
+}
+
+/// Parallel-encode CSR shards using rayon.
+///
+/// Clones the numpy-borrowed arrays into Rust-owned `Arc` slices for thread
+/// safety, then encodes all shards in parallel under `py.allow_threads()`.
+/// Returns `PreEncodedSection`s in shard order, ready for sequential write.
+#[allow(clippy::too_many_arguments)]
+fn parallel_encode_csr_shards(
+    py: Python<'_>,
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    boundaries: &[ShardBoundary],
+    csr_validated: bool,
+    explicit_codec: Option<CodecId>,
+    index_dtype: u8,
+    n_vars: u32,
+    section_type: SectionType,
+    name_prefix: &str,
+) -> PyResult<Vec<PreEncodedSection>> {
+    if boundaries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Clone into Rust-owned Arc slices for Send + Sync across rayon threads.
+    let indptr_owned: Arc<[i64]> = indptr.to_vec().into();
+    let indices_owned: Arc<[i32]> = indices.to_vec().into();
+    let data_owned: Arc<[f32]> = data.to_vec().into();
+    let name_prefix = name_prefix.to_string();
+    let index_dtype_u16 = index_dtype == 0;
+
+    let result: Result<Vec<PreEncodedSection>, String> = py.allow_threads(|| {
+        boundaries
+            .par_iter()
+            .map(|b| {
+                // 1. Rebase indptr for this shard
+                let shard_indptr: Vec<u64> = if csr_validated {
+                    indptr_owned[b.row_start..=b.row_end]
+                        .iter()
+                        .map(|&v| (v - b.indptr_base) as u64)
+                        .collect()
+                } else {
+                    indptr_owned[b.row_start..=b.row_end]
+                        .iter()
+                        .map(|&v| {
+                            if v < b.indptr_base {
+                                Err(format!(
+                                    "indptr value {v} < base {} (non-monotonic)",
+                                    b.indptr_base
+                                ))
+                            } else {
+                                Ok((v - b.indptr_base) as u64)
+                            }
+                        })
+                        .collect::<Result<Vec<u64>, String>>()?
+                };
+
+                // 2. Convert indices i32 → u32
+                let shard_indices: Vec<u32> = if csr_validated {
+                    indices_owned[b.nnz_start..b.nnz_end]
+                        .iter()
+                        .map(|&v| v as u32)
+                        .collect()
+                } else {
+                    indices_owned[b.nnz_start..b.nnz_end]
+                        .iter()
+                        .map(|&v| {
+                            if v < 0 {
+                                Err(format!("negative CSR index {v}"))
+                            } else {
+                                Ok(v as u32)
+                            }
+                        })
+                        .collect::<Result<Vec<u32>, String>>()?
+                };
+
+                // 3. Detect value encoding and encode values
+                let shard_data = &data_owned[b.nnz_start..b.nnz_end];
+                let shard_value_encoding = detect_value_encoding(shard_data);
+                let shard_values_bytes = encode_values(shard_data, shard_value_encoding);
+
+                // 4. Select codec
+                let shard_codec = match explicit_codec {
+                    Some(codec_id) => {
+                        if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
+                            CodecId::Zstd
+                        } else {
+                            codec_id
+                        }
+                    }
+                    None => select_codec(&shard_values_bytes, shard_value_encoding),
+                };
+
+                // 5. Encode shard
+                let encoded = scx_codec::encode_shard(
+                    &shard_indptr,
+                    &shard_indices,
+                    &shard_values_bytes,
+                    shard_codec,
+                    shard_value_encoding,
+                    index_dtype_u16,
+                )
+                .map_err(|e| format!("encode_shard failed: {e}"))?;
+
+                // 6. Build block index (Phase 1: single entry covering entire shard)
+                let n_major = (shard_indptr.len() - 1) as u32;
+                let nnz = *shard_indptr.last().unwrap_or(&0);
+                let block_index = BlockIndex {
+                    entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz)
+                        .map_err(|e| format!("{e}"))?],
+                };
+                let mut block_index_bytes = Vec::new();
+                block_index
+                    .write_to(&mut block_index_bytes)
+                    .map_err(|e| format!("{e}"))?;
+
+                // 7. Shard-level checksum (8-byte truncated BLAKE3)
+                let mut shard_hasher = blake3::Hasher::new();
+                shard_hasher.update(&encoded.indptr_bytes);
+                shard_hasher.update(&encoded.indices_bytes);
+                shard_hasher.update(&encoded.values_bytes);
+                shard_hasher.update(&block_index_bytes);
+                let shard_hash = shard_hasher.finalize();
+                let mut shard_checksum = [0u8; 8];
+                shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
+
+                // 8. Build ShardHeader with relative offsets
+                let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
+                let indptr_length = encoded.indptr_bytes.len() as u32;
+                let indices_rel_offset = indptr_rel_offset + indptr_length;
+                let indices_length = encoded.indices_bytes.len() as u32;
+                let values_rel_offset = indices_rel_offset + indices_length;
+                let values_length = encoded.values_bytes.len() as u32;
+                let block_index_rel_offset = values_rel_offset + values_length;
+                let block_index_length = block_index_bytes.len() as u32;
+
+                let shard_header = ShardHeader {
+                    magic: SHARD_MAGIC,
+                    shard_format_version: 1,
+                    shard_type: 0, // CSR
+                    codec_id: shard_codec as u8,
+                    value_encoding: shard_value_encoding as u8,
+                    index_dtype,
+                    reserved_flags: [0; 3],
+                    n_major,
+                    n_minor: n_vars,
+                    nnz,
+                    global_offset: b.row_start as u64,
+                    indptr_rel_offset,
+                    indptr_length,
+                    indices_rel_offset,
+                    indices_length,
+                    values_rel_offset,
+                    values_length,
+                    block_index_rel_offset,
+                    block_index_length,
+                    checksum: shard_checksum,
+                };
+
+                let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
+                shard_header
+                    .write_to(&mut header_buf)
+                    .map_err(|e| format!("{e}"))?;
+
+                // 9. Section-level checksum (full 32-byte BLAKE3)
+                let mut section_hasher = blake3::Hasher::new();
+                section_hasher.update(&header_buf);
+                section_hasher.update(&encoded.indptr_bytes);
+                section_hasher.update(&encoded.indices_bytes);
+                section_hasher.update(&encoded.values_bytes);
+                section_hasher.update(&block_index_bytes);
+                let section_checksum = *section_hasher.finalize().as_bytes();
+
+                let section_length = (header_buf.len()
+                    + encoded.indptr_bytes.len()
+                    + encoded.indices_bytes.len()
+                    + encoded.values_bytes.len()
+                    + block_index_bytes.len()) as u64;
+
+                // 10. Compute shard stats
+                let stats = compute_shard_stats(
+                    &shard_values_bytes,
+                    shard_value_encoding,
+                    b.row_start as u64,
+                    n_major as u64,
+                    nnz,
+                );
+
+                let name = format!("{name_prefix}_shard_{}", b.shard_idx);
+
+                Ok(PreEncodedSection {
+                    encoded,
+                    block_index_bytes,
+                    header_buf,
+                    section_checksum,
+                    section_length,
+                    stats,
+                    name,
+                    section_type,
+                    nnz,
+                })
+            })
+            .collect()
+    });
+
+    result.map_err(PyRuntimeError::new_err)
 }
 
 /// Implementation of from_anndata: extract data from AnnData and write SCX.
@@ -870,40 +1167,46 @@ pub fn from_anndata_impl(
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
 
-    // Extract X as CSR
+    // Extract X as CSR (1C.1: smart extraction avoids .sorted_indices() copy)
     let x = adata.getattr("X")?;
-    let x_csr = ensure_csr(py, &x)?;
+    let (x_csr, csr_validated) = ensure_csr(py, &x)?;
 
     // Get shape
     let shape: (u64, u64) = x_csr.getattr("shape")?.extract()?;
     let n_obs = shape.0;
     let n_vars = shape.1;
 
-    // Extract CSR arrays — ensure proper dtypes
+    // Extract CSR arrays — skip .astype() when dtypes already match (1C.1)
     let np = py.import("numpy")?;
 
     let indptr_obj = x_csr.getattr("indptr")?;
-    let indptr_arr = indptr_obj.call_method1("astype", (np.getattr("int64")?,))?;
+    let indptr_arr = astype_if_needed(&indptr_obj, &np, "int64")?;
     let indptr: PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
     let indptr_slice = indptr
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let indices_obj = x_csr.getattr("indices")?;
-    let indices_arr = indices_obj.call_method1("astype", (np.getattr("int32")?,))?;
+    let indices_arr = astype_if_needed(&indices_obj, &np, "int32")?;
     let indices: PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
     let indices_slice = indices
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let data_obj = x_csr.getattr("data")?;
-    let data_arr = data_obj.call_method1("astype", (np.getattr("float32")?,))?;
+    let data_arr = astype_if_needed(&data_obj, &np, "float32")?;
     let data: PyReadonlyArray1<'_, f32> = data_arr.extract()?;
     let data_slice = data
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let nnz = data_slice.len() as u64;
+
+    // 1C.2: Fast upfront validation when CSR bypass is active.
+    // After this, the shard loop can skip per-element checks.
+    if csr_validated {
+        validate_csr_arrays(indptr_slice, indices_slice, n_vars)?;
+    }
 
     // Determine index dtype
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
@@ -963,112 +1266,104 @@ pub fn from_anndata_impl(
     // Write obs — always write even for 0-cell datasets to preserve column schema (finding 9.7).
     let obs_df = adata.getattr("obs")?;
     let obs_batch = pandas_to_record_batch(py, &obs_df)?;
-    writer.write_obs(&obs_batch).map_err(to_pyerr)?;
 
     // Write var — always write even for 0-gene datasets to preserve column schema (finding 9.7).
     let var_df = adata.getattr("var")?;
     let var_batch = pandas_to_record_batch(py, &var_df)?;
-    writer.write_var(&var_batch).map_err(to_pyerr)?;
 
-    // Write CSR shards
+    // 1E.2: Write obs/var outside GIL (pure Rust Arrow IPC serialization + I/O)
+    py.allow_threads(|| {
+        writer.write_obs(&obs_batch)?;
+        writer.write_var(&var_batch)?;
+        Ok::<(), scx_format::ScxError>(())
+    })
+    .map_err(to_pyerr)?;
+
+    // Write CSR shards (1D: parallel shard encoding)
     let n_obs_usize = n_obs as usize;
     let shard_rows = shard_target_rows as usize;
 
-    let mut row_start: usize = 0;
-    while row_start < n_obs_usize {
-        let row_end = (row_start + shard_rows).min(n_obs_usize);
-
-        // Rebase indptr for this shard (finding 9.2: validate non-negative).
-        let base = indptr_slice[row_start];
-        if base < 0 {
-            return Err(PyRuntimeError::new_err(format!(
-                "negative indptr value {base} at row {row_start}"
-            )));
+    // 1D.1: Compute shard boundaries sequentially
+    let mut boundaries = Vec::new();
+    {
+        let mut row_start: usize = 0;
+        let mut shard_idx: u32 = 0;
+        while row_start < n_obs_usize {
+            let row_end = (row_start + shard_rows).min(n_obs_usize);
+            let base = indptr_slice[row_start];
+            boundaries.push(ShardBoundary {
+                row_start,
+                row_end,
+                nnz_start: base as usize,
+                nnz_end: indptr_slice[row_end] as usize,
+                indptr_base: base,
+                shard_idx,
+            });
+            row_start = row_end;
+            shard_idx += 1;
         }
-        let shard_indptr: Vec<u64> = indptr_slice[row_start..=row_end]
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(PyRuntimeError::new_err(format!(
-                        "indptr value {v} < base {base} (non-monotonic)"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<PyResult<Vec<u64>>>()?;
-
-        let nnz_start = base as usize;
-        let nnz_end = indptr_slice[row_end] as usize;
-
-        // Convert indices from i32 to u32 (finding 9.2: validate non-negative).
-        let shard_indices: Vec<u32> = indices_slice[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                if v < 0 {
-                    Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
-                } else {
-                    Ok(v as u32)
-                }
-            })
-            .collect::<PyResult<Vec<u32>>>()?;
-
-        // Per-shard value encoding detection and byte conversion
-        let shard_data = &data_slice[nnz_start..nnz_end];
-        let shard_value_encoding = detect_value_encoding(shard_data);
-        let shard_values_bytes = encode_values(shard_data, shard_value_encoding);
-
-        // Per-shard codec selection
-        let shard_codec = match explicit_codec {
-            Some(codec_id) => {
-                if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
-                    CodecId::Zstd
-                } else {
-                    codec_id
-                }
-            }
-            None => select_codec(&shard_values_bytes, shard_value_encoding),
-        };
-
-        writer
-            .write_csr_shard(
-                &shard_indptr,
-                &shard_indices,
-                &shard_values_bytes,
-                shard_codec,
-                shard_value_encoding,
-                row_start as u64,
-            )
-            .map_err(to_pyerr)?;
-
-        row_start = row_end;
     }
 
-    // Write obsm
+    // 1D.2+1D.3: Parallel encode + sequential write
+    let pre_encoded = parallel_encode_csr_shards(
+        py,
+        indptr_slice,
+        indices_slice,
+        data_slice,
+        &boundaries,
+        csr_validated,
+        explicit_codec,
+        index_dtype,
+        n_vars as u32,
+        SectionType::CsrShard,
+        "X",
+    )?;
+    for section in pre_encoded {
+        writer.write_preencoded_shard(section).map_err(to_pyerr)?;
+    }
+
+    // 1E.2: Collect obsm RecordBatches under GIL
     let obsm = adata.getattr("obsm")?;
     let obsm_keys: Vec<String> = py
         .import("builtins")?
         .call_method1("list", (obsm.call_method0("keys")?,))?
         .extract()?;
-    for key in &obsm_keys {
-        let arr = obsm.call_method1("__getitem__", (key,))?;
-        // Wrap numpy array in a pandas DataFrame, then convert to RecordBatch
-        let pd = py.import("pandas")?;
-        let df = pd.call_method1("DataFrame", (&arr,))?;
-        let batch = pandas_to_record_batch(py, &df)?;
-        writer.write_obsm(key, &batch).map_err(to_pyerr)?;
-    }
+    let obsm_batches: Vec<(String, RecordBatch)> = obsm_keys
+        .iter()
+        .map(|key| {
+            let arr = obsm.call_method1("__getitem__", (key,))?;
+            let pd = py.import("pandas")?;
+            let df = pd.call_method1("DataFrame", (&arr,))?;
+            let batch = pandas_to_record_batch(py, &df)?;
+            Ok((key.clone(), batch))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
 
-    // Write uns
+    // 1E.2: Collect uns JSON under GIL
     let uns = adata.getattr("uns")?;
     let uns_len: usize = uns.call_method0("__len__")?.extract()?;
-    if uns_len > 0 {
+    let uns_json: Option<serde_json::Value> = if uns_len > 0 {
         let json_mod = py.import("json")?;
         let json_str: String = json_mod.call_method1("dumps", (&uns,))?.extract()?;
-        let json_val: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse uns JSON: {}", e)))?;
-        writer.write_uns(&json_val).map_err(to_pyerr)?;
-    }
+        Some(
+            serde_json::from_str(&json_str)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse uns JSON: {}", e)))?,
+        )
+    } else {
+        None
+    };
+
+    // 1E.2: Write obsm and uns outside GIL (pure Rust)
+    py.allow_threads(|| {
+        for (key, batch) in &obsm_batches {
+            writer.write_obsm(key, batch)?;
+        }
+        if let Some(ref json_val) = uns_json {
+            writer.write_uns(json_val)?;
+        }
+        Ok::<(), scx_format::ScxError>(())
+    })
+    .map_err(to_pyerr)?;
 
     // Write layers
     let layers = adata.getattr("layers")?;
@@ -1078,101 +1373,70 @@ pub fn from_anndata_impl(
         .extract()?;
     for layer_name in &layer_keys {
         let layer_x = layers.call_method1("__getitem__", (layer_name,))?;
-        let layer_csr = ensure_csr(py, &layer_x)?;
+        let (layer_csr, l_csr_validated) = ensure_csr(py, &layer_x)?;
 
         let l_indptr_obj = layer_csr.getattr("indptr")?;
-        let l_indptr_arr = l_indptr_obj.call_method1("astype", (np.getattr("int64")?,))?;
+        let l_indptr_arr = astype_if_needed(&l_indptr_obj, &np, "int64")?;
         let l_indptr: PyReadonlyArray1<'_, i64> = l_indptr_arr.extract()?;
         let l_indptr_slice = l_indptr
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let l_indices_obj = layer_csr.getattr("indices")?;
-        let l_indices_arr = l_indices_obj.call_method1("astype", (np.getattr("int32")?,))?;
+        let l_indices_arr = astype_if_needed(&l_indices_obj, &np, "int32")?;
         let l_indices: PyReadonlyArray1<'_, i32> = l_indices_arr.extract()?;
         let l_indices_slice = l_indices
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let l_data_obj = layer_csr.getattr("data")?;
-        let l_data_arr = l_data_obj.call_method1("astype", (np.getattr("float32")?,))?;
+        let l_data_arr = astype_if_needed(&l_data_obj, &np, "float32")?;
         let l_data: PyReadonlyArray1<'_, f32> = l_data_arr.extract()?;
         let l_data_slice = l_data
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let mut l_row_start: usize = 0;
-        let mut shard_idx: u32 = 0;
-        while l_row_start < n_obs_usize {
-            let l_row_end = (l_row_start + shard_rows).min(n_obs_usize);
+        // 1C.2: Upfront validation for layer bypass
+        if l_csr_validated {
+            validate_csr_arrays(l_indptr_slice, l_indices_slice, n_vars)?;
+        }
 
-            let l_base = l_indptr_slice[l_row_start];
-            if l_base < 0 {
-                return Err(PyRuntimeError::new_err(format!(
-                    "layer '{layer_name}': negative indptr value {l_base} at row {l_row_start}"
-                )));
-            }
-            let l_shard_indptr: Vec<u64> = l_indptr_slice[l_row_start..=l_row_end]
-                .iter()
-                .map(|&v| {
-                    if v < l_base {
-                        Err(PyRuntimeError::new_err(format!(
-                            "layer '{layer_name}': indptr value {v} < base {l_base} (non-monotonic)"
-                        )))
-                    } else {
-                        Ok((v - l_base) as u64)
-                    }
-                })
-                .collect::<PyResult<Vec<u64>>>()?;
-
-            let l_nnz_start = l_base as usize;
-            let l_nnz_end = l_indptr_slice[l_row_end] as usize;
-
-            let l_shard_indices: Vec<u32> = l_indices_slice[l_nnz_start..l_nnz_end]
-                .iter()
-                .map(|&v| {
-                    if v < 0 {
-                        Err(PyRuntimeError::new_err(format!(
-                            "layer '{layer_name}': negative CSR index {v}"
-                        )))
-                    } else {
-                        Ok(v as u32)
-                    }
-                })
-                .collect::<PyResult<Vec<u32>>>()?;
-
-            // Per-shard value encoding detection and byte conversion
-            let l_shard_data = &l_data_slice[l_nnz_start..l_nnz_end];
-            let l_shard_encoding = detect_value_encoding(l_shard_data);
-            let l_shard_values_bytes = encode_values(l_shard_data, l_shard_encoding);
-
-            // Per-shard codec selection
-            let l_shard_codec = match explicit_codec {
-                Some(codec_id) => {
-                    if codec_id == CodecId::Scx1 && !l_shard_encoding.is_integer() {
-                        CodecId::Zstd
-                    } else {
-                        codec_id
-                    }
-                }
-                None => select_codec(&l_shard_values_bytes, l_shard_encoding),
-            };
-
-            writer
-                .write_layer_csr_shard(
-                    &l_shard_indptr,
-                    &l_shard_indices,
-                    &l_shard_values_bytes,
-                    l_shard_codec,
-                    l_shard_encoding,
-                    l_row_start as u64,
-                    layer_name,
+        // 1D: Parallel shard encoding for layers
+        let mut l_boundaries = Vec::new();
+        {
+            let mut l_row_start: usize = 0;
+            let mut shard_idx: u32 = 0;
+            while l_row_start < n_obs_usize {
+                let l_row_end = (l_row_start + shard_rows).min(n_obs_usize);
+                let l_base = l_indptr_slice[l_row_start];
+                l_boundaries.push(ShardBoundary {
+                    row_start: l_row_start,
+                    row_end: l_row_end,
+                    nnz_start: l_base as usize,
+                    nnz_end: l_indptr_slice[l_row_end] as usize,
+                    indptr_base: l_base,
                     shard_idx,
-                )
-                .map_err(to_pyerr)?;
+                });
+                l_row_start = l_row_end;
+                shard_idx += 1;
+            }
+        }
 
-            l_row_start = l_row_end;
-            shard_idx += 1;
+        let l_pre_encoded = parallel_encode_csr_shards(
+            py,
+            l_indptr_slice,
+            l_indices_slice,
+            l_data_slice,
+            &l_boundaries,
+            l_csr_validated,
+            explicit_codec,
+            index_dtype,
+            n_vars as u32,
+            SectionType::LayerCsrShard,
+            layer_name,
+        )?;
+        for section in l_pre_encoded {
+            writer.write_preencoded_shard(section).map_err(to_pyerr)?;
         }
     }
 

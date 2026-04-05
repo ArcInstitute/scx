@@ -64,6 +64,32 @@ pub struct ScxWriter {
     has_obsp: bool,
 }
 
+/// Output of parallel shard encoding, ready for sequential write.
+///
+/// Contains all bytes and metadata needed to write a complete shard section
+/// without any re-encoding or re-computation. Built in parallel (e.g., via
+/// rayon) and consumed sequentially by [`ScxWriter::write_preencoded_shard`].
+pub struct PreEncodedSection {
+    /// The codec-compressed shard arrays (from `scx_codec::encode_shard`).
+    pub encoded: scx_codec::EncodedShard,
+    /// Serialized block index bytes.
+    pub block_index_bytes: Vec<u8>,
+    /// Serialized 76-byte shard header.
+    pub header_buf: Vec<u8>,
+    /// Full 32-byte BLAKE3 section checksum (header + all payload).
+    pub section_checksum: [u8; 32],
+    /// Total section length in bytes (header + indptr + indices + values + block_index).
+    pub section_length: u64,
+    /// Shard statistics computed from raw values.
+    pub stats: ShardStats,
+    /// Section name (e.g., "X_shard_0", "layer_name_shard_1").
+    pub name: String,
+    /// Section type (CsrShard, LayerCsrShard, etc.).
+    pub section_type: SectionType,
+    /// NNZ count for this shard.
+    pub nnz: u64,
+}
+
 impl ScxWriter {
     /// Create a new ScxWriter that will write to `path`.
     ///
@@ -506,6 +532,42 @@ impl ScxWriter {
         if section_type == SectionType::CsrShard {
             self.csr_shard_count += 1;
             self.total_nnz += nnz;
+        }
+
+        Ok(())
+    }
+
+    /// Write a pre-encoded shard section produced by parallel encoding.
+    ///
+    /// The encoding, checksums, and stats have all been computed in advance
+    /// (typically in parallel via rayon). This method only performs the
+    /// sequential I/O write and catalog entry bookkeeping.
+    pub fn write_preencoded_shard(&mut self, section: PreEncodedSection) -> Result<()> {
+        self.write_padding()?;
+
+        let shard_global_offset = self.current_offset;
+
+        let w = self.writer()?;
+        w.write_all(&section.header_buf)?;
+        w.write_all(&section.encoded.indptr_bytes)?;
+        w.write_all(&section.encoded.indices_bytes)?;
+        w.write_all(&section.encoded.values_bytes)?;
+        w.write_all(&section.block_index_bytes)?;
+
+        self.current_offset += section.section_length;
+
+        self.entries.push(FullCatalogEntry {
+            name: section.name,
+            offset: shard_global_offset,
+            length: section.section_length,
+            section_type: section.section_type,
+            checksum: section.section_checksum,
+            stats: Some(section.stats),
+        });
+
+        if section.section_type == SectionType::CsrShard {
+            self.csr_shard_count += 1;
+            self.total_nnz += section.nnz;
         }
 
         Ok(())

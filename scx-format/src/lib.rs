@@ -32,4 +32,4 @@ pub use shard::{
     SHARD_MAGIC,
 };
 pub use shard_source::ShardSource;
-pub use writer::{compute_shard_stats, ScxWriter, SECTIONS_START_OFFSET};
+pub use writer::{compute_shard_stats, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET};
