@@ -350,6 +350,33 @@ fn shard_ref_lz4shuffle_float32_roundtrip() {
 }
 
 // =========================================================================
+// FOR-BP SIMD path reference vector (Phase 2E)
+// =========================================================================
+
+#[test]
+fn forbp_ref_large_row_simd_roundtrip() {
+    // 200 sorted indices — exercises the BitPacker4x SIMD path (NNZ >= 128)
+    // Round-trip only (no exact byte checks — SIMD uses interleaved format)
+    let indices: Vec<u32> = (0..200).map(|i| i * 3).collect(); // [0, 3, 6, ..., 597]
+    let row_lengths = vec![200usize];
+    let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
+    let (dec_indices, dec_row_lengths) = forbp_decode(&encoded, 1, true).unwrap();
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_row_lengths, row_lengths);
+}
+
+#[test]
+fn forbp_ref_large_row_u32_simd_roundtrip() {
+    // Same test with u32 index mode
+    let indices: Vec<u32> = (0..256).map(|i| i * 100).collect();
+    let row_lengths = vec![256usize];
+    let encoded = forbp_encode(&indices, &row_lengths, false).unwrap();
+    let (dec_indices, dec_row_lengths) = forbp_decode(&encoded, 1, false).unwrap();
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_row_lengths, row_lengths);
+}
+
+// =========================================================================
 // Bitstream reference vectors
 // =========================================================================
 
