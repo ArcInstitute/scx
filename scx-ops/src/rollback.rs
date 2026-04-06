@@ -154,7 +154,7 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
     let mut buf = vec![0u8; total_catalog_len];
     file.read_exact(&mut buf)?;
 
-    let catalog = FullCatalog::read_from(&mut Cursor::new(&buf), total_catalog_len)?;
+    let catalog = FullCatalog::read_from(&mut Cursor::new(&buf), total_catalog_len, true)?;
     Ok((catalog, total_catalog_len as u64))
 }
 

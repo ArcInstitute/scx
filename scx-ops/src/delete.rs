@@ -35,7 +35,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         lock.seek(SeekFrom::Start(fc_offset))?;
         let mut buf = vec![0u8; fc_length as usize];
         std::io::Read::read_exact(&mut lock, &mut buf)?;
-        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize)?
+        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize, true)?
     };
 
     // Load existing deletion vectors if present

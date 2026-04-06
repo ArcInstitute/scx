@@ -25,13 +25,43 @@ fn to_pyerr(e: ScxError) -> PyErr {
 
 /// Open an SCX file and return a PyExperiment handle.
 ///
+/// Args:
+///     path: Path to the SCX file.
+///     verify: If True (default), verify the catalog BLAKE3 checksum on open.
+///         Set to False for performance-sensitive paths where the file is
+///         trusted (e.g., repeated reads of a file that was already validated).
+///
 /// Example:
 ///     exp = pyscx.open("data.scx")
 ///     adata = exp.to_anndata()
+///     # Fast open for trusted files:
+///     exp = pyscx.open("data.scx", verify=False)
 #[pyfunction]
-fn open(path: &str) -> PyResult<PyExperiment> {
-    let reader = scx_format::ScxReader::open(path).map_err(to_pyerr)?;
+#[pyo3(signature = (path, verify=true))]
+fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
+    let reader = if verify {
+        scx_format::ScxReader::open(path)
+    } else {
+        scx_format::ScxReader::open_unchecked(path)
+    }
+    .map_err(to_pyerr)?;
     Ok(PyExperiment::new(reader, std::path::PathBuf::from(path)))
+}
+
+/// Validate all section checksums in an SCX file.
+///
+/// Opens the file with full catalog verification, then checks every section's
+/// BLAKE3 checksum against the catalog. Returns a list of (section_name, passed)
+/// tuples. Raises RuntimeError if any essential section (obs, var, CsrShard) fails.
+///
+/// Example:
+///     results = pyscx.validate("data.scx")
+///     for name, passed in results:
+///         print(f"{name}: {'OK' if passed else 'FAIL'}")
+#[pyfunction]
+fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
+    let reader = scx_format::ScxReader::open(path).map_err(to_pyerr)?;
+    reader.validate().map_err(to_pyerr)
 }
 
 /// Convert an AnnData object to an SCX file.
@@ -116,6 +146,7 @@ fn to_mtx(scx_path: &str, output_dir: &str) -> PyResult<()> {
 fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;

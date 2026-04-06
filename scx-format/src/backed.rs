@@ -410,7 +410,7 @@ impl BackedCsrReader {
                             index: shard_idx,
                             count: self.sorted_entries.len(),
                         })?;
-                self.reader.read_shard_from_entry(entry)?
+                self.reader.read_shard_from_entry_unchecked(entry)?
             }
         };
         let n_rows = indptr.len().saturating_sub(1);
@@ -448,7 +448,7 @@ impl BackedCsrReader {
                             index: shard_idx,
                             count: self.sorted_entries.len(),
                         })?;
-                self.reader.read_shard_from_entry(entry)?
+                self.reader.read_shard_from_entry_unchecked(entry)?
             }
         };
         let n_rows = indptr.len().saturating_sub(1);

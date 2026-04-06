@@ -336,7 +336,12 @@ impl FullCatalog {
 
     /// Deserialize a full catalog. `total_len` is the total byte count
     /// (including the trailing 32-byte checksum) as indicated by the file header.
-    pub fn read_from<R: Read>(r: &mut R, total_len: usize) -> Result<Self> {
+    ///
+    /// When `verify_checksum` is `true`, the trailing BLAKE3 checksum is
+    /// validated before parsing. When `false`, the checksum bytes are still
+    /// consumed but not verified, which is useful for trusted-source reads
+    /// where catalog integrity is assumed.
+    pub fn read_from<R: Read>(r: &mut R, total_len: usize, verify_checksum: bool) -> Result<Self> {
         if total_len < 32 {
             return Err(ScxError::ChecksumMismatch);
         }
@@ -346,14 +351,16 @@ impl FullCatalog {
 
         let payload_len = total_len - 32;
         let payload = &all_bytes[..payload_len];
-        let expected_checksum = &all_bytes[payload_len..];
 
-        let computed = blake3_hash(payload);
-        if computed[..] != *expected_checksum {
-            return Err(ScxError::ChecksumMismatch);
+        if verify_checksum {
+            let expected_checksum = &all_bytes[payload_len..];
+            let computed = blake3_hash(payload);
+            if computed[..] != *expected_checksum {
+                return Err(ScxError::ChecksumMismatch);
+            }
         }
 
-        // Parse the verified payload
+        // Parse the payload
         let mut cur = std::io::Cursor::new(payload);
         let catalog_version = cur.read_u16::<LittleEndian>()?;
         let manifest_sequence = cur.read_u64::<LittleEndian>()?;
@@ -670,7 +677,7 @@ mod tests {
 
         let total_len = buf.len();
         let mut cursor = Cursor::new(&buf);
-        let decoded = FullCatalog::read_from(&mut cursor, total_len).unwrap();
+        let decoded = FullCatalog::read_from(&mut cursor, total_len, true).unwrap();
 
         assert_eq!(decoded.catalog_version, catalog.catalog_version);
         assert_eq!(decoded.manifest_sequence, catalog.manifest_sequence);
@@ -703,7 +710,7 @@ mod tests {
 
         let total_len = buf.len();
         let mut cursor = Cursor::new(&buf);
-        let err = FullCatalog::read_from(&mut cursor, total_len).unwrap_err();
+        let err = FullCatalog::read_from(&mut cursor, total_len, true).unwrap_err();
         assert!(matches!(err, ScxError::ChecksumMismatch));
     }
 
@@ -723,7 +730,7 @@ mod tests {
 
         let total_len = buf.len();
         let mut cursor = Cursor::new(&buf);
-        let decoded = FullCatalog::read_from(&mut cursor, total_len).unwrap();
+        let decoded = FullCatalog::read_from(&mut cursor, total_len, true).unwrap();
 
         assert_eq!(decoded.catalog_version, 1);
         assert_eq!(decoded.entries.len(), 0);

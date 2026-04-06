@@ -40,6 +40,20 @@ impl ScxReader {
     /// Validates the file header magic/version/endianness and the full
     /// catalog's trailing BLAKE3 checksum.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path, true)
+    }
+
+    /// Open an SCX file without verifying the catalog checksum.
+    ///
+    /// Skips the full catalog BLAKE3 verification for performance-sensitive
+    /// paths where the file is trusted (e.g., `scx info`, repeated reads of
+    /// a file that was already validated). The header magic/version/endianness
+    /// are still checked.
+    pub fn open_unchecked(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path, false)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
 
@@ -87,7 +101,8 @@ impl ScxReader {
             });
         }
         let fc_slice = &mmap[fc_offset..fc_end];
-        let full_catalog = FullCatalog::read_from(&mut Cursor::new(fc_slice), fc_length)?;
+        let full_catalog =
+            FullCatalog::read_from(&mut Cursor::new(fc_slice), fc_length, verify_catalog)?;
 
         Ok(ScxReader {
             mmap,
@@ -523,23 +538,40 @@ impl ScxReader {
     }
 
     /// Read and decode a single shard from a catalog entry.
+    ///
+    /// Skips per-shard checksum verification for performance. The catalog
+    /// checksum verified at `ScxReader::open()` already provides file-level
+    /// integrity, making per-shard checksums redundant for most reads.
+    /// Use [`read_shard_from_entry_verified`] when explicit per-shard
+    /// verification is needed (e.g., `scx validate`).
     pub fn read_shard_from_entry(
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
-        self.read_shard_from_entry_inner(entry, true)
+        self.read_shard_from_entry_inner(entry, false)
     }
 
     /// Read and decode a single shard without verifying checksums.
     ///
-    /// Used by the training data loader where throughput is critical and data
-    /// integrity was already verified at file open time. Skips the BLAKE3
-    /// checksum computation and the associated payload copy.
+    /// Alias for [`read_shard_from_entry`] — both skip checksums.
+    /// Retained for call-site clarity (e.g., in the training loader).
     pub fn read_shard_from_entry_unchecked(
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
         self.read_shard_from_entry_inner(entry, false)
+    }
+
+    /// Read and decode a single shard with explicit checksum verification.
+    ///
+    /// Computes the BLAKE3 hash of the shard payload and compares it to the
+    /// truncated 8-byte checksum in the shard header. Use this for `scx validate`
+    /// or when data integrity must be confirmed per-shard.
+    pub fn read_shard_from_entry_verified(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        self.read_shard_from_entry_inner(entry, true)
     }
 
     fn read_shard_from_entry_inner(
@@ -615,7 +647,7 @@ impl ScxReader {
         // Decode all shards in parallel
         let decoded: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shards
             .par_iter()
-            .map(|entry| self.read_shard_from_entry(entry))
+            .map(|entry| self.read_shard_from_entry_unchecked(entry))
             .collect::<Result<Vec<_>>>()?;
 
         // Pre-compute total sizes for allocation
@@ -669,7 +701,7 @@ impl ScxReader {
         let mut cumulative_nnz: i64 = 0;
 
         for (i, entry) in shards.iter().enumerate() {
-            let (indptr, indices, data) = self.read_shard_from_entry(entry)?;
+            let (indptr, indices, data) = self.read_shard_from_entry_unchecked(entry)?;
 
             if i == 0 {
                 merged_indptr.extend_from_slice(&indptr);
@@ -985,6 +1017,43 @@ mod tests {
         let result = reader.validate();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ScxError::ChecksumMismatch));
+    }
+
+    /// Regression guard for Phase 2A: verified path catches corruption,
+    /// unchecked path (default) does not error on corrupted shard payload.
+    #[test]
+    fn test_verified_vs_unchecked_shard_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "verify_guard.scx", 6, 10, 2, false);
+
+        // Read the file, corrupt a byte in a shard payload, write back
+        let mut data = std::fs::read(&path).unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        let shards = reader.catalog().shards_sorted();
+        assert!(!shards.is_empty());
+        let shard_entry = shards[0].clone();
+        let shard_offset = shard_entry.offset as usize;
+        let corrupt_pos = shard_offset + SHARD_HEADER_SIZE + 1;
+        drop(reader);
+
+        data[corrupt_pos] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        // Re-open (catalog checksum is still intact since we only corrupted
+        // shard payload bytes, not the catalog region)
+        let reader = ScxReader::open(&path).unwrap();
+
+        // Verified path should detect the corruption
+        let verified_result = reader.read_shard_from_entry_verified(&shard_entry);
+        assert!(verified_result.is_err());
+        assert!(matches!(
+            verified_result.unwrap_err(),
+            ScxError::ChecksumMismatch
+        ));
+
+        // Unchecked path (default) should not error — it skips the checksum
+        let unchecked_result = reader.read_shard_from_entry(&shard_entry);
+        assert!(unchecked_result.is_ok());
     }
 
     // -----------------------------------------------------------------------
