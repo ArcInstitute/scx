@@ -1,6 +1,10 @@
 {
   "algorithm": "blake3",
   "files": {
+    "golden_lz4shuffle_f32.scx": "eabe8a7770fe04db8b33bf72977b8a2c535952c2561fd9dd09b018a6581fba31",
+    "golden_lz4shuffle_u16.scx": "0b7912694d04b3ae1bc494cb7fe9b6efdb3525a1e9d6c775088959b3f2e7c000",
+    "golden_lz4shuffle_u32.scx": "85d24b445957f30e203b911a45c1bca16d0fd3c9df69501c4570467f35867cdf",
+    "golden_lz4shuffle_u8.scx": "9b08b9c08c24142324a12d44affa9520ca3d1c072b343b2b26f6d8f4c632d607",
     "golden_none_f32.scx": "1ecf5345c9b1e692ffd40334e9417967180ba14dfe44aa30e50ef7d9ba76c4df",
     "golden_none_u16.scx": "27765581a844f0fcc563bc36a60381332d2fecb3a84d65431152a2eda2b1e621",
     "golden_none_u32.scx": "ff1c8bb2641500a2dd31d19b804acca509d9f4b7e905b5fc9942561908b5f089",
