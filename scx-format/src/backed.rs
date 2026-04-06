@@ -190,9 +190,13 @@ pub struct BackedCsrReader {
     n_obs: usize,
     /// If set, this reader targets a specific layer rather than X.
     layer_name: Option<String>,
+    /// Pre-sorted catalog entries for X shards.
+    x_sorted_entries: Vec<FullCatalogEntry>,
     /// Pre-sorted catalog entries for layer shards (empty for X shards).
     sorted_entries: Vec<FullCatalogEntry>,
     cache: Option<Mutex<LruCache<usize, ScxCsr>>>,
+    /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
+    prefetch_count: usize,
 }
 
 impl BackedCsrReader {
@@ -204,14 +208,23 @@ impl BackedCsrReader {
         let n_vars = reader.n_vars() as usize;
         let n_obs = reader.n_obs() as usize;
         let cache = Self::make_cache(cache_shards);
+        let x_sorted_entries = reader
+            .catalog()
+            .shards_sorted()
+            .into_iter()
+            .cloned()
+            .collect();
+        let prefetch_count = cache_shards.max(2);
         BackedCsrReader {
             reader,
             index,
             n_vars,
             n_obs,
             layer_name: None,
+            x_sorted_entries,
             sorted_entries: Vec::new(),
             cache,
+            prefetch_count,
         }
     }
 
@@ -237,14 +250,23 @@ impl BackedCsrReader {
             .collect();
         sorted_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
 
+        let x_sorted_entries = reader
+            .catalog()
+            .shards_sorted()
+            .into_iter()
+            .cloned()
+            .collect();
+        let prefetch_count = cache_shards.max(2);
         BackedCsrReader {
             reader,
             index,
             n_vars,
             n_obs,
             layer_name: Some(layer_name.to_string()),
+            x_sorted_entries,
             sorted_entries,
             cache,
+            prefetch_count,
         }
     }
 
@@ -276,6 +298,26 @@ impl BackedCsrReader {
     /// Access the underlying shard index.
     pub fn index(&self) -> &BackedCsrIndex {
         &self.index
+    }
+
+    /// Get the catalog entry for a shard by index.
+    ///
+    /// Uses `sorted_entries` for layer readers, `x_sorted_entries` for X readers.
+    fn shard_entry(&self, shard_idx: usize) -> Option<&FullCatalogEntry> {
+        if self.layer_name.is_some() {
+            self.sorted_entries.get(shard_idx)
+        } else {
+            self.x_sorted_entries.get(shard_idx)
+        }
+    }
+
+    /// Total number of shards.
+    fn shard_count(&self) -> usize {
+        if self.layer_name.is_some() {
+            self.sorted_entries.len()
+        } else {
+            self.x_sorted_entries.len()
+        }
     }
 
     /// Read rows `[start, end)` as a scipy-compatible `ScxCsr`.
@@ -413,6 +455,23 @@ impl BackedCsrReader {
                 self.reader.read_shard_from_entry_unchecked(entry)?
             }
         };
+
+        // Release page cache for the just-decoded shard. This is safe because
+        // the mmap is read-only and the data has been copied into owned Vecs.
+        #[cfg(unix)]
+        {
+            use memmap2::UncheckedAdvice;
+            if let Some(entry) = self.shard_entry(shard_idx) {
+                unsafe {
+                    let _ = self.reader.mmap_ref().unchecked_advise_range(
+                        UncheckedAdvice::DontNeed,
+                        entry.offset as usize,
+                        entry.length as usize,
+                    );
+                }
+            }
+        }
+
         let n_rows = indptr.len().saturating_sub(1);
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.n_vars),
@@ -458,6 +517,23 @@ impl BackedCsrReader {
         if let Some(ref cache_mutex) = self.cache {
             let mut cache = cache_mutex.lock().unwrap();
             cache.put(shard_idx, csr.clone());
+        }
+
+        // Prefetch upcoming shards so the kernel starts paging them in.
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            let n_shards = self.shard_count();
+            let end = std::cmp::min(shard_idx + 1 + self.prefetch_count, n_shards);
+            for prefetch_idx in (shard_idx + 1)..end {
+                if let Some(entry) = self.shard_entry(prefetch_idx) {
+                    let _ = self.reader.mmap_ref().advise_range(
+                        Advice::WillNeed,
+                        entry.offset as usize,
+                        entry.length as usize,
+                    );
+                }
+            }
         }
 
         Ok(csr)

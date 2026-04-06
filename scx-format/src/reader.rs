@@ -57,12 +57,13 @@ impl ScxReader {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Hint the kernel that we read sequentially so it can prefetch ahead
-        // and reclaim already-read pages, reducing peak RSS for large files.
+        // Start with Normal advice (kernel default heuristic). Access-pattern-
+        // specific hints (Sequential, WillNeed, DontNeed) are issued at each
+        // call site — see assemble_shards*() and BackedCsrReader.
         #[cfg(unix)]
         {
             use memmap2::Advice;
-            let _ = mmap.advise(Advice::Sequential);
+            let _ = mmap.advise(Advice::Normal);
         }
 
         // Check minimum file size (header + root catalog placeholder)
@@ -458,6 +459,40 @@ impl ScxReader {
         &self.mmap
     }
 
+    /// Expose the underlying `Mmap` for range-specific madvise calls.
+    pub(crate) fn mmap_ref(&self) -> &Mmap {
+        &self.mmap
+    }
+
+    /// Hint sequential access for a byte range (`MADV_SEQUENTIAL`).
+    #[cfg(unix)]
+    fn advise_sequential(&self, offset: usize, len: usize) {
+        use memmap2::Advice;
+        let _ = self.mmap.advise_range(Advice::Sequential, offset, len);
+    }
+
+    /// Hint that a byte range will be needed soon (`MADV_WILLNEED`).
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    fn advise_willneed(&self, offset: usize, len: usize) {
+        use memmap2::Advice;
+        let _ = self.mmap.advise_range(Advice::WillNeed, offset, len);
+    }
+
+    /// Hint that a byte range is no longer needed (`MADV_DONTNEED`).
+    ///
+    /// # Safety
+    /// `UncheckedAdvice::DontNeed` may discard dirty pages on some platforms,
+    /// but our mmap is read-only so this is safe.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    unsafe fn advise_dontneed(&self, offset: usize, len: usize) {
+        use memmap2::UncheckedAdvice;
+        let _ = self
+            .mmap
+            .unchecked_advise_range(UncheckedAdvice::DontNeed, offset, len);
+    }
+
     // -----------------------------------------------------------------------
     // Validate (11.12)
     // -----------------------------------------------------------------------
@@ -647,6 +682,15 @@ impl ScxReader {
             ));
         }
 
+        // Hint aggressive readahead across the contiguous shard region.
+        #[cfg(unix)]
+        {
+            let first_offset = shards[0].offset as usize;
+            let last = shards.last().unwrap();
+            let end = last.offset as usize + last.length as usize;
+            self.advise_sequential(first_offset, end - first_offset);
+        }
+
         // Pre-compute per-shard (n_rows, nnz) from catalog stats
         let shard_sizes: Vec<(usize, usize)> = shards
             .iter()
@@ -749,6 +793,15 @@ impl ScxReader {
                 vec![],
                 vec![],
             ));
+        }
+
+        // Hint aggressive readahead across the contiguous shard region.
+        #[cfg(unix)]
+        {
+            let first_offset = shards[0].offset as usize;
+            let last = shards.last().unwrap();
+            let end = last.offset as usize + last.length as usize;
+            self.advise_sequential(first_offset, end - first_offset);
         }
 
         // Pre-compute per-shard (n_rows, nnz) from catalog stats
