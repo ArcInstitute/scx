@@ -282,38 +282,36 @@ pub fn decode_shard_scipy(
     Ok((indptr, indices, data))
 }
 
-/// Convert Vec<u64> to Vec<i64>, returning an error if any value exceeds i64::MAX.
+/// Convert Vec<u64> to Vec<i64> via zero-copy reinterpretation.
+/// CSR indptr values are always non-negative and well below i64::MAX,
+/// so the bit patterns are identical. Uses bytemuck for safe transmute.
 fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
-    data.into_iter()
-        .map(|v| {
-            i64::try_from(v).map_err(|_| {
-                CodecError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("indptr value {} exceeds i64::MAX", v),
-                ))
-            })
-        })
-        .collect()
+    debug_assert!(
+        data.iter().all(|&v| v <= i64::MAX as u64),
+        "indptr value exceeds i64::MAX"
+    );
+    Ok(bytemuck::cast_vec::<u64, i64>(data))
 }
 
-/// Convert Vec<u32> to Vec<i32>, returning an error if any value exceeds i32::MAX.
+/// Convert Vec<u32> to Vec<i32> via zero-copy reinterpretation.
+/// Column indices are always non-negative and below n_vars (well within i32 range),
+/// so the bit patterns are identical. Uses bytemuck for safe transmute.
 fn u32_vec_to_i32(data: Vec<u32>) -> Result<Vec<i32>, CodecError> {
-    data.into_iter()
-        .map(|v| {
-            i32::try_from(v).map_err(|_| {
-                CodecError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("index value {} exceeds i32::MAX", v),
-                ))
-            })
-        })
-        .collect()
+    debug_assert!(
+        data.iter().all(|&v| v <= i32::MAX as u32),
+        "index value exceeds i32::MAX"
+    );
+    Ok(bytemuck::cast_vec::<u32, i32>(data))
 }
 
 /// Convert raw LE value bytes to f32 according to ValueEncoding.
 fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
     match encoding {
-        ValueEncoding::Uint8 => raw.iter().map(|&b| b as f32).collect(),
+        ValueEncoding::Uint8 => {
+            let mut out = Vec::with_capacity(raw.len());
+            out.extend(raw.iter().map(|&b| b as f32));
+            out
+        }
         ValueEncoding::Uint16 => raw
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
@@ -322,10 +320,18 @@ fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
             .collect(),
-        ValueEncoding::Float32 => raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
+        ValueEncoding::Float32 => {
+            #[cfg(target_endian = "little")]
+            {
+                bytemuck::cast_slice::<u8, f32>(raw).to_vec()
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            }
+        }
         ValueEncoding::Float16 => raw
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -908,21 +914,46 @@ mod tests {
     }
 
     #[test]
-    fn test_u64_to_i64_rejects_overflow() {
-        let data = vec![0u64, 100, u64::MAX];
-        assert!(u64_vec_to_i64(data).is_err());
-
+    fn test_u64_to_i64_cast_valid() {
         let data = vec![0u64, 100, i64::MAX as u64];
-        assert!(u64_vec_to_i64(data).is_ok());
+        let result = u64_vec_to_i64(data).unwrap();
+        assert_eq!(result, vec![0i64, 100, i64::MAX]);
     }
 
     #[test]
-    fn test_u32_to_i32_rejects_overflow() {
-        let data = vec![0u32, 100, u32::MAX];
-        assert!(u32_vec_to_i32(data).is_err());
+    #[should_panic(expected = "indptr value exceeds i64::MAX")]
+    fn test_u64_to_i64_debug_assert_overflow() {
+        let data = vec![0u64, 100, u64::MAX];
+        let _ = u64_vec_to_i64(data);
+    }
 
+    #[test]
+    fn test_u32_to_i32_cast_valid() {
         let data = vec![0u32, 100, i32::MAX as u32];
-        assert!(u32_vec_to_i32(data).is_ok());
+        let result = u32_vec_to_i32(data).unwrap();
+        assert_eq!(result, vec![0i32, 100, i32::MAX]);
+    }
+
+    #[test]
+    #[should_panic(expected = "index value exceeds i32::MAX")]
+    fn test_u32_to_i32_debug_assert_overflow() {
+        let data = vec![0u32, 100, u32::MAX];
+        let _ = u32_vec_to_i32(data);
+    }
+
+    #[test]
+    fn test_values_raw_to_f32_uint8() {
+        let raw = vec![0u8, 1, 127, 255];
+        let result = values_raw_to_f32(&raw, ValueEncoding::Uint8);
+        assert_eq!(result, vec![0.0f32, 1.0, 127.0, 255.0]);
+    }
+
+    #[test]
+    fn test_values_raw_to_f32_float32_le() {
+        let vals = [1.0f32, -2.5, 0.0, f32::MAX];
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let result = values_raw_to_f32(&raw, ValueEncoding::Float32);
+        assert_eq!(result, vals.to_vec());
     }
 
     #[test]

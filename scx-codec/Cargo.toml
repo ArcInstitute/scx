@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 byteorder = { workspace = true }
+bytemuck = { workspace = true }
 half = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
