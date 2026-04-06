@@ -633,6 +633,9 @@ impl ScxReader {
     }
 
     /// Assemble multiple shard entries into a single ScxCsr using parallel decode.
+    ///
+    /// Pre-allocates the final merged arrays to exact sizes using catalog stats,
+    /// then decodes each shard in parallel directly into its non-overlapping region.
     #[cfg(feature = "parallel")]
     fn assemble_shards_parallel(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
         if shards.is_empty() {
@@ -644,46 +647,99 @@ impl ScxReader {
             ));
         }
 
-        // Decode all shards in parallel
-        let decoded: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shards
-            .par_iter()
-            .map(|entry| self.read_shard_from_entry_unchecked(entry))
-            .collect::<Result<Vec<_>>>()?;
+        // Pre-compute per-shard (n_rows, nnz) from catalog stats
+        let shard_sizes: Vec<(usize, usize)> = shards
+            .iter()
+            .map(|e| {
+                let stats = e.stats.as_ref().expect("shard entry must have stats");
+                (
+                    (stats.row_end - stats.row_start) as usize,
+                    stats.nnz as usize,
+                )
+            })
+            .collect();
+        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
+        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
 
-        // Pre-compute total sizes for allocation
-        let total_indices: usize = decoded.iter().map(|(_, idx, _)| idx.len()).sum();
-        let total_data: usize = decoded.iter().map(|(_, _, d)| d.len()).sum();
-        let total_indptr: usize =
-            decoded.iter().map(|(ip, _, _)| ip.len()).sum::<usize>() - (decoded.len() - 1); // subtract duplicate leading zeros
-
-        let mut merged_indptr = Vec::with_capacity(total_indptr);
-        let mut merged_indices = Vec::with_capacity(total_indices);
-        let mut merged_data = Vec::with_capacity(total_data);
-        let mut cumulative_nnz: i64 = 0;
-
-        for (i, (indptr, indices, data)) in decoded.iter().enumerate() {
-            if i == 0 {
-                merged_indptr.extend_from_slice(indptr);
-            } else {
-                for &v in &indptr[1..] {
-                    merged_indptr.push(v + cumulative_nnz);
-                }
-            }
-            cumulative_nnz += *indptr.last().unwrap_or(&0);
-            merged_indices.extend_from_slice(indices);
-            merged_data.extend_from_slice(data);
+        // Compute per-shard cumulative offsets
+        let mut row_offsets = Vec::with_capacity(shards.len());
+        let mut nnz_offsets = Vec::with_capacity(shards.len());
+        let (mut cum_rows, mut cum_nnz) = (0usize, 0usize);
+        for &(n_rows, nnz) in &shard_sizes {
+            row_offsets.push(cum_rows);
+            nnz_offsets.push(cum_nnz);
+            cum_rows += n_rows;
+            cum_nnz += nnz;
         }
 
-        let n_rows = merged_indptr.len().saturating_sub(1);
+        // Single allocation for final merged arrays
+        let mut indptr = vec![0i64; total_rows + 1];
+        let mut indices = vec![0i32; total_nnz];
+        let mut data = vec![0f32; total_nnz];
+
+        // Parallel decode + copy into non-overlapping regions.
+        // Store base addresses as usize so they can cross thread boundaries
+        // (usize is Send+Sync; raw pointers are not).
+        // SAFETY: each rayon task writes to a disjoint region determined by
+        // pre-computed offsets, so there are no data races.
+        let indptr_base = indptr.as_mut_ptr() as usize;
+        let indices_base = indices.as_mut_ptr() as usize;
+        let data_base = data.as_mut_ptr() as usize;
+
+        shards.par_iter().enumerate().try_for_each(|(i, entry)| {
+            let (n_rows, nnz) = shard_sizes[i];
+            let row_off = row_offsets[i];
+            let nnz_off = nnz_offsets[i];
+
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+
+            // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping
+            let ix_out = unsafe {
+                std::slice::from_raw_parts_mut((indices_base as *mut i32).add(nnz_off), nnz)
+            };
+            let d_out = unsafe {
+                std::slice::from_raw_parts_mut((data_base as *mut f32).add(nnz_off), nnz)
+            };
+            ix_out.copy_from_slice(&shard_ix);
+            d_out.copy_from_slice(&shard_data);
+
+            // Indptr: shard 0 copies all n_rows+1 values as-is;
+            // shard i>0 copies [1..] with cumulative nnz offset.
+            if i == 0 {
+                // SAFETY: shard 0 writes to [0..n_rows+1], non-overlapping with i>0
+                let ip_out =
+                    unsafe { std::slice::from_raw_parts_mut(indptr_base as *mut i64, n_rows + 1) };
+                ip_out.copy_from_slice(&shard_ip);
+            } else {
+                // SAFETY: shard i writes to [row_off+1..row_off+1+n_rows], non-overlapping
+                let ip_out = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (indptr_base as *mut i64).add(row_off + 1),
+                        n_rows,
+                    )
+                };
+                let nnz_off_i64 = nnz_off as i64;
+                for j in 0..n_rows {
+                    ip_out[j] = shard_ip[j + 1] + nnz_off_i64;
+                }
+            }
+
+            Ok::<_, ScxError>(())
+        })?;
+
+        let n_rows = indptr.len().saturating_sub(1);
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.header.n_vars as usize),
-            merged_indptr,
-            merged_indices,
-            merged_data,
+            indptr,
+            indices,
+            data,
         ))
     }
 
     /// Assemble multiple shard entries into a single ScxCsr (sequential).
+    ///
+    /// Pre-allocates the final merged arrays to exact sizes using catalog stats,
+    /// then decodes each shard sequentially into its target region.
     #[cfg(any(not(feature = "parallel"), test))]
     fn assemble_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
         if shards.is_empty() {
@@ -695,34 +751,56 @@ impl ScxReader {
             ));
         }
 
-        let mut merged_indptr: Vec<i64> = Vec::new();
-        let mut merged_indices: Vec<i32> = Vec::new();
-        let mut merged_data: Vec<f32> = Vec::new();
-        let mut cumulative_nnz: i64 = 0;
+        // Pre-compute per-shard (n_rows, nnz) from catalog stats
+        let shard_sizes: Vec<(usize, usize)> = shards
+            .iter()
+            .map(|e| {
+                let stats = e.stats.as_ref().expect("shard entry must have stats");
+                (
+                    (stats.row_end - stats.row_start) as usize,
+                    stats.nnz as usize,
+                )
+            })
+            .collect();
+        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
+        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
+
+        // Single allocation for final merged arrays
+        let mut indptr = vec![0i64; total_rows + 1];
+        let mut indices = vec![0i32; total_nnz];
+        let mut data = vec![0f32; total_nnz];
+
+        let mut cum_rows = 0usize;
+        let mut cum_nnz = 0usize;
 
         for (i, entry) in shards.iter().enumerate() {
-            let (indptr, indices, data) = self.read_shard_from_entry_unchecked(entry)?;
+            let (n_rows, nnz) = shard_sizes[i];
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
 
+            // Copy indices and data into their target region
+            indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
+            data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
+
+            // Copy indptr with cumulative nnz offset
             if i == 0 {
-                merged_indptr.extend_from_slice(&indptr);
+                indptr[0..n_rows + 1].copy_from_slice(&shard_ip);
             } else {
-                // Skip first element (0) and offset by cumulative nnz
-                for &v in &indptr[1..] {
-                    merged_indptr.push(v + cumulative_nnz);
+                let nnz_off_i64 = cum_nnz as i64;
+                for j in 0..n_rows {
+                    indptr[cum_rows + 1 + j] = shard_ip[j + 1] + nnz_off_i64;
                 }
             }
 
-            cumulative_nnz += *indptr.last().unwrap_or(&0);
-            merged_indices.extend_from_slice(&indices);
-            merged_data.extend_from_slice(&data);
+            cum_rows += n_rows;
+            cum_nnz += nnz;
         }
 
-        let n_rows = merged_indptr.len().saturating_sub(1);
+        let n_rows = indptr.len().saturating_sub(1);
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.header.n_vars as usize),
-            merged_indptr,
-            merged_indices,
-            merged_data,
+            indptr,
+            indices,
+            data,
         ))
     }
 }
@@ -1122,6 +1200,107 @@ mod tests {
         assert_eq!(csr.indices, individual_indices);
         assert_eq!(csr.data, individual_data);
         assert_eq!(csr.shape, (12, 10));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2B.7: Single-allocation assembly matches individual shard merge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_single_alloc_assembly_1_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "one_shard.scx", 8, 10, 1, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        let csr = reader.read_all_csr_shards().unwrap();
+        // 1 shard: indptr should start at 0 and be monotonic
+        assert_eq!(csr.indptr[0], 0);
+        assert_eq!(csr.shape, (8, 10));
+        for w in csr.indptr.windows(2) {
+            assert!(w[1] >= w[0], "indptr not monotonic: {} > {}", w[0], w[1]);
+        }
+        for &idx in &csr.indices {
+            assert!((0..10).contains(&idx), "index {} out of bounds", idx);
+        }
+    }
+
+    #[test]
+    fn test_single_alloc_assembly_2_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "two_shards.scx", 8, 10, 2, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        // Read individually (old merge pattern)
+        let mut individual_indptr: Vec<i64> = Vec::new();
+        let mut individual_indices: Vec<i32> = Vec::new();
+        let mut individual_data: Vec<f32> = Vec::new();
+        let mut cumulative_nnz: i64 = 0;
+
+        for i in 0..2 {
+            let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+            if i == 0 {
+                individual_indptr.extend_from_slice(&indptr);
+            } else {
+                for &v in &indptr[1..] {
+                    individual_indptr.push(v + cumulative_nnz);
+                }
+            }
+            cumulative_nnz += *indptr.last().unwrap_or(&0);
+            individual_indices.extend_from_slice(&indices);
+            individual_data.extend_from_slice(&data);
+        }
+
+        // Read assembled (single-allocation path)
+        let csr = reader.read_all_csr_shards().unwrap();
+
+        assert_eq!(csr.indptr, individual_indptr);
+        assert_eq!(csr.indices, individual_indices);
+        assert_eq!(csr.data, individual_data);
+        assert_eq!(csr.shape, (8, 10));
+    }
+
+    #[test]
+    fn test_single_alloc_assembly_many_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 rows, 20 vars, 10 shards = 10 rows per shard
+        let path = write_test_file(&dir, "many_shards.scx", 100, 20, 10, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        // Read individually (old merge pattern)
+        let mut individual_indptr: Vec<i64> = Vec::new();
+        let mut individual_indices: Vec<i32> = Vec::new();
+        let mut individual_data: Vec<f32> = Vec::new();
+        let mut cumulative_nnz: i64 = 0;
+
+        for i in 0..10 {
+            let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+            if i == 0 {
+                individual_indptr.extend_from_slice(&indptr);
+            } else {
+                for &v in &indptr[1..] {
+                    individual_indptr.push(v + cumulative_nnz);
+                }
+            }
+            cumulative_nnz += *indptr.last().unwrap_or(&0);
+            individual_indices.extend_from_slice(&indices);
+            individual_data.extend_from_slice(&data);
+        }
+
+        // Read assembled (single-allocation path)
+        let csr = reader.read_all_csr_shards().unwrap();
+
+        assert_eq!(csr.indptr, individual_indptr);
+        assert_eq!(csr.indices, individual_indices);
+        assert_eq!(csr.data, individual_data);
+        assert_eq!(csr.shape, (100, 20));
+
+        // Verify invariants
+        for w in csr.indptr.windows(2) {
+            assert!(w[1] >= w[0], "indptr not monotonic");
+        }
+        for &idx in &csr.indices {
+            assert!((0..20).contains(&idx), "index {} out of bounds", idx);
+        }
     }
 
     // -----------------------------------------------------------------------
