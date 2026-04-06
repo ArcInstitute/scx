@@ -682,13 +682,18 @@ impl ScxReader {
             ));
         }
 
-        // Hint aggressive readahead across the contiguous shard region.
+        // Hint aggressive readahead across the shard region.
+        // Use min/max of file offsets since shards are sorted by row_start,
+        // not file offset — they may not be contiguous after append/compact.
         #[cfg(unix)]
         {
-            let first_offset = shards[0].offset as usize;
-            let last = shards.last().unwrap();
-            let end = last.offset as usize + last.length as usize;
-            self.advise_sequential(first_offset, end - first_offset);
+            let min_offset = shards.iter().map(|e| e.offset as usize).min().unwrap();
+            let max_end = shards
+                .iter()
+                .map(|e| (e.offset + e.length) as usize)
+                .max()
+                .unwrap();
+            self.advise_sequential(min_offset, max_end - min_offset);
         }
 
         // Pre-compute per-shard (n_rows, nnz) from catalog stats
@@ -736,6 +741,25 @@ impl ScxReader {
             let nnz_off = nnz_offsets[i];
 
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+            debug_assert_eq!(
+                shard_ip.len(),
+                n_rows + 1,
+                "shard {i} indptr length mismatch: catalog says {}, got {}",
+                n_rows + 1,
+                shard_ip.len()
+            );
+            debug_assert_eq!(
+                shard_ix.len(),
+                nnz,
+                "shard {i} indices length mismatch: catalog says {nnz}, got {}",
+                shard_ix.len()
+            );
+            debug_assert_eq!(
+                shard_data.len(),
+                nnz,
+                "shard {i} data length mismatch: catalog says {nnz}, got {}",
+                shard_data.len()
+            );
 
             // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping
             let ix_out = unsafe {
@@ -795,13 +819,18 @@ impl ScxReader {
             ));
         }
 
-        // Hint aggressive readahead across the contiguous shard region.
+        // Hint aggressive readahead across the shard region.
+        // Use min/max of file offsets since shards are sorted by row_start,
+        // not file offset — they may not be contiguous after append/compact.
         #[cfg(unix)]
         {
-            let first_offset = shards[0].offset as usize;
-            let last = shards.last().unwrap();
-            let end = last.offset as usize + last.length as usize;
-            self.advise_sequential(first_offset, end - first_offset);
+            let min_offset = shards.iter().map(|e| e.offset as usize).min().unwrap();
+            let max_end = shards
+                .iter()
+                .map(|e| (e.offset + e.length) as usize)
+                .max()
+                .unwrap();
+            self.advise_sequential(min_offset, max_end - min_offset);
         }
 
         // Pre-compute per-shard (n_rows, nnz) from catalog stats
@@ -829,6 +858,9 @@ impl ScxReader {
         for (i, entry) in shards.iter().enumerate() {
             let (n_rows, nnz) = shard_sizes[i];
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+            debug_assert_eq!(shard_ip.len(), n_rows + 1);
+            debug_assert_eq!(shard_ix.len(), nnz);
+            debug_assert_eq!(shard_data.len(), nnz);
 
             // Copy indices and data into their target region
             indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
