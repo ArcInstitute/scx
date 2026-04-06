@@ -296,7 +296,8 @@ scGPT train end-to-end on atlas-scale SCX data.
 ### 3.5 Quality + Polish
 - [ ] Full conformance test suite with reference .scx files
 - [ ] Fuzz targets in CI for all decoders and parsers
-- [ ] SIMD codec optimizations (AVX2, NEON) with runtime dispatch
+- [x] SIMD FOR-BP decode (BitPacker4x, 44% faster index decode) — done in Sprint 2, Phase 2E
+- [ ] SIMD Rice/Delta-Golomb optimizations (AVX2, NEON) with runtime dispatch
 - [ ] Detection bitmap layer (Roaring Bitmap, Section 5)
 - [ ] Documentation: API reference, tutorials, migration guide from h5ad
 - [ ] Benchmark suite: automated regression testing of throughput

@@ -7,7 +7,7 @@
 | Crate | Location | Key tests |
 |-------|----------|-----------|
 | `scx-format` | `tests/integration.rs` | Round-trip validation, minimum file size, checksum verification |
-| `scx-codec` | Per-module unit tests | Rice, FOR-BP, Delta-Golomb encode/decode round-trips |
+| `scx-codec` | Per-module unit tests | Rice, FOR-BP (scalar + SIMD BitPacker4x), Delta-Golomb, LZ4+shuffle, byte-shuffle encode/decode round-trips. Reference vector tests for all codecs. |
 | `scx-sparse` | Unit tests | CSR construction, row slicing, dense conversion |
 | `scx-ops` | `tests/` | Append, delete, compact, rollback, merge, flock concurrency |
 | `scx-engine` | Unit tests | Predicate parsing, pipeline validation, pushdown, fused ops |
@@ -15,6 +15,7 @@
 | `scx-cloud` | `tests/` | Explode/pack round-trip, cloud-optimize, pull/push (local backend) |
 | `scx-accel` | Unit tests | PCA round-trip, kNN recall, UMAP trustworthiness, DE p-values, pseudobulk aggregation |
 | `scx-gpu` | Unit tests | CUDA Rice/FOR-BP decode, sparse-to-dense, cuSPARSE SpMM, cuSOLVER QR, cuRAND, GPU PCA pipeline, GPU UMAP SGD, GPU preprocessing (normalize+log1p). GPU parity with CPU reference. |
+| `scx-integration-tests` | `tests/golden_files.rs` | Golden file regression: 15 golden files (None/Scx1/Zstd/Lz4Shuffle × value encodings), BLAKE3 manifest, CSR bit-exact match, metadata match, backward compatibility, unknown codec rejection |
 | `rscx` | via `R CMD check` | Seurat/SCE round-trip, query, CSR transpose |
 
 ## Python Test Suite
@@ -84,6 +85,9 @@
 | `setup_cloud_test_data.sh` | Set up cloud test data in GCS bucket |
 | `run_benchmarks_slurm.sh` | SLURM job script for HPC benchmarks |
 | `submit_benchmarks.py` | Submit and manage benchmark SLURM jobs |
+| `benchmark_madvise_rss.py` | MADV_DONTNEED RSS impact: peak RSS during streaming aggregation (orchestrator) |
+| `benchmark_madvise_rss_worker.py` | Subprocess worker for RSS measurement (samples /proc/self/statm) |
+| `slurm_phase2g_exit.sh` | Sprint 2 exit benchmark: parallel SLURM submission for D1–D7 |
 
 ### Running Benchmarks
 

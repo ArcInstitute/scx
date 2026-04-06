@@ -882,7 +882,50 @@ v1 but is recommended for robustness.
 for ~75-80% of the compressed CSR payload, while Rice values account for ~20%.
 Optimizing index compression (e.g., PFor-Delta with patching for outlier column gaps)
 has ~4× more impact on file size than further optimizing value compression. Future
-codec versions (codec_id ≥ 3) should prioritize index encoding improvements.
+codec versions should prioritize index encoding improvements.
+
+### 4.7 LZ4+Shuffle Codec (codec_id = 3)
+
+The LZ4+shuffle codec applies a byte-shuffle pre-filter before LZ4 frame compression.
+This matches the Zarr/Blosc compression pipeline and is effective for data with
+correlated byte patterns across elements (e.g., float arrays where the exponent bytes
+are similar).
+
+**Encoding pipeline** (per array — indptr, indices, values independently):
+
+```
+1. Byte-shuffle: rearrange bytes by position within each element
+   (all byte-0s first, then byte-1s, etc.)
+   Element width: 8 bytes (indptr u64), 2 or 4 bytes (indices), 1-4 bytes (values)
+2. LZ4 frame compress the shuffled bytes
+```
+
+**Decoding pipeline**: LZ4 frame decompress → byte-unshuffle (reverse of encoding).
+
+**When to use**: LZ4+shuffle is available via `codec="lz4"` in `from_anndata()` and
+`scx convert`. It is not auto-selected by the codec heuristic. It provides:
+- 3.1× compression on float data (vs 2.9× for Zstd on Smart-seq2)
+- Fast decompression (~1.5× faster than Zstd on typical data)
+- Familiar compression style for users migrating from Zarr/Blosc
+
+**Implementation**: `scx-codec/src/shuffle.rs` (byte-shuffle/unshuffle),
+`scx-codec/src/dispatch.rs` (encode/decode dispatch).
+
+### 4.8 SIMD FOR-BP Decode (codec_id = 1)
+
+FOR-BP index decoding uses SIMD BitPacker4x for rows with ≥128 non-zeros. The
+SIMD-interleaved bit layout packs 4 × 32-element blocks simultaneously, enabling
+128-element decode in a single pass.
+
+**Performance**: 44–45% faster isolated FOR-BP decode, translating to 10–12%
+end-to-end read_full improvement for Scx1-encoded files.
+
+**Format note**: The BitPacker4x SIMD layout is a breaking change from the pre-Sprint-2
+sequential bit-packing format. Files written with the SIMD encoder cannot be decoded
+by pre-Sprint-2 readers for rows with ≥128 NNZ. Rows with <128 NNZ use the original
+sequential bit-packing and are backward-compatible.
+
+**Implementation**: `scx-codec/src/forbp.rs` (BitPacker4x encode/decode).
 
 ---
 

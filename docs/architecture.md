@@ -137,7 +137,7 @@ CSR Shard
 | Codec | Array | Technique |
 |-------|-------|-----------|
 | **Delta-Golomb** | indptr | Delta encoding + Rice coding of deltas |
-| **FOR-BP** | indices | Frame-of-Reference + Bit-Packing, 128-row blocks |
+| **FOR-BP** | indices | Frame-of-Reference + Bit-Packing, 128-row blocks (SIMD BitPacker4x for ≥128 NNZ rows) |
 | **Adaptive Rice** | values | Per-block (256 values) Rice coding with adaptive *k* parameter |
 
 All codecs use **LSB-first** bit packing. The bitstream module (`scx-codec/src/bitstream.rs`)
@@ -150,11 +150,13 @@ The file header stores a default `codec_id`, but each shard header may **overrid
 | codec_id | Name | When used |
 |----------|------|-----------|
 | 0 | None | Raw LE arrays. Fast for GDS bypass. |
-| 1 | Scx1 | Integer counts with median ≤ 8 (typical 10x UMI data) |
+| 1 | Scx1 | Integer counts with median ≤ 8 (typical 10x UMI data). Uses SIMD BitPacker4x for FOR-BP index decode. |
 | 2 | Zstd | Float layers, or integer data with median > 8 |
+| 3 | Lz4Shuffle | Byte-shuffle pre-filter + LZ4 frame compression. Works with any value encoding. Matches Zarr/Blosc style. |
 
 Auto-codec selection (`scx-format/src/codec_select.rs`) samples up to 10K non-zero
 values per shard and applies the median heuristic to choose Scx1 vs Zstd.
+LZ4+shuffle is available via `codec="lz4"` but not auto-selected.
 
 ---
 
@@ -196,7 +198,7 @@ Uses an **atomic rename** strategy for crash safety:
 Opens a file via `mmap` and validates magic/version/checksums:
 
 ```
-1. mmap the file
+1. mmap the file (MADV_NORMAL default)
 2. Parse 256-byte header
 3. Parse root catalog (offset 256)
 4. Parse full catalog (from header's full_catalog_offset)
@@ -204,6 +206,11 @@ Opens a file via `mmap` and validates magic/version/checksums:
 ```
 
 All section access is via offset+length from the catalog — no sequential scanning.
+
+**madvise hints** (Unix only, `#[cfg(unix)]`):
+- `MADV_SEQUENTIAL` on the shard byte range during `assemble_shards_parallel()` — tells kernel to readahead aggressively for full reads
+- `MADV_WILLNEED` on next N shards in `BackedCsrReader::read_shard_cached()` — prefetches upcoming shards after a cache miss
+- `MADV_DONTNEED` after `read_shard_uncached()` — releases page cache for decoded shards during streaming aggregation (67% RSS reduction on 1M cells)
 
 ---
 

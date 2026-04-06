@@ -185,7 +185,7 @@ pyscx.from_anndata(adata, "dataset.scx", codec="auto", shard_size=8192)
 ```
 
 The `codec` parameter accepts `"auto"` (default — selects best codec per shard),
-`"scx1"` (domain-specific integer codec), `"zstd"`, or `"none"`.
+`"scx1"` (domain-specific integer codec), `"zstd"`, `"lz4"` (byte-shuffle + LZ4 frame), or `"none"`.
 
 ### From 10x HDF5
 
