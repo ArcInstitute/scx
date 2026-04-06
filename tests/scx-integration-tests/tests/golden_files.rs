@@ -105,6 +105,7 @@ fn codec_name(c: CodecId) -> &'static str {
         CodecId::None => "none",
         CodecId::Scx1 => "scx1",
         CodecId::Zstd => "zstd",
+        CodecId::Lz4Shuffle => "lz4shuffle",
     }
 }
 

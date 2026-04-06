@@ -1,4 +1,4 @@
-"""SCX format benchmark runner (auto, none, scx1, zstd codec variants)."""
+"""SCX format benchmark runner (auto, none, scx1, zstd, lz4 codec variants)."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ _CODEC_NAMES = {
     "none": ("SCX (none)", "scx_none"),
     "scx1": ("SCX (scx1)", "scx_scx1"),
     "zstd": ("SCX (zstd)", "scx_zstd"),
+    "lz4": ("SCX (lz4)", "scx_lz4"),
 }
 
 

@@ -225,6 +225,42 @@ proptest! {
         prop_assert_eq!(&d_v, &values);
     }
 
+    #[test]
+    fn dispatch_lz4shuffle_u8_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint8)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint8, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint8, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_lz4shuffle_u16_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_lz4shuffle_u32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
     /// Regression guard for Phase 1B: mixed per-shard encodings through
     /// the full encode→decode roundtrip. Shard 1 uses uint8, shard 2 uses
     /// uint16 — both with Scx1 codec.

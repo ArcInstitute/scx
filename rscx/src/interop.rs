@@ -573,6 +573,22 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
 
 // ─── Shared SCX writer helper ────────────────────────────────────────────────
 
+/// Parse a codec name from R to an Option<CodecId>.
+fn parse_codec_r(codec: Option<&str>) -> Result<Option<scx_codec::CodecId>> {
+    use scx_codec::CodecId;
+    match codec {
+        None | Some("auto") => Ok(None),
+        Some("none") => Ok(Some(CodecId::None)),
+        Some("scx1") => Ok(Some(CodecId::Scx1)),
+        Some("zstd") => Ok(Some(CodecId::Zstd)),
+        Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
+        Some(other) => Err(Error::Other(format!(
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', or 'lz4'.",
+            other
+        ))),
+    }
+}
+
 /// Write CSR data to an SCX file with multi-shard splitting and auto-codec.
 ///
 /// Shared by `from_seurat` and `from_sce` — both extract R objects into
@@ -588,6 +604,7 @@ fn write_csr_to_scx(
     n_vars: usize,
     obs_batch: &RecordBatch,
     var_batch: &RecordBatch,
+    explicit_codec: Option<scx_codec::CodecId>,
 ) -> Result<()> {
     use scx_codec::CodecId;
     use scx_format::header::FileHeader;
@@ -651,7 +668,16 @@ fn write_csr_to_scx(
         let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
         let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
 
-        let codec = select_codec(shard_values, value_encoding);
+        let codec = match explicit_codec {
+            Some(c) => {
+                if c == CodecId::Scx1 && !value_encoding.is_integer() {
+                    CodecId::Zstd
+                } else {
+                    c
+                }
+            }
+            None => select_codec(shard_values, value_encoding),
+        };
 
         writer
             .write_csr_shard(
@@ -683,7 +709,8 @@ fn write_csr_to_scx(
 /// Extracts meta.data → obs, feature metadata → var.
 /// @export
 #[extendr]
-pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
+pub fn from_seurat(seurat_obj: Robj, output_path: &str, codec: Option<&str>) -> Result<()> {
+    let explicit_codec = parse_codec_r(codec)?;
     // Single R!() call — moves seurat_obj once, returns a lightweight list
     let parts = R!("
         if (!requireNamespace('Seurat', quietly = TRUE))
@@ -727,6 +754,7 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
         n_vars,
         &obs_batch,
         &var_batch,
+        explicit_codec,
     )
 }
 
@@ -734,7 +762,8 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str) -> Result<()> {
 /// Same CSC→CSR transpose as from_seurat.
 /// @export
 #[extendr]
-pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
+pub fn from_sce(sce_obj: Robj, output_path: &str, codec: Option<&str>) -> Result<()> {
+    let explicit_codec = parse_codec_r(codec)?;
     // Single R!() call — moves sce_obj once, returns a lightweight list
     let parts = R!("
         if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
@@ -777,6 +806,7 @@ pub fn from_sce(sce_obj: Robj, output_path: &str) -> Result<()> {
         n_vars,
         &obs_batch,
         &var_batch,
+        explicit_codec,
     )
 }
 

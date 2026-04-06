@@ -19,7 +19,7 @@ pub use catalog::{
     ShardStats, ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE,
 };
 pub use checksum::{blake3_hash, blake3_truncated_64};
-pub use codec_select::select_codec;
+pub use codec_select::{select_codec, select_codec_with_profile, CodecProfile};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use error::{Result, ScxError};

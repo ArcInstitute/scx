@@ -2,6 +2,19 @@
 
 use scx_codec::{CodecId, ValueEncoding};
 
+/// Codec selection profile for user-facing codec choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecProfile {
+    /// Automatic selection (Scx1 for small UMI integers, Zstd for larger/float).
+    Auto,
+    /// Optimizes for fast encode/decode: LZ4 with byte-shuffle.
+    Fast,
+    /// Optimizes for compression ratio: Zstd or Scx1 depending on data.
+    Compact,
+    /// Force the domain-specific Scx1 codec (integer only).
+    Scx1,
+}
+
 /// Compute floor median of a u32 slice. Returns 0 for empty input.
 fn floor_median_u32(values: &mut [u32]) -> u32 {
     if values.is_empty() {
@@ -9,6 +22,30 @@ fn floor_median_u32(values: &mut [u32]) -> u32 {
     }
     values.sort_unstable();
     values[values.len() / 2]
+}
+
+/// Select codec using a profile hint.
+///
+/// - `Fast` → LZ4+shuffle for all data types.
+/// - `Compact` → Scx1 for small UMI integers, Zstd for larger/float.
+/// - `Scx1` → Force Scx1 (falls back to Zstd for float encodings).
+/// - `Auto` → Same as `Compact` (backward-compatible default).
+pub fn select_codec_with_profile(
+    raw_values: &[u8],
+    value_encoding: ValueEncoding,
+    profile: CodecProfile,
+) -> CodecId {
+    match profile {
+        CodecProfile::Fast => CodecId::Lz4Shuffle,
+        CodecProfile::Scx1 => {
+            if value_encoding.is_integer() {
+                CodecId::Scx1
+            } else {
+                CodecId::Zstd
+            }
+        }
+        CodecProfile::Auto | CodecProfile::Compact => select_codec(raw_values, value_encoding),
+    }
 }
 
 /// Analyze raw value bytes and choose the best codec.

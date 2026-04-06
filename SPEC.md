@@ -803,7 +803,8 @@ optimizations that must produce bit-identical results.
 | 0  | none  | No compression. Raw CSR arrays (uint types). For GDS fast-path. |
 | 1  | scx1  | Delta-Golomb indptr + FOR-BP indices + Rice values (this spec). |
 | 2  | zstd  | Zstd per-section. Fallback for non-count data (float layers). |
-| 3-255 | reserved | Future codecs (e.g., ANS-based entropy coder). |
+| 3  | lz4shuffle | LZ4 frame compression with byte-shuffle pre-filter. |
+| 4-255 | reserved | Future codecs (e.g., ANS-based entropy coder). |
 
 **Per-shard adaptive encoding**: The file header's `codec_id` is a **default**.
 Each shard's header may **override** it with a different codec_id. This allows

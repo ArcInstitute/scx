@@ -31,6 +31,7 @@ indicatif = "0.17"
 hdf5 = "0.8"
 
 half = "2"
+lz4_flex = "0.11"
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 roaring = "0.10"
 lru = "0.12"

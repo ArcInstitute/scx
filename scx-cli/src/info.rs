@@ -35,6 +35,7 @@ pub fn run_info(
         Some(CodecId::None) => "none",
         Some(CodecId::Scx1) => "scx1",
         Some(CodecId::Zstd) => "zstd",
+        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
         None => "unknown",
     };
 
@@ -178,6 +179,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         Some(CodecId::None) => "none",
         Some(CodecId::Scx1) => "scx1",
         Some(CodecId::Zstd) => "zstd",
+        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
         None => "unknown",
     };
 
