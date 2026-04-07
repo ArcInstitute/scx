@@ -478,7 +478,7 @@ fn dispatch_convert(
         "pcodec" => Some(CodecId::Pcodec),
         other => {
             return Err(format!(
-                "Unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, pcodec, or pcodec.",
+                "Unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
                 other
             )
             .into())

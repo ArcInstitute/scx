@@ -136,6 +136,10 @@ pub async fn io_stage(
             }
         }
 
+        // Capture pre-computed byte range for this group's MADV_WILLNEED hint.
+        #[cfg(unix)]
+        let current_byte_range = group_byte_ranges[group_count];
+
         // Clone Arc handles for the spawn_blocking closure.
         let reader = Arc::clone(&reader);
         let deletion_map = Arc::clone(&deletion_map);
@@ -149,20 +153,10 @@ pub async fn io_stage(
             let mut shards = Vec::with_capacity(group_indices.len());
 
             // Issue a coalesced MADV_WILLNEED for this group's byte range.
-            // Adjacent shards that are contiguous in the file benefit from a
-            // single madvise hint covering the entire range.
+            // Uses the pre-computed range to avoid reiterating over group_indices.
             #[cfg(unix)]
             {
-                let mut min_offset = usize::MAX;
-                let mut max_end = 0usize;
-                for &idx in &group_indices {
-                    if let Some(entry) = sorted.get(idx) {
-                        let start = entry.offset as usize;
-                        let end = start + entry.length as usize;
-                        min_offset = min_offset.min(start);
-                        max_end = max_end.max(end);
-                    }
-                }
+                let (min_offset, max_end) = current_byte_range;
                 if min_offset < max_end {
                     reader.advise_willneed(min_offset, max_end - min_offset);
                 }
