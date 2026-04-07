@@ -16,6 +16,7 @@ benchmarks/comprehensive/results/raw/
 **/*.rs.bk
 Cargo.lock
 **/debug/
+rscx/tests/testthat/fixtures/
 
 # Python
 __pycache__/
