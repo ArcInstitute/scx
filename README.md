@@ -243,6 +243,58 @@ See [`docs/multithreading.md`](docs/multithreading.md) for a full guide
 including pipeline architecture, thread safety of key types, and how to
 control parallelism.
 
+### How SCX compares to existing formats
+
+Every existing single-cell format has significant trade-offs that SCX was designed to avoid:
+
+#### h5ad (HDF5)
+
+The scverse standard. Ubiquitous but showing its age at atlas scale.
+
+- **File locking breaks on HPC.** HDF5 uses mandatory POSIX `flock()`, which fails on NFS, Lustre, and GPFS — the most common HPC parallel filesystems. Users must set `HDF5_USE_FILE_LOCKING=FALSE`, disabling integrity checks entirely.
+- **Single-threaded reads in Python.** h5py holds a global lock and does not release the GIL during HDF5 calls, so multithreaded reads gain zero parallelism.
+- **Integer counts stored as float32.** AnnData stores UMI counts as 32-bit floats by default, wasting 2-4× space for data that fits in uint8/uint16.
+- **Slow or weak compression.** Default gzip is slow to decompress; lzf is fast but achieves poor ratios. Zstd requires the third-party `hdf5plugin` and is not natively supported.
+- **No cloud-native access.** HDF5 metadata is scattered throughout the file, requiring many small range requests on S3/GCS. The S3 VFD is read-only and limited.
+- **No append without rewrite.** Adding cells or modifying obs/var requires rewriting the entire file. Backed mode (`r+`) only supports updating X values in-place.
+
+#### Zarr
+
+Cloud-native array storage. Good for object stores, problematic on local/HPC filesystems.
+
+- **Multi-file directory structure.** Each chunk is a separate file on disk. A 1M-cell dataset produces tens of thousands of files, hitting inode quotas on Lustre/GPFS and causing heavy metadata server load.
+- **No atomic writes.** A Zarr store is a directory tree — interrupted writes leave partial/corrupt state with no rollback mechanism.
+- **No integrity verification.** No built-in checksums, tree hashing, or corruption detection. There is no way to validate a Zarr store's integrity after transfer or filesystem errors.
+- **v2/v3 ecosystem fragmentation.** Zarr v3 is a breaking change (new metadata format, new codec pipeline). The anndata Zarr backend still defaults to v2; v3 sharding support is immature and significantly slower in practice.
+- **No query or filter capability.** Zarr provides array-level chunk access only — no predicate pushdown, no cell/gene filtering without reading full chunks.
+- **Filesystem overhead on HPC.** The one-file-per-chunk design suits object stores (S3) but penalizes local and HPC filesystems with per-file open/close syscall costs, directory traversal, and block alignment waste.
+
+#### TileDB-SOMA
+
+CELLxGENE Census standard. Powerful for cloud queries, heavy for everything else.
+
+- **Multi-file directory structure.** Like Zarr, each TileDB array is a directory with many internal fragment files. On HPC shared filesystems, metadata operations (open, stat, list) are slow due to inode pressure. Fragment proliferation after repeated writes requires periodic consolidation — an operational burden absent from single-file formats.
+- **Deep dependency stack.** TileDB-SOMA depends on TileDB Core (C++), libtiledbsoma, PyArrow, and multiple SOMA API layers (~5 layers deep). Building from source requires CMake and C++17. Conda packages frequently lag or conflict with RAPIDS/CUDA environments.
+- **Slow for simple operations.** Opening a SOMA experiment requires listing and reading all fragment metadata — cold opens on networked storage take 5-30 seconds for large experiments. Simple "read all X into memory" is slower than h5ad for datasets under ~500K cells.
+- **Complex API.** Reading a matrix requires navigating Experiment → Collection → Measurement → X["raw"] with Arrow table intermediaries, vs a single `sc.read_h5ad(path)` call.
+- **Storage bloat before consolidation.** Fragment-based writes cause 1.5-3× storage bloat until consolidated. Each mutation creates a new fragment rather than updating in place.
+- **Limited scanpy integration.** Converting SOMA to AnnData for scanpy/scVI typically materializes the full dataset, negating lazy-read benefits.
+
+#### SCX addresses all of these
+
+| Issue | h5ad | Zarr | TileDB-SOMA | SCX |
+|-------|------|------|-------------|-----|
+| Single file | Yes | No (directory) | No (directory) | **Yes** |
+| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | **Yes** (mmap, advisory locks) |
+| Atomic writes | No | No | Fragment-based | **Yes** (atomic rename) |
+| Integrity verification | Partial | None | Per-fragment | **Full** (BLAKE3 checksums) |
+| Parallel reads | No (GIL) | Chunk-level | Tile-level | **Shard-level** (rayon) |
+| Append without rewrite | No | No | Yes (fragments) | **Yes** (append sections) |
+| Cloud-native access | No | Yes | Yes | **Yes** (explode/pack, selective pull) |
+| Built-in query engine | No | No | Yes | **Yes** (predicate pushdown) |
+| Domain-specific compression | No | No | No | **Yes** (Scx1 codec, 2-5× better) |
+| Integer-aware storage | No (float32) | No (float32) | No (float64) | **Yes** (uint8/uint16 auto-detect) |
+
 ## Installation
 
 ### Python (recommended)
