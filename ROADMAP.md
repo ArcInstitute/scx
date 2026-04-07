@@ -112,13 +112,14 @@ are smaller than h5ad with dramatically lower memory usage.
 *Rice codec increases size for non-UMI data — auto-codec selection needed (Phase 2).
 
 **Key finding**: Default codec=None gives good compression via integer dtype detection
-alone (float32→uint8/uint16). With codecs enabled, ratios reach 20-35%. SCX reads are
-7-23× slower than h5ad (sequential decode, no parallelism) but use 4-38× less memory
-(mmap + zero-copy). See `benchmarks/results/benchmark_results.md` for full analysis.
+alone (float32→uint8/uint16). With codecs enabled, ratios reach 20-35%. Phase 1 SCX reads
+were 7-23× slower than h5ad (sequential decode, no parallelism) but used 4-38× less memory
+(mmap + zero-copy). **Sprint 2 resolved the read gap**: SCX is now 1.5-2× faster than all
+competitors on 100K+ cell datasets (see `benchmarks/comprehensive/reporting/phase3_report.md`).
 
-**Lessons for Phase 2**:
-1. Auto-codec selection is critical (Rice hurts non-UMI data)
-2. Parallel shard decode is the highest-impact read performance fix
+**Lessons for Phase 2** (all addressed in Sprint 2):
+1. Auto-codec selection is critical (Rice hurts non-UMI data) → Phase 2D added LZ4+shuffle
+2. Parallel shard decode is the highest-impact read performance fix → Phase 2A (rayon par_iter)
 3. Memory efficiency (4-38× less than h5ad) is a major selling point
 4. Training loader bypasses to_anndata() entirely — read perf is less relevant there
 
@@ -155,7 +156,7 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 
 ### 2.0 Phase 1 Fixes (immediate, before new features)
 - [x] Auto-codec selection: choose Scx1 vs Zstd based on value distribution
-- [x] Parallel shard decode via rayon (address 7-23× read slowdown)
+- [x] Parallel shard decode via rayon (addressed 7-23× read slowdown → now 1.5× faster than competitors)
 - [x] Default `from_anndata()` codec from None to "auto"
 
 ### 2.1 Training Loader
