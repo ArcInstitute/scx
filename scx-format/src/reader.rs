@@ -472,9 +472,10 @@ impl ScxReader {
     }
 
     /// Hint that a byte range will be needed soon (`MADV_WILLNEED`).
+    ///
+    /// Used by the training loader to prefetch upcoming shard byte ranges.
     #[cfg(unix)]
-    #[allow(dead_code)]
-    fn advise_willneed(&self, offset: usize, len: usize) {
+    pub fn advise_willneed(&self, offset: usize, len: usize) {
         use memmap2::Advice;
         let _ = self.mmap.advise_range(Advice::WillNeed, offset, len);
     }

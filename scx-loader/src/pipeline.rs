@@ -413,8 +413,12 @@ impl TrainingPipeline {
         // Join previous epoch handles if they exist
         self.join_epoch_handles()?;
 
-        // Generate shuffled shard groups for this epoch
-        let shard_groups = self.shuffler.shuffle_epoch();
+        // Generate offset-sorted shard groups for this epoch.
+        // Shard groups are randomly composed (stochastic across epochs) but
+        // sorted by file offset within and across groups for sequential I/O.
+        let sorted_entries = self.reader.catalog().shards_sorted();
+        let shard_offsets: Vec<u64> = sorted_entries.iter().map(|e| e.offset).collect();
+        let shard_groups = self.shuffler.shuffle_epoch_sorted(&shard_offsets);
 
         // Create bounded channels
         // I/O → Decode: tokio mpsc channel. Each item is a ShardGroup containing

@@ -95,11 +95,47 @@ pub async fn io_stage(
             None => std::collections::HashMap::new(),
         });
 
+    // Pre-compute per-group byte ranges for coalesced MADV_WILLNEED prefetch.
+    // Each entry is (min_offset, max_end) covering all shards in the group.
+    #[cfg(unix)]
+    let group_byte_ranges: Vec<(usize, usize)> = shard_groups
+        .iter()
+        .map(|group_indices| {
+            let mut min_offset = usize::MAX;
+            let mut max_end = 0usize;
+            for &idx in group_indices {
+                if let Some(entry) = sorted_entries.get(idx) {
+                    let start = entry.offset as usize;
+                    let end = start + entry.length as usize;
+                    min_offset = min_offset.min(start);
+                    max_end = max_end.max(end);
+                }
+            }
+            (min_offset, max_end)
+        })
+        .collect();
+
     let profile = profiling_enabled();
     let io_start = Instant::now();
     let mut group_count = 0usize;
+    let n_groups = shard_groups.len();
 
     for group_indices in shard_groups {
+        // Prefetch upcoming groups with MADV_WILLNEED (look ahead 2 groups).
+        #[cfg(unix)]
+        {
+            let lookahead = 2;
+            for ahead in 1..=lookahead {
+                let future_idx = group_count + ahead;
+                if future_idx < n_groups {
+                    let (start, end) = group_byte_ranges[future_idx];
+                    if start < end {
+                        reader.advise_willneed(start, end - start);
+                    }
+                }
+            }
+        }
+
         // Clone Arc handles for the spawn_blocking closure.
         let reader = Arc::clone(&reader);
         let deletion_map = Arc::clone(&deletion_map);
@@ -111,6 +147,26 @@ pub async fn io_stage(
             let t0 = Instant::now();
             let sorted = reader.catalog().shards_sorted();
             let mut shards = Vec::with_capacity(group_indices.len());
+
+            // Issue a coalesced MADV_WILLNEED for this group's byte range.
+            // Adjacent shards that are contiguous in the file benefit from a
+            // single madvise hint covering the entire range.
+            #[cfg(unix)]
+            {
+                let mut min_offset = usize::MAX;
+                let mut max_end = 0usize;
+                for &idx in &group_indices {
+                    if let Some(entry) = sorted.get(idx) {
+                        let start = entry.offset as usize;
+                        let end = start + entry.length as usize;
+                        min_offset = min_offset.min(start);
+                        max_end = max_end.max(end);
+                    }
+                }
+                if min_offset < max_end {
+                    reader.advise_willneed(min_offset, max_end - min_offset);
+                }
+            }
 
             for &shard_idx in &group_indices {
                 if shard_idx >= sorted.len() {
@@ -564,5 +620,68 @@ mod tests {
         assert_eq!(results[0].0.len(), 11);
         // Shard 1: 10 rows → indptr has 11 elements
         assert_eq!(results[1].0.len(), 11);
+    }
+
+    // -----------------------------------------------------------------
+    // 3F Tests: Prefetch scheduling
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_io_stage_offset_sorted_order() {
+        // Verify that when shard groups are sorted by offset, shards arrive
+        // in the expected order.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "sorted.scx", 40, 10, 4);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
+
+            // Feed groups already sorted by offset: [0,1], [2,3]
+            let shard_groups = vec![vec![0, 1], vec![2, 3]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+
+            let mut received = Vec::new();
+            while let Some(group) = rx.recv().await {
+                received.push(group);
+            }
+            handle.await.unwrap().unwrap();
+
+            assert_eq!(received.len(), 2);
+            // First group: shards 0 and 1 (offsets ascending)
+            assert_eq!(received[0].shards.len(), 2);
+            assert!(
+                received[0].shards[0].global_row_offset < received[0].shards[1].global_row_offset
+            );
+            // Second group: shards 2 and 3
+            assert_eq!(received[1].shards.len(), 2);
+            assert!(
+                received[1].shards[0].global_row_offset < received[1].shards[1].global_row_offset
+            );
+            // Group 1 offsets should be after group 0
+            assert!(
+                received[0].shards[1].global_row_offset < received[1].shards[0].global_row_offset
+            );
+        });
+    }
+
+    #[test]
+    fn test_io_stage_prefetch_does_not_panic() {
+        // Smoke test: prefetch hints on a small file should not panic.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_test_file(&dir, "prefetch.scx", 5, 3, 1);
+            let reader = Arc::new(ScxReader::open(&path).unwrap());
+
+            let shard_groups = vec![vec![0]];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+
+            let group = rx.recv().await.unwrap();
+            assert_eq!(group.shards.len(), 1);
+            assert!(rx.recv().await.is_none());
+            handle.await.unwrap().unwrap();
+        });
     }
 }
