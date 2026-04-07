@@ -40,15 +40,30 @@ impl ScxReader {
     /// Validates the file header magic/version/endianness and the full
     /// catalog's trailing BLAKE3 checksum.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path, true)
+    }
+
+    /// Open an SCX file without verifying the catalog checksum.
+    ///
+    /// Skips the full catalog BLAKE3 verification for performance-sensitive
+    /// paths where the file is trusted (e.g., `scx info`, repeated reads of
+    /// a file that was already validated). The header magic/version/endianness
+    /// are still checked.
+    pub fn open_unchecked(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path, false)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Hint the kernel that we read sequentially so it can prefetch ahead
-        // and reclaim already-read pages, reducing peak RSS for large files.
+        // Start with Normal advice (kernel default heuristic). Access-pattern-
+        // specific hints (Sequential, WillNeed, DontNeed) are issued at each
+        // call site — see assemble_shards*() and BackedCsrReader.
         #[cfg(unix)]
         {
             use memmap2::Advice;
-            let _ = mmap.advise(Advice::Sequential);
+            let _ = mmap.advise(Advice::Normal);
         }
 
         // Check minimum file size (header + root catalog placeholder)
@@ -87,7 +102,8 @@ impl ScxReader {
             });
         }
         let fc_slice = &mmap[fc_offset..fc_end];
-        let full_catalog = FullCatalog::read_from(&mut Cursor::new(fc_slice), fc_length)?;
+        let full_catalog =
+            FullCatalog::read_from(&mut Cursor::new(fc_slice), fc_length, verify_catalog)?;
 
         Ok(ScxReader {
             mmap,
@@ -443,6 +459,40 @@ impl ScxReader {
         &self.mmap
     }
 
+    /// Expose the underlying `Mmap` for range-specific madvise calls.
+    pub(crate) fn mmap_ref(&self) -> &Mmap {
+        &self.mmap
+    }
+
+    /// Hint sequential access for a byte range (`MADV_SEQUENTIAL`).
+    #[cfg(unix)]
+    fn advise_sequential(&self, offset: usize, len: usize) {
+        use memmap2::Advice;
+        let _ = self.mmap.advise_range(Advice::Sequential, offset, len);
+    }
+
+    /// Hint that a byte range will be needed soon (`MADV_WILLNEED`).
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    fn advise_willneed(&self, offset: usize, len: usize) {
+        use memmap2::Advice;
+        let _ = self.mmap.advise_range(Advice::WillNeed, offset, len);
+    }
+
+    /// Hint that a byte range is no longer needed (`MADV_DONTNEED`).
+    ///
+    /// # Safety
+    /// `UncheckedAdvice::DontNeed` may discard dirty pages on some platforms,
+    /// but our mmap is read-only so this is safe.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    unsafe fn advise_dontneed(&self, offset: usize, len: usize) {
+        use memmap2::UncheckedAdvice;
+        let _ = self
+            .mmap
+            .unchecked_advise_range(UncheckedAdvice::DontNeed, offset, len);
+    }
+
     // -----------------------------------------------------------------------
     // Validate (11.12)
     // -----------------------------------------------------------------------
@@ -523,23 +573,40 @@ impl ScxReader {
     }
 
     /// Read and decode a single shard from a catalog entry.
+    ///
+    /// Skips per-shard checksum verification for performance. The catalog
+    /// checksum verified at `ScxReader::open()` already provides file-level
+    /// integrity, making per-shard checksums redundant for most reads.
+    /// Use [`read_shard_from_entry_verified`] when explicit per-shard
+    /// verification is needed (e.g., `scx validate`).
     pub fn read_shard_from_entry(
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
-        self.read_shard_from_entry_inner(entry, true)
+        self.read_shard_from_entry_inner(entry, false)
     }
 
     /// Read and decode a single shard without verifying checksums.
     ///
-    /// Used by the training data loader where throughput is critical and data
-    /// integrity was already verified at file open time. Skips the BLAKE3
-    /// checksum computation and the associated payload copy.
+    /// Alias for [`read_shard_from_entry`] — both skip checksums.
+    /// Retained for call-site clarity (e.g., in the training loader).
     pub fn read_shard_from_entry_unchecked(
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
         self.read_shard_from_entry_inner(entry, false)
+    }
+
+    /// Read and decode a single shard with explicit checksum verification.
+    ///
+    /// Computes the BLAKE3 hash of the shard payload and compares it to the
+    /// truncated 8-byte checksum in the shard header. Use this for `scx validate`
+    /// or when data integrity must be confirmed per-shard.
+    pub fn read_shard_from_entry_verified(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        self.read_shard_from_entry_inner(entry, true)
     }
 
     fn read_shard_from_entry_inner(
@@ -601,6 +668,9 @@ impl ScxReader {
     }
 
     /// Assemble multiple shard entries into a single ScxCsr using parallel decode.
+    ///
+    /// Pre-allocates the final merged arrays to exact sizes using catalog stats,
+    /// then decodes each shard in parallel directly into its non-overlapping region.
     #[cfg(feature = "parallel")]
     fn assemble_shards_parallel(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
         if shards.is_empty() {
@@ -612,46 +682,132 @@ impl ScxReader {
             ));
         }
 
-        // Decode all shards in parallel
-        let decoded: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shards
-            .par_iter()
-            .map(|entry| self.read_shard_from_entry(entry))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Pre-compute total sizes for allocation
-        let total_indices: usize = decoded.iter().map(|(_, idx, _)| idx.len()).sum();
-        let total_data: usize = decoded.iter().map(|(_, _, d)| d.len()).sum();
-        let total_indptr: usize =
-            decoded.iter().map(|(ip, _, _)| ip.len()).sum::<usize>() - (decoded.len() - 1); // subtract duplicate leading zeros
-
-        let mut merged_indptr = Vec::with_capacity(total_indptr);
-        let mut merged_indices = Vec::with_capacity(total_indices);
-        let mut merged_data = Vec::with_capacity(total_data);
-        let mut cumulative_nnz: i64 = 0;
-
-        for (i, (indptr, indices, data)) in decoded.iter().enumerate() {
-            if i == 0 {
-                merged_indptr.extend_from_slice(indptr);
-            } else {
-                for &v in &indptr[1..] {
-                    merged_indptr.push(v + cumulative_nnz);
-                }
-            }
-            cumulative_nnz += *indptr.last().unwrap_or(&0);
-            merged_indices.extend_from_slice(indices);
-            merged_data.extend_from_slice(data);
+        // Hint aggressive readahead across the shard region.
+        // Use min/max of file offsets since shards are sorted by row_start,
+        // not file offset — they may not be contiguous after append/compact.
+        #[cfg(unix)]
+        {
+            let min_offset = shards.iter().map(|e| e.offset as usize).min().unwrap();
+            let max_end = shards
+                .iter()
+                .map(|e| (e.offset + e.length) as usize)
+                .max()
+                .unwrap();
+            self.advise_sequential(min_offset, max_end - min_offset);
         }
 
-        let n_rows = merged_indptr.len().saturating_sub(1);
+        // Pre-compute per-shard (n_rows, nnz) from catalog stats
+        let shard_sizes: Vec<(usize, usize)> = shards
+            .iter()
+            .map(|e| {
+                let stats = e.stats.as_ref().expect("shard entry must have stats");
+                (
+                    (stats.row_end - stats.row_start) as usize,
+                    stats.nnz as usize,
+                )
+            })
+            .collect();
+        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
+        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
+
+        // Compute per-shard cumulative offsets
+        let mut row_offsets = Vec::with_capacity(shards.len());
+        let mut nnz_offsets = Vec::with_capacity(shards.len());
+        let (mut cum_rows, mut cum_nnz) = (0usize, 0usize);
+        for &(n_rows, nnz) in &shard_sizes {
+            row_offsets.push(cum_rows);
+            nnz_offsets.push(cum_nnz);
+            cum_rows += n_rows;
+            cum_nnz += nnz;
+        }
+
+        // Single allocation for final merged arrays
+        let mut indptr = vec![0i64; total_rows + 1];
+        let mut indices = vec![0i32; total_nnz];
+        let mut data = vec![0f32; total_nnz];
+
+        // Parallel decode + copy into non-overlapping regions.
+        // Store base addresses as usize so they can cross thread boundaries
+        // (usize is Send+Sync; raw pointers are not).
+        // SAFETY: each rayon task writes to a disjoint region determined by
+        // pre-computed offsets, so there are no data races.
+        let indptr_base = indptr.as_mut_ptr() as usize;
+        let indices_base = indices.as_mut_ptr() as usize;
+        let data_base = data.as_mut_ptr() as usize;
+
+        shards.par_iter().enumerate().try_for_each(|(i, entry)| {
+            let (n_rows, nnz) = shard_sizes[i];
+            let row_off = row_offsets[i];
+            let nnz_off = nnz_offsets[i];
+
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+            debug_assert_eq!(
+                shard_ip.len(),
+                n_rows + 1,
+                "shard {i} indptr length mismatch: catalog says {}, got {}",
+                n_rows + 1,
+                shard_ip.len()
+            );
+            debug_assert_eq!(
+                shard_ix.len(),
+                nnz,
+                "shard {i} indices length mismatch: catalog says {nnz}, got {}",
+                shard_ix.len()
+            );
+            debug_assert_eq!(
+                shard_data.len(),
+                nnz,
+                "shard {i} data length mismatch: catalog says {nnz}, got {}",
+                shard_data.len()
+            );
+
+            // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping
+            let ix_out = unsafe {
+                std::slice::from_raw_parts_mut((indices_base as *mut i32).add(nnz_off), nnz)
+            };
+            let d_out = unsafe {
+                std::slice::from_raw_parts_mut((data_base as *mut f32).add(nnz_off), nnz)
+            };
+            ix_out.copy_from_slice(&shard_ix);
+            d_out.copy_from_slice(&shard_data);
+
+            // Indptr: shard 0 copies all n_rows+1 values as-is;
+            // shard i>0 copies [1..] with cumulative nnz offset.
+            if i == 0 {
+                // SAFETY: shard 0 writes to [0..n_rows+1], non-overlapping with i>0
+                let ip_out =
+                    unsafe { std::slice::from_raw_parts_mut(indptr_base as *mut i64, n_rows + 1) };
+                ip_out.copy_from_slice(&shard_ip);
+            } else {
+                // SAFETY: shard i writes to [row_off+1..row_off+1+n_rows], non-overlapping
+                let ip_out = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (indptr_base as *mut i64).add(row_off + 1),
+                        n_rows,
+                    )
+                };
+                let nnz_off_i64 = nnz_off as i64;
+                for j in 0..n_rows {
+                    ip_out[j] = shard_ip[j + 1] + nnz_off_i64;
+                }
+            }
+
+            Ok::<_, ScxError>(())
+        })?;
+
+        let n_rows = indptr.len().saturating_sub(1);
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.header.n_vars as usize),
-            merged_indptr,
-            merged_indices,
-            merged_data,
+            indptr,
+            indices,
+            data,
         ))
     }
 
     /// Assemble multiple shard entries into a single ScxCsr (sequential).
+    ///
+    /// Pre-allocates the final merged arrays to exact sizes using catalog stats,
+    /// then decodes each shard sequentially into its target region.
     #[cfg(any(not(feature = "parallel"), test))]
     fn assemble_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
         if shards.is_empty() {
@@ -663,34 +819,73 @@ impl ScxReader {
             ));
         }
 
-        let mut merged_indptr: Vec<i64> = Vec::new();
-        let mut merged_indices: Vec<i32> = Vec::new();
-        let mut merged_data: Vec<f32> = Vec::new();
-        let mut cumulative_nnz: i64 = 0;
+        // Hint aggressive readahead across the shard region.
+        // Use min/max of file offsets since shards are sorted by row_start,
+        // not file offset — they may not be contiguous after append/compact.
+        #[cfg(unix)]
+        {
+            let min_offset = shards.iter().map(|e| e.offset as usize).min().unwrap();
+            let max_end = shards
+                .iter()
+                .map(|e| (e.offset + e.length) as usize)
+                .max()
+                .unwrap();
+            self.advise_sequential(min_offset, max_end - min_offset);
+        }
+
+        // Pre-compute per-shard (n_rows, nnz) from catalog stats
+        let shard_sizes: Vec<(usize, usize)> = shards
+            .iter()
+            .map(|e| {
+                let stats = e.stats.as_ref().expect("shard entry must have stats");
+                (
+                    (stats.row_end - stats.row_start) as usize,
+                    stats.nnz as usize,
+                )
+            })
+            .collect();
+        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
+        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
+
+        // Single allocation for final merged arrays
+        let mut indptr = vec![0i64; total_rows + 1];
+        let mut indices = vec![0i32; total_nnz];
+        let mut data = vec![0f32; total_nnz];
+
+        let mut cum_rows = 0usize;
+        let mut cum_nnz = 0usize;
 
         for (i, entry) in shards.iter().enumerate() {
-            let (indptr, indices, data) = self.read_shard_from_entry(entry)?;
+            let (n_rows, nnz) = shard_sizes[i];
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+            debug_assert_eq!(shard_ip.len(), n_rows + 1);
+            debug_assert_eq!(shard_ix.len(), nnz);
+            debug_assert_eq!(shard_data.len(), nnz);
 
+            // Copy indices and data into their target region
+            indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
+            data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
+
+            // Copy indptr with cumulative nnz offset
             if i == 0 {
-                merged_indptr.extend_from_slice(&indptr);
+                indptr[0..n_rows + 1].copy_from_slice(&shard_ip);
             } else {
-                // Skip first element (0) and offset by cumulative nnz
-                for &v in &indptr[1..] {
-                    merged_indptr.push(v + cumulative_nnz);
+                let nnz_off_i64 = cum_nnz as i64;
+                for j in 0..n_rows {
+                    indptr[cum_rows + 1 + j] = shard_ip[j + 1] + nnz_off_i64;
                 }
             }
 
-            cumulative_nnz += *indptr.last().unwrap_or(&0);
-            merged_indices.extend_from_slice(&indices);
-            merged_data.extend_from_slice(&data);
+            cum_rows += n_rows;
+            cum_nnz += nnz;
         }
 
-        let n_rows = merged_indptr.len().saturating_sub(1);
+        let n_rows = indptr.len().saturating_sub(1);
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.header.n_vars as usize),
-            merged_indptr,
-            merged_indices,
-            merged_data,
+            indptr,
+            indices,
+            data,
         ))
     }
 }
@@ -987,6 +1182,43 @@ mod tests {
         assert!(matches!(result.unwrap_err(), ScxError::ChecksumMismatch));
     }
 
+    /// Regression guard for Phase 2A: verified path catches corruption,
+    /// unchecked path (default) does not error on corrupted shard payload.
+    #[test]
+    fn test_verified_vs_unchecked_shard_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "verify_guard.scx", 6, 10, 2, false);
+
+        // Read the file, corrupt a byte in a shard payload, write back
+        let mut data = std::fs::read(&path).unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        let shards = reader.catalog().shards_sorted();
+        assert!(!shards.is_empty());
+        let shard_entry = shards[0].clone();
+        let shard_offset = shard_entry.offset as usize;
+        let corrupt_pos = shard_offset + SHARD_HEADER_SIZE + 1;
+        drop(reader);
+
+        data[corrupt_pos] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        // Re-open (catalog checksum is still intact since we only corrupted
+        // shard payload bytes, not the catalog region)
+        let reader = ScxReader::open(&path).unwrap();
+
+        // Verified path should detect the corruption
+        let verified_result = reader.read_shard_from_entry_verified(&shard_entry);
+        assert!(verified_result.is_err());
+        assert!(matches!(
+            verified_result.unwrap_err(),
+            ScxError::ChecksumMismatch
+        ));
+
+        // Unchecked path (default) should not error — it skips the checksum
+        let unchecked_result = reader.read_shard_from_entry(&shard_entry);
+        assert!(unchecked_result.is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // 11.17: Unknown section types handled gracefully
     // -----------------------------------------------------------------------
@@ -1053,6 +1285,107 @@ mod tests {
         assert_eq!(csr.indices, individual_indices);
         assert_eq!(csr.data, individual_data);
         assert_eq!(csr.shape, (12, 10));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2B.7: Single-allocation assembly matches individual shard merge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_single_alloc_assembly_1_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "one_shard.scx", 8, 10, 1, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        let csr = reader.read_all_csr_shards().unwrap();
+        // 1 shard: indptr should start at 0 and be monotonic
+        assert_eq!(csr.indptr[0], 0);
+        assert_eq!(csr.shape, (8, 10));
+        for w in csr.indptr.windows(2) {
+            assert!(w[1] >= w[0], "indptr not monotonic: {} > {}", w[0], w[1]);
+        }
+        for &idx in &csr.indices {
+            assert!((0..10).contains(&idx), "index {} out of bounds", idx);
+        }
+    }
+
+    #[test]
+    fn test_single_alloc_assembly_2_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "two_shards.scx", 8, 10, 2, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        // Read individually (old merge pattern)
+        let mut individual_indptr: Vec<i64> = Vec::new();
+        let mut individual_indices: Vec<i32> = Vec::new();
+        let mut individual_data: Vec<f32> = Vec::new();
+        let mut cumulative_nnz: i64 = 0;
+
+        for i in 0..2 {
+            let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+            if i == 0 {
+                individual_indptr.extend_from_slice(&indptr);
+            } else {
+                for &v in &indptr[1..] {
+                    individual_indptr.push(v + cumulative_nnz);
+                }
+            }
+            cumulative_nnz += *indptr.last().unwrap_or(&0);
+            individual_indices.extend_from_slice(&indices);
+            individual_data.extend_from_slice(&data);
+        }
+
+        // Read assembled (single-allocation path)
+        let csr = reader.read_all_csr_shards().unwrap();
+
+        assert_eq!(csr.indptr, individual_indptr);
+        assert_eq!(csr.indices, individual_indices);
+        assert_eq!(csr.data, individual_data);
+        assert_eq!(csr.shape, (8, 10));
+    }
+
+    #[test]
+    fn test_single_alloc_assembly_many_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 rows, 20 vars, 10 shards = 10 rows per shard
+        let path = write_test_file(&dir, "many_shards.scx", 100, 20, 10, false);
+        let reader = ScxReader::open(&path).unwrap();
+
+        // Read individually (old merge pattern)
+        let mut individual_indptr: Vec<i64> = Vec::new();
+        let mut individual_indices: Vec<i32> = Vec::new();
+        let mut individual_data: Vec<f32> = Vec::new();
+        let mut cumulative_nnz: i64 = 0;
+
+        for i in 0..10 {
+            let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+            if i == 0 {
+                individual_indptr.extend_from_slice(&indptr);
+            } else {
+                for &v in &indptr[1..] {
+                    individual_indptr.push(v + cumulative_nnz);
+                }
+            }
+            cumulative_nnz += *indptr.last().unwrap_or(&0);
+            individual_indices.extend_from_slice(&indices);
+            individual_data.extend_from_slice(&data);
+        }
+
+        // Read assembled (single-allocation path)
+        let csr = reader.read_all_csr_shards().unwrap();
+
+        assert_eq!(csr.indptr, individual_indptr);
+        assert_eq!(csr.indices, individual_indices);
+        assert_eq!(csr.data, individual_data);
+        assert_eq!(csr.shape, (100, 20));
+
+        // Verify invariants
+        for w in csr.indptr.windows(2) {
+            assert!(w[1] >= w[0], "indptr not monotonic");
+        }
+        for &idx in &csr.indices {
+            assert!((0..20).contains(&idx), "index {} out of bounds", idx);
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -47,7 +47,7 @@ pub fn append(
         lock.seek(SeekFrom::Start(fc_offset))?;
         let mut buf = vec![0u8; fc_length as usize];
         std::io::Read::read_exact(&mut lock, &mut buf)?;
-        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize)?
+        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize, true)?
     };
 
     if new_indptr.is_empty() {

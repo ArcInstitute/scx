@@ -963,7 +963,7 @@ mod tests {
         let fc_end = fc_start + hdr.full_catalog_length as usize;
         let mut fc_cursor = std::io::Cursor::new(&data[fc_start..fc_end]);
         let catalog =
-            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize).unwrap();
+            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize, true).unwrap();
         assert_eq!(catalog.entries.len(), 3); // obs + var + 1 shard
 
         // Verify all section offsets are 8-byte aligned
@@ -1051,7 +1051,7 @@ mod tests {
         let fc_end = fc_start + hdr.full_catalog_length as usize;
         let mut fc_cursor = std::io::Cursor::new(&data[fc_start..fc_end]);
         let catalog =
-            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize).unwrap();
+            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize, true).unwrap();
 
         assert_eq!(catalog.entries.len(), 6); // obs + var + 4 shards
 
@@ -1148,7 +1148,7 @@ mod tests {
         let fc_end = fc_start + hdr.full_catalog_length as usize;
         let mut fc_cursor = std::io::Cursor::new(&data[fc_start..fc_end]);
         let catalog =
-            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize).unwrap();
+            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize, true).unwrap();
 
         // obs, var, csr_shard, layer_csr_shard, obsm, uns, provenance = 7
         assert_eq!(catalog.entries.len(), 7);
@@ -1327,7 +1327,7 @@ mod tests {
         let fc_end = fc_start + hdr.full_catalog_length as usize;
         let mut fc_cursor = std::io::Cursor::new(&data[fc_start..fc_end]);
         let catalog =
-            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize).unwrap();
+            FullCatalog::read_from(&mut fc_cursor, hdr.full_catalog_length as usize, true).unwrap();
 
         // obs + var + 1 CSR shard + 1 CSC shard = 4 entries
         assert_eq!(catalog.entries.len(), 4);

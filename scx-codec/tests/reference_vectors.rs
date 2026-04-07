@@ -245,6 +245,138 @@ fn shard_ref_scx1_roundtrip() {
 }
 
 // =========================================================================
+// Full shard reference vector (CodecId::Lz4Shuffle)
+// =========================================================================
+
+#[test]
+fn shard_ref_lz4shuffle_u8_u16_roundtrip() {
+    // Same 3×5 matrix as None/Scx1 tests, but with LZ4+shuffle codec
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_raw: Vec<u8> = vec![5, 10, 1, 3, 7, 2]; // u8 encoding
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint8,
+        true, // u16 indices
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint8,
+        3,
+        6,
+        true,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+#[test]
+fn shard_ref_lz4shuffle_u32_roundtrip() {
+    // Same matrix with u32 values and u32 indices
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_u32: Vec<u32> = vec![5, 10, 1, 3, 7, 2];
+    let mut values_raw = Vec::new();
+    for &v in &values_u32 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        false, // u32 indices
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        3,
+        6,
+        false,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+#[test]
+fn shard_ref_lz4shuffle_float32_roundtrip() {
+    // Same matrix with float32 values
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_f32: Vec<f32> = vec![5.0, 10.0, 1.0, 3.0, 7.0, 2.0];
+    let mut values_raw = Vec::new();
+    for &v in &values_f32 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Float32,
+        true,
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Float32,
+        3,
+        6,
+        true,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+// =========================================================================
+// FOR-BP SIMD path reference vector (Phase 2E)
+// =========================================================================
+
+#[test]
+fn forbp_ref_large_row_simd_roundtrip() {
+    // 200 sorted indices — exercises the BitPacker4x SIMD path (NNZ >= 128)
+    // Round-trip only (no exact byte checks — SIMD uses interleaved format)
+    let indices: Vec<u32> = (0..200).map(|i| i * 3).collect(); // [0, 3, 6, ..., 597]
+    let row_lengths = vec![200usize];
+    let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
+    let (dec_indices, dec_row_lengths) = forbp_decode(&encoded, 1, true).unwrap();
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_row_lengths, row_lengths);
+}
+
+#[test]
+fn forbp_ref_large_row_u32_simd_roundtrip() {
+    // Same test with u32 index mode
+    let indices: Vec<u32> = (0..256).map(|i| i * 100).collect();
+    let row_lengths = vec![256usize];
+    let encoded = forbp_encode(&indices, &row_lengths, false).unwrap();
+    let (dec_indices, dec_row_lengths) = forbp_decode(&encoded, 1, false).unwrap();
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_row_lengths, row_lengths);
+}
+
+// =========================================================================
 // Bitstream reference vectors
 // =========================================================================
 

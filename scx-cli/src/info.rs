@@ -13,7 +13,7 @@ pub fn run_info(
     json_output: bool,
     history: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let reader = ScxReader::open(path)?;
+    let reader = ScxReader::open_unchecked(path)?;
     let header = reader.header();
     let catalog = reader.catalog();
 
@@ -35,6 +35,7 @@ pub fn run_info(
         Some(CodecId::None) => "none",
         Some(CodecId::Scx1) => "scx1",
         Some(CodecId::Zstd) => "zstd",
+        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
         None => "unknown",
     };
 
@@ -178,6 +179,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         Some(CodecId::None) => "none",
         Some(CodecId::Scx1) => "scx1",
         Some(CodecId::Zstd) => "zstd",
+        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
         None => "unknown",
     };
 
@@ -370,7 +372,7 @@ fn try_read_catalog_at(
                 continue;
             }
             let try_slice = &mmap[offset..offset + candidate];
-            if let Ok(fc) = FullCatalog::read_from(&mut Cursor::new(try_slice), candidate) {
+            if let Ok(fc) = FullCatalog::read_from(&mut Cursor::new(try_slice), candidate, true) {
                 return Ok(fc);
             }
         }

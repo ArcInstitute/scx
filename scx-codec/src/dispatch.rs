@@ -7,6 +7,7 @@ use crate::bitstream::BitStreamError;
 use crate::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
 use crate::forbp::{forbp_decode_with_hint, forbp_encode};
 use crate::rice::{rice_decode, rice_encode, B_VAL};
+use crate::shuffle::{byte_shuffle, byte_unshuffle};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,6 +23,9 @@ pub enum CodecId {
     Scx1 = 1,
     /// Zstd compression per array. Works with any value encoding.
     Zstd = 2,
+    /// LZ4 frame compression with byte-shuffle pre-filter.
+    /// Matches Zarr/Blosc compression style. Works with any value encoding.
+    Lz4Shuffle = 3,
 }
 
 impl CodecId {
@@ -30,6 +34,7 @@ impl CodecId {
             0 => Some(Self::None),
             1 => Some(Self::Scx1),
             2 => Some(Self::Zstd),
+            3 => Some(Self::Lz4Shuffle),
             _ => None,
         }
     }
@@ -186,6 +191,9 @@ pub fn encode_shard(
         CodecId::None => encode_none(indptr, indices, values, index_dtype_u16),
         CodecId::Scx1 => encode_scx1(indptr, indices, values, value_encoding, index_dtype_u16),
         CodecId::Zstd => encode_zstd(indptr, indices, values, index_dtype_u16),
+        CodecId::Lz4Shuffle => {
+            encode_lz4_shuffle(indptr, indices, values, value_encoding, index_dtype_u16)
+        }
     }
 }
 
@@ -224,6 +232,9 @@ pub fn decode_shard_ref(
         CodecId::None => decode_none_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
         CodecId::Scx1 => decode_scx1_ref(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
         CodecId::Zstd => decode_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
+        CodecId::Lz4Shuffle => {
+            decode_lz4_shuffle_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16)
+        }
     }
 }
 
@@ -267,7 +278,7 @@ pub fn decode_shard_scipy(
         return Ok((indptr, indices, data));
     }
 
-    // For None and Zstd: decode to raw types, then convert
+    // For None, Zstd, and Lz4Shuffle: decode to raw types, then convert
     let (indptr_u64, indices_u32, values_raw) = decode_shard_ref(
         encoded,
         codec_id,
@@ -282,38 +293,36 @@ pub fn decode_shard_scipy(
     Ok((indptr, indices, data))
 }
 
-/// Convert Vec<u64> to Vec<i64>, returning an error if any value exceeds i64::MAX.
+/// Convert Vec<u64> to Vec<i64> via zero-copy reinterpretation.
+/// CSR indptr values are always non-negative and well below i64::MAX,
+/// so the bit patterns are identical. Uses bytemuck for safe transmute.
 fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
-    data.into_iter()
-        .map(|v| {
-            i64::try_from(v).map_err(|_| {
-                CodecError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("indptr value {} exceeds i64::MAX", v),
-                ))
-            })
-        })
-        .collect()
+    debug_assert!(
+        data.iter().all(|&v| v <= i64::MAX as u64),
+        "indptr value exceeds i64::MAX"
+    );
+    Ok(bytemuck::cast_vec::<u64, i64>(data))
 }
 
-/// Convert Vec<u32> to Vec<i32>, returning an error if any value exceeds i32::MAX.
+/// Convert Vec<u32> to Vec<i32> via zero-copy reinterpretation.
+/// Column indices are always non-negative and below n_vars (well within i32 range),
+/// so the bit patterns are identical. Uses bytemuck for safe transmute.
 fn u32_vec_to_i32(data: Vec<u32>) -> Result<Vec<i32>, CodecError> {
-    data.into_iter()
-        .map(|v| {
-            i32::try_from(v).map_err(|_| {
-                CodecError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("index value {} exceeds i32::MAX", v),
-                ))
-            })
-        })
-        .collect()
+    debug_assert!(
+        data.iter().all(|&v| v <= i32::MAX as u32),
+        "index value exceeds i32::MAX"
+    );
+    Ok(bytemuck::cast_vec::<u32, i32>(data))
 }
 
 /// Convert raw LE value bytes to f32 according to ValueEncoding.
 fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
     match encoding {
-        ValueEncoding::Uint8 => raw.iter().map(|&b| b as f32).collect(),
+        ValueEncoding::Uint8 => {
+            let mut out = Vec::with_capacity(raw.len());
+            out.extend(raw.iter().map(|&b| b as f32));
+            out
+        }
         ValueEncoding::Uint16 => raw
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
@@ -322,10 +331,18 @@ fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
             .collect(),
-        ValueEncoding::Float32 => raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
+        ValueEncoding::Float32 => {
+            #[cfg(target_endian = "little")]
+            {
+                bytemuck::cast_slice::<u8, f32>(raw).to_vec()
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            }
+        }
         ValueEncoding::Float16 => raw
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -492,6 +509,90 @@ fn decode_zstd_ref(
     let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
     let indices_raw = zstd_decode_bounded(encoded.indices_bytes, indices_max)?;
     let values_raw = zstd_decode_bounded(encoded.values_bytes, values_max)?;
+
+    let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
+    let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
+
+    let expected_len = nnz * value_encoding.byte_width();
+    if values_raw.len() != expected_len {
+        return Err(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed values byte length {} != expected {}",
+                values_raw.len(),
+                expected_len
+            ),
+        )));
+    }
+
+    Ok((indptr, indices, values_raw))
+}
+
+// ---------------------------------------------------------------------------
+// CodecId::Lz4Shuffle
+// ---------------------------------------------------------------------------
+
+fn lz4_frame_compress(data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    use std::io::Write;
+    let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    encoder.write_all(data)?;
+    let buf = encoder
+        .finish()
+        .map_err(|e| CodecError::Io(std::io::Error::other(e)))?;
+    Ok(buf)
+}
+
+fn lz4_frame_decompress(data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    use std::io::Read;
+    let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn encode_lz4_shuffle(
+    indptr: &[u64],
+    indices: &[u32],
+    values: &[u8],
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<EncodedShard, CodecError> {
+    let indptr_raw = u64_slice_to_le_bytes(indptr);
+    let indices_raw = indices_to_le_bytes(indices, index_dtype_u16)?;
+
+    // Byte-shuffle then LZ4 frame compress each array
+    let indptr_shuffled = byte_shuffle(&indptr_raw, 8); // u64 = 8 bytes
+    let index_width = if index_dtype_u16 { 2 } else { 4 };
+    let indices_shuffled = byte_shuffle(&indices_raw, index_width);
+    let values_shuffled = byte_shuffle(values, value_encoding.byte_width());
+
+    let indptr_bytes = lz4_frame_compress(&indptr_shuffled)?;
+    let indices_bytes = lz4_frame_compress(&indices_shuffled)?;
+    let values_bytes = lz4_frame_compress(&values_shuffled)?;
+
+    Ok(EncodedShard {
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+    })
+}
+
+fn decode_lz4_shuffle_ref(
+    encoded: &EncodedShardRef,
+    n_rows: usize,
+    nnz: usize,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<DecodedShard, CodecError> {
+    // LZ4 frame decompress then byte-unshuffle each array
+    let indptr_shuffled = lz4_frame_decompress(encoded.indptr_bytes)?;
+    let indices_shuffled = lz4_frame_decompress(encoded.indices_bytes)?;
+    let values_shuffled = lz4_frame_decompress(encoded.values_bytes)?;
+
+    let indptr_raw = byte_unshuffle(&indptr_shuffled, 8);
+    let index_width = if index_dtype_u16 { 2 } else { 4 };
+    let indices_raw = byte_unshuffle(&indices_shuffled, index_width);
+    let values_raw = byte_unshuffle(&values_shuffled, value_encoding.byte_width());
 
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
@@ -725,7 +826,12 @@ mod tests {
     /// Task 6.7: Round-trip through each CodecId × integer ValueEncoding.
     #[test]
     fn test_roundtrip_all_integer_codecs() {
-        let codecs = [CodecId::None, CodecId::Scx1, CodecId::Zstd];
+        let codecs = [
+            CodecId::None,
+            CodecId::Scx1,
+            CodecId::Zstd,
+            CodecId::Lz4Shuffle,
+        ];
         let encodings = [
             ValueEncoding::Uint8,
             ValueEncoding::Uint16,
@@ -845,6 +951,62 @@ mod tests {
         assert_eq!(values, dec_values);
     }
 
+    /// LZ4Shuffle + Float32 round-trips correctly.
+    #[test]
+    fn test_lz4_shuffle_float32_roundtrip() {
+        let (indptr, indices, values, n_rows, nnz) = make_test_csr(ValueEncoding::Float32);
+        let encoded = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Lz4Shuffle,
+            ValueEncoding::Float32,
+            false,
+        )
+        .unwrap();
+        let (dec_indptr, dec_indices, dec_values) = decode_shard(
+            &encoded,
+            CodecId::Lz4Shuffle,
+            ValueEncoding::Float32,
+            n_rows,
+            nnz,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indptr, dec_indptr);
+        assert_eq!(indices, dec_indices);
+        assert_eq!(values, dec_values);
+    }
+
+    /// LZ4Shuffle + Float16 round-trips correctly.
+    #[test]
+    fn test_lz4_shuffle_float16_roundtrip() {
+        let (indptr, indices, values, n_rows, nnz) = make_test_csr(ValueEncoding::Float16);
+        let encoded = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Lz4Shuffle,
+            ValueEncoding::Float16,
+            false,
+        )
+        .unwrap();
+        let (dec_indptr, dec_indices, dec_values) = decode_shard(
+            &encoded,
+            CodecId::Lz4Shuffle,
+            ValueEncoding::Float16,
+            n_rows,
+            nnz,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indptr, dec_indptr);
+        assert_eq!(indices, dec_indices);
+        assert_eq!(values, dec_values);
+    }
+
     /// Test None with u16 indices.
     #[test]
     fn test_none_u16_indices() {
@@ -869,7 +1031,8 @@ mod tests {
         assert_eq!(CodecId::from_u8(0), Some(CodecId::None));
         assert_eq!(CodecId::from_u8(1), Some(CodecId::Scx1));
         assert_eq!(CodecId::from_u8(2), Some(CodecId::Zstd));
-        assert_eq!(CodecId::from_u8(3), None);
+        assert_eq!(CodecId::from_u8(3), Some(CodecId::Lz4Shuffle));
+        assert_eq!(CodecId::from_u8(4), None);
 
         assert_eq!(ValueEncoding::from_u8(0), Some(ValueEncoding::Uint8));
         assert_eq!(ValueEncoding::from_u8(4), Some(ValueEncoding::Float16));
@@ -908,21 +1071,46 @@ mod tests {
     }
 
     #[test]
-    fn test_u64_to_i64_rejects_overflow() {
-        let data = vec![0u64, 100, u64::MAX];
-        assert!(u64_vec_to_i64(data).is_err());
-
+    fn test_u64_to_i64_cast_valid() {
         let data = vec![0u64, 100, i64::MAX as u64];
-        assert!(u64_vec_to_i64(data).is_ok());
+        let result = u64_vec_to_i64(data).unwrap();
+        assert_eq!(result, vec![0i64, 100, i64::MAX]);
     }
 
     #[test]
-    fn test_u32_to_i32_rejects_overflow() {
-        let data = vec![0u32, 100, u32::MAX];
-        assert!(u32_vec_to_i32(data).is_err());
+    #[should_panic(expected = "indptr value exceeds i64::MAX")]
+    fn test_u64_to_i64_debug_assert_overflow() {
+        let data = vec![0u64, 100, u64::MAX];
+        let _ = u64_vec_to_i64(data);
+    }
 
+    #[test]
+    fn test_u32_to_i32_cast_valid() {
         let data = vec![0u32, 100, i32::MAX as u32];
-        assert!(u32_vec_to_i32(data).is_ok());
+        let result = u32_vec_to_i32(data).unwrap();
+        assert_eq!(result, vec![0i32, 100, i32::MAX]);
+    }
+
+    #[test]
+    #[should_panic(expected = "index value exceeds i32::MAX")]
+    fn test_u32_to_i32_debug_assert_overflow() {
+        let data = vec![0u32, 100, u32::MAX];
+        let _ = u32_vec_to_i32(data);
+    }
+
+    #[test]
+    fn test_values_raw_to_f32_uint8() {
+        let raw = vec![0u8, 1, 127, 255];
+        let result = values_raw_to_f32(&raw, ValueEncoding::Uint8);
+        assert_eq!(result, vec![0.0f32, 1.0, 127.0, 255.0]);
+    }
+
+    #[test]
+    fn test_values_raw_to_f32_float32_le() {
+        let vals = [1.0f32, -2.5, 0.0, f32::MAX];
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let result = values_raw_to_f32(&raw, ValueEncoding::Float32);
+        assert_eq!(result, vals.to_vec());
     }
 
     #[test]

@@ -95,8 +95,9 @@ See [SPEC.md](SPEC.md) §3 for full details.
 ### Codec System
 
 - `None (0)` — Raw LE arrays
-- `Scx1 (1)` — Delta-Golomb (indptr) + FOR-BP (indices) + Rice (values). **Integer only.**
+- `Scx1 (1)` — Delta-Golomb (indptr) + FOR-BP (indices, SIMD BitPacker4x) + Rice (values). **Integer only.**
 - `Zstd (2)` — Zstd per-section. Fallback for float layers.
+- `Lz4Shuffle (3)` — Byte-shuffle pre-filter + LZ4 frame compression. Works with any value encoding. Matches Zarr/Blosc compression style.
 
 **Auto-codec**: `codec_select.rs` chooses Scx1 vs Zstd based on median value (threshold ≤ 8). Default for `from_anndata()` and `scx convert` is `"auto"`.
 
@@ -113,7 +114,8 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 
 - **Phase 1 (Format + Codec + AnnData Bridge)**: Complete.
 - **Phase 2 (Training Loader + Query Engine)**: Complete.
-- **Phase 3**: Step 1 (SIMD) skipped. Step 2 (scx-gpu) in progress. Step 3 (rscx) complete. Steps 4–5 partially done.
+- **Phase 3**: Step 1 (SIMD FOR-BP via BitPacker4x) complete (Sprint 2, Phase 2E). Step 2 (scx-gpu) in progress. Step 3 (rscx) complete. Steps 4–5 partially done.
+- **Sprint 2 (Read Gap Closure)**: Complete — parallel shard decode (2A), catalog seek (2B), format cleanup (2C), LZ4+shuffle codec (2D), SIMD FOR-BP (2E), madvise hints (2F), integration testing (2G). Cumulative result: 61% faster reads on tabula_sapiens_100k, 67% RSS reduction during streaming aggregation. See `benchmarks/comprehensive/reporting/phase3_report.md`.
 - **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
 - **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
 - **Phase 4c (GPU Accelerators)**: Implementation complete, benchmarked — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN, 9.4× standalone on 1M cells), native CUDA UMAP SGD (7.7× on 1M cells), cuGraph Leiden (16× on 1M cells), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Go/No-Go: 3/4 pass (PCA correctness, kNN recall, graceful fallback); 10× pipeline target not met (3.8× median, 8.8× best run). Requires `scx-gpu` conda env for RAPIDS compatibility. See `benchmarks/results/gpu_gonogo.json`.

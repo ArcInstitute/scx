@@ -67,6 +67,7 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
   - Integer values with median ≤ 8 → Scx1 (Rice coding)
   - Integer values with median > 8 → Zstd
   - Float values → always Zstd
+- LZ4+shuffle (`codec="lz4"`) available but not auto-selected — user must opt in
 
 ## Provenance
 
@@ -537,19 +538,19 @@ for batch in dataset:
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd] [--shard-size N]`
+- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd|lz4] [--shard-size N]`
 - `scx info <file> [--json] [--history]`
 - `scx validate <file> [--verbose]`
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`
 
 ### File operations
-- `scx append <target> --input <source> [--codec auto|none|scx1|zstd] [--shard-size N]`
+- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4] [--shard-size N]`
 - `scx delete <file> --filter <expr> [--dry-run]`
 - `scx compact <input> --output <path> [--force]`
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path>`
 - `scx query <file> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]`
-- `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd]` — Extract a subset of cells and/or genes into a new SCX file
+- `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4]` — Extract a subset of cells and/or genes into a new SCX file
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
 

@@ -8,7 +8,10 @@ authors.workspace = true
 
 [dependencies]
 byteorder = { workspace = true }
+bytemuck = { workspace = true }
 half = { workspace = true }
+lz4_flex = { workspace = true }
+bitpacking = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
 

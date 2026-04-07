@@ -168,6 +168,32 @@ proptest! {
         prop_assert_eq!(dec_indices, indices);
         prop_assert_eq!(dec_row_lengths, row_lengths);
     }
+
+    /// Large-row proptest exercising the BitPacker4x SIMD path (NNZ >= 128).
+    #[test]
+    fn forbp_roundtrip_large_rows(n_rows in 1..50usize) {
+        let mut indices = Vec::new();
+        let mut row_lengths = Vec::new();
+        let mut rng_state = 0xDEAD_BEEFu64.wrapping_add(n_rows as u64);
+
+        for _ in 0..n_rows {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // NNZ up to 300 — most rows will exceed the 128-value SIMD threshold
+            let nnz = ((rng_state >> 33) % 300) as usize;
+            let mut prev = 0u32;
+            for _ in 0..nnz {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                prev += ((rng_state >> 33) % 50 + 1) as u32;
+                indices.push(prev);
+            }
+            row_lengths.push(nnz);
+        }
+
+        let encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
+        let (dec_indices, dec_row_lengths) = forbp_decode(&encoded, n_rows, true).unwrap();
+        prop_assert_eq!(dec_indices, indices);
+        prop_assert_eq!(dec_row_lengths, row_lengths);
+    }
 }
 
 // =========================================================================
@@ -220,6 +246,42 @@ proptest! {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Uint32, u16_idx).unwrap();
         let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Zstd, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_lz4shuffle_u8_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint8)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint8, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint8, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_lz4shuffle_u16_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_lz4shuffle_u32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
         prop_assert_eq!(&d_ip, &indptr);
         prop_assert_eq!(&d_ix, &indices);
         prop_assert_eq!(&d_v, &values);

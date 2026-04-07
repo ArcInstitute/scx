@@ -78,6 +78,7 @@ pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<Pus
     let full_catalog = FullCatalog::read_from(
         &mut Cursor::new(&file_data[fc_offset..fc_offset + fc_length]),
         fc_length,
+        true,
     )?;
 
     // 2. Parse destination and create backend
@@ -366,7 +367,8 @@ mod tests {
         // Read and validate _catalog.bin
         let catalog_data = std::fs::read(dest_dir.join("_catalog.bin")).unwrap();
         let catalog =
-            FullCatalog::read_from(&mut Cursor::new(&catalog_data), catalog_data.len()).unwrap();
+            FullCatalog::read_from(&mut Cursor::new(&catalog_data), catalog_data.len(), true)
+                .unwrap();
 
         // All section files referenced by catalog should exist
         for entry in &catalog.entries {

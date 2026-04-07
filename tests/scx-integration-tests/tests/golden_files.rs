@@ -47,6 +47,11 @@ fn golden_combinations() -> Vec<(CodecId, ValueEncoding)> {
         (CodecId::Zstd, ValueEncoding::Uint16),
         (CodecId::Zstd, ValueEncoding::Uint32),
         (CodecId::Zstd, ValueEncoding::Float32),
+        // Sprint 2: LZ4+shuffle (Phase 2D) — works with any value encoding
+        (CodecId::Lz4Shuffle, ValueEncoding::Uint8),
+        (CodecId::Lz4Shuffle, ValueEncoding::Uint16),
+        (CodecId::Lz4Shuffle, ValueEncoding::Uint32),
+        (CodecId::Lz4Shuffle, ValueEncoding::Float32),
     ]
 }
 
@@ -105,6 +110,7 @@ fn codec_name(c: CodecId) -> &'static str {
         CodecId::None => "none",
         CodecId::Scx1 => "scx1",
         CodecId::Zstd => "zstd",
+        CodecId::Lz4Shuffle => "lz4shuffle",
     }
 }
 
@@ -499,4 +505,112 @@ fn test_manifest_hashes() {
         golden_combinations().len(),
         "Manifest entry count mismatch"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Backward compatibility tests (§2G.6)
+// ---------------------------------------------------------------------------
+
+/// §2G.6(b): A reader that only knows codecs 0–2 should reject LZ4+shuffle files
+/// with a clear `UnknownCodec` error, not a crash or silent corruption.
+///
+/// We simulate this by writing an LZ4+shuffle file, then patching the shard header's
+/// codec_id byte to a hypothetical future codec (e.g., 99) and verifying the reader
+/// produces a clear error.
+#[test]
+fn test_unknown_codec_rejected_gracefully() {
+    // Write a valid Lz4Shuffle file
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = dir.path().join("test_unknown_codec.scx");
+
+    let (indptr, indices, data_f32) = generate_matrix(ValueEncoding::Uint16);
+    let values_bytes = ValueEncoding::Uint16.encode_f32_batch(&data_f32).unwrap();
+
+    let header = make_header();
+    let mut writer = ScxWriter::new(&scx_path, header).unwrap();
+    writer.write_obs(&make_obs()).unwrap();
+    writer.write_var(&make_var()).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values_bytes,
+            CodecId::Lz4Shuffle,
+            ValueEncoding::Uint16,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Verify the file reads correctly with the current reader
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape, (N_OBS, N_VARS));
+
+    // Now patch the shard header's codec_id byte to 99 (unknown future codec)
+    let mut file_bytes = fs::read(&scx_path).unwrap();
+
+    // Find the shard header magic "SCXS" and patch codec_id (offset +6 from magic)
+    let shard_magic = b"SCXS";
+    let mut patched = false;
+    for i in 0..file_bytes.len() - 4 {
+        if &file_bytes[i..i + 4] == shard_magic {
+            // Shard header layout: magic(4) + shard_format_version(1) + shard_type(1) + codec_id(1)
+            file_bytes[i + 6] = 99; // patch codec_id to unknown value
+            patched = true;
+            break;
+        }
+    }
+    assert!(patched, "Could not find shard header magic in file");
+
+    // Write patched file
+    let patched_path = dir.path().join("test_patched_codec.scx");
+    fs::write(&patched_path, &file_bytes).unwrap();
+
+    // The reader should open the file (header is fine) but fail on shard decode
+    // with UnknownCodec error
+    let reader2 = ScxReader::open(&patched_path).unwrap();
+    let result = reader2.read_all_csr_shards();
+    assert!(result.is_err(), "Expected error for unknown codec, got Ok");
+    let err = result.unwrap_err();
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("unknown codec ID: 99"),
+        "Expected 'unknown codec ID: 99' in error message, got: {err_msg}"
+    );
+}
+
+/// §2G.6(a): Phase 0 golden files (codecs 0–2) must still be readable
+/// after Sprint 2 changes. This is implicitly tested by the above tests
+/// (test_golden_files_validate, test_golden_files_csr_match, etc.) which
+/// run on every `cargo test`. This test explicitly verifies the Phase 0
+/// subset still works.
+#[test]
+fn test_phase0_golden_files_still_readable() {
+    let phase0_combinations = vec![
+        (CodecId::None, ValueEncoding::Uint8),
+        (CodecId::None, ValueEncoding::Uint16),
+        (CodecId::None, ValueEncoding::Uint32),
+        (CodecId::None, ValueEncoding::Float32),
+        (CodecId::Scx1, ValueEncoding::Uint8),
+        (CodecId::Scx1, ValueEncoding::Uint16),
+        (CodecId::Scx1, ValueEncoding::Uint32),
+        (CodecId::Zstd, ValueEncoding::Uint8),
+        (CodecId::Zstd, ValueEncoding::Uint16),
+        (CodecId::Zstd, ValueEncoding::Uint32),
+        (CodecId::Zstd, ValueEncoding::Float32),
+    ];
+
+    for (codec, encoding) in phase0_combinations {
+        let basename = golden_basename(codec, encoding);
+        let path = scx_path_for(&basename);
+        assert!(path.exists(), "Phase 0 golden file missing: {path:?}");
+        let reader = ScxReader::open(&path).unwrap();
+        let csr = reader.read_all_csr_shards().unwrap();
+        assert_eq!(
+            csr.shape,
+            (N_OBS, N_VARS),
+            "{basename}: shape mismatch in Phase 0 golden file"
+        );
+    }
 }

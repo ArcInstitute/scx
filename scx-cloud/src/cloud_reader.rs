@@ -176,8 +176,11 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
         Ok(get_result) => {
             // Exploded directory
             let catalog_bytes = get_result.bytes().await?.to_vec();
-            let catalog =
-                FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len())?;
+            let catalog = FullCatalog::read_from(
+                &mut Cursor::new(&catalog_bytes),
+                catalog_bytes.len(),
+                true,
+            )?;
 
             let header_path = {
                 let f = crate::pull::build_path_fn(&location);
@@ -253,7 +256,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                         .to_vec()
                 };
 
-                let catalog = FullCatalog::read_from(&mut Cursor::new(&fc_bytes), fc_bytes.len())?;
+                let catalog =
+                    FullCatalog::read_from(&mut Cursor::new(&fc_bytes), fc_bytes.len(), true)?;
 
                 Ok(CloudReader {
                     backend,
@@ -277,7 +281,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     .await?
                     .to_vec();
 
-                let catalog = FullCatalog::read_from(&mut Cursor::new(&fc_bytes), fc_bytes.len())?;
+                let catalog =
+                    FullCatalog::read_from(&mut Cursor::new(&fc_bytes), fc_bytes.len(), true)?;
 
                 Ok(CloudReader {
                     backend,

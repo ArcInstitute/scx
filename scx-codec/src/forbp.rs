@@ -3,10 +3,16 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
 
+use bitpacking::{BitPacker, BitPacker4x};
+
 use crate::bitstream::{BitStreamError, BitWriter};
 
 /// Block size for FOR-BP coding of indices: 128 rows per block.
 pub const B_IDX: usize = 128;
+
+/// Minimum NNZ per row to use BitPacker4x SIMD path.
+/// BitPacker4x processes 128 values per call.
+const SIMD_THRESHOLD: usize = BitPacker4x::BLOCK_LEN;
 
 // ---------------------------------------------------------------------------
 // LEB128 varint helpers (task 5.2)
@@ -135,11 +141,38 @@ pub fn forbp_encode(
 
             // Bit-pack deltas if frame_bits > 0
             if frame_bits > 0 {
-                let mut bw = BitWriter::new();
-                for &d in &deltas {
-                    bw.write_bits(d as u64, frame_bits);
+                if nnz >= SIMD_THRESHOLD {
+                    // SIMD path: BitPacker4x for 128-value chunks
+                    let packer = BitPacker4x::new();
+                    let full_chunks = nnz / SIMD_THRESHOLD;
+                    let remainder = nnz % SIMD_THRESHOLD;
+                    let chunk_bytes = frame_bits as usize * SIMD_THRESHOLD / 8;
+                    let mut compressed = vec![0u8; chunk_bytes];
+                    for c in 0..full_chunks {
+                        let start = c * SIMD_THRESHOLD;
+                        packer.compress(
+                            &deltas[start..start + SIMD_THRESHOLD],
+                            &mut compressed,
+                            frame_bits,
+                        );
+                        output.extend_from_slice(&compressed);
+                    }
+                    // Remainder: scalar BitWriter
+                    if remainder > 0 {
+                        let mut bw = BitWriter::new();
+                        for &d in &deltas[full_chunks * SIMD_THRESHOLD..] {
+                            bw.write_bits(d as u64, frame_bits);
+                        }
+                        output.extend_from_slice(&bw.flush());
+                    }
+                } else {
+                    // Scalar path for small rows
+                    let mut bw = BitWriter::new();
+                    for &d in &deltas {
+                        bw.write_bits(d as u64, frame_bits);
+                    }
+                    output.extend_from_slice(&bw.flush());
                 }
-                output.extend_from_slice(&bw.flush());
             }
 
             idx_offset += nnz;
@@ -291,28 +324,74 @@ fn forbp_decode_inner(
             let frame_bits = cursor.read_u8().map_err(|_| BitStreamError)?;
 
             if frame_bits > 0 {
-                let total_bits = frame_bits as usize * nnz;
-                let total_bytes = total_bits.div_ceil(8);
-
-                let pos = cursor.position() as usize;
-                if pos + total_bytes > data.len() {
-                    return Err(BitStreamError);
-                }
-                let bit_data = &data[pos..pos + total_bytes];
-
-                // Pass 1: Batch-extract all deltas into all_indices
                 let start = all_indices.len();
                 all_indices.resize(start + nnz, 0);
-                unpack_fixed_width(bit_data, 0, nnz, frame_bits, &mut all_indices[start..]);
 
-                // Pass 2: Prefix-sum to reconstruct absolute indices
+                if nnz >= SIMD_THRESHOLD {
+                    // SIMD path: BitPacker4x for 128-value chunks
+                    let packer = BitPacker4x::new();
+                    let full_chunks = nnz / SIMD_THRESHOLD;
+                    let remainder = nnz % SIMD_THRESHOLD;
+                    let chunk_bytes = frame_bits as usize * SIMD_THRESHOLD / 8;
+                    let pos = cursor.position() as usize;
+                    let mut data_offset = pos;
+
+                    for c in 0..full_chunks {
+                        let dst_start = start + c * SIMD_THRESHOLD;
+                        if data_offset + chunk_bytes > data.len() {
+                            return Err(BitStreamError);
+                        }
+                        packer.decompress(
+                            &data[data_offset..],
+                            &mut all_indices[dst_start..dst_start + SIMD_THRESHOLD],
+                            frame_bits,
+                        );
+                        data_offset += chunk_bytes;
+                    }
+
+                    // Remainder: scalar unpack
+                    if remainder > 0 {
+                        let rem_start = start + full_chunks * SIMD_THRESHOLD;
+                        let rem_bits = remainder * frame_bits as usize;
+                        let rem_bytes = rem_bits.div_ceil(8);
+                        if data_offset + rem_bytes > data.len() {
+                            return Err(BitStreamError);
+                        }
+                        unpack_fixed_width(
+                            &data[data_offset..data_offset + rem_bytes],
+                            0,
+                            remainder,
+                            frame_bits,
+                            &mut all_indices[rem_start..],
+                        );
+                        data_offset += rem_bytes;
+                    }
+
+                    cursor.set_position(data_offset as u64);
+                } else {
+                    // Scalar path for small rows
+                    let total_bits = frame_bits as usize * nnz;
+                    let total_bytes = total_bits.div_ceil(8);
+                    let pos = cursor.position() as usize;
+                    if pos + total_bytes > data.len() {
+                        return Err(BitStreamError);
+                    }
+                    unpack_fixed_width(
+                        &data[pos..pos + total_bytes],
+                        0,
+                        nnz,
+                        frame_bits,
+                        &mut all_indices[start..],
+                    );
+                    cursor.set_position((pos + total_bytes) as u64);
+                }
+
+                // Prefix-sum to reconstruct absolute indices
                 let mut prev = frame_min;
                 for idx in &mut all_indices[start..start + nnz] {
                     prev += *idx;
                     *idx = prev;
                 }
-
-                cursor.set_position((pos + total_bytes) as u64);
             } else {
                 // frame_bits == 0: all indices equal frame_min
                 for _ in 0..nnz {
@@ -612,5 +691,93 @@ mod tests {
         // Same index with u32 mode should succeed
         let result = forbp_encode(&indices, &row_lengths, false);
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // SIMD path tests (Phase 2E) — rows with NNZ >= 128 use BitPacker4x
+    // -----------------------------------------------------------------------
+
+    /// Helper to generate a sorted row of `n` indices with small gaps.
+    fn make_sorted_row(n: usize, start: u32, max_gap: u32) -> Vec<u32> {
+        let mut row = Vec::with_capacity(n);
+        let mut prev = start;
+        let mut state: u64 = 0xBEEF_CAFE_0000 + n as u64;
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let gap = (state % max_gap as u64 + 1) as u32;
+            prev += gap;
+            row.push(prev);
+        }
+        row
+    }
+
+    #[test]
+    fn simd_roundtrip_large_row() {
+        // 500 indices — exercises multiple SIMD chunks + remainder
+        let row = make_sorted_row(500, 0, 50);
+        round_trip(&[row.clone()], true);
+        round_trip(&[row], false);
+    }
+
+    #[test]
+    fn simd_roundtrip_exact_128() {
+        // Exactly 128 NNZ — one full SIMD chunk, no remainder
+        let row = make_sorted_row(128, 0, 30);
+        round_trip(&[row], true);
+    }
+
+    #[test]
+    fn simd_roundtrip_129() {
+        // 129 NNZ — one full chunk + 1 remainder
+        let row = make_sorted_row(129, 0, 30);
+        round_trip(&[row], true);
+    }
+
+    #[test]
+    fn simd_roundtrip_256() {
+        // 256 NNZ — two full SIMD chunks, no remainder
+        let row = make_sorted_row(256, 0, 30);
+        round_trip(&[row], true);
+    }
+
+    #[test]
+    fn simd_mixed_small_large_rows() {
+        // Mix of small (< 128 NNZ) and large (>= 128 NNZ) rows
+        let rows = vec![
+            vec![1, 5, 10],              // small
+            vec![],                      // empty
+            make_sorted_row(200, 0, 20), // large
+            vec![42],                    // single
+            make_sorted_row(128, 0, 15), // exact threshold
+            vec![100, 200, 300],         // small
+            make_sorted_row(300, 0, 10), // large
+        ];
+        round_trip(&rows, true);
+    }
+
+    #[test]
+    fn simd_across_block_boundary() {
+        // 130 rows, some with NNZ >= 128 — exercises block headers + SIMD
+        let mut rows = Vec::new();
+        for i in 0..130 {
+            if i % 10 == 0 {
+                rows.push(make_sorted_row(200, 0, 20));
+            } else if i % 5 == 0 {
+                rows.push(vec![]);
+            } else {
+                rows.push(vec![i as u32 * 3, i as u32 * 3 + 1]);
+            }
+        }
+        round_trip(&rows, true);
+    }
+
+    #[test]
+    fn simd_dense_row_1000() {
+        // 1000 consecutive indices (dense row, typical scRNA-seq)
+        // Gaps are all 1, so frame_bits = 1
+        let row: Vec<u32> = (0..1000).collect();
+        round_trip(&[row], true);
     }
 }

@@ -28,7 +28,7 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
     // 1. Read _catalog.bin (authoritative index)
     let catalog_bytes = std::fs::read(input_dir.join("_catalog.bin"))?;
     let original_catalog =
-        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len())?;
+        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     // 2. Read _header.bin
     let header_bytes = std::fs::read(input_dir.join("_header.bin"))?;
@@ -507,6 +507,7 @@ mod tests {
         let catalog = FullCatalog::read_from(
             &mut Cursor::new(&input_data[fc_offset..fc_offset + fc_length]),
             fc_length,
+            true,
         )
         .unwrap();
 

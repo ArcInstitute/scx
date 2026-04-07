@@ -8,7 +8,7 @@ runtimes are involved, and how it all stays safe.
 
 | Component | Threading model | Key crate(s) |
 |-----------|----------------|---------------|
-| **Shard decode** (read) | Rayon data parallelism | `scx-format` (opt-in), `scx-engine` |
+| **Shard decode** (read) | Rayon data parallelism + SIMD BitPacker4x | `scx-format` (opt-in), `scx-engine` |
 | **Query engine** | Rayon `par_iter` over shards | `scx-engine` |
 | **Training loader** | Triple-buffered pipeline (tokio + rayon + std::thread) | `scx-loader` |
 | **Cloud I/O** | Tokio async tasks | `scx-cloud` |
@@ -25,8 +25,12 @@ and checksum.
 ### scx-format (opt-in `parallel` feature)
 
 `ScxReader::read_all_csr_shards()` and `ScxReader::read_layer()` use rayon's
-`par_iter()` to decode shards concurrently when the `parallel` Cargo feature is
-enabled:
+`par_iter()` to decode shards concurrently via `assemble_shards_parallel()`.
+Each shard is independently decompressible — the reader issues `MADV_SEQUENTIAL`
+on the shard byte range before the parallel decode loop. Within each shard,
+FOR-BP index decode uses SIMD BitPacker4x (4 × 32-element blocks) for rows
+with ≥128 non-zeros, further reducing per-shard decode time. The parallel
+feature is enabled:
 
 ```toml
 # Cargo.toml

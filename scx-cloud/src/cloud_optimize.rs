@@ -62,8 +62,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
             data_len: input_data.len(),
         });
     }
-    let full_catalog =
-        FullCatalog::read_from(&mut Cursor::new(&input_data[fc_offset..fc_end]), fc_length)?;
+    let full_catalog = FullCatalog::read_from(
+        &mut Cursor::new(&input_data[fc_offset..fc_end]),
+        fc_length,
+        true,
+    )?;
 
     // We'll write the front catalog after we know the new section offsets.
     // First, estimate its size from the original catalog so we can reserve space.
@@ -475,9 +478,9 @@ mod tests {
         // They won't be identical byte-for-byte because the offsets changed.
         // But both should parse to equivalent catalogs.
         let front_catalog =
-            FullCatalog::read_from(&mut Cursor::new(front_bytes), front_bytes.len()).unwrap();
+            FullCatalog::read_from(&mut Cursor::new(front_bytes), front_bytes.len(), true).unwrap();
         let full_catalog =
-            FullCatalog::read_from(&mut Cursor::new(full_bytes), full_bytes.len()).unwrap();
+            FullCatalog::read_from(&mut Cursor::new(full_bytes), full_bytes.len(), true).unwrap();
 
         assert_eq!(front_catalog.entries.len(), full_catalog.entries.len());
         assert_eq!(front_catalog.n_obs, full_catalog.n_obs);
@@ -586,9 +589,12 @@ mod tests {
         // Read the full catalog to get section offsets
         let fc_start = hdr.full_catalog_offset as usize;
         let fc_len = hdr.full_catalog_length as usize;
-        let catalog =
-            FullCatalog::read_from(&mut Cursor::new(&data[fc_start..fc_start + fc_len]), fc_len)
-                .unwrap();
+        let catalog = FullCatalog::read_from(
+            &mut Cursor::new(&data[fc_start..fc_start + fc_len]),
+            fc_len,
+            true,
+        )
+        .unwrap();
 
         let obs_entry = catalog.get("obs").unwrap();
         let var_entry = catalog.get("var").unwrap();

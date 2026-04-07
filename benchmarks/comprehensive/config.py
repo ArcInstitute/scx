@@ -106,6 +106,10 @@ class DatasetConfig:
     def scx_none_path(self) -> Path:
         return DATA_DIR / f"{self.name}_none.scx"
 
+    @property
+    def scx_lz4_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_lz4.scx"
+
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key."""
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
@@ -125,6 +129,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_scx1": "scx_scx1_path",
     "scx_zstd": "scx_zstd_path",
     "scx_none": "scx_none_path",
+    "scx_lz4": "scx_lz4_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
 }
@@ -216,6 +221,8 @@ PRIMARY_FORMATS: list[FormatVariant] = [
                   {"codec": "scx1"}),
     FormatVariant("SCX (zstd)", "scx_zstd", "primary", "scx_runner",
                   {"codec": "zstd"}),
+    FormatVariant("SCX (lz4)", "scx_lz4", "primary", "scx_runner",
+                  {"codec": "lz4"}),
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [

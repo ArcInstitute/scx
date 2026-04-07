@@ -49,8 +49,11 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
             data_len: input_data.len(),
         });
     }
-    let full_catalog =
-        FullCatalog::read_from(&mut Cursor::new(&input_data[fc_offset..fc_end]), fc_length)?;
+    let full_catalog = FullCatalog::read_from(
+        &mut Cursor::new(&input_data[fc_offset..fc_end]),
+        fc_length,
+        true,
+    )?;
 
     // Create output directory
     std::fs::create_dir_all(output_dir)?;

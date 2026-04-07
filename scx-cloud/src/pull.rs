@@ -108,7 +108,7 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     let catalog_data = backend.get(&catalog_path).await?.bytes().await?;
     let catalog_bytes = catalog_data.to_vec();
     let original_catalog =
-        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len())?;
+        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     let header_path = make_path("_header.bin");
     let header_data = backend.get(&header_path).await?.bytes().await?;
@@ -443,7 +443,7 @@ pub async fn pull_filtered(
     let catalog_data = backend.get(&catalog_path).await?.bytes().await?;
     let catalog_bytes = catalog_data.to_vec();
     let original_catalog =
-        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len())?;
+        FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     let header_path = make_path("_header.bin");
     let header_data = backend.get(&header_path).await?.bytes().await?;
