@@ -32,6 +32,7 @@ hdf5 = "0.8"
 
 half = "2"
 lz4_flex = "0.11"
+pco = "1"
 bitpacking = "0.9"
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 roaring = "0.10"

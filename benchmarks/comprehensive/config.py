@@ -110,6 +110,10 @@ class DatasetConfig:
     def scx_lz4_path(self) -> Path:
         return DATA_DIR / f"{self.name}_lz4.scx"
 
+    @property
+    def scx_pcodec_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_pcodec.scx"
+
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key."""
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
@@ -130,6 +134,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_zstd": "scx_zstd_path",
     "scx_none": "scx_none_path",
     "scx_lz4": "scx_lz4_path",
+    "scx_pcodec": "scx_pcodec_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
 }
@@ -184,6 +189,25 @@ DATASETS: dict[str, DatasetConfig] = {
         protocol="Mixed", source="CELLxGENE Census (blood)",
         approx_h5ad_mb=176_000, available=True,
     ),
+    # Log-normalized variants (normalize_total + log1p) for Pcodec float benchmarks
+    "pbmc3k_lognorm": DatasetConfig(
+        id="D1_LN", name="pbmc3k_lognorm",
+        n_obs=2_700, n_vars=32_738,
+        protocol="10x v2 (UMI)", source="10x Genomics (log-normalized)",
+        approx_h5ad_mb=21, available=True,
+    ),
+    "smartseq2_lognorm": DatasetConfig(
+        id="D3_LN", name="smartseq2_lognorm",
+        n_obs=50_000, n_vars=61_497,
+        protocol="Smart-seq2", source="CELLxGENE Census (log-normalized)",
+        approx_h5ad_mb=1_070, available=True,
+    ),
+    "tabula_sapiens_100k_lognorm": DatasetConfig(
+        id="D4_LN", name="tabula_sapiens_100k_lognorm",
+        n_obs=100_000, n_vars=61_497,
+        protocol="10x (UMI)", source="CELLxGENE Census (log-normalized)",
+        approx_h5ad_mb=1_600, available=True,
+    ),
 }
 
 
@@ -223,6 +247,8 @@ PRIMARY_FORMATS: list[FormatVariant] = [
                   {"codec": "zstd"}),
     FormatVariant("SCX (lz4)", "scx_lz4", "primary", "scx_runner",
                   {"codec": "lz4"}),
+    FormatVariant("SCX (pcodec)", "scx_pcodec", "primary", "scx_runner",
+                  {"codec": "pcodec"}),
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [

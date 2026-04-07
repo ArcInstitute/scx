@@ -185,7 +185,9 @@ pyscx.from_anndata(adata, "dataset.scx", codec="auto", shard_size=8192)
 ```
 
 The `codec` parameter accepts `"auto"` (default — selects best codec per shard),
-`"scx1"` (domain-specific integer codec), `"zstd"`, `"lz4"` (byte-shuffle + LZ4 frame), or `"none"`.
+`"scx1"` (domain-specific integer codec), `"zstd"`, `"pcodec"` (optimal for float layers),
+`"lz4"` (byte-shuffle + LZ4 frame), or `"none"`. With `"auto"`, integer data uses Scx1 or Zstd
+and float data (e.g., log-normalized layers) uses Pcodec for 7–16% better compression than Zstd.
 
 ### From 10x HDF5
 

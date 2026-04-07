@@ -151,12 +151,13 @@ The file header stores a default `codec_id`, but each shard header may **overrid
 |----------|------|-----------|
 | 0 | None | Raw LE arrays. Fast for GDS bypass. |
 | 1 | Scx1 | Integer counts with median ≤ 8 (typical 10x UMI data). Uses SIMD BitPacker4x for FOR-BP index decode. |
-| 2 | Zstd | Float layers, or integer data with median > 8 |
-| 3 | Lz4Shuffle | Byte-shuffle pre-filter + LZ4 frame compression. Works with any value encoding. Matches Zarr/Blosc style. |
+| 2 | Zstd | Integer data with median > 8. General-purpose fallback. |
+| 3 | Lz4Shuffle | Byte-shuffle pre-filter + LZ4 frame compression. Speed-optimized. Matches Zarr/Blosc style. |
+| 4 | Pcodec | Pcodec (pco) lossless numerical compression. Optimal for float layers (log-normalized, embeddings). 7–16% better compression than Zstd on float data, with ~20–40% slower encode/decode. |
 
 Auto-codec selection (`scx-format/src/codec_select.rs`) samples up to 10K non-zero
-values per shard and applies the median heuristic to choose Scx1 vs Zstd.
-LZ4+shuffle is available via `codec="lz4"` but not auto-selected.
+values per shard: integer data uses the median heuristic to choose Scx1 vs Zstd,
+float data routes to Pcodec. LZ4+shuffle is available via `codec="lz4"` but not auto-selected.
 
 ---
 

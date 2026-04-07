@@ -350,6 +350,131 @@ fn shard_ref_lz4shuffle_float32_roundtrip() {
 }
 
 // =========================================================================
+// Full shard reference vector (CodecId::Pcodec)
+// =========================================================================
+
+#[test]
+fn shard_ref_pcodec_u8_u16_roundtrip() {
+    // Same 3×5 matrix, Pcodec codec (uses Zstd for integer values internally)
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_raw: Vec<u8> = vec![5, 10, 1, 3, 7, 2]; // u8 encoding
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Pcodec,
+        ValueEncoding::Uint8,
+        true, // u16 indices
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) =
+        decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Uint8, 3, 6, true).unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+#[test]
+fn shard_ref_pcodec_u16_roundtrip() {
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_u16: Vec<u16> = vec![5, 10, 1, 3, 7, 2];
+    let mut values_raw = Vec::new();
+    for &v in &values_u16 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Pcodec,
+        ValueEncoding::Uint16,
+        true,
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) =
+        decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Uint16, 3, 6, true).unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+#[test]
+fn shard_ref_pcodec_u32_roundtrip() {
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_u32: Vec<u32> = vec![5, 10, 1, 3, 7, 2];
+    let mut values_raw = Vec::new();
+    for &v in &values_u32 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Pcodec,
+        ValueEncoding::Uint32,
+        false,
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::Pcodec,
+        ValueEncoding::Uint32,
+        3,
+        6,
+        false,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+#[test]
+fn shard_ref_pcodec_float32_roundtrip() {
+    // Float32 values — Pcodec's primary advantage
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_f32: Vec<f32> = vec![5.5, 10.1, 1.3, 3.7, 7.9, 2.2];
+    let mut values_raw = Vec::new();
+    for &v in &values_f32 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        true,
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        3,
+        6,
+        true,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    // Bit-exact comparison for lossless float codec
+    assert_eq!(dec_values, values_raw);
+}
+
+// =========================================================================
 // FOR-BP SIMD path reference vector (Phase 2E)
 // =========================================================================
 

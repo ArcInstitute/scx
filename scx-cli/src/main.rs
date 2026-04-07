@@ -85,7 +85,7 @@ enum Commands {
         /// Source SCX file containing cells to append
         #[arg(long)]
         input: PathBuf,
-        /// Compression codec for new shards: auto, none, scx1, zstd, lz4
+        /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Target rows per shard
@@ -258,7 +258,7 @@ enum Commands {
         /// Target rows per shard in the output file
         #[arg(long, default_value = "10000")]
         shard_size: u32,
-        /// Compression codec for output: auto, none, scx1, zstd, lz4
+        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
     },
@@ -475,9 +475,10 @@ fn dispatch_convert(
         "scx1" => Some(CodecId::Scx1),
         "zstd" => Some(CodecId::Zstd),
         "lz4" => Some(CodecId::Lz4Shuffle),
+        "pcodec" => Some(CodecId::Pcodec),
         other => {
             return Err(format!(
-                "Unknown codec: '{}'. Use auto, none, scx1, zstd, or lz4.",
+                "Unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, pcodec, or pcodec.",
                 other
             )
             .into())

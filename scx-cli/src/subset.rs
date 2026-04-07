@@ -109,9 +109,10 @@ pub fn run_subset(
         "scx1" => Some(scx_codec::CodecId::Scx1),
         "zstd" => Some(scx_codec::CodecId::Zstd),
         "lz4" => Some(scx_codec::CodecId::Lz4Shuffle),
+        "pcodec" => Some(scx_codec::CodecId::Pcodec),
         other => {
             return Err(format!(
-                "Unknown codec: '{}'. Use auto, none, scx1, zstd, or lz4.",
+                "Unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
                 other
             )
             .into())

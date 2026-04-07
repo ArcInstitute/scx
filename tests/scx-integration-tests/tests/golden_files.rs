@@ -52,6 +52,11 @@ fn golden_combinations() -> Vec<(CodecId, ValueEncoding)> {
         (CodecId::Lz4Shuffle, ValueEncoding::Uint16),
         (CodecId::Lz4Shuffle, ValueEncoding::Uint32),
         (CodecId::Lz4Shuffle, ValueEncoding::Float32),
+        // Sprint 3: Pcodec (Phase 3C) — works with any value encoding
+        (CodecId::Pcodec, ValueEncoding::Uint8),
+        (CodecId::Pcodec, ValueEncoding::Uint16),
+        (CodecId::Pcodec, ValueEncoding::Uint32),
+        (CodecId::Pcodec, ValueEncoding::Float32),
     ]
 }
 
@@ -111,6 +116,7 @@ fn codec_name(c: CodecId) -> &'static str {
         CodecId::Scx1 => "scx1",
         CodecId::Zstd => "zstd",
         CodecId::Lz4Shuffle => "lz4shuffle",
+        CodecId::Pcodec => "pcodec",
     }
 }
 
