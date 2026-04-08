@@ -26,6 +26,9 @@ pub enum CodecId {
     /// LZ4 frame compression with byte-shuffle pre-filter.
     /// Matches Zarr/Blosc compression style. Works with any value encoding.
     Lz4Shuffle = 3,
+    /// Pcodec (pco) lossless numerical compression.
+    /// Optimal for float layers; uses Zstd for indptr/indices.
+    Pcodec = 4,
 }
 
 impl CodecId {
@@ -35,6 +38,7 @@ impl CodecId {
             1 => Some(Self::Scx1),
             2 => Some(Self::Zstd),
             3 => Some(Self::Lz4Shuffle),
+            4 => Some(Self::Pcodec),
             _ => None,
         }
     }
@@ -194,6 +198,7 @@ pub fn encode_shard(
         CodecId::Lz4Shuffle => {
             encode_lz4_shuffle(indptr, indices, values, value_encoding, index_dtype_u16)
         }
+        CodecId::Pcodec => encode_pcodec(indptr, indices, values, value_encoding, index_dtype_u16),
     }
 }
 
@@ -235,6 +240,7 @@ pub fn decode_shard_ref(
         CodecId::Lz4Shuffle => {
             decode_lz4_shuffle_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16)
         }
+        CodecId::Pcodec => decode_pcodec_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
     }
 }
 
@@ -596,6 +602,116 @@ fn decode_lz4_shuffle_ref(
 
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
+
+    let expected_len = nnz * value_encoding.byte_width();
+    if values_raw.len() != expected_len {
+        return Err(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed values byte length {} != expected {}",
+                values_raw.len(),
+                expected_len
+            ),
+        )));
+    }
+
+    Ok((indptr, indices, values_raw))
+}
+
+// ---------------------------------------------------------------------------
+// CodecId::Pcodec
+// ---------------------------------------------------------------------------
+
+fn encode_pcodec(
+    indptr: &[u64],
+    indices: &[u32],
+    values: &[u8],
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<EncodedShard, CodecError> {
+    let indptr_raw = u64_slice_to_le_bytes(indptr);
+    let indices_raw = indices_to_le_bytes(indices, index_dtype_u16)?;
+
+    // indptr and indices: Zstd (already well-compressed by generic codecs)
+    let indptr_bytes = zstd::encode_all(indptr_raw.as_slice(), 3)?;
+    let indices_bytes = zstd::encode_all(indices_raw.as_slice(), 3)?;
+
+    // values: Pcodec for float encodings, Zstd for integer encodings
+    let values_bytes = match value_encoding {
+        ValueEncoding::Float32 => {
+            let floats: Vec<f32> = values
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            pco::standalone::simple_compress(&floats, &pco::ChunkConfig::default())
+                .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?
+        }
+        ValueEncoding::Float16 => {
+            // Widen f16 to f32, then compress as f32
+            let floats: Vec<f32> = values
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect();
+            pco::standalone::simple_compress(&floats, &pco::ChunkConfig::default())
+                .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?
+        }
+        _ => {
+            // Integer encodings: Zstd (Pcodec advantage is on floats)
+            zstd::encode_all(values, 3)?
+        }
+    };
+
+    Ok(EncodedShard {
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+    })
+}
+
+fn decode_pcodec_ref(
+    encoded: &EncodedShardRef,
+    n_rows: usize,
+    nnz: usize,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<DecodedShard, CodecError> {
+    // indptr and indices: Zstd decompress
+    let indptr_max = (n_rows + 1) * 8;
+    let indices_max = nnz * (if index_dtype_u16 { 2 } else { 4 });
+
+    let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
+    let indices_raw = zstd_decode_bounded(encoded.indices_bytes, indices_max)?;
+
+    let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
+    let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
+
+    // values: Pcodec for float encodings, Zstd for integer encodings
+    let values_raw = match value_encoding {
+        ValueEncoding::Float32 => {
+            let floats: Vec<f32> = pco::standalone::simple_decompress(encoded.values_bytes)
+                .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?;
+            let mut buf = Vec::with_capacity(floats.len() * 4);
+            for &f in &floats {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            buf
+        }
+        ValueEncoding::Float16 => {
+            // Decompress as f32, narrow back to f16
+            let floats: Vec<f32> = pco::standalone::simple_decompress(encoded.values_bytes)
+                .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?;
+            let mut buf = Vec::with_capacity(floats.len() * 2);
+            for &f in &floats {
+                buf.extend_from_slice(&half::f16::from_f32(f).to_le_bytes());
+            }
+            buf
+        }
+        _ => {
+            // Integer encodings: Zstd decompress
+            let values_max = nnz * value_encoding.byte_width();
+            zstd_decode_bounded(encoded.values_bytes, values_max)?
+        }
+    };
 
     let expected_len = nnz * value_encoding.byte_width();
     if values_raw.len() != expected_len {
@@ -1032,7 +1148,8 @@ mod tests {
         assert_eq!(CodecId::from_u8(1), Some(CodecId::Scx1));
         assert_eq!(CodecId::from_u8(2), Some(CodecId::Zstd));
         assert_eq!(CodecId::from_u8(3), Some(CodecId::Lz4Shuffle));
-        assert_eq!(CodecId::from_u8(4), None);
+        assert_eq!(CodecId::from_u8(4), Some(CodecId::Pcodec));
+        assert_eq!(CodecId::from_u8(5), None);
 
         assert_eq!(ValueEncoding::from_u8(0), Some(ValueEncoding::Uint8));
         assert_eq!(ValueEncoding::from_u8(4), Some(ValueEncoding::Float16));

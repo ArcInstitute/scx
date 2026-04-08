@@ -90,7 +90,21 @@ fn arb_csr(
                             }
                             buf
                         }
-                        _ => values_u32.iter().take(nnz).map(|&v| v as u8).collect(),
+                        ValueEncoding::Float32 => {
+                            let mut buf = Vec::with_capacity(nnz * 4);
+                            for &v in values_u32.iter().take(nnz) {
+                                buf.extend_from_slice(&(v as f32).to_le_bytes());
+                            }
+                            buf
+                        }
+                        ValueEncoding::Float16 => {
+                            let mut buf = Vec::with_capacity(nnz * 2);
+                            for &v in values_u32.iter().take(nnz) {
+                                let f = half::f16::from_f32(v as f32);
+                                buf.extend_from_slice(&f.to_le_bytes());
+                            }
+                            buf
+                        }
                     };
 
                     (indptr, all_indices, values_raw, n_rows, nnz, index_u16)
@@ -282,6 +296,54 @@ proptest! {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint32, u16_idx).unwrap();
         let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_pcodec_u8_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint8)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Uint8, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Uint8, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_pcodec_u16_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Uint16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Uint16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_pcodec_u32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Uint32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_pcodec_f32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Float32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Float32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Float32, n_rows, nnz, u16_idx).unwrap();
         prop_assert_eq!(&d_ip, &indptr);
         prop_assert_eq!(&d_ix, &indices);
         prop_assert_eq!(&d_v, &values);

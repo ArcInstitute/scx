@@ -32,6 +32,7 @@ _CODEC_NAMES = {
     "scx1": ("SCX (scx1)", "scx_scx1"),
     "zstd": ("SCX (zstd)", "scx_zstd"),
     "lz4": ("SCX (lz4)", "scx_lz4"),
+    "pcodec": ("SCX (pcodec)", "scx_pcodec"),
 }
 
 

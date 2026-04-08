@@ -5,7 +5,7 @@ use scx_codec::{CodecId, ValueEncoding};
 /// Codec selection profile for user-facing codec choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecProfile {
-    /// Automatic selection (Scx1 for small UMI integers, Zstd for larger/float).
+    /// Automatic selection (Scx1 for small UMI integers, Pcodec for floats, Zstd for larger integers).
     Auto,
     /// Optimizes for fast encode/decode: LZ4 with byte-shuffle.
     Fast,
@@ -27,8 +27,8 @@ fn floor_median_u32(values: &mut [u32]) -> u32 {
 /// Select codec using a profile hint.
 ///
 /// - `Fast` → LZ4+shuffle for all data types.
-/// - `Compact` → Scx1 for small UMI integers, Zstd for larger/float.
-/// - `Scx1` → Force Scx1 (falls back to Zstd for float encodings).
+/// - `Compact` → Scx1 for small UMI integers, Pcodec for float, Zstd for larger integers.
+/// - `Scx1` → Force Scx1 (falls back to Pcodec for float encodings).
 /// - `Auto` → Same as `Compact` (backward-compatible default).
 pub fn select_codec_with_profile(
     raw_values: &[u8],
@@ -41,7 +41,7 @@ pub fn select_codec_with_profile(
             if value_encoding.is_integer() {
                 CodecId::Scx1
             } else {
-                CodecId::Zstd
+                CodecId::Pcodec
             }
         }
         CodecProfile::Auto | CodecProfile::Compact => select_codec(raw_values, value_encoding),
@@ -50,13 +50,13 @@ pub fn select_codec_with_profile(
 
 /// Analyze raw value bytes and choose the best codec.
 ///
-/// - Float/Float16 → always Zstd (Rice only handles integers)
+/// - Float/Float16 → always Pcodec (optimal for float data)
 /// - Integer → sample up to 10K raw value bytes, decode to u32, compute floor median
 ///   - median <= 8 → Scx1 (Rice optimal for small UMI counts)
 ///   - median > 8 → Zstd (LZ77 dictionary wins for larger values)
 pub fn select_codec(raw_values: &[u8], value_encoding: ValueEncoding) -> CodecId {
     match value_encoding {
-        ValueEncoding::Float32 | ValueEncoding::Float16 => CodecId::Zstd,
+        ValueEncoding::Float32 | ValueEncoding::Float16 => CodecId::Pcodec,
 
         ValueEncoding::Uint8 | ValueEncoding::Uint16 | ValueEncoding::Uint32 => {
             let bw = value_encoding.byte_width();
@@ -122,15 +122,15 @@ mod tests {
     }
 
     #[test]
-    fn test_float_selects_zstd() {
+    fn test_float_selects_pcodec() {
         let raw = vec![0u8; 40]; // 10 float32 values
-        assert_eq!(select_codec(&raw, ValueEncoding::Float32), CodecId::Zstd);
+        assert_eq!(select_codec(&raw, ValueEncoding::Float32), CodecId::Pcodec);
     }
 
     #[test]
-    fn test_float16_selects_zstd() {
+    fn test_float16_selects_pcodec() {
         let raw = vec![0u8; 20]; // 10 float16 values
-        assert_eq!(select_codec(&raw, ValueEncoding::Float16), CodecId::Zstd);
+        assert_eq!(select_codec(&raw, ValueEncoding::Float16), CodecId::Pcodec);
     }
 
     #[test]

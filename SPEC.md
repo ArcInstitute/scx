@@ -804,7 +804,8 @@ optimizations that must produce bit-identical results.
 | 1  | scx1  | Delta-Golomb indptr + FOR-BP indices + Rice values (this spec). |
 | 2  | zstd  | Zstd per-section. Fallback for non-count data (float layers). |
 | 3  | lz4shuffle | LZ4 frame compression with byte-shuffle pre-filter. |
-| 4-255 | reserved | Future codecs (e.g., ANS-based entropy coder). |
+| 4  | pcodec | Pcodec (pco) lossless numerical compression. Optimal for float layers. |
+| 5-255 | reserved | Future codecs. |
 
 **Per-shard adaptive encoding**: The file header's `codec_id` is a **default**.
 Each shard's header may **override** it with a different codec_id. This allows

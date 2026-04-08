@@ -72,9 +72,10 @@ pub fn run_append(
         "scx1" => CodecId::Scx1,
         "zstd" => CodecId::Zstd,
         "lz4" => CodecId::Lz4Shuffle,
+        "pcodec" => CodecId::Pcodec,
         other => {
             return Err(format!(
-                "unknown codec: '{}'. Use auto, none, scx1, zstd, or lz4.",
+                "unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
                 other
             )
             .into())

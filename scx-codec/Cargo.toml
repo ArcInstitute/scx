@@ -13,6 +13,7 @@ half = { workspace = true }
 lz4_flex = { workspace = true }
 bitpacking = { workspace = true }
 thiserror = { workspace = true }
+pco = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]

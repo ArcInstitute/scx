@@ -100,18 +100,20 @@ pub fn decode_shard_gpu(dev: &GpuDevice, shard_bytes: &[u8]) -> Result<GpuCsr, G
             n_cols,
             nnz,
         ),
-        CodecId::None | CodecId::Zstd | CodecId::Lz4Shuffle => decode_cpu_fallback(
-            dev,
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
-            codec_id,
-            value_encoding,
-            index_dtype_u16,
-            n_rows,
-            n_cols,
-            nnz,
-        ),
+        CodecId::None | CodecId::Zstd | CodecId::Lz4Shuffle | CodecId::Pcodec => {
+            decode_cpu_fallback(
+                dev,
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                codec_id,
+                value_encoding,
+                index_dtype_u16,
+                n_rows,
+                n_cols,
+                nnz,
+            )
+        }
     }
 }
 

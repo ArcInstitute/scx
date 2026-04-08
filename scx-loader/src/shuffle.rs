@@ -53,17 +53,48 @@ impl ShardShuffler {
     ///
     /// Increments `self.epoch` after generating groups.
     pub fn shuffle_epoch(&mut self) -> Vec<Vec<usize>> {
-        // Derive a unique RNG from (seed, epoch) for reproducibility
+        self.shuffle_epoch_inner()
+    }
+
+    /// Generate offset-sorted shard groups for this epoch.
+    ///
+    /// Like [`shuffle_epoch`], randomly permutes shard indices and groups them,
+    /// but then sorts shards within each group by file offset (ascending) and
+    /// sorts the groups themselves by minimum offset. This converts random I/O
+    /// into a mostly-sequential scan while preserving stochastic group
+    /// composition across epochs.
+    ///
+    /// `shard_offsets[i]` is the file offset of shard `i`.
+    pub fn shuffle_epoch_sorted(&mut self, shard_offsets: &[u64]) -> Vec<Vec<usize>> {
+        let mut groups = self.shuffle_epoch_inner();
+
+        // Sort shards within each group by file offset (ascending)
+        for group in &mut groups {
+            group.sort_by_key(|&idx| shard_offsets.get(idx).copied().unwrap_or(u64::MAX));
+        }
+
+        // Sort groups by the minimum offset within each group
+        groups.sort_by_key(|group| {
+            group
+                .iter()
+                .filter_map(|&idx| shard_offsets.get(idx).copied())
+                .min()
+                .unwrap_or(u64::MAX)
+        });
+
+        groups
+    }
+
+    /// Core shuffle logic shared by `shuffle_epoch` and `shuffle_epoch_sorted`.
+    fn shuffle_epoch_inner(&mut self) -> Vec<Vec<usize>> {
         let combined_seed = self
             .rng_seed
             .wrapping_add(self.epoch.wrapping_mul(0x9E3779B97F4A7C15));
         let mut rng = ChaCha8Rng::seed_from_u64(combined_seed);
 
-        // Permute shard indices
         let mut indices: Vec<usize> = (0..self.n_shards).collect();
         indices.shuffle(&mut rng);
 
-        // Group into chunks of shard_group_size
         let groups: Vec<Vec<usize>> = indices
             .chunks(self.shard_group_size)
             .map(|chunk| chunk.to_vec())
@@ -237,5 +268,113 @@ mod tests {
             msg.contains("shard_group_size"),
             "expected 'shard_group_size' in: {msg}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // shuffle_epoch_sorted tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_shuffle_epoch_sorted_preserves_all_shards() {
+        let n_shards = 17;
+        // Offsets are spaced 1000 apart to simulate real file layout
+        let offsets: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+        let mut shuffler = ShardShuffler::new(n_shards, 5, 123).unwrap();
+
+        for _ in 0..3 {
+            let groups = shuffler.shuffle_epoch_sorted(&offsets);
+            let flat: Vec<usize> = groups.into_iter().flatten().collect();
+
+            assert_eq!(flat.len(), n_shards, "all shards should appear");
+            let unique: HashSet<usize> = flat.iter().copied().collect();
+            assert_eq!(unique.len(), n_shards, "no duplicates");
+            for i in 0..n_shards {
+                assert!(unique.contains(&i), "shard index {i} missing");
+            }
+        }
+    }
+
+    #[test]
+    fn test_shuffle_epoch_sorted_groups_ordered_by_offset() {
+        let n_shards = 20;
+        let offsets: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+        let mut shuffler = ShardShuffler::new(n_shards, 4, 42).unwrap();
+
+        for _ in 0..5 {
+            let groups = shuffler.shuffle_epoch_sorted(&offsets);
+
+            // Each group's min offset should be <= the next group's min offset
+            let group_min_offsets: Vec<u64> = groups
+                .iter()
+                .map(|g| g.iter().map(|&idx| offsets[idx]).min().unwrap())
+                .collect();
+
+            for w in group_min_offsets.windows(2) {
+                assert!(
+                    w[0] <= w[1],
+                    "groups must be sorted by min offset: {} > {}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_shuffle_epoch_sorted_within_group_ordered() {
+        let n_shards = 20;
+        let offsets: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+        let mut shuffler = ShardShuffler::new(n_shards, 4, 42).unwrap();
+
+        for _ in 0..5 {
+            let groups = shuffler.shuffle_epoch_sorted(&offsets);
+
+            for group in &groups {
+                let group_offsets: Vec<u64> = group.iter().map(|&idx| offsets[idx]).collect();
+                for w in group_offsets.windows(2) {
+                    assert!(
+                        w[0] <= w[1],
+                        "shards within group must be sorted by offset: {} > {}",
+                        w[0],
+                        w[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_shuffle_epoch_sorted_different_epochs_different_composition() {
+        let n_shards = 20;
+        let offsets: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+        let mut shuffler = ShardShuffler::new(n_shards, 4, 42).unwrap();
+
+        let epoch0 = shuffler.shuffle_epoch_sorted(&offsets);
+        let epoch1 = shuffler.shuffle_epoch_sorted(&offsets);
+
+        // Groups contain different shard compositions across epochs
+        // (even though both are offset-sorted)
+        let sets0: Vec<HashSet<usize>> =
+            epoch0.iter().map(|g| g.iter().copied().collect()).collect();
+        let sets1: Vec<HashSet<usize>> =
+            epoch1.iter().map(|g| g.iter().copied().collect()).collect();
+        assert_ne!(
+            sets0, sets1,
+            "different epochs should have different group compositions"
+        );
+    }
+
+    #[test]
+    fn test_shuffle_epoch_sorted_reproducible() {
+        let n_shards = 20;
+        let offsets: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+
+        let mut shuffler1 = ShardShuffler::new(n_shards, 4, 42).unwrap();
+        let mut shuffler2 = ShardShuffler::new(n_shards, 4, 42).unwrap();
+
+        let groups1 = shuffler1.shuffle_epoch_sorted(&offsets);
+        let groups2 = shuffler2.shuffle_epoch_sorted(&offsets);
+
+        assert_eq!(groups1, groups2, "same seed + same epoch must be identical");
     }
 }

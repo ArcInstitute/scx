@@ -63,11 +63,24 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 
 ## Codec Selection (`scx-format/src/codec_select.rs`)
 
-- `select_codec(values, encoding)` — Auto-select Scx1 vs Zstd based on median value
-  - Integer values with median ≤ 8 → Scx1 (Rice coding)
-  - Integer values with median > 8 → Zstd
-  - Float values → always Zstd
-- LZ4+shuffle (`codec="lz4"`) available but not auto-selected — user must opt in
+- `select_codec(values, encoding)` — Auto-select best codec per shard based on data type and distribution:
+  - Integer values with median ≤ 8 → Scx1 (Rice coding, optimal for typical 10x UMI counts)
+  - Integer values with median > 8 → Zstd (LZ77 dictionary wins for larger values)
+  - Float values (Float32, Float16) → Pcodec (7–16% better compression than Zstd on log-normalized data)
+- LZ4+shuffle (`codec="lz4"`) and Pcodec (`codec="pcodec"`) also available as explicit overrides
+
+**Codec tradeoffs:**
+
+| Codec | Best for | Compression | Read speed | Write speed |
+|-------|----------|-------------|------------|-------------|
+| `auto` | General use (recommended default) | Best per-shard | Best per-shard | Best per-shard |
+| `scx1` | Small UMI counts (median ≤ 8) | Best for 10x data (~4.8×) | Fastest (SIMD decode) | Moderate |
+| `zstd` | Large integers, general fallback | Good (~4.3× UMI, ~3.8× float) | Fast | Fast |
+| `pcodec` | Log-normalized, PCA embeddings, float layers | Best for floats (~4.1–4.7×) | Moderate (19–39% slower than Zstd) | Slower (35–40% slower than Zstd) |
+| `lz4` | Speed-critical pipelines | Lower (~2.2–3.1×) | Fast | Fastest compressed |
+| `none` | GDS bypass, debugging | 1× (no compression) | Fastest (I/O bound) | Fastest |
+
+For raw count data (integer-valued), `auto` selects Scx1 or Zstd — Pcodec falls through to Zstd internally since its advantage is specific to float values. For storage-constrained workflows with normalized float data, explicitly selecting `pcodec` gives the best compression. For latency-sensitive pipelines, `zstd` or `lz4` are better choices.
 
 ## Provenance
 
@@ -538,19 +551,19 @@ for batch in dataset:
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd|lz4] [--shard-size N]`
+- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]`
 - `scx info <file> [--json] [--history]`
 - `scx validate <file> [--verbose]`
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`
 
 ### File operations
-- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4] [--shard-size N]`
+- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]`
 - `scx delete <file> --filter <expr> [--dry-run]`
 - `scx compact <input> --output <path> [--force]`
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path>`
 - `scx query <file> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]`
-- `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4]` — Extract a subset of cells and/or genes into a new SCX file
+- `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
 
