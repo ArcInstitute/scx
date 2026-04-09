@@ -140,8 +140,11 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 | `slurm_phase0_baseline_large.sh` | varies | 32 CPUs, 80–500 GB | 2–4 h/job | Phase 0 regression baseline D5–D7 (submits 18 parallel jobs + archival) |
 | `slurm_phase3_small.sh` | `cpu` | 32 CPUs, 80 GB | 6 h | Phase 3 benchmarks D1–D4 (sequential, single job) |
 | `slurm_phase3_large.sh` | `cpu_high_mem` | 32 CPUs, 500 GB | 12 h | Phase 3 benchmarks D5–D7 (sequential, single job) |
+| `slurm_phase3_parallel_large.sh` | varies | 32 CPUs, 80–500 GB | 4–12 h/job | Phase 3 D5–D7 parallel submission (one job per benchmark×dataset) |
+| `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel_scaling only, D5–D7 |
 | `slurm_fused_bench.sh` | `cpu` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
 | `slurm_lazy_preprocess_bench.sh` | `cpu` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
+| `slurm_phase4_ml_loader.sh` | `cpu`+`gpu` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
 
 ### GPU Benchmarks
 
@@ -255,16 +258,17 @@ See [docs/gpu-setup.md](../docs/gpu-setup.md) for full GPU environment setup ins
 
 ## Results
 
-Benchmark outputs are saved to `benchmarks/results/`:
+Benchmark outputs are organized into two directories:
 
-- **JSON files** (`*.json`) — Machine-readable results for each benchmark
-- **Markdown reports** (`*_benchmark.md`) — Human-readable summaries with tables
-- **Go/No-Go gate** (`gpu_gonogo.json`, `lazy_preprocess_gonogo.json`) — Pass/fail criteria for GPU and lazy preprocessing
+- **`benchmarks/results/`** — Per-script benchmark results (JSON + Markdown reports, GPU Go/No-Go gates)
+- **`benchmarks/comprehensive/results/raw/`** — Phase 3 comprehensive benchmarks (500+ JSON files, one per benchmark×format×dataset)
+- **`benchmarks/comprehensive/reporting/phase3_report.md`** — Phase 3 comprehensive report (D1–D7, 12 formats, 6 benchmarks)
 
-To list all results after benchmarks complete:
+To list comprehensive results:
 
 ```bash
-ls -la benchmarks/results/*.json benchmarks/results/*.md
+ls benchmarks/comprehensive/results/raw/*.json | wc -l   # ~500 results
+ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 ```
 
 ---
