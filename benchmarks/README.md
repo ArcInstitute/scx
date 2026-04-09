@@ -145,6 +145,7 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 | `slurm_fused_bench.sh` | `cpu` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
 | `slurm_lazy_preprocess_bench.sh` | `cpu` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
 | `slurm_phase4_ml_loader.sh` | `cpu`+`gpu` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
+| `slurm_phase5_accel_bench.sh` | `cpu` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
 
 ### GPU Benchmarks
 
@@ -298,4 +299,7 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 | `benchmark_gpu_pipeline.py` | End-to-end GPU pipeline + Go/No-Go gate |
 | `benchmark_gpu_scvi.py` | GPU scVI training benchmark |
 | `benchmark_lazy_preprocess.py` | Phase 4d lazy transforms, memory, column projection |
+| `benchmark_accelerators.py` | Phase 4b CPU accelerators: PCA, kNN, UMAP, DE vs scanpy |
+| `benchmark_accel_pipeline.py` | Full pipeline (3 variants: SCX OOC, SCX preprocess, scanpy) |
+| `benchmark_accel_preprocessing.py` | pyscx.preprocess() vs scanpy normalize+log1p |
 | `benchmark_bpcells.R` | BPCells comparison (R) |
