@@ -18,7 +18,7 @@ const LOGFC_PSEUDOCOUNT: f64 = 1e-9;
 /// Results from a differential expression analysis.
 ///
 /// Each field is indexed as `[group_idx][gene_rank]`, where genes are
-/// sorted by descending absolute score within each group.
+/// sorted by descending signed score (default) or absolute score within each group.
 #[derive(Debug, Clone)]
 pub struct DiffExpResult {
     /// Group names in the order they appear in the results.
@@ -66,6 +66,7 @@ pub fn wilcoxon_rank_sum(
     group_names: &[String],
     reference: Option<usize>,
     log_transformed: bool,
+    rankby_abs: bool,
 ) -> Result<DiffExpResult> {
     let n_groups = group_names.len();
     if data.len() != n_obs * n_vars {
@@ -179,13 +180,17 @@ pub fn wilcoxon_rank_sum(
             })
             .collect();
 
-        // Sort genes by absolute score descending (matching scanpy's default).
+        // Sort genes by signed score descending (matching scanpy's default rankby_abs=False).
+        // When rankby_abs=true, sort by |score| descending (scanpy's rankby_abs=True).
+        // Tiebreaker: ascending gene index (matches numpy stable sort preserving original order).
         let mut sorted: Vec<GeneTestResult> = gene_results;
         sorted.sort_by(|a, b| {
-            b.score
-                .abs()
-                .partial_cmp(&a.score.abs())
+            let a_key = if rankby_abs { a.score.abs() } else { a.score };
+            let b_key = if rankby_abs { b.score.abs() } else { b.score };
+            b_key
+                .partial_cmp(&a_key)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.gene_idx.cmp(&b.gene_idx))
         });
 
         let names: Vec<String> = sorted
@@ -364,6 +369,7 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 /// 3. Merge all chunk results with global BH correction.
 ///
 /// Peak memory: O(n_obs × gene_chunk_size) instead of O(n_obs × n_vars).
+#[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum_streaming(
     reader: &scx_format::backed::BackedCsrReader,
     gene_names: &[String],
@@ -372,6 +378,7 @@ pub fn wilcoxon_rank_sum_streaming(
     reference: Option<usize>,
     gene_chunk_size: usize,
     log_transformed: bool,
+    rankby_abs: bool,
 ) -> Result<DiffExpResult> {
     let n_obs = reader.n_obs();
     let n_vars = gene_names.len();
@@ -430,13 +437,13 @@ pub fn wilcoxon_rank_sum_streaming(
             group_names,
             reference,
             log_transformed,
+            rankby_abs,
         )?;
         all_chunk_results.push(chunk_result);
     }
 
-    // Merge: concatenate per-group gene lists, re-sort by |z|,
-    // and re-apply BH correction globally across all genes.
-    merge_diff_exp_results(all_chunk_results)
+    // Merge: concatenate per-group gene lists, re-sort, and re-apply BH correction globally.
+    merge_diff_exp_results(all_chunk_results, rankby_abs)
 }
 
 /// Gene-chunked Wilcoxon rank-sum from an in-memory `ScxCsr`.
@@ -446,6 +453,7 @@ pub fn wilcoxon_rank_sum_streaming(
 /// O(n_obs × n_vars) dense materialization that `.toarray()` would require.
 ///
 /// Peak memory: O(n_obs × gene_chunk_size) instead of O(n_obs × n_vars).
+#[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum_sparse(
     csr: &scx_sparse::ScxCsr,
     gene_names: &[String],
@@ -454,6 +462,7 @@ pub fn wilcoxon_rank_sum_sparse(
     reference: Option<usize>,
     gene_chunk_size: usize,
     log_transformed: bool,
+    rankby_abs: bool,
 ) -> Result<DiffExpResult> {
     let n_obs = csr.n_rows();
     let n_vars = gene_names.len();
@@ -509,24 +518,28 @@ pub fn wilcoxon_rank_sum_sparse(
             group_names,
             reference,
             log_transformed,
+            rankby_abs,
         )?;
         all_chunk_results.push(chunk_result);
     }
 
-    merge_diff_exp_results(all_chunk_results)
+    merge_diff_exp_results(all_chunk_results, rankby_abs)
 }
 
 /// Merge per-chunk `DiffExpResult`s into a single result with global BH correction.
 ///
 /// For each group:
 /// 1. Concatenate gene names, scores, p-values, and fold-changes from all chunks.
-/// 2. Re-sort by descending |z-score|.
+/// 2. Re-sort by descending signed score (or |score| when `rankby_abs`).
 /// 3. Apply Benjamini–Hochberg on the globally-sorted raw p-values.
 ///
 /// This is essential because BH correction depends on the total number of tests.
 /// Applying BH per-chunk would use `chunk_size` as the denominator instead of
 /// `n_vars`, inflating FDR.
-pub fn merge_diff_exp_results(chunks: Vec<DiffExpResult>) -> Result<DiffExpResult> {
+pub fn merge_diff_exp_results(
+    chunks: Vec<DiffExpResult>,
+    rankby_abs: bool,
+) -> Result<DiffExpResult> {
     if chunks.is_empty() {
         return Ok(DiffExpResult {
             group_names: vec![],
@@ -574,10 +587,12 @@ pub fn merge_diff_exp_results(chunks: Vec<DiffExpResult>) -> Result<DiffExpResul
             }
         }
 
-        // Sort by |z| descending.
+        // Sort by signed score descending (default) or |score| descending (rankby_abs).
         gene_entries.sort_by(|a, b| {
-            b.1.abs()
-                .partial_cmp(&a.1.abs())
+            let a_key = if rankby_abs { a.1.abs() } else { a.1 };
+            let b_key = if rankby_abs { b.1.abs() } else { b.1 };
+            b_key
+                .partial_cmp(&a_key)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -711,6 +726,7 @@ mod tests {
             &group_names,
             None,
             false,
+            true, // rankby_abs=true to test absolute sort (original test expectation)
         )
         .unwrap();
 
@@ -786,6 +802,7 @@ mod tests {
             &group_names,
             Some(0),
             false,
+            false,
         )
         .unwrap();
 
@@ -832,6 +849,7 @@ mod tests {
             &group_names,
             None,
             true,
+            false,
         )
         .unwrap();
 
@@ -844,6 +862,7 @@ mod tests {
             &groups,
             &group_names,
             None,
+            false,
             false,
         )
         .unwrap();
@@ -872,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_merge_empty() {
-        let merged = merge_diff_exp_results(vec![]).unwrap();
+        let merged = merge_diff_exp_results(vec![], false).unwrap();
         assert!(merged.group_names.is_empty());
         assert!(merged.names.is_empty());
     }
@@ -888,7 +907,7 @@ mod tests {
             pvals_adj: vec![vec![0.002, 0.05]],
             logfoldchanges: vec![vec![2.0, 0.5]],
         };
-        let merged = merge_diff_exp_results(vec![chunk.clone()]).unwrap();
+        let merged = merge_diff_exp_results(vec![chunk.clone()], false).unwrap();
         assert_eq!(merged.group_names, chunk.group_names);
         assert_eq!(merged.names, chunk.names);
         assert_eq!(merged.scores, chunk.scores);
@@ -915,10 +934,10 @@ mod tests {
             logfoldchanges: vec![vec![2.0]],
         };
 
-        let merged = merge_diff_exp_results(vec![chunk1, chunk2]).unwrap();
+        let merged = merge_diff_exp_results(vec![chunk1, chunk2], false).unwrap();
         assert_eq!(merged.group_names, vec!["G"]);
         assert_eq!(merged.names[0].len(), 2);
-        // gene_b should be first (|z| = 3.0 > 1.0).
+        // gene_b should be first (signed score 3.0 > 1.0).
         assert_eq!(merged.names[0][0], "gene_b");
         assert_eq!(merged.names[0][1], "gene_a");
         assert_eq!(merged.scores[0][0], 3.0);
@@ -945,11 +964,10 @@ mod tests {
             logfoldchanges: vec![vec![0.5]],
         };
 
-        let merged = merge_diff_exp_results(vec![chunk1, chunk2]).unwrap();
+        let merged = merge_diff_exp_results(vec![chunk1, chunk2], false).unwrap();
         // With global BH (n=2): sorted p-vals are [0.03, 0.04]
-        // BH: rank 2 → 0.04 * 2/2 = 0.04, rank 1 → 0.03 * 2/1 = 0.06 → cummin 0.04
-        // But results are sorted by |z|: gene_a (z=2) first, gene_b (z=1) second
-        // So pvals_adj order follows the |z| sort.
+        // Results sorted by signed score: gene_a (z=2) first, gene_b (z=1) second
+        // So pvals_adj order follows the score sort.
         // All adjusted should be >= raw and <= 1.
         for (raw, adj) in merged.pvals[0].iter().zip(merged.pvals_adj[0].iter()) {
             assert!(*adj >= *raw - 1e-12);
@@ -991,6 +1009,7 @@ mod tests {
             &group_names,
             None,
             false,
+            false,
         )
         .unwrap();
 
@@ -1011,14 +1030,22 @@ mod tests {
         let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, data);
 
         // Sparse path with chunk_size=2 (forces 2 chunks for 3 genes)
-        let result_sparse =
-            wilcoxon_rank_sum_sparse(&csr, &gene_names, &groups, &group_names, None, 2, false)
-                .unwrap();
+        let result_sparse = wilcoxon_rank_sum_sparse(
+            &csr,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            2,
+            false,
+            false,
+        )
+        .unwrap();
 
         // Same group structure
         assert_eq!(result_dense.group_names, result_sparse.group_names);
 
-        // Same gene names per group (same ordering by |z|)
+        // Same gene names per group (same ordering)
         for g in 0..result_dense.group_names.len() {
             assert_eq!(result_dense.names[g], result_sparse.names[g]);
             // Scores should match
