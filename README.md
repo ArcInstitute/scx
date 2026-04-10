@@ -1,6 +1,6 @@
 # SCX — Sparse Cell eXpression System
 
-A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files**, **1.5-18× faster reads**, **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
+A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files**, **fastest reads at census scale** (1.4× faster than Zarr on 1M cells, up to 7× with parallel decode), **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
 
 **Python** — works with scanpy, scVI, and any scverse tool:
 
@@ -33,13 +33,13 @@ h5ad stores integer UMI counts as 32-bit floats. SCX detects this and uses the n
 integer type that fits (uint8/uint16), then applies domain-specific codecs designed for
 the statistical properties of count data. Result:
 
-| Dataset | Cells | h5ad | SCX (auto) | SCX (zstd) | Best ratio |
-|---------|-------|------|------------|------------|------------|
-| PBMC 3K | 2,700 | 21.5 MB | 4.4 MB | 5.0 MB | **4.9×** |
-| Smart-seq2 | 50,000 | 1.07 GB | 535 MB | 370 MB | **2.9×** |
-| Tabula Sapiens | 100,000 | 1.59 GB | 428 MB | 322 MB | **4.9×** |
-| CELLxGENE Census 1M | 1,000,000 | 11.4 GB | 2.75 GB | 2.35 GB | **4.8×** |
-| CELLxGENE Census 5M | 5,000,000 | 91.4 GB | 15.1 GB | 12.5 GB | **7.3×** |
+| Dataset | Cells | h5ad | SCX (best) | Best ratio | Read time (SCX vs Zarr) |
+|---------|-------|------|------------|------------|------------------------|
+| PBMC 3K | 2,700 | 21.5 MB | 4.4 MB | **4.9×** | 0.04s vs 0.01s |
+| Smart-seq2 | 50,000 | 1.07 GB | 350 MB | **3.1×** | 0.99s vs 0.37s |
+| Tabula Sapiens | 100,000 | 1.59 GB | 322 MB | **4.9×** | 0.62s vs 0.56s |
+| CELLxGENE Census 1M | 1,000,000 | 11.4 GB | 2.35 GB | **4.8×** | **2.9s** vs 4.0s |
+| CELLxGENE Census 5M | 5,000,000 | 91.4 GB | 12.5 GB | **7.3×** | **35s** vs 41s |
 
 ### Your atlas doesn't fit in memory? SCX does.
 
@@ -81,10 +81,12 @@ SCX includes a **triple-buffered Rust pipeline** (tokio I/O → rayon decode →
 keeps your GPU fed. Zero Python on the hot path — all I/O, decompression, shuffling,
 sparse-to-dense conversion, and normalization happen in compiled Rust.
 
-| | SCX | AnnData | TileDB-SOMA-ML |
-|--|-----|---------|----------------|
-| 1M cells (batches/sec) | **38.4** | 17.6 | 14.2 |
-| vs SCX | — | 2.2× slower | 2.7× slower |
+| | SCX | AnnData | TileDB-SOMA-ML | scDataLoader |
+|--|-----|---------|----------------|--------------|
+| 1M cells (batches/sec) | **1,405** | 16.3 | 17.1 | 4.4 |
+| vs SCX | — | 86× slower | 82× slower | 319× slower |
+
+> _batch_size=1024, HVG=2000, normalize+log1p (hvg_norm scenario). See [detailed results](#training-loader-batchessec-batch_size1024-hvg2000-normalizelog1p) below._
 
 ```python
 # GPU-saturating training loader — no num_workers needed
@@ -548,16 +550,15 @@ Peak RSS during full read (lower is better):
 
 For streaming aggregation (row_sums, col_sums), `MADV_DONTNEED` reduces SCX peak RSS by **67%** — from 3.5 GB to 1.1 GB on Census 1M. h5ad has lowest peak RSS (lazy/backed mode). SCX uses less memory than Zarr at scale (18.5 GB vs 87.7 GB on Census 5M).
 
-### Training Loader (batches/sec, batch_size=1024)
+### Training Loader (batches/sec, batch_size=1024, HVG=2000, normalize+log1p)
 
-| Dataset | SCX | AnnData | TileDB-SOMA-ML | SCX/SOMA |
-|---------|-----|---------|----------------|----------|
-| Census 1M | **38.4** | 17.6 | 14.2 | **2.7×** |
-| Tabula Sapiens | 19.9 | 13.9 | 20.8 | 1.0× |
-| Smart-seq2 | 19.7 | 8.7 | 19.6 | 1.0× |
+| Dataset | SCX | AnnData | TileDB-SOMA-ML | scDataLoader | SCX/SOMA |
+|---------|-----|---------|----------------|--------------|----------|
+| Census 1M | **1,405** | 16.3 | 17.1 | 4.4 | **82×** |
+| Tabula Sapiens 100K | **1,060** | 14.5 | 16.1 | 4.0 | **66×** |
+| PBMC 3K | **168** | 14.5 | 5.0 | 6.3 | **34×** |
 
-SCX's advantage grows with dataset size — at atlas scale (1M+ cells), the compressed-shard
-streaming pipeline outperforms random-access approaches.
+SCX's triple-buffered pipeline (tokio I/O → rayon decode → Python) with native HVG projection and fused normalize+log1p delivers **34–82× higher throughput** than TileDB-SOMA-ML at scale. TTFB (time to first batch): 16 ms on PBMC 3K, 603 ms on Census 1M.
 
 ### GPU Acceleration (NVIDIA H100)
 

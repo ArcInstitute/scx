@@ -114,8 +114,10 @@ are smaller than h5ad with dramatically lower memory usage.
 **Key finding**: Default codec=None gives good compression via integer dtype detection
 alone (float32→uint8/uint16). With codecs enabled, ratios reach 20-35%. Phase 1 SCX reads
 were 7-23× slower than h5ad (sequential decode, no parallelism) but used 4-38× less memory
-(mmap + zero-copy). **Sprint 2 resolved the read gap**: SCX is now 1.5-2× faster than all
-competitors on 100K+ cell datasets (see `benchmarks/comprehensive/reporting/phase3_report.md`).
+(mmap + zero-copy). **Sprint 2–3 resolved the read gap and then some**: SCX is now 1.15–1.38× faster
+than Zarr lz4 on census-scale datasets (500K–5M cells), achieves up to 7× parallel scaling
+at 32 threads, and dominates column projection (4–8× faster than all competitors).
+See `benchmarks/comprehensive/reporting/phase3_report.md` for the full Phase 3 benchmark report.
 
 **Lessons for Phase 2** (all addressed in Sprint 2):
 1. Auto-codec selection is critical (Rice hurts non-UMI data) → Phase 2D added LZ4+shuffle

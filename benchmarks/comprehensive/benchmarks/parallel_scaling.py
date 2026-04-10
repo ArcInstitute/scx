@@ -67,7 +67,8 @@ _WORKER_SCRIPT = textwrap.dedent("""\
 
     # Build a minimal FormatVariant just to instantiate the runner.
     fmt = FormatVariant(
-        name="worker", key="worker", runner=runner_name, params=runner_params,
+        name="worker", key="worker", category="primary",
+        runner=runner_name, params=runner_params,
     )
     runner = make_runner(fmt)
 

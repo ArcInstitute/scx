@@ -166,7 +166,10 @@ def run_benchmark(
                 write_result(result)
                 results.append(result)
                 median = result.median_wall_s
-                print(f"      → {median:.3f}s (median of {n_runs} runs)")
+                if median is not None:
+                    print(f"      → {median:.3f}s (median of {n_runs} runs)")
+                else:
+                    print(f"      → completed ({len(result.runs)} runs)")
         except Exception as e:
             print(f"      ERROR: {e}")
 
