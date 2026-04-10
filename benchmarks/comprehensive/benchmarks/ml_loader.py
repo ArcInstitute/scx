@@ -800,7 +800,10 @@ def run(
                         with open("/proc/sys/vm/drop_caches", "w") as f:
                             f.write("3\n")
                     except (PermissionError, OSError):
-                        pass
+                        logger.warning(
+                            "Could not drop caches (permission denied). "
+                            "Cold-cache benchmark will run with warm cache."
+                        )
 
                 logger.info("  Timed run %d/%d", i + 1, n_runs)
                 try:
