@@ -607,6 +607,8 @@ def generate_report():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(
         description="SCX Full Pipeline Benchmark (3 variants)"
     )

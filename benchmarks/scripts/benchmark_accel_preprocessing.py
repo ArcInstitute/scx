@@ -359,6 +359,8 @@ def generate_report():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(
         description="SCX Preprocessing Benchmark (Phase 4a)"
     )

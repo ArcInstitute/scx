@@ -55,7 +55,7 @@ echo "Validation job: ${VAL_JOB}"
 JOB_IDS=()
 
 # PCA benchmarks
-for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "census_1m:256G:12:00:00"; do
+for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_1m:256G:12:00:00"; do
     IFS=: read -r ds mem timelimit <<< "${cfg}"
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
@@ -73,7 +73,7 @@ for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "censu
 done
 
 # kNN benchmarks
-for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "census_1m:256G:12:00:00"; do
+for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_1m:256G:12:00:00"; do
     IFS=: read -r ds mem timelimit <<< "${cfg}"
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
@@ -91,7 +91,7 @@ for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "censu
 done
 
 # UMAP benchmarks
-for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "census_1m:256G:12:00:00"; do
+for cfg in "tabula_sapiens_100k:200G:04:00:00" "census_1m:350G:12:00:00"; do
     IFS=: read -r ds mem timelimit <<< "${cfg}"
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
@@ -109,7 +109,7 @@ for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "censu
 done
 
 # DE in-memory benchmarks
-for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_500k:160G:08:00:00" "census_1m:256G:16:00:00"; do
+for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_1m:256G:16:00:00"; do
     IFS=: read -r ds mem timelimit <<< "${cfg}"
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
@@ -133,7 +133,7 @@ JOB_ID=$(sbatch --parsable \
     --partition=cpu \
     --qos=normal \
     --cpus-per-task=16 \
-    --mem=64G \
+    --mem=128G \
     --time=08:00:00 \
     --output="benchmarks/logs/phase5_de_streaming_%j.log" \
     --error="benchmarks/logs/phase5_de_streaming_%j.err" \
