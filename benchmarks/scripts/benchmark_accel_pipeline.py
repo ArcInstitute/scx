@@ -21,7 +21,6 @@ import json
 import os
 import sys
 import tempfile
-import statistics
 import time
 from pathlib import Path
 
