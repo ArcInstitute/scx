@@ -22,7 +22,10 @@ pub use diffexp::{
 };
 pub use error::{AccelError, Result};
 pub use neighbors::{build_knn_graph, KnnResult};
-pub use pca::{randomized_pca, randomized_pca_inmemory, PcaResult};
+pub use pca::{
+    covariance_pca, covariance_pca_inmemory, randomized_pca, randomized_pca_inmemory, PcaResult,
+    COVARIANCE_PCA_THRESHOLD,
+};
 pub use pseudobulk::{
     pseudobulk_aggregate, pseudobulk_aggregate_inmemory, AggregationMethod, PseudobulkResult,
 };

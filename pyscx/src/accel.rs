@@ -11,6 +11,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use scx_format::ShardSource;
+
 use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::projected_agg;
@@ -382,32 +384,47 @@ pub fn pca(
     }
 
     // CPU path (default or fallback)
+    // Auto-route: use covariance method when n_vars <= threshold (faster for HVG data)
+    let cov_threshold = scx_accel::COVARIANCE_PCA_THRESHOLD;
+
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // Streaming PCA from backed mode
         backend = "scx-accel-cpu";
         let reader = &*backed.backed;
-        scx_accel::randomized_pca(
-            reader,
-            n_comps,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            random_state,
-        )
-        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        let (_n_obs, n_vars) = reader.shape();
+        if n_vars <= cov_threshold {
+            scx_accel::covariance_pca(reader, n_comps, zero_center)
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            scx_accel::randomized_pca(
+                reader,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        }
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         backend = "scx-accel-cpu";
         // Streaming PCA through lazy transforms — no materialization
         let source = lazy.as_shard_source();
-        scx_accel::randomized_pca(
-            &source,
-            n_comps,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            random_state,
-        )
-        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        let (_n_obs, n_vars) = source.shape();
+        if n_vars <= cov_threshold {
+            scx_accel::covariance_pca(&source, n_comps, zero_center)
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            scx_accel::randomized_pca(
+                &source,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        }
     } else {
         // Materialized: extract scipy CSR → ScxCsr → in-memory PCA
         backend = "scx-accel-cpu";
@@ -439,15 +456,20 @@ pub fn pca(
                 .extract::<Vec<f32>>()?;
 
             let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
-            scx_accel::randomized_pca_inmemory(
-                &csr,
-                n_comps,
-                n_oversamples,
-                n_power_iterations,
-                zero_center,
-                random_state,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            if shape.1 <= cov_threshold {
+                scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center)
+                    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            } else {
+                scx_accel::randomized_pca_inmemory(
+                    &csr,
+                    n_comps,
+                    n_oversamples,
+                    n_power_iterations,
+                    zero_center,
+                    random_state,
+                )
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            }
         } else {
             // Dense numpy array: convert to CSR first
             let csr = scipy_sparse.call_method1("csr_matrix", (&x,))?;
@@ -466,15 +488,20 @@ pub fn pca(
                 .extract::<Vec<f32>>()?;
 
             let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
-            scx_accel::randomized_pca_inmemory(
-                &csr,
-                n_comps,
-                n_oversamples,
-                n_power_iterations,
-                zero_center,
-                random_state,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            if shape.1 <= cov_threshold {
+                scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center)
+                    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            } else {
+                scx_accel::randomized_pca_inmemory(
+                    &csr,
+                    n_comps,
+                    n_oversamples,
+                    n_power_iterations,
+                    zero_center,
+                    random_state,
+                )
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            }
         }
     };
 
