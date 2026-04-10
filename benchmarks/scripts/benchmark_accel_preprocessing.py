@@ -18,6 +18,7 @@ import argparse
 import gc
 import json
 import os
+import statistics
 import sys
 import tempfile
 import time
@@ -46,11 +47,6 @@ N_RUNS = 3
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _median(values):
-    s = sorted(values)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def get_rss_mb():
@@ -223,7 +219,7 @@ def run_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"\n  SCX preprocess on {ds_name} ({n_runs} runs)...")
         scx_times = []
         scx_file_sizes = []
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             gc.collect()
             rss_before = get_rss_mb()
 
@@ -239,6 +235,10 @@ def run_benchmark(datasets=None, n_runs=N_RUNS):
                 wall = time.perf_counter() - t0
                 rss_after = get_rss_mb()
 
+                if run < 0:
+                    print(f"    Warmup: {wall:.2f}s")
+                    continue
+
                 scx_times.append(wall)
                 file_size_mb = os.path.getsize(prep_path) / (1024 * 1024)
                 scx_file_sizes.append(file_size_mb)
@@ -253,7 +253,7 @@ def run_benchmark(datasets=None, n_runs=N_RUNS):
         # Scanpy preprocess
         print(f"  Scanpy preprocess on {ds_name} ({n_runs} runs)...")
         scanpy_times = []
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             gc.collect()
             rss_before = get_rss_mb()
 
@@ -264,14 +264,21 @@ def run_benchmark(datasets=None, n_runs=N_RUNS):
             wall = time.perf_counter() - t0
             rss_after = get_rss_mb()
 
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata; gc.collect()
+                continue
+
             scanpy_times.append(wall)
+            if run == 0:
+                n_obs = adata.n_obs
             print(f"    Run {run+1}: {wall:.2f}s, "
                   f"RSS delta: {rss_after - rss_before:.0f} MB")
             del adata
             gc.collect()
 
-        scx_median = _median(scx_times)
-        scanpy_median = _median(scanpy_times)
+        scx_median = statistics.median(scx_times)
+        scanpy_median = statistics.median(scanpy_times)
         speedup = scanpy_median / scx_median if scx_median > 0 else 0
 
         result = {
@@ -283,14 +290,14 @@ def run_benchmark(datasets=None, n_runs=N_RUNS):
             "scx_median_s": round(scx_median, 3),
             "scanpy_median_s": round(scanpy_median, 3),
             "speedup": round(speedup, 2),
-            "scx_output_file_size_mb": round(_median(scx_file_sizes), 1),
+            "scx_output_file_size_mb": round(statistics.median(scx_file_sizes), 1),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         results.append(result)
 
         print(f"  SCX median: {scx_median:.2f}s, Scanpy median: {scanpy_median:.2f}s, "
               f"Speedup: {speedup:.1f}x")
-        print(f"  SCX output file size: {_median(scx_file_sizes):.1f} MB")
+        print(f"  SCX output file size: {statistics.median(scx_file_sizes):.1f} MB")
 
     save_json(results, "accel_preprocessing_benchmark.json")
     return results

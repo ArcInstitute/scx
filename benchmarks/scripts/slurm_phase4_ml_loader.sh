@@ -74,12 +74,13 @@ for ds in "${DATASETS[@]}"; do
         --cpus-per-task=16 \
         --mem="${GPU_MEM[$ds]}" \
         --time="${GPU_TIME[$ds]}" \
-        --dependency="afterany:${DEP_STR}" \
+        --dependency="afterok:${DEP_STR}" \
         --output="benchmarks/logs/phase4_ml_gpu_${ds}_%j.log" \
         --error="benchmarks/logs/phase4_ml_gpu_${ds}_%j.err" \
         --wrap="cd ${SCX_DIR} && \
-            .venv/bin/maturin develop --release --manifest-path pyscx/Cargo.toml && \
-            .venv/bin/python benchmarks/comprehensive/scripts/run_all.py \
+            source activate scx-gpu && \
+            maturin develop --features gpu --release --manifest-path pyscx/Cargo.toml && \
+            python benchmarks/comprehensive/scripts/run_all.py \
                 --benchmarks ml_loader \
                 --datasets ${ds} \
                 --formats ${SCX_FORMATS}")

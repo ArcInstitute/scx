@@ -4,11 +4,11 @@
 # Submits one SLURM job per dataset with appropriate resources.
 # Must use --cpus-per-task=32 since parallel_scaling tests up to 32 threads.
 #
-# Usage: cd /home/nickyoungblut/dev/rust/scx && bash benchmarks/scripts/slurm_phase3_parallel_scaling_d5d7.sh
+# Usage: bash benchmarks/scripts/slurm_phase3_parallel_scaling_d5d7.sh
 
 set -euo pipefail
 
-SCX_DIR="/home/nickyoungblut/dev/rust/scx"
+SCX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${SCX_DIR}/.venv/bin/python"
 
 cd "${SCX_DIR}"

@@ -86,6 +86,8 @@ sparse-to-dense conversion, and normalization happen in compiled Rust.
 | 1M cells (batches/sec) | **1,405** | 16.3 | 17.1 | 4.4 |
 | vs SCX | — | 86× slower | 82× slower | 319× slower |
 
+> _batch_size=1024, HVG=2000, normalize+log1p (hvg_norm scenario). See [detailed results](#training-loader-batchessec-batch_size1024-hvg2000-normalizelog1p) below._
+
 ```python
 # GPU-saturating training loader — no num_workers needed
 dataset = pyscx.TrainingDataset(

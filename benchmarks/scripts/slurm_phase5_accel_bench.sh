@@ -4,11 +4,11 @@
 # Submits one SLURM job per (benchmark, dataset) pair. A build job runs first
 # as a dependency for all benchmark jobs.
 #
-# Usage: cd /home/nickyoungblut/dev/rust/scx && bash benchmarks/scripts/slurm_phase5_accel_bench.sh
+# Usage: bash benchmarks/scripts/slurm_phase5_accel_bench.sh
 
 set -euo pipefail
 
-SCX_DIR="/home/nickyoungblut/dev/rust/scx"
+SCX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VENV="${SCX_DIR}/.venv"
 PYTHON="${VENV}/bin/python"
 MATURIN="${VENV}/bin/maturin"

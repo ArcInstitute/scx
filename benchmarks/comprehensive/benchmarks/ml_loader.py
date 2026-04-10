@@ -545,7 +545,7 @@ def _run_gpu_train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     # Start nvidia-smi monitoring
-    smi_log = Path(f"/tmp/nvidia_smi_log_{os.getpid()}.csv")
+    smi_log = Path(tempfile.gettempdir()) / f"nvidia_smi_log_{os.getpid()}.csv"
     smi_proc = subprocess.Popen(
         ["nvidia-smi", "dmon", "-s", "u", "-d", "1", "-f", str(smi_log)],
         stdout=subprocess.DEVNULL,
@@ -742,26 +742,26 @@ def run(
 
             # Build the epoch function and TTFB function for this loader
             if loader_type == "scx":
-                epoch_fn = lambda: _run_scx_epoch(
+                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_scx_epoch(
                     data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
                 )
-                ttfb_fn = lambda: _ttfb_scx(
+                ttfb_fn = lambda hvg=hvg, normalize=normalize: _ttfb_scx(
                     data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
                 )
             elif loader_type == "anndata":
-                epoch_fn = lambda: _run_anndata_epoch(
+                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_anndata_epoch(
                     data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
                 )
-                ttfb_fn = lambda: _ttfb_anndata(
+                ttfb_fn = lambda hvg=hvg, normalize=normalize: _ttfb_anndata(
                     data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
                 )
             elif loader_type == "soma":
-                epoch_fn = lambda: _run_soma_epoch(
+                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_soma_epoch(
                     data_path, ML_BATCH_SIZE, hvg, normalize
                 )
                 ttfb_fn = lambda: _ttfb_soma(data_path, ML_BATCH_SIZE)
             elif loader_type == "scdataloader":
-                epoch_fn = lambda: _run_scdataloader_epoch(
+                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_scdataloader_epoch(
                     data_path, ML_BATCH_SIZE, hvg, normalize
                 )
                 ttfb_fn = lambda: _ttfb_scdataloader(data_path, ML_BATCH_SIZE)
@@ -796,7 +796,7 @@ def run(
             for i in range(n_runs):
                 if cold_cache:
                     try:
-                        os.system("sync")
+                        subprocess.run(["sync"], check=False)
                         with open("/proc/sys/vm/drop_caches", "w") as f:
                             f.write("3\n")
                     except (PermissionError, OSError):

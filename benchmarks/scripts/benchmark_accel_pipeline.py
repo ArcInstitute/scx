@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import statistics
 import time
 from pathlib import Path
 
@@ -47,11 +48,6 @@ N_HVGS = 2000
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _median(values):
-    s = sorted(values)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def get_rss_mb():
@@ -108,6 +104,57 @@ def compute_de_gene_overlap(genes_a, genes_b, n_top=100):
     return float(np.mean(overlaps))
 
 
+def _run_analysis_stages(adata, timings, *, pca_fn, neighbors_fn, umap_fn, de_fn):
+    """Run HVG -> PCA -> kNN -> UMAP -> Leiden -> DE, recording per-stage timings.
+
+    Args:
+        adata: AnnData to operate on (modified in-place).
+        timings: Dict to record per-stage wall-clock times.
+        pca_fn: Callable(adata) for PCA.
+        neighbors_fn: Callable(adata) for kNN graph construction.
+        umap_fn: Callable(adata) for UMAP embedding.
+        de_fn: Callable(adata) for differential expression.
+    """
+    import scanpy as sc
+
+    # HVG
+    t0 = time.perf_counter()
+    n_top = min(N_HVGS, adata.n_vars)
+    try:
+        sc.pp.highly_variable_genes(
+            adata, n_top_genes=n_top, flavor="seurat_v3",
+            subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0
+        )
+    except Exception:
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
+    timings["hvg"] = time.perf_counter() - t0
+
+    # PCA
+    t0 = time.perf_counter()
+    pca_fn(adata)
+    timings["pca"] = time.perf_counter() - t0
+
+    # kNN
+    t0 = time.perf_counter()
+    neighbors_fn(adata)
+    timings["knn"] = time.perf_counter() - t0
+
+    # UMAP
+    t0 = time.perf_counter()
+    umap_fn(adata)
+    timings["umap"] = time.perf_counter() - t0
+
+    # Leiden
+    t0 = time.perf_counter()
+    sc.tl.leiden(adata, resolution=1.0, random_state=42)
+    timings["leiden"] = time.perf_counter() - t0
+
+    # DE
+    t0 = time.perf_counter()
+    de_fn(adata)
+    timings["de"] = time.perf_counter() - t0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline Variant 1: SCX Out-of-Core (Phase 4d)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -125,12 +172,15 @@ def run_scx_ooc_pipeline(dataset_name, n_runs=N_RUNS):
         return None
 
     all_runs = []
-    for run in range(n_runs):
+    for run in range(-1, n_runs):
         gc.collect()
         rss_baseline = get_rss_mb()
         timings = {}
 
-        print(f"    Run {run+1}/{n_runs}...")
+        if run < 0:
+            print(f"    Warmup run...")
+        else:
+            print(f"    Run {run+1}/{n_runs}...")
 
         # Open backed
         adata = pyscx.open(str(scx_path)).to_anndata()
@@ -141,45 +191,23 @@ def run_scx_ooc_pipeline(dataset_name, n_runs=N_RUNS):
         pyscx.accel.log1p(adata)
         timings["normalize_log1p"] = time.perf_counter() - t0
 
-        # HVG (backed, streaming var)
-        t0 = time.perf_counter()
-        n_top = min(N_HVGS, adata.n_vars)
-        try:
-            sc.pp.highly_variable_genes(
-                adata, n_top_genes=n_top, flavor="seurat_v3",
-                subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0
-            )
-        except Exception:
-            sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
-        timings["hvg"] = time.perf_counter() - t0
-
-        # Streaming PCA (through lazy transforms)
-        t0 = time.perf_counter()
-        pyscx.accel.pca(adata, n_comps=N_COMPS, device="cpu")
-        timings["pca"] = time.perf_counter() - t0
-
-        # kNN
-        t0 = time.perf_counter()
-        pyscx.accel.neighbors(adata, n_neighbors=N_NEIGHBORS, device="cpu")
-        timings["knn"] = time.perf_counter() - t0
-
-        # UMAP
-        t0 = time.perf_counter()
-        pyscx.accel.umap(adata, device="cpu")
-        timings["umap"] = time.perf_counter() - t0
-
-        # Leiden
-        t0 = time.perf_counter()
-        sc.tl.leiden(adata, resolution=1.0)
-        timings["leiden"] = time.perf_counter() - t0
-
-        # DE
-        t0 = time.perf_counter()
-        pyscx.accel.rank_genes_groups(adata, groupby="leiden", reference="rest")
-        timings["de"] = time.perf_counter() - t0
+        # HVG -> PCA -> kNN -> UMAP -> Leiden -> DE
+        _run_analysis_stages(
+            adata, timings,
+            pca_fn=lambda a: pyscx.accel.pca(a, n_comps=N_COMPS, device="cpu"),
+            neighbors_fn=lambda a: pyscx.accel.neighbors(a, n_neighbors=N_NEIGHBORS, device="cpu"),
+            umap_fn=lambda a: pyscx.accel.umap(a, device="cpu", random_state=42),
+            de_fn=lambda a: pyscx.accel.rank_genes_groups(a, groupby="leiden", reference="rest"),
+        )
 
         timings["total"] = sum(timings.values())
         rss_peak = get_rss_mb()
+
+        if run < 0:
+            print(f"      Warmup total: {timings['total']:.2f}s")
+            del adata; gc.collect()
+            continue
+
         timings["peak_rss_mb"] = round(rss_peak, 0)
         timings["rss_delta_mb"] = round(rss_peak - rss_baseline, 0)
 
@@ -215,12 +243,15 @@ def run_scx_preprocess_pipeline(dataset_name, n_runs=N_RUNS):
         return None
 
     all_runs = []
-    for run in range(n_runs):
+    for run in range(-1, n_runs):
         gc.collect()
         rss_baseline = get_rss_mb()
         timings = {}
 
-        print(f"    Run {run+1}/{n_runs}...")
+        if run < 0:
+            print(f"    Warmup run...")
+        else:
+            print(f"    Run {run+1}/{n_runs}...")
 
         # Preprocess: write new SCX file
         with tempfile.NamedTemporaryFile(suffix=".scx", delete=False,
@@ -237,45 +268,23 @@ def run_scx_preprocess_pipeline(dataset_name, n_runs=N_RUNS):
             # Open preprocessed
             adata = pyscx.open(prep_path).to_anndata()
 
-            # HVG
-            t0 = time.perf_counter()
-            n_top = min(N_HVGS, adata.n_vars)
-            try:
-                sc.pp.highly_variable_genes(
-                    adata, n_top_genes=n_top, flavor="seurat_v3",
-                    subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0
-                )
-            except Exception:
-                sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
-            timings["hvg"] = time.perf_counter() - t0
-
-            # PCA
-            t0 = time.perf_counter()
-            pyscx.accel.pca(adata, n_comps=N_COMPS, device="cpu")
-            timings["pca"] = time.perf_counter() - t0
-
-            # kNN
-            t0 = time.perf_counter()
-            pyscx.accel.neighbors(adata, n_neighbors=N_NEIGHBORS, device="cpu")
-            timings["knn"] = time.perf_counter() - t0
-
-            # UMAP
-            t0 = time.perf_counter()
-            pyscx.accel.umap(adata, device="cpu")
-            timings["umap"] = time.perf_counter() - t0
-
-            # Leiden
-            t0 = time.perf_counter()
-            sc.tl.leiden(adata, resolution=1.0)
-            timings["leiden"] = time.perf_counter() - t0
-
-            # DE
-            t0 = time.perf_counter()
-            pyscx.accel.rank_genes_groups(adata, groupby="leiden", reference="rest")
-            timings["de"] = time.perf_counter() - t0
+            # HVG -> PCA -> kNN -> UMAP -> Leiden -> DE
+            _run_analysis_stages(
+                adata, timings,
+                pca_fn=lambda a: pyscx.accel.pca(a, n_comps=N_COMPS, device="cpu"),
+                neighbors_fn=lambda a: pyscx.accel.neighbors(a, n_neighbors=N_NEIGHBORS, device="cpu"),
+                umap_fn=lambda a: pyscx.accel.umap(a, device="cpu", random_state=42),
+                de_fn=lambda a: pyscx.accel.rank_genes_groups(a, groupby="leiden", reference="rest"),
+            )
 
             timings["total"] = sum(timings.values())
             rss_peak = get_rss_mb()
+
+            if run < 0:
+                print(f"      Warmup total: {timings['total']:.2f}s")
+                del adata
+                continue
+
             timings["peak_rss_mb"] = round(rss_peak, 0)
 
             all_runs.append(timings)
@@ -315,12 +324,15 @@ def run_scanpy_pipeline(dataset_name, n_runs=N_RUNS):
         return None
 
     all_runs = []
-    for run in range(n_runs):
+    for run in range(-1, n_runs):
         gc.collect()
         rss_baseline = get_rss_mb()
         timings = {}
 
-        print(f"    Run {run+1}/{n_runs}...")
+        if run < 0:
+            print(f"    Warmup run...")
+        else:
+            print(f"    Run {run+1}/{n_runs}...")
 
         adata = anndata.read_h5ad(str(h5ad_path))
 
@@ -330,45 +342,23 @@ def run_scanpy_pipeline(dataset_name, n_runs=N_RUNS):
         sc.pp.log1p(adata)
         timings["normalize_log1p"] = time.perf_counter() - t0
 
-        # HVG
-        t0 = time.perf_counter()
-        n_top = min(N_HVGS, adata.n_vars)
-        try:
-            sc.pp.highly_variable_genes(
-                adata, n_top_genes=n_top, flavor="seurat_v3",
-                subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0
-            )
-        except Exception:
-            sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
-        timings["hvg"] = time.perf_counter() - t0
-
-        # PCA
-        t0 = time.perf_counter()
-        sc.pp.pca(adata, n_comps=N_COMPS)
-        timings["pca"] = time.perf_counter() - t0
-
-        # kNN
-        t0 = time.perf_counter()
-        sc.pp.neighbors(adata, n_neighbors=N_NEIGHBORS)
-        timings["knn"] = time.perf_counter() - t0
-
-        # UMAP
-        t0 = time.perf_counter()
-        sc.tl.umap(adata)
-        timings["umap"] = time.perf_counter() - t0
-
-        # Leiden
-        t0 = time.perf_counter()
-        sc.tl.leiden(adata, resolution=1.0)
-        timings["leiden"] = time.perf_counter() - t0
-
-        # DE
-        t0 = time.perf_counter()
-        sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon")
-        timings["de"] = time.perf_counter() - t0
+        # HVG -> PCA -> kNN -> UMAP -> Leiden -> DE
+        _run_analysis_stages(
+            adata, timings,
+            pca_fn=lambda a: sc.pp.pca(a, n_comps=N_COMPS),
+            neighbors_fn=lambda a: sc.pp.neighbors(a, n_neighbors=N_NEIGHBORS),
+            umap_fn=lambda a: sc.tl.umap(a, random_state=42),
+            de_fn=lambda a: sc.tl.rank_genes_groups(a, groupby="leiden", method="wilcoxon"),
+        )
 
         timings["total"] = sum(timings.values())
         rss_peak = get_rss_mb()
+
+        if run < 0:
+            print(f"      Warmup total: {timings['total']:.2f}s")
+            del adata; gc.collect()
+            continue
+
         timings["peak_rss_mb"] = round(rss_peak, 0)
 
         all_runs.append(timings)

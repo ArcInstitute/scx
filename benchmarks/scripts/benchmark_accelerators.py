@@ -34,6 +34,7 @@ import argparse
 import gc
 import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -65,11 +66,6 @@ N_RUNS = 3
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _median(values):
-    s = sorted(values)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def get_rss_mb() -> float:
@@ -247,24 +243,28 @@ def ensure_perturbation_labels(adata):
 
 
 def ensure_cell_type_column(adata, n_types: int = 5):
-    """Ensure cell_type column exists for stratified DE. Caps at top n_types."""
+    """Ensure cell_type column exists for stratified DE. Caps at top n_types.
+
+    Returns the (possibly subsetted) adata.
+    """
     import pandas as pd
     if "cell_type" in adata.obs.columns and adata.obs["cell_type"].nunique() >= 3:
         n_unique = adata.obs["cell_type"].nunique()
         if n_unique > n_types:
             top = adata.obs["cell_type"].value_counts().head(n_types).index.tolist()
             mask = adata.obs["cell_type"].isin(top)
-            adata._inplace_subset_obs(mask)
+            adata = adata[mask].copy()
             adata.obs["cell_type"] = adata.obs["cell_type"].cat.remove_unused_categories()
             print(f"  Using real cell_type (top {n_types} of {n_unique}, "
                   f"{adata.n_obs:,} cells)")
         else:
             print(f"  Using real cell_type ({n_unique} types)")
-        return
+        return adata
     rng = np.random.RandomState(42)
     types = [f"type_{i}" for i in range(n_types)]
     adata.obs["cell_type"] = pd.Categorical(rng.choice(types, size=adata.n_obs))
     print(f"  Added synthetic cell_type column with {n_types} types")
+    return adata
 
 
 def cosine_similarity_per_pc(pcs_a, pcs_b):
@@ -370,9 +370,10 @@ def run_pca_benchmark(datasets=None, n_runs=N_RUNS):
         # SCX PCA
         print(f"\n  SCX PCA on {ds_name} ({n_runs} runs)...")
         scx_times = []
+        scx_rss_deltas = []
         scx_pcs = None
         scx_var_ratio = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_copy = adata.copy()
             gc.collect()
             rss_before = get_rss_mb()
@@ -380,7 +381,12 @@ def run_pca_benchmark(datasets=None, n_runs=N_RUNS):
             pyscx.accel.pca(adata_copy, n_comps=n_comps, device="cpu")
             wall = time.perf_counter() - t0
             rss_after = get_rss_mb()
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_copy; gc.collect()
+                continue
             scx_times.append(wall)
+            scx_rss_deltas.append(rss_after - rss_before)
             if run == 0:
                 scx_pcs = adata_copy.obsm["X_pca"].copy()
                 scx_var_ratio = adata_copy.uns["pca"]["variance_ratio"].copy()
@@ -391,15 +397,23 @@ def run_pca_benchmark(datasets=None, n_runs=N_RUNS):
         # Scanpy PCA
         print(f"  Scanpy PCA on {ds_name} ({n_runs} runs)...")
         scanpy_times = []
+        scanpy_rss_deltas = []
         scanpy_pcs = None
         scanpy_var_ratio = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_copy = adata.copy()
             gc.collect()
+            rss_before = get_rss_mb()
             t0 = time.perf_counter()
             sc.pp.pca(adata_copy, n_comps=n_comps)
             wall = time.perf_counter() - t0
+            rss_after = get_rss_mb()
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_copy; gc.collect()
+                continue
             scanpy_times.append(wall)
+            scanpy_rss_deltas.append(rss_after - rss_before)
             if run == 0:
                 scanpy_pcs = adata_copy.obsm["X_pca"].copy()
                 scanpy_var_ratio = adata_copy.uns["pca"]["variance_ratio"].copy()
@@ -417,8 +431,8 @@ def run_pca_benchmark(datasets=None, n_runs=N_RUNS):
         mean_top10 = float(np.mean(sims[:min(10, len(sims))]))
         mean_top20 = float(np.mean(sims[:min(20, len(sims))]))
 
-        scx_median = _median(scx_times)
-        scanpy_median = _median(scanpy_times)
+        scx_median = statistics.median(scx_times)
+        scanpy_median = statistics.median(scanpy_times)
         speedup = scanpy_median / scx_median if scx_median > 0 else 0
 
         result = {
@@ -432,6 +446,8 @@ def run_pca_benchmark(datasets=None, n_runs=N_RUNS):
             "scx_median_s": round(scx_median, 3),
             "scanpy_median_s": round(scanpy_median, 3),
             "speedup": round(speedup, 2),
+            "scx_rss_delta_mb": round(statistics.median(scx_rss_deltas), 0),
+            "scanpy_rss_delta_mb": round(statistics.median(scanpy_rss_deltas), 0),
             "cosine_sim_mean_top5": round(mean_top5, 6),
             "cosine_sim_mean_top10": round(mean_top10, 6),
             "cosine_sim_mean_top20": round(mean_top20, 6),
@@ -500,12 +516,16 @@ def run_knn_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"  SCX kNN on {ds_name} ({n_runs} runs)...")
         scx_times = []
         scx_indices = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_scx = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
             pyscx.accel.neighbors(adata_scx, n_neighbors=n_neighbors, device="cpu")
             wall = time.perf_counter() - t0
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_scx; gc.collect()
+                continue
             scx_times.append(wall)
             if run == 0:
                 scx_indices = get_knn_indices_from_adata(adata_scx, n_neighbors)
@@ -517,12 +537,16 @@ def run_knn_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"  Scanpy kNN on {ds_name} ({n_runs} runs)...")
         scanpy_times = []
         scanpy_indices = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_scanpy = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
             sc.pp.neighbors(adata_scanpy, n_neighbors=n_neighbors)
             wall = time.perf_counter() - t0
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_scanpy; gc.collect()
+                continue
             scanpy_times.append(wall)
             if run == 0:
                 scanpy_indices = get_knn_indices_from_adata(adata_scanpy, n_neighbors)
@@ -530,8 +554,8 @@ def run_knn_benchmark(datasets=None, n_runs=N_RUNS):
             del adata_scanpy
             gc.collect()
 
-        scx_median = _median(scx_times)
-        scanpy_median = _median(scanpy_times)
+        scx_median = statistics.median(scx_times)
+        scanpy_median = statistics.median(scanpy_times)
         speedup = scanpy_median / scx_median if scx_median > 0 else 0
 
         # Quality metrics
@@ -561,11 +585,11 @@ def run_knn_benchmark(datasets=None, n_runs=N_RUNS):
         try:
             adata_scx_l = adata.copy()
             pyscx.accel.neighbors(adata_scx_l, n_neighbors=n_neighbors, device="cpu")
-            sc.tl.leiden(adata_scx_l, resolution=1.0)
+            sc.tl.leiden(adata_scx_l, resolution=1.0, random_state=42)
 
             adata_scanpy_l = adata.copy()
             sc.pp.neighbors(adata_scanpy_l, n_neighbors=n_neighbors)
-            sc.tl.leiden(adata_scanpy_l, resolution=1.0)
+            sc.tl.leiden(adata_scanpy_l, resolution=1.0, random_state=42)
 
             ari = adjusted_rand_score(
                 adata_scx_l.obs["leiden"], adata_scanpy_l.obs["leiden"]
@@ -622,12 +646,16 @@ def run_umap_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"\n  SCX UMAP on {ds_name} ({n_runs} runs)...")
         scx_times = []
         scx_umap = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_scx = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
-            pyscx.accel.umap(adata_scx, device="cpu")
+            pyscx.accel.umap(adata_scx, device="cpu", random_state=42)
             wall = time.perf_counter() - t0
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_scx; gc.collect()
+                continue
             scx_times.append(wall)
             if run == 0:
                 scx_umap = adata_scx.obsm["X_umap"].copy()
@@ -639,12 +667,16 @@ def run_umap_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"  Scanpy UMAP on {ds_name} ({n_runs} runs)...")
         scanpy_times = []
         scanpy_umap = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_scanpy = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
-            sc.tl.umap(adata_scanpy)
+            sc.tl.umap(adata_scanpy, random_state=42)
             wall = time.perf_counter() - t0
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_scanpy; gc.collect()
+                continue
             scanpy_times.append(wall)
             if run == 0:
                 scanpy_umap = adata_scanpy.obsm["X_umap"].copy()
@@ -652,8 +684,8 @@ def run_umap_benchmark(datasets=None, n_runs=N_RUNS):
             del adata_scanpy
             gc.collect()
 
-        scx_median = _median(scx_times)
-        scanpy_median = _median(scanpy_times)
+        scx_median = statistics.median(scx_times)
+        scanpy_median = statistics.median(scanpy_times)
         speedup = scanpy_median / scx_median if scx_median > 0 else 0
 
         # Trustworthiness (subsample if > 50K cells — pairwise distances are O(n^2))
@@ -732,13 +764,17 @@ def run_de_inmemory_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"\n  SCX DE on {ds_name} ({n_runs} runs)...")
         scx_times = []
         scx_genes = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_scx = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
             pyscx.accel.rank_genes_groups(adata_scx, groupby=groupby,
                                            reference="rest")
             wall = time.perf_counter() - t0
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_scx; gc.collect()
+                continue
             scx_times.append(wall)
             if run == 0:
                 scx_genes = get_de_gene_names(adata_scx, n_top=100)
@@ -750,13 +786,17 @@ def run_de_inmemory_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"  Scanpy DE on {ds_name} ({n_runs} runs)...")
         scanpy_times = []
         scanpy_genes = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_scanpy = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
             sc.tl.rank_genes_groups(adata_scanpy, groupby=groupby,
                                     method="wilcoxon")
             wall = time.perf_counter() - t0
+            if run < 0:
+                print(f"    Warmup: {wall:.2f}s")
+                del adata_scanpy; gc.collect()
+                continue
             scanpy_times.append(wall)
             if run == 0:
                 scanpy_genes = get_de_gene_names(adata_scanpy, n_top=100)
@@ -764,8 +804,8 @@ def run_de_inmemory_benchmark(datasets=None, n_runs=N_RUNS):
             del adata_scanpy
             gc.collect()
 
-        scx_median = _median(scx_times)
-        scanpy_median = _median(scanpy_times)
+        scx_median = statistics.median(scx_times)
+        scanpy_median = statistics.median(scanpy_times)
         speedup = scanpy_median / scx_median if scx_median > 0 else 0
 
         # Quality: gene overlap
@@ -891,7 +931,7 @@ def run_de_streaming_benchmark(datasets=None, n_runs=N_RUNS):
 
             stream_times = []
             stream_genes = None
-            for run in range(n_runs):
+            for run in range(-1, n_runs):
                 gc.collect()
                 rss_before = get_rss_mb()
                 t0 = time.perf_counter()
@@ -900,13 +940,16 @@ def run_de_streaming_benchmark(datasets=None, n_runs=N_RUNS):
                                                gene_chunk_size=chunk_size)
                 wall = time.perf_counter() - t0
                 rss_after = get_rss_mb()
+                if run < 0:
+                    print(f"    Warmup: {wall:.2f}s")
+                    continue
                 stream_times.append(wall)
                 if run == 0:
                     stream_genes = get_de_gene_names(backed, n_top=50)
                 print(f"    Run {run+1}: {wall:.2f}s, RSS delta: "
                       f"{rss_after - rss_before:.0f} MB")
 
-            stream_median = _median(stream_times)
+            stream_median = statistics.median(stream_times)
 
             # Quality: should be identical to in-memory
             gene_overlap = compute_de_gene_overlap(stream_genes, inmem_genes, n_top=50)
@@ -968,7 +1011,7 @@ def run_pseudobulk_benchmark(datasets=None, n_runs=N_RUNS):
         print(f"\n  In-memory pseudobulk DE on {ds_name} ({n_runs} runs)...")
         inmem_times = []
         inmem_result_df = None
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_copy = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
@@ -980,6 +1023,10 @@ def run_pseudobulk_benchmark(datasets=None, n_runs=N_RUNS):
                     reference=reference,
                 )
                 wall = time.perf_counter() - t0
+                if run < 0:
+                    print(f"    Warmup: {wall:.2f}s")
+                    del adata_copy; gc.collect()
+                    continue
                 inmem_times.append(wall)
                 if run == 0:
                     inmem_result_df = df
@@ -1000,7 +1047,7 @@ def run_pseudobulk_benchmark(datasets=None, n_runs=N_RUNS):
         backed_result_df = None
         if backed is not None:
             backed_ref = ensure_perturbation_labels(backed)
-            for run in range(n_runs):
+            for run in range(-1, n_runs):
                 gc.collect()
                 rss_before = get_rss_mb()
                 t0 = time.perf_counter()
@@ -1013,6 +1060,9 @@ def run_pseudobulk_benchmark(datasets=None, n_runs=N_RUNS):
                     )
                     wall = time.perf_counter() - t0
                     rss_after = get_rss_mb()
+                    if run < 0:
+                        print(f"    Warmup: {wall:.2f}s")
+                        continue
                     backed_times.append(wall)
                     if run == 0:
                         backed_result_df = df
@@ -1033,11 +1083,11 @@ def run_pseudobulk_benchmark(datasets=None, n_runs=N_RUNS):
 
         if inmem_times:
             result["inmem_times_s"] = [round(t, 3) for t in inmem_times]
-            result["inmem_median_s"] = round(_median(inmem_times), 3)
+            result["inmem_median_s"] = round(statistics.median(inmem_times), 3)
 
         if backed_times:
             result["backed_times_s"] = [round(t, 3) for t in backed_times]
-            result["backed_median_s"] = round(_median(backed_times), 3)
+            result["backed_median_s"] = round(statistics.median(backed_times), 3)
 
         # Quality: log2FC correlation between backed and in-memory
         if inmem_result_df is not None and backed_result_df is not None:
@@ -1103,12 +1153,12 @@ def run_stratified_benchmark(datasets=None, n_runs=N_RUNS):
 
         n_obs = adata.n_obs
         reference = ensure_perturbation_labels(adata)
-        ensure_cell_type_column(adata, n_types=5)
+        adata = ensure_cell_type_column(adata, n_types=5)
 
         # Single-cell stratified DE
         print(f"\n  Single-cell stratified DE on {ds_name} ({n_runs} runs)...")
         sc_strat_times = []
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_copy = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
@@ -1120,6 +1170,10 @@ def run_stratified_benchmark(datasets=None, n_runs=N_RUNS):
                     min_cells_per_stratum=20,
                 )
                 wall = time.perf_counter() - t0
+                if run < 0:
+                    print(f"    Warmup: {wall:.2f}s")
+                    del adata_copy; gc.collect()
+                    continue
                 sc_strat_times.append(wall)
                 print(f"    Run {run+1}: {wall:.2f}s")
             except Exception as e:
@@ -1131,7 +1185,7 @@ def run_stratified_benchmark(datasets=None, n_runs=N_RUNS):
         # Pseudobulk stratified DE
         print(f"  Pseudobulk stratified DE on {ds_name} ({n_runs} runs)...")
         pb_strat_times = []
-        for run in range(n_runs):
+        for run in range(-1, n_runs):
             adata_copy = adata.copy()
             gc.collect()
             t0 = time.perf_counter()
@@ -1145,6 +1199,10 @@ def run_stratified_benchmark(datasets=None, n_runs=N_RUNS):
                     min_cells_per_stratum=20,
                 )
                 wall = time.perf_counter() - t0
+                if run < 0:
+                    print(f"    Warmup: {wall:.2f}s")
+                    del adata_copy; gc.collect()
+                    continue
                 pb_strat_times.append(wall)
                 print(f"    Run {run+1}: {wall:.2f}s")
             except ImportError as e:
@@ -1166,11 +1224,11 @@ def run_stratified_benchmark(datasets=None, n_runs=N_RUNS):
 
         if sc_strat_times:
             result["sc_stratified_times_s"] = [round(t, 3) for t in sc_strat_times]
-            result["sc_stratified_median_s"] = round(_median(sc_strat_times), 3)
+            result["sc_stratified_median_s"] = round(statistics.median(sc_strat_times), 3)
 
         if pb_strat_times:
             result["pb_stratified_times_s"] = [round(t, 3) for t in pb_strat_times]
-            result["pb_stratified_median_s"] = round(_median(pb_strat_times), 3)
+            result["pb_stratified_median_s"] = round(statistics.median(pb_strat_times), 3)
 
         results.append(result)
         del adata
