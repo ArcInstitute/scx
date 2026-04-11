@@ -321,7 +321,7 @@ def n_runs_for_dataset(dataset_name: str) -> int:
 
 SLURM_DEFAULTS = {
     "cpu": {
-        "partition": "cpu",
+        "partition": "cpu_preemptible",
         "cpus_per_task": 16,
         "mem_gb": 80,
         "time": "04:00:00",
@@ -333,7 +333,7 @@ SLURM_DEFAULTS = {
         "time": "08:00:00",
     },
     "gpu": {
-        "partition": "gpu",
+        "partition": "preemptible",
         "cpus_per_task": 16,
         "mem_gb": 128,
         "gpus": 1,

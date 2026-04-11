@@ -54,8 +54,8 @@ def main():
                         help="Run GPU scaling sweep (1, 2, 4 GPUs)")
     parser.add_argument("--local", action="store_true",
                         help="Run locally (no SLURM)")
-    parser.add_argument("--partition", type=str, default="gpu",
-                        help="SLURM partition")
+    parser.add_argument("--partition", type=str, default="preemptible",
+                        help="SLURM partition (default: preemptible for GPU jobs)")
     parser.add_argument("--time", type=str, default="4:00:00",
                         help="SLURM time limit")
     args = parser.parse_args()
@@ -122,7 +122,7 @@ def main():
 
     for ds in datasets:
         for n_gpus in gpu_configs:
-            partition = args.partition if n_gpus > 0 else "cpu_high_mem"
+            partition = args.partition if n_gpus > 0 else "cpu_preemptible"
             time_limit = args.time
 
             executor = submitit.AutoExecutor(folder=str(SLURM_LOG_DIR))

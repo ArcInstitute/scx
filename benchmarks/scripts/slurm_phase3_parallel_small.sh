@@ -27,7 +27,7 @@ for bench in "${BENCHMARKS[@]}"; do
     for ds in "${DATASETS[@]}"; do
         JOB_ID=$(sbatch --parsable \
             --job-name="p3_${bench:0:4}_${ds}" \
-            --partition=cpu \
+            --partition=cpu_preemptible \
             --qos=normal \
             --cpus-per-task=32 \
             --mem=80G \

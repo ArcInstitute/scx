@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=scx_gpu_knn
-#SBATCH --partition=gpu
+#SBATCH --partition=preemptible
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G

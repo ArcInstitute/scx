@@ -139,18 +139,28 @@ pub fn randomized_pca<S: ShardSource>(
     // Step 2: Random Gaussian Ω (n_vars × k), row-major
     let omega = random_gaussian(n_vars, k, seed);
 
-    // Step 3 + 4 + 5: Streaming SpMM → QR → power iteration
-    // All intermediate buffers are row-major Vec<f64>; QR produces column-major Mat<f64>.
+    // Step 3 + 4 + 5: Streaming SpMM → power iteration → QR
+    // When n_power_iterations <= 2, skip intermediate QR on the transpose result
+    // (matching sklearn's default 'auto' normalization mode). The transpose result
+    // (n_vars × k) is fed directly back into the forward SpMM, saving one QR + one
+    // mat_to_row_major_buf per iteration. QR is still applied to the forward result
+    // (n_obs × k) each iteration to prevent basis collapse.
     let y = streaming_spmm_forward(source, &omega, k, means_ref)?;
     let mut q = qr_thin_q_row_major(&y, n_obs, k);
 
     for _ in 0..n_power_iterations {
         let b = streaming_spmm_transpose(source, &q, means_ref)?;
-        let q_b = qr_thin_q_row_major(&b, n_vars, k);
-        // q_b is column-major Mat; extract to row-major for forward SpMM
-        let q_b_rm = mat_to_row_major_buf(&q_b);
-        let y = streaming_spmm_forward(source, &q_b_rm, k, means_ref)?;
-        q = qr_thin_q_row_major(&y, n_obs, k);
+        if n_power_iterations > 2 {
+            // Full QR normalization on transpose result for numerical stability
+            let q_b = qr_thin_q_row_major(&b, n_vars, k);
+            let q_b_rm = mat_to_row_major_buf(&q_b);
+            let y = streaming_spmm_forward(source, &q_b_rm, k, means_ref)?;
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        } else {
+            // Skip QR on b — feed row-major b directly into forward SpMM
+            let y = streaming_spmm_forward(source, &b, k, means_ref)?;
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        }
     }
 
     // Step 6: B = (X - μ)^T @ Q
@@ -194,12 +204,17 @@ pub fn randomized_pca_inmemory(
 
     for _ in 0..n_power_iterations {
         let b = spmm_transpose_csr(csr, &q, means_ref);
-        let q_b = qr_thin_q_row_major(&b, n_vars, k);
-        // q_b is column-major Mat; extract to row-major for forward SpMM
-        // (small: n_vars × k, e.g. 2000×60 = 120K elements)
-        let q_b_rm = mat_to_row_major_buf(&q_b);
-        let y = spmm_forward_csr(csr, &q_b_rm, k, means_ref);
-        q = qr_thin_q_row_major(&y, n_obs, k);
+        if n_power_iterations > 2 {
+            // Full QR normalization for numerical stability
+            let q_b = qr_thin_q_row_major(&b, n_vars, k);
+            let q_b_rm = mat_to_row_major_buf(&q_b);
+            let y = spmm_forward_csr(csr, &q_b_rm, k, means_ref);
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        } else {
+            // Skip QR on transpose result — feed directly into forward SpMM
+            let y = spmm_forward_csr(csr, &b, k, means_ref);
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        }
     }
 
     let b_rm = spmm_transpose_csr(csr, &q, means_ref);
@@ -294,8 +309,8 @@ fn streaming_spmm_forward<S: ShardSource>(
 
 /// Streaming transpose SpMM: Z = (X - μ)^T @ Q, shard-by-shard.
 ///
-/// Q is `Mat<f64>` (n_obs × k), column-major. Reads via per-row buffer to
-/// avoid a full `mat_to_row_major` allocation.
+/// Q is `Mat<f64>` (n_obs × k), column-major. Each shard is parallelized
+/// via rayon thread-local accumulators (same approach as `spmm_transpose_csr`).
 /// Returns row-major `Vec<f64>` of shape (n_vars × k).
 fn streaming_spmm_transpose<S: ShardSource>(
     source: &S,
@@ -315,35 +330,105 @@ fn streaming_spmm_transpose<S: ShardSource>(
 
     let n_shards = source.n_shards();
     let mut global_row = 0usize;
-    let mut q_row = vec![0.0f64; k];
 
     for shard_idx in 0..n_shards {
         let csr = source.read_shard(shard_idx)?;
         let shard_rows = csr.n_rows();
+        let use_parallel = shard_rows * k > 10_000;
 
-        // Z[col, :] += X[row, col] * Q[row, :]
-        for r in 0..shard_rows {
-            let gr = global_row + r;
-            // Copy one row from column-major Q into contiguous buffer
-            for j in 0..k {
-                q_row[j] = q[(gr, j)];
+        if use_parallel {
+            let gr_base = global_row;
+            let chunk_size = (shard_rows / rayon::current_num_threads().max(1)).max(256);
+
+            let (z_shard, sq_shard) = (0..shard_rows)
+                .into_par_iter()
+                .with_min_len(chunk_size)
+                .fold(
+                    || {
+                        (
+                            vec![0.0f64; n_vars * k],
+                            if means.is_some() {
+                                vec![0.0f64; k]
+                            } else {
+                                vec![]
+                            },
+                        )
+                    },
+                    |(mut zl, mut sql), r| {
+                        let gr = gr_base + r;
+                        let mut q_row = vec![0.0f64; k];
+                        for j in 0..k {
+                            q_row[j] = q[(gr, j)];
+                        }
+                        if means.is_some() {
+                            for j in 0..k {
+                                sql[j] += q_row[j];
+                            }
+                        }
+                        let start = csr.indptr[r] as usize;
+                        let end = csr.indptr[r + 1] as usize;
+                        for idx in start..end {
+                            let col = csr.indices[idx] as usize;
+                            let val = csr.data[idx] as f64;
+                            let z_offset = col * k;
+                            for j in 0..k {
+                                zl[z_offset + j] += val * q_row[j];
+                            }
+                        }
+                        (zl, sql)
+                    },
+                )
+                .reduce(
+                    || {
+                        (
+                            vec![0.0f64; n_vars * k],
+                            if means.is_some() {
+                                vec![0.0f64; k]
+                            } else {
+                                vec![]
+                            },
+                        )
+                    },
+                    |(mut za, mut sqa), (zb, sqb)| {
+                        for i in 0..za.len() {
+                            za[i] += zb[i];
+                        }
+                        for i in 0..sqa.len() {
+                            sqa[i] += sqb[i];
+                        }
+                        (za, sqa)
+                    },
+                );
+
+            // Merge shard results into global accumulators
+            for i in 0..z.len() {
+                z[i] += z_shard[i];
             }
-
-            // Accumulate column sums for mean correction
-            if means.is_some() {
+            for i in 0..sum_q.len() {
+                sum_q[i] += sq_shard[i];
+            }
+        } else {
+            // Sequential path for small shards
+            let mut q_row = vec![0.0f64; k];
+            for r in 0..shard_rows {
+                let gr = global_row + r;
                 for j in 0..k {
-                    sum_q[j] += q_row[j];
+                    q_row[j] = q[(gr, j)];
                 }
-            }
-
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            for idx in start..end {
-                let col = csr.indices[idx] as usize;
-                let val = csr.data[idx] as f64;
-                let z_offset = col * k;
-                for j in 0..k {
-                    z[z_offset + j] += val * q_row[j];
+                if means.is_some() {
+                    for j in 0..k {
+                        sum_q[j] += q_row[j];
+                    }
+                }
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                for idx in start..end {
+                    let col = csr.indices[idx] as usize;
+                    let val = csr.data[idx] as f64;
+                    let z_offset = col * k;
+                    for j in 0..k {
+                        z[z_offset + j] += val * q_row[j];
+                    }
                 }
             }
         }
@@ -389,56 +474,137 @@ fn spmm_forward_csr(csr: &ScxCsr, m_data: &[f64], k: usize, means: Option<&[f64]
 
 /// In-memory transpose SpMM: Z = (X - μ)^T @ Q using a single CSR.
 ///
-/// Reads from column-major `Mat<f64>` via a per-row buffer (avoids
-/// allocating a full n_obs × k row-major copy).
+/// Parallelized via rayon: each thread accumulates into a thread-local
+/// `z_local` buffer (n_vars × k), then all buffers are reduced by summation.
 /// Returns row-major `Vec<f64>` of shape (n_vars × k).
 fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<f64> {
     let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
     let k = q.ncols();
-    let mut z = vec![0.0f64; n_vars * k];
-    let mut sum_q = if means.is_some() {
-        vec![0.0f64; k]
+
+    // Parallel threshold: use rayon when work is substantial
+    let use_parallel = n_obs * k > 10_000;
+
+    if use_parallel {
+        // Each chunk of rows produces a thread-local (z_local, sum_q_local).
+        // We partition rows into ~equal chunks for rayon.
+        let chunk_size = (n_obs / rayon::current_num_threads().max(1)).max(256);
+
+        let (z, sum_q) = (0..n_obs)
+            .into_par_iter()
+            .with_min_len(chunk_size)
+            .fold(
+                || {
+                    (
+                        vec![0.0f64; n_vars * k],
+                        if means.is_some() {
+                            vec![0.0f64; k]
+                        } else {
+                            vec![]
+                        },
+                    )
+                },
+                |(mut z_local, mut sq_local), r| {
+                    // Copy one row from column-major Q into contiguous buffer
+                    let mut q_row = vec![0.0f64; k];
+                    for j in 0..k {
+                        q_row[j] = q[(r, j)];
+                    }
+                    if means.is_some() {
+                        for j in 0..k {
+                            sq_local[j] += q_row[j];
+                        }
+                    }
+                    let start = csr.indptr[r] as usize;
+                    let end = csr.indptr[r + 1] as usize;
+                    for idx in start..end {
+                        let col = csr.indices[idx] as usize;
+                        let val = csr.data[idx] as f64;
+                        let z_offset = col * k;
+                        for j in 0..k {
+                            z_local[z_offset + j] += val * q_row[j];
+                        }
+                    }
+                    (z_local, sq_local)
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        vec![0.0f64; n_vars * k],
+                        if means.is_some() {
+                            vec![0.0f64; k]
+                        } else {
+                            vec![]
+                        },
+                    )
+                },
+                |(mut za, mut sqa), (zb, sqb)| {
+                    for i in 0..za.len() {
+                        za[i] += zb[i];
+                    }
+                    for i in 0..sqa.len() {
+                        sqa[i] += sqb[i];
+                    }
+                    (za, sqa)
+                },
+            );
+
+        // Apply mean correction
+        if let Some(mu) = means {
+            let mut z = z;
+            #[allow(clippy::needless_range_loop)]
+            for v in 0..n_vars {
+                for j in 0..k {
+                    z[v * k + j] -= mu[v] * sum_q[j];
+                }
+            }
+            z
+        } else {
+            z
+        }
     } else {
-        vec![]
-    };
-    let mut q_row = vec![0.0f64; k];
+        // Sequential path for small matrices
+        let mut z = vec![0.0f64; n_vars * k];
+        let mut sum_q = if means.is_some() {
+            vec![0.0f64; k]
+        } else {
+            vec![]
+        };
+        let mut q_row = vec![0.0f64; k];
 
-    for r in 0..n_obs {
-        // Copy one row from column-major Q into contiguous buffer
-        for j in 0..k {
-            q_row[j] = q[(r, j)];
-        }
-
-        // Accumulate column sums for mean correction
-        if means.is_some() {
+        for r in 0..n_obs {
             for j in 0..k {
-                sum_q[j] += q_row[j];
+                q_row[j] = q[(r, j)];
+            }
+            if means.is_some() {
+                for j in 0..k {
+                    sum_q[j] += q_row[j];
+                }
+            }
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            for idx in start..end {
+                let col = csr.indices[idx] as usize;
+                let val = csr.data[idx] as f64;
+                let z_offset = col * k;
+                for j in 0..k {
+                    z[z_offset + j] += val * q_row[j];
+                }
             }
         }
 
-        let start = csr.indptr[r] as usize;
-        let end = csr.indptr[r + 1] as usize;
-        for idx in start..end {
-            let col = csr.indices[idx] as usize;
-            let val = csr.data[idx] as f64;
-            let z_offset = col * k;
-            for j in 0..k {
-                z[z_offset + j] += val * q_row[j];
+        if let Some(mu) = means {
+            #[allow(clippy::needless_range_loop)]
+            for v in 0..n_vars {
+                for j in 0..k {
+                    z[v * k + j] -= mu[v] * sum_q[j];
+                }
             }
         }
+
+        z
     }
-
-    if let Some(mu) = means {
-        #[allow(clippy::needless_range_loop)]
-        for v in 0..n_vars {
-            for j in 0..k {
-                z[v * k + j] -= mu[v] * sum_q[j];
-            }
-        }
-    }
-
-    z
 }
 
 /// Shared SpMM-forward kernel: accumulates X_shard @ M into y[global_row*k..].

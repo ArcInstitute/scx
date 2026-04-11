@@ -7,7 +7,7 @@
 # resources (memory, time, CPUs, exclusive mode).
 #
 # Usage:
-#     # Submit with defaults (cpu partition, 80 GB, 4 hours)
+#     # Submit with defaults (cpu_preemptible partition, 80 GB, 4 hours)
 #     bash benchmarks/comprehensive/scripts/run_slurm.sh
 #
 #     # Submit with custom resources
@@ -27,7 +27,7 @@
 #
 #     # Submit GPU benchmarks
 #     bash benchmarks/comprehensive/scripts/run_slurm.sh \
-#         --partition gpu --gpus 1 --benchmarks "gpu_accelerators"
+#         --partition preemptible --gpus 1 --benchmarks "gpu_accelerators"
 #
 # =============================================================================
 
@@ -49,7 +49,7 @@ mkdir -p "$LOGS_DIR"
 # ---------------------------------------------------------------------------
 # Default SLURM parameters (overridable via CLI flags)
 # ---------------------------------------------------------------------------
-PARTITION="cpu"
+PARTITION="cpu_preemptible"
 CPUS=16
 MEM="80G"
 TIME="04:00:00"
