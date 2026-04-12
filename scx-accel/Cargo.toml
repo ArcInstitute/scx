@@ -21,6 +21,7 @@ rand_chacha = "0.3"
 rand_distr = "0.4"
 instant-distance = "0.6"
 rayon = { workspace = true }
+libc = "0.2"
 thiserror = { workspace = true }
 
 [dev-dependencies]

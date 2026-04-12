@@ -58,10 +58,14 @@ def save_json(data, filename):
 
 
 def preprocess_for_leiden(dataset_name):
-    """Load dataset and run preprocessing up to neighbors (shared for both backends)."""
+    """Load dataset and run preprocessing up to neighbors (shared for both backends).
+
+    Uses scanpy (not pyscx) for PCA and neighbors to avoid initializing rayon's
+    global thread pool with all available CPUs, which causes OOM on SLURM nodes
+    with many CPUs (e.g. 192) due to GLIBC per-thread memory arenas.
+    """
     import anndata
     import scanpy as sc
-    import pyscx
 
     info = DATASETS[dataset_name]
     h5ad_path = info["h5ad"]
@@ -89,9 +93,9 @@ def preprocess_for_leiden(dataset_name):
     gc.collect()
     print(f"  After HVG subset. RSS={get_rss_mb():.0f}MB")
 
-    # Use Rust accelerators for PCA + neighbors (fast)
-    pyscx.accel.pca(adata, n_comps=N_COMPS, device="cpu")
-    pyscx.accel.neighbors(adata, n_neighbors=N_NEIGHBORS, device="cpu")
+    # Use scanpy for PCA + neighbors (avoids rayon global pool init on SLURM)
+    sc.tl.pca(adata, n_comps=N_COMPS)
+    sc.pp.neighbors(adata, n_neighbors=N_NEIGHBORS)
     gc.collect()
 
     print(f"  Preprocessed: {adata.n_obs:,} cells, {adata.n_vars:,} genes, "
@@ -104,30 +108,44 @@ def preprocess_for_leiden(dataset_name):
 # Benchmark: Rust Leiden vs Python leidenalg
 # ──────────────────────────────────────────────────────────────────────────────
 
-def bench_leiden_rust(adata, resolution=1.0, seed=42, n_runs=N_RUNS):
+def bench_leiden_rust(adata, resolution=1.0, seed=42, n_runs=N_RUNS, parallel=False):
     """Benchmark Rust-native Leiden (pyscx.accel.leiden)."""
     import pyscx
+    import ctypes
+
+    mode_label = "parallel" if parallel else "sequential"
+    key = "leiden_rust"
+
+    # Force glibc to return freed pages between runs to prevent OOM
+    # from heap fragmentation on SLURM nodes with many CPUs.
+    try:
+        _libc = ctypes.CDLL("libc.so.6")
+        _malloc_trim = _libc.malloc_trim
+    except (OSError, AttributeError):
+        _malloc_trim = None
 
     times = []
     for run in range(-1, n_runs):
         t0 = time.perf_counter()
         pyscx.accel.leiden(
-            adata, resolution=resolution, key_added="leiden_rust",
-            random_state=seed, device="cpu"
+            adata, resolution=resolution, key_added=key,
+            random_state=seed, device="cpu", parallel=parallel,
         )
         elapsed = time.perf_counter() - t0
         gc.collect()
+        if _malloc_trim:
+            _malloc_trim(0)  # Return freed pages to OS
 
         if run < 0:
-            print(f"    Rust warmup: {elapsed:.2f}s")
+            print(f"    Rust ({mode_label}) warmup: {elapsed:.2f}s")
         else:
             times.append(elapsed)
-            print(f"    Rust run {run+1}/{n_runs}: {elapsed:.2f}s")
+            print(f"    Rust ({mode_label}) run {run+1}/{n_runs}: {elapsed:.2f}s")
 
-    membership = adata.obs["leiden_rust"].values.copy()
-    modularity = adata.uns.get("leiden_rust", {}).get("modularity", None)
-    n_comms = adata.uns.get("leiden_rust", {}).get("n_communities", None)
-    backend = adata.uns.get("leiden_rust", {}).get("backend", "unknown")
+    membership = adata.obs[key].values.copy()
+    modularity = adata.uns.get(key, {}).get("modularity", None)
+    n_comms = adata.uns.get(key, {}).get("n_communities", None)
+    backend = adata.uns.get(key, {}).get("backend", "unknown")
 
     return {
         "times": times,
@@ -136,6 +154,7 @@ def bench_leiden_rust(adata, resolution=1.0, seed=42, n_runs=N_RUNS):
         "modularity": modularity,
         "n_communities": n_comms,
         "backend": backend,
+        "mode": mode_label,
     }
 
 
@@ -181,6 +200,12 @@ def bench_leiden_python(adata, resolution=1.0, seed=42, n_runs=N_RUNS):
 def bench_resolution_effect(adata, seed=42):
     """Verify that higher resolution yields more communities."""
     import pyscx
+    import ctypes
+    try:
+        _libc = ctypes.CDLL("libc.so.6")
+        _malloc_trim = _libc.malloc_trim
+    except (OSError, AttributeError):
+        _malloc_trim = None
 
     resolutions = [0.5, 1.0, 2.0]
     results = []
@@ -201,6 +226,9 @@ def bench_resolution_effect(adata, seed=42):
         if key in adata.uns:
             del adata.uns[key]
         gc.collect()
+        if _malloc_trim:
+            _malloc_trim(0)  # Return freed pages to OS
+        gc.collect()
 
     # Check: community count should be non-decreasing with resolution
     comms = [r["n_communities"] for r in results]
@@ -219,7 +247,7 @@ def run_leiden_benchmark(datasets=None, n_runs=N_RUNS):
         datasets = list(DATASETS.keys())
 
     print(f"\n{'='*60}")
-    print(f"Leiden Benchmark — Rust-native vs Python leidenalg")
+    print(f"Leiden Benchmark — Rust sequential/parallel vs Python leidenalg")
     print(f"{'='*60}")
 
     results = []
@@ -250,22 +278,43 @@ def run_leiden_benchmark(datasets=None, n_runs=N_RUNS):
         result["resolution_monotonic"] = monotonic
         print(f"  Community count monotonic with resolution: {monotonic}")
 
-        # --- Rust Leiden ---
-        print(f"\n  Rust-native Leiden (pyscx.accel.leiden):")
-        rust_result = bench_leiden_rust(adata, n_runs=n_runs)
-        result["rust_median_s"] = rust_result["median_s"]
-        result["rust_times_s"] = rust_result["times"]
-        result["rust_modularity"] = rust_result["modularity"]
-        result["rust_n_communities"] = rust_result["n_communities"]
-        result["rust_backend"] = rust_result["backend"]
+        # --- Rust Leiden (sequential — default, matches C++ leidenalg) ---
+        print(f"\n  Rust Leiden (sequential):")
+        rust_seq = bench_leiden_rust(adata, n_runs=n_runs, parallel=False)
+        result["rust_seq_median_s"] = rust_seq["median_s"]
+        result["rust_seq_times_s"] = rust_seq["times"]
+        result["rust_seq_modularity"] = rust_seq["modularity"]
+        result["rust_seq_n_communities"] = rust_seq["n_communities"]
+        result["rust_seq_backend"] = rust_seq["backend"]
+        # Keep for backwards compat
+        result["rust_median_s"] = rust_seq["median_s"]
+        result["rust_times_s"] = rust_seq["times"]
+        result["rust_modularity"] = rust_seq["modularity"]
+        result["rust_n_communities"] = rust_seq["n_communities"]
+        result["rust_backend"] = rust_seq["backend"]
 
         # --- Modularity check ---
-        print(f"\n  Modularity (Rust): {rust_result['modularity']}")
+        print(f"\n  Modularity (Rust seq): {rust_seq['modularity']}")
         result["modularity_positive"] = (
-            rust_result["modularity"] is not None and rust_result["modularity"] > 0
+            rust_seq["modularity"] is not None and rust_seq["modularity"] > 0
         )
 
-        # Clean up Rust results from adata before Python run
+        # Clean up before parallel run
+        if "leiden_rust" in adata.obs.columns:
+            del adata.obs["leiden_rust"]
+        if "leiden_rust" in adata.uns:
+            del adata.uns["leiden_rust"]
+        gc.collect()
+
+        # --- Rust Leiden (parallel — conflict-free batched) ---
+        print(f"\n  Rust Leiden (parallel):")
+        rust_par = bench_leiden_rust(adata, n_runs=n_runs, parallel=True)
+        result["rust_par_median_s"] = rust_par["median_s"]
+        result["rust_par_times_s"] = rust_par["times"]
+        result["rust_par_modularity"] = rust_par["modularity"]
+        result["rust_par_n_communities"] = rust_par["n_communities"]
+
+        # Clean up before Python run
         if "leiden_rust" in adata.obs.columns:
             del adata.obs["leiden_rust"]
         if "leiden_rust" in adata.uns:
@@ -279,24 +328,34 @@ def run_leiden_benchmark(datasets=None, n_runs=N_RUNS):
         result["python_times_s"] = python_result["times"]
         result["python_n_communities"] = python_result["n_communities"]
 
-        # --- ARI comparison ---
-        ari = adjusted_rand_score(rust_result["membership"], python_result["membership"])
-        result["ari_rust_vs_python"] = round(ari, 4)
-        print(f"\n  ARI (Rust vs Python): {ari:.4f}")
+        # --- ARI comparisons ---
+        ari_seq = adjusted_rand_score(rust_seq["membership"], python_result["membership"])
+        ari_par = adjusted_rand_score(rust_par["membership"], python_result["membership"])
+        result["ari_rust_seq_vs_python"] = round(ari_seq, 4)
+        result["ari_rust_par_vs_python"] = round(ari_par, 4)
+        # Keep for backwards compat
+        result["ari_rust_vs_python"] = round(ari_seq, 4)
+        print(f"\n  ARI (Rust seq vs Python): {ari_seq:.4f}")
+        print(f"  ARI (Rust par vs Python): {ari_par:.4f}")
 
         # --- Speedup ---
         if python_result["median_s"] > 0:
-            speedup = python_result["median_s"] / rust_result["median_s"]
-            result["speedup_vs_python"] = round(speedup, 2)
-            print(f"  Speedup: {speedup:.2f}x")
+            speedup_seq = python_result["median_s"] / rust_seq["median_s"]
+            speedup_par = python_result["median_s"] / rust_par["median_s"]
+            result["speedup_seq_vs_python"] = round(speedup_seq, 2)
+            result["speedup_par_vs_python"] = round(speedup_par, 2)
+            result["speedup_vs_python"] = round(speedup_seq, 2)
+            print(f"  Speedup (seq): {speedup_seq:.2f}x")
+            print(f"  Speedup (par): {speedup_par:.2f}x")
 
         # --- Summary ---
         print(f"\n  ── Summary for {ds_name} ──")
-        print(f"  Rust Leiden:   {rust_result['median_s']:.2f}s "
-              f"({rust_result['n_communities']} communities)")
-        print(f"  Python Leiden: {python_result['median_s']:.2f}s "
-              f"({python_result['n_communities']} communities)")
-        print(f"  ARI: {ari:.4f}")
+        print(f"  Rust seq:      {rust_seq['median_s']:.2f}s "
+              f"({rust_seq['n_communities']} comms, ARI={ari_seq:.4f})")
+        print(f"  Rust par:      {rust_par['median_s']:.2f}s "
+              f"({rust_par['n_communities']} comms, ARI={ari_par:.4f})")
+        print(f"  Python:        {python_result['median_s']:.2f}s "
+              f"({python_result['n_communities']} comms)")
         print(f"  Modularity > 0: {result['modularity_positive']}")
         print(f"  Resolution monotonic: {monotonic}")
 
@@ -315,10 +374,10 @@ def run_leiden_benchmark(datasets=None, n_runs=N_RUNS):
 def generate_report():
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lines = [
-        "# Leiden Benchmark Report — Rust-native vs Python leidenalg",
+        "# Leiden Benchmark Report — Rust seq/par vs Python leidenalg",
         "",
         f"**Generated**: {ts}",
-        f"**Phase**: 8b — Parallel Rust Leiden",
+        f"**Phase**: 8c — Sequential + Parallel Rust Leiden",
         "",
     ]
 
@@ -336,30 +395,43 @@ def generate_report():
     lines += [
         "## Performance",
         "",
-        "| Dataset | Cells | Rust (s) | Python (s) | Speedup | ARI | Rust Communities | Python Communities |",
-        "|---------|------:|--------:|-----------:|--------:|----:|-----------------:|-------------------:|",
+        "| Dataset | Cells | Rust seq (s) | Rust par (s) | Python (s) | Seq speedup | ARI seq | ARI par | Seq comms | Par comms | Py comms |",
+        "|---------|------:|-----------:|-----------:|-----------:|------------:|--------:|--------:|----------:|----------:|---------:|",
     ]
     for r in data:
+        seq_s = r.get('rust_seq_median_s', r.get('rust_median_s', 0))
+        par_s = r.get('rust_par_median_s', 'N/A')
+        py_s = r['python_median_s']
+        ari_seq = r.get('ari_rust_seq_vs_python', r.get('ari_rust_vs_python', 0))
+        ari_par = r.get('ari_rust_par_vs_python', 'N/A')
+        seq_comms = r.get('rust_seq_n_communities', r.get('rust_n_communities', '?'))
+        par_comms = r.get('rust_par_n_communities', 'N/A')
+        py_comms = r['python_n_communities']
+        speedup_seq = r.get('speedup_seq_vs_python', r.get('speedup_vs_python', 'N/A'))
         lines.append(
             f"| {r['dataset']} | {r['n_obs']:,} | "
-            f"{r['rust_median_s']:.2f} | {r['python_median_s']:.2f} | "
-            f"{r.get('speedup_vs_python', 'N/A')}x | "
-            f"{r['ari_rust_vs_python']:.4f} | "
-            f"{r['rust_n_communities']} | {r['python_n_communities']} |"
+            f"{seq_s:.2f} | {par_s if isinstance(par_s, str) else f'{par_s:.2f}'} | {py_s:.2f} | "
+            f"{speedup_seq}x | "
+            f"{ari_seq:.4f} | {ari_par if isinstance(ari_par, str) else f'{ari_par:.4f}'} | "
+            f"{seq_comms} | {par_comms} | {py_comms} |"
         )
     lines.append("")
 
     # Validation checks
     lines += ["## Validation", ""]
     for r in data:
+        ari_seq = r.get('ari_rust_seq_vs_python', r.get('ari_rust_vs_python', 0))
+        ari_par = r.get('ari_rust_par_vs_python', None)
         lines.append(f"### {r['dataset']}")
-        lines.append(f"- **ARI ≥ 0.80**: {'PASS' if r['ari_rust_vs_python'] >= 0.80 else 'FAIL'} "
-                      f"(ARI = {r['ari_rust_vs_python']:.4f})")
+        lines.append(f"- **ARI seq ≥ 0.80**: {'PASS' if ari_seq >= 0.80 else 'FAIL'} "
+                      f"(ARI = {ari_seq:.4f})")
+        if ari_par is not None:
+            lines.append(f"- **ARI par**: {ari_par:.4f}")
         lines.append(f"- **Modularity > 0**: {'PASS' if r.get('modularity_positive') else 'FAIL'} "
-                      f"(Q = {r.get('rust_modularity', 'N/A')})")
+                      f"(Q = {r.get('rust_seq_modularity', r.get('rust_modularity', 'N/A'))})")
         lines.append(f"- **Resolution monotonic**: "
                       f"{'PASS' if r.get('resolution_monotonic') else 'FAIL'}")
-        lines.append(f"- **Backend**: {r.get('rust_backend', 'unknown')}")
+        lines.append(f"- **Backend**: {r.get('rust_seq_backend', r.get('rust_backend', 'unknown'))}")
         lines.append("")
 
         # Resolution details

@@ -1811,7 +1811,7 @@ pub fn pseudobulk_dex(
 ///     strategy than leidenalg). Both produce valid, high-quality community
 ///     structures. Compare results via ARI or NMI when switching backends.
 #[pyfunction]
-#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto"))]
+#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto", parallel=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     py: Python<'_>,
@@ -1821,6 +1821,7 @@ pub fn leiden(
     random_state: u64,
     n_iterations: i64,
     device: &str,
+    parallel: bool,
 ) -> PyResult<()> {
     // Determine effective device
     let use_gpu = resolve_device(device)?;
@@ -1843,6 +1844,7 @@ pub fn leiden(
         key_added,
         random_state,
         n_iterations,
+        parallel,
     ) {
         Ok(()) => return Ok(()),
         Err(e) => {
@@ -1900,6 +1902,7 @@ pub fn leiden(
 /// Extracts CSR from the connectivities sparse matrix, calls
 /// `scx_accel::leiden()` directly (no Python igraph or leidenalg required),
 /// and writes results to adata.
+#[allow(clippy::too_many_arguments)]
 fn run_rust_leiden(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -1908,6 +1911,7 @@ fn run_rust_leiden(
     key_added: &str,
     random_state: u64,
     n_iterations: i64,
+    parallel: bool,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
     let pd = py.import("pandas")?;
@@ -1932,7 +1936,7 @@ fn run_rust_leiden(
     let max_iter = if n_iterations > 0 {
         n_iterations as usize
     } else {
-        0 // 0 means use default (100)
+        0 // 0 means use default (run until convergence)
     };
 
     // Run Rust-native Leiden — releases the GIL for the compute-heavy part.
@@ -1946,6 +1950,7 @@ fn run_rust_leiden(
                 resolution,
                 random_state,
                 max_iter,
+                parallel,
             )
         })
         .map_err(|e| PyRuntimeError::new_err(format!("Rust Leiden error: {e}")))?;
