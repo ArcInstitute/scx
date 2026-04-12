@@ -99,78 +99,128 @@ pub fn wilcoxon_rank_sum(
         None => (0..n_groups).collect(),
     };
 
-    let mut result_names = Vec::with_capacity(test_groups.len());
-    let mut result_scores = Vec::with_capacity(test_groups.len());
-    let mut result_pvals = Vec::with_capacity(test_groups.len());
-    let mut result_pvals_adj = Vec::with_capacity(test_groups.len());
-    let mut result_logfc = Vec::with_capacity(test_groups.len());
-    let mut result_group_names = Vec::with_capacity(test_groups.len());
-
-    for &g in &test_groups {
-        let group_cells = &group_indices[g];
-
-        // Build reference cell indices.
-        let ref_cells: Vec<usize> = match reference {
-            Some(ref_idx) => group_indices[ref_idx].clone(),
-            None => {
-                // 1-vs-rest: all cells not in group g
-                groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &grp)| grp != g)
-                    .map(|(i, _)| i)
-                    .collect()
+    // Pre-compute group sums per gene for logFC (avoids redundant gathering).
+    // group_gene_sums[g][var] = sum of values for cells in group g at gene var.
+    let mut group_gene_sums: Vec<Vec<f64>> = vec![vec![0.0; n_vars]; n_groups];
+    for g in 0..n_groups {
+        for &cell in &group_indices[g] {
+            let base = cell * n_vars;
+            for var in 0..n_vars {
+                group_gene_sums[g][var] += data[base + var] as f64;
             }
-        };
-
-        let n1 = group_cells.len();
-        let n2 = ref_cells.len();
-
-        if n1 == 0 || n2 == 0 {
-            // Degenerate: fill with NaNs.
-            let nans = vec![f64::NAN; n_vars];
-            let gene_order: Vec<String> = (0..n_vars).map(|i| gene_names[i].clone()).collect();
-            result_names.push(gene_order);
-            result_scores.push(nans.clone());
-            result_pvals.push(vec![1.0; n_vars]);
-            result_pvals_adj.push(vec![1.0; n_vars]);
-            result_logfc.push(nans);
-            result_group_names.push(group_names[g].clone());
-            continue;
         }
+    }
 
-        // Parallel over genes.
-        let gene_results: Vec<GeneTestResult> = (0..n_vars)
-            .into_par_iter()
+    let n_test_groups = test_groups.len();
+
+    // --- Pre-rank approach: rank once per gene, then derive per-group statistics ---
+    // For 1-vs-rest: rank all n_obs values once per gene (10× fewer sorts).
+    // For pairwise: rank (group + ref) cells per test group per gene.
+    let gene_group_results: Vec<Vec<(f64, f64, f64)>> = (0..n_vars)
+        .into_par_iter()
+        .map_init(
+            || {
+                // Thread-local buffers reused across genes (no per-gene allocation).
+                (
+                    vec![0.0f64; n_obs],
+                    Vec::with_capacity(n_obs),
+                    Vec::with_capacity(n_obs),
+                )
+            },
+            |(values_buf, index_buf, ranks_buf), var_idx| {
+                let mut group_results = Vec::with_capacity(n_test_groups);
+
+                match reference {
+                    None => {
+                        // 1-vs-rest: rank all n_obs values once, reuse across groups.
+                        for i in 0..n_obs {
+                            values_buf[i] = data[i * n_vars + var_idx] as f64;
+                        }
+                        let tie_correction =
+                            rank_with_ties(&values_buf[..n_obs], index_buf, ranks_buf);
+
+                        for &g in &test_groups {
+                            let n1 = group_indices[g].len();
+                            if n1 == 0 || n1 == n_obs {
+                                group_results.push((f64::NAN, 1.0, f64::NAN));
+                                continue;
+                            }
+                            let n2 = n_obs - n1;
+
+                            let (score, pval) = wilcoxon_from_ranks(
+                                ranks_buf,
+                                &group_indices[g],
+                                n_obs,
+                                tie_correction,
+                            );
+
+                            let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
+                            let rest_sum: f64 = (0..n_groups)
+                                .filter(|&gg| gg != g)
+                                .map(|gg| group_gene_sums[gg][var_idx])
+                                .sum();
+                            let mean_ref = rest_sum / n2 as f64;
+                            let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
+                            group_results.push((score, pval, logfc));
+                        }
+                    }
+                    Some(ref_idx) => {
+                        // Pairwise: rank only (group + ref) cells per test group.
+                        let ref_cells = &group_indices[ref_idx];
+                        for &g in &test_groups {
+                            let group_cells = &group_indices[g];
+                            let n1 = group_cells.len();
+                            let n2 = ref_cells.len();
+                            if n1 == 0 || n2 == 0 {
+                                group_results.push((f64::NAN, 1.0, f64::NAN));
+                                continue;
+                            }
+                            let n_total = n1 + n2;
+
+                            // Gather combined values into buffer.
+                            for (i, &cell) in group_cells.iter().enumerate() {
+                                values_buf[i] = data[cell * n_vars + var_idx] as f64;
+                            }
+                            for (i, &cell) in ref_cells.iter().enumerate() {
+                                values_buf[n1 + i] = data[cell * n_vars + var_idx] as f64;
+                            }
+
+                            let tie_correction =
+                                rank_with_ties(&values_buf[..n_total], index_buf, ranks_buf);
+
+                            // Group cells are at indices 0..n1 in the combined buffer.
+                            let group_indices_in_buf: Vec<usize> = (0..n1).collect();
+                            let (score, pval) = wilcoxon_from_ranks(
+                                ranks_buf,
+                                &group_indices_in_buf,
+                                n_total,
+                                tie_correction,
+                            );
+
+                            let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
+                            let mean_ref = group_gene_sums[ref_idx][var_idx] / n2 as f64;
+                            let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
+                            group_results.push((score, pval, logfc));
+                        }
+                    }
+                }
+                group_results
+            },
+        )
+        .collect();
+
+    // Transpose: gene_group_results[var][tg_idx] -> per-group sorted gene lists.
+    let mut result_names = Vec::with_capacity(n_test_groups);
+    let mut result_scores = Vec::with_capacity(n_test_groups);
+    let mut result_pvals = Vec::with_capacity(n_test_groups);
+    let mut result_pvals_adj = Vec::with_capacity(n_test_groups);
+    let mut result_logfc = Vec::with_capacity(n_test_groups);
+    let mut result_group_names = Vec::with_capacity(n_test_groups);
+
+    for (tg_idx, &g) in test_groups.iter().enumerate() {
+        let mut sorted: Vec<GeneTestResult> = (0..n_vars)
             .map(|var_idx| {
-                // Gather values for this gene.
-                let mut group_vals: Vec<f64> = Vec::with_capacity(n1);
-                let mut ref_vals: Vec<f64> = Vec::with_capacity(n2);
-
-                for &cell in group_cells {
-                    group_vals.push(data[cell * n_vars + var_idx] as f64);
-                }
-                for &cell in &ref_cells {
-                    ref_vals.push(data[cell * n_vars + var_idx] as f64);
-                }
-
-                // Log2 fold-change with pseudocount.
-                let mean_group = group_vals.iter().sum::<f64>() / n1 as f64;
-                let mean_ref = ref_vals.iter().sum::<f64>() / n2 as f64;
-                let logfc = if log_transformed {
-                    // Match scanpy: back-transform from log-space (undo log1p)
-                    // before computing ratio. scanpy uses expm1(mean) + 1e-9.
-                    let expm1_group = mean_group.exp_m1();
-                    let expm1_ref = mean_ref.exp_m1();
-                    ((expm1_group + LOGFC_PSEUDOCOUNT) / (expm1_ref + LOGFC_PSEUDOCOUNT)).log2()
-                } else {
-                    // Raw counts: direct log2 ratio.
-                    (mean_group + LOGFC_PSEUDOCOUNT).log2() - (mean_ref + LOGFC_PSEUDOCOUNT).log2()
-                };
-
-                // Wilcoxon rank-sum test.
-                let (score, pval) = wilcoxon_test(&group_vals, &ref_vals);
-
+                let (score, pval, logfc) = gene_group_results[var_idx][tg_idx];
                 GeneTestResult {
                     gene_idx: var_idx,
                     score,
@@ -180,10 +230,6 @@ pub fn wilcoxon_rank_sum(
             })
             .collect();
 
-        // Sort genes by signed score descending (matching scanpy's default rankby_abs=False).
-        // When rankby_abs=true, sort by |score| descending (scanpy's rankby_abs=True).
-        // Tiebreaker: ascending gene index (matches numpy stable sort preserving original order).
-        let mut sorted: Vec<GeneTestResult> = gene_results;
         sorted.sort_by(|a, b| {
             let a_key = if rankby_abs { a.score.abs() } else { a.score };
             let b_key = if rankby_abs { b.score.abs() } else { b.score };
@@ -201,7 +247,6 @@ pub fn wilcoxon_rank_sum(
         let pvals: Vec<f64> = sorted.iter().map(|r| r.pval).collect();
         let logfc: Vec<f64> = sorted.iter().map(|r| r.logfc).collect();
 
-        // BH adjustment (on the sorted-by-score order).
         let pvals_adj = benjamini_hochberg(&pvals);
 
         result_names.push(names);
@@ -222,9 +267,98 @@ pub fn wilcoxon_rank_sum(
     })
 }
 
+/// Compute log2 fold-change between group and reference means.
+fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
+    if log_transformed {
+        let expm1_group = mean_group.exp_m1();
+        let expm1_ref = mean_ref.exp_m1();
+        ((expm1_group + LOGFC_PSEUDOCOUNT) / (expm1_ref + LOGFC_PSEUDOCOUNT)).log2()
+    } else {
+        (mean_group + LOGFC_PSEUDOCOUNT).log2() - (mean_ref + LOGFC_PSEUDOCOUNT).log2()
+    }
+}
+
+/// Rank values with mid-rank tie handling. Returns `(ranks, tie_correction)`.
+///
+/// `ranks[i]` is the 1-based mid-rank for `values[i]`.
+/// `tie_correction` is `Σ (t³ - t)` over tie groups, used in the variance
+/// formula for the Wilcoxon test. Shared across all group comparisons for
+/// the same gene, since ties are a property of the value distribution.
+fn rank_with_ties(values: &[f64], index_buf: &mut Vec<usize>, ranks: &mut Vec<f64>) -> f64 {
+    let n = values.len();
+    index_buf.clear();
+    index_buf.extend(0..n);
+    index_buf.sort_unstable_by(|&a, &b| {
+        values[a]
+            .partial_cmp(&values[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    ranks.resize(n, 0.0);
+    let mut tie_correction = 0.0f64;
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && values[index_buf[j]] == values[index_buf[i]] {
+            j += 1;
+        }
+        let mid_rank = (i as f64 + 1.0 + j as f64) / 2.0;
+        let tie_size = (j - i) as f64;
+        for idx in &index_buf[i..j] {
+            ranks[*idx] = mid_rank;
+        }
+        if tie_size > 1.0 {
+            tie_correction += tie_size * tie_size * tie_size - tie_size;
+        }
+        i = j;
+    }
+    tie_correction
+}
+
+/// Compute Wilcoxon rank-sum z-score and p-value from pre-computed ranks.
+///
+/// `ranks` contains the 1-based mid-ranks for ALL cells (length n_obs).
+/// `group_cells` are the indices of cells in the test group.
+/// `n_total` is the total number of cells (n_obs).
+/// `tie_correction` is the pre-computed tie correction term from `rank_with_ties`.
+fn wilcoxon_from_ranks(
+    ranks: &[f64],
+    group_cells: &[usize],
+    n_total: usize,
+    tie_correction: f64,
+) -> (f64, f64) {
+    let n1 = group_cells.len() as f64;
+    let n2 = n_total as f64 - n1;
+    let n = n_total as f64;
+
+    if n1 == 0.0 || n2 == 0.0 {
+        return (0.0, 1.0);
+    }
+
+    // Rank sum for the group.
+    let rank_sum: f64 = group_cells.iter().map(|&i| ranks[i]).sum();
+
+    // U-statistic.
+    let u1 = rank_sum - n1 * (n1 + 1.0) / 2.0;
+
+    // Expected U and variance under H0.
+    let mu = n1 * n2 / 2.0;
+    let sigma_sq = (n1 * n2 / 12.0) * ((n + 1.0) - tie_correction / (n * (n - 1.0)));
+
+    if sigma_sq <= 0.0 {
+        return (0.0, 1.0);
+    }
+
+    let z = (u1 - mu) / sigma_sq.sqrt();
+    let p = 2.0 * normal_cdf(-z.abs());
+    (z, p)
+}
+
 /// Wilcoxon rank-sum (Mann–Whitney U) test with normal approximation and tie correction.
 ///
 /// Returns `(z_score, two_sided_p_value)`.
+/// Used only in tests; production code uses `rank_with_ties` + `wilcoxon_from_ranks`.
+#[cfg(test)]
 fn wilcoxon_test(group: &[f64], rest: &[f64]) -> (f64, f64) {
     let n1 = group.len() as f64;
     let n2 = rest.len() as f64;
