@@ -86,6 +86,89 @@ fn mat_to_row_major_buf(mat: &Mat<f64>) -> Vec<f64> {
     data
 }
 
+/// Accumulate the sparse outer product X^T @ X directly from CSR nonzeros.
+///
+/// For each row, iterates pairs of nonzeros and accumulates `C[c1, c2] += v1 * v2`.
+/// Exploits symmetry: only computes upper triangle and mirrors to lower.
+/// Also accumulates `col_sums` in the same pass (caller provides the slice).
+fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut Mat<f64>) {
+    let n_rows = csr.n_rows();
+    for r in 0..n_rows {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        // Accumulate col_sums
+        for idx in start..end {
+            let c = csr.indices[idx] as usize;
+            let v = csr.data[idx] as f64;
+            col_sums[c] += v;
+        }
+        // Sparse outer product with symmetry exploitation
+        for i in start..end {
+            let c1 = csr.indices[i] as usize;
+            let v1 = csr.data[i] as f64;
+            cov[(c1, c1)] += v1 * v1; // diagonal
+            for j in (i + 1)..end {
+                let c2 = csr.indices[j] as usize;
+                let v2 = csr.data[j] as f64;
+                let prod = v1 * v2;
+                cov[(c1, c2)] += prod;
+                cov[(c2, c1)] += prod;
+            }
+        }
+    }
+}
+
+/// Parallel sparse outer product accumulation using thread-local `Mat<f64>` accumulators.
+///
+/// Same algorithm as [`sparse_outer_product_accumulate`] but distributes rows across
+/// rayon threads. Each thread gets its own n_vars × n_vars covariance matrix (~30 MB
+/// for n_vars=2000) and col_sums vector, then results are reduced by element-wise addition.
+fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>, Vec<f64>) {
+    let n_rows = csr.n_rows();
+    let chunk_size = (n_rows / rayon::current_num_threads()).max(256);
+
+    (0..n_rows)
+        .into_par_iter()
+        .with_min_len(chunk_size)
+        .fold(
+            || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
+            |(mut cov_local, mut sums_local), r| {
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                for idx in start..end {
+                    let c = csr.indices[idx] as usize;
+                    let v = csr.data[idx] as f64;
+                    sums_local[c] += v;
+                }
+                for i in start..end {
+                    let c1 = csr.indices[i] as usize;
+                    let v1 = csr.data[i] as f64;
+                    cov_local[(c1, c1)] += v1 * v1;
+                    for j in (i + 1)..end {
+                        let c2 = csr.indices[j] as usize;
+                        let v2 = csr.data[j] as f64;
+                        let prod = v1 * v2;
+                        cov_local[(c1, c2)] += prod;
+                        cov_local[(c2, c1)] += prod;
+                    }
+                }
+                (cov_local, sums_local)
+            },
+        )
+        .reduce(
+            || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
+            |(mut ca, mut sa), (cb, sb)| {
+                for i in 0..n_vars {
+                    for j in 0..n_vars {
+                        ca[(i, j)] += cb[(i, j)];
+                    }
+                    sa[i] += sb[i];
+                }
+                (ca, sa)
+            },
+        )
+}
+
 /// Thin SVD: A = U Σ V^T. Returns (U, σ, V^T).
 fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
     let svd = mat
@@ -780,40 +863,15 @@ pub fn covariance_pca<S: ShardSource>(
     validate_inputs(n_obs, n_vars, n_components)?;
 
     // --- Pass 1: Accumulate covariance matrix and column sums ---
-    let mut cov = Mat::<f64>::zeros(n_vars, n_vars); // column-major
+    // Sparse outer product: accumulate C[c1,c2] += v1*v2 directly from CSR nonzeros.
+    // No densification — touches only nonzero entries (~2% for typical HVG-selected data).
+    let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
     let mut col_sums = vec![0.0f64; n_vars];
-    let mut col_sum_sq = vec![0.0f64; n_vars];
 
     let n_shards = source.n_shards();
     for shard_idx in 0..n_shards {
         let csr = source.read_shard(shard_idx)?;
-        let shard_rows = csr.n_rows();
-        let shard_cols = csr.n_cols();
-
-        // Convert shard to dense f64 for GEMM (row-major, shard_rows × n_vars)
-        let mut dense = vec![0.0f64; shard_rows * shard_cols];
-        for r in 0..shard_rows {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            for idx in start..end {
-                let c = csr.indices[idx] as usize;
-                let v = csr.data[idx] as f64;
-                dense[r * shard_cols + c] = v;
-                col_sums[c] += v;
-                col_sum_sq[c] += v * v;
-            }
-        }
-
-        // C += X_shard^T @ X_shard using faer GEMM
-        let x_ref = MatRef::from_row_major_slice(&dense, shard_rows, shard_cols);
-        faer::linalg::matmul::matmul(
-            cov.as_mut(),
-            faer::Accum::Add,
-            x_ref.transpose(),
-            x_ref,
-            1.0,
-            faer::Par::rayon(0),
-        );
+        sparse_outer_product_accumulate(&csr, &mut col_sums, &mut cov);
     }
 
     // --- Mean centering ---
@@ -953,33 +1011,10 @@ pub fn covariance_pca_inmemory(
     let (n_obs, n_vars) = (csr.n_rows(), csr.n_cols());
     validate_inputs(n_obs, n_vars, n_components)?;
 
-    // --- Build covariance matrix ---
-    let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
-    let mut col_sums = vec![0.0f64; n_vars];
-
-    // Convert full CSR to dense f64 for GEMM
-    let mut dense = vec![0.0f64; n_obs * n_vars];
-    for r in 0..n_obs {
-        let start = csr.indptr[r] as usize;
-        let end = csr.indptr[r + 1] as usize;
-        for idx in start..end {
-            let c = csr.indices[idx] as usize;
-            let v = csr.data[idx] as f64;
-            dense[r * n_vars + c] = v;
-            col_sums[c] += v;
-        }
-    }
-
-    // C = X^T @ X
-    let x_ref = MatRef::from_row_major_slice(&dense, n_obs, n_vars);
-    faer::linalg::matmul::matmul(
-        cov.as_mut(),
-        faer::Accum::Add,
-        x_ref.transpose(),
-        x_ref,
-        1.0,
-        faer::Par::rayon(0),
-    );
+    // --- Build covariance matrix via sparse outer products ---
+    // Parallel accumulation: each rayon thread gets a thread-local n_vars × n_vars
+    // covariance matrix (~30 MB for n_vars=2000) and col_sums vector.
+    let (mut cov, col_sums) = sparse_outer_product_accumulate_par(csr, n_vars);
 
     // Mean centering
     let means = if zero_center {
@@ -1496,6 +1531,81 @@ mod tests {
                     })
                     .sum();
                 assert!(dot.abs() < 0.01, "PC{i} · PC{j} = {dot}, expected ~0");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_covariance_matches_dense() {
+        // Verify that sparse outer product accumulation produces the same
+        // covariance matrix as the dense GEMM approach (X^T @ X).
+        let csr = test_csr_10x5();
+        let n_vars = csr.n_cols();
+        let n_obs = csr.n_rows();
+
+        // --- Dense GEMM reference ---
+        let mut dense = vec![0.0f64; n_obs * n_vars];
+        let mut col_sums_dense = vec![0.0f64; n_vars];
+        for r in 0..n_obs {
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            for idx in start..end {
+                let c = csr.indices[idx] as usize;
+                let v = csr.data[idx] as f64;
+                dense[r * n_vars + c] = v;
+                col_sums_dense[c] += v;
+            }
+        }
+        let mut cov_dense = Mat::<f64>::zeros(n_vars, n_vars);
+        let x_ref = MatRef::from_row_major_slice(&dense, n_obs, n_vars);
+        faer::linalg::matmul::matmul(
+            cov_dense.as_mut(),
+            faer::Accum::Add,
+            x_ref.transpose(),
+            x_ref,
+            1.0,
+            faer::Par::rayon(0),
+        );
+
+        // --- Sparse sequential ---
+        let mut cov_sparse = Mat::<f64>::zeros(n_vars, n_vars);
+        let mut col_sums_sparse = vec![0.0f64; n_vars];
+        sparse_outer_product_accumulate(&csr, &mut col_sums_sparse, &mut cov_sparse);
+
+        // --- Sparse parallel ---
+        let (cov_par, col_sums_par) = sparse_outer_product_accumulate_par(&csr, n_vars);
+
+        // Check col_sums match
+        for c in 0..n_vars {
+            assert!(
+                (col_sums_dense[c] - col_sums_sparse[c]).abs() < 1e-10,
+                "col_sums mismatch at {c}: dense={}, sparse={}",
+                col_sums_dense[c],
+                col_sums_sparse[c]
+            );
+            assert!(
+                (col_sums_dense[c] - col_sums_par[c]).abs() < 1e-10,
+                "col_sums mismatch at {c}: dense={}, par={}",
+                col_sums_dense[c],
+                col_sums_par[c]
+            );
+        }
+
+        // Check covariance matrices match
+        for i in 0..n_vars {
+            for j in 0..n_vars {
+                assert!(
+                    (cov_dense[(i, j)] - cov_sparse[(i, j)]).abs() < 1e-10,
+                    "cov mismatch at ({i},{j}): dense={}, sparse={}",
+                    cov_dense[(i, j)],
+                    cov_sparse[(i, j)]
+                );
+                assert!(
+                    (cov_dense[(i, j)] - cov_par[(i, j)]).abs() < 1e-10,
+                    "cov mismatch at ({i},{j}): dense={}, par={}",
+                    cov_dense[(i, j)],
+                    cov_par[(i, j)]
+                );
             }
         }
     }
