@@ -1834,7 +1834,29 @@ pub fn leiden(
         )
     })?;
 
-    // GPU path: try cuGraph Leiden
+    // Priority 1: Rust-native Leiden (fastest, no Python dependencies)
+    match run_rust_leiden(
+        py,
+        adata,
+        &conn,
+        resolution,
+        key_added,
+        random_state,
+        n_iterations,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            let warnings = py.import("warnings")?;
+            warnings.call_method1(
+                "warn",
+                (format!(
+                    "Rust-native Leiden failed ({e}) — falling back to GPU/Python path"
+                ),),
+            )?;
+        }
+    }
+
+    // Priority 2: GPU cuGraph Leiden
     if use_gpu {
         match try_cugraph_leiden(
             py,
@@ -1861,7 +1883,7 @@ pub fn leiden(
         }
     }
 
-    // CPU path: leidenalg via igraph
+    // Priority 3: Python leidenalg via igraph (fallback)
     run_cpu_leiden(
         py,
         adata,
@@ -1871,6 +1893,87 @@ pub fn leiden(
         random_state,
         n_iterations,
     )
+}
+
+/// Run Leiden community detection via Rust-native implementation.
+///
+/// Extracts CSR from the connectivities sparse matrix, calls
+/// `scx_accel::leiden()` directly (no Python igraph or leidenalg required),
+/// and writes results to adata.
+fn run_rust_leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    conn: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    n_iterations: i64,
+) -> PyResult<()> {
+    let numpy = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Extract CSR components from connectivities sparse matrix.
+    let shape: (usize, usize) = conn.getattr("shape")?.extract()?;
+    let n_obs = shape.0;
+
+    let indptr: Vec<i64> = numpy
+        .call_method1("asarray", (conn.getattr("indptr")?,))?
+        .call_method1("astype", ("int64",))?
+        .extract::<Vec<i64>>()?;
+    let indices: Vec<i32> = numpy
+        .call_method1("asarray", (conn.getattr("indices")?,))?
+        .call_method1("astype", ("int32",))?
+        .extract::<Vec<i32>>()?;
+    let data: Vec<f64> = numpy
+        .call_method1("asarray", (conn.getattr("data")?,))?
+        .call_method1("astype", ("float64",))?
+        .extract::<Vec<f64>>()?;
+
+    let max_iter = if n_iterations > 0 {
+        n_iterations as usize
+    } else {
+        0 // 0 means use default (100)
+    };
+
+    // Run Rust-native Leiden — releases the GIL for the compute-heavy part.
+    let result = py
+        .allow_threads(|| {
+            scx_accel::leiden(
+                &indptr,
+                &indices,
+                &data,
+                n_obs,
+                resolution,
+                random_state,
+                max_iter,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("Rust Leiden error: {e}")))?;
+
+    // Convert membership Vec<usize> to string labels (scanpy convention).
+    let membership_strs: Vec<String> = result.membership.iter().map(|c| c.to_string()).collect();
+    let labels = pyo3::types::PyList::new(py, &membership_strs)?;
+    let cat_labels = pd.call_method1("Categorical", (&labels,))?;
+
+    // Write to adata.obs[key_added]
+    let obs = adata.getattr("obs")?;
+    obs.set_item(key_added, cat_labels)?;
+
+    // Write metadata to adata.uns[key_added]
+    let leiden_dict = PyDict::new(py);
+    let params_dict = PyDict::new(py);
+    params_dict.set_item("resolution", resolution)?;
+    params_dict.set_item("random_state", random_state)?;
+    params_dict.set_item("n_iterations", n_iterations)?;
+    leiden_dict.set_item("params", params_dict)?;
+    leiden_dict.set_item("backend", "scx-accel")?;
+    leiden_dict.set_item("modularity", result.modularity)?;
+    leiden_dict.set_item("n_communities", result.n_communities)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item(key_added, leiden_dict)?;
+
+    Ok(())
 }
 
 /// Try GPU Leiden via cuGraph Python import.
