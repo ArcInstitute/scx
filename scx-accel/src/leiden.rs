@@ -357,12 +357,18 @@ impl LeidenGraph {
 
 // ─── Grouping ─────────────────────────────────────────────────────────
 
-/// Community membership tracking with eagerly-maintained group sizes.
+/// Community membership tracking with eagerly-maintained group sizes
+/// and a reuse pool of empty community IDs (matching C++ libleidenalg's
+/// `_empty_communities` vector in MutableVertexPartition).
 #[derive(Clone)]
 struct Grouping {
     assignments: Vec<usize>,
     group_count: usize,
     group_sizes: Vec<usize>,
+    /// Stack of community IDs that have zero members and can be reused.
+    /// Maintained by `set_group()`: pushed when a community becomes empty,
+    /// removed when a community gains its first member.
+    empty_communities: Vec<usize>,
 }
 
 impl Grouping {
@@ -372,6 +378,7 @@ impl Grouping {
             assignments: (0..n).collect(),
             group_count: n,
             group_sizes: vec![1; n],
+            empty_communities: Vec::new(),
         }
     }
 
@@ -383,10 +390,14 @@ impl Grouping {
         for &g in input {
             group_sizes[g] += 1;
         }
+        // Collect initially-empty groups.
+        let empty_communities: Vec<usize> =
+            (0..group_count).filter(|&g| group_sizes[g] == 0).collect();
         let mut grouping = Self {
             assignments: input.to_vec(),
             group_count,
             group_sizes,
+            empty_communities,
         };
         grouping.normalize_groups();
         grouping
@@ -404,8 +415,18 @@ impl Grouping {
             return;
         }
         self.group_sizes[old] -= 1;
+        // Old community became empty — add to reuse pool.
+        if self.group_sizes[old] == 0 {
+            self.empty_communities.push(old);
+        }
         if group >= self.group_sizes.len() {
             self.group_sizes.resize(group + 1, 0);
+        }
+        // Target community was empty — remove from reuse pool.
+        if self.group_sizes[group] == 0 {
+            if let Some(pos) = self.empty_communities.iter().rposition(|&g| g == group) {
+                self.empty_communities.swap_remove(pos);
+            }
         }
         self.group_sizes[group] += 1;
         self.assignments[node] = group;
@@ -455,6 +476,8 @@ impl Grouping {
         for &g in &self.assignments {
             self.group_sizes[g] += 1;
         }
+        // All empty groups were eliminated by renumbering.
+        self.empty_communities.clear();
     }
 
     /// Returns `Vec<Vec<usize>>` — members of each group.
@@ -665,7 +688,22 @@ impl RBPartition {
     }
 
     fn add_empty_community(&mut self) {
+        let new_id = self.grouping.group_count;
         self.community_strengths.push(0.0);
+        self.grouping.group_sizes.push(0);
+        self.grouping.group_count += 1;
+        self.grouping.empty_communities.push(new_id);
+    }
+
+    /// Return a reusable empty community ID, or create a new one.
+    /// Matches C++ `MutableVertexPartition::get_empty_community()`.
+    fn get_empty_community(&mut self) -> usize {
+        if let Some(&id) = self.grouping.empty_communities.last() {
+            id
+        } else {
+            self.add_empty_community();
+            self.grouping.group_count - 1
+        }
     }
 
     // ── Accessors ──
@@ -788,11 +826,11 @@ impl ConflictFreeBatcher {
 fn evaluate_batch(
     batch: &[usize],
     partition: &RBPartition,
-    consider_empty: bool,
+    empty_comm: Option<usize>,
 ) -> Vec<ProposedMove> {
     batch
         .par_iter()
-        .filter_map(|&node| evaluate_node(node, partition, consider_empty))
+        .filter_map(|&node| evaluate_node(node, partition, empty_comm))
         .collect()
 }
 
@@ -800,7 +838,7 @@ fn evaluate_batch(
 fn evaluate_node(
     node: usize,
     partition: &RBPartition,
-    consider_empty: bool,
+    empty_comm: Option<usize>,
 ) -> Option<ProposedMove> {
     let current_comm = partition.membership(node);
 
@@ -824,12 +862,13 @@ fn evaluate_node(
     }
 
     // Consider moving to an empty community.
-    if consider_empty && partition.group_size(current_comm) > 1 {
-        let empty_comm = partition.community_count();
-        let improv = partition.diff_move(node, empty_comm);
-        if improv > best_improv {
-            best_comm = empty_comm;
-            best_improv = improv;
+    if let Some(ec) = empty_comm {
+        if partition.group_size(current_comm) > 1 {
+            let improv = partition.diff_move(node, ec);
+            if improv > best_improv {
+                best_comm = ec;
+                best_improv = improv;
+            }
         }
     }
 
@@ -952,8 +991,14 @@ impl LeidenOptimizer {
 
             let mut made_move = false;
             for batch in batches {
-                let proposed =
-                    evaluate_batch(&batch, partition, self.config.consider_empty_community);
+                // Pre-compute empty community ID for this batch (shared across
+                // all parallel evaluations). Uses reuse pool if available.
+                let empty_comm = if self.config.consider_empty_community {
+                    Some(partition.get_empty_community())
+                } else {
+                    None
+                };
+                let proposed = evaluate_batch(&batch, partition, empty_comm);
 
                 for m in proposed {
                     // Verify the move is still beneficial after sequential application
@@ -1041,8 +1086,9 @@ impl LeidenOptimizer {
             }
 
             // Consider moving to an empty community (matching C++ lines 615-634).
+            // Uses get_empty_community() to reuse IDs instead of creating new ones.
             if self.config.consider_empty_community && partition.group_size(v_comm) > 1 {
-                let empty_comm = partition.community_count();
+                let empty_comm = partition.get_empty_community();
                 let improv = partition.diff_move(v, empty_comm);
                 if improv > best_improv {
                     best_comm = empty_comm;
@@ -1055,7 +1101,8 @@ impl LeidenOptimizer {
 
             // Move node if beneficial (matching C++ lines 675-734).
             if best_comm != v_comm {
-                // Ensure community exists.
+                // Ensure community exists (only needed if get_empty_community
+                // returned a brand-new ID that hasn't been registered yet).
                 while partition.community_count() <= best_comm {
                     partition.add_empty_community();
                 }
@@ -1251,13 +1298,11 @@ pub fn leiden(
     // typically converges in 3-8 inner iterations (100K→30K→7K→1K→200→50→25→19).
     // Cap at 10 to prevent excessive memory from allocator fragmentation.
     //
-    // Note: consider_empty_community is disabled because our implementation
-    // creates new community IDs for each empty-community move (the C++ reuses
-    // existing empty community slots via get_empty_community()). Without reuse,
-    // the community count balloons on large graphs, causing OOM.
+    // consider_empty_community re-enabled: get_empty_community() now reuses
+    // empty community IDs (matching C++ MutableVertexPartition::get_empty_community())
+    // instead of creating new IDs, preventing community-count explosion and OOM.
     let config = LeidenConfig {
         max_iterations: 10,
-        consider_empty_community: false,
         seed: Some(seed),
         resolution,
         parallel,
@@ -1273,17 +1318,12 @@ pub fn leiden(
     let mut partition = RBPartition::new_singleton(graph, resolution);
     let mut optimizer = LeidenOptimizer::new(config);
 
-    // Run the Leiden algorithm. Each optimize() call does a full hierarchical
-    // pass: move → refine → aggregate → repeat until convergence.
-    //
-    // Note: the outer re-optimization loop (re-running optimize() from the
-    // converged partition, matching leidenalg's n_iterations parameter) is
-    // limited because glibc's allocator does not return freed pages during
-    // the second optimize() pass, causing OOM on large graphs (100K+ nodes).
-    // A single pass produces high-quality results; the marginal ARI
-    // improvement from additional passes is small.
+    // Outer re-optimization loop: re-runs the full Leiden hierarchy from
+    // the converged partition. Matches leidenalg's default n_iterations=2
+    // (leidenalg/functions.py:20, Optimiser.py:252). Each optimize() call
+    // does a full hierarchical pass: move → refine → aggregate → converge.
     let outer_limit = if max_iterations == 0 {
-        1
+        2
     } else {
         max_iterations
     };
