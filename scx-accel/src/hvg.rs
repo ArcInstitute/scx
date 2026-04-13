@@ -25,9 +25,32 @@ pub struct HvgStats {
 ///
 /// This matches scanpy's `correction=1` parameter in `mean_var()`.
 /// Memory: O(n_vars) for two accumulator vectors.
+///
+/// # Numerical stability
+///
+/// The two-pass sum-of-squares formula (`sum_sq - n * mean^2`) can suffer from
+/// catastrophic cancellation when values are large relative to the variance.
+/// Accumulating f32 sparse values into f64 provides sufficient headroom for
+/// typical scRNA-seq data (counts 0-100, up to ~10M cells). Negative variances
+/// from numerical noise are clamped to zero.
+///
+/// If this is ever needed for data with much larger magnitudes or tighter
+/// variance, Welford's online algorithm would provide better numerical
+/// stability at the cost of a branch per nonzero element.
+///
+/// Returns zero means and zero variances when `n_obs == 0`.
 pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
     let n_vars = source.n_vars();
     let n_obs = source.n_obs();
+
+    // Early return for empty source: avoid division by zero.
+    if n_obs == 0 {
+        return Ok(HvgStats {
+            means: vec![0.0; n_vars],
+            variances: vec![0.0; n_vars],
+        });
+    }
+
     let mut col_sum = vec![0.0f64; n_vars];
     let mut col_sum_sq = vec![0.0f64; n_vars];
 
@@ -215,8 +238,9 @@ mod tests {
             n_obs: 0,
             n_vars: 3,
         };
-        // Should not panic on n=0
+        // Should not panic on n=0; returns deterministic zeros
         let stats = streaming_mean_var(&source).unwrap();
-        assert!(stats.means.iter().all(|&v| v.is_nan() || v == 0.0));
+        assert!(stats.means.iter().all(|&v| v == 0.0));
+        assert!(stats.variances.iter().all(|&v| v == 0.0));
     }
 }

@@ -1398,7 +1398,13 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Compose new column indices with an existing col_projection.
-    /// Returns sorted, deduplicated indices (matching col_projection convention).
+    ///
+    /// `new_indices` are in the user-visible column space (`0..shape_val.1`).
+    /// Returns sorted, deduplicated indices in the original on-disk column space
+    /// (matching the convention that `col_projection` is always sorted).
+    ///
+    /// The output is always in on-disk column order regardless of input order,
+    /// and duplicate indices in `new_indices` are silently collapsed.
     fn compose_col_projection(&self, new_indices: &[u32]) -> Vec<u32> {
         let mut composed = match &self.col_projection {
             Some(existing) => new_indices.iter().map(|&i| existing[i as usize]).collect(),
@@ -1657,6 +1663,28 @@ pub(crate) struct LazyShardSource {
 }
 
 impl LazyShardSource {
+    /// Create a shard source with an optional pre-existing kept-to-global mapping.
+    ///
+    /// Pass `None` for `kept_to_global` to signal "all rows kept" — this skips
+    /// the deletion-vector filtering path in `read_shard` and avoids allocating
+    /// a full identity range vector.
+    pub(crate) fn new(
+        backed: Arc<BackedCsrReader>,
+        transforms: Vec<Transform>,
+        kept_to_global: Option<Arc<Vec<u64>>>,
+        col_projection: Option<Arc<Vec<u32>>>,
+        n_obs: usize,
+        n_vars: usize,
+    ) -> Self {
+        LazyShardSource {
+            backed,
+            transforms,
+            kept_to_global,
+            col_projection,
+            shape_val: (n_obs, n_vars),
+        }
+    }
+
     /// Create a batch-filtered shard source for streaming HVG computation.
     ///
     /// `kept_to_global` contains the global row indices for cells in this batch.

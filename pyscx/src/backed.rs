@@ -1218,7 +1218,7 @@ impl ScxBackedSparseDataset {
         if self.is_all_rows_slice(py, row_idx)? {
             if let Some(col_indices) = self.extract_col_indices(py, col_idx)? {
                 let composed = self.compose_col_projection(&col_indices);
-                let mut new_ds = ScxBackedSparseDataset {
+                let new_ds = ScxBackedSparseDataset {
                     backed: Arc::clone(&self.backed),
                     shape_val: (self.shape_val.0, composed.len()),
                     n_shards: self.n_shards,
@@ -1227,8 +1227,6 @@ impl ScxBackedSparseDataset {
                     col_projection: Some(Arc::new(composed)),
                     non_negative: self.non_negative,
                 };
-                // Ensure shape is consistent
-                let _ = &mut new_ds;
                 return Ok(new_ds.into_pyobject(py)?.into_any().unbind().into_bound(py));
             }
         }
@@ -1326,9 +1324,13 @@ impl ScxBackedSparseDataset {
     }
 
     /// Compose new column indices with an existing col_projection.
-    /// `new_indices` are in the user-visible column space (0..shape_val.1).
+    ///
+    /// `new_indices` are in the user-visible column space (`0..shape_val.1`).
     /// Returns sorted, deduplicated indices in the original on-disk column space
     /// (matching the convention that `col_projection` is always sorted).
+    ///
+    /// The output is always in on-disk column order regardless of input order,
+    /// and duplicate indices in `new_indices` are silently collapsed.
     fn compose_col_projection(&self, new_indices: &[u32]) -> Vec<u32> {
         let mut composed = match &self.col_projection {
             Some(existing) => {

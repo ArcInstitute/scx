@@ -3570,15 +3570,19 @@ fn build_shard_source(
             )
         }
         None => {
-            // Full dataset (or existing kept_to_global)
-            LazyShardSource::with_kept_rows(
+            // Full dataset (or existing kept_to_global).
+            // Pass None when no filtering needed — avoids allocating a full
+            // identity range and skips the deletion-vector path in read_shard.
+            let n_obs = match kept_to_global {
+                Some(ref k) => k.len(),
+                None => reader.shape().0,
+            };
+            LazyShardSource::new(
                 Arc::clone(reader),
                 transforms.to_vec(),
-                match kept_to_global {
-                    Some(k) => k.as_ref().clone(),
-                    None => (0..reader.shape().0 as u64).collect(),
-                },
+                kept_to_global.as_ref().map(Arc::clone),
                 col_projection.clone(),
+                n_obs,
                 n_vars,
             )
         }
@@ -3916,45 +3920,15 @@ fn hvg_seurat<'py>(
     }
 
     // ── 3. Bin by mean, z-score dispersion within bins (via Python) ────
-    let locals2 = PyDict::new(py);
-    locals2.set_item("log_means_arr", numpy::PyArray::from_vec(py, log_means))?;
-    locals2.set_item(
-        "log_disp_arr",
-        numpy::PyArray::from_vec(py, log_dispersions),
-    )?;
-    locals2.set_item("n_bins", n_bins)?;
+    let log_means_np = numpy::PyArray::from_vec(py, log_means);
+    let log_disp_np = numpy::PyArray::from_vec(py, log_dispersions);
 
-    py.run(
-        pyo3::ffi::c_str!(
-            r#"
-import numpy as _np
-import pandas as _pd
-_lm = _np.array(log_means_arr)
-_ld = _np.array(log_disp_arr)
-_n = len(_lm)
-_dn = _np.full(_n, 0.0)
-_mb = _pd.cut(_lm, bins=n_bins)
-for _b in _mb.categories:
-    _mask = _np.asarray(_mb == _b)
-    if _mask.sum() == 0:
-        continue
-    _vals = _ld[_mask]
-    _avg = _np.nanmean(_vals)
-    _std = _np.nanstd(_vals, ddof=1)
-    if _np.isnan(_std) or _std == 0:
-        _std = 1.0
-    _dn[_mask] = (_vals - _avg) / _std
-_dn[_np.isnan(_dn)] = 0.0
-_result_disp_norm = _dn.tolist()
-"#
-        ),
-        None,
-        Some(&locals2),
-    )?;
-
-    let dispersions_norm: Vec<f64> = locals2
-        .get_item("_result_disp_norm")?
-        .ok_or_else(|| PyRuntimeError::new_err("dispersion normalization failed"))?
+    let helpers = py.import("pyscx._hvg_helpers")?;
+    let dispersions_norm: Vec<f64> = helpers
+        .call_method1(
+            "binned_dispersion_norm",
+            (log_means_np, log_disp_np, n_bins),
+        )?
         .extract()?;
 
     // ── 4. Select top genes by normalized dispersion ────────────────────

@@ -8,7 +8,6 @@ Usage:
 """
 
 import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,12 +17,10 @@ load_dotenv(REPO_ROOT / ".env")
 
 _work = os.environ.get("SCX_WORK_DIR", "")
 if not _work:
-    print(
-        "ERROR: SCX_WORK_DIR is not set.\n"
-        "Create a .env file in the repo root (see .env.example) or export SCX_WORK_DIR.",
-        file=sys.stderr,
+    raise RuntimeError(
+        "SCX_WORK_DIR is not set. "
+        "Create a .env file in the repo root (see .env.example) or export SCX_WORK_DIR."
     )
-    sys.exit(1)
 
 WORK_DIR = Path(_work)
 DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "")) or WORK_DIR / "benchmarks" / "datasets"
