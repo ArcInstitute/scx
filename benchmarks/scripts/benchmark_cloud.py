@@ -13,7 +13,7 @@ End-to-end benchmarks for cloud operations, measuring:
 
 Requires:
 - GOOGLE_APPLICATION_CREDENTIALS pointing to a GCS service account key
-- tabula_sapiens_100k.scx in $SCX_DATA_DIR (default: /scratch/ctc/nickyoungblut/scx)
+- tabula_sapiens_100k.scx in $SCX_WORK_DIR (set via .env)
 - Release-built scx-cli with cloud feature
 
 Usage:
@@ -33,7 +33,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 GCS_PREFIX = os.environ.get("GCS_TEST_BUCKET", "gs://arc-ctc-nextflow/scx-test")
 DATASET = "tabula_sapiens_100k"
 N_RUNS = 3
@@ -718,10 +718,10 @@ def main():
     binary = find_scx_binary()
     print(f"Binary: {binary}")
 
-    scx_path = DATA_DIR / f"{DATASET}.scx"
+    scx_path = WORK_DIR / f"{DATASET}.scx"
     if not scx_path.exists():
         print(f"ERROR: {scx_path} not found.", file=sys.stderr)
-        print(f"Set $SCX_DATA_DIR to the directory containing {DATASET}.scx",
+        print(f"Set $SCX_WORK_DIR to the directory containing {DATASET}.scx",
               file=sys.stderr)
         sys.exit(1)
 

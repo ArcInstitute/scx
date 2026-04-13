@@ -25,13 +25,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 
 DATASETS = {
-    "pbmc3k": {"scx": DATA_DIR / "pbmc3k.scx", "cells": 2_700, "genes": 32_738},
-    "tabula_sapiens_100k": {"scx": DATA_DIR / "tabula_sapiens_100k.scx", "cells": 100_000, "genes": 60_000},
-    "census_1m": {"scx": DATA_DIR / "census_1m.scx", "cells": 1_000_000, "genes": 61_497},
-    "census_10m_blood": {"scx": DATA_DIR / "census_10m_blood.scx", "cells": 10_000_000, "genes": 60_000},
+    "pbmc3k": {"scx": WORK_DIR / "pbmc3k.scx", "cells": 2_700, "genes": 32_738},
+    "tabula_sapiens_100k": {"scx": WORK_DIR / "tabula_sapiens_100k.scx", "cells": 100_000, "genes": 60_000},
+    "census_1m": {"scx": WORK_DIR / "census_1m.scx", "cells": 1_000_000, "genes": 61_497},
+    "census_10m_blood": {"scx": WORK_DIR / "census_10m_blood.scx", "cells": 10_000_000, "genes": 60_000},
 }
 
 

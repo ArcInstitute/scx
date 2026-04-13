@@ -12,7 +12,17 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VENV="${REPO}/.venv"
 PYTHON="${VENV}/bin/python"
-DATA_DIR="${SCX_DATA_DIR:-/scratch/ctc/nickyoungblut/scx}"
+
+# Load environment from .env if present
+if [ -f "${REPO}/.env" ]; then
+    set -a; source "${REPO}/.env"; set +a
+fi
+if [ -z "${SCX_WORK_DIR:-}" ]; then
+    echo "ERROR: SCX_WORK_DIR is not set. Define it in ${REPO}/.env or export it."
+    exit 1
+fi
+WORK_DIR="${SCX_WORK_DIR}"
+DATA_DIR="${SCX_DATA_DIR:-${WORK_DIR}/benchmarks/datasets}"
 RESULTS_DIR="${REPO}/benchmarks/results"
 LOGS_DIR="${REPO}/benchmarks/logs"
 

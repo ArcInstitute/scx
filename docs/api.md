@@ -10,8 +10,8 @@ ObsIndex (1)           — Arrow IPC index for observations
 VarMetadata (2)        — Arrow IPC metadata for variables
 VarIndex (3)           — Arrow IPC index for variables
 CsrShard (4)           — Main expression matrix (row-major)
-CscShard (5)           — Gene-major view (opt-in, Phase 3)
-BitmapShard (6)        — Detection bitmap (Phase 3)
+CscShard (5)           — Gene-major view (not yet implemented)
+BitmapShard (6)        — Detection bitmap (not yet implemented)
 LayerCsrShard (7)      — Alternative expression layers
 ObsmEmbedding (8)      — Embeddings (obsm)
 ObspCsrShard (9)       — Cell-cell graphs (obsp)

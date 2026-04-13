@@ -8,6 +8,7 @@ and system-level settings. All benchmark scripts import from here.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,8 @@ RAW_RESULTS_DIR = RESULTS_DIR / "raw"
 REPORTS_DIR = RESULTS_DIR / "reports"
 FIGURES_DIR = REPORTS_DIR / "figures"
 
-# Default data directory — override via SCX_DATA_DIR env var
-DATA_DIR = Path(os.environ.get(
-    "SCX_DATA_DIR",
-    "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets",
-))
+sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
+from bench_env import DATA_DIR
 
 # Conda environments for benchmarking (isolated from dev .venv/)
 # These are created by: bash benchmarks/comprehensive/scripts/install_dependencies.sh

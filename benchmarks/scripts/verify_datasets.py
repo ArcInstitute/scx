@@ -12,7 +12,9 @@ import numpy as np
 import anndata as ad
 import scipy.sparse as sp
 
-DATASETS_DIR = "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets"
+from bench_env import DATA_DIR
+
+DATASETS_DIR = str(DATA_DIR)
 
 DATASET_META = {
     "pbmc3k":             {"id": "D1", "protocol": "10x v2 (UMI)", "source": "10x Genomics"},

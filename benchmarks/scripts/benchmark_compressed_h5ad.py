@@ -9,8 +9,7 @@ Usage:
     .venv/bin/python benchmarks/scripts/benchmark_compressed_h5ad.py
 
 Environment:
-    SCX_DATA_DIR  — directory containing .h5ad and .scx files
-                    (default: /scratch/ctc/nickyoungblut/scx)
+    SCX_WORK_DIR  — directory containing .h5ad and .scx files (set via .env)
 """
 
 import gc
@@ -25,7 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 sys.path.insert(0, str(Path(__file__).parent))
 from build_release import ensure_release_build
 
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 N_WARMUP = 1
 N_REPEATS = 3
 
@@ -102,8 +101,8 @@ def benchmark_dataset(dataset_name):
     import anndata
     import pyscx
 
-    h5ad_path = DATA_DIR / f"{dataset_name}.h5ad"
-    scx_path = DATA_DIR / f"{dataset_name}.scx"
+    h5ad_path = WORK_DIR / f"{dataset_name}.h5ad"
+    scx_path = WORK_DIR / f"{dataset_name}.scx"
 
     if not h5ad_path.exists():
         return None
@@ -122,7 +121,7 @@ def benchmark_dataset(dataset_name):
         if comp == "none":
             compressed_paths[comp] = h5ad_path
         else:
-            comp_path = DATA_DIR / f"{dataset_name}_{comp}.h5ad"
+            comp_path = WORK_DIR / f"{dataset_name}_{comp}.h5ad"
             create_compressed_h5ad(h5ad_path, comp_path, comp)
             compressed_paths[comp] = comp_path
 
@@ -177,7 +176,7 @@ def generate_report(results):
     lines.append("# Compressed h5ad Benchmark Report")
     lines.append("")
     lines.append(f"**Generated**: {datetime.now().strftime('%Y-%m-%d')}")
-    lines.append(f"**Data directory**: `{DATA_DIR}`")
+    lines.append(f"**Data directory**: `{WORK_DIR}`")
     lines.append("")
     lines.append("## Context")
     lines.append("")
@@ -320,7 +319,7 @@ def run_all():
         try:
             result = benchmark_dataset(name)
             if result is None:
-                print(f"  SKIP: {name}.h5ad not found in {DATA_DIR}")
+                print(f"  SKIP: {name}.h5ad not found in {WORK_DIR}")
                 continue
             results.append(result)
 
@@ -336,7 +335,7 @@ def run_all():
             traceback.print_exc()
 
     if not results:
-        print("\nNo datasets found. Set SCX_DATA_DIR to the directory containing .h5ad files.")
+        print("\nNo datasets found. Set SCX_WORK_DIR to the directory containing .h5ad files.")
         return
 
     # Generate report

@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WORKER = Path(__file__).parent / "benchmark_madvise_rss_worker.py"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 PYTHON = str(REPO_ROOT / ".venv" / "bin" / "python")
 
 
@@ -52,7 +52,7 @@ def main():
     parser.add_argument("--label", default="", help="Label for this run (e.g., 'with_dontneed')")
     args = parser.parse_args()
 
-    scx_path = DATA_DIR / f"{args.dataset}.scx"
+    scx_path = WORK_DIR / f"{args.dataset}.scx"
     if not scx_path.exists():
         print(f"ERROR: {scx_path} not found", file=sys.stderr)
         sys.exit(1)

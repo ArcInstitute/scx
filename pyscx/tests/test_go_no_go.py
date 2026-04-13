@@ -7,14 +7,24 @@ Three criteria:
 """
 
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import scipy.sparse as sp
 
-DATA_DIR = os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx")
-PBMC_H5AD = Path(DATA_DIR) / "pbmc3k.h5ad"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks" / "scripts"))
+try:
+    from bench_env import DATA_DIR
+except (RuntimeError, ModuleNotFoundError):
+    # SCX_WORK_DIR not set or python-dotenv not installed — skip this module
+    pytest.skip(
+        "bench_env unavailable (SCX_WORK_DIR not set or python-dotenv missing)",
+        allow_module_level=True,
+    )
+
+PBMC_H5AD = DATA_DIR / "pbmc3k.h5ad"
 
 
 # =========================================================================

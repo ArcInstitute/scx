@@ -33,26 +33,26 @@ from build_release import ensure_release_build
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 
 DATASETS = {
     "pbmc3k": {
-        "scx": DATA_DIR / "pbmc3k.scx",
+        "scx": WORK_DIR / "pbmc3k.scx",
         "cells": 2700,
         "genes": 32738,
     },
     "tabula_sapiens_100k": {
-        "scx": DATA_DIR / "tabula_sapiens_100k.scx",
+        "scx": WORK_DIR / "tabula_sapiens_100k.scx",
         "cells": 100000,
         "genes": 60000,
     },
     "census_1m": {
-        "scx": DATA_DIR / "census_1m.scx",
+        "scx": WORK_DIR / "census_1m.scx",
         "cells": 1000000,
         "genes": 61497,
     },
     "census_10m_blood": {
-        "scx": DATA_DIR / "census_10m_blood.scx",
+        "scx": WORK_DIR / "census_10m_blood.scx",
         "cells": 10000000,
         "genes": 60000,
     },

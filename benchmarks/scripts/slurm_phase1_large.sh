@@ -19,6 +19,16 @@ set -euo pipefail
 SCX_DIR="/home/nickyoungblut/dev/rust/scx"
 PYTHON="${SCX_DIR}/.venv/bin/python"
 
+# Load environment from .env if present
+if [ -f "${SCX_DIR}/.env" ]; then
+    set -a; source "${SCX_DIR}/.env"; set +a
+fi
+if [ -z "${SCX_WORK_DIR:-}" ]; then
+    echo "ERROR: SCX_WORK_DIR is not set. Define it in ${SCX_DIR}/.env or export it."
+    exit 1
+fi
+DATA_DIR="${SCX_DATA_DIR:-${SCX_WORK_DIR}/benchmarks/datasets}"
+
 cd "${SCX_DIR}"
 mkdir -p benchmarks/logs
 
@@ -48,4 +58,4 @@ echo "Date: $(date)"
 # List all files in the datasets directory for verification
 echo ""
 echo "--- All dataset files ---"
-ls -lhS /scratch/ctc/nickyoungblut/scx/benchmarks/datasets/
+ls -lhS "${DATA_DIR}/"

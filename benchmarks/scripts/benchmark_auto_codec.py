@@ -16,13 +16,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 sys.path.insert(0, str(Path(__file__).parent))
 from build_release import ensure_release_build
 
-DATA_DIR = os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx")
+from bench_env import WORK_DIR
 
 
 def get_h5ad_files():
-    data_path = Path(DATA_DIR)
+    data_path = Path(WORK_DIR)
     if not data_path.exists():
-        print(f"WARNING: Data directory not found: {DATA_DIR}")
+        print(f"WARNING: Data directory not found: {WORK_DIR}")
         return []
     return sorted(data_path.glob("*.h5ad"))
 

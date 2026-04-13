@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 sys.path.insert(0, str(Path(__file__).parent))
 from build_release import ensure_release_build
 
-DATA_DIR = os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx")
+from bench_env import WORK_DIR
 RESULTS_DIR = PROJECT_ROOT / "benchmarks" / "results"
 THREAD_COUNTS = [1, 2, 4, 8]
 N_WARMUP = 1
@@ -125,10 +125,10 @@ def get_shard_count(scx_path):
 
 def run_all():
     """Run parallel read benchmarks on all datasets."""
-    data_path = Path(DATA_DIR)
+    data_path = Path(WORK_DIR)
     h5ad_files = sorted(data_path.glob("*.h5ad")) if data_path.exists() else []
     if not h5ad_files:
-        print(f"No h5ad files found in {DATA_DIR}. Run download_datasets.sh first.")
+        print(f"No h5ad files found in {WORK_DIR}. Run download_datasets.sh first.")
         return
 
     all_results = []

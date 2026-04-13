@@ -2,13 +2,32 @@
 # Download benchmark datasets for SCX benchmarks.
 # Usage: bash download_datasets.sh [DATA_DIR]
 #
-# Data directory defaults to /scratch/ctc/nickyoungblut/scx/
+# Data directory defaults to SCX_WORK_DIR (from .env or environment).
 # Each dataset is downloaded only if not already present (idempotent).
 
 set -euo pipefail
 
-DATA_DIR="${1:-/scratch/ctc/nickyoungblut/scx}"
-VENV="$(cd "$(dirname "$0")/../.." && pwd)/.venv"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Load environment from .env if present
+if [ -f "${REPO_ROOT}/.env" ]; then
+    set -a; source "${REPO_ROOT}/.env"; set +a
+fi
+
+if [ -n "${1:-}" ]; then
+    DATA_DIR="$1"
+elif [ -n "${SCX_DATA_DIR:-}" ]; then
+    DATA_DIR="${SCX_DATA_DIR}"
+elif [ -n "${SCX_WORK_DIR:-}" ]; then
+    DATA_DIR="${SCX_WORK_DIR}/benchmarks/datasets"
+else
+    echo "ERROR: No data directory specified. Either:"
+    echo "  1. Pass a DATA_DIR argument: bash download_datasets.sh /path/to/data"
+    echo "  2. Set SCX_WORK_DIR in ${REPO_ROOT}/.env"
+    echo "  3. Export SCX_WORK_DIR or SCX_DATA_DIR"
+    exit 1
+fi
+VENV="${REPO_ROOT}/.venv"
 PYTHON="${VENV}/bin/python"
 
 if [ ! -x "$PYTHON" ]; then

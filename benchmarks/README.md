@@ -32,26 +32,33 @@ benchmarks/
 
 ## Prerequisites
 
-1. **Python venv** — All scripts use the project's uv virtualenv at `.venv/`:
+1. **Environment config** — Copy `.env.example` to `.env` and set `SCX_WORK_DIR` to your base data directory:
+   ```bash
+   cp .env.example .env
+   # Edit .env: set SCX_WORK_DIR=/path/to/your/scx/workdir
+   ```
+   `SCX_DATA_DIR` defaults to `$SCX_WORK_DIR/benchmarks/datasets` if not set.
+
+2. **Python venv** — All scripts use the project's uv virtualenv at `.venv/`:
    ```bash
    # From repo root:
    uv venv .venv
-   uv pip install scanpy anndata cellxgene-census tiledbsoma tiledbsoma-ml submitit
+   uv pip install scanpy anndata cellxgene-census tiledbsoma tiledbsoma-ml submitit python-dotenv
    ```
 
-2. **pyscx release build** — Benchmark scripts automatically rebuild pyscx in release mode. You can also do this manually:
+3. **pyscx release build** — Benchmark scripts automatically rebuild pyscx in release mode. You can also do this manually:
    ```bash
    cd pyscx && ../.venv/bin/maturin develop --release && cd ..
    ```
 
-3. **Rust toolchain** — Required for Rust-level benchmarks (ops, query engine, GPU decode):
+4. **Rust toolchain** — Required for Rust-level benchmarks (ops, query engine, GPU decode):
    ```bash
    cargo build --release --workspace
    ```
 
-4. **Datasets** — Download benchmark datasets to the data directory (default: `/scratch/ctc/nickyoungblut/scx/`). See [Dataset Preparation](#dataset-preparation) below.
+5. **Datasets** — Download benchmark datasets to the data directory. Paths are configured via `SCX_WORK_DIR` and `SCX_DATA_DIR` environment variables (see `.env` at repo root). See [Dataset Preparation](#dataset-preparation) below.
 
-5. **GPU environment** (for GPU benchmarks only) — See [docs/gpu-setup.md](../docs/gpu-setup.md) for CUDA/RAPIDS setup.
+6. **GPU environment** (for GPU benchmarks only) — See [docs/gpu-setup.md](../docs/gpu-setup.md) for CUDA/RAPIDS setup.
 
 ---
 
@@ -117,7 +124,7 @@ sbatch benchmarks/scripts/slurm_build_census_10m.sh
 | D7 | `census_5m` | 5,000,000 | 10x (UMI) | CELLxGENE Census |
 | D8 | `census_10m` | 10,000,000 | Mixed | CELLxGENE Census |
 
-By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override with `SCX_DATA_DIR` env var).
+Dataset paths are configured via the `.env` file at the repo root (or environment variables). `SCX_WORK_DIR` sets the base working directory; `SCX_DATA_DIR` defaults to `$SCX_WORK_DIR/benchmarks/datasets`.
 
 ---
 
@@ -143,7 +150,7 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 | `slurm_phase3_parallel_large.sh` | varies | 32 CPUs, 80–500 GB | 4–12 h/job | Phase 3 D5–D7 parallel submission (one job per benchmark×dataset) |
 | `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel_scaling only, D5–D7 |
 | `slurm_fused_bench.sh` | `cpu_preemptible` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
-| `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
+| `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 16–32 CPUs, 80–256 GB | 6–16 h/job | Phase 5c lazy preprocessing benchmarks (§3.13.1–3.13.6; submits ~15 parallel jobs) |
 | `slurm_phase4_ml_loader.sh` | `cpu_preemptible`+`preemptible` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
 | `slurm_phase5_accel_bench.sh` | `cpu_preemptible` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
 
@@ -236,7 +243,7 @@ sbatch --exclusive benchmarks/scripts/slurm_gpu_analysis_bench.sh
 ```
 
 > [!IMPORTANT]
-> Always run dataset preparation jobs first. The benchmark scripts assume datasets exist at the `SCX_DATA_DIR` path (default: `/scratch/ctc/nickyoungblut/scx/`).
+> Always run dataset preparation jobs first. The benchmark scripts assume datasets exist at the `SCX_DATA_DIR` path (configured via `.env` at the repo root; defaults to `$SCX_WORK_DIR/benchmarks/datasets`).
 
 ---
 
@@ -319,7 +326,8 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 | `benchmark_gpu_preprocess.py` | GPU fused preprocessing (normalize+log1p) |
 | `benchmark_gpu_pipeline.py` | End-to-end GPU pipeline + Go/No-Go gate |
 | `benchmark_gpu_scvi.py` | GPU scVI training benchmark |
-| `benchmark_lazy_preprocess.py` | Phase 4d lazy transforms, memory, column projection |
+| `benchmark_lazy_preprocess.py` | Phase 4d/5c lazy transforms, memory, column projection, fused opt, E2E OOC pipeline |
+| `benchmark_lazy_preprocess_rss_worker.py` | RSS time-series subprocess worker for lazy preprocessing benchmarks |
 | `benchmark_accelerators.py` | Phase 4b CPU accelerators: PCA, kNN, UMAP, DE vs scanpy |
 | `benchmark_accel_pipeline.py` | Full pipeline (3 variants: SCX OOC, SCX preprocess, scanpy) |
 | `benchmark_accel_preprocessing.py` | pyscx.preprocess() vs scanpy normalize+log1p |

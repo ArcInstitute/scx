@@ -661,9 +661,5 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 - [SPEC.md](../SPEC.md) — Full binary format specification (v0.5)
 - [api.md](api.md) — API reference for Rust, Python, and CLI
 - [scanpy.md](scanpy.md) — Scanpy integration, backed mode, and accelerator usage
-- [ROADMAP.md](../ROADMAP.md) — Phased implementation plan
-- [Phase4.md](../tasks/Phase4.md) — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete)
-- [Phase4-GPU.md](../tasks/Phase4-GPU.md) — Phase 4c GPU accelerator specification and benchmark results
-- [Phase4-ACC-ALL.md](../tasks/Phase4-ACC-ALL.md) — Phase 4d spec: lazy preprocessing, streaming PCA, non-materializing filters
-- [Phase3.md](../Phase3.md) — Phase 3 specification (GPU, R, multimodal)
+- [performance.md](performance.md) — Benchmark results and performance characteristics
 - [testing.md](testing.md) — Test infrastructure and benchmarks

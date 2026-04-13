@@ -13,7 +13,9 @@ import tempfile
 import scanpy as sc
 import anndata as ad
 
-OUTPUT_DIR = "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets"
+from bench_env import DATA_DIR
+
+OUTPUT_DIR = str(DATA_DIR)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "pbmc10k.h5ad")
 
 # 10x Genomics public dataset: 10k PBMCs from a Healthy Donor (v3 chemistry)

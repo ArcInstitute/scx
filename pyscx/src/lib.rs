@@ -205,6 +205,10 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     accel_module.add_function(wrap_pyfunction!(accel::filter_cells, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::filter_genes, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(accel::subset_obs, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::highly_variable_genes,
+        &accel_module
+    )?)?;
     m.add_submodule(&accel_module)?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
