@@ -158,10 +158,8 @@ fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>
         .reduce(
             || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
             |(mut ca, mut sa), (cb, sb)| {
+                ca += cb;
                 for i in 0..n_vars {
-                    for j in 0..n_vars {
-                        ca[(i, j)] += cb[(i, j)];
-                    }
                     sa[i] += sb[i];
                 }
                 (ca, sa)

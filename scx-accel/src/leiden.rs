@@ -766,29 +766,35 @@ impl ConflictFreeBatcher {
     ) -> Vec<Vec<usize>> {
         let mut batches = Vec::new();
         let mut remaining: Vec<usize> = nodes.iter().copied().filter(|&n| !is_stable[n]).collect();
+        let mut locked = vec![false; graph.node_count()];
 
         while !remaining.is_empty() {
-            let (batch, leftover) = self.extract_batch(&remaining, graph);
+            let (batch, leftover) = self.extract_batch(&remaining, graph, &mut locked);
             if batch.is_empty() {
                 break;
             }
             batches.push(batch);
             remaining = leftover;
+            locked.fill(false);
         }
         batches
     }
 
-    fn extract_batch(&self, candidates: &[usize], graph: &LeidenGraph) -> (Vec<usize>, Vec<usize>) {
+    fn extract_batch(
+        &self,
+        candidates: &[usize],
+        graph: &LeidenGraph,
+        locked: &mut [bool],
+    ) -> (Vec<usize>, Vec<usize>) {
         let mut batch = Vec::new();
         let mut leftover = Vec::new();
-        let mut locked = vec![false; graph.node_count()];
 
         for &node in candidates {
-            if self.has_conflict(node, graph, &locked) {
+            if self.has_conflict(node, graph, locked) {
                 leftover.push(node);
             } else {
                 batch.push(node);
-                self.mark_locked(node, graph, &mut locked);
+                self.mark_locked(node, graph, locked);
                 if batch.len() >= self.max_batch_size {
                     // Remaining candidates go to leftover.
                     let pos = candidates.iter().position(|&n| n == node).unwrap();
@@ -1140,6 +1146,8 @@ impl LeidenOptimizer {
         let mut total_improv = 0.0;
         let mut vertex_order: Vec<usize> = (0..n).collect();
         vertex_order.shuffle(&mut self.rng);
+        // Reuse HashSet across iterations to avoid per-vertex heap allocation.
+        let mut comms = HashSet::new();
 
         for v in vertex_order {
             let v_comm = partition.membership(v);
@@ -1151,7 +1159,7 @@ impl LeidenOptimizer {
 
             // Collect constrained candidates (AllNeighComms within same constrained group).
             let v_constrained = constrained_membership[v];
-            let mut comms = HashSet::new();
+            comms.clear();
             for (neighbor, _) in partition.graph.neighbors(v) {
                 if constrained_membership[neighbor] == v_constrained {
                     comms.insert(partition.membership(neighbor));
@@ -1161,7 +1169,7 @@ impl LeidenOptimizer {
             let mut best_comm = v_comm;
             let mut best_improv = 0.0;
 
-            for comm in comms {
+            for &comm in &comms {
                 let improv = partition.diff_move(v, comm);
                 if improv >= best_improv && comm != v_comm {
                     best_comm = comm;
@@ -1319,17 +1327,25 @@ pub fn leiden(
     let mut optimizer = LeidenOptimizer::new(config);
 
     // Outer re-optimization loop: re-runs the full Leiden hierarchy from
-    // the converged partition. Matches leidenalg's default n_iterations=2
-    // (leidenalg/functions.py:20, Optimiser.py:252). Each optimize() call
-    // does a full hierarchical pass: move → refine → aggregate → converge.
-    let outer_limit = if max_iterations == 0 {
-        2
+    // the converged partition. Each optimize() call does a full hierarchical
+    // pass: move → refine → aggregate → converge.
+    //
+    // When max_iterations == 0 (from scanpy's n_iterations=-1 default):
+    // repeat until no improvement, matching leidenalg's Optimiser.py:299-310.
+    // When max_iterations > 0: run exactly that many outer passes.
+    if max_iterations == 0 {
+        // Converge: repeat until no improvement.
+        // Safety cap at 100 to prevent infinite loops on pathological inputs.
+        for _ in 0..100 {
+            let improvement = optimizer.optimize(&mut partition)?;
+            if improvement <= 0.0 {
+                break;
+            }
+        }
     } else {
-        max_iterations
-    };
-
-    for _outer in 0..outer_limit {
-        optimizer.optimize(&mut partition)?;
+        for _ in 0..max_iterations {
+            optimizer.optimize(&mut partition)?;
+        }
     }
 
     let membership = partition.membership_vector();
