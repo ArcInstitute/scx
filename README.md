@@ -550,6 +550,8 @@ Peak RSS during full read (lower is better):
 
 For streaming aggregation (row_sums, col_sums), `MADV_DONTNEED` reduces SCX peak RSS by **67%** — from 3.5 GB to 1.1 GB on Census 1M. h5ad has lowest peak RSS (lazy/backed mode). SCX uses less memory than Zarr at scale (18.5 GB vs 87.7 GB on Census 5M).
 
+Full out-of-core analysis pipeline (QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) on 1M cells: **5.1 GB peak RSS** — an **88% reduction** from 43.6 GB materialized. All preprocessing stages stream shard-by-shard without materializing the full matrix.
+
 ### Training Loader (batches/sec, batch_size=1024, HVG=2000, normalize+log1p)
 
 | Dataset | SCX | AnnData | TileDB-SOMA-ML | scDataLoader | SCX/SOMA |

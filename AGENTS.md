@@ -218,7 +218,8 @@ See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
 - Uses `faer` for dense linear algebra (QR, SVD, eigendecomposition in PCA)
 - Uses `instant-distance` for HNSW-based approximate kNN
-- Adapted Leiden from `single-clustering` (BSD 3-Clause). Uses `rand_chacha` for deterministic seeding and `libc` for `malloc_trim` on Linux.
+- HVG: streaming `streaming_mean_var()` and `streaming_clip_square_sum()` in `hvg.rs`, loess via `skmisc.loess`
+- Adapted Leiden from `single-clustering` (BSD 3-Clause). Default `n_iterations=2` (matches leidenalg package default). Uses `rand_chacha` for deterministic seeding and `libc` for `malloc_trim` on Linux.
 - Pseudobulk aggregation streams via `BackedCsrReader`, statistical testing delegated to `pydeseq2`
 
 ## Known Risks and Pitfalls
