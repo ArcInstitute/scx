@@ -143,7 +143,7 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 | `slurm_phase3_parallel_large.sh` | varies | 32 CPUs, 80–500 GB | 4–12 h/job | Phase 3 D5–D7 parallel submission (one job per benchmark×dataset) |
 | `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel_scaling only, D5–D7 |
 | `slurm_fused_bench.sh` | `cpu_preemptible` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
-| `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
+| `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 16–32 CPUs, 80–256 GB | 6–16 h/job | Phase 5c lazy preprocessing benchmarks (§3.13.1–3.13.6; submits ~15 parallel jobs) |
 | `slurm_phase4_ml_loader.sh` | `cpu_preemptible`+`preemptible` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
 | `slurm_phase5_accel_bench.sh` | `cpu_preemptible` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
 
@@ -319,7 +319,8 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 | `benchmark_gpu_preprocess.py` | GPU fused preprocessing (normalize+log1p) |
 | `benchmark_gpu_pipeline.py` | End-to-end GPU pipeline + Go/No-Go gate |
 | `benchmark_gpu_scvi.py` | GPU scVI training benchmark |
-| `benchmark_lazy_preprocess.py` | Phase 4d lazy transforms, memory, column projection |
+| `benchmark_lazy_preprocess.py` | Phase 4d/5c lazy transforms, memory, column projection, fused opt, E2E OOC pipeline |
+| `benchmark_lazy_preprocess_rss_worker.py` | RSS time-series subprocess worker for lazy preprocessing benchmarks |
 | `benchmark_accelerators.py` | Phase 4b CPU accelerators: PCA, kNN, UMAP, DE vs scanpy |
 | `benchmark_accel_pipeline.py` | Full pipeline (3 variants: SCX OOC, SCX preprocess, scanpy) |
 | `benchmark_accel_preprocessing.py` | pyscx.preprocess() vs scanpy normalize+log1p |

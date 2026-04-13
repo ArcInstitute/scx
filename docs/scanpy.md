@@ -154,7 +154,7 @@ sc.pp.highly_variable_genes(adata)
 pyscx.accel.pca(adata, n_comps=50)
 pyscx.accel.neighbors(adata, n_neighbors=15)
 pyscx.accel.umap(adata)
-pyscx.accel.leiden(adata)                    # Rust-native, 48× faster than leidenalg
+pyscx.accel.leiden(adata)                    # Rust-native, 40× faster than leidenalg
 sc.pl.umap(adata, color="leiden")
 ```
 
@@ -765,7 +765,7 @@ calls on large datasets.
 
 SCX includes optional Rust-native implementations of PCA, kNN graph
 construction, UMAP embedding, Leiden clustering, and differential expression
-via `pyscx.accel`. These accelerators are 2–48× faster than their scanpy
+via `pyscx.accel`. These accelerators are 2–40× faster than their scanpy
 equivalents at scale (>100K cells) while writing results to the same AnnData
 slots — so downstream scanpy functions (plotting, etc.) work identically.
 
@@ -898,7 +898,8 @@ pyscx.accel.leiden(adata, resolution=1.0)
 The Rust path is tried first; if it fails, a warning is issued and the next
 backend is tried.
 
-Benchmarked at 55s on 1M cells (**48× faster** than Python leidenalg's 2,939s).
+Benchmarked at 55s on 1M cells (**40× faster** than Python leidenalg's 2,226s
+in same-conditions comparison; **53× faster** vs the 2,939s Phase I baseline).
 ARI 0.92 vs Python leidenalg on census_1m. The Rust implementation may
 converge to a different local optimum than Python leidenalg — both produce
 valid, high-quality community structures. Compare via ARI or NMI when
@@ -1054,7 +1055,7 @@ adata = adata[:, adata.var["highly_variable"]].copy()
 pyscx.accel.pca(adata, n_comps=50)             # 5× faster (covariance method for HVGs)
 pyscx.accel.neighbors(adata)                    # HNSW kNN
 pyscx.accel.umap(adata)                         # faster than sc.tl.umap
-pyscx.accel.leiden(adata)                        # 48× faster than leidenalg
+pyscx.accel.leiden(adata)                        # 40× faster than leidenalg
 pyscx.accel.rank_genes_groups(adata, "leiden")   # 3× faster than sc.tl.rank_genes_groups
 
 # Downstream scanpy works identically
