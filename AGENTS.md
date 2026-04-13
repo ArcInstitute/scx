@@ -2,29 +2,22 @@
 
 ## Project Overview
 
-SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. Replaces AnnData/h5ad with a unified Rust-native stack.
-
-**Phase 1 complete.** Phase 2 complete. Phase 3 partially complete (GPU, R bindings, CLI extensions). Phase 4a complete (scanpy parity — selective loading, chunk iteration, preprocessing pipeline). Phase 4b complete (Rust-native accelerators — PCA, kNN, UMAP, DE, pseudobulk). Phase 4c complete (GPU accelerators — benchmarked, 3/4 Go/No-Go gates pass). Phase 4d complete (lazy preprocessing — materialization-free normalize_total/log1p, streaming PCA via ShardSource trait, non-materializing filter_cells/filter_genes; 71% RSS reduction on 1M cells). Phase 4e complete (PCA/DE/Leiden optimization — covariance PCA for HVG data, optimized Wilcoxon DE with pre-ranking, Rust-native Leiden; pipeline 4.6× faster on 1M cells). See [ROADMAP.md](ROADMAP.md), [Phase3.md](Phase3.md), [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md), [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md), and [PCA-DE-FIX.md](tasks/PCA-DE-FIX.md).
+SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compression codec, query engine, and ML data loader for single-cell RNA-seq data. It replaces AnnData/h5ad with a unified Rust-native stack providing 3-7x smaller files, fastest reads at census scale, 4-44x less memory, a GPU-saturating training loader, lazy query engine, and Rust-native analysis accelerators — with native bindings for Python and R, fully compatible with the scverse ecosystem and Seurat v5.
 
 ## Key Documents
 
 - **[SPEC.md](SPEC.md)** — Format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
-- **[ROADMAP.md](ROADMAP.md)** — Phased implementation plan (Phases 1–4).
-- **[Phase3.md](Phase3.md)** — Phase 3 plan (GPU, R bindings, CLI extensions — partially done).
-- **[Phase4.md](./tasks/Phase4.md)** — Phase 4 plan (scanpy parity + Rust-native accelerators — 4a/4b complete).
-- **[Phase4-GPU.md](./tasks/Phase4-GPU.md)** — Phase 4c GPU accelerator spec and benchmark results (cuSPARSE, cuVS/CAGRA, CUDA UMAP).
-- **[Phase4-ACC-ALL.md](./tasks/Phase4-ACC-ALL.md)** — Phase 4d spec: materialization-free lazy preprocessing (ScxLazyTransformedDataset, column-projected streaming aggregation).
-- **[PCA-DE-FIX.md](tasks/PCA-DE-FIX.md)** — Phase 4e spec: PCA covariance method, DE pre-ranking optimization, Rust-native Leiden. Root cause analysis, algorithm details, and benchmark results.
-- **[COMPREHENSIVE-BENCHMARKING.md](COMPREHENSIVE-BENCHMARKING.md)** — Benchmark specs for accelerators and preprocessing.
-- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark×dataset pair) rather than sequential single-job scripts.
+- **[ROADMAP.md](ROADMAP.md)** — Historical phased implementation plan (Phases 1-4).
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
+- **[docs/performance.md](docs/performance.md)** — Benchmark results and performance characteristics.
 - **[docs/gpu-setup.md](docs/gpu-setup.md)** — GPU setup guide: CUDA, RAPIDS, conda, container, SLURM, troubleshooting.
 - **[docs/testing.md](docs/testing.md)** — Test and benchmark details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
-- **[tasks/](tasks/)** — Completed phase specs and code reviews.
+- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts.
+- **[tasks/](tasks/)** — Historical phase specs and code reviews.
 
 ## Build and Test
 
@@ -80,16 +73,16 @@ Key isolation rules:
 - `scx-cli`: `hdf5` (h5ad conversion), `cloud` (cloud operations) — both opt-in
 - `pyscx`: `cloud` (cloud operations), `gpu` (GPU-accelerated analysis) — both opt-in
 - `scx-gpu`: `gds` (GPUDirect Storage) — opt-in, requires nvidia-fs drivers
-- `scx-accel`: `gpu` (GPU dispatch via `scx-gpu`) — opt-in, requires CUDA Toolkit ≥ 12.0
+- `scx-accel`: `gpu` (GPU dispatch via `scx-gpu`) — opt-in, requires CUDA Toolkit >= 12.0
 - Build with: `cargo build --features hdf5,cloud` or `maturin develop --features cloud,gpu`
 
 ### File Format Summary
 
-See [SPEC.md](SPEC.md) §3 for full details.
+See [SPEC.md](SPEC.md) S3 for full details.
 
 - **File header**: 256 bytes, LE, magic `b"SCX\x01"`. Includes `front_catalog_offset`/`length` (populated by `cloud-optimize`, zero otherwise).
 - **Root catalog**: At offset 256, max 4096 bytes.
-- **Sections**: 8-byte aligned. 15 types defined (0–14, see [docs/api.md](docs/api.md#section-types)).
+- **Sections**: 8-byte aligned. 15 types defined (0-14, see [docs/api.md](docs/api.md#section-types)).
 - **Full catalog**: At EOF. Per-entry checksums + shard statistics (`CategoryBitset` for pushdown).
 - **CSR shard header**: 76 bytes (NOT 64 — spec diagram discrepancy), magic `b"SCXS"`.
 
@@ -100,7 +93,7 @@ See [SPEC.md](SPEC.md) §3 for full details.
 - `Zstd (2)` — Zstd per-section. Fallback for float layers.
 - `Lz4Shuffle (3)` — Byte-shuffle pre-filter + LZ4 frame compression. Works with any value encoding. Matches Zarr/Blosc compression style.
 
-**Auto-codec**: `codec_select.rs` chooses Scx1 vs Zstd based on median value (threshold ≤ 8). Default for `from_anndata()` and `scx convert` is `"auto"`.
+**Auto-codec**: `codec_select.rs` chooses Scx1 vs Zstd based on median value (threshold <= 8). Default for `from_anndata()` and `scx convert` is `"auto"`.
 
 Per-shard codec override: readers MUST use the shard header's `codec_id`, not the file header's.
 
@@ -111,19 +104,67 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **Value encodings**: uint8 (0), uint16 (1), uint32 (2), float32 (3), float16 (4)
 - **Index dtype**: u16 if n_vars <= 65535, else u32
 
-### Phase Status Summary
+## Capabilities
 
-- **Phase 1 (Format + Codec + AnnData Bridge)**: Complete.
-- **Phase 2 (Training Loader + Query Engine)**: Complete.
-- **Phase 3**: Steps 1–3 complete (SIMD FOR-BP, scx-gpu, rscx). Steps 4–5 partially done. Comprehensive benchmarking complete (D1–D7, 12 formats, 6 benchmarks).
-- **Sprint 2 (Read Gap Closure)**: Complete — parallel shard decode (2A), catalog seek (2B), format cleanup (2C), LZ4+shuffle codec (2D), SIMD FOR-BP (2E), madvise hints (2F), integration testing (2G).
-- **Sprint 3 (Comprehensive Benchmarks)**: Complete — SCX is now the fastest reader at census scale (1.38× faster than Zarr lz4 on 1M cells, 1.15× on 5M cells), achieves up to 7× parallel scaling at 32 threads, and writes are only 2–3× slower than Zarr (down from 10–60×). Column projection is 4–8× faster than all competitors. See `benchmarks/comprehensive/reporting/phase3_report.md`.
-- **Phase 4a (Scanpy Integration)**: Complete — backed mode aggregation, comparison optimization, streaming preprocess, chunk iterator, selective loading.
-- **Phase 4b (Rust-Native Accelerators)**: Complete — PCA, kNN, UMAP, Wilcoxon DE (in-memory + streaming), pseudobulk DE, stratified DE. All in `scx-accel` crate with `pyscx.accel.*` Python API.
-- **Phase 4c (GPU Accelerators)**: Implementation complete, benchmarked — cuSPARSE SpMM, cuSOLVER QR, cuRAND (GPU PCA), cuVS CAGRA (GPU kNN, 9.4× standalone on 1M cells), native CUDA UMAP SGD (7.7× on 1M cells), cuGraph Leiden (16× on 1M cells), fused GPU preprocessing (normalize+log1p). All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Go/No-Go: 3/4 pass (PCA correctness, kNN recall, graceful fallback); 10× pipeline target not met (3.8× median, 8.8× best run). Requires `scx-gpu` conda env for RAPIDS compatibility. See `benchmarks/results/gpu_gonogo.json`.
-- **Phase 4d (Lazy Preprocessing)**: Complete — `ScxLazyTransformedDataset` wraps backed reader with chained transforms (NormalizeTotal, Log1p, RowScale). `ShardSource` trait enables streaming PCA through transforms without materialization. `pyscx.accel.normalize_total()`, `log1p()`, `filter_cells()`, `filter_genes()`, `subset_obs()`, `calculate_qc_metrics()` all work without materializing. Fused NormalizeTotal+Log1p optimization. Full out-of-core pipeline: open → QC filter → normalize → log1p → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS on 1M cells (71% reduction from 38 GB materialized baseline). Benchmarked on census_1m (SLURM job 1935465). See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md).
-- **Phase 4e (PCA/DE/Leiden Optimization)**: Complete — three major accelerator improvements. (1) **Covariance PCA**: exact eigendecomposition via sparse outer product accumulation for HVG-scale data (n_vars ≤ 5000), auto-routed in `pyscx.accel.pca()`; 4.2s on 1M cells (was 21s, **5× faster**, 1.9× faster than scanpy). (2) **Optimized Wilcoxon DE**: pre-ranking approach ranks all cells once per gene and reuses across groups (10× fewer sorts); `rankby_abs` parameter matches scanpy's default signed-score ranking; 5.4s on 1M cells (was 27s, **5× faster**, 3.2× faster than scanpy). (3) **Rust-native Leiden**: full Leiden algorithm (Traag et al. 2019) with RB configuration model, sequential and parallel modes, adapted from single-clustering (BSD 3-Clause); 55s on 1M cells (was 2,226s via Python leidenalg in same-conditions comparison, **40× faster**); ARI 0.92 vs Python leidenalg. Pipeline total: 870s on 1M cells (was 3,971s, **4.6× faster**). See [PCA-DE-FIX.md](tasks/PCA-DE-FIX.md).
-- **Phase 4 ML Loader Benchmarks (§3.6)**: Complete — comprehensive ML data loader throughput benchmarks comparing SCX TrainingDataset vs AnnData, TileDB-SOMA-ML, and scDataLoader across pbmc3k, tabula_sapiens_100k, census_1m. SCX achieves 1,405 batches/sec on census_1m (hvg_norm scenario) vs 17.1 for TileDB-SOMA-ML (**82× faster**). GPU training scenario benchmarked with scVI-equivalent VAE. See `benchmarks/comprehensive/benchmarks/ml_loader.py` and results in `benchmarks/comprehensive/results/raw/ml_loader__*`.
+### Analysis Accelerators (scx-accel)
+
+Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standard AnnData slots:
+
+- **PCA**: Two methods auto-routed by `n_vars`:
+  - *Covariance PCA* (n_vars <= 5000): sparse outer product accumulation (`X^T @ X` directly from CSR nonzeros with symmetry exploitation), eigendecomposition via `faer`. Exact results, optimal for HVG-selected data.
+  - *Randomized SVD* (n_vars > 5000): streaming SpMM shard-by-shard with zero-copy `MatRef::from_row_major_slice` views. No full matrix materialization.
+- **kNN**: HNSW-based approximate nearest neighbors via `instant-distance`.
+- **UMAP**: SGD-based layout optimization.
+- **Differential expression**: Pre-ranking Wilcoxon test — ranks all cells once per gene, reuses across groups (10x fewer sorts). `rankby_abs` parameter matches scanpy's signed-score ranking.
+- **Leiden clustering**: Rust-native implementation (Traag et al. 2019) with RB configuration model. Sequential mode (default) matches C++ leidenalg convergence; parallel mode uses conflict-free graph coloring. Uses `rand_chacha` for deterministic seeding.
+- **HVG**: Streaming `highly_variable_genes()` via `ShardSource` — `streaming_mean_var()` and `streaming_clip_square_sum()`, loess fit via Python `skmisc.loess`, seurat_v3 and seurat flavors. `subset=True` uses column projection (no materialization).
+- **Pseudobulk**: Streaming aggregation via `BackedCsrReader`, statistical testing delegated to `pydeseq2`.
+
+### GPU Acceleration (scx-gpu)
+
+All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Requires `scx-gpu` conda env with RAPIDS. See [docs/gpu-setup.md](docs/gpu-setup.md).
+
+- **GPU PCA**: cuSPARSE SpMM + cuSOLVER QR + cuRAND.
+- **GPU kNN**: cuVS CAGRA (9.4x standalone on 1M cells).
+- **GPU UMAP**: Native CUDA SGD (7.7x on 1M cells).
+- **GPU Leiden**: cuGraph (16x on 1M cells).
+- **GPU preprocessing**: Fused normalize_total + log1p.
+- **Fallback**: Graceful CPU fallback when GPU unavailable.
+
+### Lazy Preprocessing
+
+`ScxLazyTransformedDataset` wraps the backed reader with chained transforms (NormalizeTotal, Log1p, RowScale) — no materialization. `ShardSource` trait enables streaming PCA through transforms.
+
+Materialization-free operations via `pyscx.accel.*`:
+- `normalize_total()`, `log1p()` — lazy transforms, fused when chained
+- `filter_cells()`, `filter_genes()` — non-materializing filters
+- `subset_obs()`, `calculate_qc_metrics()` — streaming
+- `highly_variable_genes()` — streaming HVG (seurat_v3 + seurat flavors, 99.5% overlap with scanpy on pbmc3k)
+- `X[:, col_array]` — returns backed/lazy dataset with column projection
+
+Full out-of-core pipeline: open -> QC filter -> normalize -> log1p -> HVG -> PCA -> kNN -> UMAP -> Leiden with **5.1 GB peak RSS** on 1M cells (down from 43.6 GB — **88% reduction**).
+
+### ML Training Loader
+
+Triple-buffered Rust pipeline (tokio I/O -> rayon decode -> Python consumer). Zero Python on the hot path — all I/O, decompression, shuffling, sparse-to-dense conversion, and normalization in compiled Rust. See [docs/api.md](docs/api.md) for `TrainingPipeline` API.
+
+## Performance
+
+See [docs/performance.md](docs/performance.md) for detailed benchmark data.
+
+| Area | Metric | Result |
+|------|--------|--------|
+| Read | vs Zarr lz4, 1M cells | **1.38x faster** |
+| Read | Parallel scaling (32 threads) | **Up to 7x** |
+| Column projection | vs all competitors | **4-8x faster** |
+| Memory (OOC pipeline) | Peak RSS, 1M cells | **5.1 GB** (88% reduction) |
+| PCA | vs scanpy, 1M cells (HVG) | **1.9x faster** (4.2s) |
+| DE (Wilcoxon) | vs scanpy, 1M cells | **3.2x faster** (5.4s) |
+| Leiden | vs Python leidenalg, 1M cells | **40x faster** (55s) |
+| Training loader | batches/sec, 1M cells | **1,405** (82x vs TileDB-SOMA-ML) |
+| GPU kNN | vs CPU, 1M cells | **9.4x faster** |
+| GPU UMAP | vs CPU, 1M cells | **7.7x faster** |
+| GPU Leiden | vs CPU, 1M cells | **16x faster** |
 
 ## Coding Conventions
 
@@ -148,7 +189,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 
 - Write to temp file, then `fsync()` + `rename()` to final path
 - Sections start at offset 4352 (256 header + 4096 root catalog placeholder)
-- `finish()`: write full catalog at EOF → pwrite root catalog at 256 → pwrite header at 0 → fsync → rename
+- `finish()`: write full catalog at EOF -> pwrite root catalog at 256 -> pwrite header at 0 -> fsync -> rename
 
 ### Python Bindings (pyscx)
 
@@ -156,13 +197,13 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - Pin `pyo3` and `numpy` crate to same minor version (currently 0.23)
 - `PyArray::from_vec()` for zero-copy (moves Rust Vec to numpy)
 - ScxCsr `i64/i32/f32` matches scipy exactly — avoids copy
-- Arrow → pandas via pyarrow's `to_pandas()` for obs/var metadata
+- Arrow -> pandas via pyarrow's `to_pandas()` for obs/var metadata
 - Accelerators exposed via `pyscx.accel.*` — results written to standard AnnData slots
 - Optional Python deps (`pydeseq2`) imported at runtime with clear `ImportError` if missing
 
 ### R Bindings (rscx)
 
-- `extendr` v0.8.x for Rust↔R FFI
+- `extendr` v0.8.x for Rust<->R FFI
 - SCX CSR (row-major) must be transposed to dgCMatrix (CSC, column-major) for R/Matrix interop
 - R has no unsigned integers — use `i32` for all integer arguments from R, convert internally
 
@@ -177,11 +218,7 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 
 - Uses `faer` for dense linear algebra (QR, SVD, eigendecomposition in PCA)
 - Uses `instant-distance` for HNSW-based approximate kNN
-- PCA: two methods auto-routed by `n_vars`:
-  - **Covariance PCA** (n_vars ≤ 5000): sparse outer product accumulation (`X^T @ X` directly from CSR nonzeros with symmetry exploitation), eigendecomposition. Exact results, faster for HVG-selected data.
-  - **Randomized SVD** (n_vars > 5000): streaming SpMM shard-by-shard with zero-copy `MatRef::from_row_major_slice` views. No full matrix materialization.
-- DE: pre-ranking approach ranks all cells once per gene, reuses ranks across groups (10× fewer sorts). `rankby_abs` parameter (default `false`) matches scanpy's signed-score ranking.
-- Leiden: Rust-native implementation (Traag et al. 2019) with RB configuration model. Sequential mode (default) matches C++ leidenalg convergence; parallel mode uses conflict-free graph coloring. Adapted from `single-clustering` (BSD 3-Clause). Uses `rand_chacha` for deterministic seeding and `libc` for `malloc_trim` on Linux.
+- Adapted Leiden from `single-clustering` (BSD 3-Clause). Uses `rand_chacha` for deterministic seeding and `libc` for `malloc_trim` on Linux.
 - Pseudobulk aggregation streams via `BackedCsrReader`, statistical testing delegated to `pydeseq2`
 
 ## Known Risks and Pitfalls
@@ -190,15 +227,11 @@ Per-shard codec override: readers MUST use the shard header's `codec_id`, not th
 - **h5ad files are messy**: missing encoding-type attrs, CSC instead of CSR, dense X, pickled uns. Handle gracefully.
 - **tokio + rayon interaction** (scx-loader): Keep tokio for I/O only, rayon for CPU work. Bounded channels for back-pressure.
 - **Cloud auth**: `object_store` handles credentials via environment variables and instance metadata. No custom auth code.
-- **Known bugs**: See [Phase4_CODE-REVIEW.md](tasks/Phase4_CODE-REVIEW.md) for latest issues and fix priorities.
 
-## Known SPEC Discrepancies
+## Known Limitations
 
-1. **FileHeader**: `front_catalog_offset`/`length` fields for cloud layout (SPEC §12.2). Non-cloud-optimized files write zero. Total: 256 bytes.
-2. **ShardHeader**: Spec diagram says 64 bytes, actual fields sum to **76 bytes**. SPEC v0.5 clarifies.
-3. **SPEC §16 roadmap**: Fixed in v0.5. Authoritative roadmap is ROADMAP.md.
-
-## Out of Scope (Current Phase)
-
-- CSC as primary storage, multimodal (Phase 3, Steps 4–5 — planned)
-- GPU-accelerated analysis: 10× pipeline target not met (3.8× achieved on 1M cells; kNN 9.4×, UMAP 7.6×, Leiden 16×)
+- **GPU pipeline speedup**: 3.8x median achieved on 1M cells (10x target not met). Best individual: kNN 9.4x, UMAP 7.7x, Leiden 16x.
+- **GPU Leiden correctness**: ARI 0.92 vs Python leidenalg (Go/No-Go: 3/4 gates pass).
+- **CSC storage**: Gene-major (CscShard) not yet implemented — CSR only.
+- **Multimodal**: CITE-seq, spatial transcriptomics not yet supported.
+- **GDS**: GPUDirect Storage requires local NVMe + nvidia-fs drivers + ext4/XFS; always falls back to CPU path.

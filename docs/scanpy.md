@@ -397,12 +397,12 @@ cells touches ≤ 1 shard.
 | `sc.pp.filter_cells()` | ✅ | Native Rust row sums/NNZ |
 | `sc.pp.filter_genes()` | ✅ | Native Rust column sums/NNZ |
 | `sc.pp.calculate_qc_metrics()` | ✅ | `(X > 0).sum()` short-circuits to `getnnz()` |
-| `sc.pp.calculate_qc_metrics(qc_vars=)` | ✅ | Column-projected streaming aggregation (Phase 4d) |
+| `sc.pp.calculate_qc_metrics(qc_vars=)` | ✅ | Column-projected streaming aggregation (non-materializing) |
 | `sc.pp.highly_variable_genes()` | ✅ | Native Rust column variance |
 | `adata[mask].copy()` | ✅ | Subset → materialize → preprocess |
 | `sc.pp.pca()` | ✅ | Forces materialization of HVG columns |
-| `pyscx.accel.normalize_total()` | ✅ | Lazy — no materialization (Phase 4d) |
-| `pyscx.accel.log1p()` | ✅ | Lazy — no materialization (Phase 4d) |
+| `pyscx.accel.normalize_total()` | ✅ | Lazy — no materialization |
+| `pyscx.accel.log1p()` | ✅ | Lazy — no materialization |
 | `sc.pp.normalize_total()` | ⚠️ | Use `pyscx.accel.normalize_total()` instead — see [Lazy preprocessing](#lazy-preprocessing-in-backed-mode) |
 | `sc.pp.log1p()` | ⚠️ | Use `pyscx.accel.log1p()` instead — see [Lazy preprocessing](#lazy-preprocessing-in-backed-mode) |
 
@@ -575,7 +575,7 @@ in that chunk.
 
 ## Lazy preprocessing in backed mode
 
-Phase 4d introduces **materialization-free preprocessing** for backed mode.
+SCX supports **materialization-free preprocessing** for backed mode.
 Instead of loading the entire expression matrix into RAM, `pyscx.accel.normalize_total()`
 and `pyscx.accel.log1p()` create a **lazy transform wrapper** that applies
 transformations on-read — data stays on disk.
@@ -677,7 +677,7 @@ import scanpy as sc
 
 adata = pyscx.open("atlas.scx").to_anndata(backed=True)
 
-# QC — fully streaming, including gene subsets (Phase 4d col-projected aggregation)
+# QC — fully streaming, including gene subsets (column-projected streaming aggregation)
 adata.var["mt"] = adata.var_names.str.startswith("MT-")
 sc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], inplace=True)
 sc.pp.filter_cells(adata, min_genes=200)
@@ -899,7 +899,7 @@ The Rust path is tried first; if it fails, a warning is issued and the next
 backend is tried.
 
 Benchmarked at 55s on 1M cells (**40× faster** than Python leidenalg's 2,226s
-in same-conditions comparison; **53× faster** vs the 2,939s Phase I baseline).
+in same-conditions comparison).
 ARI 0.92 vs Python leidenalg on census_1m. The Rust implementation may
 converge to a different local optimum than Python leidenalg — both produce
 valid, high-quality community structures. Compare via ARI or NMI when
@@ -1099,7 +1099,7 @@ GPU and CPU accelerators may produce slightly different results due to:
 | **Leiden** | Rust-native vs cuGraph vs leidenalg may produce different partitions | ARI > 0.90; biological conclusions equivalent |
 
 For reproducibility notes and tolerance thresholds, see
-[Phase4-GPU.md §7](../Phase4-GPU.md).
+[Phase4-GPU.md §7](../tasks/Phase4-GPU.md).
 
 ### Checking which backend was used
 

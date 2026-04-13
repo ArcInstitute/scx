@@ -574,7 +574,7 @@ H100 80GB HBM3:
 | Sparse → dense | 16K rows × 30K cols | 433,252 | 7,711 | **56.2×** |
 | Sparse → dense (HVG 2K) | 16K rows × 2K output | 110,416 | 897 | **123.1×** |
 
-#### GPU Analysis Pipeline (Phase 4c)
+#### GPU Analysis Pipeline
 
 GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuVS CAGRA,
 native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB
