@@ -15,7 +15,14 @@ import pytest
 import scipy.sparse as sp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks" / "scripts"))
-from bench_env import DATA_DIR
+try:
+    from bench_env import DATA_DIR
+except (RuntimeError, ModuleNotFoundError):
+    # SCX_WORK_DIR not set or python-dotenv not installed — skip this module
+    pytest.skip(
+        "bench_env unavailable (SCX_WORK_DIR not set or python-dotenv missing)",
+        allow_module_level=True,
+    )
 
 PBMC_H5AD = DATA_DIR / "pbmc3k.h5ad"
 
