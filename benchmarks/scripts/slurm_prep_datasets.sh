@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=prep_datasets
-#SBATCH --partition=cpu
+#SBATCH --partition=cpu_preemptible
 #SBATCH --qos=normal
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G

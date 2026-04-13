@@ -21,8 +21,8 @@ echo ""
 
 # Per-dataset resource configuration: "dataset:partition:memory:time"
 DATASET_CONFIGS=(
-    "census_500k:cpu:80G:6:00:00"
-    "census_1m:cpu:160G:10:00:00"
+    "census_500k:cpu_preemptible:80G:6:00:00"
+    "census_1m:cpu_preemptible:160G:10:00:00"
     "census_5m:cpu_high_mem:500G:16:00:00"
 )
 

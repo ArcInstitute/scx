@@ -443,8 +443,8 @@ class TestRankGenesGroups:
             scx_top = set(rgg_scx["names"][group][:n_top])
             overlap = len(sc_top & scx_top) / n_top
             assert (
-                overlap >= 0.30
-            ), f"overlap for group {group} = {overlap:.2f} (expected >= 0.30)"
+                overlap >= 0.80
+            ), f"overlap for group {group} = {overlap:.2f} (expected >= 0.80)"
 
     def test_pairwise_reference(self, synthetic_adata):
         """With reference='A', only non-A groups should appear in results."""

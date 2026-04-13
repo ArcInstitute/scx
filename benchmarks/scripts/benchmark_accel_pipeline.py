@@ -103,7 +103,7 @@ def compute_de_gene_overlap(genes_a, genes_b, n_top=100):
     return float(np.mean(overlaps))
 
 
-def _run_analysis_stages(adata, timings, *, pca_fn, neighbors_fn, umap_fn, de_fn):
+def _run_analysis_stages(adata, timings, *, pca_fn, neighbors_fn, umap_fn, leiden_fn, de_fn):
     """Run HVG -> PCA -> kNN -> UMAP -> Leiden -> DE, recording per-stage timings.
 
     Args:
@@ -112,6 +112,7 @@ def _run_analysis_stages(adata, timings, *, pca_fn, neighbors_fn, umap_fn, de_fn
         pca_fn: Callable(adata) for PCA.
         neighbors_fn: Callable(adata) for kNN graph construction.
         umap_fn: Callable(adata) for UMAP embedding.
+        leiden_fn: Callable(adata) for Leiden community detection.
         de_fn: Callable(adata) for differential expression.
     """
     import scanpy as sc
@@ -145,7 +146,7 @@ def _run_analysis_stages(adata, timings, *, pca_fn, neighbors_fn, umap_fn, de_fn
 
     # Leiden
     t0 = time.perf_counter()
-    sc.tl.leiden(adata, resolution=1.0, random_state=42)
+    leiden_fn(adata)
     timings["leiden"] = time.perf_counter() - t0
 
     # DE
@@ -196,6 +197,7 @@ def run_scx_ooc_pipeline(dataset_name, n_runs=N_RUNS):
             pca_fn=lambda a: pyscx.accel.pca(a, n_comps=N_COMPS, device="cpu"),
             neighbors_fn=lambda a: pyscx.accel.neighbors(a, n_neighbors=N_NEIGHBORS, device="cpu"),
             umap_fn=lambda a: pyscx.accel.umap(a, device="cpu", random_state=42),
+            leiden_fn=lambda a: pyscx.accel.leiden(a, resolution=1.0, random_state=42, device="cpu"),
             de_fn=lambda a: pyscx.accel.rank_genes_groups(a, groupby="leiden", reference="rest"),
         )
 
@@ -273,6 +275,7 @@ def run_scx_preprocess_pipeline(dataset_name, n_runs=N_RUNS):
                 pca_fn=lambda a: pyscx.accel.pca(a, n_comps=N_COMPS, device="cpu"),
                 neighbors_fn=lambda a: pyscx.accel.neighbors(a, n_neighbors=N_NEIGHBORS, device="cpu"),
                 umap_fn=lambda a: pyscx.accel.umap(a, device="cpu", random_state=42),
+                leiden_fn=lambda a: pyscx.accel.leiden(a, resolution=1.0, random_state=42, device="cpu"),
                 de_fn=lambda a: pyscx.accel.rank_genes_groups(a, groupby="leiden", reference="rest"),
             )
 
@@ -347,6 +350,7 @@ def run_scanpy_pipeline(dataset_name, n_runs=N_RUNS):
             pca_fn=lambda a: sc.pp.pca(a, n_comps=N_COMPS),
             neighbors_fn=lambda a: sc.pp.neighbors(a, n_neighbors=N_NEIGHBORS),
             umap_fn=lambda a: sc.tl.umap(a, random_state=42),
+            leiden_fn=lambda a: sc.tl.leiden(a, resolution=1.0, random_state=42),
             de_fn=lambda a: sc.tl.rank_genes_groups(a, groupby="leiden", method="wilcoxon"),
         )
 

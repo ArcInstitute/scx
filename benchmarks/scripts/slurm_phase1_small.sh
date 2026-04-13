@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=phase1_small
-#SBATCH --partition=cpu
+#SBATCH --partition=cpu_preemptible
 #SBATCH --qos=normal
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G

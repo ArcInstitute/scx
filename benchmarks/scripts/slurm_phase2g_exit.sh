@@ -22,7 +22,7 @@ echo ""
 
 BENCHMARKS=(compression write read_full read_selective parallel_scaling memory)
 
-# D1-D4 (small/medium) — cpu partition, 80 GB
+# D1-D4 (small/medium) — cpu_preemptible partition, 80 GB
 SMALL_DATASETS=(pbmc3k pbmc10k smartseq2 tabula_sapiens_100k)
 # D5-D7 (large) — cpu_high_mem partition, 500 GB
 LARGE_DATASETS=(census_500k census_1m census_5m)
@@ -34,7 +34,7 @@ for bench in "${BENCHMARKS[@]}"; do
     for ds in "${SMALL_DATASETS[@]}"; do
         JOB_ID=$(sbatch --parsable \
             --job-name="2g_${bench:0:4}_${ds}" \
-            --partition=cpu \
+            --partition=cpu_preemptible \
             --qos=normal \
             --cpus-per-task=32 \
             --mem=80G \
@@ -74,7 +74,7 @@ DEPS=$(IFS=:; echo "${JOB_IDS[*]}")
 ARCHIVE_ID=$(sbatch --parsable \
     --dependency=afterok:"${DEPS}" \
     --job-name=2g_archive \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --mem=4G \
     --time=00:10:00 \

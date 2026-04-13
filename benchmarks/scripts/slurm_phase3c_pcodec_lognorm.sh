@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=phase3c_lognorm
-#SBATCH --partition=cpu
+#SBATCH --partition=cpu_preemptible
 #SBATCH --qos=normal
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=80G

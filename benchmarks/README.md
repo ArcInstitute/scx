@@ -127,7 +127,7 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 
 | Script | Partition | Resources | Time | Purpose |
 |--------|-----------|-----------|------|---------|
-| `slurm_prep_datasets.sh` | `cpu` | 8 CPUs, 64 GB | 4 h | Prepare D1–D6 |
+| `slurm_prep_datasets.sh` | `cpu_preemptible` | 8 CPUs, 64 GB | 4 h | Prepare D1–D6 |
 | `slurm_build_census_5m.sh` | `cpu_high_mem` | 16 CPUs, 500 GB | 8 h | Build D7 from chunks |
 | `slurm_build_census_10m.sh` | `cpu_high_mem` | 16 CPUs, 1.5 TB | 12 h | Build D8 from chunks |
 
@@ -135,26 +135,26 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 
 | Script | Partition | Resources | Time | Purpose |
 |--------|-----------|-----------|------|---------|
-| `run_benchmarks_slurm.sh` | `cpu` | 16 CPUs, 80 GB | 4 h | All-in-one (compression + write + read + ops + query + ML loader; submits 3 sub-jobs) |
-| `slurm_phase0_baseline.sh` | `cpu` | 32 CPUs, 80 GB | 2 h/job | Phase 0 regression baseline D1–D4 (submits 24 parallel jobs + archival) |
+| `run_benchmarks_slurm.sh` | `cpu_preemptible` | 16 CPUs, 80 GB | 4 h | All-in-one (compression + write + read + ops + query + ML loader; submits 3 sub-jobs) |
+| `slurm_phase0_baseline.sh` | `cpu_preemptible` | 32 CPUs, 80 GB | 2 h/job | Phase 0 regression baseline D1–D4 (submits 24 parallel jobs + archival) |
 | `slurm_phase0_baseline_large.sh` | varies | 32 CPUs, 80–500 GB | 2–4 h/job | Phase 0 regression baseline D5–D7 (submits 18 parallel jobs + archival) |
-| `slurm_phase3_small.sh` | `cpu` | 32 CPUs, 80 GB | 6 h | Phase 3 benchmarks D1–D4 (sequential, single job) |
+| `slurm_phase3_small.sh` | `cpu_preemptible` | 32 CPUs, 80 GB | 6 h | Phase 3 benchmarks D1–D4 (sequential, single job) |
 | `slurm_phase3_large.sh` | `cpu_high_mem` | 32 CPUs, 500 GB | 12 h | Phase 3 benchmarks D5–D7 (sequential, single job) |
 | `slurm_phase3_parallel_large.sh` | varies | 32 CPUs, 80–500 GB | 4–12 h/job | Phase 3 D5–D7 parallel submission (one job per benchmark×dataset) |
 | `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel_scaling only, D5–D7 |
-| `slurm_fused_bench.sh` | `cpu` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
-| `slurm_lazy_preprocess_bench.sh` | `cpu` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
-| `slurm_phase4_ml_loader.sh` | `cpu`+`gpu` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
-| `slurm_phase5_accel_bench.sh` | `cpu` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
+| `slurm_fused_bench.sh` | `cpu_preemptible` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
+| `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 8 CPUs, 64 GB | 2 h | Phase 4d lazy preprocessing benchmarks |
+| `slurm_phase4_ml_loader.sh` | `cpu_preemptible`+`preemptible` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
+| `slurm_phase5_accel_bench.sh` | `cpu_preemptible` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
 
 ### GPU Benchmarks
 
 | Script | Partition | Resources | Time | Purpose |
 |--------|-----------|-----------|------|---------|
-| `slurm_gpu_bench.sh` | `gpu` | 1 GPU, 8 CPUs, 32 GB | 30 min | GPU decode microbenchmarks |
-| `slurm_gpu_knn_bench.sh` | `gpu` | 1 GPU, 16 CPUs, 64 GB | 1 h | GPU kNN (CAGRA) validation + benchmark |
-| `slurm_gpu_pca_opt_bench.sh` | `gpu` | 1 GPU, 16 CPUs, 128 GB | 2 h | GPU PCA optimization benchmark |
-| `slurm_gpu_analysis_bench.sh` | `gpu` | 1 GPU, 16 CPUs, 128 GB | 4 h | Full GPU suite: PCA + kNN + UMAP + preprocessing + pipeline |
+| `slurm_gpu_bench.sh` | `preemptible` | 1 GPU, 8 CPUs, 32 GB | 30 min | GPU decode microbenchmarks |
+| `slurm_gpu_knn_bench.sh` | `preemptible` | 1 GPU, 16 CPUs, 64 GB | 1 h | GPU kNN (CAGRA) validation + benchmark |
+| `slurm_gpu_pca_opt_bench.sh` | `preemptible` | 1 GPU, 16 CPUs, 128 GB | 2 h | GPU PCA optimization benchmark |
+| `slurm_gpu_analysis_bench.sh` | `preemptible` | 1 GPU, 16 CPUs, 128 GB | 4 h | Full GPU suite: PCA + kNN + UMAP + preprocessing + pipeline |
 
 ### Programmatic Submission (submitit)
 
@@ -173,6 +173,27 @@ By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override w
 
 # Run locally without SLURM (for debugging)
 .venv/bin/python benchmarks/scripts/submit_benchmarks.py --local --smoke
+```
+
+---
+
+## SLURM Partition Policy
+
+Benchmarks use the following partitions:
+
+| Workload | Primary Partition | Fallback Partition |
+|----------|------------------|--------------------|
+| Standard CPU jobs | `cpu_preemptible` | `cpu_batch` |
+| High-memory CPU jobs (≥500 GB) | `cpu_high_mem` | — |
+| GPU jobs | `preemptible` | `gpu_batch` |
+
+Preemptible partitions offer faster scheduling and lower cost. If a job is preempted, resubmit it — benchmark scripts are idempotent. Use the fallback (`cpu_batch` / `gpu_batch`) partitions only when preemptible queues are too congested or when you need guaranteed completion (e.g., multi-day runs).
+
+To override the partition for any script that takes a `--partition` flag:
+
+```bash
+# Example: use cpu_batch instead of cpu_preemptible
+bash benchmarks/comprehensive/scripts/run_slurm.sh --partition cpu_batch
 ```
 
 ---
@@ -207,7 +228,7 @@ sbatch --exclusive benchmarks/scripts/slurm_gpu_analysis_bench.sh
    sbatch benchmarks/scripts/slurm_fused_bench.sh
    sbatch benchmarks/scripts/slurm_lazy_preprocess_bench.sh
 
-3. GPU benchmarks (require gpu partition):
+3. GPU benchmarks (require preemptible partition with GPUs):
    sbatch benchmarks/scripts/slurm_gpu_analysis_bench.sh
    sbatch benchmarks/scripts/slurm_gpu_bench.sh
    sbatch benchmarks/scripts/slurm_gpu_knn_bench.sh
@@ -240,12 +261,12 @@ cat benchmarks/logs/<script>_<JOBID>.log
 
 **GPU benchmarks** use different environments depending on the script:
 
-| Script | Environment | Reason |
-|--------|-------------|--------|
-| `slurm_gpu_analysis_bench.sh` | conda `scx-gpu` env | Full CUDA + RAPIDS stack (cuVS, cuGraph) |
-| `slurm_gpu_pca_opt_bench.sh` | conda `scx-gpu` env | Same as above |
-| `slurm_gpu_knn_bench.sh` | uv `.venv/` + `LD_LIBRARY_PATH` | pip-installed RAPIDS, manual lib paths |
-| `slurm_gpu_bench.sh` | Rust-only (cargo) | No Python RAPIDS deps |
+| Script | Partition | Environment | Reason |
+|--------|-----------|-------------|--------|
+| `slurm_gpu_analysis_bench.sh` | `preemptible` | conda `scx-gpu` env | Full CUDA + RAPIDS stack (cuVS, cuGraph) |
+| `slurm_gpu_pca_opt_bench.sh` | `preemptible` | conda `scx-gpu` env | Same as above |
+| `slurm_gpu_knn_bench.sh` | `preemptible` | uv `.venv/` + `LD_LIBRARY_PATH` | pip-installed RAPIDS, manual lib paths |
+| `slurm_gpu_bench.sh` | `preemptible` | Rust-only (cargo) | No Python RAPIDS deps |
 
 All GPU scripts rebuild pyscx with `--features gpu` before running:
 

@@ -4,8 +4,8 @@
 # Submits one SLURM job per (benchmark, dataset) pair = 18 parallel jobs,
 # plus a final archival job that copies results to baseline_pre_sprint1/.
 # Memory and partition are scaled per dataset:
-#   census_500k:  80G on cpu
-#   census_1m:   160G on cpu
+#   census_500k:  80G on cpu_preemptible
+#   census_1m:   160G on cpu_preemptible
 #   census_5m:   500G on cpu_high_mem
 #
 # Usage: cd /home/nickyoungblut/dev/rust/scx && bash benchmarks/scripts/slurm_phase0_baseline_large.sh
@@ -30,8 +30,8 @@ BENCHMARKS=(compression write read_full read_selective parallel_scaling memory)
 # census_5m is excluded — requires too many resources for routine baseline runs.
 # To include it, uncomment the census_5m line below.
 DATASET_CONFIGS=(
-    "census_500k:cpu:80G:4:00:00"
-    "census_1m:cpu:160G:8:00:00"
+    "census_500k:cpu_preemptible:80G:4:00:00"
+    "census_1m:cpu_preemptible:160G:8:00:00"
     # "census_5m:cpu_high_mem:500G:12:00:00"
 )
 
@@ -62,7 +62,7 @@ DEPS=$(IFS=:; echo "${JOB_IDS[*]}")
 ARCHIVE_ID=$(sbatch --parsable \
     --dependency=afterok:"${DEPS}" \
     --job-name=p0_archive_lg \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --mem=4G \
     --time=00:10:00 \

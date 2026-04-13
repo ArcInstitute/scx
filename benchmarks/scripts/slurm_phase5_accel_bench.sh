@@ -25,7 +25,7 @@ echo ""
 
 BUILD_JOB=$(sbatch --parsable \
     --job-name="p5_build" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=8 \
     --mem=16G \
@@ -40,7 +40,7 @@ echo "Build job: ${BUILD_JOB}"
 VAL_JOB=$(sbatch --parsable \
     --dependency=afterok:${BUILD_JOB} \
     --job-name="p5_validate" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=8 \
     --mem=16G \
@@ -60,7 +60,7 @@ for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_1m:256G:12:00:00"; do
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
         --job-name="p5_pca_${ds}" \
-        --partition=cpu \
+        --partition=cpu_preemptible \
         --qos=normal \
         --cpus-per-task=16 \
         --mem="${mem}" \
@@ -78,7 +78,7 @@ for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_1m:256G:12:00:00"; do
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
         --job-name="p5_knn_${ds}" \
-        --partition=cpu \
+        --partition=cpu_preemptible \
         --qos=normal \
         --cpus-per-task=16 \
         --mem="${mem}" \
@@ -96,7 +96,7 @@ for cfg in "tabula_sapiens_100k:200G:04:00:00" "census_1m:350G:12:00:00"; do
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
         --job-name="p5_umap_${ds}" \
-        --partition=cpu \
+        --partition=cpu_preemptible \
         --qos=normal \
         --cpus-per-task=16 \
         --mem="${mem}" \
@@ -114,7 +114,7 @@ for cfg in "tabula_sapiens_100k:80G:04:00:00" "census_1m:256G:16:00:00"; do
     JOB_ID=$(sbatch --parsable \
         --dependency=afterok:${BUILD_JOB} \
         --job-name="p5_de_${ds}" \
-        --partition=cpu \
+        --partition=cpu_preemptible \
         --qos=normal \
         --cpus-per-task=16 \
         --mem="${mem}" \
@@ -130,7 +130,7 @@ done
 JOB_ID=$(sbatch --parsable \
     --dependency=afterok:${BUILD_JOB} \
     --job-name="p5_de_stream" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=16 \
     --mem=128G \
@@ -145,7 +145,7 @@ echo "  DE streaming -> job ${JOB_ID}"
 JOB_ID=$(sbatch --parsable \
     --dependency=afterok:${BUILD_JOB} \
     --job-name="p5_pseudobulk" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=16 \
     --mem=128G \
@@ -160,7 +160,7 @@ echo "  Pseudobulk -> job ${JOB_ID}"
 JOB_ID=$(sbatch --parsable \
     --dependency=afterok:${BUILD_JOB} \
     --job-name="p5_stratified" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=16 \
     --mem=80G \
@@ -176,7 +176,7 @@ echo "  Stratified -> job ${JOB_ID}"
 JOB_ID=$(sbatch --parsable \
     --dependency=afterok:${BUILD_JOB} \
     --job-name="p5_pipeline" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=16 \
     --mem=256G \
@@ -192,7 +192,7 @@ echo "  Pipeline -> job ${JOB_ID}"
 JOB_ID=$(sbatch --parsable \
     --dependency=afterok:${BUILD_JOB} \
     --job-name="p5_preprocess" \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --cpus-per-task=16 \
     --mem=160G \

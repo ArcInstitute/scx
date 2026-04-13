@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fused_bench
-#SBATCH --partition=cpu
+#SBATCH --partition=cpu_preemptible
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00

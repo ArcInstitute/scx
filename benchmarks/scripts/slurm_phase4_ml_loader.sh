@@ -43,7 +43,7 @@ CPU_JOBS=()
 for ds in "${DATASETS[@]}"; do
     JOB_ID=$(sbatch --parsable \
         --job-name="p4_ml_cpu_${ds}" \
-        --partition=cpu \
+        --partition=cpu_preemptible \
         --cpus-per-task=32 \
         --mem="${CPU_MEM[$ds]}" \
         --time="${CPU_TIME[$ds]}" \
@@ -69,7 +69,7 @@ DEP_STR=$(IFS=:; echo "${CPU_JOBS[*]}")
 for ds in "${DATASETS[@]}"; do
     JOB_ID=$(sbatch --parsable \
         --job-name="p4_ml_gpu_${ds}" \
-        --partition=gpu \
+        --partition=preemptible \
         --gpus-per-node=1 \
         --cpus-per-task=16 \
         --mem="${GPU_MEM[$ds]}" \

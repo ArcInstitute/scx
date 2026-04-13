@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=scx_gpu_bench
-#SBATCH --partition=gpu
+#SBATCH --partition=preemptible
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G

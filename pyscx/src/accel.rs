@@ -11,6 +11,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use scx_format::ShardSource;
+
 use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::projected_agg;
@@ -382,32 +384,47 @@ pub fn pca(
     }
 
     // CPU path (default or fallback)
+    // Auto-route: use covariance method when n_vars <= threshold (faster for HVG data)
+    let cov_threshold = scx_accel::COVARIANCE_PCA_THRESHOLD;
+
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // Streaming PCA from backed mode
         backend = "scx-accel-cpu";
         let reader = &*backed.backed;
-        scx_accel::randomized_pca(
-            reader,
-            n_comps,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            random_state,
-        )
-        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        let (_n_obs, n_vars) = reader.shape();
+        if n_vars <= cov_threshold {
+            scx_accel::covariance_pca(reader, n_comps, zero_center)
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            scx_accel::randomized_pca(
+                reader,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        }
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         backend = "scx-accel-cpu";
         // Streaming PCA through lazy transforms — no materialization
         let source = lazy.as_shard_source();
-        scx_accel::randomized_pca(
-            &source,
-            n_comps,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            random_state,
-        )
-        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        let (_n_obs, n_vars) = source.shape();
+        if n_vars <= cov_threshold {
+            scx_accel::covariance_pca(&source, n_comps, zero_center)
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            scx_accel::randomized_pca(
+                &source,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        }
     } else {
         // Materialized: extract scipy CSR → ScxCsr → in-memory PCA
         backend = "scx-accel-cpu";
@@ -439,15 +456,20 @@ pub fn pca(
                 .extract::<Vec<f32>>()?;
 
             let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
-            scx_accel::randomized_pca_inmemory(
-                &csr,
-                n_comps,
-                n_oversamples,
-                n_power_iterations,
-                zero_center,
-                random_state,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            if shape.1 <= cov_threshold {
+                scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center)
+                    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            } else {
+                scx_accel::randomized_pca_inmemory(
+                    &csr,
+                    n_comps,
+                    n_oversamples,
+                    n_power_iterations,
+                    zero_center,
+                    random_state,
+                )
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            }
         } else {
             // Dense numpy array: convert to CSR first
             let csr = scipy_sparse.call_method1("csr_matrix", (&x,))?;
@@ -466,15 +488,20 @@ pub fn pca(
                 .extract::<Vec<f32>>()?;
 
             let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
-            scx_accel::randomized_pca_inmemory(
-                &csr,
-                n_comps,
-                n_oversamples,
-                n_power_iterations,
-                zero_center,
-                random_state,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            if shape.1 <= cov_threshold {
+                scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center)
+                    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            } else {
+                scx_accel::randomized_pca_inmemory(
+                    &csr,
+                    n_comps,
+                    n_oversamples,
+                    n_power_iterations,
+                    zero_center,
+                    random_state,
+                )
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+            }
         }
     };
 
@@ -1001,6 +1028,7 @@ fn run_rank_genes_groups_inner(
     groupby: &str,
     reference: &str,
     gene_chunk_size: Option<usize>,
+    rankby_abs: bool,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -1076,6 +1104,7 @@ fn run_rank_genes_groups_inner(
             ref_idx,
             chunk_size,
             log_transformed,
+            rankby_abs,
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
@@ -1111,6 +1140,7 @@ fn run_rank_genes_groups_inner(
                 ref_idx,
                 gene_chunk_size.unwrap_or(500),
                 log_transformed,
+                rankby_abs,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
@@ -1133,6 +1163,7 @@ fn run_rank_genes_groups_inner(
                 &unique_groups,
                 ref_idx,
                 log_transformed,
+                rankby_abs,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         }
@@ -1205,7 +1236,7 @@ fn de_result_to_dataframe<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -1217,6 +1248,7 @@ pub fn rank_genes_groups(
     gene_chunk_size: Option<usize>,
     stratify_by: Option<Vec<String>>,
     min_cells_per_stratum: usize,
+    rankby_abs: bool,
 ) -> PyResult<PyObject> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
@@ -1240,7 +1272,14 @@ pub fn rank_genes_groups(
             let sub_adata = sub_adata.call_method0("copy")?;
 
             // Run DE on the subset.
-            match run_rank_genes_groups_inner(py, &sub_adata, groupby, reference, gene_chunk_size) {
+            match run_rank_genes_groups_inner(
+                py,
+                &sub_adata,
+                groupby,
+                reference,
+                gene_chunk_size,
+                rankby_abs,
+            ) {
                 Ok((result, _unique)) => {
                     let df = de_result_to_dataframe(py, &result, n_genes)?;
                     // Add stratum columns.
@@ -1279,7 +1318,7 @@ pub fn rank_genes_groups(
 
     // --- Non-stratified path (original behavior) ---
     let (result, _unique_groups) =
-        run_rank_genes_groups_inner(py, adata, groupby, reference, gene_chunk_size)?;
+        run_rank_genes_groups_inner(py, adata, groupby, reference, gene_chunk_size, rankby_abs)?;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
     write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;
@@ -1772,7 +1811,7 @@ pub fn pseudobulk_dex(
 ///     strategy than leidenalg). Both produce valid, high-quality community
 ///     structures. Compare results via ARI or NMI when switching backends.
 #[pyfunction]
-#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto"))]
+#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto", parallel=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     py: Python<'_>,
@@ -1782,6 +1821,7 @@ pub fn leiden(
     random_state: u64,
     n_iterations: i64,
     device: &str,
+    parallel: bool,
 ) -> PyResult<()> {
     // Determine effective device
     let use_gpu = resolve_device(device)?;
@@ -1795,7 +1835,30 @@ pub fn leiden(
         )
     })?;
 
-    // GPU path: try cuGraph Leiden
+    // Priority 1: Rust-native Leiden (fastest, no Python dependencies)
+    match run_rust_leiden(
+        py,
+        adata,
+        &conn,
+        resolution,
+        key_added,
+        random_state,
+        n_iterations,
+        parallel,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            let warnings = py.import("warnings")?;
+            warnings.call_method1(
+                "warn",
+                (format!(
+                    "Rust-native Leiden failed ({e}) — falling back to GPU/Python path"
+                ),),
+            )?;
+        }
+    }
+
+    // Priority 2: GPU cuGraph Leiden
     if use_gpu {
         match try_cugraph_leiden(
             py,
@@ -1822,7 +1885,7 @@ pub fn leiden(
         }
     }
 
-    // CPU path: leidenalg via igraph
+    // Priority 3: Python leidenalg via igraph (fallback)
     run_cpu_leiden(
         py,
         adata,
@@ -1832,6 +1895,90 @@ pub fn leiden(
         random_state,
         n_iterations,
     )
+}
+
+/// Run Leiden community detection via Rust-native implementation.
+///
+/// Extracts CSR from the connectivities sparse matrix, calls
+/// `scx_accel::leiden()` directly (no Python igraph or leidenalg required),
+/// and writes results to adata.
+#[allow(clippy::too_many_arguments)]
+fn run_rust_leiden(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    conn: &Bound<'_, PyAny>,
+    resolution: f64,
+    key_added: &str,
+    random_state: u64,
+    n_iterations: i64,
+    parallel: bool,
+) -> PyResult<()> {
+    let numpy = py.import("numpy")?;
+    let pd = py.import("pandas")?;
+
+    // Extract CSR components from connectivities sparse matrix.
+    let shape: (usize, usize) = conn.getattr("shape")?.extract()?;
+    let n_obs = shape.0;
+
+    let indptr: Vec<i64> = numpy
+        .call_method1("asarray", (conn.getattr("indptr")?,))?
+        .call_method1("astype", ("int64",))?
+        .extract::<Vec<i64>>()?;
+    let indices: Vec<i32> = numpy
+        .call_method1("asarray", (conn.getattr("indices")?,))?
+        .call_method1("astype", ("int32",))?
+        .extract::<Vec<i32>>()?;
+    let data: Vec<f64> = numpy
+        .call_method1("asarray", (conn.getattr("data")?,))?
+        .call_method1("astype", ("float64",))?
+        .extract::<Vec<f64>>()?;
+
+    let max_iter = if n_iterations > 0 {
+        n_iterations as usize
+    } else {
+        0 // 0 means use default (run until convergence)
+    };
+
+    // Run Rust-native Leiden — releases the GIL for the compute-heavy part.
+    let result = py
+        .allow_threads(|| {
+            scx_accel::leiden(
+                &indptr,
+                &indices,
+                &data,
+                n_obs,
+                resolution,
+                random_state,
+                max_iter,
+                parallel,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("Rust Leiden error: {e}")))?;
+
+    // Convert membership Vec<usize> to string labels (scanpy convention).
+    let membership_strs: Vec<String> = result.membership.iter().map(|c| c.to_string()).collect();
+    let labels = pyo3::types::PyList::new(py, &membership_strs)?;
+    let cat_labels = pd.call_method1("Categorical", (&labels,))?;
+
+    // Write to adata.obs[key_added]
+    let obs = adata.getattr("obs")?;
+    obs.set_item(key_added, cat_labels)?;
+
+    // Write metadata to adata.uns[key_added]
+    let leiden_dict = PyDict::new(py);
+    let params_dict = PyDict::new(py);
+    params_dict.set_item("resolution", resolution)?;
+    params_dict.set_item("random_state", random_state)?;
+    params_dict.set_item("n_iterations", n_iterations)?;
+    leiden_dict.set_item("params", params_dict)?;
+    leiden_dict.set_item("backend", "scx-accel")?;
+    leiden_dict.set_item("modularity", result.modularity)?;
+    leiden_dict.set_item("n_communities", result.n_communities)?;
+
+    let uns = adata.getattr("uns")?;
+    uns.set_item(key_added, leiden_dict)?;
+
+    Ok(())
 }
 
 /// Try GPU Leiden via cuGraph Python import.

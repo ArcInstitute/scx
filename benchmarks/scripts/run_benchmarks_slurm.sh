@@ -3,9 +3,9 @@
 # Usage: bash benchmarks/scripts/run_benchmarks_slurm.sh
 #
 # Submits 3 jobs:
-#   1. A-C: Compression + Write + Read (cpu partition, 80GB, ~2 hours)
-#   2. D-E: Ops + Query engine (cpu partition, 16GB, ~5 min, Rust tests)
-#   3. F:   ML Data Loader + SOTA baselines (gpu partition, 80GB, ~1 hour)
+#   1. A-C: Compression + Write + Read (cpu_preemptible partition, 80GB, ~2 hours)
+#   2. D-E: Ops + Query engine (cpu_preemptible partition, 16GB, ~5 min, Rust tests)
+#   3. F:   ML Data Loader + SOTA baselines (cpu_preemptible partition, 80GB, ~1 hour)
 
 set -euo pipefail
 
@@ -56,7 +56,7 @@ chmod +x "$JOB1_SCRIPT"
 
 JOB1_ID=$(sbatch \
     --job-name=scx-bench-abc \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --cpus-per-task=16 \
     --mem=80G \
     --time=04:00:00 \
@@ -93,7 +93,7 @@ chmod +x "$JOB2_SCRIPT"
 
 JOB2_ID=$(sbatch \
     --job-name=scx-bench-de \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --cpus-per-task=8 \
     --mem=16G \
     --time=00:30:00 \
@@ -328,7 +328,7 @@ chmod +x "$JOB3_SCRIPT"
 
 JOB3_ID=$(sbatch \
     --job-name=scx-bench-f \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --cpus-per-task=16 \
     --mem=80G \
     --time=04:00:00 \

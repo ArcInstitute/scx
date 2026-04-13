@@ -28,7 +28,7 @@ for bench in "${BENCHMARKS[@]}"; do
     for ds in "${DATASETS[@]}"; do
         JOB_ID=$(sbatch --parsable \
             --job-name="p0_${bench:0:4}_${ds}" \
-            --partition=cpu \
+            --partition=cpu_preemptible \
             --qos=normal \
             --cpus-per-task=32 \
             --mem=80G \
@@ -49,7 +49,7 @@ DEPS=$(IFS=:; echo "${JOB_IDS[*]}")
 ARCHIVE_ID=$(sbatch --parsable \
     --dependency=afterok:"${DEPS}" \
     --job-name=p0_archive \
-    --partition=cpu \
+    --partition=cpu_preemptible \
     --qos=normal \
     --mem=4G \
     --time=00:10:00 \

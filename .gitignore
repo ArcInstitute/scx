@@ -7,6 +7,7 @@ data/*.h5ad
 benchmarks/logs/
 benchmarks/comprehensive/results/raw/
 *.proptest-regressions
+external-repos/
 
 # Rust
 /target/

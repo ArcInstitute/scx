@@ -18,7 +18,7 @@
 //! Peak memory: O(n_obs × k + n_vars × k) where k = n_components + n_oversamples.
 //! One decoded shard (~16K × n_vars × 4 bytes) is held at a time.
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -59,23 +59,23 @@ pub struct PcaResult {
 }
 
 // ---------------------------------------------------------------------------
-// faer::Mat helpers — convert between row-major Vec<f64> and column-major Mat
+// faer helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `faer::Mat<f64>` from a row-major `Vec<f64>`.
-fn dense_from_row_major(data: &[f64], rows: usize, cols: usize) -> Mat<f64> {
-    debug_assert_eq!(data.len(), rows * cols);
-    let mut mat = Mat::<f64>::zeros(rows, cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            mat[(r, c)] = data[r * cols + c];
-        }
-    }
-    mat
+/// Economy QR on a row-major buffer: wraps as `MatRef`, computes QR, returns
+/// the thin Q factor as an owned `Mat<f64>` (column-major).
+fn qr_thin_q_row_major(data: &[f64], rows: usize, cols: usize) -> Mat<f64> {
+    let view = MatRef::from_row_major_slice(data, rows, cols);
+    let qr = view.qr();
+    qr.compute_thin_Q()
 }
 
-/// Extract a `faer::Mat<f64>` into a row-major `Vec<f64>`.
-fn mat_to_row_major(mat: &Mat<f64>) -> Vec<f64> {
+/// Extract a column-major `Mat<f64>` to a row-major `Vec<f64>`.
+///
+/// Used only for small matrices (n_vars × k) during power iteration where
+/// the forward SpMM kernel needs row-major input. For n_vars=2000, k=60
+/// this is only 120K elements (< 1 MB).
+fn mat_to_row_major_buf(mat: &Mat<f64>) -> Vec<f64> {
     let (rows, cols) = (mat.nrows(), mat.ncols());
     let mut data = vec![0.0f64; rows * cols];
     for r in 0..rows {
@@ -86,10 +86,85 @@ fn mat_to_row_major(mat: &Mat<f64>) -> Vec<f64> {
     data
 }
 
-/// Economy QR: return Q with orthonormal columns.
-fn qr_thin_q(mat: &Mat<f64>) -> Mat<f64> {
-    let qr = mat.qr();
-    qr.compute_thin_Q()
+/// Accumulate the sparse outer product X^T @ X directly from CSR nonzeros.
+///
+/// For each row, iterates pairs of nonzeros and accumulates `C[c1, c2] += v1 * v2`.
+/// Exploits symmetry: only computes upper triangle and mirrors to lower.
+/// Also accumulates `col_sums` in the same pass (caller provides the slice).
+fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut Mat<f64>) {
+    let n_rows = csr.n_rows();
+    for r in 0..n_rows {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        // Accumulate col_sums
+        for idx in start..end {
+            let c = csr.indices[idx] as usize;
+            let v = csr.data[idx] as f64;
+            col_sums[c] += v;
+        }
+        // Sparse outer product with symmetry exploitation
+        for i in start..end {
+            let c1 = csr.indices[i] as usize;
+            let v1 = csr.data[i] as f64;
+            cov[(c1, c1)] += v1 * v1; // diagonal
+            for j in (i + 1)..end {
+                let c2 = csr.indices[j] as usize;
+                let v2 = csr.data[j] as f64;
+                let prod = v1 * v2;
+                cov[(c1, c2)] += prod;
+                cov[(c2, c1)] += prod;
+            }
+        }
+    }
+}
+
+/// Parallel sparse outer product accumulation using thread-local `Mat<f64>` accumulators.
+///
+/// Same algorithm as [`sparse_outer_product_accumulate`] but distributes rows across
+/// rayon threads. Each thread gets its own n_vars × n_vars covariance matrix (~30 MB
+/// for n_vars=2000) and col_sums vector, then results are reduced by element-wise addition.
+fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>, Vec<f64>) {
+    let n_rows = csr.n_rows();
+    let chunk_size = (n_rows / rayon::current_num_threads()).max(256);
+
+    (0..n_rows)
+        .into_par_iter()
+        .with_min_len(chunk_size)
+        .fold(
+            || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
+            |(mut cov_local, mut sums_local), r| {
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                for idx in start..end {
+                    let c = csr.indices[idx] as usize;
+                    let v = csr.data[idx] as f64;
+                    sums_local[c] += v;
+                }
+                for i in start..end {
+                    let c1 = csr.indices[i] as usize;
+                    let v1 = csr.data[i] as f64;
+                    cov_local[(c1, c1)] += v1 * v1;
+                    for j in (i + 1)..end {
+                        let c2 = csr.indices[j] as usize;
+                        let v2 = csr.data[j] as f64;
+                        let prod = v1 * v2;
+                        cov_local[(c1, c2)] += prod;
+                        cov_local[(c2, c1)] += prod;
+                    }
+                }
+                (cov_local, sums_local)
+            },
+        )
+        .reduce(
+            || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
+            |(mut ca, mut sa), (cb, sb)| {
+                ca += cb;
+                for i in 0..n_vars {
+                    sa[i] += sb[i];
+                }
+                (ca, sa)
+            },
+        )
 }
 
 /// Thin SVD: A = U Σ V^T. Returns (U, σ, V^T).
@@ -142,26 +217,40 @@ pub fn randomized_pca<S: ShardSource>(
     let (means, col_sum_sq) = source.col_means_and_sum_sq(zero_center)?;
     let means_ref = means.as_deref();
 
-    // Step 2: Random Gaussian Ω (n_vars × k)
-    let omega = dense_from_row_major(&random_gaussian(n_vars, k, seed), n_vars, k);
+    // Step 2: Random Gaussian Ω (n_vars × k), row-major
+    let omega = random_gaussian(n_vars, k, seed);
 
-    // Step 3 + 4 + 5: Streaming SpMM → QR → power iteration
-    let y = streaming_spmm_forward(source, &omega, means_ref)?;
-    let mut q = qr_thin_q(&y);
+    // Step 3 + 4 + 5: Streaming SpMM → power iteration → QR
+    // When n_power_iterations <= 2, skip intermediate QR on the transpose result
+    // (matching sklearn's default 'auto' normalization mode). The transpose result
+    // (n_vars × k) is fed directly back into the forward SpMM, saving one QR + one
+    // mat_to_row_major_buf per iteration. QR is still applied to the forward result
+    // (n_obs × k) each iteration to prevent basis collapse.
+    let y = streaming_spmm_forward(source, &omega, k, means_ref)?;
+    let mut q = qr_thin_q_row_major(&y, n_obs, k);
 
     for _ in 0..n_power_iterations {
         let b = streaming_spmm_transpose(source, &q, means_ref)?;
-        let q_b = qr_thin_q(&b);
-        let y = streaming_spmm_forward(source, &q_b, means_ref)?;
-        q = qr_thin_q(&y);
+        if n_power_iterations > 2 {
+            // Full QR normalization on transpose result for numerical stability
+            let q_b = qr_thin_q_row_major(&b, n_vars, k);
+            let q_b_rm = mat_to_row_major_buf(&q_b);
+            let y = streaming_spmm_forward(source, &q_b_rm, k, means_ref)?;
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        } else {
+            // Skip QR on b — feed row-major b directly into forward SpMM
+            let y = streaming_spmm_forward(source, &b, k, means_ref)?;
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        }
     }
 
     // Step 6: B = (X - μ)^T @ Q
-    let b = streaming_spmm_transpose(source, &q, means_ref)?;
+    let b_rm = streaming_spmm_transpose(source, &q, means_ref)?;
 
     // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass)
     let total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
-    build_pca_result(&q, &b, &means, n_components, n_obs, n_vars, total_var)
+    let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
+    build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
 
 /// Compute randomized PCA from an in-memory ScxCsr matrix.
@@ -188,20 +277,31 @@ pub fn randomized_pca_inmemory(
     };
     let means_ref = means.as_deref();
 
-    let omega = dense_from_row_major(&random_gaussian(n_vars, k, seed), n_vars, k);
-    let y = spmm_forward_csr(csr, &omega, means_ref);
-    let mut q = qr_thin_q(&y);
+    // All SpMM operations work with row-major Vec<f64>.
+    // QR/SVD use MatRef::from_row_major_slice for zero-copy faer views.
+    let omega = random_gaussian(n_vars, k, seed);
+    let y = spmm_forward_csr(csr, &omega, k, means_ref);
+    let mut q = qr_thin_q_row_major(&y, n_obs, k);
 
     for _ in 0..n_power_iterations {
         let b = spmm_transpose_csr(csr, &q, means_ref);
-        let q_b = qr_thin_q(&b);
-        let y = spmm_forward_csr(csr, &q_b, means_ref);
-        q = qr_thin_q(&y);
+        if n_power_iterations > 2 {
+            // Full QR normalization for numerical stability
+            let q_b = qr_thin_q_row_major(&b, n_vars, k);
+            let q_b_rm = mat_to_row_major_buf(&q_b);
+            let y = spmm_forward_csr(csr, &q_b_rm, k, means_ref);
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        } else {
+            // Skip QR on transpose result — feed directly into forward SpMM
+            let y = spmm_forward_csr(csr, &b, k, means_ref);
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        }
     }
 
-    let b = spmm_transpose_csr(csr, &q, means_ref);
+    let b_rm = spmm_transpose_csr(csr, &q, means_ref);
     let total_var = compute_total_variance_inmemory(csr, means_ref);
-    build_pca_result(&q, &b, &means, n_components, n_obs, n_vars, total_var)
+    let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
+    build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,19 +343,16 @@ fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
 /// Streaming forward SpMM: Y = (X - μ) @ M, shard-by-shard.
 ///
 /// X is (n_obs × n_vars) stored as sharded CSR.
-/// M is Mat<f64> (n_vars × k).
-/// Returns Mat<f64> (n_obs × k).
+/// `m_data` is row-major `&[f64]` of shape (n_vars × k).
+/// Returns row-major `Vec<f64>` of shape (n_obs × k).
 fn streaming_spmm_forward<S: ShardSource>(
     source: &S,
-    m: &Mat<f64>,
+    m_data: &[f64],
+    k: usize,
     means: Option<&[f64]>,
-) -> Result<Mat<f64>> {
+) -> Result<Vec<f64>> {
     let (n_obs, n_vars) = source.shape();
-    let k = m.ncols();
-    debug_assert_eq!(m.nrows(), n_vars);
-
-    // Extract M to row-major for cache-friendly SpMM kernel access
-    let m_data = mat_to_row_major(m);
+    debug_assert_eq!(m_data.len(), n_vars * k);
 
     let mut y = vec![0.0f64; n_obs * k];
 
@@ -279,7 +376,7 @@ fn streaming_spmm_forward<S: ShardSource>(
 
         spmm_forward_into(
             &csr,
-            &m_data,
+            m_data,
             k,
             &mut y,
             global_row,
@@ -288,26 +385,29 @@ fn streaming_spmm_forward<S: ShardSource>(
         global_row += shard_rows;
     }
 
-    Ok(dense_from_row_major(&y, n_obs, k))
+    Ok(y)
 }
 
 /// Streaming transpose SpMM: Z = (X - μ)^T @ Q, shard-by-shard.
 ///
-/// Q is Mat<f64> (n_obs × k).
-/// Returns Mat<f64> (n_vars × k).
+/// Q is `Mat<f64>` (n_obs × k), column-major. Each shard is parallelized
+/// via rayon thread-local accumulators (same approach as `spmm_transpose_csr`).
+/// Returns row-major `Vec<f64>` of shape (n_vars × k).
 fn streaming_spmm_transpose<S: ShardSource>(
     source: &S,
     q: &Mat<f64>,
     means: Option<&[f64]>,
-) -> Result<Mat<f64>> {
+) -> Result<Vec<f64>> {
     let (n_obs, n_vars) = source.shape();
     let k = q.ncols();
     debug_assert_eq!(q.nrows(), n_obs);
 
-    // Extract Q to row-major for cache-friendly access
-    let q_data = mat_to_row_major(q);
-
     let mut z = vec![0.0f64; n_vars * k];
+    let mut sum_q = if means.is_some() {
+        vec![0.0f64; k]
+    } else {
+        vec![]
+    };
 
     let n_shards = source.n_shards();
     let mut global_row = 0usize;
@@ -315,20 +415,101 @@ fn streaming_spmm_transpose<S: ShardSource>(
     for shard_idx in 0..n_shards {
         let csr = source.read_shard(shard_idx)?;
         let shard_rows = csr.n_rows();
+        let use_parallel = shard_rows * k > 10_000;
 
-        // Z[col, :] += X[row, col] * Q[row, :]
-        #[allow(clippy::needless_range_loop)]
-        for r in 0..shard_rows {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            let q_offset = (global_row + r) * k;
+        if use_parallel {
+            let gr_base = global_row;
+            let chunk_size = (shard_rows / rayon::current_num_threads().max(1)).max(256);
 
-            for idx in start..end {
-                let col = csr.indices[idx] as usize;
-                let val = csr.data[idx] as f64;
-                let z_offset = col * k;
+            let (z_shard, sq_shard) = (0..shard_rows)
+                .into_par_iter()
+                .with_min_len(chunk_size)
+                .fold(
+                    || {
+                        (
+                            vec![0.0f64; n_vars * k],
+                            if means.is_some() {
+                                vec![0.0f64; k]
+                            } else {
+                                vec![]
+                            },
+                        )
+                    },
+                    |(mut zl, mut sql), r| {
+                        let gr = gr_base + r;
+                        let mut q_row = vec![0.0f64; k];
+                        for j in 0..k {
+                            q_row[j] = q[(gr, j)];
+                        }
+                        if means.is_some() {
+                            for j in 0..k {
+                                sql[j] += q_row[j];
+                            }
+                        }
+                        let start = csr.indptr[r] as usize;
+                        let end = csr.indptr[r + 1] as usize;
+                        for idx in start..end {
+                            let col = csr.indices[idx] as usize;
+                            let val = csr.data[idx] as f64;
+                            let z_offset = col * k;
+                            for j in 0..k {
+                                zl[z_offset + j] += val * q_row[j];
+                            }
+                        }
+                        (zl, sql)
+                    },
+                )
+                .reduce(
+                    || {
+                        (
+                            vec![0.0f64; n_vars * k],
+                            if means.is_some() {
+                                vec![0.0f64; k]
+                            } else {
+                                vec![]
+                            },
+                        )
+                    },
+                    |(mut za, mut sqa), (zb, sqb)| {
+                        for i in 0..za.len() {
+                            za[i] += zb[i];
+                        }
+                        for i in 0..sqa.len() {
+                            sqa[i] += sqb[i];
+                        }
+                        (za, sqa)
+                    },
+                );
+
+            // Merge shard results into global accumulators
+            for i in 0..z.len() {
+                z[i] += z_shard[i];
+            }
+            for i in 0..sum_q.len() {
+                sum_q[i] += sq_shard[i];
+            }
+        } else {
+            // Sequential path for small shards
+            let mut q_row = vec![0.0f64; k];
+            for r in 0..shard_rows {
+                let gr = global_row + r;
                 for j in 0..k {
-                    z[z_offset + j] += val * q_data[q_offset + j];
+                    q_row[j] = q[(gr, j)];
+                }
+                if means.is_some() {
+                    for j in 0..k {
+                        sum_q[j] += q_row[j];
+                    }
+                }
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                for idx in start..end {
+                    let col = csr.indices[idx] as usize;
+                    let val = csr.data[idx] as f64;
+                    let z_offset = col * k;
+                    for j in 0..k {
+                        z[z_offset + j] += val * q_row[j];
+                    }
                 }
             }
         }
@@ -338,13 +519,6 @@ fn streaming_spmm_transpose<S: ShardSource>(
 
     // Mean centering correction: Z -= μ @ (1^T @ Q)
     if let Some(mu) = means {
-        let mut sum_q = vec![0.0f64; k];
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..n_obs {
-            for j in 0..k {
-                sum_q[j] += q_data[i * k + j];
-            }
-        }
         #[allow(clippy::needless_range_loop)]
         for v in 0..n_vars {
             for j in 0..k {
@@ -353,16 +527,16 @@ fn streaming_spmm_transpose<S: ShardSource>(
         }
     }
 
-    Ok(dense_from_row_major(&z, n_vars, k))
+    Ok(z)
 }
 
 /// In-memory forward SpMM: Y = (X - μ) @ M using a single CSR.
-fn spmm_forward_csr(csr: &ScxCsr, m: &Mat<f64>, means: Option<&[f64]>) -> Mat<f64> {
+///
+/// `m_data` is row-major `&[f64]` of shape (n_vars × k).
+/// Returns row-major `Vec<f64>` of shape (n_obs × k).
+fn spmm_forward_csr(csr: &ScxCsr, m_data: &[f64], k: usize, means: Option<&[f64]>) -> Vec<f64> {
     let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
-    let k = m.ncols();
-
-    let m_data = mat_to_row_major(m);
 
     let mean_correction: Option<Vec<f64>> = means.map(|mu| {
         let mut mc = vec![0.0f64; k];
@@ -375,51 +549,143 @@ fn spmm_forward_csr(csr: &ScxCsr, m: &Mat<f64>, means: Option<&[f64]>) -> Mat<f6
     });
 
     let mut y = vec![0.0f64; n_obs * k];
-    spmm_forward_into(csr, &m_data, k, &mut y, 0, mean_correction.as_deref());
-    dense_from_row_major(&y, n_obs, k)
+    spmm_forward_into(csr, m_data, k, &mut y, 0, mean_correction.as_deref());
+    y
 }
 
 /// In-memory transpose SpMM: Z = (X - μ)^T @ Q using a single CSR.
-fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Mat<f64> {
+///
+/// Parallelized via rayon: each thread accumulates into a thread-local
+/// `z_local` buffer (n_vars × k), then all buffers are reduced by summation.
+/// Returns row-major `Vec<f64>` of shape (n_vars × k).
+fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<f64> {
     let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
     let k = q.ncols();
-    let q_data = mat_to_row_major(q);
-    let mut z = vec![0.0f64; n_vars * k];
 
-    #[allow(clippy::needless_range_loop)]
-    for r in 0..n_obs {
-        let start = csr.indptr[r] as usize;
-        let end = csr.indptr[r + 1] as usize;
-        let q_offset = r * k;
+    // Parallel threshold: use rayon when work is substantial
+    let use_parallel = n_obs * k > 10_000;
 
-        for idx in start..end {
-            let col = csr.indices[idx] as usize;
-            let val = csr.data[idx] as f64;
-            let z_offset = col * k;
+    if use_parallel {
+        // Each chunk of rows produces a thread-local (z_local, sum_q_local).
+        // We partition rows into ~equal chunks for rayon.
+        let chunk_size = (n_obs / rayon::current_num_threads().max(1)).max(256);
+
+        let (z, sum_q) = (0..n_obs)
+            .into_par_iter()
+            .with_min_len(chunk_size)
+            .fold(
+                || {
+                    (
+                        vec![0.0f64; n_vars * k],
+                        if means.is_some() {
+                            vec![0.0f64; k]
+                        } else {
+                            vec![]
+                        },
+                    )
+                },
+                |(mut z_local, mut sq_local), r| {
+                    // Copy one row from column-major Q into contiguous buffer
+                    let mut q_row = vec![0.0f64; k];
+                    for j in 0..k {
+                        q_row[j] = q[(r, j)];
+                    }
+                    if means.is_some() {
+                        for j in 0..k {
+                            sq_local[j] += q_row[j];
+                        }
+                    }
+                    let start = csr.indptr[r] as usize;
+                    let end = csr.indptr[r + 1] as usize;
+                    for idx in start..end {
+                        let col = csr.indices[idx] as usize;
+                        let val = csr.data[idx] as f64;
+                        let z_offset = col * k;
+                        for j in 0..k {
+                            z_local[z_offset + j] += val * q_row[j];
+                        }
+                    }
+                    (z_local, sq_local)
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        vec![0.0f64; n_vars * k],
+                        if means.is_some() {
+                            vec![0.0f64; k]
+                        } else {
+                            vec![]
+                        },
+                    )
+                },
+                |(mut za, mut sqa), (zb, sqb)| {
+                    for i in 0..za.len() {
+                        za[i] += zb[i];
+                    }
+                    for i in 0..sqa.len() {
+                        sqa[i] += sqb[i];
+                    }
+                    (za, sqa)
+                },
+            );
+
+        // Apply mean correction
+        if let Some(mu) = means {
+            let mut z = z;
+            #[allow(clippy::needless_range_loop)]
+            for v in 0..n_vars {
+                for j in 0..k {
+                    z[v * k + j] -= mu[v] * sum_q[j];
+                }
+            }
+            z
+        } else {
+            z
+        }
+    } else {
+        // Sequential path for small matrices
+        let mut z = vec![0.0f64; n_vars * k];
+        let mut sum_q = if means.is_some() {
+            vec![0.0f64; k]
+        } else {
+            vec![]
+        };
+        let mut q_row = vec![0.0f64; k];
+
+        for r in 0..n_obs {
             for j in 0..k {
-                z[z_offset + j] += val * q_data[q_offset + j];
+                q_row[j] = q[(r, j)];
+            }
+            if means.is_some() {
+                for j in 0..k {
+                    sum_q[j] += q_row[j];
+                }
+            }
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            for idx in start..end {
+                let col = csr.indices[idx] as usize;
+                let val = csr.data[idx] as f64;
+                let z_offset = col * k;
+                for j in 0..k {
+                    z[z_offset + j] += val * q_row[j];
+                }
             }
         }
+
+        if let Some(mu) = means {
+            #[allow(clippy::needless_range_loop)]
+            for v in 0..n_vars {
+                for j in 0..k {
+                    z[v * k + j] -= mu[v] * sum_q[j];
+                }
+            }
+        }
+
+        z
     }
-
-    if let Some(mu) = means {
-        let mut sum_q = vec![0.0f64; k];
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..n_obs {
-            for j in 0..k {
-                sum_q[j] += q_data[i * k + j];
-            }
-        }
-        #[allow(clippy::needless_range_loop)]
-        for v in 0..n_vars {
-            for j in 0..k {
-                z[v * k + j] -= mu[v] * sum_q[j];
-            }
-        }
-    }
-
-    dense_from_row_major(&z, n_vars, k)
 }
 
 /// Shared SpMM-forward kernel: accumulates X_shard @ M into y[global_row*k..].
@@ -512,18 +778,19 @@ fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
     }
 }
 
-/// Build PcaResult from Q, B, and SVD.
+/// Build PcaResult from Q (column-major Mat) and B (MatRef, possibly row-major view).
 #[allow(clippy::too_many_arguments)]
 fn build_pca_result(
     q: &Mat<f64>,
-    b: &Mat<f64>,
+    b: &MatRef<'_, f64>,
     means: &Option<Vec<f64>>,
     n_components: usize,
     n_obs: usize,
     n_vars: usize,
     total_var: f64,
 ) -> Result<PcaResult> {
-    let (u_hat, sigma, vt) = thin_svd_decomp(b)?;
+    let b_owned = b.to_owned();
+    let (u_hat, sigma, vt) = thin_svd_decomp(&b_owned)?;
 
     // Embeddings = Q @ V * Σ (take first n_components columns)
     let v = vt.transpose().to_owned();
@@ -539,8 +806,8 @@ fn build_pca_result(
     // Components: rows of U_hat^T → (n_components × n_vars)
     let mut components = vec![0.0f64; n_components * n_vars];
     for pc in 0..n_components {
-        for v in 0..n_vars {
-            components[pc * n_vars + v] = u_hat[(v, pc)];
+        for v_idx in 0..n_vars {
+            components[pc * n_vars + v_idx] = u_hat[(v_idx, pc)];
         }
     }
 
@@ -563,6 +830,292 @@ fn build_pca_result(
         variance_explained,
         variance_ratio,
         mean: means.clone(),
+        n_components,
+        n_obs,
+        n_vars,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Covariance PCA — optimal when n_vars << n_obs (e.g. HVG-selected data)
+// ---------------------------------------------------------------------------
+
+/// Default threshold: use covariance method when n_vars <= this value.
+pub const COVARIANCE_PCA_THRESHOLD: usize = 5_000;
+
+/// Compute PCA via the covariance method, streaming from a [`ShardSource`].
+///
+/// Algorithm (2 passes over data):
+/// 1. Accumulate covariance `C += X_shard^T @ X_shard` and column sums
+/// 2. Mean-center: `C -= (col_sums^T @ col_sums) / n_obs`
+/// 3. Eigendecompose C (self-adjoint, top k eigenvectors)
+/// 4. Stream again to compute embeddings: `E += (X_shard - mean) @ V[:, top_k]`
+///
+/// Memory: O(n_vars²) for the covariance matrix. Only practical when n_vars ≤ ~5,000.
+pub fn covariance_pca<S: ShardSource>(
+    source: &S,
+    n_components: usize,
+    zero_center: bool,
+) -> Result<PcaResult> {
+    let (n_obs, n_vars) = source.shape();
+    validate_inputs(n_obs, n_vars, n_components)?;
+
+    // --- Pass 1: Accumulate covariance matrix and column sums ---
+    // Sparse outer product: accumulate C[c1,c2] += v1*v2 directly from CSR nonzeros.
+    // No densification — touches only nonzero entries (~2% for typical HVG-selected data).
+    let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
+    let mut col_sums = vec![0.0f64; n_vars];
+
+    let n_shards = source.n_shards();
+    for shard_idx in 0..n_shards {
+        let csr = source.read_shard(shard_idx)?;
+        sparse_outer_product_accumulate(&csr, &mut col_sums, &mut cov);
+    }
+
+    // --- Mean centering ---
+    let means = if zero_center {
+        Some(
+            col_sums
+                .iter()
+                .map(|&s| s / n_obs as f64)
+                .collect::<Vec<f64>>(),
+        )
+    } else {
+        None
+    };
+
+    if let Some(ref mu) = means {
+        // C -= n_obs * (mu^T @ mu)  (rank-1 correction for mean centering)
+        for i in 0..n_vars {
+            for j in 0..n_vars {
+                cov[(i, j)] -= n_obs as f64 * mu[i] * mu[j];
+            }
+        }
+    }
+
+    // Convert to sample covariance: C /= (n-1)
+    let denom = (n_obs as f64 - 1.0).max(1.0);
+    for i in 0..n_vars {
+        for j in 0..n_vars {
+            cov[(i, j)] /= denom;
+        }
+    }
+
+    // --- Eigendecomposition ---
+    let evd = cov
+        .self_adjoint_eigen(faer::Side::Lower)
+        .map_err(|e| AccelError::LinAlg(format!("Eigendecomposition failed: {e:?}")))?;
+
+    // faer returns eigenvalues in nondecreasing order; we want the largest k.
+    let all_eigenvalues = evd.S().column_vector();
+    let eigvecs = evd.U(); // columns are eigenvectors
+
+    // Total variance = sum of all eigenvalues (they ARE the variances since C is sample cov)
+    let total_var: f64 = (0..n_vars).map(|i| all_eigenvalues[i]).sum();
+
+    // Select top k eigenvectors (last k columns, reversed for descending order)
+    let n_components = n_components.min(n_vars);
+    let mut variance_explained = Vec::with_capacity(n_components);
+    // Build V: (n_vars × n_components) row-major — columns are the top eigenvectors
+    let mut v_rm = vec![0.0f64; n_vars * n_components];
+    for pc in 0..n_components {
+        let eig_idx = n_vars - 1 - pc; // descending: largest first
+        let eigenvalue = all_eigenvalues[eig_idx];
+        variance_explained.push(eigenvalue.max(0.0));
+        for v in 0..n_vars {
+            v_rm[v * n_components + pc] = eigvecs[(v, eig_idx)];
+        }
+    }
+
+    let variance_ratio: Vec<f64> = if total_var > 0.0 {
+        variance_explained
+            .iter()
+            .map(|&ve| ve / total_var)
+            .collect()
+    } else {
+        vec![0.0; n_components]
+    };
+
+    // Components: each PC is a row (n_components × n_vars)
+    let mut components = vec![0.0f64; n_components * n_vars];
+    for pc in 0..n_components {
+        for v in 0..n_vars {
+            components[pc * n_vars + v] = v_rm[v * n_components + pc];
+        }
+    }
+
+    // --- Pass 2: Compute embeddings E = (X - μ) @ V ---
+    let mut embeddings = vec![0.0f64; n_obs * n_components];
+    let means_ref = means.as_deref();
+
+    // Pre-compute mean correction: mu^T @ V (1 × n_components)
+    let mean_correction: Option<Vec<f64>> = means_ref.map(|mu| {
+        let mut mc = vec![0.0f64; n_components];
+        for v in 0..n_vars {
+            for pc in 0..n_components {
+                mc[pc] += mu[v] * v_rm[v * n_components + pc];
+            }
+        }
+        mc
+    });
+
+    let mut global_row = 0usize;
+    for shard_idx in 0..n_shards {
+        let csr = source.read_shard(shard_idx)?;
+        let shard_rows = csr.n_rows();
+
+        // E[row, :] = X[row, :] @ V - mc
+        for r in 0..shard_rows {
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            let e_offset = (global_row + r) * n_components;
+            for idx in start..end {
+                let c = csr.indices[idx] as usize;
+                let val = csr.data[idx] as f64;
+                let v_offset = c * n_components;
+                for pc in 0..n_components {
+                    embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
+                }
+            }
+            if let Some(ref mc) = mean_correction {
+                for pc in 0..n_components {
+                    embeddings[e_offset + pc] -= mc[pc];
+                }
+            }
+        }
+        global_row += shard_rows;
+    }
+
+    Ok(PcaResult {
+        embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean: means,
+        n_components,
+        n_obs,
+        n_vars,
+    })
+}
+
+/// Compute PCA via the covariance method from an in-memory `ScxCsr`.
+///
+/// Single-shard special case of [`covariance_pca`].
+pub fn covariance_pca_inmemory(
+    csr: &ScxCsr,
+    n_components: usize,
+    zero_center: bool,
+) -> Result<PcaResult> {
+    let (n_obs, n_vars) = (csr.n_rows(), csr.n_cols());
+    validate_inputs(n_obs, n_vars, n_components)?;
+
+    // --- Build covariance matrix via sparse outer products ---
+    // Parallel accumulation: each rayon thread gets a thread-local n_vars × n_vars
+    // covariance matrix (~30 MB for n_vars=2000) and col_sums vector.
+    let (mut cov, col_sums) = sparse_outer_product_accumulate_par(csr, n_vars);
+
+    // Mean centering
+    let means = if zero_center {
+        Some(
+            col_sums
+                .iter()
+                .map(|&s| s / n_obs as f64)
+                .collect::<Vec<f64>>(),
+        )
+    } else {
+        None
+    };
+
+    if let Some(ref mu) = means {
+        for i in 0..n_vars {
+            for j in 0..n_vars {
+                cov[(i, j)] -= n_obs as f64 * mu[i] * mu[j];
+            }
+        }
+    }
+
+    // Sample covariance
+    let denom = (n_obs as f64 - 1.0).max(1.0);
+    for i in 0..n_vars {
+        for j in 0..n_vars {
+            cov[(i, j)] /= denom;
+        }
+    }
+
+    // Eigendecomposition
+    let evd = cov
+        .self_adjoint_eigen(faer::Side::Lower)
+        .map_err(|e| AccelError::LinAlg(format!("Eigendecomposition failed: {e:?}")))?;
+
+    let all_eigenvalues = evd.S().column_vector();
+    let eigvecs = evd.U();
+    let total_var: f64 = (0..n_vars).map(|i| all_eigenvalues[i]).sum();
+
+    let n_components = n_components.min(n_vars);
+    let mut variance_explained = Vec::with_capacity(n_components);
+    let mut v_rm = vec![0.0f64; n_vars * n_components];
+    for pc in 0..n_components {
+        let eig_idx = n_vars - 1 - pc;
+        let eigenvalue = all_eigenvalues[eig_idx];
+        variance_explained.push(eigenvalue.max(0.0));
+        for v in 0..n_vars {
+            v_rm[v * n_components + pc] = eigvecs[(v, eig_idx)];
+        }
+    }
+
+    let variance_ratio: Vec<f64> = if total_var > 0.0 {
+        variance_explained
+            .iter()
+            .map(|&ve| ve / total_var)
+            .collect()
+    } else {
+        vec![0.0; n_components]
+    };
+
+    let mut components = vec![0.0f64; n_components * n_vars];
+    for pc in 0..n_components {
+        for v in 0..n_vars {
+            components[pc * n_vars + v] = v_rm[v * n_components + pc];
+        }
+    }
+
+    // Embeddings: E = (X - μ) @ V
+    let mut embeddings = vec![0.0f64; n_obs * n_components];
+    let mean_correction: Option<Vec<f64>> = means.as_deref().map(|mu| {
+        let mut mc = vec![0.0f64; n_components];
+        for v in 0..n_vars {
+            for pc in 0..n_components {
+                mc[pc] += mu[v] * v_rm[v * n_components + pc];
+            }
+        }
+        mc
+    });
+
+    for r in 0..n_obs {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        let e_offset = r * n_components;
+        for idx in start..end {
+            let c = csr.indices[idx] as usize;
+            let val = csr.data[idx] as f64;
+            let v_offset = c * n_components;
+            for pc in 0..n_components {
+                embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
+            }
+        }
+        if let Some(ref mc) = mean_correction {
+            for pc in 0..n_components {
+                embeddings[e_offset + pc] -= mc[pc];
+            }
+        }
+    }
+
+    Ok(PcaResult {
+        embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean: means,
         n_components,
         n_obs,
         n_vars,
@@ -776,10 +1329,8 @@ mod tests {
         let n_vars = 5;
         let k = 3;
 
-        let m = dense_from_row_major(&random_gaussian(n_vars, k, 42), n_vars, k);
-        let y_sparse = spmm_forward_csr(&csr, &m, None);
-        let y_sparse_data = mat_to_row_major(&y_sparse);
-        let m_data = mat_to_row_major(&m);
+        let m_data = random_gaussian(n_vars, k, 42);
+        let y_sparse = spmm_forward_csr(&csr, &m_data, k, None);
 
         // Dense matmul reference
         let mut y_dense = vec![0.0f64; n_obs * k];
@@ -794,9 +1345,9 @@ mod tests {
 
         for i in 0..n_obs * k {
             assert!(
-                (y_sparse_data[i] - y_dense[i]).abs() < 1e-10,
+                (y_sparse[i] - y_dense[i]).abs() < 1e-10,
                 "mismatch at {i}: {} vs {}",
-                y_sparse_data[i],
+                y_sparse[i],
                 y_dense[i]
             );
         }
@@ -805,8 +1356,7 @@ mod tests {
     #[test]
     fn test_qr_orthonormal() {
         let data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0];
-        let mat = dense_from_row_major(&data, 4, 2);
-        let q = qr_thin_q(&mat);
+        let q = qr_thin_q_row_major(&data, 4, 2);
 
         assert_eq!(q.nrows(), 4);
         assert_eq!(q.ncols(), 2);
@@ -823,7 +1373,8 @@ mod tests {
     #[test]
     fn test_svd_basic() {
         let data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        let mat = dense_from_row_major(&data, 3, 2);
+        let view = MatRef::from_row_major_slice(&data, 3, 2);
+        let mat = view.to_owned();
         let (u, sigma, vt) = thin_svd_decomp(&mat).unwrap();
 
         assert_eq!(u.nrows(), 3);
@@ -834,5 +1385,226 @@ mod tests {
         assert!(sigma[0] > 0.0);
         assert!(sigma[1] > 0.0);
         assert!(sigma[0] >= sigma[1]);
+    }
+
+    #[test]
+    fn test_qr_and_svd_on_row_major_slice() {
+        // Verify QR and SVD produce correct results when input is a
+        // MatRef::from_row_major_slice (transposed column-major view).
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let view = MatRef::from_row_major_slice(&data, 4, 3);
+
+        // QR: Q should have orthonormal columns
+        let q = qr_thin_q_row_major(&data, 4, 3);
+        assert_eq!(q.nrows(), 4);
+        assert_eq!(q.ncols(), 3);
+        for c in 0..3 {
+            let norm: f64 = (0..4).map(|r| q[(r, c)].powi(2)).sum();
+            assert!(
+                (norm - 1.0).abs() < 1e-10,
+                "QR col {c} norm = {norm}, expected 1.0"
+            );
+        }
+
+        // SVD: reconstruct A ≈ U @ diag(σ) @ V^T
+        let mat = view.to_owned();
+        let (u, sigma, vt) = thin_svd_decomp(&mat).unwrap();
+        for i in 0..4 {
+            for j in 0..3 {
+                let reconstructed: f64 = (0..3).map(|s| u[(i, s)] * sigma[s] * vt[(s, j)]).sum();
+                let original = view[(i, j)];
+                assert!(
+                    (reconstructed - original).abs() < 1e-10,
+                    "SVD reconstruction mismatch at ({i},{j}): {reconstructed} vs {original}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_covariance_pca_basic() {
+        let csr = test_csr_10x5();
+        let result = covariance_pca_inmemory(&csr, 3, true).unwrap();
+
+        assert_eq!(result.n_components, 3);
+        assert_eq!(result.n_obs, 10);
+        assert_eq!(result.n_vars, 5);
+        assert_eq!(result.embeddings.len(), 30);
+        assert_eq!(result.components.len(), 15);
+        assert_eq!(result.variance_explained.len(), 3);
+        assert_eq!(result.variance_ratio.len(), 3);
+        assert!(result.mean.is_some());
+
+        // Variance explained: positive and non-increasing
+        for &ve in &result.variance_explained {
+            assert!(ve > 0.0, "variance_explained should be positive");
+        }
+        for w in result.variance_explained.windows(2) {
+            assert!(w[0] >= w[1], "variance_explained should be non-increasing");
+        }
+
+        // Variance ratio sum ∈ (0, 1]
+        let ratio_sum: f64 = result.variance_ratio.iter().sum();
+        assert!(
+            ratio_sum > 0.0 && ratio_sum <= 1.0 + 1e-10,
+            "ratio sum = {ratio_sum}"
+        );
+    }
+
+    #[test]
+    fn test_covariance_pca_cosine_similarity_vs_randomized() {
+        // Both methods should produce similar top PCs (cosine similarity > 0.99)
+        let csr = test_csr_10x5();
+        let cov_result = covariance_pca_inmemory(&csr, 3, true).unwrap();
+        let rand_result = randomized_pca_inmemory(&csr, 3, 5, 2, true, 42).unwrap();
+
+        // Compare top-3 PC embeddings via cosine similarity per component
+        for pc in 0..3 {
+            let mut cov_col = vec![0.0f64; 10];
+            let mut rand_col = vec![0.0f64; 10];
+            for i in 0..10 {
+                cov_col[i] = cov_result.embeddings[i * 3 + pc];
+                rand_col[i] = rand_result.embeddings[i * 3 + pc];
+            }
+
+            let dot: f64 = cov_col.iter().zip(&rand_col).map(|(a, b)| a * b).sum();
+            let norm_a: f64 = cov_col.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let norm_b: f64 = rand_col.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let cosine = if norm_a > 0.0 && norm_b > 0.0 {
+                (dot / (norm_a * norm_b)).abs()
+            } else {
+                0.0
+            };
+
+            assert!(
+                cosine > 0.99,
+                "PC{pc} cosine similarity = {cosine:.4} (expected > 0.99)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_covariance_pca_variance_ratio_matches_randomized() {
+        let csr = test_csr_10x5();
+        let cov_result = covariance_pca_inmemory(&csr, 3, true).unwrap();
+        let rand_result = randomized_pca_inmemory(&csr, 3, 5, 2, true, 42).unwrap();
+
+        // Variance ratios should be close (within 5% relative)
+        for pc in 0..3 {
+            let cov_vr = cov_result.variance_ratio[pc];
+            let rand_vr = rand_result.variance_ratio[pc];
+            let rel_diff = ((cov_vr - rand_vr) / rand_vr.max(1e-12)).abs();
+            assert!(
+                rel_diff < 0.05,
+                "PC{pc} variance ratio: cov={cov_vr:.6}, rand={rand_vr:.6}, rel_diff={rel_diff:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_covariance_pca_no_center() {
+        let csr = test_csr_10x5();
+        let result = covariance_pca_inmemory(&csr, 2, false).unwrap();
+
+        assert_eq!(result.n_components, 2);
+        assert!(result.mean.is_none());
+        for &ve in &result.variance_explained {
+            assert!(ve > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_covariance_pca_components_orthogonal() {
+        let csr = test_csr_10x5();
+        let result = covariance_pca_inmemory(&csr, 3, true).unwrap();
+
+        for i in 0..result.n_components {
+            for j in (i + 1)..result.n_components {
+                let dot: f64 = (0..result.n_vars)
+                    .map(|v| {
+                        result.components[i * result.n_vars + v]
+                            * result.components[j * result.n_vars + v]
+                    })
+                    .sum();
+                assert!(dot.abs() < 0.01, "PC{i} · PC{j} = {dot}, expected ~0");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_covariance_matches_dense() {
+        // Verify that sparse outer product accumulation produces the same
+        // covariance matrix as the dense GEMM approach (X^T @ X).
+        let csr = test_csr_10x5();
+        let n_vars = csr.n_cols();
+        let n_obs = csr.n_rows();
+
+        // --- Dense GEMM reference ---
+        let mut dense = vec![0.0f64; n_obs * n_vars];
+        let mut col_sums_dense = vec![0.0f64; n_vars];
+        for r in 0..n_obs {
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            for idx in start..end {
+                let c = csr.indices[idx] as usize;
+                let v = csr.data[idx] as f64;
+                dense[r * n_vars + c] = v;
+                col_sums_dense[c] += v;
+            }
+        }
+        let mut cov_dense = Mat::<f64>::zeros(n_vars, n_vars);
+        let x_ref = MatRef::from_row_major_slice(&dense, n_obs, n_vars);
+        faer::linalg::matmul::matmul(
+            cov_dense.as_mut(),
+            faer::Accum::Add,
+            x_ref.transpose(),
+            x_ref,
+            1.0,
+            faer::Par::rayon(0),
+        );
+
+        // --- Sparse sequential ---
+        let mut cov_sparse = Mat::<f64>::zeros(n_vars, n_vars);
+        let mut col_sums_sparse = vec![0.0f64; n_vars];
+        sparse_outer_product_accumulate(&csr, &mut col_sums_sparse, &mut cov_sparse);
+
+        // --- Sparse parallel ---
+        let (cov_par, col_sums_par) = sparse_outer_product_accumulate_par(&csr, n_vars);
+
+        // Check col_sums match
+        for c in 0..n_vars {
+            assert!(
+                (col_sums_dense[c] - col_sums_sparse[c]).abs() < 1e-10,
+                "col_sums mismatch at {c}: dense={}, sparse={}",
+                col_sums_dense[c],
+                col_sums_sparse[c]
+            );
+            assert!(
+                (col_sums_dense[c] - col_sums_par[c]).abs() < 1e-10,
+                "col_sums mismatch at {c}: dense={}, par={}",
+                col_sums_dense[c],
+                col_sums_par[c]
+            );
+        }
+
+        // Check covariance matrices match
+        for i in 0..n_vars {
+            for j in 0..n_vars {
+                assert!(
+                    (cov_dense[(i, j)] - cov_sparse[(i, j)]).abs() < 1e-10,
+                    "cov mismatch at ({i},{j}): dense={}, sparse={}",
+                    cov_dense[(i, j)],
+                    cov_sparse[(i, j)]
+                );
+                assert!(
+                    (cov_dense[(i, j)] - cov_par[(i, j)]).abs() < 1e-10,
+                    "cov mismatch at ({i},{j}): dense={}, par={}",
+                    cov_dense[(i, j)],
+                    cov_par[(i, j)]
+                );
+            }
+        }
     }
 }

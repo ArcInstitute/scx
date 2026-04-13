@@ -17,7 +17,7 @@ Usage:
     # Large datasets on high-mem partition
     python benchmarks/comprehensive/scripts/run_parallel.py \\
         --datasets census_500k census_1m census_5m \\
-        --partition cpu_high_mem --mem-gb 500 --timeout 480
+        --partition cpu_preemptible --mem-gb 500 --timeout 480
 
     # Specific benchmarks and formats
     python benchmarks/comprehensive/scripts/run_parallel.py \\
@@ -345,8 +345,8 @@ def parse_args() -> argparse.Namespace:
                         help="Show what would be submitted without running.")
 
     # SLURM parameters
-    parser.add_argument("--partition", default="cpu",
-                        help="SLURM partition (default: cpu)")
+    parser.add_argument("--partition", default="cpu_preemptible",
+                        help="SLURM partition (default: cpu_preemptible)")
     parser.add_argument("--cpus", type=int, default=16,
                         help="CPUs per task (default: 16)")
     parser.add_argument("--mem-gb", type=int, default=80,
