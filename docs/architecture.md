@@ -62,7 +62,7 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
-| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (randomized SVD), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
+| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (covariance eigh + randomized SVD, auto-routed), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native Leiden community detection), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
 | **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA), `gpu_umap` (CUDA SGD), `gpu_preprocess` (fused normalize+log1p), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess`, `lazy_transform`, `projected_agg` |
@@ -76,7 +76,9 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 > `scx-mtx` is **always-on** (no feature gate) since MTX is pure text I/O with no
 > HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
 > `scx-accel` depends only on `scx-format` and `scx-sparse` — no engine/loader
-> dependency. It uses `faer` for dense linear algebra and `instant-distance` for HNSW kNN.
+> dependency. It uses `faer` for dense linear algebra (QR, SVD, eigendecomposition),
+> `instant-distance` for HNSW kNN, `rand_chacha` for deterministic Leiden seeding,
+> and `libc` for `malloc_trim` in the Leiden optimizer.
 > With the `gpu` feature enabled, `scx-accel` gains an optional dependency on `scx-gpu`
 > for GPU-accelerated PCA (cuSPARSE SpMM + cuSOLVER QR), kNN (cuVS CAGRA), and
 > UMAP (native CUDA SGD kernel).
