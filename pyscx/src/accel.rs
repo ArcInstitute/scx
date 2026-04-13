@@ -3607,27 +3607,20 @@ fn hvg_seurat_v3<'py>(
     subset: bool,
     flavor: &str,
 ) -> PyResult<()> {
-    // ── 1. Compute global means/variances ───────────────────────────────
-    let source = build_shard_source(
-        &reader,
-        &transforms,
-        &kept_to_global,
-        &col_projection,
-        n_vars,
-        None,
-    );
-    let global_stats = scx_accel::streaming_mean_var(&source)
-        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
-
-    // ── 2. Determine batches ────────────────────────────────────────────
+    // ── 1. Determine batches ────────────────────────────────────────────
     let batches: Vec<Vec<usize>> = match batch_key {
         Some(bk) => {
             let obs = adata.getattr("obs")?;
             let batch_col = obs.get_item(bk)?;
-            let cat_codes: Vec<i64> = batch_col
-                .getattr("cat")?
-                .getattr("codes")?
-                .call_method0("to_numpy")?
+            // Handle both categorical and non-categorical columns:
+            // wrap in pd.Categorical() which is a no-op for already-categorical data.
+            let pd = py.import("pandas")?;
+            let np = py.import("numpy")?;
+            let cat = pd.call_method1("Categorical", (&batch_col,))?;
+            let codes = cat.getattr("codes")?;
+            let cat_codes: Vec<i64> = np
+                .call_method1("asarray", (&codes,))?
+                .call_method1("astype", ("int64",))?
                 .extract()?;
             let n_batches = *cat_codes.iter().max().unwrap_or(&0) as usize + 1;
             let mut groups = vec![vec![]; n_batches];
@@ -3641,28 +3634,44 @@ fn hvg_seurat_v3<'py>(
         None => vec![(0..n_obs).collect()],
     };
 
-    // ── 3. Per-batch: mean/var → loess → clip → norm_gene_var ───────────
-    let mut all_norm_vars: Vec<Vec<f64>> = Vec::new();
+    let n_batches_actual = batches.len();
 
-    for batch_cells in &batches {
+    // Build cell-to-batch mapping for batched streaming
+    let mut cell_batch = vec![-1i32; n_obs];
+    for (batch_id, batch_cells) in batches.iter().enumerate() {
+        for &cell_idx in batch_cells {
+            cell_batch[cell_idx] = batch_id as i32;
+        }
+    }
+
+    // ── 2. Batched streaming mean/var (single pass for ALL batches + global) ──
+    let source = build_shard_source(
+        &reader,
+        &transforms,
+        &kept_to_global,
+        &col_projection,
+        n_vars,
+        None,
+    );
+    let batched_stats =
+        scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?;
+
+    let global_stats = batched_stats.global.clone();
+
+    // ── 3. Per-batch: loess fit → clip_val (in-memory, no I/O) ───────────
+    let mut all_clip_vals: Vec<Vec<f64>> = Vec::new();
+    let mut batch_estimat_vars: Vec<Vec<f64>> = Vec::new();
+
+    for (b, batch_cells) in batches.iter().enumerate() {
         let batch_n = batch_cells.len();
         if batch_n < 2 {
-            all_norm_vars.push(vec![0.0; n_vars]);
+            all_clip_vals.push(vec![0.0; n_vars]);
+            batch_estimat_vars.push(vec![0.0; n_vars]);
             continue;
         }
 
-        let batch_source = build_shard_source(
-            &reader,
-            &transforms,
-            &kept_to_global,
-            &col_projection,
-            n_vars,
-            Some(batch_cells),
-        );
-
-        // Batch mean/var
-        let batch_stats = scx_accel::streaming_mean_var(&batch_source)
-            .map_err(|e| PyRuntimeError::new_err(format!("batch streaming_mean_var: {e}")))?;
+        let batch_stats = &batched_stats.per_batch[b];
 
         // Loess fit via Python (on non-constant genes)
         let mut estimat_var = vec![0.0f64; n_vars];
@@ -3686,7 +3695,6 @@ fn hvg_seurat_v3<'py>(
             let x_arr = numpy::PyArray::from_vec(py, x_vals);
             let y_arr = numpy::PyArray::from_vec(py, y_vals);
 
-            // Call skmisc.loess via PyO3
             let loess_mod = py.import("skmisc.loess")?;
             let loess_cls = loess_mod.getattr("loess")?;
             let kwargs = PyDict::new(py);
@@ -3717,13 +3725,35 @@ fn hvg_seurat_v3<'py>(
             clip_val[j] = reg_std * sqrt_n + batch_stats.means[j];
         }
 
-        // Streaming clipped accumulation
-        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum(&batch_source, &clip_val)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum: {e}")))?;
+        all_clip_vals.push(clip_val);
+        batch_estimat_vars.push(estimat_var);
+    }
 
-        // Compute normalized variance per gene
-        let mut norm_gene_var = vec![0.0f64; n_vars];
+    // ── 4. Batched streaming clipped sums (single pass for ALL batches) ──
+    let all_clipped = scx_accel::streaming_clip_square_sum_batched(
+        &source,
+        &cell_batch,
+        n_batches_actual,
+        &all_clip_vals,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_batched: {e}")))?;
+
+    // ── 5. Compute normalized variance per batch (in-memory) ─────────────
+    let mut all_norm_vars: Vec<Vec<f64>> = Vec::new();
+    for (b, batch_cells) in batches.iter().enumerate() {
+        let batch_n = batch_cells.len();
+        if batch_n < 2 {
+            all_norm_vars.push(vec![0.0; n_vars]);
+            continue;
+        }
+
+        let batch_stats = &batched_stats.per_batch[b];
+        let (ref bcs, ref sbcs) = all_clipped[b];
+        let estimat_var = &batch_estimat_vars[b];
+        let batch_n_f = batch_n as f64;
         let denom_n = (batch_n_f - 1.0).max(1.0);
+
+        let mut norm_gene_var = vec![0.0f64; n_vars];
         for j in 0..n_vars {
             let reg_std_sq = 10.0f64.powf(estimat_var[j]);
             if reg_std_sq > 0.0 {
@@ -3732,7 +3762,6 @@ fn hvg_seurat_v3<'py>(
                         - 2.0 * bcs[j] * batch_stats.means[j]);
             }
         }
-
         all_norm_vars.push(norm_gene_var);
     }
 
@@ -4005,7 +4034,11 @@ fn apply_hvg_subset(
             .set_col_projection(new_col_indices.clone());
         update_layers_col_projection(adata, &new_col_indices)?;
 
-        // Then slice var (use _var to bypass shape validation)
+        // Slice var via _var: AnnData's public var setter validates
+        // len(value) == self.n_vars, where n_vars is derived from the current
+        // _var DataFrame. Since we're changing the column count, the public
+        // setter would reject the new (shorter) DataFrame. Setting _var
+        // directly is the same approach used by anndata's own _inplace_subset_var.
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
         adata.setattr("_var", filtered_var)?;
@@ -4029,6 +4062,7 @@ fn apply_hvg_subset(
             .set_col_projection(new_col_indices.clone());
         update_layers_col_projection(adata, &new_col_indices)?;
 
+        // See comment above in backed branch for why _var is used.
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
         adata.setattr("_var", filtered_var)?;

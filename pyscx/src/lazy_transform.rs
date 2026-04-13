@@ -1374,6 +1374,10 @@ impl ScxLazyTransformedDataset {
                     .collect();
                 Ok(Some(indices))
             }
+            // Integer array (signed or unsigned).
+            // Only use non-materializing projection for sorted, unique indices.
+            // Unsorted or duplicate indices need materialization to preserve
+            // user-specified column order/repetition (numpy __getitem__ semantics).
             "i" | "u" => {
                 let indices: Vec<i64> = col_idx.extract()?;
                 let n = self.shape_val.1 as i64;
@@ -1391,6 +1395,9 @@ impl ScxLazyTransformedDataset {
                         }
                     })
                     .collect::<PyResult<Vec<_>>>()?;
+                if !resolved.windows(2).all(|w| w[0] < w[1]) {
+                    return Ok(None); // unsorted or duplicates → materialize
+                }
                 Ok(Some(resolved))
             }
             _ => Ok(None),

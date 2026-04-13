@@ -115,6 +115,155 @@ pub fn streaming_clip_square_sum<S: ShardSource>(
     Ok((batch_counts_sum, sq_batch_counts_sum))
 }
 
+/// Per-batch and global mean/variance from a single streaming pass.
+#[derive(Debug, Clone)]
+pub struct BatchedHvgStats {
+    /// Per-batch mean and variance (length = `n_batches`).
+    pub per_batch: Vec<HvgStats>,
+    /// Global mean and variance (aggregated from all batches).
+    pub global: HvgStats,
+    /// Number of cells in each batch.
+    pub batch_counts: Vec<usize>,
+}
+
+/// Single-pass streaming mean and variance per column **for multiple batches**.
+///
+/// Iterates through all shards once, accumulating per-batch sum and sum-of-squares
+/// in f64. Also derives global statistics from the per-batch accumulators (no
+/// extra pass needed). This reduces multi-batch HVG from 1 + 2N passes to 2 total.
+///
+/// `cell_batch` maps each visible cell (in shard-iteration order) to a batch index.
+/// Use `-1` for cells that should be excluded from all batches.
+///
+/// Memory: O(n_vars * n_batches) for per-batch accumulators.
+pub fn streaming_mean_var_batched<S: ShardSource>(
+    source: &S,
+    cell_batch: &[i32],
+    n_batches: usize,
+) -> Result<BatchedHvgStats> {
+    let n_vars = source.n_vars();
+
+    let mut batch_sum = vec![vec![0.0f64; n_vars]; n_batches];
+    let mut batch_sum_sq = vec![vec![0.0f64; n_vars]; n_batches];
+    let mut batch_count = vec![0usize; n_batches];
+
+    let mut cell_offset = 0usize;
+    for shard_idx in 0..source.n_shards() {
+        let csr = source.read_shard(shard_idx)?;
+        let n_rows = csr.n_rows();
+
+        for row in 0..n_rows {
+            let cell_idx = cell_offset + row;
+            let b = cell_batch[cell_idx];
+            if b < 0 {
+                continue;
+            }
+            let b = b as usize;
+            batch_count[b] += 1;
+
+            let start = csr.indptr[row] as usize;
+            let end = csr.indptr[row + 1] as usize;
+            for j in start..end {
+                let c = csr.indices[j] as usize;
+                let v = csr.data[j] as f64;
+                batch_sum[b][c] += v;
+                batch_sum_sq[b][c] += v * v;
+            }
+        }
+        cell_offset += n_rows;
+    }
+
+    // Compute per-batch means and variances.
+    let mut per_batch = Vec::with_capacity(n_batches);
+    for b in 0..n_batches {
+        let n = batch_count[b] as f64;
+        let mut means = vec![0.0f64; n_vars];
+        let mut variances = vec![0.0f64; n_vars];
+        if batch_count[b] > 0 {
+            let denom = (n - 1.0).max(1.0);
+            for j in 0..n_vars {
+                let mean = batch_sum[b][j] / n;
+                means[j] = mean;
+                variances[j] = ((batch_sum_sq[b][j] - n * mean * mean) / denom).max(0.0);
+            }
+        }
+        per_batch.push(HvgStats { means, variances });
+    }
+
+    // Derive global stats from per-batch accumulators (no extra pass).
+    let total_n: usize = batch_count.iter().sum();
+    let total_f = total_n as f64;
+    let mut global_means = vec![0.0f64; n_vars];
+    let mut global_variances = vec![0.0f64; n_vars];
+    if total_n > 0 {
+        let denom = (total_f - 1.0).max(1.0);
+        for j in 0..n_vars {
+            let global_sum: f64 = batch_sum.iter().map(|bs| bs[j]).sum();
+            let global_sum_sq: f64 = batch_sum_sq.iter().map(|bs| bs[j]).sum();
+            let mean = global_sum / total_f;
+            global_means[j] = mean;
+            global_variances[j] = ((global_sum_sq - total_f * mean * mean) / denom).max(0.0);
+        }
+    }
+
+    Ok(BatchedHvgStats {
+        per_batch,
+        global: HvgStats {
+            means: global_means,
+            variances: global_variances,
+        },
+        batch_counts: batch_count,
+    })
+}
+
+/// Single-pass streaming clipped accumulation for **multiple batches**.
+///
+/// For each nonzero value, looks up the cell's batch, clips by that batch's
+/// `clip_val`, and accumulates per-batch clipped sums and squared sums.
+///
+/// `clip_vals[batch][gene]` is the clip threshold for each batch/gene pair.
+///
+/// Memory: O(n_vars * n_batches).
+pub fn streaming_clip_square_sum_batched<S: ShardSource>(
+    source: &S,
+    cell_batch: &[i32],
+    n_batches: usize,
+    clip_vals: &[Vec<f64>],
+) -> Result<Vec<(Vec<f64>, Vec<f64>)>> {
+    let n_vars = source.n_vars();
+    debug_assert_eq!(clip_vals.len(), n_batches);
+
+    let mut batch_bcs = vec![vec![0.0f64; n_vars]; n_batches];
+    let mut batch_sbcs = vec![vec![0.0f64; n_vars]; n_batches];
+
+    let mut cell_offset = 0usize;
+    for shard_idx in 0..source.n_shards() {
+        let csr = source.read_shard(shard_idx)?;
+        let n_rows = csr.n_rows();
+
+        for row in 0..n_rows {
+            let cell_idx = cell_offset + row;
+            let b = cell_batch[cell_idx];
+            if b < 0 {
+                continue;
+            }
+            let b = b as usize;
+
+            let start = csr.indptr[row] as usize;
+            let end = csr.indptr[row + 1] as usize;
+            for j in start..end {
+                let c = csr.indices[j] as usize;
+                let v = (csr.data[j] as f64).min(clip_vals[b][c]);
+                batch_bcs[b][c] += v;
+                batch_sbcs[b][c] += v * v;
+            }
+        }
+        cell_offset += n_rows;
+    }
+
+    Ok(batch_bcs.into_iter().zip(batch_sbcs).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +391,86 @@ mod tests {
         let stats = streaming_mean_var(&source).unwrap();
         assert!(stats.means.iter().all(|&v| v == 0.0));
         assert!(stats.variances.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_streaming_mean_var_batched() {
+        let source = make_test_source();
+        // Rows: 0,1 in batch 0; rows 2,3 in batch 1
+        let cell_batch = [0i32, 0, 1, 1];
+        let result = streaming_mean_var_batched(&source, &cell_batch, 2).unwrap();
+
+        assert_eq!(result.batch_counts, vec![2, 2]);
+
+        // Batch 0: rows 0,1 → col0=[1,0], col1=[0,2], col2=[3,0]
+        // Means: [0.5, 1.0, 1.5]
+        let b0 = &result.per_batch[0];
+        assert!((b0.means[0] - 0.5).abs() < 1e-10);
+        assert!((b0.means[1] - 1.0).abs() < 1e-10);
+        assert!((b0.means[2] - 1.5).abs() < 1e-10);
+
+        // Batch 1: rows 2,3 → col0=[4,0], col1=[0,5], col2=[0,6]
+        // Means: [2.0, 2.5, 3.0]
+        let b1 = &result.per_batch[1];
+        assert!((b1.means[0] - 2.0).abs() < 1e-10);
+        assert!((b1.means[1] - 2.5).abs() < 1e-10);
+        assert!((b1.means[2] - 3.0).abs() < 1e-10);
+
+        // Global should match the non-batched result
+        let global_ref = streaming_mean_var(&source).unwrap();
+        for j in 0..3 {
+            assert!(
+                (result.global.means[j] - global_ref.means[j]).abs() < 1e-10,
+                "global mean[{j}]: {} vs {}",
+                result.global.means[j],
+                global_ref.means[j],
+            );
+            assert!(
+                (result.global.variances[j] - global_ref.variances[j]).abs() < 1e-10,
+                "global var[{j}]: {} vs {}",
+                result.global.variances[j],
+                global_ref.variances[j],
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_clip_square_sum_batched() {
+        let source = make_test_source();
+        // Rows: 0,1 in batch 0; rows 2,3 in batch 1
+        let cell_batch = [0i32, 0, 1, 1];
+        let clip_vals = vec![
+            vec![2.0, 3.0, 4.0], // batch 0 clip values
+            vec![3.0, 4.0, 5.0], // batch 1 clip values
+        ];
+
+        let result =
+            streaming_clip_square_sum_batched(&source, &cell_batch, 2, &clip_vals).unwrap();
+
+        // Batch 0 nonzeros: (row0: col0=1, col2=3), (row1: col1=2)
+        // Clipped by batch 0 clip_vals [2.0, 3.0, 4.0]:
+        //   col0: min(1,2)=1 → sum=1, sq=1
+        //   col1: min(2,3)=2 → sum=2, sq=4
+        //   col2: min(3,4)=3 → sum=3, sq=9
+        let (bcs0, sbcs0) = &result[0];
+        assert!((bcs0[0] - 1.0).abs() < 1e-10);
+        assert!((bcs0[1] - 2.0).abs() < 1e-10);
+        assert!((bcs0[2] - 3.0).abs() < 1e-10);
+        assert!((sbcs0[0] - 1.0).abs() < 1e-10);
+        assert!((sbcs0[1] - 4.0).abs() < 1e-10);
+        assert!((sbcs0[2] - 9.0).abs() < 1e-10);
+
+        // Batch 1 nonzeros: (row2: col0=4), (row3: col1=5, col2=6)
+        // Clipped by batch 1 clip_vals [3.0, 4.0, 5.0]:
+        //   col0: min(4,3)=3 → sum=3, sq=9
+        //   col1: min(5,4)=4 → sum=4, sq=16
+        //   col2: min(6,5)=5 → sum=5, sq=25
+        let (bcs1, sbcs1) = &result[1];
+        assert!((bcs1[0] - 3.0).abs() < 1e-10);
+        assert!((bcs1[1] - 4.0).abs() < 1e-10);
+        assert!((bcs1[2] - 5.0).abs() < 1e-10);
+        assert!((sbcs1[0] - 9.0).abs() < 1e-10);
+        assert!((sbcs1[1] - 16.0).abs() < 1e-10);
+        assert!((sbcs1[2] - 25.0).abs() < 1e-10);
     }
 }
