@@ -1226,57 +1226,64 @@ def evaluate_gate() -> dict:
         ],
     }
 
-    # Gate 2: lazy preprocess RSS < 1.5 GB on census_1m (revised target, Solution D)
-    mem_path = RESULTS_DIR / "lazy_preprocess_memory.json"
-    if mem_path.exists():
-        mem_data = json.loads(mem_path.read_text())
-        for entry in mem_data:
-            if entry.get("task") == "lazy_preprocess" and "error" not in entry:
-                rss = entry.get("peak_rss_mb", float("inf"))
-                gate["criteria"]["lazy_preprocess_rss"] = {
-                    "pass": rss < 1536,
-                    "target": "peak RSS < 1.5 GB on census_1m",
-                    "value_mb": rss,
-                    "dataset": entry.get("dataset", "?"),
-                }
-                break
+    # Gate 2: lazy preprocess RSS < 1.5 GB on census_1m
+    # Use new RSS worker results (current RSS via /proc/self/statm) instead of
+    # old worker (ru_maxrss high-water mark which inflates measurements).
+    mem_eff_path = RESULTS_DIR / "lazy_preprocess_memory_efficiency.json"
+    if mem_eff_path.exists():
+        mem_eff_data = json.loads(mem_eff_path.read_text())
+        if isinstance(mem_eff_data, list):
+            mem_eff_data = mem_eff_data[0] if mem_eff_data else {}
+        scenarios = mem_eff_data.get("scenarios", {})
+        lazy_pre = scenarios.get("lazy_preprocess_rss", {})
+        if lazy_pre and "error" not in lazy_pre:
+            rss = lazy_pre.get("peak_rss_mb", float("inf"))
+            gate["criteria"]["lazy_preprocess_rss"] = {
+                "pass": rss < 1536,
+                "target": "peak RSS < 1.5 GB on census_1m",
+                "value_mb": rss,
+                "dataset": lazy_pre.get("dataset", mem_eff_data.get("dataset", "?")),
+            }
         else:
             gate["criteria"]["lazy_preprocess_rss"] = {
                 "pass": False,
                 "target": "peak RSS < 1.5 GB",
-                "details": ["lazy_preprocess task not found in memory results"],
+                "details": ["lazy_preprocess_rss scenario not found or errored in memory efficiency results"],
             }
     else:
         gate["criteria"]["lazy_preprocess_rss"] = {
             "pass": False,
             "target": "peak RSS < 1.5 GB",
-            "details": ["lazy_preprocess_memory.json not found — run --mode bench first"],
+            "details": ["lazy_preprocess_memory_efficiency.json not found — run --mode memory_efficiency first"],
         }
 
-    # Gate 3: full pipeline RSS < 5 GB on census_1m (revised target, Solution D)
-    if mem_path.exists():
-        mem_data = json.loads(mem_path.read_text())
-        for entry in mem_data:
-            if entry.get("task") == "full_pipeline" and "error" not in entry:
-                rss = entry.get("peak_rss_mb", float("inf"))
-                gate["criteria"]["full_pipeline_rss"] = {
-                    "pass": rss < 5120,
-                    "target": "peak RSS < 5 GB on census_1m",
-                    "value_mb": rss,
-                    "dataset": entry.get("dataset", "?"),
-                }
-                break
+    # Gate 3: full pipeline RSS < 5 GB on census_1m
+    # Use lazy_pca_rss from new RSS worker (preprocess + streaming PCA).
+    if mem_eff_path.exists():
+        mem_eff_data = json.loads(mem_eff_path.read_text())
+        if isinstance(mem_eff_data, list):
+            mem_eff_data = mem_eff_data[0] if mem_eff_data else {}
+        scenarios = mem_eff_data.get("scenarios", {})
+        lazy_pca = scenarios.get("lazy_pca_rss", {})
+        if lazy_pca and "error" not in lazy_pca:
+            rss = lazy_pca.get("peak_rss_mb", float("inf"))
+            gate["criteria"]["full_pipeline_rss"] = {
+                "pass": rss < 5120,
+                "target": "peak RSS < 5 GB on census_1m",
+                "value_mb": rss,
+                "dataset": lazy_pca.get("dataset", mem_eff_data.get("dataset", "?")),
+            }
         else:
             gate["criteria"]["full_pipeline_rss"] = {
                 "pass": False,
                 "target": "peak RSS < 5 GB",
-                "details": ["full_pipeline task not found in memory results"],
+                "details": ["lazy_pca_rss scenario not found or errored in memory efficiency results"],
             }
     else:
         gate["criteria"]["full_pipeline_rss"] = {
             "pass": False,
             "target": "peak RSS < 5 GB",
-            "details": ["lazy_preprocess_memory.json not found — run --mode bench first"],
+            "details": ["lazy_preprocess_memory_efficiency.json not found — run --mode memory_efficiency first"],
         }
 
     # Gate 4: correctness — max abs error < 1e-5

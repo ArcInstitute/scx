@@ -22,6 +22,7 @@ dependencies = [
 dev = [
     "pytest",
     "scanpy",
+    "python-dotenv",
 ]
 scvi = [
     "scvi-tools",

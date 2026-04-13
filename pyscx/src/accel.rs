@@ -1802,7 +1802,8 @@ pub fn pseudobulk_dex(
 ///     resolution: Resolution parameter controlling cluster granularity (default: 1.0)
 ///     key_added: Column name in adata.obs for cluster labels (default: "leiden")
 ///     random_state: Random seed for reproducibility (default: 0)
-///     n_iterations: Maximum optimization iterations; -1 for until convergence (default: -1)
+///     n_iterations: Maximum optimization iterations; 2 runs two outer passes
+///         (matching leidenalg package default), -1 for until convergence (default: 2)
 ///     device: Device selection — "auto" (default), "cpu", or "gpu"
 ///
 /// Notes:
@@ -1811,7 +1812,7 @@ pub fn pseudobulk_dex(
 ///     strategy than leidenalg). Both produce valid, high-quality community
 ///     structures. Compare results via ARI or NMI when switching backends.
 #[pyfunction]
-#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto", parallel=false))]
+#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=2, device="auto", parallel=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     py: Python<'_>,

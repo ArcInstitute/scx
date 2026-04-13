@@ -1330,9 +1330,10 @@ pub fn leiden(
     // the converged partition. Each optimize() call does a full hierarchical
     // pass: move → refine → aggregate → converge.
     //
-    // When max_iterations == 0 (from scanpy's n_iterations=-1 default):
+    // When max_iterations == 0 (from n_iterations=-1, convergence mode):
     // repeat until no improvement, matching leidenalg's Optimiser.py:299-310.
-    // When max_iterations > 0: run exactly that many outer passes.
+    // When max_iterations > 0 (default 2, matching leidenalg package default):
+    // run exactly that many outer passes.
     if max_iterations == 0 {
         // Converge: repeat until no improvement.
         // Safety cap at 100 to prevent infinite loops on pathological inputs.

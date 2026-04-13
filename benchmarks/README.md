@@ -32,26 +32,33 @@ benchmarks/
 
 ## Prerequisites
 
-1. **Python venv** — All scripts use the project's uv virtualenv at `.venv/`:
+1. **Environment config** — Copy `.env.example` to `.env` and set `SCX_WORK_DIR` to your base data directory:
+   ```bash
+   cp .env.example .env
+   # Edit .env: set SCX_WORK_DIR=/path/to/your/scx/workdir
+   ```
+   `SCX_DATA_DIR` defaults to `$SCX_WORK_DIR/benchmarks/datasets` if not set.
+
+2. **Python venv** — All scripts use the project's uv virtualenv at `.venv/`:
    ```bash
    # From repo root:
    uv venv .venv
-   uv pip install scanpy anndata cellxgene-census tiledbsoma tiledbsoma-ml submitit
+   uv pip install scanpy anndata cellxgene-census tiledbsoma tiledbsoma-ml submitit python-dotenv
    ```
 
-2. **pyscx release build** — Benchmark scripts automatically rebuild pyscx in release mode. You can also do this manually:
+3. **pyscx release build** — Benchmark scripts automatically rebuild pyscx in release mode. You can also do this manually:
    ```bash
    cd pyscx && ../.venv/bin/maturin develop --release && cd ..
    ```
 
-3. **Rust toolchain** — Required for Rust-level benchmarks (ops, query engine, GPU decode):
+4. **Rust toolchain** — Required for Rust-level benchmarks (ops, query engine, GPU decode):
    ```bash
    cargo build --release --workspace
    ```
 
-4. **Datasets** — Download benchmark datasets to the data directory. Paths are configured via `SCX_WORK_DIR` and `SCX_DATA_DIR` environment variables (see `.env` at repo root). See [Dataset Preparation](#dataset-preparation) below.
+5. **Datasets** — Download benchmark datasets to the data directory. Paths are configured via `SCX_WORK_DIR` and `SCX_DATA_DIR` environment variables (see `.env` at repo root). See [Dataset Preparation](#dataset-preparation) below.
 
-5. **GPU environment** (for GPU benchmarks only) — See [docs/gpu-setup.md](../docs/gpu-setup.md) for CUDA/RAPIDS setup.
+6. **GPU environment** (for GPU benchmarks only) — See [docs/gpu-setup.md](../docs/gpu-setup.md) for CUDA/RAPIDS setup.
 
 ---
 
