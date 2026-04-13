@@ -1290,6 +1290,25 @@ impl ScxLazyTransformedDataset {
             return Ok(0.0f32.into_pyobject(py)?.into_any());
         }
 
+        // ── Non-materializing column projection ────────────────────────
+        // When row_idx selects ALL rows (`:` or `slice(None)`) and col_idx
+        // is an array or boolean mask, return a new ScxLazyTransformedDataset
+        // with col_projection set instead of materializing to scipy.
+        if self.is_all_rows_slice(py, row_idx)? {
+            if let Some(col_indices) = self.extract_col_indices(py, col_idx)? {
+                let composed = self.compose_col_projection(&col_indices);
+                let new_ds = ScxLazyTransformedDataset::new(
+                    Arc::clone(&self.backed),
+                    (self.shape_val.0, composed.len()),
+                    self.kept_to_global.clone(),
+                    Some(Arc::new(composed)),
+                    self.transforms.clone(),
+                    self.non_negative,
+                );
+                return Ok(new_ds.into_pyobject(py)?.into_any().unbind().into_bound(py));
+            }
+        }
+
         // Get the full row selection first
         let row_csr = self.getitem_rows(py, row_idx)?;
 
@@ -1307,6 +1326,87 @@ impl ScxLazyTransformedDataset {
         let slice_none = builtins.call_method1("slice", (py.None(),))?;
         let col_tuple = PyTuple::new(py, &[slice_none.unbind(), col_idx.clone().unbind()])?;
         row_csr.get_item(col_tuple)
+    }
+
+    /// Check whether `row_idx` selects all rows (is `slice(None)` / `:`).
+    fn is_all_rows_slice(&self, _py: Python<'_>, row_idx: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if let Ok(slice) = row_idx.downcast::<PySlice>() {
+            let indices = slice.indices(self.shape_val.0 as isize)?;
+            Ok(
+                indices.start == 0
+                    && indices.stop == self.shape_val.0 as isize
+                    && indices.step == 1,
+            )
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Try to extract integer column indices from `col_idx`.
+    /// Returns `Some(Vec<u32>)` for ndarray (int or bool), `None` otherwise.
+    fn extract_col_indices(
+        &self,
+        py: Python<'_>,
+        col_idx: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Vec<u32>>> {
+        let numpy = py.import("numpy")?;
+        let is_ndarray = col_idx.is_instance(&numpy.getattr("ndarray")?)?;
+        if !is_ndarray {
+            return Ok(None);
+        }
+
+        let dtype_str: String = col_idx.getattr("dtype")?.getattr("kind")?.extract()?;
+
+        match dtype_str.as_str() {
+            "b" => {
+                let mask: Vec<bool> = col_idx.extract()?;
+                if mask.len() != self.shape_val.1 {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "boolean index length {} doesn't match axis 1 size {}",
+                        mask.len(),
+                        self.shape_val.1,
+                    )));
+                }
+                let indices: Vec<u32> = mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &b)| if b { Some(i as u32) } else { None })
+                    .collect();
+                Ok(Some(indices))
+            }
+            "i" | "u" => {
+                let indices: Vec<i64> = col_idx.extract()?;
+                let n = self.shape_val.1 as i64;
+                let resolved: Vec<u32> = indices
+                    .iter()
+                    .map(|&i| {
+                        let i = if i < 0 { n + i } else { i };
+                        if i < 0 || i >= n {
+                            Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                                "column index {} out of range for axis of size {}",
+                                i, n,
+                            )))
+                        } else {
+                            Ok(i as u32)
+                        }
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(Some(resolved))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Compose new column indices with an existing col_projection.
+    /// Returns sorted, deduplicated indices (matching col_projection convention).
+    fn compose_col_projection(&self, new_indices: &[u32]) -> Vec<u32> {
+        let mut composed = match &self.col_projection {
+            Some(existing) => new_indices.iter().map(|&i| existing[i as usize]).collect(),
+            None => new_indices.to_vec(),
+        };
+        composed.sort_unstable();
+        composed.dedup();
+        composed
     }
 
     /// Apply transforms row-by-row for non-contiguous access.

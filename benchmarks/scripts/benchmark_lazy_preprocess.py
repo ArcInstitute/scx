@@ -790,8 +790,10 @@ def run_col_projected_full_benchmark(dataset_name: str) -> dict:
         times.append(time.perf_counter() - t0)
     proj_cs_median = _median(times)
     ratio_cs = proj_cs_median / unprojected_median if unprojected_median > 0 else 0
-    # Correctness: compare projected result vs reference
-    correct_cs = bool(np.allclose(proj_col_sums, ref_col_sums[mt_idx], rtol=1e-5))
+    # Correctness: compare projected result vs reference.
+    # col_projection sorts indices internally, so compare against sorted mt_idx.
+    mt_idx_sorted = np.sort(mt_idx)
+    correct_cs = bool(np.allclose(proj_col_sums, ref_col_sums[mt_idx_sorted], rtol=1e-5))
     scenarios["projected_col_sums"] = {
         "times_s": [round(t, 3) for t in times],
         "median_s": round(proj_cs_median, 3),
@@ -820,17 +822,15 @@ def run_col_projected_full_benchmark(dataset_name: str) -> dict:
     print(f"    Median: {proj_rs_median:.3f}s, ratio: {ratio_rs:.2f}x")
 
     # Scenario 4: Projected col_var
-    # Note: scipy csr_matrix has no .var() method; compute manually as E[X^2] - E[X]^2
+    # X[:, hvg_idx] now returns a ScxBackedSparseDataset with col_projection,
+    # so var(axis=0) uses the f64 streaming path directly.
     print(f"  Projected col_var X[:, hvg].var(axis=0) ({len(hvg_idx)} HVGs, median of {n_runs})...")
     times = []
     for _ in range(n_runs):
         gc.collect()
         t0 = time.perf_counter()
         X_proj = adata.X[:, hvg_idx]
-        n = X_proj.shape[0]
-        mean = np.asarray(X_proj.mean(axis=0)).ravel()
-        sq_mean = np.asarray(X_proj.multiply(X_proj).mean(axis=0)).ravel()
-        proj_var = sq_mean - mean ** 2
+        proj_var = np.asarray(X_proj.var(axis=0)).ravel()
         times.append(time.perf_counter() - t0)
     proj_var_median = _median(times)
     ratio_var = proj_var_median / unprojected_median if unprojected_median > 0 else 0
