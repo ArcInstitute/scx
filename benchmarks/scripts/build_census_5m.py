@@ -2,7 +2,7 @@
 """Build census_5m.h5ad from existing census chunk h5ad files.
 
 Concatenates the first 50 chunks (50 × 100K = 5M cells) from
-/scratch/ctc/nickyoungblut/scx/_census_chunk_*.h5ad
+WORK_DIR/_census_chunk_*.h5ad (see bench_env.py)
 
 This script requires significant memory (~200+ GB) and should be
 run on a high-memory SLURM node.
@@ -16,8 +16,10 @@ import anndata as ad
 import scipy.sparse as sp
 import numpy as np
 
-CHUNKS_DIR = "/scratch/ctc/nickyoungblut/scx"
-OUTPUT_DIR = "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets"
+from bench_env import WORK_DIR, DATA_DIR
+
+CHUNKS_DIR = str(WORK_DIR)
+OUTPUT_DIR = str(DATA_DIR)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "census_5m.h5ad")
 N_CHUNKS = 50  # 50 chunks × 100K cells = 5M cells
 

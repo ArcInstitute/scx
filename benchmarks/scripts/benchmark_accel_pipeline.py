@@ -31,11 +31,11 @@ from build_release import ensure_release_build
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 
 DATASETS = {
-    "tabula_sapiens_100k": {"h5ad": DATA_DIR / "tabula_sapiens_100k.h5ad", "cells": 100_000},
-    "census_1m": {"h5ad": DATA_DIR / "census_1m.h5ad", "cells": 1_000_000},
+    "tabula_sapiens_100k": {"h5ad": WORK_DIR / "tabula_sapiens_100k.h5ad", "cells": 100_000},
+    "census_1m": {"h5ad": WORK_DIR / "census_1m.h5ad", "cells": 1_000_000},
 }
 
 N_RUNS = 3
@@ -256,7 +256,7 @@ def run_scx_preprocess_pipeline(dataset_name, n_runs=N_RUNS):
 
         # Preprocess: write new SCX file
         with tempfile.NamedTemporaryFile(suffix=".scx", delete=False,
-                                          dir=str(DATA_DIR)) as tmp:
+                                          dir=str(WORK_DIR)) as tmp:
             prep_path = tmp.name
 
         try:

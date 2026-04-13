@@ -5,6 +5,8 @@ from pathlib import Path
 
 os.environ.setdefault("RAYON_NUM_THREADS", str(os.environ.get("SLURM_CPUS_PER_TASK", "16")))
 
+from bench_env import WORK_DIR
+
 def rss():
     try:
         with open("/proc/self/status") as f:
@@ -16,7 +18,7 @@ def rss():
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     ds = sys.argv[1] if len(sys.argv) > 1 else "tabula_sapiens_100k"
-    data_dir = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+    data_dir = WORK_DIR
     h5ad = data_dir / f"{ds}.h5ad"
     results = {"dataset": ds, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
 

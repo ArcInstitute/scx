@@ -13,8 +13,10 @@ import anndata as ad
 import scipy.sparse as sp
 import numpy as np
 
-CHUNKS_DIR = "/scratch/ctc/nickyoungblut/scx"
-OUTPUT_DIR = "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets"
+from bench_env import WORK_DIR, DATA_DIR
+
+CHUNKS_DIR = str(WORK_DIR)
+OUTPUT_DIR = str(DATA_DIR)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "census_500k.h5ad")
 N_CHUNKS = 5  # 5 × 100K = 500K cells
 

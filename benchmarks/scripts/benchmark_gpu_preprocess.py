@@ -35,12 +35,12 @@ from build_release import ensure_release_build
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 
 DATASETS = {
-    "pbmc3k": {"h5ad": DATA_DIR / "pbmc3k.h5ad", "cells": 2_700},
-    "tabula_sapiens_100k": {"h5ad": DATA_DIR / "tabula_sapiens_100k.h5ad", "cells": 100_000},
-    "census_1m": {"h5ad": DATA_DIR / "census_1m.h5ad", "cells": 1_000_000},
+    "pbmc3k": {"h5ad": WORK_DIR / "pbmc3k.h5ad", "cells": 2_700},
+    "tabula_sapiens_100k": {"h5ad": WORK_DIR / "tabula_sapiens_100k.h5ad", "cells": 100_000},
+    "census_1m": {"h5ad": WORK_DIR / "census_1m.h5ad", "cells": 1_000_000},
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ def run_preprocess_validation(dataset_name: str = "pbmc3k") -> dict:
 
     # SCX streaming preprocess
     print(f"  Running pyscx.preprocess (streaming CPU)...")
-    dst_path = str(DATA_DIR / f"{dataset_name}_preproc_bench.scx")
+    dst_path = str(WORK_DIR / f"{dataset_name}_preproc_bench.scx")
     t0 = time.perf_counter()
     pyscx.preprocess(str(scx_path), dst_path, ["normalize_total", "log1p"])
     t_scx = time.perf_counter() - t0
@@ -218,7 +218,7 @@ def run_timing_benchmark(datasets: list[str] | None = None,
         # SCX CPU streaming preprocess timing
         scx_times = []
         for run in range(n_runs):
-            dst = str(DATA_DIR / f"{ds_name}_preproc_bench_{run}.scx")
+            dst = str(WORK_DIR / f"{ds_name}_preproc_bench_{run}.scx")
             t0 = time.perf_counter()
             pyscx.preprocess(str(scx_path), dst, ["normalize_total", "log1p"])
             scx_times.append(time.perf_counter() - t0)

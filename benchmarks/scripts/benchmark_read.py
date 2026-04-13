@@ -18,7 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 sys.path.insert(0, str(Path(__file__).parent))
 from build_release import ensure_release_build
 
-DATA_DIR = os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx")
+from bench_env import WORK_DIR
 N_WARMUP = 1
 N_REPEATS = 3
 
@@ -44,8 +44,8 @@ def benchmark_read(dataset_name):
     import anndata
     import pyscx
 
-    h5ad_path = Path(DATA_DIR) / f"{dataset_name}.h5ad"
-    scx_path = Path(DATA_DIR) / f"{dataset_name}.scx"
+    h5ad_path = Path(WORK_DIR) / f"{dataset_name}.h5ad"
+    scx_path = Path(WORK_DIR) / f"{dataset_name}.scx"
 
     if not h5ad_path.exists():
         return None

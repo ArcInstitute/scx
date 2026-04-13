@@ -21,7 +21,9 @@ import time
 import h5py
 import numpy as np
 
-DATASETS_DIR = "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets"
+from bench_env import DATA_DIR
+
+DATASETS_DIR = str(DATA_DIR)
 
 DATASET_NAMES = [
     "pbmc3k",

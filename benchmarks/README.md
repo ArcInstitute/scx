@@ -49,7 +49,7 @@ benchmarks/
    cargo build --release --workspace
    ```
 
-4. **Datasets** — Download benchmark datasets to the data directory (default: `/scratch/ctc/nickyoungblut/scx/`). See [Dataset Preparation](#dataset-preparation) below.
+4. **Datasets** — Download benchmark datasets to the data directory. Paths are configured via `SCX_WORK_DIR` and `SCX_DATA_DIR` environment variables (see `.env` at repo root). See [Dataset Preparation](#dataset-preparation) below.
 
 5. **GPU environment** (for GPU benchmarks only) — See [docs/gpu-setup.md](../docs/gpu-setup.md) for CUDA/RAPIDS setup.
 
@@ -117,7 +117,7 @@ sbatch benchmarks/scripts/slurm_build_census_10m.sh
 | D7 | `census_5m` | 5,000,000 | 10x (UMI) | CELLxGENE Census |
 | D8 | `census_10m` | 10,000,000 | Mixed | CELLxGENE Census |
 
-By default, datasets are stored in `/scratch/ctc/nickyoungblut/scx/` (override with `SCX_DATA_DIR` env var).
+Dataset paths are configured via the `.env` file at the repo root (or environment variables). `SCX_WORK_DIR` sets the base working directory; `SCX_DATA_DIR` defaults to `$SCX_WORK_DIR/benchmarks/datasets`.
 
 ---
 
@@ -236,7 +236,7 @@ sbatch --exclusive benchmarks/scripts/slurm_gpu_analysis_bench.sh
 ```
 
 > [!IMPORTANT]
-> Always run dataset preparation jobs first. The benchmark scripts assume datasets exist at the `SCX_DATA_DIR` path (default: `/scratch/ctc/nickyoungblut/scx/`).
+> Always run dataset preparation jobs first. The benchmark scripts assume datasets exist at the `SCX_DATA_DIR` path (configured via `.env` at the repo root; defaults to `$SCX_WORK_DIR/benchmarks/datasets`).
 
 ---
 

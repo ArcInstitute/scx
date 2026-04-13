@@ -12,7 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 sys.path.insert(0, str(Path(__file__).parent))
 from build_release import ensure_release_build
 
-DATA_DIR = os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx")
+from bench_env import WORK_DIR
 N_REPEATS = 3
 
 
@@ -98,7 +98,7 @@ def benchmark_write_per_codec(h5ad_path):
 
 def run_all():
     """Run write benchmarks on benchmark datasets."""
-    data_path = Path(DATA_DIR)
+    data_path = Path(WORK_DIR)
 
     results = []
     for name in BENCHMARK_DATASETS:

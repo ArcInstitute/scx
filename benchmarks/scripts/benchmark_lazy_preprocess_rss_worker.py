@@ -31,7 +31,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ def task_lazy_preprocess_rss(dataset_name: str) -> dict:
     sampler = RssSampler(interval_ms=100)
     sampler.start()
 
-    scx_path = str(DATA_DIR / f"{dataset_name}.scx")
+    scx_path = str(WORK_DIR / f"{dataset_name}.scx")
     t0 = time.perf_counter()
 
     adata = pyscx.open(scx_path).to_anndata(backed=True)
@@ -131,7 +131,7 @@ def task_scanpy_preprocess_rss(dataset_name: str) -> dict:
     sampler = RssSampler(interval_ms=100)
     sampler.start()
 
-    h5ad_path = str(DATA_DIR / f"{dataset_name}.h5ad")
+    h5ad_path = str(WORK_DIR / f"{dataset_name}.h5ad")
     t0 = time.perf_counter()
 
     adata = anndata.read_h5ad(h5ad_path)
@@ -166,7 +166,7 @@ def task_lazy_pca_rss(dataset_name: str) -> dict:
     sampler = RssSampler(interval_ms=100)
     sampler.start()
 
-    scx_path = str(DATA_DIR / f"{dataset_name}.scx")
+    scx_path = str(WORK_DIR / f"{dataset_name}.scx")
     t0 = time.perf_counter()
 
     adata = pyscx.open(scx_path).to_anndata(backed=True)
@@ -209,7 +209,7 @@ def task_scanpy_pca_rss(dataset_name: str) -> dict:
     sampler = RssSampler(interval_ms=100)
     sampler.start()
 
-    h5ad_path = str(DATA_DIR / f"{dataset_name}.h5ad")
+    h5ad_path = str(WORK_DIR / f"{dataset_name}.h5ad")
     t0 = time.perf_counter()
 
     adata = anndata.read_h5ad(h5ad_path)
@@ -252,7 +252,7 @@ def task_e2e_ooc_pipeline(dataset_name: str) -> dict:
 
     # 1. Open backed
     t0 = time.perf_counter()
-    scx_path = str(DATA_DIR / f"{dataset_name}.scx")
+    scx_path = str(WORK_DIR / f"{dataset_name}.scx")
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     stage_timings["open"] = round(time.perf_counter() - t0, 3)
@@ -368,7 +368,7 @@ def task_e2e_scanpy_pipeline(dataset_name: str) -> dict:
 
     # 1. Load
     t0 = time.perf_counter()
-    h5ad_path = str(DATA_DIR / f"{dataset_name}.h5ad")
+    h5ad_path = str(WORK_DIR / f"{dataset_name}.h5ad")
     adata = anndata.read_h5ad(h5ad_path)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     stage_timings["load"] = round(time.perf_counter() - t0, 3)

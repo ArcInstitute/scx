@@ -11,9 +11,7 @@ from pathlib import Path
 import anndata
 import scanpy as sc
 
-DATA_DIR = Path(
-    os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets")
-)
+from bench_env import DATA_DIR
 
 DATASETS = ["pbmc3k", "smartseq2", "tabula_sapiens_100k"]
 

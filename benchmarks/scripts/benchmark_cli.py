@@ -10,7 +10,7 @@ End-to-end benchmarks for the scx CLI binary, measuring:
 5. Merge throughput — scx merge on 3 copies
 
 Requires:
-- tabula_sapiens_100k.scx (and .h5ad) in $SCX_DATA_DIR
+- tabula_sapiens_100k.scx (and .h5ad) in $SCX_WORK_DIR
 - Release-built scx-cli binary
 
 Usage:
@@ -29,7 +29,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 DATASET = "tabula_sapiens_100k"
 N_RUNS = 5
 # Actual cell_type values in tabula_sapiens_100k:
@@ -127,12 +127,12 @@ def prepare_dataset(tmpdir, binary):
 
     Returns dict with paths to the various test files needed.
     """
-    scx_path = DATA_DIR / f"{DATASET}.scx"
-    h5ad_path = DATA_DIR / f"{DATASET}.h5ad"
+    scx_path = WORK_DIR / f"{DATASET}.scx"
+    h5ad_path = WORK_DIR / f"{DATASET}.h5ad"
 
     if not scx_path.exists():
         print(f"ERROR: {scx_path} not found.", file=sys.stderr)
-        print(f"Set $SCX_DATA_DIR to the directory containing {DATASET}.scx", file=sys.stderr)
+        print(f"Set $SCX_WORK_DIR to the directory containing {DATASET}.scx", file=sys.stderr)
         sys.exit(1)
 
     # Get file info

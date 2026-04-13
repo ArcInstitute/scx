@@ -33,43 +33,43 @@ from build_release import ensure_release_build
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 sys.path.insert(0, str(REPO_ROOT / "pyscx"))
 
 DATASETS = {
     "pbmc3k": {
-        "h5ad": DATA_DIR / "pbmc3k.h5ad",
-        "scx": DATA_DIR / "pbmc3k.scx",
+        "h5ad": WORK_DIR / "pbmc3k.h5ad",
+        "scx": WORK_DIR / "pbmc3k.scx",
         "cells": 2700,
         "genes": 32738,
         "desc": "PBMC 3K — smoke test",
     },
     "smartseq2": {
-        "h5ad": DATA_DIR / "smartseq2.h5ad",
-        "scx": DATA_DIR / "smartseq2.scx",
+        "h5ad": WORK_DIR / "smartseq2.h5ad",
+        "scx": WORK_DIR / "smartseq2.scx",
         "cells": 70000,
         "genes": 60000,
         "desc": "Smart-seq2 — full-gene panel",
     },
     "tabula_sapiens_100k": {
-        "h5ad": DATA_DIR / "tabula_sapiens_100k.h5ad",
-        "scx": DATA_DIR / "tabula_sapiens_100k.scx",
+        "h5ad": WORK_DIR / "tabula_sapiens_100k.h5ad",
+        "scx": WORK_DIR / "tabula_sapiens_100k.scx",
         "cells": 100000,
         "genes": 60000,
         "desc": "Tabula Sapiens 100K — primary throughput",
     },
     "census_1m": {
-        "h5ad": DATA_DIR / "census_1m.h5ad",
-        "scx": DATA_DIR / "census_1m.scx",
+        "h5ad": WORK_DIR / "census_1m.h5ad",
+        "scx": WORK_DIR / "census_1m.scx",
         "cells": 1000000,
         "genes": 61497,
         "desc": "CELLxGENE Census 1M blood — scale validation",
     },
     "census_10m_blood": {
-        "h5ad": DATA_DIR / "census_10m_blood.h5ad",
-        "scx": DATA_DIR / "census_10m_blood.scx",
+        "h5ad": WORK_DIR / "census_10m_blood.h5ad",
+        "scx": WORK_DIR / "census_10m_blood.scx",
         "cells": 10000000,
         "genes": 60000,
         "desc": "CELLxGENE Census 10M — scale & Go/No-Go",
@@ -410,7 +410,7 @@ def bench_baseline_soma(dataset_name: str, batch_size: int = 1024) -> dict:
 
     # We need the h5ad converted to SOMA format first
     ds = DATASETS[dataset_name]
-    soma_uri = str(DATA_DIR / f"{dataset_name}.soma")
+    soma_uri = str(WORK_DIR / f"{dataset_name}.soma")
 
     if not Path(soma_uri).exists():
         # Convert h5ad → SOMA experiment

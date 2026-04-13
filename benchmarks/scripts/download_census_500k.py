@@ -12,7 +12,9 @@ import cellxgene_census
 import anndata as ad
 import scipy.sparse as sp
 
-OUTPUT_DIR = "/scratch/ctc/nickyoungblut/scx/benchmarks/datasets"
+from bench_env import DATA_DIR
+
+OUTPUT_DIR = str(DATA_DIR)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "census_500k.h5ad")
 TARGET_CELLS = 500_000
 SEED = 42

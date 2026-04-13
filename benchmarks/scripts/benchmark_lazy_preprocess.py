@@ -39,16 +39,16 @@ from build_release import ensure_release_build
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 WORKER_SCRIPT = Path(__file__).parent / "benchmark_lazy_preprocess_worker.py"
 RSS_WORKER_SCRIPT = Path(__file__).parent / "benchmark_lazy_preprocess_rss_worker.py"
 
 DATASETS = {
-    "pbmc3k": {"h5ad": DATA_DIR / "pbmc3k.h5ad", "cells": 2_700},
-    "tabula_sapiens_100k": {"h5ad": DATA_DIR / "tabula_sapiens_100k.h5ad", "cells": 100_000},
-    "census_500k": {"h5ad": DATA_DIR / "census_500k.h5ad", "cells": 500_000},
-    "census_1m": {"h5ad": DATA_DIR / "census_1m.h5ad", "cells": 1_000_000},
-    "census_5m": {"h5ad": DATA_DIR / "census_5m.h5ad", "cells": 5_000_000},
+    "pbmc3k": {"h5ad": WORK_DIR / "pbmc3k.h5ad", "cells": 2_700},
+    "tabula_sapiens_100k": {"h5ad": WORK_DIR / "tabula_sapiens_100k.h5ad", "cells": 100_000},
+    "census_500k": {"h5ad": WORK_DIR / "census_500k.h5ad", "cells": 500_000},
+    "census_1m": {"h5ad": WORK_DIR / "census_1m.h5ad", "cells": 1_000_000},
+    "census_5m": {"h5ad": WORK_DIR / "census_5m.h5ad", "cells": 5_000_000},
 }
 
 N_RUNS = 3

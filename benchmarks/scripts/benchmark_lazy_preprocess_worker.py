@@ -22,7 +22,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "pyscx"))
 
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "/scratch/ctc/nickyoungblut/scx"))
+from bench_env import WORK_DIR
 
 
 def _rss_mb():
@@ -35,7 +35,7 @@ def measure_lazy_preprocess(dataset_name: str) -> dict:
     gc.collect()
     import pyscx
 
-    scx_path = str(DATA_DIR / f"{dataset_name}.scx")
+    scx_path = str(WORK_DIR / f"{dataset_name}.scx")
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     n_obs, n_vars = adata.n_obs, adata.n_vars
 
@@ -66,7 +66,7 @@ def measure_full_pipeline(dataset_name: str) -> dict:
     import pyscx
     import scanpy as sc
 
-    scx_path = str(DATA_DIR / f"{dataset_name}.scx")
+    scx_path = str(WORK_DIR / f"{dataset_name}.scx")
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     print(f"  X type after open: {type(adata.X).__name__}", flush=True)
@@ -112,7 +112,7 @@ def measure_materialized_preprocess(dataset_name: str) -> dict:
     import anndata
     import scanpy as sc
 
-    h5ad_path = str(DATA_DIR / f"{dataset_name}.h5ad")
+    h5ad_path = str(WORK_DIR / f"{dataset_name}.h5ad")
 
     t0 = time.perf_counter()
     adata = anndata.read_h5ad(h5ad_path)
