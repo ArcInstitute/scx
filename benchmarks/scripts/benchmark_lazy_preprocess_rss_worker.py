@@ -293,16 +293,13 @@ def task_e2e_ooc_pipeline(dataset_name: str) -> dict:
     pyscx.accel.log1p(adata)
     stage_timings["log1p"] = round(time.perf_counter() - t0, 3)
 
-    # 7. HVG (on normalized+log1p data, using default seurat flavor)
+    # 7. HVG (streaming via pyscx — no materialization)
     t0 = time.perf_counter()
     n_top = min(2000, adata.n_vars)
-    try:
-        sc.pp.highly_variable_genes(
-            adata, n_top_genes=n_top, flavor="seurat_v3",
-            subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0,
-        )
-    except Exception:
-        sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
+    pyscx.accel.highly_variable_genes(
+        adata, n_top_genes=n_top, flavor="seurat_v3",
+        subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0,
+    )
     stage_timings["hvg"] = round(time.perf_counter() - t0, 3)
 
     # 8. PCA

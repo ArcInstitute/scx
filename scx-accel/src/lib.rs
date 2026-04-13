@@ -11,6 +11,7 @@
 
 pub mod diffexp;
 pub mod error;
+pub mod hvg;
 pub mod leiden;
 pub mod neighbors;
 pub mod pca;
@@ -22,6 +23,7 @@ pub use diffexp::{
     wilcoxon_rank_sum_streaming, DiffExpResult,
 };
 pub use error::{AccelError, Result};
+pub use hvg::{streaming_clip_square_sum, streaming_mean_var, HvgStats};
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{

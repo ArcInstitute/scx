@@ -3377,3 +3377,688 @@ pub fn subset_obs(
 
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Highly Variable Genes
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Streaming highly-variable gene selection without materialization.
+///
+/// Computes HVG statistics shard-by-shard via the `ShardSource` abstraction,
+/// then selects the top `n_top_genes` by normalized variance (seurat_v3) or
+/// normalized dispersion (seurat).
+///
+/// Args:
+///     adata: AnnData with X as ScxBackedSparseDataset or ScxLazyTransformedDataset
+///     n_top_genes: Number of highly variable genes to select (default: 2000)
+///     flavor: "seurat_v3" (raw counts) or "seurat" (log-normalized) (default: "seurat_v3")
+///     batch_key: Column in adata.obs for batch-aware HVG (default: None)
+///     span: Loess span for seurat_v3 (default: 0.3)
+///     subset: If True, subset adata to HVG via column projection (default: False)
+///     n_bins: Number of bins for seurat flavor (default: 20)
+#[pyfunction]
+#[pyo3(signature = (adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=false, n_bins=20))]
+#[allow(clippy::too_many_arguments)]
+pub fn highly_variable_genes<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    n_top_genes: usize,
+    flavor: &str,
+    batch_key: Option<&str>,
+    span: f64,
+    subset: bool,
+    n_bins: usize,
+) -> PyResult<()> {
+    let x = adata.getattr("X")?;
+
+    // ── Try SCX backed dataset ──────────────────────────────────────────
+    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+        let backed_ref = backed.borrow();
+        let reader = Arc::clone(&backed_ref.backed);
+        let n_vars = backed_ref.shape_val.1;
+        let n_obs = backed_ref.shape_val.0;
+        let kept = backed_ref.kept_to_global.clone();
+        let col_proj = backed_ref.col_projection_arc();
+        drop(backed_ref);
+
+        return hvg_on_source(
+            py,
+            adata,
+            &x,
+            reader,
+            vec![],
+            kept,
+            col_proj,
+            n_obs,
+            n_vars,
+            n_top_genes,
+            flavor,
+            batch_key,
+            span,
+            subset,
+            n_bins,
+        );
+    }
+
+    // ── Try SCX lazy-transformed dataset ────────────────────────────────
+    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+        let lazy_ref = lazy.borrow();
+        let reader = Arc::clone(&lazy_ref.backed);
+        let transforms = lazy_ref.transforms.clone();
+        let n_vars = lazy_ref.shape_val.1;
+        let n_obs = lazy_ref.shape_val.0;
+        let kept = lazy_ref.kept_to_global.clone();
+        let col_proj = lazy_ref.col_projection.clone();
+        drop(lazy_ref);
+
+        return hvg_on_source(
+            py,
+            adata,
+            &x,
+            reader,
+            transforms,
+            kept,
+            col_proj,
+            n_obs,
+            n_vars,
+            n_top_genes,
+            flavor,
+            batch_key,
+            span,
+            subset,
+            n_bins,
+        );
+    }
+
+    // ── Fallback to scanpy ──────────────────────────────────────────────
+    let sc = py.import("scanpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("n_top_genes", n_top_genes)?;
+    kwargs.set_item("flavor", flavor)?;
+    kwargs.set_item("span", span)?;
+    kwargs.set_item("subset", subset)?;
+    kwargs.set_item("n_bins", n_bins)?;
+    if let Some(bk) = batch_key {
+        kwargs.set_item("batch_key", bk)?;
+    }
+    sc.getattr("pp")?
+        .call_method("highly_variable_genes", (adata,), Some(&kwargs))?;
+    Ok(())
+}
+
+/// Core HVG logic for SCX-backed sources. Dispatches to seurat_v3 or seurat.
+#[allow(clippy::too_many_arguments)]
+fn hvg_on_source<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    x_obj: &Bound<'py, PyAny>,
+    reader: Arc<scx_format::BackedCsrReader>,
+    transforms: Vec<Transform>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
+    col_projection: Option<Arc<Vec<u32>>>,
+    n_obs: usize,
+    n_vars: usize,
+    n_top_genes: usize,
+    flavor: &str,
+    batch_key: Option<&str>,
+    span: f64,
+    subset: bool,
+    n_bins: usize,
+) -> PyResult<()> {
+    match flavor {
+        "seurat_v3" | "seurat_v3_paper" => hvg_seurat_v3(
+            py,
+            adata,
+            x_obj,
+            reader,
+            transforms,
+            kept_to_global,
+            col_projection,
+            n_obs,
+            n_vars,
+            n_top_genes,
+            batch_key,
+            span,
+            subset,
+            flavor,
+        ),
+        "seurat" => hvg_seurat(
+            py,
+            adata,
+            x_obj,
+            reader,
+            transforms,
+            kept_to_global,
+            col_projection,
+            n_obs,
+            n_vars,
+            n_top_genes,
+            batch_key,
+            subset,
+            n_bins,
+        ),
+        _ => Err(PyValueError::new_err(format!(
+            "Unsupported HVG flavor '{flavor}'. Use 'seurat_v3' or 'seurat'."
+        ))),
+    }
+}
+
+/// Build a LazyShardSource, optionally filtered to a batch of cells.
+fn build_shard_source(
+    reader: &Arc<scx_format::BackedCsrReader>,
+    transforms: &[Transform],
+    kept_to_global: &Option<Arc<Vec<u64>>>,
+    col_projection: &Option<Arc<Vec<u32>>>,
+    n_vars: usize,
+    batch_indices: Option<&[usize]>,
+) -> crate::lazy_transform::LazyShardSource {
+    use crate::lazy_transform::LazyShardSource;
+
+    match batch_indices {
+        Some(indices) => {
+            // Compose batch indices with existing kept_to_global
+            let global_rows: Vec<u64> = match kept_to_global {
+                Some(existing) => indices.iter().map(|&i| existing[i]).collect(),
+                None => indices.iter().map(|&i| i as u64).collect(),
+            };
+            LazyShardSource::with_kept_rows(
+                Arc::clone(reader),
+                transforms.to_vec(),
+                global_rows,
+                col_projection.clone(),
+                n_vars,
+            )
+        }
+        None => {
+            // Full dataset (or existing kept_to_global)
+            LazyShardSource::with_kept_rows(
+                Arc::clone(reader),
+                transforms.to_vec(),
+                match kept_to_global {
+                    Some(k) => k.as_ref().clone(),
+                    None => (0..reader.shape().0 as u64).collect(),
+                },
+                col_projection.clone(),
+                n_vars,
+            )
+        }
+    }
+}
+
+/// seurat_v3 flavor: raw count data, loess fit, clipped variance.
+#[allow(clippy::too_many_arguments)]
+fn hvg_seurat_v3<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    x_obj: &Bound<'py, PyAny>,
+    reader: Arc<scx_format::BackedCsrReader>,
+    transforms: Vec<Transform>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
+    col_projection: Option<Arc<Vec<u32>>>,
+    n_obs: usize,
+    n_vars: usize,
+    n_top_genes: usize,
+    batch_key: Option<&str>,
+    span: f64,
+    subset: bool,
+    flavor: &str,
+) -> PyResult<()> {
+    // ── 1. Compute global means/variances ───────────────────────────────
+    let source = build_shard_source(
+        &reader,
+        &transforms,
+        &kept_to_global,
+        &col_projection,
+        n_vars,
+        None,
+    );
+    let global_stats = scx_accel::streaming_mean_var(&source)
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
+
+    // ── 2. Determine batches ────────────────────────────────────────────
+    let batches: Vec<Vec<usize>> = match batch_key {
+        Some(bk) => {
+            let obs = adata.getattr("obs")?;
+            let batch_col = obs.get_item(bk)?;
+            let cat_codes: Vec<i64> = batch_col
+                .getattr("cat")?
+                .getattr("codes")?
+                .call_method0("to_numpy")?
+                .extract()?;
+            let n_batches = *cat_codes.iter().max().unwrap_or(&0) as usize + 1;
+            let mut groups = vec![vec![]; n_batches];
+            for (i, &code) in cat_codes.iter().enumerate() {
+                if code >= 0 {
+                    groups[code as usize].push(i);
+                }
+            }
+            groups.into_iter().filter(|g| !g.is_empty()).collect()
+        }
+        None => vec![(0..n_obs).collect()],
+    };
+
+    // ── 3. Per-batch: mean/var → loess → clip → norm_gene_var ───────────
+    let mut all_norm_vars: Vec<Vec<f64>> = Vec::new();
+
+    for batch_cells in &batches {
+        let batch_n = batch_cells.len();
+        if batch_n < 2 {
+            all_norm_vars.push(vec![0.0; n_vars]);
+            continue;
+        }
+
+        let batch_source = build_shard_source(
+            &reader,
+            &transforms,
+            &kept_to_global,
+            &col_projection,
+            n_vars,
+            Some(batch_cells),
+        );
+
+        // Batch mean/var
+        let batch_stats = scx_accel::streaming_mean_var(&batch_source)
+            .map_err(|e| PyRuntimeError::new_err(format!("batch streaming_mean_var: {e}")))?;
+
+        // Loess fit via Python (on non-constant genes)
+        let mut estimat_var = vec![0.0f64; n_vars];
+        let not_const: Vec<bool> = batch_stats.variances.iter().map(|&v| v > 0.0).collect();
+        let x_vals: Vec<f64> = batch_stats
+            .means
+            .iter()
+            .zip(not_const.iter())
+            .filter(|(_, &nc)| nc)
+            .map(|(&m, _)| m.max(1e-300).log10())
+            .collect();
+        let y_vals: Vec<f64> = batch_stats
+            .variances
+            .iter()
+            .zip(not_const.iter())
+            .filter(|(_, &nc)| nc)
+            .map(|(&v, _)| v.max(1e-300).log10())
+            .collect();
+
+        if x_vals.len() >= 3 {
+            let x_arr = numpy::PyArray::from_vec(py, x_vals);
+            let y_arr = numpy::PyArray::from_vec(py, y_vals);
+
+            // Call skmisc.loess via PyO3
+            let loess_mod = py.import("skmisc.loess")?;
+            let loess_cls = loess_mod.getattr("loess")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("span", span)?;
+            kwargs.set_item("degree", 2)?;
+            let model = loess_cls.call((x_arr, y_arr), Some(&kwargs))?;
+            model.call_method0("fit")?;
+            let fitted: Vec<f64> = model
+                .getattr("outputs")?
+                .getattr("fitted_values")?
+                .extract()?;
+
+            let mut fi = 0;
+            for (j, &nc) in not_const.iter().enumerate() {
+                if nc {
+                    estimat_var[j] = fitted[fi];
+                    fi += 1;
+                }
+            }
+        }
+
+        // reg_std and clip_val
+        let mut clip_val = vec![0.0f64; n_vars];
+        let batch_n_f = batch_n as f64;
+        let sqrt_n = batch_n_f.sqrt();
+        for j in 0..n_vars {
+            let reg_std = 10.0f64.powf(estimat_var[j]).sqrt();
+            clip_val[j] = reg_std * sqrt_n + batch_stats.means[j];
+        }
+
+        // Streaming clipped accumulation
+        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum(&batch_source, &clip_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum: {e}")))?;
+
+        // Compute normalized variance per gene
+        let mut norm_gene_var = vec![0.0f64; n_vars];
+        let denom_n = (batch_n_f - 1.0).max(1.0);
+        for j in 0..n_vars {
+            let reg_std_sq = 10.0f64.powf(estimat_var[j]);
+            if reg_std_sq > 0.0 {
+                norm_gene_var[j] = (1.0 / (denom_n * reg_std_sq))
+                    * (batch_n_f * batch_stats.means[j] * batch_stats.means[j] + sbcs[j]
+                        - 2.0 * bcs[j] * batch_stats.means[j]);
+            }
+        }
+
+        all_norm_vars.push(norm_gene_var);
+    }
+
+    // ── 4. Rank genes and select top N ──────────────────────────────────
+    let n_batches = all_norm_vars.len();
+
+    // Mean normalized variance across batches
+    let mut mean_norm_var = vec![0.0f64; n_vars];
+    for nv in &all_norm_vars {
+        for (j, &v) in nv.iter().enumerate() {
+            mean_norm_var[j] += v;
+        }
+    }
+    for v in &mut mean_norm_var {
+        *v /= n_batches as f64;
+    }
+
+    // For multi-batch: rank within each batch, then combine ranks
+    let (hvg_mask, ranks) = if n_batches > 1 {
+        // Per-batch ranks: for each batch, rank genes by normalized variance (descending)
+        let mut batch_ranks: Vec<Vec<usize>> = Vec::new();
+        for nv in &all_norm_vars {
+            let mut indices: Vec<usize> = (0..n_vars).collect();
+            indices.sort_by(|&a, &b| {
+                nv[b]
+                    .partial_cmp(&nv[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut rank = vec![0usize; n_vars];
+            for (r, &idx) in indices.iter().enumerate() {
+                rank[idx] = r;
+            }
+            batch_ranks.push(rank);
+        }
+
+        // Count in how many batches each gene is in top n_top_genes
+        let mut nbatches_hv = vec![0usize; n_vars];
+        let mut median_ranks = vec![f64::NAN; n_vars];
+        for j in 0..n_vars {
+            let ranks_j: Vec<usize> = batch_ranks.iter().map(|br| br[j]).collect();
+            nbatches_hv[j] = ranks_j.iter().filter(|&&r| r < n_top_genes).count();
+            // Median of ranks where gene is in top n_top_genes
+            let mut valid: Vec<f64> = ranks_j
+                .iter()
+                .filter(|&&r| r < n_top_genes)
+                .map(|&r| r as f64)
+                .collect();
+            if !valid.is_empty() {
+                valid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                median_ranks[j] = valid[valid.len() / 2];
+            }
+        }
+
+        // Sort genes: by nbatches (desc), then median_rank (asc)
+        let mut gene_order: Vec<usize> = (0..n_vars).collect();
+        if flavor == "seurat_v3_paper" {
+            gene_order.sort_by(|&a, &b| {
+                nbatches_hv[b].cmp(&nbatches_hv[a]).then(
+                    median_ranks[a]
+                        .partial_cmp(&median_ranks[b])
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+        } else {
+            gene_order.sort_by(|&a, &b| {
+                median_ranks[a]
+                    .partial_cmp(&median_ranks[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(nbatches_hv[b].cmp(&nbatches_hv[a]))
+            });
+        }
+
+        let mut mask = vec![false; n_vars];
+        let mut rank_out = vec![f64::NAN; n_vars];
+        for (r, &g) in gene_order.iter().enumerate().take(n_top_genes.min(n_vars)) {
+            mask[g] = true;
+            rank_out[g] = r as f64;
+        }
+        (mask, rank_out)
+    } else {
+        // Single batch: simple rank by normalized variance descending
+        let mut indices: Vec<usize> = (0..n_vars).collect();
+        indices.sort_by(|&a, &b| {
+            mean_norm_var[b]
+                .partial_cmp(&mean_norm_var[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut mask = vec![false; n_vars];
+        let mut rank_out = vec![f64::NAN; n_vars];
+        for (r, &g) in indices.iter().enumerate().take(n_top_genes.min(n_vars)) {
+            mask[g] = true;
+            rank_out[g] = r as f64;
+        }
+        (mask, rank_out)
+    };
+
+    // ── 5. Write results to adata.var ───────────────────────────────────
+    let var = adata.getattr("var")?;
+    var.set_item(
+        "highly_variable",
+        numpy::PyArray::from_vec(py, hvg_mask.clone()),
+    )?;
+    var.set_item("means", numpy::PyArray::from_vec(py, global_stats.means))?;
+    var.set_item(
+        "variances",
+        numpy::PyArray::from_vec(py, global_stats.variances),
+    )?;
+    var.set_item(
+        "variances_norm",
+        numpy::PyArray::from_vec(py, mean_norm_var),
+    )?;
+    var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
+
+    // ── 6. Subset if requested ──────────────────────────────────────────
+    if subset {
+        apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+    }
+
+    Ok(())
+}
+
+/// seurat flavor: log-normalized data, binned dispersion normalization.
+#[allow(clippy::too_many_arguments)]
+fn hvg_seurat<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    x_obj: &Bound<'py, PyAny>,
+    reader: Arc<scx_format::BackedCsrReader>,
+    transforms: Vec<Transform>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
+    col_projection: Option<Arc<Vec<u32>>>,
+    _n_obs: usize,
+    n_vars: usize,
+    n_top_genes: usize,
+    batch_key: Option<&str>,
+    subset: bool,
+    n_bins: usize,
+) -> PyResult<()> {
+    // For batched seurat, fall back to scanpy (complex aggregation logic)
+    if batch_key.is_some() {
+        let sc = py.import("scanpy")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("n_top_genes", n_top_genes)?;
+        kwargs.set_item("flavor", "seurat")?;
+        kwargs.set_item("subset", subset)?;
+        kwargs.set_item("n_bins", n_bins)?;
+        kwargs.set_item("batch_key", batch_key)?;
+        sc.getattr("pp")?
+            .call_method("highly_variable_genes", (adata,), Some(&kwargs))?;
+        return Ok(());
+    }
+
+    // ── 1. Streaming mean/var ───────────────────────────────────────────
+    let source = build_shard_source(
+        &reader,
+        &transforms,
+        &kept_to_global,
+        &col_projection,
+        n_vars,
+        None,
+    );
+    let stats = scx_accel::streaming_mean_var(&source)
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
+
+    // ── 2. Compute dispersion (matching scanpy's seurat flavor) ────────
+    let mut dispersions = vec![0.0f64; n_vars];
+    let mut log_dispersions = vec![f64::NAN; n_vars];
+    let mut log_means = vec![0.0f64; n_vars];
+    let mut means_for_disp = stats.means.clone();
+
+    for j in 0..n_vars {
+        // scanpy: mean[mean == 0] = 1e-12 (before dispersion computation)
+        if means_for_disp[j] == 0.0 {
+            means_for_disp[j] = 1e-12;
+        }
+        dispersions[j] = stats.variances[j] / means_for_disp[j];
+        // scanpy: dispersion[dispersion == 0] = NaN, then log(dispersion)
+        if dispersions[j] > 0.0 {
+            log_dispersions[j] = dispersions[j].ln();
+        } else {
+            dispersions[j] = f64::NAN;
+        }
+        // scanpy: mean = log1p(mean) — overwrite mean with log1p for binning
+        log_means[j] = (means_for_disp[j] + 1.0).ln();
+    }
+
+    // ── 3. Bin by mean, z-score dispersion within bins (via Python) ────
+    let locals2 = PyDict::new(py);
+    locals2.set_item("log_means_arr", numpy::PyArray::from_vec(py, log_means))?;
+    locals2.set_item(
+        "log_disp_arr",
+        numpy::PyArray::from_vec(py, log_dispersions),
+    )?;
+    locals2.set_item("n_bins", n_bins)?;
+
+    py.run(
+        pyo3::ffi::c_str!(
+            r#"
+import numpy as _np
+import pandas as _pd
+_lm = _np.array(log_means_arr)
+_ld = _np.array(log_disp_arr)
+_n = len(_lm)
+_dn = _np.full(_n, 0.0)
+_mb = _pd.cut(_lm, bins=n_bins)
+for _b in _mb.categories:
+    _mask = _np.asarray(_mb == _b)
+    if _mask.sum() == 0:
+        continue
+    _vals = _ld[_mask]
+    _avg = _np.nanmean(_vals)
+    _std = _np.nanstd(_vals, ddof=1)
+    if _np.isnan(_std) or _std == 0:
+        _std = 1.0
+    _dn[_mask] = (_vals - _avg) / _std
+_dn[_np.isnan(_dn)] = 0.0
+_result_disp_norm = _dn.tolist()
+"#
+        ),
+        None,
+        Some(&locals2),
+    )?;
+
+    let dispersions_norm: Vec<f64> = locals2
+        .get_item("_result_disp_norm")?
+        .ok_or_else(|| PyRuntimeError::new_err("dispersion normalization failed"))?
+        .extract()?;
+
+    // ── 4. Select top genes by normalized dispersion ────────────────────
+    let mut indices: Vec<usize> = (0..n_vars).collect();
+    indices.sort_by(|&a, &b| {
+        dispersions_norm[b]
+            .partial_cmp(&dispersions_norm[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut mask = vec![false; n_vars];
+    for &g in indices.iter().take(n_top_genes.min(n_vars)) {
+        mask[g] = true;
+    }
+
+    // ── 5. Write results to adata.var ───────────────────────────────────
+    let var = adata.getattr("var")?;
+    var.set_item(
+        "highly_variable",
+        numpy::PyArray::from_vec(py, mask.clone()),
+    )?;
+    var.set_item("means", numpy::PyArray::from_vec(py, stats.means))?;
+    var.set_item("dispersions", numpy::PyArray::from_vec(py, dispersions))?;
+    var.set_item(
+        "dispersions_norm",
+        numpy::PyArray::from_vec(
+            py,
+            dispersions_norm
+                .iter()
+                .map(|&v| v as f32)
+                .collect::<Vec<f32>>(),
+        ),
+    )?;
+
+    // ── 6. Subset if requested ──────────────────────────────────────────
+    if subset {
+        apply_hvg_subset(py, adata, x_obj, &mask)?;
+    }
+
+    Ok(())
+}
+
+/// Apply HVG subset: set column projection on X (and layers), slice var.
+///
+/// Order: update X col_projection + layers FIRST so shapes match,
+/// then set `_var` (bypassing AnnData shape validation).
+fn apply_hvg_subset(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    x_obj: &Bound<'_, PyAny>,
+    hvg_mask: &[bool],
+) -> PyResult<()> {
+    let mask_arr = numpy::PyArray::from_vec(py, hvg_mask.to_vec());
+
+    if let Ok(backed) = x_obj.downcast::<ScxBackedSparseDataset>() {
+        let new_col_indices: Vec<u32> = match backed.borrow().col_projection() {
+            Some(existing) => hvg_mask
+                .iter()
+                .enumerate()
+                .filter(|(_, &k)| k)
+                .map(|(i, _)| existing[i])
+                .collect(),
+            None => hvg_mask
+                .iter()
+                .enumerate()
+                .filter(|(_, &k)| k)
+                .map(|(i, _)| i as u32)
+                .collect(),
+        };
+
+        // Update X and layers FIRST so shapes are consistent
+        backed
+            .borrow_mut()
+            .set_col_projection(new_col_indices.clone());
+        update_layers_col_projection(adata, &new_col_indices)?;
+
+        // Then slice var (use _var to bypass shape validation)
+        let var = adata.getattr("var")?;
+        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
+        adata.setattr("_var", filtered_var)?;
+    } else if let Ok(lazy) = x_obj.downcast::<ScxLazyTransformedDataset>() {
+        let new_col_indices: Vec<u32> = match lazy.borrow().col_projection() {
+            Some(existing) => hvg_mask
+                .iter()
+                .enumerate()
+                .filter(|(_, &k)| k)
+                .map(|(i, _)| existing[i])
+                .collect(),
+            None => hvg_mask
+                .iter()
+                .enumerate()
+                .filter(|(_, &k)| k)
+                .map(|(i, _)| i as u32)
+                .collect(),
+        };
+
+        lazy.borrow_mut()
+            .set_col_projection(new_col_indices.clone());
+        update_layers_col_projection(adata, &new_col_indices)?;
+
+        let var = adata.getattr("var")?;
+        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
+        adata.setattr("_var", filtered_var)?;
+    }
+
+    Ok(())
+}

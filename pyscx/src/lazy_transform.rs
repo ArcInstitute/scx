@@ -1656,6 +1656,29 @@ pub(crate) struct LazyShardSource {
     shape_val: (usize, usize),
 }
 
+impl LazyShardSource {
+    /// Create a batch-filtered shard source for streaming HVG computation.
+    ///
+    /// `kept_to_global` contains the global row indices for cells in this batch.
+    /// Reuses the existing deletion vector infrastructure in `read_shard()`.
+    pub(crate) fn with_kept_rows(
+        backed: Arc<BackedCsrReader>,
+        transforms: Vec<Transform>,
+        kept_to_global: Vec<u64>,
+        col_projection: Option<Arc<Vec<u32>>>,
+        n_vars: usize,
+    ) -> Self {
+        let n_obs = kept_to_global.len();
+        LazyShardSource {
+            backed,
+            transforms,
+            kept_to_global: Some(Arc::new(kept_to_global)),
+            col_projection,
+            shape_val: (n_obs, n_vars),
+        }
+    }
+}
+
 impl scx_format::ShardSource for LazyShardSource {
     fn n_shards(&self) -> usize {
         self.backed.index().n_shards()
