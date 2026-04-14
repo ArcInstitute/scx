@@ -154,6 +154,15 @@ Dataset paths are configured via the `.env` file at the repo root (or environmen
 | `slurm_phase4_ml_loader.sh` | `cpu_preemptible`+`preemptible` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
 | `slurm_phase5_accel_bench.sh` | `cpu_preemptible` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
 
+### Correctness Validation
+
+| Script | Partition | Resources | Time | Purpose |
+|--------|-----------|-----------|------|---------|
+| `comprehensive/scripts/slurm_validation_suite.sh` | `cpu_preemptible` | 16 CPUs, 80 GB | 2 h | Correctness validation on pbmc3k (fast gate) |
+| `comprehensive/scripts/slurm_validation_suite.sh --scale` | `cpu_preemptible` | 16 CPUs, 200 GB | 6 h | Correctness validation on pbmc3k + tabula_sapiens_100k |
+
+See the "Correctness Validation Suite" section in [docs/testing.md](../docs/testing.md) for details and threshold rationale.
+
 ### GPU Benchmarks
 
 | Script | Partition | Resources | Time | Purpose |

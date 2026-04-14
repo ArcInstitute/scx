@@ -13,7 +13,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
 - **[docs/performance.md](docs/performance.md)** — Benchmark results and performance characteristics.
 - **[docs/gpu-setup.md](docs/gpu-setup.md)** — GPU setup guide: CUDA, RAPIDS, conda, container, SLURM, troubleshooting.
-- **[docs/testing.md](docs/testing.md)** — Test and benchmark details.
+- **[docs/testing.md](docs/testing.md)** — Test, benchmark, and correctness validation details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts.

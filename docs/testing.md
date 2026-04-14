@@ -60,6 +60,118 @@
 | `test_b2_col_projection.py` | Column projection bug regression (streaming col aggregation) |
 | `conftest.py` | Shared pytest fixtures |
 
+## Correctness Validation Suite
+
+The correctness validation suite verifies that SCX's Rust-native accelerators, backed-mode data access, and preprocessing pipelines produce results equivalent to their scanpy/scipy counterparts. Unlike the unit tests in `pyscx/tests/`, the validation suite runs on real datasets with structured JSON reporting and quantitative pass/fail thresholds.
+
+**Location**: `benchmarks/comprehensive/scripts/validate_*.py`
+**Results**: `benchmarks/comprehensive/results/raw/correctness__*.json`
+
+### Running
+
+```bash
+# Run all three suites on pbmc3k (~5 min)
+SCX_DATA_DIR=/path/to/datasets \
+  .venv/bin/python benchmarks/comprehensive/scripts/validate_scanpy_equivalence.py --dataset pbmc3k
+SCX_DATA_DIR=/path/to/datasets \
+  .venv/bin/python benchmarks/comprehensive/scripts/validate_backed_equivalence.py --dataset pbmc3k
+SCX_DATA_DIR=/path/to/datasets \
+  .venv/bin/python benchmarks/comprehensive/scripts/validate_preprocessing_paths.py --dataset pbmc3k
+
+# Or run on SLURM (pbmc3k + tabula_sapiens_100k, ~1 hr, 200 GB)
+bash benchmarks/comprehensive/scripts/slurm_validation_suite.sh --scale --mem 200G
+
+# Or run via the benchmark module system
+.venv/bin/python benchmarks/comprehensive/scripts/run_all.py \
+  --benchmarks correctness --datasets pbmc3k --formats scx_auto
+```
+
+### Scanpy Equivalence (`validate_scanpy_equivalence.py`)
+
+Runs every `pyscx.accel.*` function and its scanpy equivalent side-by-side on the same data (14 checks).
+
+| Function | Comparison | Threshold | pbmc3k Result |
+|----------|-----------|-----------|---------------|
+| `normalize_total()` | Max abs error vs `sc.pp.normalize_total()` | < 1e-3 | 1.2e-4 |
+| `log1p()` | Max abs error vs `sc.pp.log1p()` | < 1e-3 | 4.8e-7 |
+| `pca()` | Cosine similarity per PC vs `sc.pp.pca()` | > 0.99 | > 0.999 |
+| `pca()` | Variance ratio Pearson r | > 0.99 | > 0.999 |
+| `neighbors()` | Recall@15 vs `sc.pp.neighbors()` | > 0.90 | 0.93 |
+| `neighbors()` | Downstream Leiden ARI | > 0.80 | 0.98 |
+| `umap()` | Trustworthiness at k=15 | > 0.90 | 0.92 |
+| `rank_genes_groups()` | Mean top-100 gene overlap per group | > 60% | 72% |
+| `rank_genes_groups()` | Min p-value Spearman r | > 0.80 | 0.91 |
+| `rank_genes_groups(gene_chunk_size)` | Top-50 gene overlap vs in-memory | 100% | 100% |
+| `pseudobulk_dex()` | Runs without error, produces results | Finite LFCs | 49,902 |
+| `pseudobulk_dex(stratify_by)` | Per-stratum consistency | Runs | 3 strata |
+| `rank_genes_groups(stratify_by)` | Per-stratum consistency | Runs | OK |
+| `filter_cells()` / `filter_genes()` | Exact mask vs scanpy | 100% | 100% |
+| `calculate_qc_metrics()` | Float max abs error; int exact | < 1e-5; exact | 0.0; exact |
+| `subset_obs()` | Shape + data vs `adata[mask].copy()` | Exact | Exact |
+
+### Backed-Mode Equivalence (`validate_backed_equivalence.py`)
+
+Verifies that every operation on backed-mode (on-disk) data matches the same operation on fully materialized data (19 checks).
+
+| Operation | Comparison | Threshold | pbmc3k Result |
+|-----------|-----------|-----------|---------------|
+| Row slice, fancy index, bool mask, 2D slice | Exact CSR equality | Exact | Exact |
+| `sum(axis=1)`, `sum(axis=0)` | Max abs error | < 1e-6 | 0.0 |
+| `var(axis=0)` | Max rel error | < 1e-3 | 1.3e-4 |
+| `getnnz(axis=0)`, `getnnz(axis=1)` | Exact match | Exact | Exact |
+| PCA (backed vs non-backed) | Cosine similarity per PC | > 0.99 | > 0.999 |
+| QC metrics | Max abs error | < 1e-5 | 6.6e-7 |
+| `filter_cells()`, `filter_genes()`, `subset_obs()` | Shape + data agreement | Exact | Exact |
+| `X / row_sums`, `X * factors` (operator interception) | Max abs error vs scipy | < 1e-6 | 0.0 |
+| Lazy aggregation (sum through transforms) | Max abs error vs materialized | < 0.1 | 0.025 |
+| Shape, obs, var metadata | Exact match | Exact | Exact |
+| `issparse()` / `format` checks | True / "csr" for backed and lazy | True | True |
+
+### Preprocessing Path Cross-Validation (`validate_preprocessing_paths.py`)
+
+Three-way comparison (3 checks): **A** scanpy in-memory, **B** SCX write-back (`pyscx.preprocess()`), **C** SCX lazy (backed + `pyscx.accel.*`, then materialize).
+
+| Check | Comparison | Threshold | pbmc3k Result |
+|-------|-----------|-----------|---------------|
+| normalize + log1p | Pairwise max abs error on X | < 1e-5 | 4.8e-7 |
+| PCA | Pairwise cosine similarity per PC | > 0.99 | > 0.999 |
+| Extended pipeline (Leiden/DE/UMAP) | ARI > 0.95, DE overlap > 90%, Procrustes > 0.95 | See thresholds | 1.0 / 100% / 0.96 |
+
+### Precision Expectations
+
+SCX uses f32 throughout its Rust pipeline (matching scipy CSR's `float32`), while scanpy often uses f64 intermediates:
+
+| Source | Typical magnitude | Affected checks |
+|--------|-------------------|-----------------|
+| f32 accumulation in normalize_total | ~1e-4 max abs error | normalize_total, log1p |
+| Streaming f32 variance (two-pass) | ~1e-4 relative error | col_var |
+| Cumulative error through chained transforms | ~0.01-0.03 abs error on sums | lazy_aggregation |
+| HNSW vs sklearn kNN | ~93% recall@15 | neighbors |
+| Randomized SVD vs ARPACK PCA | >0.999 cosine on HVG-subset data | pca |
+
+### Adding New Checks
+
+All three scripts follow the same pattern — write a function returning `ValidationCheck`, add it to `run_all_checks()`:
+
+```python
+from benchmarks.comprehensive.scripts.validation_helpers import (
+    ValidationCheck, run_check, max_abs_error
+)
+
+def check_my_function(adata) -> ValidationCheck:
+    err = max_abs_error(result_pyscx, result_scanpy)
+    threshold = 1e-5
+    return ValidationCheck(
+        name="my_function", passed=err < threshold,
+        metrics={"max_abs_error": err}, thresholds={"max_abs_error": threshold},
+    )
+
+# In run_all_checks():
+checks.append(run_check("my_function", check_my_function, adata))
+```
+
+Helper utilities in `validation_helpers.py`: `max_abs_error`, `max_rel_error`, `cosine_similarity_columns`, `pearson_r`, `spearman_r`, `recall_at_k`, `gene_overlap_pct`, `csr_equal`, `to_dense`.
+
 ## Benchmarks
 
 **Location**: `benchmarks/scripts/`
