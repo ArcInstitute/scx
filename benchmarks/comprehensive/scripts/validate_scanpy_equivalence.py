@@ -39,6 +39,7 @@ from benchmarks.comprehensive.scripts.validation_helpers import (  # noqa: E402
     print_summary,
     recall_at_k,
     run_check,
+    run_leiden,
     spearman_r,
     to_dense,
     write_validation_json,
@@ -76,10 +77,7 @@ def _prepare_preprocessed_adata(adata_raw):
     sc.pp.pca(adata, n_comps=n_comps)
 
     sc.pp.neighbors(adata, n_neighbors=15, random_state=0)
-    try:
-        sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False, random_state=0)
-    except ImportError:
-        sc.tl.leiden(adata, random_state=0)
+    run_leiden(adata, random_state=0)
 
     return adata
 
@@ -251,12 +249,8 @@ def check_neighbors(adata_prepped) -> ValidationCheck:
     recall = recall_at_k(ref_indices, test_indices, k=k)
 
     # Downstream Leiden ARI — run Leiden on both neighbor graphs
-    try:
-        sc.tl.leiden(adata_sc, flavor="igraph", n_iterations=2, directed=False, random_state=0)
-        sc.tl.leiden(adata_pyscx, flavor="igraph", n_iterations=2, directed=False, random_state=0)
-    except ImportError:
-        sc.tl.leiden(adata_sc, random_state=0)
-        sc.tl.leiden(adata_pyscx, random_state=0)
+    run_leiden(adata_sc, random_state=0)
+    run_leiden(adata_pyscx, random_state=0)
     ari = adjusted_rand_score(adata_sc.obs["leiden"], adata_pyscx.obs["leiden"])
 
     recall_threshold = 0.90

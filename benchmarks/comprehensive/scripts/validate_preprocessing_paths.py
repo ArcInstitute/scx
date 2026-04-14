@@ -33,6 +33,7 @@ from benchmarks.comprehensive.scripts.validation_helpers import (  # noqa: E402
     parse_common_args,
     print_summary,
     run_check,
+    run_leiden,
     to_dense,
     write_validation_json,
 )
@@ -192,10 +193,7 @@ def check_extended_pipeline(adata_raw) -> ValidationCheck:
         sc.pp.pca(ad, n_comps=n_comps, random_state=0)
         sc.pp.neighbors(ad, n_neighbors=15, random_state=0)
         sc.tl.umap(ad, random_state=0)
-        try:
-            sc.tl.leiden(ad, flavor="igraph", n_iterations=2, directed=False, random_state=0)
-        except ImportError:
-            sc.tl.leiden(ad, random_state=0)
+        run_leiden(ad, random_state=0)
         sc.tl.rank_genes_groups(ad, groupby="leiden", method="wilcoxon")
 
     # Leiden ARI
