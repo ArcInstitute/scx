@@ -63,19 +63,23 @@ def _prepare_preprocessed_adata(adata_raw):
 
     adata = adata_raw.copy()
     sc.pp.filter_genes(adata, min_cells=3)
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
 
-    # HVG selection — real pipelines always do this before PCA.
+    # HVG selection on raw counts (seurat_v3 expects integers).
     # Running PCA on 32k genes causes divergence between algorithms.
     sc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3")
     adata = adata[:, adata.var["highly_variable"]].copy()
+
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
 
     n_comps = min(50, adata.n_vars - 1, adata.n_obs - 1)
     sc.pp.pca(adata, n_comps=n_comps)
 
     sc.pp.neighbors(adata, n_neighbors=15, random_state=0)
-    sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False, random_state=0)
+    try:
+        sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False, random_state=0)
+    except ImportError:
+        sc.tl.leiden(adata, random_state=0)
 
     return adata
 
@@ -247,8 +251,12 @@ def check_neighbors(adata_prepped) -> ValidationCheck:
     recall = recall_at_k(ref_indices, test_indices, k=k)
 
     # Downstream Leiden ARI — run Leiden on both neighbor graphs
-    sc.tl.leiden(adata_sc, flavor="igraph", n_iterations=2, directed=False, random_state=0)
-    sc.tl.leiden(adata_pyscx, flavor="igraph", n_iterations=2, directed=False, random_state=0)
+    try:
+        sc.tl.leiden(adata_sc, flavor="igraph", n_iterations=2, directed=False, random_state=0)
+        sc.tl.leiden(adata_pyscx, flavor="igraph", n_iterations=2, directed=False, random_state=0)
+    except ImportError:
+        sc.tl.leiden(adata_sc, random_state=0)
+        sc.tl.leiden(adata_pyscx, random_state=0)
     ari = adjusted_rand_score(adata_sc.obs["leiden"], adata_pyscx.obs["leiden"])
 
     recall_threshold = 0.90

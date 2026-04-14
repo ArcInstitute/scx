@@ -11,6 +11,8 @@ benchmarks/logs/
 benchmarks/comprehensive/results/raw/
 *.proptest-regressions
 external-repos/
+benchmarks/comprehensive/results/reports/figures/
+benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md
 
 # Rust
 /target/

@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
         --time)         TIME="$2"; shift 2 ;;
         --job-name)     JOB_NAME="$2"; shift 2 ;;
         --conda-env)    CONDA_ENV="$2"; shift 2 ;;
-        --scale)        SCALE=true; DATASETS="pbmc3k tabula_sapiens_100k"; TIME="04:00:00"; shift ;;
+        --scale)        SCALE=true; DATASETS="pbmc3k tabula_sapiens_100k"; TIME="04:00:00"; MEM="500G"; shift ;;
         *)              echo "Unknown option: $1"; exit 1 ;;
     esac
 done
