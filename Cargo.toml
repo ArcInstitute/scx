@@ -1,5 +1,7 @@
 [workspace]
 members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "pyscx", "rscx", "tests/scx-integration-tests"]
+# rscx excluded from default-members: requires R toolchain + extendr, not always
+# available (CI, Rust-only dev). Build explicitly with: cargo build -p rscx
 default-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "pyscx", "tests/scx-integration-tests"]
 resolver = "2"
 

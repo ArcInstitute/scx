@@ -69,6 +69,9 @@ BENCHMARK_NAMES = [
     "memory",
 ]
 
+# Benchmarks that work from h5ad source and don't need pre-converted files.
+_NO_CONVERSION = {"write", "parallel_write_scaling"}
+
 LOGS_DIR = PROJECT_ROOT / "benchmarks" / "comprehensive" / "logs" / "submitit"
 
 
@@ -124,7 +127,7 @@ def _run_benchmark(
     mod = importlib.import_module(f"benchmarks.comprehensive.benchmarks.{bench_name}")
 
     # write.py and parallel_write_scaling.py don't accept converted_path
-    if bench_name in ("write", "parallel_write_scaling"):
+    if bench_name in _NO_CONVERSION:
         result = mod.run(dataset=dataset, format_variant=fmt,
                          n_runs=n_runs, cold_cache=cold_cache)
     else:
@@ -190,7 +193,6 @@ def main() -> None:
     logger.info("Benchmarks: %s", benchmarks)
 
     # Determine which benchmarks need pre-converted files
-    _NO_CONVERSION = {"write", "parallel_write_scaling"}
     needs_conversion = [b for b in benchmarks if b not in _NO_CONVERSION]
     needs_write = "write" in benchmarks
 
@@ -268,7 +270,7 @@ def main() -> None:
                 label = f"{bench_name}/{ds_name}/{fmt.key}"
 
                 # write and parallel_write_scaling don't need pre-converted files
-                if bench_name in ("write", "parallel_write_scaling"):
+                if bench_name in _NO_CONVERSION:
                     conv_path = None
                 else:
                     conv_path = conversion_paths.get(key)

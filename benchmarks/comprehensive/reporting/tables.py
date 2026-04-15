@@ -432,7 +432,7 @@ def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
                         cells.append("—")
 
                 max_spd = max(speedup.values()) if speedup else None
-                cells.append(f"{max_spd:.1f}x" if max_spd else "—")
+                cells.append(f"{max_spd:.1f}x" if max_spd is not None else "—")
                 lines.append(f"| {display} | " + " | ".join(cells) + " |")
 
     return "\n".join(lines)

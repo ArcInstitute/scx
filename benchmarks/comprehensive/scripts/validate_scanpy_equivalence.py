@@ -332,16 +332,26 @@ def check_rank_genes_groups(adata_prepped) -> ValidationCheck:
         valid = np.isfinite(pvals_sc) & np.isfinite(pvals_pyscx)
         if valid.sum() >= 2:
             sr = spearman_r(pvals_sc[valid], pvals_pyscx[valid])
-            # spearman_r returns NaN for constant inputs — treat as passing
             if np.isnan(sr):
-                sr = 1.0
+                # NaN means at least one array is constant (zero variance).
+                both_const = (np.std(pvals_sc[valid]) == 0
+                              and np.std(pvals_pyscx[valid]) == 0)
+                if both_const:
+                    # Neither method could rank — skip this group
+                    continue
+                else:
+                    # One method found signal, the other didn't — disagreement
+                    sr = 0.0
         else:
-            sr = 1.0  # Vacuously true if too few valid values
+            # Too few valid values to compute correlation — skip
+            continue
         spearman_rs.append(sr)
 
+    n_spearman_skipped = len(groups) - len(spearman_rs)
     min_overlap = min(overlaps) if overlaps else 0.0
     mean_overlap = float(np.mean(overlaps)) if overlaps else 0.0
-    min_spearman = min(spearman_rs) if spearman_rs else 0.0
+    # If all groups were skipped, vacuously true (no ranking was possible)
+    min_spearman = min(spearman_rs) if spearman_rs else 1.0
 
     # The Wilcoxon test implementation differs in tie-breaking and exact-test
     # heuristics, so per-group overlap can be lower for small clusters.
@@ -355,6 +365,7 @@ def check_rank_genes_groups(adata_prepped) -> ValidationCheck:
             "min_top100_overlap_pct": min_overlap,
             "mean_top100_overlap_pct": mean_overlap,
             "min_pval_spearman_r": min_spearman,
+            "n_spearman_skipped": n_spearman_skipped,
         },
         thresholds={
             "mean_top100_overlap_pct": mean_overlap_threshold,

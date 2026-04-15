@@ -1,6 +1,6 @@
 # SCX — Sparse Cell eXpression System
 
-A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files**, **fastest reads at census scale** (1.4× faster than Zarr on 1M cells, up to 7× with parallel decode), **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
+A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files**, **fastest reads at census scale** (1.4× faster than Zarr on 1M cells, up to 7× with parallel decode, up to 3.2× parallel write scaling), **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
 
 **Python** — works with scanpy, scVI, and any scverse tool:
 
@@ -227,14 +227,16 @@ guidelines, CLI/Python/R commands, and how sharding powers each SCX feature.
 ### Multithreading for parallel decode and overlapped I/O
 
 SCX exploits multicore CPUs at every stage. Rayon decodes shards in parallel
-during reads and queries. The training loader runs a triple-buffered pipeline
-(tokio I/O → rayon decode → Python/GPU) so that I/O, decompression, and GPU
-transfer all overlap. Cloud downloads run as concurrent async tasks. File
-mutations are serialized with advisory `flock()` locks — reads never lock.
+during reads (up to 7× at 32 threads) and encodes shards in parallel during
+writes (up to 3.2× at 32 threads). The training loader runs a triple-buffered
+pipeline (tokio I/O → rayon decode → Python/GPU) so that I/O, decompression,
+and GPU transfer all overlap. Cloud downloads run as concurrent async tasks.
+File mutations are serialized with advisory `flock()` locks — reads never lock.
 
 | Component | Threading model | Runtime |
 |-----------|----------------|---------|
-| Shard decode | Data parallelism | Rayon `par_iter` |
+| Shard decode (read) | Data parallelism | Rayon `par_iter` |
+| Shard encoding (write) | Data parallelism | Rayon `par_iter` |
 | Query engine | Parallel shard decode + filter | Rayon |
 | Training loader | Triple-buffered pipeline | tokio + rayon + std::thread |
 | Cloud I/O | Parallel async downloads/uploads | tokio |
@@ -526,6 +528,29 @@ All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1–2 TB RAM. Full results
 | Census 5M | **35.4s** | 43.7s | 291s | 40.6s | 80.6s |
 
 SCX is the fastest reader at scale — **1.5× faster than Zarr**, **2.1× faster than uncompressed h5ad**, and **17.7× faster than gzip h5ad** on 1M cells. Four codecs available: `auto` (default), `scx1`, `zstd`, `lz4`.
+
+### Parallel Scaling
+
+SCX parallelizes both reads (shard decode) and writes (shard encoding) via rayon. No other format scales either direction.
+
+**Read scaling** (full load, 32 threads):
+
+| Dataset | SCX (auto) | Speedup | Zarr (lz4) | h5ad |
+|---------|-----------|---------|------------|------|
+| Census 500K | 1.5s | **6.3×** | 2.0s (1.0×) | no scaling |
+| Census 1M | 3.0s | **6.1×** | 3.7s (1.0×) | no scaling |
+| Census 5M | 37.5s | **3.1×** | 89.6s (1.0×) | no scaling |
+
+**Write scaling** (in-memory AnnData → SCX, 32 threads, census_500k):
+
+| Codec | 1 thread | 32 threads | Speedup |
+|-------|---------|-----------|---------|
+| SCX (pcodec) | 36.1s | 11.4s | **3.2×** |
+| SCX (zstd) | 35.9s | 11.4s | **3.2×** |
+| SCX (auto) | 32.3s | 12.7s | **2.5×** |
+| SCX (none) | 21.3s | 12.5s | 1.7× |
+
+Heavier codecs benefit most from parallel encoding. Scaling plateaus around 8–16 threads due to sequential I/O in the final write phase.
 
 ### Column Projection (2000 HVGs)
 

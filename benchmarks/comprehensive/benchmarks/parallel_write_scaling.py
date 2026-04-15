@@ -99,17 +99,18 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         gc.collect()
         if cold_cache:
             runner._drop_caches()
+        rss_before = _get_rss_mb()
         t0 = time.perf_counter()
         if mode == "write_only":
             import pyscx
             pyscx.from_anndata(adata, str(out_path), codec=codec)
             wall = time.perf_counter() - t0
-            rss = _get_rss_mb()
+            rss_after = _get_rss_mb()
             output_size = os.path.getsize(out_path)
             throughput = (output_size / (1024 * 1024)) / wall if wall > 0 else 0.0
             return {
                 "wall_s": wall,
-                "peak_rss_mb": rss,
+                "peak_rss_mb": max(rss_before, rss_after),
                 "output_size_bytes": output_size,
                 "write_throughput_mb_s": throughput,
             }
@@ -181,8 +182,10 @@ def _run_with_thread_count(
         )
 
     try:
-        return json.loads(proc.stdout.strip())
-    except json.JSONDecodeError as exc:
+        # Parse JSON from the last line — earlier lines may contain library
+        # warnings or deprecation notices printed to stdout.
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as exc:
         raise RuntimeError(
             f"Failed to parse worker JSON output: {exc}\n"
             f"--- stdout ---\n{proc.stdout}"
