@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-07 (post-Sprint 3)
 **Results:** `benchmarks/comprehensive/results/raw/` (507 JSON files)
-**Spec:** [COMPREHENSIVE-BENCHMARKING.md](../../../COMPREHENSIVE-BENCHMARKING.md) Sections 3.1–3.7
+**Methodology:** See [benchmarks/README.md](../../../benchmarks/README.md) for formats, measurement protocol, and environments.
 
 ## System Configuration
 
@@ -544,4 +544,4 @@ bash benchmarks/scripts/slurm_phase3_parallel_scaling_d5d7.sh
     --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k census_500k census_1m census_5m
 ```
 
-Raw JSON results are in `benchmarks/comprehensive/results/raw/`. Each file follows the schema defined in `COMPREHENSIVE-BENCHMARKING.md` S5.3.
+Raw JSON results are in `benchmarks/comprehensive/results/raw/`. Each file follows the JSON schema documented in [benchmarks/README.md](../../../benchmarks/README.md#output-format).

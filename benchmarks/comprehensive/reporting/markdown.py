@@ -66,7 +66,7 @@ def generate_report() -> str:
 
 **Generated:** {date}
 **Results:** {n_results} JSON files in `benchmarks/comprehensive/results/raw/`
-**Specification:** [COMPREHENSIVE-BENCHMARKING.md](../../../COMPREHENSIVE-BENCHMARKING.md)
+**Methodology:** See [benchmarks/README.md](../../../benchmarks/README.md) for formats, measurement protocol, and environments.
 
 ---
 

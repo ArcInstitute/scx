@@ -2,8 +2,6 @@
 
 This directory contains the benchmarking infrastructure for SCX — scripts, SLURM job definitions, results, and logs for evaluating compression, read/write performance, ML data loader throughput, GPU accelerators, and lazy preprocessing.
 
-For the full benchmarking specification (formats under test, dataset matrix, methodology, metrics), see [COMPREHENSIVE-BENCHMARKING.md](../COMPREHENSIVE-BENCHMARKING.md).
-
 ---
 
 ## Directory Layout
@@ -24,9 +22,232 @@ benchmarks/
 │   ├── build_release.py                 # Helper: ensure pyscx release build
 │   ├── verify_datasets.py               # Validate datasets & record metadata
 │   └── setup_cloud_test_data.sh         # Cloud benchmark test data setup
-├── results/               # Benchmark output (JSON + Markdown reports)
+├── comprehensive/         # Comprehensive benchmark suite (Phase 3+)
+│   ├── config.py                        # Dataset paths, format configs, constants
+│   ├── sysinfo.py                       # System info collector (CPU, RAM, OS, disk)
+│   ├── results.py                       # BenchmarkResult schema + JSON writer
+│   ├── convert.py                       # Shared conversion cache (convert once, reuse)
+│   ├── envs/                            # Conda environment definitions
+│   │   ├── scx-bench.yml                # CPU benchmark environment
+│   │   ├── scx-bench-gpu.yml            # GPU benchmark environment (CUDA + RAPIDS)
+│   │   └── scx-bench-r.yml             # R / BPCells benchmark environment
+│   ├── runners/                         # Per-format benchmark runners
+│   │   ├── base.py                      # Abstract FormatRunner interface
+│   │   ├── h5ad_runner.py               # h5ad (uncompressed, gzip, lzf)
+│   │   ├── zarr_runner.py               # Zarr (zstd, blosc-lz4)
+│   │   ├── tiledb_runner.py             # TileDB-SOMA
+│   │   ├── scx_runner.py                # SCX (auto, none, scx1, zstd, pcodec, lz4)
+│   │   ├── bpcells_runner.py            # BPCells (R subprocess)
+│   │   └── parquet_runner.py            # Parquet (pyarrow)
+│   ├── benchmarks/                      # Benchmark modules (one per dimension)
+│   ├── reporting/                       # Report generation (markdown, plots, tables)
+│   ├── scripts/                         # Orchestrators and SLURM launchers
+│   │   ├── run_all.py                   # Serial benchmark orchestrator
+│   │   ├── run_parallel.py              # Parallel SLURM launcher via submitit
+│   │   ├── run_slurm.sh                 # SLURM submission script
+│   │   ├── install_dependencies.sh      # Create conda environments
+│   │   ├── validate_*.py                # Correctness validation scripts
+│   │   └── slurm_*.sh                   # SLURM job scripts
+│   ├── r_scripts/                       # BPCells R benchmark scripts
+│   └── results/                         # Raw JSON results + generated reports
+│       ├── raw/                         # One JSON per benchmark×format×dataset
+│       └── reports/                     # Generated markdown + plots
+├── results/               # Per-script benchmark output (JSON + Markdown reports)
 └── logs/                  # SLURM job logs (.out, .err, .log)
 ```
+
+---
+
+## Formats Under Test
+
+The benchmark suite compares SCX against all relevant single-cell data formats:
+
+### Primary Competitors
+
+| Format | Variant | Library / Tool | Notes |
+|--------|---------|---------------|-------|
+| **h5ad** (uncompressed) | CSR in HDF5, no filter | `anndata` + `h5py` | Default of `adata.write_h5ad()` (`compression=None`) |
+| **h5ad** (gzip) | CSR in HDF5, gzip level 4 | `anndata` + `h5py` | Commonly used by researchers |
+| **h5ad** (lzf) | CSR in HDF5, lzf filter | `anndata` + `h5py` | Faster alternative to gzip |
+| **Zarr** (zstd) | CSR arrays, Zarr v3, zstd level 3 | `zarr` >= 3.0 | Chunked, cloud-native |
+| **Zarr** (blosc-lz4) | CSR arrays, Zarr v3, blosc-lz4 | `zarr` >= 3.0 | Fast decompression variant |
+| **TileDB-SOMA** | SOMAExperiment | `tiledbsoma` >= 2.3 + `tiledbsoma_ml` | CELLxGENE Census native format |
+| **SCX** | auto, none, scx1, zstd, pcodec, lz4 | `pyscx` / `scx-cli` | System under test (multiple codec variants) |
+
+### Additional Competitors
+
+| Format | Library / Tool | Notes |
+|--------|---------------|-------|
+| **BPCells** | `BPCells` R package | Bitpacking, disk-backed streaming. R-only; benchmarked via `Rscript` subprocess. |
+| **Parquet** (zstd) | `pyarrow` | Columnar; store CSR arrays as columns. |
+
+### Out of Scope
+
+| Format | Reason |
+|--------|--------|
+| Lance | No established single-cell tooling |
+| DuckDB / AnnSQL | SQL query engine, not a storage format |
+| Loom | Deprecated in favor of h5ad |
+| 10x HDF5 (.h5) | Legacy input format, not used for analysis storage |
+
+---
+
+## Benchmark Methodology
+
+### Benchmark Dimensions
+
+The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocessing, and correctness benchmarks:
+
+| Dimension | Script(s) | What it measures |
+|-----------|-----------|------------------|
+| **Compression** (3.1) | `compression.py` | On-disk file size for every format x dataset |
+| **Write** (3.2) | `write.py` | h5ad -> target format conversion time, throughput, peak RSS |
+| **Read Full** (3.3) | `read_full.py` | Full expression matrix read into in-memory CSR |
+| **Selective Read** (3.4) | `read_selective.py` | Row slices, column projection (2K HVGs), filtered queries |
+| **Parallel Scaling** (3.5) | `parallel_scaling.py`, `parallel_write_scaling.py` | Read/write throughput vs thread count (1, 2, 4, 8, 16, 32) |
+| **ML Loader** (3.6) | `ml_loader.py` | Batched iteration throughput (batches/sec, TTFB, peak RSS) |
+| **Memory** (3.7) | `memory.py` | Peak RSS during common operations |
+
+### Measurement Protocol
+
+- **Timing**: `time.perf_counter()` for wall-clock. Median of 3 runs (large datasets) or 5 runs (small datasets).
+- **Cold start**: Fresh Python subprocess per run to avoid warm-up artifacts.
+- **Cache control**: Warm-cache = 3 warm-up reads discarded. Cold-cache = `sync; echo 3 > /proc/sys/vm/drop_caches` between runs (requires root).
+- **Memory**: Peak RSS via `/proc/self/status` or `resource.getrusage(RUSAGE_SELF).ru_maxrss`.
+- **Parallel scaling**: Each thread count runs in a separate subprocess so rayon/thread pools are created fresh. SCX parallelism controlled via `RAYON_NUM_THREADS` env var.
+- **Reproducibility**: Use SLURM `--exclusive` for CPU binding. Record `uname -a`, CPU model, RAM, and storage device for every run (via `sysinfo.py`). All dependencies pinned in conda `environment.yml` files.
+- **Directory sizes**: For multi-file formats (Zarr, TileDB-SOMA, BPCells), measure with `du -sb` on the full directory.
+
+### Output Format
+
+All results are stored as structured JSON in `comprehensive/results/raw/`:
+
+```json
+{
+  "benchmark": "read_full",
+  "format": "scx_auto",
+  "dataset": "census_1m",
+  "timestamp": "2026-03-25T10:00:00",
+  "system": { "hostname": "...", "cpu": "...", "ram_gb": 2113 },
+  "runs": [
+    { "wall_s": 12.491, "user_s": 11.2, "sys_s": 1.1, "peak_rss_mb": 264.2 },
+    ...
+  ],
+  "median_wall_s": 12.491,
+  "file_size_bytes": 2470000000
+}
+```
+
+---
+
+## Benchmark Environments
+
+The comprehensive benchmark suite uses **isolated conda environments** for reproducibility, separate from the development `.venv/`. Environment definitions are in `comprehensive/envs/`:
+
+| Environment | Purpose | Key additions |
+|-------------|---------|---------------|
+| `scx-bench` | CPU benchmarks: format comparisons, accelerators, lazy preprocessing, correctness validation, ML loaders | All Python deps + PyTorch (CPU) |
+| `scx-bench-gpu` | GPU benchmarks: CUDA-accelerated PCA, kNN, UMAP, Leiden, fused preprocessing | Extends CPU deps with `cuda-version`, `cuvs`, `cugraph`, PyTorch (CUDA) |
+| `scx-bench-r` | BPCells benchmarks | R, Matrix, HDF5, BPCells (from GitHub) |
+
+### Setup
+
+```bash
+# Create all environments (one-time)
+bash benchmarks/comprehensive/scripts/install_dependencies.sh --all
+
+# Or create individually
+bash benchmarks/comprehensive/scripts/install_dependencies.sh          # CPU only (default)
+bash benchmarks/comprehensive/scripts/install_dependencies.sh --gpu    # GPU + RAPIDS
+bash benchmarks/comprehensive/scripts/install_dependencies.sh --r      # R + BPCells
+
+# Verify installations
+bash benchmarks/comprehensive/scripts/install_dependencies.sh --check
+
+# Rebuild pyscx inside an environment
+bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild
+bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
+```
+
+> [!IMPORTANT]
+> The `scx-bench-gpu` environment pins `cuda-version` to match the NVIDIA driver. The default is `12.2` (for driver 535.x). Edit `benchmarks/comprehensive/envs/scx-bench-gpu.yml` to adjust for your driver version. See [docs/gpu-setup.md](../docs/gpu-setup.md) for the driver compatibility table.
+
+### Which environment to use
+
+**Comprehensive benchmark suite** (`comprehensive/`):
+
+| Script | Environment | Activation |
+|--------|-------------|------------|
+| `comprehensive/scripts/run_all.py` | `scx-bench` | `conda activate scx-bench` |
+| `comprehensive/scripts/run_parallel.py` | `scx-bench` | `conda activate scx-bench` |
+| `comprehensive/scripts/validate_*.py` | `scx-bench` | `conda activate scx-bench` |
+| GPU benchmarks | `scx-bench-gpu` | `conda activate scx-bench-gpu` |
+| BPCells benchmarks | `scx-bench-r` | `conda activate scx-bench-r` |
+
+**Legacy scripts** (`scripts/`) still reference the dev `.venv/` (CPU) and the `scx-gpu` conda env (GPU), and are preserved as-is.
+
+SLURM scripts in `comprehensive/scripts/` auto-detect the correct environment. Override with `--conda-env`:
+
+```bash
+bash benchmarks/comprehensive/scripts/run_slurm.sh --conda-env scx-bench-gpu
+```
+
+---
+
+## Parallel Benchmark Execution (run_parallel.py)
+
+The serial orchestrator (`run_all.py`) processes benchmarks sequentially within a single SLURM job. For faster execution, `run_parallel.py` uses two-phase parallel execution via `submitit`:
+
+**Phase A — Convert once.** Each (dataset, format) pair is converted exactly once and written to a persistent path. Conversions run as independent parallel SLURM jobs. Existing files are skipped automatically (`--overwrite` to force).
+
+**Phase B — Benchmark in parallel.** Each (benchmark, dataset, format) triple is submitted as an independent SLURM job reading from the pre-converted file. All jobs run concurrently.
+
+```
+Serial (run_all.py):     420 tasks x avg 3 min = ~21 hours wall time
+Parallel (run_parallel.py): conversions + benchmarks, all concurrent
+                            Wall time ~ max(single slowest job) ~ 50 min
+```
+
+### Usage
+
+```bash
+# Small datasets (D1-D4)
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
+
+# Large datasets — high-memory partition
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets census_500k census_1m census_5m \
+    --partition cpu_preemptible --mem-gb 500 --timeout 480
+
+# Specific benchmarks and formats only
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks read_full read_selective \
+    --formats scx_auto zarr_zstd h5ad_gzip \
+    --datasets census_1m
+
+# Dry run — show job count without submitting
+python benchmarks/comprehensive/scripts/run_parallel.py --dry-run
+
+# Skip conversion phase (reuse existing pre-converted files)
+python benchmarks/comprehensive/scripts/run_parallel.py --skip-convert
+```
+
+submitit logs are written to `comprehensive/logs/submitit/`. Each SLURM job writes its result JSON independently to `comprehensive/results/raw/` — filenames are unique per triple, so concurrent writes are safe.
+
+---
+
+## Known Challenges and Mitigations
+
+| Challenge | Mitigation |
+|-----------|------------|
+| OOM when creating 10M cell h5ad | Use SCX `merge` to build directly from chunk h5ad files. For h5ad baseline, use incremental h5py writes or run on a >= 500 GB RAM SLURM node. |
+| TileDB-SOMA-ML import path | The ML wrapper is a separate package (`pip install tiledbsoma-ml`). Import as `from tiledbsoma_ml import ExperimentDataset`. |
+| BPCells requires R | Use the `scx-bench-r` conda environment. Run via `Rscript` subprocess. Parse JSON output from R scripts. |
+| h5ad gzip/lzf conversion at scale | Pre-generate compressed h5ad variants for all datasets. `anndata.write_h5ad()` defaults to `compression=None` (uncompressed); gzip/lzf must be set explicitly. |
+| Warm vs cold cache inconsistency | Warm-cache: 3 warm-up reads discarded. Cold-cache: `drop_caches` between each run (requires root). Report both. |
+| Non-deterministic timing on shared nodes | Use SLURM `--exclusive` flag. If not available, run at least 5 repeats and report median + IQR. |
+| Formats without native subsetting | For h5ad: read full file then subset in memory. Record total time and note in results. |
 
 ---
 
@@ -273,6 +494,10 @@ cat benchmarks/logs/<script>_<JOBID>.log
 ---
 
 ## Environment Notes
+
+**Comprehensive benchmark suite** (`comprehensive/`) uses isolated conda environments (`scx-bench`, `scx-bench-gpu`, `scx-bench-r`) for reproducibility. See [Benchmark Environments](#benchmark-environments) above for setup.
+
+**Legacy scripts** (`scripts/`):
 
 **CPU benchmarks** use the project's uv virtualenv (`.venv/`). The scripts reference it automatically.
 
