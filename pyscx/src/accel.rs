@@ -1029,6 +1029,7 @@ fn run_rank_genes_groups_inner(
     reference: &str,
     gene_chunk_size: Option<usize>,
     rankby_abs: bool,
+    tie_correct: bool,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -1105,6 +1106,7 @@ fn run_rank_genes_groups_inner(
             chunk_size,
             log_transformed,
             rankby_abs,
+            tie_correct,
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
@@ -1141,6 +1143,7 @@ fn run_rank_genes_groups_inner(
                 gene_chunk_size.unwrap_or(500),
                 log_transformed,
                 rankby_abs,
+                tie_correct,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
@@ -1164,6 +1167,7 @@ fn run_rank_genes_groups_inner(
                 ref_idx,
                 log_transformed,
                 rankby_abs,
+                tie_correct,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         }
@@ -1236,7 +1240,7 @@ fn de_result_to_dataframe<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -1249,6 +1253,7 @@ pub fn rank_genes_groups(
     stratify_by: Option<Vec<String>>,
     min_cells_per_stratum: usize,
     rankby_abs: bool,
+    tie_correct: bool,
 ) -> PyResult<PyObject> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
@@ -1279,6 +1284,7 @@ pub fn rank_genes_groups(
                 reference,
                 gene_chunk_size,
                 rankby_abs,
+                tie_correct,
             ) {
                 Ok((result, _unique)) => {
                     let df = de_result_to_dataframe(py, &result, n_genes)?;
@@ -1317,8 +1323,15 @@ pub fn rank_genes_groups(
     }
 
     // --- Non-stratified path (original behavior) ---
-    let (result, _unique_groups) =
-        run_rank_genes_groups_inner(py, adata, groupby, reference, gene_chunk_size, rankby_abs)?;
+    let (result, _unique_groups) = run_rank_genes_groups_inner(
+        py,
+        adata,
+        groupby,
+        reference,
+        gene_chunk_size,
+        rankby_abs,
+        tie_correct,
+    )?;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
     write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;
