@@ -14,7 +14,8 @@ runtimes are involved, and how it all stays safe.
 | **Cloud I/O** | Tokio async tasks | `scx-cloud` |
 | **File mutations** | Advisory `flock()` via `fs4` | `scx-ops` |
 | **GPU decode** | CUDA kernel parallelism | `scx-gpu` |
-| **File writing** | Single-threaded (atomic rename) | `scx-format` |
+| **Shard encoding** (write) | Rayon `par_iter` over shard boundaries | `pyscx` |
+| **File writing** (I/O) | Sequential (atomic rename) | `scx-format` |
 
 ## Parallel shard decode
 
@@ -146,9 +147,17 @@ locks degrade gracefully — readers are never blocked.
 
 ## File writing
 
-File writing is intentionally single-threaded. `ScxWriter` writes sections
-sequentially to a temporary file, then performs `fsync()` + `rename()` for
-atomic visibility. This guarantees readers never see a partially-written file.
+File writing has two phases: parallel encoding followed by sequential I/O.
+
+1. **Shard encoding (parallel)**: `parallel_encode_csr_shards` in pyscx uses
+   rayon `par_iter()` to encode all shards concurrently — compression,
+   BLAKE3 checksumming, and statistics computation all run on separate threads.
+   This achieves up to **3.2x speedup** at 32 threads for compression-heavy
+   codecs (pcodec, zstd) on 500K+ cell datasets.
+
+2. **Disk I/O (sequential)**: `ScxWriter` writes pre-encoded sections
+   sequentially to a temporary file, then performs `fsync()` + `rename()` for
+   atomic visibility. This guarantees readers never see a partially-written file.
 
 ## GPU parallelism
 

@@ -69,7 +69,8 @@ AVAILABLE_BENCHMARKS = [
     "write",               # §3.2 — Write / conversion performance
     "read_full",           # §3.3 — Full file load
     "read_selective",      # §3.4 — Selective read (query / subsetting)
-    "parallel_scaling",    # §3.5 — Parallel read scaling
+    "parallel_scaling",    # §3.5.1 — Parallel read scaling
+    "parallel_write_scaling",  # §3.5.2 — Parallel write scaling
     "ml_loader",           # §3.6 — ML data loader throughput
     "memory",              # §3.7 — Memory efficiency
     "append_update",       # §3.8 — Append / update (SCX-specific)

@@ -354,7 +354,7 @@ Thread counts tested: 1, 2, 4, 8, 16, 32. SCX via `RAYON_NUM_THREADS`, h5ad sing
 | zarr_lz4 | 89.6s | 89.8s | 89.3s | 89.6s | 1.00x |
 | tiledb_soma | 124.1s | 114.4s | 112.6s | 109.3s | 1.14x |
 
-### Parallel Scaling Takeaways
+### Parallel Read Scaling Takeaways
 
 1. **SCX shows strong parallel scaling at census scale** — up to **7.1x speedup at 32 threads** (scx_pcodec on census_1m). All SCX codecs achieve 3–7x speedup via rayon shard-parallel decode.
 2. **Zarr and h5ad show no parallel scaling** at any dataset size — their I/O is fundamentally single-threaded (Zarr's Python-level threading doesn't help on decompression-bound workloads).
@@ -362,6 +362,37 @@ Thread counts tested: 1, 2, 4, 8, 16, 32. SCX via `RAYON_NUM_THREADS`, h5ad sing
 4. **Diminishing returns beyond 16 threads** — at census_5m, scx_auto at 16t (36.8s) is slightly faster than 32t (37.5s), suggesting I/O bandwidth saturation.
 5. **The parallel scaling advantage is SCX's key differentiator** — single-threaded SCX is slower than Zarr, but multi-threaded SCX overtakes it. The crossover happens between 4–8 threads depending on codec and dataset size.
 6. **TileDB-SOMA shows minimal scaling** (~1.1x at 32t on census_5m) despite supporting parallel reads.
+
+### Parallel Write Scaling (S3.5.2)
+
+Write-only mode (in-memory AnnData → format, isolates parallel shard encoding):
+
+#### census_500k (D5)
+
+| Format | 1 thread | 4 threads | 8 threads | 16 threads | 32 threads | Speedup (32t) |
+|---|---:|---:|---:|---:|---:|---:|
+| scx_pcodec | 36.1s | 15.9s | 13.6s | 12.2s | **11.4s** | **3.16x** |
+| scx_zstd | 35.9s | 16.7s | 13.9s | 12.3s | **11.4s** | **3.16x** |
+| scx_scx1 | 32.3s | 15.8s | 13.6s | 12.6s | 12.0s | 2.69x |
+| scx_auto | 32.3s | 16.0s | 13.9s | 13.3s | 12.7s | 2.55x |
+| scx_lz4 | 27.2s | 14.3s | 12.7s | 11.5s | 11.2s | 2.42x |
+| scx_none | 21.3s | 13.7s | 12.9s | 12.6s | 12.5s | 1.70x |
+
+#### tabula_sapiens_100k (D4)
+
+| Format | 1 thread | 4 threads | 8 threads | 16 threads | 32 threads | Speedup (32t) |
+|---|---:|---:|---:|---:|---:|---:|
+| scx_auto | 4.3s | 2.8s | 2.3s | 2.0s | 2.1s | 2.06x |
+
+Small datasets (pbmc3k, pbmc10k) show no write scaling — they fit in a single shard.
+
+### Parallel Write Scaling Takeaways
+
+1. **SCX write scaling reaches up to 3.2x** at 32 threads for compression-heavy codecs (pcodec, zstd) on census_500k. The heavier the per-shard CPU work, the more parallelism helps.
+2. **Write scaling is more modest than read scaling** (3.2x vs 7.1x) because the write path has a sequential I/O bottleneck — shard encoding is parallel, but the final disk writes are serial.
+3. **SCX (none) shows only 1.7x** write scaling — minimal compression means less CPU work to parallelize, so the sequential I/O phase dominates.
+4. **Scaling plateaus around 8–16 threads** — diminishing returns past that point due to I/O serialization.
+5. **Write-only mode shows ~15–25% better scaling than the full pipeline** (h5ad read + write), confirming that the single-threaded h5ad read dilutes the observed speedup.
 
 ---
 
@@ -435,7 +466,7 @@ At small scale, all formats fit easily in memory. Peak RSS reflects the benchmar
 
 - **Best compression on UMI count data** — scx_pcodec/zstd consistently #1 at census scale. SCX lz4 also beats Zarr lz4.
 - **Fastest full reads at census scale** — 1.15–1.38x faster than Zarr lz4 on 500K–5M cells (single-threaded). With 32 threads: **2.4x faster** on census_5m (37.5s vs 89.6s).
-- **Strong parallel scaling** — up to 7.1x speedup at 32 threads (vs no scaling for Zarr/h5ad). SCX is the only format that benefits from multi-core hardware.
+- **Strong parallel scaling** — up to 7.1x read speedup and 3.2x write speedup at 32 threads (vs no scaling for Zarr/h5ad). SCX is the only format that benefits from multi-core hardware for both reads and writes.
 - **Dominant column projection** — 4–8x faster than all competitors for gene-level subsetting (SCX's block index enables per-shard column filtering).
 - **Practical write speed** — 2–3x slower than Zarr (not 10–60x as in pre-Sprint-3). All census-scale conversions complete in under 4 minutes.
 - **Efficient memory at scale** — scx_auto uses 18.5 GB Peak RSS on 5M cells, less than half of Zarr's 87.9 GB.
@@ -450,8 +481,8 @@ At small scale, all formats fit easily in memory. Peak RSS reflects the benchmar
 
 ### Competitive Landscape
 
-- **Zarr (lz4/zstd)**: Fastest I/O on small-to-medium datasets; trails SCX at census scale for both compression and full reads. No parallel scaling.
-- **TileDB-SOMA**: Best row-slice performance at scale; weakest in compression and full reads. Minimal parallel scaling.
+- **Zarr (lz4/zstd)**: Fastest I/O on small-to-medium datasets; trails SCX at census scale for both compression and full reads. No parallel read or write scaling.
+- **TileDB-SOMA**: Best row-slice performance at scale; weakest in compression and full reads. Minimal parallel scaling (reads or writes).
 - **h5ad gzip**: Consistently the slowest I/O format but uses the least memory. Remains the most common format.
 - **SCX lz4 (Sprint 3)**: Strong all-around — best compression of any LZ4-based format, competitive read speed, fast writes.
 
@@ -463,7 +494,8 @@ At small scale, all formats fit easily in memory. Peak RSS reflects the benchmar
 | Write | 12 formats | 12 formats | 12 formats | 12 formats |
 | Read Full | 12 formats | 12 formats | 12 formats | 12 formats |
 | Read Selective | 12 formats | 12 formats | 12 formats | 12 formats |
-| Parallel Scaling | 10 formats | 9 formats† | 9 formats† | 9 formats† |
+| Parallel Read Scaling | 10 formats | 9 formats† | 9 formats† | 9 formats† |
+| Parallel Write Scaling | 12 formats | 12 formats | — | — |
 | Memory | 12 formats | 12 formats | 12 formats | 12 formats |
 | ML Loader | 4 loaders | — | 4 loaders | — |
 

@@ -7,12 +7,13 @@ tasks/
 tmp/
 learn/
 data/*.h5ad
-benchmarks/logs/
-benchmarks/comprehensive/results/raw/
 *.proptest-regressions
 external-repos/
+benchmarks/logs/
+benchmarks/comprehensive/results/raw/
 benchmarks/comprehensive/results/reports/figures/
 benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md
+benchmarks/comprehensive/logs/
 
 # Rust
 /target/

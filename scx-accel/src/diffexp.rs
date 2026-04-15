@@ -67,6 +67,7 @@ pub fn wilcoxon_rank_sum(
     reference: Option<usize>,
     log_transformed: bool,
     rankby_abs: bool,
+    tie_correct: bool,
 ) -> Result<DiffExpResult> {
     let n_groups = group_names.len();
     if data.len() != n_obs * n_vars {
@@ -136,8 +137,8 @@ pub fn wilcoxon_rank_sum(
                         for i in 0..n_obs {
                             values_buf[i] = data[i * n_vars + var_idx] as f64;
                         }
-                        let tie_correction =
-                            rank_with_ties(&values_buf[..n_obs], index_buf, ranks_buf);
+                        let raw_tc = rank_with_ties(&values_buf[..n_obs], index_buf, ranks_buf);
+                        let tc = if tie_correct { raw_tc } else { 0.0 };
 
                         for &g in &test_groups {
                             let n1 = group_indices[g].len();
@@ -147,12 +148,8 @@ pub fn wilcoxon_rank_sum(
                             }
                             let n2 = n_obs - n1;
 
-                            let (score, pval) = wilcoxon_from_ranks(
-                                ranks_buf,
-                                &group_indices[g],
-                                n_obs,
-                                tie_correction,
-                            );
+                            let (score, pval) =
+                                wilcoxon_from_ranks(ranks_buf, &group_indices[g], n_obs, tc);
 
                             let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
                             let rest_sum: f64 = (0..n_groups)
@@ -185,17 +182,14 @@ pub fn wilcoxon_rank_sum(
                                 values_buf[n1 + i] = data[cell * n_vars + var_idx] as f64;
                             }
 
-                            let tie_correction =
+                            let raw_tc =
                                 rank_with_ties(&values_buf[..n_total], index_buf, ranks_buf);
+                            let tc = if tie_correct { raw_tc } else { 0.0 };
 
                             // Group cells are at indices 0..n1 in the combined buffer.
                             let group_indices_in_buf: Vec<usize> = (0..n1).collect();
-                            let (score, pval) = wilcoxon_from_ranks(
-                                ranks_buf,
-                                &group_indices_in_buf,
-                                n_total,
-                                tie_correction,
-                            );
+                            let (score, pval) =
+                                wilcoxon_from_ranks(ranks_buf, &group_indices_in_buf, n_total, tc);
 
                             let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
                             let mean_ref = group_gene_sums[ref_idx][var_idx] / n2 as f64;
@@ -350,7 +344,7 @@ fn wilcoxon_from_ranks(
     }
 
     let z = (u1 - mu) / sigma_sq.sqrt();
-    let p = 2.0 * normal_cdf(-z.abs());
+    let p = 2.0 * normal_sf(z.abs());
     (z, p)
 }
 
@@ -430,36 +424,60 @@ fn wilcoxon_test(group: &[f64], rest: &[f64]) -> (f64, f64) {
     (z, p)
 }
 
-/// Standard normal CDF via Abramowitz & Stegun erfc approximation (7.1.26).
-/// Φ(z) = erfc(−z/√2) / 2.  Accurate to ~1.5e-7.
-fn normal_cdf(z: f64) -> f64 {
-    if z < -8.0 {
-        return 0.0;
+/// Standard normal survival function: P(Z > z) = 1 − Φ(z).
+///
+/// Uses the upper-tail Mills-ratio continued-fraction expansion for |z| > 8,
+/// which stays accurate down to ~10⁻³⁰⁰ (matching `scipy.stats.norm.sf`).
+/// For |z| ≤ 8, falls back to the Abramowitz & Stegun 7.1.26 erfc
+/// approximation (~1.5e-7 accuracy).
+fn normal_sf(z: f64) -> f64 {
+    let az = z.abs();
+
+    if az > 37.5 {
+        // Beyond ~37.5σ the result underflows f64 (< 5e-308).
+        return if z > 0.0 { 0.0 } else { 1.0 };
     }
-    if z > 8.0 {
-        return 1.0;
-    }
 
-    // A&S 7.1.26 coefficients for erfc(x) where t = 1/(1 + p*x), x >= 0.
-    let a1 = 0.254829592_f64;
-    let a2 = -0.284496736_f64;
-    let a3 = 1.421413741_f64;
-    let a4 = -1.453152027_f64;
-    let a5 = 1.061405429_f64;
-    let p = 0.3275911_f64;
-
-    // erfc(x) for x = |z| / sqrt(2)
-    let x = z.abs() / std::f64::consts::SQRT_2;
-    let t = 1.0 / (1.0 + p * x);
-    let poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
-    let erfc_val = poly * (-x * x).exp();
-
-    // Φ(z) = 1 - erfc(z/√2)/2 for z >= 0, erfc(-z/√2)/2 for z < 0
-    if z >= 0.0 {
-        1.0 - erfc_val / 2.0
+    let sf = if az > 8.0 {
+        // Upper-tail continued-fraction (Abramowitz & Stegun 26.2.14):
+        //   Φ̄(x) ≈ φ(x) · [1/x − 1/x³ + 3/x⁵ − 15/x⁷ + …]
+        // Truncated after enough terms for ~1e-15 relative accuracy.
+        let x = az;
+        let x2 = x * x;
+        // Compute φ(x) = exp(-x²/2) / √(2π) in log-space to avoid underflow.
+        let log_phi = -0.5 * x2 - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        // Continued-fraction coefficients (from the back): cf = 1/(x + k/(x + …))
+        let mut cf = x;
+        for k in (1..=20).rev() {
+            cf = x + k as f64 / cf;
+        }
+        (log_phi - cf.ln()).exp()
     } else {
-        erfc_val / 2.0
+        // A&S 7.1.26 erfc approximation for moderate |z|.
+        let a1 = 0.254829592_f64;
+        let a2 = -0.284496736_f64;
+        let a3 = 1.421413741_f64;
+        let a4 = -1.453152027_f64;
+        let a5 = 1.061405429_f64;
+        let p = 0.3275911_f64;
+
+        let x = az / std::f64::consts::SQRT_2;
+        let t = 1.0 / (1.0 + p * x);
+        let poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+        poly * (-x * x).exp() / 2.0
+    };
+
+    if z > 0.0 {
+        sf
+    } else {
+        1.0 - sf
     }
+}
+
+/// Standard normal CDF: Φ(z) = 1 − sf(z).
+#[cfg(test)]
+fn normal_cdf(z: f64) -> f64 {
+    1.0 - normal_sf(z)
 }
 
 /// Benjamini–Hochberg p-value adjustment.
@@ -513,6 +531,7 @@ pub fn wilcoxon_rank_sum_streaming(
     gene_chunk_size: usize,
     log_transformed: bool,
     rankby_abs: bool,
+    tie_correct: bool,
 ) -> Result<DiffExpResult> {
     let n_obs = reader.n_obs();
     let n_vars = gene_names.len();
@@ -572,6 +591,7 @@ pub fn wilcoxon_rank_sum_streaming(
             reference,
             log_transformed,
             rankby_abs,
+            tie_correct,
         )?;
         all_chunk_results.push(chunk_result);
     }
@@ -597,6 +617,7 @@ pub fn wilcoxon_rank_sum_sparse(
     gene_chunk_size: usize,
     log_transformed: bool,
     rankby_abs: bool,
+    tie_correct: bool,
 ) -> Result<DiffExpResult> {
     let n_obs = csr.n_rows();
     let n_vars = gene_names.len();
@@ -653,6 +674,7 @@ pub fn wilcoxon_rank_sum_sparse(
             reference,
             log_transformed,
             rankby_abs,
+            tie_correct,
         )?;
         all_chunk_results.push(chunk_result);
     }
@@ -860,7 +882,8 @@ mod tests {
             &group_names,
             None,
             false,
-            true, // rankby_abs=true to test absolute sort (original test expectation)
+            true,  // rankby_abs=true to test absolute sort (original test expectation)
+            false, // tie_correct=false (match scanpy default)
         )
         .unwrap();
 
@@ -937,6 +960,7 @@ mod tests {
             Some(0),
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -984,6 +1008,7 @@ mod tests {
             None,
             true,
             false,
+            false,
         )
         .unwrap();
 
@@ -996,6 +1021,7 @@ mod tests {
             &groups,
             &group_names,
             None,
+            false,
             false,
             false,
         )
@@ -1144,6 +1170,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1171,6 +1198,7 @@ mod tests {
             &group_names,
             None,
             2,
+            false,
             false,
             false,
         )

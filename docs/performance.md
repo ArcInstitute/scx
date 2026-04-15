@@ -25,7 +25,21 @@ All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1-2 TB RAM unless noted ot
 | Census 1M | **2.74s** | 5.89s | 48.5s | 3.99s | 12.9s |
 | Census 5M | **35.4s** | 43.7s | 291s | 40.6s | 80.6s |
 
-SCX is the fastest reader at census scale — **1.5x faster than Zarr**, **2.1x faster than uncompressed h5ad**, and **17.7x faster than gzip h5ad** on 1M cells. Parallel scaling: up to **7x** at 32 threads.
+SCX is the fastest reader at census scale — **1.5x faster than Zarr**, **2.1x faster than uncompressed h5ad**, and **17.7x faster than gzip h5ad** on 1M cells. Parallel read scaling: up to **7x** at 32 threads.
+
+## Write Scaling (parallel shard encoding)
+
+Write-only mode (in-memory AnnData → SCX, 500K cells):
+
+| Codec | 1 thread | 32 threads | Speedup |
+|-------|---------|-----------|---------|
+| SCX (pcodec) | 36.1s | 11.4s | **3.2x** |
+| SCX (zstd) | 35.9s | 11.4s | **3.2x** |
+| SCX (scx1) | 32.3s | 12.0s | 2.7x |
+| SCX (auto) | 32.3s | 12.7s | 2.5x |
+| SCX (none) | 21.3s | 12.5s | 1.7x |
+
+SCX parallelizes shard encoding via rayon — compression, checksumming, and statistics run on separate threads. Heavier codecs (pcodec, zstd) benefit most from parallel encoding. Write scaling plateaus around 8–16 threads due to sequential I/O.
 
 ## Column Projection (2000 HVGs)
 
