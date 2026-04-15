@@ -29,6 +29,7 @@ from benchmarks.comprehensive.reporting.tables import (
     write_speed_table,
     memory_table,
     parallel_scaling_table,
+    parallel_write_scaling_table,
     ml_loader_table,
     correctness_table,
     correctness_detail_table,
@@ -218,10 +219,20 @@ Column projection: 2,000 HVG columns selected from full gene set.
 
 {_fig("parallel_scaling")}
 
-**Takeaways:**
+**Takeaways (read):**
 - SCX achieves up to 7.1x speedup at 32 threads via shard-level parallelism.
 - Zarr and h5ad show no parallel scaling (single-threaded I/O paths).
 - Efficiency decreases at high thread counts due to memory bus saturation.
+
+### Write Scaling
+
+{parallel_write_scaling_table()}
+
+{_fig("parallel_write_scaling")}
+
+**Takeaways (write):**
+- SCX write-only (in-memory AnnData to SCX) isolates the parallel shard encoding phase, showing clearer scaling.
+- Full pipeline speedup is diluted by single-threaded h5ad read overhead.
 """)
 
     # -----------------------------------------------------------------------

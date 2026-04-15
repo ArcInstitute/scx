@@ -238,9 +238,8 @@ def ensure_metadata_columns(adata) -> None:
 def run_leiden(adata, **kwargs) -> None:
     """Run Leiden clustering with graceful fallback.
 
-    Tries igraph flavor first, then leidenalg, then louvain. Ensures a
-    ``"leiden"`` column exists in ``adata.obs`` regardless of which backend
-    is available.
+    Tries igraph flavor first, then leidenalg, then louvain. Raises
+    ``ImportError`` if no graph clustering backend is available.
     """
     import scanpy as sc
 
@@ -250,12 +249,24 @@ def run_leiden(adata, **kwargs) -> None:
             adata, flavor="igraph", n_iterations=2, directed=False,
             random_state=random_state, **kwargs,
         )
-    except ImportError:
-        try:
-            sc.tl.leiden(adata, random_state=random_state, **kwargs)
-        except ImportError:
-            sc.tl.louvain(adata, random_state=random_state, **kwargs)
-            adata.obs["leiden"] = adata.obs["louvain"]
+        return
+    except (ImportError, ModuleNotFoundError):
+        pass
+    try:
+        sc.tl.leiden(adata, random_state=random_state, **kwargs)
+        return
+    except (ImportError, ModuleNotFoundError):
+        pass
+    try:
+        sc.tl.louvain(adata, random_state=random_state, **kwargs)
+        adata.obs["leiden"] = adata.obs["louvain"]
+        return
+    except (ImportError, ModuleNotFoundError):
+        pass
+    raise ImportError(
+        "No graph clustering backend available. "
+        "Install one of: python-igraph, leidenalg, or louvain."
+    )
 
 
 def prepare_scx_file(adata, tmp_dir: Path, name: str = "test.scx") -> str:

@@ -148,7 +148,8 @@ Dataset paths are configured via the `.env` file at the repo root (or environmen
 | `slurm_phase3_small.sh` | `cpu_preemptible` | 32 CPUs, 80 GB | 6 h | Phase 3 benchmarks D1–D4 (sequential, single job) |
 | `slurm_phase3_large.sh` | `cpu_high_mem` | 32 CPUs, 500 GB | 12 h | Phase 3 benchmarks D5–D7 (sequential, single job) |
 | `slurm_phase3_parallel_large.sh` | varies | 32 CPUs, 80–500 GB | 4–12 h/job | Phase 3 D5–D7 parallel submission (one job per benchmark×dataset) |
-| `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel_scaling only, D5–D7 |
+| `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel read scaling only, D5–D7 |
+| `slurm_parallel_write_scaling.sh` | varies | 32 CPUs, 80–500 GB | 2–24 h/job | Parallel write scaling (§3.5.2), D1–D7 (one job per dataset) |
 | `slurm_fused_bench.sh` | `cpu_preemptible` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
 | `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 16–32 CPUs, 80–256 GB | 6–16 h/job | Phase 5c lazy preprocessing benchmarks (§3.13.1–3.13.6; submits ~15 parallel jobs) |
 | `slurm_phase4_ml_loader.sh` | `cpu_preemptible`+`preemptible` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |

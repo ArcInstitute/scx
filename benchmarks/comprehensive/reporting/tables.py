@@ -365,6 +365,79 @@ def parallel_scaling_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
+    """Generate parallel write scaling table: Format x Thread count showing wall time and speedup.
+
+    Produces separate sub-tables for each mode (full pipeline vs write-only).
+    """
+    if datasets is None:
+        datasets = ["census_500k", "census_1m", "census_5m"]
+    results = load_all_results(benchmark="parallel_write_scaling")
+
+    if not results:
+        return "*No parallel write scaling results available yet.*"
+
+    lines = []
+
+    # Collect all modes present in results.
+    all_modes: set[str] = set()
+    for r in results:
+        meta = r.get("metadata", {})
+        speedup = meta.get("speedup", {})
+        all_modes.update(speedup.keys())
+
+    mode_labels = {"full": "Full pipeline (h5ad read + write)", "write_only": "Write only (in-memory AnnData)"}
+
+    for mode in ["full", "write_only"]:
+        if mode not in all_modes:
+            continue
+
+        lines.append(f"\n**{mode_labels.get(mode, mode)}**\n")
+
+        for ds in datasets:
+            ds_results = [r for r in results if r.get("dataset") == ds]
+            if not ds_results:
+                continue
+
+            lines.append(f"\n*{SHORT_NAMES.get(ds, ds)}*\n")
+            lines.append("| Format | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads | Max speedup |")
+            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+
+            sorted_results = sorted(
+                ds_results,
+                key=lambda r: FORMAT_ORDER.index(r.get("format", ""))
+                if r.get("format", "") in FORMAT_ORDER else 999,
+            )
+
+            for r in sorted_results:
+                fmt = r.get("format", "")
+                display = FORMAT_DISPLAY.get(fmt, fmt)
+                meta = r.get("metadata", {})
+                scaling = meta.get("scaling_wall_s", {}).get(mode, {})
+                speedup = meta.get("speedup", {}).get(mode, {})
+
+                if not scaling:
+                    continue
+
+                cells = []
+                for t in ["1", "2", "4", "8", "16", "32"]:
+                    wall = scaling.get(t)
+                    spd = speedup.get(t)
+                    if wall is not None:
+                        if spd is not None and t != "1":
+                            cells.append(f"{_fmt_time(wall)} ({spd:.1f}x)")
+                        else:
+                            cells.append(_fmt_time(wall))
+                    else:
+                        cells.append("—")
+
+                max_spd = max(speedup.values()) if speedup else None
+                cells.append(f"{max_spd:.1f}x" if max_spd else "—")
+                lines.append(f"| {display} | " + " | ".join(cells) + " |")
+
+    return "\n".join(lines)
+
+
 def ml_loader_table(datasets: list[str] | None = None) -> str:
     """Generate ML loader comparison table: Format x Dataset showing b/s and TTFB."""
     if datasets is None:
@@ -559,6 +632,7 @@ def generate_all_tables() -> dict[str, str]:
         "read_speed": read_speed_table(),
         "read_selective": read_selective_table(),
         "parallel_scaling": parallel_scaling_table(),
+        "parallel_write_scaling": parallel_write_scaling_table(),
         "memory": memory_table(),
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),

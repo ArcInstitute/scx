@@ -155,7 +155,8 @@ See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 | Area | Metric | Result |
 |------|--------|--------|
 | Read | vs Zarr lz4, 1M cells | **1.38x faster** |
-| Read | Parallel scaling (32 threads) | **Up to 7x** |
+| Read | Parallel read scaling (32 threads) | **Up to 7x** |
+| Write | Parallel write scaling (32 threads) | **Up to 3.2x** |
 | Column projection | vs all competitors | **4-8x faster** |
 | Memory (OOC pipeline) | Peak RSS, 1M cells | **5.1 GB** (88% reduction) |
 | PCA | vs scanpy, 1M cells (HVG) | **1.9x faster** (4.2s) |

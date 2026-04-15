@@ -323,6 +323,66 @@ def plot_parallel_scaling(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Parallel write scaling
+# ---------------------------------------------------------------------------
+
+def plot_parallel_write_scaling(output_dir: Path | None = None):
+    """Line plot: write speedup vs thread count, one line per format x dataset.
+
+    Plots the "write_only" mode (in-memory AnnData → format) when available,
+    as it isolates the parallel encoding benefit. Falls back to "full" mode.
+    """
+    _setup_style()
+    results = load_all_results(benchmark="parallel_write_scaling")
+    datasets = ["census_500k", "census_1m", "census_5m"]
+    formats = ["scx_auto", "scx_pcodec", "scx_zstd", "zarr_lz4", "tiledb_soma"]
+
+    fig, axes = plt.subplots(1, len(datasets), figsize=(5 * len(datasets), 5), sharey=True)
+    if len(datasets) == 1:
+        axes = [axes]
+
+    for ax, ds in zip(axes, datasets):
+        ds_results = [r for r in results if r.get("dataset") == ds]
+
+        for r in ds_results:
+            fmt = r.get("format", "")
+            if fmt not in formats:
+                continue
+            meta = r.get("metadata", {})
+            # Prefer write_only mode for SCX; fall back to full.
+            speedup_by_mode = meta.get("speedup", {})
+            speedup = speedup_by_mode.get("write_only") or speedup_by_mode.get("full", {})
+            if not speedup:
+                continue
+            threads = sorted(int(k) for k in speedup.keys())
+            spds = [speedup[str(t)] for t in threads]
+            ax.plot(
+                threads, spds, "o-",
+                label=FORMAT_LABELS.get(fmt, fmt),
+                color=FORMAT_COLORS.get(fmt, "#999999"),
+                markersize=4, linewidth=1.5,
+            )
+
+        # Ideal scaling line
+        max_t = 32
+        ax.plot([1, max_t], [1, max_t], "k--", alpha=0.3, label="Ideal")
+
+        ds_short = SHORT_NAMES.get(ds, ds).replace("\n", " ")
+        ax.set_title(ds_short)
+        ax.set_xlabel("Threads")
+        ax.set_xscale("log", base=2)
+        ax.set_xticks([1, 2, 4, 8, 16, 32])
+        ax.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
+
+    axes[0].set_ylabel("Speedup vs 1 thread")
+    axes[-1].legend(fontsize=8, loc="upper left")
+    fig.suptitle("Parallel Write Scaling", fontsize=13)
+    fig.tight_layout()
+
+    _save_fig(fig, "parallel_write_scaling", output_dir)
+
+
+# ---------------------------------------------------------------------------
 # 5. Memory vs cell count
 # ---------------------------------------------------------------------------
 
@@ -831,6 +891,7 @@ def generate_all_plots(output_dir: Path | None = None) -> list[str]:
         ("read_speed_bar", plot_read_speed),
         ("scaling_curves", plot_scaling_curves),
         ("parallel_scaling", plot_parallel_scaling),
+        ("parallel_write_scaling", plot_parallel_write_scaling),
         ("memory_scaling", plot_memory_scaling),
         ("lazy_vs_materialized_rss", plot_lazy_vs_materialized_rss),
         ("column_projection_latency", plot_column_projection_latency),

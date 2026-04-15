@@ -23,4 +23,5 @@ if not _work:
     )
 
 WORK_DIR = Path(_work)
-DATA_DIR = Path(os.environ.get("SCX_DATA_DIR", "")) or WORK_DIR / "benchmarks" / "datasets"
+_data = os.environ.get("SCX_DATA_DIR", "")
+DATA_DIR = Path(_data) if _data else WORK_DIR / "benchmarks" / "datasets"
