@@ -84,7 +84,9 @@ accelerators, and correctness.
   2.35 GB on 1M cells (4.85x smaller than h5ad). Ratio improves with scale:
   7.30x on 5M cells.
 - **Read speed:** SCX is the fastest reader at census scale — 1.38x faster than
-  Zarr lz4 on 1M cells, with up to 7.1x parallel scaling at 32 threads.
+  Zarr lz4 on 1M cells, with up to 7.1x parallel read scaling at 32 threads.
+- **Write scaling:** Parallel shard encoding yields up to 3.2x write speedup at
+  32 threads (pcodec/zstd on 500K cells). No other format scales writes.
 - **Column projection:** SCX dominates — 4.2x faster than Zarr on 1M cells,
   7.6x on 5M cells.
 - **ML loader:** SCX TrainingDataset delivers 1,405 batches/sec on 1M cells —
@@ -231,8 +233,15 @@ Column projection: 2,000 HVG columns selected from full gene set.
 {_fig("parallel_write_scaling")}
 
 **Takeaways (write):**
-- SCX write-only (in-memory AnnData to SCX) isolates the parallel shard encoding phase, showing clearer scaling.
-- Full pipeline speedup is diluted by single-threaded h5ad read overhead.
+- SCX achieves up to **3.2x write speedup** at 32 threads for compression-heavy
+  codecs (pcodec, zstd) on 500K cells. Heavier per-shard CPU work yields more
+  parallelism.
+- Write-only mode (in-memory AnnData → SCX) shows ~15–25% better scaling than
+  the full pipeline, since it isolates parallel shard encoding from the
+  single-threaded h5ad read.
+- SCX (none) shows only 1.7x — minimal compression means less work to parallelize.
+- Scaling plateaus around 8–16 threads due to sequential I/O in the final write phase.
+- Small datasets (pbmc3k, pbmc10k) show no write scaling — they fit in a single shard.
 """)
 
     # -----------------------------------------------------------------------
@@ -516,8 +525,8 @@ differences in kNN (HNSW vs PyNNDescent) and UMAP (Rust SGD vs C++).
 
 ### SCX Weaknesses
 
-1. **Write speed.** 1.8–2.9x slower than Zarr lz4 due to shard construction
-   and codec encoding overhead.
+1. **Write speed.** 1.8–2.9x slower than Zarr lz4 at single-threaded, though
+   parallel shard encoding (up to 3.2x at 32 threads) narrows the gap.
 2. **PCA.** Covariance eigendecomposition is slower than scanpy's ARPACK
    (iterative vs direct). Bottleneck is shard-to-dense conversion for GEMM.
 3. **kNN on small data.** HNSW graph construction overhead dominates when
@@ -530,7 +539,7 @@ differences in kNN (HNSW vs PyNNDescent) and UMAP (Rust SGD vs C++).
 | Format | Best at | Weakest at |
 |--------|---------|------------|
 | SCX (zstd/pcodec) | Compression, selective reads | Write speed |
-| SCX (auto) | Read speed, parallel scaling | Write speed |
+| SCX (auto) | Read speed, parallel scaling (read+write) | Write speed (single-threaded) |
 | Zarr (zstd) | Compression (close to SCX) | Parallel scaling, selective reads |
 | Zarr (lz4) | Write speed | Compression |
 | TileDB-SOMA | Schema richness, ecosystem | Read speed, ML loading |
@@ -539,7 +548,8 @@ differences in kNN (HNSW vs PyNNDescent) and UMAP (Rust SGD vs C++).
 
 ### Areas for Improvement
 
-- **Write optimization:** Parallel shard encoding, streaming CSR construction.
+- **Write optimization:** Parallel shard encoding delivers up to 3.2x speedup;
+  further gains possible via streaming CSR construction and parallel I/O.
 - **PCA:** Streaming randomized SVD without shard-to-dense conversion.
 - **GPU pipeline:** Minimize host-device transfers; unified memory for PCA.
 - **CSC storage:** Gene-major layout for column-heavy workloads.
@@ -581,7 +591,8 @@ Examples:
 | `write` | Conversion/write throughput | ~84 |
 | `read_full` | Full-file load performance | ~84 |
 | `read_selective` | Column projection performance | ~70 |
-| `parallel_scaling` | Thread scaling (1–32 threads) | ~42 |
+| `parallel_scaling` | Read thread scaling (1–32 threads) | ~42 |
+| `parallel_write_scaling` | Write thread scaling (1–32 threads) | ~53 |
 | `memory` | Peak RSS during operations | ~42 |
 | `ml_loader` | ML data loader throughput | ~12 |
 | `correctness` | Validation pass/fail results | ~3 |
