@@ -11,8 +11,10 @@ data/*.h5ad
 external-repos/
 benchmarks/logs/
 benchmarks/comprehensive/results/raw/
+benchmarks/comprehensive/results/raw_archive_*/
 benchmarks/comprehensive/results/reports/figures/
 benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md
+benchmarks/comprehensive/results/reports_archive_*/
 benchmarks/comprehensive/logs/
 
 # Rust

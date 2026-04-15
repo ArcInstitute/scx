@@ -150,14 +150,30 @@ def _slurm_params(args, is_conversion: bool = False) -> dict:
     if is_conversion and timeout_min < 240:
         timeout_min = 240  # conversions need more time for large datasets
 
+    # Detect whether we're running inside a conda env (scx-bench) or the
+    # project .venv/.  SLURM jobs need the same Python that has pyscx installed.
+    import os
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    if "scx-bench" in conda_prefix:
+        conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
+        if not conda_base:
+            conda_base = str(Path.home() / "miniforge3")
+        env_name = os.path.basename(conda_prefix)
+        setup_cmds = [
+            f'eval "$({conda_base}/bin/conda shell.bash hook)"',
+            f"conda activate {env_name}",
+        ]
+    else:
+        setup_cmds = [
+            f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
+        ]
+
     return {
         "slurm_partition": args.partition,
         "cpus_per_task": args.cpus,
         "mem_gb": args.mem_gb,
         "timeout_min": timeout_min,
-        "slurm_setup": [
-            f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
-        ],
+        "slurm_setup": setup_cmds,
     }
 
 
