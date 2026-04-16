@@ -122,18 +122,23 @@ pub fn compute_discrimination_score(
         return Err(crate::AccelError::InvalidInput("n_genes is 0".to_string()));
     }
 
-    // ── NaN/Inf guard ────────────────────────────────────────────────
-    // Pseudobulk means with all-zero groups can produce NaN (0/0).
-    // NaN distances would silently give rank 0 (since NaN < x is always
-    // false), yielding artificially high scores.
-    debug_assert!(
-        real_effects.iter().all(|v| v.is_finite()),
-        "real_effects contains NaN or Inf values"
-    );
-    debug_assert!(
-        pred_effects.iter().all(|v| v.is_finite()),
-        "pred_effects contains NaN or Inf values"
-    );
+    // Pseudobulk means with all-zero groups produce NaN (0/0); NaN distances
+    // silently yield rank 0 (since `NaN < x` is false), which would mask the
+    // upstream bug as an artificially perfect score. Reject in release too.
+    if !real_effects.iter().all(|v| v.is_finite()) {
+        return Err(crate::AccelError::InvalidInput(
+            "real_effects contains non-finite values (NaN/Inf); \
+             likely caused by an empty perturbation group in pseudobulk input"
+                .to_string(),
+        ));
+    }
+    if !pred_effects.iter().all(|v| v.is_finite()) {
+        return Err(crate::AccelError::InvalidInput(
+            "pred_effects contains non-finite values (NaN/Inf); \
+             likely caused by an empty perturbation group in pseudobulk input"
+                .to_string(),
+        ));
+    }
 
     // ── Pre-build gene name → column index map (if needed) ──────────
     let gene_idx_map: Option<std::collections::HashMap<&str, usize>> = if exclude_target_gene {
@@ -650,6 +655,45 @@ mod tests {
                 "pert_{i} expected score 1.0, got {score}"
             );
         }
+    }
+
+    #[test]
+    fn test_rejects_non_finite_effects() {
+        let perts = vec!["p0".to_string(), "p1".to_string()];
+
+        let mut real_with_nan = vec![1.0, 2.0, 3.0, 4.0];
+        real_with_nan[2] = f64::NAN;
+        let err = compute_discrimination_score(
+            &real_with_nan,
+            &[0.0; 4],
+            2,
+            2,
+            &perts,
+            None,
+            DistanceMetric::Euclidean,
+            false,
+        )
+        .expect_err("NaN in real_effects must error");
+        assert!(
+            matches!(err, crate::AccelError::InvalidInput(ref m) if m.contains("real_effects"))
+        );
+
+        let mut pred_with_inf = vec![1.0, 2.0, 3.0, 4.0];
+        pred_with_inf[0] = f64::INFINITY;
+        let err = compute_discrimination_score(
+            &[0.0; 4],
+            &pred_with_inf,
+            2,
+            2,
+            &perts,
+            None,
+            DistanceMetric::Euclidean,
+            false,
+        )
+        .expect_err("Inf in pred_effects must error");
+        assert!(
+            matches!(err, crate::AccelError::InvalidInput(ref m) if m.contains("pred_effects"))
+        );
     }
 
     #[test]

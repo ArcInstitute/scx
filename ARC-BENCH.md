@@ -1299,6 +1299,23 @@ isolated from the main benchmark and development environments.
 
 ## Results
 
+### Tolerance justification
+
+Parity tolerances in `pyscx/tests/test_cell_eval_parity.py` and
+`pyscx/tests/test_eval_metrics.py` fall into five classes, each tied to
+the numerical structure of the algorithm. A future regression that
+bumps the tolerance to make a test pass should re-read this section
+first — if the regression isn't in one of these classes, it's a
+correctness bug, not a tolerance issue.
+
+| Class | Tolerance | Metrics | Rationale |
+|---|---|---|---|
+| 1. Label-only scoring (pure integer/f64) | `atol=1e-10` | AMI, NMI, ARI on label vectors; small-fixture unit tests for pearson/mse/mae/mse_delta/mae_delta | Inputs are integer labels or tiny f64 fixtures. Output parity is limited by double-precision floor (~2.2e-16); `1e-10` is a comfortable ceiling. |
+| 2. Streaming statistics with f32→f64 promotion | `atol=1e-6` | pseudobulk_means, pearson_delta, mse/mae/mse_delta/mae_delta on census data, knockdown_efficiency, log_deviation | On-disk CSR data is f32; `knockdown.rs:89` and `bulk_metrics.rs:70-91` promote to f64 before accumulation. Expected rounding is `O(n_cells · 2⁻²³) ≈ 1e-7` for 1M cells — `1e-6` leaves one decimal of headroom for reduction-order differences vs the reference. |
+| 3. O(N²) pairwise distance kernels | `atol=1e-4` | energy_distance / pearson_edistance | Streaming mean over ~N²/2 f64 squared-differences. sklearn's reference goes through a different reduction order (BLAS GEMM chunks); observed divergence is ≤5e-5 at 10K cells, so `1e-4` is deliberately 2× that. |
+| 4. Stochastic pipelines | `atol=0.05` per-resolution, `atol=0.15` aggregate | clustering_agreement (AMI over Leiden sweep) | Leiden is RNG-seeded but not bit-identical across implementations. Tolerances are absolute (not relative) because AMI is bounded in `[0, 1]`. The aggregate tolerance is looser because it averages over 7 resolutions, each contributing its own seed-dependent variance. |
+| 5. Exact match | `abs=0` | discrimination_score rank | Integer rank computation; parity is bit-identical once the upstream f64 distances match across tiebreaks. Any non-zero diff is a correctness regression. |
+
 ### Correctness parity (7.3–7.10, 7.12)
 
 `pytest pyscx/tests/test_cell_eval_parity.py` — **30 passed, 0 skipped**
@@ -1307,18 +1324,18 @@ isolated from the main benchmark and development environments.
 All metrics match the cell-eval / arc-bench references within the
 tolerance table in §7.10:
 
-| Metric                    | Tolerance  | Observed | Notes                              |
-|---------------------------|------------|----------|------------------------------------|
-| pseudobulk_means          | `atol=1e-6` | ✅       | vs `PerturbationAnndataPair._bulk_anndata` |
-| pearson_delta             | `atol=1e-6` | ✅       |                                    |
-| mse / mae                 | `atol=1e-6` | ✅       |                                    |
-| mse_delta / mae_delta     | `atol=1e-6` | ✅       |                                    |
-| pearson_edistance         | `atol=1e-4` | ✅       |                                    |
-| discrimination_score (l1/l2/cosine) | exact | ✅   | integer-rank, bit-identical to cell-eval |
-| knockdown_efficiency      | `atol=1e-6` | ✅       | vs `arc_bench.compute_knockdown_efficiency` |
-| log_deviation             | `atol=1e-6` | ✅       | vs `arc_bench.compute_log_deviation` |
-| AMI / NMI / ARI           | `atol=1e-10` | ✅      | vs `sklearn.metrics.*` (ARI uses cell-eval's `(ARI+1)/2`) |
-| clustering_agreement      | `atol=0.15` | ✅       | loose tolerance, stochastic Leiden |
+| Metric                    | Tolerance  | Class | Observed | Notes                              |
+|---------------------------|------------|-------|----------|------------------------------------|
+| pseudobulk_means          | `atol=1e-6` | 2     | ✅       | vs `PerturbationAnndataPair._bulk_anndata` |
+| pearson_delta             | `atol=1e-6` | 2     | ✅       |                                    |
+| mse / mae                 | `atol=1e-6` | 2     | ✅       |                                    |
+| mse_delta / mae_delta     | `atol=1e-6` | 2     | ✅       |                                    |
+| pearson_edistance         | `atol=1e-4` | 3     | ✅       |                                    |
+| discrimination_score (l1/l2/cosine) | exact | 5 | ✅   | integer-rank, bit-identical to cell-eval |
+| knockdown_efficiency      | `atol=1e-6` | 2     | ✅       | vs `arc_bench.compute_knockdown_efficiency` |
+| log_deviation             | `atol=1e-6` | 2     | ✅       | vs `arc_bench.compute_log_deviation` |
+| AMI / NMI / ARI           | `atol=1e-10` | 1    | ✅       | vs `sklearn.metrics.*` (ARI uses cell-eval's `(ARI+1)/2`) |
+| clustering_agreement      | `atol=0.15` | 4    | ✅       | loose tolerance, stochastic Leiden |
 
 ### Performance (§7.11.1)
 

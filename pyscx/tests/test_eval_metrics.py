@@ -1094,6 +1094,21 @@ class TestDiscriminationScore:
         with pytest.raises(ValueError, match="NaN"):
             pyscx.accel.discrimination_score(adata_real, adata_pred)
 
+    def test_nan_in_x_rejected(self):
+        """NaN in X (which propagates into pseudobulk effects) must error,
+        not silently produce rank 0 / score 1.0."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        X = adata_real.X.toarray()
+        X[0, 0] = np.nan
+        adata_real.X = sp.csr_matrix(X)
+
+        with pytest.raises((RuntimeError, ValueError), match="non-finite"):
+            pyscx.accel.discrimination_score(
+                adata_real, adata_pred, metric="l1", exclude_target_gene=False
+            )
+
     def test_backed_scx_input(self, tmp_path):
         """Test with backed SCX input."""
         import pyscx

@@ -68,16 +68,23 @@ pub fn pseudobulk_means<'py>(
     let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
 
     // Perform aggregation with Mean method: backed, lazy-transformed, or in-memory.
+    // Each branch releases the GIL around the Rust kernel. `PyReadonlyArray1`
+    // guards are held in the branch's outer scope (keeping numpy buffers alive);
+    // only the plain `&[T]` slices cross `allow_threads`.
     let x = adata.getattr("X")?;
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        scx_accel::pseudobulk_aggregate(
-            &backed.backed,
-            &obs_groups,
-            &groupby_columns,
-            &gene_names,
-            scx_accel::AggregationMethod::Mean,
-            min_cells_per_group,
-        )
+        let backed_reader = std::sync::Arc::clone(&backed.backed);
+        drop(backed);
+        py.allow_threads(|| {
+            scx_accel::pseudobulk_aggregate(
+                &backed_reader,
+                &obs_groups,
+                &groupby_columns,
+                &gene_names,
+                scx_accel::AggregationMethod::Mean,
+                min_cells_per_group,
+            )
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         // Lazy-transformed datasets: materialize through the transform pipeline
@@ -111,17 +118,19 @@ pub fn pseudobulk_means<'py>(
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        scx_accel::pseudobulk_aggregate_from_slices(
-            shape,
-            indptr_slice,
-            indices_slice,
-            data_slice,
-            &obs_groups,
-            &groupby_columns,
-            &gene_names,
-            scx_accel::AggregationMethod::Mean,
-            min_cells_per_group,
-        )
+        py.allow_threads(|| {
+            scx_accel::pseudobulk_aggregate_from_slices(
+                shape,
+                indptr_slice,
+                indices_slice,
+                data_slice,
+                &obs_groups,
+                &groupby_columns,
+                &gene_names,
+                scx_accel::AggregationMethod::Mean,
+                min_cells_per_group,
+            )
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else {
         // In-memory: extract scipy CSR → zero-copy slices.
@@ -170,17 +179,19 @@ pub fn pseudobulk_means<'py>(
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        scx_accel::pseudobulk_aggregate_from_slices(
-            shape,
-            indptr_slice,
-            indices_slice,
-            data_slice,
-            &obs_groups,
-            &groupby_columns,
-            &gene_names,
-            scx_accel::AggregationMethod::Mean,
-            min_cells_per_group,
-        )
+        py.allow_threads(|| {
+            scx_accel::pseudobulk_aggregate_from_slices(
+                shape,
+                indptr_slice,
+                indices_slice,
+                data_slice,
+                &obs_groups,
+                &groupby_columns,
+                &gene_names,
+                scx_accel::AggregationMethod::Mean,
+                min_cells_per_group,
+            )
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     };
 
@@ -624,17 +635,21 @@ pub fn perturbation_metrics<'py>(
         ))
     })?;
 
-    // Call Rust bulk metrics computation.
-    let result = scx_accel::compute_bulk_metrics(
-        &means_real_flat,
-        &means_pred_flat,
-        ctrl_idx,
-        n_perts,
-        n_genes,
-        &common,
-        &bulk_metrics,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // Call Rust bulk metrics computation. Release the GIL — all inputs are
+    // owned Vecs / plain scalars, so the closure is Ungil+Send.
+    let result = py
+        .allow_threads(|| {
+            scx_accel::compute_bulk_metrics(
+                &means_real_flat,
+                &means_pred_flat,
+                ctrl_idx,
+                n_perts,
+                n_genes,
+                &common,
+                &bulk_metrics,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Convert to dict[str, dict[str, float]].
     let outer_dict = PyDict::new(py);
@@ -778,17 +793,21 @@ fn run_energy_distance<'py>(
         ));
     }
 
-    scx_accel::compute_energy_distance(
-        &real_flat,
-        &pred_flat,
-        &real_groups,
-        &pred_groups,
-        ctrl_group_idx,
-        &pert_names,
-        &pert_group_indices,
-        n_dims,
-        dist_metric,
-    )
+    // Release the GIL for the O(N²) rayon-parallel kernel. All arguments are
+    // owned Vecs or plain scalars.
+    py.allow_threads(|| {
+        scx_accel::compute_energy_distance(
+            &real_flat,
+            &pred_flat,
+            &real_groups,
+            &pred_groups,
+            ctrl_group_idx,
+            &pert_names,
+            &pert_group_indices,
+            n_dims,
+            dist_metric,
+        )
+    })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
@@ -995,17 +1014,21 @@ pub fn discrimination_score<'py>(
     };
 
     // ── Call Rust discrimination score ───────────────────────────────
-    let result = scx_accel::compute_discrimination_score(
-        &real_effects,
-        &pred_effects,
-        n_output,
-        n_genes,
-        &output_pert_names,
-        gene_names_ref,
-        dist_metric,
-        effective_exclude,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // Release the GIL for the rayon-parallel inner loop.
+    let result = py
+        .allow_threads(|| {
+            scx_accel::compute_discrimination_score(
+                &real_effects,
+                &pred_effects,
+                n_output,
+                n_genes,
+                &output_pert_names,
+                gene_names_ref,
+                dist_metric,
+                effective_exclude,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // ── Convert to dict[str, float] ─────────────────────────────────
     let dict = PyDict::new(py);
@@ -1111,54 +1134,57 @@ pub fn knockdown_efficiency<'py>(
 
     // ── Extract CSR arrays as zero-copy slices ──────────────────────
     let slices = extract_csr_slices(py, &np, &csr_obj, "knockdown_efficiency", 1)?;
+    // Lift the slice references out of `slices` (keeps `slices` alive as the
+    // numpy-buffer anchor) so the closures are Ungil+Send — `CsrSlices` itself
+    // holds `PyReadonlyArray1`, which is GIL-bound and cannot cross allow_threads.
+    let indptr = slices.indptr();
+    let indices = slices.indices();
+    let data = slices.data();
 
-    // ── Compute control baseline ────────────────────────────────────
-    let baseline = scx_accel::compute_control_baseline(
-        slices.indptr(),
-        slices.indices(),
-        slices.data(),
-        &pert_labels,
-        control,
-        n_vars,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // ── Compute control baseline + knockdown efficiency + log deviation ──
+    // Release the GIL for all three kernels. The log-transform allocations
+    // also happen inside the closure to avoid a round-trip.
+    let (efficiency, log_fc) = py
+        .allow_threads(|| -> scx_accel::Result<_> {
+            let baseline = scx_accel::compute_control_baseline(
+                indptr,
+                indices,
+                data,
+                &pert_labels,
+                control,
+                n_vars,
+            )?;
 
-    // ── Compute knockdown efficiency (on current data) ──────────────
-    let efficiency = scx_accel::compute_knockdown_efficiency(
-        slices.indptr(),
-        slices.indices(),
-        slices.data(),
-        &pert_labels,
-        control,
-        &gene_names,
-        &baseline,
-        eps,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let efficiency = scx_accel::compute_knockdown_efficiency(
+                indptr,
+                indices,
+                data,
+                &pert_labels,
+                control,
+                &gene_names,
+                &baseline,
+                eps,
+            )?;
 
-    // ── Compute log deviation ───────────────────────────────────────
-    // Arc-bench computes log deviation AFTER log1p on the data.
-    // We apply log1p to the data values (on a copy) and log1p to baseline.
-    let baseline_log: Vec<f64> = baseline.iter().map(|&v| v.ln_1p()).collect();
+            // Arc-bench computes log deviation AFTER log1p. Apply log1p to
+            // the CSR values (on a copy) and log1p to the baseline.
+            // f32 → f64 → ln_1p → f32: intentional double promotion for accuracy.
+            let baseline_log: Vec<f64> = baseline.iter().map(|&v| v.ln_1p()).collect();
+            let data_log: Vec<f32> = data.iter().map(|&v| (v as f64).ln_1p() as f32).collect();
 
-    // Apply log1p to the CSR data values for the log deviation pass.
-    // f32 → f64 → ln_1p → f32: intentional double promotion for accuracy.
-    let data_log: Vec<f32> = slices
-        .data()
-        .iter()
-        .map(|&v| (v as f64).ln_1p() as f32)
-        .collect();
+            let log_fc = scx_accel::compute_log_deviation(
+                indptr,
+                indices,
+                &data_log,
+                &pert_labels,
+                control,
+                &gene_names,
+                &baseline_log,
+            )?;
 
-    let log_fc = scx_accel::compute_log_deviation(
-        slices.indptr(),
-        slices.indices(),
-        &data_log,
-        &pert_labels,
-        control,
-        &gene_names,
-        &baseline_log,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok((efficiency, log_fc))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // ── Write results to adata.obs ──────────────────────────────────
     let obs = adata.getattr("obs")?;
@@ -1213,6 +1239,10 @@ pub fn clustering_agreement<'py>(
     embed_key: Option<&str>,
     min_cells_per_group: usize,
 ) -> PyResult<f64> {
+    // Note: this function intentionally holds the GIL throughout. Its per-
+    // resolution loop calls `sc.pp.neighbors` and `sc.tl.leiden` (Python
+    // scanpy), which require the GIL. Pushing clustering into pure Rust
+    // would let us release — that refactor is tracked as a follow-up.
     let np = py.import("numpy")?;
     let sc = py.import("scanpy")?;
     let ad_mod = py.import("anndata")?;
@@ -1458,7 +1488,7 @@ pub fn adjusted_mutual_info(
             b.len()
         )));
     }
-    Ok(scx_accel::adjusted_mutual_info(&a, &b))
+    Ok(py.allow_threads(|| scx_accel::adjusted_mutual_info(&a, &b)))
 }
 
 /// Normalized Mutual Information (sklearn arithmetic-mean convention).
@@ -1480,7 +1510,7 @@ pub fn normalized_mutual_info(
             b.len()
         )));
     }
-    Ok(scx_accel::normalized_mutual_info(&a, &b))
+    Ok(py.allow_threads(|| scx_accel::normalized_mutual_info(&a, &b)))
 }
 
 /// Adjusted Rand Index, rescaled to [0, 1] via `(ARI + 1) / 2`.
@@ -1503,5 +1533,5 @@ pub fn adjusted_rand_index(
             b.len()
         )));
     }
-    Ok(scx_accel::adjusted_rand_index_rescaled(&a, &b))
+    Ok(py.allow_threads(|| scx_accel::adjusted_rand_index_rescaled(&a, &b)))
 }
