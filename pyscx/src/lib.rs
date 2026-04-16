@@ -188,47 +188,80 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Accelerators submodule
     let accel_module = PyModule::new(m.py(), "accel")?;
-    accel_module.add_function(wrap_pyfunction!(accel::gpu_info, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::estimate_gpu_memory, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::pca, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::neighbors, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::umap, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::rank_genes_groups, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::pseudobulk_dex, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::leiden, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::normalize_total, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::log1p, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::gpu::gpu_info, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(
-        accel::calculate_qc_metrics,
+        accel::gpu::estimate_gpu_memory,
         &accel_module
     )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::filter_cells, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::filter_genes, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::subset_obs, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::pca::pca, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(
-        accel::highly_variable_genes,
+        accel::neighbors::neighbors,
         &accel_module
     )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::pseudobulk_means, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::umap::umap, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(
-        accel::perturbation_metrics,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::energy_distance, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::discrimination_score,
+        accel::de::rank_genes_groups,
         &accel_module
     )?)?;
     accel_module.add_function(wrap_pyfunction!(
-        accel::knockdown_efficiency,
+        accel::pseudobulk::pseudobulk_dex,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::leiden::leiden, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::preprocessing::normalize_total,
         &accel_module
     )?)?;
     accel_module.add_function(wrap_pyfunction!(
-        accel::clustering_agreement,
+        accel::preprocessing::log1p,
         &accel_module
     )?)?;
     accel_module.add_function(wrap_pyfunction!(
-        accel::rank_genes_groups_df,
+        accel::preprocessing::calculate_qc_metrics,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::filtering::filter_cells,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::filtering::filter_genes,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::filtering::subset_obs,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::hvg::highly_variable_genes,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::pseudobulk_means,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::perturbation_metrics,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::energy_distance,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::discrimination_score,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::knockdown_efficiency,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::clustering_agreement,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::de::rank_genes_groups_df,
         &accel_module
     )?)?;
     m.add_submodule(&accel_module)?;
