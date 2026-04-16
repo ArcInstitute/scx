@@ -1097,10 +1097,10 @@ pub fn knockdown_efficiency<'py>(
 
     // Get CSR matrix — handle backed, lazy-transformed, sparse, and dense inputs.
     let csr_obj = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        // Backed SCX: materialize to scipy CSR for column access
+        // Backed SCX: materialize as *sparse* scipy CSR via `to_memory`.
+        // `toarray()` would densify the whole matrix (~240 GB at 1M × 30K).
         drop(backed);
-        let arr = x.call_method0("toarray")?;
-        scipy_sparse.call_method1("csr_matrix", (&arr,))?
+        x.call_method0("to_memory")?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         // Lazy-transformed: materialize through transforms
         let scipy_csr = lazy.to_memory_py(py)?;
@@ -1166,20 +1166,21 @@ pub fn knockdown_efficiency<'py>(
                 eps,
             )?;
 
-            // Arc-bench computes log deviation AFTER log1p. Apply log1p to
-            // the CSR values (on a copy) and log1p to the baseline.
-            // f32 → f64 → ln_1p → f32: intentional double promotion for accuracy.
+            // Arc-bench computes log deviation AFTER log1p. Baseline is
+            // precomputed as `log1p(mean)`; the kernel applies `log1p` to
+            // each per-cell value during its binary-search column extraction,
+            // so we avoid allocating a full second copy of `data`.
             let baseline_log: Vec<f64> = baseline.iter().map(|&v| v.ln_1p()).collect();
-            let data_log: Vec<f32> = data.iter().map(|&v| (v as f64).ln_1p() as f32).collect();
 
             let log_fc = scx_accel::compute_log_deviation(
                 indptr,
                 indices,
-                &data_log,
+                data,
                 &pert_labels,
                 control,
                 &gene_names,
                 &baseline_log,
+                true,
             )?;
 
             Ok((efficiency, log_fc))

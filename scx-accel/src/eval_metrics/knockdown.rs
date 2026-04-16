@@ -213,19 +213,28 @@ pub fn compute_knockdown_efficiency(
 /// FC[cell] = X_log[cell, gene_idx] - baseline_log[gene_idx]
 /// ```
 ///
+/// When `apply_log1p` is true, `data` is treated as raw (non-log-transformed)
+/// values and `log1p` is applied on-the-fly to each extracted entry. This
+/// avoids allocating a second copy of the full data array when the caller
+/// already has raw data in hand.
+///
 /// Expects already log1p-transformed input (matches arc-bench pipeline order).
 ///
 /// # Arguments
 /// * `indptr` — CSR indptr array (length = n_obs + 1).
 /// * `indices` — CSR column indices (sorted within each row).
-/// * `data` — CSR values (already log1p-transformed).
+/// * `data` — CSR values. If `apply_log1p` is false, expected to be already
+///   log1p-transformed; if true, expected to be raw (non-log) and the kernel
+///   applies `log1p` to each extracted entry.
 /// * `pert_labels` — Per-cell perturbation labels.
 /// * `ctrl_label` — Label identifying control cells.
 /// * `gene_names` — Gene names (length = n_vars).
 /// * `baseline_log` — log1p of mean control expression per gene.
+/// * `apply_log1p` — When true, apply `log1p` on-the-fly to `data` entries.
 ///
 /// # Returns
 /// Vec<f32> of length n_obs with per-cell log fold change.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_log_deviation(
     indptr: &[i64],
     indices: &[i32],
@@ -234,6 +243,7 @@ pub fn compute_log_deviation(
     ctrl_label: &str,
     gene_names: &[String],
     baseline_log: &[f64],
+    apply_log1p: bool,
 ) -> crate::Result<Vec<f32>> {
     let n_obs = pert_labels.len();
     let n_vars = gene_names.len();
@@ -274,7 +284,8 @@ pub fn compute_log_deviation(
 
         let start = indptr[row] as usize;
         let end = indptr[row + 1] as usize;
-        let x_log = csr_get_value(indices, data, start, end, gene_idx as i32) as f64;
+        let raw = csr_get_value(indices, data, start, end, gene_idx as i32) as f64;
+        let x_log = if apply_log1p { raw.ln_1p() } else { raw };
         let mu_log = baseline_log[gene_idx];
 
         log_fc[row] = (x_log - mu_log) as f32;
@@ -469,6 +480,7 @@ mod tests {
             "control",
             &gene_names,
             &baseline_log,
+            false,
         )
         .unwrap();
 
@@ -505,6 +517,7 @@ mod tests {
             "control",
             &gene_names,
             &baseline_log,
+            false,
         )
         .unwrap();
 
