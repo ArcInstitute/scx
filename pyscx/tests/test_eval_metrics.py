@@ -733,3 +733,443 @@ class TestEnergyDistance:
         assert isinstance(corr, float)
         assert -1.0 <= corr <= 1.0 or np.isnan(corr)
 
+
+class TestDiscriminationScore:
+    """Test pyscx.accel.discrimination_score().
+
+    Reference implementation mirrors cell-eval's discrimination_score which
+    computes per-perturbation ranking of predicted effects against real effects.
+    """
+
+    def _make_paired_adata(self, n_obs=200, n_vars=30, n_perts=5, seed=42):
+        """Create paired real/predicted AnnData with distinct perturbation effects.
+
+        Gene names match perturbation names for some perturbations so that
+        exclude_target_gene behavior can be tested.
+        """
+        rng = np.random.default_rng(seed)
+        base = rng.exponential(2.0, size=n_vars).astype(np.float32)
+
+        # Name perturbations after the first few genes (for target gene exclusion testing)
+        gene_names = [f"gene_{j}" for j in range(n_vars)]
+        pert_names = ["control"] + [f"gene_{i}" for i in range(n_perts - 1)]
+
+        deltas = {}
+        for name in pert_names[1:]:
+            scale = rng.uniform(0.5, 3.0)
+            deltas[name] = rng.normal(0, scale, size=n_vars).astype(np.float32)
+
+        cells_per_pert = n_obs // n_perts
+        labels = []
+        for name in pert_names:
+            labels.extend([name] * cells_per_pert)
+        while len(labels) < n_obs:
+            labels.append("control")
+
+        import pandas as pd
+
+        X_real = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_real[i] = np.maximum(base + noise, 0)
+            else:
+                X_real[i] = np.maximum(base + deltas[label] + noise, 0)
+
+        X_pred = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_pred[i] = np.maximum(base + noise, 0)
+            else:
+                pred_delta = deltas[label] + rng.normal(
+                    0, 0.3, size=n_vars
+                ).astype(np.float32)
+                X_pred[i] = np.maximum(base + pred_delta + noise, 0)
+
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=gene_names)
+
+        adata_real = ad.AnnData(
+            X=sp.csr_matrix(X_real), obs=obs.copy(), var=var.copy()
+        )
+        adata_pred = ad.AnnData(
+            X=sp.csr_matrix(X_pred), obs=obs.copy(), var=var.copy()
+        )
+        return adata_real, adata_pred, pert_names
+
+    @staticmethod
+    def _reference_discrimination_score(adata_real, adata_pred,
+                                         pert_col="perturbation",
+                                         control="control", metric="l1",
+                                         exclude_target_gene=True,
+                                         embed_key=None):
+        """Reference implementation matching cell-eval's algorithm."""
+        from sklearn.metrics import pairwise_distances
+
+        # cell-eval: L1/manhattan forces embed_key=None
+        if metric in ("l1", "manhattan", "cityblock"):
+            embed_key = None
+
+        if embed_key is not None:
+            matrix_real = adata_real.obsm[embed_key].astype(np.float64)
+            matrix_pred = adata_pred.obsm[embed_key].astype(np.float64)
+            gene_names = None
+        else:
+            X_real = adata_real.X.toarray() if sp.issparse(adata_real.X) else adata_real.X
+            X_pred = adata_pred.X.toarray() if sp.issparse(adata_pred.X) else adata_pred.X
+            matrix_real = X_real.astype(np.float64)
+            matrix_pred = X_pred.astype(np.float64)
+            gene_names = list(adata_real.var_names)
+
+        real_labels = adata_real.obs[pert_col].values
+        pred_labels = adata_pred.obs[pert_col].values
+        perts = sorted(set(real_labels) - {control})
+
+        # Compute pseudobulk means
+        def pseudobulk(matrix, labels):
+            means = {}
+            for p in sorted(set(labels)):
+                mask = labels == p
+                means[p] = matrix[mask].mean(axis=0)
+            return means
+
+        means_real = pseudobulk(matrix_real, real_labels)
+        means_pred = pseudobulk(matrix_pred, pred_labels)
+
+        # Compute effects (subtract control)
+        real_effects = np.array([means_real[p] - means_real[control] for p in perts])
+        pred_effects = np.array([means_pred[p] - means_pred[control] for p in perts])
+
+        # Map sklearn metric names
+        sklearn_metric = {
+            "l1": "manhattan",
+            "l2": "euclidean",
+            "euclidean": "euclidean",
+            "cosine": "cosine",
+        }[metric]
+
+        scores = {}
+        for pi, p in enumerate(perts):
+            include_mask = np.ones(real_effects.shape[1], dtype=bool)
+            if exclude_target_gene and gene_names is not None and embed_key is None:
+                if p in gene_names:
+                    gene_idx = gene_names.index(p)
+                    include_mask[gene_idx] = False
+
+            re_masked = real_effects[:, include_mask]
+            pe_masked = pred_effects[pi, include_mask].reshape(1, -1)
+
+            distances = pairwise_distances(
+                re_masked, pe_masked, metric=sklearn_metric
+            ).flatten()
+
+            # Rank: number of perturbations closer than the correct one
+            correct_dist = distances[pi]
+            rank = np.sum(distances < correct_dist)
+            scores[p] = 1.0 - rank / len(perts)
+
+        return scores
+
+    def test_basic_discrimination_score(self):
+        """Verify discrimination_score runs and returns correct structure."""
+        import pyscx
+
+        adata_real, adata_pred, pert_names = self._make_paired_adata()
+        scores = pyscx.accel.discrimination_score(adata_real, adata_pred)
+
+        assert isinstance(scores, dict)
+        non_ctrl = [p for p in pert_names if p != "control"]
+        for pert in non_ctrl:
+            assert pert in scores, f"{pert} missing from scores"
+            assert isinstance(scores[pert], float)
+            assert 0.0 <= scores[pert] <= 1.0, f"score out of range: {scores[pert]}"
+
+    def test_against_reference_l1(self):
+        """Verify L1 discrimination score matches reference implementation."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1"
+        )
+        ref_scores = self._reference_discrimination_score(
+            adata_real, adata_pred, metric="l1"
+        )
+
+        for pert in ref_scores:
+            np.testing.assert_allclose(
+                rust_scores[pert], ref_scores[pert], atol=1e-10,
+                err_msg=f"L1 discrimination score mismatch for {pert}"
+            )
+
+    def test_against_reference_l2(self):
+        """Verify L2 discrimination score matches reference implementation."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l2"
+        )
+        ref_scores = self._reference_discrimination_score(
+            adata_real, adata_pred, metric="l2"
+        )
+
+        for pert in ref_scores:
+            np.testing.assert_allclose(
+                rust_scores[pert], ref_scores[pert], atol=1e-10,
+                err_msg=f"L2 discrimination score mismatch for {pert}"
+            )
+
+    def test_against_reference_cosine(self):
+        """Verify cosine discrimination score matches reference implementation."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="cosine"
+        )
+        ref_scores = self._reference_discrimination_score(
+            adata_real, adata_pred, metric="cosine"
+        )
+
+        for pert in ref_scores:
+            np.testing.assert_allclose(
+                rust_scores[pert], ref_scores[pert], atol=1e-10,
+                err_msg=f"cosine discrimination score mismatch for {pert}"
+            )
+
+    def test_exclude_target_gene_true(self):
+        """Test with exclude_target_gene=True (default) matches reference."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1", exclude_target_gene=True
+        )
+        ref_scores = self._reference_discrimination_score(
+            adata_real, adata_pred, metric="l1", exclude_target_gene=True
+        )
+
+        for pert in ref_scores:
+            np.testing.assert_allclose(
+                rust_scores[pert], ref_scores[pert], atol=1e-10,
+                err_msg=f"exclude_target_gene=True mismatch for {pert}"
+            )
+
+    def test_exclude_target_gene_false(self):
+        """Test with exclude_target_gene=False matches reference."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1", exclude_target_gene=False
+        )
+        ref_scores = self._reference_discrimination_score(
+            adata_real, adata_pred, metric="l1", exclude_target_gene=False
+        )
+
+        for pert in ref_scores:
+            np.testing.assert_allclose(
+                rust_scores[pert], ref_scores[pert], atol=1e-10,
+                err_msg=f"exclude_target_gene=False mismatch for {pert}"
+            )
+
+    def test_identical_real_pred(self):
+        """When real == pred, all discrimination scores should be 1.0."""
+        import pyscx
+
+        adata_real, _, _ = self._make_paired_adata()
+        adata_pred = adata_real.copy()
+
+        scores = pyscx.accel.discrimination_score(adata_real, adata_pred)
+        for pert, score in scores.items():
+            np.testing.assert_allclose(
+                score, 1.0, atol=1e-10,
+                err_msg=f"identical data should give score 1.0 for {pert}"
+            )
+
+    def test_embed_key(self):
+        """Test using obsm embeddings instead of X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rng = np.random.default_rng(123)
+        n_components = 5
+        adata_real.obsm["X_pca"] = rng.normal(size=(adata_real.n_obs, n_components))
+        adata_pred.obsm["X_pca"] = rng.normal(size=(adata_pred.n_obs, n_components))
+
+        # cosine with embed_key should work (L1 forces embed_key=None)
+        scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="cosine", embed_key="X_pca"
+        )
+        assert isinstance(scores, dict)
+        for score in scores.values():
+            assert 0.0 <= score <= 1.0
+
+    def test_l1_forces_embed_key_none(self):
+        """L1 metric should force embed_key=None (cell-eval behavior)."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rng = np.random.default_rng(123)
+        adata_real.obsm["X_pca"] = rng.normal(size=(adata_real.n_obs, 5))
+        adata_pred.obsm["X_pca"] = rng.normal(size=(adata_pred.n_obs, 5))
+
+        # With L1, embed_key should be ignored → result should match X-based
+        scores_with_embed = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1", embed_key="X_pca"
+        )
+        scores_without_embed = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1", embed_key=None
+        )
+
+        for pert in scores_with_embed:
+            np.testing.assert_allclose(
+                scores_with_embed[pert], scores_without_embed[pert], atol=1e-10,
+                err_msg=f"L1 should ignore embed_key for {pert}"
+            )
+
+    def test_dense_input(self):
+        """Test with dense numpy X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.X = adata_real.X.toarray()
+        adata_pred.X = adata_pred.X.toarray()
+
+        scores = pyscx.accel.discrimination_score(adata_real, adata_pred)
+        assert isinstance(scores, dict)
+        for score in scores.values():
+            assert 0.0 <= score <= 1.0
+
+    def test_missing_control(self):
+        """Missing control label should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="control.*not found"):
+            pyscx.accel.discrimination_score(
+                adata_real, adata_pred, control="nonexistent_control"
+            )
+
+    def test_invalid_metric(self):
+        """Invalid metric should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="unknown metric"):
+            pyscx.accel.discrimination_score(
+                adata_real, adata_pred, metric="invalid_metric"
+            )
+
+    def test_custom_pert_col(self):
+        """Test with non-default perturbation column."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.obs = adata_real.obs.rename(columns={"perturbation": "condition"})
+        adata_pred.obs = adata_pred.obs.rename(columns={"perturbation": "condition"})
+
+        scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, pert_col="condition"
+        )
+        assert isinstance(scores, dict)
+        assert "control" not in scores  # control excluded
+
+    def test_nan_labels_raise(self):
+        """NaN perturbation labels should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.obs.iloc[0, 0] = np.nan
+
+        with pytest.raises(ValueError, match="NaN"):
+            pyscx.accel.discrimination_score(adata_real, adata_pred)
+
+    def test_backed_scx_input(self, tmp_path):
+        """Test with backed SCX input."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        real_path = str(tmp_path / "real.scx")
+        pred_path = str(tmp_path / "pred.scx")
+        pyscx.from_anndata(adata_real, real_path)
+        pyscx.from_anndata(adata_pred, pred_path)
+
+        real_backed = pyscx.open(real_path).to_anndata(backed=True)
+        pred_backed = pyscx.open(pred_path).to_anndata(backed=True)
+
+        scores_backed = pyscx.accel.discrimination_score(
+            real_backed, pred_backed, metric="l1", exclude_target_gene=False
+        )
+        scores_mem = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1", exclude_target_gene=False
+        )
+
+        for pert in scores_mem:
+            np.testing.assert_allclose(
+                scores_backed[pert], scores_mem[pert], atol=1e-4,
+                err_msg=f"Backed vs mem mismatch for {pert}"
+            )
+
+    def test_embed_key_ignores_exclude_target_gene(self):
+        """exclude_target_gene should be a no-op when using embed_key.
+
+        Embeddings have no gene names, so exclude_target_gene=True and
+        exclude_target_gene=False should produce identical results when
+        embed_key is set (and metric is not L1, which forces embed_key=None).
+        """
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rng = np.random.default_rng(123)
+        n_components = 5
+        adata_real.obsm["X_pca"] = rng.normal(size=(adata_real.n_obs, n_components))
+        adata_pred.obsm["X_pca"] = rng.normal(size=(adata_pred.n_obs, n_components))
+
+        scores_with_excl = pyscx.accel.discrimination_score(
+            adata_real, adata_pred,
+            metric="cosine", embed_key="X_pca", exclude_target_gene=True
+        )
+        scores_without_excl = pyscx.accel.discrimination_score(
+            adata_real, adata_pred,
+            metric="cosine", embed_key="X_pca", exclude_target_gene=False
+        )
+
+        for pert in scores_with_excl:
+            np.testing.assert_allclose(
+                scores_with_excl[pert], scores_without_excl[pert], atol=1e-12,
+                err_msg=f"embed_key should make exclude_target_gene a no-op for {pert}"
+            )
+
+
+class TestPerturbationMetricsNaN:
+    """Verify perturbation_metrics now detects NaN labels after M1 refactor."""
+
+    def test_nan_labels_raise(self):
+        """NaN perturbation labels should raise ValueError in perturbation_metrics."""
+        import pyscx
+        import pandas as pd
+
+        rng = np.random.default_rng(42)
+        X = sp.random(20, 10, density=0.3, format="csr", random_state=rng)
+        obs = pd.DataFrame({"perturbation": ["control"] * 10 + ["drug"] * 10})
+        var = pd.DataFrame(index=[f"g{i}" for i in range(10)])
+        adata = ad.AnnData(X=X.astype(np.float32), obs=obs, var=var)
+
+        # Inject NaN
+        adata_nan = adata.copy()
+        adata_nan.obs.iloc[0, 0] = np.nan
+
+        with pytest.raises(ValueError, match="NaN"):
+            pyscx.accel.perturbation_metrics(adata_nan, adata)

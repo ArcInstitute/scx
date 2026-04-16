@@ -4354,86 +4354,19 @@ pub fn perturbation_metrics<'py>(
         })
         .collect::<PyResult<Vec<_>>>()?;
 
-    // Compute pseudobulk means for both real and predicted.
-    let means_real_obj = pseudobulk_means(py, adata_real, pert_col, min_cells_per_group)?;
-    let means_pred_obj = pseudobulk_means(py, adata_pred, pert_col, min_cells_per_group)?;
-
-    let np = py.import("numpy")?;
-
-    // Extract numpy arrays and group names from the tuples.
-    let real_tuple = means_real_obj.bind(py);
-    let pred_tuple = means_pred_obj.bind(py);
-
-    let means_real_np = real_tuple.get_item(0)?;
-    let groups_real: Vec<String> = real_tuple.get_item(1)?.extract()?;
-
-    let means_pred_np = pred_tuple.get_item(0)?;
-    let groups_pred: Vec<String> = pred_tuple.get_item(1)?.extract()?;
-
-    // Validate group names match between real and predicted.
-    if groups_real.len() != groups_pred.len() {
-        return Err(PyValueError::new_err(format!(
-            "real has {} groups but pred has {}. Ensure both have the same perturbations.",
-            groups_real.len(),
-            groups_pred.len()
-        )));
-    }
-
-    // Find common perturbations, sort them for deterministic alignment.
-    let real_set: std::collections::HashSet<&str> =
-        groups_real.iter().map(|s| s.as_str()).collect();
-    let pred_set: std::collections::HashSet<&str> =
-        groups_pred.iter().map(|s| s.as_str()).collect();
-
-    let mut common: Vec<String> = real_set
-        .intersection(&pred_set)
-        .map(|s| s.to_string())
-        .collect();
-    common.sort();
-
-    if common.is_empty() {
-        return Err(PyValueError::new_err(
-            "no common perturbation groups between real and predicted AnnData objects",
-        ));
-    }
-
-    // Reorder both matrices to have the same row ordering.
-    // Build index maps: group_name → row_index.
-    let real_idx_map: std::collections::HashMap<&str, usize> = groups_real
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i))
-        .collect();
-    let pred_idx_map: std::collections::HashMap<&str, usize> = groups_pred
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i))
-        .collect();
-
-    // Extract the common rows in sorted order.
-    let real_indices: Vec<usize> = common.iter().map(|s| real_idx_map[s.as_str()]).collect();
-    let pred_indices: Vec<usize> = common.iter().map(|s| pred_idx_map[s.as_str()]).collect();
-
-    let real_idx_arr = np.call_method1("array", (real_indices,))?;
-    let pred_idx_arr = np.call_method1("array", (pred_indices,))?;
-
-    let means_real_ordered = means_real_np.get_item(&real_idx_arr)?;
-    let means_pred_ordered = means_pred_np.get_item(&pred_idx_arr)?;
-
-    // Flatten to Vec<f64>.
-    let means_real_flat: Vec<f64> = means_real_ordered
-        .call_method0("ravel")?
-        .call_method1("astype", ("float64",))?
-        .extract()?;
-    let means_pred_flat: Vec<f64> = means_pred_ordered
-        .call_method0("ravel")?
-        .call_method1("astype", ("float64",))?
-        .extract()?;
+    // Use shared helper for pseudobulk computation, alignment, and NaN validation.
+    let (means_real_flat, means_pred_flat, common, n_genes, _gene_names) =
+        compute_aligned_pseudobulk_means(
+            py,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            None, // no embed_key for perturbation_metrics
+            min_cells_per_group,
+        )?;
 
     let n_perts = common.len();
-    let n_genes_arr = means_real_ordered.getattr("shape")?;
-    let shape: (usize, usize) = n_genes_arr.extract()?;
-    let n_genes = shape.1;
 
     // Find control index.
     let ctrl_idx = common.iter().position(|s| s == control).ok_or_else(|| {
@@ -4614,6 +4547,387 @@ pub fn energy_distance<'py>(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(result.correlation)
+}
+
+/// Compute discrimination score between real and predicted perturbation data.
+///
+/// For each perturbation, computes how well the predicted perturbation effect
+/// ranks among all real perturbation effects by pairwise distance. A score of
+/// 1.0 means the correct perturbation is the closest match; 0.0 means it is
+/// the furthest.
+///
+/// This metric builds on pseudobulk means: effects are computed as
+/// means[pert] - means[control] for each perturbation.
+///
+/// When `exclude_target_gene=True` (default) and not using embeddings, the
+/// gene column matching each perturbation's name is excluded from the distance
+/// computation, preventing trivially high scores from knockdown-gene dominance.
+///
+/// Args:
+///     adata_real: AnnData with real (ground truth) data
+///     adata_pred: AnnData with predicted data
+///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
+///     control: Label for control perturbation (default: "control")
+///     metric: Distance metric — "l1" (default), "l2"/"euclidean", or "cosine"
+///     exclude_target_gene: Exclude gene named after perturbation (default: True)
+///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None).
+///         When set, exclude_target_gene is ignored (gene names don't apply to
+///         embeddings). When metric is L1/manhattan/cityblock, embed_key is forced
+///         to None (matching cell-eval behavior).
+///     min_cells_per_group: Skip groups with fewer cells (default: 1)
+///
+/// Returns:
+///     dict[str, float] — {perturbation_name: normalized_rank_score}
+///
+/// Example:
+///     scores = pyscx.accel.discrimination_score(adata_real, adata_pred)
+///     # scores["drug_A"] == 0.95  (high = good prediction)
+///     # Three metric variants correspond to cell-eval's:
+///     #   discrimination_score_l1 → metric="l1"
+///     #   discrimination_score_l2 → metric="l2"
+///     #   discrimination_score_cosine → metric="cosine"
+#[pyfunction]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="l1", exclude_target_gene=true, embed_key=None, min_cells_per_group=1))]
+#[allow(clippy::too_many_arguments)]
+pub fn discrimination_score<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    exclude_target_gene: bool,
+    embed_key: Option<&str>,
+    min_cells_per_group: usize,
+) -> PyResult<PyObject> {
+    // Parse distance metric.
+    let dist_metric = match metric.to_lowercase().as_str() {
+        "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
+        "l1" | "manhattan" | "cityblock" => scx_accel::DistanceMetric::L1,
+        "cosine" => scx_accel::DistanceMetric::Cosine,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unknown metric '{}'. Valid: l1, l2, euclidean, cosine",
+                metric
+            )))
+        }
+    };
+
+    // Cell-eval behavior: L1/manhattan/cityblock forces embed_key=None
+    let effective_embed_key = if matches!(
+        metric.to_lowercase().as_str(),
+        "l1" | "manhattan" | "cityblock"
+    ) {
+        None
+    } else {
+        embed_key
+    };
+
+    // Determine if we're using embeddings (affects exclude_target_gene behavior).
+    let using_embeddings = effective_embed_key.is_some();
+
+    // ── Compute pseudobulk means for both real and predicted ────────
+    let (means_real_flat, means_pred_flat, common, n_genes, gene_names) =
+        compute_aligned_pseudobulk_means(
+            py,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            effective_embed_key,
+            min_cells_per_group,
+        )?;
+
+    let n_perts = common.len();
+
+    // Find control index.
+    let ctrl_idx = common.iter().position(|s| s == control).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "control '{}' not found in perturbation groups. Available: {:?}",
+            control, common
+        ))
+    })?;
+
+    // ── Compute perturbation effects: means[p] - means[ctrl] ────────
+    let ctrl_real = &means_real_flat[ctrl_idx * n_genes..(ctrl_idx + 1) * n_genes];
+    let ctrl_pred = &means_pred_flat[ctrl_idx * n_genes..(ctrl_idx + 1) * n_genes];
+
+    // Build effect matrices (excluding control row).
+    let n_output = n_perts - 1;
+    let mut real_effects = Vec::with_capacity(n_output * n_genes);
+    let mut pred_effects = Vec::with_capacity(n_output * n_genes);
+    let mut output_pert_names = Vec::with_capacity(n_output);
+
+    for p in 0..n_perts {
+        if p == ctrl_idx {
+            continue;
+        }
+        output_pert_names.push(common[p].clone());
+        let row_real = &means_real_flat[p * n_genes..(p + 1) * n_genes];
+        let row_pred = &means_pred_flat[p * n_genes..(p + 1) * n_genes];
+        for g in 0..n_genes {
+            real_effects.push(row_real[g] - ctrl_real[g]);
+        }
+        for g in 0..n_genes {
+            pred_effects.push(row_pred[g] - ctrl_pred[g]);
+        }
+    }
+
+    // ── Gene exclusion setup ────────────────────────────────────────
+    // exclude_target_gene only applies when not using embeddings.
+    let effective_exclude = exclude_target_gene && !using_embeddings;
+    let gene_names_ref = if effective_exclude {
+        Some(gene_names.as_slice())
+    } else {
+        None
+    };
+
+    // ── Call Rust discrimination score ───────────────────────────────
+    let result = scx_accel::compute_discrimination_score(
+        &real_effects,
+        &pred_effects,
+        n_output,
+        n_genes,
+        &output_pert_names,
+        gene_names_ref,
+        dist_metric,
+        effective_exclude,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // ── Convert to dict[str, float] ─────────────────────────────────
+    let dict = PyDict::new(py);
+    for (i, pert_name) in result.pert_names.iter().enumerate() {
+        dict.set_item(pert_name.as_str(), result.scores[i])?;
+    }
+
+    Ok(dict.into_any().unbind())
+}
+
+/// Shared helper: compute pseudobulk means for both AnnData objects, align
+/// them to a common set of perturbations (sorted), and return flat f64 arrays.
+///
+/// Returns: (means_real_flat, means_pred_flat, common_pert_names, n_genes, gene_names)
+#[allow(clippy::type_complexity)]
+fn compute_aligned_pseudobulk_means<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    embed_key: Option<&str>,
+    min_cells_per_group: usize,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<String>, usize, Vec<String>)> {
+    let np = py.import("numpy")?;
+
+    // Validate no NaN in perturbation labels (NaN → "nan" is silent and wrong).
+    for (label, adata) in [("real", adata_real), ("pred", adata_pred)] {
+        let obs = adata.getattr("obs")?;
+        let series = obs.get_item(pert_col).map_err(|_| {
+            PyValueError::new_err(format!("column '{}' not found in adata.obs", pert_col))
+        })?;
+        let pd = py.import("pandas")?;
+        let isna = pd.call_method1("isna", (&series,))?;
+        let any_na: bool = isna.call_method0("any")?.extract()?;
+        if any_na {
+            let n_na: usize = isna.call_method0("sum")?.extract()?;
+            return Err(PyValueError::new_err(format!(
+                "{label} adata.obs['{}'] has {} NaN values. Remove or fill NaN before calling.",
+                pert_col, n_na
+            )));
+        }
+    }
+
+    // For embed_key: use obsm-based pseudobulk (compute manually).
+    // For X: use the existing pseudobulk_means infrastructure.
+    let (means_real_np, groups_real, means_pred_np, groups_pred, gene_names) =
+        if let Some(key) = embed_key {
+            // Extract obsm embeddings and compute group means manually
+            let (means_r, groups_r) =
+                compute_obsm_pseudobulk(py, &np, adata_real, pert_col, key, min_cells_per_group)?;
+            let (means_p, groups_p) =
+                compute_obsm_pseudobulk(py, &np, adata_pred, pert_col, key, min_cells_per_group)?;
+            // No gene names when using embeddings
+            let n_dims: usize = means_r.getattr("shape")?.extract::<(usize, usize)>()?.1;
+            let empty_genes: Vec<String> = (0..n_dims).map(|i| format!("embed_{i}")).collect();
+            (means_r, groups_r, means_p, groups_p, empty_genes)
+        } else {
+            // Use standard X-based pseudobulk means
+            let means_real_obj = pseudobulk_means(py, adata_real, pert_col, min_cells_per_group)?;
+            let means_pred_obj = pseudobulk_means(py, adata_pred, pert_col, min_cells_per_group)?;
+
+            let real_tuple = means_real_obj.bind(py);
+            let pred_tuple = means_pred_obj.bind(py);
+
+            let means_r = real_tuple.get_item(0)?;
+            let groups_r: Vec<String> = real_tuple.get_item(1)?.extract()?;
+            let means_p = pred_tuple.get_item(0)?;
+            let groups_p: Vec<String> = pred_tuple.get_item(1)?.extract()?;
+
+            // Extract gene names from adata_real.var_names
+            let var = adata_real.getattr("var")?;
+            let var_names = var.getattr("index")?;
+            let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+
+            (means_r, groups_r, means_p, groups_p, gene_names)
+        };
+
+    // ── Align perturbation groups ───────────────────────────────────
+    if groups_real.is_empty() || groups_pred.is_empty() {
+        return Err(PyValueError::new_err(
+            "no groups passed the min_cells_per_group filter",
+        ));
+    }
+
+    let real_set: std::collections::HashSet<&str> =
+        groups_real.iter().map(|s| s.as_str()).collect();
+    let pred_set: std::collections::HashSet<&str> =
+        groups_pred.iter().map(|s| s.as_str()).collect();
+
+    let mut common: Vec<String> = real_set
+        .intersection(&pred_set)
+        .map(|s| s.to_string())
+        .collect();
+    common.sort();
+
+    if common.is_empty() {
+        return Err(PyValueError::new_err(
+            "no common perturbation groups between real and predicted",
+        ));
+    }
+
+    // Ensure control is in the common set
+    if !common.contains(&control.to_string()) {
+        return Err(PyValueError::new_err(format!(
+            "control '{}' not found in common perturbation groups. Available: {:?}",
+            control, common
+        )));
+    }
+
+    // Reorder both matrices to common ordering
+    let real_idx_map: std::collections::HashMap<&str, usize> = groups_real
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    let pred_idx_map: std::collections::HashMap<&str, usize> = groups_pred
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    let real_indices: Vec<usize> = common.iter().map(|s| real_idx_map[s.as_str()]).collect();
+    let pred_indices: Vec<usize> = common.iter().map(|s| pred_idx_map[s.as_str()]).collect();
+
+    let real_idx_arr = np.call_method1("array", (real_indices,))?;
+    let pred_idx_arr = np.call_method1("array", (pred_indices,))?;
+
+    let means_real_ordered = means_real_np.get_item(&real_idx_arr)?;
+    let means_pred_ordered = means_pred_np.get_item(&pred_idx_arr)?;
+
+    let shape: (usize, usize) = means_real_ordered.getattr("shape")?.extract()?;
+    let n_genes = shape.1;
+
+    let means_real_flat: Vec<f64> = means_real_ordered
+        .call_method0("ravel")?
+        .call_method1("astype", ("float64",))?
+        .extract()?;
+    let means_pred_flat: Vec<f64> = means_pred_ordered
+        .call_method0("ravel")?
+        .call_method1("astype", ("float64",))?
+        .extract()?;
+
+    Ok((
+        means_real_flat,
+        means_pred_flat,
+        common,
+        n_genes,
+        gene_names,
+    ))
+}
+
+/// Compute pseudobulk means from adata.obsm[embed_key] using numpy group-by.
+fn compute_obsm_pseudobulk<'py>(
+    py: Python<'py>,
+    np: &Bound<'py, PyModule>,
+    adata: &Bound<'py, PyAny>,
+    pert_col: &str,
+    embed_key: &str,
+    min_cells_per_group: usize,
+) -> PyResult<(Bound<'py, PyAny>, Vec<String>)> {
+    let obsm = adata.getattr("obsm")?;
+    let embeddings = obsm.get_item(embed_key).map_err(|_| {
+        PyValueError::new_err(format!("embed_key '{}' not found in adata.obsm", embed_key))
+    })?;
+    let matrix = np
+        .call_method1("asarray", (&embeddings,))?
+        .call_method1("astype", ("float64",))?;
+    let shape: (usize, usize) = matrix.getattr("shape")?.extract()?;
+    let n_obs = shape.0;
+    let n_dims = shape.1;
+
+    // Warn for large materializations (consistent with extract_dense_matrix).
+    let n_bytes = n_obs * n_dims * 8; // f64 = 8 bytes
+    if n_bytes > 500_000_000 {
+        let mb = n_bytes / (1024 * 1024);
+        eprintln!(
+            "[pyscx] warning: materializing obsm['{embed_key}'] ({n_obs}×{n_dims}) \
+             into {mb} MB of memory"
+        );
+    }
+
+    let labels = extract_obs_column(py, adata, pert_col)?;
+    if labels.len() != n_obs {
+        return Err(PyValueError::new_err(format!(
+            "obs has {} rows but obsm['{embed_key}'] has {n_obs} rows",
+            labels.len()
+        )));
+    }
+
+    // Group by label and compute mean.
+    // BTreeMap guarantees sorted iteration over keys, producing deterministic
+    // group ordering. The downstream sort in compute_aligned_pseudobulk_means
+    // is a harmless no-op but kept for defensive correctness.
+    let mut group_map: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, label) in labels.iter().enumerate() {
+        group_map.entry(label.clone()).or_default().push(i);
+    }
+
+    // Filter by min_cells_per_group
+    let groups: Vec<(String, Vec<usize>)> = group_map
+        .into_iter()
+        .filter(|(_, indices)| indices.len() >= min_cells_per_group)
+        .collect();
+
+    if groups.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "no groups passed the min_cells_per_group filter",
+        ));
+    }
+
+    let n_groups = groups.len();
+    let mut means_data = vec![0.0f64; n_groups * n_dims];
+    let matrix_flat: Vec<f64> = matrix.call_method0("ravel")?.extract()?;
+
+    for (g, (_, indices)) in groups.iter().enumerate() {
+        let n = indices.len() as f64;
+        for &i in indices {
+            for d in 0..n_dims {
+                means_data[g * n_dims + d] += matrix_flat[i * n_dims + d];
+            }
+        }
+        for d in 0..n_dims {
+            means_data[g * n_dims + d] /= n;
+        }
+    }
+
+    let group_names: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
+
+    let means_arr = np.call_method1("array", (means_data,))?;
+    let means_2d = means_arr.call_method1("reshape", ((n_groups, n_dims),))?;
+
+    Ok((means_2d, group_names))
 }
 
 /// Extract a dense `[N, D]` matrix from adata.X (or adata.obsm[embed_key])

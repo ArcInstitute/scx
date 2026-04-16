@@ -26,6 +26,7 @@ pub use diffexp::{
 pub use error::{AccelError, Result};
 pub use eval_metrics::{
     bulk_metrics::{compute_bulk_metrics, pearson_correlation, BulkMetric, BulkMetricsResult},
+    discrimination::{compute_discrimination_score, DiscriminationResult},
     edistance::{compute_energy_distance, fused_edistance, EDistanceResult},
     DistanceMetric,
 };
