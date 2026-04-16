@@ -3,13 +3,14 @@
 # SCX Comprehensive Benchmark Suite — Environment Setup
 # =============================================================================
 #
-# Creates isolated conda environments for benchmarking. Three environments
+# Creates isolated conda environments for benchmarking. Four environments
 # are available:
 #
 #   scx-bench       CPU benchmarks (all format comparisons, accelerators,
 #                   lazy preprocessing, correctness validation, ML loaders)
 #   scx-bench-gpu   GPU benchmarks (extends CPU with CUDA + RAPIDS: cuVS, cuGraph)
 #   scx-bench-r     R / BPCells benchmarks (isolated R environment)
+#   scx-bench-eval  cell-eval / arc-bench parity validation
 #
 # Usage:
 #     # Create the CPU benchmark environment (default)
@@ -21,7 +22,10 @@
 #     # Create the R / BPCells benchmark environment
 #     bash benchmarks/comprehensive/scripts/install_dependencies.sh --r
 #
-#     # Create all three environments
+#     # Create the cell-eval / arc-bench parity validation environment
+#     bash benchmarks/comprehensive/scripts/install_dependencies.sh --eval
+#
+#     # Create all four environments
 #     bash benchmarks/comprehensive/scripts/install_dependencies.sh --all
 #
 #     # Check what's installed in each environment
@@ -64,6 +68,7 @@ fi
 CREATE_CPU=false
 CREATE_GPU=false
 CREATE_R=false
+CREATE_EVAL=false
 CHECK_ONLY=false
 REBUILD_ONLY=false
 
@@ -76,7 +81,8 @@ for arg in "$@"; do
         --cpu)      CREATE_CPU=true ;;
         --gpu)      CREATE_GPU=true ;;
         --r)        CREATE_R=true ;;
-        --all)      CREATE_CPU=true; CREATE_GPU=true; CREATE_R=true ;;
+        --eval)     CREATE_EVAL=true ;;
+        --all)      CREATE_CPU=true; CREATE_GPU=true; CREATE_R=true; CREATE_EVAL=true ;;
         --check)    CHECK_ONLY=true ;;
         --rebuild)  REBUILD_ONLY=true ;;
         -h|--help)
@@ -147,7 +153,7 @@ build_pyscx() {
 # Check mode: verify installed packages in each environment
 # ---------------------------------------------------------------------------
 if $CHECK_ONLY; then
-    for env_name in scx-bench scx-bench-gpu scx-bench-r; do
+    for env_name in scx-bench scx-bench-gpu scx-bench-r scx-bench-eval; do
         prefix=$(get_env_prefix "$env_name")
         if [[ -z "$prefix" ]]; then
             echo "❌ ${env_name}: NOT CREATED"
@@ -160,6 +166,30 @@ if $CHECK_ONLY; then
             # R environment — check R and BPCells
             echo "  R:       $("${prefix}/bin/R" --version 2>/dev/null | head -1 || echo 'not found')"
             echo "  BPCells: $("${prefix}/bin/Rscript" -e 'cat(as.character(packageVersion("BPCells")))' 2>/dev/null || echo 'not installed')"
+        elif [[ "$env_name" == "scx-bench-eval" ]]; then
+            # Eval environment — check cell-eval / arc-bench specific packages
+            "${prefix}/bin/python" -c "
+import importlib.metadata
+packages = [
+    'anndata', 'scanpy', 'scipy', 'numpy', 'pandas', 'h5py',
+    'scikit-learn', 'python-igraph', 'leidenalg',
+    'pyarrow', 'maturin', 'psutil',
+    'cell-eval', 'arc-bench', 'pdex', 'polars', 'tqdm',
+]
+for pkg in packages:
+    try:
+        v = importlib.metadata.version(pkg)
+        print(f'  ✅ {pkg:20s} {v}')
+    except importlib.metadata.PackageNotFoundError:
+        print(f'  ❌ {pkg:20s} NOT INSTALLED')
+
+# pyscx
+try:
+    import pyscx
+    print(f'  ✅ {\"pyscx\":20s} (from source)')
+except ImportError:
+    print(f'  ⚠️  {\"pyscx\":20s} NOT BUILT — run: install_dependencies.sh --rebuild --eval')
+" 2>/dev/null || echo "  (failed to query packages)"
         else
             # Python environment — check key packages
             "${prefix}/bin/python" -c "
@@ -230,6 +260,10 @@ if $REBUILD_ONLY; then
         echo "--- Rebuilding pyscx in scx-bench-gpu ---"
         activate_env "scx-bench-gpu"
         build_pyscx "gpu"
+    elif $CREATE_EVAL; then
+        echo "--- Rebuilding pyscx in scx-bench-eval ---"
+        activate_env "scx-bench-eval"
+        build_pyscx
     else
         echo "--- Rebuilding pyscx in scx-bench ---"
         activate_env "scx-bench"
@@ -305,6 +339,25 @@ if $CREATE_R; then
     echo ""
 fi
 
+if $CREATE_EVAL; then
+    echo "=============================================="
+    echo "Creating scx-bench-eval (cell-eval / arc-bench parity validation)"
+    echo "=============================================="
+    if get_env_prefix "scx-bench-eval" | grep -q .; then
+        echo "  Environment 'scx-bench-eval' already exists. Updating..."
+        "$CONDA" env update -f "${ENVS_DIR}/scx-bench-eval.yml" --prune 2>&1 | tail -10
+    else
+        "$CONDA" env create -f "${ENVS_DIR}/scx-bench-eval.yml" 2>&1 | tail -10
+    fi
+    echo ""
+
+    # Build pyscx (release mode, no GPU features)
+    echo "--- Building pyscx in scx-bench-eval ---"
+    activate_env "scx-bench-eval"
+    build_pyscx
+    echo ""
+fi
+
 # ---------------------------------------------------------------------------
 # Verify
 # ---------------------------------------------------------------------------
@@ -320,6 +373,7 @@ echo "Usage:"
 echo "  CPU benchmarks:  conda activate scx-bench"
 echo "  GPU benchmarks:  conda activate scx-bench-gpu"
 echo "  R benchmarks:    conda activate scx-bench-r"
+echo "  Eval parity:     conda activate scx-bench-eval"
 echo ""
 echo "  Run orchestrator:"
 echo "    conda activate scx-bench"

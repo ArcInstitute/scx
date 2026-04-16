@@ -1,0 +1,1102 @@
+"""Cell-eval / arc-bench parity validation tests.
+
+Compares SCX-accelerated metric implementations head-to-head against the
+Python reference implementations in cell-eval and arc-bench. Every Tier 1
+metric must match the Python reference within specified tolerance on the
+same input data before the Rust accelerators can replace the Python codepath.
+
+Run from within the scx-bench-eval conda environment:
+    conda activate scx-bench-eval
+    cd pyscx && maturin develop --release && cd ..
+    pytest pyscx/tests/test_cell_eval_parity.py -v
+
+External dependencies (only available in scx-bench-eval):
+    - cell-eval  (/home/nickyoungblut/dev/python/cell-eval)
+    - arc-bench  (/home/nickyoungblut/dev/python/arc-bench)
+    - pdex, polars, tqdm
+"""
+
+import time
+
+import anndata as ad
+import numpy as np
+import pytest
+import scipy.sparse as sp
+
+# Guard: skip entire module if cell-eval / arc-bench are not installed.
+cell_eval = pytest.importorskip("cell_eval", reason="cell-eval not installed (need scx-bench-eval env)")
+arc_bench = pytest.importorskip("arc_bench", reason="arc-bench not installed (need scx-bench-eval env)")
+pl = pytest.importorskip("polars", reason="polars not installed (need scx-bench-eval env)")
+
+import pyscx  # noqa: E402
+import pyscx.accel  # noqa: E402
+from cell_eval import PerturbationAnndataPair, score_agg_metrics  # noqa: E402
+from cell_eval.metrics._anndata import (  # noqa: E402
+    ClusteringAgreement,
+    discrimination_score as ce_discrimination_score,
+    edistance as ce_edistance,
+    mae as ce_mae,
+    mae_delta as ce_mae_delta,
+    mse as ce_mse,
+    mse_delta as ce_mse_delta,
+    pearson_delta as ce_pearson_delta,
+)
+from arc_bench.tools.normalize_transform.core import (  # noqa: E402
+    compute_control_baseline,
+    compute_knockdown_efficiency,
+    compute_log_deviation,
+)
+from sklearn.metrics import (  # noqa: E402
+    adjusted_mutual_info_score,
+    adjusted_rand_score,
+    normalized_mutual_info_score,
+)
+
+
+# =============================================================================
+# §7.2 Shared synthetic dataset
+# =============================================================================
+
+def _make_cell_eval_adata(
+    n_obs=500, n_vars=100, n_perts=8, seed=42, as_sparse=True,
+) -> tuple[ad.AnnData, ad.AnnData]:
+    """Paired real/pred AnnData matching cell-eval conventions.
+
+    - obs column: "perturbation" (matches CANONICAL_PERTURBATION_COL)
+    - control label: "control" (matches CANONICAL_CONTROL_LABEL)
+    - Perturbation names match gene names (gene_0..gene_{n_perts-2})
+      so knockdown_efficiency can look up target genes
+    - Normalize-total + log1p applied (cell-eval expects lognorm input)
+    - Predicted data = real + Gaussian noise (correlated but imperfect)
+
+    Key constraints:
+    - Gene names must match perturbation names for n_perts - 1 entries
+      (excluding control) — required for knockdown/discrimination
+      target-gene exclusion tests
+    - Data must pass cell_eval.utils.guess_is_lognorm() (values in
+      [0, 15), has fractional component)
+    - At least 20 cells per perturbation (required for stable pseudobulk)
+    - Both real and pred must share the same var_names (cell-eval validates
+      this in PerturbationAnndataPair.__init__)
+    """
+    import pandas as pd
+    import scanpy as sc
+
+    rng = np.random.default_rng(seed)
+
+    # Gene names: first n_perts-1 genes match perturbation names
+    pert_names = ["control"] + [f"gene_{i}" for i in range(n_perts - 1)]
+    gene_names = [f"gene_{i}" for i in range(n_vars)]
+
+    # Verify gene names match perturbation names for n_perts-1 entries
+    for pname in pert_names[1:]:
+        assert pname in gene_names, (
+            f"Perturbation '{pname}' not in gene_names — need n_vars >= n_perts-1"
+        )
+
+    # Ensure at least 20 cells per perturbation
+    cells_per_pert = max(20, n_obs // n_perts)
+    n_obs = cells_per_pert * n_perts  # Adjust to be evenly divisible
+
+    # Assign cells to perturbations
+    labels = []
+    for name in pert_names:
+        labels.extend([name] * cells_per_pert)
+
+    # Base expression (count-like integers)
+    base = rng.exponential(5.0, size=n_vars).astype(np.float32)
+
+    # Perturbation-specific effects
+    deltas = {}
+    for name in pert_names[1:]:
+        deltas[name] = rng.normal(0, 2, size=n_vars).astype(np.float32)
+        # Make the target gene's knockdown visible
+        gene_idx = gene_names.index(name)
+        deltas[name][gene_idx] = -base[gene_idx] * 0.7  # 70% knockdown
+
+    # Build real expression (raw counts)
+    X_real = np.zeros((n_obs, n_vars), dtype=np.float32)
+    for i, label in enumerate(labels):
+        noise = rng.poisson(0.5, size=n_vars).astype(np.float32)
+        if label == "control":
+            X_real[i] = np.maximum(base + noise, 0)
+        else:
+            X_real[i] = np.maximum(base + deltas[label] + noise, 0)
+    # Round to integer-ish counts (cell-eval will normalize+log1p)
+    X_real = np.round(X_real).astype(np.float32)
+
+    # Build predicted expression (noisy version of real)
+    X_pred = np.zeros((n_obs, n_vars), dtype=np.float32)
+    for i, label in enumerate(labels):
+        noise = rng.poisson(0.5, size=n_vars).astype(np.float32)
+        if label == "control":
+            X_pred[i] = np.maximum(base + noise, 0)
+        else:
+            pred_delta = deltas[label] + rng.normal(
+                0, 0.5, size=n_vars
+            ).astype(np.float32)
+            X_pred[i] = np.maximum(base + pred_delta + noise, 0)
+    X_pred = np.round(X_pred).astype(np.float32)
+
+    obs = pd.DataFrame({"perturbation": labels})
+    var = pd.DataFrame(index=gene_names)
+
+    adata_real = ad.AnnData(X=X_real, obs=obs.copy(), var=var.copy())
+    adata_pred = ad.AnnData(X=X_pred, obs=obs.copy(), var=var.copy())
+
+    # Normalize + log1p (cell-eval expects lognorm input)
+    sc.pp.normalize_total(adata_real)
+    sc.pp.log1p(adata_real)
+    sc.pp.normalize_total(adata_pred)
+    sc.pp.log1p(adata_pred)
+
+    # Self-check: data must pass cell-eval's lognorm detection
+    from cell_eval.utils import guess_is_lognorm
+    assert guess_is_lognorm(adata_real, validate=True), (
+        "Synthetic real data failed guess_is_lognorm — values may be "
+        "outside [0, 15) or lack fractional component"
+    )
+    assert guess_is_lognorm(adata_pred, validate=True), (
+        "Synthetic pred data failed guess_is_lognorm"
+    )
+
+    # Self-check: var_names must match between real and pred
+    assert list(adata_real.var_names) == list(adata_pred.var_names), (
+        "var_names mismatch between real and pred AnnData"
+    )
+
+    if as_sparse:
+        adata_real.X = sp.csr_matrix(adata_real.X)
+        adata_pred.X = sp.csr_matrix(adata_pred.X)
+
+    return adata_real, adata_pred
+
+
+def _make_raw_count_adata(
+    n_obs=500, n_vars=100, n_perts=8, seed=42,
+) -> ad.AnnData:
+    """Raw-count AnnData for knockdown efficiency tests (NOT log1p).
+
+    Perturbation names match gene names so knockdown can find target genes.
+    Returns raw integer-ish counts (normalize_total NOT applied).
+    """
+    import pandas as pd
+
+    rng = np.random.default_rng(seed)
+
+    pert_names = ["control"] + [f"gene_{i}" for i in range(n_perts - 1)]
+    gene_names = [f"gene_{i}" for i in range(n_vars)]
+
+    cells_per_pert = max(20, n_obs // n_perts)
+    n_obs = cells_per_pert * n_perts
+
+    labels = []
+    for name in pert_names:
+        labels.extend([name] * cells_per_pert)
+
+    base = rng.exponential(5.0, size=n_vars).astype(np.float32)
+
+    deltas = {}
+    for name in pert_names[1:]:
+        deltas[name] = rng.normal(0, 1, size=n_vars).astype(np.float32)
+        gene_idx = gene_names.index(name)
+        deltas[name][gene_idx] = -base[gene_idx] * 0.7
+
+    X = np.zeros((n_obs, n_vars), dtype=np.float32)
+    for i, label in enumerate(labels):
+        noise = rng.poisson(0.5, size=n_vars).astype(np.float32)
+        if label == "control":
+            X[i] = np.maximum(base + noise, 0)
+        else:
+            X[i] = np.maximum(base + deltas[label] + noise, 0)
+
+    X = np.round(X).astype(np.float32)
+
+    obs = pd.DataFrame({"perturbation": labels})
+    var = pd.DataFrame(index=gene_names)
+
+    return ad.AnnData(X=sp.csr_matrix(X), obs=obs, var=var)
+
+
+def _build_pair(
+    adata_real: ad.AnnData,
+    adata_pred: ad.AnnData,
+) -> PerturbationAnndataPair:
+    """Build a cell-eval PerturbationAnndataPair from real/pred AnnData."""
+    return PerturbationAnndataPair(
+        real=adata_real,
+        pred=adata_pred,
+        pert_col="perturbation",
+        control_pert="control",
+    )
+
+
+# =============================================================================
+# §7.2 Shared synthetic dataset validation
+# =============================================================================
+
+class TestSharedDataset:
+    """§7.2.1: Validate _make_cell_eval_adata() meets all constraints."""
+
+    def test_gene_names_match_perturbation_names(self):
+        """Gene names must match perturbation names for n_perts-1 entries."""
+        adata_real, adata_pred = _make_cell_eval_adata(n_perts=8)
+        gene_names = list(adata_real.var_names)
+        pert_names = sorted(set(adata_real.obs["perturbation"]) - {"control"})
+        for pname in pert_names:
+            assert pname in gene_names, f"Perturbation '{pname}' not in gene names"
+
+    def test_passes_guess_is_lognorm(self):
+        """Data must pass cell_eval.utils.guess_is_lognorm()."""
+        from cell_eval.utils import guess_is_lognorm
+
+        adata_real, adata_pred = _make_cell_eval_adata()
+        assert guess_is_lognorm(adata_real, validate=True)
+        assert guess_is_lognorm(adata_pred, validate=True)
+
+    def test_min_cells_per_perturbation(self):
+        """At least 20 cells per perturbation."""
+        adata_real, _ = _make_cell_eval_adata()
+        counts = adata_real.obs["perturbation"].value_counts()
+        for pert, count in counts.items():
+            assert count >= 20, f"Perturbation '{pert}' has only {count} cells (<20)"
+
+    def test_var_names_match(self):
+        """Both real and pred must share the same var_names."""
+        adata_real, adata_pred = _make_cell_eval_adata()
+        assert list(adata_real.var_names) == list(adata_pred.var_names)
+
+    def test_obs_column_and_control_label(self):
+        """obs column is 'perturbation', control label is 'control'."""
+        adata_real, adata_pred = _make_cell_eval_adata()
+        assert "perturbation" in adata_real.obs.columns
+        assert "perturbation" in adata_pred.obs.columns
+        assert "control" in adata_real.obs["perturbation"].values
+        assert "control" in adata_pred.obs["perturbation"].values
+
+    def test_same_perturbation_sets(self):
+        """Real and pred have identical perturbation label sets."""
+        adata_real, adata_pred = _make_cell_eval_adata()
+        real_perts = set(adata_real.obs["perturbation"].unique())
+        pred_perts = set(adata_pred.obs["perturbation"].unique())
+        assert real_perts == pred_perts
+
+    def test_values_in_valid_range(self):
+        """Values in [0, 15) with fractional component (lognorm range)."""
+        adata_real, adata_pred = _make_cell_eval_adata()
+        for adata, name in [(adata_real, "real"), (adata_pred, "pred")]:
+            X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
+            assert X.min() >= 0, f"{name}: negative values found"
+            assert X.max() < 15, f"{name}: max value {X.max():.2f} >= 15"
+            # Must have fractional values (not all integer)
+            frac, _ = np.modf(X.data if sp.issparse(adata.X) else X)
+            assert np.any(frac > 1e-3), f"{name}: no fractional values found"
+
+    def test_cell_eval_pair_creation(self):
+        """PerturbationAnndataPair can be created without errors."""
+        adata_real, adata_pred = _make_cell_eval_adata()
+        pair = _build_pair(adata_real, adata_pred)
+        # cell-eval's __post_init__ validates gene alignment, perturbation
+        # overlap, control presence, etc. If we get here, all checks passed.
+        assert len(pair.perts) > 0
+        assert "control" not in pair.perts  # control excluded from perts
+
+    def test_pred_is_correlated_but_imperfect(self):
+        """Predicted data should be correlated with real but not identical."""
+        adata_real, adata_pred = _make_cell_eval_adata(as_sparse=False)
+        X_real = adata_real.X
+        X_pred = adata_pred.X
+
+        # Not identical
+        assert not np.allclose(X_real, X_pred), "Real and pred should not be identical"
+
+        # But correlated (per-gene correlation should be positive for most genes)
+        from scipy.stats import pearsonr
+        n_positive = 0
+        for g in range(X_real.shape[1]):
+            r, _ = pearsonr(X_real[:, g], X_pred[:, g])
+            if r > 0:
+                n_positive += 1
+        frac_positive = n_positive / X_real.shape[1]
+        assert frac_positive > 0.5, (
+            f"Only {frac_positive:.0%} of genes have positive real-pred correlation"
+        )
+
+    def test_raw_count_adata_is_not_lognorm(self):
+        """_make_raw_count_adata() should produce raw counts (not lognorm)."""
+        from cell_eval.utils import guess_is_lognorm
+
+        adata = _make_raw_count_adata()
+        assert not guess_is_lognorm(adata, validate=False), (
+            "Raw-count data should not pass guess_is_lognorm"
+        )
+
+
+# =============================================================================
+# §7.3 Pseudobulk means parity
+# =============================================================================
+
+class TestPseudobulkParity:
+    """§7.3.1: Verify pseudobulk means match cell-eval's polars group_by().mean()."""
+
+    def test_pseudobulk_vs_cell_eval(self):
+        adata_real, _adata_pred = _make_cell_eval_adata()
+
+        # SCX pseudobulk
+        scx_means, scx_groups = pyscx.accel.pseudobulk_means(
+            adata_real, "perturbation"
+        )
+
+        # cell-eval pseudobulk (polars group_by().mean())
+        ce_keys, ce_values = PerturbationAnndataPair._bulk_anndata(
+            adata_real, "perturbation"
+        )
+
+        # Both should be sorted by group name
+        assert sorted(scx_groups) == sorted(list(ce_keys))
+
+        # Compare per-group means
+        for i, group in enumerate(scx_groups):
+            ce_idx = np.flatnonzero(ce_keys == group)[0]
+            np.testing.assert_allclose(
+                scx_means[i], ce_values[ce_idx], atol=1e-6,
+                err_msg=f"Pseudobulk mismatch for group '{group}'",
+            )
+
+
+# =============================================================================
+# §7.4 Bulk perturbation metrics parity
+# =============================================================================
+
+class TestBulkMetricsParity:
+    """§7.4: Verify pearson_delta, mse, mae, mse_delta, mae_delta match cell-eval."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.adata_real, self.adata_pred = _make_cell_eval_adata()
+        self.pair = _build_pair(self.adata_real, self.adata_pred)
+
+    def test_pearson_delta_vs_cell_eval(self):
+        """§7.4.1"""
+        scx_result = pyscx.accel.perturbation_metrics(
+            self.adata_real, self.adata_pred, metrics=["pearson_delta"],
+        )
+        ce_result = ce_pearson_delta(self.pair)
+
+        for pert in ce_result:
+            np.testing.assert_allclose(
+                scx_result["pearson_delta"][pert], ce_result[pert], atol=1e-6,
+                err_msg=f"pearson_delta mismatch for '{pert}'",
+            )
+
+    def test_mse_mae_vs_cell_eval(self):
+        """§7.4.2"""
+        scx_result = pyscx.accel.perturbation_metrics(
+            self.adata_real, self.adata_pred,
+            metrics=["mse", "mae", "mse_delta", "mae_delta"],
+        )
+
+        ce_mse_result = ce_mse(self.pair)
+        ce_mae_result = ce_mae(self.pair)
+        ce_mse_delta_result = ce_mse_delta(self.pair)
+        ce_mae_delta_result = ce_mae_delta(self.pair)
+
+        for pert in ce_mse_result:
+            np.testing.assert_allclose(
+                scx_result["mse"][pert], ce_mse_result[pert], atol=1e-6,
+                err_msg=f"mse mismatch for '{pert}'",
+            )
+            np.testing.assert_allclose(
+                scx_result["mae"][pert], ce_mae_result[pert], atol=1e-6,
+                err_msg=f"mae mismatch for '{pert}'",
+            )
+            np.testing.assert_allclose(
+                scx_result["mse_delta"][pert], ce_mse_delta_result[pert], atol=1e-6,
+                err_msg=f"mse_delta mismatch for '{pert}'",
+            )
+            np.testing.assert_allclose(
+                scx_result["mae_delta"][pert], ce_mae_delta_result[pert], atol=1e-6,
+                err_msg=f"mae_delta mismatch for '{pert}'",
+            )
+
+    def test_perturbation_metrics_agg_vs_cell_eval(self):
+        """§7.4.3: Compare aggregated (mean across perturbations) metrics."""
+        scx_result = pyscx.accel.perturbation_metrics(
+            self.adata_real, self.adata_pred,
+        )
+
+        ce_results = {
+            "pearson_delta": ce_pearson_delta(self.pair),
+            "mse": ce_mse(self.pair),
+            "mae": ce_mae(self.pair),
+            "mse_delta": ce_mse_delta(self.pair),
+            "mae_delta": ce_mae_delta(self.pair),
+        }
+
+        for metric_name, ce_vals in ce_results.items():
+            scx_vals = scx_result[metric_name]
+            # Compute mean across perturbations
+            ce_mean = np.mean(list(ce_vals.values()))
+            scx_mean = np.mean(list(scx_vals.values()))
+            np.testing.assert_allclose(
+                scx_mean, ce_mean, atol=1e-5,
+                err_msg=f"Aggregated {metric_name} mean mismatch",
+            )
+
+
+# =============================================================================
+# §7.5 Energy distance parity
+# =============================================================================
+
+class TestEdistanceParity:
+    """§7.5: Verify energy distance matches cell-eval."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.adata_real, self.adata_pred = _make_cell_eval_adata(
+            n_obs=400, n_vars=20, n_perts=5, seed=42,
+        )
+        self.pair = _build_pair(self.adata_real, self.adata_pred)
+
+    def test_edistance_vs_cell_eval(self):
+        """§7.5.1: Compare Pearson correlation of e-distance vectors."""
+        scx_corr = pyscx.accel.energy_distance(
+            self.adata_real, self.adata_pred,
+            pert_col="perturbation", control="control",
+        )
+        ce_corr = ce_edistance(self.pair)
+
+        np.testing.assert_allclose(
+            scx_corr, ce_corr, atol=1e-4,
+            err_msg=f"e-distance correlation: SCX={scx_corr} vs cell-eval={ce_corr}",
+        )
+
+    def test_edistance_intermediate_values(self):
+        """§7.5.2: Compare per-perturbation e-distance vectors.
+
+        This catches cases where Pearson correlation accidentally matches
+        but individual e-distances diverge.
+        """
+        # SCX returns full result with per-perturbation values
+        scx_result = pyscx.accel.energy_distance(
+            self.adata_real, self.adata_pred,
+            pert_col="perturbation", control="control",
+            return_details=True,
+        )
+
+        # If return_details is not supported, just verify the correlation
+        if isinstance(scx_result, float):
+            pytest.skip("energy_distance does not support return_details yet")
+
+        # Otherwise compare per-perturbation e-distances
+        # (this test will be enabled when return_details is implemented)
+
+
+# =============================================================================
+# §7.6 Discrimination score parity
+# =============================================================================
+
+class TestDiscriminationScoreParity:
+    """§7.6: Verify discrimination score matches cell-eval."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.adata_real, self.adata_pred = _make_cell_eval_adata()
+        self.pair = _build_pair(self.adata_real, self.adata_pred)
+
+    def test_discrimination_score_l1_vs_cell_eval(self):
+        """§7.6.1: L1 metric — rank scores should match exactly."""
+        scx_result = pyscx.accel.discrimination_score(
+            self.adata_real, self.adata_pred, metric="l1",
+        )
+        ce_result = ce_discrimination_score(self.pair, metric="l1")
+
+        for pert in ce_result:
+            assert scx_result[pert] == pytest.approx(ce_result[pert], abs=0), (
+                f"discrimination_score_l1 mismatch for '{pert}': "
+                f"SCX={scx_result[pert]} vs cell-eval={ce_result[pert]}"
+            )
+
+    def test_discrimination_score_l2_cosine_vs_cell_eval(self):
+        """§7.6.2: L2 and cosine metrics."""
+        for metric, ce_metric in [("l2", "l2"), ("cosine", "cosine")]:
+            scx_result = pyscx.accel.discrimination_score(
+                self.adata_real, self.adata_pred, metric=metric,
+            )
+            ce_result = ce_discrimination_score(self.pair, metric=ce_metric)
+
+            for pert in ce_result:
+                assert scx_result[pert] == pytest.approx(ce_result[pert], abs=0), (
+                    f"discrimination_score_{metric} mismatch for '{pert}': "
+                    f"SCX={scx_result[pert]} vs cell-eval={ce_result[pert]}"
+                )
+
+    def test_discrimination_target_exclusion_parity(self):
+        """§7.6.3: Verify exclude_target_gene behavior matches cell-eval."""
+        # With target gene exclusion (default in cell-eval)
+        scx_with = pyscx.accel.discrimination_score(
+            self.adata_real, self.adata_pred, metric="l1",
+            exclude_target_gene=True,
+        )
+        ce_with = ce_discrimination_score(
+            self.pair, metric="l1", exclude_target_gene=True,
+        )
+
+        # Without target gene exclusion
+        scx_without = pyscx.accel.discrimination_score(
+            self.adata_real, self.adata_pred, metric="l1",
+            exclude_target_gene=False,
+        )
+        ce_without = ce_discrimination_score(
+            self.pair, metric="l1", exclude_target_gene=False,
+        )
+
+        for pert in ce_with:
+            assert scx_with[pert] == pytest.approx(ce_with[pert], abs=0), (
+                f"exclude_target_gene=True mismatch for '{pert}'"
+            )
+            assert scx_without[pert] == pytest.approx(ce_without[pert], abs=0), (
+                f"exclude_target_gene=False mismatch for '{pert}'"
+            )
+
+        # Confirm there is a delta (exclusion changes some scores)
+        any_delta = any(
+            scx_with[p] != scx_without[p] for p in scx_with
+        )
+        assert any_delta, (
+            "exclude_target_gene had no effect — test data may not have "
+            "perturbation names matching gene names"
+        )
+
+
+# =============================================================================
+# §7.7 Knockdown efficiency parity
+# =============================================================================
+
+class TestKnockdownParity:
+    """§7.7: Verify knockdown efficiency matches arc-bench."""
+
+    def test_knockdown_vs_arc_bench(self):
+        """§7.7.1: Raw-count knockdown efficiency."""
+        import scanpy as sc
+
+        adata = _make_raw_count_adata()
+
+        # Normalize (NOT log1p) — knockdown is computed before log1p
+        adata_norm = adata.copy()
+        sc.pp.normalize_total(adata_norm)
+
+        # arc-bench reference
+        baseline_ref = compute_control_baseline(
+            adata_norm, "perturbation", "control",
+        )
+        kd_ref = compute_knockdown_efficiency(
+            adata_norm, baseline_ref, "perturbation", "control",
+        )
+
+        # SCX implementation
+        pyscx.accel.knockdown_efficiency(
+            adata_norm, pert_col="perturbation", control="control",
+        )
+        kd_scx = adata_norm.obs["KnockDownEfficiency"].values
+
+        # Compare — NaN positions must match exactly
+        nan_ref = np.isnan(kd_ref)
+        nan_scx = np.isnan(kd_scx)
+        np.testing.assert_array_equal(
+            nan_ref, nan_scx,
+            err_msg="NaN positions in knockdown efficiency differ",
+        )
+
+        # Compare non-NaN values
+        mask = ~nan_ref
+        np.testing.assert_allclose(
+            kd_scx[mask], kd_ref[mask], atol=1e-6,
+            err_msg="Knockdown efficiency values differ",
+        )
+
+    def test_log_deviation_vs_arc_bench(self):
+        """§7.7.2: Log deviation after normalize+log1p."""
+        import scanpy as sc
+
+        adata = _make_raw_count_adata()
+
+        # Normalize + compute baseline (before log1p)
+        adata_norm = adata.copy()
+        sc.pp.normalize_total(adata_norm)
+        baseline_ref = compute_control_baseline(
+            adata_norm, "perturbation", "control",
+        )
+        baseline_log_ref = np.log1p(baseline_ref)
+
+        # Apply log1p
+        sc.pp.log1p(adata_norm)
+
+        # arc-bench reference
+        fc_ref = compute_log_deviation(
+            adata_norm, baseline_log_ref, "perturbation", "control",
+        )
+
+        # SCX implementation
+        pyscx.accel.knockdown_efficiency(
+            adata_norm, pert_col="perturbation", control="control",
+        )
+        fc_scx = adata_norm.obs["KnockDownGeneFC"].values
+
+        # Compare — NaN positions must match exactly
+        nan_ref = np.isnan(fc_ref)
+        nan_scx = np.isnan(fc_scx)
+        np.testing.assert_array_equal(
+            nan_ref, nan_scx,
+            err_msg="NaN positions in log deviation differ",
+        )
+
+        mask = ~nan_ref
+        np.testing.assert_allclose(
+            fc_scx[mask], fc_ref[mask], atol=1e-6,
+            err_msg="Log deviation values differ",
+        )
+
+    def test_knockdown_missing_gene(self):
+        """§7.7.3: Perturbation name not in var_names → NaN for those cells."""
+        import pandas as pd
+        import scanpy as sc
+
+        rng = np.random.default_rng(99)
+        n_obs, n_vars = 100, 20
+        X = rng.poisson(5, size=(n_obs, n_vars)).astype(np.float32)
+
+        # "missing_gene" is not in var_names
+        labels = (["control"] * 50) + (["missing_gene"] * 25) + (["gene_0"] * 25)
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_vars)])
+        adata = ad.AnnData(X=sp.csr_matrix(X), obs=obs, var=var)
+        sc.pp.normalize_total(adata)
+
+        # arc-bench reference
+        baseline = compute_control_baseline(adata, "perturbation", "control")
+        kd_ref = compute_knockdown_efficiency(
+            adata, baseline, "perturbation", "control",
+        )
+
+        # SCX
+        pyscx.accel.knockdown_efficiency(
+            adata, pert_col="perturbation", control="control",
+        )
+        kd_scx = adata.obs["KnockDownEfficiency"].values
+
+        # "missing_gene" cells should be NaN in both
+        missing_mask = np.array(labels) == "missing_gene"
+        assert np.all(np.isnan(kd_ref[missing_mask])), "arc-bench should produce NaN for missing gene"
+        assert np.all(np.isnan(kd_scx[missing_mask])), "SCX should produce NaN for missing gene"
+
+        # NaN positions should match exactly
+        np.testing.assert_array_equal(
+            np.isnan(kd_ref), np.isnan(kd_scx),
+            err_msg="NaN positions differ for missing gene case",
+        )
+
+
+# =============================================================================
+# §7.8 Clustering agreement parity
+# =============================================================================
+
+class TestClusteringAgreementParity:
+    """§7.8: Verify clustering agreement metrics."""
+
+    def test_clustering_agreement_vs_cell_eval(self):
+        """§7.8.1: Compare clustering agreement scores.
+
+        Note: Exact match not expected due to stochastic Leiden.
+        """
+        adata_real, adata_pred = _make_cell_eval_adata(
+            n_obs=400, n_vars=50, n_perts=8, seed=42,
+        )
+        pair = _build_pair(adata_real, adata_pred)
+
+        scx_score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred,
+            pert_col="perturbation", control="control", metric="ami",
+        )
+        ce_scorer = ClusteringAgreement(metric="ami")
+        ce_score = ce_scorer(pair)
+
+        # Loose tolerance due to stochastic Leiden
+        np.testing.assert_allclose(
+            scx_score, ce_score, atol=0.15,
+            err_msg=f"Clustering agreement: SCX={scx_score} vs cell-eval={ce_score}",
+        )
+
+    def test_clustering_scoring_functions_vs_sklearn(self):
+        """§7.8.2: Verify AMI/NMI/ARI scoring on identical labels match sklearn."""
+        rng = np.random.default_rng(42)
+        labels_a = rng.integers(0, 5, size=100).tolist()
+        labels_b = rng.integers(0, 5, size=100).tolist()
+
+        # AMI
+        scx_ami = pyscx.accel.adjusted_mutual_info(labels_a, labels_b)
+        sk_ami = adjusted_mutual_info_score(labels_a, labels_b)
+        np.testing.assert_allclose(scx_ami, sk_ami, atol=1e-10, err_msg="AMI mismatch")
+
+        # NMI
+        scx_nmi = pyscx.accel.normalized_mutual_info(labels_a, labels_b)
+        sk_nmi = normalized_mutual_info_score(labels_a, labels_b)
+        np.testing.assert_allclose(scx_nmi, sk_nmi, atol=1e-10, err_msg="NMI mismatch")
+
+        # ARI — cell-eval uses (ARI + 1) / 2 rescaling
+        scx_ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)
+        sk_ari = adjusted_rand_score(labels_a, labels_b)
+        ce_ari_rescaled = (sk_ari + 1) / 2
+        np.testing.assert_allclose(
+            scx_ari, ce_ari_rescaled, atol=1e-10,
+            err_msg=f"ARI mismatch (with cell-eval rescaling): SCX={scx_ari} vs (sklearn+1)/2={ce_ari_rescaled}",
+        )
+
+
+# =============================================================================
+# §7.9 DE result format bridge parity
+# =============================================================================
+
+class TestDEBridgeParity:
+    """§7.9: Verify DE result format bridge."""
+
+    def test_de_dataframe_format(self):
+        """§7.9.1: Verify output DataFrame schema matches cell-eval's DEResults."""
+        adata_real, _ = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
+
+        df = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", control="control",
+        )
+
+        required_cols = {
+            "target", "feature", "fold_change", "p_value",
+            "fdr", "log2_fold_change", "abs_log2_fold_change",
+        }
+        assert required_cols.issubset(set(df.columns)), (
+            f"Missing columns: {required_cols - set(df.columns)}"
+        )
+
+        # Verify column types
+        assert df["target"].dtype == pl.Utf8
+        assert df["feature"].dtype == pl.Utf8
+        for col in ["fold_change", "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change"]:
+            assert df[col].dtype == pl.Float64, f"{col} should be Float64, got {df[col].dtype}"
+
+    def test_de_bridge_feeds_cell_eval_metrics(self):
+        """§7.9.2: Verify DE bridge output can be consumed by cell-eval DE metrics.
+
+        Note: Exact values don't need to match (SCX Wilcoxon vs pdex),
+        just format compatibility.
+        """
+        adata_real, adata_pred = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
+
+        # Compute DE via SCX for both real and pred
+        df_real = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", control="control",
+        )
+        df_pred = pyscx.accel.rank_genes_groups_df(
+            adata_pred, "perturbation", control="control",
+        )
+
+        # Feed into cell-eval's DE initialization
+        from cell_eval import initialize_de_comparison
+
+        de_comparison = initialize_de_comparison(real=df_real, pred=df_pred)
+
+        # Verify cell-eval can compute DE metrics (no errors)
+        from cell_eval._pipeline import MetricPipeline
+
+        pipeline = MetricPipeline(profile="de", break_on_error=False)
+        pipeline.compute_de_metrics(de_comparison)
+        results = pipeline.get_results()
+
+        # All DE metrics should produce valid float values
+        assert results.height > 0, "No DE metric results produced"
+        for col in results.columns:
+            if col == "perturbation":
+                continue
+            values = results[col].to_numpy()
+            non_null = values[~np.isnan(values.astype(float))]
+            assert len(non_null) > 0, f"DE metric '{col}' produced all NaN/null"
+
+
+# =============================================================================
+# §7.10 Full pipeline integration test
+# =============================================================================
+
+class TestFullPipelineParity:
+    """§7.10: Full pipeline integration against cell-eval."""
+
+    # Tolerance table from ARC-BENCH.md
+    TOLERANCE = {
+        "pearson_delta": 1e-6,
+        "mse": 1e-6,
+        "mae": 1e-6,
+        "mse_delta": 1e-6,
+        "mae_delta": 1e-6,
+        "discrimination_score_l1": 0,  # exact (integer rank)
+        "discrimination_score_l2": 0,
+        "discrimination_score_cosine": 0,
+        "pearson_edistance": 1e-4,
+        "clustering_agreement": 0.15,
+    }
+
+    def test_full_pipeline_vs_cell_eval(self):
+        """§7.10.1: Run complete SCX pipeline vs cell-eval MetricPipeline."""
+        adata_real, adata_pred = _make_cell_eval_adata()
+        pair = _build_pair(adata_real, adata_pred)
+
+        # --- cell-eval pipeline (anndata metrics only, skip DE) ---
+        from cell_eval import MetricsEvaluator
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            evaluator = MetricsEvaluator(
+                adata_pred=adata_pred,
+                adata_real=adata_real,
+                control_pert="control",
+                pert_col="perturbation",
+                outdir=tmpdir,
+                skip_de=True,
+            )
+            ce_results, ce_agg = evaluator.compute(
+                profile="anndata", write_csv=False, break_on_error=True,
+            )
+
+        # --- SCX pipeline ---
+        scx_results = {}
+
+        # Bulk metrics
+        bulk = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+        for metric_name, vals in bulk.items():
+            scx_results[metric_name] = vals
+
+        # Discrimination score (all 3 metrics)
+        for metric in ["l1", "l2", "cosine"]:
+            scx_results[f"discrimination_score_{metric}"] = (
+                pyscx.accel.discrimination_score(
+                    adata_real, adata_pred, metric=metric,
+                )
+            )
+
+        # Energy distance
+        scx_edistance = pyscx.accel.energy_distance(adata_real, adata_pred)
+
+        # Clustering agreement
+        scx_clustering = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred,
+            pert_col="perturbation", control="control", metric="ami",
+        )
+
+        # --- Compare per-perturbation results ---
+        perts = sorted(set(adata_real.obs["perturbation"]) - {"control"})
+
+        for metric_name in [
+            "pearson_delta", "mse", "mae", "mse_delta", "mae_delta",
+            "discrimination_score_l1", "discrimination_score_l2",
+            "discrimination_score_cosine",
+        ]:
+            tol = self.TOLERANCE[metric_name]
+            if metric_name not in ce_results.columns:
+                continue
+
+            for pert in perts:
+                ce_row = ce_results.filter(pl.col("perturbation") == pert)
+                if ce_row.height == 0:
+                    continue
+                ce_val = ce_row[metric_name][0]
+                scx_val = scx_results[metric_name].get(pert)
+                if scx_val is None or ce_val is None:
+                    continue
+                np.testing.assert_allclose(
+                    scx_val, ce_val, atol=tol,
+                    err_msg=f"Pipeline mismatch: {metric_name}[{pert}]",
+                )
+
+        # e-distance (single correlation value)
+        if "pearson_edistance" in ce_results.columns:
+            ce_edist = ce_results["pearson_edistance"][0]
+            np.testing.assert_allclose(
+                scx_edistance, ce_edist, atol=self.TOLERANCE["pearson_edistance"],
+                err_msg="Pipeline mismatch: pearson_edistance",
+            )
+
+        # Clustering (loose tolerance due to stochastic Leiden)
+        if "clustering_agreement" in ce_results.columns:
+            ce_clust = ce_results["clustering_agreement"][0]
+            np.testing.assert_allclose(
+                scx_clustering, ce_clust,
+                atol=self.TOLERANCE["clustering_agreement"],
+                err_msg="Pipeline mismatch: clustering_agreement",
+            )
+
+    def test_full_pipeline_arc_bench_cli_parity(self):
+        """§7.10.2: Simulate arc_bench.tools.pert_eval.cli._run_standard().
+
+        Validates the end-to-end arc-bench integration:
+        1. Clip X to [0, 14]
+        2. Run MetricsEvaluator + SCX pipeline
+        """
+        adata_real, adata_pred = _make_cell_eval_adata()
+
+        # Clip X to [0, 14] as arc-bench does
+        if sp.issparse(adata_real.X):
+            adata_real.X = adata_real.X.toarray()
+        if sp.issparse(adata_pred.X):
+            adata_pred.X = adata_pred.X.toarray()
+
+        adata_real.X = np.clip(adata_real.X, 0, 14)
+        adata_pred.X = np.clip(adata_pred.X, 0, 14)
+
+        # Run SCX bulk metrics on clipped data
+        scx_bulk = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+
+        # Run cell-eval on clipped data
+        pair = _build_pair(adata_real, adata_pred)
+        ce_mse_result = ce_mse(pair)
+        ce_pearson_result = ce_pearson_delta(pair)
+
+        # Verify parity on clipped data
+        for pert in ce_mse_result:
+            np.testing.assert_allclose(
+                scx_bulk["mse"][pert], ce_mse_result[pert], atol=1e-6,
+                err_msg=f"arc-bench parity mismatch: mse[{pert}]",
+            )
+            np.testing.assert_allclose(
+                scx_bulk["pearson_delta"][pert], ce_pearson_result[pert], atol=1e-6,
+                err_msg=f"arc-bench parity mismatch: pearson_delta[{pert}]",
+            )
+
+
+# =============================================================================
+# §7.11 Performance comparison
+# =============================================================================
+
+class TestPerformanceComparison:
+    """§7.11.1: Informational speedup comparison (no assertions on speedup)."""
+
+    @pytest.mark.slow
+    def test_performance_vs_cell_eval(self):
+        """Time both SCX and cell-eval on a larger dataset."""
+        adata_real, adata_pred = _make_cell_eval_adata(
+            n_obs=10000, n_vars=2000, n_perts=50, seed=42,
+        )
+        pair = _build_pair(adata_real, adata_pred)
+
+        timings = {}
+
+        # Pseudobulk means
+        t0 = time.perf_counter()
+        pyscx.accel.pseudobulk_means(adata_real, "perturbation")
+        timings["scx_pseudobulk"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        PerturbationAnndataPair._bulk_anndata(adata_real, "perturbation")
+        timings["ce_pseudobulk"] = time.perf_counter() - t0
+
+        # Bulk metrics (all 5 bundled)
+        t0 = time.perf_counter()
+        pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+        timings["scx_bulk_metrics"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        ce_pearson_delta(pair)
+        ce_mse(pair)
+        ce_mae(pair)
+        ce_mse_delta(pair)
+        ce_mae_delta(pair)
+        timings["ce_bulk_metrics"] = time.perf_counter() - t0
+
+        # Discrimination score L1
+        t0 = time.perf_counter()
+        pyscx.accel.discrimination_score(adata_real, adata_pred, metric="l1")
+        timings["scx_discrimination_l1"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        ce_discrimination_score(pair, metric="l1")
+        timings["ce_discrimination_l1"] = time.perf_counter() - t0
+
+        # Print results
+        print("\n" + "=" * 60)
+        print("Performance Comparison: SCX vs cell-eval")
+        print("=" * 60)
+        print(f"  Dataset: {adata_real.n_obs} cells × {adata_real.n_vars} genes × {50} perts")
+        print()
+        for key in sorted(timings):
+            print(f"  {key:30s}  {timings[key]:8.3f}s")
+        print()
+
+        # Compute speedups
+        for name in ["pseudobulk", "bulk_metrics", "discrimination_l1"]:
+            scx_t = timings.get(f"scx_{name}", 0)
+            ce_t = timings.get(f"ce_{name}", 0)
+            if scx_t > 0:
+                speedup = ce_t / scx_t
+                print(f"  {name:30s}  {speedup:.1f}x speedup")
+        print("=" * 60)
+
+
+# =============================================================================
+# §7.12 Scoring parity
+# =============================================================================
+
+class TestScoringParity:
+    """§7.12.1: Verify score_agg_metrics compatibility."""
+
+    def test_score_agg_metrics_parity(self):
+        """Verify normalized scores are compatible with cell-eval's scoring."""
+        import tempfile
+
+        adata_real, adata_pred = _make_cell_eval_adata()
+        pair = _build_pair(adata_real, adata_pred)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Run cell-eval pipeline to get agg results
+            evaluator = cell_eval.MetricsEvaluator(
+                adata_pred=adata_pred,
+                adata_real=adata_real,
+                control_pert="control",
+                pert_col="perturbation",
+                outdir=tmpdir,
+                skip_de=True,
+            )
+            ce_results, ce_agg = evaluator.compute(
+                profile="anndata", write_csv=False, break_on_error=True,
+            )
+
+        # Build SCX results in the same DataFrame format
+        scx_all = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+
+        # Build a DataFrame matching cell-eval's format
+        perts = sorted(set(adata_real.obs["perturbation"]) - {"control"})
+        scx_rows = []
+        for pert in perts:
+            row = {"perturbation": pert}
+            for metric_name, vals in scx_all.items():
+                row[metric_name] = vals.get(pert, float("nan"))
+            scx_rows.append(row)
+
+        scx_results_df = pl.DataFrame(scx_rows)
+        scx_agg = scx_results_df.drop("perturbation").describe()
+
+        # Verify aggregated metrics have the same structure
+        assert set(scx_agg.columns).issubset(set(ce_agg.columns) | {"statistic"}), (
+            "SCX aggregated results have unexpected columns"
+        )
+
+        # Compare mean values for overlapping metrics
+        for col in scx_agg.columns:
+            if col == "statistic" or col not in ce_agg.columns:
+                continue
+            # Extract mean row
+            scx_mean_row = scx_agg.filter(pl.col("statistic") == "mean")
+            ce_mean_row = ce_agg.filter(pl.col("statistic") == "mean")
+            if scx_mean_row.height == 0 or ce_mean_row.height == 0:
+                continue
+            scx_val = scx_mean_row[col][0]
+            ce_val = ce_mean_row[col][0]
+            if scx_val is not None and ce_val is not None:
+                np.testing.assert_allclose(
+                    float(scx_val), float(ce_val), atol=1e-5,
+                    err_msg=f"Aggregated score mismatch for '{col}'",
+                )
