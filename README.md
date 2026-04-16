@@ -186,6 +186,39 @@ materialization in CPU memory. This enables GPU analysis on datasets larger
 than VRAM. When no GPU is available, every operation falls back to CPU
 automatically with a warning.
 
+### Your perturb-seq evaluation pipeline is slow
+
+SCX ships Rust-accelerated equivalents of the metrics in
+[`cell-eval`](https://github.com/arcinstitute/cell-eval) and
+[`arc-bench`](https://github.com/arcinstitute/arc-bench) — pseudobulk means,
+bundled bulk metrics (pearson_delta / mse / mae / mse_delta / mae_delta),
+discrimination score, energy distance, knockdown efficiency, and clustering
+agreement. Output is numerically equivalent to the Python references
+(30/30 parity tests pass), so you can swap in `pyscx.accel.*` without changing
+the rest of your pipeline.
+
+```python
+# One call replaces cell-eval's pearson_delta + mse + mae + mse_delta + mae_delta
+results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+
+# Per-cell knockdown efficiency vs control (arc-bench equivalent)
+pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation", control="control")
+# → adata.obs["KnockDownEfficiency"], adata.obs["KnockDownGeneFC"]
+```
+
+| Operation | 100K cells | 500K cells | 1M cells |
+|---|---:|---:|---:|
+| Pseudobulk means | **11.6×** | **13.8×** | **19.4×** |
+| Bulk metrics (5 bundled) | **12.1×** | **13.6×** | **21.9×** |
+| Discrimination score | **12.0×** | **12.9×** | **20.1×** |
+| Energy distance | **14.4×** | — ¹ | — ¹ |
+
+¹ Reference's `sklearn.metrics.pairwise_distances` doesn't scale above 100K.
+
+See [`docs/scanpy.md`](docs/scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)
+for the full API and [`docs/performance.md`](docs/performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
+for the benchmark methodology.
+
 ### No more file locking headaches
 
 HDF5 acquires **mandatory POSIX file locks** on every open — even for reads. On shared
