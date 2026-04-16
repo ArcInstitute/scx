@@ -223,6 +223,10 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
         accel::knockdown_efficiency,
         &accel_module
     )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::clustering_agreement,
+        &accel_module
+    )?)?;
     m.add_submodule(&accel_module)?;
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.

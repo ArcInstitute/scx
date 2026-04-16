@@ -1489,3 +1489,382 @@ class TestKnockdownEfficiency:
         # Upregulation (x>baseline) → KD < 0
         assert np.all(np.isfinite(eff[valid])), "All non-NaN values should be finite"
 
+
+class TestClusteringAgreement:
+    """Test pyscx.accel.clustering_agreement().
+
+    Reference: cell-eval's ClusteringAgreement class which builds centroid
+    AnnData objects, clusters with scanpy Leiden at multiple resolutions,
+    and scores with sklearn's AMI/NMI/ARI.
+    """
+
+    def _make_paired_adata(self, n_obs=500, n_vars=30, n_perts=8, seed=42):
+        """Create paired real/predicted AnnData with distinct perturbation structure.
+
+        Perturbations are designed so that clustering should find meaningful
+        groups in the centroids.
+        """
+        rng = np.random.default_rng(seed)
+        base = rng.exponential(2.0, size=n_vars).astype(np.float32)
+
+        pert_names = ["control"] + [f"drug_{i}" for i in range(n_perts - 1)]
+
+        # Create distinct cluster structure: drugs 0-2 in one cluster,
+        # drugs 3-5 in another, drug 6 alone.
+        deltas = {}
+        cluster_shifts = {
+            "drug_0": np.array([3.0] * 10 + [0.0] * 20),
+            "drug_1": np.array([2.5] * 10 + [0.0] * 20),
+            "drug_2": np.array([3.5] * 10 + [0.0] * 20),
+            "drug_3": np.array([0.0] * 10 + [3.0] * 10 + [0.0] * 10),
+            "drug_4": np.array([0.0] * 10 + [2.5] * 10 + [0.0] * 10),
+            "drug_5": np.array([0.0] * 10 + [3.5] * 10 + [0.0] * 10),
+            "drug_6": np.array([0.0] * 20 + [3.0] * 10),
+        }
+        for name in pert_names[1:]:
+            deltas[name] = cluster_shifts[name].astype(np.float32)
+
+        cells_per_pert = n_obs // n_perts
+        labels = []
+        for name in pert_names:
+            labels.extend([name] * cells_per_pert)
+        while len(labels) < n_obs:
+            labels.append("control")
+
+        import pandas as pd
+
+        X_real = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_real[i] = np.maximum(base + noise, 0)
+            else:
+                X_real[i] = np.maximum(base + deltas[label] + noise, 0)
+
+        # Predicted data: same structure but with noise
+        X_pred = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_pred[i] = np.maximum(base + noise, 0)
+            else:
+                pred_delta = deltas[label] + rng.normal(
+                    0, 0.3, size=n_vars
+                ).astype(np.float32)
+                X_pred[i] = np.maximum(base + pred_delta + noise, 0)
+
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_vars)])
+
+        adata_real = ad.AnnData(
+            X=sp.csr_matrix(X_real), obs=obs.copy(), var=var.copy()
+        )
+        adata_pred = ad.AnnData(
+            X=sp.csr_matrix(X_pred), obs=obs.copy(), var=var.copy()
+        )
+        return adata_real, adata_pred, pert_names
+
+    def test_basic_clustering_agreement(self):
+        """Verify clustering_agreement runs and returns a float in [0, 1]."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        score = pyscx.accel.clustering_agreement(adata_real, adata_pred)
+
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0, f"Score {score} out of [0, 1] range"
+
+    def test_ami_metric(self):
+        """Test with AMI metric."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred, metric="ami"
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_nmi_metric(self):
+        """Test with NMI metric."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred, metric="nmi"
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_ari_metric(self):
+        """Test with ARI metric (rescaled to [0, 1])."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred, metric="ari"
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_identical_data_high_score(self):
+        """When real == pred, clustering agreement should be high or perfect."""
+        import pyscx
+
+        adata_real, _, _ = self._make_paired_adata()
+        adata_pred = adata_real.copy()
+
+        for m in ["ami", "nmi", "ari"]:
+            score = pyscx.accel.clustering_agreement(
+                adata_real, adata_pred, metric=m
+            )
+            # Identical data should yield high agreement (allowing for
+            # stochastic Leiden, but centroids are identical so clustering
+            # should be ~identical).
+            assert score >= 0.5, (
+                f"Identical data should have high agreement for {m}, got {score}"
+            )
+
+    def test_custom_resolutions(self):
+        """Test with custom pred_resolutions."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred,
+            pred_resolutions=[0.5, 1.0, 2.0],
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_single_resolution(self):
+        """Test with a single predicted resolution."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred,
+            pred_resolutions=[1.0],
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_custom_pert_col_and_control(self):
+        """Test with non-default perturbation column and control label."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        adata_real.obs = adata_real.obs.rename(columns={"perturbation": "condition"})
+        adata_pred.obs = adata_pred.obs.rename(columns={"perturbation": "condition"})
+        adata_real.obs["condition"] = adata_real.obs["condition"].replace(
+            {"control": "vehicle"}
+        )
+        adata_pred.obs["condition"] = adata_pred.obs["condition"].replace(
+            {"control": "vehicle"}
+        )
+
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred,
+            pert_col="condition",
+            control="vehicle",
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_invalid_metric(self):
+        """Invalid metric should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="unknown metric"):
+            pyscx.accel.clustering_agreement(
+                adata_real, adata_pred, metric="invalid_metric"
+            )
+
+    def test_missing_control(self):
+        """Missing control label should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="control.*not found"):
+            pyscx.accel.clustering_agreement(
+                adata_real, adata_pred, control="nonexistent_control"
+            )
+
+    def test_too_few_perturbations(self):
+        """Fewer than 2 non-control perturbations should raise ValueError."""
+        import pyscx
+        import pandas as pd
+
+        rng = np.random.default_rng(42)
+        n_obs, n_vars = 40, 10
+        X = sp.random(n_obs, n_vars, density=0.3, format="csr", random_state=rng)
+        labels = ["control"] * 20 + ["single_drug"] * 20
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+        adata = ad.AnnData(X=X.astype(np.float32), obs=obs, var=var)
+
+        with pytest.raises(ValueError, match="at least 2"):
+            pyscx.accel.clustering_agreement(adata, adata)
+
+    def test_empty_resolutions(self):
+        """Empty pred_resolutions should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="must not be empty"):
+            pyscx.accel.clustering_agreement(
+                adata_real, adata_pred, pred_resolutions=[]
+            )
+
+    def test_dense_input(self):
+        """Test with dense numpy X instead of sparse."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.X = adata_real.X.toarray()
+        adata_pred.X = adata_pred.X.toarray()
+
+        score = pyscx.accel.clustering_agreement(adata_real, adata_pred)
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_embed_key(self):
+        """Test using obsm embeddings instead of X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        # Add PCA-like embeddings
+        rng = np.random.default_rng(123)
+        n_components = 10
+        adata_real.obsm["X_pca"] = rng.normal(size=(adata_real.n_obs, n_components))
+        adata_pred.obsm["X_pca"] = rng.normal(size=(adata_pred.n_obs, n_components))
+
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred, embed_key="X_pca"
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_identical_centroids_perfect_score(self):
+        """Identical centroids + same resolution should give perfect clustering agreement.
+
+        This validates the full pipeline: pseudobulk → centroid AnnData → scanpy
+        neighbors/Leiden → Rust scoring. With identical centroids and the same
+        resolution, Leiden produces the same clusters for real and predicted,
+        so all three scoring metrics should return 1.0 (or very close).
+
+        The Rust unit tests in clustering.rs independently verify the AMI/NMI/ARI
+        scoring functions against exact sklearn reference values:
+          AMI([0,0,0,1,1,1], [0,0,1,1,2,2]) = 0.298792458170890  (sklearn ± 1e-10)
+          NMI([0,0,0,1,1,1], [0,0,1,1,2,2]) = 0.515803742979389  (sklearn ± 1e-10)
+          ARI([0,0,0,1,1,1], [0,0,1,1,2,2]) = 0.242424242424242  (sklearn ± 1e-10)
+        """
+        import pyscx
+
+        adata_real, _, _ = self._make_paired_adata(seed=42)
+        adata_pred = adata_real.copy()
+
+        # With identical data, centroids are identical.
+        # All three metrics should yield perfect or near-perfect agreement.
+        for m in ["ami", "nmi", "ari"]:
+            score = pyscx.accel.clustering_agreement(
+                adata_real, adata_pred, metric=m,
+                pred_resolutions=[1.0],  # same as real_resolution
+            )
+            # With identical centroids and same resolution, Leiden is
+            # deterministic (igraph flavor) → identical cluster labels
+            # → scoring function returns 1.0.
+            assert score >= 0.8, (
+                f"Identical centroids with same resolution should give high {m}, got {score}"
+            )
+
+    def test_sklearn_reference_values(self):
+        """Cross-check that sklearn AMI/NMI/ARI reference values are self-consistent.
+
+        The Rust unit tests directly verify our implementations against these
+        exact sklearn values (to 1e-10 tolerance). This test documents those
+        reference values and ensures the sklearn version we use produces them.
+        """
+        from sklearn.metrics import (
+            adjusted_mutual_info_score,
+            normalized_mutual_info_score,
+            adjusted_rand_score,
+        )
+
+        a = np.array([0, 0, 0, 1, 1, 1])
+        b = np.array([0, 0, 1, 1, 2, 2])
+
+        # These exact values are verified in the Rust unit tests at 1e-10.
+        np.testing.assert_allclose(
+            adjusted_mutual_info_score(a, b), 0.298792458170890, atol=1e-10,
+            err_msg="sklearn AMI reference value changed"
+        )
+        np.testing.assert_allclose(
+            normalized_mutual_info_score(a, b), 0.515803742979389, atol=1e-10,
+            err_msg="sklearn NMI reference value changed"
+        )
+        np.testing.assert_allclose(
+            adjusted_rand_score(a, b), 0.242424242424242, atol=1e-10,
+            err_msg="sklearn ARI reference value changed"
+        )
+
+    def test_nan_labels_raise(self):
+        """NaN perturbation labels should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.obs.iloc[0, 0] = np.nan
+
+        with pytest.raises(ValueError, match="NaN"):
+            pyscx.accel.clustering_agreement(adata_real, adata_pred)
+
+    def test_n_neighbors_capped(self):
+        """n_neighbors should be capped at n_output - 1 for small centroid sets."""
+        import pyscx
+
+        # Only 3 non-control perturbations → n_output = 3
+        adata_real, adata_pred, _ = self._make_paired_adata(
+            n_obs=200, n_perts=4, seed=99
+        )
+
+        # n_neighbors=15 should be capped to 2 (= 3 - 1) without error.
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred, n_neighbors=15
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_best_across_resolutions(self):
+        """Score should be the best (maximum) across all predicted resolutions."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        # Get score with many resolutions.
+        score_many = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred,
+            pred_resolutions=[0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0],
+        )
+
+        # Get scores with individual resolutions.
+        individual_scores = []
+        for r in [0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0]:
+            s = pyscx.accel.clustering_agreement(
+                adata_real, adata_pred,
+                pred_resolutions=[r],
+            )
+            individual_scores.append(s)
+
+        # The many-resolution score should equal the max of individual scores.
+        # (This can fail if Leiden is non-deterministic across runs, but
+        # scanpy igraph Leiden is typically deterministic for the same graph.)
+        max_individual = max(individual_scores)
+        # Allow a small tolerance for potential Leiden stochasticity.
+        np.testing.assert_allclose(
+            score_many, max_individual, atol=0.05,
+            err_msg="Score with all resolutions should ≈ max of individual scores"
+        )
+

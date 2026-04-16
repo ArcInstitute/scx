@@ -26,6 +26,10 @@ pub use diffexp::{
 pub use error::{AccelError, Result};
 pub use eval_metrics::{
     bulk_metrics::{compute_bulk_metrics, pearson_correlation, BulkMetric, BulkMetricsResult},
+    clustering::{
+        adjusted_mutual_info, adjusted_rand_index, adjusted_rand_index_rescaled,
+        normalized_mutual_info, ClusteringMetric,
+    },
     discrimination::{compute_discrimination_score, DiscriminationResult},
     edistance::{compute_energy_distance, fused_edistance, EDistanceResult},
     knockdown::{compute_control_baseline, compute_knockdown_efficiency, compute_log_deviation},

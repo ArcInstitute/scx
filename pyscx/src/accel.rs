@@ -5283,3 +5283,261 @@ pub fn knockdown_efficiency<'py>(
 
     Ok(())
 }
+
+/// Compute clustering agreement between real and predicted perturbation centroids.
+///
+/// Builds centroid matrices (pseudobulk means per perturbation, excluding
+/// control), constructs kNN graphs, clusters via Leiden at multiple resolutions,
+/// and scores the agreement between real and predicted cluster assignments
+/// using AMI, NMI, or ARI.
+///
+/// This metric evaluates whether predicted perturbation effects preserve the
+/// cluster structure of real perturbation effects. It chains existing SCX
+/// accelerators (pseudobulk means) with scanpy's neighbors/Leiden (for the
+/// small centroid matrices, typically 50–200 rows) and Rust-native AMI/NMI/ARI
+/// scoring.
+///
+/// Args:
+///     adata_real: AnnData with real (ground truth) data
+///     adata_pred: AnnData with predicted data
+///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
+///     control: Label for control perturbation (default: "control")
+///     metric: Agreement metric — "ami" (default), "nmi", or "ari"
+///     real_resolution: Leiden resolution for real centroids (default: 1.0)
+///     pred_resolutions: Tuple of Leiden resolutions to sweep for predicted
+///         centroids (default: (0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0))
+///     n_neighbors: Number of neighbors for kNN graph (default: 15)
+///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None)
+///     min_cells_per_group: Skip groups with fewer cells (default: 1)
+///
+/// Returns:
+///     float — Best clustering agreement score across predicted resolutions
+///
+/// Example:
+///     score = pyscx.accel.clustering_agreement(adata_real, adata_pred)
+///     # score ≈ 0.7 means good cluster structure preservation
+///     #
+///     # Metric variants correspond to cell-eval's ClusteringAgreement:
+///     #   metric="ami" → adjusted_mutual_info_score
+///     #   metric="nmi" → normalized_mutual_info_score
+///     #   metric="ari" → (adjusted_rand_score + 1) / 2
+#[pyfunction]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1))]
+#[allow(clippy::too_many_arguments)]
+pub fn clustering_agreement<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    real_resolution: f64,
+    pred_resolutions: Option<Vec<f64>>,
+    n_neighbors: usize,
+    embed_key: Option<&str>,
+    min_cells_per_group: usize,
+) -> PyResult<f64> {
+    let np = py.import("numpy")?;
+    let sc = py.import("scanpy")?;
+    let ad_mod = py.import("anndata")?;
+
+    // Parse clustering metric.
+    let clustering_metric = scx_accel::ClusteringMetric::parse(metric).ok_or_else(|| {
+        PyValueError::new_err(format!("unknown metric '{}'. Valid: ami, nmi, ari", metric))
+    })?;
+
+    let default_resolutions = vec![0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0];
+    let resolutions = pred_resolutions.unwrap_or(default_resolutions);
+
+    if resolutions.is_empty() {
+        return Err(PyValueError::new_err("pred_resolutions must not be empty"));
+    }
+
+    // ── Compute pseudobulk means (centroids) for both sides ─────────
+    let (means_real_flat, means_pred_flat, common, n_genes, _gene_names) =
+        compute_aligned_pseudobulk_means(
+            py,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            embed_key,
+            min_cells_per_group,
+        )?;
+
+    let n_perts = common.len();
+
+    // Find control index and filter it out.
+    let ctrl_idx = common.iter().position(|s| s == control);
+
+    // Build non-control perturbation names and centroid matrices.
+    let mut pert_names: Vec<String> = Vec::with_capacity(n_perts);
+    let mut centroids_real: Vec<f64> = Vec::with_capacity(n_perts * n_genes);
+    let mut centroids_pred: Vec<f64> = Vec::with_capacity(n_perts * n_genes);
+
+    for p in 0..n_perts {
+        if Some(p) == ctrl_idx {
+            continue;
+        }
+        pert_names.push(common[p].clone());
+        centroids_real.extend_from_slice(&means_real_flat[p * n_genes..(p + 1) * n_genes]);
+        centroids_pred.extend_from_slice(&means_pred_flat[p * n_genes..(p + 1) * n_genes]);
+    }
+
+    let n_output = pert_names.len();
+    if n_output < 2 {
+        return Err(PyValueError::new_err(format!(
+            "need at least 2 non-control perturbations for clustering agreement, got {}",
+            n_output
+        )));
+    }
+
+    // Sort centroids by perturbation name to align between real and pred.
+    // We create sorted indices and reorder both centroid matrices.
+    let mut sorted_indices: Vec<usize> = (0..n_output).collect();
+    sorted_indices.sort_by(|&a, &b| pert_names[a].cmp(&pert_names[b]));
+
+    let mut sorted_real = vec![0.0f64; n_output * n_genes];
+    let mut sorted_pred = vec![0.0f64; n_output * n_genes];
+
+    for (new_idx, &old_idx) in sorted_indices.iter().enumerate() {
+        sorted_real[new_idx * n_genes..(new_idx + 1) * n_genes]
+            .copy_from_slice(&centroids_real[old_idx * n_genes..(old_idx + 1) * n_genes]);
+        sorted_pred[new_idx * n_genes..(new_idx + 1) * n_genes]
+            .copy_from_slice(&centroids_pred[old_idx * n_genes..(old_idx + 1) * n_genes]);
+    }
+
+    // ── Build AnnData centroid objects for scanpy ────────────────────
+    let real_arr = np.call_method1("array", (sorted_real,))?;
+    let real_2d = real_arr.call_method1("reshape", ((n_output, n_genes),))?;
+    let real_2d_f64 = real_2d.call_method1("astype", ("float64",))?;
+    let ad_real_cent = ad_mod.call_method(
+        "AnnData",
+        (),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("X", &real_2d_f64)?;
+            kw
+        }),
+    )?;
+
+    let pred_arr = np.call_method1("array", (sorted_pred,))?;
+    let pred_2d = pred_arr.call_method1("reshape", ((n_output, n_genes),))?;
+    let pred_2d_f64 = pred_2d.call_method1("astype", ("float64",))?;
+    let ad_pred_cent = ad_mod.call_method(
+        "AnnData",
+        (),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("X", &pred_2d_f64)?;
+            kw
+        }),
+    )?;
+
+    // ── Build kNN graphs and cluster ────────────────────────────────
+    let effective_n_neighbors = n_neighbors.min(n_output - 1);
+
+    // Build kNN graph + Leiden for real centroids.
+    let sc_pp = sc.getattr("pp")?;
+    let sc_tl = sc.getattr("tl")?;
+
+    sc_pp.call_method(
+        "neighbors",
+        (&ad_real_cent,),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("n_neighbors", effective_n_neighbors)?;
+            kw.set_item("use_rep", "X")?;
+            kw
+        }),
+    )?;
+
+    sc_tl.call_method(
+        "leiden",
+        (&ad_real_cent,),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("resolution", real_resolution)?;
+            kw.set_item("key_added", "real_clusters")?;
+            kw.set_item("flavor", "igraph")?;
+            kw.set_item("n_iterations", 2)?;
+            kw
+        }),
+    )?;
+
+    // Extract real cluster labels as u32 array.
+    let real_obs = ad_real_cent.getattr("obs")?;
+    let real_labels_series = real_obs.get_item("real_clusters")?;
+    let real_label_codes: Vec<i64> = real_labels_series
+        .getattr("cat")?
+        .getattr("codes")?
+        .call_method0("tolist")?
+        .extract()?;
+    // Validate and convert label codes. Pandas categorical codes use -1 for
+    // missing/NA values, which would silently become u32::MAX.
+    if real_label_codes.iter().any(|&c| c < 0) {
+        return Err(PyRuntimeError::new_err(
+            "Leiden produced NA cluster labels for real centroids",
+        ));
+    }
+    let real_labels_u32: Vec<u32> = real_label_codes.iter().map(|&c| c as u32).collect();
+
+    // Build kNN graph for predicted centroids (reusable across resolutions).
+    sc_pp.call_method(
+        "neighbors",
+        (&ad_pred_cent,),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("n_neighbors", effective_n_neighbors)?;
+            kw.set_item("use_rep", "X")?;
+            kw
+        }),
+    )?;
+
+    // ── Sweep predicted resolutions and compute best score ──────────
+    // Initialize to NEG_INFINITY so that even if all scores are negative
+    // (possible with AMI), we return an actual computed value.
+    let mut best_score = f64::NEG_INFINITY;
+
+    for &r in &resolutions {
+        let pred_key = format!("pred_clusters_{}", r);
+
+        sc_tl.call_method(
+            "leiden",
+            (&ad_pred_cent,),
+            Some(&{
+                let kw = PyDict::new(py);
+                kw.set_item("resolution", r)?;
+                kw.set_item("key_added", pred_key.as_str())?;
+                kw.set_item("flavor", "igraph")?;
+                kw.set_item("n_iterations", 2)?;
+                kw
+            }),
+        )?;
+
+        // Extract predicted cluster labels.
+        let pred_obs = ad_pred_cent.getattr("obs")?;
+        let pred_labels_series = pred_obs.get_item(pred_key.as_str())?;
+        let pred_label_codes: Vec<i64> = pred_labels_series
+            .getattr("cat")?
+            .getattr("codes")?
+            .call_method0("tolist")?
+            .extract()?;
+        // Validate and convert predicted label codes.
+        if pred_label_codes.iter().any(|&c| c < 0) {
+            return Err(PyRuntimeError::new_err(format!(
+                "Leiden produced NA cluster labels for predicted centroids at resolution {}",
+                r
+            )));
+        }
+        let pred_labels_u32: Vec<u32> = pred_label_codes.iter().map(|&c| c as u32).collect();
+
+        // Compute scoring metric in Rust.
+        let score = clustering_metric.score(&real_labels_u32, &pred_labels_u32);
+        if score > best_score {
+            best_score = score;
+        }
+    }
+
+    Ok(best_score)
+}
