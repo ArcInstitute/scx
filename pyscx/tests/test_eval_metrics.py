@@ -1868,3 +1868,456 @@ class TestClusteringAgreement:
             err_msg="Score with all resolutions should ≈ max of individual scores"
         )
 
+
+# Guard: skip entire class if polars not installed (optional eval dependency).
+pl = pytest.importorskip("polars", reason="polars required for DE format bridge tests")
+
+
+class TestRankGenesGroupsDf:
+    """Test pyscx.accel.rank_genes_groups_df() — DE result format bridge.
+
+    Verifies that the output polars DataFrame matches cell-eval's DEResults
+    schema: (target, feature, fold_change, p_value, fdr, log2_fold_change,
+    abs_log2_fold_change).
+    """
+
+    def _make_adata(self, n_obs=200, n_vars=50, n_groups=4, seed=42):
+        """Create synthetic AnnData with sparse X and group labels."""
+        rng = np.random.default_rng(seed)
+        import pandas as pd
+
+        # Sparse count matrix with distinct group signatures
+        base = rng.exponential(2.0, size=n_vars).astype(np.float32)
+        group_names = ["control"] + [f"pert_{i}" for i in range(n_groups - 1)]
+        cells_per = n_obs // n_groups
+        labels = []
+        for name in group_names:
+            labels.extend([name] * cells_per)
+        while len(labels) < n_obs:
+            labels.append("control")
+
+        X = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X[i] = np.maximum(base + noise, 0)
+            else:
+                delta = rng.normal(0, 1.0, size=n_vars).astype(np.float32)
+                X[i] = np.maximum(base + delta + noise, 0)
+
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_vars)])
+        adata = ad.AnnData(X=sp.csr_matrix(X), obs=obs, var=var)
+        return adata
+
+    def test_returns_polars_dataframe(self):
+        """Verify the return type is a polars DataFrame."""
+        import pyscx
+
+
+        adata = self._make_adata()
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        assert isinstance(df, pl.DataFrame), f"Expected polars DataFrame, got {type(df)}"
+
+    def test_required_columns_present(self):
+        """Verify all cell-eval DEResults columns are present."""
+        import pyscx
+
+
+        adata = self._make_adata()
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        required_cols = {
+            "target", "feature", "fold_change",
+            "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change",
+        }
+        assert required_cols == set(df.columns), (
+            f"Column mismatch: expected {required_cols}, got {set(df.columns)}"
+        )
+
+    def test_column_dtypes(self):
+        """Verify column types match cell-eval expectations."""
+        import pyscx
+
+
+        adata = self._make_adata()
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        # String columns
+        assert df["target"].dtype == pl.Utf8
+        assert df["feature"].dtype == pl.Utf8
+
+        # Numeric columns
+        for col in ["fold_change", "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change"]:
+            assert df[col].dtype == pl.Float64, f"{col} should be Float64, got {df[col].dtype}"
+
+    def test_row_count(self):
+        """Verify row count = n_groups × n_genes."""
+        import pyscx
+
+        adata = self._make_adata(n_vars=50, n_groups=4)
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        n_groups = len(adata.obs["perturbation"].unique())
+        n_vars = adata.n_vars
+        assert len(df) == n_groups * n_vars, (
+            f"Expected {n_groups * n_vars} rows, got {len(df)}"
+        )
+
+    def test_n_genes_limits_output(self):
+        """n_genes parameter should limit genes per group."""
+        import pyscx
+
+        adata = self._make_adata(n_vars=50, n_groups=4)
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation", n_genes=10)
+
+        n_groups = len(adata.obs["perturbation"].unique())
+        assert len(df) == n_groups * 10, (
+            f"Expected {n_groups * 10} rows with n_genes=10, got {len(df)}"
+        )
+
+    def test_fold_change_is_2_to_log2fc(self):
+        """fold_change should equal 2^log2_fold_change."""
+        import pyscx
+
+        adata = self._make_adata()
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        log2fc = df["log2_fold_change"].to_numpy()
+        fc = df["fold_change"].to_numpy()
+
+        # Only check finite values (NaN/Inf are passed through)
+        finite_mask = np.isfinite(log2fc)
+        expected_fc = np.power(2.0, log2fc[finite_mask])
+        np.testing.assert_allclose(
+            fc[finite_mask], expected_fc, atol=1e-10,
+            err_msg="fold_change should be 2^log2_fold_change"
+        )
+
+    def test_abs_log2fc_is_absolute(self):
+        """abs_log2_fold_change should be |log2_fold_change|."""
+        import pyscx
+
+        adata = self._make_adata()
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        log2fc = df["log2_fold_change"].to_numpy()
+        abs_log2fc = df["abs_log2_fold_change"].to_numpy()
+
+        np.testing.assert_allclose(
+            abs_log2fc, np.abs(log2fc), atol=1e-10,
+            err_msg="abs_log2_fold_change should be |log2_fold_change|"
+        )
+
+    def test_pvalues_bounded(self):
+        """p_value and fdr should be in [0, 1]."""
+        import pyscx
+
+        adata = self._make_adata()
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        pvals = df["p_value"].to_numpy()
+        fdrs = df["fdr"].to_numpy()
+
+        # Filter out NaN
+        finite_pvals = pvals[np.isfinite(pvals)]
+        finite_fdrs = fdrs[np.isfinite(fdrs)]
+
+        assert np.all(finite_pvals >= 0.0) and np.all(finite_pvals <= 1.0), \
+            "p_value should be in [0, 1]"
+        assert np.all(finite_fdrs >= 0.0) and np.all(finite_fdrs <= 1.0), \
+            "fdr should be in [0, 1]"
+
+    def test_each_group_has_genes(self):
+        """Every group should appear in the target column."""
+        import pyscx
+
+        adata = self._make_adata(n_groups=4)
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        unique_targets = set(df["target"].to_list())
+        expected_groups = set(adata.obs["perturbation"].unique())
+        assert unique_targets == expected_groups, (
+            f"Targets mismatch: {unique_targets} != {expected_groups}"
+        )
+
+    def test_reference_group(self):
+        """With reference='control', control group should be excluded."""
+        import pyscx
+
+        adata = self._make_adata(n_groups=4)
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", reference="control"
+        )
+
+        unique_targets = set(df["target"].to_list())
+        assert "control" not in unique_targets, (
+            "control should not appear in targets when used as reference"
+        )
+
+    def test_dense_input(self):
+        """Test with dense numpy X."""
+        import pyscx
+
+
+        adata = self._make_adata()
+        adata.X = adata.X.toarray()
+
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        assert isinstance(df, pl.DataFrame)
+        assert "target" in df.columns
+
+    def test_consistency_with_rank_genes_groups(self):
+        """Values should match the existing rank_genes_groups function."""
+        import pyscx
+
+        adata = self._make_adata()
+        adata_copy = adata.copy()
+
+        # Run the new DataFrame-returning function
+        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+
+        # Run the existing adata.uns-writing function
+        pyscx.accel.rank_genes_groups(adata_copy, "perturbation")
+
+        # Extract values from uns for comparison
+        rgg = adata_copy.uns["rank_genes_groups"]
+        for group_name in rgg["names"].dtype.names:
+            # Get genes from uns (first 10).
+            # Note: scores (z-statistics) are intentionally not bridged —
+            # cell-eval's DEResults schema doesn't include a score column.
+            uns_genes = list(rgg["names"][group_name][:10])
+            uns_pvals = list(rgg["pvals"][group_name][:10])
+            uns_logfc = list(rgg["logfoldchanges"][group_name][:10])
+
+            # Get from DataFrame
+            df_group = df.filter(df["target"] == group_name)
+            df_genes = df_group["feature"].to_list()[:10]
+            df_scores_log2fc = df_group["log2_fold_change"].to_list()[:10]
+            df_pvals = df_group["p_value"].to_list()[:10]
+
+            # Gene order should match
+            assert df_genes == uns_genes, (
+                f"Gene order mismatch for {group_name}: "
+                f"{df_genes[:3]}... vs {uns_genes[:3]}..."
+            )
+
+            # p-values should match
+            np.testing.assert_allclose(
+                df_pvals, uns_pvals, atol=1e-10,
+                err_msg=f"p_value mismatch for {group_name}"
+            )
+
+            # log2_fold_change should match logfoldchanges from uns
+            np.testing.assert_allclose(
+                df_scores_log2fc, uns_logfc, atol=1e-10,
+                err_msg=f"log2_fold_change mismatch for {group_name}"
+            )
+
+
+class TestEndToEndPipeline:
+    """End-to-end integration test: run the full SCX perturbation evaluation pipeline.
+
+    This corresponds to Phase 6, Task 6.5 in ARC-BENCH.md. Validates the
+    complete workflow: pseudobulk_means → perturbation_metrics →
+    discrimination_score → energy_distance → knockdown_efficiency.
+    """
+
+    def _make_e2e_adata(self, n_obs=300, n_vars=30, n_perts=5, seed=42):
+        """Create paired real/predicted AnnData suitable for all metric types.
+
+        Key properties:
+        - Gene names match perturbation names (for knockdown + discrimination)
+        - Sparse CSR X
+        - Distinct perturbation effects (for meaningful metric values)
+        """
+        rng = np.random.default_rng(seed)
+        import pandas as pd
+
+        base = rng.exponential(3.0, size=n_vars).astype(np.float32)
+        gene_names = [f"gene_{j}" for j in range(n_vars)]
+
+        # Name perturbations after first few genes (for knockdown/target gene logic)
+        pert_names = ["control"] + [f"gene_{i}" for i in range(n_perts - 1)]
+        deltas = {}
+        for name in pert_names[1:]:
+            scale = rng.uniform(1.0, 4.0)
+            deltas[name] = rng.normal(0, scale, size=n_vars).astype(np.float32)
+
+        cells_per = n_obs // n_perts
+        labels = []
+        for name in pert_names:
+            labels.extend([name] * cells_per)
+        while len(labels) < n_obs:
+            labels.append("control")
+
+        X_real = np.zeros((n_obs, n_vars), dtype=np.float32)
+        X_pred = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise_r = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            noise_p = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_real[i] = np.maximum(base + noise_r, 0)
+                X_pred[i] = np.maximum(base + noise_p, 0)
+            else:
+                X_real[i] = np.maximum(base + deltas[label] + noise_r, 0)
+                pred_delta = deltas[label] + rng.normal(0, 0.3, size=n_vars).astype(np.float32)
+                X_pred[i] = np.maximum(base + pred_delta + noise_p, 0)
+
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=gene_names)
+
+        adata_real = ad.AnnData(X=sp.csr_matrix(X_real), obs=obs.copy(), var=var.copy())
+        adata_pred = ad.AnnData(X=sp.csr_matrix(X_pred), obs=obs.copy(), var=var.copy())
+        return adata_real, adata_pred, pert_names
+
+    def test_full_pipeline(self):
+        """Run all SCX perturbation metrics end-to-end and verify outputs."""
+        import pyscx
+
+        adata_real, adata_pred, pert_names = self._make_e2e_adata()
+        non_ctrl = [p for p in pert_names if p != "control"]
+
+        # ── 1. Pseudobulk means ──
+        means_real, groups_real = pyscx.accel.pseudobulk_means(
+            adata_real, "perturbation"
+        )
+        means_pred, groups_pred = pyscx.accel.pseudobulk_means(
+            adata_pred, "perturbation"
+        )
+        assert means_real.shape[0] == len(pert_names)
+        assert means_pred.shape[0] == len(pert_names)
+        assert means_real.shape[1] == adata_real.n_vars
+        assert set(groups_real) == set(pert_names)
+        assert set(groups_pred) == set(pert_names)
+
+        # ── 2. Perturbation metrics (pearson_delta, mse, mae, mse_delta, mae_delta) ──
+        bulk_results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+        assert isinstance(bulk_results, dict)
+        for metric in ["pearson_delta", "mse", "mae", "mse_delta", "mae_delta"]:
+            assert metric in bulk_results, f"Missing metric: {metric}"
+            for pert in non_ctrl:
+                assert pert in bulk_results[metric], f"{pert} missing from {metric}"
+                val = bulk_results[metric][pert]
+                assert isinstance(val, float), f"{metric}[{pert}] not float: {type(val)}"
+                assert np.isfinite(val), f"{metric}[{pert}] is not finite: {val}"
+
+        # MSE/MAE should be >= 0
+        for metric in ["mse", "mae", "mse_delta", "mae_delta"]:
+            for pert in non_ctrl:
+                assert bulk_results[metric][pert] >= 0.0, \
+                    f"{metric}[{pert}] should be non-negative"
+
+        # Pearson should be in [-1, 1]
+        for pert in non_ctrl:
+            assert -1.0 <= bulk_results["pearson_delta"][pert] <= 1.0, \
+                f"pearson_delta[{pert}] out of range"
+
+        # ── 3. Discrimination score ──
+        disc_scores = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1"
+        )
+        assert isinstance(disc_scores, dict)
+        for pert in non_ctrl:
+            assert pert in disc_scores, f"{pert} missing from discrimination_score"
+            assert 0.0 <= disc_scores[pert] <= 1.0, \
+                f"discrimination_score[{pert}] out of [0,1]: {disc_scores[pert]}"
+
+        # ── 4. Energy distance ──
+        edist_corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+        assert isinstance(edist_corr, float)
+        assert -1.0 <= edist_corr <= 1.0 or np.isnan(edist_corr), \
+            f"energy_distance correlation out of range: {edist_corr}"
+
+        # ── 5. Knockdown efficiency ──
+        adata_kd = adata_real.copy()
+        pyscx.accel.knockdown_efficiency(adata_kd, pert_col="perturbation")
+        assert "KnockDownEfficiency" in adata_kd.obs.columns
+        assert "KnockDownGeneFC" in adata_kd.obs.columns
+
+        # Control cells should have NaN knockdown values
+        ctrl_mask = adata_kd.obs["perturbation"] == "control"
+        assert np.all(np.isnan(adata_kd.obs.loc[ctrl_mask, "KnockDownEfficiency"]))
+
+        # Non-control cells with matching genes should have finite values
+        for pert in non_ctrl:
+            pert_mask = adata_kd.obs["perturbation"] == pert
+            kd_vals = adata_kd.obs.loc[pert_mask, "KnockDownEfficiency"].values
+            if pert in adata_kd.var_names:
+                assert np.any(np.isfinite(kd_vals)), \
+                    f"Expected finite KD values for {pert}"
+
+        # ── 6. DE result format bridge ──
+        de_df = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control"
+        )
+
+        assert isinstance(de_df, pl.DataFrame)
+        required_cols = {
+            "target", "feature", "fold_change",
+            "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change",
+        }
+        assert required_cols == set(de_df.columns)
+        assert "control" not in de_df["target"].to_list()
+        assert len(de_df) == len(non_ctrl) * adata_real.n_vars
+
+        # ── 7. Clustering agreement ──
+        score = pyscx.accel.clustering_agreement(
+            adata_real, adata_pred, metric="ami",
+            pred_resolutions=[0.5, 1.0, 1.5],
+        )
+        assert isinstance(score, float)
+        # AMI can be negative but typically in [-0.5, 1.0] range
+        assert score >= -1.0 and score <= 1.0, \
+            f"clustering_agreement AMI out of range: {score}"
+
+    def test_pipeline_all_metrics_match_tolerance(self):
+        """Verify that identical data produces perfect metric values."""
+        import pyscx
+
+        adata_real, _, _ = self._make_e2e_adata()
+        adata_pred = adata_real.copy()
+
+        # Identical data → MSE/MAE should be 0, Pearson should be 1
+        results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+        for pert in results["mse"]:
+            np.testing.assert_allclose(
+                results["mse"][pert], 0.0, atol=1e-10,
+                err_msg=f"MSE should be 0 for identical data ({pert})"
+            )
+            np.testing.assert_allclose(
+                results["pearson_delta"][pert], 1.0, atol=1e-10,
+                err_msg=f"Pearson should be 1 for identical data ({pert})"
+            )
+
+        # Identical data → energy distance correlation should be 1
+        edist = pyscx.accel.energy_distance(adata_real, adata_pred)
+        np.testing.assert_allclose(
+            edist, 1.0, atol=1e-6,
+            err_msg="Energy distance correlation should be 1 for identical data"
+        )
+
+        # Identical data → discrimination scores should be 1.0
+        disc = pyscx.accel.discrimination_score(
+            adata_real, adata_pred, metric="l1"
+        )
+        for pert, score in disc.items():
+            np.testing.assert_allclose(
+                score, 1.0, atol=1e-10,
+                err_msg=f"Discrimination score should be 1.0 for identical data ({pert})"
+            )
+
+        # Identical data → DE bridge should produce valid output
+        de_df = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control"
+        )
+
+        assert isinstance(de_df, pl.DataFrame)
+        assert set(de_df.columns) == {
+            "target", "feature", "fold_change",
+            "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change",
+        }
+        # All p-values should be valid (finite, in [0, 1])
+        pvals = de_df["p_value"].to_numpy()
+        finite_pvals = pvals[np.isfinite(pvals)]
+        assert np.all(finite_pvals >= 0.0) and np.all(finite_pvals <= 1.0)

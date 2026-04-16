@@ -1433,6 +1433,160 @@ fn write_de_to_adata(
     Ok(())
 }
 
+/// Convert a DiffExpResult into a polars DataFrame matching cell-eval's
+/// `DEResults` schema.
+///
+/// Output columns:
+///   - `target` (Utf8): group/perturbation name
+///   - `feature` (Utf8): gene name
+///   - `fold_change` (Float64): 2^(log2_fold_change) — linear fold change
+///   - `p_value` (Float64): raw p-value
+///   - `fdr` (Float64): BH-adjusted p-value
+///   - `log2_fold_change` (Float64): log2 fold change
+///   - `abs_log2_fold_change` (Float64): |log2_fold_change|
+fn de_result_to_cell_eval_dataframe<'py>(
+    py: Python<'py>,
+    result: &scx_accel::DiffExpResult,
+    n_genes: Option<usize>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pl = py.import("polars").map_err(|_| {
+        PyRuntimeError::new_err(
+            "polars is required for rank_genes_groups_df(). \
+             Install it: pip install 'pyscx[eval]'  (or: pip install polars)",
+        )
+    })?;
+
+    // Pre-compute total row count for capacity pre-allocation.
+    let total_rows: usize = result
+        .group_names
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            n_genes
+                .unwrap_or(result.names[i].len())
+                .min(result.names[i].len())
+        })
+        .sum();
+
+    // Build flat column vectors from per-group arrays.
+    let mut targets: Vec<String> = Vec::with_capacity(total_rows);
+    let mut features: Vec<String> = Vec::with_capacity(total_rows);
+    let mut fold_changes: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut p_values: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut fdrs: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut log2_fcs: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut abs_log2_fcs: Vec<f64> = Vec::with_capacity(total_rows);
+
+    for (i, group_name) in result.group_names.iter().enumerate() {
+        let full_n_genes = result.names[i].len();
+        let n = n_genes.unwrap_or(full_n_genes).min(full_n_genes);
+
+        // Batch-clone the group name once per group instead of per-gene.
+        targets.extend(std::iter::repeat_n(group_name.clone(), n));
+        features.extend(result.names[i][..n].iter().cloned());
+
+        for j in 0..n {
+            let lfc = result.logfoldchanges[i][j];
+            log2_fcs.push(lfc);
+            // Non-finite values (NaN, ±Inf) are passed through intentionally:
+            // NaN.abs() → NaN, (-Inf).abs() → Inf.  Downstream polars consumers
+            // can filter these via drop_nulls()/is_finite() as needed.
+            abs_log2_fcs.push(lfc.abs());
+            // Convert log2 fold change to linear fold change: 2^lfc.
+            // Use f64::exp2 for precision. Non-finite values pass through.
+            fold_changes.push(if lfc.is_finite() { lfc.exp2() } else { lfc });
+
+            p_values.push(result.pvals[i][j]);
+            fdrs.push(result.pvals_adj[i][j]);
+        }
+    }
+
+    // Build polars DataFrame from column vectors with explicit column order
+    // matching cell-eval's DEResults schema.
+    let dict = PyDict::new(py);
+    dict.set_item("target", targets)?;
+    dict.set_item("feature", features)?;
+    dict.set_item("fold_change", fold_changes)?;
+    dict.set_item("p_value", p_values)?;
+    dict.set_item("fdr", fdrs)?;
+    dict.set_item("log2_fold_change", log2_fcs)?;
+    dict.set_item("abs_log2_fold_change", abs_log2_fcs)?;
+
+    let df = pl.call_method1("DataFrame", (dict,))?;
+    // Enforce column order to match cell-eval's DEResults schema, regardless
+    // of dict iteration order or polars constructor behavior.
+    let column_order = pyo3::types::PyList::new(
+        py,
+        [
+            "target",
+            "feature",
+            "fold_change",
+            "p_value",
+            "fdr",
+            "log2_fold_change",
+            "abs_log2_fold_change",
+        ],
+    )?;
+    let df = df.call_method1("select", (column_order,))?;
+    Ok(df)
+}
+
+/// Run Wilcoxon rank-sum DE and return results as a polars DataFrame in
+/// cell-eval's `DEResults` format.
+///
+/// This is the format bridge between SCX's Wilcoxon DE and cell-eval's DE
+/// metric pipeline. The returned DataFrame can be fed directly into
+/// `cell_eval.data.DEResults` or `cell_eval.data.DEComparison`.
+///
+/// Output columns:
+///   - `target` (str): perturbation/group name
+///   - `feature` (str): gene name
+///   - `fold_change` (f64): linear fold change (2^log2FC)
+///   - `p_value` (f64): raw p-value
+///   - `fdr` (f64): BH-adjusted p-value
+///   - `log2_fold_change` (f64): log2 fold change
+///   - `abs_log2_fold_change` (f64): |log2FC|
+///
+/// Args:
+///     adata: AnnData object with X and obs[groupby]
+///     groupby: Column in adata.obs to group cells by
+///     reference: Group name to compare against (default: "rest" = 1-vs-rest)
+///     n_genes: Number of top genes to report per group (default: all genes)
+///     gene_chunk_size: Genes per chunk for streaming DE (default: None, which
+///         uses 500 internally for sparse/backed inputs)
+///     rankby_abs: Sort genes by |score| instead of signed score (default: False)
+///     tie_correct: Apply tie correction in the Wilcoxon test (default: False)
+///
+/// Example:
+///     de_df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+///     # de_df is a polars DataFrame with cell-eval columns
+#[pyfunction]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false))]
+#[allow(clippy::too_many_arguments)]
+pub fn rank_genes_groups_df(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    groupby: &str,
+    reference: &str,
+    n_genes: Option<usize>,
+    gene_chunk_size: Option<usize>,
+    rankby_abs: bool,
+    tie_correct: bool,
+) -> PyResult<PyObject> {
+    let (result, _unique_groups) = run_rank_genes_groups_inner(
+        py,
+        adata,
+        groupby,
+        reference,
+        gene_chunk_size,
+        rankby_abs,
+        tie_correct,
+    )?;
+
+    let df = de_result_to_cell_eval_dataframe(py, &result, n_genes)?;
+    Ok(df.unbind())
+}
+
 /// Pseudobulk differential expression via Rust aggregation + pydeseq2.
 ///
 /// Aggregates single-cell counts into pseudobulk samples by grouping cells

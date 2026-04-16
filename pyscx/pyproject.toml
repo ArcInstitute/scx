@@ -24,6 +24,9 @@ dev = [
     "scanpy",
     "python-dotenv",
 ]
+eval = [
+    "polars",
+]
 scvi = [
     "scvi-tools",
 ]
