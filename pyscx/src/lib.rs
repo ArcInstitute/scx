@@ -249,6 +249,10 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
         &accel_module
     )?)?;
     accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::energy_distance_details,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
         accel::eval_metrics::discrimination_score,
         &accel_module
     )?)?;
@@ -258,6 +262,18 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     accel_module.add_function(wrap_pyfunction!(
         accel::eval_metrics::clustering_agreement,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::adjusted_mutual_info,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::normalized_mutual_info,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(
+        accel::eval_metrics::adjusted_rand_index,
         &accel_module
     )?)?;
     accel_module.add_function(wrap_pyfunction!(

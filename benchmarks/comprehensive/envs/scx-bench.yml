@@ -55,3 +55,15 @@ dependencies:
     - submitit>=1.5.0
     # TileDB-SOMA-ML (separate package, not on conda-forge)
     - tiledbsoma-ml>=0.1.0
+    # cell-eval / arc-bench for the cell_eval_parity_perf benchmark.
+    #
+    # cell-eval is public — pin to the tag the parity suite was validated
+    # against. arc-bench is private; the SSH URL relies on the user's own
+    # GitHub SSH key (works inside Arc's network without embedded secrets).
+    # Override with a local clone for development:
+    #     pip install -e /path/to/local/cell-eval -e /path/to/local/arc-bench
+    - cell-eval @ git+https://github.com/arcinstitute/cell-eval.git@v0.7.0
+    - arc-bench @ git+ssh://git@github.com/arcinstitute/arc-bench.git@54563413dffb92ed8fb6e6c3647fa4fb5f07d091
+    - pdex>=0.2.0
+    - polars>=1.30.0
+    - tqdm>=4.67

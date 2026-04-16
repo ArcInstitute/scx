@@ -679,10 +679,8 @@ pub fn perturbation_metrics<'py>(
 ///     corr = pyscx.accel.energy_distance(adata_real, adata_pred)
 ///     # corr ≈ 0.85 means real and predicted perturbation effects
 ///     # have similar relative magnitudes
-#[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
-#[allow(clippy::too_many_arguments)]
-pub fn energy_distance<'py>(
+/// Shared prep + compute for energy_distance / energy_distance_details.
+fn run_energy_distance<'py>(
     py: Python<'py>,
     adata_real: &Bound<'py, PyAny>,
     adata_pred: &Bound<'py, PyAny>,
@@ -690,7 +688,7 @@ pub fn energy_distance<'py>(
     control: &str,
     metric: &str,
     embed_key: Option<&str>,
-) -> PyResult<f64> {
+) -> PyResult<scx_accel::EDistanceResult> {
     let np = py.import("numpy")?;
 
     // Parse distance metric.
@@ -738,7 +736,6 @@ pub fn energy_distance<'py>(
     }
 
     // ── Build group → index mapping ─────────────────────────────────
-    // Collect unique group names from both sides.
     let mut all_groups = std::collections::BTreeSet::new();
     for l in real_labels.iter().chain(pred_labels.iter()) {
         all_groups.insert(l.as_str());
@@ -749,7 +746,6 @@ pub fn energy_distance<'py>(
         .map(|(i, &g)| (g, i as u32))
         .collect();
 
-    // Map labels to group indices.
     let real_groups: Vec<u32> = real_labels
         .iter()
         .map(|l| group_to_idx[l.as_str()])
@@ -759,7 +755,6 @@ pub fn energy_distance<'py>(
         .map(|l| group_to_idx[l.as_str()])
         .collect();
 
-    // Identify control group index.
     let ctrl_group_idx = *group_to_idx.get(control).ok_or_else(|| {
         PyValueError::new_err(format!(
             "control '{}' not found in perturbation labels. Available: {:?}",
@@ -768,7 +763,6 @@ pub fn energy_distance<'py>(
         ))
     })?;
 
-    // Non-control perturbation names and their group indices.
     let mut pert_names = Vec::new();
     let mut pert_group_indices = Vec::new();
     for &g in &all_groups {
@@ -784,8 +778,7 @@ pub fn energy_distance<'py>(
         ));
     }
 
-    // ── Call Rust energy distance ────────────────────────────────────
-    let result = scx_accel::compute_energy_distance(
+    scx_accel::compute_energy_distance(
         &real_flat,
         &pred_flat,
         &real_groups,
@@ -796,9 +789,76 @@ pub fn energy_distance<'py>(
         n_dims,
         dist_metric,
     )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
 
+#[pyfunction]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn energy_distance<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    embed_key: Option<&str>,
+) -> PyResult<f64> {
+    let result = run_energy_distance(
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key,
+    )?;
     Ok(result.correlation)
+}
+
+/// Compute energy distance with per-perturbation details.
+///
+/// Same inputs and semantics as `energy_distance`, but returns the full
+/// per-perturbation e-distance vectors alongside the Pearson correlation.
+///
+/// Returns:
+///     dict with keys:
+///     - `"correlation"`: float — Pearson correlation of real vs pred e-distances
+///     - `"d_real"`: dict[str, float] — per-perturbation e-distance on real side
+///     - `"d_pred"`: dict[str, float] — per-perturbation e-distance on pred side
+///     - `"pert_names"`: list[str] — perturbation names in order
+///
+/// Example:
+///     out = pyscx.accel.energy_distance_details(adata_real, adata_pred)
+///     # out["correlation"] ≈ 0.85
+///     # out["d_real"]["drug_A"] == 12.34
+#[pyfunction]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn energy_distance_details<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    embed_key: Option<&str>,
+) -> PyResult<PyObject> {
+    let result = run_energy_distance(
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key,
+    )?;
+
+    let d_real = PyDict::new(py);
+    let d_pred = PyDict::new(py);
+    for (i, name) in result.pert_names.iter().enumerate() {
+        d_real.set_item(name.as_str(), result.d_real[i])?;
+        d_pred.set_item(name.as_str(), result.d_pred[i])?;
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("correlation", result.correlation)?;
+    out.set_item("d_real", d_real)?;
+    out.set_item("d_pred", d_pred)?;
+    out.set_item(
+        "pert_names",
+        pyo3::types::PyList::new(py, &result.pert_names)?,
+    )?;
+
+    Ok(out.into_any().unbind())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1355,4 +1415,93 @@ pub fn clustering_agreement<'py>(
     }
 
     Ok(best_score)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Clustering scoring functions (AMI / NMI / ARI) on raw label vectors
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Convert a Python list/array of integer labels to Vec<u32>.
+///
+/// Accepts pandas categorical codes, numpy integer arrays, or plain Python
+/// lists. Negative codes are rejected (pandas uses -1 for NA).
+fn extract_u32_labels(py: Python<'_>, labels: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    let np = py.import("numpy")?;
+    let arr = np
+        .call_method1("asarray", (labels,))?
+        .call_method1("astype", ("int64",))?;
+    let vec: Vec<i64> = arr.call_method0("tolist")?.extract()?;
+    if vec.iter().any(|&c| c < 0) {
+        return Err(PyValueError::new_err(
+            "label array contains negative values (NA codes); drop or fill them before calling",
+        ));
+    }
+    Ok(vec.iter().map(|&c| c as u32).collect())
+}
+
+/// Adjusted Mutual Information (sklearn arithmetic-mean convention).
+///
+/// Matches `sklearn.metrics.adjusted_mutual_info_score(labels_a, labels_b,
+/// average_method="arithmetic")` to within 1e-10.
+#[pyfunction]
+pub fn adjusted_mutual_info(
+    py: Python<'_>,
+    labels_a: &Bound<'_, PyAny>,
+    labels_b: &Bound<'_, PyAny>,
+) -> PyResult<f64> {
+    let a = extract_u32_labels(py, labels_a)?;
+    let b = extract_u32_labels(py, labels_b)?;
+    if a.len() != b.len() {
+        return Err(PyValueError::new_err(format!(
+            "label length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok(scx_accel::adjusted_mutual_info(&a, &b))
+}
+
+/// Normalized Mutual Information (sklearn arithmetic-mean convention).
+///
+/// Matches `sklearn.metrics.normalized_mutual_info_score(labels_a, labels_b,
+/// average_method="arithmetic")` to within 1e-10.
+#[pyfunction]
+pub fn normalized_mutual_info(
+    py: Python<'_>,
+    labels_a: &Bound<'_, PyAny>,
+    labels_b: &Bound<'_, PyAny>,
+) -> PyResult<f64> {
+    let a = extract_u32_labels(py, labels_a)?;
+    let b = extract_u32_labels(py, labels_b)?;
+    if a.len() != b.len() {
+        return Err(PyValueError::new_err(format!(
+            "label length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok(scx_accel::normalized_mutual_info(&a, &b))
+}
+
+/// Adjusted Rand Index, rescaled to [0, 1] via `(ARI + 1) / 2`.
+///
+/// This matches cell-eval's convention for the ARI clustering agreement
+/// metric. For the raw sklearn ARI (in [-0.5, 1]), use
+/// `(2 * adjusted_rand_index(a, b)) - 1`.
+#[pyfunction]
+pub fn adjusted_rand_index(
+    py: Python<'_>,
+    labels_a: &Bound<'_, PyAny>,
+    labels_b: &Bound<'_, PyAny>,
+) -> PyResult<f64> {
+    let a = extract_u32_labels(py, labels_a)?;
+    let b = extract_u32_labels(py, labels_b)?;
+    if a.len() != b.len() {
+        return Err(PyValueError::new_err(format!(
+            "label length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok(scx_accel::adjusted_rand_index_rescaled(&a, &b))
 }

@@ -50,9 +50,14 @@ class DatasetConfig:
     source: str        # e.g. "10x Genomics"
     approx_h5ad_mb: int  # Approximate uncompressed h5ad size in MB
     available: bool = True  # Whether the dataset is expected to already exist
+    synthetic: bool = False  # If True, materialized on demand by the benchmark
+    synth_params: dict[str, Any] = field(default_factory=dict)
 
     @property
     def h5ad_path(self) -> Path:
+        if self.synthetic:
+            # Synthetic datasets live under a sibling 'synthetic/' tree.
+            return DATA_DIR / "synthetic" / f"{self.name}.h5ad"
         return DATA_DIR / f"{self.name}.h5ad"
 
     @property
@@ -205,6 +210,42 @@ DATASETS: dict[str, DatasetConfig] = {
         n_obs=100_000, n_vars=61_497,
         protocol="10x (UMI)", source="CELLxGENE Census (log-normalized)",
         approx_h5ad_mb=1_600, available=True,
+    ),
+    # Synthetic perturbation datasets for cell-eval / arc-bench parity
+    # benchmarks. The perturbation obs column + gene-name matching constraint
+    # (knockdown target lookup) rules out the real census datasets; these are
+    # generated on first access by benchmarks.comprehensive.benchmarks._pert_synth.
+    "pert_synth_10k": DatasetConfig(
+        id="PS1", name="pert_synth_10k",
+        n_obs=10_000, n_vars=2_000,
+        protocol="synthetic (paired real/pred)",
+        source="_pert_synth.make_paired_adata",
+        approx_h5ad_mb=40, available=True, synthetic=True,
+        synth_params={"n_obs": 10_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
+    ),
+    "pert_synth_100k": DatasetConfig(
+        id="PS2", name="pert_synth_100k",
+        n_obs=100_000, n_vars=2_000,
+        protocol="synthetic (paired real/pred)",
+        source="_pert_synth.make_paired_adata",
+        approx_h5ad_mb=400, available=True, synthetic=True,
+        synth_params={"n_obs": 100_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
+    ),
+    "pert_synth_500k": DatasetConfig(
+        id="PS3", name="pert_synth_500k",
+        n_obs=500_000, n_vars=2_000,
+        protocol="synthetic (paired real/pred)",
+        source="_pert_synth.make_paired_adata",
+        approx_h5ad_mb=2_000, available=True, synthetic=True,
+        synth_params={"n_obs": 500_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
+    ),
+    "pert_synth_1m": DatasetConfig(
+        id="PS4", name="pert_synth_1m",
+        n_obs=1_000_000, n_vars=2_000,
+        protocol="synthetic (paired real/pred)",
+        source="_pert_synth.make_paired_adata",
+        approx_h5ad_mb=4_000, available=True, synthetic=True,
+        synth_params={"n_obs": 1_000_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
     ),
 }
 

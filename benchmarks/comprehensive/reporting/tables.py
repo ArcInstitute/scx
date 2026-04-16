@@ -621,6 +621,60 @@ def datasets_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def cell_eval_parity_perf_table() -> str:
+    """SCX vs cell-eval / arc-bench perturbation-metric performance.
+
+    One row per (dataset, operation). Columns: dataset size, operation,
+    SCX median wall, reference (cell-eval / arc-bench) median wall, speedup,
+    SCX peak RSS, reference peak RSS. Skipped ops are shown with the reason.
+    """
+    results = load_all_results(benchmark="cell_eval_parity_perf")
+    if not results:
+        return "_No cell_eval_parity_perf results found._"
+
+    lines = [
+        "| Dataset | n_obs | Operation | SCX | cell-eval | Speedup | SCX RSS | ref RSS | Notes |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---|",
+    ]
+
+    # Order datasets by ascending n_obs where possible
+    def _n_obs(r: dict[str, Any]) -> int:
+        return r.get("metadata", {}).get("n_obs", 0)
+
+    for r in sorted(results, key=_n_obs):
+        dataset = r.get("dataset", "—")
+        md = r.get("metadata", {}) or {}
+        n_obs = md.get("n_obs", 0)
+        for op in md.get("operations", []) or []:
+            name = op.get("name", "—")
+            if op.get("skipped"):
+                note = f"_skipped: {op.get('skipped_reason', '—')}_"
+                lines.append(
+                    f"| {dataset} | {n_obs:,} | {name} | — | — | — | — | — | {note} |"
+                )
+                continue
+            if "scx_error" in op or "ref_error" in op:
+                err = op.get("scx_error") or op.get("ref_error") or "unknown"
+                lines.append(
+                    f"| {dataset} | {n_obs:,} | {name} | — | — | — | — | — "
+                    f"| **err**: {err} |"
+                )
+                continue
+
+            speedup = op.get("speedup")
+            speedup_str = f"{speedup:.1f}x" if speedup is not None else "—"
+            lines.append(
+                f"| {dataset} | {n_obs:,} | {name} "
+                f"| {_fmt_time(op.get('scx_median_s'))} "
+                f"| {_fmt_time(op.get('ref_median_s'))} "
+                f"| {speedup_str} "
+                f"| {_fmt_mem(op.get('scx_peak_rss_mb'))} "
+                f"| {_fmt_mem(op.get('ref_peak_rss_mb'))} |  |"
+            )
+
+    return "\n".join(lines)
+
+
 def generate_all_tables() -> dict[str, str]:
     """Generate all summary tables, returning a dict of table_name -> markdown."""
     return {
@@ -637,4 +691,5 @@ def generate_all_tables() -> dict[str, str]:
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),
+        "cell_eval_parity_perf": cell_eval_parity_perf_table(),
     }

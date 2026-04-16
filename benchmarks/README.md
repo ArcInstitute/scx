@@ -107,6 +107,7 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 | **Parallel Scaling** (3.5) | `parallel_scaling.py`, `parallel_write_scaling.py` | Read/write throughput vs thread count (1, 2, 4, 8, 16, 32) |
 | **ML Loader** (3.6) | `ml_loader.py` | Batched iteration throughput (batches/sec, TTFB, peak RSS) |
 | **Memory** (3.7) | `memory.py` | Peak RSS during common operations |
+| **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval / arc-bench reference, on synthetic perturbation datasets at 100K–1M cells |
 
 ### Measurement Protocol
 
@@ -567,3 +568,4 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 | `benchmark_accel_pipeline.py` | Full pipeline (3 variants: SCX OOC, SCX preprocess, scanpy) |
 | `benchmark_accel_preprocessing.py` | pyscx.preprocess() vs scanpy normalize+log1p |
 | `benchmark_bpcells.R` | BPCells comparison (R) |
+| `comprehensive/benchmarks/cell_eval_parity_perf.py` | cell-eval / arc-bench parity perf (pseudobulk, perturbation metrics, energy distance, discrimination score, knockdown efficiency, clustering agreement) at synthetic 100K–1M scale |

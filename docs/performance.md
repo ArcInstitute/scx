@@ -84,6 +84,25 @@ Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):
 
 Full pipeline (PCA -> kNN -> UMAP -> Leiden -> DE) on 1M cells: **870s** (vs 3,971s — **4.6x faster**).
 
+## Perturbation Metrics (cell-eval / arc-bench parity)
+
+Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (30/30 parity tests pass within the tolerances specified in [`ARC-BENCH.md`](../ARC-BENCH.md#results)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
+
+| Operation | 10K | 100K | 500K | 1M |
+|-----------|----:|-----:|-----:|----:|
+| Pseudobulk means | 7.8x | **11.6x** | **13.8x** | **19.4x** |
+| Bulk metrics (pearson_delta + mse + mae + mse_delta + mae_delta, bundled) | 9.1x | **12.1x** | **13.6x** | **21.9x** |
+| Discrimination score (L1) | 8.1x | **12.0x** | **12.9x** | **20.1x** |
+| Energy distance | 4.0x | **14.4x** | skipped¹ | skipped¹ |
+| Clustering agreement (AMI) | 4.9x | **7.6x** | **24.6x** | **10.0x** |
+| Knockdown efficiency + log deviation | 0.6x | 0.9x | **1.3x** | 0.7x |
+
+¹ `energy_distance` is skipped at ≥500K because the reference's `sklearn.metrics.pairwise_distances` path allocates an O(N²) distance matrix per perturbation and runs ~18 s/pert × 49 perts at 100K already (941 s/run observed); larger sizes would take hours for the reference alone. SCX's fused-e-distance Rust kernel remains feasible but has no comparable baseline.
+
+Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of arc-bench's tight NumPy column-access loop and is not currently a speedup target. `clustering_agreement` depends on stochastic Leiden across 7 resolution sweeps, so its wall-time ratio varies (10x–25x range).
+
+Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/comprehensive/results/raw/cell_eval_parity_perf__scx_auto__pert_synth_*.json` and rendered in the "Cell-eval / arc-bench Parity Performance" section of the comprehensive benchmark report.
+
 ## GPU Acceleration (NVIDIA H100)
 
 ### Codec Decode and Training Pipeline
