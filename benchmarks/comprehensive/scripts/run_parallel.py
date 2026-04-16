@@ -154,17 +154,24 @@ def _slurm_params(args, is_conversion: bool = False) -> dict:
     # project .venv/.  SLURM jobs need the same Python that has pyscx installed.
     import os
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
+
+    # Clear inherited SLURM env vars that conflict with submitit's srun call
+    # (e.g. SLURM_CPUS_PER_TASK from a parent interactive job).
+    env_cleanup = "unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK 2>/dev/null || true"
+
     if "scx-bench" in conda_prefix:
         conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
         if not conda_base:
             conda_base = str(Path.home() / "miniforge3")
         env_name = os.path.basename(conda_prefix)
         setup_cmds = [
+            env_cleanup,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
     else:
         setup_cmds = [
+            env_cleanup,
             f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
         ]
 
