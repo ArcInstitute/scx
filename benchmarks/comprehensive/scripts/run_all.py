@@ -80,6 +80,7 @@ AVAILABLE_BENCHMARKS = [
     "streaming_preproc",   # §3.12 — Streaming preprocessing pipeline
     "lazy_preproc",        # §3.13 — Lazy preprocessing & column-projected agg
     "correctness",         # §3.14 — Correctness validation suite
+    "cell_eval_parity_perf",  # §3.15 — cell-eval / arc-bench parity perf
 ]
 
 # Benchmarks appropriate for smoke testing
@@ -92,10 +93,15 @@ SMOKE_DATASETS = ["pbmc3k"]
 # ---------------------------------------------------------------------------
 
 def discover_available_datasets() -> list[str]:
-    """Return names of datasets whose h5ad files exist on disk."""
+    """Return names of datasets that are ready to benchmark.
+
+    Non-synthetic datasets must have their h5ad file present on disk.
+    Synthetic datasets are always considered available — they're generated
+    on demand by the benchmark module that uses them.
+    """
     available = []
     for name, cfg in DATASETS.items():
-        if cfg.h5ad_path.exists():
+        if cfg.synthetic or cfg.h5ad_path.exists():
             available.append(name)
     return available
 
@@ -130,7 +136,10 @@ def run_benchmark(
         print(f"  SKIP: Unknown dataset '{dataset_name}'")
         return []
 
-    if not cfg.h5ad_path.exists():
+    # Synthetic datasets are materialized on demand by the benchmark module
+    # (see benchmarks/comprehensive/benchmarks/_pert_synth.py) — skip the
+    # existence gate so the benchmark gets a chance to generate the data.
+    if not cfg.synthetic and not cfg.h5ad_path.exists():
         print(f"  SKIP: {dataset_name} h5ad not found at {cfg.h5ad_path}")
         return []
 

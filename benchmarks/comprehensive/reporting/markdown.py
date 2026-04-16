@@ -21,6 +21,7 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import REPORTS_DIR, FIGURES_DIR, RAW_RESULTS_DIR
 from benchmarks.comprehensive.reporting.tables import (
+    cell_eval_parity_perf_table,
     compression_table,
     compression_ratio_table,
     datasets_table,
@@ -498,6 +499,28 @@ the projected gene columns.
 All Leiden ARI values exceed the >= 0.80 threshold, confirming that SCX and
 scanpy pipelines produce comparable biological results despite algorithmic
 differences in kNN (HNSW vs PyNNDescent) and UMAP (Rust SGD vs C++).
+""")
+
+    # -----------------------------------------------------------------------
+    # 13b. Cell-eval / arc-bench parity performance
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 13b. Cell-eval / arc-bench Parity Performance
+
+Wall-clock and peak-RSS comparison of SCX-accelerated perturbation metrics
+(``pyscx.accel.*``) against the Python reference implementations in
+``cell-eval`` and ``arc-bench`` on synthetic perturbation datasets. These
+numbers complement the parity correctness suite at
+``pyscx/tests/test_cell_eval_parity.py`` (30 tests, all passing) and the
+small-scale 10K-cell snapshot recorded in ``ARC-BENCH.md``.
+
+Operations with cost superlinear in ``n_obs`` (``energy_distance`` at O(N²),
+``clustering_agreement`` at very large scale) are skipped automatically at
+the sizes where they become infeasible — see the Notes column.
+
+{cell_eval_parity_perf_table()}
 """)
 
     # -----------------------------------------------------------------------

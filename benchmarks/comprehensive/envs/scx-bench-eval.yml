@@ -1,0 +1,48 @@
+# SCX Benchmark Suite — cell-eval / arc-bench Parity Validation
+#
+# Create:   conda env create -f benchmarks/comprehensive/envs/scx-bench-eval.yml
+# Activate: conda activate scx-bench-eval
+# Build pyscx: cd pyscx && maturin develop --release && cd ..
+#
+# NOTE: pyscx is built from source inside the env; it is not a conda package.
+
+name: scx-bench-eval
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.13
+
+  # Core single-cell stack (matches scx-bench)
+  - anndata>=0.12.7
+  - scanpy>=1.12
+  - scipy>=1.16
+  - numpy>=2.2
+  - pandas>=2.3
+  - h5py>=3.16
+
+  # Analysis (needed by cell-eval and clustering agreement tests)
+  - scikit-learn>=1.8
+  - python-igraph>=1.0
+  - leidenalg>=0.11
+
+  # Data handling
+  - pyarrow>=18.0
+
+  # Build tooling (pyscx from source)
+  - maturin>=1.5.0
+
+  # System monitoring
+  - psutil>=7.0
+
+  # pip-only packages
+  - pip:
+    # cell-eval and arc-bench (editable from local repos)
+    - -e /home/nickyoungblut/dev/python/cell-eval
+    - -e /home/nickyoungblut/dev/python/arc-bench
+    # cell-eval's transitive deps
+    - pdex>=0.2.0
+    - polars>=1.30.0
+    - tqdm>=4.67

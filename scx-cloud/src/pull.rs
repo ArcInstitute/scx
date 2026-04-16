@@ -551,10 +551,8 @@ pub async fn pull_filtered(
     for entry in &original_catalog.entries {
         match entry.section_type {
             SectionType::ObsMetadata => continue, // already downloaded
-            SectionType::CsrShard => {
-                if shard_name_set.contains(&entry.name) {
-                    entries_to_download.push(entry);
-                }
+            SectionType::CsrShard if shard_name_set.contains(&entry.name) => {
+                entries_to_download.push(entry);
             }
             SectionType::VarMetadata | SectionType::VarIndex | SectionType::UnsBlob => {
                 entries_to_download.push(entry);

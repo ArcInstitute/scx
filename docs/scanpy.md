@@ -1037,6 +1037,174 @@ not collide with `groupby` or `test_col`.
 > `pydeseq2` is an **optional** runtime dependency. Install with
 > `pip install pydeseq2` before calling `pseudobulk_dex()`.
 
+### Perturbation evaluation metrics (cell-eval / arc-bench parity)
+
+SCX ships Rust-accelerated equivalents of the metrics in
+[`cell-eval`](https://github.com/arcinstitute/cell-eval) and
+[`arc-bench`](https://github.com/arcinstitute/arc-bench). The outputs are
+numerically equivalent to the Python references within the tolerances in
+[`ARC-BENCH.md`](../ARC-BENCH.md) (30/30 parity tests pass), so an existing
+cell-eval pipeline can swap in `pyscx.accel.*` for 10–20× wall-clock speedup
+at census-scale perturbation datasets (see
+[`docs/performance.md`](performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
+for numbers at 10K / 100K / 500K / 1M cells).
+
+All functions accept in-memory, backed, or lazy-transformed inputs. They
+expect the `cell-eval` data conventions: an `obs` column with
+perturbation labels, a designated control label, and — for the knockdown
+and discrimination metrics — perturbation names that match gene names in
+`var_names` so the target gene can be looked up.
+
+#### Pseudobulk means (`pyscx.accel.pseudobulk_means`)
+
+Group-by mean on sparse `X`. Foundation for the pairwise metrics below.
+
+```python
+means, groups = pyscx.accel.pseudobulk_means(adata, "perturbation")
+# means.shape == (n_perturbations, n_genes), dtype float64
+# groups == ["control", "drug_A", "drug_B", ...]  (sorted)
+```
+
+Streams directly from CSR shards with no full-matrix materialization. On
+backed data, processes shard-by-shard; on lazy-transformed data, applies
+the transform stack before aggregation.
+
+#### Bulk perturbation metrics (`pyscx.accel.perturbation_metrics`)
+
+Pearson of the perturbation→control delta plus MSE/MAE — the five metrics
+`cell-eval` computes on pseudobulked pairs, bundled into a single pass:
+
+```python
+results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+# {
+#   "pearson_delta": {"drug_A": 0.95, ...},
+#   "mse":          {"drug_A": 0.12, ...},
+#   "mae":          {"drug_A": 0.08, ...},
+#   "mse_delta":    {...},
+#   "mae_delta":    {...},
+# }
+
+# Pick a subset:
+results = pyscx.accel.perturbation_metrics(
+    adata_real, adata_pred, metrics=["pearson_delta", "mse"],
+)
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pert_col` | `"perturbation"` | `obs` column containing perturbation labels |
+| `control` | `"control"` | Control label |
+| `metrics` | all 5 | Subset of `{pearson_delta, mse, mae, mse_delta, mae_delta}` |
+| `min_cells_per_group` | 1 | Skip perturbations with fewer cells |
+
+#### Discrimination score (`pyscx.accel.discrimination_score`)
+
+For each perturbation, ranks how well the predicted effect matches the
+correct real effect among all perturbations by pairwise distance. Returns
+a normalized rank in `[0, 1]` where 1 = correct perturbation is the closest
+match, 0 = furthest.
+
+```python
+scores = pyscx.accel.discrimination_score(
+    adata_real, adata_pred, metric="l1",  # "l1" | "l2" | "cosine"
+)
+# scores["drug_A"] == 0.96
+```
+
+With `exclude_target_gene=True` (default), the gene matching each
+perturbation's name is dropped from the distance — prevents trivially high
+scores from knockdown-gene dominance and matches cell-eval's default.
+
+#### Energy distance (`pyscx.accel.energy_distance`)
+
+Per-perturbation e-distance between perturbation cells and control cells on
+both real and predicted sides, returning the Pearson correlation of the
+two e-distance vectors.
+
+```python
+corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+
+# For per-perturbation details (individual e_real / e_pred values):
+details = pyscx.accel.energy_distance_details(adata_real, adata_pred)
+# {
+#   "correlation": 0.85,
+#   "d_real": {"drug_A": 12.34, ...},
+#   "d_pred": {"drug_A": 11.82, ...},
+#   "pert_names": [...],
+# }
+```
+
+SCX's implementation avoids materializing the `[N, N]` distance matrix per
+perturbation (streaming accumulation), precomputes control self-distance
+once, and parallelizes across perturbations with rayon. At 100K cells it's
+~14× faster than cell-eval's `sklearn.metrics.pairwise_distances` path;
+above ~500K the reference becomes infeasible while SCX remains usable.
+
+#### Knockdown efficiency (`pyscx.accel.knockdown_efficiency`)
+
+Per-cell CRISPR knockdown efficiency and log-fold change against a
+control baseline. Writes two columns to `adata.obs`:
+
+```python
+import scanpy as sc
+adata = pyscx.open("perturb_seq.scx").to_anndata(backed=True)
+sc.pp.normalize_total(adata)          # input must be normalized, not log1p'd
+
+pyscx.accel.knockdown_efficiency(
+    adata, pert_col="perturbation", control="control",
+)
+# adata.obs["KnockDownEfficiency"]  — 1 - x_target / (mu_control[target] + eps)
+# adata.obs["KnockDownGeneFC"]      — x_log[target] - log1p(mu_control[target])
+```
+
+Input is expected on the normalized (linear) scale; the log-deviation pass
+applies `log1p` internally. Control cells and cells whose perturbation name
+isn't in `var_names` get `NaN` in both columns — matching `arc-bench`.
+
+#### Clustering agreement (`pyscx.accel.clustering_agreement`)
+
+Builds perturbation-centroid matrices (pseudobulks excluding control), runs
+kNN + Leiden at multiple resolutions, and scores the real-vs-predicted
+cluster assignments via AMI / NMI / ARI. Matches
+`cell_eval.metrics._anndata.ClusteringAgreement`.
+
+```python
+score = pyscx.accel.clustering_agreement(
+    adata_real, adata_pred,
+    pert_col="perturbation", control="control",
+    metric="ami",                    # "ami" | "nmi" | "ari" (ARI rescaled to [0,1])
+    pred_resolutions=(0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
+    n_neighbors=15,
+)
+```
+
+The underlying scoring functions are also exposed for direct use on label
+vectors (equivalent to `sklearn.metrics.*` within 1e-10, ARI uses
+cell-eval's `(ARI+1)/2` rescaling):
+
+```python
+ami = pyscx.accel.adjusted_mutual_info(labels_a, labels_b)
+nmi = pyscx.accel.normalized_mutual_info(labels_a, labels_b)
+ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)  # rescaled
+```
+
+#### DE result format bridge (`pyscx.accel.rank_genes_groups_df`)
+
+Same computation as `rank_genes_groups()` but returns a **polars DataFrame**
+in cell-eval's `DEResults` schema — ready to feed into
+`cell_eval.initialize_de_comparison()` and `MetricPipeline(profile="de")`:
+
+```python
+df = pyscx.accel.rank_genes_groups_df(
+    adata, "perturbation", reference="control",
+)
+# Columns: target, feature, fold_change, p_value, fdr,
+#          log2_fold_change, abs_log2_fold_change
+```
+
+Useful when you want SCX's faster Wilcoxon but cell-eval's DE metrics
+downstream (overlap@N, precision@N, pr_auc, etc.).
+
 
 The accelerators write to the same AnnData slots as scanpy, so they are
 fully interchangeable. You can mix and match:
