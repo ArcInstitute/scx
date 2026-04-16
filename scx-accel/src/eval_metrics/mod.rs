@@ -14,11 +14,14 @@
 //!   with streaming mean computation (no N×N allocation).
 //! - [`edistance`] — Energy distance metric: per-perturbation e-distances
 //!   with Pearson correlation between real and predicted.
+//! - [`knockdown`] — Per-cell knockdown efficiency and log fold change from
+//!   arc-bench, with efficient CSR single-column extraction.
 
 pub mod bulk_metrics;
 pub mod discrimination;
 pub mod distances;
 pub mod edistance;
+pub mod knockdown;
 
 /// Distance metric for pairwise computations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,3 +37,6 @@ pub enum DistanceMetric {
 pub use bulk_metrics::{compute_bulk_metrics, BulkMetric, BulkMetricsResult};
 pub use discrimination::{compute_discrimination_score, DiscriminationResult};
 pub use edistance::{compute_energy_distance, fused_edistance, EDistanceResult};
+pub use knockdown::{
+    compute_control_baseline, compute_knockdown_efficiency, compute_log_deviation,
+};

@@ -1173,3 +1173,319 @@ class TestPerturbationMetricsNaN:
 
         with pytest.raises(ValueError, match="NaN"):
             pyscx.accel.perturbation_metrics(adata_nan, adata)
+
+
+class TestKnockdownEfficiency:
+    """Test pyscx.accel.knockdown_efficiency().
+
+    Reference implementation mirrors arc-bench's compute_knockdown_efficiency()
+    and compute_log_deviation() from normalize_transform/core.py.
+    """
+
+    def _make_adata(self, n_obs=200, n_vars=20, n_perts=5, seed=42):
+        """Create AnnData with perturbation names matching gene names.
+
+        - Gene names: gene_0 .. gene_{n_vars-1}
+        - Perturbation names: "control" + "gene_0" .. "gene_{n_perts-2}"
+        - Raw count-like data (positive integers)
+        """
+        rng = np.random.default_rng(seed)
+
+        # Gene names
+        gene_names = [f"gene_{j}" for j in range(n_vars)]
+
+        # Perturbation names: control + first (n_perts-1) gene names
+        pert_names = ["control"] + [f"gene_{i}" for i in range(n_perts - 1)]
+
+        # Assign cells to perturbations evenly
+        cells_per_pert = n_obs // n_perts
+        labels = []
+        for name in pert_names:
+            labels.extend([name] * cells_per_pert)
+        while len(labels) < n_obs:
+            labels.append("control")
+
+        import pandas as pd
+
+        # Create sparse count matrix with known structure
+        # Control cells have moderate expression across all genes
+        # Perturbation cells have reduced expression of their target gene
+        X = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            # Base expression: random positive counts
+            X[i] = rng.poisson(5, size=n_vars).astype(np.float32)
+            # Perturbation cells: knockdown target gene
+            if label != "control" and label in gene_names:
+                gene_idx = gene_names.index(label)
+                # Reduce target gene expression (partial knockdown)
+                X[i, gene_idx] = rng.poisson(1)
+
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=gene_names)
+        adata = ad.AnnData(X=sp.csr_matrix(X), obs=obs, var=var)
+        return adata, pert_names, gene_names
+
+    @staticmethod
+    def _reference_knockdown_efficiency(adata, pert_col="perturbation",
+                                         control="control", eps=1e-8):
+        """Reference implementation matching arc-bench's algorithm."""
+        X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
+        gene_names = list(adata.var_names)
+        gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+
+        # Control baseline (mean of control cells) — use f64 to match Rust's
+        # intentional f64 accumulation for precision over many control cells.
+        labels = adata.obs[pert_col].values
+        control_mask = labels == control
+        baseline = X[control_mask].mean(axis=0).astype(np.float64)
+
+        # Knockdown efficiency (on raw normalized data)
+        n_cells = adata.n_obs
+        efficiency = np.full(n_cells, np.nan, dtype=np.float32)
+        for target_gene in np.unique(labels):
+            if target_gene == control or target_gene not in gene_to_idx:
+                continue
+            gene_idx = gene_to_idx[target_gene]
+            pert_mask = labels == target_gene
+            expr = X[pert_mask, gene_idx]
+            mu_control = baseline[gene_idx]
+            efficiency[pert_mask] = 1.0 - (expr / (mu_control + eps))
+
+        # Log deviation (on log1p-transformed data)
+        baseline_log = np.log1p(baseline)
+        X_log = np.log1p(X)
+        log_fc = np.full(n_cells, np.nan, dtype=np.float32)
+        for target_gene in np.unique(labels):
+            if target_gene == control or target_gene not in gene_to_idx:
+                continue
+            gene_idx = gene_to_idx[target_gene]
+            pert_mask = labels == target_gene
+            expr_log = X_log[pert_mask, gene_idx]
+            log_fc[pert_mask] = expr_log - baseline_log[gene_idx]
+
+        return efficiency, log_fc
+
+    def test_basic_knockdown(self):
+        """Verify knockdown_efficiency runs and writes adata.obs columns."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        pyscx.accel.knockdown_efficiency(adata)
+
+        assert "KnockDownEfficiency" in adata.obs.columns
+        assert "KnockDownGeneFC" in adata.obs.columns
+        assert len(adata.obs["KnockDownEfficiency"]) == adata.n_obs
+        assert len(adata.obs["KnockDownGeneFC"]) == adata.n_obs
+
+    def test_against_reference(self):
+        """Verify knockdown metrics match arc-bench reference implementation."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+
+        # Run reference first (before pyscx modifies adata.obs)
+        ref_eff, ref_fc = self._reference_knockdown_efficiency(adata)
+
+        # Run Rust implementation
+        pyscx.accel.knockdown_efficiency(adata)
+        rust_eff = adata.obs["KnockDownEfficiency"].values
+        rust_fc = adata.obs["KnockDownGeneFC"].values
+
+        # Check efficiency
+        # NaN positions should match
+        nan_mask_ref = np.isnan(ref_eff)
+        nan_mask_rust = np.isnan(rust_eff)
+        np.testing.assert_array_equal(
+            nan_mask_ref, nan_mask_rust,
+            err_msg="NaN positions differ in efficiency"
+        )
+        # Non-NaN values should match
+        valid = ~nan_mask_ref
+        np.testing.assert_allclose(
+            rust_eff[valid], ref_eff[valid], atol=1e-5,
+            err_msg="Knockdown efficiency values differ"
+        )
+
+        # Check log FC
+        nan_mask_ref_fc = np.isnan(ref_fc)
+        nan_mask_rust_fc = np.isnan(rust_fc)
+        np.testing.assert_array_equal(
+            nan_mask_ref_fc, nan_mask_rust_fc,
+            err_msg="NaN positions differ in log FC"
+        )
+        valid_fc = ~nan_mask_ref_fc
+        np.testing.assert_allclose(
+            rust_fc[valid_fc], ref_fc[valid_fc], atol=1e-5,
+            err_msg="Log FC values differ"
+        )
+
+    def test_control_cells_are_nan(self):
+        """Control cells should have NaN in both columns."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        pyscx.accel.knockdown_efficiency(adata)
+
+        control_mask = adata.obs["perturbation"].values == "control"
+        assert np.all(np.isnan(adata.obs["KnockDownEfficiency"].values[control_mask]))
+        assert np.all(np.isnan(adata.obs["KnockDownGeneFC"].values[control_mask]))
+
+    def test_missing_gene(self):
+        """Perturbation name not in var_names → NaN for those cells."""
+        import pyscx
+        import pandas as pd
+
+        rng = np.random.default_rng(42)
+        X = sp.random(30, 10, density=0.3, format="csr", random_state=rng).astype(np.float32)
+        gene_names = [f"gene_{i}" for i in range(10)]
+        labels = ["control"] * 10 + ["unknown_pert"] * 10 + ["gene_0"] * 10
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=gene_names)
+        adata = ad.AnnData(X=X, obs=obs, var=var)
+
+        pyscx.accel.knockdown_efficiency(adata)
+
+        eff = adata.obs["KnockDownEfficiency"].values
+        # "unknown_pert" doesn't match any gene → NaN
+        assert np.all(np.isnan(eff[10:20]))
+        # "gene_0" matches gene_0 → should have valid values
+        assert not np.any(np.isnan(eff[20:30]))
+
+    def test_dense_input(self):
+        """Test with dense numpy X instead of sparse."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        adata.X = adata.X.toarray()
+
+        ref_eff, ref_fc = self._reference_knockdown_efficiency(adata)
+        pyscx.accel.knockdown_efficiency(adata)
+
+        valid_eff = ~np.isnan(ref_eff)
+        np.testing.assert_allclose(
+            adata.obs["KnockDownEfficiency"].values[valid_eff],
+            ref_eff[valid_eff], atol=1e-5
+        )
+
+        valid_fc = ~np.isnan(ref_fc)
+        np.testing.assert_allclose(
+            adata.obs["KnockDownGeneFC"].values[valid_fc],
+            ref_fc[valid_fc], atol=1e-5
+        )
+
+    def test_backed_scx_input(self, tmp_path):
+        """Test with backed SCX input."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+
+        # Get reference from in-memory
+        ref_eff, ref_fc = self._reference_knockdown_efficiency(adata)
+
+        # Write to SCX and read backed
+        scx_path = str(tmp_path / "test.scx")
+        pyscx.from_anndata(adata, scx_path)
+        exp = pyscx.open(scx_path)
+        adata_backed = exp.to_anndata(backed=True)
+
+        pyscx.accel.knockdown_efficiency(adata_backed)
+
+        rust_eff = adata_backed.obs["KnockDownEfficiency"].values
+
+        # NaN positions should match
+        nan_eff = np.isnan(ref_eff)
+        np.testing.assert_array_equal(np.isnan(rust_eff), nan_eff)
+
+        # Values should be close (SCX codec may cause small differences)
+        valid = ~nan_eff
+        np.testing.assert_allclose(
+            rust_eff[valid], ref_eff[valid], atol=1e-3,
+            err_msg="Backed efficiency values differ"
+        )
+
+    def test_custom_pert_col_and_control(self):
+        """Test with non-default column names."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        adata.obs = adata.obs.rename(columns={"perturbation": "condition"})
+        adata.obs["condition"] = adata.obs["condition"].replace({"control": "vehicle"})
+
+        pyscx.accel.knockdown_efficiency(
+            adata, pert_col="condition", control="vehicle"
+        )
+
+        assert "KnockDownEfficiency" in adata.obs.columns
+        # Vehicle (control) cells should be NaN
+        vehicle_mask = adata.obs["condition"].values == "vehicle"
+        assert np.all(np.isnan(adata.obs["KnockDownEfficiency"].values[vehicle_mask]))
+
+    def test_custom_eps(self):
+        """Test with custom eps value."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        pyscx.accel.knockdown_efficiency(adata, eps=1.0)
+
+        # Should still produce valid results
+        assert "KnockDownEfficiency" in adata.obs.columns
+
+    def test_missing_pert_col(self):
+        """Non-existent perturbation column should raise ValueError."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        with pytest.raises(ValueError, match="not found"):
+            pyscx.accel.knockdown_efficiency(adata, pert_col="nonexistent")
+
+    def test_missing_control(self):
+        """Non-existent control label should raise RuntimeError."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        with pytest.raises(RuntimeError, match="no cells found"):
+            pyscx.accel.knockdown_efficiency(adata, control="nonexistent_control")
+
+    def test_nan_labels_raise(self):
+        """NaN perturbation labels should raise ValueError."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        adata.obs.iloc[0, 0] = np.nan
+
+        with pytest.raises(ValueError, match="NaN"):
+            pyscx.accel.knockdown_efficiency(adata)
+
+    def test_all_genes_matched(self):
+        """When all perturbations match genes, no cell should be NaN (except control)."""
+        import pyscx
+
+        adata, pert_names, gene_names = self._make_adata()
+        pyscx.accel.knockdown_efficiency(adata)
+
+        eff = adata.obs["KnockDownEfficiency"].values
+        labels = adata.obs["perturbation"].values
+
+        for p in pert_names:
+            if p == "control":
+                mask = labels == p
+                assert np.all(np.isnan(eff[mask])), "control cells should be NaN"
+            elif p in gene_names:
+                mask = labels == p
+                assert not np.any(np.isnan(eff[mask])), f"{p} cells should not be NaN"
+
+    def test_knockdown_values_range(self):
+        """KD efficiency should typically be in (-inf, 1] for knockdown genes."""
+        import pyscx
+
+        adata, _, _ = self._make_adata()
+        pyscx.accel.knockdown_efficiency(adata)
+
+        eff = adata.obs["KnockDownEfficiency"].values
+        valid = ~np.isnan(eff)
+        # Knockdown → target expression is lower → KD should be positive
+        # Perfect knockdown (x=0) → KD = 1.0
+        # No knockdown (x=baseline) → KD ≈ 0
+        # Upregulation (x>baseline) → KD < 0
+        assert np.all(np.isfinite(eff[valid])), "All non-NaN values should be finite"
+

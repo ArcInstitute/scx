@@ -4097,6 +4097,96 @@ fn astype_no_copy<'py>(
     arr.call_method("astype", (dtype,), Some(&kwargs))
 }
 
+/// Holds borrowed CSR array slices extracted from a scipy CSR matrix.
+///
+/// The `PyReadonlyArray1` borrows keep the underlying numpy arrays alive
+/// for the lifetime `'py`.
+struct CsrSlices<'py> {
+    _indptr: numpy::PyReadonlyArray1<'py, i64>,
+    _indices: numpy::PyReadonlyArray1<'py, i32>,
+    _data: numpy::PyReadonlyArray1<'py, f32>,
+}
+
+impl<'py> CsrSlices<'py> {
+    fn indptr(&self) -> &[i64] {
+        // SAFETY: the readonly array is guaranteed contiguous by the
+        // as_slice() check in extract_csr_slices.
+        self._indptr.as_slice().unwrap()
+    }
+    fn indices(&self) -> &[i32] {
+        self._indices.as_slice().unwrap()
+    }
+    fn data(&self) -> &[f32] {
+        self._data.as_slice().unwrap()
+    }
+}
+
+/// Extract CSR indptr/indices/data as borrowed Rust slices from a scipy
+/// CSR matrix object.
+///
+/// This consolidates the repeated `getattr → asarray → astype_no_copy →
+/// PyReadonlyArray1 → as_slice` pattern used by multiple bindings.
+/// Emits a Python `warnings.warn()` if the CSR `nnz` exceeds `warn_nnz`
+/// (set to 0 to suppress the warning).
+fn extract_csr_slices<'py>(
+    py: Python<'py>,
+    np: &Bound<'py, PyModule>,
+    csr: &Bound<'py, PyAny>,
+    warn_label: &str,
+    warn_nnz: usize,
+) -> PyResult<CsrSlices<'py>> {
+    // Optional large-data warning based on nnz.
+    if warn_nnz > 0 {
+        let nnz: usize = csr.getattr("nnz")?.extract()?;
+        // Each nonzero costs 4 bytes (data) + 4 bytes (index) = 8 bytes.
+        // indptr is small relative to nnz for large matrices.
+        let estimated_bytes = nnz * 8;
+        if estimated_bytes > 2_000_000_000 {
+            let gb = estimated_bytes as f64 / 1e9;
+            let shape: (usize, usize) = csr.getattr("shape")?.extract()?;
+            let warnings = py.import("warnings")?;
+            warnings.call_method1(
+                "warn",
+                (format!(
+                    "{warn_label}: materializing a {:.1} GB CSR matrix ({} × {}, nnz={nnz}). \
+                     Consider subsetting the data for better performance.",
+                    gb, shape.0, shape.1
+                ),),
+            )?;
+        }
+    }
+
+    let indptr_obj = csr.getattr("indptr")?;
+    let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
+    let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
+    let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
+    indptr_ro
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(format!("indptr not contiguous: {e}")))?;
+
+    let indices_obj = csr.getattr("indices")?;
+    let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
+    let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
+    let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
+    indices_ro
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(format!("indices not contiguous: {e}")))?;
+
+    let data_obj = csr.getattr("data")?;
+    let data_arr = np.call_method1("asarray", (&data_obj,))?;
+    let data_arr = astype_no_copy(py, &data_arr, "float32")?;
+    let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
+    data_ro
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(format!("data not contiguous: {e}")))?;
+
+    Ok(CsrSlices {
+        _indptr: indptr_ro,
+        _indices: indices_ro,
+        _data: data_ro,
+    })
+}
+
 /// Compute pseudobulk means (group-by mean on sparse X).
 ///
 /// Aggregates single-cell expression into per-group means, returning the
@@ -5025,4 +5115,171 @@ fn extract_obs_column<'py>(
         .call_method0("tolist")?
         .extract()?;
     Ok(labels)
+}
+
+/// Compute per-cell knockdown efficiency and log deviation.
+///
+/// For each perturbed cell, this function measures how effectively the
+/// perturbation knocked down its target gene. Perturbation names must match
+/// gene names (var_names) for the lookup to work.
+///
+/// **Knockdown efficiency** (computed on normalized, NOT log-transformed data):
+///     KD = 1 - x_target / (μ_control[target_gene] + eps)
+///
+/// **Log fold change** (computed on log1p-transformed data):
+///     FC = x_log[target_gene] - log1p(μ_control[target_gene])
+///
+/// Control cells and cells whose perturbation name doesn't match any gene
+/// will have NaN in both output columns.
+///
+/// This function operates in two passes matching arc-bench's pipeline order:
+/// 1. Compute KD on raw normalized data (before log1p)
+/// 2. Apply log1p, then compute log deviation
+///
+/// For data already in log-space (e.g., adata already log1p-transformed),
+/// only the log deviation is meaningful. The efficiency column will still be
+/// computed but may not be physically meaningful on log-space values.
+///
+/// Args:
+///     adata: AnnData object with sparse or dense X matrix.
+///         Must have obs[pert_col] with perturbation labels where perturbation
+///         names match gene names (var_names).
+///     pert_col: Column name in adata.obs for perturbation labels (default: "perturbation")
+///     control: Label for control perturbation (default: "control")
+///     eps: Small value for numerical stability (default: 1e-8)
+///
+/// Returns:
+///     None — writes two columns to adata.obs:
+///     - "KnockDownEfficiency": per-cell knockdown efficiency (float32)
+///     - "KnockDownGeneFC": per-cell log fold change (float32)
+///
+/// Example:
+///     pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation")
+///     adata.obs["KnockDownEfficiency"]  # per-cell KD scores
+///     adata.obs["KnockDownGeneFC"]      # per-cell log FC
+#[pyfunction]
+#[pyo3(signature = (adata, pert_col="perturbation", control="control", eps=1e-8))]
+pub fn knockdown_efficiency<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    eps: f64,
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+
+    // ── Extract perturbation labels ─────────────────────────────────
+    let pert_labels = extract_obs_column(py, adata, pert_col)?;
+    let n_obs = pert_labels.len();
+
+    // ── Extract gene names ──────────────────────────────────────────
+    let var = adata.getattr("var")?;
+    let var_names = var.getattr("index")?;
+    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+    let n_vars = gene_names.len();
+
+    // ── Extract CSR data from adata.X ───────────────────────────────
+    let x = adata.getattr("X")?;
+    let scipy_sparse = py.import("scipy.sparse")?;
+
+    // Get CSR matrix — handle backed, lazy-transformed, sparse, and dense inputs.
+    // TODO: For backed SCX, consider streaming single-column extraction per shard
+    // instead of materializing the full matrix — the knockdown metric only needs
+    // one gene column per perturbation, making full materialization wasteful at scale.
+    let csr_obj = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        // Backed SCX: materialize to scipy CSR for column access
+        drop(backed);
+        let arr = x.call_method0("toarray")?;
+        scipy_sparse.call_method1("csr_matrix", (&arr,))?
+    } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        // Lazy-transformed: materialize through transforms
+        let scipy_csr = lazy.to_memory_py(py)?;
+        drop(lazy);
+        scipy_csr
+    } else {
+        let is_sparse: bool = scipy_sparse.call_method1("issparse", (&x,))?.extract()?;
+        if is_sparse {
+            scipy_sparse.call_method1("csr_matrix", (&x,))?
+        } else {
+            let arr = np
+                .call_method1("asarray", (&x,))?
+                .call_method1("astype", ("float32",))?;
+            scipy_sparse.call_method1("csr_matrix", (&arr,))?
+        }
+    };
+
+    let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
+    if shape.0 != n_obs {
+        return Err(PyValueError::new_err(format!(
+            "X has {} rows but obs has {} rows",
+            shape.0, n_obs
+        )));
+    }
+    if shape.1 != n_vars {
+        return Err(PyValueError::new_err(format!(
+            "X has {} columns but var has {} genes",
+            shape.1, n_vars
+        )));
+    }
+
+    // ── Extract CSR arrays as zero-copy slices ──────────────────────
+    let slices = extract_csr_slices(py, &np, &csr_obj, "knockdown_efficiency", 1)?;
+
+    // ── Compute control baseline ────────────────────────────────────
+    let baseline = scx_accel::compute_control_baseline(
+        slices.indptr(),
+        slices.indices(),
+        slices.data(),
+        &pert_labels,
+        control,
+        n_vars,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // ── Compute knockdown efficiency (on current data) ──────────────
+    let efficiency = scx_accel::compute_knockdown_efficiency(
+        slices.indptr(),
+        slices.indices(),
+        slices.data(),
+        &pert_labels,
+        control,
+        &gene_names,
+        &baseline,
+        eps,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // ── Compute log deviation ───────────────────────────────────────
+    // Arc-bench computes log deviation AFTER log1p on the data.
+    // We apply log1p to the data values (on a copy) and log1p to baseline.
+    let baseline_log: Vec<f64> = baseline.iter().map(|&v| v.ln_1p()).collect();
+
+    // Apply log1p to the CSR data values for the log deviation pass.
+    // f32 → f64 → ln_1p → f32: intentional double promotion for accuracy.
+    let data_log: Vec<f32> = slices
+        .data()
+        .iter()
+        .map(|&v| (v as f64).ln_1p() as f32)
+        .collect();
+
+    let log_fc = scx_accel::compute_log_deviation(
+        slices.indptr(),
+        slices.indices(),
+        &data_log,
+        &pert_labels,
+        control,
+        &gene_names,
+        &baseline_log,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // ── Write results to adata.obs ──────────────────────────────────
+    let obs = adata.getattr("obs")?;
+    let eff_array = numpy::PyArray::from_vec(py, efficiency);
+    obs.set_item("KnockDownEfficiency", eff_array)?;
+
+    let fc_array = numpy::PyArray::from_vec(py, log_fc);
+    obs.set_item("KnockDownGeneFC", fc_array)?;
+
+    Ok(())
 }
