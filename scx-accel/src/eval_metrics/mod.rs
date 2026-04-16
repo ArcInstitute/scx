@@ -8,8 +8,14 @@
 //!
 //! - [`bulk_metrics`] — Per-perturbation metrics on pseudobulk means:
 //!   pearson_delta, MSE, MAE, MSE_delta, MAE_delta.
+//! - [`distances`] — Shared pairwise distance kernels (Euclidean, L1, cosine)
+//!   with streaming mean computation (no N×N allocation).
+//! - [`edistance`] — Energy distance metric: per-perturbation e-distances
+//!   with Pearson correlation between real and predicted.
 
 pub mod bulk_metrics;
+pub mod distances;
+pub mod edistance;
 
 /// Distance metric for pairwise computations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,3 +29,4 @@ pub enum DistanceMetric {
 }
 
 pub use bulk_metrics::{compute_bulk_metrics, BulkMetric, BulkMetricsResult};
+pub use edistance::{compute_energy_distance, fused_edistance, EDistanceResult};

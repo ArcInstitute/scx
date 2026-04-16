@@ -1,4 +1,4 @@
-"""Integration tests for eval_metrics: pseudobulk_means and perturbation_metrics.
+"""Integration tests for eval_metrics: pseudobulk_means, perturbation_metrics, energy_distance.
 
 Verifies Rust-accelerated implementations against reference implementations
 (polars group_by().mean() for pseudobulk, scipy/sklearn for metrics).
@@ -472,3 +472,264 @@ class TestPerturbationMetrics:
         # All zeros: MSE and MAE should be 0
         assert results["mse"]["drug"] == 0.0
         assert results["mae"]["drug"] == 0.0
+
+
+class TestEnergyDistance:
+    """Test pyscx.accel.energy_distance().
+
+    Reference implementation mirrors cell-eval's _edistance() which uses
+    sklearn.metrics.pairwise_distances.
+    """
+
+    def _make_paired_adata(self, n_obs=200, n_vars=10, n_perts=5, seed=42):
+        """Create paired real/predicted AnnData with distinct perturbation effects.
+
+        Uses smaller n_vars for energy distance tests since this metric
+        operates on per-cell data (not pseudobulk), and pairwise distances
+        are O(N²).
+        """
+        rng = np.random.default_rng(seed)
+        base = rng.exponential(2.0, size=n_vars).astype(np.float32)
+
+        pert_names = ["control"] + [f"drug_{i}" for i in range(n_perts - 1)]
+        deltas = {}
+        for name in pert_names[1:]:
+            # Different magnitudes to ensure varying e-distances
+            scale = rng.uniform(1.0, 5.0)
+            deltas[name] = rng.normal(0, scale, size=n_vars).astype(np.float32)
+
+        cells_per_pert = n_obs // n_perts
+        labels = []
+        for name in pert_names:
+            labels.extend([name] * cells_per_pert)
+        while len(labels) < n_obs:
+            labels.append("control")
+
+        import pandas as pd
+
+        X_real = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_real[i] = np.maximum(base + noise, 0)
+            else:
+                X_real[i] = np.maximum(base + deltas[label] + noise, 0)
+
+        X_pred = np.zeros((n_obs, n_vars), dtype=np.float32)
+        for i, label in enumerate(labels):
+            noise = rng.normal(0, 0.1, size=n_vars).astype(np.float32)
+            if label == "control":
+                X_pred[i] = np.maximum(base + noise, 0)
+            else:
+                pred_delta = deltas[label] + rng.normal(
+                    0, 0.3, size=n_vars
+                ).astype(np.float32)
+                X_pred[i] = np.maximum(base + pred_delta + noise, 0)
+
+        obs = pd.DataFrame({"perturbation": labels})
+        var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_vars)])
+
+        adata_real = ad.AnnData(
+            X=sp.csr_matrix(X_real), obs=obs.copy(), var=var.copy()
+        )
+        adata_pred = ad.AnnData(
+            X=sp.csr_matrix(X_pred), obs=obs.copy(), var=var.copy()
+        )
+        return adata_real, adata_pred, pert_names
+
+    @staticmethod
+    def _reference_edistance(adata_real, adata_pred, pert_col="perturbation",
+                             control="control", metric="euclidean"):
+        """Reference implementation using sklearn, matching cell-eval's algorithm."""
+        from sklearn.metrics import pairwise_distances
+        from scipy.stats import pearsonr
+
+        X_real = adata_real.X.toarray() if sp.issparse(adata_real.X) else adata_real.X
+        X_pred = adata_pred.X.toarray() if sp.issparse(adata_pred.X) else adata_pred.X
+
+        real_labels = adata_real.obs[pert_col].values
+        pred_labels = adata_pred.obs[pert_col].values
+
+        ctrl_real = X_real[real_labels == control].astype(np.float64)
+        ctrl_pred = X_pred[pred_labels == control].astype(np.float64)
+
+        sigma_ctrl_real = pairwise_distances(ctrl_real, ctrl_real, metric=metric).mean()
+        sigma_ctrl_pred = pairwise_distances(ctrl_pred, ctrl_pred, metric=metric).mean()
+
+        perts = sorted(set(real_labels) - {control})
+        e_real = []
+        e_pred = []
+        for p in perts:
+            pr = X_real[real_labels == p].astype(np.float64)
+            pp = X_pred[pred_labels == p].astype(np.float64)
+
+            d_cross_r = pairwise_distances(pr, ctrl_real, metric=metric).mean()
+            d_self_r = pairwise_distances(pr, pr, metric=metric).mean()
+            e_real.append(2.0 * d_cross_r - d_self_r - sigma_ctrl_real)
+
+            d_cross_p = pairwise_distances(pp, ctrl_pred, metric=metric).mean()
+            d_self_p = pairwise_distances(pp, pp, metric=metric).mean()
+            e_pred.append(2.0 * d_cross_p - d_self_p - sigma_ctrl_pred)
+
+        return pearsonr(e_real, e_pred).statistic
+
+    def test_basic_energy_distance(self):
+        """Verify energy_distance runs and returns a float."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+
+        assert isinstance(corr, float)
+        assert -1.0 <= corr <= 1.0 or np.isnan(corr)
+
+    def test_against_reference(self):
+        """Verify energy_distance matches sklearn-based reference."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+        ref_corr = self._reference_edistance(adata_real, adata_pred)
+
+        np.testing.assert_allclose(
+            rust_corr, ref_corr, atol=1e-6,
+            err_msg=f"Rust e-distance correlation {rust_corr} != reference {ref_corr}"
+        )
+
+    def test_identical_real_pred(self):
+        """When real == pred, correlation should be ~1.0."""
+        import pyscx
+
+        adata_real, _, _ = self._make_paired_adata()
+        adata_pred = adata_real.copy()
+
+        corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+        np.testing.assert_allclose(
+            corr, 1.0, atol=1e-6,
+            err_msg="identical data should give correlation ≈ 1.0"
+        )
+
+    def test_l1_metric(self):
+        """Test with L1 distance metric."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_corr = pyscx.accel.energy_distance(
+            adata_real, adata_pred, metric="l1"
+        )
+        ref_corr = self._reference_edistance(
+            adata_real, adata_pred, metric="manhattan"
+        )
+
+        np.testing.assert_allclose(
+            rust_corr, ref_corr, atol=1e-6,
+            err_msg="L1 metric mismatch"
+        )
+
+    def test_cosine_metric(self):
+        """Test with cosine distance metric."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        rust_corr = pyscx.accel.energy_distance(
+            adata_real, adata_pred, metric="cosine"
+        )
+        ref_corr = self._reference_edistance(
+            adata_real, adata_pred, metric="cosine"
+        )
+
+        np.testing.assert_allclose(
+            rust_corr, ref_corr, atol=1e-6,
+            err_msg="cosine metric mismatch"
+        )
+
+    def test_embed_key(self):
+        """Test using obsm embeddings instead of X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        # Add a PCA-like embedding
+        rng = np.random.default_rng(123)
+        n_components = 5
+        adata_real.obsm["X_pca"] = rng.normal(size=(adata_real.n_obs, n_components))
+        adata_pred.obsm["X_pca"] = rng.normal(size=(adata_pred.n_obs, n_components))
+
+        corr = pyscx.accel.energy_distance(
+            adata_real, adata_pred, embed_key="X_pca"
+        )
+        assert isinstance(corr, float)
+        assert -1.0 <= corr <= 1.0 or np.isnan(corr)
+
+    def test_dense_input(self):
+        """Test with dense numpy X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.X = adata_real.X.toarray()
+        adata_pred.X = adata_pred.X.toarray()
+
+        rust_corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+        # Should still work and produce a valid correlation
+        assert isinstance(rust_corr, float)
+        assert -1.0 <= rust_corr <= 1.0
+
+    def test_missing_control(self):
+        """Missing control label should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="not found"):
+            pyscx.accel.energy_distance(
+                adata_real, adata_pred, control="nonexistent_control"
+            )
+
+    def test_invalid_metric(self):
+        """Invalid metric should raise ValueError."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="unknown metric"):
+            pyscx.accel.energy_distance(
+                adata_real, adata_pred, metric="invalid_metric"
+            )
+
+    def test_custom_pert_col(self):
+        """Test with non-default perturbation column."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        adata_real.obs = adata_real.obs.rename(columns={"perturbation": "condition"})
+        adata_pred.obs = adata_pred.obs.rename(columns={"perturbation": "condition"})
+
+        corr = pyscx.accel.energy_distance(
+            adata_real, adata_pred, pert_col="condition"
+        )
+        assert isinstance(corr, float)
+
+    def test_nan_labels_raise(self):
+        """NaN perturbation labels should raise ValueError, not silently become 'nan'."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        # Inject NaN into obs column
+        adata_real.obs.iloc[0, 0] = np.nan
+
+        with pytest.raises(ValueError, match="NaN"):
+            pyscx.accel.energy_distance(adata_real, adata_pred)
+
+    def test_many_perturbations_stress(self):
+        """Stress test with 50 perturbations to exercise rayon parallel codepath."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata(
+            n_obs=500, n_vars=5, n_perts=50, seed=99
+        )
+
+        corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+        assert isinstance(corr, float)
+        assert -1.0 <= corr <= 1.0 or np.isnan(corr)
+

@@ -4467,3 +4467,248 @@ pub fn perturbation_metrics<'py>(
 
     Ok(outer_dict.into_any().unbind())
 }
+
+/// Compute energy distance between real and predicted perturbation data.
+///
+/// For each perturbation, computes the energy distance (e-distance) between
+/// perturbation cells and control cells on both real and predicted sides,
+/// then returns the Pearson correlation of per-perturbation e-distances.
+///
+/// This is the most expensive cell-eval metric — O(N²) pairwise distances
+/// per perturbation. The Rust implementation avoids materializing N×N
+/// distance matrices (streaming accumulation), precomputes control
+/// self-distances once, and parallelizes across perturbations with rayon.
+///
+/// Args:
+///     adata_real: AnnData with real (ground truth) data
+///     adata_pred: AnnData with predicted data
+///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
+///     control: Label for control perturbation (default: "control")
+///     metric: Distance metric — "euclidean" (default), "l1", or "cosine"
+///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None)
+///
+/// Returns:
+///     float — Pearson correlation of per-perturbation e-distances
+///
+/// Example:
+///     corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+///     # corr ≈ 0.85 means real and predicted perturbation effects
+///     # have similar relative magnitudes
+#[pyfunction]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn energy_distance<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    embed_key: Option<&str>,
+) -> PyResult<f64> {
+    let np = py.import("numpy")?;
+
+    // Parse distance metric.
+    let dist_metric = match metric.to_lowercase().as_str() {
+        "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
+        "l1" | "manhattan" | "cityblock" => scx_accel::DistanceMetric::L1,
+        "cosine" => scx_accel::DistanceMetric::Cosine,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unknown metric '{}'. Valid: euclidean, l1, cosine",
+                metric
+            )))
+        }
+    };
+
+    // ── Extract dense matrices from both AnnData objects ────────────
+    let (real_flat, n_real, n_dims_real) = extract_dense_matrix(py, &np, adata_real, embed_key)?;
+    let (pred_flat, n_pred, n_dims_pred) = extract_dense_matrix(py, &np, adata_pred, embed_key)?;
+
+    if n_dims_real != n_dims_pred {
+        return Err(PyValueError::new_err(format!(
+            "dimension mismatch: real has {} features but pred has {}",
+            n_dims_real, n_dims_pred
+        )));
+    }
+    let n_dims = n_dims_real;
+
+    // ── Extract perturbation labels ─────────────────────────────────
+    let real_labels = extract_obs_column(py, adata_real, pert_col)?;
+    let pred_labels = extract_obs_column(py, adata_pred, pert_col)?;
+
+    if real_labels.len() != n_real {
+        return Err(PyValueError::new_err(format!(
+            "real adata has {} obs but X has {} rows",
+            real_labels.len(),
+            n_real
+        )));
+    }
+    if pred_labels.len() != n_pred {
+        return Err(PyValueError::new_err(format!(
+            "pred adata has {} obs but X has {} rows",
+            pred_labels.len(),
+            n_pred
+        )));
+    }
+
+    // ── Build group → index mapping ─────────────────────────────────
+    // Collect unique group names from both sides.
+    let mut all_groups = std::collections::BTreeSet::new();
+    for l in real_labels.iter().chain(pred_labels.iter()) {
+        all_groups.insert(l.as_str());
+    }
+    let group_to_idx: std::collections::HashMap<&str, u32> = all_groups
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| (g, i as u32))
+        .collect();
+
+    // Map labels to group indices.
+    let real_groups: Vec<u32> = real_labels
+        .iter()
+        .map(|l| group_to_idx[l.as_str()])
+        .collect();
+    let pred_groups: Vec<u32> = pred_labels
+        .iter()
+        .map(|l| group_to_idx[l.as_str()])
+        .collect();
+
+    // Identify control group index.
+    let ctrl_group_idx = *group_to_idx.get(control).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "control '{}' not found in perturbation labels. Available: {:?}",
+            control,
+            all_groups.iter().collect::<Vec<_>>()
+        ))
+    })?;
+
+    // Non-control perturbation names and their group indices.
+    let mut pert_names = Vec::new();
+    let mut pert_group_indices = Vec::new();
+    for &g in &all_groups {
+        if g != control {
+            pert_names.push(g.to_string());
+            pert_group_indices.push(group_to_idx[g]);
+        }
+    }
+
+    if pert_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "no non-control perturbation groups found",
+        ));
+    }
+
+    // ── Call Rust energy distance ────────────────────────────────────
+    let result = scx_accel::compute_energy_distance(
+        &real_flat,
+        &pred_flat,
+        &real_groups,
+        &pred_groups,
+        ctrl_group_idx,
+        &pert_names,
+        &pert_group_indices,
+        n_dims,
+        dist_metric,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(result.correlation)
+}
+
+/// Extract a dense `[N, D]` matrix from adata.X (or adata.obsm[embed_key])
+/// as a flat `Vec<f64>`.
+///
+/// Handles scipy sparse (converts to dense), numpy arrays, and SCX backed types.
+/// Emits a Python warning for large materializations (>2 GB estimated).
+fn extract_dense_matrix<'py>(
+    py: Python<'py>,
+    np: &Bound<'py, PyModule>,
+    adata: &Bound<'py, PyAny>,
+    embed_key: Option<&str>,
+) -> PyResult<(Vec<f64>, usize, usize)> {
+    let matrix_obj = if let Some(key) = embed_key {
+        let obsm = adata.getattr("obsm")?;
+        obsm.get_item(key).map_err(|_| {
+            PyValueError::new_err(format!("embed_key '{}' not found in adata.obsm", key))
+        })?
+    } else {
+        adata.getattr("X")?
+    };
+
+    // Check if it's a SCX backed or lazy-transformed type — must materialize.
+    let dense = if matrix_obj.is_instance_of::<ScxBackedSparseDataset>()
+        || matrix_obj.is_instance_of::<ScxLazyTransformedDataset>()
+    {
+        let arr = matrix_obj.call_method0("toarray")?;
+        arr.call_method1("astype", ("float64",))?
+    } else {
+        // Check for scipy sparse.
+        let scipy_sparse = py.import("scipy.sparse")?;
+        let is_sparse: bool = scipy_sparse
+            .call_method1("issparse", (&matrix_obj,))?
+            .extract()?;
+
+        if is_sparse {
+            let arr = matrix_obj.call_method0("toarray")?;
+            arr.call_method1("astype", ("float64",))?
+        } else {
+            np.call_method1("asarray", (&matrix_obj,))?
+                .call_method1("astype", ("float64",))?
+        }
+    };
+
+    let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
+
+    // Warn if the dense matrix is very large (> 2 GB).
+    let estimated_bytes = shape.0 * shape.1 * 8; // f64 = 8 bytes
+    if estimated_bytes > 2_000_000_000 {
+        let gb = estimated_bytes as f64 / 1e9;
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            (format!(
+                "energy_distance: materializing a {:.1} GB dense matrix ({} × {} × 8 bytes). \
+                 Consider using embed_key='X_pca' or subsetting the data.",
+                gb, shape.0, shape.1
+            ),),
+        )?;
+    }
+
+    let flat: Vec<f64> = dense.call_method0("ravel")?.extract()?;
+
+    Ok((flat, shape.0, shape.1))
+}
+
+/// Extract a column from adata.obs as Vec<String>.
+///
+/// Raises ValueError if the column contains NaN values (which would
+/// silently become the string `"nan"` after `.astype(str)`).
+fn extract_obs_column<'py>(
+    _py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    col: &str,
+) -> PyResult<Vec<String>> {
+    let obs = adata.getattr("obs")?;
+    let series = obs
+        .get_item(col)
+        .map_err(|_| PyValueError::new_err(format!("column '{}' not found in adata.obs", col)))?;
+
+    // Detect NaN values before string conversion (NaN → "nan" is silent and wrong).
+    let pd = _py.import("pandas")?;
+    let isna = pd.call_method1("isna", (&series,))?;
+    let any_na: bool = isna.call_method0("any")?.extract()?;
+    if any_na {
+        let n_na: usize = isna.call_method0("sum")?.extract()?;
+        return Err(PyValueError::new_err(format!(
+            "column '{}' has {} NaN values. Remove or fill NaN before calling.",
+            col, n_na
+        )));
+    }
+
+    let labels: Vec<String> = series
+        .call_method1("astype", ("str",))?
+        .call_method0("tolist")?
+        .extract()?;
+    Ok(labels)
+}
