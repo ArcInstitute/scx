@@ -4083,3 +4083,387 @@ fn apply_hvg_subset(
 
     Ok(())
 }
+
+/// Call `array.astype(dtype, copy=False)` — avoids a deep copy when the
+/// source already has the target dtype. This mirrors numpy's behavior where
+/// `copy=False` returns the same array object if no conversion is needed.
+fn astype_no_copy<'py>(
+    py: Python<'py>,
+    arr: &Bound<'py, PyAny>,
+    dtype: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("copy", false)?;
+    arr.call_method("astype", (dtype,), Some(&kwargs))
+}
+
+/// Compute pseudobulk means (group-by mean on sparse X).
+///
+/// Aggregates single-cell expression into per-group means, returning the
+/// dense means matrix and group names. This is the foundation for
+/// perturbation evaluation metrics (pearson_delta, MSE, discrimination
+/// score, etc.).
+///
+/// Supports backed SCX, lazy-transformed, scipy CSR, and dense numpy inputs.
+///
+/// Args:
+///     adata: AnnData object with X and obs columns for groupby
+///     groupby: Column name in adata.obs to group by (e.g., "perturbation")
+///     min_cells_per_group: Skip groups with fewer cells (default: 1)
+///
+/// Returns:
+///     Tuple of (means, group_names):
+///     - means: numpy array of shape [P, G] (float64) — per-group mean expression
+///     - group_names: list of str — group names in order
+///
+/// Example:
+///     means, groups = pyscx.accel.pseudobulk_means(adata, "perturbation")
+///     # means.shape == (n_perturbations, n_genes)
+///     # groups == ["control", "drug_A", "drug_B", ...]
+#[pyfunction]
+#[pyo3(signature = (adata, groupby, min_cells_per_group=1))]
+pub fn pseudobulk_means<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    groupby: &str,
+    min_cells_per_group: usize,
+) -> PyResult<PyObject> {
+    let np = py.import("numpy")?;
+
+    // Extract groupby column from adata.obs as Vec<String>.
+    let obs = adata.getattr("obs")?;
+    let col = obs.get_item(groupby).map_err(|_| {
+        PyValueError::new_err(format!(
+            "groupby column '{}' not found in adata.obs",
+            groupby
+        ))
+    })?;
+    let labels: Vec<String> = col
+        .call_method1("astype", ("str",))?
+        .call_method0("tolist")?
+        .extract()?;
+    let obs_groups = vec![labels];
+    let groupby_columns = vec![groupby.to_string()];
+
+    // Get gene names.
+    let var = adata.getattr("var")?;
+    let var_names = var.getattr("index")?;
+    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+
+    // Perform aggregation with Mean method: backed, lazy-transformed, or in-memory.
+    let x = adata.getattr("X")?;
+    let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        scx_accel::pseudobulk_aggregate(
+            &backed.backed,
+            &obs_groups,
+            &groupby_columns,
+            &gene_names,
+            scx_accel::AggregationMethod::Mean,
+            min_cells_per_group,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        // Lazy-transformed datasets: materialize through the transform pipeline
+        // (normalize, log1p, etc.) to get a scipy CSR, then aggregate in-memory.
+        let scipy_csr = lazy.to_memory_py(py)?;
+        let shape: (usize, usize) = scipy_csr.getattr("shape")?.extract()?;
+
+        // Use astype with copy=False to avoid redundant copies when dtypes match,
+        // then borrow via PyReadonlyArray1 for zero-copy slice access.
+        let indptr_obj = scipy_csr.getattr("indptr")?;
+        let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
+        let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
+        let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
+        let indptr_slice = indptr_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let indices_obj = scipy_csr.getattr("indices")?;
+        let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
+        let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
+        let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
+        let indices_slice = indices_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let data_obj = scipy_csr.getattr("data")?;
+        let data_arr = np.call_method1("asarray", (&data_obj,))?;
+        let data_arr = astype_no_copy(py, &data_arr, "float32")?;
+        let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
+        let data_slice = data_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        scx_accel::pseudobulk_aggregate_from_slices(
+            shape,
+            indptr_slice,
+            indices_slice,
+            data_slice,
+            &obs_groups,
+            &groupby_columns,
+            &gene_names,
+            scx_accel::AggregationMethod::Mean,
+            min_cells_per_group,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    } else {
+        // In-memory: extract scipy CSR → zero-copy slices.
+        let scipy_sparse = py.import("scipy.sparse")?;
+        let is_sparse = scipy_sparse
+            .call_method1("issparse", (&x,))?
+            .extract::<bool>()?;
+
+        let csr_obj = if is_sparse {
+            scipy_sparse.call_method1("csr_matrix", (&x,))?
+        } else if x.hasattr("toarray")? {
+            let arr = x.call_method0("toarray")?;
+            scipy_sparse.call_method1("csr_matrix", (&arr,))?
+        } else {
+            let arr = np
+                .call_method1("asarray", (&x,))?
+                .call_method1("astype", ("float32",))?;
+            scipy_sparse.call_method1("csr_matrix", (&arr,))?
+        };
+
+        let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
+
+        // Use astype with copy=False to avoid redundant copies when dtypes match,
+        // then borrow via PyReadonlyArray1 for zero-copy slice access.
+        let indptr_obj = csr_obj.getattr("indptr")?;
+        let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
+        let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
+        let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
+        let indptr_slice = indptr_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let indices_obj = csr_obj.getattr("indices")?;
+        let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
+        let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
+        let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
+        let indices_slice = indices_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let data_obj = csr_obj.getattr("data")?;
+        let data_arr = np.call_method1("asarray", (&data_obj,))?;
+        let data_arr = astype_no_copy(py, &data_arr, "float32")?;
+        let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
+        let data_slice = data_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        scx_accel::pseudobulk_aggregate_from_slices(
+            shape,
+            indptr_slice,
+            indices_slice,
+            data_slice,
+            &obs_groups,
+            &groupby_columns,
+            &gene_names,
+            scx_accel::AggregationMethod::Mean,
+            min_cells_per_group,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    };
+
+    if result.n_groups == 0 {
+        return Err(PyRuntimeError::new_err(
+            "no groups passed the min_cells_per_group filter",
+        ));
+    }
+
+    // Convert to numpy [P, G] float64 array.
+    let counts_array = np.call_method1("array", (result.counts.clone(),))?;
+    let means_2d = counts_array.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
+
+    // Extract group names (first column of group_labels, since we only have
+    // one groupby column).
+    let group_names: Vec<String> = result.group_labels.iter().map(|l| l[0].clone()).collect();
+
+    // Return (means, group_names) tuple.
+    let tuple = pyo3::types::PyTuple::new(
+        py,
+        &[
+            means_2d.into_any(),
+            pyo3::types::PyList::new(py, &group_names)?.into_any(),
+        ],
+    )?;
+
+    Ok(tuple.into())
+}
+
+/// Compute bulk perturbation metrics between real and predicted AnnData objects.
+///
+/// First computes pseudobulk means for both inputs, then evaluates per-perturbation
+/// metrics comparing real vs predicted expression profiles.
+///
+/// Available metrics:
+/// - **pearson_delta**: Pearson correlation of perturbation effects (delta from control)
+/// - **mse**: Mean squared error of pseudobulk means
+/// - **mae**: Mean absolute error of pseudobulk means
+/// - **mse_delta**: MSE of perturbation effects (delta from control)
+/// - **mae_delta**: MAE of perturbation effects (delta from control)
+///
+/// Args:
+///     adata_real: AnnData object with real (ground truth) data
+///     adata_pred: AnnData object with predicted data
+///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
+///     control: Label for control perturbation (default: "control")
+///     metrics: List of metric names to compute (default: all five)
+///     min_cells_per_group: Skip groups with fewer cells (default: 1)
+///
+/// Returns:
+///     dict[str, dict[str, float]] — {metric_name: {perturbation: value}}
+///
+/// Example:
+///     results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
+///     # results["pearson_delta"]["drug_A"] == 0.95
+///     # results["mse"]["drug_A"] == 0.12
+#[pyfunction]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1))]
+#[allow(clippy::too_many_arguments)]
+pub fn perturbation_metrics<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metrics: Option<Vec<String>>,
+    min_cells_per_group: usize,
+) -> PyResult<PyObject> {
+    // Determine which metrics to compute.
+    let default_metrics = vec![
+        "pearson_delta".to_string(),
+        "mse".to_string(),
+        "mae".to_string(),
+        "mse_delta".to_string(),
+        "mae_delta".to_string(),
+    ];
+    let metric_names = metrics.unwrap_or(default_metrics);
+
+    let bulk_metrics: Vec<scx_accel::BulkMetric> = metric_names
+        .iter()
+        .map(|name| {
+            scx_accel::BulkMetric::parse(name).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown metric '{}'. Valid: pearson_delta, mse, mae, mse_delta, mae_delta",
+                    name
+                ))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    // Compute pseudobulk means for both real and predicted.
+    let means_real_obj = pseudobulk_means(py, adata_real, pert_col, min_cells_per_group)?;
+    let means_pred_obj = pseudobulk_means(py, adata_pred, pert_col, min_cells_per_group)?;
+
+    let np = py.import("numpy")?;
+
+    // Extract numpy arrays and group names from the tuples.
+    let real_tuple = means_real_obj.bind(py);
+    let pred_tuple = means_pred_obj.bind(py);
+
+    let means_real_np = real_tuple.get_item(0)?;
+    let groups_real: Vec<String> = real_tuple.get_item(1)?.extract()?;
+
+    let means_pred_np = pred_tuple.get_item(0)?;
+    let groups_pred: Vec<String> = pred_tuple.get_item(1)?.extract()?;
+
+    // Validate group names match between real and predicted.
+    if groups_real.len() != groups_pred.len() {
+        return Err(PyValueError::new_err(format!(
+            "real has {} groups but pred has {}. Ensure both have the same perturbations.",
+            groups_real.len(),
+            groups_pred.len()
+        )));
+    }
+
+    // Find common perturbations, sort them for deterministic alignment.
+    let real_set: std::collections::HashSet<&str> =
+        groups_real.iter().map(|s| s.as_str()).collect();
+    let pred_set: std::collections::HashSet<&str> =
+        groups_pred.iter().map(|s| s.as_str()).collect();
+
+    let mut common: Vec<String> = real_set
+        .intersection(&pred_set)
+        .map(|s| s.to_string())
+        .collect();
+    common.sort();
+
+    if common.is_empty() {
+        return Err(PyValueError::new_err(
+            "no common perturbation groups between real and predicted AnnData objects",
+        ));
+    }
+
+    // Reorder both matrices to have the same row ordering.
+    // Build index maps: group_name → row_index.
+    let real_idx_map: std::collections::HashMap<&str, usize> = groups_real
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    let pred_idx_map: std::collections::HashMap<&str, usize> = groups_pred
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    // Extract the common rows in sorted order.
+    let real_indices: Vec<usize> = common.iter().map(|s| real_idx_map[s.as_str()]).collect();
+    let pred_indices: Vec<usize> = common.iter().map(|s| pred_idx_map[s.as_str()]).collect();
+
+    let real_idx_arr = np.call_method1("array", (real_indices,))?;
+    let pred_idx_arr = np.call_method1("array", (pred_indices,))?;
+
+    let means_real_ordered = means_real_np.get_item(&real_idx_arr)?;
+    let means_pred_ordered = means_pred_np.get_item(&pred_idx_arr)?;
+
+    // Flatten to Vec<f64>.
+    let means_real_flat: Vec<f64> = means_real_ordered
+        .call_method0("ravel")?
+        .call_method1("astype", ("float64",))?
+        .extract()?;
+    let means_pred_flat: Vec<f64> = means_pred_ordered
+        .call_method0("ravel")?
+        .call_method1("astype", ("float64",))?
+        .extract()?;
+
+    let n_perts = common.len();
+    let n_genes_arr = means_real_ordered.getattr("shape")?;
+    let shape: (usize, usize) = n_genes_arr.extract()?;
+    let n_genes = shape.1;
+
+    // Find control index.
+    let ctrl_idx = common.iter().position(|s| s == control).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "control '{}' not found in perturbation groups. Ensure control exists and passes min_cells_per_group filter. Available: {:?}",
+            control, common
+        ))
+    })?;
+
+    // Call Rust bulk metrics computation.
+    let result = scx_accel::compute_bulk_metrics(
+        &means_real_flat,
+        &means_pred_flat,
+        ctrl_idx,
+        n_perts,
+        n_genes,
+        &common,
+        &bulk_metrics,
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // Convert to dict[str, dict[str, float]].
+    let outer_dict = PyDict::new(py);
+    for (metric_name, values) in &result.metrics {
+        let inner_dict = PyDict::new(py);
+        for (i, pert_name) in result.pert_names.iter().enumerate() {
+            inner_dict.set_item(pert_name.as_str(), values[i])?;
+        }
+        outer_dict.set_item(metric_name.as_str(), inner_dict)?;
+    }
+
+    Ok(outer_dict.into_any().unbind())
+}

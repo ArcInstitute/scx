@@ -11,6 +11,7 @@
 
 pub mod diffexp;
 pub mod error;
+pub mod eval_metrics;
 pub mod hvg;
 pub mod leiden;
 pub mod neighbors;
@@ -23,6 +24,10 @@ pub use diffexp::{
     wilcoxon_rank_sum_streaming, DiffExpResult,
 };
 pub use error::{AccelError, Result};
+pub use eval_metrics::{
+    bulk_metrics::{compute_bulk_metrics, pearson_correlation, BulkMetric, BulkMetricsResult},
+    DistanceMetric,
+};
 pub use hvg::{
     streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
     streaming_mean_var_batched, BatchedHvgStats, HvgStats,
@@ -34,7 +39,8 @@ pub use pca::{
     COVARIANCE_PCA_THRESHOLD,
 };
 pub use pseudobulk::{
-    pseudobulk_aggregate, pseudobulk_aggregate_inmemory, AggregationMethod, PseudobulkResult,
+    pseudobulk_aggregate, pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory,
+    AggregationMethod, PseudobulkResult,
 };
 pub use umap::{compute_umap, UmapResult};
 

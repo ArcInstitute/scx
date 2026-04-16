@@ -252,6 +252,71 @@ pub fn pseudobulk_aggregate_inmemory(
     )
 }
 
+/// In-memory pseudobulk aggregation from borrowed CSR slices.
+///
+/// Same algorithm as `pseudobulk_aggregate_inmemory()` but operates on
+/// borrowed slices (`&[i64]`, `&[i32]`, `&[f32]`) instead of requiring
+/// an owning `ScxCsr`. This enables zero-copy aggregation from numpy
+/// arrays via `PyReadonlyArray1` without cloning the data.
+#[allow(clippy::too_many_arguments)]
+pub fn pseudobulk_aggregate_from_slices(
+    shape: (usize, usize),
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    method: AggregationMethod,
+    min_cells_per_group: usize,
+) -> Result<PseudobulkResult> {
+    let (n_obs, n_vars) = shape;
+
+    validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
+
+    let (cell_to_group, group_labels) = build_group_mapping(obs_groups, n_obs);
+    let n_groups = group_labels.len();
+
+    let mut counts = vec![0.0f64; n_groups * n_vars];
+    let mut cell_counts = vec![0usize; n_groups];
+
+    for &g in &cell_to_group {
+        cell_counts[g] += 1;
+    }
+
+    // Iterate all rows of the CSR using borrowed slices.
+    for (row, &group_idx) in cell_to_group.iter().enumerate() {
+        let start = indptr[row] as usize;
+        let end = indptr[row + 1] as usize;
+        for j in start..end {
+            let col = indices[j] as usize;
+            counts[group_idx * n_vars + col] += data[j] as f64;
+        }
+    }
+
+    if method == AggregationMethod::Mean {
+        for g in 0..n_groups {
+            if cell_counts[g] > 0 {
+                let cc = cell_counts[g] as f64;
+                for v in 0..n_vars {
+                    counts[g * n_vars + v] /= cc;
+                }
+            }
+        }
+    }
+
+    filter_and_build_result(
+        counts,
+        group_labels,
+        groupby_columns,
+        cell_counts,
+        gene_names,
+        n_groups,
+        n_vars,
+        min_cells_per_group,
+    )
+}
+
 /// Validate common inputs for both streaming and in-memory paths.
 fn validate_inputs(
     obs_groups: &[Vec<String>],
