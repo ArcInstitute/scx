@@ -123,15 +123,59 @@ impl ScxCsr {
         })
     }
 
-    /// Create a new ScxCsr without validation.
+    /// Create a new ScxCsr without public validation.
     ///
-    /// Use when the data is known to be valid (e.g., decoded from checksummed shards).
+    /// # Invariants the caller must uphold
+    ///
+    /// 1. `indptr.len() == shape.0 + 1`
+    /// 2. `indptr[0] == 0`
+    /// 3. `indptr` is monotone non-decreasing
+    /// 4. `indices.len() == data.len() == *indptr.last().unwrap() as usize`
+    /// 5. Every `indices[k]` is in `[0, shape.1)`
+    /// 6. `shape.0 > 0` OR `indptr == vec![0]` (empty matrices must still have
+    ///    a valid single-element indptr)
+    ///
+    /// Violating any invariant causes out-of-bounds reads in downstream
+    /// operations (SpMM, column projection, iteration). These are logic bugs,
+    /// not memory-safety UB — they will trigger bounds-check panics rather
+    /// than silently return wrong answers. A future refactor could upgrade
+    /// this constructor to an `unsafe fn` if the accessors ever switch to
+    /// unchecked indexing.
+    ///
+    /// In debug builds, invariants 1–3 are checked via `debug_assert!`; if
+    /// that fires the caller has a bug.
+    ///
+    /// Use when the data is known to be valid (e.g., decoded from
+    /// checksummed shards).
     pub fn new_unchecked(
         shape: (usize, usize),
         indptr: Vec<i64>,
         indices: Vec<i32>,
         data: Vec<f32>,
     ) -> Self {
+        debug_assert_eq!(
+            indptr.len(),
+            shape.0 + 1,
+            "ScxCsr::new_unchecked: indptr.len() must equal shape.0 + 1"
+        );
+        debug_assert!(
+            indptr.first().copied() == Some(0),
+            "ScxCsr::new_unchecked: indptr[0] must be 0"
+        );
+        debug_assert!(
+            indptr.windows(2).all(|w| w[0] <= w[1]),
+            "ScxCsr::new_unchecked: indptr must be monotone non-decreasing"
+        );
+        debug_assert_eq!(
+            indices.len(),
+            data.len(),
+            "ScxCsr::new_unchecked: indices.len() must equal data.len()"
+        );
+        debug_assert_eq!(
+            indices.len() as i64,
+            *indptr.last().unwrap_or(&0),
+            "ScxCsr::new_unchecked: indices.len() must equal indptr.last()"
+        );
         Self {
             shape,
             indptr,
@@ -693,9 +737,17 @@ mod tests {
 
     #[test]
     fn test_to_dense_dimension_overflow() {
-        // Create a CSR with dimensions that overflow usize when multiplied
+        // Create a CSR with dimensions that overflow usize when multiplied.
+        // Build via struct literal to bypass the debug_assert invariants in
+        // `new_unchecked` — the point of this test is to exercise the
+        // dimension-overflow path in `to_dense`, not the constructor.
         let huge = usize::MAX / 2 + 1;
-        let csr = ScxCsr::new_unchecked((huge, 2), vec![], vec![], vec![]);
+        let csr = ScxCsr {
+            shape: (huge, 2),
+            indptr: vec![],
+            indices: vec![],
+            data: vec![],
+        };
         let err = csr.to_dense().unwrap_err();
         assert!(matches!(err, CsrError::DimensionOverflow { .. }));
     }

@@ -214,7 +214,7 @@ pub async fn io_stage(
 
                 // Decode the shard CSR data (skip checksum for throughput —
                 // data integrity verified at file open or via explicit validate()).
-                let (indptr, indices, data) = reader.read_shard_from_entry_unchecked(entry)?;
+                let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
 
                 shards.push(ShardData {
                     indptr,

@@ -350,12 +350,17 @@ fn compute_connectivities(
 }
 
 /// Binary search for σ such that Σ exp(-max(d - ρ, 0) / σ) = target.
+///
+/// 50 iterations is enough: starting bounds [1e-10, 1000], the interval
+/// width drops below 1e-12 by iteration 50 — tighter than f64's ~52-bit
+/// mantissa for typical σ magnitudes. Additional iterations just spin on
+/// rounding noise.
 fn find_sigma(distances: &[f64], rho: f64, target: f64) -> f64 {
     let mut lo = 1e-10_f64;
     let mut hi = 1000.0_f64;
     let mut mid;
 
-    for _ in 0..64 {
+    for _ in 0..50 {
         mid = (lo + hi) / 2.0;
 
         let sum: f64 = distances

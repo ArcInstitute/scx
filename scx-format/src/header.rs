@@ -26,7 +26,18 @@ pub struct FileHeader {
     pub format_version: u16,
     /// Header length in bytes (always 256)
     pub header_length: u16,
-    /// Bit-field flags
+    /// Bit-field flags.
+    ///
+    /// | Bit | Meaning                                              |
+    /// |-----|------------------------------------------------------|
+    /// |   0 | `has_csc`                                            |
+    /// |   1 | `has_bitmap`                                         |
+    /// |   2 | `has_obsm`                                           |
+    /// |   3 | `has_obsp`                                           |
+    /// |   4 | **reserved** — must be zero on write, ignored on read |
+    /// |   5 | `has_deletion_vectors`                               |
+    /// |   6 | `has_front_catalog`                                  |
+    /// | 7–31 | reserved for future use                              |
     pub flags: u32,
     /// Number of observations (rows)
     pub n_obs: u64,

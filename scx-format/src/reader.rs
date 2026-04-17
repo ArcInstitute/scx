@@ -591,6 +591,9 @@ impl ScxReader {
     ///
     /// Alias for [`read_shard_from_entry`] — both skip checksums.
     /// Retained for call-site clarity (e.g., in the training loader).
+    #[deprecated(note = "call `read_shard_from_entry` (identical behavior) or \
+                `read_shard_from_entry_verified` when per-shard checksum \
+                verification is required.")]
     pub fn read_shard_from_entry_unchecked(
         &self,
         entry: &FullCatalogEntry,
@@ -701,13 +704,18 @@ impl ScxReader {
         let shard_sizes: Vec<(usize, usize)> = shards
             .iter()
             .map(|e| {
-                let stats = e.stats.as_ref().expect("shard entry must have stats");
-                (
+                let stats = e.stats.as_ref().ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard entry '{}' at offset {} has no stats block",
+                        e.name, e.offset
+                    ))
+                })?;
+                Ok::<_, ScxError>((
                     (stats.row_end - stats.row_start) as usize,
                     stats.nnz as usize,
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
         let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
 
@@ -741,7 +749,24 @@ impl ScxReader {
             let row_off = row_offsets[i];
             let nnz_off = nnz_offsets[i];
 
-            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+            // Release-mode bounds guards — catch catalog corruption / stat
+            // drift before dereferencing raw pointers below.  `assert!` (not
+            // `debug_assert!`) because these invariants are the ONLY thing
+            // keeping the unsafe block below from writing past the allocated
+            // region; stripping them in release would silently corrupt the
+            // heap on malformed inputs.
+            assert!(
+                nnz_off + nnz <= total_nnz,
+                "shard {i}: nnz range {nnz_off}..{} exceeds total_nnz {total_nnz}",
+                nnz_off + nnz
+            );
+            assert!(
+                row_off + n_rows <= total_rows,
+                "shard {i}: row range {row_off}..{} exceeds total_rows {total_rows}",
+                row_off + n_rows
+            );
+
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
             debug_assert_eq!(
                 shard_ip.len(),
                 n_rows + 1,
@@ -762,7 +787,10 @@ impl ScxReader {
                 shard_data.len()
             );
 
-            // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping
+            // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping.
+            // The non-overlap invariant is enforced by the monotonic `nnz_offsets`
+            // prefix scan at L725–733 combined with the `nnz_off + nnz <= total_nnz`
+            // guard above.
             let ix_out = unsafe {
                 std::slice::from_raw_parts_mut((indices_base as *mut i32).add(nnz_off), nnz)
             };
@@ -775,12 +803,14 @@ impl ScxReader {
             // Indptr: shard 0 copies all n_rows+1 values as-is;
             // shard i>0 copies [1..] with cumulative nnz offset.
             if i == 0 {
-                // SAFETY: shard 0 writes to [0..n_rows+1], non-overlapping with i>0
+                // SAFETY: shard 0 writes to [0..n_rows+1], non-overlapping with i>0.
+                // Bounded by `row_off + n_rows <= total_rows` guard above.
                 let ip_out =
                     unsafe { std::slice::from_raw_parts_mut(indptr_base as *mut i64, n_rows + 1) };
                 ip_out.copy_from_slice(&shard_ip);
             } else {
-                // SAFETY: shard i writes to [row_off+1..row_off+1+n_rows], non-overlapping
+                // SAFETY: shard i writes to [row_off+1..row_off+1+n_rows], non-overlapping.
+                // Bounded by `row_off + n_rows <= total_rows` guard above.
                 let ip_out = unsafe {
                     std::slice::from_raw_parts_mut(
                         (indptr_base as *mut i64).add(row_off + 1),
@@ -838,13 +868,18 @@ impl ScxReader {
         let shard_sizes: Vec<(usize, usize)> = shards
             .iter()
             .map(|e| {
-                let stats = e.stats.as_ref().expect("shard entry must have stats");
-                (
+                let stats = e.stats.as_ref().ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard entry '{}' at offset {} has no stats block",
+                        e.name, e.offset
+                    ))
+                })?;
+                Ok::<_, ScxError>((
                     (stats.row_end - stats.row_start) as usize,
                     stats.nnz as usize,
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
         let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
 
@@ -858,7 +893,7 @@ impl ScxReader {
 
         for (i, entry) in shards.iter().enumerate() {
             let (n_rows, nnz) = shard_sizes[i];
-            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry_unchecked(entry)?;
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
             debug_assert_eq!(shard_ip.len(), n_rows + 1);
             debug_assert_eq!(shard_ix.len(), nnz);
             debug_assert_eq!(shard_data.len(), nnz);

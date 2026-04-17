@@ -81,7 +81,6 @@ struct LeidenGraphData {
     degrees: Vec<usize>,
     strengths: Vec<f64>,
     total_weight: f64,
-    edge_count: usize,
 }
 
 /// Arc-wrapped CSR graph — cheap to clone (reference counted).
@@ -133,8 +132,6 @@ impl LeidenGraph {
     /// `indptr` (length n_nodes+1, i64), `indices` (i32), `data` (f64) describe
     /// the full symmetric adjacency — each undirected edge appears twice.
     pub fn from_csr(indptr: &[i64], indices: &[i32], data: &[f64], n_nodes: usize) -> Self {
-        let nnz = indices.len();
-
         // Convert types
         let node_ptrs: Vec<usize> = indptr.iter().map(|&p| p as usize).collect();
         let mut neighbors: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
@@ -192,7 +189,6 @@ impl LeidenGraph {
                 degrees,
                 strengths,
                 total_weight,
-                edge_count: nnz / 2,
             }),
         }
     }
@@ -258,7 +254,6 @@ impl LeidenGraph {
                 degrees,
                 strengths,
                 total_weight,
-                edge_count: edges.len(),
             }),
         }
     }

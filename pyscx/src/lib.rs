@@ -289,15 +289,41 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.
-    // Best-effort: if anndata isn't installed, skip silently.
+    // Best-effort: if anndata isn't installed we skip silently (common on
+    // stripped-down envs); but if the import succeeds and `register` raises
+    // we surface the error on stderr so a user debugging why
+    // `ad.AnnData(X=scx_backed)` rejects the object has actionable output
+    // rather than silence. (Migrate to structured `log::warn!` when M19
+    // lands — see §11.6 of the code review.)
     let py = m.py();
-    if let Ok(abc) = py.import("anndata.abc") {
-        if let Ok(csr_dataset) = abc.getattr("CSRDataset") {
-            let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedSparseDataset")?,));
-            let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedLayerDataset")?,));
-            let _ =
-                csr_dataset.call_method1("register", (m.getattr("ScxLazyTransformedDataset")?,));
+    match py.import("anndata.abc") {
+        Ok(abc) => match abc.getattr("CSRDataset") {
+            Ok(csr_dataset) => {
+                for cls_name in [
+                    "ScxBackedSparseDataset",
+                    "ScxBackedLayerDataset",
+                    "ScxLazyTransformedDataset",
+                ] {
+                    if let Err(err) = csr_dataset.call_method1("register", (m.getattr(cls_name)?,))
+                    {
+                        eprintln!(
+                            "pyscx WARN: failed to register {cls_name} with anndata.abc.CSRDataset: {err}"
+                        );
+                    }
+                }
+            }
+            Err(err) => eprintln!(
+                "pyscx WARN: anndata.abc.CSRDataset lookup failed ({err}); backed datasets won't \
+                 isinstance-check as CSRDataset."
+            ),
+        },
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyModuleNotFoundError>(py) => {
+            // anndata not installed — scx is usable without it, no warning.
         }
+        Err(err) => eprintln!(
+            "pyscx WARN: unexpected error importing anndata.abc ({err}); backed datasets won't \
+             isinstance-check as CSRDataset."
+        ),
     }
 
     Ok(())

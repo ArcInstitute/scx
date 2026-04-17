@@ -39,6 +39,9 @@ pub enum ScxError {
     #[error("shard index {index} out of bounds (count: {count})")]
     ShardIndexOutOfBounds { index: usize, count: usize },
 
+    #[error("invalid catalog: {0}")]
+    InvalidCatalog(String),
+
     #[error("block n_rows {0} exceeds u16::MAX (65535)")]
     BlockRowsOverflow(u32),
 

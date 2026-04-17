@@ -12,6 +12,8 @@
 //! - `preprocessing` — normalize_total, log1p, calculate_qc_metrics
 //! - `filtering` — filter_cells, filter_genes, subset_obs (non-materializing)
 //! - `hvg` — Highly variable gene selection (seurat_v3 + seurat flavors)
+//! - `harmony` — Harmony2 batch integration (soft k-means + ridge correction)
+//! - `lisi` — Local Inverse Simpson Index (exact-kNN + Gaussian bandwidth)
 //! - `eval_metrics` — Perturbation evaluation metrics (pseudobulk means,
 //!   energy distance, discrimination score, knockdown, clustering agreement)
 //! - `util` — Shared CSR extraction helpers

@@ -239,6 +239,12 @@ fn estimate_memory(
     // During a full epoch, most of the file will be resident in page cache.
     // With MADV_SEQUENTIAL the kernel may reclaim pages, but we conservatively
     // include the full file size since ru_maxrss captures the high-water mark.
+    //
+    // NOTE: this is an intentional over-estimate of steady-state RSS — the
+    // kernel reclaims sequentially-read pages aggressively under memory pressure,
+    // so a caller that sees this budget fit their memory limit will nearly always
+    // fit at runtime. The mmap_resident term exists to protect against peak
+    // page-cache residency near the end of an epoch, not to reflect steady-state.
     let mmap_resident = file_size_bytes;
 
     shard_buffer + batch_buffer + mmap_resident + PYTHON_OVERHEAD
@@ -565,6 +571,17 @@ impl TrainingPipeline {
 }
 
 impl Drop for TrainingPipeline {
+    /// Best-effort shutdown when a pipeline is dropped without an explicit
+    /// `shutdown()`.
+    ///
+    /// **Async-context caveat:** `Drop` calls `self.runtime.block_on(...)` to
+    /// join the tokio I/O task. If the pipeline is dropped from inside a
+    /// running tokio runtime (e.g. an `async fn`), the nested `block_on` will
+    /// panic. Callers running inside an async context MUST call
+    /// `.shutdown().await` before dropping. When `block_on` is unsafe to call
+    /// here, we detect the running runtime via `Handle::try_current()` and
+    /// skip the join — the task will simply continue until the pipeline's
+    /// channel receivers are dropped and it exits on its own.
     fn drop(&mut self) {
         // Drop channels first to signal shutdown to stages
         self.batch_rx = None;
@@ -573,7 +590,11 @@ impl Drop for TrainingPipeline {
         if let Some(handle) = self.io_handle.take() {
             // Cancel the tokio task if it's still running
             handle.abort();
-            let _ = self.runtime.block_on(handle);
+            if tokio::runtime::Handle::try_current().is_err() {
+                let _ = self.runtime.block_on(handle);
+            }
+            // else: we're in an async context; the aborted task will wind down
+            // on its own. Dropping the handle detaches it.
         }
         if let Some(handle) = self.decode_handle.take() {
             let _ = handle.join();

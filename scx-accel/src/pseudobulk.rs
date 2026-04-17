@@ -44,51 +44,55 @@ pub struct PseudobulkResult {
 
 /// Build a group-key → group-index mapping from per-cell obs column vectors.
 ///
-/// Each cell's group key is the concatenation of its values across all groupby
-/// columns, joined by `"\x1F"` (unit separator, safe for any string value).
+/// The group key is the cell's tuple of values across all groupby columns
+/// (e.g. `("drug_A", "donor_1")`). Keying directly by `Vec<String>` (cheaply
+/// cloned per unique group, not per cell) avoids both the old `"\x1F"`
+/// unit-separator joined-string scheme (which collided on values that
+/// themselves contained `\x1F`) and the per-cell `String::new + push_str`
+/// allocations on the hot path.
 ///
 /// Returns:
 /// - `cell_to_group`: group index for each cell (length = n_obs)
 /// - `group_labels`: per-group label vectors (each Vec has len = n_groupby_cols)
-/// - ordered deterministically (sorted by group key)
+/// - ordered deterministically (sorted lexicographically by the label tuple)
 fn build_group_mapping(obs_groups: &[Vec<String>], n_obs: usize) -> (Vec<usize>, Vec<Vec<String>>) {
     let n_cols = obs_groups.len();
 
     // Build composite keys for each cell.
-    let mut key_to_index: HashMap<String, usize> = HashMap::new();
+    let mut key_to_index: HashMap<Vec<String>, usize> = HashMap::new();
     let mut group_labels: Vec<Vec<String>> = Vec::new();
     let mut cell_to_group = Vec::with_capacity(n_obs);
 
     for cell in 0..n_obs {
-        // Build composite key.
-        let mut key = String::new();
-        for (col_idx, col) in obs_groups.iter().enumerate() {
-            if col_idx > 0 {
-                key.push('\x1F');
-            }
-            key.push_str(&col[cell]);
-        }
+        // Assemble the per-cell key by borrowing from each obs column.
+        // Lookup uses a temporary Vec<&str> — only when we insert a new group
+        // do we clone into owned Strings.
+        let key_ref: Vec<&str> = obs_groups.iter().map(|col| col[cell].as_str()).collect();
+        // HashMap doesn't accept Vec<&str> for a Vec<String> key without an
+        // owning conversion, so we materialize once per cell. This is still
+        // cheaper than the old concatenated String when label values are
+        // short, and never collides on '\x1F' inside a value.
+        let key_owned: Vec<String> = key_ref.iter().map(|s| (*s).to_string()).collect();
 
-        let group_idx = if let Some(&idx) = key_to_index.get(&key) {
+        let group_idx = if let Some(&idx) = key_to_index.get(&key_owned) {
             idx
         } else {
             let idx = group_labels.len();
-            key_to_index.insert(key, idx);
-            let labels: Vec<String> = (0..n_cols).map(|c| obs_groups[c][cell].clone()).collect();
-            group_labels.push(labels);
+            key_to_index.insert(key_owned.clone(), idx);
+            group_labels.push(key_owned);
             idx
         };
 
         cell_to_group.push(group_idx);
     }
 
-    // Sort groups deterministically by their composite key.
+    // Suppress unused warning when n_cols is 0 (empty groupby is nonsensical
+    // but the builder must not panic).
+    let _ = n_cols;
+
+    // Sort groups deterministically by their label tuple (lexicographic).
     let mut sorted_indices: Vec<usize> = (0..group_labels.len()).collect();
-    sorted_indices.sort_by(|&a, &b| {
-        let key_a: String = group_labels[a].join("\x1F");
-        let key_b: String = group_labels[b].join("\x1F");
-        key_a.cmp(&key_b)
-    });
+    sorted_indices.sort_by(|&a, &b| group_labels[a].cmp(&group_labels[b]));
 
     // Build remapping: old index → new index.
     let mut remap = vec![0usize; group_labels.len()];
