@@ -222,10 +222,15 @@ pub fn randomized_pca<S: ShardSource>(
 
     // Step 3 + 4 + 5: Streaming SpMM → power iteration → QR
     // When n_power_iterations <= 2, skip intermediate QR on the transpose result
-    // (matching sklearn's default 'auto' normalization mode). The transpose result
-    // (n_vars × k) is fed directly back into the forward SpMM, saving one QR + one
+    // (matching sklearn's `_randomized_svd` `normalizer='auto'` threshold — see
+    // sklearn.utils.extmath.randomized_svd). The transpose result (n_vars × k) is
+    // fed directly back into the forward SpMM, saving one QR + one
     // mat_to_row_major_buf per iteration. QR is still applied to the forward result
     // (n_obs × k) each iteration to prevent basis collapse.
+    //
+    // For difficult spectra (slow singular-value decay — e.g. noisy unnormalized
+    // counts or cold-start raw expression matrices) callers should pass
+    // `n_power_iterations >= 4` to engage the full-QR path for better convergence.
     let y = streaming_spmm_forward(source, &omega, k, means_ref)?;
     let mut q = qr_thin_q_row_major(&y, n_obs, k);
 
@@ -751,6 +756,13 @@ fn spmm_forward_row(
 // from `scx_format::total_variance_from_col_sq`).
 
 /// Total variance (in-memory).
+///
+/// Uses the textbook two-pass variance formula: `Σ(x - μ)²` after a separate
+/// mean pass. This is numerically safe for scRNA data because raw counts and
+/// log1p-transformed values are small non-negative magnitudes where
+/// catastrophic cancellation doesn't occur. If future callers feed data with
+/// large offsets (e.g. non-centered embeddings), switch to Welford's
+/// single-pass algorithm.
 fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
     let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
@@ -1190,7 +1202,7 @@ pub fn randomized_pca_gpu(
 /// Returns `true` if at least one CUDA device is found.
 #[cfg(feature = "gpu")]
 pub fn gpu_available() -> bool {
-    scx_gpu::GpuDevice::count().map_or(false, |n| n > 0)
+    scx_gpu::GpuDevice::count().is_ok_and(|n| n > 0)
 }
 
 /// GPU device information returned by [`gpu_info`].

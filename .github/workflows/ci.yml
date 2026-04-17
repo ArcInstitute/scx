@@ -40,6 +40,38 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  feature-check:
+    name: Feature matrix (cargo check)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # scx-cli cloud feature only
+          - flags: "-p scx-cli --features cloud"
+            name: "scx-cli --features cloud"
+          # scx-cli cloud + hdf5 — pulls in the hdf5-rust bindings
+          - flags: "-p scx-cli --features hdf5,cloud"
+            name: "scx-cli --features hdf5,cloud"
+          # scx-accel gpu feature — requires cudarc stubs only, no CUDA toolkit
+          - flags: "-p scx-accel --features gpu"
+            name: "scx-accel --features gpu"
+          # pyscx cloud — covered by the python job; also check standalone
+          - flags: "-p pyscx --features cloud"
+            name: "pyscx --features cloud"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # hdf5 feature needs the system library. Install on demand.
+      - name: Install hdf5 dev headers
+        if: contains(matrix.flags, 'hdf5')
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+      - name: cargo check ${{ matrix.name }}
+        run: cargo check ${{ matrix.flags }}
+      - name: cargo clippy ${{ matrix.name }}
+        run: cargo clippy ${{ matrix.flags }} -- -D warnings
+
   python:
     name: Python bindings
     runs-on: ubuntu-latest

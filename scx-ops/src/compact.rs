@@ -321,8 +321,8 @@ fn build_keep_mask(
         if let Some(ref stats) = shard_entry.stats {
             let shard_idx = shard_idx as u32;
 
-            if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx) {
-                for local_row in sd.bitmap.iter() {
+            if let Some(bitmap) = dv.shards.get(&shard_idx) {
+                for local_row in bitmap.iter() {
                     let global_row = stats.row_start + local_row as u64;
                     if (global_row as usize) < n_obs {
                         mask[global_row as usize] = false;

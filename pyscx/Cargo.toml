@@ -28,6 +28,8 @@ serde_json = { workspace = true }
 byteorder = { workspace = true }
 rayon = { workspace = true }
 blake3 = { workspace = true }
+log = { workspace = true }
+pyo3-log = { workspace = true }
 
 [features]
 cloud = ["scx-cloud", "tokio"]

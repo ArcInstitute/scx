@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use arrow::array::RecordBatch;
@@ -115,8 +115,13 @@ impl ScxWriter {
             .open(&tmp_path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write 4352 zero bytes as placeholder for header + root catalog
-        writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
+        // Write 4352 zero bytes as placeholder for header + root catalog.
+        // Stream zeros from `io::repeat` rather than allocating a 4 KB heap
+        // buffer — same result with no allocation.
+        std::io::copy(
+            &mut std::io::repeat(0).take(SECTIONS_START_OFFSET),
+            &mut writer,
+        )?;
 
         Ok(ScxWriter {
             final_path,
@@ -145,9 +150,12 @@ impl ScxWriter {
     /// Write zero-byte padding to reach 8-byte alignment.
     fn write_padding(&mut self) -> Result<()> {
         let aligned = align_to_8(self.current_offset);
-        let pad = (aligned - self.current_offset) as usize;
+        let pad = aligned - self.current_offset;
         if pad > 0 {
-            self.writer()?.write_all(&vec![0u8; pad])?;
+            // At most 7 bytes of padding — stack-allocated zero buffer avoids
+            // the heap allocation that `vec![0u8; pad]` would incur.
+            const ZEROS: [u8; 7] = [0; 7];
+            self.writer()?.write_all(&ZEROS[..pad as usize])?;
             self.current_offset = aligned;
         }
         Ok(())
@@ -720,10 +728,10 @@ impl ScxWriter {
         file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         file.write_all(&root_buf)?;
 
-        // 8. fsync
+        // 7. fsync
         file.sync_all()?;
 
-        // 9. Atomic rename
+        // 8. Atomic rename
         std::fs::rename(&self.tmp_path, &self.final_path)?;
 
         Ok(self.final_path.clone())

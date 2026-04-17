@@ -75,8 +75,9 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 > `scx-cloud` reuses `scx-engine` for predicate parsing (selective pull).
 > `scx-mtx` is **always-on** (no feature gate) since MTX is pure text I/O with no
 > HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
-> `scx-accel` depends only on `scx-format` and `scx-sparse` — no engine/loader
-> dependency. It uses `faer` for dense linear algebra (QR, SVD, eigendecomposition),
+> `scx-accel` depends on `scx-format`, `scx-sparse`, and `scx-engine` (for
+> `project_csr` in `diffexp.rs`) — no loader dependency.
+> It uses `faer` for dense linear algebra (QR, SVD, eigendecomposition),
 > `instant-distance` for HNSW kNN, `rand_chacha` for deterministic Leiden seeding,
 > and `libc` for `malloc_trim` in the Leiden optimizer.
 > With the `gpu` feature enabled, `scx-accel` gains an optional dependency on `scx-gpu`

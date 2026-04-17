@@ -275,6 +275,10 @@ enum Commands {
 }
 
 fn main() {
+    // Initialize the `log` sink. Default severity is `info`; override with
+    // `RUST_LOG=scx=debug`, `RUST_LOG=scx_loader=warn`, etc.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let cli = Cli::parse();
 
     let result = match cli.command {

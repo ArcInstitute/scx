@@ -14,9 +14,10 @@ use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
 
+use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
-use crate::rollback::{build_root_catalog_from_full, compute_file_checksum};
+use crate::rollback::build_root_catalog_from_full;
 
 /// Append new rows to an existing SCX file.
 #[allow(clippy::too_many_arguments)]
@@ -390,6 +391,15 @@ pub fn append(
     lock.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
     lock.write_all(&root_buf)?;
 
+    // Durability barrier between root catalog and header. Without this,
+    // a power loss between the two writes could leave the new root catalog
+    // on disk while the header still references the previous one — not
+    // fatal (old root catalog data is still at its previous offset), but
+    // the file's on-disk root catalog would silently go stale relative to
+    // the header. (Finding H7.)
+    lock.flush()?;
+    lock.sync_all()?;
+
     // Update header
     header.n_obs = new_n_obs;
     header.nnz += total_new_nnz;
@@ -410,19 +420,9 @@ pub fn append(
     header.front_catalog_offset = 0;
     header.front_catalog_length = 0;
 
-    // Write header with zero checksum
-    header.file_checksum = 0;
-    lock.seek(SeekFrom::Start(0))?;
-    header.write_to(&mut lock)?;
-    lock.flush()?;
-
-    // Compute and write final checksum
-    let file_checksum = compute_file_checksum(&mut lock)?;
-    header.file_checksum = file_checksum;
-    lock.seek(SeekFrom::Start(0))?;
-    header.write_to(&mut lock)?;
-
-    lock.sync_all()?;
+    // Single-write header finalization (H5 + M16) — avoids the crash window
+    // where a zero-checksum header could be the durable on-disk state.
+    finalize_header_with_checksum(&mut lock, &mut header)?;
     Ok(())
 }
 

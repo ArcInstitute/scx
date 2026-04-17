@@ -73,8 +73,8 @@ pub fn prune_shards_by_catalog_with_dict(
         // B3: Check deletion vectors — if entire shard is deleted, skip it
         if let Some(dv) = deletion_vectors {
             let shard_n_rows = stats.row_end - stats.row_start;
-            if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
-                if sd.bitmap.len() >= shard_n_rows {
+            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
+                if bitmap.len() >= shard_n_rows {
                     // All rows deleted → skip this shard entirely
                     continue;
                 }
@@ -545,7 +545,6 @@ mod tests {
     };
     use roaring::RoaringBitmap;
     use scx_format::catalog::{FullCatalog, FullCatalogEntry, ShardStats};
-    use scx_format::deletion_vectors::ShardDeletion;
     use scx_format::section::SectionType;
     use scx_format::DeletionVectors;
 
@@ -769,13 +768,8 @@ mod tests {
         for i in 0..100u32 {
             bm.insert(i);
         }
-        let dv = DeletionVectors {
-            dv_version: 1,
-            shards: vec![ShardDeletion {
-                shard_id: 0,
-                bitmap: bm,
-            }],
-        };
+        let mut dv = DeletionVectors::new();
+        dv.shards.insert(0, bm);
         let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
@@ -792,13 +786,8 @@ mod tests {
         for i in 0..50u32 {
             bm.insert(i);
         }
-        let dv = DeletionVectors {
-            dv_version: 1,
-            shards: vec![ShardDeletion {
-                shard_id: 0,
-                bitmap: bm,
-            }],
-        };
+        let mut dv = DeletionVectors::new();
+        dv.shards.insert(0, bm);
         let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
         // Both shards included: shard 0 is only partially deleted
         assert_eq!(candidates.len(), 2);

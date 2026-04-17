@@ -14,6 +14,12 @@ pub enum AccelError {
 
     #[error("statistics error: {0}")]
     StatsError(String),
+
+    #[error("shape error: {0}")]
+    ShapeError(String),
+
+    #[error("numerical instability: {0}")]
+    NumericalInstability(String),
 }
 
 pub type Result<T> = std::result::Result<T, AccelError>;

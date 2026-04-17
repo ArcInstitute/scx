@@ -57,7 +57,7 @@ scx-codec (standalone)
             ├─> scx-loader (depends on scx-format, scx-codec, scx-sparse)
             ├─> scx-cloud (depends on scx-format, scx-codec, scx-engine)
             ├─> scx-gpu (depends on scx-format, scx-codec, scx-sparse)
-            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE/Leiden/Harmony2/LISI; optional gpu dep on scx-gpu)
+            ├─> scx-accel (depends on scx-format, scx-sparse, scx-engine; PCA/kNN/UMAP/DE/Leiden/Harmony2/LISI; optional gpu dep on scx-gpu)
             ├─> scx-cli (depends on all above)
             ├─> pyscx (depends on all above)
             └─> rscx (depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
@@ -68,7 +68,7 @@ scx-codec (standalone)
 Key isolation rules:
 - `scx-loader` does NOT depend on `scx-engine` — it has its own streaming-optimized gene projection and fused ops.
 - `scx-cloud` does NOT depend on `scx-loader` — they are siblings.
-- `scx-accel` depends only on `scx-format` and `scx-sparse` — no engine/loader dependency.
+- `scx-accel` depends on `scx-format`, `scx-sparse`, and `scx-engine` (for `project_csr` in `diffexp.rs`) — no loader dependency.
 
 ### Feature Flags
 

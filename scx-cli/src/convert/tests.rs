@@ -21,7 +21,9 @@ use scx_format::reader::ScxReader;
 
 use super::csc_transpose::csc_to_csr;
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
-use super::dtype::{detect_value_encoding, is_integer_data};
+use scx_codec::value_encoding::is_integer_data;
+
+use super::dtype::detect_value_encoding;
 use super::pipeline::{h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions};
 
 // -----------------------------------------------------------------------

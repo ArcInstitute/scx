@@ -22,11 +22,28 @@ use crate::section::SectionType;
 /// Precomputed shard index for O(log n) row-range lookups.
 ///
 /// Built once from a [`FullCatalog`] at open time.  Each entry stores
-/// `(row_start, row_end, catalog_entry_index)` sorted by `row_start`.
+/// `row_start`, `row_end`, and a `sorted_shard_idx` — the position of the
+/// shard after sort-by-`row_start` and filter-by-section-type, **not** the
+/// original index in the catalog's `entries` vec. This distinction matters
+/// because `BackedCsrReader::read_shard_cached` indexes
+/// `self.sorted_entries[sorted_shard_idx]`, which is already in that sorted
+/// order.
+#[derive(Debug, Clone, Copy)]
+struct ShardRange {
+    row_start: u64,
+    row_end: u64,
+    /// Position in the sorted-and-filtered shard list (not the raw catalog
+    /// entry index).
+    sorted_shard_idx: usize,
+}
+
+/// Precomputed shard index for O(log n) row-range lookups.
+///
+/// Built once from a [`FullCatalog`] at open time.
 #[derive(Debug, Clone)]
 pub struct BackedCsrIndex {
-    /// Sorted by `row_start`.  Each entry: `(row_start, row_end, entry_index_in_sorted_shards)`.
-    shard_ranges: Vec<(u64, u64, usize)>,
+    /// Sorted by `row_start`.
+    shard_ranges: Vec<ShardRange>,
 }
 
 impl BackedCsrIndex {
@@ -55,24 +72,27 @@ impl BackedCsrIndex {
         section_type: SectionType,
         name_prefix: Option<&str>,
     ) -> Self {
-        let mut shard_entries: Vec<(u64, u64, usize)> = catalog
+        let mut shard_entries: Vec<ShardRange> = catalog
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| {
+            .filter(|e| {
                 e.section_type == section_type && name_prefix.is_none_or(|p| e.name.starts_with(p))
             })
-            .filter_map(|(_, e)| {
-                e.stats.as_ref().map(|s| (s.row_start, s.row_end, 0usize)) // index filled below
+            .filter_map(|e| {
+                e.stats.as_ref().map(|s| ShardRange {
+                    row_start: s.row_start,
+                    row_end: s.row_end,
+                    sorted_shard_idx: 0, // filled below
+                })
             })
             .collect();
 
         // Sort by row_start (deterministic ordering)
-        shard_entries.sort_by_key(|&(rs, _, _)| rs);
+        shard_entries.sort_by_key(|r| r.row_start);
 
         // Assign sorted indices
         for (i, entry) in shard_entries.iter_mut().enumerate() {
-            entry.2 = i;
+            entry.sorted_shard_idx = i;
         }
 
         BackedCsrIndex {
@@ -101,14 +121,14 @@ impl BackedCsrIndex {
         // We scan from the first candidate shard onwards.
         let first = self
             .shard_ranges
-            .partition_point(|&(_, s_end, _)| s_end <= row_start);
+            .partition_point(|r| r.row_end <= row_start);
 
         let mut result = Vec::new();
-        for &(s_start, _s_end, idx) in &self.shard_ranges[first..] {
-            if s_start >= row_end {
+        for r in &self.shard_ranges[first..] {
+            if r.row_start >= row_end {
                 break; // no more overlapping shards
             }
-            result.push(idx);
+            result.push(r.sorted_shard_idx);
         }
         result
     }
@@ -130,16 +150,14 @@ impl BackedCsrIndex {
 
         for &row in &sorted_rows {
             // Find the shard containing this row: shard where row_start <= row < row_end
-            let pos = self
-                .shard_ranges
-                .partition_point(|&(s_start, _, _)| s_start <= row);
+            let pos = self.shard_ranges.partition_point(|r| r.row_start <= row);
             if pos == 0 {
                 continue; // row is before all shards
             }
-            let (s_start, s_end, idx) = self.shard_ranges[pos - 1];
-            if row >= s_start && row < s_end && last_shard != Some(idx) {
-                result.push(idx);
-                last_shard = Some(idx);
+            let r = self.shard_ranges[pos - 1];
+            if row >= r.row_start && row < r.row_end && last_shard != Some(r.sorted_shard_idx) {
+                result.push(r.sorted_shard_idx);
+                last_shard = Some(r.sorted_shard_idx);
             }
         }
         result
@@ -152,7 +170,7 @@ impl BackedCsrIndex {
     pub fn shard_range(&self, shard_idx: usize) -> Option<(u64, u64)> {
         self.shard_ranges
             .get(shard_idx)
-            .map(|&(rs, re, _)| (rs, re))
+            .map(|r| (r.row_start, r.row_end))
     }
 }
 
@@ -452,7 +470,7 @@ impl BackedCsrReader {
                             index: shard_idx,
                             count: self.sorted_entries.len(),
                         })?;
-                self.reader.read_shard_from_entry_unchecked(entry)?
+                self.reader.read_shard_from_entry(entry)?
             }
         };
 
@@ -507,7 +525,7 @@ impl BackedCsrReader {
                             index: shard_idx,
                             count: self.sorted_entries.len(),
                         })?;
-                self.reader.read_shard_from_entry_unchecked(entry)?
+                self.reader.read_shard_from_entry(entry)?
             }
         };
         let n_rows = indptr.len().saturating_sub(1);
@@ -620,15 +638,23 @@ impl BackedCsrReader {
         Ok(counts)
     }
 
-    /// Total NNZ across all shards without materializing.
+    /// Total NNZ across all shards.
+    ///
+    /// Reads shard statistics directly from the catalog — no shard decode
+    /// required. Returns the sum of `stats.nnz` across every shard the
+    /// reader covers (X shards when `layer_name.is_none()`, layer shards
+    /// otherwise). Shards without a `stats` block contribute 0.
     pub fn total_nnz(&self) -> Result<usize> {
-        let n_shards = self.index.n_shards();
-        let mut total = 0usize;
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            total += csr.nnz();
-        }
-        Ok(total)
+        let entries = if self.layer_name.is_none() {
+            &self.x_sorted_entries
+        } else {
+            &self.sorted_entries
+        };
+        let total: u64 = entries
+            .iter()
+            .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
+            .sum();
+        Ok(total as usize)
     }
 
     /// Compute per-row sum of squared values without materializing the full matrix.

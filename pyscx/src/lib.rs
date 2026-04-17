@@ -186,119 +186,176 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<backed::ScxComparisonResult>()?;
     m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
 
-    // Accelerators submodule
+    // Accelerators submodule.  Functions are grouped by domain into
+    // `register_*` helpers so adding a new accelerator only touches one
+    // helper — not this ~100-line registration block. Each helper adds
+    // every function to the flat `accel_module` (so `pyscx.accel.pca`
+    // continues to work — no Python-side API break).
     let accel_module = PyModule::new(m.py(), "accel")?;
-    accel_module.add_function(wrap_pyfunction!(accel::gpu::gpu_info, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::gpu::estimate_gpu_memory,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::pca::pca, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::neighbors::neighbors,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::umap::umap, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::de::rank_genes_groups,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::pseudobulk::pseudobulk_dex,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::leiden::leiden, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::harmony::harmony_integrate,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(accel::lisi::compute_lisi, &accel_module)?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::preprocessing::normalize_total,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::preprocessing::log1p,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::preprocessing::calculate_qc_metrics,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::filtering::filter_cells,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::filtering::filter_genes,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::filtering::subset_obs,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::hvg::highly_variable_genes,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::pseudobulk_means,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::perturbation_metrics,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::energy_distance,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::energy_distance_details,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::discrimination_score,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::knockdown_efficiency,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::clustering_agreement,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::adjusted_mutual_info,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::normalized_mutual_info,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::eval_metrics::adjusted_rand_index,
-        &accel_module
-    )?)?;
-    accel_module.add_function(wrap_pyfunction!(
-        accel::de::rank_genes_groups_df,
-        &accel_module
-    )?)?;
+    register_gpu(&accel_module)?;
+    register_dim_reduction(&accel_module)?;
+    register_neighbors(&accel_module)?;
+    register_clustering(&accel_module)?;
+    register_de(&accel_module)?;
+    register_pseudobulk(&accel_module)?;
+    register_batch_integration(&accel_module)?;
+    register_preprocessing(&accel_module)?;
+    register_filtering(&accel_module)?;
+    register_hvg(&accel_module)?;
+    register_eval_metrics(&accel_module)?;
     m.add_submodule(&accel_module)?;
+
+    // Route Rust-side `log::*!` calls through Python's `logging` module so
+    // Python users can configure severity/filtering/sinks via the standard
+    // `logging.getLogger("pyscx")` API. Initialized once at module import;
+    // a subsequent re-import is a no-op.
+    let _ = pyo3_log::try_init();
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.
-    // Best-effort: if anndata isn't installed, skip silently.
+    // Best-effort: if anndata isn't installed we skip silently (common on
+    // stripped-down envs); but if the import succeeds and `register` raises
+    // we surface the error via `log::warn!` so a user debugging why
+    // `ad.AnnData(X=scx_backed)` rejects the object has actionable output.
     let py = m.py();
-    if let Ok(abc) = py.import("anndata.abc") {
-        if let Ok(csr_dataset) = abc.getattr("CSRDataset") {
-            let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedSparseDataset")?,));
-            let _ = csr_dataset.call_method1("register", (m.getattr("ScxBackedLayerDataset")?,));
-            let _ =
-                csr_dataset.call_method1("register", (m.getattr("ScxLazyTransformedDataset")?,));
+    match py.import("anndata.abc") {
+        Ok(abc) => match abc.getattr("CSRDataset") {
+            Ok(csr_dataset) => {
+                for cls_name in [
+                    "ScxBackedSparseDataset",
+                    "ScxBackedLayerDataset",
+                    "ScxLazyTransformedDataset",
+                ] {
+                    if let Err(err) = csr_dataset.call_method1("register", (m.getattr(cls_name)?,))
+                    {
+                        log::warn!(
+                            "failed to register {cls_name} with anndata.abc.CSRDataset: {err}"
+                        );
+                    }
+                }
+            }
+            Err(err) => log::warn!(
+                "anndata.abc.CSRDataset lookup failed ({err}); backed datasets won't \
+                 isinstance-check as CSRDataset."
+            ),
+        },
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyModuleNotFoundError>(py) => {
+            // anndata not installed — scx is usable without it, no warning.
         }
+        Err(err) => log::warn!(
+            "unexpected error importing anndata.abc ({err}); backed datasets won't \
+             isinstance-check as CSRDataset."
+        ),
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Accelerator registration helpers
+// ---------------------------------------------------------------------------
+//
+// Each `register_*` helper wires one domain of accelerator functions onto the
+// flat `pyscx.accel` module. Grouping keeps the per-domain churn localized
+// when a new function is added and documents intent at the call site in
+// `pymodule`.  Every helper is a thin PyModule::add_function loop — no Python
+// semantics change versus the pre-M7 flat registration.
+
+fn register_gpu(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::gpu::gpu_info, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::gpu::estimate_gpu_memory, m)?)?;
+    Ok(())
+}
+
+fn register_dim_reduction(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::pca::pca, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::umap::umap, m)?)?;
+    Ok(())
+}
+
+fn register_neighbors(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::neighbors::neighbors, m)?)?;
+    Ok(())
+}
+
+fn register_clustering(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::leiden::leiden, m)?)?;
+    Ok(())
+}
+
+fn register_de(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::de::rank_genes_groups, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::de::rank_genes_groups_df, m)?)?;
+    Ok(())
+}
+
+fn register_pseudobulk(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::pseudobulk::pseudobulk_dex, m)?)?;
+    Ok(())
+}
+
+fn register_batch_integration(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::harmony::harmony_integrate, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::lisi::compute_lisi, m)?)?;
+    Ok(())
+}
+
+fn register_preprocessing(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::preprocessing::normalize_total, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::preprocessing::log1p, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::preprocessing::calculate_qc_metrics,
+        m
+    )?)?;
+    Ok(())
+}
+
+fn register_filtering(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::filtering::filter_cells, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::filtering::filter_genes, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::filtering::subset_obs, m)?)?;
+    Ok(())
+}
+
+fn register_hvg(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::hvg::highly_variable_genes, m)?)?;
+    Ok(())
+}
+
+fn register_eval_metrics(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::eval_metrics::pseudobulk_means, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::perturbation_metrics,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(accel::eval_metrics::energy_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::energy_distance_details,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::discrimination_score,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::knockdown_efficiency,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::clustering_agreement,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::adjusted_mutual_info,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::normalized_mutual_info,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        accel::eval_metrics::adjusted_rand_index,
+        m
+    )?)?;
     Ok(())
 }

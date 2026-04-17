@@ -625,8 +625,8 @@ fn compute_kept_to_global(reader: &ScxReader) -> PyResult<Option<Vec<u64>>> {
     let mut deleted = vec![false; n_obs];
     for (shard_idx, shard_entry) in shards.iter().enumerate() {
         if let Some(ref stats) = shard_entry.stats {
-            if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
-                for local_row in sd.bitmap.iter() {
+            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
+                for local_row in bitmap.iter() {
                     let global_row = stats.row_start + local_row as u64;
                     if (global_row as usize) < n_obs {
                         deleted[global_row as usize] = true;
@@ -667,8 +667,8 @@ fn filter_obs_by_deletion_vectors(
     let mut keep = vec![true; n_obs];
     for (shard_idx, shard_entry) in shards.iter().enumerate() {
         if let Some(ref stats) = shard_entry.stats {
-            if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
-                for local_row in sd.bitmap.iter() {
+            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
+                for local_row in bitmap.iter() {
                     let global_row = stats.row_start + local_row as u64;
                     if (global_row as usize) < n_obs {
                         keep[global_row as usize] = false;
@@ -687,32 +687,10 @@ fn filter_obs_by_deletion_vectors(
 // from_anndata: AnnData → SCX
 // ---------------------------------------------------------------------------
 
-/// Detect the best value encoding for f32 data.
-///
-/// Checks `is_finite()` so that Infinity/NaN fall through to Float32
-/// (finding 9.4). Compares max as f64 to avoid precision loss for
-/// values > 2^24 (finding 9.1).
-pub(crate) fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
-    let all_integer = data
-        .iter()
-        .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
-
-    if !all_integer {
-        return ValueEncoding::Float32;
-    }
-
-    // Compare as f64 to avoid precision loss for values > 2^24 and
-    // saturation for values > u32::MAX (finding 9.1).
-    let max_val: f64 = data.iter().map(|&v| v as f64).fold(0.0f64, f64::max);
-
-    if max_val <= 255.0 {
-        ValueEncoding::Uint8
-    } else if max_val <= 65535.0 {
-        ValueEncoding::Uint16
-    } else {
-        ValueEncoding::Uint32
-    }
-}
+// Detection lives in `scx_codec::value_encoding` — re-exported here under
+// the historical name so call sites elsewhere in `pyscx/` don't have to
+// change.
+pub(crate) use scx_codec::value_encoding::detect_value_encoding;
 
 // ---------------------------------------------------------------------------
 // Type conversion helpers (D2)

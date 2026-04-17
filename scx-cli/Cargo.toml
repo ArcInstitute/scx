@@ -30,6 +30,8 @@ scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 chrono = "0.4"
 half = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

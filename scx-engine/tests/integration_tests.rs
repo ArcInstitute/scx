@@ -14,7 +14,7 @@ use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{build_indexes, QueryPipeline};
 use scx_format::header::FileHeader;
 use scx_format::writer::ScxWriter;
-use scx_format::{DeletionVectors, ShardDeletion};
+use scx_format::DeletionVectors;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -314,17 +314,11 @@ fn write_deletion_vectors_fixture(dir: &TempDir) -> PathBuf {
     bm0.insert(0);
     bm0.insert(1);
     bm0.insert(2);
-    dv.shards.push(ShardDeletion {
-        shard_id: 0,
-        bitmap: bm0,
-    });
+    dv.shards.insert(0, bm0);
     let mut bm2 = RoaringBitmap::new();
     bm2.insert(10);
     bm2.insert(11);
-    dv.shards.push(ShardDeletion {
-        shard_id: 2,
-        bitmap: bm2,
-    });
+    dv.shards.insert(2, bm2);
     writer.write_deletion_vectors(&dv).unwrap();
 
     writer.finish().unwrap();
