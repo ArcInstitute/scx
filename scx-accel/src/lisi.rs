@@ -212,7 +212,10 @@ fn exact_knn(emb: &[f64], n: usize, d: usize, k: usize) -> (Vec<usize>, Vec<f64>
             // Drain heap in descending distance, then reverse.
             let mut pairs: Vec<(f64, usize)> =
                 heap.into_iter().map(|e| (e.dist_sq, e.idx)).collect();
-            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            pairs.sort_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .expect("dist_sq is finite — clamped by max(0.0)")
+            });
 
             for (slot, (dsq, jdx)) in pairs.into_iter().enumerate() {
                 idx_row[slot] = jdx;

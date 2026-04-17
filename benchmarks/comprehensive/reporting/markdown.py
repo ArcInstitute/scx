@@ -24,6 +24,7 @@ from benchmarks.comprehensive.reporting.tables import (
     cell_eval_parity_perf_table,
     compression_table,
     compression_ratio_table,
+    scx_parallel_write_callout_table,
     datasets_table,
     harmony_scaling_table,
     harmony_validation_table,
@@ -167,12 +168,37 @@ otherwise noted.
 
 ## 3. Write Performance
 
+### Single-threaded (`num_threads=1`)
+
+All competing formats (Zarr, h5ad, TileDB-SOMA) write single-threaded —
+they cannot scale across cores. SCX parallelises shard encoding via
+rayon, so a 1-thread number is SCX's worst case and should be read
+alongside the 32-thread column below, not as its headline write speed.
+
 {write_speed_table()}
 
+### With parallel shard encoding (SCX only)
+
+Writing the same h5ad → SCX pipeline with 32 rayon threads (`full` mode —
+h5ad read + SCX write). Zarr / h5ad / TileDB-SOMA are omitted because
+their writers don't parallelise (Δ = 1.0× across all SCX codecs at every
+thread count in §6).
+
+{scx_parallel_write_callout_table()}
+
 **Takeaways:**
-- Zarr lz4 is the fastest writer. SCX writes are 1.8–2.9x slower at census
-  scale (improved from 10–60x pre-Sprint 3).
-- h5ad gzip and TileDB-SOMA are significantly slower due to heavier compression.
+- **Apples-to-apples, SCX is competitive at 32 threads.** On census_1m,
+  SCX (pcodec) drops from 72s single-threaded to 26s at 32 threads
+  (2.8× speedup) — roughly 2× the Zarr (blosc-lz4) wall at 14s but with
+  a 1.2× smaller file and 17× faster subsequent reads.
+- **SCX is the only format that scales writes with cores.** Zarr,
+  h5ad, and TileDB-SOMA stay flat regardless of `num_threads` (see §6
+  for the per-thread-count breakdown across all formats).
+- **Compression-heavy SCX codecs (pcodec, zstd) scale best** (2.6–2.9×
+  at 32T) — more CPU work per shard gives rayon more to schedule.
+  `scx1` and `none` plateau earlier (2.2× / 1.6×).
+- **h5ad gzip and TileDB-SOMA are significantly slower at any thread
+  count** (single-threaded compression / fragment writes dominate).
 """)
 
     # -----------------------------------------------------------------------

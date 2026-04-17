@@ -32,7 +32,7 @@ noise*:
   * Per-PC Pearson r >= 0.95  (>= 0.998 in the deterministic limit,
     which would require aligning RNG streams across languages —
     deferred as a future improvement).
-  * Iteration count within ±3 (RNG divergence perturbs the per-iter
+  * Iteration count within ±6 (RNG divergence perturbs the per-iter
     objective trajectory).
   * LISI mean within 5% (R `lisi` has its own RNG path through
     `Rtsne::Hbeta`; see benchmarks/results/harmony/REPORT.md for the
@@ -141,7 +141,7 @@ def test_per_pc_pearson_ge_0998(
     mean_r = float(np.mean([r for _, r in rs]))
     assert mean_r >= 0.97, f"{name}: mean per-PC r {mean_r:.4f} < 0.97"
 
-    # Iteration count within ±3 (RNG divergence perturbs the trajectory).
+    # Iteration count within ±6 (RNG divergence perturbs the trajectory).
     n_iter_ref = int(meta["ref"]["n_iterations"])
     n_iter_scx = int(adata.uns["harmony"]["n_iterations"])
     assert abs(n_iter_scx - n_iter_ref) <= 6, (
@@ -154,7 +154,7 @@ def test_per_pc_pearson_ge_0998(
     VALIDATION_SETS,
     ids=[v[0] for v in VALIDATION_SETS],
 )
-def test_lisi_mean_within_1pct(
+def test_lisi_mean_within_5pct(
     name, _dataset, _batch_col, _multi, _n_cap, _n_pcs
 ):
     import pyscx

@@ -290,6 +290,8 @@ impl HarmonyState {
         }
 
         // --- Transpose row-major f32 → column-major f64 (d x N) ---
+        // Core math runs in f64 for stable covariance / LU / ridge solves;
+        // the corrected embedding is cast back to f32 at the Python boundary.
         let mut z_orig = vec![0f64; d * n];
         for i in 0..n {
             for j in 0..d {
@@ -481,45 +483,49 @@ fn compute_distances(y: &[f64], z_cos: &[f64], d: usize, k: usize, n: usize) -> 
 ///
 /// `dist` is row-major K x N; sigma has length K; returns row-major K x N.
 fn softmax_r_from_dist(dist: &[f64], sigma: &[f64], k: usize, n: usize) -> Vec<f64> {
+    // Two-pass layout: compute each cell's softmax into a col-major
+    // temporary (N contiguous K-blocks) so the hot loop writes are
+    // contiguous and can run per-cell in parallel; then transpose
+    // row-by-row in parallel to the final row-major K x N output.
+    let mut col_major = vec![0f64; k * n];
+    col_major
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(i, cell)| {
+            let mut max_neg = f64::NEG_INFINITY;
+            for ku in 0..k {
+                let v = -dist[ku * n + i] / sigma[ku];
+                cell[ku] = v;
+                if v > max_neg {
+                    max_neg = v;
+                }
+            }
+            let mut sum = 0f64;
+            for ku in 0..k {
+                let e = (cell[ku] - max_neg).exp();
+                cell[ku] = e;
+                sum += e;
+            }
+            if sum > 0.0 {
+                let inv = 1.0 / sum;
+                for ku in 0..k {
+                    cell[ku] *= inv;
+                }
+            } else {
+                // Degenerate: assign uniform.
+                let u = 1.0 / k as f64;
+                for ku in 0..k {
+                    cell[ku] = u;
+                }
+            }
+        });
+
     let mut r = vec![0f64; k * n];
-    // Parallelize by cell (columns). For each cell: compute -dist/sigma,
-    // subtract max for stability, exp, normalize.
-    (0..n).into_par_iter().for_each(|_i| {});
-    // Write result in row-major K x N — cells aren't contiguous in memory
-    // for a given cell, so we fall back to serial outer scatter (K is small
-    // ~100, N large, so work per cell is O(K)).
-    //
-    // Simple serial implementation (correctness first; performance can be
-    // improved later).
-    for i in 0..n {
-        let mut max_neg = f64::NEG_INFINITY;
-        let mut vals = vec![0f64; k];
-        for ku in 0..k {
-            let v = -dist[ku * n + i] / sigma[ku];
-            vals[ku] = v;
-            if v > max_neg {
-                max_neg = v;
-            }
+    r.par_chunks_mut(n).enumerate().for_each(|(ku, row)| {
+        for i in 0..n {
+            row[i] = col_major[i * k + ku];
         }
-        let mut sum = 0f64;
-        for ku in 0..k {
-            let e = (vals[ku] - max_neg).exp();
-            vals[ku] = e;
-            sum += e;
-        }
-        if sum > 0.0 {
-            let inv = 1.0 / sum;
-            for ku in 0..k {
-                r[ku * n + i] = vals[ku] * inv;
-            }
-        } else {
-            // Degenerate: assign uniform.
-            let u = 1.0 / k as f64;
-            for ku in 0..k {
-                r[ku * n + i] = u;
-            }
-        }
-    }
+    });
     r
 }
 
@@ -1355,9 +1361,13 @@ mod gpu_impl {
             .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}")))?;
 
         // Flatten per-covariate labels to (C x N) row-major i32 and upload.
+        // Labels are u32 category indices; the GPU kernel uses i32, so
+        // assert they fit. Batch count per covariate is bounded in practice
+        // by `max_batches` (default 1024), well under i32::MAX.
         let mut labels_flat = vec![0i32; c_count * n];
         for (ci, cov) in covariates.iter().enumerate() {
             for (i, &lab) in cov.labels.iter().enumerate() {
+                debug_assert!(lab <= i32::MAX as u32, "batch label {lab} exceeds i32::MAX");
                 labels_flat[ci * n + i] = lab as i32;
             }
         }

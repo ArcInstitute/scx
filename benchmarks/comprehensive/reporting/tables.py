@@ -365,6 +365,67 @@ def parallel_scaling_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def scx_parallel_write_callout_table(
+    datasets: list[str] | None = None,
+) -> str:
+    """Compact SCX-only 1T → 32T → speedup table for the Write Performance section.
+
+    Pulled from the `parallel_write_scaling` results, `full` mode only (the
+    h5ad-read + SCX-write pipeline that `write_speed_table()` measures
+    single-threaded). Used to reframe §3 so readers don't walk away with
+    the misleading impression that SCX writes are slow at every thread
+    count — the single-threaded figure in `write_speed_table()` is the
+    worst case for a shard-parallel codec.
+    """
+    if datasets is None:
+        datasets = ["census_500k", "census_1m"]
+    results = load_all_results(benchmark="parallel_write_scaling")
+    if not results:
+        return "*No parallel write scaling results available yet.*"
+
+    # Keep SCX rows only; other formats do not parallelise at all.
+    scx_formats = [f for f in FORMAT_ORDER if f.startswith("scx_")]
+
+    header_cells = ["Format"]
+    for ds in datasets:
+        header_cells += [
+            f"{SHORT_NAMES.get(ds, ds)} @1T",
+            f"{SHORT_NAMES.get(ds, ds)} @32T",
+            f"{SHORT_NAMES.get(ds, ds)} Δ",
+        ]
+    lines = [
+        "| " + " | ".join(header_cells) + " |",
+        "|" + "|".join(["---"] + ["---:"] * (len(header_cells) - 1)) + "|",
+    ]
+
+    for fmt in scx_formats:
+        row = [FORMAT_DISPLAY.get(fmt, fmt)]
+        any_cell = False
+        for ds in datasets:
+            r = next(
+                (x for x in results
+                 if x.get("format") == fmt and x.get("dataset") == ds),
+                None,
+            )
+            scaling = (r or {}).get("metadata", {}).get("scaling_wall_s", {}).get("full", {})
+            t1 = scaling.get("1")
+            t32 = scaling.get("32")
+            if t1 is not None and t32 is not None:
+                any_cell = True
+                speedup = t1 / t32 if t32 else None
+                row += [
+                    _fmt_time(t1),
+                    _fmt_time(t32),
+                    f"{speedup:.1f}x" if speedup else "—",
+                ]
+            else:
+                row += ["—", "—", "—"]
+        if any_cell:
+            lines.append("| " + " | ".join(row) + " |")
+
+    return "\n".join(lines)
+
+
 def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
     """Generate parallel write scaling table: Format x Thread count showing wall time and speedup.
 
@@ -847,6 +908,7 @@ def generate_all_tables() -> dict[str, str]:
         "compression": compression_table(),
         "compression_ratio": compression_ratio_table(),
         "write_speed": write_speed_table(),
+        "scx_parallel_write_callout": scx_parallel_write_callout_table(),
         "read_speed": read_speed_table(),
         "read_selective": read_selective_table(),
         "parallel_scaling": parallel_scaling_table(),
