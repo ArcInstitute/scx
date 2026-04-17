@@ -1293,6 +1293,332 @@ impl HarmonyState {
     }
 }
 
+// ─── GPU path (behind `gpu` feature) ─────────────────────────────────
+
+#[cfg(feature = "gpu")]
+mod gpu_impl {
+    use super::*;
+    // `gpu_harmony_softmax_penalty` is exposed by scx-gpu for future fusion
+    // (one launch for softmax + diversity penalty). This orchestrator keeps
+    // the block-wise R update on CPU for now, so we don't import it here.
+    use scx_gpu::{
+        gpu_harmony_correction, gpu_harmony_distances, gpu_harmony_l2_normalize_cols, GpuDevice,
+    };
+
+    /// Helper: convert a `Vec<f64>` slice to f32 (GPU kernels use f32).
+    fn f64_to_f32(v: &[f64]) -> Vec<f32> {
+        v.iter().map(|&x| x as f32).collect()
+    }
+
+    /// GPU-accelerated Harmony2 integration.
+    ///
+    /// Reuses the CPU `HarmonyState` for orchestration, substituting GPU
+    /// kernels for the three compute-hot operations: cosine distance
+    /// computation, column L2 normalization, and per-batch correction
+    /// scatter-subtract. K-means++ seeding, soft assignment block updates,
+    /// objective/convergence tracking, and covariance inversion remain on
+    /// CPU — each is either inexpensive or requires branching that fits
+    /// poorly on GPU.
+    ///
+    /// Output is bit-compatible in structure (same `HarmonyResult` shape)
+    /// with the CPU path, but values differ slightly due to f32 rounding
+    /// on GPU vs. f64 on CPU. Per-PC Pearson correlation with the CPU
+    /// reference should be >= 0.99.
+    pub fn harmony_integrate_gpu(
+        embeddings: &[f32],
+        n_obs: usize,
+        n_pcs: usize,
+        covariates: &[BatchCovariate],
+        config: &HarmonyConfig,
+    ) -> Result<HarmonyResult> {
+        // Initialise CPU state (validates inputs, runs kmeans++/Lloyd, sets up
+        // initial R/O/E). Reusing this keeps the two paths algorithmically in
+        // step for the first iteration.
+        let mut state = HarmonyState::new(embeddings, n_obs, n_pcs, covariates, config)?;
+        let n = state.n;
+        let d = state.d;
+        let k = state.k;
+        let b = state.layout.b;
+        let c_count = state.layout.c;
+
+        let dev =
+            GpuDevice::new(0).map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+        // Upload Z_orig once — it never changes.
+        let d_z_orig = dev
+            .htod_copy(&f64_to_f32(&state.z_orig))
+            .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}")))?;
+
+        // Persistent device buffers (reused across iterations).
+        let mut d_z_corr = dev
+            .htod_copy(&f64_to_f32(&state.z_orig))
+            .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}")))?;
+
+        // Flatten per-covariate labels to (C x N) row-major i32 and upload.
+        let mut labels_flat = vec![0i32; c_count * n];
+        for (ci, cov) in covariates.iter().enumerate() {
+            for (i, &lab) in cov.labels.iter().enumerate() {
+                labels_flat[ci * n + i] = lab as i32;
+            }
+        }
+        let _d_labels = dev
+            .htod_copy(&labels_flat)
+            .map_err(|e| AccelError::LinAlg(format!("upload batch labels: {e}")))?;
+
+        let mut converged = false;
+        let mut iters_used = 0usize;
+
+        for iter in 0..state.config.max_iter {
+            iters_used = iter + 1;
+
+            if iter > 0 {
+                // Cold-start R on GPU: Z_cos = l2_normalize(Z_corr), then
+                // dist = 2*(1 - Y^T Z_cos). We keep R/dist on CPU once
+                // downloaded so the k-means sub-loop (CPU) can proceed.
+                let mut d_z_cos = dev
+                    .htod_copy(&f64_to_f32(&state.z_corr))
+                    .map_err(|e| AccelError::LinAlg(format!("upload Z_corr->cos: {e}")))?;
+                gpu_harmony_l2_normalize_cols(&dev, &mut d_z_cos, d, n)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize: {e}")))?;
+
+                let d_y = dev
+                    .htod_copy(&f64_to_f32(&state.y))
+                    .map_err(|e| AccelError::LinAlg(format!("upload Y: {e}")))?;
+                let mut d_dist = dev
+                    .alloc_zeros::<f32>(k * n)
+                    .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}")))?;
+                gpu_harmony_distances(&dev, &d_y, &d_z_cos, &mut d_dist, d, k, n)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU distances: {e}")))?;
+                dev.synchronize()
+                    .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
+
+                let dist_f32 = dev
+                    .dtoh_copy(&d_dist)
+                    .map_err(|e| AccelError::LinAlg(format!("download dist: {e}")))?;
+                state.z_cos = state.z_corr.clone();
+                l2_normalize_columns(&mut state.z_cos, d, n);
+                state.dist_mat = dist_f32.iter().map(|&v| v as f64).collect();
+                state.r = softmax_r_from_dist(&state.dist_mat, &state.sigma, k, n);
+                let (o, e) = compute_o_e(
+                    &state.r,
+                    &state.batch_index,
+                    &state.layout,
+                    &state.pr_b,
+                    k,
+                    n,
+                );
+                state.o = o;
+                state.e = e;
+            }
+
+            // K-means sub-loop stays on CPU — block-wise R update is branchy
+            // and relies on interleaved O/E increments that aren't a natural
+            // GPU fit at this workload size.
+            let mut local_obj: Vec<f64> = Vec::new();
+            for _sub in 0..state.config.max_iter_kmeans {
+                state.update_r();
+                let obj = state.compute_objective();
+                local_obj.push(obj);
+                state.objective_kmeans.push(obj);
+                if check_convergence_kmeans(
+                    &local_obj,
+                    state.config.window_size,
+                    state.config.epsilon_kmeans,
+                ) {
+                    break;
+                }
+            }
+
+            // --- Correction step (GPU scatter-subtract) ---
+            //
+            // Reset Z_corr = Z_orig on device.
+            dev.stream()
+                .memcpy_dtod(&d_z_orig, &mut d_z_corr)
+                .map_err(|e| AccelError::LinAlg(format!("reset Z_corr: {e}")))?;
+
+            // Mirror CPU correction logic, with the per-batch scatter done on
+            // GPU. Centroid rows W[0, :] still flow through CPU state.y.
+            for ku in 0..k {
+                let (kept, active_cov) = prune_batches_for_cluster(&state, ku);
+                if active_cov == 0 || kept.is_empty() {
+                    continue;
+                }
+                let b_prime = kept.len();
+                let size = b_prime + 1;
+
+                let lambda = match &state.lambda_fixed {
+                    Some(lam) => {
+                        let mut local = vec![0f64; size];
+                        for (j, &gb) in kept.iter().enumerate() {
+                            local[j + 1] = lam[gb + 1];
+                        }
+                        local
+                    }
+                    None => build_dynamic_lambda(&state, ku, &kept),
+                };
+
+                let mut cov = vec![0f64; size * size];
+                let mut sum_o = 0f64;
+                for (j, &gb) in kept.iter().enumerate() {
+                    let o_kb = state.o[ku * b + gb];
+                    cov[j + 1] = o_kb;
+                    cov[(j + 1) * size] = o_kb;
+                    cov[(j + 1) * size + (j + 1)] = o_kb;
+                    sum_o += o_kb;
+                }
+                cov[0] = sum_o;
+                for j in 0..size {
+                    cov[j * size + j] += lambda[j];
+                }
+
+                let inv_cov = if c_count == 1 {
+                    arrowhead_inverse(&cov, size)
+                } else {
+                    full_matrix_inverse(&cov, size)?
+                };
+
+                // z_sum_all + z_sum[j] from Z_orig (CPU-resident).
+                let mut z_sum = vec![0f64; b_prime * d];
+                for (j, &gb) in kept.iter().enumerate() {
+                    let (ci, lvl) = state.gb_to_cov_level(gb);
+                    let cells = &state.batch_index[ci][lvl];
+                    for &i in cells {
+                        let r_ki = state.r[ku * n + i];
+                        if r_ki == 0.0 {
+                            continue;
+                        }
+                        let z_col = &state.z_orig[i * d..(i + 1) * d];
+                        let row_off = j * d;
+                        for t in 0..d {
+                            z_sum[row_off + t] += z_col[t] * r_ki;
+                        }
+                    }
+                }
+                let mut z_sum_all = vec![0f64; d];
+                for j in 0..b_prime {
+                    let row_off = j * d;
+                    for t in 0..d {
+                        z_sum_all[t] += z_sum[row_off + t];
+                    }
+                }
+
+                let mut w = vec![0f64; size * d];
+                for r in 0..size {
+                    let ic0 = inv_cov[r * size];
+                    let row_off = r * d;
+                    for t in 0..d {
+                        w[row_off + t] = ic0 * z_sum_all[t];
+                    }
+                    for j in 0..b_prime {
+                        let icj = inv_cov[r * size + (j + 1)];
+                        if icj == 0.0 {
+                            continue;
+                        }
+                        let zj_off = j * d;
+                        for t in 0..d {
+                            w[row_off + t] += icj * z_sum[zj_off + t];
+                        }
+                    }
+                }
+
+                // Extract centroid into CPU state.y; zero W[0, :].
+                let y_off = ku * d;
+                for t in 0..d {
+                    state.y[y_off + t] = w[t];
+                    w[t] = 0.0;
+                }
+
+                // Upload R[k, :] once for this cluster.
+                let r_row_f32: Vec<f32> = state.r[ku * n..(ku + 1) * n]
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect();
+                let d_r_row = dev
+                    .htod_copy(&r_row_f32)
+                    .map_err(|e| AccelError::LinAlg(format!("upload R row: {e}")))?;
+
+                // Apply each kept batch on the GPU.
+                for (j, &gb) in kept.iter().enumerate() {
+                    let (ci, lvl) = state.gb_to_cov_level(gb);
+                    let cells_i32: Vec<i32> = state.batch_index[ci][lvl]
+                        .iter()
+                        .map(|&i| i as i32)
+                        .collect();
+                    if cells_i32.is_empty() {
+                        continue;
+                    }
+                    let d_cells = dev
+                        .htod_copy(&cells_i32)
+                        .map_err(|e| AccelError::LinAlg(format!("upload cells: {e}")))?;
+                    let w_row_f32: Vec<f32> = w[(j + 1) * d..(j + 2) * d]
+                        .iter()
+                        .map(|&v| v as f32)
+                        .collect();
+                    let d_w = dev
+                        .htod_copy(&w_row_f32)
+                        .map_err(|e| AccelError::LinAlg(format!("upload W row: {e}")))?;
+                    gpu_harmony_correction(&dev, &mut d_z_corr, d, n, &d_cells, &d_r_row, &d_w)
+                        .map_err(|e| AccelError::LinAlg(format!("GPU correction: {e}")))?;
+                }
+            }
+
+            // L2-normalize Y columns on GPU (d x K).
+            let mut d_y = dev
+                .htod_copy(&f64_to_f32(&state.y))
+                .map_err(|e| AccelError::LinAlg(format!("upload Y for norm: {e}")))?;
+            gpu_harmony_l2_normalize_cols(&dev, &mut d_y, d, k)
+                .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize Y: {e}")))?;
+            dev.synchronize()
+                .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
+            let y_back = dev
+                .dtoh_copy(&d_y)
+                .map_err(|e| AccelError::LinAlg(format!("download Y: {e}")))?;
+            for (dst, src) in state.y.iter_mut().zip(y_back.iter()) {
+                *dst = *src as f64;
+            }
+
+            // Sync Z_corr back to CPU state so cold_start_r can consume it
+            // on the next iteration.
+            let z_corr_back = dev
+                .dtoh_copy(&d_z_corr)
+                .map_err(|e| AccelError::LinAlg(format!("download Z_corr: {e}")))?;
+            for (dst, src) in state.z_corr.iter_mut().zip(z_corr_back.iter()) {
+                *dst = *src as f64;
+            }
+
+            if let Some(&last) = state.objective_kmeans.last() {
+                state.objective_harmony.push(last);
+            }
+            if check_convergence_harmony(&state.objective_harmony, state.config.epsilon_harmony) {
+                converged = true;
+                break;
+            }
+        }
+
+        // Build output as (N x d) row-major f64.
+        let mut z_out = vec![0f64; n * d];
+        for i in 0..n {
+            for j in 0..d {
+                z_out[i * d + j] = state.z_corr[j + i * d];
+            }
+        }
+
+        Ok(HarmonyResult {
+            z_corrected: z_out,
+            n_obs: n,
+            n_pcs: d,
+            r_matrix: std::mem::take(&mut state.r),
+            n_clusters: state.k,
+            objective_harmony: std::mem::take(&mut state.objective_harmony),
+            n_iterations: iters_used,
+            converged,
+        })
+    }
+}
+
+#[cfg(feature = "gpu")]
+pub use gpu_impl::harmony_integrate_gpu;
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1692,5 +2018,103 @@ mod tests {
         assert_eq!(result.z_corrected.len(), n * d);
         assert!(result.z_corrected.iter().all(|v| v.is_finite()));
         assert_eq!(result.r_matrix.len(), result.n_clusters * n);
+    }
+
+    // ── GPU tests ─────────────────────────────────────────────────────
+    // Skip silently on machines without a CUDA driver; run otherwise.
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_harmony_shape_matches_cpu() {
+        // Skip if no GPU available.
+        if scx_gpu::GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU harmony test");
+            return;
+        }
+        let n = 200;
+        let d = 6;
+        let emb = random_embeddings(n, d, 100);
+        let labels: Vec<u32> = (0..n as u32).map(|i| i % 3).collect();
+        let cov = BatchCovariate {
+            labels,
+            n_levels: 3,
+            name: None,
+        };
+        let config = HarmonyConfig {
+            n_clusters: Some(5),
+            max_iter: 2,
+            random_state: 7,
+            ..Default::default()
+        };
+        let result =
+            harmony_integrate_gpu(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+        assert_eq!(result.n_obs, n);
+        assert_eq!(result.n_pcs, d);
+        assert_eq!(result.z_corrected.len(), n * d);
+        assert!(result.z_corrected.iter().all(|v| v.is_finite()));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_vs_cpu_per_pc_correlation() {
+        // Skip on machines without CUDA.
+        if scx_gpu::GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU harmony correlation test");
+            return;
+        }
+        let n_per = 80;
+        let d = 5;
+        let (emb, labels) = batched_gaussian(n_per, d, 123);
+        let n = emb.len() / d;
+        let cov = BatchCovariate {
+            labels,
+            n_levels: 2,
+            name: None,
+        };
+        let config = HarmonyConfig {
+            n_clusters: Some(4),
+            max_iter: 3,
+            random_state: 11,
+            ..Default::default()
+        };
+        let cpu = harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+        let gpu = harmony_integrate_gpu(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+
+        // Compare per-PC Pearson correlation (f32 rounding → expect ~0.99+).
+        for pc in 0..d {
+            let mut x: Vec<f64> = Vec::with_capacity(n);
+            let mut y: Vec<f64> = Vec::with_capacity(n);
+            for i in 0..n {
+                x.push(cpu.z_corrected[i * d + pc]);
+                y.push(gpu.z_corrected[i * d + pc]);
+            }
+            let mx: f64 = x.iter().sum::<f64>() / n as f64;
+            let my: f64 = y.iter().sum::<f64>() / n as f64;
+            let mut num = 0f64;
+            let mut dx = 0f64;
+            let mut dy = 0f64;
+            for i in 0..n {
+                let a = x[i] - mx;
+                let b = y[i] - my;
+                num += a * b;
+                dx += a * a;
+                dy += b * b;
+            }
+            let r = num / (dx.sqrt() * dy.sqrt() + 1e-30);
+            // Either strong correlation OR both PCs are near-constant (dx or dy ~ 0).
+            if dx > 1e-8 && dy > 1e-8 {
+                assert!(r > 0.95, "PC {pc}: r={r}");
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_memory_estimate_reasonable() {
+        use scx_gpu::gpu_harmony_memory_bytes;
+        let bytes = gpu_harmony_memory_bytes(10_000, 30, 50, 3, 1);
+        // Order-of-magnitude: ~few MB, well under 1 GB.
+        assert!(bytes > 1_000_000);
+        assert!(bytes < 1_000_000_000);
     }
 }

@@ -343,7 +343,7 @@ R bindings. Multimodal support. Full documentation.
 
 ## Phase 4: Rust-Native Analysis Accelerators — 4a/4b COMPLETE
 
-**Implementation plan**: [Phase4.md](Phase4.md), [Phase4-GPU.md](Phase4-GPU.md), [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)
+**Implementation plan**: [Phase4.md](Phase4.md), [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)
 
 **Goal**: For operations where scanpy is a bottleneck at scale, provide
 faster Rust implementations. These are **optional optimizations** — the
@@ -372,7 +372,7 @@ full scverse pipeline works via AnnData from Phase 1.
 - [x] Fused GPU preprocessing (normalize+log1p)
 - [x] Graceful fallback to CPU when GPU unavailable
 
-See [Phase4-GPU.md](Phase4-GPU.md) for detailed specification and benchmark results.
+See [docs/gpu-setup.md](docs/gpu-setup.md) and [docs/performance.md](docs/performance.md) for setup and benchmark results.
 
 ### Phase 4d: Eliminating Materialization — COMPLETE
 - [x] Column-projected streaming aggregation (`sum`, `var`, `nnz`, `max`, `min` with gene subsets)

@@ -88,9 +88,8 @@ pub fn harmony_integrate(
     random_state: u64,
     device: &str,
 ) -> PyResult<()> {
-    // Resolve device. GPU path lands in Phase 3; for now only validate.
-    let _use_gpu = resolve_device(device)?;
-    let backend = "scx-accel-cpu";
+    // Resolve device (true = GPU, false = CPU).
+    let use_gpu = resolve_device(device)?;
 
     // --- Extract embeddings (N x d, f32 row-major) ---
     let obsm = adata.getattr("obsm")?;
@@ -202,13 +201,42 @@ pub fn harmony_integrate(
     };
 
     // --- Dispatch Rust core with GIL released ---
-    let result = py
-        .allow_threads(|| {
-            scx_accel::harmony_integrate(&embeddings, n_obs, n_pcs, &covariates, &config)
-        })
-        .map_err(|e: scx_accel::AccelError| {
-            PyRuntimeError::new_err(format!("harmony_integrate: {e}"))
-        })?;
+    // GPU path is only compiled when pyscx is built with `--features gpu`.
+    #[cfg(feature = "gpu")]
+    let (result, backend) = if use_gpu {
+        let r = py
+            .allow_threads(|| {
+                scx_accel::harmony_integrate_gpu(&embeddings, n_obs, n_pcs, &covariates, &config)
+            })
+            .map_err(|e: scx_accel::AccelError| {
+                PyRuntimeError::new_err(format!("harmony_integrate_gpu: {e}"))
+            })?;
+        (r, "scx-gpu")
+    } else {
+        let r = py
+            .allow_threads(|| {
+                scx_accel::harmony_integrate(&embeddings, n_obs, n_pcs, &covariates, &config)
+            })
+            .map_err(|e: scx_accel::AccelError| {
+                PyRuntimeError::new_err(format!("harmony_integrate: {e}"))
+            })?;
+        (r, "scx-accel-cpu")
+    };
+
+    #[cfg(not(feature = "gpu"))]
+    let (result, backend) = {
+        // Without the `gpu` feature, `resolve_device` rejects device="gpu";
+        // "auto" collapses to CPU. `use_gpu` can only be false here.
+        let _ = use_gpu;
+        let r = py
+            .allow_threads(|| {
+                scx_accel::harmony_integrate(&embeddings, n_obs, n_pcs, &covariates, &config)
+            })
+            .map_err(|e: scx_accel::AccelError| {
+                PyRuntimeError::new_err(format!("harmony_integrate: {e}"))
+            })?;
+        (r, "scx-accel-cpu")
+    };
 
     // --- Write corrected embeddings back as float32 (N x d) ---
     let out_f32: Vec<f32> = result.z_corrected.iter().map(|&v| v as f32).collect();

@@ -50,6 +50,7 @@ pub mod cusparse;
 pub mod device;
 pub mod error;
 pub mod forbp_gpu;
+pub mod gpu_harmony;
 pub mod gpu_knn;
 pub mod gpu_pca;
 pub mod gpu_preprocess;
@@ -67,6 +68,10 @@ pub use cusparse::{
 pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
+pub use gpu_harmony::{
+    gpu_harmony_correction, gpu_harmony_distances, gpu_harmony_l2_normalize_cols,
+    gpu_harmony_memory_bytes, gpu_harmony_softmax_penalty,
+};
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
 pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
 pub use gpu_preprocess::{gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p};

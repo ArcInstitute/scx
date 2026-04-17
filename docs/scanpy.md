@@ -1274,8 +1274,18 @@ GPU and CPU accelerators may produce slightly different results due to:
 | **UMAP non-determinism** | GPU uses `atomicAdd` (race conditions are intentional) | Embedding coordinates differ; cluster structure preserved |
 | **Leiden** | Rust-native vs cuGraph vs leidenalg may produce different partitions | ARI > 0.90; biological conclusions equivalent |
 
-For reproducibility notes and tolerance thresholds, see
-[Phase4-GPU.md §7](../tasks/Phase4-GPU.md).
+### Tolerance thresholds (correctness tests)
+
+The GPU test suite (`pyscx/tests/test_accel_gpu.py`) enforces these thresholds vs the CPU reference:
+
+| Test | Metric | Threshold | Notes |
+|------|--------|-----------|-------|
+| GPU PCA vs CPU PCA | Cosine similarity per PC | > 0.99 | Sign-invariant; GPU=f32, CPU=f64 |
+| GPU kNN vs CPU HNSW | Recall@k | > 0.95 | Different algorithms (CAGRA vs HNSW); exact match not expected |
+| GPU UMAP | Trustworthiness | > 0.95 | Non-deterministic due to `atomicAdd` races |
+| GPU Leiden vs CPU Leiden | ARI | > 0.90 | Graph partitioning is inherently non-deterministic |
+| GPU SpMM vs CPU SpMM | Max relative error | < 1e-5 | Relative error (not absolute) for values near zero |
+| GPU normalize + log1p | Element-wise | rtol=1e-7 | Possible f32 rounding differences vs CPU |
 
 ### Checking which backend was used
 
@@ -1298,6 +1308,50 @@ If cuML or cuGraph are importable at runtime, they are used as optimized
 backends for UMAP and GPU Leiden respectively. Otherwise, SCX's native CUDA
 kernels (UMAP) or the Rust-native Leiden implementation are used. The
 Leiden dispatch order is: Rust-native → GPU cuGraph → Python leidenalg.
+
+## Multithreading
+
+Most scx-accel and pyscx entry points are multithreaded via rayon by default,
+and release the GIL (`py.allow_threads()`) so Python stays responsive. For the
+full architecture — runtimes, thread pools, channel topology, and how to control
+parallelism — see [docs/multithreading.md](multithreading.md).
+
+### Per-function threading
+
+| Function | Threading | Notes |
+|----------|-----------|-------|
+| `pyscx.open()`, `to_anndata()`, `read_layer()` | Rayon parallel shard decode | `scx-format` with `parallel` feature; SIMD BitPacker4x within each shard |
+| `ScxBackedDataset` slicing / column projection | Rayon per access | Each `X[...]` call decodes touched shards in parallel |
+| `pyscx.query().where(...).collect()` | Rayon parallel shard decode | Only shards surviving catalog pushdown are decoded |
+| `pyscx.iter_chunks()`, `pyscx.preprocess()`, `pyscx.save_layer()` | Rayon parallel shard decode + encode | Parallel encode achieves up to 3.2× at 32 threads |
+| `pyscx.accel.pca` (CPU) | Rayon | Parallel covariance accumulation (thread-local matrices); streaming SpMM parallelizes inner products |
+| `pyscx.accel.neighbors` (CPU) | Rayon | Parallel kNN queries on HNSW index |
+| `pyscx.accel.umap` (CPU) | Single-threaded SGD | Edge updates are serial on CPU; GPU path uses CUDA kernel parallelism |
+| `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (matches C++ leidenalg); parallel uses conflict-free graph coloring |
+| `pyscx.accel.rank_genes_groups` | Rayon | Parallel Wilcoxon rank-sum across genes |
+| `pyscx.accel.pseudobulk_dex` | Rayon (aggregation) | Streaming aggregation is parallel; downstream `pydeseq2` testing runs single-threaded |
+| `pyscx.accel.highly_variable_genes` | Rayon (via streaming reader) | Parallelism comes from shard decode; the mean/var reduction itself is serial |
+| `pyscx.accel.perturbation_metrics`, `discrimination_score`, `energy_distance` | Rayon | Parallelizes across perturbations / pairwise-distance rows |
+| `pyscx.accel.knockdown_efficiency`, `clustering_agreement` | Rayon | Parallel per-perturbation / per-label reductions |
+| `pyscx.accel.harmony` (batch correction) | Rayon | Parallel per-cluster correction |
+| `pyscx.accel.normalize_total`, `log1p`, `filter_cells`, `filter_genes`, `calculate_qc_metrics` | Rayon (via streaming reader) | Lazy — no work until materialized or consumed |
+| `pyscx.pull()` / `pyscx.push()` (cloud) | Tokio async | `parallelism` parameter controls concurrent transfers (default 8) |
+| `pyscx.TrainingDataset` | Triple-buffered (tokio I/O + rayon decode + Python consumer) | See [multithreading.md §Training data loader](multithreading.md#training-data-loader-triple-buffered-pipeline) |
+| `pyscx.accel.*` with `device="gpu"` | CUDA kernel parallelism | CPU side launches kernels and manages transfers |
+
+### Controlling parallelism
+
+```python
+import os
+os.environ["RAYON_NUM_THREADS"] = "8"   # must be set before `import pyscx`
+import pyscx
+```
+
+The cloud runtime exposes its own knob:
+
+```python
+pyscx.pull("gs://bucket/atlas.scxd/", "atlas.scx", parallelism=16)
+```
 
 ## Common scanpy workflows
 

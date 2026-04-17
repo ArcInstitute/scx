@@ -5,8 +5,6 @@ SCX GPU UMAP Validation & Benchmark
 Validates GPU-accelerated UMAP (native CUDA SGD kernel) via trustworthiness
 metric against CPU UMAP. Benchmarks GPU vs CPU UMAP wall-clock timing.
 
-Covers Phase4-GPU.md Step 4 unchecked items.
-
 Usage:
     # Validate trustworthiness on pbmc3k
     python benchmarks/scripts/benchmark_gpu_umap.py --mode validate
