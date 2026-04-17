@@ -136,6 +136,31 @@ Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):
 
 Full pipeline (PCA -> kNN -> UMAP -> Leiden -> DE) on 1M cells: **870s** (vs 3,971s — **4.6x faster**).
 
+### Harmony2 batch integration + LISI
+
+Rust-native re-implementation of the Harmony2 algorithm (Korsunsky et al., 2019) and the Local Inverse Simpson Index (LISI). Exposed via `pyscx.accel.harmony_integrate` and `pyscx.accel.compute_lisi`; R wrappers are `rscx::scx_harmony_integrate` and `rscx::scx_compute_lisi`. GPU path available behind the `gpu` feature (`pyscx.accel.harmony_integrate(adata, ..., device="gpu")`).
+
+Numerical parity against R `harmony` v2.x (clean-room Rust implementation; validation fixtures + thresholds in `pyscx/tests/test_harmony_validation.py`):
+
+| Dataset | N | Batches | d | K | mean per-PC Pearson r vs R | mean LISI agreement |
+|---------|---:|---:|---:|---:|---:|---:|
+| pbmc_small (D1) | 2,700 | 3 | 30 | 100 | **0.999** | within 5% |
+| cell_lines (smartseq2, D3) | 9,478 | 47 | 20 | 100 | **0.989** | within 5% |
+| hlca_subset (tabula_sapiens, D4) | 50,000 | 118 | 30 | 100 | **0.999** | within 5% |
+
+The Rust RNG (`rand_chacha`) draws differ from R's Mersenne Twister, so tail PCs can deviate by up to ~2% on high-batch-count inputs (see `benchmarks/results/harmony/REPORT.md` for per-PC curves and wall/RSS scaling across D1–D7 for CPU scx-accel vs harmonypy vs R harmony).
+
+Scaling sweep (wall time vs N, d=30, K=100, theta=2, max_iter=10; log–log exponents α from `REPORT.md`):
+
+| Impl / device | α (wall vs N) | D7 (5M cells) wall | Commentary |
+|---------------|--------------:|-------------------:|-----------|
+| scx-accel CPU | **0.67** | 37.5 min | sub-linear; rayon-parallel distance + L2-norm keep constants low |
+| scx-accel GPU | **1.00** | 31.1 min | near-linear, dominated by HTD/DTH transfers per iteration |
+| harmonypy (CPU) | **0.73** | 22.4 min | near-linear; numpy/OpenBLAS benefits at large N |
+| R harmony (CPU) | **1.02** | 80.5 min | linear with the highest wall constant of the four |
+
+LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi` on D1–D4 (e.g. smartseq2 3.85 s vs 43.11 s; tabula_sapiens_100k 12 s vs 110 s), with mean-LISI agreement within 0.8–2.4 % of the R reference.
+
 ## Perturbation Metrics (cell-eval / arc-bench parity)
 
 Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (30/30 parity tests pass within the tolerances documented in [`docs/scanpy.md`](scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
