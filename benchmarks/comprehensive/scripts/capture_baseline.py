@@ -140,12 +140,14 @@ def _run(cmd: list[str], cwd: Path | None = None) -> str:
 def capture_environment() -> dict[str, Any]:
     from benchmarks.comprehensive.sysinfo import collect_system_info
 
+    # Single `git status --porcelain` — an empty output means a clean tree,
+    # the sentinel "unknown" means the command failed (not a dirty tree).
+    git_status = _run(["git", "status", "--porcelain"], cwd=PROJECT_ROOT)
     env: dict[str, Any] = {
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "git_sha": _run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT),
         "git_branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=PROJECT_ROOT),
-        "git_dirty": bool(_run(["git", "status", "--porcelain"], cwd=PROJECT_ROOT)
-                          and _run(["git", "status", "--porcelain"], cwd=PROJECT_ROOT) != "unknown"),
+        "git_dirty": git_status not in ("", "unknown"),
         "git_describe": _run(["git", "describe", "--always", "--dirty"], cwd=PROJECT_ROOT),
         "determinism_env": {
             "RAYON_NUM_THREADS": os.environ.get("RAYON_NUM_THREADS", "unset"),
