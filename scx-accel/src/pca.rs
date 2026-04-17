@@ -1202,7 +1202,7 @@ pub fn randomized_pca_gpu(
 /// Returns `true` if at least one CUDA device is found.
 #[cfg(feature = "gpu")]
 pub fn gpu_available() -> bool {
-    scx_gpu::GpuDevice::count().map_or(false, |n| n > 0)
+    scx_gpu::GpuDevice::count().is_ok_and(|n| n > 0)
 }
 
 /// GPU device information returned by [`gpu_info`].

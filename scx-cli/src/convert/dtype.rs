@@ -7,7 +7,7 @@ use scx_codec::{CodecId, ValueEncoding};
 use scx_format::select_codec;
 
 pub use scx_codec::value_encoding::{
-    detect_value_encoding as detect_value_encoding_only, is_integer_data, values_to_raw_bytes,
+    detect_value_encoding as detect_value_encoding_only, values_to_raw_bytes,
 };
 
 /// Detect the best value encoding and auto-select codec for the data.
