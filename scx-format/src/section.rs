@@ -1,4 +1,4 @@
-// Section alignment, padding, types (SPEC §3)
+// Section alignment, padding, types (docs/format.md)
 
 /// Section types in the SCX file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

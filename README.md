@@ -691,7 +691,7 @@ SCX is a Rust workspace with 14 crates:
 | `pyscx` | Python bindings (PyO3) |
 | `rscx` | R bindings (extendr) |
 
-For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/scanpy.md`](docs/scanpy.md), and [`SPEC.md`](SPEC.md).
+For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md).
 
 ## License
 

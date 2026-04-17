@@ -1,7 +1,6 @@
 //! Quasi-random shard and row shuffling for training data randomization.
 //!
-//! Implements [SPEC.md §8.3](../SPEC.md#83-quasi-random-shard-shuffle):
-//! two-level shuffle that provides training randomization without random I/O.
+//! Two-level shuffle that provides training randomization without random I/O.
 //!
 //! - **Level 1 (shard order)**: Permute shard indices each epoch, then group
 //!   into contiguous shard groups for sequential disk I/O.

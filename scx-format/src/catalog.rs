@@ -1,4 +1,4 @@
-// RootCatalog + FullCatalog (SPEC §3.2)
+// RootCatalog + FullCatalog (docs/format.md (Dual Catalog))
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
@@ -97,22 +97,22 @@ impl RootCatalog {
 }
 
 // ---------------------------------------------------------------------------
-// ColumnStat — per-column statistics for shard pruning (SPEC §3.2, Phase 2)
+// ColumnStat — per-column statistics for shard pruning (docs/format.md (Dual Catalog), Phase 2)
 // ---------------------------------------------------------------------------
 
 /// Per-column statistic stored in ShardStats for predicate pushdown.
 ///
-/// - `MinMax`: stat_type == 0 in SPEC §3.2. Stores numeric min/max.
-/// - `CategoryBitset`: stat_type == 1 in SPEC §3.2. Bit i set if dictionary index i is present.
+/// - `MinMax`: stat_type == 0 in docs/format.md (Dual Catalog). Stores numeric min/max.
+/// - `CategoryBitset`: stat_type == 1 in docs/format.md (Dual Catalog). Bit i set if dictionary index i is present.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnStat {
-    /// stat_type == 0 in SPEC §3.2
+    /// stat_type == 0 in docs/format.md (Dual Catalog)
     MinMax {
         column_name_hash: u64, // BLAKE3 truncated hash of column name
         min: f64,
         max: f64,
     },
-    /// stat_type == 1 in SPEC §3.2
+    /// stat_type == 1 in docs/format.md (Dual Catalog)
     CategoryBitset {
         column_name_hash: u64,
         bitset: Vec<u8>, // bit i set if dictionary index i present

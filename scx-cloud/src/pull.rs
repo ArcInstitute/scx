@@ -1,7 +1,7 @@
 //! Streaming Pull: download from cloud/local exploded `.scxd` and pack
 //! into a local `.scx` file in a single pass.
 //!
-//! Implements SPEC §12.8.
+//! Implements docs/cloud.md (Streaming pull/push).
 //!
 //! Pipeline:
 //!   1. GET `_catalog.bin` + `_header.bin`

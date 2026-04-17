@@ -7,8 +7,9 @@
 SCX does **not** need to reimplement scanpy, scVI, Harmony, or any other
 scverse analysis tool. The entire scverse ecosystem operates on AnnData
 objects backed by scipy sparse matrices and pandas/Arrow DataFrames.
-SCX's `to_anndata()` produces exactly this via zero-copy (SPEC.md Section
-6.2), so every existing tool works unmodified:
+SCX's `to_anndata()` produces exactly this via zero-copy (see
+[docs/format.md](docs/format.md) and [docs/api.md](docs/api.md)),
+so every existing tool works unmodified:
 
 ```python
 adata = scx.open("experiment.scx").to_anndata()
@@ -38,18 +39,18 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
 → scanpy pipeline works`. Publish compression and I/O benchmarks.
 
 ### 1.1 scx-format
-- [x] File header read/write (256 bytes, all fields from SPEC.md Section 3.1)
-- [x] Root catalog read/write (Section 3.2)
+- [x] File header read/write (256 bytes, all fields; see docs/format.md §File Header)
+- [x] Root catalog read/write (docs/format.md §Dual Catalog)
 - [x] Full catalog read/write with per-entry checksums and shard statistics
 - [x] Section alignment (8-byte) and padding
-- [x] Atomic rename write path (Section 3.6.1)
+- [x] Atomic rename write path (docs/format.md §Initial file creation)
 - [x] `mmap` read path for local files
 - [x] BLAKE3 checksums (per-section and file-level)
 
 ### 1.2 scx-codec
-- [x] Rice encoder/decoder (Section 4.3) with per-block adaptive k
-- [x] FOR-BP encoder/decoder for indices (Section 4.2)
-- [x] Delta-Golomb encoder/decoder for indptr (Section 4.1)
+- [x] Rice encoder/decoder (docs/codec.md §Values) with per-block adaptive k
+- [x] FOR-BP encoder/decoder for indices (docs/codec.md §Indices)
+- [x] Delta-Golomb encoder/decoder for indptr (docs/codec.md §Indptr)
 - [x] Codec dispatch by `codec_id` (none, scx1, zstd)
 - [x] Per-shard codec override (shard header overrides file header)
 - [x] Conformance test vectors: known input → exact encoded bytes
@@ -162,14 +163,14 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 - [x] Default `from_anndata()` codec from None to "auto"
 
 ### 2.1 Training Loader
-- [x] Triple-buffered Rust pipeline (Section 8.2):
+- [x] Triple-buffered Rust pipeline (see docs/architecture.md §Training Data Loader):
   - Stage 1: tokio async I/O reads shard groups from .scx
   - Stage 2: rayon thread pool shuffles + densifies batches
   - Stage 3: pinned memory handoff to PyTorch via buffer protocol
 - [x] Pipeline coordinator with back-pressure (bounded channels)
-- [x] Gene projection at decode time (HVG bitmap, Section 8.4)
-- [x] Sparse-to-dense direct write into pinned tensors (Section 8.5)
-- [x] Quasi-random shard shuffle (Section 8.3)
+- [x] Gene projection at decode time (HVG bitmap)
+- [x] Sparse-to-dense direct write into pinned tensors
+- [x] Quasi-random shard shuffle
 - [x] scVI DataModule integration (obs covariates in batch)
 - [ ] scGPT DataModule integration
 - [x] Configurable memory budget (`max_loader_memory_mb`)
@@ -178,7 +179,7 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 - [x] Lazy pipeline builder: `open → filter → select → collect`
 - [x] Schema validation at pipeline construction time (fail-fast)
 - [x] Predicate pushdown level 1: catalog-level shard pruning via stats
-- [x] Predicate pushdown level 2: predicate index lookups (Section 3.5)
+- [x] Predicate pushdown level 2: predicate index lookups (docs/format.md §Predicate Indexes)
 - [x] Projection pushdown: skip unreferenced sections
 - [x] Parallel shard processing with rayon
 - [x] Result as AnnData (filtered subset)
@@ -191,26 +192,26 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 - [ ] `scx-cli` flag to specify indexed columns during conversion
 
 ### 2.4 Fragment/Manifest Operations
-- [x] `scx append` — append new shards + updated catalog (Section 3.6.2)
-- [x] `scx delete --filter` — logical deletion via deletion vectors (Section 3.6.3)
-- [x] `scx compact` — rewrite file reclaiming space (Section 3.6.4)
-- [x] `scx rollback` — revert to previous manifest (Section 3.6.5)
+- [x] `scx append` — append new shards + updated catalog (docs/format.md §Append)
+- [x] `scx delete --filter` — logical deletion via deletion vectors (docs/format.md §Deletion vectors)
+- [x] `scx compact` — rewrite file reclaiming space (docs/format.md §Compaction)
+- [x] `scx rollback` — revert to previous manifest (docs/format.md §Rollback)
 - [x] `scx merge` — streaming merge of multiple .scx files
 - [x] Advisory `flock()` for concurrent append safety
 - [x] Python API: `scx.open("file.scx", mode="append")`
 
-### 2.5 Cloud Operations (SPEC §12)
-- [x] `scx cloud-optimize` — rewrite with front-of-file catalog (SPEC §12.2)
-- [x] `scx explode` / `scx pack` — packed ↔ exploded directory (SPEC §12.5)
-- [x] `scx pull` — streaming cloud → packed with on-the-fly repackaging (SPEC §12.8)
-- [x] `scx push` — streaming packed → cloud with on-the-fly explode (SPEC §12.8)
-- [x] `scx pull --filter` — selective pull with predicate pushdown (SPEC §12.8)
+### 2.5 Cloud Operations (docs/cloud.md)
+- [x] `scx cloud-optimize` — rewrite with front-of-file catalog (docs/cloud.md (Cloud-optimized layout))
+- [x] `scx explode` / `scx pack` — packed ↔ exploded directory (docs/cloud.md (Exploded layout))
+- [x] `scx pull` — streaming cloud → packed with on-the-fly repackaging (docs/cloud.md (Streaming pull/push))
+- [x] `scx push` — streaming packed → cloud with on-the-fly explode (docs/cloud.md (Streaming pull/push))
+- [x] `scx pull --filter` — selective pull with predicate pushdown (docs/cloud.md (Streaming pull/push))
 - [x] `object_store` integration (S3, GCS, Azure backends)
 - [x] Python API: `scx.pull()`, `scx.push()`, `scx.open_cloud("gs://...")`
 - [x] `CloudReader` for direct cloud reads without full download
 
 ### 2.6 Fused Operations (performance, not analysis reimplementation)
-- [x] Fused normalize + log1p (single CSR row scan, Section 7.2)
+- [x] Fused normalize + log1p (single CSR row scan)
 - [x] HVG selection via CSR column aggregation (faster than scanpy for large data)
 - [x] These run inside the SCX query pipeline; results are written into
   the AnnData so downstream scanpy operations see the expected slots
@@ -220,7 +221,7 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 - [x] Training throughput: batches/sec, GPU utilization, time-to-first-batch
 - [x] Compare against TileDB-SOMA-ML (latest release, recommended config)
 - [x] Query engine: measure shard skip rate on filtered queries
-- [x] Memory footprint validation (~330 MB per Section 8.8)
+- [x] Memory footprint validation (~330 MB)
 - [x] Publish reproducible benchmark scripts and results
 
 ### Deliverable
@@ -246,7 +247,7 @@ scGPT train end-to-end on atlas-scale SCX data.
   it gets Python bindings or inspires a Python equivalent, it could address some of
   the same performance gaps SCX targets — without requiring a new file format.
 - **PyTorch DataLoader integration is tricky.** `num_workers=0` is required because
-  the Rust pipeline manages its own threads (SPEC §8.7). This means the standard
+  the Rust pipeline manages its own threads (docs/multithreading.md (Training data loader)). This means the standard
   PyTorch multiprocessing prefetch doesn't apply — the Rust pipeline must provide
   equivalent or better prefetching. Users familiar with `num_workers>0` patterns
   may be confused. Document this clearly.
@@ -260,7 +261,7 @@ scGPT train end-to-end on atlas-scale SCX data.
   skip rate" target assumes queries filter on columns with non-uniform distribution
   across shards (e.g., cell_type). For uniformly distributed columns (e.g.,
   n_counts), skip rates will be much lower. Benchmark with realistic query workloads.
-- **Memory budget enforcement.** The 330 MB projection (SPEC §8.8) assumes specific
+- **Memory budget enforcement.** The 330 MB projection (docs/multithreading.md (Training data loader)) assumes specific
   configuration. Make `max_loader_memory_mb` a configurable parameter and auto-tune
   `shard_group_size` and `prefetch_batches` to fit within it. Users on
   memory-constrained systems (shared HPC nodes) need this.
@@ -281,7 +282,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] `scx build-csc input.scx output.scx` — streaming transpose
 - [x] `scx benchmark experiment.scx` — I/O + pipeline benchmarks
 - [x] `scx subset` — extract cell/gene subsets to new file
-- [x] `scx upgrade input.scx output.scx` — rewrite to latest format version (SPEC §3.9)
+- [x] `scx upgrade input.scx output.scx` — rewrite to latest format version (docs/format.md (Versioning))
 
 ### 3.3 rscx (R Bindings) — COMPLETE
 - [x] extendr-based R package
@@ -291,7 +292,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] SingleCellExperiment interop
 
 ### 3.4 Multimodal Support
-- [ ] CITE-seq (RNA + protein): multi-feature-space layout (Section 11.1)
+- [ ] CITE-seq (RNA + protein): multi-feature-space layout (docs/format.md §Multimodal Extension)
 - [ ] Spatial transcriptomics: spatial coordinates + optional R-tree index
 - [ ] `scx convert --from h5mu` (MuData format)
 - [ ] Round-trip with MuData/MuOn objects
@@ -301,7 +302,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [ ] Fuzz targets in CI for all decoders and parsers
 - [x] SIMD FOR-BP decode (BitPacker4x, 44% faster index decode) — done in Sprint 2, Phase 2E
 - [ ] SIMD Rice/Delta-Golomb optimizations (AVX2, NEON) with runtime dispatch
-- [ ] Detection bitmap layer (Roaring Bitmap, Section 5)
+- [ ] Detection bitmap layer (Roaring Bitmap, docs/format.md §Detection Bitmap)
 - [ ] Documentation: API reference, tutorials, migration guide from h5ad
 - [ ] Benchmark suite: automated regression testing of throughput
 
@@ -323,7 +324,7 @@ R bindings. Multimodal support. Full documentation.
   restrictions. The CPU path (`pread()`) must always work as a fallback and should be
   the default unless GDS is explicitly requested.
 - **CUDA codec decoders are hard to debug.** Warp-level parallel decode of Rice/FOR-BP
-  (SPEC §4.4) is a non-trivial CUDA kernel. The scalar Rust reference is normative;
+  (docs/codec.md (SIMD and GPU Decode)) is a non-trivial CUDA kernel. The scalar Rust reference is normative;
   the GPU decoder must produce bit-identical results. Invest in extensive
   cross-validation between scalar and GPU decode paths before trusting the GPU path.
 - **extendr (R bindings) is less mature than PyO3.** extendr works but has fewer
@@ -335,7 +336,7 @@ R bindings. Multimodal support. Full documentation.
   which may change. Pin to a specific Seurat version and test against it.
 - **CITE-seq protein counts break Rice codec assumptions.** ADT (Antibody-Derived Tag)
   counts have wider distributions and less sparsity than RNA UMI counts. Per-shard
-  codec override (SPEC §4.5) allows Zstd fallback, but the multimodal extension
+  codec override (docs/codec.md (Codec IDs)) allows Zstd fallback, but the multimodal extension
   should default to Zstd for protein modalities. Benchmark Rice vs Zstd on real
   CITE-seq data before choosing.
 

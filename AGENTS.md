@@ -6,9 +6,10 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 
 ## Key Documents
 
-- **[SPEC.md](SPEC.md)** — Format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
 - **[ROADMAP.md](ROADMAP.md)** — Historical phased implementation plan (Phases 1-4).
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
+- **[docs/format.md](docs/format.md)** — Binary format reference: file header, catalogs, CSR shard layout, fragment/manifest model, checksums.
+- **[docs/codec.md](docs/codec.md)** — Bit-level codec specification: Delta-Golomb-Rice, FOR-BP, Rice, LZ4+shuffle, auto-selection.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
 - **[docs/performance.md](docs/performance.md)** — Benchmark results and performance characteristics.
@@ -16,6 +17,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/testing.md](docs/testing.md)** — Test, benchmark, and correctness validation details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
+- **[docs/cloud.md](docs/cloud.md)** — Using SCX in cloud environments: auth, layouts, tuning, provider-specific notes.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts.
 - **[tasks/](tasks/)** — Historical phase specs and code reviews.
 
@@ -78,7 +80,7 @@ Key isolation rules:
 
 ### File Format Summary
 
-See [SPEC.md](SPEC.md) S3 for full details.
+See [docs/format.md](docs/format.md) for full details.
 
 - **File header**: 256 bytes, LE, magic `b"SCX\x01"`. Includes `front_catalog_offset`/`length` (populated by `cloud-optimize`, zero otherwise).
 - **Root catalog**: At offset 256, max 4096 bytes.

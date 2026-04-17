@@ -1,4 +1,4 @@
-// FOR-BP encoder/decoder for indices (SPEC §4.2)
+// FOR-BP encoder/decoder for indices (docs/codec.md (Indices))
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;

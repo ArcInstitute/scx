@@ -1,4 +1,4 @@
-// Deletion vectors (SPEC §3.6.3)
+// Deletion vectors (docs/format.md (Deletion Vectors))
 //
 // Binary layout: u8 version, u32 n_shards,
 // then per-shard: u32 shard_id, u32 bitmap_len, [u8; bitmap_len] roaring bitmap.

@@ -1,4 +1,4 @@
-// Codec ID dispatch + zstd fallback (SPEC §4.5)
+// Codec ID dispatch + zstd fallback (docs/codec.md (Codec IDs))
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
@@ -13,7 +13,7 @@ use crate::shuffle::{byte_shuffle, byte_unshuffle};
 // Types
 // ---------------------------------------------------------------------------
 
-/// Identifies the compression codec used for a shard (SPEC §3.4).
+/// Identifies the compression codec used for a shard (docs/format.md (Arrow IPC)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecId {
     /// Raw little-endian arrays, no compression.

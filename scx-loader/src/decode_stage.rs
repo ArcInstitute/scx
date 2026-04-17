@@ -5,9 +5,8 @@
 //! normalize+log1p, extracts obs metadata columns, and sends completed
 //! `Batch`es downstream via bounded channel.
 //!
-//! See [SPEC.md §8.2](../SPEC.md#82-scx-training-loader-architecture),
-//! [SPEC.md §8.5](../SPEC.md#85-sparse-to-dense-direct-write), and
-//! [Phase2-Step5.md §D](../Phase2-Step5.md#phase-d--decode-stage-stage-2).
+//! See [docs/architecture.md §Training Data Loader](../../docs/architecture.md)
+//! and [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -5,7 +5,7 @@ SCX (Sparse Cell eXpression System) is a co-designed **file format**, **compress
 scipy.sparse, and the scanpy I/O layer with a unified Rust-native stack.
 
 This document describes the high-level architecture, crate structure, and data flow.
-For the full binary format specification, see [SPEC.md](../SPEC.md).
+For the full binary format specification, see [format.md](format.md) and [codec.md](codec.md).
 For the API reference, see [api.md](api.md).
 
 ---
@@ -116,7 +116,7 @@ catalog for O(1) random access to any component.
 - **Immutable fragments** — sections are never overwritten; appends write new data at EOF and update the catalog pointer atomically
 - **Dual catalog** — root catalog (fixed position) for fast open; full catalog (at EOF) for random access
 
-For the complete binary layout, see [SPEC.md §3](../SPEC.md).
+For the complete binary layout, see [format.md](format.md).
 
 ---
 
@@ -658,7 +658,8 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 
 ## Further Reading
 
-- [SPEC.md](../SPEC.md) — Full binary format specification (v0.5)
+- [format.md](format.md) — Binary format reference: header, catalogs, CSR shards, fragment/manifest, checksums
+- [codec.md](codec.md) — Bit-level codec specification
 - [api.md](api.md) — API reference for Rust, Python, and CLI
 - [scanpy.md](scanpy.md) — Scanpy integration, backed mode, and accelerator usage
 - [performance.md](performance.md) — Benchmark results and performance characteristics

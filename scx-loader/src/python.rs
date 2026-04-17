@@ -1,8 +1,7 @@
 //! Python bindings for the SCX training data loader.
 //!
 //! Provides `TrainingDataset`, a PyTorch-compatible iterable dataset that wraps
-//! the triple-buffered `TrainingPipeline`. See [SPEC.md §8.7] for the Python API
-//! specification.
+//! the triple-buffered `TrainingPipeline`.
 //!
 //! # Usage from Python
 //!

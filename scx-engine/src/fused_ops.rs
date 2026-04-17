@@ -1,8 +1,7 @@
 //! Fused normalize + log1p operations for CSR data.
 //!
 //! Applies both transformations in a single pass over each CSR row, avoiding
-//! a separate traversal for each operation. See SPEC.md §7.2 "Operation fusion"
-//! and ROADMAP.md §2.6.
+//! a separate traversal for each operation.
 
 use scx_sparse::ScxCsr;
 

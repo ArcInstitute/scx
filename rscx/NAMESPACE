@@ -21,6 +21,8 @@ export(scx_compact)
 export(scx_delete)
 export(scx_merge)
 export(scx_rollback)
+export(scx_harmony_integrate)
+export(RunHarmony_scx)
 export(from_seurat)
 export(from_sce)
 

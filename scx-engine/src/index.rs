@@ -1,8 +1,8 @@
-// Predicate index read/write — SPEC §3.5
+// Predicate index read/write — docs/format.md (Predicate Indexes)
 //
 // Implements sorted value-to-shard-range mappings that enable fine-grained
 // row-level filtering within shards. This is level 2 of the two-level pushdown
-// strategy (SPEC §7.2).
+// strategy (docs/api.md (Query engine, optimizations)).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -20,7 +20,7 @@ use crate::error::{EngineError, Result};
 // C1. Data structures
 // ============================================================================
 
-/// A predicate index section per SPEC §3.5.
+/// A predicate index section per docs/format.md (Predicate Indexes).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredicateIndex {
     pub version: u8, // 1
@@ -100,11 +100,11 @@ pub struct HashIndex {
 }
 
 // ============================================================================
-// C2. Serialization — SPEC §3.5 binary layout
+// C2. Serialization — docs/format.md (Predicate Indexes) binary layout
 // ============================================================================
 
 impl PredicateIndex {
-    /// Serialize the predicate index per SPEC §3.5.
+    /// Serialize the predicate index per docs/format.md (Predicate Indexes).
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u8(self.version)?;
         w.write_u16::<LittleEndian>(self.columns.len() as u16)?;

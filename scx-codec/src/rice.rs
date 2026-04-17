@@ -1,4 +1,4 @@
-// Adaptive Rice encoder/decoder for values (SPEC §4.3)
+// Adaptive Rice encoder/decoder for values (docs/codec.md (Values))
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 

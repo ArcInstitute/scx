@@ -281,4 +281,4 @@ Each CSR shard is a 76-byte header followed by three compressed sections:
 Each shard can independently override the file-level `codec_id` and `value_encoding`,
 enabling per-shard adaptive codec selection and mixed integer/float layers.
 
-For the full binary specification, see [SPEC.md §3.3](../SPEC.md).
+For the full binary specification, see [format.md §CSR Shard Internal Layout](format.md#4-csr-shard-internal-layout).

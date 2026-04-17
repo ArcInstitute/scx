@@ -15,6 +15,7 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-engine = { path = "../scx-engine" }
 scx-ops = { path = "../scx-ops" }
+scx-accel = { path = "../scx-accel" }
 extendr-api = { version = "0.8", features = ["non-api"] }
 arrow = { workspace = true }
 thiserror = { workspace = true }

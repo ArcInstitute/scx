@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use extendr_api::prelude::*;
 use scx_format::ScxReader;
 
+mod harmony;
 mod interop;
 mod ops;
 mod query;
@@ -131,5 +132,6 @@ extendr_module! {
     use query;
     use ops;
     use interop;
+    use harmony;
     impl ScxExperiment;
 }

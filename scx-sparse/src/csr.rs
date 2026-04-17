@@ -1,4 +1,4 @@
-// ScxCsr struct + operations (SPEC §6.1)
+// ScxCsr struct + operations (docs/api.md (in-memory data model))
 
 /// Errors from CSR construction and validation.
 #[derive(Debug, thiserror::Error)]

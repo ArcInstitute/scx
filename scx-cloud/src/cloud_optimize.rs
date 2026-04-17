@@ -1,6 +1,6 @@
 //! Cloud-optimize: rewrite an SCX file with a front-of-file catalog.
 //!
-//! Implements SPEC §12.2. Copies all sections into a new file with the
+//! Implements docs/cloud.md (Cloud-optimized layout). Copies all sections into a new file with the
 //! full catalog duplicated near the file header, enabling single-read
 //! file opening from cloud object stores.
 //!

@@ -1,7 +1,7 @@
 //! Streaming Push: upload a local `.scx` file to a cloud/local exploded
 //! `.scxd` directory without creating an intermediate local directory.
 //!
-//! Implements SPEC §12.8.
+//! Implements docs/cloud.md (Streaming pull/push).
 //!
 //! Pipeline:
 //!   1. Open local `.scx`, read header + full catalog

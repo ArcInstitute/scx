@@ -1,8 +1,7 @@
 // Gene/column projection during CSR decode.
 //
 // Reduces the number of columns extracted from each shard by only keeping
-// entries whose column index appears in the requested gene set. See
-// SPEC.md §8.4 for the projection design.
+// entries whose column index appears in the requested gene set.
 
 use arrow::array::{RecordBatch, UInt32Array};
 use arrow::compute;

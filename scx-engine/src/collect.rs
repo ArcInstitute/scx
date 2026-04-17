@@ -163,7 +163,7 @@ pub fn filter_csr_rows(
 /// Execute a QueryPipeline and return the query result.
 ///
 /// This is the main entry point called by `QueryPipeline::collect()`.
-/// Execution steps (from SPEC §7):
+/// Execution steps (from docs/api.md (Query engine)):
 ///  1. Build plan (catalog-level pruning)
 ///  2. Read obs metadata
 ///  3. Evaluate obs predicates → boolean mask
