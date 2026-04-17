@@ -102,6 +102,17 @@ scx_harmony_integrate <- function(embeddings, batch,
         as.integer(random_state))
 }
 
+# ── LISI metric ────────────────────────────────────────────────
+scx_compute_lisi <- function(embeddings, labels,
+                             perplexity = 30.0,
+                             n_neighbors = NULL) {
+  .Call(wrap__scx_compute_lisi,
+        embeddings,
+        as.character(labels),
+        as.numeric(perplexity),
+        if (is.null(n_neighbors)) NULL else as.integer(n_neighbors))
+}
+
 # ── Import functions (interop module) ──────────────────────────
 #' @export
 from_seurat <- function(seurat_obj, output_path) {

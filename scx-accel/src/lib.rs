@@ -15,6 +15,7 @@ pub mod eval_metrics;
 pub mod harmony;
 pub mod hvg;
 pub mod leiden;
+pub mod lisi;
 pub mod neighbors;
 pub mod pca;
 pub mod pseudobulk;
@@ -42,6 +43,7 @@ pub use hvg::{
     streaming_mean_var_batched, BatchedHvgStats, HvgStats,
 };
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
+pub use lisi::{compute_lisi, LisiConfig, LisiResult};
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
     covariance_pca, covariance_pca_inmemory, randomized_pca, randomized_pca_inmemory, PcaResult,

@@ -23,6 +23,7 @@ pub mod gpu;
 pub mod harmony;
 pub mod hvg;
 pub mod leiden;
+pub mod lisi;
 pub mod neighbors;
 pub mod pca;
 pub mod preprocessing;

@@ -5,6 +5,7 @@ use scx_format::ScxReader;
 
 mod harmony;
 mod interop;
+mod lisi;
 mod ops;
 mod query;
 
@@ -133,5 +134,6 @@ extendr_module! {
     use ops;
     use interop;
     use harmony;
+    use lisi;
     impl ScxExperiment;
 }
