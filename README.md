@@ -25,6 +25,17 @@ seurat_obj <- exp$to_seurat()    # Seurat v5 assay
 sce <- exp$to_sce()              # SingleCellExperiment
 ```
 
+## Main features
+
+- **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.4× faster than Zarr, and produces a file ~1.2–1.7× smaller than gzipped h5ad (4–5× smaller than anndata's default uncompressed h5ad). Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
+- **Scales on CPU and GPU** — shard-level parallelism via rayon delivers up to **7× read** and **3.2× write** scaling. The CUDA path (cuSPARSE · cuSOLVER · cuVS CAGRA · cuGraph) gives **3.8× end-to-end** on PCA → kNN → UMAP → Leiden at 1M cells; the training loader hits **1,405 batches/s** — 82× faster than TileDB-SOMA-ML.
+- **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline runs at **5.1 GB peak RSS** vs 43.6 GB when materialised (88% less). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
+- **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression, pseudobulk, and [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1). Same scanpy-shaped API, 3–40× faster; every op has a `device="auto"` switch that picks GPU when available.
+- **Mutable without rewriting** — append new cells, mark-delete doublets, compact, merge, or roll back in milliseconds. Append is O(new cells), not O(total cells); delete is a logical mask, not a data rewrite.
+- **Lazy query engine** — predicate pushdown skips ~55% of shards on realistic queries; selective reads land in under **5 ms**. Filter by cell type, tissue, donor, etc. before paying to read.
+- **Drop-in for scverse and Seurat** — works with AnnData, scanpy, and scVI (Python), and Seurat v5 + SingleCellExperiment (R). Round-trips cleanly with h5ad, 10x HDF5, and Cell Ranger MTX.
+- **Cloud-native** — streaming push/pull to S3, GCS, and Azure with selective download (only the shards you need) and a direct `open_cloud()` path that skips the full download.
+
 ## Why SCX?
 
 ### Your h5ad files are bigger than they need to be

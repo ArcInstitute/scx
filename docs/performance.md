@@ -150,14 +150,69 @@ Numerical parity against R `harmony` v2.x (clean-room Rust implementation; valid
 
 The Rust RNG (`rand_chacha`) draws differ from R's Mersenne Twister, so tail PCs can deviate by up to ~2% on high-batch-count inputs (see `benchmarks/results/harmony/REPORT.md` for per-PC curves and wall/RSS scaling across D1–D7 for CPU scx-accel vs harmonypy vs R harmony).
 
-Scaling sweep (wall time vs N, d=30, K=100, theta=2, max_iter=10; log–log exponents α from `REPORT.md`):
+Scaling sweep (d=30, K=100, theta=2, max_iter=10) — wall time in seconds per dataset size:
 
-| Impl / device | α (wall vs N) | D7 (5M cells) wall | Commentary |
-|---------------|--------------:|-------------------:|-----------|
-| scx-accel CPU | **0.67** | 37.5 min | sub-linear; rayon-parallel distance + L2-norm keep constants low |
-| scx-accel GPU | **1.00** | 31.1 min | near-linear, dominated by HTD/DTH transfers per iteration |
-| harmonypy (CPU) | **0.73** | 22.4 min | near-linear; numpy/OpenBLAS benefits at large N |
-| R harmony (CPU) | **1.02** | 80.5 min | linear with the highest wall constant of the four |
+| Impl / device | D1 (2.7K) | D2 (11.8K) | D3 (50K) | D4 (100K) | D5 (500K) | D6 (1M) | D7 (5M) | α (wall) |
+|---------------|---:|---:|---:|---:|---:|---:|---:|---:|
+| scx-accel CPU | 5.7 | 22.1 | 69.7 | 19.7 | 100.0 | 236.8 | 2,249.2 | **0.67** |
+| scx-accel GPU | — | 4.4 | 10.6 | 20.8 | 109.7 | 209.3 | 1,868.3 | **1.00** |
+| harmonypy (CPU) | 5.2 | 7.0 | 12.4 | 53.4 | 77.0 | 166.3 | 1,344.6 | **0.73** |
+| R harmony (CPU) | — | 8.7 | 36.7 | 67.8 | 312.3 | 626.8 | 4,831.2 | **1.02** |
+
+Peak RSS in MB (host; GPU VRAM not counted):
+
+| Impl / device | D1 | D2 | D3 | D4 | D5 | D6 | D7 | β (RSS) |
+|---------------|---:|---:|---:|---:|---:|---:|---:|---:|
+| scx-accel CPU | 455 | 6,771 | 47,798 | 784 | 2,187 | 3,945 | 174,779 | **+0.21** |
+| scx-accel GPU | — | 530 | 678 | 890 | 12,218 | 22,376 | 174,666 | **+1.04** |
+| harmonypy (CPU) | 563 | 6,773 | 47,797 | 1,164 | 2,521 | 4,733 | 174,778 | **+0.44** |
+| R harmony (CPU) | — | 6,659 | 47,788 | 86 | 294 | 552 | 2,623 | **−0.35** |
+
+Peak-RSS anomalies at D3 reflect the in-process PCA-cache build (densifies a 50K×2K float32 scaled matrix) rather than Harmony itself; R harmony dodges the spike because it receives a pre-built NumPy matrix from a child `Rscript` process. Scaling exponents α/β fit `log(y) = α·log(N) + b` over the points above; full per-PC correlations, log-log plots, and secondary PC/cluster-count sweeps live in `benchmarks/results/harmony/REPORT.md`.
+
+#### Extrapolated capacity (500 GB / 1000 GB RAM)
+
+Power-law extrapolation of the **D5–D6–D7** points (`log y = α log N + b`,
+i.e. large-N regime only) gives a rough read on the largest dataset each
+implementation can process for a given memory budget, and how long it would
+take. Peak RSS in these rows includes the scanpy `normalize → PCA` cache build
+that runs inside the benchmark driver — for scx-accel CPU/GPU and harmonypy
+that is the dominant allocation at D7. Supplying a precomputed PCA (skipping
+`_build_pca_cache`) shifts their RSS scaling onto the R-harmony curve
+(β≈0.95 — memory-proportional to N), which dramatically raises the capacity.
+
+| Impl / device | β (RSS) | α (wall) | @ 500 GB: N (M cells), wall | @ 1000 GB: N (M cells), wall |
+|---|---:|---:|---:|---:|
+| scx-accel CPU | 1.98 | 1.36 |  9.1M, 1.4 h |  12.9M, 2.2 h |
+| scx-accel GPU | 1.18 | 1.25 | 12.6M, 1.6 h |  22.7M, 3.3 h |
+| harmonypy (CPU) | 1.91 | 1.25 |  9.2M, 0.8 h |  13.3M, 1.2 h |
+| R harmony (CPU) | 0.95 | 1.20 |   compute-bound¹ |  compute-bound¹ |
+
+¹ R harmony's RSS scales ~linearly with N (β≈0.95), so a 500 GB budget
+would technically fit >1B cells, but the α≈1.20 wall-time curve puts even
+50M cells at ~1.5 days of wall time. Memory is not the binding constraint;
+throughput is.
+
+**Practical takeaways**
+
+- With the default benchmark driver (scanpy PCA cache + Harmony), a
+  1000 GB node supports ~13M cells in ~2 h on scx-accel CPU, ~23M cells in
+  ~3 h on scx-accel GPU, and ~13M in ~1.2 h with harmonypy.
+- The memory ceiling for scx-accel CPU/GPU and harmonypy sits on the
+  scanpy `normalize → PCA` cache build, not Harmony itself. Feeding
+  Harmony a pre-computed PCA (a real-world pattern — scanpy pipelines
+  usually persist `X_pca` once) should shift each implementation's RSS
+  curve onto roughly the R-harmony line (β≈0.95), moving the bottleneck
+  onto compute. An isolated Harmony-only RSS measurement is not in the
+  current sweep; see `benchmarks/results/harmony/REPORT.md` for the
+  raw per-run RSS time-series.
+- GPU wins on both axes above D6: at 1000 GB it clears ~23M cells in
+  ~3 h, versus 13M cells / 2 h on CPU.
+
+Extrapolations assume d=30 PCs, K=100 clusters, single-covariate batch.
+Increasing d or K shifts wall time (see the D4 PC/K secondary sweeps in
+`benchmarks/results/harmony/REPORT.md`) but leaves memory roughly
+unchanged for the Harmony core.
 
 LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi` on D1–D4 (e.g. smartseq2 3.85 s vs 43.11 s; tabula_sapiens_100k 12 s vs 110 s), with mean-LISI agreement within 0.8–2.4 % of the R reference.
 

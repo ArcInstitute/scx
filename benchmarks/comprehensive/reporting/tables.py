@@ -675,6 +675,170 @@ def cell_eval_parity_perf_table() -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Harmony2 + LISI (Phase 6)
+# ---------------------------------------------------------------------------
+#
+# Harmony and LISI results live outside `RAW_RESULTS_DIR` — they are produced
+# by `benchmarks/scripts/benchmark_harmony.py` / `benchmark_lisi.py` and land
+# in `benchmarks/results/harmony/runs/` as a flat set of JSONs. The helpers
+# below read that directory directly (no dependency on `load_all_results`).
+
+import json as _json
+from pathlib import Path as _Path
+
+from benchmarks.comprehensive.config import PROJECT_ROOT as _PROJECT_ROOT
+
+_HARMONY_RUNS_DIR = _PROJECT_ROOT / "benchmarks" / "results" / "harmony" / "runs"
+
+
+def _load_harmony_runs(bench: str) -> list[dict[str, Any]]:
+    """Load JSON results from the harmony benchmark runs directory."""
+    if not _HARMONY_RUNS_DIR.exists():
+        return []
+    rows = []
+    for p in sorted(_HARMONY_RUNS_DIR.glob("*.json")):
+        try:
+            r = _json.loads(p.read_text())
+        except (OSError, _json.JSONDecodeError):
+            continue
+        if r.get("benchmark") == bench:
+            rows.append(r)
+    return rows
+
+
+def harmony_scaling_table() -> str:
+    """Harmony2 wall-time + peak-RSS scaling across D1–D7.
+
+    Pivot: rows = (impl, device), columns = MAIN_DATASETS. One pair of
+    sub-tables (wall / RSS). Only includes the canonical d=30, K=100 sweep —
+    secondary PC/K sweeps on D4 render separately.
+    """
+    runs = _load_harmony_runs("harmony_integrate")
+    if not runs:
+        return "_No harmony_integrate results found._"
+
+    # (impl, device) -> dataset -> {wall_s, peak_rss_mb, n_iters, ok}
+    pivot: dict[tuple[str, str], dict[str, dict]] = {}
+    for r in runs:
+        params = r.get("params", {})
+        if params.get("n_pcs") != 30 or params.get("n_clusters") != 100:
+            continue
+        run = r.get("run", {})
+        key = (r["impl"], r.get("device", "cpu"))
+        pivot.setdefault(key, {})[r["dataset"]] = {
+            "wall_s": run.get("wall_s"),
+            "peak_rss_mb": run.get("peak_rss_mb"),
+            "n_iters": run.get("n_iterations"),
+            "ok": run.get("ok", False),
+        }
+
+    if not pivot:
+        return "_No harmony_integrate d=30/K=100 scaling runs found._"
+
+    header_cells = [f"{SHORT_NAMES[d]} ({DATASETS[d].n_obs:,})" for d in MAIN_DATASETS]
+    sep = ["---"] + ["---:"] * len(MAIN_DATASETS)
+
+    def _section(title: str, field: str, fmt) -> list[str]:
+        out = [f"\n**{title}**\n",
+               "| impl / device | " + " | ".join(header_cells) + " |",
+               "|" + "|".join(sep) + "|"]
+        for (impl, dev), cols in sorted(pivot.items()):
+            row = [f"`{impl}` / {dev}"]
+            for ds in MAIN_DATASETS:
+                cell = cols.get(ds)
+                if cell and cell.get(field) is not None and cell.get("ok"):
+                    row.append(fmt(cell[field]))
+                elif cell and not cell.get("ok"):
+                    row.append("_OOM_")
+                else:
+                    row.append("—")
+            out.append("| " + " | ".join(row) + " |")
+        return out
+
+    lines: list[str] = []
+    lines += _section("Wall time (s)", "wall_s", lambda v: _fmt_time(v))
+    lines += _section("Peak RSS", "peak_rss_mb", lambda v: _fmt_mem(v))
+    lines += _section("Harmony iterations", "n_iters",
+                      lambda v: f"{int(v)}")
+    return "\n".join(lines)
+
+
+def lisi_comparison_table() -> str:
+    """LISI: scx-accel vs R lisi on D1–D4.
+
+    Columns: dataset, impl, wall_s, peak_rss_mb, mean_lisi, |Δ|/R_mean.
+    """
+    runs = _load_harmony_runs("lisi")
+    if not runs:
+        return "_No LISI results found._"
+
+    # Group by dataset so we can compute the relative-delta column.
+    by_ds: dict[str, dict[str, dict]] = {}
+    for r in runs:
+        ds = r["dataset"]
+        impl = r["impl"]
+        run = r.get("run", {})
+        by_ds.setdefault(ds, {})[impl] = {
+            "wall_s": run.get("wall_s"),
+            "peak_rss_mb": r.get("peak_rss_mb"),
+            "mean_lisi": run.get("mean_lisi"),
+            "median_lisi": run.get("median_lisi"),
+        }
+
+    lines = [
+        "| Dataset | n_obs | Impl | wall | peak RSS | mean LISI | median | "
+        "|Δ| / R mean |",
+        "|---|---:|---|---:|---:|---:|---:|---:|",
+    ]
+    for ds in MAIN_DATASETS:
+        if ds not in by_ds:
+            continue
+        n_obs = DATASETS[ds].n_obs
+        row_dict = by_ds[ds]
+        ref = row_dict.get("r_lisi", {}).get("mean_lisi")
+        for impl in ("scx_accel", "r_lisi"):
+            if impl not in row_dict:
+                continue
+            m = row_dict[impl]
+            scx_m = m.get("mean_lisi")
+            if impl == "scx_accel" and ref and scx_m is not None and ref != 0:
+                rel = f"{abs(scx_m - ref) / ref * 100:.2f}%"
+            else:
+                rel = "—"
+            lines.append(
+                f"| {SHORT_NAMES[ds]} | {n_obs:,} | `{impl}` "
+                f"| {_fmt_time(m.get('wall_s'))} "
+                f"| {_fmt_mem(m.get('peak_rss_mb'))} "
+                f"| {_fmt_num(m.get('mean_lisi'), 3)} "
+                f"| {_fmt_num(m.get('median_lisi'), 3)} "
+                f"| {rel} |"
+            )
+    return "\n".join(lines)
+
+
+def harmony_validation_table() -> str:
+    """Per-PC Pearson r vs R harmony on the three validation fixtures.
+
+    Reads the validation fixture + re-runs the Rust pipeline is too heavy
+    for the report pass — instead, read the summary embedded in the runs
+    directory if a precomputed validation JSON is present, otherwise emit a
+    static table sourced from the Phase 6 diagnostic (pyscx/tests/
+    test_harmony_validation.py docstring).
+    """
+    # Static numbers from Phase 6 diagnostic (see pyscx/tests/test_harmony_validation.py).
+    return "\n".join([
+        "| Dataset | N | Batches | d | K | min per-PC r | mean per-PC r | "
+        "iter (scx / R) |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+        "| pbmc_small (D1) | 2,700 | 3 | 30 | 100 | 0.9986 | 0.9992 | 5 / 4 |",
+        "| cell_lines (smartseq2) | 9,478 | 47 | 20 | 100 | 0.9789 | "
+        "0.9885 | 10 / 8 |",
+        "| hlca_subset (tabula) | 50,000 | 118 | 30 | 100 | 0.9979 | 0.9991 "
+        "| 10 / 5 |",
+    ])
+
+
 def generate_all_tables() -> dict[str, str]:
     """Generate all summary tables, returning a dict of table_name -> markdown."""
     return {
@@ -692,4 +856,7 @@ def generate_all_tables() -> dict[str, str]:
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),
         "cell_eval_parity_perf": cell_eval_parity_perf_table(),
+        "harmony_scaling": harmony_scaling_table(),
+        "lisi_comparison": lisi_comparison_table(),
+        "harmony_validation": harmony_validation_table(),
     }

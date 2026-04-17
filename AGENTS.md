@@ -57,7 +57,7 @@ scx-codec (standalone)
             ├─> scx-loader (depends on scx-format, scx-codec, scx-sparse)
             ├─> scx-cloud (depends on scx-format, scx-codec, scx-engine)
             ├─> scx-gpu (depends on scx-format, scx-codec, scx-sparse)
-            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE/Leiden; optional gpu dep on scx-gpu)
+            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE/Leiden/Harmony2/LISI; optional gpu dep on scx-gpu)
             ├─> scx-cli (depends on all above)
             ├─> pyscx (depends on all above)
             └─> rscx (depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
@@ -119,6 +119,8 @@ Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standar
 - **UMAP**: SGD-based layout optimization.
 - **Differential expression**: Pre-ranking Wilcoxon test — ranks all cells once per gene, reuses across groups (10x fewer sorts). `rankby_abs` parameter matches scanpy's signed-score ranking.
 - **Leiden clustering**: Rust-native implementation (Traag et al. 2019) with RB configuration model. Sequential mode (default) matches C++ leidenalg convergence; parallel mode uses conflict-free graph coloring. Uses `rand_chacha` for deterministic seeding.
+- **Harmony2 batch integration**: Clean-room Rust port of Harmony2 (Korsunsky et al. 2019) — soft k-means with diversity penalty + ridge-regression correction on PCA embeddings. Exposed as `pyscx.accel.harmony_integrate` (scanpy-compatible signature) and `rscx::scx_harmony_integrate`. GPU path accelerates distance / L2-normalize / batched scatter-subtract kernels. Mean per-PC Pearson r 0.989–0.999 vs R `harmony` v2.x on the validation fixtures (full parity limited by RNG stream divergence — see `pyscx/tests/test_harmony_validation.py`).
+- **LISI**: Local Inverse Simpson Index via exact brute-force kNN + t-SNE-style Gaussian-bandwidth search + Simpson reduction. Exposed as `pyscx.accel.compute_lisi` and `rscx::scx_compute_lisi`. ~10× faster than the R `lisi` reference with mean-LISI agreement within 0.8–2.4 % on D1–D4.
 - **HVG**: Streaming `highly_variable_genes()` via `ShardSource` — `streaming_mean_var()` and `streaming_clip_square_sum()`, loess fit via Python `skmisc.loess`, seurat_v3 and seurat flavors. `subset=True` uses column projection (no materialization).
 - **Pseudobulk**: Streaming aggregation via `BackedCsrReader`, statistical testing delegated to `pydeseq2`.
 - **Perturbation evaluation metrics**: Rust-accelerated equivalents of the `cell-eval` and `arc-bench` metric pipelines (`pseudobulk_means`, `perturbation_metrics` bundling pearson_delta/mse/mae/mse_delta/mae_delta, `discrimination_score` with target-gene exclusion, `energy_distance` + `energy_distance_details` with streaming pairwise distance, `knockdown_efficiency` writing `obs["KnockDownEfficiency"]`/`obs["KnockDownGeneFC"]`, `clustering_agreement` with AMI/NMI/ARI scoring, `rank_genes_groups_df` bridge to cell-eval's DE format). Parity verified in `pyscx/tests/test_cell_eval_parity.py` (30/30 tests) within tolerances documented in `docs/scanpy.md` (perturbation evaluation metrics section). 10–20× faster than the Python references at 100K–1M cells (see `docs/performance.md`).
