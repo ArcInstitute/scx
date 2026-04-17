@@ -108,27 +108,15 @@ fn parse_codec_str(s: &str) -> Result<Option<CodecId>, MtxError> {
     }
 }
 
+use scx_codec::value_encoding::{
+    detect_value_encoding as detect_value_encoding_only, values_to_raw_bytes,
+};
+
 fn detect_value_encoding(
     data: &[f32],
     explicit_codec: Option<CodecId>,
 ) -> (ValueEncoding, CodecId) {
-    let is_integer = data
-        .iter()
-        .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
-
-    let encoding = if !is_integer {
-        ValueEncoding::Float32
-    } else {
-        let max_val: f64 = data.iter().map(|&v| v as f64).fold(0.0f64, f64::max);
-        if max_val <= 255.0 {
-            ValueEncoding::Uint8
-        } else if max_val <= 65535.0 {
-            ValueEncoding::Uint16
-        } else {
-            ValueEncoding::Uint32
-        }
-    };
-
+    let encoding = detect_value_encoding_only(data);
     let raw_bytes = values_to_raw_bytes(data, encoding);
     let codec = match explicit_codec {
         Some(codec_id) => {
@@ -142,33 +130,6 @@ fn detect_value_encoding(
     };
 
     (encoding, codec)
-}
-
-fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
-    match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => {
-            let mut buf = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                buf.extend_from_slice(&(v as u16).to_le_bytes());
-            }
-            buf
-        }
-        ValueEncoding::Uint32 => {
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.extend_from_slice(&(v as u32).to_le_bytes());
-            }
-            buf
-        }
-        ValueEncoding::Float32 | ValueEncoding::Float16 => {
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            buf
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -348,9 +348,9 @@ impl TrainingPipeline {
         config.batch_size = memory_budget.batch_size;
 
         if memory_budget.budget_exceeded {
-            eprintln!(
-                "[scx-loader] WARNING: estimated memory ({} MB) exceeds budget ({} MB) \
-                 even at minimums (batch_size={}, shard_group_size=1, prefetch_batches=2). \
+            log::warn!(
+                "estimated memory ({} MB) exceeds budget ({} MB) even at minimums \
+                 (batch_size={}, shard_group_size=1, prefetch_batches=2). \
                  Consider setting hvg_indices to reduce n_output_genes from {}.",
                 memory_budget.estimated_bytes / (1024 * 1024),
                 config.max_memory_mb,

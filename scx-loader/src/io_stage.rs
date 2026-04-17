@@ -84,10 +84,10 @@ pub async fn io_stage(
         Arc::new(match &deletion_vectors {
             Some(dv) => {
                 let mut map = std::collections::HashMap::new();
-                for sd in &dv.shards {
-                    let shard_idx = sd.shard_id as usize;
-                    if shard_idx < n_shards && !sd.bitmap.is_empty() {
-                        map.insert(shard_idx, sd.bitmap.clone());
+                for (&shard_id, bitmap) in &dv.shards {
+                    let shard_idx = shard_id as usize;
+                    if shard_idx < n_shards && !bitmap.is_empty() {
+                        map.insert(shard_idx, bitmap.clone());
                     }
                 }
                 map
@@ -524,10 +524,7 @@ mod tests {
             for i in 0..5u32 {
                 bm.insert(i);
             }
-            dv.shards.push(scx_format::deletion_vectors::ShardDeletion {
-                shard_id: 0,
-                bitmap: bm,
-            });
+            dv.shards.insert(0, bm);
 
             let shard_groups = vec![vec![0, 1]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -557,10 +554,7 @@ mod tests {
             let mut bm = RoaringBitmap::new();
             bm.insert(1);
             bm.insert(3);
-            dv.shards.push(scx_format::deletion_vectors::ShardDeletion {
-                shard_id: 0,
-                bitmap: bm,
-            });
+            dv.shards.insert(0, bm);
 
             let shard_groups = vec![vec![0, 1]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);

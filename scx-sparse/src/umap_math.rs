@@ -103,17 +103,25 @@ pub fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
     // Boundary detection: warn if the optimum is near a grid edge,
     // which indicates the true optimum may lie outside the search range.
     if (best_a - a_start).abs() < A_STEP || (a_end - best_a).abs() < A_STEP {
-        eprintln!(
-            "scx WARN: UMAP find_ab_params: optimal `a` ({:.4}) is near search boundary \
+        log::warn!(
+            "UMAP find_ab_params: optimal `a` ({:.4}) is near search boundary \
              [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
-            best_a, a_start, a_end, spread, min_dist
+            best_a,
+            a_start,
+            a_end,
+            spread,
+            min_dist
         );
     }
     if (best_b - b_start).abs() < B_STEP || (b_end - best_b).abs() < B_STEP {
-        eprintln!(
-            "scx WARN: UMAP find_ab_params: optimal `b` ({:.4}) is near search boundary \
+        log::warn!(
+            "UMAP find_ab_params: optimal `b` ({:.4}) is near search boundary \
              [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
-            best_b, b_start, b_end, spread, min_dist
+            best_b,
+            b_start,
+            b_end,
+            spread,
+            min_dist
         );
     }
 

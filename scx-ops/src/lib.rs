@@ -1,4 +1,5 @@
 pub mod append;
+pub mod checksum;
 pub mod compact;
 pub mod delete;
 pub mod error;

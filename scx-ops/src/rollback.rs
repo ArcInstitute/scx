@@ -9,6 +9,7 @@ use scx_format::catalog::{FullCatalog, RootCatalog, RootCatalogEntry};
 use scx_format::header::{FileHeader, HEADER_SIZE};
 use scx_format::section::SectionType;
 
+use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
 
@@ -159,8 +160,8 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
 }
 
 /// Apply a catalog at `catalog_offset` as the active catalog.
-fn apply_catalog_at(
-    file: &mut (impl Read + Write + Seek),
+fn apply_catalog_at<F: Read + Write + Seek + crate::checksum::SyncAllIfApplicable>(
+    file: &mut F,
     mut header: FileHeader,
     catalog_offset: u64,
 ) -> Result<()> {
@@ -217,22 +218,15 @@ fn apply_catalog_at(
     file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
     file.write_all(&root_buf)?;
 
+    // Durability barrier between root catalog and header write (H7).
+    file.flush()?;
+    file.sync_all_if_applicable()?;
+
     header.root_catalog_offset = HEADER_SIZE as u64;
     header.root_catalog_length = root_catalog_length;
 
-    // Recompute file checksum
-    header.file_checksum = 0;
-    file.seek(SeekFrom::Start(0))?;
-    header.write_to(file)?;
-    file.flush()?;
-
-    let file_checksum = compute_file_checksum(file)?;
-    header.file_checksum = file_checksum;
-
-    file.seek(SeekFrom::Start(0))?;
-    header.write_to(file)?;
-
-    file.flush()?;
+    // Single-write header finalization (H5 + M16).
+    finalize_header_with_checksum(file, &mut header)?;
     Ok(())
 }
 
@@ -267,19 +261,4 @@ pub(crate) fn build_root_catalog(catalog: &FullCatalog) -> RootCatalog {
 
 pub(crate) fn build_root_catalog_from_full(catalog: &FullCatalog) -> RootCatalog {
     build_root_catalog(catalog)
-}
-
-pub(crate) fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut chunk = [0u8; 65536];
-    loop {
-        let n = file.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&chunk[..n]);
-    }
-    let hash = hasher.finalize();
-    Ok(u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()))
 }

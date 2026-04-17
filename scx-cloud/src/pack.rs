@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_pack_with_deletion_vectors() {
-        use scx_format::deletion_vectors::{DeletionVectors, ShardDeletion};
+        use scx_format::deletion_vectors::DeletionVectors;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("with_dv.scx");
@@ -653,13 +653,8 @@ mod tests {
         let mut bitmap = roaring::RoaringBitmap::new();
         bitmap.insert(5);
         bitmap.insert(10);
-        let dv = DeletionVectors {
-            dv_version: 1,
-            shards: vec![ShardDeletion {
-                shard_id: 0,
-                bitmap,
-            }],
-        };
+        let mut dv = DeletionVectors::new();
+        dv.shards.insert(0, bitmap);
         writer.write_deletion_vectors(&dv).unwrap();
         writer.finish().unwrap();
 

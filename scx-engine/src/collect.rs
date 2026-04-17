@@ -204,13 +204,11 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         let sorted_shards = reader.catalog().shards_sorted();
         for (shard_idx, shard_entry) in sorted_shards.iter().enumerate() {
             if let Some(ref stats) = shard_entry.stats {
-                for sd in &dv.shards {
-                    if sd.shard_id == shard_idx as u32 {
-                        for local_row in sd.bitmap.iter() {
-                            let global_row = stats.row_start + local_row as u64;
-                            if (global_row as usize) < n_obs {
-                                obs_mask[global_row as usize] = false;
-                            }
+                if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
+                    for local_row in bitmap.iter() {
+                        let global_row = stats.row_start + local_row as u64;
+                        if (global_row as usize) < n_obs {
+                            obs_mask[global_row as usize] = false;
                         }
                     }
                 }

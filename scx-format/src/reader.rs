@@ -417,8 +417,8 @@ impl ScxReader {
         let mut keep = vec![true; n_obs];
         for (shard_idx, shard_entry) in shards.iter().enumerate() {
             if let Some(ref stats) = shard_entry.stats {
-                if let Some(sd) = dv.shards.iter().find(|sd| sd.shard_id == shard_idx as u32) {
-                    for local_row in sd.bitmap.iter() {
+                if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
+                    for local_row in bitmap.iter() {
                         let global_row = stats.row_start + local_row as u64;
                         if (global_row as usize) < n_obs {
                             keep[global_row as usize] = false;
