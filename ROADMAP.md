@@ -478,7 +478,6 @@ and tuning knobs. [`benchmarks/scripts/benchmark_cloud.py`](benchmarks/scripts/b
 - [x] `scx info` / metadata-only latency on cloud-ready `.scx`
 - [ ] **Promote cloud benchmarks into `benchmarks/comprehensive/`** — currently a standalone `benchmark_cloud.py`; should be a first-class `FormatRunner` dimension so every format is compared end-to-end on GCS. **NOT STARTED**
 - [ ] **GCP compute-node matrix** — measure from same-region GCE VMs (n2-standard, c3-standard, H100 A3) to characterize latency / throughput vs instance type and bandwidth — **NOT STARTED**
-- [ ] **Cross-region pull** — same-region vs cross-region egress cost and throughput — **NOT STARTED**
 - [ ] **Cloud competitor parity** — Zarr v3 (zarr-python 3, async I/O), TileDB-SOMA, and SLAF cloud reads on identical GCS layout and queries — **NOT STARTED**
 - [ ] **CloudReader vs pull** — `pyscx.open_cloud(...)` (catalog-only, selective range reads) vs full `pull` for metadata + predicate-selective queries — **NOT STARTED**
 - [ ] **Request-cost accounting** — GET count and bytes transferred per operation → published cost model (cents per 1M cells queried, by layout) — **NOT STARTED**

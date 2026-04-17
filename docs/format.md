@@ -244,8 +244,8 @@ decode, exploded `.scxd` layouts, and selective pull.
 | `block_index_length` | `u32` | |
 | `checksum` | `[u8; 8]` | BLAKE3 truncated to 64 bits, covers everything after the header |
 
-Total: 76 bytes. Implementations MUST use exactly 76 (prior diagrams showing
-64 bytes were wrong).
+Total: 76 bytes. Implementations MUST use exactly 76 — this matches
+`SHARD_HEADER_SIZE` in `scx-format/src/shard.rs`.
 
 > **Per-shard codec override**: readers MUST use the shard header's
 > `codec_id` and `value_encoding`, not the file header's. The file header

@@ -86,7 +86,7 @@ See [docs/format.md](docs/format.md) for full details.
 - **Root catalog**: At offset 256, max 4096 bytes.
 - **Sections**: 8-byte aligned. 15 types defined (0-14, see [docs/api.md](docs/api.md#section-types)).
 - **Full catalog**: At EOF. Per-entry checksums + shard statistics (`CategoryBitset` for pushdown).
-- **CSR shard header**: 76 bytes (NOT 64 — spec diagram discrepancy), magic `b"SCXS"`.
+- **CSR shard header**: 76 bytes, magic `b"SCXS"`.
 
 ### Codec System
 

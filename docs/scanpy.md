@@ -170,6 +170,11 @@ sc.pl.umap(adata, color="leiden")
 
 ## Converting existing data to SCX
 
+> **Benchmarks**: for h5ad → SCX conversion throughput across datasets, codecs,
+> and thread counts (including `full` mode that covers the h5ad read + SCX
+> write), see [docs/performance.md §Conversion (h5ad → format)](performance.md#conversion-h5ad--format)
+> and [§Write Scaling (parallel shard encoding)](performance.md#write-scaling-parallel-shard-encoding).
+
 ### From AnnData / h5ad
 
 ```python
