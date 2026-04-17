@@ -1,4 +1,4 @@
-//! Harmony2 batch integration algorithm (clean-room Rust port).
+//! Harmony2 batch integration algorithm.
 //!
 //! Operates on dense PCA embeddings and corrects batch effects via iterative
 //! soft k-means clustering + ridge regression. Reference: Korsunsky et al.

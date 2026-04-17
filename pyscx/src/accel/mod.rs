@@ -20,6 +20,7 @@ pub mod de;
 pub mod eval_metrics;
 pub mod filtering;
 pub mod gpu;
+pub mod harmony;
 pub mod hvg;
 pub mod leiden;
 pub mod neighbors;
