@@ -6,8 +6,6 @@ Validates GPU-accelerated PCA (cuSPARSE SpMM + cuSOLVER QR) against CPU PCA
 via per-PC cosine similarity. Benchmarks GPU vs CPU PCA wall-clock timing
 across dataset sizes.
 
-Covers Phase4-GPU.md Steps 1 (SpMM benchmark) and 2 (PCA validation + benchmark).
-
 Usage:
     # Validate cosine similarity on pbmc3k
     python benchmarks/scripts/benchmark_gpu_pca.py --mode validate --dataset pbmc3k

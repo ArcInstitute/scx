@@ -1,6 +1,6 @@
 //! Range coalescing for cloud reads from packed SCX files.
 //!
-//! Implements SPEC §12.3. Merges adjacent or nearby byte ranges into
+//! Implements docs/cloud.md (Range coalescing). Merges adjacent or nearby byte ranges into
 //! larger reads to minimize the number of cloud GET requests.
 
 /// Given a set of (offset, length) byte ranges, merge adjacent or nearby

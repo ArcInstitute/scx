@@ -1,4 +1,4 @@
-// ScxReader — mmap + pread paths (SPEC §10)
+// ScxReader — mmap + pread paths (docs/architecture.md)
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -342,7 +342,7 @@ impl ScxReader {
     }
 
     // -----------------------------------------------------------------------
-    // Predicate indexes (SPEC §3.5, Phase 2)
+    // Predicate indexes (docs/format.md (Predicate Indexes), Phase 2)
     // -----------------------------------------------------------------------
 
     /// Read the raw bytes of the obs predicate index section, if present.

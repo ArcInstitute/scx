@@ -209,6 +209,11 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     accel_module.add_function(wrap_pyfunction!(accel::leiden::leiden, &accel_module)?)?;
     accel_module.add_function(wrap_pyfunction!(
+        accel::harmony::harmony_integrate,
+        &accel_module
+    )?)?;
+    accel_module.add_function(wrap_pyfunction!(accel::lisi::compute_lisi, &accel_module)?)?;
+    accel_module.add_function(wrap_pyfunction!(
         accel::preprocessing::normalize_total,
         &accel_module
     )?)?;

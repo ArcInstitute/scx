@@ -2,7 +2,7 @@
 //
 // The pipeline is lazy: it stores configuration but performs no I/O
 // until `.collect()` is called. Schema errors are raised immediately
-// at construction time (SPEC §7.1).
+// at construction time (docs/api.md (Query engine, lazy evaluation)).
 
 use std::path::Path;
 
@@ -22,8 +22,6 @@ pub struct NormalizeConfig {
 }
 
 /// Result of a query pipeline execution.
-///
-/// See SPEC.md §6.1 for the in-memory data model.
 pub struct QueryResult {
     /// The expression matrix (filtered + projected).
     pub x: ScxCsr,

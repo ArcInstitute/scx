@@ -1,4 +1,4 @@
-// ScxWriter — atomic rename path (SPEC §10)
+// ScxWriter — atomic rename path (docs/architecture.md)
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -30,7 +30,7 @@ pub const SECTIONS_START_OFFSET: u64 = 4352;
 /// # Section-Ordering Convention
 ///
 /// The writer accepts sections in **any order**, but callers should follow
-/// the canonical layout described in SPEC §3.1 for maximum compatibility
+/// the canonical layout described in docs/format.md (File Header) for maximum compatibility
 /// with inspection tools and downstream readers:
 ///
 /// 1. `write_obs` — cell metadata (Arrow IPC)
@@ -577,7 +577,7 @@ impl ScxWriter {
     ///
     /// This must be called immediately after `write_csr_shard()` (or its
     /// layer/obsp variants) to attach `CategoryBitset` or `MinMax` column
-    /// stats that enable catalog-level predicate pushdown (SPEC §3.2).
+    /// stats that enable catalog-level predicate pushdown (docs/format.md (Dual Catalog)).
     ///
     /// If the last entry is not a shard (no stats), this is a no-op.
     pub fn set_shard_column_stats(
@@ -839,7 +839,7 @@ pub fn compute_shard_stats(
         }
         // Float types: value_min/value_max are u32 and value_sum is u64, which
         // cannot represent float statistics. Return zeros; these fields are
-        // documented as undefined for float value encodings (see SPEC §3.2).
+        // documented as undefined for float value encodings (see docs/format.md (Dual Catalog)).
         ValueEncoding::Float32 | ValueEncoding::Float16 => (0, 0, 0),
     };
 

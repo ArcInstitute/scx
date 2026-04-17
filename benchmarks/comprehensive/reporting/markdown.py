@@ -24,7 +24,11 @@ from benchmarks.comprehensive.reporting.tables import (
     cell_eval_parity_perf_table,
     compression_table,
     compression_ratio_table,
+    scx_parallel_write_callout_table,
     datasets_table,
+    harmony_scaling_table,
+    harmony_validation_table,
+    lisi_comparison_table,
     read_speed_table,
     read_selective_table,
     write_speed_table,
@@ -164,12 +168,37 @@ otherwise noted.
 
 ## 3. Write Performance
 
+### Single-threaded (`num_threads=1`)
+
+All competing formats (Zarr, h5ad, TileDB-SOMA) write single-threaded —
+they cannot scale across cores. SCX parallelises shard encoding via
+rayon, so a 1-thread number is SCX's worst case and should be read
+alongside the 32-thread column below, not as its headline write speed.
+
 {write_speed_table()}
 
+### With parallel shard encoding (SCX only)
+
+Writing the same h5ad → SCX pipeline with 32 rayon threads (`full` mode —
+h5ad read + SCX write). Zarr / h5ad / TileDB-SOMA are omitted because
+their writers don't parallelise (Δ = 1.0× across all SCX codecs at every
+thread count in §6).
+
+{scx_parallel_write_callout_table()}
+
 **Takeaways:**
-- Zarr lz4 is the fastest writer. SCX writes are 1.8–2.9x slower at census
-  scale (improved from 10–60x pre-Sprint 3).
-- h5ad gzip and TileDB-SOMA are significantly slower due to heavier compression.
+- **Apples-to-apples, SCX is competitive at 32 threads.** On census_1m,
+  SCX (pcodec) drops from 72s single-threaded to 26s at 32 threads
+  (2.8× speedup) — roughly 2× the Zarr (blosc-lz4) wall at 14s but with
+  a 1.2× smaller file and 17× faster subsequent reads.
+- **SCX is the only format that scales writes with cores.** Zarr,
+  h5ad, and TileDB-SOMA stay flat regardless of `num_threads` (see §6
+  for the per-thread-count breakdown across all formats).
+- **Compression-heavy SCX codecs (pcodec, zstd) scale best** (2.6–2.9×
+  at 32T) — more CPU work per shard gives rayon more to schedule.
+  `scx1` and `none` plateau earlier (2.2× / 1.6×).
+- **h5ad gzip and TileDB-SOMA are significantly slower at any thread
+  count** (single-threaded compression / fragment writes dominate).
 """)
 
     # -----------------------------------------------------------------------
@@ -514,13 +543,91 @@ Wall-clock and peak-RSS comparison of SCX-accelerated perturbation metrics
 ``cell-eval`` and ``arc-bench`` on synthetic perturbation datasets. These
 numbers complement the parity correctness suite at
 ``pyscx/tests/test_cell_eval_parity.py`` (30 tests, all passing) and the
-small-scale 10K-cell snapshot recorded in ``ARC-BENCH.md``.
+small-scale 10K-cell snapshot recorded by
+``test_performance_vs_cell_eval`` in that same file.
 
 Operations with cost superlinear in ``n_obs`` (``energy_distance`` at O(N²),
 ``clustering_agreement`` at very large scale) are skipped automatically at
 the sizes where they become infeasible — see the Notes column.
 
 {cell_eval_parity_perf_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 13c. Harmony2 batch integration + LISI (Phase 6)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 13c. Harmony2 Batch Integration + LISI
+
+Clean-room Rust reimplementation of Harmony2 (Korsunsky et al., 2019) and
+the Local Inverse Simpson Index (LISI), exposed via
+``pyscx.accel.harmony_integrate`` / ``pyscx.accel.compute_lisi`` and the
+R wrappers in ``rscx::scx_harmony_integrate`` / ``rscx::scx_compute_lisi``.
+GPU path available when ``pyscx`` is built with ``--features gpu``.
+
+Source JSONs: ``benchmarks/results/harmony/runs/``. Full per-PC curves
+and log-log scaling plots: ``benchmarks/results/harmony/REPORT.md``.
+
+### Numerical parity vs R harmony v2.x
+
+Measured on the three validation fixtures under
+``benchmarks/results/harmony/reference/``. The Rust core uses
+``rand_chacha`` (ChaCha8) while R harmony uses Mersenne Twister; tail PCs
+can drift by ~2% on high-batch-count inputs despite otherwise identical
+arithmetic, so the assertion in ``pyscx/tests/test_harmony_validation.py``
+uses a ≥0.95 per-PC floor and ≥0.97 mean rather than the 0.998 deterministic
+target from the spec.
+
+{harmony_validation_table()}
+
+### Scaling (d=30, K=100, theta=2, max_iter=10, single batch covariate)
+
+All four implementations share the same per-dataset PCA cache built by
+``benchmarks/scripts/benchmark_harmony.py``. The RSS spike at ``smartseq2``
+(~47 GB across three impls) reflects the in-process scale → PCA step that
+densifies a 50K × 2K float32 matrix; R harmony dodges it because its worker
+receives the precomputed matrix via an ``Rscript`` child process.
+
+{harmony_scaling_table()}
+
+Log-log exponents (``log y = α log N + b``) from ``REPORT.md``:
+
+| Impl / device | α (wall vs N) | β (RSS vs N) |
+|---|---:|---:|
+| scx-accel CPU | 0.67 | +0.21 |
+| scx-accel GPU | 1.00 | +1.04 |
+| harmonypy (CPU) | 0.73 | +0.44 |
+| R harmony (CPU) | 1.02 | −0.35 |
+
+Key observations:
+
+- **scx-accel CPU** has the lowest wall-time exponent (α=0.67) — rayon
+  parallelises the distance, L2-norm, and update_R hot paths; the full
+  Harmony loop stays sub-linear in N up to 5M cells.
+- **scx-accel GPU** is competitive from D5 onward (500k cells ≤ scx-accel CPU)
+  and fastest at D7 (31.1 min vs 37.5 min CPU).
+- **harmonypy** is the fastest CPU implementation on every dataset (numpy
+  BLAS wins at scale) but its peak RSS grows with N (β=+0.44).
+- **R harmony** is the slowest at every scale (80 min on D7 vs 22–37 min for
+  the Rust/Python impls) and has the highest wall-time exponent (α=1.02).
+
+### LISI — scx-accel vs R `lisi`
+
+Exact-kNN brute-force LISI in Rust vs the reference R package. Benchmarked
+only on D1–D4 because brute-force LISI is O(N²·d) and becomes impractical
+at census scale; at those sizes the HNSW-approximate path would be used
+instead (not part of this comparison).
+
+{lisi_comparison_table()}
+
+- scx-accel LISI is **~10× faster** than R lisi across D1–D4 (0.02s vs
+  0.40s on pbmc3k; 3.85s vs 43.11s on smartseq2; 12.07s vs 110.29s on
+  tabula_sapiens_100k).
+- Mean-LISI agreement vs the R reference is within 0.76–2.39 %, well
+  inside the 5 % tolerance asserted in
+  ``pyscx/tests/test_harmony_validation.py``.
 """)
 
     # -----------------------------------------------------------------------

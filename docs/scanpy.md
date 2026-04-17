@@ -170,6 +170,11 @@ sc.pl.umap(adata, color="leiden")
 
 ## Converting existing data to SCX
 
+> **Benchmarks**: for h5ad → SCX conversion throughput across datasets, codecs,
+> and thread counts (including `full` mode that covers the h5ad read + SCX
+> write), see [docs/performance.md §Conversion (h5ad → format)](performance.md#conversion-h5ad--format)
+> and [§Write Scaling (parallel shard encoding)](performance.md#write-scaling-parallel-shard-encoding).
+
 ### From AnnData / h5ad
 
 ```python
@@ -905,6 +910,123 @@ converge to a different local optimum than Python leidenalg — both produce
 valid, high-quality community structures. Compare via ARI or NMI when
 switching backends.
 
+### Batch integration / Harmony2 (`pyscx.accel.harmony_integrate`)
+
+Clean-room Rust implementation of the Harmony2 algorithm (Korsunsky et
+al., 2019): iterative soft k-means clustering with a diversity penalty
+over batch covariates, followed by ridge-regression correction of the
+PCA embedding. Drop-in replacement for
+`scanpy.external.pp.harmony_integrate` — the parameter names
+(`key`, `basis`, `adjusted_basis`, `theta`, `lamb`) match, so existing
+scanpy pipelines can swap in without other changes.
+
+```python
+import pyscx
+import scanpy as sc
+
+adata = pyscx.open("atlas.scx").to_anndata()
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="batch")
+
+# PCA first — Harmony corrects the PCA embedding, not the raw matrix.
+pyscx.accel.pca(adata, n_comps=30)
+
+# Default: overwrite adata.obsm["X_pca"] with the corrected embedding.
+pyscx.accel.harmony_integrate(adata, "batch")
+
+# Or keep the raw PCA and write the corrected embedding to a new obsm key:
+pyscx.accel.harmony_integrate(
+    adata, "batch", adjusted_basis="X_pca_harmony"
+)
+
+# Multi-covariate integration (e.g., donor + assay):
+pyscx.accel.harmony_integrate(adata, ["donor_id", "assay"])
+
+# Downstream scanpy works on the corrected embedding just like raw PCA:
+pyscx.accel.neighbors(adata, use_rep="X_pca")
+pyscx.accel.umap(adata)
+pyscx.accel.leiden(adata)
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `key` | (required) | `obs` column name, or list of column names, for the batch covariate(s). Each is factorised via `pandas.factorize(sort=False)`. |
+| `basis` | `"X_pca"` | `obsm` key holding the input embedding. |
+| `adjusted_basis` | `None` | `obsm` key for the corrected embedding. `None` overwrites `basis` in place (scanpy-compatible default). |
+| `n_clusters` | `None` | Soft cluster count K. `None` → `min(N/30, 100)`, clamped to `[2, N/2]`. |
+| `theta` | `2.0` | Diversity-penalty strength. Scalar broadcasts to every covariate. |
+| `sigma` | `0.1` | Gaussian bandwidth for soft assignments. |
+| `lamb` | `None` | Ridge penalty. `None` enables dynamic estimation (`alpha × E[k,b]`). |
+| `max_iter` | `10` | Maximum Harmony outer iterations (cluster → correct rounds). |
+| `max_iter_kmeans` | `4` | Maximum k-means sub-iterations per Harmony iter. |
+| `random_state` | `0` | RNG seed (`ChaCha8Rng` for determinism across runs). |
+| `device` | `"auto"` | `"cpu"` / `"gpu"` / `"auto"`. GPU path requires pyscx built with `--features gpu`. |
+
+Results:
+
+- `adata.obsm[adjusted_basis or basis]` — corrected embedding (N × d, f32).
+- `adata.uns["harmony"]` — dict with `params`, `converged`, `n_iterations`,
+  `objective_harmony` (per-iteration objective curve), and `backend`
+  (`"scx-accel-cpu"` or `"scx-gpu"`).
+
+**Numerical parity** against R `harmony` v2.x on the validation fixtures
+in `benchmarks/results/harmony/reference/`: mean per-PC Pearson r is
+0.989–0.999. Rust uses `rand_chacha` while R uses Mersenne Twister, so
+tail PCs can drift by a few percent on high-batch-count inputs — see
+[`docs/performance.md`](performance.md#harmony2-batch-integration--lisi)
+and `pyscx/tests/test_harmony_validation.py`.
+
+**Scaling** (5M cells × 30 PCs × 100 clusters, single covariate):
+scx-accel CPU 37.5 min, scx-accel GPU 31.1 min, harmonypy 22.4 min,
+R harmony 80.5 min. Full curves in `benchmarks/results/harmony/REPORT.md`.
+
+### LISI — local batch mixing (`pyscx.accel.compute_lisi`)
+
+Local Inverse Simpson Index (Korsunsky et al., 2019) — per-cell measure
+of local categorical diversity. Values approach 1 when a cell's
+neighbours share a single label (poor mixing) and approach the number
+of categories under uniform mixing (good mixing). Useful as a
+batch-integration QC summary: run before and after `harmony_integrate`
+and compare the distribution shift.
+
+```python
+import pyscx
+import numpy as np
+
+# Run on the uncorrected PCA first
+lisi_pre = pyscx.accel.compute_lisi(adata, "batch", basis="X_pca")
+
+# Run Harmony, then LISI on the corrected embedding
+pyscx.accel.harmony_integrate(adata, "batch", adjusted_basis="X_pca_harmony")
+lisi_post = pyscx.accel.compute_lisi(
+    adata, "batch", basis="X_pca_harmony"
+)
+
+# Integration improves local mixing — mean LISI should rise toward n_batches.
+print(f"LISI pre={np.mean(lisi_pre):.2f}  post={np.mean(lisi_post):.2f}")
+
+# Also written to adata.obs:
+print(adata.obs["lisi_batch"].describe())
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `key` | (required) | `obs` column with the categorical label to score. |
+| `basis` | `"X_pca"` | `obsm` key for the embedding to compute neighbourhoods over. |
+| `perplexity` | `30.0` | Gaussian-kernel target perplexity (t-SNE-style bandwidth search). |
+| `n_neighbors` | `None` | k for the exact kNN graph. `None` → `ceil(3 × perplexity)`. |
+
+Returns a `numpy.ndarray` of length N and also writes the values to
+`adata.obs[f"lisi_{key}"]`.
+
+The implementation uses an exact brute-force kNN (per-row squared-norm
+expansion + per-cell top-k heap) to stay numerically in lockstep with
+the R `lisi` reference. On D1–D4 it is **~10× faster** than
+R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
+Brute-force kNN is O(N²·d); at census scale (D5+) you'd want to pair
+this with an HNSW-approximate kNN step instead.
+
 ### Differential Expression (`pyscx.accel.rank_genes_groups`)
 
 Parallel Wilcoxon rank-sum test with rayon. Uses a pre-ranking approach:
@@ -1042,12 +1164,20 @@ not collide with `groupby` or `test_col`.
 SCX ships Rust-accelerated equivalents of the metrics in
 [`cell-eval`](https://github.com/arcinstitute/cell-eval) and
 [`arc-bench`](https://github.com/arcinstitute/arc-bench). The outputs are
-numerically equivalent to the Python references within the tolerances in
-[`ARC-BENCH.md`](../ARC-BENCH.md) (30/30 parity tests pass), so an existing
-cell-eval pipeline can swap in `pyscx.accel.*` for 10–20× wall-clock speedup
-at census-scale perturbation datasets (see
+numerically equivalent to the Python references within the tolerances
+below (30/30 parity tests in `pyscx/tests/test_cell_eval_parity.py` pass),
+so an existing cell-eval pipeline can swap in `pyscx.accel.*` for 10–20×
+wall-clock speedup at census-scale perturbation datasets (see
 [`docs/performance.md`](performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
 for numbers at 10K / 100K / 500K / 1M cells).
+
+| Metric | Tolerance | Rationale |
+|---|---|---|
+| AMI / NMI / ARI on label vectors | `atol=1e-10` | Integer-label inputs; limited by double-precision floor (~2.2e-16). |
+| pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. |
+| energy_distance / pearson_edistance | `atol=1e-4` | O(N²) pairwise streaming mean; reduction order differs from sklearn BLAS GEMM (observed ≤5e-5 at 10K). |
+| clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Leiden is RNG-seeded but not bit-identical across implementations; AMI is bounded in `[0, 1]`. |
+| discrimination_score rank | exact (`abs=0`) | Integer rank computation; any non-zero diff is a correctness regression. |
 
 All functions accept in-memory, backed, or lazy-transformed inputs. They
 expect the `cell-eval` data conventions: an `obs` column with
@@ -1266,8 +1396,18 @@ GPU and CPU accelerators may produce slightly different results due to:
 | **UMAP non-determinism** | GPU uses `atomicAdd` (race conditions are intentional) | Embedding coordinates differ; cluster structure preserved |
 | **Leiden** | Rust-native vs cuGraph vs leidenalg may produce different partitions | ARI > 0.90; biological conclusions equivalent |
 
-For reproducibility notes and tolerance thresholds, see
-[Phase4-GPU.md §7](../tasks/Phase4-GPU.md).
+### Tolerance thresholds (correctness tests)
+
+The GPU test suite (`pyscx/tests/test_accel_gpu.py`) enforces these thresholds vs the CPU reference:
+
+| Test | Metric | Threshold | Notes |
+|------|--------|-----------|-------|
+| GPU PCA vs CPU PCA | Cosine similarity per PC | > 0.99 | Sign-invariant; GPU=f32, CPU=f64 |
+| GPU kNN vs CPU HNSW | Recall@k | > 0.95 | Different algorithms (CAGRA vs HNSW); exact match not expected |
+| GPU UMAP | Trustworthiness | > 0.95 | Non-deterministic due to `atomicAdd` races |
+| GPU Leiden vs CPU Leiden | ARI | > 0.90 | Graph partitioning is inherently non-deterministic |
+| GPU SpMM vs CPU SpMM | Max relative error | < 1e-5 | Relative error (not absolute) for values near zero |
+| GPU normalize + log1p | Element-wise | rtol=1e-7 | Possible f32 rounding differences vs CPU |
 
 ### Checking which backend was used
 
@@ -1290,6 +1430,50 @@ If cuML or cuGraph are importable at runtime, they are used as optimized
 backends for UMAP and GPU Leiden respectively. Otherwise, SCX's native CUDA
 kernels (UMAP) or the Rust-native Leiden implementation are used. The
 Leiden dispatch order is: Rust-native → GPU cuGraph → Python leidenalg.
+
+## Multithreading
+
+Most scx-accel and pyscx entry points are multithreaded via rayon by default,
+and release the GIL (`py.allow_threads()`) so Python stays responsive. For the
+full architecture — runtimes, thread pools, channel topology, and how to control
+parallelism — see [docs/multithreading.md](multithreading.md).
+
+### Per-function threading
+
+| Function | Threading | Notes |
+|----------|-----------|-------|
+| `pyscx.open()`, `to_anndata()`, `read_layer()` | Rayon parallel shard decode | `scx-format` with `parallel` feature; SIMD BitPacker4x within each shard |
+| `ScxBackedDataset` slicing / column projection | Rayon per access | Each `X[...]` call decodes touched shards in parallel |
+| `pyscx.query().where(...).collect()` | Rayon parallel shard decode | Only shards surviving catalog pushdown are decoded |
+| `pyscx.iter_chunks()`, `pyscx.preprocess()`, `pyscx.save_layer()` | Rayon parallel shard decode + encode | Parallel encode achieves up to 3.2× at 32 threads |
+| `pyscx.accel.pca` (CPU) | Rayon | Parallel covariance accumulation (thread-local matrices); streaming SpMM parallelizes inner products |
+| `pyscx.accel.neighbors` (CPU) | Rayon | Parallel kNN queries on HNSW index |
+| `pyscx.accel.umap` (CPU) | Single-threaded SGD | Edge updates are serial on CPU; GPU path uses CUDA kernel parallelism |
+| `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (matches C++ leidenalg); parallel uses conflict-free graph coloring |
+| `pyscx.accel.rank_genes_groups` | Rayon | Parallel Wilcoxon rank-sum across genes |
+| `pyscx.accel.pseudobulk_dex` | Rayon (aggregation) | Streaming aggregation is parallel; downstream `pydeseq2` testing runs single-threaded |
+| `pyscx.accel.highly_variable_genes` | Rayon (via streaming reader) | Parallelism comes from shard decode; the mean/var reduction itself is serial |
+| `pyscx.accel.perturbation_metrics`, `discrimination_score`, `energy_distance` | Rayon | Parallelizes across perturbations / pairwise-distance rows |
+| `pyscx.accel.knockdown_efficiency`, `clustering_agreement` | Rayon | Parallel per-perturbation / per-label reductions |
+| `pyscx.accel.harmony` (batch correction) | Rayon | Parallel per-cluster correction |
+| `pyscx.accel.normalize_total`, `log1p`, `filter_cells`, `filter_genes`, `calculate_qc_metrics` | Rayon (via streaming reader) | Lazy — no work until materialized or consumed |
+| `pyscx.pull()` / `pyscx.push()` (cloud) | Tokio async | `parallelism` parameter controls concurrent transfers (default 8) |
+| `pyscx.TrainingDataset` | Triple-buffered (tokio I/O + rayon decode + Python consumer) | See [multithreading.md §Training data loader](multithreading.md#training-data-loader-triple-buffered-pipeline) |
+| `pyscx.accel.*` with `device="gpu"` | CUDA kernel parallelism | CPU side launches kernels and manages transfers |
+
+### Controlling parallelism
+
+```python
+import os
+os.environ["RAYON_NUM_THREADS"] = "8"   # must be set before `import pyscx`
+import pyscx
+```
+
+The cloud runtime exposes its own knob:
+
+```python
+pyscx.pull("gs://bucket/atlas.scxd/", "atlas.scx", parallelism=16)
+```
 
 ## Common scanpy workflows
 
@@ -1417,10 +1601,45 @@ sc.tl.rank_genes_groups(adata, groupby="cell_type", method="wilcoxon")
 sc.pl.rank_genes_groups(adata, n_genes=20)
 ```
 
-### Batch integration with scVI
+### Batch integration
+
+Two integrated batch-correction paths, neither of which requires leaving
+the pyscx stack:
+
+**Harmony2 (fast, linear).** Clean-room Rust port of Harmony2. Operates
+on the PCA embedding — correct once, feed the result into kNN / UMAP /
+Leiden as if it were raw PCA. Drop-in replacement for
+`scanpy.external.pp.harmony_integrate`.
 
 ```python
 import pyscx
+import scanpy as sc
+
+adata = pyscx.open("multi_batch.scx").to_anndata()
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="batch")
+
+pyscx.accel.pca(adata, n_comps=30)
+pyscx.accel.harmony_integrate(adata, "batch")  # overwrites obsm["X_pca"]
+
+# Use corrected embedding for downstream:
+pyscx.accel.neighbors(adata, use_rep="X_pca")
+pyscx.accel.umap(adata)
+pyscx.accel.leiden(adata)
+
+# QC: batch mixing before / after
+adata.obsm["X_pca_raw"] = adata.obsm["X_pca"]  # (not actually raw after overwrite — use adjusted_basis if you need both)
+lisi = pyscx.accel.compute_lisi(adata, "batch")
+print(f"mean LISI batch = {lisi.mean():.2f}  (ideal: ≈ n_batches)")
+```
+
+**scVI (deep-learning, nonlinear).** When you need nonlinear
+integration or want to learn a latent space for transfer tasks.
+
+```python
+import pyscx
+import scanpy as sc
 import scvi
 
 adata = pyscx.open("multi_batch.scx").to_anndata()
@@ -1433,6 +1652,13 @@ model = scvi.model.SCVI(adata)
 model.train()
 adata.obsm["X_scVI"] = model.get_latent_representation()
 ```
+
+Harmony runs in seconds-to-minutes on 1M cells (see
+[`docs/performance.md`](performance.md#harmony2-batch-integration--lisi));
+scVI adds a GPU-minutes training phase but captures nonlinear
+batch effects Harmony cannot. For most routine integration tasks start
+with Harmony; reach for scVI when Harmony underperforms on a
+`compute_lisi` gate.
 
 ## File operations with scanpy
 

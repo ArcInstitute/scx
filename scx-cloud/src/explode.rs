@@ -1,6 +1,6 @@
 //! Explode: convert a packed `.scx` file into an exploded `.scxd` directory.
 //!
-//! Implements SPEC §12.5. Each section becomes a separate file, enabling
+//! Implements docs/cloud.md (Exploded layout). Each section becomes a separate file, enabling
 //! individual section uploads to cloud object stores.
 //!
 //! Output directory structure:

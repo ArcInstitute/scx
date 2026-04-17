@@ -1,4 +1,4 @@
-// ShardHeader + shard read/write (SPEC §3.3)
+// ShardHeader + shard read/write (docs/format.md (CSR Shard))
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};

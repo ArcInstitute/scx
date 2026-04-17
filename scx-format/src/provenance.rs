@@ -1,4 +1,4 @@
-// Provenance section read/write (SPEC §3.7)
+// Provenance section read/write (docs/format.md (Provenance))
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};

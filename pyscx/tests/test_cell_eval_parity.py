@@ -859,7 +859,7 @@ class TestDEBridgeParity:
 class TestFullPipelineParity:
     """§7.10: Full pipeline integration against cell-eval."""
 
-    # Tolerance table from ARC-BENCH.md
+    # Tolerance table (see docs/scanpy.md "Perturbation evaluation metrics")
     TOLERANCE = {
         "pearson_delta": 1e-6,
         "mse": 1e-6,

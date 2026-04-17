@@ -1,9 +1,9 @@
 // Catalog-level and index-level shard pruning for predicate pushdown.
 //
-// Level 1 (catalog-level): Use per-shard ShardStats (SPEC §3.2) to skip
+// Level 1 (catalog-level): Use per-shard ShardStats (docs/format.md (Dual Catalog)) to skip
 // shards whose column stats prove no rows can match the predicate.
 //
-// Level 2 (index-level): Use PredicateIndex (SPEC §3.5) to narrow row
+// Level 2 (index-level): Use PredicateIndex (docs/format.md (Predicate Indexes)) to narrow row
 // ranges within shards. Implemented in Phase C.
 
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ pub struct ShardCandidate {
 /// Determine which shards may contain matching rows based on catalog-level
 /// statistics. Shards that definitely don't match are excluded.
 ///
-/// This is the "cheap" level 1 pushdown (SPEC §7.2) that avoids reading
+/// This is the "cheap" level 1 pushdown (docs/api.md (Query engine, optimizations)) that avoids reading
 /// any shard data. When `n_indexed_columns == 0` (Phase 1 files),
 /// all shards pass through to post-read filtering.
 ///

@@ -700,7 +700,7 @@ fn test_append_crash_safety() {
 
     // Simulate partial append: write garbage at EOF but DON'T update the header.
     // This simulates a crash after writing new shard data but before the header
-    // pwrite commit point (SPEC §3.6.2).
+    // pwrite commit point (docs/format.md (Append)).
     {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()

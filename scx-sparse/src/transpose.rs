@@ -1,4 +1,4 @@
-// Streaming CSR → CSC transpose (SPEC §10.3)
+// Streaming CSR → CSC transpose (docs/architecture.md (CLI))
 
 use crate::csr::{CsrError, ScxCsr};
 

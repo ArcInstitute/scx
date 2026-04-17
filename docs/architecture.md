@@ -5,7 +5,7 @@ SCX (Sparse Cell eXpression System) is a co-designed **file format**, **compress
 scipy.sparse, and the scanpy I/O layer with a unified Rust-native stack.
 
 This document describes the high-level architecture, crate structure, and data flow.
-For the full binary format specification, see [SPEC.md](../SPEC.md).
+For the full binary format specification, see [format.md](format.md) and [codec.md](codec.md).
 For the API reference, see [api.md](api.md).
 
 ---
@@ -62,8 +62,8 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
-| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (covariance eigh + randomized SVD, auto-routed), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native Leiden community detection), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
-| **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA), `gpu_umap` (CUDA SGD), `gpu_preprocess` (fused normalize+log1p), `gds` |
+| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (covariance eigh + randomized SVD, auto-routed), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native Leiden community detection), `harmony` (Harmony2 batch integration — soft k-means + ridge regression), `lisi` (exact-kNN Local Inverse Simpson Index), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
+| **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA), `gpu_umap` (CUDA SGD), `gpu_harmony` (distance / softmax+penalty / L2-normalize / batched correction kernels), `gpu_preprocess` (fused normalize+log1p), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess`, `lazy_transform`, `projected_agg` |
 | **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
@@ -116,7 +116,7 @@ catalog for O(1) random access to any component.
 - **Immutable fragments** — sections are never overwritten; appends write new data at EOF and update the catalog pointer atomically
 - **Dual catalog** — root catalog (fixed position) for fast open; full catalog (at EOF) for random access
 
-For the complete binary layout, see [SPEC.md §3](../SPEC.md).
+For the complete binary layout, see [format.md](format.md).
 
 ---
 
@@ -658,7 +658,8 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 
 ## Further Reading
 
-- [SPEC.md](../SPEC.md) — Full binary format specification (v0.5)
+- [format.md](format.md) — Binary format reference: header, catalogs, CSR shards, fragment/manifest, checksums
+- [codec.md](codec.md) — Bit-level codec specification
 - [api.md](api.md) — API reference for Rust, Python, and CLI
 - [scanpy.md](scanpy.md) — Scanpy integration, backed mode, and accelerator usage
 - [performance.md](performance.md) — Benchmark results and performance characteristics

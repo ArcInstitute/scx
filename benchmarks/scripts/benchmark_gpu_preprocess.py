@@ -12,8 +12,6 @@ GPU decode/loader pipeline. This benchmark measures:
 GPU kernel correctness is validated in Rust unit tests
 (scx-gpu::gpu_preprocess::test_gpu_normalize_log1p_matches_cpu).
 
-Covers Phase4-GPU.md Step 6 unchecked item.
-
 Usage:
     python benchmarks/scripts/benchmark_gpu_preprocess.py --mode validate
     python benchmarks/scripts/benchmark_gpu_preprocess.py --mode bench

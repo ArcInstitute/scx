@@ -6,9 +6,10 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 
 ## Key Documents
 
-- **[SPEC.md](SPEC.md)** — Format specification (v0.5). Authoritative reference for binary layouts, codecs, and section types.
 - **[ROADMAP.md](ROADMAP.md)** — Historical phased implementation plan (Phases 1-4).
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
+- **[docs/format.md](docs/format.md)** — Binary format reference: file header, catalogs, CSR shard layout, fragment/manifest model, checksums.
+- **[docs/codec.md](docs/codec.md)** — Bit-level codec specification: Delta-Golomb-Rice, FOR-BP, Rice, LZ4+shuffle, auto-selection.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
 - **[docs/performance.md](docs/performance.md)** — Benchmark results and performance characteristics.
@@ -16,6 +17,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/testing.md](docs/testing.md)** — Test, benchmark, and correctness validation details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
+- **[docs/cloud.md](docs/cloud.md)** — Using SCX in cloud environments: auth, layouts, tuning, provider-specific notes.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts.
 - **[tasks/](tasks/)** — Historical phase specs and code reviews.
 
@@ -55,7 +57,7 @@ scx-codec (standalone)
             ├─> scx-loader (depends on scx-format, scx-codec, scx-sparse)
             ├─> scx-cloud (depends on scx-format, scx-codec, scx-engine)
             ├─> scx-gpu (depends on scx-format, scx-codec, scx-sparse)
-            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE/Leiden; optional gpu dep on scx-gpu)
+            ├─> scx-accel (depends on scx-format, scx-sparse; PCA/kNN/UMAP/DE/Leiden/Harmony2/LISI; optional gpu dep on scx-gpu)
             ├─> scx-cli (depends on all above)
             ├─> pyscx (depends on all above)
             └─> rscx (depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
@@ -78,13 +80,13 @@ Key isolation rules:
 
 ### File Format Summary
 
-See [SPEC.md](SPEC.md) S3 for full details.
+See [docs/format.md](docs/format.md) for full details.
 
 - **File header**: 256 bytes, LE, magic `b"SCX\x01"`. Includes `front_catalog_offset`/`length` (populated by `cloud-optimize`, zero otherwise).
 - **Root catalog**: At offset 256, max 4096 bytes.
 - **Sections**: 8-byte aligned. 15 types defined (0-14, see [docs/api.md](docs/api.md#section-types)).
 - **Full catalog**: At EOF. Per-entry checksums + shard statistics (`CategoryBitset` for pushdown).
-- **CSR shard header**: 76 bytes (NOT 64 — spec diagram discrepancy), magic `b"SCXS"`.
+- **CSR shard header**: 76 bytes, magic `b"SCXS"`.
 
 ### Codec System
 
@@ -117,9 +119,11 @@ Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standar
 - **UMAP**: SGD-based layout optimization.
 - **Differential expression**: Pre-ranking Wilcoxon test — ranks all cells once per gene, reuses across groups (10x fewer sorts). `rankby_abs` parameter matches scanpy's signed-score ranking.
 - **Leiden clustering**: Rust-native implementation (Traag et al. 2019) with RB configuration model. Sequential mode (default) matches C++ leidenalg convergence; parallel mode uses conflict-free graph coloring. Uses `rand_chacha` for deterministic seeding.
+- **Harmony2 batch integration**: Clean-room Rust port of Harmony2 (Korsunsky et al. 2019) — soft k-means with diversity penalty + ridge-regression correction on PCA embeddings. Exposed as `pyscx.accel.harmony_integrate` (scanpy-compatible signature) and `rscx::scx_harmony_integrate`. GPU path accelerates distance / L2-normalize / batched scatter-subtract kernels. Mean per-PC Pearson r 0.989–0.999 vs R `harmony` v2.x on the validation fixtures (full parity limited by RNG stream divergence — see `pyscx/tests/test_harmony_validation.py`).
+- **LISI**: Local Inverse Simpson Index via exact brute-force kNN + t-SNE-style Gaussian-bandwidth search + Simpson reduction. Exposed as `pyscx.accel.compute_lisi` and `rscx::scx_compute_lisi`. ~10× faster than the R `lisi` reference with mean-LISI agreement within 0.8–2.4 % on D1–D4.
 - **HVG**: Streaming `highly_variable_genes()` via `ShardSource` — `streaming_mean_var()` and `streaming_clip_square_sum()`, loess fit via Python `skmisc.loess`, seurat_v3 and seurat flavors. `subset=True` uses column projection (no materialization).
 - **Pseudobulk**: Streaming aggregation via `BackedCsrReader`, statistical testing delegated to `pydeseq2`.
-- **Perturbation evaluation metrics**: Rust-accelerated equivalents of the `cell-eval` and `arc-bench` metric pipelines (`pseudobulk_means`, `perturbation_metrics` bundling pearson_delta/mse/mae/mse_delta/mae_delta, `discrimination_score` with target-gene exclusion, `energy_distance` + `energy_distance_details` with streaming pairwise distance, `knockdown_efficiency` writing `obs["KnockDownEfficiency"]`/`obs["KnockDownGeneFC"]`, `clustering_agreement` with AMI/NMI/ARI scoring, `rank_genes_groups_df` bridge to cell-eval's DE format). Parity verified in `pyscx/tests/test_cell_eval_parity.py` (30/30 tests) within tolerances defined in `ARC-BENCH.md`. 10–20× faster than the Python references at 100K–1M cells (see `docs/performance.md`).
+- **Perturbation evaluation metrics**: Rust-accelerated equivalents of the `cell-eval` and `arc-bench` metric pipelines (`pseudobulk_means`, `perturbation_metrics` bundling pearson_delta/mse/mae/mse_delta/mae_delta, `discrimination_score` with target-gene exclusion, `energy_distance` + `energy_distance_details` with streaming pairwise distance, `knockdown_efficiency` writing `obs["KnockDownEfficiency"]`/`obs["KnockDownGeneFC"]`, `clustering_agreement` with AMI/NMI/ARI scoring, `rank_genes_groups_df` bridge to cell-eval's DE format). Parity verified in `pyscx/tests/test_cell_eval_parity.py` (30/30 tests) within tolerances documented in `docs/scanpy.md` (perturbation evaluation metrics section). 10–20× faster than the Python references at 100K–1M cells (see `docs/performance.md`).
 
 ### GPU Acceleration (scx-gpu)
 

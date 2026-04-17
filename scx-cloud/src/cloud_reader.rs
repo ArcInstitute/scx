@@ -5,7 +5,7 @@
 //!   - Cloud-ready packed `.scx` → range read first 256KB (header + front catalog)
 //!   - Non-cloud-ready packed `.scx` → HEAD + range read header + range read catalog at EOF
 //!
-//! Implements SPEC §12 cloud access patterns.
+//! Implements docs/cloud.md cloud access patterns.
 
 use std::io::Cursor;
 use std::sync::Arc;

@@ -27,9 +27,35 @@ All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1-2 TB RAM unless noted ot
 
 SCX is the fastest reader at census scale — **1.5x faster than Zarr**, **2.1x faster than uncompressed h5ad**, and **17.7x faster than gzip h5ad** on 1M cells. Parallel read scaling: up to **7x** at 32 threads.
 
+## Conversion (h5ad → format)
+
+End-to-end write time (in-memory AnnData → target format) and peak RSS during the write. Single-threaded, 3 runs median, median wall / max peak RSS reported.
+
+| Dataset | SCX (auto) | h5ad (none) | h5ad (gzip) | Zarr (lz4) | TileDB-SOMA |
+|---------|-----------|-------------|-------------|------------|-------------|
+| PBMC 10K | 1.78s / 0.4 GB | 0.33s / 0.4 GB | 4.14s / 0.4 GB | **0.33s** / 0.3 GB | 7.12s / 1.1 GB |
+| Smart-seq2 50K | 7.31s / 1.3 GB | **1.37s** / 1.2 GB | 29.4s / 1.2 GB | 1.48s / 0.3 GB | 26.7s / 2.3 GB |
+| Tabula Sapiens 100K | 4.70s / 1.9 GB | **2.06s** / 1.7 GB | 31.7s / 1.7 GB | 2.09s / 0.3 GB | 44.2s / 2.8 GB |
+| Census 500K | 13.7s / 6.7 GB | **6.83s** / 6.0 GB | 123s / 6.0 GB | 7.74s / 0.4 GB | 173s / 7.0 GB |
+| Census 1M | 30.0s / 12.3 GB | **11.8s** / 11.1 GB | 224s / 11.1 GB | 14.6s / 0.5 GB | 255s / 12.1 GB |
+
+Takeaways:
+- **h5ad (none) and Zarr (lz4) are fastest at writing** because they do the least work — no compression (h5ad none) or minimal LZ4 (Zarr). They pay for it on the read side (Zarr lz4 files are ~4–7× larger than SCX; see Compression).
+- **SCX writes are 5–8× faster than h5ad (gzip)** while producing smaller files.
+- **SCX writes are 8–10× faster than TileDB-SOMA** across all sizes tested. TileDB's fragment-based write path has significant per-row overhead.
+- **SCX and Zarr have similar peak RSS characteristics for writes** — both stream compressed output incrementally. h5ad materializes each chunk in memory before compressing, explaining its higher RSS on large datasets.
+- Census 5M write benchmarks are not yet available; parallel write scaling data at 500K is in the next section.
+
+Source: `benchmarks/comprehensive/results/raw/write__{format}__{dataset}.json`.
+
 ## Write Scaling (parallel shard encoding)
 
-Write-only mode (in-memory AnnData → SCX, 500K cells):
+SCX parallelizes shard encoding via rayon — compression, checksumming, and statistics run on separate threads. Benchmarks cover two modes:
+
+- **`write_only`** — in-memory AnnData → SCX (isolates the SCX encoder).
+- **`full`** — end-to-end h5ad → SCX (h5ad read + SCX write; what most users actually do).
+
+### `write_only`: in-memory AnnData → SCX, Census 500K
 
 | Codec | 1 thread | 32 threads | Speedup |
 |-------|---------|-----------|---------|
@@ -39,7 +65,33 @@ Write-only mode (in-memory AnnData → SCX, 500K cells):
 | SCX (auto) | 32.3s | 12.7s | 2.5x |
 | SCX (none) | 21.3s | 12.5s | 1.7x |
 
-SCX parallelizes shard encoding via rayon — compression, checksumming, and statistics run on separate threads. Heavier codecs (pcodec, zstd) benefit most from parallel encoding. Write scaling plateaus around 8–16 threads due to sequential I/O.
+### `full`: h5ad → SCX (auto codec), dataset sweep
+
+| Dataset | 1t | 2t | 4t | 8t | 16t | 32t | Speedup |
+|---------|---:|---:|---:|---:|----:|----:|--------:|
+| PBMC 10K | 1.78s | 1.78s | 1.78s | 1.77s | 1.77s | 1.78s | 1.0x |
+| Smart-seq2 50K | 11.95s | 9.76s | 7.86s | 7.77s | 7.68s | **7.71s** | 1.6x |
+| Tabula Sapiens 100K | 9.40s | 6.40s | 5.57s | 4.74s | 4.64s | **4.68s** | 2.0x |
+| Census 500K | 34.4s | 23.3s | 18.1s | 15.3s | 14.4s | **14.0s** | 2.5x |
+| Census 1M | 72.4s | 46.5s | 35.3s | 32.1s | 32.8s | **33.5s** | 2.2x |
+
+### `full`: h5ad → SCX codec sweep, Census 500K
+
+| Codec | 1 thread | 32 threads | Speedup |
+|-------|---------:|-----------:|--------:|
+| SCX (pcodec) | 39.1s | 13.6s | **2.9x** |
+| SCX (zstd) | 37.7s | 14.4s | 2.6x |
+| SCX (auto) | 34.4s | 14.0s | 2.5x |
+| SCX (scx1) | 35.6s | 16.9s | 2.1x |
+| SCX (none) | 23.2s | 14.7s | 1.6x |
+
+Takeaways:
+- **Small datasets (≤10K cells) don't benefit from threading** — write finishes before rayon's fork/join amortizes. Use fewer threads to avoid overhead.
+- **Speedup plateaus at 8–16 threads** — sequential h5ad read, output I/O, and metadata serialization bound further scaling. Full-mode speedups are slightly lower than write-only because the h5ad read is single-threaded via `h5py`.
+- **Heavier codecs (pcodec, zstd) parallelize best** — more CPU work per shard gives rayon more to schedule. `none` parallelizes least because the hot path is I/O-bound.
+- **`auto` picks `scx1` for UMI data**, so its scaling profile matches `scx1` (median-value-based heuristic — see [docs/codec.md](codec.md#8-automatic-codec-selection)).
+
+Source: `benchmarks/comprehensive/results/raw/parallel_write_scaling__{codec}__{dataset}.json` (`metadata.scaling_wall_s.full` and `metadata.scaling_wall_s.write_only`).
 
 ## Column Projection (2000 HVGs)
 
@@ -84,9 +136,89 @@ Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):
 
 Full pipeline (PCA -> kNN -> UMAP -> Leiden -> DE) on 1M cells: **870s** (vs 3,971s — **4.6x faster**).
 
+### Harmony2 batch integration + LISI
+
+Rust-native re-implementation of the Harmony2 algorithm (Korsunsky et al., 2019) and the Local Inverse Simpson Index (LISI). Exposed via `pyscx.accel.harmony_integrate` and `pyscx.accel.compute_lisi`; R wrappers are `rscx::scx_harmony_integrate` and `rscx::scx_compute_lisi`. GPU path available behind the `gpu` feature (`pyscx.accel.harmony_integrate(adata, ..., device="gpu")`).
+
+Numerical parity against R `harmony` v2.x (clean-room Rust implementation; validation fixtures + thresholds in `pyscx/tests/test_harmony_validation.py`):
+
+| Dataset | N | Batches | d | K | mean per-PC Pearson r vs R | mean LISI agreement |
+|---------|---:|---:|---:|---:|---:|---:|
+| pbmc_small (D1) | 2,700 | 3 | 30 | 100 | **0.999** | within 5% |
+| cell_lines (smartseq2, D3) | 9,478 | 47 | 20 | 100 | **0.989** | within 5% |
+| hlca_subset (tabula_sapiens, D4) | 50,000 | 118 | 30 | 100 | **0.999** | within 5% |
+
+The Rust RNG (`rand_chacha`) draws differ from R's Mersenne Twister, so tail PCs can deviate by up to ~2% on high-batch-count inputs (see `benchmarks/results/harmony/REPORT.md` for per-PC curves and wall/RSS scaling across D1–D7 for CPU scx-accel vs harmonypy vs R harmony).
+
+Scaling sweep (d=30, K=100, theta=2, max_iter=10) — wall time in seconds per dataset size:
+
+| Impl / device | D1 (2.7K) | D2 (11.8K) | D3 (50K) | D4 (100K) | D5 (500K) | D6 (1M) | D7 (5M) | α (wall) |
+|---------------|---:|---:|---:|---:|---:|---:|---:|---:|
+| scx-accel CPU | 5.7 | 22.1 | 69.7 | 19.7 | 100.0 | 236.8 | 2,249.2 | **0.67** |
+| scx-accel GPU | — | 4.4 | 10.6 | 20.8 | 109.7 | 209.3 | 1,868.3 | **1.00** |
+| harmonypy (CPU) | 5.2 | 7.0 | 12.4 | 53.4 | 77.0 | 166.3 | 1,344.6 | **0.73** |
+| R harmony (CPU) | — | 8.7 | 36.7 | 67.8 | 312.3 | 626.8 | 4,831.2 | **1.02** |
+
+Peak RSS in MB (host; GPU VRAM not counted):
+
+| Impl / device | D1 | D2 | D3 | D4 | D5 | D6 | D7 | β (RSS) |
+|---------------|---:|---:|---:|---:|---:|---:|---:|---:|
+| scx-accel CPU | 455 | 6,771 | 47,798 | 784 | 2,187 | 3,945 | 174,779 | **+0.21** |
+| scx-accel GPU | — | 530 | 678 | 890 | 12,218 | 22,376 | 174,666 | **+1.04** |
+| harmonypy (CPU) | 563 | 6,773 | 47,797 | 1,164 | 2,521 | 4,733 | 174,778 | **+0.44** |
+| R harmony (CPU) | — | 6,659 | 47,788 | 86 | 294 | 552 | 2,623 | **−0.35** |
+
+Peak-RSS anomalies at D3 reflect the in-process PCA-cache build (densifies a 50K×2K float32 scaled matrix) rather than Harmony itself; R harmony dodges the spike because it receives a pre-built NumPy matrix from a child `Rscript` process. Scaling exponents α/β fit `log(y) = α·log(N) + b` over the points above; full per-PC correlations, log-log plots, and secondary PC/cluster-count sweeps live in `benchmarks/results/harmony/REPORT.md`.
+
+#### Extrapolated capacity (500 GB / 1000 GB RAM)
+
+Power-law extrapolation of the **D5–D6–D7** points (`log y = α log N + b`,
+i.e. large-N regime only) gives a rough read on the largest dataset each
+implementation can process for a given memory budget, and how long it would
+take. Peak RSS in these rows includes the scanpy `normalize → PCA` cache build
+that runs inside the benchmark driver — for scx-accel CPU/GPU and harmonypy
+that is the dominant allocation at D7. Supplying a precomputed PCA (skipping
+`_build_pca_cache`) shifts their RSS scaling onto the R-harmony curve
+(β≈0.95 — memory-proportional to N), which dramatically raises the capacity.
+
+| Impl / device | β (RSS) | α (wall) | @ 500 GB: N (M cells), wall | @ 1000 GB: N (M cells), wall |
+|---|---:|---:|---:|---:|
+| scx-accel CPU | 1.98 | 1.36 |  9.1M, 1.4 h |  12.9M, 2.2 h |
+| scx-accel GPU | 1.18 | 1.25 | 12.6M, 1.6 h |  22.7M, 3.3 h |
+| harmonypy (CPU) | 1.91 | 1.25 |  9.2M, 0.8 h |  13.3M, 1.2 h |
+| R harmony (CPU) | 0.95 | 1.20 |   compute-bound¹ |  compute-bound¹ |
+
+¹ R harmony's RSS scales ~linearly with N (β≈0.95), so a 500 GB budget
+would technically fit >1B cells, but the α≈1.20 wall-time curve puts even
+50M cells at ~1.5 days of wall time. Memory is not the binding constraint;
+throughput is.
+
+**Practical takeaways**
+
+- With the default benchmark driver (scanpy PCA cache + Harmony), a
+  1000 GB node supports ~13M cells in ~2 h on scx-accel CPU, ~23M cells in
+  ~3 h on scx-accel GPU, and ~13M in ~1.2 h with harmonypy.
+- The memory ceiling for scx-accel CPU/GPU and harmonypy sits on the
+  scanpy `normalize → PCA` cache build, not Harmony itself. Feeding
+  Harmony a pre-computed PCA (a real-world pattern — scanpy pipelines
+  usually persist `X_pca` once) should shift each implementation's RSS
+  curve onto roughly the R-harmony line (β≈0.95), moving the bottleneck
+  onto compute. An isolated Harmony-only RSS measurement is not in the
+  current sweep; see `benchmarks/results/harmony/REPORT.md` for the
+  raw per-run RSS time-series.
+- GPU wins on both axes above D6: at 1000 GB it clears ~23M cells in
+  ~3 h, versus 13M cells / 2 h on CPU.
+
+Extrapolations assume d=30 PCs, K=100 clusters, single-covariate batch.
+Increasing d or K shifts wall time (see the D4 PC/K secondary sweeps in
+`benchmarks/results/harmony/REPORT.md`) but leaves memory roughly
+unchanged for the Harmony core.
+
+LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi` on D1–D4 (e.g. smartseq2 3.85 s vs 43.11 s; tabula_sapiens_100k 12 s vs 110 s), with mean-LISI agreement within 0.8–2.4 % of the R reference.
+
 ## Perturbation Metrics (cell-eval / arc-bench parity)
 
-Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (30/30 parity tests pass within the tolerances specified in [`ARC-BENCH.md`](../ARC-BENCH.md#results)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
+Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (30/30 parity tests pass within the tolerances documented in [`docs/scanpy.md`](scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
 
 | Operation | 10K | 100K | 500K | 1M |
 |-----------|----:|-----:|-----:|----:|

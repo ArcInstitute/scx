@@ -9,8 +9,6 @@ and evaluates the Phase 4c Go/No-Go gate criteria:
   3. End-to-end GPU pipeline >= 10x faster than CPU on 1M cells
   4. Graceful fallback: GPU ops fall back to CPU without crashing
 
-Covers Phase4-GPU.md Section 9 (Go/No-Go Gate).
-
 Usage:
     # Run end-to-end pipeline timing
     python benchmarks/scripts/benchmark_gpu_pipeline.py --mode pipeline

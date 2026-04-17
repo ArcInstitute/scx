@@ -68,6 +68,51 @@ RQueryResult$.wrap <- function(ptr) {
 }
 class(RQueryResult) <- "RQueryResult__class"
 
+# ── Harmony batch integration ──────────────────────────────────
+# Free function wrapper; documentation lives in R/harmony.R.
+scx_harmony_integrate <- function(embeddings, batch,
+                                  n_clusters = NULL,
+                                  theta = 2.0,
+                                  sigma = 0.1,
+                                  lambda = NULL,
+                                  alpha = 0.2,
+                                  max_iter = 10L,
+                                  max_iter_kmeans = 4L,
+                                  epsilon_harmony = 1e-2,
+                                  epsilon_kmeans = 1e-3,
+                                  block_size = 0.05,
+                                  batch_prop_cutoff = 1e-5,
+                                  tau = 0.0,
+                                  random_state = 0L) {
+  .Call(wrap__scx_harmony_integrate,
+        embeddings,
+        as.character(batch),
+        if (is.null(n_clusters)) NULL else as.integer(n_clusters),
+        as.numeric(theta),
+        as.numeric(sigma),
+        if (is.null(lambda)) NULL else as.numeric(lambda),
+        as.numeric(alpha),
+        as.integer(max_iter),
+        as.integer(max_iter_kmeans),
+        as.numeric(epsilon_harmony),
+        as.numeric(epsilon_kmeans),
+        as.numeric(block_size),
+        as.numeric(batch_prop_cutoff),
+        as.numeric(tau),
+        as.integer(random_state))
+}
+
+# ── LISI metric ────────────────────────────────────────────────
+scx_compute_lisi <- function(embeddings, labels,
+                             perplexity = 30.0,
+                             n_neighbors = NULL) {
+  .Call(wrap__scx_compute_lisi,
+        embeddings,
+        as.character(labels),
+        as.numeric(perplexity),
+        if (is.null(n_neighbors)) NULL else as.integer(n_neighbors))
+}
+
 # ── Import functions (interop module) ──────────────────────────
 #' @export
 from_seurat <- function(seurat_obj, output_path) {

@@ -10,6 +10,9 @@ scx-codec = { path = "../../scx-codec" }
 scx-ops = { path = "../../scx-ops" }
 scx-engine = { path = "../../scx-engine" }
 scx-sparse = { path = "../../scx-sparse" }
+scx-accel = { path = "../../scx-accel" }
+rand = { workspace = true }
+rand_chacha = "0.3"
 tempfile = { workspace = true }
 arrow = { workspace = true }
 serde = { workspace = true }

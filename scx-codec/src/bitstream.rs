@@ -1,4 +1,4 @@
-// Bitstream primitives: LSB-first bit reader/writer (SPEC §4)
+// Bitstream primitives: LSB-first bit reader/writer (docs/codec.md)
 
 /// Error returned when a `BitReader` attempts to read past the end of its data.
 #[derive(Debug, thiserror::Error)]

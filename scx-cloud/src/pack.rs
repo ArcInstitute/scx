@@ -1,6 +1,6 @@
 //! Pack: convert an exploded `.scxd` directory back into a packed `.scx` file.
 //!
-//! Implements SPEC §12.5.  Reads `_catalog.bin` as the authoritative section
+//! Implements docs/cloud.md (Exploded layout).  Reads `_catalog.bin` as the authoritative section
 //! index, reads each section file, and writes a new packed `.scx` file.
 //! The output includes a front-of-file catalog (cloud-ready by default).
 

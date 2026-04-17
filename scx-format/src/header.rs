@@ -1,4 +1,4 @@
-// FileHeader struct + read/write (SPEC §3.1)
+// FileHeader struct + read/write (docs/format.md (File Header))
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};

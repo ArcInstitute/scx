@@ -8,6 +8,9 @@ authors.workspace = true
 
 [features]
 default = []
+# GPU-accelerated variants (PCA, kNN, UMAP, Harmony) — require the CUDA
+# toolkit at build time (for PTX compilation in scx-gpu) and a CUDA driver
+# at runtime.
 gpu = ["dep:scx-gpu"]
 
 [dependencies]

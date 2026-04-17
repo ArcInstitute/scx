@@ -22,9 +22,7 @@ fn profiling_enabled() -> bool {
 
 /// Configuration for the training data loader pipeline.
 ///
-/// See [SPEC.md §8.8](../SPEC.md#88-throughput-projections) for the memory
-/// budget model and [Phase2.md §5.2](../Phase2.md#step-5-scx-loader) for
-/// the full config description.
+/// The memory budget model is computed by `memory_budget()` below.
 #[derive(Debug, Clone)]
 pub struct LoaderConfig {
     /// Mini-batch size (default: 1024).
@@ -120,7 +118,7 @@ pub struct MemoryBudget {
 
 /// Compute the memory budget for the training pipeline.
 ///
-/// Implements the memory model from [SPEC.md §8.8]:
+/// Memory model:
 /// ```text
 /// n_output_genes     = hvg_indices.len() if present, else n_vars
 /// shard_buffer       = (shard_group_size + 1) × decoded_shard_bytes
@@ -257,7 +255,7 @@ fn estimate_memory(
 /// 2. **Decode stage** (std::thread + rayon): Shuffles, projects, densifies, normalizes
 /// 3. **GPU stage** (caller): Consumes pre-built `Batch`es via `next_batch()`
 ///
-/// See [SPEC.md §8.2](../SPEC.md#82-scx-training-loader-architecture).
+/// See [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 pub struct TrainingPipeline {
     config: LoaderConfig,
     reader: Arc<ScxReader>,

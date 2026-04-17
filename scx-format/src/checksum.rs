@@ -1,4 +1,4 @@
-// BLAKE3 helpers (SPEC §3.8)
+// BLAKE3 helpers (docs/format.md (Checksums))
 
 /// Compute a full 32-byte BLAKE3 hash.
 pub fn blake3_hash(data: &[u8]) -> [u8; 32] {

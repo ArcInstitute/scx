@@ -1,6 +1,5 @@
 //! HVG (Highly Variable Gene) projection at decode time.
 //!
-//! Implements [SPEC.md §8.4](../SPEC.md#84-gene-projection-at-decode-time).
 //! During CSR row decode, only values whose column index is in the HVG set
 //! are written into the dense output tensor. Non-HVG values are skipped.
 //!

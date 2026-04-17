@@ -1,4 +1,4 @@
-// Delta-Golomb-Rice encoder/decoder for indptr (SPEC §4.1)
+// Delta-Golomb-Rice encoder/decoder for indptr (docs/codec.md (Indptr))
 //
 // Single-stream codec for monotonically non-decreasing u64 indptr arrays.
 // Layout: [raw LE u64 first value] [1-byte k] [Rice-coded deltas] [byte-pad]

@@ -1,8 +1,8 @@
 // I/O Stage (Stage 1) — async shard group reader for the training pipeline.
 //
 // Reads shard groups from the SCX file using tokio async I/O and sends
-// decoded shard data to the decode stage via bounded channel. See
-// SPEC.md §8.2 (Triple-Buffered Pipeline).
+// decoded shard data to the decode stage via bounded channel.
+// See docs/multithreading.md §Training data loader (triple-buffered pipeline).
 
 use std::sync::Arc;
 use std::time::Instant;
