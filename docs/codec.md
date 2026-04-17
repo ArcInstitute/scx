@@ -1,9 +1,8 @@
 # SCX Codec Reference (Bit-Level)
 
 This document is the bit-level specification of the codecs used inside SCX
-shards. See [docs/format.md](format.md) for the containing file/shard layout
-and [SPEC-level references] in the source tree for the reference
-implementation (`scx-codec`).
+shards. See [docs/format.md](format.md) for the containing file/shard layout.
+The reference implementation lives in the `scx-codec` crate.
 
 **All multi-byte values within codec streams are little-endian.**
 
