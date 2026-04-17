@@ -15,11 +15,18 @@
 //! - `Float16` falls back to `Float32` bytes with no panic — the canonical
 //!   rule is that callers should have re-encoded before reaching an
 //!   f32-only path. This matches `scx-ops::compact` and tolerates the
-//!   existing `pyscx::anndata::encode_values` preconditions.
+//!   existing `pyscx::anndata::encode_values` preconditions. A
+//!   `log::warn!` fires at most once per process when the fallback is
+//!   taken, preserving the visibility the prior `scx-cli` `eprintln!`
+//!   warning offered before this module absorbed the three call sites.
+
+use std::sync::Once;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::dispatch::ValueEncoding;
+
+static FLOAT16_FALLBACK_WARNED: Once = Once::new();
 
 /// Return true if every element is a non-negative finite integer-valued f32.
 #[inline]
@@ -66,6 +73,14 @@ pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
             buf
         }
         ValueEncoding::Float32 | ValueEncoding::Float16 => {
+            if matches!(encoding, ValueEncoding::Float16) {
+                FLOAT16_FALLBACK_WARNED.call_once(|| {
+                    log::warn!(
+                        "Float16 value encoding is not implemented; serializing as Float32 bytes. \
+                         Re-encode upstream to avoid this fallback."
+                    );
+                });
+            }
             let mut buf = Vec::with_capacity(data.len() * 4);
             for &v in data {
                 buf.write_f32::<LittleEndian>(v).unwrap();

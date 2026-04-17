@@ -45,11 +45,12 @@ pub struct PseudobulkResult {
 /// Build a group-key → group-index mapping from per-cell obs column vectors.
 ///
 /// The group key is the cell's tuple of values across all groupby columns
-/// (e.g. `("drug_A", "donor_1")`). Keying directly by `Vec<String>` (cheaply
-/// cloned per unique group, not per cell) avoids both the old `"\x1F"`
-/// unit-separator joined-string scheme (which collided on values that
-/// themselves contained `\x1F`) and the per-cell `String::new + push_str`
-/// allocations on the hot path.
+/// (e.g. `("drug_A", "donor_1")`). Strings are interned once per column,
+/// giving each distinct label a `u32` id; the per-cell hot path then builds
+/// a `Vec<u32>` of ids and looks it up by borrowed slice, so lookups of
+/// already-seen groups allocate nothing. This replaces the old `"\x1F"`
+/// joined-string scheme (which collided on values containing the separator)
+/// without re-introducing the per-cell `String` allocations that scheme paid.
 ///
 /// Returns:
 /// - `cell_to_group`: group index for each cell (length = n_obs)
@@ -58,37 +59,62 @@ pub struct PseudobulkResult {
 fn build_group_mapping(obs_groups: &[Vec<String>], n_obs: usize) -> (Vec<usize>, Vec<Vec<String>>) {
     let n_cols = obs_groups.len();
 
-    // Build composite keys for each cell.
-    let mut key_to_index: HashMap<Vec<String>, usize> = HashMap::new();
-    let mut group_labels: Vec<Vec<String>> = Vec::new();
+    // Per-column string interners. Keyed by `&str` borrowed from obs_groups;
+    // the backing Vec<String>s live for the full call, so the borrow is sound.
+    let mut col_interners: Vec<HashMap<&str, u32>> = (0..n_cols).map(|_| HashMap::new()).collect();
+    let mut col_vocab: Vec<Vec<&str>> = vec![Vec::new(); n_cols];
+
+    // Group table: `Vec<u32>` of interned ids -> group index.
+    let mut key_to_index: HashMap<Vec<u32>, usize> = HashMap::new();
+    let mut group_label_ids: Vec<Vec<u32>> = Vec::new();
     let mut cell_to_group = Vec::with_capacity(n_obs);
 
-    for cell in 0..n_obs {
-        // Assemble the per-cell key by borrowing from each obs column.
-        // Lookup uses a temporary Vec<&str> — only when we insert a new group
-        // do we clone into owned Strings.
-        let key_ref: Vec<&str> = obs_groups.iter().map(|col| col[cell].as_str()).collect();
-        // HashMap doesn't accept Vec<&str> for a Vec<String> key without an
-        // owning conversion, so we materialize once per cell. This is still
-        // cheaper than the old concatenated String when label values are
-        // short, and never collides on '\x1F' inside a value.
-        let key_owned: Vec<String> = key_ref.iter().map(|s| (*s).to_string()).collect();
+    // Reused per-cell buffer — avoids n_obs * n_cols * u32 reallocations.
+    let mut key_buf: Vec<u32> = Vec::with_capacity(n_cols);
 
-        let group_idx = if let Some(&idx) = key_to_index.get(&key_owned) {
+    // Parallel-index across `n_cols` columns — idiomatic `for cell in ...` is
+    // clearer than the clippy-suggested iterator chain over the first column.
+    #[allow(clippy::needless_range_loop)]
+    for cell in 0..n_obs {
+        key_buf.clear();
+        for col_idx in 0..n_cols {
+            let s: &str = obs_groups[col_idx][cell].as_str();
+            let id = match col_interners[col_idx].get(s) {
+                Some(&id) => id,
+                None => {
+                    let id = col_vocab[col_idx].len() as u32;
+                    col_interners[col_idx].insert(s, id);
+                    col_vocab[col_idx].push(s);
+                    id
+                }
+            };
+            key_buf.push(id);
+        }
+
+        // Borrowed-slice lookup: `Vec<u32>: Borrow<[u32]>`, so we hit without
+        // allocating a key. Only new groups pay a single clone on insert.
+        let group_idx = if let Some(&idx) = key_to_index.get(key_buf.as_slice()) {
             idx
         } else {
-            let idx = group_labels.len();
-            key_to_index.insert(key_owned.clone(), idx);
-            group_labels.push(key_owned);
+            let idx = group_label_ids.len();
+            key_to_index.insert(key_buf.clone(), idx);
+            group_label_ids.push(key_buf.clone());
             idx
         };
 
         cell_to_group.push(group_idx);
     }
 
-    // Suppress unused warning when n_cols is 0 (empty groupby is nonsensical
-    // but the builder must not panic).
-    let _ = n_cols;
+    // Materialize owned group labels from interned ids (once per unique group).
+    let group_labels: Vec<Vec<String>> = group_label_ids
+        .iter()
+        .map(|ids| {
+            ids.iter()
+                .enumerate()
+                .map(|(col_idx, &id)| col_vocab[col_idx][id as usize].to_string())
+                .collect()
+        })
+        .collect();
 
     // Sort groups deterministically by their label tuple (lexicographic).
     let mut sorted_indices: Vec<usize> = (0..group_labels.len()).collect();

@@ -22,18 +22,22 @@ pub struct ShardDeletion {
 
 /// Deletion vectors section: tracks logically deleted rows per shard.
 ///
-/// Storage is a `BTreeMap<shard_id, bitmap>` — O(log n) lookup plus sorted
-/// iteration on write, which preserves the on-disk byte sequence produced by
-/// the previous `Vec<ShardDeletion>`-based implementation.
+/// Storage is a `BTreeMap<shard_id, bitmap>` — O(log n) lookup and canonical
+/// sorted-by-key iteration on write. Files produced by the previous
+/// `Vec<ShardDeletion>`-based implementation whose entries happened to be
+/// pushed in ascending shard-id order are byte-identical under the new
+/// writer; files whose entries were pushed out of order now serialize in
+/// sorted order, producing a different byte sequence but equivalent semantic
+/// content. Readers are order-agnostic, so old files of either shape still
+/// decode correctly.
 #[derive(Debug, Clone)]
 pub struct DeletionVectors {
     pub dv_version: u8,
     /// Per-shard deletion bitmaps keyed by shard id.
     ///
     /// Public so callers can mutate freely (e.g. tests asserting specific
-    /// state); write ordering on disk is BTreeMap iteration order, which is
-    /// sorted by key — matches the legacy `shards.sort_by_key(|s| s.shard_id)`
-    /// behavior that older files relied on.
+    /// state); write order on disk is BTreeMap iteration order (sorted by
+    /// shard id).
     pub shards: BTreeMap<u32, RoaringBitmap>,
 }
 
@@ -47,7 +51,8 @@ impl DeletionVectors {
     }
 
     /// Serialize to writer. Shard iteration order is sorted by `shard_id`
-    /// (BTreeMap invariant), matching the legacy on-disk byte sequence.
+    /// (BTreeMap invariant) — see the struct-level docs on compat with the
+    /// legacy `Vec<ShardDeletion>` writer.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u8(self.dv_version)?;
         w.write_u32::<LittleEndian>(self.shards.len() as u32)?;
@@ -75,8 +80,14 @@ impl DeletionVectors {
             r.read_exact(&mut bitmap_bytes)?;
             let bitmap = RoaringBitmap::deserialize_from(&bitmap_bytes[..])
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            // Later entries for the same shard id overwrite earlier ones —
-            // malformed duplicate input shouldn't cause panics.
+            // Behavioral note vs. the legacy `Vec<ShardDeletion>` reader:
+            // that reader preserved duplicate shard_ids in the vector, so
+            // `is_deleted` OR'd them via linear scan. The BTreeMap can hold
+            // only one entry per key, so a duplicate silently overwrites the
+            // earlier one — last-writer-wins. A well-formed file produced by
+            // any SCX writer never emits duplicates (writers dedupe by
+            // shard_id before serialization), so this path only fires on
+            // malformed or hand-crafted input.
             shards.insert(shard_id, bitmap);
         }
         Ok(Self { dv_version, shards })
