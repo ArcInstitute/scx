@@ -1042,12 +1042,20 @@ not collide with `groupby` or `test_col`.
 SCX ships Rust-accelerated equivalents of the metrics in
 [`cell-eval`](https://github.com/arcinstitute/cell-eval) and
 [`arc-bench`](https://github.com/arcinstitute/arc-bench). The outputs are
-numerically equivalent to the Python references within the tolerances in
-[`ARC-BENCH.md`](../ARC-BENCH.md) (30/30 parity tests pass), so an existing
-cell-eval pipeline can swap in `pyscx.accel.*` for 10–20× wall-clock speedup
-at census-scale perturbation datasets (see
+numerically equivalent to the Python references within the tolerances
+below (30/30 parity tests in `pyscx/tests/test_cell_eval_parity.py` pass),
+so an existing cell-eval pipeline can swap in `pyscx.accel.*` for 10–20×
+wall-clock speedup at census-scale perturbation datasets (see
 [`docs/performance.md`](performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
 for numbers at 10K / 100K / 500K / 1M cells).
+
+| Metric | Tolerance | Rationale |
+|---|---|---|
+| AMI / NMI / ARI on label vectors | `atol=1e-10` | Integer-label inputs; limited by double-precision floor (~2.2e-16). |
+| pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. |
+| energy_distance / pearson_edistance | `atol=1e-4` | O(N²) pairwise streaming mean; reduction order differs from sklearn BLAS GEMM (observed ≤5e-5 at 10K). |
+| clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Leiden is RNG-seeded but not bit-identical across implementations; AMI is bounded in `[0, 1]`. |
+| discrimination_score rank | exact (`abs=0`) | Integer rank computation; any non-zero diff is a correctness regression. |
 
 All functions accept in-memory, backed, or lazy-transformed inputs. They
 expect the `cell-eval` data conventions: an `obs` column with

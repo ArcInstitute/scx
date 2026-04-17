@@ -2133,8 +2133,7 @@ class TestRankGenesGroupsDf:
 class TestEndToEndPipeline:
     """End-to-end integration test: run the full SCX perturbation evaluation pipeline.
 
-    This corresponds to Phase 6, Task 6.5 in ARC-BENCH.md. Validates the
-    complete workflow: pseudobulk_means → perturbation_metrics →
+    Validates the complete workflow: pseudobulk_means → perturbation_metrics →
     discrimination_score → energy_distance → knockdown_efficiency.
     """
 

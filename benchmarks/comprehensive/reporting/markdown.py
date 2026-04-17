@@ -514,7 +514,8 @@ Wall-clock and peak-RSS comparison of SCX-accelerated perturbation metrics
 ``cell-eval`` and ``arc-bench`` on synthetic perturbation datasets. These
 numbers complement the parity correctness suite at
 ``pyscx/tests/test_cell_eval_parity.py`` (30 tests, all passing) and the
-small-scale 10K-cell snapshot recorded in ``ARC-BENCH.md``.
+small-scale 10K-cell snapshot recorded by
+``test_performance_vs_cell_eval`` in that same file.
 
 Operations with cost superlinear in ``n_obs`` (``energy_distance`` at O(N²),
 ``clustering_agreement`` at very large scale) are skipped automatically at
