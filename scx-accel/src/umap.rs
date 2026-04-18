@@ -14,6 +14,7 @@
 //! 3. **Output**: Low-dimensional embedding (n_obs × n_components).
 
 use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 use rand_distr::Normal;
 
 use crate::error::{AccelError, Result};
@@ -156,7 +157,7 @@ pub fn compute_umap(
     };
 
     // SGD optimization
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let n_edges = head.len();
     let epochs_per_negative_sample: Vec<f64> = epochs_per_sample
         .iter()
@@ -288,7 +289,7 @@ fn spectral_init(
     // (equivalent to smallest non-trivial eigenvectors of Laplacian)
     let max_iters = 300;
     let tol = 1e-6;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let normal = Normal::new(0.0_f64, 1.0).unwrap();
 
     let mut eigenvectors: Vec<Vec<f64>> = Vec::with_capacity(n_components);
@@ -423,7 +424,7 @@ fn spectral_init(
     }
 
     // Add small noise to break ties
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
+    let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
     let noise = Normal::new(0.0_f64, 1e-4).unwrap();
     for v in &mut embedding {
         *v += rng.sample(noise);

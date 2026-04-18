@@ -9,5 +9,6 @@ authors.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 rand = { workspace = true }
+rand_chacha = { workspace = true }
 rand_distr = { workspace = true }
 log = { workspace = true }

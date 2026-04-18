@@ -18,11 +18,14 @@
 //! Peak memory: O(n_obs × k + n_vars × k) where k = n_components + n_oversamples.
 //! One decoded shard (~16K × n_vars × 4 bytes) is held at a time.
 
+use std::cell::RefCell;
+
 use faer::{Mat, MatRef};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
+use thread_local::ThreadLocal;
 
 use scx_format::total_variance_from_col_sq;
 use scx_format::ShardSource;
@@ -340,7 +343,7 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
 
 /// Generate a random Gaussian matrix (rows × cols), row-major.
 fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let normal = StandardNormal;
     (0..rows * cols).map(|_| normal.sample(&mut rng)).collect()
 }
@@ -417,6 +420,14 @@ fn streaming_spmm_transpose<S: ShardSource>(
     let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
+    // Per-thread scratch buffers hoisted across shards so the parallel path
+    // does not re-allocate `n_vars * k` f64s per chunk task. Zeroed at the
+    // start of each shard iteration before use.
+    let mut tls_z: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
+    let mut tls_sq: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
+    let tls_q_row: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
+    let sq_len = if means.is_some() { k } else { 0 };
+
     for shard_idx in 0..n_shards {
         let csr = source.read_shard(shard_idx)?;
         let shard_rows = csr.n_rows();
@@ -426,72 +437,62 @@ fn streaming_spmm_transpose<S: ShardSource>(
             let gr_base = global_row;
             let chunk_size = (shard_rows / rayon::current_num_threads().max(1)).max(256);
 
-            let (z_shard, sq_shard) = (0..shard_rows)
+            // Zero each thread-local buffer that was touched on a prior shard.
+            for buf in tls_z.iter_mut() {
+                buf.get_mut().fill(0.0);
+            }
+            for buf in tls_sq.iter_mut() {
+                buf.get_mut().fill(0.0);
+            }
+
+            (0..shard_rows)
                 .into_par_iter()
                 .with_min_len(chunk_size)
-                .fold(
-                    || {
-                        (
-                            vec![0.0f64; n_vars * k],
-                            if means.is_some() {
-                                vec![0.0f64; k]
-                            } else {
-                                vec![]
-                            },
-                        )
-                    },
-                    |(mut zl, mut sql), r| {
-                        let gr = gr_base + r;
-                        let mut q_row = vec![0.0f64; k];
-                        for j in 0..k {
-                            q_row[j] = q[(gr, j)];
-                        }
-                        if means.is_some() {
-                            for j in 0..k {
-                                sql[j] += q_row[j];
-                            }
-                        }
-                        let start = csr.indptr[r] as usize;
-                        let end = csr.indptr[r + 1] as usize;
-                        for idx in start..end {
-                            let col = csr.indices[idx] as usize;
-                            let val = csr.data[idx] as f64;
-                            let z_offset = col * k;
-                            for j in 0..k {
-                                zl[z_offset + j] += val * q_row[j];
-                            }
-                        }
-                        (zl, sql)
-                    },
-                )
-                .reduce(
-                    || {
-                        (
-                            vec![0.0f64; n_vars * k],
-                            if means.is_some() {
-                                vec![0.0f64; k]
-                            } else {
-                                vec![]
-                            },
-                        )
-                    },
-                    |(mut za, mut sqa), (zb, sqb)| {
-                        for i in 0..za.len() {
-                            za[i] += zb[i];
-                        }
-                        for i in 0..sqa.len() {
-                            sqa[i] += sqb[i];
-                        }
-                        (za, sqa)
-                    },
-                );
+                .for_each(|r| {
+                    let mut zl = tls_z
+                        .get_or(|| RefCell::new(vec![0.0f64; n_vars * k]))
+                        .borrow_mut();
+                    let mut sql = tls_sq
+                        .get_or(|| RefCell::new(vec![0.0f64; sq_len]))
+                        .borrow_mut();
 
-            // Merge shard results into global accumulators
-            for i in 0..z.len() {
-                z[i] += z_shard[i];
+                    let mut q_row = tls_q_row
+                        .get_or(|| RefCell::new(vec![0.0f64; k]))
+                        .borrow_mut();
+
+                    let gr = gr_base + r;
+                    for j in 0..k {
+                        q_row[j] = q[(gr, j)];
+                    }
+                    if means.is_some() {
+                        for j in 0..k {
+                            sql[j] += q_row[j];
+                        }
+                    }
+                    let start = csr.indptr[r] as usize;
+                    let end = csr.indptr[r + 1] as usize;
+                    for idx in start..end {
+                        let col = csr.indices[idx] as usize;
+                        let val = csr.data[idx] as f64;
+                        let z_offset = col * k;
+                        for j in 0..k {
+                            zl[z_offset + j] += val * q_row[j];
+                        }
+                    }
+                });
+
+            // Reduce thread-local shards into global accumulators.
+            for buf in tls_z.iter_mut() {
+                let zl = buf.get_mut();
+                for (zg, zv) in z.iter_mut().zip(zl.iter()) {
+                    *zg += *zv;
+                }
             }
-            for i in 0..sum_q.len() {
-                sum_q[i] += sq_shard[i];
+            for buf in tls_sq.iter_mut() {
+                let sql = buf.get_mut();
+                for (sg, sv) in sum_q.iter_mut().zip(sql.iter()) {
+                    *sg += *sv;
+                }
             }
         } else {
             // Sequential path for small shards
