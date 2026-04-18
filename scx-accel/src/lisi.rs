@@ -420,13 +420,13 @@ fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> 
 ///
 /// `weights` sum to 1 (post-hbeta). `neigh_idx` indexes into `labels`.
 fn simpson_inverse(weights: &[f64], neigh_idx: &[usize], labels: &[u32]) -> f64 {
-    // Accumulate per-category probabilities using a small hashmap; since
-    // labels are contiguous u32 we could use a Vec, but k is typically
-    // ≤ 200 so the extra branching + zeroing would cost more than a
-    // tiny hashmap for common inputs. Use a Vec when the dense path
-    // obviously wins (# distinct labels ≈ k).
-    use std::collections::HashMap;
-    let mut probs: HashMap<u32, f64> = HashMap::with_capacity(weights.len());
+    // Accumulate per-category probabilities. Uses `BTreeMap` (not `HashMap`)
+    // so iteration order is sorted-by-label and the final `Σ p²` summation
+    // runs in a reproducible order — float addition is not associative, so
+    // HashMap's randomised iteration order leaked ULP-scale nondeterminism
+    // into the per-cell LISI value and through to the fingerprint.
+    use std::collections::BTreeMap;
+    let mut probs: BTreeMap<u32, f64> = BTreeMap::new();
     for (w, &j) in weights.iter().zip(neigh_idx.iter()) {
         *probs.entry(labels[j]).or_insert(0.0) += *w;
     }
