@@ -139,9 +139,15 @@ pub fn append(
     };
 
     // Validate obs schema equivalence between the target file's existing obs
-    // and the new batch. `concat_batches` below would error on a mismatch
-    // too, but surfacing it here gives a clearer diagnostic and avoids any
-    // chance that a partial write precedes the schema check.
+    // and the new batch. `concat_batches` below runs after `unify_dict_columns`
+    // strips `Dictionary(_, V) → V` on both sides, so the relevant comparison
+    // is over *effective* value types — Arrow IPC round-trips Dictionary columns
+    // down to their value type (e.g. `Dictionary(Int8, Utf8)` → `Utf8`), so a
+    // strict `a.data_type() == b.data_type()` check would reject a legitimate
+    // append where one side came from disk and the other from a fresh
+    // AnnData → Arrow conversion. Surfacing the check here gives a clearer
+    // diagnostic than the downstream `concat_batches` error and avoids any
+    // chance that a partial write precedes it.
     let old_schema = old_obs.schema();
     let new_schema = new_obs.schema();
     if old_schema.fields().len() != new_schema.fields().len() {
@@ -154,7 +160,7 @@ pub fn append(
         });
     }
     for (a, b) in old_schema.fields().iter().zip(new_schema.fields().iter()) {
-        if a.name() != b.name() || a.data_type() != b.data_type() {
+        if a.name() != b.name() || effective_type(a.data_type()) != effective_type(b.data_type()) {
             return Err(OpsError::SchemaMismatch {
                 detail: format!(
                     "obs column '{}'({:?}) vs new '{}'({:?})",
@@ -498,6 +504,17 @@ pub fn append(
     // where a zero-checksum header could be the durable on-disk state.
     finalize_header_with_checksum(&mut lock, &mut header)?;
     Ok(())
+}
+
+/// Return the effective (dictionary-stripped) value type of a `DataType`.
+/// Mirrors the behaviour of [`unify_dict_columns`] so the append-time schema
+/// check can compare across `Dictionary(_, V)` ↔ `V` asymmetries introduced
+/// by Arrow IPC round-trips.
+fn effective_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataType {
+    match dt {
+        arrow::datatypes::DataType::Dictionary(_, value_type) => value_type,
+        other => other,
+    }
 }
 
 /// Cast dictionary-encoded columns to their value type to unify (deduplicate)
