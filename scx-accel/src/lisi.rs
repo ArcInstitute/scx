@@ -279,7 +279,6 @@ fn approximate_knn(emb: &[f32], n: usize, d: usize, k: usize) -> Result<(Vec<usi
     let points: Vec<P> = (0..n)
         .map(|i| P(emb[i * d..(i + 1) * d].to_vec()))
         .collect();
-    let queries = points.clone();
     let (hnsw, point_ids) = Hnsw::<P>::builder()
         .ef_construction(200)
         .ef_search(200)
@@ -297,12 +296,12 @@ fn approximate_knn(emb: &[f32], n: usize, d: usize, k: usize) -> Result<(Vec<usi
     knn_idx
         .par_chunks_mut(k)
         .zip(knn_dist.par_chunks_mut(k))
-        .zip(queries.par_iter())
         .enumerate()
-        .for_each(|(i, ((idx_row, dist_row), query))| {
+        .for_each(|(i, (idx_row, dist_row))| {
+            let query = P(emb[i * d..(i + 1) * d].to_vec());
             let mut search = Search::default();
             let mut slot = 0usize;
-            for item in hnsw.search(query, &mut search) {
+            for item in hnsw.search(&query, &mut search) {
                 let orig = internal_to_original[item.pid.into_inner() as usize];
                 if orig == i {
                     continue;

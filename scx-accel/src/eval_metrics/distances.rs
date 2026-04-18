@@ -94,12 +94,17 @@ pub fn mean_pairwise_distance(
     debug_assert!(a.len() >= n_a * n_dims);
     debug_assert!(b.len() >= n_b * n_dims);
 
-    // Parallelize the outer loop. `with_min_len(n_b * 16)` prevents
-    // oversubscription when this runs inside `fused_edistance`, where the
-    // caller already holds a rayon scope — tiny chunks would thrash.
-    // Reduction is associative; float sum order is stable given fixed chunk
-    // boundaries (rayon's split_at is deterministic for slices).
-    let total: f64 = (0..n_a)
+    // Parallelize per-row work but reduce sequentially in row order for
+    // bit-stable output across thread counts and environments. Float
+    // addition is not associative and rayon's `.sum()` combines partial
+    // results in work-stealing order, so we can't use it here. The
+    // `Vec<f64>` row-sum buffer costs O(n_a) transient memory — trivial
+    // vs. the O(n_a * n_b * n_dims) inner work.
+    //
+    // `with_min_len(n_b * 16)` prevents oversubscription when this runs
+    // inside `fused_edistance`, where the caller already holds a rayon
+    // scope — tiny chunks would thrash.
+    let row_sums: Vec<f64> = (0..n_a)
         .into_par_iter()
         .with_min_len((n_b * 16).max(1))
         .map(|i| {
@@ -111,7 +116,8 @@ pub fn mean_pairwise_distance(
             }
             row_sum
         })
-        .sum();
+        .collect();
+    let total: f64 = row_sums.iter().sum();
     total / (n_a as f64 * n_b as f64)
 }
 

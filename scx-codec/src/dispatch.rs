@@ -372,7 +372,7 @@ fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
                     && raw.len().is_multiple_of(std::mem::size_of::<half::f16>())
                 {
                     use half::slice::HalfFloatSliceExt;
-                    // Safety: alignment + length checked immediately above,
+                    // SAFETY: alignment + length checked immediately above,
                     // `half::f16` is `#[repr(transparent)]` over `u16`, so any
                     // aligned 2-byte little-endian group is a valid `f16` bit
                     // pattern.

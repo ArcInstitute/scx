@@ -1251,14 +1251,19 @@ impl HarmonyState {
         // Caller invariant: `gb` ∈ `[0, layout.total_cov_levels)`. Every
         // call site synthesises `gb` from the partitioned batch-level loop,
         // so falling off the end here means the invariant was violated by
-        // a coding bug. Preserve the behaviour in release (return a safe
-        // default that wouldn't corrupt downstream indexing) but scream in
-        // debug so we catch it in tests.
+        // a coding bug. Panic in debug; in release, log at error level and
+        // return a safe default so downstream indexing doesn't corrupt.
+        let total_cov_levels = self.layout.cov_offset.last().copied().unwrap_or(0)
+            + self.covariates.last().map(|c| c.n_levels).unwrap_or(0);
         debug_assert!(
             false,
             "gb_to_cov_level: gb={gb} is outside [0, {}), layout.c={}",
-            self.layout.cov_offset.last().copied().unwrap_or(0)
-                + self.covariates.last().map(|c| c.n_levels).unwrap_or(0),
+            total_cov_levels, self.layout.c,
+        );
+        log::error!(
+            "gb_to_cov_level: gb={gb} outside [0, {}), layout.c={} — \
+             caller invariant violated; returning safe default",
+            total_cov_levels,
             self.layout.c,
         );
         (self.layout.c.saturating_sub(1), 0)

@@ -27,6 +27,13 @@ fn random_init(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
     umap_math::random_init_f64(n_obs, n_components, seed)
 }
 
+/// Upper bound on `n_components` enforced by [`compute_umap`]. The SGD inner
+/// loop uses a `[f64; MAX_UMAP_COMPONENTS]` stack buffer to cache the
+/// component-wise diff between two embeddings; anything larger would overflow
+/// the buffer. UMAP targets 2–3D in every realistic workflow, so the cap is
+/// more than an order of magnitude above the typical use case.
+pub const MAX_UMAP_COMPONENTS: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -93,6 +100,13 @@ pub fn compute_umap(
         return Err(AccelError::InvalidInput(
             "n_components must be > 0".to_string(),
         ));
+    }
+    if n_components > MAX_UMAP_COMPONENTS {
+        return Err(AccelError::InvalidInput(format!(
+            "n_components ({n_components}) exceeds MAX_UMAP_COMPONENTS ({MAX_UMAP_COMPONENTS}); \
+             the SGD inner loop uses a stack-allocated diff buffer of that size. \
+             UMAP typically targets 2–3D."
+        )));
     }
     if n_epochs == 0 {
         return Err(AccelError::InvalidInput("n_epochs must be > 0".to_string()));
@@ -169,13 +183,9 @@ pub fn compute_umap(
             // Functionally identical to the original (same summation order,
             // same f64 identities), but the compiler can now keep `diff`
             // in SIMD registers across the two uses instead of re-loading
-            // `embedding[i]` / `embedding[j]` twice.
-            //
-            // `n_components` is typically 2 (UMAP default), so a stack
-            // buffer suffices; 16 covers every realistic embedding
-            // dimension without heap allocation.
-            let mut diff = [0.0_f64; 16];
-            debug_assert!(n_components <= diff.len());
+            // `embedding[i]` / `embedding[j]` twice. `n_components` is
+            // bounded by `MAX_UMAP_COMPONENTS` (enforced at function entry).
+            let mut diff = [0.0_f64; MAX_UMAP_COMPONENTS];
             let mut dist_sq = 0.0_f64;
             for d in 0..n_components {
                 let delta = embedding[i * n_components + d] - embedding[j * n_components + d];
@@ -206,7 +216,7 @@ pub fn compute_umap(
                     continue;
                 }
 
-                let mut neg_diff = [0.0_f64; 16];
+                let mut neg_diff = [0.0_f64; MAX_UMAP_COMPONENTS];
                 let mut neg_dist_sq = 0.0_f64;
                 for d in 0..n_components {
                     let delta = embedding[i * n_components + d] - embedding[k * n_components + d];
