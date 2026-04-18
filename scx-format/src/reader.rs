@@ -1705,10 +1705,10 @@ mod tests {
 
     #[test]
     fn test_values_to_f32_float32() {
-        let val: f32 = 3.14;
+        let val: f32 = 1.23456;
         let raw = val.to_le_bytes().to_vec();
         let result = values_to_f32(&raw, ValueEncoding::Float32);
         assert_eq!(result.len(), 1);
-        assert!((result[0] - 3.14).abs() < 1e-6);
+        assert!((result[0] - 1.23456).abs() < 1e-6);
     }
 }

@@ -17,6 +17,7 @@ benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md
 benchmarks/comprehensive/results/reports_archive_*/
 benchmarks/comprehensive/logs/
 benchmarks/comprehensive/results/baseline_*/
+benchmarks/comprehensive/results/candidate_*/
 .claude/*.lock
 
 # Rust

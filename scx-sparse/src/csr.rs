@@ -414,10 +414,14 @@ impl ScxCsr {
 
     /// Compute per-column max, accounting for implicit zeros.
     ///
-    /// `n_obs` is the total number of rows (needed to know if a column
-    /// has implicit zeros). When the column has fewer stored entries than
-    /// `n_obs`, returns `max(stored_max, 0.0)`.
-    pub fn col_max(&self, n_obs: usize) -> Vec<f64> {
+    /// `total_n_obs` is the total number of rows **across the full dataset**
+    /// (not just this shard). The parameter used to be called `n_obs`, which
+    /// was ambiguous at call sites where the CSR object holds a single shard:
+    /// callers must pass the *global* row count so the implicit-zero
+    /// correction compares stored-nnz against the right denominator.
+    /// When the column has fewer stored entries than `total_n_obs`, returns
+    /// `max(stored_max, 0.0)`.
+    pub fn col_max(&self, total_n_obs: usize) -> Vec<f64> {
         let mut maxes = vec![f64::NEG_INFINITY; self.shape.1];
         let mut col_counts = vec![0usize; self.shape.1];
 
@@ -429,7 +433,7 @@ impl ScxCsr {
         }
 
         for c in 0..self.shape.1 {
-            if col_counts[c] < n_obs {
+            if col_counts[c] < total_n_obs {
                 // Has implicit zeros — max is at least 0.0
                 if maxes[c] == f64::NEG_INFINITY {
                     maxes[c] = 0.0; // all entries in this shard contribute nothing
@@ -437,8 +441,8 @@ impl ScxCsr {
                     maxes[c] = maxes[c].max(0.0);
                 }
             }
-            // If col_counts[c] == n_obs, all entries are stored; keep stored_max
-            // If col_counts[c] == 0 and n_obs == 0, keep NEG_INFINITY (degenerate)
+            // If col_counts[c] == total_n_obs, all entries are stored; keep stored_max
+            // If col_counts[c] == 0 and total_n_obs == 0, keep NEG_INFINITY (degenerate)
         }
         maxes
     }
@@ -483,9 +487,11 @@ impl ScxCsr {
 
     /// Compute per-column min, accounting for implicit zeros.
     ///
-    /// `n_obs` is the total number of rows. When the column has fewer
-    /// stored entries than `n_obs`, returns `min(stored_min, 0.0)`.
-    pub fn col_min(&self, n_obs: usize) -> Vec<f64> {
+    /// `total_n_obs` is the total number of rows **across the full dataset**
+    /// (not just this shard); see [`Self::col_max`] for the rationale on
+    /// the renaming. When the column has fewer stored entries than
+    /// `total_n_obs`, returns `min(stored_min, 0.0)`.
+    pub fn col_min(&self, total_n_obs: usize) -> Vec<f64> {
         let mut mins = vec![f64::INFINITY; self.shape.1];
         let mut col_counts = vec![0usize; self.shape.1];
 
@@ -497,7 +503,7 @@ impl ScxCsr {
         }
 
         for c in 0..self.shape.1 {
-            if col_counts[c] < n_obs {
+            if col_counts[c] < total_n_obs {
                 if mins[c] == f64::INFINITY {
                     mins[c] = 0.0;
                 } else {

@@ -222,18 +222,30 @@ fn estimate_memory(
     // Python interpreter + numpy + Arrow RecordBatch + tokio/rayon stacks
     const PYTHON_OVERHEAD: usize = 50 * 1024 * 1024;
 
-    // Decoded shard size: CSR arrays
-    let decoded_shard_bytes =
-        shard_target_rows * (avg_nnz_per_cell as usize) * BYTES_PER_NNZ_DECODED
-            + (shard_target_rows + 1) * 8; // indptr: (n_rows + 1) × i64
+    // Decoded shard size: CSR arrays. Every multiply is done with
+    // `checked_mul`/`checked_add` so pathological configs (petabyte shard
+    // sizes, UB-flavoured integer overflow on 32-bit builds) return
+    // `usize::MAX` rather than silently wrap. Callers reading this as a
+    // "fits in memory?" hint correctly see an over-budget answer.
+    let decoded_shard_bytes = shard_target_rows
+        .checked_mul(avg_nnz_per_cell as usize)
+        .and_then(|v| v.checked_mul(BYTES_PER_NNZ_DECODED))
+        .and_then(|v| v.checked_add(shard_target_rows.saturating_add(1).saturating_mul(8)))
+        .unwrap_or(usize::MAX);
 
     // I/O pipeline overlap: shard_group_size in channel + 1 being decoded
-    let shard_buffer = (shard_group_size + 1) * decoded_shard_bytes;
+    let shard_buffer = shard_group_size
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(decoded_shard_bytes))
+        .unwrap_or(usize::MAX);
 
     // Batch ring: channel capacity + 1 being consumed by Python
     let live_batches = prefetch_batches.max(2) + 1;
-    let batch_bytes = batch_size * n_output_genes * 4; // f32
-    let batch_buffer = live_batches * batch_bytes;
+    let batch_bytes = batch_size
+        .checked_mul(n_output_genes)
+        .and_then(|v| v.checked_mul(4)) // f32
+        .unwrap_or(usize::MAX);
+    let batch_buffer = live_batches.saturating_mul(batch_bytes);
 
     // Mmap'd file: the OS faults pages into RSS as shards are read sequentially.
     // During a full epoch, most of the file will be resident in page cache.
@@ -247,7 +259,10 @@ fn estimate_memory(
     // page-cache residency near the end of an epoch, not to reflect steady-state.
     let mmap_resident = file_size_bytes;
 
-    shard_buffer + batch_buffer + mmap_resident + PYTHON_OVERHEAD
+    shard_buffer
+        .saturating_add(batch_buffer)
+        .saturating_add(mmap_resident)
+        .saturating_add(PYTHON_OVERHEAD)
 }
 
 // ---------------------------------------------------------------------------

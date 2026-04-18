@@ -4,6 +4,8 @@
 //! streaming mean pairwise distance computation that avoids materializing
 //! the full `[N, N]` distance matrix — computing the running sum instead.
 
+use rayon::prelude::*;
+
 use super::DistanceMetric;
 
 /// Euclidean distance between two row vectors of length `n_dims`.
@@ -92,14 +94,30 @@ pub fn mean_pairwise_distance(
     debug_assert!(a.len() >= n_a * n_dims);
     debug_assert!(b.len() >= n_b * n_dims);
 
-    let mut total = 0.0f64;
-    for i in 0..n_a {
-        let row_a = &a[i * n_dims..(i + 1) * n_dims];
-        for j in 0..n_b {
-            let row_b = &b[j * n_dims..(j + 1) * n_dims];
-            total += point_distance(row_a, row_b, n_dims, metric);
-        }
-    }
+    // Parallelize per-row work but reduce sequentially in row order for
+    // bit-stable output across thread counts and environments. Float
+    // addition is not associative and rayon's `.sum()` combines partial
+    // results in work-stealing order, so we can't use it here. The
+    // `Vec<f64>` row-sum buffer costs O(n_a) transient memory — trivial
+    // vs. the O(n_a * n_b * n_dims) inner work.
+    //
+    // `with_min_len(n_b * 16)` prevents oversubscription when this runs
+    // inside `fused_edistance`, where the caller already holds a rayon
+    // scope — tiny chunks would thrash.
+    let row_sums: Vec<f64> = (0..n_a)
+        .into_par_iter()
+        .with_min_len((n_b * 16).max(1))
+        .map(|i| {
+            let row_a = &a[i * n_dims..(i + 1) * n_dims];
+            let mut row_sum = 0.0f64;
+            for j in 0..n_b {
+                let row_b = &b[j * n_dims..(j + 1) * n_dims];
+                row_sum += point_distance(row_a, row_b, n_dims, metric);
+            }
+            row_sum
+        })
+        .collect();
+    let total: f64 = row_sums.iter().sum();
     total / (n_a as f64 * n_b as f64)
 }
 

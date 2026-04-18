@@ -75,11 +75,7 @@ pub fn finalize_header_with_checksum<F: Read + Write + Seek + SyncAllIfApplicabl
         hasher.update(&chunk[..n]);
     }
     let digest = hasher.finalize();
-    let file_checksum = u64::from_le_bytes(
-        digest.as_bytes()[..8]
-            .try_into()
-            .expect("blake3 hash is always 32 bytes"),
-    );
+    let file_checksum = scx_format::checksum::truncate_hash_to_u64(&digest);
 
     // 4. Patch the checksum field of the in-memory header bytes. Keeps the
     //    struct in sync with what hits disk.
@@ -196,7 +192,7 @@ mod tests {
         copy[..HEADER_SIZE].copy_from_slice(&zhb);
 
         let digest = blake3::hash(&copy);
-        let expected = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap());
+        let expected = scx_format::checksum::truncate_hash_to_u64(&digest);
         assert_eq!(expected, hdr.file_checksum);
     }
 

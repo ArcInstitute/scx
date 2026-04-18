@@ -717,7 +717,7 @@ impl ScxWriter {
         final_hasher.update(&catalog_buf); // full catalog from memory
 
         let file_hash = final_hasher.finalize();
-        let file_checksum = u64::from_le_bytes(file_hash.as_bytes()[..8].try_into().unwrap());
+        let file_checksum = crate::checksum::truncate_hash_to_u64(&file_hash);
 
         // 5. Write header with correct checksum (written only once)
         self.header.file_checksum = file_checksum;

@@ -59,6 +59,51 @@ pub fn append(
         return Ok(());
     }
 
+    // Validate CSR shape invariants before touching any on-disk state.
+    // (These fire before the file has been modified, so the target file is
+    // untouched if any validation fails.)
+    let expected_nnz = *new_indptr.last().expect("indptr is non-empty") as usize;
+    if new_indices.len() != expected_nnz {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "indices length {} does not match final indptr entry {}",
+                new_indices.len(),
+                expected_nnz
+            ),
+        });
+    }
+    let value_byte_size = match value_encoding {
+        ValueEncoding::Uint8 => 1,
+        ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
+        ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
+    };
+    if new_values.len() != expected_nnz * value_byte_size {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "values length {} does not match nnz {} × byte_width {} = {}",
+                new_values.len(),
+                expected_nnz,
+                value_byte_size,
+                expected_nnz * value_byte_size
+            ),
+        });
+    }
+    for w in new_indptr.windows(2) {
+        if w[0] > w[1] {
+            return Err(OpsError::ShapeMismatch {
+                detail: "indptr is not monotonically non-decreasing".to_string(),
+            });
+        }
+    }
+
+    // obs schema / length must match the existing obs on disk.
+    if new_obs.num_rows() != n_new_rows {
+        return Err(OpsError::VarLengthMismatch {
+            expected: n_new_rows,
+            found: new_obs.num_rows(),
+        });
+    }
+
     // Validate indices are within [0, n_vars)
     let file_n_vars = header.n_vars;
     if let Some(&max_idx) = new_indices.iter().max() {
@@ -92,6 +137,41 @@ pub fn append(
             ))
         })??
     };
+
+    // Validate obs schema equivalence between the target file's existing obs
+    // and the new batch. `concat_batches` below runs after `unify_dict_columns`
+    // strips `Dictionary(_, V) → V` on both sides, so the relevant comparison
+    // is over *effective* value types — Arrow IPC round-trips Dictionary columns
+    // down to their value type (e.g. `Dictionary(Int8, Utf8)` → `Utf8`), so a
+    // strict `a.data_type() == b.data_type()` check would reject a legitimate
+    // append where one side came from disk and the other from a fresh
+    // AnnData → Arrow conversion. Surfacing the check here gives a clearer
+    // diagnostic than the downstream `concat_batches` error and avoids any
+    // chance that a partial write precedes it.
+    let old_schema = old_obs.schema();
+    let new_schema = new_obs.schema();
+    if old_schema.fields().len() != new_schema.fields().len() {
+        return Err(OpsError::SchemaMismatch {
+            detail: format!(
+                "obs column count: existing has {}, new has {}",
+                old_schema.fields().len(),
+                new_schema.fields().len()
+            ),
+        });
+    }
+    for (a, b) in old_schema.fields().iter().zip(new_schema.fields().iter()) {
+        if a.name() != b.name() || effective_type(a.data_type()) != effective_type(b.data_type()) {
+            return Err(OpsError::SchemaMismatch {
+                detail: format!(
+                    "obs column '{}'({:?}) vs new '{}'({:?})",
+                    a.name(),
+                    a.data_type(),
+                    b.name(),
+                    b.data_type()
+                ),
+            });
+        }
+    }
 
     // Seek to EOF for appending
     let mut write_offset = lock.seek(SeekFrom::End(0))?;
@@ -424,6 +504,17 @@ pub fn append(
     // where a zero-checksum header could be the durable on-disk state.
     finalize_header_with_checksum(&mut lock, &mut header)?;
     Ok(())
+}
+
+/// Return the effective (dictionary-stripped) value type of a `DataType`.
+/// Mirrors the behaviour of [`unify_dict_columns`] so the append-time schema
+/// check can compare across `Dictionary(_, V)` ↔ `V` asymmetries introduced
+/// by Arrow IPC round-trips.
+fn effective_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataType {
+    match dt {
+        arrow::datatypes::DataType::Dictionary(_, value_type) => value_type,
+        other => other,
+    }
 }
 
 /// Cast dictionary-encoded columns to their value type to unify (deduplicate)

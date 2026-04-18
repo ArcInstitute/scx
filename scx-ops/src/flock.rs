@@ -7,6 +7,14 @@ use std::path::Path;
 use crate::error::{OpsError, Result};
 
 /// Exclusive file lock. Releases on drop.
+///
+/// The inner `Option<File>` is a necessary quirk of the `into_file()`
+/// consumer — it lets `Drop` run `unlock()` even after the file has been
+/// moved out. None of the `expect("FileLock already consumed")` paths below
+/// are reachable from safe user code: every public API that accesses the
+/// file (Deref, DerefMut, Read, Write, Seek, `file()`) takes `&self` or
+/// `&mut self`, and `into_file()` consumes `self` by value — so observing
+/// a `None` requires an impossible borrow.
 pub struct FileLock {
     file: Option<File>,
 }

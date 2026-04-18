@@ -1,7 +1,6 @@
 // to_anndata / from_anndata conversion
 
 use arrow::array::RecordBatch;
-use byteorder::{LittleEndian, WriteBytesExt};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -735,39 +734,14 @@ pub(crate) fn i32_to_u32(v: &[i32]) -> PyResult<Vec<u32>> {
 }
 
 /// Encode f32 values to raw LE bytes according to a value encoding.
+///
+/// Delegates to the canonical [`scx_codec::value_encoding::values_to_raw_bytes`]
+/// so all three historical call-site copies (pyscx/anndata, scx-cli/dtype,
+/// scx-mtx/convert) share one implementation — and so Float16 no longer
+/// panics here (the canonical impl falls back to Float32 bytes with a
+/// one-shot `log::warn`).
 pub(crate) fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
-    match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => {
-            let mut buf = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                buf.write_u16::<LittleEndian>(v as u16).unwrap();
-            }
-            buf
-        }
-        ValueEncoding::Uint32 => {
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.write_u32::<LittleEndian>(v as u32).unwrap();
-            }
-            buf
-        }
-        ValueEncoding::Float32 => {
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.write_f32::<LittleEndian>(v).unwrap();
-            }
-            buf
-        }
-        ValueEncoding::Float16 => {
-            // Float16 encoding is not yet supported. Callers should transcode
-            // to Float32 and update the encoding flag before reaching this point.
-            panic!(
-                "Float16 value encoding is not yet supported in encode_values. \
-                 Transcode to Float32 before calling."
-            );
-        }
-    }
+    scx_codec::value_encoding::values_to_raw_bytes(data, encoding)
 }
 
 /// Parse codec name string to Option<CodecId>.

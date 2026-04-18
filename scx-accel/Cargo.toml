@@ -18,13 +18,15 @@ scx-engine = { path = "../scx-engine" }
 scx-format = { path = "../scx-format" }
 scx-sparse = { path = "../scx-sparse" }
 scx-gpu = { path = "../scx-gpu", optional = true }
-faer = "0.24"
+faer = { workspace = true }
 rand = { workspace = true }
-rand_chacha = "0.3"
-rand_distr = "0.4"
+rand_chacha = { workspace = true }
+rand_distr = { workspace = true }
 instant-distance = "0.6"
 rayon = { workspace = true }
 libc = "0.2"
+libm = "0.2"
+log = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

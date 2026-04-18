@@ -27,6 +27,13 @@ fn random_init(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
     umap_math::random_init_f64(n_obs, n_components, seed)
 }
 
+/// Upper bound on `n_components` enforced by [`compute_umap`]. The SGD inner
+/// loop uses a `[f64; MAX_UMAP_COMPONENTS]` stack buffer to cache the
+/// component-wise diff between two embeddings; anything larger would overflow
+/// the buffer. UMAP targets 2–3D in every realistic workflow, so the cap is
+/// more than an order of magnitude above the typical use case.
+pub const MAX_UMAP_COMPONENTS: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -93,6 +100,13 @@ pub fn compute_umap(
         return Err(AccelError::InvalidInput(
             "n_components must be > 0".to_string(),
         ));
+    }
+    if n_components > MAX_UMAP_COMPONENTS {
+        return Err(AccelError::InvalidInput(format!(
+            "n_components ({n_components}) exceeds MAX_UMAP_COMPONENTS ({MAX_UMAP_COMPONENTS}); \
+             the SGD inner loop uses a stack-allocated diff buffer of that size. \
+             UMAP typically targets 2–3D."
+        )));
     }
     if n_epochs == 0 {
         return Err(AccelError::InvalidInput("n_epochs must be > 0".to_string()));
@@ -164,11 +178,19 @@ pub fn compute_umap(
             let i = head[edge_idx];
             let j = tail[edge_idx];
 
-            // Attractive force
+            // Cache the component-wise difference once and reuse it for
+            // both the squared-distance reduction and the gradient step.
+            // Functionally identical to the original (same summation order,
+            // same f64 identities), but the compiler can now keep `diff`
+            // in SIMD registers across the two uses instead of re-loading
+            // `embedding[i]` / `embedding[j]` twice. `n_components` is
+            // bounded by `MAX_UMAP_COMPONENTS` (enforced at function entry).
+            let mut diff = [0.0_f64; MAX_UMAP_COMPONENTS];
             let mut dist_sq = 0.0_f64;
             for d in 0..n_components {
-                let diff = embedding[i * n_components + d] - embedding[j * n_components + d];
-                dist_sq += diff * diff;
+                let delta = embedding[i * n_components + d] - embedding[j * n_components + d];
+                diff[d] = delta;
+                dist_sq += delta * delta;
             }
             dist_sq = dist_sq.max(1e-10);
 
@@ -176,8 +198,7 @@ pub fn compute_umap(
             let grad_coeff = -2.0 * a * b * dist_sq.powf(b - 1.0) / (1.0 + a * dist_sq.powf(b));
 
             for d in 0..n_components {
-                let diff = embedding[i * n_components + d] - embedding[j * n_components + d];
-                let grad = (grad_coeff * diff).clamp(-clip_val, clip_val);
+                let grad = (grad_coeff * diff[d]).clamp(-clip_val, clip_val);
                 embedding[i * n_components + d] += alpha * grad;
                 embedding[j * n_components + d] -= alpha * grad;
             }
@@ -195,10 +216,12 @@ pub fn compute_umap(
                     continue;
                 }
 
+                let mut neg_diff = [0.0_f64; MAX_UMAP_COMPONENTS];
                 let mut neg_dist_sq = 0.0_f64;
                 for d in 0..n_components {
-                    let diff = embedding[i * n_components + d] - embedding[k * n_components + d];
-                    neg_dist_sq += diff * diff;
+                    let delta = embedding[i * n_components + d] - embedding[k * n_components + d];
+                    neg_diff[d] = delta;
+                    neg_dist_sq += delta * delta;
                 }
                 neg_dist_sq = neg_dist_sq.max(1e-10);
 
@@ -207,8 +230,7 @@ pub fn compute_umap(
                     2.0 * b / ((0.001 + neg_dist_sq) * (1.0 + a * neg_dist_sq.powf(b)));
 
                 for d in 0..n_components {
-                    let diff = embedding[i * n_components + d] - embedding[k * n_components + d];
-                    let grad = (neg_grad_coeff * diff).clamp(-clip_val, clip_val);
+                    let grad = (neg_grad_coeff * neg_diff[d]).clamp(-clip_val, clip_val);
                     embedding[i * n_components + d] += alpha * grad;
                 }
             }
@@ -352,13 +374,15 @@ fn spectral_init(
                 *vi /= v_norm;
             }
 
-            // Check convergence
-            let diff: f64 = v
-                .iter()
-                .zip(v_new.iter())
-                .map(|(a, b)| (a - b).abs())
-                .sum::<f64>()
-                / n_obs as f64;
+            // Convergence by cosine similarity to the previous iterate.
+            // The L1-mean test this replaced was sign-sensitive — an
+            // eigenvector and its negative (arbitrary sign from power
+            // iteration) registered as maximally different even at
+            // convergence. `1 - |cos(v, v_new)|` is sign-invariant and
+            // rotation-aware, matching the convergence criterion used by
+            // `umap-learn`'s spectral_layout reference.
+            let cos_sim: f64 = v.iter().zip(v_new.iter()).map(|(a, b)| a * b).sum();
+            let diff = 1.0 - cos_sim.abs();
 
             v = v_new;
 

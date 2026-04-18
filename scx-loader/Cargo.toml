@@ -15,7 +15,7 @@ rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
-rand_chacha = "0.3"
+rand_chacha = { workspace = true }
 arrow = { workspace = true }
 roaring = { workspace = true }
 log = { workspace = true }
