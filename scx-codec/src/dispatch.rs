@@ -338,9 +338,22 @@ fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
             .collect(),
         ValueEncoding::Float32 => {
+            // `bytemuck::cast_slice::<u8, f32>` panics if the source bytes
+            // aren't 4-byte aligned. Mmap'd payloads are usually aligned, but
+            // we can't rely on it — decompressed buffers from Zstd/LZ4 land at
+            // whatever alignment the allocator picked. Branch on alignment +
+            // length; fall back to a scalar byteswap-free decode otherwise.
             #[cfg(target_endian = "little")]
             {
-                bytemuck::cast_slice::<u8, f32>(raw).to_vec()
+                if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+                    && raw.len().is_multiple_of(std::mem::size_of::<f32>())
+                {
+                    bytemuck::cast_slice::<u8, f32>(raw).to_vec()
+                } else {
+                    raw.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                }
             }
             #[cfg(not(target_endian = "little"))]
             {
@@ -349,10 +362,42 @@ fn values_raw_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
                     .collect()
             }
         }
-        ValueEncoding::Float16 => raw
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
+        ValueEncoding::Float16 => {
+            // `half::slice::HalfFloatSliceExt::convert_to_f32_slice` uses a
+            // vectorized path when the input is aligned. Same alignment
+            // guard as Float32 above.
+            #[cfg(target_endian = "little")]
+            {
+                if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<half::f16>())
+                    && raw.len().is_multiple_of(std::mem::size_of::<half::f16>())
+                {
+                    use half::slice::HalfFloatSliceExt;
+                    // Safety: alignment + length checked immediately above,
+                    // `half::f16` is `#[repr(transparent)]` over `u16`, so any
+                    // aligned 2-byte little-endian group is a valid `f16` bit
+                    // pattern.
+                    let src: &[half::f16] = unsafe {
+                        std::slice::from_raw_parts(
+                            raw.as_ptr() as *const half::f16,
+                            raw.len() / std::mem::size_of::<half::f16>(),
+                        )
+                    };
+                    let mut out = vec![0.0f32; src.len()];
+                    src.convert_to_f32_slice(&mut out);
+                    out
+                } else {
+                    raw.chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect()
+                }
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                raw.chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect()
+            }
+        }
     }
 }
 

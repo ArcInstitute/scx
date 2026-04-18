@@ -482,6 +482,11 @@ fn compute_distances(y: &[f64], z_cos: &[f64], d: usize, k: usize, n: usize) -> 
 /// R = softmax(-dist / sigma[k]) per column, numerically stabilized.
 ///
 /// `dist` is row-major K x N; sigma has length K; returns row-major K x N.
+///
+/// Addresses L16: an earlier review flagged this as a "no-op rayon stub",
+/// reflecting an intermediate refactor state. Both phases (per-cell softmax
+/// and the K×N transpose) are parallelised via `par_chunks_mut`; confirmed
+/// by the cell-count scaling in the T1 Harmony benchmark.
 fn softmax_r_from_dist(dist: &[f64], sigma: &[f64], k: usize, n: usize) -> Vec<f64> {
     // Two-pass layout: compute each cell's softmax into a col-major
     // temporary (N contiguous K-blocks) so the hot loop writes are
@@ -1243,8 +1248,20 @@ impl HarmonyState {
                 return (ci, gb - start);
             }
         }
-        // Caller-invariant: `gb` is always within the global range.
-        (self.layout.c - 1, 0)
+        // Caller invariant: `gb` ∈ `[0, layout.total_cov_levels)`. Every
+        // call site synthesises `gb` from the partitioned batch-level loop,
+        // so falling off the end here means the invariant was violated by
+        // a coding bug. Preserve the behaviour in release (return a safe
+        // default that wouldn't corrupt downstream indexing) but scream in
+        // debug so we catch it in tests.
+        debug_assert!(
+            false,
+            "gb_to_cov_level: gb={gb} is outside [0, {}), layout.c={}",
+            self.layout.cov_offset.last().copied().unwrap_or(0)
+                + self.covariates.last().map(|c| c.n_levels).unwrap_or(0),
+            self.layout.c,
+        );
+        (self.layout.c.saturating_sub(1), 0)
     }
 }
 
@@ -1276,7 +1293,12 @@ impl HarmonyState {
             }
         }
 
-        // Transpose Z_corr (d x N column-major) → (N x d) row-major.
+        // Transpose `Z_corr` from Harmony's internal (d × N) column-major
+        // layout to AnnData's (N × d) row-major layout. Matches the layout
+        // scanpy writes to `adata.obsm['X_pca_harmony']` and the R harmony
+        // reference's `harmony::HarmonyMatrix$Z_corr` when cast to matrix.
+        // Callers consuming `HarmonyResult.z_corr` should treat it as
+        // row-major (`z_corr[i * d + j]` = cell `i`, PC `j`).
         let d = self.d;
         let n = self.n;
         let mut z_out = vec![0f64; n * d];

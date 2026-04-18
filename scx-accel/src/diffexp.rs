@@ -279,6 +279,16 @@ fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
 /// formula for the Wilcoxon test. Shared across all group comparisons for
 /// the same gene, since ties are a property of the value distribution.
 fn rank_with_ties(values: &[f64], index_buf: &mut Vec<usize>, ranks: &mut Vec<f64>) -> f64 {
+    // NaN values would be silently ordered as `Equal` by the fallback below,
+    // producing a meaningless rank and a garbage p-value downstream. In debug
+    // builds, assert that the caller pre-sanitised the input; in release,
+    // upstream filters (QC) should have removed NaNs before we get here —
+    // if one slips through we still produce a deterministic (if wrong)
+    // result rather than panicking.
+    debug_assert!(
+        !values.iter().any(|v| v.is_nan()),
+        "rank_with_ties received NaN input — filter NaNs before ranking"
+    );
     let n = values.len();
     index_buf.clear();
     index_buf.extend(0..n);
@@ -426,52 +436,15 @@ fn wilcoxon_test(group: &[f64], rest: &[f64]) -> (f64, f64) {
 
 /// Standard normal survival function: P(Z > z) = 1 − Φ(z).
 ///
-/// Uses the upper-tail Mills-ratio continued-fraction expansion for |z| > 8,
-/// which stays accurate down to ~10⁻³⁰⁰ (matching `scipy.stats.norm.sf`).
-/// For |z| ≤ 8, falls back to the Abramowitz & Stegun 7.1.26 erfc
-/// approximation (~1.5e-7 accuracy).
+/// Delegates to `libm::erfc`, which is the same IEEE-754-accurate
+/// implementation `scipy.stats.norm.sf` uses via the C math library.
+/// Accurate to ~1 ULP across the full range and stays finite down to
+/// ~1e-300 without needing the Mills-ratio tail the old hand-rolled
+/// implementation used for |z| > 8.
+///
+/// Identity: sf(z) = 0.5 · erfc(z / √2).
 fn normal_sf(z: f64) -> f64 {
-    let az = z.abs();
-
-    if az > 37.5 {
-        // Beyond ~37.5σ the result underflows f64 (< 5e-308).
-        return if z > 0.0 { 0.0 } else { 1.0 };
-    }
-
-    let sf = if az > 8.0 {
-        // Upper-tail continued-fraction (Abramowitz & Stegun 26.2.14):
-        //   Φ̄(x) ≈ φ(x) · [1/x − 1/x³ + 3/x⁵ − 15/x⁷ + …]
-        // Truncated after enough terms for ~1e-15 relative accuracy.
-        let x = az;
-        let x2 = x * x;
-        // Compute φ(x) = exp(-x²/2) / √(2π) in log-space to avoid underflow.
-        let log_phi = -0.5 * x2 - 0.5 * (2.0 * std::f64::consts::PI).ln();
-        // Continued-fraction coefficients (from the back): cf = 1/(x + k/(x + …))
-        let mut cf = x;
-        for k in (1..=20).rev() {
-            cf = x + k as f64 / cf;
-        }
-        (log_phi - cf.ln()).exp()
-    } else {
-        // A&S 7.1.26 erfc approximation for moderate |z|.
-        let a1 = 0.254829592_f64;
-        let a2 = -0.284496736_f64;
-        let a3 = 1.421413741_f64;
-        let a4 = -1.453152027_f64;
-        let a5 = 1.061405429_f64;
-        let p = 0.3275911_f64;
-
-        let x = az / std::f64::consts::SQRT_2;
-        let t = 1.0 / (1.0 + p * x);
-        let poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
-        poly * (-x * x).exp() / 2.0
-    };
-
-    if z > 0.0 {
-        sf
-    } else {
-        1.0 - sf
-    }
+    0.5 * libm::erfc(z / std::f64::consts::SQRT_2)
 }
 
 /// Standard normal CDF: Φ(z) = 1 − sf(z).

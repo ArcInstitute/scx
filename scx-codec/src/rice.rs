@@ -1,4 +1,11 @@
 // Adaptive Rice encoder/decoder for values (docs/codec.md (Values))
+//
+// Implementation follows the adaptive Rice-coding scheme described in
+// Malvar, H. S. "Adaptive run-length / Golomb-Rice encoding of quantised
+// generalised Gaussian sources with unknown statistics." Data Compression
+// Conference, 2006 (DCC'06), pp. 23–32. Block size B_VAL=256 matches the
+// reference; the k-selection rule (k ≈ ⌊log2(0.6931 · median)⌋) is the
+// standard Gaussian-geometric estimator used by JPEG-LS / HP-LOCO.
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 

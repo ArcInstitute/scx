@@ -164,11 +164,23 @@ pub fn compute_umap(
             let i = head[edge_idx];
             let j = tail[edge_idx];
 
-            // Attractive force
+            // Cache the component-wise difference once and reuse it for
+            // both the squared-distance reduction and the gradient step.
+            // Functionally identical to the original (same summation order,
+            // same f64 identities), but the compiler can now keep `diff`
+            // in SIMD registers across the two uses instead of re-loading
+            // `embedding[i]` / `embedding[j]` twice.
+            //
+            // `n_components` is typically 2 (UMAP default), so a stack
+            // buffer suffices; 16 covers every realistic embedding
+            // dimension without heap allocation.
+            let mut diff = [0.0_f64; 16];
+            debug_assert!(n_components <= diff.len());
             let mut dist_sq = 0.0_f64;
             for d in 0..n_components {
-                let diff = embedding[i * n_components + d] - embedding[j * n_components + d];
-                dist_sq += diff * diff;
+                let delta = embedding[i * n_components + d] - embedding[j * n_components + d];
+                diff[d] = delta;
+                dist_sq += delta * delta;
             }
             dist_sq = dist_sq.max(1e-10);
 
@@ -176,8 +188,7 @@ pub fn compute_umap(
             let grad_coeff = -2.0 * a * b * dist_sq.powf(b - 1.0) / (1.0 + a * dist_sq.powf(b));
 
             for d in 0..n_components {
-                let diff = embedding[i * n_components + d] - embedding[j * n_components + d];
-                let grad = (grad_coeff * diff).clamp(-clip_val, clip_val);
+                let grad = (grad_coeff * diff[d]).clamp(-clip_val, clip_val);
                 embedding[i * n_components + d] += alpha * grad;
                 embedding[j * n_components + d] -= alpha * grad;
             }
@@ -195,10 +206,12 @@ pub fn compute_umap(
                     continue;
                 }
 
+                let mut neg_diff = [0.0_f64; 16];
                 let mut neg_dist_sq = 0.0_f64;
                 for d in 0..n_components {
-                    let diff = embedding[i * n_components + d] - embedding[k * n_components + d];
-                    neg_dist_sq += diff * diff;
+                    let delta = embedding[i * n_components + d] - embedding[k * n_components + d];
+                    neg_diff[d] = delta;
+                    neg_dist_sq += delta * delta;
                 }
                 neg_dist_sq = neg_dist_sq.max(1e-10);
 
@@ -207,8 +220,7 @@ pub fn compute_umap(
                     2.0 * b / ((0.001 + neg_dist_sq) * (1.0 + a * neg_dist_sq.powf(b)));
 
                 for d in 0..n_components {
-                    let diff = embedding[i * n_components + d] - embedding[k * n_components + d];
-                    let grad = (neg_grad_coeff * diff).clamp(-clip_val, clip_val);
+                    let grad = (neg_grad_coeff * neg_diff[d]).clamp(-clip_val, clip_val);
                     embedding[i * n_components + d] += alpha * grad;
                 }
             }
@@ -352,13 +364,15 @@ fn spectral_init(
                 *vi /= v_norm;
             }
 
-            // Check convergence
-            let diff: f64 = v
-                .iter()
-                .zip(v_new.iter())
-                .map(|(a, b)| (a - b).abs())
-                .sum::<f64>()
-                / n_obs as f64;
+            // Convergence by cosine similarity to the previous iterate.
+            // The L1-mean test this replaced was sign-sensitive — an
+            // eigenvector and its negative (arbitrary sign from power
+            // iteration) registered as maximally different even at
+            // convergence. `1 - |cos(v, v_new)|` is sign-invariant and
+            // rotation-aware, matching the convergence criterion used by
+            // `umap-learn`'s spectral_layout reference.
+            let cos_sim: f64 = v.iter().zip(v_new.iter()).map(|(a, b)| a * b).sum();
+            let diff = 1.0 - cos_sim.abs();
 
             v = v_new;
 

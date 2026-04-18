@@ -280,7 +280,7 @@ fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
         hasher.update(&chunk[..n]);
     }
     let hash = hasher.finalize();
-    Ok(u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()))
+    Ok(scx_format::checksum::truncate_hash_to_u64(&hash))
 }
 
 #[cfg(test)]

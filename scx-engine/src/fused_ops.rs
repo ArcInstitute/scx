@@ -497,7 +497,7 @@ mod tests {
             log1p_row(&mut csr.data, &csr.indptr, row);
         }
         // All values should be ln(original + 1)
-        let original = vec![5.0_f32, 10.0, 1.0, 3.0, 7.0, 2.0];
+        let original = [5.0_f32, 10.0, 1.0, 3.0, 7.0, 2.0];
         for (i, &orig) in original.iter().enumerate() {
             let expected = orig.ln_1p();
             assert!(

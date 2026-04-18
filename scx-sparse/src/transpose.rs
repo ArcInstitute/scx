@@ -423,7 +423,7 @@ mod tests {
 
         // Streaming with small memory limit — force multiple passes
         // 4 rows × 12 bytes = 48 bytes/col. Use 100 bytes → ~2 cols per chunk → 3 passes
-        let csc_streamed = streaming_csr_to_csc(&[csr.clone()], 4, 6, 100).unwrap();
+        let csc_streamed = streaming_csr_to_csc(std::slice::from_ref(&csr), 4, 6, 100).unwrap();
         let dense_streamed = csc_to_dense(&csc_streamed);
         assert_eq!(dense_streamed, dense);
 

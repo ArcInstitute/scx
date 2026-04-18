@@ -120,9 +120,12 @@ pub fn build_knn_graph(
         )));
     }
 
-    // Build query points (used for search; separate from HNSW build points
-    // because build_hnsw() consumes its input)
-    let query_points: Vec<EuclideanPoint> = (0..n_obs)
+    // Build a single Vec of points, hand it to HNSW (which consumes it),
+    // then regenerate per-query points from the caller's `data` slice
+    // during the parallel search. Peak memory is ~1× the embedding, down
+    // from 2× (the previous `query_points.clone()` held a second copy
+    // resident for the entire search phase).
+    let build_points: Vec<EuclideanPoint> = (0..n_obs)
         .map(|i| {
             let start = i * n_vars;
             EuclideanPoint(data[start..start + n_vars].to_vec())
@@ -132,7 +135,6 @@ pub fn build_knn_graph(
     // Build HNSW index
     // build_hnsw() returns (Hnsw, Vec<PointId>) where the Vec maps
     // original_index -> internal PointId (points are shuffled internally)
-    let build_points: Vec<EuclideanPoint> = query_points.clone();
     let (hnsw, point_ids) = Hnsw::<EuclideanPoint>::builder()
         .ef_construction(ef_construction)
         .ef_search(ef_search)
@@ -145,18 +147,18 @@ pub fn build_knn_graph(
         internal_to_original[pid.into_inner() as usize] = original_idx;
     }
 
-    // Query k-nearest neighbors for each point in parallel.
-    // Hnsw::search takes &self (shared ref) and Hnsw<P> is Sync when P: Sync,
-    // so concurrent searches are safe. Each thread creates its own Search struct
-    // which holds per-query mutable state.
-    let all_results: Vec<Vec<(usize, f64)>> = query_points
-        .par_iter()
-        .enumerate()
-        .map(|(i, query)| {
+    // Query k-nearest neighbors for each point in parallel. Each thread
+    // synthesizes its query point from `data` on the fly — no duplicated
+    // Vec<EuclideanPoint> needs to stay resident.
+    let all_results: Vec<Vec<(usize, f64)>> = (0..n_obs)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * n_vars;
+            let query = EuclideanPoint(data[start..start + n_vars].to_vec());
             let mut search = Search::default();
 
             // Query k+1 neighbors since the point itself will be in the results
-            hnsw.search(query, &mut search)
+            hnsw.search(&query, &mut search)
                 .take(n_neighbors + 1)
                 .filter_map(|item| {
                     let original_idx = internal_to_original[item.pid.into_inner() as usize];

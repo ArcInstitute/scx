@@ -4,6 +4,8 @@
 //! streaming mean pairwise distance computation that avoids materializing
 //! the full `[N, N]` distance matrix — computing the running sum instead.
 
+use rayon::prelude::*;
+
 use super::DistanceMetric;
 
 /// Euclidean distance between two row vectors of length `n_dims`.
@@ -92,14 +94,24 @@ pub fn mean_pairwise_distance(
     debug_assert!(a.len() >= n_a * n_dims);
     debug_assert!(b.len() >= n_b * n_dims);
 
-    let mut total = 0.0f64;
-    for i in 0..n_a {
-        let row_a = &a[i * n_dims..(i + 1) * n_dims];
-        for j in 0..n_b {
-            let row_b = &b[j * n_dims..(j + 1) * n_dims];
-            total += point_distance(row_a, row_b, n_dims, metric);
-        }
-    }
+    // Parallelize the outer loop. `with_min_len(n_b * 16)` prevents
+    // oversubscription when this runs inside `fused_edistance`, where the
+    // caller already holds a rayon scope — tiny chunks would thrash.
+    // Reduction is associative; float sum order is stable given fixed chunk
+    // boundaries (rayon's split_at is deterministic for slices).
+    let total: f64 = (0..n_a)
+        .into_par_iter()
+        .with_min_len((n_b * 16).max(1))
+        .map(|i| {
+            let row_a = &a[i * n_dims..(i + 1) * n_dims];
+            let mut row_sum = 0.0f64;
+            for j in 0..n_b {
+                let row_b = &b[j * n_dims..(j + 1) * n_dims];
+                row_sum += point_distance(row_a, row_b, n_dims, metric);
+            }
+            row_sum
+        })
+        .sum();
     total / (n_a as f64 * n_b as f64)
 }
 

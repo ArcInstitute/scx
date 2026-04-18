@@ -5,7 +5,7 @@
 //! Used by pyscx's backed mode to implement AnnData-compatible lazy access.
 
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use scx_sparse::ScxCsr;
@@ -212,7 +212,7 @@ pub struct BackedCsrReader {
     x_sorted_entries: Vec<FullCatalogEntry>,
     /// Pre-sorted catalog entries for layer shards (empty for X shards).
     sorted_entries: Vec<FullCatalogEntry>,
-    cache: Option<Mutex<LruCache<usize, ScxCsr>>>,
+    cache: Option<Mutex<LruCache<usize, Arc<ScxCsr>>>>,
     /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
     prefetch_count: usize,
 }
@@ -288,7 +288,7 @@ impl BackedCsrReader {
         }
     }
 
-    fn make_cache(cache_shards: usize) -> Option<Mutex<LruCache<usize, ScxCsr>>> {
+    fn make_cache(cache_shards: usize) -> Option<Mutex<LruCache<usize, Arc<ScxCsr>>>> {
         if cache_shards > 0 {
             Some(Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_shards).unwrap(),
@@ -364,7 +364,7 @@ impl BackedCsrReader {
 
         let mut slices = Vec::with_capacity(shard_indices.len());
         for &shard_idx in &shard_indices {
-            let shard_csr = self.read_shard_cached(shard_idx)?;
+            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
 
             // Compute local row range within this shard
             let (s_start, s_end) =
@@ -415,7 +415,7 @@ impl BackedCsrReader {
         let mut row_csrs: Vec<(usize, ScxCsr)> = Vec::new();
 
         for &shard_idx in &shard_indices {
-            let shard_csr = self.read_shard_cached(shard_idx)?;
+            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
             let (s_start, s_end) =
                 self.index
                     .shard_range(shard_idx)
@@ -499,16 +499,27 @@ impl BackedCsrReader {
         ))
     }
 
-    /// Read and optionally cache a single decoded shard.
+    /// Read and optionally cache a single decoded shard (owned clone).
+    ///
+    /// Clones the decoded buffers out of the Arc so the caller can mutate.
+    /// Streaming callers that only read should prefer
+    /// [`Self::read_shard_cached_arc`] to avoid the clone.
     ///
     /// Public so that downstream crates (e.g. `scx-accel`) can iterate
     /// shards directly for streaming operations like SpMM.
     pub fn read_shard_cached(&self, shard_idx: usize) -> Result<ScxCsr> {
+        Ok((*self.read_shard_cached_arc(shard_idx)?).clone())
+    }
+
+    /// Read and optionally cache a single decoded shard, returning a shared
+    /// `Arc<ScxCsr>` — zero-copy clone from the cache. Use this for streaming
+    /// read-only passes (SpMM, row/col sums, PCA shard iteration).
+    pub fn read_shard_cached_arc(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
         // Check cache first
         if let Some(ref cache_mutex) = self.cache {
             let mut cache = cache_mutex.lock().unwrap();
             if let Some(cached) = cache.get(&shard_idx) {
-                return Ok(cached.clone());
+                return Ok(Arc::clone(cached));
             }
         }
 
@@ -529,12 +540,17 @@ impl BackedCsrReader {
             }
         };
         let n_rows = indptr.len().saturating_sub(1);
-        let csr = ScxCsr::new_unchecked((n_rows, self.n_vars), indptr, indices, data);
+        let csr = Arc::new(ScxCsr::new_unchecked(
+            (n_rows, self.n_vars),
+            indptr,
+            indices,
+            data,
+        ));
 
         // Insert into cache
         if let Some(ref cache_mutex) = self.cache {
             let mut cache = cache_mutex.lock().unwrap();
-            cache.put(shard_idx, csr.clone());
+            cache.put(shard_idx, Arc::clone(&csr));
         }
 
         // Prefetch upcoming shards so the kernel starts paging them in.

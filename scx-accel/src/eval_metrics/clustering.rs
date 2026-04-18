@@ -154,7 +154,13 @@ fn expected_mutual_information(
 
     let nf = n as f64;
 
-    // Precompute log-factorials up to n.
+    // Precompute log-factorials up to `N`. In a standard contingency table
+    // `sum(row_sums) == sum(col_sums) == N`, so `N` is the tight upper bound
+    // on every intermediate index (`log_fact[ai]`, `log_fact[bj]`,
+    // `log_fact[ai - nij]`, `log_fact[n - ai - bj + nij]`, …). A smaller
+    // table keyed on `max(sum(row_sums), sum(col_sums))` would save memory
+    // only for malformed confusion matrices; well-formed input already
+    // reaches the full `N`.
     let max_val = n as usize + 1;
     let mut log_fact = vec![0.0f64; max_val + 1];
     for i in 2..=max_val {

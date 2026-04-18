@@ -33,6 +33,18 @@ pub enum OpsError {
     #[error("layer '{name}' missing in input file {file_index}")]
     LayerMissing { name: String, file_index: usize },
 
+    #[error("obs schema mismatch on append: {detail}")]
+    SchemaMismatch { detail: String },
+
+    #[error(
+        "obs batch length mismatch on append: target expects {expected} new rows, \
+         new_obs has {found}"
+    )]
+    VarLengthMismatch { expected: usize, found: usize },
+
+    #[error("CSR shape mismatch on append: {detail}")]
+    ShapeMismatch { detail: String },
+
     #[error("f32 value {value} out of range for {encoding} encoding (max {max})")]
     ValueOutOfRange {
         value: f32,

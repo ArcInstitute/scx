@@ -14,6 +14,21 @@ pub fn blake3_truncated_64(data: &[u8]) -> [u8; 8] {
     out
 }
 
+/// Extract the leading 8 bytes of a `blake3::Hash` as a little-endian `u64`.
+/// Centralises the `as_bytes()[..8].try_into().unwrap()` idiom that was
+/// duplicated across `scx-format/writer`, `scx-cloud/{pack,pull,cloud_optimize}`,
+/// and `scx-ops/checksum`. The `try_into` can't actually fail (BLAKE3 is
+/// always 32 bytes), but the helper gives a single obvious name for the
+/// pattern.
+#[inline]
+pub fn truncate_hash_to_u64(h: &blake3::Hash) -> u64 {
+    u64::from_le_bytes(
+        h.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 hash is always 32 bytes"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
