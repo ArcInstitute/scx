@@ -420,9 +420,11 @@ fn streaming_spmm_transpose<S: ShardSource>(
     let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
-    // Per-thread scratch buffers hoisted across shards so the parallel path
-    // does not re-allocate `n_vars * k` f64s per chunk task. Zeroed at the
-    // start of each shard iteration before use.
+    // Per-thread scratch buffers hoisted across *all* shards: each thread's
+    // buffer accumulates its contributions across every parallel shard, and
+    // the final reduction into `z` / `sum_q` runs once after the shard loop.
+    // Eliminates `n_shards - 1` zero-and-reduce passes over the `n_vars·k`
+    // accumulator compared with per-shard reduction.
     let mut tls_z: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
     let mut tls_sq: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
     let tls_q_row: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
@@ -436,14 +438,6 @@ fn streaming_spmm_transpose<S: ShardSource>(
         if use_parallel {
             let gr_base = global_row;
             let chunk_size = (shard_rows / rayon::current_num_threads().max(1)).max(256);
-
-            // Zero each thread-local buffer that was touched on a prior shard.
-            for buf in tls_z.iter_mut() {
-                buf.get_mut().fill(0.0);
-            }
-            for buf in tls_sq.iter_mut() {
-                buf.get_mut().fill(0.0);
-            }
 
             (0..shard_rows)
                 .into_par_iter()
@@ -480,20 +474,6 @@ fn streaming_spmm_transpose<S: ShardSource>(
                         }
                     }
                 });
-
-            // Reduce thread-local shards into global accumulators.
-            for buf in tls_z.iter_mut() {
-                let zl = buf.get_mut();
-                for (zg, zv) in z.iter_mut().zip(zl.iter()) {
-                    *zg += *zv;
-                }
-            }
-            for buf in tls_sq.iter_mut() {
-                let sql = buf.get_mut();
-                for (sg, sv) in sum_q.iter_mut().zip(sql.iter()) {
-                    *sg += *sv;
-                }
-            }
         } else {
             // Sequential path for small shards
             let mut q_row = vec![0.0f64; k];
@@ -521,6 +501,22 @@ fn streaming_spmm_transpose<S: ShardSource>(
         }
 
         global_row += shard_rows;
+    }
+
+    // Reduce thread-local parallel-path accumulators into the globals.
+    // Sequential-path shards wrote directly to `z` / `sum_q`, so this step
+    // folds in the parallel contributions only.
+    for buf in tls_z.iter_mut() {
+        let zl = buf.get_mut();
+        for (zg, zv) in z.iter_mut().zip(zl.iter()) {
+            *zg += *zv;
+        }
+    }
+    for buf in tls_sq.iter_mut() {
+        let sql = buf.get_mut();
+        for (sg, sv) in sum_q.iter_mut().zip(sql.iter()) {
+            *sg += *sv;
+        }
     }
 
     // Mean centering correction: Z -= μ @ (1^T @ Q)

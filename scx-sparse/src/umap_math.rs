@@ -19,10 +19,13 @@ use rand_distr::Normal;
 ///   `f(d) = 1` if `d ≤ min_dist`, else `exp(-(d - min_dist) / spread)`.
 ///
 /// Gauss-Newton least-squares on the residual `f(x; a, b) - y`, seeded at
-/// `(a, b) = (1.93, 0.79)` — the umap-learn defaults for
-/// `(spread=1.0, min_dist=0.1)`. Backtracking line search accepts a step
-/// only if the residual sum of squares decreases. Target precision is
-/// ~1e-4 of scipy `curve_fit` / umap-learn.
+/// `(a, b) = (1.93, 0.79)` — the class-attribute placeholders used by
+/// umap-learn's `UMAP` constructor before `curve_fit` runs (not the fitted
+/// result, which is ≈ (1.577, 0.895) for `spread=1.0, min_dist=0.1`). The
+/// seed is close enough to the global basin that GN converges there in
+/// ≲ 20 iterations. Backtracking line search accepts a step only if the
+/// residual sum of squares decreases. Target precision is ~1e-4 of scipy
+/// `curve_fit` / umap-learn.
 pub fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
     // Match umap-learn's sampling exactly: `np.linspace(0, 3*spread, 300)`
     // with a strict `x < min_dist` branch. Including x=0 anchors the curve
@@ -55,9 +58,10 @@ pub fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
             .sum::<f64>()
     };
 
-    // Seed from the umap-learn default. These are global-optimum near for
-    // (spread=1.0, min_dist=0.1); for other inputs Gauss-Newton converges
-    // reliably within ≲ 20 iterations from this point.
+    // Seed from umap-learn's class-default `_a`/`_b` placeholders. These
+    // are NOT the `curve_fit` result; they sit near the global-optimum
+    // basin (fitted ≈ 1.577, 0.895 at spread=1, min_dist=0.1) and
+    // Gauss-Newton reliably converges from here within ≲ 20 iterations.
     let mut a = 1.93_f64;
     let mut b = 0.79_f64;
     let mut err = sse(a, b);
