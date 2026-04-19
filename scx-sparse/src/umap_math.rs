@@ -5,6 +5,7 @@
 //! and these functions have no format/GPU/engine dependencies.
 
 use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 use rand_distr::Normal;
 
 // ---------------------------------------------------------------------------
@@ -17,32 +18,28 @@ use rand_distr::Normal;
 /// Fit to the piecewise target:
 ///   `f(d) = 1` if `d ≤ min_dist`, else `exp(-(d - min_dist) / spread)`.
 ///
-/// Uses a coarse grid search followed by local refinement, replicating
-/// umap-learn's `scipy.optimize.curve_fit` result closely enough for
-/// SGD embedding quality.
+/// Gauss-Newton least-squares on the residual `f(x; a, b) - y`, seeded at
+/// `(a, b) = (1.93, 0.79)` — the class-attribute placeholders used by
+/// umap-learn's `UMAP` constructor before `curve_fit` runs (not the fitted
+/// result, which is ≈ (1.577, 0.895) for `spread=1.0, min_dist=0.1`). The
+/// seed is close enough to the global basin that GN converges there in
+/// ≲ 20 iterations. Backtracking line search accepts a step only if the
+/// residual sum of squares decreases. Target precision is ~1e-4 of scipy
+/// `curve_fit` / umap-learn.
 pub fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
-    // Grid boundary constants for the coarse search.
-    // Default UMAP params (spread=1.0, min_dist=0.1) produce a≈1.93, b≈0.79,
-    // well within these ranges. Unusual param combos could hit the edges.
-    const A_STEP: f64 = 0.1;
-    const A_STEPS: usize = 100;
-    const B_STEP: f64 = 0.1;
-    const B_STEPS: usize = 40;
-    // Derived bounds (A: 0.1..10.0, B: 0.1..4.0)
-    let a_start = A_STEP;
-    let b_start = B_STEP;
-    let a_end = A_STEP * A_STEPS as f64;
-    let b_end = B_STEP * B_STEPS as f64;
-
+    // Match umap-learn's sampling exactly: `np.linspace(0, 3*spread, 300)`
+    // with a strict `x < min_dist` branch. Including x=0 anchors the curve
+    // at pred=1; the Jacobian contribution at x=0 is skipped below to
+    // avoid ln(0) blowing up `db`.
     let n_points = 300;
     let x_max = 3.0 * spread;
     let xs: Vec<f64> = (0..n_points)
-        .map(|i| (i as f64 + 0.5) / n_points as f64 * x_max)
+        .map(|i| x_max * i as f64 / (n_points - 1) as f64)
         .collect();
     let ys: Vec<f64> = xs
         .iter()
         .map(|&x| {
-            if x <= min_dist {
+            if x < min_dist {
                 1.0
             } else {
                 (-(x - min_dist) / spread).exp()
@@ -50,82 +47,99 @@ pub fn find_ab_params(spread: f64, min_dist: f64) -> (f64, f64) {
         })
         .collect();
 
-    // Least-squares error for a candidate (a, b) pair.
-    let compute_error = |a: f64, b: f64| -> f64 {
+    let sse = |a: f64, b: f64| -> f64 {
         xs.iter()
             .zip(ys.iter())
             .map(|(&x, &y)| {
                 let pred = 1.0 / (1.0 + a * x.powf(2.0 * b));
-                (pred - y) * (pred - y)
+                let r = pred - y;
+                r * r
             })
-            .sum()
+            .sum::<f64>()
     };
 
-    let mut best_a = 1.0_f64;
-    let mut best_b = 1.0_f64;
-    let mut best_err = f64::MAX;
+    // Seed from umap-learn's class-default `_a`/`_b` placeholders. These
+    // are NOT the `curve_fit` result; they sit near the global-optimum
+    // basin (fitted ≈ 1.577, 0.895 at spread=1, min_dist=0.1) and
+    // Gauss-Newton reliably converges from here within ≲ 20 iterations.
+    let mut a = 1.93_f64;
+    let mut b = 0.79_f64;
+    let mut err = sse(a, b);
 
-    // Coarse grid
-    for a_idx in 1..=A_STEPS {
-        let a = a_idx as f64 * A_STEP;
-        for b_idx in 1..=B_STEPS {
-            let b = b_idx as f64 * B_STEP;
-            let err = compute_error(a, b);
-            if err < best_err {
-                best_err = err;
-                best_a = a;
-                best_b = b;
+    const MAX_ITER: usize = 64;
+    const STEP_TOL: f64 = 1e-10;
+    const GRAD_TOL: f64 = 1e-14;
+
+    for _ in 0..MAX_ITER {
+        // Accumulate J^T J (2×2, symmetric) and J^T r (2×1).
+        let mut jtj_aa = 0.0;
+        let mut jtj_ab = 0.0;
+        let mut jtj_bb = 0.0;
+        let mut jtr_a = 0.0;
+        let mut jtr_b = 0.0;
+
+        for (&x, &y) in xs.iter().zip(ys.iter()) {
+            if x <= 0.0 {
+                // Residual is 0 here (pred=1=y when b>0, xb=0); Jacobian
+                // has a 0·ln(0) factor that is 0 by L'Hôpital but NaN in
+                // floating point. Skip.
+                continue;
             }
+            let xb = x.powf(2.0 * b);
+            let denom = 1.0 + a * xb;
+            let pred = 1.0 / denom;
+            let r = pred - y;
+            let common = -xb / (denom * denom);
+            let da = common;
+            // d/db (a · x^(2b)) = 2 a · x^(2b) · ln(x)
+            let db = common * a * 2.0 * x.ln();
+
+            jtj_aa += da * da;
+            jtj_ab += da * db;
+            jtj_bb += db * db;
+            jtr_a += da * r;
+            jtr_b += db * r;
+        }
+
+        if jtr_a.abs() < GRAD_TOL && jtr_b.abs() < GRAD_TOL {
+            break;
+        }
+
+        // Solve (J^T J) · δ = -J^T r using the closed-form 2×2 inverse.
+        let det = jtj_aa * jtj_bb - jtj_ab * jtj_ab;
+        if det.abs() < 1e-20 {
+            break;
+        }
+        let inv = 1.0 / det;
+        let delta_a = inv * (jtj_bb * (-jtr_a) - jtj_ab * (-jtr_b));
+        let delta_b = inv * (-jtj_ab * (-jtr_a) + jtj_aa * (-jtr_b));
+
+        // Backtracking line search: halve the step until SSE decreases or
+        // the step shrinks below tolerance.
+        let mut alpha = 1.0_f64;
+        let mut accepted = false;
+        for _ in 0..20 {
+            let trial_a = (a + alpha * delta_a).max(1e-4);
+            let trial_b = (b + alpha * delta_b).max(1e-4);
+            let trial_err = sse(trial_a, trial_b);
+            if trial_err < err {
+                a = trial_a;
+                b = trial_b;
+                err = trial_err;
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+        if (alpha * delta_a).abs() < STEP_TOL && (alpha * delta_b).abs() < STEP_TOL {
+            break;
         }
     }
 
-    // Fine refinement around best
-    let refine_range = 0.1;
-    let refine_steps = 20;
-    let a_lo = (best_a - refine_range).max(0.01);
-    let a_hi = best_a + refine_range;
-    let b_lo = (best_b - refine_range).max(0.01);
-    let b_hi = best_b + refine_range;
-
-    for a_idx in 0..=refine_steps {
-        let a = a_lo + (a_hi - a_lo) * a_idx as f64 / refine_steps as f64;
-        for b_idx in 0..=refine_steps {
-            let b = b_lo + (b_hi - b_lo) * b_idx as f64 / refine_steps as f64;
-            let err = compute_error(a, b);
-            if err < best_err {
-                best_err = err;
-                best_a = a;
-                best_b = b;
-            }
-        }
-    }
-
-    // Boundary detection: warn if the optimum is near a grid edge,
-    // which indicates the true optimum may lie outside the search range.
-    if (best_a - a_start).abs() < A_STEP || (a_end - best_a).abs() < A_STEP {
-        log::warn!(
-            "UMAP find_ab_params: optimal `a` ({:.4}) is near search boundary \
-             [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
-            best_a,
-            a_start,
-            a_end,
-            spread,
-            min_dist
-        );
-    }
-    if (best_b - b_start).abs() < B_STEP || (b_end - best_b).abs() < B_STEP {
-        log::warn!(
-            "UMAP find_ab_params: optimal `b` ({:.4}) is near search boundary \
-             [{}, {}] for spread={}, min_dist={}. Results may be inaccurate.",
-            best_b,
-            b_start,
-            b_end,
-            spread,
-            min_dist
-        );
-    }
-
-    (best_a, best_b)
+    (a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +176,7 @@ pub fn compute_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Vec<f64> {
 ///
 /// Produces an `n_obs × n_components` embedding with effective std dev ≈ 1e-3.
 pub fn random_init_f64(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let normal = Normal::new(0.0_f64, 1e-4).unwrap();
     (0..n_obs * n_components)
         .map(|_| rng.sample(normal) * 10.0)
@@ -174,7 +188,7 @@ pub fn random_init_f64(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64>
 /// Produces an `n_obs × n_components` embedding with effective std dev ≈ 1e-3.
 /// Same distribution as [`random_init_f64`] but in single precision for GPU use.
 pub fn random_init_f32(n_obs: usize, n_components: usize, seed: u64) -> Vec<f32> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let normal = Normal::new(0.0_f32, 1e-4).unwrap();
     (0..n_obs * n_components)
         .map(|_| rng.sample(normal) * 10.0)

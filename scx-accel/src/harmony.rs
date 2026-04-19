@@ -145,10 +145,14 @@ impl BatchLayout {
 }
 
 struct HarmonyState {
-    // Embeddings (d x N, column-major f64)
+    // Embeddings (d x N, column-major f64). `z_cos` (the L2-normalized
+    // view of `z_corr` used for cosine-distance clustering) is NOT stored:
+    // normalization is done per column on demand inside `compute_distances`
+    // / `kmeans_plus_plus` / `kmeans_refine`. Saves d·N f64s (≈ 400 MB at
+    // N=1M, d=50) at the cost of one extra O(d) norm per column access in
+    // the k-means and distance paths.
     z_orig: Vec<f64>,
     z_corr: Vec<f64>,
-    z_cos: Vec<f64>,
     // Clustering (f64)
     y: Vec<f64>,        // d x K, column-major (centroids as columns)
     r: Vec<f64>,        // K x N, row-major (cluster x cell)
@@ -299,10 +303,6 @@ impl HarmonyState {
             }
         }
 
-        // --- L2-normalize columns to produce z_cos ---
-        let mut z_cos = z_orig.clone();
-        l2_normalize_columns(&mut z_cos, d, n);
-
         // --- Batch structure ---
         let layout = BatchLayout::new(covariates);
         let b = layout.b;
@@ -398,12 +398,12 @@ impl HarmonyState {
         let mut rng = ChaCha8Rng::seed_from_u64(config.random_state);
 
         // --- K-means++ seeding + Lloyd refinement ---
-        let mut y = kmeans_plus_plus(&z_cos, d, n, k, &mut rng);
-        kmeans_refine(&z_cos, &mut y, d, n, k, 10);
+        let mut y = kmeans_plus_plus(&z_orig, d, n, k, &mut rng);
+        kmeans_refine(&z_orig, &mut y, d, n, k, 10);
         l2_normalize_columns(&mut y, d, k);
 
         // --- Initial distances, R, O, E ---
-        let dist_mat = compute_distances(&y, &z_cos, d, k, n);
+        let dist_mat = compute_distances(&y, &z_orig, d, k, n);
         let r = softmax_r_from_dist(&dist_mat, &sigma, k, n);
         let (o, e) = compute_o_e(&r, &batch_index, &layout, &pr_b, k, n);
 
@@ -412,7 +412,6 @@ impl HarmonyState {
         Ok(Self {
             z_orig,
             z_corr,
-            z_cos,
             y,
             r,
             dist_mat,
@@ -459,21 +458,47 @@ fn l2_normalize_columns(m: &mut [f64], rows: usize, _cols: usize) {
     });
 }
 
-/// dist[k, i] = 2 * (1 - Y[:, k] · Z_cos[:, i]).
+/// Per-column L2 inverse-norms for an un-normalized d·N embedding
+/// (column-major). Zero-norm columns get `inv = 0` (so scaled dots are
+/// 0 and the 2·(1 - 0) distance is the "max" value, matching how the
+/// earlier explicit `z_cos` path treated zero columns).
 ///
-/// Output is row-major (K x N); rows are disjoint slices of length N, so we
+/// Length-N buffer (≈ 8 MB at N=1M) reused in `compute_distances` /
+/// `kmeans_*` instead of recomputing the norm once per (cluster, cell).
+fn compute_inv_norms(z: &[f64], d: usize, n: usize) -> Vec<f64> {
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let col = &z[i * d..(i + 1) * d];
+            let n2: f64 = col.iter().map(|v| v * v).sum();
+            if n2 > 0.0 {
+                1.0 / n2.sqrt()
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// dist[k, i] = 2 * (1 - Y[:, k] · normalize(z[:, i])).
+///
+/// `z` is the un-normalized d·N embedding (column-major). Per-cell
+/// inverse L2 norms are precomputed once (length N) before the per-cluster
+/// loop so each norm is computed once rather than K times. Output is
+/// row-major (K x N); rows are disjoint slices of length N, so we
 /// parallelize across clusters.
-fn compute_distances(y: &[f64], z_cos: &[f64], d: usize, k: usize, n: usize) -> Vec<f64> {
+fn compute_distances(y: &[f64], z: &[f64], d: usize, k: usize, n: usize) -> Vec<f64> {
+    let inv_norms = compute_inv_norms(z, d, n);
     let mut out = vec![0f64; k * n];
     out.par_chunks_mut(n).enumerate().for_each(|(ku, row)| {
         let y_col = &y[ku * d..(ku + 1) * d];
         for i in 0..n {
-            let z_col = &z_cos[i * d..(i + 1) * d];
+            let z_col = &z[i * d..(i + 1) * d];
             let mut dot = 0f64;
             for j in 0..d {
                 dot += y_col[j] * z_col[j];
             }
-            row[i] = 2.0 * (1.0 - dot);
+            row[i] = 2.0 * (1.0 - dot * inv_norms[i]);
         }
     });
     out
@@ -582,16 +607,25 @@ fn compute_o_e(
 // ─── K-means++ seeding (Harmony variant) ─────────────────────────────
 
 /// Gumbel-max weighted sampling from the most recently chosen centroid.
-/// Returns a (d x K) column-major matrix of centroids (already equal to
-/// z_cos at selected cell indices).
-fn kmeans_plus_plus(z_cos: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCha8Rng) -> Vec<f64> {
+/// Returns a (d x K) column-major matrix of centroids (already L2-normalized
+/// — equal to the normalized embedding column at each chosen cell index).
+///
+/// `z` is the un-normalized embedding. Per-cell inverse L2 norms are
+/// precomputed once (H9 + follow-up) and reused across the K-1
+/// centroid-selection passes instead of recomputing the norm ~K·N times.
+fn kmeans_plus_plus(z: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCha8Rng) -> Vec<f64> {
     let mut y = vec![0f64; d * k];
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
+    let inv_norms = compute_inv_norms(z, d, n);
 
-    // First centroid: uniform random cell.
+    // First centroid: uniform random cell (normalized).
     let i0 = rng.gen_range(0..n);
     chosen.push(i0);
-    y[..d].copy_from_slice(&z_cos[i0 * d..(i0 + 1) * d]);
+    let inv0 = inv_norms[i0];
+    let z0 = &z[i0 * d..(i0 + 1) * d];
+    for t in 0..d {
+        y[t] = z0[t] * inv0;
+    }
 
     for ci in 1..k {
         // Compute cosine distance from the most recently chosen centroid.
@@ -600,16 +634,19 @@ fn kmeans_plus_plus(z_cos: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCh
         // Try up to a few resamples on duplicate collisions.
         let mut picked = usize::MAX;
         'outer: for _attempt in 0..10 {
-            // Compute prob[j] = -log(u[j]) / dist[j] for all j, pick argmin.
             let mut best_j = 0usize;
             let mut best_val = f64::INFINITY;
             for j in 0..n {
-                let z_col = &z_cos[j * d..(j + 1) * d];
+                let inv = inv_norms[j];
+                if inv == 0.0 {
+                    continue;
+                }
+                let z_col = &z[j * d..(j + 1) * d];
                 let mut dot = 0f64;
                 for t in 0..d {
                     dot += last[t] * z_col[t];
                 }
-                let dist = (2.0 * (1.0 - dot)).abs();
+                let dist = (2.0 * (1.0 - dot * inv)).abs();
                 if dist == 0.0 {
                     continue;
                 }
@@ -634,12 +671,16 @@ fn kmeans_plus_plus(z_cos: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCh
                 }
             }
             if picked == usize::MAX {
-                // More clusters than cells — shouldn't happen due to clamp.
                 picked = ci % n;
             }
         }
         chosen.push(picked);
-        y[ci * d..(ci + 1) * d].copy_from_slice(&z_cos[picked * d..(picked + 1) * d]);
+        let inv_p = inv_norms[picked];
+        let z_p = &z[picked * d..(picked + 1) * d];
+        let y_off = ci * d;
+        for t in 0..d {
+            y[y_off + t] = z_p[t] * inv_p;
+        }
     }
 
     y
@@ -647,13 +688,21 @@ fn kmeans_plus_plus(z_cos: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCh
 
 /// Lloyd's algorithm refinement on cosine distance with L2-normalized
 /// centroids (keep_existing init). Runs `n_iter` iterations in place on `y`.
-fn kmeans_refine(z_cos: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_iter: usize) {
+///
+/// `z` is un-normalized; per-column inverse L2 norms are precomputed once
+/// (H9 + follow-up) and scaled into the dot products so we avoid
+/// normalizing twice per cell per iteration.
+fn kmeans_refine(z: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_iter: usize) {
+    let inv_norms = compute_inv_norms(z, d, n);
     for _ in 0..n_iter {
-        // Assignment: for each cell, pick argmax(Y^T z) (equivalent to
-        // argmin 2(1 - Y^T z) since all entries share the constant).
         let mut assign = vec![0usize; n];
         for i in 0..n {
-            let z_col = &z_cos[i * d..(i + 1) * d];
+            let inv = inv_norms[i];
+            if inv == 0.0 {
+                assign[i] = 0;
+                continue;
+            }
+            let z_col = &z[i * d..(i + 1) * d];
             let mut best_k = 0usize;
             let mut best_dot = f64::NEG_INFINITY;
             for ku in 0..k {
@@ -662,6 +711,9 @@ fn kmeans_refine(z_cos: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_i
                 for t in 0..d {
                     dot += y_col[t] * z_col[t];
                 }
+                // dot with the normalized column = dot * inv; the argmax is
+                // unchanged by the positive-scale factor, so we only need
+                // it for the centroid-update pass below.
                 if dot > best_dot {
                     best_dot = dot;
                     best_k = ku;
@@ -670,16 +722,19 @@ fn kmeans_refine(z_cos: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_i
             assign[i] = best_k;
         }
 
-        // Update: new centroid = mean of assigned cells, re-normalized.
-        // Keep previous centroid when a cluster is empty.
+        // Update: new centroid = mean of assigned (normalized) cells, re-normalized.
         let mut sums = vec![0f64; d * k];
         let mut counts = vec![0usize; k];
         for i in 0..n {
+            let inv = inv_norms[i];
+            if inv == 0.0 {
+                continue;
+            }
+            let z_col = &z[i * d..(i + 1) * d];
             let ku = assign[i];
             let off = ku * d;
-            let z_col = &z_cos[i * d..(i + 1) * d];
             for t in 0..d {
-                sums[off + t] += z_col[t];
+                sums[off + t] += z_col[t] * inv;
             }
             counts[ku] += 1;
         }
@@ -698,7 +753,6 @@ fn kmeans_refine(z_cos: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_i
                     }
                 }
             }
-            // else: leave y[ku] unchanged (keep_existing).
         }
     }
 }
@@ -707,10 +761,9 @@ fn kmeans_refine(z_cos: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_i
 
 impl HarmonyState {
     fn cold_start_r(&mut self) {
-        // Re-normalize Z_corr into Z_cos (columns).
-        self.z_cos.copy_from_slice(&self.z_corr);
-        l2_normalize_columns(&mut self.z_cos, self.d, self.n);
-        self.dist_mat = compute_distances(&self.y, &self.z_cos, self.d, self.k, self.n);
+        // Cosine normalization is done column-by-column inside
+        // `compute_distances`; no `z_cos` buffer is materialized (H9).
+        self.dist_mat = compute_distances(&self.y, &self.z_corr, self.d, self.k, self.n);
         self.r = softmax_r_from_dist(&self.dist_mat, &self.sigma, self.k, self.n);
         let (o, e) = compute_o_e(
             &self.r,
@@ -1035,8 +1088,11 @@ fn build_dynamic_lambda(state: &HarmonyState, k_idx: usize, kept: &[usize]) -> V
 ///     [c    D ]
 /// where D is diagonal. Matrix is passed as row-major (size x size).
 ///
-/// Returns the row-major inverse in a new Vec.
-fn arrowhead_inverse(mat: &[f64], size: usize) -> Vec<f64> {
+/// Returns the row-major inverse in a new Vec. Errors with
+/// `AccelError::NumericalInstability` when any `D[j]` is non-normal or
+/// below `1e-15` in magnitude (typically an empty batch-level/cluster
+/// combination) so the caller can fall back to the full LU inverse.
+fn arrowhead_inverse(mat: &[f64], size: usize) -> Result<Vec<f64>> {
     debug_assert!(size >= 1);
     let a = mat[0];
     // Extract c (column) and D diagonal.
@@ -1048,10 +1104,27 @@ fn arrowhead_inverse(mat: &[f64], size: usize) -> Vec<f64> {
         d[j] = mat[(j + 1) * size + (j + 1)];
     }
 
+    // Guard against near-zero diagonals that would blow up `c[j]*c[j]/d[j]`
+    // or `1/d[j]` below. Pathological inputs (empty batch/cluster) reach
+    // this path when `alpha=0` and all rows in a level are filtered out.
+    for (j, &dj) in d.iter().enumerate() {
+        if !dj.is_normal() || dj.abs() < 1e-15 {
+            return Err(AccelError::NumericalInstability(format!(
+                "arrowhead_inverse: near-zero diagonal d[{j}]={dj}; \
+                 likely an empty batch-level/cluster combination"
+            )));
+        }
+    }
+
     // u = a - c^T D^{-1} c
     let mut u = a;
     for j in 0..m {
         u -= c[j] * c[j] / d[j];
+    }
+    if !u.is_normal() || u.abs() < 1e-15 {
+        return Err(AccelError::NumericalInstability(format!(
+            "arrowhead_inverse: schur complement u={u} is non-normal"
+        )));
     }
 
     let mut inv = vec![0f64; size * size];
@@ -1068,7 +1141,7 @@ fn arrowhead_inverse(mat: &[f64], size: usize) -> Vec<f64> {
             inv[(i + 1) * size + (j + 1)] = diag + off_diag;
         }
     }
-    inv
+    Ok(inv)
 }
 
 /// Full matrix inverse via faer partial-pivot LU. Input row-major, size x size.
@@ -1152,9 +1225,21 @@ impl HarmonyState {
                 cov[j * size + j] += lambda[j];
             }
 
-            // Invert: arrowhead for single-covariate, LU otherwise.
+            // Invert: arrowhead for single-covariate, LU otherwise. Fall back
+            // to the full LU inverse if the arrowhead guard trips on a
+            // near-zero diagonal (H8).
             let inv_cov = if c_count == 1 {
-                arrowhead_inverse(&cov, size)
+                match arrowhead_inverse(&cov, size) {
+                    Ok(inv) => inv,
+                    Err(AccelError::NumericalInstability(msg)) => {
+                        log::warn!(
+                            "harmony: arrowhead_inverse unstable ({msg}); \
+                             falling back to full LU inverse"
+                        );
+                        full_matrix_inverse(&cov, size)?
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 full_matrix_inverse(&cov, size)?
             };
@@ -1432,8 +1517,9 @@ mod gpu_impl {
                 let dist_f32 = dev
                     .dtoh_copy(&d_dist)
                     .map_err(|e| AccelError::LinAlg(format!("download dist: {e}")))?;
-                state.z_cos = state.z_corr.clone();
-                l2_normalize_columns(&mut state.z_cos, d, n);
+                // No host-side `z_cos` mirror is kept (H9) — cosine
+                // normalization lives on-device for this iteration and is
+                // recomputed on-the-fly by CPU paths on later iterations.
                 state.dist_mat = dist_f32.iter().map(|&v| v as f64).collect();
                 state.r = softmax_r_from_dist(&state.dist_mat, &state.sigma, k, n);
                 let (o, e) = compute_o_e(
@@ -1509,7 +1595,17 @@ mod gpu_impl {
                 }
 
                 let inv_cov = if c_count == 1 {
-                    arrowhead_inverse(&cov, size)
+                    match arrowhead_inverse(&cov, size) {
+                        Ok(inv) => inv,
+                        Err(AccelError::NumericalInstability(msg)) => {
+                            log::warn!(
+                                "harmony: arrowhead_inverse unstable ({msg}); \
+                                 falling back to full LU inverse"
+                            );
+                            full_matrix_inverse(&cov, size)?
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     full_matrix_inverse(&cov, size)?
                 };
@@ -1857,7 +1953,7 @@ mod tests {
         // Ensure symmetric positive-definiteness-ish by bumping diagonal.
         // (Not strictly required for LU.)
 
-        let inv_ah = arrowhead_inverse(&mat, size);
+        let inv_ah = arrowhead_inverse(&mat, size).unwrap();
         let inv_lu = full_matrix_inverse(&mat, size).unwrap();
         for r in 0..size {
             for c in 0..size {
@@ -1871,6 +1967,35 @@ mod tests {
                     inv_lu[r * size + c]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_arrowhead_inverse_rejects_near_zero_diagonal() {
+        // Arrowhead matrix whose trailing diagonal block contains a
+        // near-zero entry (simulating an empty batch-level/cluster combo
+        // under alpha=0). The guard should surface this as
+        // NumericalInstability rather than produce a 1/0 inverse.
+        let size = 4;
+        let mut mat = vec![0f64; size * size];
+        mat[0] = 2.0;
+        for j in 1..size {
+            mat[j] = 0.5; // row 0
+            mat[j * size] = 0.5; // col 0
+            mat[j * size + j] = 1.0; // diagonal
+        }
+        // Zero out one trailing diagonal entry.
+        mat[2 * size + 2] = 0.0;
+
+        match arrowhead_inverse(&mat, size) {
+            Err(AccelError::NumericalInstability(msg)) => {
+                assert!(
+                    msg.contains("arrowhead_inverse"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected NumericalInstability, got Ok"),
+            Err(other) => panic!("expected NumericalInstability, got {other:?}"),
         }
     }
 

@@ -81,11 +81,15 @@ DEFAULT_BASELINE_NAME = "baseline_2026_04_17"
 RESULTS_ROOT = PROJECT_ROOT / "benchmarks" / "comprehensive" / "results"
 RAW_DIR = RESULTS_ROOT / "raw"
 
+# `mem_gb` here is the FLOOR forwarded to run_parallel.py — actual memory is
+# sized per-(benchmark, dataset, format) by `estimate_memory_gb`. Partition is
+# the DEFAULT and is auto-overridden to `cpu_high_mem` for jobs whose estimate
+# exceeds 200 GB. (Pre-fix, both values were applied uniformly to every job.)
 TIERS = {
     "small": {
         "datasets": ["pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k"],
         "partition": "cpu_preemptible",
-        "mem_gb": 80,
+        "mem_gb": 8,
         "timeout": 240,
     },
     "full": {
@@ -94,7 +98,7 @@ TIERS = {
             "census_500k", "census_1m",
         ],
         "partition": "cpu_preemptible",
-        "mem_gb": 200,
+        "mem_gb": 8,
         "timeout": 480,
     },
     "xl": {
@@ -102,8 +106,8 @@ TIERS = {
             "pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k",
             "census_500k", "census_1m", "census_5m",
         ],
-        "partition": "cpu_high_mem",
-        "mem_gb": 500,
+        "partition": "cpu_preemptible",
+        "mem_gb": 8,
         "timeout": 960,
     },
 }
