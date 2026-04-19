@@ -355,6 +355,98 @@ def n_runs_for_dataset(dataset_name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Per-job memory estimation (SLURM submitit sizing)
+# ---------------------------------------------------------------------------
+
+# Above this many GB of estimated peak RSS, route the job to the high-mem
+# partition. cpu_preemptible nodes can sustain up to ~200 GB per task; beyond
+# that we need cpu_high_mem.
+MEM_HIGH_MEM_THRESHOLD_GB = 200
+
+# Hard ceiling — the largest single-task allocation cpu_high_mem can serve.
+# Estimates above this are clamped (with a warning at submit time); jobs that
+# legitimately need more would have OOMed under the previous uniform 500 GB
+# scheme too.
+MEM_CEILING_GB = 500
+
+# Floor for any job (Python + scanpy + pyo3 baseline + scratch).
+MEM_FLOOR_GB = 8
+
+
+def estimate_memory_gb(
+    dataset: "DatasetConfig",
+    format_key: str,
+    benchmark: str,
+) -> int:
+    """Estimate per-job peak memory in GB for a (benchmark, dataset, format).
+
+    Models the worst-case in-memory footprint with a ~50% safety margin and
+    rounds up to the next 8 GB. Used by ``run_parallel.py`` to size each
+    submitit job individually instead of allocating a single uniform value
+    across all jobs in a tier.
+    """
+    import math
+
+    n_obs = dataset.n_obs
+    n_vars = dataset.n_vars
+    h5ad_mb = max(dataset.approx_h5ad_mb, 1)
+
+    # Base footprint: source AnnData object in RAM. Sparse expansion + obs/var
+    # metadata + scratch typically runs ~2× the on-disk h5ad size.
+    base_mb = h5ad_mb * 2
+
+    # Dense materialization upper bound for an X matrix at f32.
+    dense_mb = (n_obs * n_vars * 4) / (1024 * 1024)
+
+    is_h5ad = format_key.startswith("h5ad")
+    is_zarr = format_key.startswith("zarr")
+    is_dense_path = is_h5ad or is_zarr  # densify on read in scanpy/h5py path
+
+    if benchmark in ("read_full", "memory"):
+        if is_dense_path:
+            peak_mb = max(base_mb, dense_mb * 1.3)
+        else:
+            # SCX/SOMA stream sparse: bounded by sparse footprint + scratch.
+            peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("write", "parallel_write_scaling"):
+        # Both load the source h5ad (sparse) then encode; for dense input
+        # paths the encoder may materialize per-shard.
+        peak_mb = max(base_mb, dense_mb * 1.0 if is_dense_path else dense_mb * 0.5)
+    elif benchmark == "parallel_scaling":
+        # Multiple concurrent readers share buffers but inflate scratch.
+        peak_mb = max(base_mb * 4, dense_mb * 0.7)
+    elif benchmark == "read_selective":
+        # Column-projected reads — small in absolute terms.
+        peak_mb = base_mb * 0.5
+    elif benchmark == "compression":
+        # Just measures file sizes — Python overhead only.
+        peak_mb = base_mb * 0.25
+    else:
+        peak_mb = base_mb
+
+    peak_gb = math.ceil(peak_mb / 1024)
+    safety_gb = max(8, int(peak_gb * 0.5))
+    total = peak_gb + safety_gb
+    # Round up to the next 8 GB so we don't fragment the scheduler with
+    # awkward request sizes.
+    total = math.ceil(total / 8) * 8
+    total = max(total, MEM_FLOOR_GB)
+    # Clamp at the cluster's largest single-task allocation. Combinations
+    # whose true footprint exceeds this (e.g. dense-h5ad read on census_5m)
+    # would OOM either way; the cap keeps submitit from rejecting the job.
+    return min(total, MEM_CEILING_GB)
+
+
+def partition_for_memory(mem_gb: int, default: str = "cpu_preemptible") -> str:
+    """Auto-route to ``cpu_high_mem`` when ``mem_gb`` exceeds the preemptible
+    cap, otherwise stay on ``default``.
+    """
+    if mem_gb > MEM_HIGH_MEM_THRESHOLD_GB:
+        return "cpu_high_mem"
+    return default
+
+
+# ---------------------------------------------------------------------------
 # SLURM Defaults
 # ---------------------------------------------------------------------------
 

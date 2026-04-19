@@ -52,7 +52,9 @@ from benchmarks.comprehensive.config import (  # noqa: E402
     DATASETS,
     PRIMARY_FORMATS,
     FormatVariant,
+    estimate_memory_gb,
     n_runs_for_dataset,
+    partition_for_memory,
 )
 from benchmarks.comprehensive.convert import convert_dataset_format  # noqa: E402
 from benchmarks.comprehensive.results import BenchmarkResult, write_result  # noqa: E402
@@ -144,19 +146,10 @@ def _run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def _slurm_params(args, is_conversion: bool = False) -> dict:
-    """Build submitit executor parameters from CLI args."""
-    timeout_min = args.timeout
-    if is_conversion and timeout_min < 240:
-        timeout_min = 240  # conversions need more time for large datasets
-
-    # Detect whether we're running inside a conda env (scx-bench) or the
-    # project .venv/.  SLURM jobs need the same Python that has pyscx installed.
+def _slurm_setup_cmds() -> list[str]:
+    """Per-job shell setup: activate the right Python env and clear inherited SLURM vars."""
     import os
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
-
-    # Clear inherited SLURM env vars that conflict with submitit's srun call
-    # (e.g. SLURM_CPUS_PER_TASK from a parent interactive job).
     env_cleanup = "unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK 2>/dev/null || true"
 
     if "scx-bench" in conda_prefix:
@@ -164,23 +157,78 @@ def _slurm_params(args, is_conversion: bool = False) -> dict:
         if not conda_base:
             conda_base = str(Path.home() / "miniforge3")
         env_name = os.path.basename(conda_prefix)
-        setup_cmds = [
+        return [
             env_cleanup,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
-    else:
-        setup_cmds = [
-            env_cleanup,
-            f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
-        ]
+    return [
+        env_cleanup,
+        f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
+    ]
+
+
+def _slurm_params(args, is_conversion: bool = False) -> dict:
+    """Build default submitit executor parameters from CLI args.
+
+    Used as the fallback / cap when per-job sizing isn't applicable
+    (e.g. conversion jobs that don't yet know which benchmark will run).
+    """
+    timeout_min = args.timeout
+    if is_conversion and timeout_min < 240:
+        timeout_min = 240  # conversions need more time for large datasets
 
     return {
         "slurm_partition": args.partition,
         "cpus_per_task": args.cpus,
         "mem_gb": args.mem_gb,
         "timeout_min": timeout_min,
-        "slurm_setup": setup_cmds,
+        "slurm_setup": _slurm_setup_cmds(),
+    }
+
+
+def _per_job_slurm_params(
+    args,
+    dataset_name: str,
+    format_key: str,
+    benchmark: str | None,
+    is_conversion: bool = False,
+) -> dict:
+    """Per-(benchmark, dataset, format) submitit parameters.
+
+    Sizes ``mem_gb`` from ``estimate_memory_gb`` (or the conversion peak when
+    benchmark is None) and auto-routes to ``cpu_high_mem`` when the estimate
+    exceeds the preemptible cap. The ``--mem-gb`` CLI arg becomes a floor:
+    we never request less than the user explicitly asked for.
+    """
+    cfg = DATASETS[dataset_name]
+
+    if is_conversion or benchmark is None:
+        # Conversion needs to load the source h5ad and write the target —
+        # peak across read_full + write is a safe upper bound.
+        mem = max(
+            estimate_memory_gb(cfg, format_key, "read_full"),
+            estimate_memory_gb(cfg, format_key, "write"),
+        )
+    else:
+        mem = estimate_memory_gb(cfg, format_key, benchmark)
+
+    # CLI floor (never request less than the user asked for).
+    mem = max(mem, args.mem_gb)
+
+    # Partition: respect explicit --partition unless the request can't fit.
+    partition = partition_for_memory(mem, default=args.partition)
+
+    timeout_min = args.timeout
+    if is_conversion and timeout_min < 240:
+        timeout_min = 240
+
+    return {
+        "slurm_partition": partition,
+        "cpus_per_task": args.cpus,
+        "mem_gb": mem,
+        "timeout_min": timeout_min,
+        "slurm_setup": _slurm_setup_cmds(),
     }
 
 
@@ -230,7 +278,6 @@ def main() -> None:
         logger.info("=" * 60)
 
         executor = submitit.AutoExecutor(folder=str(LOGS_DIR / "convert"))
-        executor.update_parameters(**_slurm_params(args, is_conversion=True))
 
         conv_jobs: dict[tuple[str, str], submitit.Job] = {}
 
@@ -246,15 +293,28 @@ def main() -> None:
                     continue
 
                 if args.dry_run:
-                    logger.info("  [DRY RUN] Would convert: %s / %s", ds_name, fmt.key)
+                    params = _per_job_slurm_params(
+                        args, ds_name, fmt.key, benchmark=None, is_conversion=True,
+                    )
+                    logger.info(
+                        "  [DRY RUN] Would convert: %s / %s [%dG, %s]",
+                        ds_name, fmt.key, params["mem_gb"], params["slurm_partition"],
+                    )
                     continue
 
+                params = _per_job_slurm_params(
+                    args, ds_name, fmt.key, benchmark=None, is_conversion=True,
+                )
+                executor.update_parameters(**params)
                 job = executor.submit(
                     _run_conversion,
                     ds_name, fmt.key, fmt.runner, fmt.params, args.overwrite,
                 )
                 conv_jobs[key] = job
-                logger.info("  Submitted: %s / %s -> job %s", ds_name, fmt.key, job.job_id)
+                logger.info(
+                    "  Submitted: %s / %s [%dG, %s] -> job %s",
+                    ds_name, fmt.key, params["mem_gb"], params["slurm_partition"], job.job_id,
+                )
 
         # Wait for conversion jobs to complete
         if conv_jobs and not args.dry_run:
@@ -281,7 +341,6 @@ def main() -> None:
     logger.info("=" * 60)
 
     executor = submitit.AutoExecutor(folder=str(LOGS_DIR / "bench"))
-    executor.update_parameters(**_slurm_params(args))
 
     bench_jobs: list[tuple[str, submitit.Job]] = []
 
@@ -301,17 +360,26 @@ def main() -> None:
                         logger.warning("  SKIP %s: no converted file", label)
                         continue
 
+                params = _per_job_slurm_params(args, ds_name, fmt.key, bench_name)
+
                 if args.dry_run:
-                    logger.info("  [DRY RUN] Would run: %s", label)
+                    logger.info(
+                        "  [DRY RUN] Would run: %s [%dG, %s]",
+                        label, params["mem_gb"], params["slurm_partition"],
+                    )
                     continue
 
+                executor.update_parameters(**params)
                 job = executor.submit(
                     _run_benchmark,
                     bench_name, ds_name, fmt.key, fmt.runner, fmt.params,
                     n_runs, args.cold_cache, conv_path,
                 )
                 bench_jobs.append((label, job))
-                logger.info("  Submitted: %s -> job %s", label, job.job_id)
+                logger.info(
+                    "  Submitted: %s [%dG, %s] -> job %s",
+                    label, params["mem_gb"], params["slurm_partition"], job.job_id,
+                )
 
     if args.dry_run:
         n_conv = sum(1 for ds in datasets for fmt in formats
@@ -376,8 +444,10 @@ def parse_args() -> argparse.Namespace:
                         help="SLURM partition (default: cpu_preemptible)")
     parser.add_argument("--cpus", type=int, default=16,
                         help="CPUs per task (default: 16)")
-    parser.add_argument("--mem-gb", type=int, default=80,
-                        help="Memory in GB per job (default: 80)")
+    parser.add_argument("--mem-gb", type=int, default=8,
+                        help="Memory floor in GB per job (default: 8). "
+                             "Each job is sized via estimate_memory_gb() based on "
+                             "(benchmark, dataset, format); --mem-gb is the lower bound.")
     parser.add_argument("--timeout", type=int, default=240,
                         help="Timeout in minutes per job (default: 240)")
 
