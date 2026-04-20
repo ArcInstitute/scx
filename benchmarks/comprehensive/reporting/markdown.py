@@ -28,6 +28,7 @@ from benchmarks.comprehensive.reporting.tables import (
     datasets_table,
     cloud_filtered_table,
     fragment_ops_table,
+    gcp_matrix_table,
     harmony_scaling_table,
     harmony_validation_table,
     lisi_comparison_table,
@@ -380,6 +381,27 @@ Bytes-transferred and GET-count columns are deferred to Phase F.2 when
 the object-store telemetry shim lands.
 
 {cloud_filtered_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8d. GCP Compute-Node Matrix
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8d. GCP Compute-Node Matrix
+
+Cloud-read latency and throughput vs GCP instance type, collected by
+`benchmarks/comprehensive/scripts/submit_gcp_matrix.py`. The launcher
+provisions each instance in the bucket's region, runs the cloud
+benchmarks with `SCX_BENCH_GCP_INSTANCE` / `SCX_BENCH_GCP_REGION`
+exported, and tears the VM down. Result JSONs carry `system.gcp` tags
+so the table pivots across instances automatically.
+
+Only results with a `system.gcp.instance_type` label are shown; on-cluster
+runs without the label are excluded to keep the matrix view clean.
+
+{gcp_matrix_table()}
 """)
 
     # -----------------------------------------------------------------------

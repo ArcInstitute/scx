@@ -637,6 +637,95 @@ def cloud_filtered_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines).rstrip() or "*No cloud_filtered rows to render.*"
 
 
+def gcp_matrix_table(datasets: list[str] | None = None) -> str:
+    """GCP compute-node matrix — Instance × Format × Dataset.
+
+    Pivots ``cloud_read`` results that carry ``system.gcp.instance_type``
+    (set by ``submit_gcp_matrix.py`` via ``SCX_BENCH_GCP_INSTANCE``) into
+    a table of median wall-clock with p95 in parentheses. Rows collapse
+    the instance and format, columns span the selected datasets.
+
+    Runs without a GCP instance label are excluded so on-cluster results
+    don't contaminate the matrix view.
+    """
+    from benchmarks.comprehensive.config import GCP_INSTANCE_TYPES
+
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cloud_read")
+    results = [
+        r for r in results
+        if r.get("system", {}).get("gcp", {}).get("instance_type")
+    ]
+    if not results:
+        return "*No GCP-matrix cloud_read results available yet.*"
+
+    # (instance, format) -> dataset -> (median, p95)
+    pivot: dict[tuple[str, str], dict[str, tuple[float, float]]] = {}
+    instances_seen: set[str] = set()
+    for r in results:
+        instance = r["system"]["gcp"]["instance_type"]
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        runs = r.get("runs", []) or []
+        walls = [x.get("wall_s") for x in runs if x.get("wall_s") is not None]
+        if not walls:
+            continue
+        walls_sorted = sorted(walls)
+        median = walls_sorted[len(walls_sorted) // 2]
+        p95 = walls_sorted[max(0, int(0.95 * len(walls_sorted)) - 1)]
+        pivot.setdefault((instance, fmt), {})[ds] = (median, p95)
+        instances_seen.add(instance)
+
+    if not pivot:
+        return "*No GCP-matrix cloud_read rows match the selected datasets.*"
+
+    instance_order = [i for i in GCP_INSTANCE_TYPES if i in instances_seen] + [
+        i for i in sorted(instances_seen) if i not in GCP_INSTANCE_TYPES
+    ]
+    headers = [SHORT_NAMES.get(d, d) for d in datasets]
+    lines = [
+        "| Instance | Format | " + " | ".join(headers) + " |",
+        "|---|---|" + "|".join(["---:" for _ in datasets]) + "|",
+    ]
+    for instance in instance_order:
+        fmt_rows = sorted(
+            {fmt for (i, fmt) in pivot if i == instance},
+            key=lambda f: (
+                FORMAT_ORDER.index(f) if f in FORMAT_ORDER else len(FORMAT_ORDER)
+            ),
+        )
+        for fmt in fmt_rows:
+            per_ds = pivot.get((instance, fmt), {})
+            cells = []
+            for ds in datasets:
+                entry = per_ds.get(ds)
+                if entry is None:
+                    cells.append("—")
+                    continue
+                median, p95 = entry
+                cell = _fmt_time(median)
+                if p95 != median:
+                    cell += f" ({_fmt_time(p95)})"
+                cells.append(cell)
+            lines.append(
+                f"| `{instance}` | {FORMAT_DISPLAY.get(fmt, fmt)} | "
+                + " | ".join(cells) + " |"
+            )
+
+    # Footer: per-instance egress class from the config table, so the
+    # reader can contextualize throughput numbers against the VM's
+    # published egress bandwidth.
+    lines.append("")
+    lines.append("*Egress class per instance:* " + ", ".join(
+        f"`{i}`={GCP_INSTANCE_TYPES[i]['egress_gbps']} Gbps"
+        for i in instance_order if i in GCP_INSTANCE_TYPES
+    ))
+    return "\n".join(lines)
+
+
 def ml_loader_table(datasets: list[str] | None = None) -> str:
     """Generate ML loader comparison table: Format x Dataset showing b/s and TTFB."""
     if datasets is None:
@@ -1054,6 +1143,7 @@ def generate_all_tables() -> dict[str, str]:
         "memory": memory_table(),
         "fragment_ops": fragment_ops_table(),
         "cloud_filtered": cloud_filtered_table(),
+        "gcp_matrix": gcp_matrix_table(),
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),

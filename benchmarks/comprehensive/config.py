@@ -189,6 +189,61 @@ GCP_PROJECT = os.environ.get("GCP_PROJECT", "c-tc-429521")
 # egress stays intra-region. Override via env if the bucket ever moves.
 GCP_BUCKET_REGION = os.environ.get("GCP_BUCKET_REGION", "us-central1")
 
+# ---------------------------------------------------------------------------
+# GCP compute-node matrix (Phase E)
+# ---------------------------------------------------------------------------
+
+# Instance-type profiles for the cloud compute-node matrix. Egress bandwidth
+# is the per-VM egress *class* published by Google (not a guaranteed floor);
+# reporting uses it to contextualize measured throughput. A VM's region MUST
+# match the GCS bucket region — cross-region reads silently incur egress
+# charges, so ``ensure_instance_region_matches_bucket`` is called by the
+# launcher before any `gcloud compute instances create`.
+GCP_INSTANCE_TYPES: dict[str, dict[str, Any]] = {
+    "n2-standard-8": {
+        "vcpus": 8,
+        "mem_gb": 32,
+        "gpu": None,
+        "egress_gbps": 16,
+        "family": "n2",
+        "notes": "general-purpose Cascade Lake / Ice Lake; baseline CPU tier",
+    },
+    "c3-standard-8": {
+        "vcpus": 8,
+        "mem_gb": 32,
+        "gpu": None,
+        "egress_gbps": 23,
+        "family": "c3",
+        "notes": "Sapphire Rapids; higher per-core bandwidth",
+    },
+    "a3-highgpu-1g": {
+        "vcpus": 26,
+        "mem_gb": 234,
+        "gpu": "H100 80GB x1",
+        "egress_gbps": 200,
+        "family": "a3",
+        "notes": "H100 GPU node; used for GPU cloud benchmarks + high-egress baseline",
+    },
+}
+
+
+def ensure_instance_region_matches_bucket(instance_region: str) -> None:
+    """Fail fast when the chosen VM region doesn't match the bucket region.
+
+    Cross-region reads from GCS incur per-GB egress charges that silently
+    dominate the benchmark budget, and they also invalidate comparisons
+    (network RTT + saturation differ). The launcher calls this before any
+    `gcloud compute instances create` invocation.
+    """
+    if instance_region != GCP_BUCKET_REGION:
+        raise RuntimeError(
+            f"GCP instance region {instance_region!r} does not match the "
+            f"configured bucket region {GCP_BUCKET_REGION!r}. Override "
+            f"GCP_BUCKET_REGION if the bucket has moved; do not run "
+            f"benchmarks cross-region (silent egress charges)."
+        )
+
+
 # Cloud layout suffixes per format. SCX uses the exploded ``.scxd/`` layout
 # on GCS (see docs/cloud.md); others keep their native directory suffix.
 _FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {

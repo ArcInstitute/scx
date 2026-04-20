@@ -44,6 +44,23 @@ def collect_system_info() -> dict[str, Any]:
     # Storage info (best-effort)
     info["storage"] = _get_storage_info()
 
+    # GCP compute-node matrix labels (Phase E). The launcher sets these env
+    # vars on each VM before invoking the benchmark so the emitted JSON
+    # self-labels with the instance type + region. Absent off-cloud, so
+    # local runs never carry stale GCP tags.
+    gcp_instance = os.environ.get("SCX_BENCH_GCP_INSTANCE")
+    gcp_region = os.environ.get("SCX_BENCH_GCP_REGION")
+    gcp_zone = os.environ.get("SCX_BENCH_GCP_ZONE")
+    if gcp_instance or gcp_region or gcp_zone:
+        gcp: dict[str, str] = {}
+        if gcp_instance:
+            gcp["instance_type"] = gcp_instance
+        if gcp_region:
+            gcp["region"] = gcp_region
+        if gcp_zone:
+            gcp["zone"] = gcp_zone
+        info["gcp"] = gcp
+
     return info
 
 
