@@ -189,6 +189,14 @@ GCP_PROJECT = os.environ.get("GCP_PROJECT", "c-tc-429521")
 # egress stays intra-region. Override via env if the bucket ever moves.
 GCP_BUCKET_REGION = os.environ.get("GCP_BUCKET_REGION", "us-central1")
 
+# Rolling-dashboard publish target (Phase G.4). When set, ``publish_dashboard.py``
+# rsyncs the HTML snapshot tree to this destination. Empty → the publish
+# script is a no-op (so CI can unconditionally invoke it). Typical values:
+#   rsync-over-SSH: "user@host:/var/www/scx-bench/"
+#   GCS:            "gs://my-bucket/scx-bench/" (requires gsutil, not rsync)
+# The publish script picks the protocol by URL prefix.
+DASHBOARD_PUBLISH_TARGET = os.environ.get("DASHBOARD_PUBLISH_TARGET", "").strip()
+
 # ---------------------------------------------------------------------------
 # GCP compute-node matrix (Phase E)
 # ---------------------------------------------------------------------------

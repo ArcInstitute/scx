@@ -1,0 +1,38 @@
+# Absolute-floor regression thresholds.
+#
+# Consumed by ``compare_against_baseline.py --gate --thresholds <this-file>``.
+# For each entry, the gate reads the named metric out of every run's
+# ``extra`` dict in ``<current_run>/raw/<benchmark>__<format>__<dataset>.json``,
+# takes the median across runs, and fails when the median is below ``min``
+# (or the metric is missing entirely).
+#
+# These floors are absolute — they don't depend on the baseline snapshot,
+# and they survive baseline promotion. Use them for hard contracts: "a
+# cloud push at or below 50 MB/s is a support incident regardless of the
+# prior snapshot's numbers." Relative-tolerance checks (the default diff)
+# remain the primary gate.
+#
+# Schema:
+#   absolute_floors:
+#     - benchmark: <benchmark name>   # matches the benchmark's result 'benchmark' field
+#       format:    <format key>       # e.g. scx_auto
+#       dataset:   <dataset name>
+#       metric:    <field name in runs[].extra>
+#       min:       <float>
+
+absolute_floors:
+  # Cloud push/pull throughput — migrated from the retired
+  # ``benchmark_cloud.py`` hardcoded ``_median(throughputs) > 50`` gate.
+  # The 50 MB/s floor is a "network path is healthy" check, not a
+  # performance target; a value below this indicates misconfiguration or
+  # a provider-side regression, not a tuning opportunity.
+  - benchmark: cloud_push
+    format: scx_auto
+    dataset: pbmc3k
+    metric: throughput_mbps
+    min: 50.0
+  - benchmark: cloud_pull
+    format: scx_auto
+    dataset: pbmc3k
+    metric: throughput_mbps
+    min: 50.0

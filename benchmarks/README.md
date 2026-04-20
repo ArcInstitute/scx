@@ -587,6 +587,154 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 
 ---
 
+## Regression Gating
+
+Regression gating is **on-demand, not scheduled**. No nightly cron runs —
+operators invoke the gate per PR, pre-release, or on suspicion of
+regression. No wasted compute when nothing has changed, and every gate
+result is tied to a specific commit the operator cares about.
+
+### On-demand workflow (one command)
+
+```bash
+bash benchmarks/comprehensive/scripts/gate_candidate.sh
+```
+
+That captures a snapshot named `candidate_<git-sha>_<YYYYMMDD>` at the
+`small` tier and runs the gate against `results/baselines/LATEST`
+(maintained by `promote_baseline.py`). Exit code bubbles up: `0` = pass,
+`1` = unjustified regression / floor violation / fingerprint mismatch,
+`2` = missing inputs.
+
+Common options:
+
+```bash
+# Larger tier (full dataset set)
+bash benchmarks/comprehensive/scripts/gate_candidate.sh --tier full
+
+# Reuse an already-captured candidate (skips the capture step)
+bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+    --skip-capture --name candidate_abc1234_20260420
+
+# Pin a specific historical baseline instead of LATEST
+bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+    --baseline benchmarks/comprehensive/results/baselines/v0.4.0
+
+# Anything after known flags is passed through to compare_against_baseline.py
+bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+    --timing-tolerance 0.05 --report-json /tmp/gate.json
+```
+
+**Recommended trigger points:**
+
+- Pre-PR: run on your topic branch before opening the PR.
+- Pre-merge: re-run on the merge candidate if CPU / memory-sensitive code changed.
+- Pre-release: run at the `xl` tier; promote the candidate as the new
+  baseline if the gate passes (see "Promoting" below).
+- On-suspicion: after a suspicious benchmark result, landed profiler
+  change, or upstream dependency bump.
+
+### Direct gate invocation (advanced)
+
+The wrapper is a thin convenience layer over
+`compare_against_baseline.py`; invoke it directly when you need finer
+control:
+
+```bash
+python benchmarks/comprehensive/scripts/compare_against_baseline.py \
+    --current benchmarks/comprehensive/results/candidate_$(date +%Y_%m_%d) \
+    --gate
+```
+
+Under `--gate`, these flags auto-default and can be omitted:
+- `--baseline` → `results/baselines/LATEST`
+- `--justifications` → `results/justifications/`
+- `--thresholds` → `benchmarks/comprehensive/thresholds.yaml`
+
+Override any of them by passing the flag explicitly. Without `--gate` the
+script stays in pure-diff mode — no justification or floor logic, no
+disappeared-benchmark flagging.
+
+Exit codes: `0` = pass, `1` = unjustified regression / floor violation /
+fingerprint mismatch, `2` = baseline or current directory missing or no
+canonical baseline promoted yet.
+
+### Promoting a canonical baseline
+
+Snapshots land in `benchmarks/comprehensive/results/<name>/` from
+`capture_baseline.py` (or via the `gate_candidate.sh` wrapper). To
+promote one as the canonical release baseline:
+
+```bash
+python benchmarks/comprehensive/scripts/promote_baseline.py \
+    --snapshot benchmarks/comprehensive/results/candidate_2026_04_18_batch_d_t3 \
+    --version v0.5.0-phase5
+```
+
+This copies only `summary.json` + `environment.json` + `MANIFEST.sha256`
+into `results/baselines/v0.5.0-phase5/`, and updates `results/baselines/LATEST`
+to point at the new version (relative symlink, pointer-file fallback on
+filesystems that reject symlinks). The gate's `--baseline` auto-resolves
+to `LATEST`, so no follow-up configuration is needed — next
+`gate_candidate.sh` run compares against the newly-promoted baseline.
+
+Raw per-run JSONs stay gitignored; the manifest provides tamper-evidence.
+Pass `--no-latest` to promote without touching the `LATEST` pointer
+(useful for backfilling historical baselines out-of-order).
+
+### Justification markdown format
+
+Add a new file under `benchmarks/comprehensive/results/justifications/`
+whenever a flagged regression has been investigated and deliberately
+accepted:
+
+```markdown
+---
+triples:
+  - benchmark: cloud_push
+    format: scx_auto
+    dataset: pbmc3k
+reason: Upstream gcsfs 2025.10.0 HTTP/2 header canonicalization (~4%).
+expires: 2026-06-01
+---
+
+One or more paragraphs of prose explaining the tradeoff. Shown in the
+gate's failure summary so reviewers see the reason inline.
+```
+
+`expires` is optional. When present and past `date.today()`, the
+justification stops suppressing and the gate fails again — forces
+periodic review. Multiple triples per file are fine; one file per PR is
+typical.
+
+### Rolling dashboard
+
+`write_report()` emits `BENCHMARK_REPORT.html` alongside the markdown
+report, with a "← previous snapshot" link threaded through
+`dashboard_history.json`. Publish to a static-hosting target via:
+
+```bash
+export DASHBOARD_PUBLISH_TARGET="user@host:/var/www/scx-bench/"   # or gs://bucket/path/
+python benchmarks/comprehensive/scripts/publish_dashboard.py
+```
+
+With `DASHBOARD_PUBLISH_TARGET` unset, the publish script is a no-op
+and exits 0 — safe for unconditional CI invocation.
+
+### Gate self-test
+
+A hermetic pytest suite validates every transition (regression fails,
+justification suppresses, expired justification stops suppressing,
+disappearing benchmarks flagged, absolute-floor violations fail):
+
+```bash
+.venv/bin/pytest benchmarks/comprehensive/tests/test_gate_self_test.py -v
+```
+
+Run it locally before opening a PR that touches the gate.
+
+---
+
 ## Individual Benchmark Scripts
 
 | Script | What it measures |

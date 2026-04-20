@@ -955,9 +955,11 @@ def _generate_pdf(md_path: Path, pdf_path: Path) -> Path:
 
 
 def write_report(output_dir: Path | None = None) -> Path:
-    """Generate and write the full benchmark report (markdown + PDF).
+    """Generate and write the full benchmark report (markdown + PDF + HTML).
 
-    Returns the path to the written markdown file.
+    Returns the path to the written markdown file. An HTML snapshot is
+    emitted alongside via ``write_html_snapshot`` (Phase G.4) so rolling-
+    dashboard navigation works without server-side state.
     """
     if output_dir is None:
         output_dir = REPORTS_DIR
@@ -972,4 +974,43 @@ def write_report(output_dir: Path | None = None) -> Path:
     pdf_path = output_dir / "BENCHMARK_REPORT.pdf"
     _generate_pdf(md_path, pdf_path)
 
+    # Emit HTML snapshot + append to dashboard history (Phase G.4).
+    try:
+        write_html_snapshot(report, output_dir)
+    except Exception as exc:  # noqa: BLE001 — snapshot is best-effort
+        logger.warning("HTML snapshot emission failed: %s", exc)
+
     return md_path
+
+
+def write_html_snapshot(
+    markdown_body: str,
+    output_dir: Path,
+    *,
+    title: str = "SCX Benchmark Report",
+) -> Path:
+    """Write a browsable HTML snapshot alongside the markdown report.
+
+    Records the snapshot's URL in ``dashboard_history.json`` so the next
+    snapshot can link back to it via "← previous snapshot". The URL is
+    the filename (relative to ``output_dir``); the static-hosting publish
+    step (``publish_dashboard.py``) preserves the same path structure so
+    relative links work unchanged on the published site.
+    """
+    from benchmarks.comprehensive.reporting import dashboard
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prev_url = dashboard.previous_url(output_dir)
+
+    html_body = dashboard.render_html(
+        markdown_body, title=title, prev_url=prev_url,
+    )
+    html_path = output_dir / "BENCHMARK_REPORT.html"
+    html_path.write_text(html_body)
+    logger.info("Wrote HTML snapshot to %s", html_path)
+
+    # Record this snapshot so the *next* render links back to it.
+    dashboard.append_history(
+        output_dir, url=html_path.name, title=title,
+    )
+    return html_path
