@@ -39,6 +39,8 @@ _CODEC_NAMES = {
 class ScxRunner(FormatRunner):
     """Benchmark runner for the SCX format with configurable codec."""
 
+    capabilities: frozenset[str] = frozenset({"filtered_query", "backed_mode"})
+
     def __init__(self, codec: str = "auto") -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
@@ -182,4 +184,60 @@ class ScxRunner(FormatRunner):
 
         _, timing = self.timed_run(_backed_slice)
         timing.extra = {"mode": "backed_slice", "start": start, "count": count}
+        return timing
+
+    # ------------------------------------------------------------------
+    # Filtered query via SCX catalog pushdown
+    # ------------------------------------------------------------------
+
+    def read_filtered_query(
+        self,
+        path: str | Path,
+        predicate,
+    ) -> TimingResult:
+        self._check_pyscx()
+        from benchmarks.comprehensive.queries import (
+            EqPredicate,
+            GtPredicate,
+            RandomSamplePredicate,
+        )
+
+        if isinstance(predicate, EqPredicate):
+            if isinstance(predicate.value, str):
+                expr = f"{predicate.column} == '{predicate.value}'"
+            else:
+                expr = f"{predicate.column} == {predicate.value}"
+        elif isinstance(predicate, GtPredicate):
+            expr = f"{predicate.column} > {predicate.threshold}"
+        elif isinstance(predicate, RandomSamplePredicate):
+            expr = None  # handled below — SCX has no SAMPLE pushdown
+        else:
+            raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
+
+        def _filtered():
+            ds = pyscx.open(str(path))
+            if expr is not None:
+                q = ds.query().filter_obs(expr)
+                _ = q.collect().to_csr()
+            else:
+                # Random-sample: materialize via backed index slicing. SCX's
+                # catalog pushdown doesn't support Bernoulli sampling, so
+                # the honest native mechanism is a random-index read.
+                import numpy as np
+
+                assert isinstance(predicate, RandomSamplePredicate)
+                n_obs = ds.n_obs
+                rng = np.random.default_rng(predicate.seed)
+                n_take = max(1, int(n_obs * predicate.fraction))
+                cell_idx = np.sort(rng.choice(n_obs, size=n_take, replace=False))
+                adata = ds.to_anndata(backed=True)
+                _ = adata.X[cell_idx]
+
+        _, timing = self.timed_run(_filtered)
+        timing.extra = {
+            "native_mechanism": "scx_pushdown"
+            if expr is not None
+            else "scx_backed_index",
+            "predicate": predicate.name,
+        }
         return timing

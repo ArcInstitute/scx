@@ -74,6 +74,14 @@ class FormatRunner(ABC):
     and cold-cache flushing.
     """
 
+    # Declared-capability manifest. ``read_selective.py`` and
+    # ``smoke_test_runners.py`` trust this set to decide whether a missing
+    # optional method is a feature gap (skip quietly) or a contract
+    # violation (fail loudly). Runners that advertise ``"filtered_query"``
+    # must implement ``read_filtered_query``; ``"backed_mode"`` requires
+    # ``read_backed`` + ``read_backed_slice``.
+    capabilities: frozenset[str] = frozenset()
+
     # ------------------------------------------------------------------
     # Identity
     # ------------------------------------------------------------------
@@ -182,6 +190,35 @@ class FormatRunner(ABC):
         TimingResult
         """
         raise NotImplementedError(f"{self.name} does not support backed row slices")
+
+    def read_filtered_query(
+        self,
+        path: str | Path,
+        predicate: "Predicate",
+    ) -> TimingResult:
+        """Execute a format-native filtered query against obs/var metadata.
+
+        A runner that advertises ``"filtered_query"`` in its ``capabilities``
+        set must override this method; the default raises so
+        ``read_selective.py`` can flag a contract violation instead of
+        silently skipping.
+
+        Parameters
+        ----------
+        path : format-specific path
+        predicate : one of the ``Predicate`` subclasses declared in
+            ``benchmarks.comprehensive.queries``.
+
+        Returns
+        -------
+        TimingResult
+            Timing for the native filtered read. The ``extra`` dict should
+            include ``"native_mechanism"`` (e.g. ``"scx_pushdown"``,
+            ``"slaf_sql"``) so reporting can group apples-to-apples.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_filtered_query"
+        )
 
     # ------------------------------------------------------------------
     # Shared helpers

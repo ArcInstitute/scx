@@ -30,7 +30,8 @@ benchmarks/
 │   ├── envs/                            # Conda environment definitions
 │   │   ├── scx-bench.yml                # CPU benchmark environment
 │   │   ├── scx-bench-gpu.yml            # GPU benchmark environment (CUDA + RAPIDS)
-│   │   └── scx-bench-r.yml             # R / BPCells benchmark environment
+│   │   ├── scx-bench-r.yml              # R / BPCells benchmark environment
+│   │   └── scx-bench-slaf.yml           # SLAF (slafdb) benchmark environment
 │   ├── runners/                         # Per-format benchmark runners
 │   │   ├── base.py                      # Abstract FormatRunner interface
 │   │   ├── h5ad_runner.py               # h5ad (uncompressed, gzip, lzf)
@@ -150,6 +151,7 @@ The comprehensive benchmark suite uses **isolated conda environments** for repro
 | `scx-bench` | CPU benchmarks: format comparisons, accelerators, lazy preprocessing, correctness validation, ML loaders | All Python deps + PyTorch (CPU) |
 | `scx-bench-gpu` | GPU benchmarks: CUDA-accelerated PCA, kNN, UMAP, Leiden, fused preprocessing | Extends CPU deps with `cuda-version`, `cuvs`, `cugraph`, PyTorch (CUDA) |
 | `scx-bench-r` | BPCells benchmarks | R, Matrix, HDF5, BPCells (from GitHub) |
+| `scx-bench-slaf` | SLAF (slafdb) benchmarks — DuckDB/Lance backend conflicts with the main env's pins, so SLAF runs alone | `slafdb`, Polars, DuckDB, Lance (pip), PyTorch (CPU) for SLAFDataLoader |
 
 ### Setup
 

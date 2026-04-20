@@ -57,7 +57,16 @@ def run(
     backed_checks = validate_backed_equivalence.run_all_checks(dataset.name)
     preproc_checks = validate_preprocessing_paths.run_all_checks(dataset.name)
 
-    all_checks = scanpy_checks + backed_checks + preproc_checks
+    # SLAF round-trip parity — skipped if slafdb is not installed in this env.
+    slaf_checks = []
+    try:
+        from benchmarks.comprehensive.scripts import validate_slaf_equivalence
+
+        slaf_checks = validate_slaf_equivalence.run_all_checks(dataset.name)
+    except ImportError as e:
+        logger.info("Skipping SLAF round-trip checks: %s", e)
+
+    all_checks = scanpy_checks + backed_checks + preproc_checks + slaf_checks
 
     n_passed = sum(1 for c in all_checks if c.passed and c.error is None)
     n_failed = sum(1 for c in all_checks if not c.passed and c.error is None)
@@ -78,6 +87,7 @@ def run(
                 "scanpy_equivalence": [c.to_dict() for c in scanpy_checks],
                 "backed_equivalence": [c.to_dict() for c in backed_checks],
                 "preprocessing_paths": [c.to_dict() for c in preproc_checks],
+                "slaf_equivalence": [c.to_dict() for c in slaf_checks],
             },
         },
     )

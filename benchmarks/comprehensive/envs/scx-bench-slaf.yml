@@ -1,0 +1,42 @@
+# SCX Comprehensive Benchmark Suite — SLAF Environment
+#
+# Isolated env for SLAF (slafdb) runner: DuckDB/Lance backend conflicts with
+# tiledbsoma/zarr pins in the main scx-bench env, so SLAF lives alone.
+#
+# Create:   conda env create -f benchmarks/comprehensive/envs/scx-bench-slaf.yml
+# Activate: conda activate scx-bench-slaf
+# Build pyscx (needed for cross-format benchmarks that invoke pyscx):
+#           cd pyscx && maturin develop --release && cd ..
+
+name: scx-bench-slaf
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.13
+
+  # Core single-cell stack (shared with scx-bench for cross-format parity)
+  - anndata=0.12.7
+  - scanpy=1.12
+  - scipy=1.16.3
+  - numpy=2.2.0
+  - pandas=2.3.3
+  - h5py=3.16.0
+  - pyarrow=23.0.1
+
+  # Benchmark orchestration
+  - psutil=7.2.2
+  - maturin>=1.5.0
+
+  # PyTorch (CPU-only — for SLAFDataLoader ml_loader scenarios)
+  - pytorch-cpu>=2.0
+
+  # pip-only packages
+  - pip:
+    - submitit>=1.5.0
+    # SLAF = slafdb on PyPI. 0.5.2 is the Phase-A validated pin (2026-04-15).
+    - slafdb==0.5.2
+    # DuckDB + polars + lance come in as slafdb transitive deps; let the pin
+    # resolve rather than double-pinning here.

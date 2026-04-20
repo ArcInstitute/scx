@@ -92,6 +92,10 @@ class DatasetConfig:
     def parquet_path(self) -> Path:
         return DATA_DIR / f"{self.name}.parquet"
 
+    @property
+    def slaf_path(self) -> Path:
+        return DATA_DIR / f"{self.name}.slaf"
+
     # Per-codec SCX paths for benchmark isolation
     @property
     def scx_auto_path(self) -> Path:
@@ -140,6 +144,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_pcodec": "scx_pcodec_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
+    "slaf": "slaf_path",
 }
 
 
@@ -288,6 +293,7 @@ PRIMARY_FORMATS: list[FormatVariant] = [
                   {"codec": "lz4"}),
     FormatVariant("SCX (pcodec)", "scx_pcodec", "primary", "scx_runner",
                   {"codec": "pcodec"}),
+    FormatVariant("SLAF", "slaf", "primary", "slaf_runner"),
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [

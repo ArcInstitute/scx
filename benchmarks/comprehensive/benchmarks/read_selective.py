@@ -29,11 +29,52 @@ from benchmarks.comprehensive.config import (
     QUERY_N_HVGS,
     RANDOM_SEED,
 )
+from benchmarks.comprehensive.queries import default_predicates
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.runners import make_runner
 from benchmarks.comprehensive.runners.base import FormatRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _obs_columns(dataset: DatasetConfig) -> set[str]:
+    """Return the obs column set for a dataset without loading X."""
+    import anndata
+
+    try:
+        adata = anndata.read_h5ad(dataset.h5ad_path, backed="r")
+        cols = set(adata.obs.columns)
+        adata.file.close()
+        return cols
+    except Exception:  # noqa: BLE001 — dataset missing / unreadable
+        return set()
+
+
+def _applicable_predicates(dataset: DatasetConfig):
+    """Filter ``default_predicates`` to those whose columns exist on *dataset*.
+
+    ``RandomSamplePredicate`` has no column requirement and always applies.
+    """
+    from benchmarks.comprehensive.queries import (
+        EqPredicate,
+        GtPredicate,
+        RandomSamplePredicate,
+    )
+
+    cols = _obs_columns(dataset)
+    out = []
+    for pred in default_predicates():
+        if isinstance(pred, RandomSamplePredicate):
+            out.append(pred)
+        elif isinstance(pred, (EqPredicate, GtPredicate)):
+            if pred.column in cols:
+                out.append(pred)
+            else:
+                logger.info(
+                    "Skipping predicate %s — obs column %r absent in %s",
+                    pred.name, pred.column, dataset.name,
+                )
+    return out
 
 
 def _generate_indices(
@@ -165,24 +206,37 @@ def run(
                     peak_rss_mb=tr.peak_rss_mb, scenario=scenario_name,
                 )
 
-        try:
-            read_filtered = getattr(runner, "read_filtered_query", None)
-            if read_filtered is not None:
-                scenario_times["filtered_query"] = []
+        # -- Filtered-query scenarios (capability-gated) --
+        declares_fq = "filtered_query" in runner.capabilities
+        if declares_fq:
+            predicates = _applicable_predicates(dataset)
+            for predicate in predicates:
+                scen_key = f"filtered_query__{predicate.name}"
+                scenario_times[scen_key] = []
                 for i in range(n_runs):
                     if cold_cache:
                         FormatRunner._drop_caches()
-                    logger.info("  filtered_query run %d/%d", i + 1, n_runs)
-                    tr = read_filtered(
-                        output_path, cell_indices=cell_idx, gene_indices=gene_idx,
+                    logger.info(
+                        "  %s run %d/%d (%s)",
+                        scen_key, i + 1, n_runs, predicate.describe(),
                     )
-                    scenario_times["filtered_query"].append(tr.wall_s)
+                    # Capability is declared, so a failure here is a contract
+                    # violation — let it propagate.
+                    tr = runner.read_filtered_query(output_path, predicate)
+                    scenario_times[scen_key].append(tr.wall_s)
+                    extra = tr.extra or {}
                     result.add_run(
                         wall_s=tr.wall_s, user_s=tr.user_s, sys_s=tr.sys_s,
-                        peak_rss_mb=tr.peak_rss_mb, scenario="filtered_query",
+                        peak_rss_mb=tr.peak_rss_mb,
+                        scenario=scen_key,
+                        predicate=predicate.name,
+                        native_mechanism=extra.get("native_mechanism", "unknown"),
                     )
-        except (NotImplementedError, TypeError):
-            logger.info("  filtered_query not supported for %s, skipping", format_variant.key)
+        else:
+            logger.info(
+                "  filtered_query not advertised by %s (capabilities=%s), skipping",
+                format_variant.key, sorted(runner.capabilities),
+            )
     finally:
         if _cleanup is not None:
             _cleanup.cleanup()
