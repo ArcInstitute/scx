@@ -312,7 +312,7 @@ def run(
     # not have to aggregate from per-run records.
     import statistics
 
-    per_op: dict[str, dict[str, float]] = {}
+    per_op: dict[str, dict[str, list[float]]] = {}
     for run_rec in result.runs:
         op = run_rec.extra.get("operation")
         if not op:
