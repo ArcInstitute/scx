@@ -45,6 +45,7 @@ class SlafRunner(FormatRunner):
         "filtered_query",
         "cloud_read",
         "cloud_subset",
+        "cloud_filtered",
     })
 
     @property
@@ -219,17 +220,15 @@ class SlafRunner(FormatRunner):
     # Filtered query (SQL pushdown)
     # ------------------------------------------------------------------
 
-    def read_filtered_query(
-        self,
-        path: str | Path,
-        predicate: "Predicate",
-    ) -> TimingResult:
-        """Execute ``predicate`` via a SQL ``WHERE`` against SLAF's cells table.
+    @staticmethod
+    def _predicate_to_cells_sql(predicate: "Predicate") -> tuple[str, str]:
+        """Return ``(cells_sql, mechanism_tag)`` for the given predicate.
 
-        The resulting cell ids feed a submatrix fetch so the timing reflects
-        end-to-end pushdown, not just predicate evaluation.
+        The ``cells_sql`` selects ``cell_integer_id`` for the matching rows;
+        the caller then materializes the expression slice. ``stride_hash`` is
+        tagged separately from ``sql`` because it's a congruence-class filter
+        (every Nth cell), not a true random sample.
         """
-        self._require_slaf()
         from benchmarks.comprehensive.queries import (
             EqPredicate,
             GtPredicate,
@@ -237,58 +236,52 @@ class SlafRunner(FormatRunner):
             sql_literal,
         )
 
-        # Resolve the native-mechanism label up front so the ``extra`` dict
-        # below reflects what the timing actually measured. ``slaf_stride_hash``
-        # is deliberately distinct from ``slaf_sql`` because the random-sample
-        # path is a congruence class (every Nth cell), not Bernoulli sampling
-        # or a WHERE predicate.
+        if isinstance(predicate, EqPredicate):
+            return (
+                "SELECT cell_integer_id FROM cells "
+                f"WHERE {predicate.column} = {sql_literal(predicate.value)}"
+            ), "sql"
+        if isinstance(predicate, GtPredicate):
+            return (
+                "SELECT cell_integer_id FROM cells "
+                f"WHERE {predicate.column} > {predicate.threshold}"
+            ), "sql"
         if isinstance(predicate, RandomSamplePredicate):
-            mechanism = "slaf_stride_hash"
-        else:
-            mechanism = "slaf_sql"
+            # Polars-SQL doesn't expose DuckDB's SAMPLE clause via
+            # SLAFArray.query — emulate with a stride-hash filter on
+            # cell_integer_id. Selects a single congruence class
+            # (every Nth cell at a fixed offset), NOT a Bernoulli sample.
+            modulus = max(int(1 / predicate.fraction), 2)
+            target = (predicate.seed * 2654435761) % modulus
+            return (
+                "SELECT cell_integer_id FROM cells "
+                f"WHERE (cell_integer_id % {modulus}) = {target}"
+            ), "stride_hash"
+        raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
+
+    def _run_filtered_query(
+        self,
+        uri: str,
+        predicate: "Predicate",
+        mechanism_prefix: str,
+    ) -> TimingResult:
+        """Execute ``predicate`` against ``uri`` (local path or gs:// URL).
+
+        Shared implementation for both ``read_filtered_query`` and
+        ``read_cloud_filtered_query``. Resolves the predicate to a set of
+        cell_integer_ids then materializes the matching expression slice —
+        mirrors the ``read_subset`` path and sidesteps ``get_submatrix``
+        (which rejects string cell_id lists).
+        """
+        sql_cells, base_tag = self._predicate_to_cells_sql(predicate)
+        mechanism = f"{mechanism_prefix}{base_tag}"
 
         def _filtered() -> None:
-            slaf_array = self._open_array(path)
-            # Resolve the predicate to a set of cell_integer_ids in one
-            # SQL roundtrip, then materialize the matching expression
-            # records with a second SQL query joined on that set. This
-            # mirrors the ``read_subset`` path and sidesteps SLAF's
-            # ``get_submatrix`` (which doesn't accept string cell_id
-            # lists).
-            if isinstance(predicate, EqPredicate):
-                sql_cells = (
-                    "SELECT cell_integer_id FROM cells "
-                    f"WHERE {predicate.column} = {sql_literal(predicate.value)}"
-                )
-            elif isinstance(predicate, GtPredicate):
-                sql_cells = (
-                    "SELECT cell_integer_id FROM cells "
-                    f"WHERE {predicate.column} > {predicate.threshold}"
-                )
-            elif isinstance(predicate, RandomSamplePredicate):
-                # Polars-SQL doesn't expose DuckDB's SAMPLE clause via
-                # ``SLAFArray.query`` — emulate with a stride-hash filter on
-                # cell_integer_id. This selects a single congruence class
-                # (every Nth cell at a fixed offset), NOT a Bernoulli sample;
-                # the mechanism is tagged ``slaf_stride_hash`` so reports can
-                # distinguish it from true random-sample paths.
-                modulus = max(int(1 / predicate.fraction), 2)
-                # (seed * 2654435761) mod modulus — Knuth multiplicative
-                # constant; selects the bucket offset from the seed.
-                target = (predicate.seed * 2654435761) % modulus
-                sql_cells = (
-                    "SELECT cell_integer_id FROM cells "
-                    f"WHERE (cell_integer_id % {modulus}) = {target}"
-                )
-            else:  # pragma: no cover — exhaustive
-                raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
-
+            slaf_array = SLAFArray(uri)
             cell_rows = slaf_array.query(sql_cells)
             ids = cell_rows["cell_integer_id"].to_list()
             if not ids:
-                return  # No matching cells — empty read
-
-            # Materialize the expression slice (long form).
+                return
             ids_csv = ",".join(str(int(i)) for i in ids)
             sql_expr = (
                 "SELECT cell_integer_id, gene_integer_id, value "
@@ -302,6 +295,19 @@ class SlafRunner(FormatRunner):
             "predicate": predicate.name,
         }
         return timing
+
+    def read_filtered_query(
+        self,
+        path: str | Path,
+        predicate: "Predicate",
+    ) -> TimingResult:
+        """Execute ``predicate`` via a SQL ``WHERE`` against SLAF's cells table.
+
+        The resulting cell ids feed a submatrix fetch so the timing reflects
+        end-to-end pushdown, not just predicate evaluation.
+        """
+        self._require_slaf()
+        return self._run_filtered_query(str(path), predicate, "slaf_")
 
     # ------------------------------------------------------------------
     # Cloud operations (Phase C — SLAF opens cloud URIs via its
@@ -318,7 +324,11 @@ class SlafRunner(FormatRunner):
             _ = adata.X
 
         _, timing = self.timed_run(_read)
-        timing.extra = {"provider": "gcs", "native_mechanism": "slaf_cloud"}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "slaf_cloud",
+            "telemetry": "phase_f_deferred",
+        }
         return timing
 
     def read_cloud_subset(
@@ -380,7 +390,11 @@ class SlafRunner(FormatRunner):
             ).tocsr()
 
         _, timing = self.timed_run(_subset)
-        timing.extra = {"provider": "gcs", "native_mechanism": "slaf_cloud_sql"}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "slaf_cloud_sql",
+            "telemetry": "phase_f_deferred",
+        }
         return timing
 
     def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
@@ -392,5 +406,31 @@ class SlafRunner(FormatRunner):
             _ = arr.shape
 
         _, timing = self.timed_run(_open)
-        timing.extra = {"provider": "gcs", "native_mechanism": "slaf_open"}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "slaf_open",
+            "telemetry": "phase_f_deferred",
+        }
+        return timing
+
+    def read_cloud_filtered_query(
+        self,
+        cloud_url: str,
+        predicate: "Predicate",
+    ) -> TimingResult:
+        """Execute ``predicate`` against a SLAF array opened from a cloud URL.
+
+        Mirrors ``read_filtered_query`` but opens the array from the GCS URI.
+        SLAF's DuckDB backend resolves object-store reads transparently —
+        mechanism tag is ``slaf_cloud_sql`` / ``slaf_cloud_stride_hash`` so
+        reports distinguish cloud-pushed queries from local ones.
+        """
+        self._require_slaf()
+        timing = self._run_filtered_query(cloud_url, predicate, "slaf_cloud_")
+        extra = timing.extra or {}
+        extra.update({
+            "provider": "gcs",
+            "telemetry": "phase_f_deferred",
+        })
+        timing.extra = extra
         return timing

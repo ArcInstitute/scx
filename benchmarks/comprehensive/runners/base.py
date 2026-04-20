@@ -82,7 +82,7 @@ class FormatRunner(ABC):
     # ``read_backed`` + ``read_backed_slice``. Cloud capabilities:
     # ``"cloud_read"`` → ``read_cloud``; ``"cloud_subset"`` →
     # ``read_cloud_subset``; ``"cloud_push"`` → ``push``; ``"cloud_pull"``
-    # → ``pull``.
+    # → ``pull``; ``"cloud_filtered"`` → ``read_cloud_filtered_query``.
     capabilities: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
@@ -257,6 +257,36 @@ class FormatRunner(ABC):
         """
         raise NotImplementedError(
             f"{self.name} does not support pull"
+        )
+
+    def read_cloud_filtered_query(
+        self,
+        cloud_url: str,
+        predicate: "Predicate",
+    ) -> TimingResult:
+        """Execute a format-native filtered query against a cloud URI.
+
+        A runner that advertises ``"cloud_filtered"`` in its ``capabilities``
+        set must override this method. The default raises so
+        ``cloud_filtered.py`` can flag a contract violation instead of
+        silently skipping.
+
+        Parameters
+        ----------
+        cloud_url : GCS URI (e.g. ``gs://arc-ctc-nextflow/scx-test/pbmc3k.soma/``)
+        predicate : one of the ``Predicate`` subclasses declared in
+            ``benchmarks.comprehensive.queries``.
+
+        Returns
+        -------
+        TimingResult
+            Timing for the native filtered cloud read. The ``extra`` dict
+            should include ``"provider"`` (``"gcs"``), ``"native_mechanism"``
+            (e.g. ``"tiledb_cloud_value_filter"``, ``"slaf_cloud_sql"``,
+            ``"scx_pull_and_filter"``), and ``"predicate"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_cloud_filtered_query"
         )
 
     def read_filtered_query(

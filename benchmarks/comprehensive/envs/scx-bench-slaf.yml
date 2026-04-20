@@ -26,6 +26,10 @@ dependencies:
   - h5py=3.16.0
   - pyarrow=23.0.1
 
+  # Cloud object-store (SLAF DuckDB cloud path + anndata async store)
+  - fsspec=2025.9.0
+  - gcsfs=2025.9.0
+
   # Benchmark orchestration
   - psutil=7.2.2
   - maturin>=1.5.0

@@ -26,6 +26,7 @@ from benchmarks.comprehensive.reporting.tables import (
     compression_ratio_table,
     scx_parallel_write_callout_table,
     datasets_table,
+    cloud_filtered_table,
     fragment_ops_table,
     harmony_scaling_table,
     harmony_validation_table,
@@ -349,6 +350,36 @@ their formats.
 - `rollback` is a single root-catalog `pwrite()` and should be
   near-instant at any scale; a regression here indicates manifest-load
   bloat.
+""")
+
+    # -----------------------------------------------------------------------
+    # 8c. Cloud Query Parity (cross-format GCS filtered reads)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8c. Cloud Query Parity (GCS)
+
+The same standardized predicate set (`cell_type == "T cell"`,
+`n_counts > 1000`, `random 1% sample`) executed directly against GCS for
+every format that declares the `cloud_filtered` capability. Each cell
+shows median wall-clock with p95 in parentheses over n runs.
+
+Runners declare the capability only if they can push the predicate
+through natively: SCX pulls then applies catalog-pushdown locally
+(`scx_pull_and_filter` — Phase F.1 adds a native cloud-pushdown
+variant); TileDB-SOMA uses `AxisQuery(value_filter=...)` on the
+`Experiment.open(gs://…)` handle (`tiledb_cloud_value_filter`); SLAF
+issues the SQL ``WHERE`` against its cloud-backed DuckDB engine
+(`slaf_cloud_sql`). Zarr variants (`zarr_zstd`, `zarr_lz4`,
+`anndata_zarr_backed`) do not declare the capability — the raw-CSR
+converters don't preserve obs metadata, so they are omitted from this
+table rather than silently skipped as dashes.
+
+Bytes-transferred and GET-count columns are deferred to Phase F.2 when
+the object-store telemetry shim lands.
+
+{cloud_filtered_table()}
 """)
 
     # -----------------------------------------------------------------------

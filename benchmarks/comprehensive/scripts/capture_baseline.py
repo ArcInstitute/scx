@@ -125,6 +125,7 @@ BENCHMARKS = [
     "cloud_pull",
     "cloud_read",
     "cloud_metadata",
+    "cloud_filtered",
 ]
 
 

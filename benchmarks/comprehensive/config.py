@@ -121,6 +121,10 @@ class DatasetConfig:
     def scx_pcodec_path(self) -> Path:
         return DATA_DIR / f"{self.name}_pcodec.scx"
 
+    @property
+    def anndata_zarr_backed_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_anndata.zarr"
+
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key."""
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
@@ -167,6 +171,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
+    "anndata_zarr_backed": "anndata_zarr_backed_path",
 }
 
 
@@ -197,6 +202,7 @@ _FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
     "zarr_lz4": ".zarr",
     "tiledb_soma": ".soma",
     "slaf": ".slaf",
+    "anndata_zarr_backed": "_anndata.zarr",
 }
 
 

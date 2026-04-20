@@ -46,6 +46,7 @@ class ScxRunner(FormatRunner):
         "cloud_subset",
         "cloud_push",
         "cloud_pull",
+        "cloud_filtered",
     })
 
     def __init__(self, codec: str = "auto") -> None:
@@ -321,6 +322,7 @@ class ScxRunner(FormatRunner):
         timing.extra = {
             "provider": "gcs",
             "native_mechanism": "scx_pull_and_read",
+            "telemetry": "phase_f_deferred",
         }
         return timing
 
@@ -361,6 +363,7 @@ class ScxRunner(FormatRunner):
         timing.extra = {
             "provider": "gcs",
             "native_mechanism": "scx_pull_and_subset",
+            "telemetry": "phase_f_deferred",
         }
         return timing
 
@@ -385,5 +388,47 @@ class ScxRunner(FormatRunner):
         timing.extra = {
             "provider": "gcs",
             "native_mechanism": "scx_open_cloud",
+            "telemetry": "phase_f_deferred",
+        }
+        return timing
+
+    def read_cloud_filtered_query(
+        self,
+        cloud_url: str,
+        predicate,
+    ) -> TimingResult:
+        """Pull the dataset then apply the predicate locally.
+
+        SCX's catalog-pushdown filter is designed for local reads; pushing
+        predicates through a range-read on ``pyscx.open_cloud`` is explicitly
+        scoped to Phase F.1. For Phase D.4 parity, the benchmark measures
+        the honest end-to-end wall-clock a user would see today: pull then
+        local filter. Mechanism tag ``scx_pull_and_filter`` distinguishes
+        this from the future native-pushdown variant.
+        """
+        import tempfile
+
+        self._check_pyscx()
+
+        def _pull_and_filter():
+            with tempfile.TemporaryDirectory(prefix="scx_cloud_filter_") as tmp:
+                local = os.path.join(tmp, "pulled.scx")
+                pyscx.pull(cloud_url, local)
+                # Re-enter the local filtered_query via ``self`` so mechanism
+                # tagging and error-handling stay centralized.
+                local_timing = self.read_filtered_query(local, predicate)
+
+            return local_timing
+
+        local_timing, timing = self.timed_run(_pull_and_filter)
+        # The timing returned by timed_run covers pull+filter; the inner
+        # local_timing is informational. Carry the predicate name through.
+        local_extra = local_timing.extra or {}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_pull_and_filter",
+            "predicate": local_extra.get("predicate", predicate.name),
+            "inner_filter_wall_s": round(local_timing.wall_s, 6),
+            "telemetry": "phase_f_deferred",
         }
         return timing

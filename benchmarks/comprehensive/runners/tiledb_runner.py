@@ -34,6 +34,7 @@ class TileDBRunner(FormatRunner):
         "filtered_query",
         "cloud_read",
         "cloud_subset",
+        "cloud_filtered",
     })
 
     @property
@@ -129,12 +130,15 @@ class TileDBRunner(FormatRunner):
     # Filtered query via TileDB-SOMA ``AxisQuery.value_filter``
     # ------------------------------------------------------------------
 
-    def read_filtered_query(
-        self,
-        path: str | Path,
-        predicate,
-    ) -> TimingResult:
-        _require_tiledbsoma()
+    @staticmethod
+    def _predicate_to_value_filter(predicate) -> tuple[str | None, str]:
+        """Translate a ``Predicate`` into a ``(value_filter, mechanism_tag)``.
+
+        ``value_filter`` is ``None`` for random-sample predicates, which must
+        fall back to coord-based selection since SOMA exposes no sampling
+        primitive. Callers run the coord fallback with the returned mechanism
+        tag (``"tiledb_random_coords"``).
+        """
         from benchmarks.comprehensive.queries import (
             EqPredicate,
             GtPredicate,
@@ -143,27 +147,43 @@ class TileDBRunner(FormatRunner):
         )
 
         if isinstance(predicate, EqPredicate):
-            value_filter = f"{predicate.column} == {sql_literal(predicate.value)}"
-            mechanism = "tiledb_value_filter"
-        elif isinstance(predicate, GtPredicate):
-            value_filter = f"{predicate.column} > {predicate.threshold}"
-            mechanism = "tiledb_value_filter"
-        elif isinstance(predicate, RandomSamplePredicate):
-            # SOMA has no sampling predicate; fall back to coord selection.
-            value_filter = None
-            mechanism = "tiledb_random_coords"
-        else:
-            raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
+            return (
+                f"{predicate.column} == {sql_literal(predicate.value)}",
+                "tiledb_value_filter",
+            )
+        if isinstance(predicate, GtPredicate):
+            return (
+                f"{predicate.column} > {predicate.threshold}",
+                "tiledb_value_filter",
+            )
+        if isinstance(predicate, RandomSamplePredicate):
+            return None, "tiledb_random_coords"
+        raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
+
+    def _run_filtered_query(
+        self,
+        uri: str,
+        predicate,
+        mechanism_prefix: str,
+    ) -> TimingResult:
+        """Execute ``predicate`` against ``uri`` (local path or gs:// URL).
+
+        Shared implementation used by both ``read_filtered_query`` and
+        ``read_cloud_filtered_query`` — the only difference between those two
+        is the mechanism tag (``tiledb_`` vs ``tiledb_cloud_``), so hoisting
+        the body into one place keeps the two surfaces honest.
+        """
+        from benchmarks.comprehensive.queries import RandomSamplePredicate
+
+        value_filter, base_mechanism = self._predicate_to_value_filter(predicate)
+        mechanism = base_mechanism.replace("tiledb_", mechanism_prefix, 1)
 
         def _filtered():
-            with tiledbsoma.Experiment.open(str(path)) as exp:
+            with tiledbsoma.Experiment.open(uri) as exp:
                 if value_filter is not None:
                     obs_query = tiledbsoma.AxisQuery(value_filter=value_filter)
                 else:
-                    import numpy as np
-
                     assert isinstance(predicate, RandomSamplePredicate)
-                    # Select coords: we need the obs domain to sample from.
                     obs_df = exp.obs.read().concat().to_pandas()
                     n_obs = len(obs_df)
                     rng = np.random.default_rng(predicate.seed)
@@ -184,6 +204,14 @@ class TileDBRunner(FormatRunner):
         }
         return timing
 
+    def read_filtered_query(
+        self,
+        path: str | Path,
+        predicate,
+    ) -> TimingResult:
+        _require_tiledbsoma()
+        return self._run_filtered_query(str(path), predicate, "tiledb_")
+
     # ------------------------------------------------------------------
     # Cloud operations (Phase C — TileDB-SOMA opens gs:// URIs natively
     # when the environment has the tiledb VFS GCS plugin available)
@@ -199,7 +227,11 @@ class TileDBRunner(FormatRunner):
                 _ = adata.X
 
         _, timing = self.timed_run(_read)
-        timing.extra = {"provider": "gcs", "native_mechanism": "soma_open_gs"}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "soma_open_gs",
+            "telemetry": "phase_f_deferred",
+        }
         return timing
 
     def read_cloud_subset(
@@ -227,7 +259,11 @@ class TileDBRunner(FormatRunner):
                     X.toarray()
 
         _, timing = self.timed_run(_subset)
-        timing.extra = {"provider": "gcs", "native_mechanism": "soma_axis_query_gs"}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "soma_axis_query_gs",
+            "telemetry": "phase_f_deferred",
+        }
         return timing
 
     def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
@@ -242,5 +278,30 @@ class TileDBRunner(FormatRunner):
                 _ = exp.ms["RNA"].var.count
 
         _, timing = self.timed_run(_open)
-        timing.extra = {"provider": "gcs", "native_mechanism": "soma_open_gs"}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "soma_open_gs",
+            "telemetry": "phase_f_deferred",
+        }
+        return timing
+
+    def read_cloud_filtered_query(
+        self,
+        cloud_url: str,
+        predicate,
+    ) -> TimingResult:
+        """Execute ``predicate`` via ``AxisQuery.value_filter`` on a cloud URI.
+
+        Opens ``tiledbsoma.Experiment.open(cloud_url)`` and pushes the
+        predicate down through SOMA's native value-filter surface — same
+        code path as the local variant, just with the GCS-opened handle.
+        """
+        _require_tiledbsoma()
+        timing = self._run_filtered_query(cloud_url, predicate, "tiledb_cloud_")
+        extra = timing.extra or {}
+        extra.update({
+            "provider": "gcs",
+            "telemetry": "phase_f_deferred",
+        })
+        timing.extra = extra
         return timing
