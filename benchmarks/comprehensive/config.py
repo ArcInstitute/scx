@@ -427,6 +427,14 @@ def estimate_memory_gb(
     elif benchmark == "compression":
         # Just measures file sizes — Python overhead only.
         peak_mb = base_mb * 0.25
+    elif benchmark == "fragment_ops":
+        # SCX-only. pyscx.append reads the entire input CSR into memory
+        # (indptr + indices + decoded values) before re-encoding into the
+        # target file — dominant footprint is ~sparse-CSR-sized working
+        # buffers, not the dense matrix. Also needs scratch room for a few
+        # on-disk copies of the base file (for per-run isolation), but those
+        # are SCX-compressed and << dense_mb.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     else:
         peak_mb = base_mb
 

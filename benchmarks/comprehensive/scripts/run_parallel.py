@@ -69,6 +69,7 @@ BENCHMARK_NAMES = [
     "parallel_scaling",
     "parallel_write_scaling",
     "memory",
+    "fragment_ops",
 ]
 
 # Benchmarks that work from h5ad source and don't need pre-converted files.

@@ -30,6 +30,18 @@ via `_dir_size`. See `benchmarks/comprehensive/results/raw/compression__slaf__ce
 
 SCX is the fastest reader at census scale — **1.5x faster than Zarr**, **2.1x faster than uncompressed h5ad**, **17.7x faster than gzip h5ad**, and **19.3x faster than SLAF** on 1M cells. Parallel read scaling: up to **7x** at 32 threads. The SLAF full-read path (`LazyAnnData.compute()`) goes through Polars fragment processing to build the CSR — competitive for predicate-selective reads but heavy for "load everything" at census scale.
 
+## Read Scaling (parallel shard decode)
+
+SCX parallelizes shard decoding via rayon. Full load, 32 threads vs 1 thread:
+
+| Dataset | SCX (auto) | Speedup | Zarr (lz4) | h5ad |
+|---------|-----------|---------|------------|------|
+| Census 500K | 1.5s | **6.3x** | 2.0s (1.0x) | no scaling |
+| Census 1M | 3.0s | **6.1x** | 3.7s (1.0x) | no scaling |
+| Census 5M | 37.5s | **3.1x** | 89.6s (1.0x) | no scaling |
+
+No other format scales full-read throughput with threads: h5py holds a global lock, Zarr's chunk reads are I/O-bound on local/HPC filesystems, and TileDB-SOMA's fragment-based reads don't benefit from additional threads at these sizes.
+
 ## Conversion (h5ad → format)
 
 End-to-end write time (in-memory AnnData → target format) and peak RSS during the write. Single-threaded, 3 runs median, median wall / max peak RSS reported.

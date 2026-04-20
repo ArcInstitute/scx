@@ -504,6 +504,8 @@ No pre-built binaries are distributed — Cargo builds all SCX crates from sourc
 
 ## Quick Start
 
+For an end-to-end walkthrough, see the [scanpy tutorial notebook](notebooks/scx_scanpy_tutorial.ipynb).
+
 ### Convert your data to SCX
 
 SCX supports **roundtrip conversion** with h5ad, 10x HDF5, and Cell Ranger MTX formats —
@@ -587,137 +589,22 @@ scx merge batch1.scx batch2.scx --output atlas.scx
 
 ## Benchmarks
 
-All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1–2 TB RAM. Full results in [`benchmarks/results/`](benchmarks/results/) and [`benchmarks/comprehensive/reporting/phase3_report.md`](benchmarks/comprehensive/reporting/phase3_report.md).
+Headline numbers at Census 1M (CELLxGENE Census, 1M cells):
 
-### Compression
+| Area | SCX | Next best | SCX advantage |
+|------|-----|-----------|---------------|
+| File size vs gzip h5ad | 2.35 GB | 11.4 GB | **4.8× smaller** |
+| Read (full load to AnnData) | **2.74 s** | 3.99 s (Zarr lz4) | **1.5× faster** |
+| Column projection (2K HVGs) | **3.53 s** | 7.24 s (Zarr lz4) | **2.0× faster** |
+| Parallel read (32 threads) | **3.0 s** | — (no other format scales) | **6.1× vs 1 thread** |
+| Parallel write (32 threads, pcodec) | 11.4 s | — | **3.2× vs 1 thread** |
+| Out-of-core pipeline peak RSS | **5.1 GB** | 43.6 GB (materialized) | **88% reduction** |
+| Training loader (batches/s) | **1,405** | 17.1 (TileDB-SOMA-ML) | **82× faster** |
+| GPU end-to-end pipeline (H100) | **286 s** | 1,077 s (CPU) | **3.8× faster** |
+| Selective query (55% shard skip) | **4.2 ms** | — | — |
+| Append 10K cells | **1 ms** | — | — |
 
-| Dataset | Cells | h5ad → SCX | vs Zarr+Zstd | vs SLAF |
-|---------|-------|-----------|--------------|---------|
-| PBMC 3K | 2,700 | **4.9×** smaller | 2% smaller | — |
-| Smart-seq2 | 50,000 | **2.9×** smaller | 5% smaller | — |
-| Tabula Sapiens | 100,000 | **4.9×** smaller | 11% smaller | — |
-| Census 1M | 1,000,000 | **4.8×** smaller | 10% smaller | **1.7×** smaller |
-| Census 5M | 5,000,000 | **7.3×** smaller | 7% smaller | — |
-
-### Read Speed (full load to AnnData)
-
-| Dataset | SCX (auto) | h5ad (none) | h5ad (gzip) | Zarr (lz4) | TileDB-SOMA | SLAF |
-|---------|-----------|-------------|-------------|------------|-------------|------|
-| PBMC 10K | 0.31s | 0.12s | 0.94s | **0.08s** | 0.44s | — |
-| Tabula Sapiens 100K | **0.58s** | 1.41s | 7.56s | 1.20s | 3.79s | — |
-| Census 1M | **2.74s** | 5.89s | 48.5s | 3.99s | 12.9s | 53.0s |
-| Census 5M | **35.4s** | 43.7s | 291s | 40.6s | 80.6s | — |
-
-SCX is the fastest reader at scale — **1.5× faster than Zarr**, **2.1× faster than uncompressed h5ad**, **17.7× faster than gzip h5ad**, and **19.3× faster than SLAF** on 1M cells. Four codecs available: `auto` (default), `scx1`, `zstd`, `lz4`.
-
-### Parallel Scaling
-
-SCX parallelizes both reads (shard decode) and writes (shard encoding) via rayon. No other format scales either direction.
-
-**Read scaling** (full load, 32 threads):
-
-| Dataset | SCX (auto) | Speedup | Zarr (lz4) | h5ad |
-|---------|-----------|---------|------------|------|
-| Census 500K | 1.5s | **6.3×** | 2.0s (1.0×) | no scaling |
-| Census 1M | 3.0s | **6.1×** | 3.7s (1.0×) | no scaling |
-| Census 5M | 37.5s | **3.1×** | 89.6s (1.0×) | no scaling |
-
-**Write scaling** (in-memory AnnData → SCX, 32 threads, census_500k):
-
-| Codec | 1 thread | 32 threads | Speedup |
-|-------|---------|-----------|---------|
-| SCX (pcodec) | 36.1s | 11.4s | **3.2×** |
-| SCX (zstd) | 35.9s | 11.4s | **3.2×** |
-| SCX (auto) | 32.3s | 12.7s | **2.5×** |
-| SCX (none) | 21.3s | 12.5s | 1.7× |
-
-Heavier codecs benefit most from parallel encoding. Scaling plateaus around 8–16 threads due to sequential I/O in the final write phase.
-
-### Column Projection (2000 HVGs)
-
-| Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA | SLAF |
-|---------|-----|-------------|------------|-------------|------|
-| Tabula Sapiens 100K | **0.55s** | 0.86s | 0.94s | 1.31s | — |
-| Census 1M | **3.53s** | 33.6s | 7.24s | 10.0s | 16.8s |
-| Census 5M | **9.79s** | 94.1s | 63.9s | 66.3s | — |
-
-SCX excels at gene selection — **2× faster than Zarr**, **4.8× faster than SLAF**, and **9.6× faster than h5ad** on 1M+ cells.
-
-### Memory
-
-Peak RSS during full read (lower is better):
-
-| Dataset | h5ad (none) | SCX (auto) | Zarr (zstd) | SLAF |
-|---------|-------------|------------|-------------|------|
-| PBMC 10K | 0.48 GB | 1.51 GB | 0.76 GB | — |
-| Tabula Sapiens 100K | 0.53 GB | 2.27 GB | 2.08 GB | — |
-| Census 1M | 0.72 GB | 6.64 GB | 11.5 GB | 34.7 GB |
-| Census 5M | 1.04 GB | 18.5 GB | 87.7 GB | — |
-
-For streaming aggregation (row_sums, col_sums), `MADV_DONTNEED` reduces SCX peak RSS by **67%** — from 3.5 GB to 1.1 GB on Census 1M. h5ad has lowest peak RSS (lazy/backed mode). SCX uses less memory than Zarr at scale (18.5 GB vs 87.7 GB on Census 5M).
-
-Full out-of-core analysis pipeline (QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) on 1M cells: **5.1 GB peak RSS** — an **88% reduction** from 43.6 GB materialized. All preprocessing stages stream shard-by-shard without materializing the full matrix.
-
-### Training Loader (batches/sec, batch_size=1024, HVG=2000, normalize+log1p)
-
-| Dataset | SCX | AnnData | TileDB-SOMA-ML | scDataLoader | SLAF | SCX/SOMA |
-|---------|-----|---------|----------------|--------------|------|----------|
-| Census 1M | **1,405** | 16.3 | 17.1 | 4.4 | 4.1 | **82×** |
-| Tabula Sapiens 100K | **1,060** | 14.5 | 16.1 | 4.0 | — | **66×** |
-| PBMC 3K | **168** | 14.5 | 5.0 | 6.3 | — | **34×** |
-
-SCX's triple-buffered pipeline (tokio I/O → rayon decode → Python) with native HVG projection and fused normalize+log1p delivers **34–82× higher throughput** than TileDB-SOMA-ML at scale (and **~340× higher throughput** than SLAF on Census 1M). TTFB (time to first batch): 16 ms on PBMC 3K, 603 ms on Census 1M. SLAF's `SLAFDataLoader` with the Geneformer tokenizer returns 0 batches on Census 10M under the default Mixture-of-Scanners prefetcher config (90 s TTFB, then timeout).
-
-### GPU Acceleration (NVIDIA H100)
-
-The `scx-gpu` crate provides CUDA-accelerated codec decoding, sparse-to-dense
-conversion, and a full GPU analysis pipeline (PCA, kNN, UMAP). Benchmarked on
-H100 80GB HBM3:
-
-#### Codec Decode & Training Pipeline
-
-| Operation | Size | CPU (μs) | GPU (μs) | Speedup |
-|-----------|------|----------|----------|---------|
-| FOR-BP index decode | 16K rows, 33M nnz | 102,900 | 4,133 | **24.9×** |
-| Sparse → dense | 16K rows × 30K cols | 433,252 | 7,711 | **56.2×** |
-| Sparse → dense (HVG 2K) | 16K rows × 2K output | 110,416 | 897 | **123.1×** |
-
-#### GPU Analysis Pipeline
-
-GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuVS CAGRA,
-native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB
-with 1M cells (CELLxGENE Census):
-
-| Operation | CPU (s) | GPU (s) | Speedup | Backend |
-|-----------|---------|---------|---------|---------|
-| kNN (k=15, 50 PCs) | 288 | 31 | **9.4×** | cuVS CAGRA |
-| UMAP (2D) | 560 | 74 | **7.6×** | native CUDA SGD |
-| Leiden | 45 | 3 | **16.0×** | cuGraph |
-| PCA (50 PCs, 2K HVGs) | 22 | 24 | 0.9× | cuSPARSE SpMM |
-| **End-to-end pipeline** | **1077** | **286** | **3.8×** | all above |
-
-The GPU PCA pipeline streams shards from disk → GPU SpMM shard-by-shard
-without materializing the full matrix — enabling PCA on datasets larger
-than VRAM. kNN uses NVIDIA's CAGRA algorithm (cuVS) for up to 9.4×
-throughput over CPU HNSW on 1M cells.
-
-Full GPU benchmark details in [`benchmarks/results/gpu_pipeline_benchmark.md`](benchmarks/results/gpu_pipeline_benchmark.md).
-
-### Query Engine
-
-| Metric | Result |
-|--------|--------|
-| Shard skip rate | **55%** average |
-| Selective query | **4.2 ms** |
-| vs AnnData subsetting | **2.1×** faster |
-
-### File Operations
-
-| Operation | Speed |
-|-----------|-------|
-| Append 10K cells | **1 ms** |
-| Merge 3 files | **342 MB/s** |
-| Compact (after 3 appends) | 0.98× fresh-write size |
+Full benchmark suite in [`docs/performance.md`](docs/performance.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval / arc-bench parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations.
 
 ## Architecture
 
