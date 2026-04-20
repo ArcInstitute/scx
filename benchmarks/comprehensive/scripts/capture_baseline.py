@@ -120,6 +120,7 @@ BENCHMARKS = [
     "parallel_scaling",
     "parallel_write_scaling",
     "memory",
+    "fragment_ops",
 ]
 
 

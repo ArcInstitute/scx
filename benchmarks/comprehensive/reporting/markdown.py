@@ -26,6 +26,7 @@ from benchmarks.comprehensive.reporting.tables import (
     compression_ratio_table,
     scx_parallel_write_callout_table,
     datasets_table,
+    fragment_ops_table,
     harmony_scaling_table,
     harmony_validation_table,
     lisi_comparison_table,
@@ -315,6 +316,39 @@ Peak RSS during full file read.
 - MADV_DONTNEED optimization reduces streaming peak RSS by 67%.
 
 {_fig("streaming_preprocess_memory")}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8b. Fragment / Manifest Operations (SCX-only)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8b. Fragment / Manifest Operations (SCX-only)
+
+Throughput and wall-clock for the four SCX fragment/manifest mutations
+exposed by `scx-ops` (`pyscx.append`, `pyscx.mark_deleted`,
+`pyscx.compact`, `pyscx.rollback`). Each cell shows median wall-clock
+with the dominant throughput metric in parentheses.
+
+Competitors (Zarr, h5ad, TileDB-SOMA, SLAF) are omitted because the
+underlying operation semantics (append without rewrite, logical delete
+via deletion vectors, rollback via manifest revert) are not defined on
+their formats.
+
+{fragment_ops_table()}
+
+**Takeaways:**
+- `append` is dominated by input-CSR read + re-encode cost; scales with
+  the number of appended rows.
+- `delete` is a logical operation — only deletion-vector construction
+  and a manifest rewrite — so wall-clock is independent of dataset size.
+- `compact` throughput tracks base-file read + re-encode bandwidth; the
+  `reclaimed_bytes` extra records the space recovered from orphaned
+  sections and logical deletions.
+- `rollback` is a single root-catalog `pwrite()` and should be
+  near-instant at any scale; a regression here indicates manifest-load
+  bloat.
 """)
 
     # -----------------------------------------------------------------------

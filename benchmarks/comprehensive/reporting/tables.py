@@ -499,6 +499,68 @@ def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def fragment_ops_table(datasets: list[str] | None = None) -> str:
+    """Fragment/manifest operation throughput — Operation x Dataset.
+
+    Each cell shows median wall-clock with a secondary metric in
+    parentheses (MB/s for append/compact, rows/s for delete, — for
+    rollback). SCX-only benchmark.
+    """
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="fragment_ops")
+    if not results:
+        return "*No fragment-ops results available yet.*"
+
+    # Operation -> dataset -> (median_wall, median_secondary, secondary_unit)
+    ops_order = ["append", "delete", "compact", "rollback"]
+    pivot: dict[str, dict[str, tuple[float | None, float | None, str]]] = {
+        op: {} for op in ops_order
+    }
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        per_op = r.get("metadata", {}).get("per_op_medians", {}) or {}
+        for op, bucket in per_op.items():
+            wall = bucket.get("walls_median")
+            if op in ("append", "compact"):
+                pivot.setdefault(op, {})[ds] = (
+                    wall, bucket.get("throughput_mb_s_median"), "MB/s"
+                )
+            elif op == "delete":
+                pivot.setdefault(op, {})[ds] = (
+                    wall, bucket.get("rows_per_sec_median"), "rows/s"
+                )
+            elif op == "rollback":
+                pivot.setdefault(op, {})[ds] = (wall, None, "")
+
+    headers = [SHORT_NAMES.get(d, d) for d in datasets]
+    lines = [
+        "| Operation | " + " | ".join(headers) + " |",
+        "|---|" + "|".join(["---:" for _ in datasets]) + "|",
+    ]
+    for op in ops_order:
+        row_data = pivot.get(op, {})
+        cells = []
+        for ds in datasets:
+            entry = row_data.get(ds)
+            if entry is None:
+                cells.append("—")
+                continue
+            wall, secondary, unit = entry
+            cell = _fmt_time(wall)
+            if secondary is not None and unit:
+                if unit == "rows/s":
+                    cell += f" ({secondary:,.0f} rows/s)"
+                else:
+                    cell += f" ({secondary:,.1f} {unit})"
+            cells.append(cell)
+        lines.append(f"| `{op}` | " + " | ".join(cells) + " |")
+
+    return "\n".join(lines)
+
+
 def ml_loader_table(datasets: list[str] | None = None) -> str:
     """Generate ML loader comparison table: Format x Dataset showing b/s and TTFB."""
     if datasets is None:
@@ -914,6 +976,7 @@ def generate_all_tables() -> dict[str, str]:
         "parallel_scaling": parallel_scaling_table(),
         "parallel_write_scaling": parallel_write_scaling_table(),
         "memory": memory_table(),
+        "fragment_ops": fragment_ops_table(),
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),
