@@ -115,10 +115,16 @@ SLAF's strongest dimension in our suite. These numbers come from the
 | Predicate | SLAF (SQL WHERE) | Native mechanism |
 |-----------|-----------------:|------------------|
 | `cell_type == 'T cell'` | 10.5s | `slaf_sql` |
-| `random 1% sample` | 9.2s | `slaf_sql` (deterministic hash) |
+| `random 1% sample` | 9.2s | `slaf_stride_hash` |
 
 The numbers are competitive with SCX's catalog pushdown at this scale; SLAF
 pays the cost on full materialization, not on predicate-selective reads.
+The `slaf_stride_hash` mechanism is a deterministic congruence-class filter
+(`cell_integer_id % N == k`), i.e. every Nth cell at a fixed offset — not
+Bernoulli sampling. It is the fastest obs-only scan SLAF exposes through
+`SLAFArray.query`, but it is *not* comparable to the `rng.choice`-based
+random-index path used by the SCX and h5ad runners for the same predicate
+name; treat the `random_1pct` scenario as a different workload per format.
 
 ## Memory
 

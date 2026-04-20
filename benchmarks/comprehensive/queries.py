@@ -81,3 +81,26 @@ CANONICAL_PREDICATES: list[Predicate] = [
 def default_predicates() -> list[Predicate]:
     """Return the shared canonical predicate list."""
     return list(CANONICAL_PREDICATES)
+
+
+# ---------------------------------------------------------------------------
+# Shared literal quoting for SQL / TileDB value-filter strings
+# ---------------------------------------------------------------------------
+
+
+def sql_literal(value: Any) -> str:
+    """Render ``value`` as a SQL / TileDB value-filter literal.
+
+    Strings are single-quoted with embedded ``'`` doubled. Numbers and bools
+    are stringified directly. Other types raise — predicate authors should
+    extend this helper rather than inline-interpolating into f-strings.
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int; handle first so ``True`` -> ``"True"``.
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    if isinstance(value, (int, float)):
+        return str(value)
+    raise TypeError(f"Unsupported SQL literal type: {type(value)!r}")

@@ -135,13 +135,11 @@ class TileDBRunner(FormatRunner):
             EqPredicate,
             GtPredicate,
             RandomSamplePredicate,
+            sql_literal,
         )
 
         if isinstance(predicate, EqPredicate):
-            if isinstance(predicate.value, str):
-                value_filter = f"{predicate.column} == '{predicate.value}'"
-            else:
-                value_filter = f"{predicate.column} == {predicate.value}"
+            value_filter = f"{predicate.column} == {sql_literal(predicate.value)}"
             mechanism = "tiledb_value_filter"
         elif isinstance(predicate, GtPredicate):
             value_filter = f"{predicate.column} > {predicate.threshold}"

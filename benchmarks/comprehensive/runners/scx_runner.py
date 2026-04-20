@@ -200,13 +200,11 @@ class ScxRunner(FormatRunner):
             EqPredicate,
             GtPredicate,
             RandomSamplePredicate,
+            sql_literal,
         )
 
         if isinstance(predicate, EqPredicate):
-            if isinstance(predicate.value, str):
-                expr = f"{predicate.column} == '{predicate.value}'"
-            else:
-                expr = f"{predicate.column} == {predicate.value}"
+            expr = f"{predicate.column} == {sql_literal(predicate.value)}"
         elif isinstance(predicate, GtPredicate):
             expr = f"{predicate.column} > {predicate.threshold}"
         elif isinstance(predicate, RandomSamplePredicate):

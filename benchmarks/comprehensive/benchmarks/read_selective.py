@@ -38,16 +38,28 @@ logger = logging.getLogger(__name__)
 
 
 def _obs_columns(dataset: DatasetConfig) -> set[str]:
-    """Return the obs column set for a dataset without loading X."""
+    """Return the obs column set for a dataset without loading X.
+
+    A missing source h5ad is the one legitimate soft-failure path (benchmarks
+    may run in environments without every dataset materialized) and returns
+    an empty set with a ``WARNING``. Every other error propagates — a corrupt
+    h5ad is a harness bug, not a predicate-skip signal.
+    """
     import anndata
 
     try:
         adata = anndata.read_h5ad(dataset.h5ad_path, backed="r")
-        cols = set(adata.obs.columns)
-        adata.file.close()
-        return cols
-    except Exception:  # noqa: BLE001 — dataset missing / unreadable
+    except FileNotFoundError:
+        logger.warning(
+            "Source h5ad not found for %s (%s); skipping all filtered_query "
+            "predicates for this dataset.",
+            dataset.name, dataset.h5ad_path,
+        )
         return set()
+    try:
+        return set(adata.obs.columns)
+    finally:
+        adata.file.close()
 
 
 def _applicable_predicates(dataset: DatasetConfig):

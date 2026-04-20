@@ -226,7 +226,18 @@ class SlafRunner(FormatRunner):
             EqPredicate,
             GtPredicate,
             RandomSamplePredicate,
+            sql_literal,
         )
+
+        # Resolve the native-mechanism label up front so the ``extra`` dict
+        # below reflects what the timing actually measured. ``slaf_stride_hash``
+        # is deliberately distinct from ``slaf_sql`` because the random-sample
+        # path is a congruence class (every Nth cell), not Bernoulli sampling
+        # or a WHERE predicate.
+        if isinstance(predicate, RandomSamplePredicate):
+            mechanism = "slaf_stride_hash"
+        else:
+            mechanism = "slaf_sql"
 
         def _filtered() -> None:
             slaf_array = self._open_array(path)
@@ -237,14 +248,9 @@ class SlafRunner(FormatRunner):
             # ``get_submatrix`` (which doesn't accept string cell_id
             # lists).
             if isinstance(predicate, EqPredicate):
-                value_literal = (
-                    f"'{predicate.value}'"
-                    if isinstance(predicate.value, str)
-                    else str(predicate.value)
-                )
                 sql_cells = (
                     "SELECT cell_integer_id FROM cells "
-                    f"WHERE {predicate.column} = {value_literal}"
+                    f"WHERE {predicate.column} = {sql_literal(predicate.value)}"
                 )
             elif isinstance(predicate, GtPredicate):
                 sql_cells = (
@@ -253,11 +259,14 @@ class SlafRunner(FormatRunner):
                 )
             elif isinstance(predicate, RandomSamplePredicate):
                 # Polars-SQL doesn't expose DuckDB's SAMPLE clause via
-                # ``SLAFArray.query``; emulate with a deterministic hash
-                # filter on cell_integer_id.
+                # ``SLAFArray.query`` — emulate with a stride-hash filter on
+                # cell_integer_id. This selects a single congruence class
+                # (every Nth cell at a fixed offset), NOT a Bernoulli sample;
+                # the mechanism is tagged ``slaf_stride_hash`` so reports can
+                # distinguish it from true random-sample paths.
                 modulus = max(int(1 / predicate.fraction), 2)
-                # (seed * 2654435761) mod 2^32 — Knuth multiplicative
-                # constant; combines seed into the bucket selection.
+                # (seed * 2654435761) mod modulus — Knuth multiplicative
+                # constant; selects the bucket offset from the seed.
                 target = (predicate.seed * 2654435761) % modulus
                 sql_cells = (
                     "SELECT cell_integer_id FROM cells "
@@ -281,7 +290,7 @@ class SlafRunner(FormatRunner):
 
         _, timing = self.timed_run(_filtered)
         timing.extra = {
-            "native_mechanism": "slaf_sql",
+            "native_mechanism": mechanism,
             "predicate": predicate.name,
         }
         return timing

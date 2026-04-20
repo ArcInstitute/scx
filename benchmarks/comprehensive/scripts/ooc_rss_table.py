@@ -131,10 +131,9 @@ def render(datasets: list[str], formats: list[str]) -> tuple[str, dict]:
                 row_payload["formats"][fmt] = {
                     "median_peak_rss_mb": peak,
                     "median_delta_rss_mb": delta,
-                    "n_runs": len([
-                        r for r in result.get("runs", [])
-                        if r.get("operation") == operation
-                    ]),
+                    "n_runs": sum(
+                        1 for r in result.get("runs", []) if _op(r) == operation
+                    ),
                 }
             lines.append("| " + " | ".join(cells) + " |")
             rows_payload.append(row_payload)

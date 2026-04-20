@@ -214,7 +214,8 @@ class FormatRunner(ABC):
         TimingResult
             Timing for the native filtered read. The ``extra`` dict should
             include ``"native_mechanism"`` (e.g. ``"scx_pushdown"``,
-            ``"slaf_sql"``) so reporting can group apples-to-apples.
+            ``"slaf_sql"``, ``"slaf_stride_hash"``) so reporting can group
+            apples-to-apples.
         """
         raise NotImplementedError(
             f"{self.name} does not support read_filtered_query"
