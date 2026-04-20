@@ -75,6 +75,9 @@ BENCHMARK_NAMES = [
     "cloud_read",
     "cloud_metadata",
     "cloud_filtered",
+    "cloud_reader_vs_pull",
+    "cost_model",
+    "cloud_large_atlas",
 ]
 
 # Benchmarks that work from h5ad source and don't need pre-converted files.

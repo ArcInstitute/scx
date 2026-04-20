@@ -173,3 +173,79 @@ def ensure_cloud_fixture(
     else:
         _gsutil_rsync(local_path, url)
     return url
+
+
+# ---------------------------------------------------------------------------
+# Cloud I/O counters (Phase F.2)
+# ---------------------------------------------------------------------------
+
+
+class CloudIOCounters:
+    """Lightweight accumulator for cloud-side transfer counters.
+
+    Wraps a block of ``pyscx.pull`` / ``pyscx.pull_filtered`` calls and
+    collects their ``bytes_downloaded`` / ``sections_downloaded`` (used as
+    a GET-count proxy) into totals. Used by ``cost_model.py`` and
+    ``cloud_reader_vs_pull.py`` to report per-operation egress cost.
+
+    This is a Python-level accumulator — it does NOT instrument the
+    ``object_store`` crate directly, so the GET count is a proxy (each
+    section is one GET today). A Rust-side counting middleware wrapping
+    ``Arc<dyn ObjectStore>`` would give exact per-request counters; that
+    is tracked as a Phase F.2 follow-up so the Python surface can stay
+    stable when the true counters land.
+    """
+
+    def __init__(self) -> None:
+        self.bytes_downloaded: int = 0
+        self.sections_downloaded: int = 0
+        self.calls: int = 0
+
+    def record_pull_stats(self, stats: dict) -> None:
+        """Fold a single ``pyscx.pull`` (or ``pull_filtered``) stats dict."""
+        self.bytes_downloaded += int(stats.get("bytes_downloaded", 0) or 0)
+        # ``pull`` returns ``sections_downloaded``; ``pull_filtered`` returns
+        # ``downloaded_shards`` + implicit catalog/header/obs/var GETs. For
+        # the cost proxy we sum the explicit shard count plus 3 for the
+        # catalog/header/obs fetches pull_filtered always issues.
+        if "sections_downloaded" in stats:
+            self.sections_downloaded += int(stats["sections_downloaded"])
+        elif "downloaded_shards" in stats:
+            self.sections_downloaded += int(stats["downloaded_shards"]) + 3
+        self.calls += 1
+
+    def as_dict(self) -> dict:
+        return {
+            "bytes_downloaded": self.bytes_downloaded,
+            "get_count_proxy": self.sections_downloaded,
+            "calls": self.calls,
+            "telemetry_source": "pyscx_stats_dict",
+        }
+
+    def egress_cost_usd(
+        self, *, cross_region: bool = False,
+    ) -> float:
+        """Compute egress cost in USD for the accumulated bytes.
+
+        Same-region (GCE ↔ GCS in the same region) is free today; pass
+        ``cross_region=True`` to price against the cross-continent rate —
+        intended as a "what if we went cross-region" sanity check, not a
+        real cost for runs pinned to the bucket region.
+        """
+        from benchmarks.comprehensive.config import GCS_PRICING
+
+        rate_key = (
+            "egress_cross_region_usd_per_gb" if cross_region
+            else "egress_same_region_usd_per_gb"
+        )
+        gb = self.bytes_downloaded / (1024 ** 3)
+        return gb * GCS_PRICING[rate_key]
+
+    def request_cost_usd(self) -> float:
+        """USD for the accumulated GET proxy under the Class-B rate."""
+        from benchmarks.comprehensive.config import GCS_PRICING
+
+        return (self.sections_downloaded / 10_000) * GCS_PRICING["class_b_per_10k_usd"]
+
+    def total_cost_usd(self, *, cross_region: bool = False) -> float:
+        return self.egress_cost_usd(cross_region=cross_region) + self.request_cost_usd()

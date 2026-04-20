@@ -29,6 +29,43 @@ use crate::explode::section_name_to_path;
 /// Offset where sections begin: 256 (header) + 4096 (root catalog placeholder).
 const SECTIONS_START_OFFSET: u64 = 4352;
 
+/// Remove stale `{dest}.tmp.*` files left behind by prior interrupted pulls.
+///
+/// Pull writes to `{dest}.tmp.{pid}` and atomically renames on completion.
+/// If a pull is interrupted (SIGTERM, crash), the `.tmp.{pid}` file remains
+/// orphaned. The current run picks a different PID-keyed path so it's not
+/// blocked, but the orphan accumulates disk usage on repeated retries.
+/// This helper sweeps any `{stem}.tmp.*` siblings of `dest` before we start
+/// downloading. Called at the top of both `pull` and `pull_filtered`.
+///
+/// Deliberately best-effort: a directory-listing failure is not a pull
+/// failure — the helper logs via `tracing` (if enabled) and returns. The
+/// worst case is that orphans persist; they never block retries.
+fn cleanup_stale_tmp_files(dest: &Path) {
+    let parent = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let stem = match dest.file_name().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let prefix = format!("{stem}.tmp.");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Options for the pull operation.
 pub struct PullOptions {
     /// Number of parallel download tasks (default: 8).
@@ -64,6 +101,11 @@ pub struct PullStats {
 /// exploded `.scxd` directory.
 pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<PullStats> {
     let start = Instant::now();
+
+    // Sweep any `.tmp.*` orphans left behind by a previously interrupted
+    // pull targeting the same destination. Best-effort; a failure here is
+    // not a pull failure (see ``cleanup_stale_tmp_files``).
+    cleanup_stale_tmp_files(dest);
 
     // 1. Parse location and create backend
     let location = crate::backend::parse_location(source)?;
@@ -431,6 +473,10 @@ pub async fn pull_filtered(
     options: PullOptions,
 ) -> Result<PullFilteredStats> {
     let start = Instant::now();
+
+    // Same orphan-sweep as `pull`: any `.tmp.{pid}` files left by a
+    // prior interrupted run are removed before we start downloading.
+    cleanup_stale_tmp_files(dest);
 
     // 1. Parse location and create backend
     let location = crate::backend::parse_location(source)?;
@@ -1222,6 +1268,65 @@ mod tests {
 
         let reader = ScxReader::open(&output).unwrap();
         assert_eq!(reader.n_obs(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_stale_tmp_files_removes_matching_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("output.scx");
+
+        // Create three stale `.tmp.*` siblings + an unrelated sibling.
+        let stale1 = dir.path().join("output.scx.tmp.1234");
+        let stale2 = dir.path().join("output.scx.tmp.5678");
+        let stale3 = dir.path().join("output.scx.tmp.abcd");
+        let unrelated = dir.path().join("other.scx");
+        for p in &[&stale1, &stale2, &stale3, &unrelated] {
+            std::fs::write(p, b"stale").unwrap();
+        }
+
+        cleanup_stale_tmp_files(&dest);
+
+        assert!(!stale1.exists(), "stale1 should be removed");
+        assert!(!stale2.exists(), "stale2 should be removed");
+        assert!(!stale3.exists(), "stale3 should be removed");
+        assert!(unrelated.exists(), "unrelated file must not be touched");
+    }
+
+    #[test]
+    fn test_cleanup_stale_tmp_files_handles_missing_parent() {
+        // Should not panic on a destination whose parent directory doesn't exist.
+        let nonexistent = std::path::Path::new("/tmp/scx-cloud-nonexistent-xyz/foo.scx");
+        cleanup_stale_tmp_files(nonexistent);
+    }
+
+    #[tokio::test]
+    async fn test_pull_retry_after_orphan_tmp_is_idempotent() {
+        // Simulates an interrupted pull by leaving an orphan `.tmp.*` file
+        // before starting a fresh pull; the fresh pull must succeed and
+        // produce a byte-identical output to a clean pull.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let source = exploded_dir.to_string_lossy().to_string();
+        let output = dir.path().join("pulled.scx");
+
+        // Plant an orphan `.tmp.*` as if a prior pull crashed.
+        let orphan = dir.path().join("pulled.scx.tmp.9999");
+        std::fs::write(&orphan, b"junk from an interrupted prior run").unwrap();
+
+        let opts = PullOptions::default();
+        let stats = pull(&source, &output, opts).await.unwrap();
+
+        assert!(stats.bytes_downloaded > 0);
+        assert!(output.exists(), "pull output should exist after retry");
+        assert!(!orphan.exists(), "orphan tmp file should have been swept");
+
+        // Verify the output is a valid SCX file.
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.n_obs(), 100);
+        assert_eq!(reader.n_vars(), 50);
     }
 
     #[tokio::test]

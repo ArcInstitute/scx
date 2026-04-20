@@ -637,6 +637,111 @@ def cloud_filtered_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines).rstrip() or "*No cloud_filtered rows to render.*"
 
 
+def cloud_reader_vs_pull_table(datasets: list[str] | None = None) -> str:
+    """CloudReader vs full-pull table — per (dataset, scenario, method).
+
+    Shows median wall-clock and bytes-downloaded across the four scenarios
+    (``metadata_only``, ``selective_{5,20,80}pct``) and the two methods
+    each scenario compares (``open_cloud`` / ``pull_full`` for metadata;
+    ``pull_filtered`` / ``pull_full`` for selectivities).
+    """
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cloud_reader_vs_pull")
+    if not results:
+        return "*No cloud_reader_vs_pull results available yet.*"
+
+    # dataset -> scenario -> method -> (median_wall, median_bytes, n_runs)
+    pivot: dict[str, dict[str, dict[str, tuple[float, int, int]]]] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        per_scen = r.get("metadata", {}).get("per_scenario_summary", {}) or {}
+        for scen, methods in per_scen.items():
+            for method, bucket in methods.items():
+                pivot.setdefault(ds, {}).setdefault(scen, {})[method] = (
+                    bucket.get("median_wall_s"),
+                    int(bucket.get("median_bytes_downloaded", 0)),
+                    int(bucket.get("n_runs", 0)),
+                )
+    if not pivot:
+        return "*No per-scenario cloud_reader_vs_pull summaries present.*"
+
+    lines: list[str] = []
+    for ds in datasets:
+        per_scen = pivot.get(ds)
+        if not per_scen:
+            continue
+        lines.append(f"**{SHORT_NAMES.get(ds, ds)}**")
+        lines.append("")
+        lines.append("| Scenario | Method | Median wall | Bytes downloaded | n |")
+        lines.append("|---|---|---:|---:|---:|")
+        for scen in sorted(per_scen):
+            for method, (wall, byts, n) in sorted(per_scen[scen].items()):
+                lines.append(
+                    f"| {scen} | `{method}` | {_fmt_time(wall)} | "
+                    f"{_fmt_size(byts)} | {n} |"
+                )
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def cost_model_table(datasets: list[str] | None = None) -> str:
+    """Cost model table — USD per 1M cells queried × (layout, scenario).
+
+    Pulled from ``cost_model`` raw JSONs' ``per_layout_scenario_median_usd
+    _per_million`` metadata bucket. Scenarios run across the four canonical
+    points (metadata, selective_5pct, selective_20pct, full_read) for
+    every cloud layout declared in the benchmark's ``_LAYOUTS`` list.
+    """
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cost_model")
+    if not results:
+        return "*No cost_model results available yet.*"
+
+    scenarios = ["metadata", "selective_5pct", "selective_20pct", "full_read"]
+    # (dataset, layout, scenario) -> median_usd_per_million
+    pivot: dict[tuple[str, str, str], float] = {}
+    layouts_seen: set[str] = set()
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        per = r.get("metadata", {}).get(
+            "per_layout_scenario_median_usd_per_million", {}
+        ) or {}
+        for combo, val in per.items():
+            if "::" not in combo:
+                continue
+            layout, scen = combo.split("::", 1)
+            layouts_seen.add(layout)
+            pivot[(ds, layout, scen)] = float(val)
+
+    if not layouts_seen:
+        return "*No cost_model per-(layout, scenario) medians present.*"
+
+    lines: list[str] = []
+    for ds in datasets:
+        ds_any = any((ds, layout, scen) in pivot
+                     for layout in layouts_seen for scen in scenarios)
+        if not ds_any:
+            continue
+        lines.append(f"**{SHORT_NAMES.get(ds, ds)}** — USD per 1M cells queried (GCS same-region pricing)")
+        lines.append("")
+        lines.append("| Layout | " + " | ".join(scenarios) + " |")
+        lines.append("|---|" + "|".join(["---:" for _ in scenarios]) + "|")
+        for layout in sorted(layouts_seen):
+            cells = []
+            for scen in scenarios:
+                v = pivot.get((ds, layout, scen))
+                cells.append(f"${v:.6f}" if v is not None else "—")
+            lines.append(f"| `{layout}` | " + " | ".join(cells) + " |")
+        lines.append("")
+    return "\n".join(lines).rstrip() or "*No cost_model rows to render.*"
+
+
 def gcp_matrix_table(datasets: list[str] | None = None) -> str:
     """GCP compute-node matrix — Instance × Format × Dataset.
 
@@ -1144,6 +1249,8 @@ def generate_all_tables() -> dict[str, str]:
         "fragment_ops": fragment_ops_table(),
         "cloud_filtered": cloud_filtered_table(),
         "gcp_matrix": gcp_matrix_table(),
+        "cloud_reader_vs_pull": cloud_reader_vs_pull_table(),
+        "cost_model": cost_model_table(),
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),

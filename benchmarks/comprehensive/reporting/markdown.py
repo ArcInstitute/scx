@@ -27,6 +27,8 @@ from benchmarks.comprehensive.reporting.tables import (
     scx_parallel_write_callout_table,
     datasets_table,
     cloud_filtered_table,
+    cloud_reader_vs_pull_table,
+    cost_model_table,
     fragment_ops_table,
     gcp_matrix_table,
     harmony_scaling_table,
@@ -402,6 +404,53 @@ Only results with a `system.gcp.instance_type` label are shown; on-cluster
 runs without the label are excluded to keep the matrix view clean.
 
 {gcp_matrix_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8e. CloudReader vs full Pull
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8e. CloudReader vs Full Pull
+
+Scored by `cloud_reader_vs_pull`: for each dataset, compares
+`pyscx.open_cloud` (single-GET metadata open) against a full
+`pyscx.pull`, and then sweeps `pyscx.pull_filtered` at ~5% / 20% / 80%
+cell selectivity against a full pull. The break-even selectivity where
+full-pull starts beating predicate-pushdown is visible in the table
+below (as selectivity approaches ~100%, `pull_filtered` downloads every
+shard and the bytes-downloaded column equalizes).
+
+`open_cloud` does not yet surface `bytes_downloaded`; a Rust-side
+object-store counting middleware (Phase F.2 follow-up) will close this
+gap so the metadata row reports non-zero bytes.
+
+{cloud_reader_vs_pull_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8f. Cost model
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8f. Cost Model (GCS pricing)
+
+Cents per 1 million cells queried, computed from GCS Standard-class
+pricing pinned in `benchmarks/comprehensive/config.py::GCS_PRICING`.
+Egress is priced at the same-region rate ($0.00/GB today — the Phase E
+launcher pins the VM region to the bucket region so this is the
+committed regime); request cost follows the Class-B $0.004/10k GET
+schedule.
+
+Scenarios: `metadata` (catalog open), `selective_5pct` / `selective_20pct`
+(predicate-pushdown pull), `full_read` (complete pull). Only the
+exploded `.scxd/` cloud layout is wired today; packed `.scx` with a
+front catalog will appear as additional rows once the benchmark's
+`_LAYOUTS` list grows.
+
+{cost_model_table()}
 """)
 
     # -----------------------------------------------------------------------

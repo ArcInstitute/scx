@@ -24,6 +24,9 @@ pub enum CloudError {
     #[error("Download failed after {retries} retries: {message}")]
     DownloadFailed { retries: usize, message: String },
 
+    #[error("Pull interrupted: {0}")]
+    Interrupted(String),
+
     #[error("Engine error: {0}")]
     Engine(#[from] scx_engine::EngineError),
 

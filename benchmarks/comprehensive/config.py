@@ -227,6 +227,29 @@ GCP_INSTANCE_TYPES: dict[str, dict[str, Any]] = {
 }
 
 
+# GCS pricing (in USD) used by the cost_model benchmark. Values are pinned
+# against the published GCS rate card for the Standard storage class in a
+# multi-region bucket, plus standard-network egress within the same region
+# (intra-region egress to GCE in the same region is $0.00/GB). Update only
+# when the rate card changes — this table is the benchmark's single source
+# of truth for cents-per-query math.
+GCS_PRICING: dict[str, float] = {
+    # Class-A operations (PUT / COPY / POST / LIST): $0.05 per 10k
+    "class_a_per_10k_usd": 0.05,
+    # Class-B operations (GET / HEAD): $0.004 per 10k
+    "class_b_per_10k_usd": 0.004,
+    # Same-region egress to GCE: $0.00 per GB — the ``ensure_instance_
+    # region_matches_bucket`` gate keeps all Phase E/F runs in this regime.
+    "egress_same_region_usd_per_gb": 0.00,
+    # Cross-continent egress (reference only; we actively avoid this by
+    # pinning the VM region to the bucket region).
+    "egress_cross_region_usd_per_gb": 0.08,
+    # Standard storage (reference only — storage cost dominates at
+    # long-term rest, not per-query).
+    "storage_standard_usd_per_gb_month": 0.026,
+}
+
+
 def ensure_instance_region_matches_bucket(instance_region: str) -> None:
     """Fail fast when the chosen VM region doesn't match the bucket region.
 

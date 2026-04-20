@@ -184,6 +184,34 @@ Return value (Python): dict with `bytes_downloaded`, `sections_downloaded`,
 `elapsed_secs`, `throughput_mbps`. Filtered pulls add `total_shards`,
 `downloaded_shards`, `skipped_shards`, `matching_cells`, `bytes_saved`.
 
+#### Interrupted pulls — idempotent retry, not resumable
+
+Pulls are **idempotent-retry**, not resumable-from-checkpoint. The
+implementation writes to `{dest}.tmp.{pid}` and atomically renames on
+completion, so:
+
+- A SIGTERM or crash leaves `{dest}.tmp.{pid}` orphaned on disk but does
+  **not** block subsequent pulls — a fresh run uses a different PID-keyed
+  path and produces the final output atomically.
+- On entry, every `pull` / `pull_filtered` invocation sweeps any
+  `{dest}.tmp.*` siblings it finds, so orphaned temp files don't
+  accumulate across retries.
+- There is **no shard-level checkpoint** — a retried pull re-downloads
+  every shard. This is a deliberate design choice: SCX shards are
+  independent and small enough that re-download cost is bounded, and a
+  checkpoint file would introduce cross-invocation state that defeats
+  the current atomic-rename safety property.
+- If your pull was killed mid-run and you need to know the committed
+  state on disk, check for `{dest}` (fully written) vs `{dest}.tmp.*`
+  (in-flight, safe to delete). The next pull will sweep the `.tmp.*`
+  automatically.
+
+The `CloudError::Interrupted` enum variant is reserved for callers that
+want to explicitly signal an interruption in downstream orchestration
+(e.g., surfacing to the regression gate); the pull implementation itself
+does not raise it today since interruptions in the streaming pipeline
+surface as `object_store::Error` / `io::Error` at the failing GET.
+
 ### `push` — stream local `.scx` → cloud `.scxd/`
 
 ```python
