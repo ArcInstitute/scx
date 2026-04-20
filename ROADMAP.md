@@ -417,7 +417,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 
 ### 5.1 Benchmark Harness Infrastructure — PARTIALLY COMPLETE
 - [x] `FormatRunner` abstraction — one runner per format (SCX, h5ad, Zarr v3, TileDB-SOMA, BPCells, Parquet)
-- [ ] **SLAF `FormatRunner`** ([slaf-project/slaf](https://github.com/slaf-project/slaf), `slafdb` on PyPI) — SQL-native sparse lazy format with Scanpy-compatible API and PyTorch dataloaders. Direct competitor across compression, selective read, lazy AnnData ops, and ML loader dimensions. **NOT STARTED**
+- [x] **SLAF `FormatRunner`** ([slaf-project/slaf](https://github.com/slaf-project/slaf), `slafdb` on PyPI) — SQL-native sparse lazy format with Scanpy-compatible API and PyTorch dataloaders. Direct competitor across compression, selective read, lazy AnnData ops, and ML loader dimensions. Lives at `benchmarks/comprehensive/runners/slaf_runner.py` with isolated `scx-bench-slaf` env; back-end goes through SLAF's `expression(cell_integer_id, gene_integer_id, value)` SQL table (SLAF's public `get_submatrix` API treats integer lists positionally and its `cell_id` column is non-unique across Lance fragments in census-scale files).
 - [x] Shared conversion cache: convert each dataset once per format, reuse across benchmarks
 - [x] Deterministic `BenchmarkResult` schema → one JSON per (benchmark × format × dataset)
 - [x] System info collector (CPU, RAM, OS, disk, driver, CUDA version) recorded with every run
@@ -427,18 +427,18 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 
 ### 5.2 Benchmark Dimensions — PARTIALLY COMPLETE
 - [x] **Compression** — file size vs h5ad/Zarr/TileDB/BPCells/Parquet across codec variants (SCX auto/none/scx1/zstd/pcodec/lz4)
-- [ ] Add SLAF to compression comparison — SLAF stores cells as rows in DuckDB-queryable tables; measure on-disk size for identical datasets
+- [x] Add SLAF to compression comparison — SLAF stores cells as rows in DuckDB-queryable tables; measure on-disk size for identical datasets. Census 1M: SLAF 4.0 GB vs SCX 2.35 GB (SCX ~1.7× smaller); see `benchmarks/comprehensive/results/raw/compression__slaf__census_1m.json`.
 - [x] **Read (full)** — `to_anndata()` wall-clock, peak RSS, mmap resident
 - [x] **Read (selective)** — column/row projection, predicate pushdown, shard skip rate
-- [ ] Add SLAF selective-read comparison — SLAF exposes SQL `SELECT ... WHERE` predicates; compare against SCX catalog-level pushdown on the same query
+- [x] Add SLAF selective-read comparison — SLAF exposes SQL `SELECT ... WHERE` predicates; compare against SCX catalog-level pushdown on the same query. SLAF SQL pushdown on Census 1M: `cell_type == 'T cell'` 10.5s, random 1% sample 9.2s. Canonical predicate set lives at `benchmarks/comprehensive/queries.py`; runners declare the capability via `FormatRunner.capabilities`.
 - [x] **Write** — end-to-end write throughput with each codec
 - [x] **Parallel scaling** — read/write throughput as a function of thread count (1 → 32 threads)
 - [x] **ML loader** — batches/sec, time-to-first-batch, GPU utilization; SCX vs TileDB-SOMA-ML
-- [ ] Extend ML loader comparison to include **SLAF's PyTorch tokenizer/dataloader** — direct head-to-head for foundation-model training workloads on the same dataset + model
+- [x] Extend ML loader comparison to include **SLAF's PyTorch tokenizer/dataloader** — direct head-to-head for foundation-model training workloads on the same dataset + model. Census 1M: SLAF 4.1 batches/s (~340× slower than SCX); on Census 10M SLAF's Mixture-of-Scanners prefetcher returns 0 batches with the default config (90 s TTFB then timeout).
 - [x] **Correctness** — round-trip parity of X / obs / var / obsm / obsp / uns vs source h5ad
-- [ ] Extend correctness to SLAF round-trip (h5ad → SLAF → AnnData vs h5ad → SCX → AnnData)
+- [x] Extend correctness to SLAF round-trip (h5ad → SLAF → AnnData vs h5ad → SCX → AnnData) — `benchmarks/comprehensive/scripts/validate_slaf_equivalence.py`, wired into the `correctness` benchmark module. Lossy fields (currently `uns`) are documented in a per-runner allowlist.
 - [x] **Memory** — peak RSS for the out-of-core pipeline (open → QC → preprocess → PCA → kNN → UMAP → Leiden)
-- [ ] Run the same out-of-core pipeline on SLAF's lazy Scanpy-compatible API to compare peak RSS end-to-end
+- [x] Run the same out-of-core pipeline on SLAF's lazy Scanpy-compatible API to compare peak RSS end-to-end — aggregated table at `benchmarks/comprehensive/results/reports/phase5A_ooc_rss.md`. Census 1M `read_full` peak RSS: SCX 345 MB vs SLAF 34.7 GB (SLAF's `LazyAnnData.compute()` builds the CSR through Polars fragment processors).
 - [x] **Perturbation / cell-eval parity** — Rust accelerator vs Python reference speed and tolerance (see `cell_eval_parity_perf.py`)
 - [ ] **Append / delete / compact / rollback** — throughput and correctness across fragment-manifest operations — **PARTIAL** (correctness tests exist; throughput benchmarks not in comprehensive suite)
 

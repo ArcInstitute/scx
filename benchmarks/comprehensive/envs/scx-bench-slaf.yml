@@ -36,6 +36,7 @@ dependencies:
   # pip-only packages
   - pip:
     - submitit>=1.5.0
+    - python-dotenv>=1.0.0
     # SLAF = slafdb on PyPI. 0.5.2 is the Phase-A validated pin (2026-04-15).
     - slafdb==0.5.2
     # DuckDB + polars + lance come in as slafdb transitive deps; let the pin

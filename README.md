@@ -328,20 +328,57 @@ CELLxGENE Census standard. Powerful for cloud queries, heavy for everything else
 - **Storage bloat before consolidation.** Fragment-based writes cause 1.5-3× storage bloat until consolidated. Each mutation creates a new fragment rather than updating in place.
 - **Limited scanpy integration.** Converting SOMA to AnnData for scanpy/scVI typically materializes the full dataset, negating lazy-read benefits.
 
+#### SLAF
+
+SQL-native lazy format backed by Lance columnar files + a DuckDB query layer.
+Compelling design idea for obs-driven analytics, but heavy at realistic read
+sizes in our benchmarks.
+
+- **Slow full-materialize path.** `LazyAnnData.compute()` goes through Polars
+  fragment processors and builds the CSR in Python-owned memory. Full read of
+  Census 1M takes **53 s** vs 2.7 s for SCX and 4.0 s for Zarr (lz4); peak RSS
+  during the materialization reached **35 GB**, an order of magnitude more than
+  any other format we tested.
+- **String `cell_id` / `gene_id` is load-bearing.** The public `get_submatrix`
+  API returns long-form `(cell_id, gene_id, value)` with string ids. In
+  real-world datasets (census, cell barcodes, etc.) those strings are not
+  unique across the file's Lance fragments, so joining back to integer
+  positions explodes row counts — consumers must go through the internal
+  `expression(cell_integer_id, gene_integer_id, value)` SQL table to get a
+  scipy CSR correctly.
+- **Non-standard selector semantics.** `get_submatrix(cell_selector=[…])`
+  treats an integer list as positional but returns string ids that don't
+  always match the list (e.g. cell at position 201469 has `cell_id = "1469"`
+  in census_1m). Integer numpy arrays, string lists, and mixed-type
+  selectors all fail in different ways.
+- **PyTorch loader stalls at atlas scale.** `SLAFDataLoader`'s
+  Mixture-of-Scanners prefetcher produced **0 batches** on Census 10M in our
+  benchmark with the default config (90 s TTFB, then timeout). On Census 1M
+  it ran cleanly at **~4 batches/sec** across raw/hvg/norm/hvg_norm — **roughly
+  340× slower than SCX**, and about 4× slower than `AnnData` in-memory
+  iteration.
+- **Heavy on-disk, small-file directory layout.** A 1M-cell dataset expands
+  to 4.0 GB vs 2.4 GB for SCX, and the `.slaf` directory holds hundreds of
+  Lance fragment + statistics files — same HPC-filesystem inode pressure
+  problem as Zarr / TileDB-SOMA.
+- **SQL predicate pushdown is a real strength.** For `cell_type == 'T cell'`
+  on Census 1M, SLAF's SQL path returns the matching expression records in
+  10 s — same order of magnitude as SCX's catalog pushdown.
+
 #### SCX addresses all of these
 
-| Issue | h5ad | Zarr | TileDB-SOMA | SCX |
-|-------|------|------|-------------|-----|
-| Single file | Yes | No (directory) | No (directory) | **Yes** |
-| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | **Yes** (mmap, advisory locks) |
-| Atomic writes | No | No | Fragment-based | **Yes** (atomic rename) |
-| Integrity verification | Partial | None | Per-fragment | **Full** (BLAKE3 checksums) |
-| Parallel reads | No (GIL) | Chunk-level | Tile-level | **Shard-level** (rayon) |
-| Append without rewrite | No | No | Yes (fragments) | **Yes** (append sections) |
-| Cloud-native access | No | Yes | Yes | **Yes** (explode/pack, selective pull) |
-| Built-in query engine | No | No | Yes | **Yes** (predicate pushdown) |
-| Domain-specific compression | No | No | No | **Yes** (Scx1 codec, 2-5× better) |
-| Integer-aware storage | No (float32) | No (float32) | No (float64) | **Yes** (uint8/uint16 auto-detect) |
+| Issue | h5ad | Zarr | TileDB-SOMA | SLAF | SCX |
+|-------|------|------|-------------|------|-----|
+| Single file | Yes | No (directory) | No (directory) | No (directory) | **Yes** |
+| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | No (inode flood) | **Yes** (mmap, advisory locks) |
+| Atomic writes | No | No | Fragment-based | Fragment-based | **Yes** (atomic rename) |
+| Integrity verification | Partial | None | Per-fragment | Per-fragment | **Full** (BLAKE3 checksums) |
+| Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | **Shard-level** (rayon) |
+| Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | **Yes** (append sections) |
+| Cloud-native access | No | Yes | Yes | Yes | **Yes** (explode/pack, selective pull) |
+| Built-in query engine | No | No | Yes | **Yes (SQL)** | **Yes** (predicate pushdown) |
+| Domain-specific compression | No | No | No | No | **Yes** (Scx1 codec, 2-5× better) |
+| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (uint8/uint16 auto-detect) |
 
 ## Installation
 
@@ -554,24 +591,24 @@ All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1–2 TB RAM. Full results
 
 ### Compression
 
-| Dataset | Cells | h5ad → SCX | vs Zarr+Zstd |
-|---------|-------|-----------|-------------|
-| PBMC 3K | 2,700 | **4.9×** smaller | 2% smaller |
-| Smart-seq2 | 50,000 | **2.9×** smaller | 5% smaller |
-| Tabula Sapiens | 100,000 | **4.9×** smaller | 11% smaller |
-| Census 1M | 1,000,000 | **4.8×** smaller | 10% smaller |
-| Census 5M | 5,000,000 | **7.3×** smaller | 7% smaller |
+| Dataset | Cells | h5ad → SCX | vs Zarr+Zstd | vs SLAF |
+|---------|-------|-----------|--------------|---------|
+| PBMC 3K | 2,700 | **4.9×** smaller | 2% smaller | — |
+| Smart-seq2 | 50,000 | **2.9×** smaller | 5% smaller | — |
+| Tabula Sapiens | 100,000 | **4.9×** smaller | 11% smaller | — |
+| Census 1M | 1,000,000 | **4.8×** smaller | 10% smaller | **1.7×** smaller |
+| Census 5M | 5,000,000 | **7.3×** smaller | 7% smaller | — |
 
 ### Read Speed (full load to AnnData)
 
-| Dataset | SCX (auto) | h5ad (none) | h5ad (gzip) | Zarr (lz4) | TileDB-SOMA |
-|---------|-----------|-------------|-------------|------------|-------------|
-| PBMC 10K | 0.31s | 0.12s | 0.94s | **0.08s** | 0.44s |
-| Tabula Sapiens 100K | **0.58s** | 1.41s | 7.56s | 1.20s | 3.79s |
-| Census 1M | **2.74s** | 5.89s | 48.5s | 3.99s | 12.9s |
-| Census 5M | **35.4s** | 43.7s | 291s | 40.6s | 80.6s |
+| Dataset | SCX (auto) | h5ad (none) | h5ad (gzip) | Zarr (lz4) | TileDB-SOMA | SLAF |
+|---------|-----------|-------------|-------------|------------|-------------|------|
+| PBMC 10K | 0.31s | 0.12s | 0.94s | **0.08s** | 0.44s | — |
+| Tabula Sapiens 100K | **0.58s** | 1.41s | 7.56s | 1.20s | 3.79s | — |
+| Census 1M | **2.74s** | 5.89s | 48.5s | 3.99s | 12.9s | 53.0s |
+| Census 5M | **35.4s** | 43.7s | 291s | 40.6s | 80.6s | — |
 
-SCX is the fastest reader at scale — **1.5× faster than Zarr**, **2.1× faster than uncompressed h5ad**, and **17.7× faster than gzip h5ad** on 1M cells. Four codecs available: `auto` (default), `scx1`, `zstd`, `lz4`.
+SCX is the fastest reader at scale — **1.5× faster than Zarr**, **2.1× faster than uncompressed h5ad**, **17.7× faster than gzip h5ad**, and **19.3× faster than SLAF** on 1M cells. Four codecs available: `auto` (default), `scx1`, `zstd`, `lz4`.
 
 ### Parallel Scaling
 
@@ -598,24 +635,24 @@ Heavier codecs benefit most from parallel encoding. Scaling plateaus around 8–
 
 ### Column Projection (2000 HVGs)
 
-| Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA |
-|---------|-----|-------------|------------|-------------|
-| Tabula Sapiens 100K | **0.55s** | 0.86s | 0.94s | 1.31s |
-| Census 1M | **3.53s** | 33.6s | 7.24s | 10.0s |
-| Census 5M | **9.79s** | 94.1s | 63.9s | 66.3s |
+| Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA | SLAF |
+|---------|-----|-------------|------------|-------------|------|
+| Tabula Sapiens 100K | **0.55s** | 0.86s | 0.94s | 1.31s | — |
+| Census 1M | **3.53s** | 33.6s | 7.24s | 10.0s | 16.8s |
+| Census 5M | **9.79s** | 94.1s | 63.9s | 66.3s | — |
 
-SCX excels at gene selection — **2× faster than Zarr** and **9.6× faster than h5ad** on 1M+ cells.
+SCX excels at gene selection — **2× faster than Zarr**, **4.8× faster than SLAF**, and **9.6× faster than h5ad** on 1M+ cells.
 
 ### Memory
 
 Peak RSS during full read (lower is better):
 
-| Dataset | h5ad (none) | SCX (auto) | Zarr (zstd) |
-|---------|-------------|------------|-------------|
-| PBMC 10K | 0.48 GB | 1.51 GB | 0.76 GB |
-| Tabula Sapiens 100K | 0.53 GB | 2.27 GB | 2.08 GB |
-| Census 1M | 0.72 GB | 6.64 GB | 11.5 GB |
-| Census 5M | 1.04 GB | 18.5 GB | 87.7 GB |
+| Dataset | h5ad (none) | SCX (auto) | Zarr (zstd) | SLAF |
+|---------|-------------|------------|-------------|------|
+| PBMC 10K | 0.48 GB | 1.51 GB | 0.76 GB | — |
+| Tabula Sapiens 100K | 0.53 GB | 2.27 GB | 2.08 GB | — |
+| Census 1M | 0.72 GB | 6.64 GB | 11.5 GB | 34.7 GB |
+| Census 5M | 1.04 GB | 18.5 GB | 87.7 GB | — |
 
 For streaming aggregation (row_sums, col_sums), `MADV_DONTNEED` reduces SCX peak RSS by **67%** — from 3.5 GB to 1.1 GB on Census 1M. h5ad has lowest peak RSS (lazy/backed mode). SCX uses less memory than Zarr at scale (18.5 GB vs 87.7 GB on Census 5M).
 
@@ -623,13 +660,13 @@ Full out-of-core analysis pipeline (QC → normalize → log1p → HVG → PCA �
 
 ### Training Loader (batches/sec, batch_size=1024, HVG=2000, normalize+log1p)
 
-| Dataset | SCX | AnnData | TileDB-SOMA-ML | scDataLoader | SCX/SOMA |
-|---------|-----|---------|----------------|--------------|----------|
-| Census 1M | **1,405** | 16.3 | 17.1 | 4.4 | **82×** |
-| Tabula Sapiens 100K | **1,060** | 14.5 | 16.1 | 4.0 | **66×** |
-| PBMC 3K | **168** | 14.5 | 5.0 | 6.3 | **34×** |
+| Dataset | SCX | AnnData | TileDB-SOMA-ML | scDataLoader | SLAF | SCX/SOMA |
+|---------|-----|---------|----------------|--------------|------|----------|
+| Census 1M | **1,405** | 16.3 | 17.1 | 4.4 | 4.1 | **82×** |
+| Tabula Sapiens 100K | **1,060** | 14.5 | 16.1 | 4.0 | — | **66×** |
+| PBMC 3K | **168** | 14.5 | 5.0 | 6.3 | — | **34×** |
 
-SCX's triple-buffered pipeline (tokio I/O → rayon decode → Python) with native HVG projection and fused normalize+log1p delivers **34–82× higher throughput** than TileDB-SOMA-ML at scale. TTFB (time to first batch): 16 ms on PBMC 3K, 603 ms on Census 1M.
+SCX's triple-buffered pipeline (tokio I/O → rayon decode → Python) with native HVG projection and fused normalize+log1p delivers **34–82× higher throughput** than TileDB-SOMA-ML at scale (and **~340× higher throughput** than SLAF on Census 1M). TTFB (time to first batch): 16 ms on PBMC 3K, 603 ms on Census 1M. SLAF's `SLAFDataLoader` with the Geneformer tokenizer returns 0 batches on Census 10M under the default Mixture-of-Scanners prefetcher config (90 s TTFB, then timeout).
 
 ### GPU Acceleration (NVIDIA H100)
 

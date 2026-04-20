@@ -1,0 +1,76 @@
+{
+  "datasets": [
+    "census_1m"
+  ],
+  "formats": [
+    "slaf",
+    "scx_auto",
+    "h5ad_none",
+    "zarr_zstd",
+    "zarr_lz4"
+  ],
+  "rows": [
+    {
+      "dataset": "census_1m",
+      "operation": "read_full",
+      "formats": {
+        "slaf": {
+          "median_peak_rss_mb": 34710.62109375,
+          "median_delta_rss_mb": 2634.27,
+          "n_runs": 0
+        },
+        "scx_auto": {
+          "median_peak_rss_mb": 345.5234375,
+          "median_delta_rss_mb": 0.0,
+          "n_runs": 0
+        },
+        "h5ad_none": {
+          "median_peak_rss_mb": 346.90234375,
+          "median_delta_rss_mb": 1.97,
+          "n_runs": 0
+        },
+        "zarr_zstd": {
+          "median_peak_rss_mb": 10994.46875,
+          "median_delta_rss_mb": 21.96,
+          "n_runs": 0
+        },
+        "zarr_lz4": {
+          "median_peak_rss_mb": 11112.578125,
+          "median_delta_rss_mb": 0.12,
+          "n_runs": 0
+        }
+      }
+    },
+    {
+      "dataset": "census_1m",
+      "operation": "read_subset_1k",
+      "formats": {
+        "slaf": {
+          "median_peak_rss_mb": 34364.98046875,
+          "median_delta_rss_mb": 270.93,
+          "n_runs": 0
+        },
+        "scx_auto": {
+          "median_peak_rss_mb": 347.23828125,
+          "median_delta_rss_mb": 32.68,
+          "n_runs": 0
+        },
+        "h5ad_none": {
+          "median_peak_rss_mb": 346.90234375,
+          "median_delta_rss_mb": 1.97,
+          "n_runs": 0
+        },
+        "zarr_zstd": {
+          "median_peak_rss_mb": 309.0859375,
+          "median_delta_rss_mb": 3.72,
+          "n_runs": 0
+        },
+        "zarr_lz4": {
+          "median_peak_rss_mb": 423.74609375,
+          "median_delta_rss_mb": 0.51,
+          "n_runs": 0
+        }
+      }
+    }
+  ]
+}

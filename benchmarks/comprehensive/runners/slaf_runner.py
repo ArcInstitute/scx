@@ -120,27 +120,88 @@ class SlafRunner(FormatRunner):
         cell_indices: np.ndarray | list[int] | None = None,
         gene_indices: np.ndarray | list[int] | None = None,
     ) -> TimingResult:
+        """Subset read via ``SLAFArray.get_submatrix`` + CSR materialization.
+
+        ``LazyAnnData[row_idx, col_idx]`` has a known issue when the row
+        array is large-valued integer indices — SLAF constructs the scipy
+        COO with the *original* cell_id as the row coord instead of the
+        subset row position. Going through ``get_submatrix`` and
+        constructing the CSR by hand side-steps that path.
+        """
         self._require_slaf()
-        from slaf.integrations.anndata import read_slaf
+        import scipy.sparse as sp
 
         def _read_subset() -> None:
-            lazy_adata = read_slaf(str(path))
+            slaf_array = self._open_array(path)
 
-            cell_sel: Any = slice(None) if cell_indices is None else np.asarray(
-                cell_indices, dtype=np.int64
+            # Convert to python lists for IN clause building.
+            cell_list = (
+                None if cell_indices is None
+                else np.asarray(cell_indices, dtype=np.int64).tolist()
             )
-            gene_sel: Any = slice(None) if gene_indices is None else np.asarray(
-                gene_indices, dtype=np.int64
+            gene_list = (
+                None if gene_indices is None
+                else np.asarray(gene_indices, dtype=np.int64).tolist()
             )
 
-            # LazyAnnData.__getitem__ takes a (rows, cols) tuple and returns a
-            # new LazyAnnData; compute() materializes a real sc.AnnData.
-            sliced = lazy_adata[cell_sel, gene_sel]
-            adata = sliced.compute()
-            _ = adata.X
+            # SLAF's high-level ``get_submatrix`` API returns (cell_id,
+            # gene_id, value) where cell_id/gene_id are *strings* that
+            # may not be unique across the dataset (census_1m has
+            # cell_ids that repeat across chunks), making the long-form
+            # ambiguous. Go directly through the SQL engine: the
+            # ``expression`` table stores ``cell_integer_id`` /
+            # ``gene_integer_id`` which are globally unique.
+            where_parts: list[str] = []
+            if cell_list is not None:
+                where_parts.append(
+                    "cell_integer_id IN ("
+                    + ",".join(str(int(c)) for c in cell_list) + ")"
+                )
+            if gene_list is not None:
+                where_parts.append(
+                    "gene_integer_id IN ("
+                    + ",".join(str(int(g)) for g in gene_list) + ")"
+                )
+            where_clause = (
+                " WHERE " + " AND ".join(where_parts) if where_parts else ""
+            )
+            sql = (
+                "SELECT cell_integer_id, gene_integer_id, value "
+                "FROM expression" + where_clause
+            )
+            df = slaf_array.query(sql)
+
+            cell_ids = df["cell_integer_id"].to_numpy()
+            gene_ids = df["gene_integer_id"].to_numpy()
+            values = df["value"].to_numpy()
+
+            if cell_list is not None:
+                cell_lookup = {c: i for i, c in enumerate(cell_list)}
+                row = np.fromiter(
+                    (cell_lookup[int(c)] for c in cell_ids),
+                    dtype=np.int64, count=len(cell_ids),
+                )
+                n_rows = len(cell_list)
+            else:
+                row = cell_ids.astype(np.int64, copy=False)
+                n_rows = slaf_array.shape[0]
+            if gene_list is not None:
+                gene_lookup = {g: i for i, g in enumerate(gene_list)}
+                col = np.fromiter(
+                    (gene_lookup[int(g)] for g in gene_ids),
+                    dtype=np.int64, count=len(gene_ids),
+                )
+                n_cols = len(gene_list)
+            else:
+                col = gene_ids.astype(np.int64, copy=False)
+                n_cols = slaf_array.shape[1]
+
+            _ = sp.coo_matrix(
+                (values, (row, col)), shape=(n_rows, n_cols)
+            ).tocsr()
 
         _, timing = self.timed_run(_read_subset)
-        timing.extra = {"query_approach": "lazy_slice+compute"}
+        timing.extra = {"query_approach": "sql_in+csr"}
         return timing
 
     def file_size(self, path: str | Path) -> int:
@@ -169,39 +230,54 @@ class SlafRunner(FormatRunner):
 
         def _filtered() -> None:
             slaf_array = self._open_array(path)
-            # Predicate → SQL WHERE clause
+            # Resolve the predicate to a set of cell_integer_ids in one
+            # SQL roundtrip, then materialize the matching expression
+            # records with a second SQL query joined on that set. This
+            # mirrors the ``read_subset`` path and sidesteps SLAF's
+            # ``get_submatrix`` (which doesn't accept string cell_id
+            # lists).
             if isinstance(predicate, EqPredicate):
                 value_literal = (
                     f"'{predicate.value}'"
                     if isinstance(predicate.value, str)
                     else str(predicate.value)
                 )
-                sql = (
-                    f"SELECT cell_id FROM cells "
+                sql_cells = (
+                    "SELECT cell_integer_id FROM cells "
                     f"WHERE {predicate.column} = {value_literal}"
                 )
             elif isinstance(predicate, GtPredicate):
-                sql = (
-                    f"SELECT cell_id FROM cells "
+                sql_cells = (
+                    "SELECT cell_integer_id FROM cells "
                     f"WHERE {predicate.column} > {predicate.threshold}"
                 )
             elif isinstance(predicate, RandomSamplePredicate):
-                # DuckDB's SAMPLE clause is deterministic under REPEATABLE.
-                pct = predicate.fraction * 100.0
-                sql = (
-                    f"SELECT cell_id FROM cells "
-                    f"USING SAMPLE {pct} PERCENT (bernoulli, {predicate.seed})"
+                # Polars-SQL doesn't expose DuckDB's SAMPLE clause via
+                # ``SLAFArray.query``; emulate with a deterministic hash
+                # filter on cell_integer_id.
+                modulus = max(int(1 / predicate.fraction), 2)
+                # (seed * 2654435761) mod 2^32 — Knuth multiplicative
+                # constant; combines seed into the bucket selection.
+                target = (predicate.seed * 2654435761) % modulus
+                sql_cells = (
+                    "SELECT cell_integer_id FROM cells "
+                    f"WHERE (cell_integer_id % {modulus}) = {target}"
                 )
             else:  # pragma: no cover — exhaustive
                 raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
 
-            cell_ids_df = slaf_array.query(sql)
-            # polars DataFrame → python list for get_submatrix
-            cell_ids = cell_ids_df["cell_id"].to_list()
-            # get_submatrix returns a Polars DataFrame of (cell_id, gene_id,
-            # value) long-form; materializing it is the comparable "read"
-            # cost for SLAF's pushdown path.
-            _ = slaf_array.get_submatrix(cell_selector=cell_ids)
+            cell_rows = slaf_array.query(sql_cells)
+            ids = cell_rows["cell_integer_id"].to_list()
+            if not ids:
+                return  # No matching cells — empty read
+
+            # Materialize the expression slice (long form).
+            ids_csv = ",".join(str(int(i)) for i in ids)
+            sql_expr = (
+                "SELECT cell_integer_id, gene_integer_id, value "
+                f"FROM expression WHERE cell_integer_id IN ({ids_csv})"
+            )
+            _ = slaf_array.query(sql_expr)
 
         _, timing = self.timed_run(_filtered)
         timing.extra = {
