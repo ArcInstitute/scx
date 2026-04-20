@@ -22,6 +22,8 @@ _COMPRESSION_NAMES = {
 
 class H5adRunner(FormatRunner):
 
+    capabilities: frozenset[str] = frozenset({"filtered_query"})
+
     def __init__(self, compression: str | None = None) -> None:
         if compression not in _COMPRESSION_NAMES:
             raise ValueError(
@@ -99,3 +101,47 @@ class H5adRunner(FormatRunner):
 
     def file_size(self, path: str | Path) -> int:
         return os.path.getsize(path)
+
+    # ------------------------------------------------------------------
+    # Filtered query — h5ad has no pushdown, load + mask is the honest path
+    # ------------------------------------------------------------------
+
+    def read_filtered_query(
+        self,
+        path: str | Path,
+        predicate,
+    ) -> TimingResult:
+        from benchmarks.comprehensive.queries import (
+            EqPredicate,
+            GtPredicate,
+            RandomSamplePredicate,
+        )
+
+        def _filtered():
+            adata = anndata.read_h5ad(str(path))
+            if isinstance(predicate, EqPredicate):
+                mask = adata.obs[predicate.column] == predicate.value
+                sub = adata[mask.values]
+            elif isinstance(predicate, GtPredicate):
+                mask = adata.obs[predicate.column] > predicate.threshold
+                sub = adata[mask.values]
+            elif isinstance(predicate, RandomSamplePredicate):
+                rng = np.random.default_rng(predicate.seed)
+                n_take = max(1, int(adata.n_obs * predicate.fraction))
+                idx = np.sort(rng.choice(adata.n_obs, size=n_take, replace=False))
+                sub = adata[idx]
+            else:
+                raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
+            X = sub.X
+            # Force full materialization with a lightweight aggregation —
+            # ``toarray()`` would OOM on atlas-scale filter results. ``sum()``
+            # traverses every non-zero (sparse) or every cell (dense) so the
+            # I/O cost is included in the timing.
+            _ = X.sum()
+
+        _, timing = self.timed_run(_filtered)
+        timing.extra = {
+            "native_mechanism": "h5ad_load_and_mask",
+            "predicate": predicate.name,
+        }
+        return timing

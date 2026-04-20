@@ -30,7 +30,8 @@ benchmarks/
 │   ├── envs/                            # Conda environment definitions
 │   │   ├── scx-bench.yml                # CPU benchmark environment
 │   │   ├── scx-bench-gpu.yml            # GPU benchmark environment (CUDA + RAPIDS)
-│   │   └── scx-bench-r.yml             # R / BPCells benchmark environment
+│   │   ├── scx-bench-r.yml              # R / BPCells benchmark environment
+│   │   └── scx-bench-slaf.yml           # SLAF (slafdb) benchmark environment
 │   ├── runners/                         # Per-format benchmark runners
 │   │   ├── base.py                      # Abstract FormatRunner interface
 │   │   ├── h5ad_runner.py               # h5ad (uncompressed, gzip, lzf)
@@ -38,7 +39,8 @@ benchmarks/
 │   │   ├── tiledb_runner.py             # TileDB-SOMA
 │   │   ├── scx_runner.py                # SCX (auto, none, scx1, zstd, pcodec, lz4)
 │   │   ├── bpcells_runner.py            # BPCells (R subprocess)
-│   │   └── parquet_runner.py            # Parquet (pyarrow)
+│   │   ├── parquet_runner.py            # Parquet (pyarrow)
+│   │   └── slaf_runner.py               # SLAF (slafdb — Lance + DuckDB)
 │   ├── benchmarks/                      # Benchmark modules (one per dimension)
 │   ├── reporting/                       # Report generation (markdown, plots, tables)
 │   ├── scripts/                         # Orchestrators and SLURM launchers
@@ -72,6 +74,7 @@ The benchmark suite compares SCX against all relevant single-cell data formats:
 | **Zarr** (zstd) | CSR arrays, Zarr v3, zstd level 3 | `zarr` >= 3.0 | Chunked, cloud-native |
 | **Zarr** (blosc-lz4) | CSR arrays, Zarr v3, blosc-lz4 | `zarr` >= 3.0 | Fast decompression variant |
 | **TileDB-SOMA** | SOMAExperiment | `tiledbsoma` >= 2.3 + `tiledbsoma_ml` | CELLxGENE Census native format |
+| **SLAF** | SLAF directory (Lance + DuckDB) | `slafdb` >= 0.5.2 | SQL-native lazy format. Isolated `scx-bench-slaf` env (DuckDB/Lance conflict with TileDB/Zarr pins) |
 | **SCX** | auto, none, scx1, zstd, pcodec, lz4 | `pyscx` / `scx-cli` | System under test (multiple codec variants) |
 
 ### Additional Competitors
@@ -85,7 +88,7 @@ The benchmark suite compares SCX against all relevant single-cell data formats:
 
 | Format | Reason |
 |--------|--------|
-| Lance | No established single-cell tooling |
+| Lance (raw) | Covered through SLAF, which wraps Lance |
 | DuckDB / AnnSQL | SQL query engine, not a storage format |
 | Loom | Deprecated in favor of h5ad |
 | 10x HDF5 (.h5) | Legacy input format, not used for analysis storage |
@@ -150,6 +153,7 @@ The comprehensive benchmark suite uses **isolated conda environments** for repro
 | `scx-bench` | CPU benchmarks: format comparisons, accelerators, lazy preprocessing, correctness validation, ML loaders | All Python deps + PyTorch (CPU) |
 | `scx-bench-gpu` | GPU benchmarks: CUDA-accelerated PCA, kNN, UMAP, Leiden, fused preprocessing | Extends CPU deps with `cuda-version`, `cuvs`, `cugraph`, PyTorch (CUDA) |
 | `scx-bench-r` | BPCells benchmarks | R, Matrix, HDF5, BPCells (from GitHub) |
+| `scx-bench-slaf` | SLAF (slafdb) benchmarks — DuckDB/Lance backend conflicts with the main env's pins, so SLAF runs alone | `slafdb`, Polars, DuckDB, Lance (pip), PyTorch (CPU) for SLAFDataLoader |
 
 ### Setup
 
@@ -184,6 +188,7 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 | `comprehensive/scripts/validate_*.py` | `scx-bench` | `conda activate scx-bench` |
 | GPU benchmarks | `scx-bench-gpu` | `conda activate scx-bench-gpu` |
 | BPCells benchmarks | `scx-bench-r` | `conda activate scx-bench-r` |
+| SLAF benchmarks | `scx-bench-slaf` | `conda activate scx-bench-slaf` |
 
 **Legacy scripts** (`scripts/`) still reference the dev `.venv/` (CPU) and the `scx-gpu` conda env (GPU), and are preserved as-is.
 
@@ -496,7 +501,7 @@ cat benchmarks/logs/<script>_<JOBID>.log
 
 ## Environment Notes
 
-**Comprehensive benchmark suite** (`comprehensive/`) uses isolated conda environments (`scx-bench`, `scx-bench-gpu`, `scx-bench-r`) for reproducibility. See [Benchmark Environments](#benchmark-environments) above for setup.
+**Comprehensive benchmark suite** (`comprehensive/`) uses isolated conda environments (`scx-bench`, `scx-bench-gpu`, `scx-bench-r`, `scx-bench-slaf`) for reproducibility. See [Benchmark Environments](#benchmark-environments) above for setup.
 
 **Legacy scripts** (`scripts/`):
 

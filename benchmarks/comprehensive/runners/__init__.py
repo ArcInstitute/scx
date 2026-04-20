@@ -7,6 +7,7 @@ from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
 from benchmarks.comprehensive.runners.scx_runner import ScxRunner
 from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
 from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
+from benchmarks.comprehensive.runners.slaf_runner import SlafRunner
 
 __all__ = [
     "FormatRunner",
@@ -18,6 +19,7 @@ __all__ = [
     "ScxRunner",
     "BPCellsRunner",
     "ParquetRunner",
+    "SlafRunner",
     "make_runner",
 ]
 
@@ -29,6 +31,7 @@ _RUNNER_MAP = {
     "scx_runner": ScxRunner,
     "bpcells_runner": BPCellsRunner,
     "parquet_runner": ParquetRunner,
+    "slaf_runner": SlafRunner,
 }
 
 

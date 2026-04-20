@@ -30,6 +30,8 @@ def _require_tiledbsoma() -> None:
 class TileDBRunner(FormatRunner):
     """Benchmark runner for TileDB-SOMA format."""
 
+    capabilities: frozenset[str] = frozenset({"filtered_query"})
+
     @property
     def name(self) -> str:
         return "TileDB-SOMA"
@@ -118,3 +120,62 @@ class TileDBRunner(FormatRunner):
 
     def file_size(self, path: str | Path) -> int:
         return self._dir_size(path)
+
+    # ------------------------------------------------------------------
+    # Filtered query via TileDB-SOMA ``AxisQuery.value_filter``
+    # ------------------------------------------------------------------
+
+    def read_filtered_query(
+        self,
+        path: str | Path,
+        predicate,
+    ) -> TimingResult:
+        _require_tiledbsoma()
+        from benchmarks.comprehensive.queries import (
+            EqPredicate,
+            GtPredicate,
+            RandomSamplePredicate,
+            sql_literal,
+        )
+
+        if isinstance(predicate, EqPredicate):
+            value_filter = f"{predicate.column} == {sql_literal(predicate.value)}"
+            mechanism = "tiledb_value_filter"
+        elif isinstance(predicate, GtPredicate):
+            value_filter = f"{predicate.column} > {predicate.threshold}"
+            mechanism = "tiledb_value_filter"
+        elif isinstance(predicate, RandomSamplePredicate):
+            # SOMA has no sampling predicate; fall back to coord selection.
+            value_filter = None
+            mechanism = "tiledb_random_coords"
+        else:
+            raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
+
+        def _filtered():
+            with tiledbsoma.Experiment.open(str(path)) as exp:
+                if value_filter is not None:
+                    obs_query = tiledbsoma.AxisQuery(value_filter=value_filter)
+                else:
+                    import numpy as np
+
+                    assert isinstance(predicate, RandomSamplePredicate)
+                    # Select coords: we need the obs domain to sample from.
+                    obs_df = exp.obs.read().concat().to_pandas()
+                    n_obs = len(obs_df)
+                    rng = np.random.default_rng(predicate.seed)
+                    n_take = max(1, int(n_obs * predicate.fraction))
+                    sel = np.sort(rng.choice(n_obs, size=n_take, replace=False))
+                    obs_query = tiledbsoma.AxisQuery(coords=(sel.tolist(),))
+
+                query = exp.axis_query("RNA", obs_query=obs_query)
+                adata = query.to_anndata(X_name="data")
+                X = adata.X
+                if hasattr(X, "toarray"):
+                    X.toarray()
+
+        _, timing = self.timed_run(_filtered)
+        timing.extra = {
+            "native_mechanism": mechanism,
+            "predicate": predicate.name,
+        }
+        return timing

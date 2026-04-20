@@ -89,6 +89,14 @@ try:
 except ImportError:
     pass
 
+_HAS_SLAF = False
+try:
+    import slaf  # noqa: F401
+
+    _HAS_SLAF = True
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -181,6 +189,8 @@ def _resolve_loader(format_key: str) -> str | None:
         return "scdataloader"
     if format_key == "tiledb_soma":
         return "soma"
+    if format_key == "slaf":
+        return "slaf"
     return None
 
 
@@ -199,6 +209,8 @@ def _loader_available(loader_type: str) -> bool:
         return _HAS_SCDATALOADER and _HAS_TORCH
     if loader_type == "soma":
         return _HAS_SOMA_ML and _HAS_TORCH
+    if loader_type == "slaf":
+        return _HAS_SLAF and _HAS_TORCH
     return False
 
 
@@ -318,6 +330,59 @@ def _run_soma_epoch(
         exp.close()
 
     return _EpochResult(n_batches=n_batches, n_cells=n_cells)
+
+
+def _run_slaf_epoch(
+    slaf_path: str, batch_size: int, hvg: bool, normalize: bool
+) -> _EpochResult:
+    """Iterate ``SLAFDataLoader`` (geneformer tokenizer) for one epoch.
+
+    SLAF's ``SLAFDataLoader`` returns tokenized batches (``input_ids``,
+    ``attention_mask``, ``cell_ids``) rather than raw dense ``X``. Counting
+    batches and cells is still meaningful for throughput, but HVG / normalize
+    are inherent to the tokenizer's gene-ranking output; we log the scenario
+    flags in the result for provenance.
+    """
+    from slaf import SLAFArray
+    from slaf.ml import SLAFDataLoader
+
+    slaf_array = SLAFArray(slaf_path)
+    max_genes = QUERY_N_HVGS if hvg else 2048
+    loader = SLAFDataLoader(
+        slaf_array=slaf_array,
+        tokenizer_type="geneformer",
+        batch_size=batch_size,
+        max_genes=max_genes,
+    )
+
+    n_batches = 0
+    n_cells = 0
+    for batch in loader:
+        input_ids = batch.get("input_ids") if isinstance(batch, dict) else None
+        if input_ids is None:
+            # Defensive: unexpected batch shape
+            n_batches += 1
+            n_cells += batch_size
+            continue
+        n_batches += 1
+        n_cells += int(input_ids.shape[0])
+
+    return _EpochResult(n_batches=n_batches, n_cells=n_cells)
+
+
+def _ttfb_slaf(slaf_path: str, batch_size: int, hvg: bool) -> None:
+    from slaf import SLAFArray
+    from slaf.ml import SLAFDataLoader
+
+    slaf_array = SLAFArray(slaf_path)
+    loader = SLAFDataLoader(
+        slaf_array=slaf_array,
+        tokenizer_type="geneformer",
+        batch_size=batch_size,
+        max_genes=QUERY_N_HVGS if hvg else 2048,
+    )
+    for _ in loader:
+        break
 
 
 def _run_scdataloader_epoch(
@@ -710,6 +775,22 @@ def run(
             )
             return None
         data_path = str(soma_path)
+    elif loader_type == "slaf":
+        if converted_path is not None and Path(converted_path).exists():
+            data_path = str(converted_path)
+        else:
+            persistent = dataset.slaf_path
+            if persistent.exists():
+                data_path = str(persistent)
+            else:
+                _cleanup = tempfile.TemporaryDirectory(
+                    prefix=f"scx_bench_slaf_{dataset.name}_"
+                )
+                out = Path(_cleanup.name) / f"{dataset.name}.slaf"
+                logger.info("Converting %s -> %s", h5ad_path.name, out)
+                runner = make_runner(format_variant)
+                runner.convert_from_h5ad(h5ad_path, out)
+                data_path = str(out)
     else:
         return None
 
@@ -765,6 +846,11 @@ def run(
                     data_path, ML_BATCH_SIZE, hvg, normalize
                 )
                 ttfb_fn = lambda: _ttfb_scdataloader(data_path, ML_BATCH_SIZE)
+            elif loader_type == "slaf":
+                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_slaf_epoch(
+                    data_path, ML_BATCH_SIZE, hvg, normalize
+                )
+                ttfb_fn = lambda hvg=hvg: _ttfb_slaf(data_path, ML_BATCH_SIZE, hvg)
             else:
                 continue
 
