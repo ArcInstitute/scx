@@ -77,8 +77,22 @@ stage_scx_fixture() {
     fi
 
     if exists_on_gcs "$remote"; then
-        info "SKIP $name — already present at $remote"
-        return 0
+        # Compare local BLAKE3 against the cloud sidecar. When they match,
+        # skip re-upload; when they differ or no sidecar exists, re-push.
+        local local_hash remote_hash
+        local_hash=$(python -c "
+import sys
+sys.path.insert(0, '$(dirname "$(dirname "$(dirname "$(realpath "$0")")")")/..')
+from benchmarks.comprehensive.cloud_fixtures import compute_blake3
+from pathlib import Path
+print(compute_blake3(Path(sys.argv[1])))
+" "$local_file" 2>/dev/null || echo "")
+        remote_hash=$(gsutil -q cat "${remote%/}.blake3" 2>/dev/null | tr -d '[:space:]' || echo "")
+        if [[ -n "$local_hash" && -n "$remote_hash" && "$local_hash" == "$remote_hash" ]]; then
+            info "SKIP $name — BLAKE3 matches cloud sidecar (${local_hash:0:12}…)"
+            return 0
+        fi
+        info "REPUSH $name — digest drift or missing sidecar (local=${local_hash:0:12}…, remote=${remote_hash:0:12}…)"
     fi
 
     info "PUSH $name: $local_file → $remote"

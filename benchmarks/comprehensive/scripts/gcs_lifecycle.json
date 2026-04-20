@@ -1,0 +1,30 @@
+{
+  "_comment": "Phase I.4 — GCS object-lifecycle rules for gs://arc-ctc-nextflow/. Apply via: gcloud storage buckets update gs://arc-ctc-nextflow --lifecycle-file=benchmarks/comprehensive/scripts/gcs_lifecycle.json. Idempotent; re-applying overrides existing rules with this set.",
+  "lifecycle": {
+    "rule": [
+      {
+        "action": {"type": "Delete"},
+        "condition": {
+          "matchesPrefix": ["scx-test/ephemeral/"],
+          "daysSinceCustomTime": 90
+        }
+      },
+      {
+        "_comment": "Clean up transient push-benchmark upload targets. cloud_push.py writes to scx-test/bench_push_* paths that are cleaned by the benchmark's finally block; this rule catches leftovers from killed runs.",
+        "action": {"type": "Delete"},
+        "condition": {
+          "matchesPrefix": ["scx-test/bench_push_"],
+          "age": 7
+        }
+      },
+      {
+        "_comment": "Orphaned .blake3 sidecars whose parent fixture has been deleted. No direct match rule possible; a 180-day bound caps unbounded accumulation.",
+        "action": {"type": "Delete"},
+        "condition": {
+          "matchesSuffix": [".blake3"],
+          "age": 180
+        }
+      }
+    ]
+  }
+}

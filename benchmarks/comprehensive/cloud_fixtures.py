@@ -172,7 +172,100 @@ def ensure_cloud_fixture(
         pyscx.push(str(local_path), url)
     else:
         _gsutil_rsync(local_path, url)
+
+    # Write a BLAKE3 fingerprint sidecar alongside the fixture so
+    # `setup_cloud_test_data.sh` and `cloud_fixtures_doctor.py` can detect
+    # stale cloud copies without re-uploading to find out.
+    try:
+        _write_blake3_sidecar(local_path, url)
+    except Exception as exc:  # noqa: BLE001 — sidecar is best-effort
+        logger.warning("failed to write BLAKE3 sidecar for %s: %s", url, exc)
+
     return url
+
+
+# ---------------------------------------------------------------------------
+# BLAKE3 fingerprinting (Phase I.4)
+# ---------------------------------------------------------------------------
+
+
+def compute_blake3(path: Path, _chunk_size: int = 1 << 20) -> str:
+    """Return the BLAKE3 hex digest of a file or a directory tree.
+
+    For directories, hashes the sorted list of relative paths + per-file
+    content — the same algorithm used by ``MANIFEST.sha256`` semantics,
+    adapted to BLAKE3 for speed. Stable across file-order changes since
+    the recursion is sorted.
+    """
+    try:
+        import blake3  # type: ignore[import-not-found]
+        hasher = blake3.blake3()
+    except ImportError:
+        # Fallback to hashlib.blake2b — 64-bit digest truncated so the
+        # string shape matches BLAKE3's 32-byte digest. The harness env
+        # has blake3 via pyscx's deps; the fallback is for clean envs.
+        import hashlib
+        hasher = hashlib.blake2b(digest_size=32)
+
+    if path.is_file():
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(_chunk_size), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    if path.is_dir():
+        for entry in sorted(path.rglob("*")):
+            if not entry.is_file():
+                continue
+            rel = str(entry.relative_to(path)).encode()
+            hasher.update(b"\x00" + rel + b"\x00")
+            with open(entry, "rb") as f:
+                for chunk in iter(lambda: f.read(_chunk_size), b""):
+                    hasher.update(chunk)
+        return hasher.hexdigest()
+
+    raise FileNotFoundError(f"not a file or directory: {path}")
+
+
+def _write_blake3_sidecar(local_path: Path, cloud_url: str) -> None:
+    """Upload a ``.blake3`` sidecar to ``{cloud_url}/.blake3`` — one-line file.
+
+    Sidecar path: ``<cloud_url trailing slash normalized>.blake3``. The
+    doctor script reads this to detect drift. Best-effort; never blocks
+    the main upload.
+    """
+    digest = compute_blake3(local_path)
+    sidecar_url = cloud_url.rstrip("/") + ".blake3"
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="scx_blake3_")
+    sidecar_local = Path(tmp_dir) / "sidecar"
+    sidecar_local.write_text(digest + "\n")
+    try:
+        subprocess.run(
+            ["gsutil", "-q", "cp", str(sidecar_local), sidecar_url],
+            check=False, timeout=30,
+        )
+    finally:
+        try:
+            sidecar_local.unlink()
+            Path(tmp_dir).rmdir()
+        except OSError:
+            pass
+
+
+def read_blake3_sidecar(cloud_url: str, timeout_s: float = 15.0) -> str | None:
+    """Fetch ``{cloud_url}.blake3`` contents, or ``None`` if absent."""
+    sidecar_url = cloud_url.rstrip("/") + ".blake3"
+    try:
+        out = subprocess.run(
+            ["gsutil", "-q", "cat", sidecar_url],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
 
 
 # ---------------------------------------------------------------------------

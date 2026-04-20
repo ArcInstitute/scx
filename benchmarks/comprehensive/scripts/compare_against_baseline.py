@@ -116,7 +116,23 @@ def _load_summary(path: Path) -> dict[str, Any]:
     f = path / "summary.json"
     if not f.exists():
         raise FileNotFoundError(f"summary.json not found at {f}")
-    return json.loads(f.read_text())
+    data = json.loads(f.read_text())
+    # summary.json itself doesn't carry schema_version today — the shape
+    # stabilized pre-Phase-5. Raw per-run JSONs DO carry schema_version now;
+    # refuse to diff when we detect an unknown future version.
+    sv = data.get("schema_version")
+    if sv is not None:
+        try:
+            from benchmarks.comprehensive.results import SCHEMA_VERSION
+        except ImportError:
+            SCHEMA_VERSION = None  # pragma: no cover — impossible in practice
+        if SCHEMA_VERSION is not None and sv > SCHEMA_VERSION:
+            raise ValueError(
+                f"{f} declares schema_version={sv} but this gate only "
+                f"understands up to {SCHEMA_VERSION}. Upgrade the harness "
+                f"or downgrade the snapshot."
+            )
+    return data
 
 
 def _load_fingerprints(path: Path) -> dict[str, Any]:

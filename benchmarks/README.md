@@ -505,26 +505,41 @@ sbatch --exclusive benchmarks/scripts/slurm_gpu_analysis_bench.sh
 
 ### Recommended execution order
 
+The comprehensive harness is the committed entrypoint. Legacy wrappers
+under `benchmarks/scripts/slurm_*.sh` are deprecated (see
+`benchmarks/scripts/README.md` for the migration table).
+
 ```
 1. Prepare datasets (run first — benchmarks depend on these):
    sbatch benchmarks/scripts/slurm_prep_datasets.sh
    sbatch benchmarks/scripts/slurm_build_census_5m.sh    # (optional, high-memory)
    sbatch benchmarks/scripts/slurm_build_census_10m.sh   # (optional, high-memory)
 
-2. CPU benchmarks (after datasets are ready):
-   bash benchmarks/scripts/run_benchmarks_slurm.sh
-   sbatch benchmarks/scripts/slurm_fused_bench.sh
-   sbatch benchmarks/scripts/slurm_lazy_preprocess_bench.sh
+2. Run benchmarks via the unified comprehensive launcher
+   (one submitit job per benchmark × format × dataset triple):
+   python benchmarks/comprehensive/scripts/run_parallel.py \
+       --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
+   python benchmarks/comprehensive/scripts/run_parallel.py \
+       --datasets census_500k census_1m census_5m --tier large
 
-3. GPU benchmarks (require preemptible partition with GPUs):
-   sbatch benchmarks/scripts/slurm_gpu_analysis_bench.sh
-   sbatch benchmarks/scripts/slurm_gpu_bench.sh
-   sbatch benchmarks/scripts/slurm_gpu_knn_bench.sh
-   sbatch benchmarks/scripts/slurm_gpu_pca_opt_bench.sh
+3. Cloud benchmarks (GCP — requires GOOGLE_APPLICATION_CREDENTIALS;
+   see check_gcp_auth.py preflight):
+   python benchmarks/comprehensive/scripts/check_gcp_auth.py
+   python benchmarks/comprehensive/scripts/run_parallel.py \
+       --benchmarks cloud_push cloud_pull cloud_read cloud_metadata \
+                    cloud_filtered cloud_reader_vs_pull cost_model \
+       --datasets pbmc3k tabula_sapiens_100k
+
+4. Regression gate (on-demand — per PR, pre-release, on-suspicion):
+   bash benchmarks/comprehensive/scripts/gate_candidate.sh
 ```
 
 > [!IMPORTANT]
-> Always run dataset preparation jobs first. The benchmark scripts assume datasets exist at the `SCX_DATA_DIR` path (configured via `.env` at the repo root; defaults to `$SCX_WORK_DIR/benchmarks/datasets`).
+> Always run dataset preparation jobs first. The comprehensive harness
+> expects datasets at `SCX_DATA_DIR` (configured via `.env`; defaults to
+> `$SCX_WORK_DIR/benchmarks/datasets`). Cloud benchmarks additionally
+> require one-time fixture staging via
+> `benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`.
 
 ---
 

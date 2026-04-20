@@ -579,6 +579,39 @@ def estimate_memory_gb(
         # on-disk copies of the base file (for per-run isolation), but those
         # are SCX-compressed and << dense_mb.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("cloud_push", "cloud_pull"):
+        # SCX-only. pyscx.push/pull stream section-by-section with a small
+        # reorder buffer; dominant footprint is the shard currently
+        # encoding/decoding plus the catalog. Well-bounded regardless of
+        # dataset size — just need enough for the source CSR read when
+        # pack'ing on pull. Keep sized against base to cover catalog parse.
+        peak_mb = max(base_mb, 4 * 1024)  # 4 GB ceiling for the streaming path
+    elif benchmark == "cloud_read":
+        # SCX pull+read needs the dense matrix at end; other runners (zarr,
+        # tiledb, slaf) materialize in-memory too. Size like read_full.
+        if is_dense_path:
+            peak_mb = max(base_mb, dense_mb * 1.3)
+        else:
+            peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "cloud_metadata":
+        # Catalog-only open — single GET + a few small parses. Trivial.
+        peak_mb = max(base_mb * 0.25, 2 * 1024)  # 2 GB floor for Python baseline
+    elif benchmark == "cloud_filtered":
+        # Cross-format predicate pushdown — matching cells subset is loaded
+        # per predicate; bounded by the largest expected result set.
+        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "cloud_reader_vs_pull":
+        # Exercises both open_cloud and pull (full) paths; sizing matches
+        # the more expensive full-pull path.
+        peak_mb = max(base_mb, dense_mb * 0.8)
+    elif benchmark == "cost_model":
+        # metadata + selective + full_read per layout. Dominant run is
+        # full_read; size to that.
+        peak_mb = max(base_mb, dense_mb * 0.8)
+    elif benchmark == "cloud_large_atlas":
+        # Assertion-based — peak RSS MUST stay under the 240 MB bound from
+        # docs/cloud.md. Give headroom but not much.
+        peak_mb = 8 * 1024  # 8 GB ceiling for safety
     else:
         peak_mb = base_mb
 
@@ -593,6 +626,70 @@ def estimate_memory_gb(
     # whose true footprint exceeds this (e.g. dense-h5ad read on census_5m)
     # would OOM either way; the cap keeps submitit from rejecting the job.
     return min(total, MEM_CEILING_GB)
+
+
+def estimate_time_minutes(
+    dataset: "DatasetConfig",
+    format_key: str,
+    benchmark: str,
+) -> int:
+    """Estimate per-job wall-clock budget in minutes for a triple.
+
+    Centralizes the time ceiling that was previously tier-uniform in
+    ``capture_baseline.py::TIERS``. Returns a value rounded up to 5-min
+    increments so scheduler fragmentation stays low. Callers that want
+    a conservative envelope multiply by ``--scale-factor``; CI defaults
+    to the aggressive 0.9× side, ad-hoc runs use 1.3×.
+    """
+    import math
+
+    n_obs = dataset.n_obs
+    # Scale with n_obs: small datasets complete in minutes, census_10m in
+    # hours. Model as a per-benchmark base rate + a per-million-cells term.
+    per_million = max(n_obs / 1_000_000, 0.1)
+
+    # Base minutes per benchmark (empirical floors on pbmc3k).
+    base_minutes: dict[str, int] = {
+        "compression":            3,
+        "write":                  10,
+        "read_full":              8,
+        "read_selective":         10,
+        "parallel_scaling":       20,
+        "parallel_write_scaling": 25,
+        "memory":                 15,
+        "fragment_ops":           15,
+        "cloud_push":             20,
+        "cloud_pull":             20,
+        "cloud_read":             20,
+        "cloud_metadata":         5,
+        "cloud_filtered":         20,
+        "cloud_reader_vs_pull":   25,
+        "cost_model":             20,
+        "cloud_large_atlas":      60,   # 50GB+ pull is not quick
+        "ml_loader":              30,
+    }
+    base = base_minutes.get(benchmark, 15)
+
+    # Per-million-cells multiplier. Cloud ops scale linearly with bytes
+    # downloaded; cost_model / cloud_large_atlas scale heavily.
+    slope_minutes_per_million = 8
+    if benchmark in ("cloud_large_atlas",):
+        slope_minutes_per_million = 30
+    elif benchmark in ("cloud_push", "cloud_pull", "cloud_read",
+                        "cloud_reader_vs_pull", "cost_model"):
+        slope_minutes_per_million = 12
+    elif benchmark in ("cloud_metadata", "cloud_filtered"):
+        slope_minutes_per_million = 4
+    elif benchmark in ("compression", "read_selective"):
+        slope_minutes_per_million = 2
+
+    total = base + int(slope_minutes_per_million * per_million)
+    # Dense-path formats (h5ad / zarr) take longer at census scale.
+    if format_key.startswith(("h5ad", "zarr")) and n_obs >= 1_000_000:
+        total = int(total * 1.5)
+
+    # Round up to 5-min increments.
+    return max(5, math.ceil(total / 5) * 5)
 
 
 def partition_for_memory(mem_gb: int, default: str = "cpu_preemptible") -> str:

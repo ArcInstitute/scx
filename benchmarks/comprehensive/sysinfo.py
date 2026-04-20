@@ -44,6 +44,12 @@ def collect_system_info() -> dict[str, Any]:
     # Storage info (best-effort)
     info["storage"] = _get_storage_info()
 
+    # GPU / CUDA / nvidia-fs (best-effort; only present on GPU nodes). Closes
+    # the ROADMAP §5.1 claim that these are captured — Phase I.2.
+    gpu = _get_gpu_info()
+    if gpu:
+        info["gpu"] = gpu
+
     # GCP compute-node matrix labels (Phase E). The launcher sets these env
     # vars on each VM before invoking the benchmark so the emitted JSON
     # self-labels with the instance type + region. Absent off-cloud, so
@@ -178,6 +184,58 @@ def _get_storage_info() -> dict[str, str]:
         info["has_nvme"] = result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         info["has_nvme"] = False
+
+    return info
+
+
+def _get_gpu_info() -> dict[str, Any]:
+    """Capture CUDA runtime / driver / nvidia-fs status (GPU nodes only).
+
+    Returns an empty dict when the host has no GPU toolchain — callers
+    then skip the ``gpu`` key entirely so CPU-only runs don't carry
+    empty-string placeholders.
+    """
+    info: dict[str, Any] = {}
+
+    # CUDA runtime (nvcc). Missing on nodes that have driver-only installs.
+    try:
+        out = subprocess.run(
+            ["nvcc", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            for line in out.stdout.splitlines():
+                if "release" in line:
+                    info["cuda_runtime"] = line.strip()
+                    break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Driver via nvidia-smi (the common case on compute nodes).
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version,name",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            first = out.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in first.split(",", 1)]
+            if parts:
+                info["driver_version"] = parts[0]
+            if len(parts) > 1:
+                info["gpu_name"] = parts[1]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # nvidia-fs (GPUDirect Storage). Presence of the kernel module implies
+    # nvidia-fs is loaded; the GPU path under scx-gpu checks this too.
+    try:
+        mods = Path("/proc/modules")
+        if mods.exists():
+            info["nvidia_fs_loaded"] = "nvidia_fs" in mods.read_text()
+    except OSError:
+        pass
 
     return info
 

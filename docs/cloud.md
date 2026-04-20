@@ -63,6 +63,61 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
 # Or: `gcloud auth application-default login` for local dev
 ```
 
+#### Benchmark service-account bootstrap (one-time)
+
+The comprehensive benchmark suite expects a dedicated service account
+`scx-bench@<project>.iam.gserviceaccount.com` with scoped bucket access.
+Run these once per GCP project (requires `roles/iam.serviceAccountAdmin`
++ `roles/resourcemanager.projectIamAdmin`):
+
+```bash
+# 1. Pin the project
+PROJECT=c-tc-429521
+BUCKET=gs://arc-ctc-nextflow
+gcloud config set project "$PROJECT"
+
+# 2. Create the service account if absent
+if ! gcloud iam service-accounts list \
+      --filter="email:scx-bench@$PROJECT.iam.gserviceaccount.com" \
+      --format="value(email)" | grep -q .; then
+    gcloud iam service-accounts create scx-bench \
+        --display-name "SCX Benchmark Runner" \
+        --project "$PROJECT"
+fi
+
+# 3. Grant bucket-scoped objectAdmin (NOT project-wide)
+gcloud storage buckets add-iam-policy-binding "$BUCKET" \
+    --member="serviceAccount:scx-bench@$PROJECT.iam.gserviceaccount.com" \
+    --role=roles/storage.objectAdmin
+
+# 4. Mint a JSON key and stash locally
+mkdir -p ~/.gcp
+gcloud iam service-accounts keys create ~/.gcp/scx-bench.json \
+    --iam-account="scx-bench@$PROJECT.iam.gserviceaccount.com"
+chmod 600 ~/.gcp/scx-bench.json
+
+# 5. Point the benchmark runner at the key
+echo 'export GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json' >> ~/.bashrc
+```
+
+**Key rotation:** re-mint every 90 days and delete the old key in the GCP
+console. Never commit the JSON, paste it into chat, or copy it into the
+repo tree.
+
+#### Preflight check
+
+After bootstrapping, verify the setup end-to-end (checks env var,
+parses the key, validates service-account identity, round-trips a
+healthcheck blob through the bucket):
+
+```bash
+python benchmarks/comprehensive/scripts/check_gcp_auth.py -v
+```
+
+Exit 0 on success, 1 on any failure with a pointed error message. Use
+`--skip-healthcheck` in CI when you want key validation without paying
+for a GCS round-trip.
+
 ### Amazon S3
 
 ```bash
