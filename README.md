@@ -504,6 +504,8 @@ No pre-built binaries are distributed — Cargo builds all SCX crates from sourc
 
 ## Quick Start
 
+For an end-to-end walkthrough, see the [scanpy tutorial notebook](notebooks/scx_scanpy_tutorial.ipynb).
+
 ### Convert your data to SCX
 
 SCX supports **roundtrip conversion** with h5ad, 10x HDF5, and Cell Ranger MTX formats —
@@ -587,7 +589,7 @@ scx merge batch1.scx batch2.scx --output atlas.scx
 
 ## Benchmarks
 
-All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1–2 TB RAM. Full results in [`benchmarks/results/`](benchmarks/results/) and [`benchmarks/comprehensive/reporting/phase3_report.md`](benchmarks/comprehensive/reporting/phase3_report.md).
+See [`docs/performance.md`](docs/performance.md) for more details.
 
 ### Compression
 

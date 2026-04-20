@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import shutil
 import tempfile
 import time
@@ -40,11 +39,8 @@ _SCX_TRIGGER_KEY = "scx_auto"
 # Number of random cell indices to mark deleted. Capped by n_obs at runtime.
 _DELETE_N = 10_000
 
-# Maximum indices to list explicitly in the JSON ``extra`` field.
-_MAX_EXTRA_INDICES = 32
 
-
-def _peak_rss_mb() -> float:
+def _current_rss_mb() -> float:
     """Current resident-set size in MB (Linux /proc/self/statm)."""
     return FormatRunner._get_rss_mb()
 
@@ -59,12 +55,17 @@ def _copy_scx(src: Path, dst: Path) -> None:
 
 
 def _time_op(fn, *args, **kwargs) -> tuple[float, float]:
-    """Run *fn* and return ``(wall_s, peak_rss_mb)``."""
+    """Run *fn* and return ``(wall_s, rss_after_mb)``.
+
+    The RSS value is the *current* resident-set size sampled immediately
+    after ``fn`` returns — not a true peak. Sufficient for detecting gross
+    regressions; if/when we need true peak, bracket with ``ru_maxrss``.
+    """
     _gc()
     t0 = time.perf_counter()
     fn(*args, **kwargs)
     wall = time.perf_counter() - t0
-    return wall, _peak_rss_mb()
+    return wall, _current_rss_mb()
 
 
 def _run_append(
@@ -90,7 +91,7 @@ def _run_append(
         _copy_scx(base_scx, target_path)
         size_before = target_path.stat().st_size
 
-        wall, peak = _time_op(pyscx.append, str(target_path), str(input_path))
+        wall, rss = _time_op(pyscx.append, str(target_path), str(input_path))
 
         size_after = target_path.stat().st_size
         throughput_mb_s = (input_bytes / (1024 * 1024)) / wall if wall > 0 else 0.0
@@ -98,7 +99,7 @@ def _run_append(
 
         result.add_run(
             wall_s=wall,
-            peak_rss_mb=peak,
+            peak_rss_mb=rss,
             operation="append",
             rows_inserted=n_rows,
             bytes_appended=input_bytes,
@@ -137,14 +138,14 @@ def _run_delete(
         _copy_scx(base_scx, target_path)
         size_before = target_path.stat().st_size
 
-        wall, peak = _time_op(pyscx.mark_deleted, str(target_path), indices)
+        wall, rss = _time_op(pyscx.mark_deleted, str(target_path), indices)
 
         size_after = target_path.stat().st_size
         rows_per_sec = n_delete / wall if wall > 0 else 0.0
 
         result.add_run(
             wall_s=wall,
-            peak_rss_mb=peak,
+            peak_rss_mb=rss,
             operation="delete",
             rows_deleted=n_delete,
             size_before_bytes=size_before,
@@ -189,7 +190,7 @@ def _run_compact(
         _copy_scx(dirty_path, input_path)
         size_before = input_path.stat().st_size
 
-        wall, peak = _time_op(pyscx.compact, str(input_path), str(output_path))
+        wall, rss = _time_op(pyscx.compact, str(input_path), str(output_path))
 
         size_after = output_path.stat().st_size
         reclaimed = size_before - size_after
@@ -197,7 +198,7 @@ def _run_compact(
 
         result.add_run(
             wall_s=wall,
-            peak_rss_mb=peak,
+            peak_rss_mb=rss,
             operation="compact",
             size_before_bytes=size_before,
             size_after_bytes=size_after,
@@ -234,12 +235,12 @@ def _run_rollback(
         pyscx.append(str(target_path), str(base_scx))
         size_before = target_path.stat().st_size
 
-        wall, peak = _time_op(pyscx.rollback, str(target_path))
+        wall, rss = _time_op(pyscx.rollback, str(target_path))
 
         size_after = target_path.stat().st_size
         result.add_run(
             wall_s=wall,
-            peak_rss_mb=peak,
+            peak_rss_mb=rss,
             operation="rollback",
             size_before_bytes=size_before,
             size_after_bytes=size_after,
