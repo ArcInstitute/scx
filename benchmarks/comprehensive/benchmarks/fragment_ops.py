@@ -1,5 +1,5 @@
 """
-Fragment / Manifest Operation Throughput benchmark — PHASE5-FINISH §B.
+Fragment / Manifest Operation Throughput benchmark.
 
 Measures wall-clock and throughput for the four SCX fragment/manifest
 mutations exposed by ``scx-ops`` via pyscx:

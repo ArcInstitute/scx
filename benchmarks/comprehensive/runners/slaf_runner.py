@@ -41,7 +41,11 @@ _MISSING_MSG = (
 class SlafRunner(FormatRunner):
     """Benchmark runner for SLAF directories."""
 
-    capabilities: frozenset[str] = frozenset({"filtered_query"})
+    capabilities: frozenset[str] = frozenset({
+        "filtered_query",
+        "cloud_read",
+        "cloud_subset",
+    })
 
     @property
     def name(self) -> str:
@@ -297,4 +301,96 @@ class SlafRunner(FormatRunner):
             "native_mechanism": mechanism,
             "predicate": predicate.name,
         }
+        return timing
+
+    # ------------------------------------------------------------------
+    # Cloud operations (Phase C — SLAF opens cloud URIs via its
+    # documented cloud-backed DuckDB path; see Phase D.3 for depth)
+    # ------------------------------------------------------------------
+
+    def read_cloud(self, cloud_url: str) -> TimingResult:
+        self._require_slaf()
+        from slaf.integrations.anndata import read_slaf
+
+        def _read() -> None:
+            lazy_adata = read_slaf(cloud_url)
+            adata = lazy_adata.compute()
+            _ = adata.X
+
+        _, timing = self.timed_run(_read)
+        timing.extra = {"provider": "gcs", "native_mechanism": "slaf_cloud"}
+        return timing
+
+    def read_cloud_subset(
+        self,
+        cloud_url: str,
+        cell_indices: np.ndarray | list[int] | None = None,
+        gene_indices: np.ndarray | list[int] | None = None,
+    ) -> TimingResult:
+        self._require_slaf()
+        import scipy.sparse as sp
+
+        cell_arr = (
+            None if cell_indices is None
+            else np.sort(np.asarray(cell_indices, dtype=np.int64))
+        )
+        gene_arr = (
+            None if gene_indices is None
+            else np.sort(np.asarray(gene_indices, dtype=np.int64))
+        )
+
+        def _subset() -> None:
+            slaf_array = SLAFArray(cloud_url)
+            where_parts: list[str] = []
+            if cell_arr is not None:
+                where_parts.append(
+                    "cell_integer_id IN ("
+                    + ",".join(str(int(c)) for c in cell_arr) + ")"
+                )
+            if gene_arr is not None:
+                where_parts.append(
+                    "gene_integer_id IN ("
+                    + ",".join(str(int(g)) for g in gene_arr) + ")"
+                )
+            where_clause = (
+                " WHERE " + " AND ".join(where_parts) if where_parts else ""
+            )
+            sql = (
+                "SELECT cell_integer_id, gene_integer_id, value "
+                "FROM expression" + where_clause
+            )
+            df = slaf_array.query(sql)
+            cell_ids = df["cell_integer_id"].to_numpy()
+            gene_ids = df["gene_integer_id"].to_numpy()
+            values = df["value"].to_numpy()
+            if cell_arr is not None:
+                row = np.searchsorted(cell_arr, cell_ids).astype(np.int64, copy=False)
+                n_rows = len(cell_arr)
+            else:
+                row = cell_ids.astype(np.int64, copy=False)
+                n_rows = slaf_array.shape[0]
+            if gene_arr is not None:
+                col = np.searchsorted(gene_arr, gene_ids).astype(np.int64, copy=False)
+                n_cols = len(gene_arr)
+            else:
+                col = gene_ids.astype(np.int64, copy=False)
+                n_cols = slaf_array.shape[1]
+            _ = sp.coo_matrix(
+                (values, (row, col)), shape=(n_rows, n_cols)
+            ).tocsr()
+
+        _, timing = self.timed_run(_subset)
+        timing.extra = {"provider": "gcs", "native_mechanism": "slaf_cloud_sql"}
+        return timing
+
+    def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
+        """Open the SLAF array and touch ``shape`` only."""
+        self._require_slaf()
+
+        def _open():
+            arr = SLAFArray(cloud_url)
+            _ = arr.shape
+
+        _, timing = self.timed_run(_open)
+        timing.extra = {"provider": "gcs", "native_mechanism": "slaf_open"}
         return timing

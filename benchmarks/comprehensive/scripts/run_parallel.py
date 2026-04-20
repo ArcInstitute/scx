@@ -70,6 +70,10 @@ BENCHMARK_NAMES = [
     "parallel_write_scaling",
     "memory",
     "fragment_ops",
+    "cloud_push",
+    "cloud_pull",
+    "cloud_read",
+    "cloud_metadata",
 ]
 
 # Benchmarks that work from h5ad source and don't need pre-converted files.

@@ -128,6 +128,28 @@ class DatasetConfig:
             raise ValueError(f"No persistent path for format key {format_key!r}")
         return getattr(self, prop)
 
+    def cloud_url(self, format_key: str, provider: str = "gcs") -> str:
+        """Return the cloud URI for this dataset in a given format.
+
+        Phase 5 is GCP-only; ``provider`` must be ``"gcs"``. The returned URL
+        points at the shared test bucket (``GCS_TEST_BUCKET``) with the
+        format-appropriate suffix (``.scxd`` for SCX, ``.zarr``, ``.soma``,
+        ``.slaf``). Directory-style layouts keep the trailing slash so
+        callers can concatenate sub-paths without conditional logic.
+        """
+        if provider != "gcs":
+            raise ValueError(
+                f"Only 'gcs' provider is supported (got {provider!r}). "
+                "AWS S3 and Azure Blob validation is deferred; see the "
+                "Cloud Benchmarks section of benchmarks/README.md."
+            )
+        suffix = _FORMAT_KEY_TO_CLOUD_SUFFIX.get(format_key)
+        if suffix is None:
+            raise ValueError(
+                f"No cloud layout defined for format key {format_key!r}"
+            )
+        return f"{GCS_TEST_BUCKET}/{self.name}{suffix}/"
+
 
 _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "h5ad_none": "h5ad_path",
@@ -145,6 +167,36 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
+}
+
+
+# ---------------------------------------------------------------------------
+# Cloud (GCP-only — see benchmarks/README.md "Cloud Benchmarks (GCP)")
+# ---------------------------------------------------------------------------
+
+# Shared test bucket. The comprehensive cloud benchmarks validate behavior
+# against GCP only; AWS S3 and Azure Blob coverage is deferred.
+GCS_TEST_BUCKET = os.environ.get(
+    "GCS_TEST_BUCKET", "gs://arc-ctc-nextflow/scx-test"
+).rstrip("/")
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "c-tc-429521")
+# Region the bucket lives in — Phase E launcher pins VM region to this so
+# egress stays intra-region. Override via env if the bucket ever moves.
+GCP_BUCKET_REGION = os.environ.get("GCP_BUCKET_REGION", "us-central1")
+
+# Cloud layout suffixes per format. SCX uses the exploded ``.scxd/`` layout
+# on GCS (see docs/cloud.md); others keep their native directory suffix.
+_FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
+    "scx_auto": ".scxd",
+    "scx_scx1": ".scxd",
+    "scx_zstd": ".scxd",
+    "scx_none": ".scxd",
+    "scx_lz4": ".scxd",
+    "scx_pcodec": ".scxd",
+    "zarr_zstd": ".zarr",
+    "zarr_lz4": ".zarr",
+    "tiledb_soma": ".soma",
+    "slaf": ".slaf",
 }
 
 

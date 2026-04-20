@@ -35,6 +35,8 @@ class ZarrRunner(FormatRunner):
 
     _VALID_COMPRESSORS = ("zstd", "lz4")
 
+    capabilities: frozenset[str] = frozenset({"cloud_read", "cloud_subset"})
+
     def __init__(self, compressor: str = "zstd", level: int = 3) -> None:
         if compressor not in self._VALID_COMPRESSORS:
             raise ValueError(
@@ -214,3 +216,69 @@ class ZarrRunner(FormatRunner):
 
     def file_size(self, path: str | Path) -> int:
         return self._dir_size(path)
+
+    # ------------------------------------------------------------------
+    # Cloud operations (Phase C — minimal GCS read via zarr-python 3.x
+    # async store / fsspec gcsfs routing)
+    # ------------------------------------------------------------------
+
+    def read_cloud(self, cloud_url: str) -> TimingResult:
+        import scipy.sparse as sp
+        import zarr
+
+        def _read() -> sp.csr_matrix:
+            store = zarr.open(cloud_url, mode="r")
+            indptr = store["indptr"][:]
+            indices = store["indices"][:]
+            data = store["data"][:]
+            shape = tuple(store.attrs["shape"])
+            return sp.csr_matrix((data, indices, indptr), shape=shape)
+
+        _, timing = self.timed_run(_read)
+        timing.extra = {"provider": "gcs", "native_mechanism": "zarr_fsspec"}
+        return timing
+
+    def read_cloud_subset(
+        self,
+        cloud_url: str,
+        cell_indices: np.ndarray | list[int] | None = None,
+        gene_indices: np.ndarray | list[int] | None = None,
+    ) -> TimingResult:
+        import scipy.sparse as sp
+        import zarr
+
+        def _subset() -> sp.csr_matrix:
+            store = zarr.open(cloud_url, mode="r")
+            indptr = store["indptr"][:]
+            shape = tuple(store.attrs["shape"])
+            all_indices = store["indices"][:]
+            all_data = store["data"][:]
+            mat = sp.csr_matrix(
+                (all_data, all_indices, indptr), shape=shape
+            )
+            if cell_indices is not None:
+                mat = mat[np.asarray(cell_indices, dtype=np.intp)]
+            if gene_indices is not None:
+                mat = mat[:, np.asarray(gene_indices, dtype=np.intp)]
+            return mat
+
+        _, timing = self.timed_run(_subset)
+        timing.extra = {"provider": "gcs", "native_mechanism": "zarr_fsspec"}
+        return timing
+
+    def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
+        """Open the store and touch attrs only — no array reads.
+
+        Zarr v3 routes ``zarr.open(gs://..., mode="r")`` through the
+        fsspec async store; ``.attrs["shape"]`` is a single GET against
+        the consolidated metadata blob where available.
+        """
+        import zarr
+
+        def _open():
+            store = zarr.open(cloud_url, mode="r")
+            _ = tuple(store.attrs.get("shape", ()))
+
+        _, timing = self.timed_run(_open)
+        timing.extra = {"provider": "gcs", "native_mechanism": "zarr_open"}
+        return timing

@@ -1,0 +1,114 @@
+"""
+Cloud metadata-open latency benchmark.
+
+Cross-format metadata-only open latency:
+  * SCX: ``pyscx.open_cloud(url)`` + touch ``n_obs / n_vars / nnz``
+  * Zarr: ``zarr.open(url)`` + touch ``attrs['shape']``
+  * TileDB-SOMA: ``Experiment.open(url)`` + touch obs/var counts
+  * SLAF: ``SLAFArray(url)`` + touch ``shape``
+
+Each runner's ``read_cloud_metadata(url)`` helper does the minimal open
+and touches only schema-level properties; array reads are excluded so the
+benchmark measures first-GET / catalog-parse latency, not bandwidth.
+Returns ``None`` for formats whose runner does not provide the helper
+(silent skip).
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+from pathlib import Path
+
+from benchmarks.comprehensive.cloud_fixtures import (
+    ensure_cloud_fixture,
+    require_gcp_credentials,
+)
+from benchmarks.comprehensive.config import (
+    DatasetConfig,
+    FormatVariant,
+    GCS_TEST_BUCKET,
+    N_WARMUP_RUNS,
+)
+from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.runners import make_runner
+
+logger = logging.getLogger(__name__)
+
+
+def run(
+    dataset: DatasetConfig,
+    format_variant: FormatVariant,
+    n_runs: int,
+    cold_cache: bool = False,
+    converted_path: Path | None = None,
+    provider: str = "gcs",
+) -> BenchmarkResult | None:
+    if provider != "gcs":
+        raise ValueError(
+            f"Only 'gcs' provider is supported in Phase 5 (got {provider!r})"
+        )
+
+    runner = make_runner(format_variant)
+    open_metadata = getattr(runner, "read_cloud_metadata", None)
+    if open_metadata is None:
+        logger.info(
+            "Skipping cloud_metadata for %s — runner has no read_cloud_metadata",
+            format_variant.key,
+        )
+        return None
+
+    if converted_path is None or not Path(converted_path).exists():
+        raise FileNotFoundError(
+            f"Missing converted {format_variant.key} file for {dataset.name}. "
+            f"Run conversion first (--formats {format_variant.key})."
+        )
+
+    require_gcp_credentials()
+    cloud_url = ensure_cloud_fixture(
+        dataset, format_variant, Path(converted_path), provider=provider,
+    )
+
+    result = BenchmarkResult(
+        benchmark="cloud_metadata",
+        format=format_variant.key,
+        dataset=dataset.name,
+        metadata={
+            "provider": provider,
+            "bucket": GCS_TEST_BUCKET,
+            "cloud_url": cloud_url,
+            "n_runs": n_runs,
+            "n_warmup": N_WARMUP_RUNS,
+            "cold_cache": cold_cache,
+        },
+    )
+    result.file_size_bytes = runner.file_size(Path(converted_path))
+
+    for i in range(N_WARMUP_RUNS):
+        logger.info("Warm-up run %d/%d", i + 1, N_WARMUP_RUNS)
+        open_metadata(cloud_url)
+        gc.collect()
+
+    for i in range(n_runs):
+        if cold_cache:
+            runner._drop_caches()
+        gc.collect()
+
+        logger.info("cloud_metadata run %d/%d ← %s", i + 1, n_runs, cloud_url)
+        timing = open_metadata(cloud_url)
+        result.add_run(
+            wall_s=timing.wall_s,
+            user_s=timing.user_s,
+            sys_s=timing.sys_s,
+            peak_rss_mb=timing.peak_rss_mb,
+            **(timing.extra or {}),
+        )
+        logger.info("  wall=%.6fs", timing.wall_s)
+
+    logger.info(
+        "cloud_metadata complete: %s / %s — median %.6fs",
+        format_variant.key,
+        dataset.name,
+        result.median_wall_s or 0.0,
+    )
+    return result

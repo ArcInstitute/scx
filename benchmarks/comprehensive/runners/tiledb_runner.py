@@ -30,7 +30,11 @@ def _require_tiledbsoma() -> None:
 class TileDBRunner(FormatRunner):
     """Benchmark runner for TileDB-SOMA format."""
 
-    capabilities: frozenset[str] = frozenset({"filtered_query"})
+    capabilities: frozenset[str] = frozenset({
+        "filtered_query",
+        "cloud_read",
+        "cloud_subset",
+    })
 
     @property
     def name(self) -> str:
@@ -178,4 +182,65 @@ class TileDBRunner(FormatRunner):
             "native_mechanism": mechanism,
             "predicate": predicate.name,
         }
+        return timing
+
+    # ------------------------------------------------------------------
+    # Cloud operations (Phase C — TileDB-SOMA opens gs:// URIs natively
+    # when the environment has the tiledb VFS GCS plugin available)
+    # ------------------------------------------------------------------
+
+    def read_cloud(self, cloud_url: str) -> TimingResult:
+        _require_tiledbsoma()
+
+        def _read():
+            with tiledbsoma.Experiment.open(cloud_url) as exp:
+                query = exp.axis_query("RNA")
+                adata = query.to_anndata(X_name="data")
+                _ = adata.X
+
+        _, timing = self.timed_run(_read)
+        timing.extra = {"provider": "gcs", "native_mechanism": "soma_open_gs"}
+        return timing
+
+    def read_cloud_subset(
+        self,
+        cloud_url: str,
+        cell_indices: np.ndarray | list[int] | None = None,
+        gene_indices: np.ndarray | list[int] | None = None,
+    ) -> TimingResult:
+        _require_tiledbsoma()
+
+        def _subset():
+            obs_query = tiledbsoma.AxisQuery(
+                coords=(list(cell_indices),)
+            ) if cell_indices is not None else tiledbsoma.AxisQuery()
+            var_query = tiledbsoma.AxisQuery(
+                coords=(list(gene_indices),)
+            ) if gene_indices is not None else tiledbsoma.AxisQuery()
+            with tiledbsoma.Experiment.open(cloud_url) as exp:
+                query = exp.axis_query(
+                    "RNA", obs_query=obs_query, var_query=var_query
+                )
+                adata = query.to_anndata(X_name="data")
+                X = adata.X
+                if hasattr(X, "toarray"):
+                    X.toarray()
+
+        _, timing = self.timed_run(_subset)
+        timing.extra = {"provider": "gcs", "native_mechanism": "soma_axis_query_gs"}
+        return timing
+
+    def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
+        """Open the experiment and touch its obs/var counts only."""
+        _require_tiledbsoma()
+
+        def _open():
+            with tiledbsoma.Experiment.open(cloud_url) as exp:
+                # Touching ``exp.obs.count`` / ``exp.ms['RNA'].var.count``
+                # triggers only schema / fragment metadata reads.
+                _ = exp.obs.count
+                _ = exp.ms["RNA"].var.count
+
+        _, timing = self.timed_run(_open)
+        timing.extra = {"provider": "gcs", "native_mechanism": "soma_open_gs"}
         return timing

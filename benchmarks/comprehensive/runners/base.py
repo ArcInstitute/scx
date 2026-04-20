@@ -79,7 +79,10 @@ class FormatRunner(ABC):
     # optional method is a feature gap (skip quietly) or a contract
     # violation (fail loudly). Runners that advertise ``"filtered_query"``
     # must implement ``read_filtered_query``; ``"backed_mode"`` requires
-    # ``read_backed`` + ``read_backed_slice``.
+    # ``read_backed`` + ``read_backed_slice``. Cloud capabilities:
+    # ``"cloud_read"`` → ``read_cloud``; ``"cloud_subset"`` →
+    # ``read_cloud_subset``; ``"cloud_push"`` → ``push``; ``"cloud_pull"``
+    # → ``pull``.
     capabilities: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
@@ -190,6 +193,71 @@ class FormatRunner(ABC):
         TimingResult
         """
         raise NotImplementedError(f"{self.name} does not support backed row slices")
+
+    # ------------------------------------------------------------------
+    # Cloud operations (Phase 5 — GCP only)
+    # ------------------------------------------------------------------
+
+    def read_cloud(self, cloud_url: str) -> TimingResult:
+        """Read the entire expression matrix directly from a cloud URI.
+
+        A runner that advertises ``"cloud_read"`` in its ``capabilities``
+        set must override this method.
+
+        Parameters
+        ----------
+        cloud_url : GCS URI (e.g. ``gs://arc-ctc-nextflow/scx-test/pbmc3k.scxd/``)
+
+        Returns
+        -------
+        TimingResult
+            ``extra`` should include ``"provider"`` (``"gcs"``) and a
+            ``"native_mechanism"`` tag so reports can group apples-to-apples.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_cloud"
+        )
+
+    def read_cloud_subset(
+        self,
+        cloud_url: str,
+        cell_indices: np.ndarray | list[int] | None = None,
+        gene_indices: np.ndarray | list[int] | None = None,
+    ) -> TimingResult:
+        """Read a subset of cells/genes directly from a cloud URI.
+
+        A runner that advertises ``"cloud_subset"`` in its ``capabilities``
+        set must override this method.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_cloud_subset"
+        )
+
+    def push(self, local_path: str | Path, cloud_url: str) -> TimingResult:
+        """Upload a local file/directory to the given cloud URI.
+
+        A runner that advertises ``"cloud_push"`` in its ``capabilities``
+        set must override this method.
+
+        Returns a TimingResult whose ``extra`` dict should include
+        ``"bytes_uploaded"`` and ``"throughput_mbps"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support push"
+        )
+
+    def pull(self, cloud_url: str, local_path: str | Path) -> TimingResult:
+        """Download a cloud URI into a local file/directory.
+
+        A runner that advertises ``"cloud_pull"`` in its ``capabilities``
+        set must override this method.
+
+        Returns a TimingResult whose ``extra`` dict should include
+        ``"bytes_downloaded"`` and ``"throughput_mbps"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support pull"
+        )
 
     def read_filtered_query(
         self,

@@ -121,6 +121,10 @@ BENCHMARKS = [
     "parallel_write_scaling",
     "memory",
     "fragment_ops",
+    "cloud_push",
+    "cloud_pull",
+    "cloud_read",
+    "cloud_metadata",
 ]
 
 

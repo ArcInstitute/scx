@@ -243,6 +243,50 @@ submitit logs are written to `comprehensive/logs/submitit/`. Each SLURM job writ
 
 ---
 
+## Cloud Benchmarks (GCP)
+
+The comprehensive suite validates cloud behavior against GCP only — AWS S3 and Azure Blob coverage is deferred until a second-provider requirement lands. Cloud benchmarks live under `comprehensive/benchmarks/cloud_*.py` and run through the same `run_parallel.py` launcher as every other benchmark:
+
+| Benchmark | Coverage | What it measures |
+|-----------|----------|------------------|
+| `cloud_push`     | SCX-only | Local `.scx` → `gs://…/.scxd/` upload throughput |
+| `cloud_pull`     | SCX-only | `gs://…/.scxd/` → local `.scx` download throughput |
+| `cloud_read`     | Cross-format | Full in-memory read directly from GCS (SCX pull-then-read; Zarr / SOMA / SLAF via their native GCS paths) |
+| `cloud_metadata` | Cross-format | Metadata-only open latency (`pyscx.open_cloud`, `zarr.open`, `Experiment.open`, `SLAFArray(url)`) |
+
+**Prerequisites**:
+1. GCP service account `scx-bench@c-tc-429521.iam.gserviceaccount.com` with bucket-scoped `roles/storage.objectAdmin` on `gs://arc-ctc-nextflow/`. One-time bootstrap (requires `roles/iam.serviceAccountAdmin` + `roles/resourcemanager.projectIamAdmin`):
+   ```bash
+   gcloud config set project c-tc-429521
+   gcloud iam service-accounts create scx-bench \
+       --display-name "SCX Benchmark Runner" --project c-tc-429521
+   gcloud storage buckets add-iam-policy-binding gs://arc-ctc-nextflow \
+       --member=serviceAccount:scx-bench@c-tc-429521.iam.gserviceaccount.com \
+       --role=roles/storage.objectAdmin
+   gcloud iam service-accounts keys create ~/.gcp/scx-bench.json \
+       --iam-account=scx-bench@c-tc-429521.iam.gserviceaccount.com
+   chmod 600 ~/.gcp/scx-bench.json
+   ```
+   Rotate the key every 90 days; never commit it or paste it into chat.
+2. Export `GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json` in the submitit job environment. `cloud_fixtures.require_gcp_credentials` falls back to that path automatically if the env var is unset.
+3. Bucket knobs are env-configurable (defaults in parens): `GCS_TEST_BUCKET` (`gs://arc-ctc-nextflow/scx-test`), `GCP_PROJECT` (`c-tc-429521`), `GCP_BUCKET_REGION` (`us-central1`).
+
+**Usage**:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks cloud_push cloud_pull cloud_read cloud_metadata \
+    --datasets pbmc3k tabula_sapiens_100k \
+    --formats scx_auto zarr_zstd tiledb_soma slaf
+```
+
+Fixtures self-heal on first run: if the expected cloud object doesn't exist, `cloud_fixtures.ensure_cloud_fixture` uploads it from the local converted file via `pyscx.push` (SCX) or `gsutil -m rsync` (other formats). SCX-only benchmarks return `None` for non-SCX formats so the orchestrator silently skips those triples.
+
+The legacy `benchmarks/scripts/benchmark_cloud.py` is a thin deprecation shim — it prints a banner and forwards to the launcher above.
+
+---
+
 ## Known Challenges and Mitigations
 
 | Challenge | Mitigation |
@@ -558,7 +602,7 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 | `benchmark_auto_codec.py` | Auto-codec selection accuracy and performance |
 | `benchmark_cli.py` | CLI command performance |
 | `benchmark_python_bindings.py` | Python bindings overhead |
-| `benchmark_cloud.py` | Cloud storage read performance |
+| `benchmark_cloud.py` | **DEPRECATED** — forwards to `comprehensive/benchmarks/cloud_*.py` (see Phase C below) |
 | `benchmark_compressed_h5ad.py` | Compressed h5ad baseline (gzip, lzf) |
 | `benchmark_gpu_decode.py` | GPU decode microbenchmarks (cuSPARSE, bitstream) |
 | `benchmark_gpu_pca.py` | GPU PCA validation + timing |
