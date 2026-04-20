@@ -2,7 +2,7 @@
 
 Benchmark results for SCX across compression, read/write, memory, analysis accelerators, GPU, training loader, and query engine.
 
-All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1-2 TB RAM unless noted otherwise. GPU benchmarks on NVIDIA H100 80GB HBM3. Full raw results in [`benchmarks/results/`](../benchmarks/results/) and [`benchmarks/comprehensive/reporting/phase3_report.md`](../benchmarks/comprehensive/reporting/phase3_report.md).
+All benchmarks on Intel Xeon Platinum 8468, 32 cores, 1-2 TB RAM unless noted otherwise. GPU benchmarks on NVIDIA H100 80GB HBM3.
 
 ---
 
@@ -307,7 +307,6 @@ GPU PCA streams shards from disk -> GPU SpMM shard-by-shard without materializin
 | Graceful fallback | CPU fallback when no GPU | **Pass** |
 | 10x pipeline speedup | end-to-end 10x vs CPU | **Fail** (3.8x achieved) |
 
-Full GPU benchmark details in [`benchmarks/results/gpu_pipeline_benchmark.md`](../benchmarks/results/gpu_pipeline_benchmark.md).
 
 ## Training Loader
 
