@@ -102,6 +102,12 @@ def check_X(adata_source, adata_rt) -> ValidationCheck:
         nnz_ok = src.nnz == rt.nnz
         src_csr = src.tocsr()
         rt_csr = rt.tocsr()
+        # scipy does not guarantee column indices are sorted within rows;
+        # normalize both sides before element-wise comparison to avoid
+        # false-negative ``indices`` / ``data`` mismatches from a reordered
+        # (but semantically identical) CSR.
+        src_csr.sort_indices()
+        rt_csr.sort_indices()
         indices_ok = np.array_equal(src_csr.indices, rt_csr.indices)
         indptr_ok = np.array_equal(src_csr.indptr, rt_csr.indptr)
         data_err = float(np.max(np.abs(src_csr.data.astype(np.float64)

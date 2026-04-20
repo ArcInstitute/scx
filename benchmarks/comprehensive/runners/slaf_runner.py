@@ -134,14 +134,17 @@ class SlafRunner(FormatRunner):
         def _read_subset() -> None:
             slaf_array = self._open_array(path)
 
-            # Convert to python lists for IN clause building.
-            cell_list = (
+            # Build sorted numpy arrays for both IN-clause construction and
+            # vectorized ``searchsorted`` index mapping below. ``read_selective``
+            # already sorts the inputs, but sorting defensively makes the
+            # method safe when called outside the harness too.
+            cell_arr = (
                 None if cell_indices is None
-                else np.asarray(cell_indices, dtype=np.int64).tolist()
+                else np.sort(np.asarray(cell_indices, dtype=np.int64))
             )
-            gene_list = (
+            gene_arr = (
                 None if gene_indices is None
-                else np.asarray(gene_indices, dtype=np.int64).tolist()
+                else np.sort(np.asarray(gene_indices, dtype=np.int64))
             )
 
             # SLAF's high-level ``get_submatrix`` API returns (cell_id,
@@ -152,15 +155,15 @@ class SlafRunner(FormatRunner):
             # ``expression`` table stores ``cell_integer_id`` /
             # ``gene_integer_id`` which are globally unique.
             where_parts: list[str] = []
-            if cell_list is not None:
+            if cell_arr is not None:
                 where_parts.append(
                     "cell_integer_id IN ("
-                    + ",".join(str(int(c)) for c in cell_list) + ")"
+                    + ",".join(str(int(c)) for c in cell_arr) + ")"
                 )
-            if gene_list is not None:
+            if gene_arr is not None:
                 where_parts.append(
                     "gene_integer_id IN ("
-                    + ",".join(str(int(g)) for g in gene_list) + ")"
+                    + ",".join(str(int(g)) for g in gene_arr) + ")"
                 )
             where_clause = (
                 " WHERE " + " AND ".join(where_parts) if where_parts else ""
@@ -175,23 +178,24 @@ class SlafRunner(FormatRunner):
             gene_ids = df["gene_integer_id"].to_numpy()
             values = df["value"].to_numpy()
 
-            if cell_list is not None:
-                cell_lookup = {c: i for i, c in enumerate(cell_list)}
-                row = np.fromiter(
-                    (cell_lookup[int(c)] for c in cell_ids),
-                    dtype=np.int64, count=len(cell_ids),
+            # Map the returned global cell_integer_id / gene_integer_id back
+            # to positions in the requested subset. ``cell_arr`` / ``gene_arr``
+            # are sorted, so ``np.searchsorted`` does this in vectorized C —
+            # dramatically faster than a per-element dict lookup at
+            # census scale.
+            if cell_arr is not None:
+                row = np.searchsorted(cell_arr, cell_ids).astype(
+                    np.int64, copy=False
                 )
-                n_rows = len(cell_list)
+                n_rows = len(cell_arr)
             else:
                 row = cell_ids.astype(np.int64, copy=False)
                 n_rows = slaf_array.shape[0]
-            if gene_list is not None:
-                gene_lookup = {g: i for i, g in enumerate(gene_list)}
-                col = np.fromiter(
-                    (gene_lookup[int(g)] for g in gene_ids),
-                    dtype=np.int64, count=len(gene_ids),
+            if gene_arr is not None:
+                col = np.searchsorted(gene_arr, gene_ids).astype(
+                    np.int64, copy=False
                 )
-                n_cols = len(gene_list)
+                n_cols = len(gene_arr)
             else:
                 col = gene_ids.astype(np.int64, copy=False)
                 n_cols = slaf_array.shape[1]

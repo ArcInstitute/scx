@@ -133,10 +133,11 @@ class H5adRunner(FormatRunner):
             else:
                 raise TypeError(f"Unsupported predicate type: {type(predicate)!r}")
             X = sub.X
-            if sp.issparse(X):
-                X.toarray()
-            else:
-                _ = X.shape
+            # Force full materialization with a lightweight aggregation —
+            # ``toarray()`` would OOM on atlas-scale filter results. ``sum()``
+            # traverses every non-zero (sparse) or every cell (dense) so the
+            # I/O cost is included in the timing.
+            _ = X.sum()
 
         _, timing = self.timed_run(_filtered)
         timing.extra = {
