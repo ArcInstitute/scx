@@ -13,12 +13,31 @@ use pyo3::types::PyDict;
 ///     source: Source URL or path (e.g., "gs://bucket/data.scxd/")
 ///     dest: Output .scx file path
 ///     filter: Optional predicate expression for selective pull
+///         (e.g., ``"n_counts > 1000"``). When ``None``, issues a full,
+///         unfiltered pull — the function does NOT raise on missing
+///         filter. Callers that want an error on missing predicates
+///         must guard at the callsite. Returned dict shape differs
+///         between the filtered and unfiltered branches (see below).
 ///     parallelism: Number of parallel download tasks (default: 8)
 ///
 /// Returns:
-///     dict with keys: bytes_downloaded, sections_downloaded, elapsed_secs,
-///     throughput_mbps. For filtered pulls: total_shards, downloaded_shards,
-///     skipped_shards, matching_cells, bytes_saved.
+///     When ``filter=None`` (full pull): dict with keys
+///     ``bytes_downloaded``, ``sections_downloaded``, ``elapsed_secs``,
+///     ``throughput_mbps``.
+///
+///     When ``filter`` is set (selective pull): dict with keys
+///     ``total_shards``, ``downloaded_shards``, ``skipped_shards``,
+///     ``matching_cells``, ``bytes_downloaded``, ``bytes_saved``,
+///     ``elapsed_secs``. No ``throughput_mbps`` key — selective pulls
+///     pair byte counts with ``bytes_saved`` for shard-skip accounting.
+///
+/// Note:
+///     Benchmark callers (``cost_model``, ``cloud_reader_vs_pull``)
+///     rely on the ``filter=None`` → full-pull behavior as a
+///     pass-through, and detect "no predicate synthesized" upstream
+///     of this call rather than inside it. See
+///     ``benchmarks/comprehensive/benchmarks/cloud_reader_vs_pull.py``
+///     for the skip-when-None pattern.
 #[pyfunction]
 #[pyo3(signature = (source, dest, filter=None, parallelism=None))]
 pub fn pull(
