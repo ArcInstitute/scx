@@ -49,7 +49,25 @@ benchmarks/
 │   │   ├── run_slurm.sh                 # SLURM submission script
 │   │   ├── install_dependencies.sh      # Create conda environments
 │   │   ├── validate_*.py                # Correctness validation scripts
-│   │   └── slurm_*.sh                   # SLURM job scripts
+│   │   ├── slurm_*.sh                   # SLURM job scripts
+│   │   │
+│   │   │  # Regression gating (on-demand)
+│   │   ├── gate_candidate.sh            # One-shot: capture + gate against LATEST baseline
+│   │   ├── capture_baseline.py          # Freeze one snapshot (raw/ + summary.json + manifest)
+│   │   ├── promote_baseline.py          # Promote a snapshot to results/baselines/<version>/
+│   │   ├── compare_against_baseline.py  # Relative + absolute-floor + justification gate
+│   │   ├── publish_dashboard.py         # Rsync HTML snapshot to DASHBOARD_PUBLISH_TARGET
+│   │   │
+│   │   │  # Cloud infrastructure (GCP)
+│   │   ├── check_gcp_auth.py            # Credentials + bucket round-trip preflight
+│   │   ├── setup_cloud_test_data.sh     # Idempotent fixture staging via BLAKE3 sidecars
+│   │   ├── cloud_fixtures_doctor.py     # Dry-run probe: local vs cloud fixture drift
+│   │   ├── submit_gcp_matrix.py         # Instance-type × benchmark launcher (--yes-spend)
+│   │   ├── gcs_lifecycle.json           # Committed GCS object-lifecycle rules
+│   │   │
+│   │   │  # Observability + migrations
+│   │   ├── watch.py                     # Rich TUI tailing run_manifest.json + submitit logs
+│   │   └── migrate_results.py           # Back-stamp schema_version on legacy raw JSONs
 │   ├── r_scripts/                       # BPCells R benchmark scripts
 │   └── results/                         # Raw JSON results + generated reports
 │       ├── raw/                         # One JSON per benchmark×format×dataset

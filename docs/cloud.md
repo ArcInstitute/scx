@@ -436,5 +436,60 @@ adata.write_scx("lung_pca.scx")
 pyscx.push("lung_pca.scx", "gs://my-bucket/lung_pca.scxd/", parallelism=16)
 ```
 
+---
+
+## Benchmark modules
+
+The comprehensive benchmark suite (`benchmarks/comprehensive/`) includes
+eight modules that exercise the cloud surface end-to-end. Each writes one
+JSON per `(benchmark × format × dataset)` under `results/raw/`; the
+reporting layer pivots them into cross-format tables automatically.
+
+| Module | Scope | What it measures |
+|---|---|---|
+| `cloud_push` | SCX only | Push throughput: local `.scx` → `gs://…/.scxd/` via `pyscx.push`. Cleanup per-run. |
+| `cloud_pull` | SCX only | Pull throughput: `gs://…/.scxd/` → local `.scx` via `pyscx.pull` (streaming + pack). |
+| `cloud_read` | cross-format | Full-dataset materialization from the cloud URI for every format that declares `cloud_read`. |
+| `cloud_metadata` | cross-format | Catalog-open latency (`open_cloud` / `open_consolidated` / `Experiment.open` / `SLAFArray`). |
+| `cloud_filtered` | cross-format (obs-preserving) | Predicate pushdown at cloud scale: `cell_type == "T cell"`, `n_counts > 1000`, random 1% sample. Zarr silently skipped (converter doesn't preserve obs). |
+| `cloud_reader_vs_pull` | SCX only | Decision table: `open_cloud` (metadata-only) vs full `pyscx.pull`, plus predicate sweep at 5% / 20% / 80% selectivity comparing `pyscx.pull(filter=…)` to a full pull. |
+| `cost_model` | SCX only | USD per 1M cells queried for each cloud layout (exploded `.scxd` today) across metadata + selective + full-read scenarios, using the GCS rate card pinned in `config.py::GCS_PRICING`. |
+| `cloud_large_atlas` | SCX only | Correctness check: streaming pull of a 50 GB+ atlas must stay within the 240 MB peak-RSS bound. Fails loudly on violation — this is a regression test, not a throughput run. |
+
+Entry points for running any combination:
+
+```bash
+# GCP auth preflight (required before first run)
+python benchmarks/comprehensive/scripts/check_gcp_auth.py
+
+# Stage cloud fixtures (one-time, BLAKE3-idempotent)
+bash benchmarks/comprehensive/scripts/setup_cloud_test_data.sh
+
+# Cross-format cloud suite
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks cloud_read cloud_metadata cloud_filtered cloud_reader_vs_pull \
+                 cost_model cloud_push cloud_pull \
+    --datasets pbmc3k tabula_sapiens_100k \
+    --formats scx_auto zarr_zstd tiledb_soma slaf
+
+# Large-atlas peak-RSS regression
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks cloud_large_atlas --datasets census_10m --formats scx_auto
+
+# GCP instance matrix (requires --yes-spend)
+python benchmarks/comprehensive/scripts/submit_gcp_matrix.py --dry-run
+python benchmarks/comprehensive/scripts/submit_gcp_matrix.py --yes-spend
+```
+
+**Scope:** GCP (GCS) only. AWS S3 and Azure Blob parity is deferred —
+the modules reject `--provider` values other than `gcs` with a clear
+error. Re-enabling a second provider is a targeted un-defer that doesn't
+require benchmark-module rewrites.
+
+**Reporting:** the consolidated tables live in `reporting/tables.py`:
+`cloud_filtered_table`, `cloud_reader_vs_pull_table`, `cost_model_table`,
+`gcp_matrix_table`. All are wired into `reporting/markdown.py` and the
+aggregated landing page `reporting/landing.py`.
+
 [docs/sharding.md]: sharding.md
 [docs/multithreading.md §Concurrent file access]: multithreading.md#concurrent-file-access

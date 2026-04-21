@@ -341,3 +341,99 @@ SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 | Append 10K cells | **1 ms** |
 | Merge 3 files | **342 MB/s** |
 | Compact (after 3 appends) | 0.98x fresh-write size |
+
+---
+
+## Phase 5
+
+Phase 5 closes SLAF parity, cloud validation on GCS, fragment-ops
+throughput, and the regression gate. Numbers below come from the
+comprehensive benchmark suite under `benchmarks/comprehensive/`; see
+`docs/cloud.md` for cloud-specific operational notes.
+
+### SLAF parity
+
+SLAF (`slafdb==0.5.2`) is now a first-class competitor across every
+comprehensive-suite dimension — compression, full read, selective read,
+filtered-query pushdown (SQL via its DuckDB engine), correctness
+round-trip, ML loader, and out-of-core memory. Key results on census_1m:
+
+| Metric | SCX | SLAF | Zarr (zstd) | h5ad (backed) |
+|---|---:|---:|---:|---:|
+| Full-read peak RSS | ~345 MB | ~34 GB | ~11 GB | ~345 MB |
+| ML-loader batches/s | 1,405 | ~4.1 | n/a | n/a |
+| Selective `cell_type == "T cell"` | scx_pushdown | slaf_sql | skipped | h5ad_load_and_mask |
+
+SLAF's Mixture-of-Scanners prefetcher returns 0 batches at 10M scale
+with the default config — flagged as a SLAF-upstream tuning issue, not
+a harness fix.
+
+### Cloud parity on GCS
+
+Identical user-facing queries executed across SCX, Zarr v3,
+TileDB-SOMA, and SLAF on the same `gs://arc-ctc-nextflow/scx-test/`
+fixtures. The predicate set — `cell_type == "T cell"`, `n_counts > 1000`,
+random 1% sample — pushes down through each format's native cloud
+mechanism:
+
+- **SCX**: pull-then-local-filter (`scx_pull_and_filter`). A native
+  `open_cloud`-range-read variant is scoped for a future pass.
+- **TileDB-SOMA**: `AxisQuery(value_filter=…)` on the cloud-opened
+  Experiment (`tiledb_cloud_value_filter`).
+- **SLAF**: SQL `WHERE` against the cloud-backed DuckDB engine
+  (`slaf_cloud_sql` / `slaf_cloud_stride_hash`).
+- **Zarr**: silently skipped — the raw-CSR converter doesn't preserve
+  obs. `anndata_zarr_backed` gets consolidated-metadata detection and
+  single-GET catalog opens via `zarr.open_consolidated`.
+
+Full cross-format tables are generated into §8c of
+`BENCHMARK_REPORT.md` ("Cloud Query Parity (GCS)") and surfaced on the
+landing page.
+
+### Cost model (GCS pricing)
+
+The cost model benchmark reports cents per 1 M cells queried across
+metadata / selective-5% / selective-20% / full_read workloads, priced
+against the pinned `GCS_PRICING` table (Class-B $0.004/10k GETs,
+same-region egress $0.00/GB on intra-region GCE ↔ GCS).
+
+On SCX's exploded `.scxd/` layout the full-read term dominates cost on
+large datasets; metadata-only opens are effectively free
+(single-digit GET count, zero egress in-region). Precise numbers live
+in §8f "Cost Model (GCS pricing)" of the benchmark report.
+
+### GCP compute-node matrix
+
+Cloud-read throughput characterized across `n2-standard-8`,
+`c3-standard-8`, and `a3-highgpu-1g`. Per-VM egress bandwidth class
+(16 / 23 / 200 Gbps) is the dominant predictor for full-read wall
+clock on atlases that fit the streaming-pull envelope. The launcher
+(`submit_gcp_matrix.py`) pins every VM to the bucket region so cross-
+region egress is impossible by construction. Results in §8d of the
+benchmark report; raw numbers require `--yes-spend` to generate.
+
+### Fragment operations throughput
+
+`pyscx.append` / `mark_deleted` / `compact` / `rollback` throughput on
+pbmc3k (see §8b):
+
+| Operation | Median wall | Dominant throughput |
+|---|---:|---:|
+| append | scales with input-CSR read + re-encode | ~38 MB/s |
+| delete (logical) | independent of n_obs | ~155 k rows/s |
+| compact | base-file read + re-encode bandwidth | ~54 MB/s |
+| rollback | single root-catalog pwrite | ~3 ms |
+
+### Regression gating
+
+All benchmark results now carry a `schema_version=1` stamp + full
+provenance (git SHA, thread pinning, run_id) in their `system.provenance`
+block. The on-demand gate (`scripts/gate_candidate.sh` + `scripts/
+compare_against_baseline.py --gate`) evaluates relative tolerances
+(3% wall / 10% RSS / 1% size), absolute floors from `thresholds.yaml`
+(e.g. cloud throughput ≥ 50 MB/s), and disappeared-benchmark
+detection. Justification markdown files under
+`results/justifications/` suppress accepted regressions with an
+optional expiry date. The dashboard (`reporting/dashboard.py`) emits a
+browsable HTML snapshot alongside the markdown report, threaded with
+"← previous snapshot" navigation via `dashboard_history.json`.
