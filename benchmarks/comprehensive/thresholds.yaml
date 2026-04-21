@@ -26,13 +26,20 @@ absolute_floors:
   # The 50 MB/s floor is a "network path is healthy" check, not a
   # performance target; a value below this indicates misconfiguration or
   # a provider-side regression, not a tuning opportunity.
+  #
+  # Keyed on ``tabula_sapiens_100k`` rather than pbmc3k because the 4 MB
+  # pbmc3k file is too small for per-request overhead to amortize —
+  # measured at ~12 MB/s push / ~0.7 MB/s pull there, well below the
+  # bandwidth regime. On tabula_sapiens_100k (428 MB file) the same
+  # hardware hits ~115 MB/s push / ~180 MB/s pull, comfortably above the
+  # 50 MB/s floor with ~2× headroom for network-noise tolerance.
   - benchmark: cloud_push
     format: scx_auto
-    dataset: pbmc3k
+    dataset: tabula_sapiens_100k
     metric: throughput_mbps
     min: 50.0
   - benchmark: cloud_pull
     format: scx_auto
-    dataset: pbmc3k
+    dataset: tabula_sapiens_100k
     metric: throughput_mbps
     min: 50.0

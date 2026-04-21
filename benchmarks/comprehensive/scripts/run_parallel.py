@@ -134,6 +134,15 @@ def _run_benchmark(
                          n_runs=n_runs, cold_cache=cold_cache,
                          converted_path=converted_path)
 
+    # Benchmarks may return None when the (bench, format) combo is a
+    # deliberate skip (e.g. fragment_ops / cloud_push / cloud_pull only
+    # apply to SCX; capability-gated cross-format modules return None for
+    # runners that don't declare the capability). That's a successful
+    # no-op, not a failure — don't try to persist it.
+    if result is None:
+        return {"skipped": True, "benchmark": bench_name,
+                "format": fmt.key, "dataset": dataset.name}
+
     write_result(result)
     return result.to_dict()
 
@@ -148,6 +157,11 @@ def _slurm_setup_cmds() -> list[str]:
     import os
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
     env_cleanup = "unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK 2>/dev/null || true"
+    # Disable srun's MPI bootstrap. Chimera's slurm.conf has MpiDefault=pmix,
+    # but the pmix plugin isn't runtime-loadable — submitit's `srun` would
+    # otherwise fail with "Cannot create context for mpi/pmix". We don't
+    # use MPI; tell srun so.
+    mpi_none = "export SLURM_MPI_TYPE=none"
 
     if "scx-bench" in conda_prefix:
         conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
@@ -156,11 +170,13 @@ def _slurm_setup_cmds() -> list[str]:
         env_name = os.path.basename(conda_prefix)
         return [
             env_cleanup,
+            mpi_none,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
     return [
         env_cleanup,
+        mpi_none,
         f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
     ]
 

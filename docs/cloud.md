@@ -96,9 +96,17 @@ gcloud iam service-accounts keys create ~/.gcp/scx-bench.json \
     --iam-account="scx-bench@$PROJECT.iam.gserviceaccount.com"
 chmod 600 ~/.gcp/scx-bench.json
 
-# 5. Point the benchmark runner at the key
-echo 'export GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json' >> ~/.bashrc
+# 5. Point the benchmark runner at the key via the repo-root .env
+#    (auto-loaded by python-dotenv through benchmarks/scripts/bench_env.py
+#    — no shell export needed; tilde is expanded on load)
+echo 'GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json' >> .env
 ```
+
+An uncommented template line is available in `.env.example` for
+reference. The env-var precedence is real-env → `.env` → default-path
+fallback (`~/.gcp/scx-bench.json`), so operators who prefer to export
+the variable in their shell can continue to do so without removing the
+`.env` entry.
 
 **Key rotation:** re-mint every 90 days and delete the old key in the GCP
 console. Never commit the JSON, paste it into chat, or copy it into the

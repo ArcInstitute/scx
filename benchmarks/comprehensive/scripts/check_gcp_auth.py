@@ -56,24 +56,34 @@ class PreflightResult:
 
 
 def _resolve_credentials() -> tuple[str | None, list[str]]:
-    creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    """Resolve the credential file path.
+
+    Accepts tilde prefixes so ``.env`` entries like
+    ``GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json`` work
+    (python-dotenv does not expand tildes on load). Writes the expanded
+    absolute path back to ``os.environ`` so downstream subprocess callers
+    (``gsutil``, the Rust object-store backend) receive a concrete path.
+    """
+    raw = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    creds = os.path.expanduser(raw) if raw else ""
     failures: list[str] = []
     if not creds and _DEFAULT_KEY_PATH.exists():
         creds = str(_DEFAULT_KEY_PATH)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds
     if not creds:
         failures.append(
-            "GOOGLE_APPLICATION_CREDENTIALS is not set and no key was found at "
-            f"{_DEFAULT_KEY_PATH}. Mint one via the bootstrap steps in "
+            "GOOGLE_APPLICATION_CREDENTIALS is not set and no key was found "
+            f"at {_DEFAULT_KEY_PATH}. Add the line to the repo-root .env "
+            "file (see .env.example) or mint a key via the bootstrap in "
             "docs/cloud.md."
         )
         return None, failures
     if not Path(creds).is_file():
         failures.append(
-            f"GOOGLE_APPLICATION_CREDENTIALS points at {creds!r} but the file "
-            "does not exist."
+            f"GOOGLE_APPLICATION_CREDENTIALS resolves to {creds!r} but the "
+            "file does not exist."
         )
         return None, failures
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds
     return creds, failures
 
 

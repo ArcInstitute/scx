@@ -64,10 +64,11 @@ def _threshold_predicate_for_fraction(
 ) -> tuple[str | None, str]:
     """Return a ``(filter_expr, describe)`` pair targeting ~fraction of cells.
 
-    Prefers a ``n_counts`` threshold (present on most census datasets);
-    falls back to ``row_id % modulus`` when obs metadata isn't accessible
-    or the column is missing. A ``(None, ...)`` return means "skip this
-    scenario — can't synthesize a matching predicate for this dataset".
+    Uses an ``n_counts`` threshold chosen via numpy quantile (present on
+    most census datasets). Returns ``(None, reason)`` when the column is
+    absent or the h5ad isn't accessible — SCX's ``filter_obs`` parser
+    doesn't support arithmetic expressions like ``row_id % N == 0``, so
+    there's no stride-hash fallback for this benchmark.
     """
     import anndata
     import numpy as np
@@ -75,20 +76,14 @@ def _threshold_predicate_for_fraction(
     try:
         adata = anndata.read_h5ad(dataset.h5ad_path, backed="r")
     except FileNotFoundError:
-        logger.info(
-            "h5ad not found for %s; falling back to row_id modulo predicate",
-            dataset.name,
-        )
-        modulus = max(int(1 / fraction), 2)
         return (
-            f"row_id % {modulus} == 0",
-            f"row_id % {modulus} == 0 (~{fraction * 100:.0f}% via stride)",
+            None,
+            f"h5ad not found for {dataset.name} — cannot synthesize predicate",
         )
 
     try:
         if "n_counts" in adata.obs.columns:
             col = np.asarray(adata.obs["n_counts"])
-            # Pick the threshold so values above it cover ``fraction``.
             cutoff = float(np.quantile(col, 1.0 - fraction))
             return (
                 f"n_counts > {cutoff}",
@@ -97,10 +92,9 @@ def _threshold_predicate_for_fraction(
     finally:
         adata.file.close()
 
-    modulus = max(int(1 / fraction), 2)
     return (
-        f"row_id % {modulus} == 0",
-        f"row_id % {modulus} == 0 (~{fraction * 100:.0f}% via stride)",
+        None,
+        f"n_counts absent on {dataset.name} — cannot synthesize predicate",
     )
 
 
@@ -214,6 +208,12 @@ def run(
     for target in _SELECTIVITY_TARGETS:
         filter_expr, describe = _threshold_predicate_for_fraction(dataset, target)
         scenario_name = f"selective_{int(target * 100)}pct"
+        if filter_expr is None:
+            logger.info(
+                "%s skipped on %s: %s",
+                scenario_name, dataset.name, describe,
+            )
+            continue
         logger.info("%s: %s — predicate=%s", scenario_name, dataset.name, describe)
 
         for i in range(n_runs):

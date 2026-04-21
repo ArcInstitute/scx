@@ -286,13 +286,22 @@ The comprehensive suite validates cloud behavior against GCP only — AWS S3 and
    chmod 600 ~/.gcp/scx-bench.json
    ```
    Rotate the key every 90 days; never commit it or paste it into chat.
-2. Export `GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json` in the submitit job environment. `cloud_fixtures.require_gcp_credentials` falls back to that path automatically if the env var is unset.
+2. Point the harness at the key via the repo-root `.env` file — it's
+   auto-loaded by `benchmarks/scripts/bench_env.py` through
+   `python-dotenv`, so no shell export is required. Tildes are expanded.
+   `cloud_fixtures.require_gcp_credentials` falls back to `~/.gcp/scx-bench.json`
+   automatically if the env var is unset.
+   ```bash
+   echo 'GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json' >> .env
+   ```
+   An uncommented template line lives in `.env.example`. Operators who
+   prefer shell exports can still use them — process env wins over `.env`.
 3. Bucket knobs are env-configurable (defaults in parens): `GCS_TEST_BUCKET` (`gs://arc-ctc-nextflow/scx-test`), `GCP_PROJECT` (`c-tc-429521`), `GCP_BUCKET_REGION` (`us-central1`).
 
 **Usage**:
 
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json
+# GOOGLE_APPLICATION_CREDENTIALS resolved from .env; see step 2 above.
 python benchmarks/comprehensive/scripts/run_parallel.py \
     --benchmarks cloud_push cloud_pull cloud_read cloud_metadata \
     --datasets pbmc3k tabula_sapiens_100k \

@@ -47,28 +47,39 @@ class CloudCredentialsError(RuntimeError):
 def require_gcp_credentials() -> str:
     """Ensure ``GOOGLE_APPLICATION_CREDENTIALS`` points at a readable key.
 
+    The env var is sourced first from the process environment and then from
+    the repo-root ``.env`` (loaded automatically via
+    ``benchmarks/scripts/bench_env.py`` at import time, since ``config.py``
+    depends on it). Tilde prefixes are expanded — ``.env`` entries like
+    ``GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json`` are supported.
     If the env var is unset and ``~/.gcp/scx-bench.json`` exists, the env
     var is populated from that default path. Returns the resolved key path.
 
     Raises ``CloudCredentialsError`` on any failure so the calling benchmark
     aborts with a clear message instead of getting cryptic 401s mid-run.
     """
-    creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    creds_raw = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "") or ""
+    creds = os.path.expanduser(creds_raw) if creds_raw else ""
+
     if not creds and _DEFAULT_KEY_PATH.exists():
         creds = str(_DEFAULT_KEY_PATH)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds
 
     if not creds:
         raise CloudCredentialsError(
             "GOOGLE_APPLICATION_CREDENTIALS is not set and no key was found at "
-            f"{_DEFAULT_KEY_PATH}. See the 'Cloud Benchmarks (GCP)' section of "
-            "benchmarks/README.md for the service-account bootstrap."
+            f"{_DEFAULT_KEY_PATH}. Add the line to the repo-root .env file "
+            "(see .env.example) or mint a key via the bootstrap in docs/cloud.md."
         )
     if not Path(creds).is_file():
         raise CloudCredentialsError(
-            f"GOOGLE_APPLICATION_CREDENTIALS points at {creds!r} but the file "
-            "does not exist."
+            f"GOOGLE_APPLICATION_CREDENTIALS resolves to {creds!r} but the "
+            "file does not exist."
         )
+
+    # Write the expanded absolute path back so subprocess callers (gsutil,
+    # pyscx's Rust cloud backend) see a concrete path rather than a tilde
+    # they might not expand consistently.
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds
     return creds
 
 

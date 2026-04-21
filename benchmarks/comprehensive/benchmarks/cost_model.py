@@ -66,6 +66,35 @@ _LAYOUTS: list[tuple[str, str]] = [
 ]
 
 
+def _n_counts_threshold_predicates(dataset: DatasetConfig) -> dict[int, str | None]:
+    """Return ``{5: "n_counts > X", 20: "n_counts > Y"}`` or Nones.
+
+    Reads the dataset's obs `n_counts` column backed-mode and picks
+    thresholds via numpy quantile so each predicate yields approximately
+    the target fraction of rows. When the column is absent (or the h5ad
+    isn't readable), returns Nones — callers skip the scenario rather
+    than synthesize a predicate the SCX parser can't evaluate.
+    """
+    import anndata
+    import numpy as np
+
+    result: dict[int, str | None] = {5: None, 20: None}
+    try:
+        adata = anndata.read_h5ad(dataset.h5ad_path, backed="r")
+    except (FileNotFoundError, OSError):
+        return result
+    try:
+        if "n_counts" in adata.obs.columns:
+            col = np.asarray(adata.obs["n_counts"])
+            for pct in (5, 20):
+                fraction = pct / 100.0
+                cutoff = float(np.quantile(col, 1.0 - fraction))
+                result[pct] = f"n_counts > {cutoff}"
+    finally:
+        adata.file.close()
+    return result
+
+
 def _cost_per_million_cells(bytes_downloaded: int, gets: int, cells: int) -> dict:
     """Compute egress + request cost for one run, normalized per 1M cells.
 
@@ -165,9 +194,23 @@ def run(
             )
 
             # ---- selective 5% / 20% ----
+            # Use an obs-column threshold predicate (`n_counts > X`) chosen
+            # via quantile to hit the target fraction. SCX's filter_obs
+            # parser doesn't support arithmetic expressions like
+            # `row_id % N == 0`, so the stride-hash fallback used in other
+            # Python-SQL formats won't work here — if the dataset has no
+            # `n_counts` column, skip the selective scenario rather than
+            # emit a failed attempt.
+            selective_predicate = _n_counts_threshold_predicates(dataset)
             for pct in (5, 20):
-                modulus = int(100 / pct)
-                filter_expr = f"row_id % {modulus} == 0"
+                filter_expr = selective_predicate.get(pct)
+                if filter_expr is None:
+                    logger.info(
+                        "  selective_%dpct skipped: no n_counts obs column "
+                        "on %s (SCX filter_obs can't evaluate row_id modulo)",
+                        pct, dataset.name,
+                    )
+                    continue
                 with tempfile.TemporaryDirectory(prefix=f"scx_cm_s{pct}_") as tmp:
                     local = os.path.join(tmp, f"filtered_{pct}.scx")
                     logger.info(
