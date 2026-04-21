@@ -13,11 +13,23 @@ benchmarks/logs/
 benchmarks/comprehensive/results/raw/
 benchmarks/comprehensive/results/raw_archive_*/
 benchmarks/comprehensive/results/reports/figures/
-benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md
 benchmarks/comprehensive/results/reports_archive_*/
 benchmarks/comprehensive/logs/
 benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/
+
+# Generated report artifacts — regenerable via write_report() / write_landing()
+# from results/raw/ or a promoted baseline snapshot. Publish via
+# DASHBOARD_PUBLISH_TARGET + publish_dashboard.py rather than committing, to
+# avoid blob churn (PDF is ~1 MB and rewrites on every run).
+benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.*
+benchmarks/comprehensive/results/reports/index.*
+# dashboard_history.json accumulates per-snapshot URLs for "← previous
+# snapshot" navigation. Local to each operator; the publish target keeps
+# its own canonical history.
+benchmarks/comprehensive/results/reports/dashboard_history.json
+# Hand-curated per-phase reports (phase3_report.md, phase5A_ooc_rss.*)
+# stay tracked — they're explicit deliverables, not regenerated per run.
 .claude/*.lock
 
 # Rust

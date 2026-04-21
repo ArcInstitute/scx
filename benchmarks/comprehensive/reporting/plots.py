@@ -116,6 +116,34 @@ def _save_fig(fig: plt.Figure, name: str, output_dir: Path | None = None):
     logger.info(f"Saved {name}.png and {name}.pdf")
 
 
+def plot_is_stale(name: str, output_dir: Path | None = None) -> bool:
+    """Return True if the cached ``{name}.png`` is older than any raw JSON.
+
+    Plot cache helper (Phase I.7): callers can short-circuit re-rendering
+    when the inputs haven't changed. Checks ``results/raw/*.json`` as the
+    universal source of truth — conservative but cheap.
+
+    Returns ``True`` (stale) if:
+      * the PNG doesn't exist, OR
+      * any raw JSON's mtime is newer than the PNG's mtime.
+    """
+    if output_dir is None:
+        output_dir = FIGURES_DIR
+    png = output_dir / f"{name}.png"
+    if not png.exists():
+        return True
+    from benchmarks.comprehensive.config import RAW_RESULTS_DIR
+    if not RAW_RESULTS_DIR.is_dir():
+        # No raw JSONs at all — the PNG can't be stale relative to
+        # nothing; keep it.
+        return False
+    png_mtime = png.stat().st_mtime
+    for raw in RAW_RESULTS_DIR.glob("*.json"):
+        if raw.stat().st_mtime > png_mtime:
+            return True
+    return False
+
+
 def _build_pivot(
     results: list[dict],
     value_key: str,

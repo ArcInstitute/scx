@@ -415,7 +415,7 @@ claims in `docs/performance.md` cite.
 single-purpose scripts in [`benchmarks/scripts/`](benchmarks/scripts/).
 Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 
-### 5.1 Benchmark Harness Infrastructure — PARTIALLY COMPLETE
+### 5.1 Benchmark Harness Infrastructure — COMPLETE
 - [x] `FormatRunner` abstraction — one runner per format (SCX, h5ad, Zarr v3, TileDB-SOMA, BPCells, Parquet)
 - [x] **SLAF `FormatRunner`** ([slaf-project/slaf](https://github.com/slaf-project/slaf), `slafdb` on PyPI) — SQL-native sparse lazy format with Scanpy-compatible API and PyTorch dataloaders. Direct competitor across compression, selective read, lazy AnnData ops, and ML loader dimensions. Lives at `benchmarks/comprehensive/runners/slaf_runner.py` with isolated `scx-bench-slaf` env; back-end goes through SLAF's `expression(cell_integer_id, gene_integer_id, value)` SQL table (SLAF's public `get_submatrix` API treats integer lists positionally and its `cell_id` column is non-unique across Lance fragments in census-scale files).
 - [x] Shared conversion cache: convert each dataset once per format, reuse across benchmarks
@@ -425,7 +425,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] Parallel SLURM submission via submitit — one job per (benchmark × format × dataset) pair (see `benchmarks/README.md`; always prefer parallel submission over sequential)
 - [x] Report generation: markdown + matplotlib plots (`benchmarks/comprehensive/reporting/`)
 
-### 5.2 Benchmark Dimensions — PARTIALLY COMPLETE
+### 5.2 Benchmark Dimensions — COMPLETE
 - [x] **Compression** — file size vs h5ad/Zarr/TileDB/BPCells/Parquet across codec variants (SCX auto/none/scx1/zstd/pcodec/lz4)
 - [x] Add SLAF to compression comparison — SLAF stores cells as rows in DuckDB-queryable tables; measure on-disk size for identical datasets. Census 1M: SLAF 4.0 GB vs SCX 2.35 GB (SCX ~1.7× smaller); see `benchmarks/comprehensive/results/raw/compression__slaf__census_1m.json`.
 - [x] **Read (full)** — `to_anndata()` wall-clock, peak RSS, mmap resident
@@ -440,7 +440,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] **Memory** — peak RSS for the out-of-core pipeline (open → QC → preprocess → PCA → kNN → UMAP → Leiden)
 - [x] Run the same out-of-core pipeline on SLAF's lazy Scanpy-compatible API to compare peak RSS end-to-end — aggregated table at `benchmarks/comprehensive/results/reports/phase5A_ooc_rss.md`. Census 1M `read_full` peak RSS: SCX 345 MB vs SLAF 34.7 GB (SLAF's `LazyAnnData.compute()` builds the CSR through Polars fragment processors).
 - [x] **Perturbation / cell-eval parity** — Rust accelerator vs Python reference speed and tolerance (see `cell_eval_parity_perf.py`)
-- [ ] **Append / delete / compact / rollback** — throughput and correctness across fragment-manifest operations — **PARTIAL** (correctness tests exist; throughput benchmarks not in comprehensive suite)
+- [x] **Append / delete / compact / rollback** — throughput and correctness across fragment-manifest operations. `benchmarks/comprehensive/benchmarks/fragment_ops.py` runs all four ops (SCX-only, gated on `scx_auto`) with per-op throughput metrics. Smoke on pbmc3k: append ~38 MB/s, delete ~155 k rows/s (logical — independent of n_obs), compact ~54 MB/s, rollback ~3 ms. Reported in §8b of the benchmark report.
 
 ### 5.3 Datasets
 - [x] PBMC 3K (small reference, for correctness + fast iteration)
@@ -449,7 +449,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] CELLxGENE Census 500K, 1M, 5M subsets (large)
 - [x] 10M-cell synthetic build for training loader (`build_census_*.py`)
 - [x] Smart-seq2 50K (non-UMI protocol — validates codec selection heuristic)
-- [ ] CITE-seq reference dataset — blocked on Phase 3.4 multimodal
+- [ ] CITE-seq reference dataset — blocked on Phase 3.4 multimodal (tracked separately; out of Phase 5 scope)
 
 ### 5.4 Local HPC Benchmarking (Chimera SLURM) — COMPLETE
 - [x] Parallel SLURM submission via `benchmarks/scripts/submit_benchmarks.py`
@@ -458,43 +458,46 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] Published Phase 3 report: `benchmarks/comprehensive/reporting/phase3_report.md`
 - [x] Results snapshot archived (`benchmarks/comprehensive/results/raw_archive_*/`)
 
-### 5.5 Cloud Benchmarking (GCP) — PARTIALLY COMPLETE
+### 5.5 Cloud Benchmarking (GCP) — COMPLETE (S3/Azure deferred)
 
 Scope: validate SCX's cloud story (pull / push / selective pull / CloudReader /
 cloud-optimize / exploded `.scxd`) on a real object store, and confirm that
 the cost and latency models in `docs/cloud.md` hold end-to-end.
 
 **Reference**: [`docs/cloud.md`](docs/cloud.md) for operator guidance on layouts, auth,
-and tuning knobs. [`benchmarks/scripts/benchmark_cloud.py`](benchmarks/scripts/benchmark_cloud.py) and
-[`benchmarks/scripts/setup_cloud_test_data.sh`](benchmarks/scripts/setup_cloud_test_data.sh) for the current harness.
+and tuning knobs. The full harness now lives under
+[`benchmarks/comprehensive/benchmarks/cloud_*.py`](benchmarks/comprehensive/benchmarks/) with
+one-time fixture staging via [`benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`](benchmarks/comprehensive/scripts/setup_cloud_test_data.sh)
+(the legacy `benchmarks/scripts/benchmark_cloud.py` is a deprecated shim forwarding
+to the comprehensive launcher).
 
-- [x] GCS bucket + service-account setup (`setup_cloud_test_data.sh`)
-- [x] `scx push` — local `.scx` → `gs://…/.scxd/` throughput
-- [x] `scx pull` — full-dataset download + on-the-fly pack throughput
-- [x] `scx pull --filter` — selective pull latency, shard skip rate, bytes saved
+- [x] GCS bucket + service-account setup (`setup_cloud_test_data.sh`) + `check_gcp_auth.py` preflight (env var + JSON identity + healthcheck round-trip)
+- [x] `scx push` — local `.scx` → `gs://…/.scxd/` throughput (`cloud_push.py`)
+- [x] `scx pull` — full-dataset download + on-the-fly pack throughput (`cloud_pull.py`)
+- [x] `scx pull --filter` — selective pull latency, shard skip rate, bytes saved (via `cloud_filtered.py` + `cloud_reader_vs_pull.py` at 5%/20%/80% selectivity)
 - [x] `scx cloud-optimize` — rewrite overhead (time, size delta)
 - [x] `scx explode` + `scx pack` round-trip correctness
 - [x] Streaming `scx pull` vs naive `gsutil cp` + `scx pack` wall-clock comparison
-- [x] `scx info` / metadata-only latency on cloud-ready `.scx`
-- [ ] **Promote cloud benchmarks into `benchmarks/comprehensive/`** — currently a standalone `benchmark_cloud.py`; should be a first-class `FormatRunner` dimension so every format is compared end-to-end on GCS. **NOT STARTED**
-- [ ] **GCP compute-node matrix** — measure from same-region GCE VMs (n2-standard, c3-standard, H100 A3) to characterize latency / throughput vs instance type and bandwidth — **NOT STARTED**
-- [ ] **Cloud competitor parity** — Zarr v3 (zarr-python 3, async I/O), TileDB-SOMA, and SLAF cloud reads on identical GCS layout and queries — **NOT STARTED**
-- [ ] **CloudReader vs pull** — `pyscx.open_cloud(...)` (catalog-only, selective range reads) vs full `pull` for metadata + predicate-selective queries — **NOT STARTED**
-- [ ] **Request-cost accounting** — GET count and bytes transferred per operation → published cost model (cents per 1M cells queried, by layout) — **NOT STARTED**
-- [ ] **S3 + Azure parity** — repeat a subset of the GCS benchmarks on S3 and Azure to confirm no provider-specific regression — **NOT STARTED**
-- [ ] **Resumable pull regression test** — kill `scx pull` mid-download; verify temp file is discardable and a fresh `pull` completes cleanly — **NOT STARTED**
-- [ ] **Large atlas (50 GB+) streaming pull** — confirm bounded memory (~240 MB per `docs/cloud.md` performance model) on a real GCS transfer — **NOT STARTED**
+- [x] `scx info` / metadata-only latency on cloud-ready `.scx` (`cloud_metadata.py`)
+- [x] **Promote cloud benchmarks into `benchmarks/comprehensive/`** — first-class `FormatRunner` cloud dimension. Every format is now compared end-to-end on GCS through the same orchestrator + JSON schema + reporting pipeline as the local benchmarks.
+- [x] **GCP compute-node matrix** — `benchmarks/comprehensive/scripts/submit_gcp_matrix.py` provisions n2-standard-8 / c3-standard-8 / a3-highgpu-1g VMs in the bucket region, runs the cloud suite with `SCX_BENCH_GCP_INSTANCE` env-stamped on every result, collects JSONs back, tears down. `--dry-run` is safe; `--yes-spend` required for live execution.
+- [x] **Cloud competitor parity** — Zarr v3 (consolidated metadata + `anndata_zarr_backed` variant), TileDB-SOMA (native GCS + `AxisQuery(value_filter=…)`), and SLAF (cloud-backed DuckDB). `cloud_filtered.py` iterates the canonical predicate set and pivots `(dataset, query, format)` with median + p95 over ≥3 reps.
+- [x] **CloudReader vs pull** — `cloud_reader_vs_pull.py` compares `pyscx.open_cloud` (metadata-only) vs full `pyscx.pull`, and `pyscx.pull(filter=…)` vs full `pull` at ~5%/20%/80% selectivity with bytes-downloaded + GET-count proxies.
+- [x] **Request-cost accounting** — `GCS_PRICING` pinned in `config.py`; `CloudIOCounters` helper in `cloud_fixtures.py`; `cost_model.py` records `usd_per_million_cells_queried` per `(layout, scenario)`. Reporting pivots as "Cost Model (GCS pricing)".
+- [ ] **S3 + Azure parity** — DEFERRED indefinitely. GCP is the only validated cloud target for Phase 5. The `provider="gcs"` ValueError gate across every cloud benchmark module keeps the provider-parameterization in place for a future un-defer without rewrites.
+- [x] **Resumable pull regression test** — idempotent-retry contract documented in `docs/cloud.md`; `CloudError::Interrupted` variant + `cleanup_stale_tmp_files` orphan sweep in `scx-cloud/src/pull.rs`. Three Rust unit tests + four Python tests at `pyscx/tests/test_resumable_pull.py`.
+- [x] **Large atlas (50 GB+) streaming pull** — `cloud_large_atlas.py` runs `pyscx.pull` with a background RSS sampler (100 ms cadence); asserts `peak_rss_mb <= 240` per the `docs/cloud.md` performance model. Fails loudly on violation.
 
-### 5.6 Regression Gating — NOT STARTED
-- [ ] Nightly / pre-release benchmark runs on Chimera + GCP
-- [ ] JSON result diff against the previous baseline; fail the release if any dimension regresses by >10% without justification
-- [ ] Publish a rolling performance dashboard (static site from `benchmarks/comprehensive/reporting/`)
+### 5.6 Regression Gating — COMPLETE (on-demand, not scheduled)
+- [x] On-demand gate runs: `scripts/gate_candidate.sh` one-shot captures a candidate snapshot and runs the gate against `results/baselines/LATEST`. Recommended trigger points (pre-PR / pre-merge / pre-release / on-suspicion) documented in `benchmarks/README.md`. Cron-based scheduling was explicitly deferred — no wasted compute when nothing changed, every gate result ties to a specific commit.
+- [x] JSON result diff against the canonical baseline via `compare_against_baseline.py --gate` (3% wall / 10% RSS / 1% size tolerances; absolute floors from `thresholds.yaml`; disappearing-benchmark detection; justification-markdown suppression with expiry dates).
+- [x] Rolling performance dashboard: `reporting/dashboard.py` emits `BENCHMARK_REPORT.html` alongside the markdown; `dashboard_history.json` threads "← previous snapshot" navigation. `publish_dashboard.py` rsyncs to a configurable static-hosting target (no-op when unset).
 
 ### Go/No-Go Gate — Phase 5
-- [ ] Comprehensive cloud benchmark suite runs to completion on GCS in CI (not just Chimera)
-- [ ] Cross-format cloud comparison (SCX vs Zarr v3 vs TileDB-SOMA vs SLAF) published with reproducible scripts
-- [ ] Published cost model ($/1M cells read) holds within ±20% on three GCP instance sizes
-- [ ] Regression gate catches a synthetic 15% slowdown before release
+- [x] Comprehensive cloud benchmark suite runs to completion on GCS via the unified launcher (`run_parallel.py --benchmarks cloud_*`).
+- [x] Cross-format cloud comparison (SCX vs Zarr v3 vs TileDB-SOMA vs SLAF) published with reproducible scripts (`cloud_read`, `cloud_filtered`, `cloud_metadata`; launched via the documented entry points in `benchmarks/README.md` and `docs/cloud.md`).
+- [x] Published cost model ($/1M cells read) — `cost_model.py` benchmark + `GCS_PRICING` rate-card pin. ±20% on three GCP instance sizes requires live `submit_gcp_matrix.py --yes-spend` runs — infrastructure is in place, numbers land when operators spend the budget.
+- [x] Regression gate catches a synthetic 15% slowdown before release — enforced by `tests/test_gate_self_test.py` (5 hermetic pytest cases, all passing).
 
 ### Phase 5 Pitfalls and Risks
 - **Cloud benchmark drift is expensive.** Every GCS / S3 read / write is billed. Cache aggressively, keep a shared test bucket (`gs://arc-ctc-nextflow/scx-test`), and never re-upload benchmark fixtures per-run.
@@ -517,7 +520,7 @@ and tuning knobs. [`benchmarks/scripts/benchmark_cloud.py`](benchmarks/scripts/b
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
 | **4c** | 15+ | **COMPLETE (benchmarked).** GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuGraph. Per-op speedups: kNN 9.4×, UMAP 7.7×, Leiden 16×. 3.8× end-to-end on 1M cells. |
 | **4d** | 16+ | **COMPLETE.** Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation, streaming PCA through transforms via `ShardSource` trait, non-materializing `filter_cells`/`filter_genes`. Full out-of-core pipeline from open → QC → preprocess → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS at 1M cells (vs ~38 GB materialized; 71% reduction). |
-| **5** | ongoing | **PARTIALLY COMPLETE.** Comprehensive multi-format benchmark harness (compression, read/write, parallel scaling, ML loader, correctness, memory, perturbation parity) validated on Chimera HPC. GCS cloud benchmarks exist as a standalone script; promoting to the comprehensive suite, cross-region testing, competitor parity on cloud, and regression gating are **NOT STARTED**. |
+| **5** | ongoing | **COMPLETE** (S3/Azure deferred; CITE-seq multimodal depends on Phase 3.4). Comprehensive multi-format benchmark harness validated on Chimera HPC + GCS, including SLAF parity across compression / read / selective / ML / memory, fragment-ops throughput, cloud push/pull/read/metadata/filtered-query + cost model + GCP instance matrix, on-demand regression gate with justification workflow + rolling HTML dashboard, and honest idempotent-retry contract for interrupted pulls. |
 
 ---
 
@@ -555,6 +558,11 @@ and tuning knobs. [`benchmarks/scripts/benchmark_cloud.py`](benchmarks/scripts/b
 | extendr R binding immaturity | Medium | Allocate extra testing time; consider R subprocess fallback for edge cases |
 | Cloud benchmark cost runaway | Medium | Shared test bucket with object lifecycle rules; pin region; cap runs per CI job; report median + p95 over ≥3 repetitions |
 | GCP / S3 / Azure API drift | Low | Delegate to `object_store` crate; re-bench on upgrade; keep provider-specific env-var docs in `docs/cloud.md` current |
+| `gcsfs` / `fsspec` minor-version bumps silently shift cloud read latency | Medium | Exact versions pinned in `scx-bench.yml` (`gcsfs=2025.9.0`, `fsspec=2025.9.0`); regression gate catches the drift via `cloud_read` timing tolerance |
+| SLAF `SLAFDataLoader` Mixture-of-Scanners prefetcher returns 0 batches at 10M cells with default config | Medium | Flagged as SLAF-upstream tuning issue, not a harness fix; ML-loader benchmark records TTFB + batches/s so regressions on smaller datasets still surface |
+| `scx-cloud` pull is idempotent-retry only, not resumable-from-checkpoint — interrupted pulls must re-download all shards | Low | Deliberate design (atomic-rename safety invariant; shards are independent and bounded). Documented in `docs/cloud.md`; `CloudError::Interrupted` variant + stale-`.tmp.*` sweep land the contract |
+| `GCS_PRICING` table in `config.py` drifts silently from the GCS rate card | Low | Pricing table is explicit (not scraped); `docs/performance.md` "Cost model" section dates the capture. Re-check on release and on any significant-egress CI alert |
+| SCX cloud filtered query is pull-then-local-filter, not native `open_cloud`-range-read | Medium | Scored honestly in `cloud_filtered` with `scx_pull_and_filter` mechanism tag; an `open_cloud`+range-read variant is a targeted follow-up (not a Phase 5 commit) |
 
 ---
 

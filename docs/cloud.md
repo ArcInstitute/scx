@@ -63,6 +63,69 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
 # Or: `gcloud auth application-default login` for local dev
 ```
 
+#### Benchmark service-account bootstrap (one-time)
+
+The comprehensive benchmark suite expects a dedicated service account
+`scx-bench@<project>.iam.gserviceaccount.com` with scoped bucket access.
+Run these once per GCP project (requires `roles/iam.serviceAccountAdmin`
++ `roles/resourcemanager.projectIamAdmin`):
+
+```bash
+# 1. Pin the project
+PROJECT=c-tc-429521
+BUCKET=gs://arc-ctc-nextflow
+gcloud config set project "$PROJECT"
+
+# 2. Create the service account if absent
+if ! gcloud iam service-accounts list \
+      --filter="email:scx-bench@$PROJECT.iam.gserviceaccount.com" \
+      --format="value(email)" | grep -q .; then
+    gcloud iam service-accounts create scx-bench \
+        --display-name "SCX Benchmark Runner" \
+        --project "$PROJECT"
+fi
+
+# 3. Grant bucket-scoped objectAdmin (NOT project-wide)
+gcloud storage buckets add-iam-policy-binding "$BUCKET" \
+    --member="serviceAccount:scx-bench@$PROJECT.iam.gserviceaccount.com" \
+    --role=roles/storage.objectAdmin
+
+# 4. Mint a JSON key and stash locally
+mkdir -p ~/.gcp
+gcloud iam service-accounts keys create ~/.gcp/scx-bench.json \
+    --iam-account="scx-bench@$PROJECT.iam.gserviceaccount.com"
+chmod 600 ~/.gcp/scx-bench.json
+
+# 5. Point the benchmark runner at the key via the repo-root .env
+#    (auto-loaded by python-dotenv through benchmarks/scripts/bench_env.py
+#    — no shell export needed; tilde is expanded on load)
+echo 'GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json' >> .env
+```
+
+An uncommented template line is available in `.env.example` for
+reference. The env-var precedence is real-env → `.env` → default-path
+fallback (`~/.gcp/scx-bench.json`), so operators who prefer to export
+the variable in their shell can continue to do so without removing the
+`.env` entry.
+
+**Key rotation:** re-mint every 90 days and delete the old key in the GCP
+console. Never commit the JSON, paste it into chat, or copy it into the
+repo tree.
+
+#### Preflight check
+
+After bootstrapping, verify the setup end-to-end (checks env var,
+parses the key, validates service-account identity, round-trips a
+healthcheck blob through the bucket):
+
+```bash
+python benchmarks/comprehensive/scripts/check_gcp_auth.py -v
+```
+
+Exit 0 on success, 1 on any failure with a pointed error message. Use
+`--skip-healthcheck` in CI when you want key validation without paying
+for a GCS round-trip.
+
 ### Amazon S3
 
 ```bash
@@ -183,6 +246,34 @@ consulted before any shard is downloaded.
 Return value (Python): dict with `bytes_downloaded`, `sections_downloaded`,
 `elapsed_secs`, `throughput_mbps`. Filtered pulls add `total_shards`,
 `downloaded_shards`, `skipped_shards`, `matching_cells`, `bytes_saved`.
+
+#### Interrupted pulls — idempotent retry, not resumable
+
+Pulls are **idempotent-retry**, not resumable-from-checkpoint. The
+implementation writes to `{dest}.tmp.{pid}` and atomically renames on
+completion, so:
+
+- A SIGTERM or crash leaves `{dest}.tmp.{pid}` orphaned on disk but does
+  **not** block subsequent pulls — a fresh run uses a different PID-keyed
+  path and produces the final output atomically.
+- On entry, every `pull` / `pull_filtered` invocation sweeps any
+  `{dest}.tmp.*` siblings it finds, so orphaned temp files don't
+  accumulate across retries.
+- There is **no shard-level checkpoint** — a retried pull re-downloads
+  every shard. This is a deliberate design choice: SCX shards are
+  independent and small enough that re-download cost is bounded, and a
+  checkpoint file would introduce cross-invocation state that defeats
+  the current atomic-rename safety property.
+- If your pull was killed mid-run and you need to know the committed
+  state on disk, check for `{dest}` (fully written) vs `{dest}.tmp.*`
+  (in-flight, safe to delete). The next pull will sweep the `.tmp.*`
+  automatically.
+
+The `CloudError::Interrupted` enum variant is reserved for callers that
+want to explicitly signal an interruption in downstream orchestration
+(e.g., surfacing to the regression gate); the pull implementation itself
+does not raise it today since interruptions in the streaming pipeline
+surface as `object_store::Error` / `io::Error` at the failing GET.
 
 ### `push` — stream local `.scx` → cloud `.scxd/`
 
@@ -352,6 +443,61 @@ adata = pyscx.open("lung.scx").to_anndata()
 adata.write_scx("lung_pca.scx")
 pyscx.push("lung_pca.scx", "gs://my-bucket/lung_pca.scxd/", parallelism=16)
 ```
+
+---
+
+## Benchmark modules
+
+The comprehensive benchmark suite (`benchmarks/comprehensive/`) includes
+eight modules that exercise the cloud surface end-to-end. Each writes one
+JSON per `(benchmark × format × dataset)` under `results/raw/`; the
+reporting layer pivots them into cross-format tables automatically.
+
+| Module | Scope | What it measures |
+|---|---|---|
+| `cloud_push` | SCX only | Push throughput: local `.scx` → `gs://…/.scxd/` via `pyscx.push`. Cleanup per-run. |
+| `cloud_pull` | SCX only | Pull throughput: `gs://…/.scxd/` → local `.scx` via `pyscx.pull` (streaming + pack). |
+| `cloud_read` | cross-format | Full-dataset materialization from the cloud URI for every format that declares `cloud_read`. |
+| `cloud_metadata` | cross-format | Catalog-open latency (`open_cloud` / `open_consolidated` / `Experiment.open` / `SLAFArray`). |
+| `cloud_filtered` | cross-format (obs-preserving) | Predicate pushdown at cloud scale: `cell_type == "T cell"`, `n_counts > 1000`, random 1% sample. Zarr silently skipped (converter doesn't preserve obs). |
+| `cloud_reader_vs_pull` | SCX only | Decision table: `open_cloud` (metadata-only) vs full `pyscx.pull`, plus predicate sweep at 5% / 20% / 80% selectivity comparing `pyscx.pull(filter=…)` to a full pull. |
+| `cost_model` | SCX only | USD per 1M cells queried for each cloud layout (exploded `.scxd` today) across metadata + selective + full-read scenarios, using the GCS rate card pinned in `config.py::GCS_PRICING`. |
+| `cloud_large_atlas` | SCX only | Correctness check: streaming pull of a 50 GB+ atlas must stay within the 240 MB peak-RSS bound. Fails loudly on violation — this is a regression test, not a throughput run. |
+
+Entry points for running any combination:
+
+```bash
+# GCP auth preflight (required before first run)
+python benchmarks/comprehensive/scripts/check_gcp_auth.py
+
+# Stage cloud fixtures (one-time, BLAKE3-idempotent)
+bash benchmarks/comprehensive/scripts/setup_cloud_test_data.sh
+
+# Cross-format cloud suite
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks cloud_read cloud_metadata cloud_filtered cloud_reader_vs_pull \
+                 cost_model cloud_push cloud_pull \
+    --datasets pbmc3k tabula_sapiens_100k \
+    --formats scx_auto zarr_zstd tiledb_soma slaf
+
+# Large-atlas peak-RSS regression
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks cloud_large_atlas --datasets census_10m --formats scx_auto
+
+# GCP instance matrix (requires --yes-spend)
+python benchmarks/comprehensive/scripts/submit_gcp_matrix.py --dry-run
+python benchmarks/comprehensive/scripts/submit_gcp_matrix.py --yes-spend
+```
+
+**Scope:** GCP (GCS) only. AWS S3 and Azure Blob parity is deferred —
+the modules reject `--provider` values other than `gcs` with a clear
+error. Re-enabling a second provider is a targeted un-defer that doesn't
+require benchmark-module rewrites.
+
+**Reporting:** the consolidated tables live in `reporting/tables.py`:
+`cloud_filtered_table`, `cloud_reader_vs_pull_table`, `cost_model_table`,
+`gcp_matrix_table`. All are wired into `reporting/markdown.py` and the
+aggregated landing page `reporting/landing.py`.
 
 [docs/sharding.md]: sharding.md
 [docs/multithreading.md §Concurrent file access]: multithreading.md#concurrent-file-access

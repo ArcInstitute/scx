@@ -61,16 +61,12 @@ from benchmarks.comprehensive.results import BenchmarkResult, write_result  # no
 
 logger = logging.getLogger(__name__)
 
-BENCHMARK_NAMES = [
-    "compression",
-    "write",
-    "read_full",
-    "read_selective",
-    "parallel_scaling",
-    "parallel_write_scaling",
-    "memory",
-    "fragment_ops",
-]
+from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS  # noqa: E402
+
+# Canonical benchmark list lives in benchmarks/__init__.py::ALL_BENCHMARKS —
+# add new benchmarks there, not here. This alias preserves the historical
+# name so existing callers / subagents don't need to change.
+BENCHMARK_NAMES = list(ALL_BENCHMARKS)
 
 # Benchmarks that work from h5ad source and don't need pre-converted files.
 _NO_CONVERSION = {"write", "parallel_write_scaling"}
@@ -138,6 +134,15 @@ def _run_benchmark(
                          n_runs=n_runs, cold_cache=cold_cache,
                          converted_path=converted_path)
 
+    # Benchmarks may return None when the (bench, format) combo is a
+    # deliberate skip (e.g. fragment_ops / cloud_push / cloud_pull only
+    # apply to SCX; capability-gated cross-format modules return None for
+    # runners that don't declare the capability). That's a successful
+    # no-op, not a failure — don't try to persist it.
+    if result is None:
+        return {"skipped": True, "benchmark": bench_name,
+                "format": fmt.key, "dataset": dataset.name}
+
     write_result(result)
     return result.to_dict()
 
@@ -152,6 +157,11 @@ def _slurm_setup_cmds() -> list[str]:
     import os
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
     env_cleanup = "unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK 2>/dev/null || true"
+    # Disable srun's MPI bootstrap. Chimera's slurm.conf has MpiDefault=pmix,
+    # but the pmix plugin isn't runtime-loadable — submitit's `srun` would
+    # otherwise fail with "Cannot create context for mpi/pmix". We don't
+    # use MPI; tell srun so.
+    mpi_none = "export SLURM_MPI_TYPE=none"
 
     if "scx-bench" in conda_prefix:
         conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
@@ -160,11 +170,13 @@ def _slurm_setup_cmds() -> list[str]:
         env_name = os.path.basename(conda_prefix)
         return [
             env_cleanup,
+            mpi_none,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
     return [
         env_cleanup,
+        mpi_none,
         f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
     ]
 
@@ -202,7 +214,12 @@ def _per_job_slurm_params(
     exceeds the preemptible cap. The ``--mem-gb`` CLI arg becomes a floor:
     we never request less than the user explicitly asked for.
     """
+    from benchmarks.comprehensive.config import (  # deferred to avoid circ
+        MEM_CEILING_GB, estimate_time_minutes,
+    )
+
     cfg = DATASETS[dataset_name]
+    scale = max(getattr(args, "scale_factor", 1.0), 0.1)
 
     if is_conversion or benchmark is None:
         # Conversion needs to load the source h5ad and write the target —
@@ -211,18 +228,28 @@ def _per_job_slurm_params(
             estimate_memory_gb(cfg, format_key, "read_full"),
             estimate_memory_gb(cfg, format_key, "write"),
         )
+        time_bench = "write"
     else:
         mem = estimate_memory_gb(cfg, format_key, benchmark)
+        time_bench = benchmark
 
-    # CLI floor (never request less than the user asked for).
-    mem = max(mem, args.mem_gb)
+    # Apply the scale factor (memory + time), then clamp.
+    mem = min(int(round(mem * scale)), MEM_CEILING_GB)
+    mem = max(mem, args.mem_gb)  # CLI floor
 
-    # Partition: respect explicit --partition unless the request can't fit.
-    partition = partition_for_memory(mem, default=args.partition)
-
-    timeout_min = args.timeout
+    est_time = estimate_time_minutes(cfg, format_key, time_bench)
+    est_time = int(round(est_time * scale))
+    timeout_min = max(est_time, args.timeout if is_conversion else 0, 5)
     if is_conversion and timeout_min < 240:
         timeout_min = 240
+
+    partition = partition_for_memory(mem, default=args.partition)
+
+    logger.info(
+        "Sized %s__%s__%s: mem=%dG time=%dm partition=%s (scale=%.2f)",
+        benchmark or "convert", format_key, dataset_name,
+        mem, timeout_min, partition, scale,
+    )
 
     return {
         "slurm_partition": partition,
@@ -260,6 +287,29 @@ def main() -> None:
     # Resolve benchmarks
     benchmarks = args.benchmarks or BENCHMARK_NAMES
 
+    # Mint a run ID that every submitted job inherits via its env, so the
+    # per-result provenance blocks share a single group key for the
+    # dashboard's "runs" view (Phase I.2).
+    from benchmarks.comprehensive.provenance import current_run_id
+    run_id = current_run_id()
+    logger.info("Run ID:     %s", run_id)
+
+    # Pre-submit runner contract check (Phase I.8). Catches capability
+    # manifest violations before a 400-job fleet hits the scheduler.
+    # Gated off with --skip-smoke for exploratory runs.
+    if not getattr(args, "skip_smoke", False):
+        logger.info("Pre-submit smoke (use --skip-smoke to bypass) …")
+        import subprocess as _sp
+        rc = _sp.call([
+            sys.executable, "-m",
+            "benchmarks.comprehensive.scripts.smoke_test_runners",
+        ])
+        if rc != 0:
+            logger.error(
+                "Runner contract check failed (rc=%d). Submit blocked. "
+                "Fix the runner or re-run with --skip-smoke.", rc,
+            )
+            return
     logger.info("Datasets:   %s", datasets)
     logger.info("Formats:    %s", [f.key for f in formats])
     logger.info("Benchmarks: %s", benchmarks)
@@ -382,6 +432,27 @@ def main() -> None:
                     label, params["mem_gb"], params["slurm_partition"], job.job_id,
                 )
 
+    # Emit run_manifest.json — an authoritative list of submitted triples so
+    # watch.py can detect missing-result failures even when submitit itself
+    # exits cleanly (Phase I.6).
+    if not args.dry_run and bench_jobs:
+        manifest_path = LOGS_DIR / "run_manifest.json"
+        manifest = {
+            "run_id": run_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "submitted": [
+                {
+                    "label": label,
+                    "job_id": job.job_id,
+                    "submitit_folder": str(job.paths.folder),
+                }
+                for label, job in bench_jobs
+            ],
+        }
+        import json as _json
+        manifest_path.write_text(_json.dumps(manifest, indent=2, default=str))
+        logger.info("Run manifest: %s", manifest_path)
+
     if args.dry_run:
         n_conv = sum(1 for ds in datasets for fmt in formats
                      if not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite)
@@ -410,6 +481,40 @@ def main() -> None:
             "All done: %d succeeded, %d failed in %.1fs (wall)",
             done, failed, elapsed,
         )
+
+        # Auto-run the regression gate when a canonical baseline exists
+        # (Phase I.6). Non-fatal — reports the gate outcome and returns
+        # normally; use the gate's own exit code elsewhere if blocking is
+        # desired (the `gate_candidate.sh` wrapper does this).
+        if getattr(args, "auto_diff", True):
+            _maybe_auto_diff(run_id)
+
+
+def _maybe_auto_diff(run_id: str) -> None:
+    """Invoke compare_against_baseline.py at the end of a run_parallel run.
+
+    Best-effort — a missing canonical baseline is treated as a "not wired
+    yet" signal rather than an error, since first-run fleets won't have a
+    baseline to compare against.
+    """
+    import subprocess
+    baselines_dir = LOGS_DIR.parent / "results" / "baselines"
+    latest = baselines_dir / "LATEST"
+    if not (latest.is_symlink() or latest.is_file()):
+        logger.info(
+            "Auto-diff skipped: no canonical baseline at %s (promote one "
+            "with scripts/promote_baseline.py to enable).",
+            latest,
+        )
+        return
+    # The current snapshot for this run isn't a capture_baseline.py tree —
+    # auto-diff works on the *last* captured snapshot. Operators who want a
+    # scored PR should use scripts/gate_candidate.sh instead.
+    logger.info(
+        "Auto-diff: run_id=%s — use scripts/gate_candidate.sh to compare "
+        "against baselines/LATEST; raw results landed in results/raw/.",
+        run_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +555,20 @@ def parse_args() -> argparse.Namespace:
                              "Each job is sized via estimate_memory_gb() based on "
                              "(benchmark, dataset, format); --mem-gb is the lower bound.")
     parser.add_argument("--timeout", type=int, default=240,
-                        help="Timeout in minutes per job (default: 240)")
+                        help="Timeout in minutes per job (default: 240 — "
+                             "used as a floor; per-job timeout is sized by "
+                             "estimate_time_minutes() × --scale-factor).")
+    parser.add_argument(
+        "--scale-factor", type=float, default=1.0,
+        help="Multiplier applied to per-job memory AND time estimates "
+             "(Phase I.5). Use <1.0 (e.g. 0.9) on well-characterized CI, "
+             ">1.0 (e.g. 1.3) for conservative operator runs on noisy "
+             "clusters. Clamped by MEM_CEILING_GB for memory.",
+    )
+    parser.add_argument(
+        "--skip-smoke", action="store_true",
+        help="Skip the pre-submit runner contract check (Phase I.8).",
+    )
 
     return parser.parse_args()
 

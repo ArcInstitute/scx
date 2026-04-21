@@ -26,9 +26,14 @@ dependencies:
   - h5py=3.16.0
   - pyarrow=23.0.1
 
+  # Cloud object-store (SLAF DuckDB cloud path + anndata async store)
+  - fsspec=2025.9.0
+  - gcsfs=2025.9.0
+
   # Benchmark orchestration
   - psutil=7.2.2
   - maturin>=1.5.0
+  - blake3=0.4  # Required by cloud_fixtures.compute_blake3 (no fallback).
 
   # PyTorch (CPU-only — for SLAFDataLoader ml_loader scenarios)
   - pytorch-cpu>=2.0
@@ -41,3 +46,9 @@ dependencies:
     - slafdb==0.5.2
     # DuckDB + polars + lance come in as slafdb transitive deps; let the pin
     # resolve rather than double-pinning here.
+    # SLAF's cloud-path support (``SLAFArray("gs://...")``) routes through
+    # ``smart_open`` — which ships the GCS backend under a ``[gcs]`` extra
+    # backed by ``google-cloud-storage``. Without this pull, SLAF's
+    # ``_path_exists`` catches the ImportError and returns False, surfacing
+    # as a misleading ``FileNotFoundError: SLAF dataset not found``.
+    - google-cloud-storage>=2.6.0

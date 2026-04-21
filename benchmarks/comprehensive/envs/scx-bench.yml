@@ -31,6 +31,10 @@ dependencies:
   - pyarrow=23.0.1
   - tiledbsoma=2.3.0
 
+  # Cloud object-store (zarr + anndata async store routing for gs:// URIs)
+  - fsspec=2025.9.0
+  - gcsfs=2025.9.0
+
   # Analysis (for accelerator comparisons against scanpy)
   - scikit-learn=1.8.0
   - umap-learn=0.5.11
@@ -43,6 +47,11 @@ dependencies:
 
   # System monitoring
   - psutil=7.2.2
+
+  # Cloud fixture fingerprinting (see cloud_fixtures.compute_blake3). The
+  # fallback to hashlib.blake2b was removed because it produced hashes
+  # that silently disagreed with the Rust writer — blake3 is now required.
+  - blake3=0.4
 
   # Build tooling (for pyscx from source)
   - maturin>=1.5.0

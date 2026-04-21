@@ -61,6 +61,8 @@ adata.write_h5ad('$PBMC_H5AD')
 print(f'  Written: {adata.n_obs} cells x {adata.n_vars} genes')
 "
     rm -f "$PBMC_H5"
+    echo "[AUGMENT] Adding obs['n_counts'] to PBMC 3K..."
+    "$PYTHON" "$(dirname "$0")/augment_obs_n_counts.py" "$PBMC_H5AD"
     echo "[DONE] PBMC 3K: $PBMC_H5AD"
 fi
 
@@ -95,6 +97,8 @@ with cellxgene_census.open_soma() as census:
     print(f'  Written: {adata.n_obs} cells x {adata.n_vars} genes')
 " || echo "[WARN] Tabula Sapiens download failed (requires cellxgene-census). Skipping."
     if [ -f "$TABULA_H5AD" ]; then
+        echo "[AUGMENT] Adding obs['n_counts'] to Tabula Sapiens..."
+        "$PYTHON" "$(dirname "$0")/augment_obs_n_counts.py" "$TABULA_H5AD"
         echo "[DONE] Tabula Sapiens: $TABULA_H5AD"
     fi
 fi

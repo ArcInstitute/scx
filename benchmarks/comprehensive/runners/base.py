@@ -11,6 +11,7 @@ import gc
 import logging
 import os
 import resource
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -79,7 +80,10 @@ class FormatRunner(ABC):
     # optional method is a feature gap (skip quietly) or a contract
     # violation (fail loudly). Runners that advertise ``"filtered_query"``
     # must implement ``read_filtered_query``; ``"backed_mode"`` requires
-    # ``read_backed`` + ``read_backed_slice``.
+    # ``read_backed`` + ``read_backed_slice``. Cloud capabilities:
+    # ``"cloud_read"`` → ``read_cloud``; ``"cloud_subset"`` →
+    # ``read_cloud_subset``; ``"cloud_push"`` → ``push``; ``"cloud_pull"``
+    # → ``pull``; ``"cloud_filtered"`` → ``read_cloud_filtered_query``.
     capabilities: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
@@ -191,6 +195,101 @@ class FormatRunner(ABC):
         """
         raise NotImplementedError(f"{self.name} does not support backed row slices")
 
+    # ------------------------------------------------------------------
+    # Cloud operations (Phase 5 — GCP only)
+    # ------------------------------------------------------------------
+
+    def read_cloud(self, cloud_url: str) -> TimingResult:
+        """Read the entire expression matrix directly from a cloud URI.
+
+        A runner that advertises ``"cloud_read"`` in its ``capabilities``
+        set must override this method.
+
+        Parameters
+        ----------
+        cloud_url : GCS URI (e.g. ``gs://arc-ctc-nextflow/scx-test/pbmc3k.scxd/``)
+
+        Returns
+        -------
+        TimingResult
+            ``extra`` should include ``"provider"`` (``"gcs"``) and a
+            ``"native_mechanism"`` tag so reports can group apples-to-apples.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_cloud"
+        )
+
+    def read_cloud_subset(
+        self,
+        cloud_url: str,
+        cell_indices: np.ndarray | list[int] | None = None,
+        gene_indices: np.ndarray | list[int] | None = None,
+    ) -> TimingResult:
+        """Read a subset of cells/genes directly from a cloud URI.
+
+        A runner that advertises ``"cloud_subset"`` in its ``capabilities``
+        set must override this method.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_cloud_subset"
+        )
+
+    def push(self, local_path: str | Path, cloud_url: str) -> TimingResult:
+        """Upload a local file/directory to the given cloud URI.
+
+        A runner that advertises ``"cloud_push"`` in its ``capabilities``
+        set must override this method.
+
+        Returns a TimingResult whose ``extra`` dict should include
+        ``"bytes_uploaded"`` and ``"throughput_mbps"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support push"
+        )
+
+    def pull(self, cloud_url: str, local_path: str | Path) -> TimingResult:
+        """Download a cloud URI into a local file/directory.
+
+        A runner that advertises ``"cloud_pull"`` in its ``capabilities``
+        set must override this method.
+
+        Returns a TimingResult whose ``extra`` dict should include
+        ``"bytes_downloaded"`` and ``"throughput_mbps"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support pull"
+        )
+
+    def read_cloud_filtered_query(
+        self,
+        cloud_url: str,
+        predicate: "Predicate",
+    ) -> TimingResult:
+        """Execute a format-native filtered query against a cloud URI.
+
+        A runner that advertises ``"cloud_filtered"`` in its ``capabilities``
+        set must override this method. The default raises so
+        ``cloud_filtered.py`` can flag a contract violation instead of
+        silently skipping.
+
+        Parameters
+        ----------
+        cloud_url : GCS URI (e.g. ``gs://arc-ctc-nextflow/scx-test/pbmc3k.soma/``)
+        predicate : one of the ``Predicate`` subclasses declared in
+            ``benchmarks.comprehensive.queries``.
+
+        Returns
+        -------
+        TimingResult
+            Timing for the native filtered cloud read. The ``extra`` dict
+            should include ``"provider"`` (``"gcs"``), ``"native_mechanism"``
+            (e.g. ``"tiledb_cloud_value_filter"``, ``"slaf_cloud_sql"``,
+            ``"scx_pull_and_filter"``), and ``"predicate"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support read_cloud_filtered_query"
+        )
+
     def read_filtered_query(
         self,
         path: str | Path,
@@ -252,12 +351,15 @@ class FormatRunner(ABC):
 
     @classmethod
     def _drop_caches(cls) -> bool:
-        """Attempt to drop OS page caches (requires root/sudo).
+        """Attempt to drop OS page caches system-wide (requires root/sudo).
 
         Returns True if successful.  Logs a warning on the first failure.
+        Prefer ``_drop_file_cache(path)`` on shared SLURM nodes without
+        root — it uses ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the
+        specific file(s) and works unprivileged.
         """
         try:
-            os.system("sync")
+            subprocess.run(["sync"], check=False)
             with open("/proc/sys/vm/drop_caches", "w") as f:
                 f.write("3\n")
             return True
@@ -265,10 +367,61 @@ class FormatRunner(ABC):
             if not cls._drop_caches_warned:
                 logger.warning(
                     "Failed to drop page caches (requires root). "
-                    "Cold-cache benchmark results may be unreliable."
+                    "Use `_drop_file_cache(path)` for per-file non-root cold "
+                    "reads via posix_fadvise."
                 )
                 cls._drop_caches_warned = True
             return False
+
+    @classmethod
+    def _drop_file_cache(cls, path: str | Path) -> str:
+        """Evict ``path`` from the page cache without root (Phase I.3).
+
+        Uses ``os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`` on the
+        given file — or every regular file under the directory when ``path``
+        is a directory (covers SCX ``.scxd/`` shard trees, Zarr stores,
+        SOMA experiments, SLAF DuckDB dirs).
+
+        Returns the ``cache_policy`` label for the per-run ``extra`` dict:
+
+          * ``"cold_fadvise"`` — the non-root path succeeded.
+          * ``"cold_root"``   — caller combined this with a successful
+            ``_drop_caches()`` (system-wide eviction).
+          * ``"warm"``        — no eviction attempted / all attempts failed.
+
+        The returned label is a string tag; callers record it verbatim.
+        ``fadvise`` only evicts CLEAN pages — any recent writes on the path
+        must be ``fsync``'d first (benchmark reads don't write, so this
+        isn't a concern for the read-path).
+        """
+        path = Path(path)
+        if not path.exists():
+            return "warm"
+        try:
+            subprocess.run(["sync"], check=False)  # best-effort — no error surfaced on failure
+            files: list[Path] = (
+                [path] if path.is_file()
+                else [p for p in path.rglob("*") if p.is_file()]
+            )
+            evicted = 0
+            for fp in files:
+                try:
+                    fd = os.open(str(fp), os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    evicted += 1
+                except (AttributeError, OSError):
+                    # AttributeError: pre-Py-3.3 or platform without
+                    # POSIX_FADV_DONTNEED (macOS, WSL1). OSError: kernel
+                    # refused the hint (rare).
+                    pass
+                finally:
+                    os.close(fd)
+            return "cold_fadvise" if evicted > 0 else "warm"
+        except Exception:  # noqa: BLE001 — cache-drop is best-effort
+            return "warm"
 
     @staticmethod
     def _gc_collect() -> None:

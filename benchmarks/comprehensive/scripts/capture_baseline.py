@@ -112,16 +112,11 @@ TIERS = {
     },
 }
 
-BENCHMARKS = [
-    "compression",
-    "write",
-    "read_full",
-    "read_selective",
-    "parallel_scaling",
-    "parallel_write_scaling",
-    "memory",
-    "fragment_ops",
-]
+from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS
+
+# Canonical benchmark list lives in benchmarks/__init__.py::ALL_BENCHMARKS.
+# Alias kept for compatibility with callers that import BENCHMARKS.
+BENCHMARKS = list(ALL_BENCHMARKS)
 
 
 # ---------------------------------------------------------------------------

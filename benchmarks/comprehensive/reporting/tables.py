@@ -561,6 +561,276 @@ def fragment_ops_table(datasets: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def cloud_filtered_table(datasets: list[str] | None = None) -> str:
+    """Cloud filtered-query parity table — Format × Query.
+
+    Each cell shows median wall-clock over the ``(dataset, query, format)``
+    triple with p95 in parentheses, sourced from ``cloud_filtered`` raw JSONs.
+    Only formats that declared ``"cloud_filtered"`` appear; runners that
+    silently skipped (no capability) are omitted rather than rendered as —.
+    """
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cloud_filtered")
+    if not results:
+        return "*No cloud_filtered results available yet.*"
+
+    # format -> dataset -> predicate -> (median, p95, n_runs)
+    pivot: dict[str, dict[str, dict[str, tuple[float, float, int]]]] = {}
+    predicates_seen: set[str] = set()
+    for r in results:
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        per_pred = r.get("metadata", {}).get("per_predicate_summary", {}) or {}
+        for pname, bucket in per_pred.items():
+            predicates_seen.add(pname)
+            pivot.setdefault(fmt, {}).setdefault(ds, {})[pname] = (
+                bucket.get("median_s"),
+                bucket.get("p95_s"),
+                bucket.get("n_runs", 0),
+            )
+
+    if not predicates_seen:
+        return "*No cloud_filtered per-predicate summaries present.*"
+
+    predicate_order = sorted(predicates_seen)
+    format_order = [f for f in FORMAT_ORDER if f in pivot] + [
+        f for f in sorted(pivot) if f not in FORMAT_ORDER
+    ]
+
+    lines: list[str] = []
+    for ds in datasets:
+        ds_any = any(ds in pivot.get(f, {}) for f in format_order)
+        if not ds_any:
+            continue
+        lines.append(f"**{SHORT_NAMES.get(ds, ds)}** — median wall-clock (p95 in parens), n_runs per cell")
+        lines.append("")
+        lines.append(
+            "| Format | " + " | ".join(predicate_order) + " |"
+        )
+        lines.append(
+            "|---|" + "|".join(["---:" for _ in predicate_order]) + "|"
+        )
+        for fmt in format_order:
+            row = pivot.get(fmt, {}).get(ds)
+            if row is None:
+                continue
+            cells = []
+            for pname in predicate_order:
+                entry = row.get(pname)
+                if entry is None:
+                    cells.append("—")
+                    continue
+                median, p95, n = entry
+                cell = _fmt_time(median)
+                if p95 is not None and p95 != median:
+                    cell += f" ({_fmt_time(p95)})"
+                if n:
+                    cell += f" ×{n}"
+                cells.append(cell)
+            lines.append(
+                f"| {FORMAT_DISPLAY.get(fmt, fmt)} | " + " | ".join(cells) + " |"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() or "*No cloud_filtered rows to render.*"
+
+
+def cloud_reader_vs_pull_table(datasets: list[str] | None = None) -> str:
+    """CloudReader vs full-pull table — per (dataset, scenario, method).
+
+    Shows median wall-clock and bytes-downloaded across the four scenarios
+    (``metadata_only``, ``selective_{5,20,80}pct``) and the two methods
+    each scenario compares (``open_cloud`` / ``pull_full`` for metadata;
+    ``pull_filtered`` / ``pull_full`` for selectivities).
+    """
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cloud_reader_vs_pull")
+    if not results:
+        return "*No cloud_reader_vs_pull results available yet.*"
+
+    # dataset -> scenario -> method -> (median_wall, median_bytes, n_runs)
+    pivot: dict[str, dict[str, dict[str, tuple[float, int, int]]]] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        per_scen = r.get("metadata", {}).get("per_scenario_summary", {}) or {}
+        for scen, methods in per_scen.items():
+            for method, bucket in methods.items():
+                pivot.setdefault(ds, {}).setdefault(scen, {})[method] = (
+                    bucket.get("median_wall_s"),
+                    int(bucket.get("median_bytes_downloaded", 0)),
+                    int(bucket.get("n_runs", 0)),
+                )
+    if not pivot:
+        return "*No per-scenario cloud_reader_vs_pull summaries present.*"
+
+    lines: list[str] = []
+    for ds in datasets:
+        per_scen = pivot.get(ds)
+        if not per_scen:
+            continue
+        lines.append(f"**{SHORT_NAMES.get(ds, ds)}**")
+        lines.append("")
+        lines.append("| Scenario | Method | Median wall | Bytes downloaded | n |")
+        lines.append("|---|---|---:|---:|---:|")
+        for scen in sorted(per_scen):
+            for method, (wall, byts, n) in sorted(per_scen[scen].items()):
+                lines.append(
+                    f"| {scen} | `{method}` | {_fmt_time(wall)} | "
+                    f"{_fmt_size(byts)} | {n} |"
+                )
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def cost_model_table(datasets: list[str] | None = None) -> str:
+    """Cost model table — USD per 1M cells queried × (layout, scenario).
+
+    Pulled from ``cost_model`` raw JSONs' ``per_layout_scenario_median_usd
+    _per_million`` metadata bucket. Scenarios run across the four canonical
+    points (metadata, selective_5pct, selective_20pct, full_read) for
+    every cloud layout declared in the benchmark's ``_LAYOUTS`` list.
+    """
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cost_model")
+    if not results:
+        return "*No cost_model results available yet.*"
+
+    scenarios = ["metadata", "selective_5pct", "selective_20pct", "full_read"]
+    # (dataset, layout, scenario) -> median_usd_per_million
+    pivot: dict[tuple[str, str, str], float] = {}
+    layouts_seen: set[str] = set()
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        per = r.get("metadata", {}).get(
+            "per_layout_scenario_median_usd_per_million", {}
+        ) or {}
+        for combo, val in per.items():
+            if "::" not in combo:
+                continue
+            layout, scen = combo.split("::", 1)
+            layouts_seen.add(layout)
+            pivot[(ds, layout, scen)] = float(val)
+
+    if not layouts_seen:
+        return "*No cost_model per-(layout, scenario) medians present.*"
+
+    lines: list[str] = []
+    for ds in datasets:
+        ds_any = any((ds, layout, scen) in pivot
+                     for layout in layouts_seen for scen in scenarios)
+        if not ds_any:
+            continue
+        lines.append(f"**{SHORT_NAMES.get(ds, ds)}** — USD per 1M cells queried (GCS same-region pricing)")
+        lines.append("")
+        lines.append("| Layout | " + " | ".join(scenarios) + " |")
+        lines.append("|---|" + "|".join(["---:" for _ in scenarios]) + "|")
+        for layout in sorted(layouts_seen):
+            cells = []
+            for scen in scenarios:
+                v = pivot.get((ds, layout, scen))
+                cells.append(f"${v:.6f}" if v is not None else "—")
+            lines.append(f"| `{layout}` | " + " | ".join(cells) + " |")
+        lines.append("")
+    return "\n".join(lines).rstrip() or "*No cost_model rows to render.*"
+
+
+def gcp_matrix_table(datasets: list[str] | None = None) -> str:
+    """GCP compute-node matrix — Instance × Format × Dataset.
+
+    Pivots ``cloud_read`` results that carry ``system.gcp.instance_type``
+    (set by ``submit_gcp_matrix.py`` via ``SCX_BENCH_GCP_INSTANCE``) into
+    a table of median wall-clock with p95 in parentheses. Rows collapse
+    the instance and format, columns span the selected datasets.
+
+    Runs without a GCP instance label are excluded so on-cluster results
+    don't contaminate the matrix view.
+    """
+    from benchmarks.comprehensive.config import GCP_INSTANCE_TYPES
+
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+    results = load_all_results(benchmark="cloud_read")
+    results = [
+        r for r in results
+        if r.get("system", {}).get("gcp", {}).get("instance_type")
+    ]
+    if not results:
+        return "*No GCP-matrix cloud_read results available yet.*"
+
+    # (instance, format) -> dataset -> (median, p95)
+    pivot: dict[tuple[str, str], dict[str, tuple[float, float]]] = {}
+    instances_seen: set[str] = set()
+    for r in results:
+        instance = r["system"]["gcp"]["instance_type"]
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        runs = r.get("runs", []) or []
+        walls = [x.get("wall_s") for x in runs if x.get("wall_s") is not None]
+        if not walls:
+            continue
+        walls_sorted = sorted(walls)
+        median = walls_sorted[len(walls_sorted) // 2]
+        p95 = walls_sorted[max(0, int(0.95 * len(walls_sorted)) - 1)]
+        pivot.setdefault((instance, fmt), {})[ds] = (median, p95)
+        instances_seen.add(instance)
+
+    if not pivot:
+        return "*No GCP-matrix cloud_read rows match the selected datasets.*"
+
+    instance_order = [i for i in GCP_INSTANCE_TYPES if i in instances_seen] + [
+        i for i in sorted(instances_seen) if i not in GCP_INSTANCE_TYPES
+    ]
+    headers = [SHORT_NAMES.get(d, d) for d in datasets]
+    lines = [
+        "| Instance | Format | " + " | ".join(headers) + " |",
+        "|---|---|" + "|".join(["---:" for _ in datasets]) + "|",
+    ]
+    for instance in instance_order:
+        fmt_rows = sorted(
+            {fmt for (i, fmt) in pivot if i == instance},
+            key=lambda f: (
+                FORMAT_ORDER.index(f) if f in FORMAT_ORDER else len(FORMAT_ORDER)
+            ),
+        )
+        for fmt in fmt_rows:
+            per_ds = pivot.get((instance, fmt), {})
+            cells = []
+            for ds in datasets:
+                entry = per_ds.get(ds)
+                if entry is None:
+                    cells.append("—")
+                    continue
+                median, p95 = entry
+                cell = _fmt_time(median)
+                if p95 != median:
+                    cell += f" ({_fmt_time(p95)})"
+                cells.append(cell)
+            lines.append(
+                f"| `{instance}` | {FORMAT_DISPLAY.get(fmt, fmt)} | "
+                + " | ".join(cells) + " |"
+            )
+
+    # Footer: per-instance egress class from the config table, so the
+    # reader can contextualize throughput numbers against the VM's
+    # published egress bandwidth.
+    lines.append("")
+    lines.append("*Egress class per instance:* " + ", ".join(
+        f"`{i}`={GCP_INSTANCE_TYPES[i]['egress_gbps']} Gbps"
+        for i in instance_order if i in GCP_INSTANCE_TYPES
+    ))
+    return "\n".join(lines)
+
+
 def ml_loader_table(datasets: list[str] | None = None) -> str:
     """Generate ML loader comparison table: Format x Dataset showing b/s and TTFB."""
     if datasets is None:
@@ -977,6 +1247,10 @@ def generate_all_tables() -> dict[str, str]:
         "parallel_write_scaling": parallel_write_scaling_table(),
         "memory": memory_table(),
         "fragment_ops": fragment_ops_table(),
+        "cloud_filtered": cloud_filtered_table(),
+        "gcp_matrix": gcp_matrix_table(),
+        "cloud_reader_vs_pull": cloud_reader_vs_pull_table(),
+        "cost_model": cost_model_table(),
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),

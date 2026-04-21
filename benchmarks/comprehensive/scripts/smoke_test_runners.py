@@ -26,9 +26,15 @@ def _log(msg: str) -> None:
 
 
 def smoke_test_runner(runner, h5ad_path: Path, tmp_dir: Path) -> bool:
-    """Run the four core operations and return True if all pass."""
+    """Run the core + declared-optional operations; return True if all pass.
+
+    Phase I.8: probe every capability the runner's ``capabilities`` set
+    advertises. A declared capability that raises ``NotImplementedError``
+    is a contract violation and fails the smoke test loudly.
+    """
     tag = runner.key
     ok = True
+    caps = getattr(runner, "capabilities", frozenset())
 
     # convert
     out_path = tmp_dir / f"{tag}_output"
@@ -47,7 +53,9 @@ def smoke_test_runner(runner, h5ad_path: Path, tmp_dir: Path) -> bool:
         _log(f"file_size FAILED: {exc}")
         ok = False
 
-    # read_full
+    # read_full + shape/nnz capture as the baseline for parity checks below.
+    baseline_shape = None
+    baseline_nnz = None
     try:
         tr = runner.read_full(out_path)
         _log(f"read_full: {tr.wall_s:.2f}s, RSS {tr.peak_rss_mb:.1f} MB")
@@ -65,6 +73,62 @@ def smoke_test_runner(runner, h5ad_path: Path, tmp_dir: Path) -> bool:
     except Exception as exc:
         _log(f"read_subset FAILED: {exc}")
         ok = False
+
+    # Optional capability probes — each declared capability must have a
+    # working method, else the runner's manifest is lying. Contract
+    # violations fail the smoke loudly (vs the old silent-skip on NotImpl).
+    if "backed_mode" in caps:
+        try:
+            tr = runner.read_backed(out_path)
+            _log(f"read_backed (declared): {tr.wall_s:.3f}s")
+        except NotImplementedError as exc:
+            _log(f"read_backed CONTRACT VIOLATION (capability declared): {exc}")
+            ok = False
+        except Exception as exc:
+            _log(f"read_backed raised: {exc}")
+            ok = False
+        try:
+            tr = runner.read_backed_slice(out_path, start=0, count=10)
+            _log(f"read_backed_slice (declared): {tr.wall_s:.3f}s")
+        except NotImplementedError as exc:
+            _log(f"read_backed_slice CONTRACT VIOLATION: {exc}")
+            ok = False
+        except Exception as exc:
+            _log(f"read_backed_slice raised: {exc}")
+            ok = False
+
+    if "filtered_query" in caps:
+        from benchmarks.comprehensive.queries import RandomSamplePredicate
+        try:
+            tr = runner.read_filtered_query(
+                out_path, RandomSamplePredicate(fraction=0.01, seed=42, name="smoke_rand"),
+            )
+            _log(f"read_filtered_query (declared): {tr.wall_s:.3f}s mech="
+                 f"{(tr.extra or {}).get('native_mechanism', '?')}")
+        except NotImplementedError as exc:
+            _log(f"read_filtered_query CONTRACT VIOLATION: {exc}")
+            ok = False
+        except Exception as exc:
+            _log(f"read_filtered_query raised: {exc}")
+            ok = False
+
+    # Cloud capabilities — smoke against a local .scxd-style directory is
+    # impractical without real fixtures; declared capabilities are probed
+    # by checking the method exists and raises the right default. True
+    # cloud coverage lives in the cloud_* benchmarks' own CI runs.
+    for cap, method_name in (
+        ("cloud_read", "read_cloud"),
+        ("cloud_subset", "read_cloud_subset"),
+        ("cloud_push", "push"),
+        ("cloud_pull", "pull"),
+        ("cloud_filtered", "read_cloud_filtered_query"),
+    ):
+        if cap in caps:
+            fn = getattr(runner, method_name, None)
+            if fn is None or fn.__qualname__.startswith("FormatRunner."):
+                _log(f"{method_name} CONTRACT VIOLATION: capability {cap!r} "
+                     f"declared but method not overridden")
+                ok = False
 
     return ok
 

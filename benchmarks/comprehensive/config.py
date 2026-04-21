@@ -28,6 +28,31 @@ FIGURES_DIR = REPORTS_DIR / "figures"
 sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
 from bench_env import DATA_DIR
 
+def _expand_path_env_vars() -> None:
+    """Expand ``~`` in path-valued env vars loaded from ``.env``.
+
+    ``python-dotenv`` does not tilde-expand values, so entries like
+    ``GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json`` would otherwise
+    reach downstream consumers (``gcsfs``, ``gsutil`` subprocess, pyscx's
+    Rust cloud backend) as a literal ``~``. ``gcsfs`` in particular silently
+    falls back to anonymous auth when the cred file path doesn't exist,
+    surfacing as cryptic ``Zstd decompression error: invalid input data`` on
+    reads (it's actually getting 401-HTML back, not zstd bytes).
+
+    ``require_gcp_credentials`` also performs this expansion, but callers
+    of the cloud stack that bypass it (notably the repro scripts under
+    ``scripts/repro_*_cloud_read.py`` — which by design hit the bug paths
+    without explicit setup) rely on this early normalization. The function
+    is idempotent, so re-invocation from test fixtures is safe.
+    """
+    for env_key in ("GOOGLE_APPLICATION_CREDENTIALS",):
+        raw = os.environ.get(env_key, "")
+        if raw and "~" in raw:
+            os.environ[env_key] = os.path.expanduser(raw)
+
+
+_expand_path_env_vars()
+
 # Conda environments for benchmarking (isolated from dev .venv/)
 # These are created by: bash benchmarks/comprehensive/scripts/install_dependencies.sh
 CONDA_ENV_CPU = "scx-bench"        # CPU benchmarks
@@ -121,12 +146,38 @@ class DatasetConfig:
     def scx_pcodec_path(self) -> Path:
         return DATA_DIR / f"{self.name}_pcodec.scx"
 
+    @property
+    def anndata_zarr_backed_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_anndata.zarr"
+
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key."""
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
         if prop is None:
             raise ValueError(f"No persistent path for format key {format_key!r}")
         return getattr(self, prop)
+
+    def cloud_url(self, format_key: str, provider: str = "gcs") -> str:
+        """Return the cloud URI for this dataset in a given format.
+
+        Phase 5 is GCP-only; ``provider`` must be ``"gcs"``. The returned URL
+        points at the shared test bucket (``GCS_TEST_BUCKET``) with the
+        format-appropriate suffix (``.scxd`` for SCX, ``.zarr``, ``.soma``,
+        ``.slaf``). Directory-style layouts keep the trailing slash so
+        callers can concatenate sub-paths without conditional logic.
+        """
+        if provider != "gcs":
+            raise ValueError(
+                f"Only 'gcs' provider is supported (got {provider!r}). "
+                "AWS S3 and Azure Blob validation is deferred; see the "
+                "Cloud Benchmarks section of benchmarks/README.md."
+            )
+        suffix = _FORMAT_KEY_TO_CLOUD_SUFFIX.get(format_key)
+        if suffix is None:
+            raise ValueError(
+                f"No cloud layout defined for format key {format_key!r}"
+            )
+        return f"{GCS_TEST_BUCKET}/{self.name}{suffix}/"
 
 
 _FORMAT_KEY_TO_PROP: dict[str, str] = {
@@ -145,6 +196,129 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
+    "anndata_zarr_backed": "anndata_zarr_backed_path",
+}
+
+
+# ---------------------------------------------------------------------------
+# Cloud (GCP-only — see benchmarks/README.md "Cloud Benchmarks (GCP)")
+# ---------------------------------------------------------------------------
+
+# Shared test bucket. The comprehensive cloud benchmarks validate behavior
+# against GCP only; AWS S3 and Azure Blob coverage is deferred.
+GCS_TEST_BUCKET = os.environ.get(
+    "GCS_TEST_BUCKET", "gs://arc-ctc-nextflow/scx-test"
+).rstrip("/")
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "c-tc-429521")
+# Region the bucket lives in — Phase E launcher pins VM region to this so
+# egress stays intra-region. Override via env if the bucket ever moves.
+GCP_BUCKET_REGION = os.environ.get("GCP_BUCKET_REGION", "us-central1")
+
+# Rolling-dashboard publish target (Phase G.4). When set, ``publish_dashboard.py``
+# rsyncs the HTML snapshot tree to this destination. Empty → the publish
+# script is a no-op (so CI can unconditionally invoke it). Typical values:
+#   rsync-over-SSH: "user@host:/var/www/scx-bench/"
+#   GCS:            "gs://my-bucket/scx-bench/" (requires gsutil, not rsync)
+# The publish script picks the protocol by URL prefix.
+DASHBOARD_PUBLISH_TARGET = os.environ.get("DASHBOARD_PUBLISH_TARGET", "").strip()
+
+# ---------------------------------------------------------------------------
+# GCP compute-node matrix (Phase E)
+# ---------------------------------------------------------------------------
+
+# Instance-type profiles for the cloud compute-node matrix. Egress bandwidth
+# is the per-VM egress *class* published by Google (not a guaranteed floor);
+# reporting uses it to contextualize measured throughput. A VM's region MUST
+# match the GCS bucket region — cross-region reads silently incur egress
+# charges, so ``ensure_instance_region_matches_bucket`` is called by the
+# launcher before any `gcloud compute instances create`.
+GCP_INSTANCE_TYPES: dict[str, dict[str, Any]] = {
+    "n2-standard-8": {
+        "vcpus": 8,
+        "mem_gb": 32,
+        "gpu": None,
+        "egress_gbps": 16,
+        "family": "n2",
+        "notes": "general-purpose Cascade Lake / Ice Lake; baseline CPU tier",
+    },
+    "c3-standard-8": {
+        "vcpus": 8,
+        "mem_gb": 32,
+        "gpu": None,
+        "egress_gbps": 23,
+        "family": "c3",
+        "notes": "Sapphire Rapids; higher per-core bandwidth",
+    },
+    "a3-highgpu-1g": {
+        "vcpus": 26,
+        "mem_gb": 234,
+        "gpu": "H100 80GB x1",
+        "egress_gbps": 200,
+        "family": "a3",
+        "notes": "H100 GPU node; used for GPU cloud benchmarks + high-egress baseline",
+    },
+}
+
+
+# GCS pricing (in USD) used by the cost_model benchmark. Values are pinned
+# against the published GCS rate card for the Standard storage class in a
+# multi-region bucket, plus standard-network egress within the same region
+# (intra-region egress to GCE in the same region is $0.00/GB). Update only
+# when the rate card changes — this table is the benchmark's single source
+# of truth for cents-per-query math.
+GCS_PRICING: dict[str, float] = {
+    # Class-A operations (PUT / COPY / POST / LIST): $0.05 per 10k
+    "class_a_per_10k_usd": 0.05,
+    # Class-B operations (GET / HEAD): $0.004 per 10k
+    "class_b_per_10k_usd": 0.004,
+    # Same-region egress to GCE: $0.00 per GB — the ``ensure_instance_
+    # region_matches_bucket`` gate keeps all Phase E/F runs in this regime.
+    "egress_same_region_usd_per_gb": 0.00,
+    # Cross-continent egress (reference only; we actively avoid this by
+    # pinning the VM region to the bucket region).
+    "egress_cross_region_usd_per_gb": 0.08,
+    # Standard storage (reference only — storage cost dominates at
+    # long-term rest, not per-query).
+    "storage_standard_usd_per_gb_month": 0.026,
+}
+
+
+def ensure_instance_region_matches_bucket(instance_region: str) -> None:
+    """Fail fast when the chosen VM region doesn't match the bucket region.
+
+    Cross-region reads from GCS incur per-GB egress charges that silently
+    dominate the benchmark budget, and they also invalidate comparisons
+    (network RTT + saturation differ). The launcher calls this before any
+    `gcloud compute instances create` invocation.
+    """
+    if instance_region != GCP_BUCKET_REGION:
+        raise RuntimeError(
+            f"GCP instance region {instance_region!r} does not match the "
+            f"configured bucket region {GCP_BUCKET_REGION!r}. Override "
+            f"GCP_BUCKET_REGION if the bucket has moved; do not run "
+            f"benchmarks cross-region (silent egress charges)."
+        )
+
+
+# Cloud layout suffixes per format. SCX uses the exploded ``.scxd/`` layout
+# on GCS (see docs/cloud.md); others keep their native directory suffix.
+_FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
+    "scx_auto": ".scxd",
+    "scx_scx1": ".scxd",
+    "scx_zstd": ".scxd",
+    "scx_none": ".scxd",
+    "scx_lz4": ".scxd",
+    "scx_pcodec": ".scxd",
+    "zarr_zstd": ".zarr",
+    # zarr_lz4 uses a codec-qualified suffix so it doesn't collide with
+    # zarr_zstd on the shared `{dataset}.zarr/` cloud path — ``ensure_cloud_fixture``
+    # would otherwise treat the already-uploaded zstd fixture as a cache hit for
+    # the lz4 variant and skip the upload, silently producing wrong numbers
+    # (cloud_read would decode zstd-compressed chunks as if they were lz4).
+    "zarr_lz4": "_lz4.zarr",
+    "tiledb_soma": ".soma",
+    "slaf": ".slaf",
+    "anndata_zarr_backed": "_anndata.zarr",
 }
 
 
@@ -435,6 +609,39 @@ def estimate_memory_gb(
         # on-disk copies of the base file (for per-run isolation), but those
         # are SCX-compressed and << dense_mb.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("cloud_push", "cloud_pull"):
+        # SCX-only. pyscx.push/pull stream section-by-section with a small
+        # reorder buffer; dominant footprint is the shard currently
+        # encoding/decoding plus the catalog. Well-bounded regardless of
+        # dataset size — just need enough for the source CSR read when
+        # pack'ing on pull. Keep sized against base to cover catalog parse.
+        peak_mb = max(base_mb, 4 * 1024)  # 4 GB ceiling for the streaming path
+    elif benchmark == "cloud_read":
+        # SCX pull+read needs the dense matrix at end; other runners (zarr,
+        # tiledb, slaf) materialize in-memory too. Size like read_full.
+        if is_dense_path:
+            peak_mb = max(base_mb, dense_mb * 1.3)
+        else:
+            peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "cloud_metadata":
+        # Catalog-only open — single GET + a few small parses. Trivial.
+        peak_mb = max(base_mb * 0.25, 2 * 1024)  # 2 GB floor for Python baseline
+    elif benchmark == "cloud_filtered":
+        # Cross-format predicate pushdown — matching cells subset is loaded
+        # per predicate; bounded by the largest expected result set.
+        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "cloud_reader_vs_pull":
+        # Exercises both open_cloud and pull (full) paths; sizing matches
+        # the more expensive full-pull path.
+        peak_mb = max(base_mb, dense_mb * 0.8)
+    elif benchmark == "cost_model":
+        # metadata + selective + full_read per layout. Dominant run is
+        # full_read; size to that.
+        peak_mb = max(base_mb, dense_mb * 0.8)
+    elif benchmark == "cloud_large_atlas":
+        # Assertion-based — peak RSS MUST stay under the 240 MB bound from
+        # docs/cloud.md. Give headroom but not much.
+        peak_mb = 8 * 1024  # 8 GB ceiling for safety
     else:
         peak_mb = base_mb
 
@@ -449,6 +656,70 @@ def estimate_memory_gb(
     # whose true footprint exceeds this (e.g. dense-h5ad read on census_5m)
     # would OOM either way; the cap keeps submitit from rejecting the job.
     return min(total, MEM_CEILING_GB)
+
+
+def estimate_time_minutes(
+    dataset: "DatasetConfig",
+    format_key: str,
+    benchmark: str,
+) -> int:
+    """Estimate per-job wall-clock budget in minutes for a triple.
+
+    Centralizes the time ceiling that was previously tier-uniform in
+    ``capture_baseline.py::TIERS``. Returns a value rounded up to 5-min
+    increments so scheduler fragmentation stays low. Callers that want
+    a conservative envelope multiply by ``--scale-factor``; CI defaults
+    to the aggressive 0.9× side, ad-hoc runs use 1.3×.
+    """
+    import math
+
+    n_obs = dataset.n_obs
+    # Scale with n_obs: small datasets complete in minutes, census_10m in
+    # hours. Model as a per-benchmark base rate + a per-million-cells term.
+    per_million = max(n_obs / 1_000_000, 0.1)
+
+    # Base minutes per benchmark (empirical floors on pbmc3k).
+    base_minutes: dict[str, int] = {
+        "compression":            3,
+        "write":                  10,
+        "read_full":              8,
+        "read_selective":         10,
+        "parallel_scaling":       20,
+        "parallel_write_scaling": 25,
+        "memory":                 15,
+        "fragment_ops":           15,
+        "cloud_push":             20,
+        "cloud_pull":             20,
+        "cloud_read":             20,
+        "cloud_metadata":         5,
+        "cloud_filtered":         20,
+        "cloud_reader_vs_pull":   25,
+        "cost_model":             20,
+        "cloud_large_atlas":      60,   # 50GB+ pull is not quick
+        "ml_loader":              30,
+    }
+    base = base_minutes.get(benchmark, 15)
+
+    # Per-million-cells multiplier. Cloud ops scale linearly with bytes
+    # downloaded; cost_model / cloud_large_atlas scale heavily.
+    slope_minutes_per_million = 8
+    if benchmark in ("cloud_large_atlas",):
+        slope_minutes_per_million = 30
+    elif benchmark in ("cloud_push", "cloud_pull", "cloud_read",
+                        "cloud_reader_vs_pull", "cost_model"):
+        slope_minutes_per_million = 12
+    elif benchmark in ("cloud_metadata", "cloud_filtered"):
+        slope_minutes_per_million = 4
+    elif benchmark in ("compression", "read_selective"):
+        slope_minutes_per_million = 2
+
+    total = base + int(slope_minutes_per_million * per_million)
+    # Dense-path formats (h5ad / zarr) take longer at census scale.
+    if format_key.startswith(("h5ad", "zarr")) and n_obs >= 1_000_000:
+        total = int(total * 1.5)
+
+    # Round up to 5-min increments.
+    return max(5, math.ceil(total / 5) * 5)
 
 
 def partition_for_memory(mem_gb: int, default: str = "cpu_preemptible") -> str:

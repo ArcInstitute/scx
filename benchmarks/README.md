@@ -49,7 +49,25 @@ benchmarks/
 │   │   ├── run_slurm.sh                 # SLURM submission script
 │   │   ├── install_dependencies.sh      # Create conda environments
 │   │   ├── validate_*.py                # Correctness validation scripts
-│   │   └── slurm_*.sh                   # SLURM job scripts
+│   │   ├── slurm_*.sh                   # SLURM job scripts
+│   │   │
+│   │   │  # Regression gating (on-demand)
+│   │   ├── gate_candidate.sh            # One-shot: capture + gate against LATEST baseline
+│   │   ├── capture_baseline.py          # Freeze one snapshot (raw/ + summary.json + manifest)
+│   │   ├── promote_baseline.py          # Promote a snapshot to results/baselines/<version>/
+│   │   ├── compare_against_baseline.py  # Relative + absolute-floor + justification gate
+│   │   ├── publish_dashboard.py         # Rsync HTML snapshot to DASHBOARD_PUBLISH_TARGET
+│   │   │
+│   │   │  # Cloud infrastructure (GCP)
+│   │   ├── check_gcp_auth.py            # Credentials + bucket round-trip preflight
+│   │   ├── setup_cloud_test_data.sh     # Idempotent fixture staging via BLAKE3 sidecars
+│   │   ├── cloud_fixtures_doctor.py     # Dry-run probe: local vs cloud fixture drift
+│   │   ├── submit_gcp_matrix.py         # Instance-type × benchmark launcher (--yes-spend)
+│   │   ├── gcs_lifecycle.json           # Committed GCS object-lifecycle rules
+│   │   │
+│   │   │  # Observability + migrations
+│   │   ├── watch.py                     # Rich TUI tailing run_manifest.json + submitit logs
+│   │   └── migrate_results.py           # Back-stamp schema_version on legacy raw JSONs
 │   ├── r_scripts/                       # BPCells R benchmark scripts
 │   └── results/                         # Raw JSON results + generated reports
 │       ├── raw/                         # One JSON per benchmark×format×dataset
@@ -240,6 +258,59 @@ python benchmarks/comprehensive/scripts/run_parallel.py --skip-convert
 ```
 
 submitit logs are written to `comprehensive/logs/submitit/`. Each SLURM job writes its result JSON independently to `comprehensive/results/raw/` — filenames are unique per triple, so concurrent writes are safe.
+
+---
+
+## Cloud Benchmarks (GCP)
+
+The comprehensive suite validates cloud behavior against GCP only — AWS S3 and Azure Blob coverage is deferred until a second-provider requirement lands. Cloud benchmarks live under `comprehensive/benchmarks/cloud_*.py` and run through the same `run_parallel.py` launcher as every other benchmark:
+
+| Benchmark | Coverage | What it measures |
+|-----------|----------|------------------|
+| `cloud_push`     | SCX-only | Local `.scx` → `gs://…/.scxd/` upload throughput |
+| `cloud_pull`     | SCX-only | `gs://…/.scxd/` → local `.scx` download throughput |
+| `cloud_read`     | Cross-format | Full in-memory read directly from GCS (SCX pull-then-read; Zarr / SOMA / SLAF via their native GCS paths) |
+| `cloud_metadata` | Cross-format | Metadata-only open latency (`pyscx.open_cloud`, `zarr.open`, `Experiment.open`, `SLAFArray(url)`) |
+
+**Prerequisites**:
+1. GCP service account `scx-bench@c-tc-429521.iam.gserviceaccount.com` with bucket-scoped `roles/storage.objectAdmin` on `gs://arc-ctc-nextflow/`. One-time bootstrap (requires `roles/iam.serviceAccountAdmin` + `roles/resourcemanager.projectIamAdmin`):
+   ```bash
+   gcloud config set project c-tc-429521
+   gcloud iam service-accounts create scx-bench \
+       --display-name "SCX Benchmark Runner" --project c-tc-429521
+   gcloud storage buckets add-iam-policy-binding gs://arc-ctc-nextflow \
+       --member=serviceAccount:scx-bench@c-tc-429521.iam.gserviceaccount.com \
+       --role=roles/storage.objectAdmin
+   gcloud iam service-accounts keys create ~/.gcp/scx-bench.json \
+       --iam-account=scx-bench@c-tc-429521.iam.gserviceaccount.com
+   chmod 600 ~/.gcp/scx-bench.json
+   ```
+   Rotate the key every 90 days; never commit it or paste it into chat.
+2. Point the harness at the key via the repo-root `.env` file — it's
+   auto-loaded by `benchmarks/scripts/bench_env.py` through
+   `python-dotenv`, so no shell export is required. Tildes are expanded.
+   `cloud_fixtures.require_gcp_credentials` falls back to `~/.gcp/scx-bench.json`
+   automatically if the env var is unset.
+   ```bash
+   echo 'GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json' >> .env
+   ```
+   An uncommented template line lives in `.env.example`. Operators who
+   prefer shell exports can still use them — process env wins over `.env`.
+3. Bucket knobs are env-configurable (defaults in parens): `GCS_TEST_BUCKET` (`gs://arc-ctc-nextflow/scx-test`), `GCP_PROJECT` (`c-tc-429521`), `GCP_BUCKET_REGION` (`us-central1`).
+
+**Usage**:
+
+```bash
+# GOOGLE_APPLICATION_CREDENTIALS resolved from .env; see step 2 above.
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks cloud_push cloud_pull cloud_read cloud_metadata \
+    --datasets pbmc3k tabula_sapiens_100k \
+    --formats scx_auto zarr_zstd tiledb_soma slaf
+```
+
+Fixtures self-heal on first run: if the expected cloud object doesn't exist, `cloud_fixtures.ensure_cloud_fixture` uploads it from the local converted file via `pyscx.push` (SCX) or `gsutil -m rsync` (other formats). SCX-only benchmarks return `None` for non-SCX formats so the orchestrator silently skips those triples.
+
+The legacy `benchmarks/scripts/benchmark_cloud.py` is a thin deprecation shim — it prints a banner and forwards to the launcher above.
 
 ---
 
@@ -461,26 +532,41 @@ sbatch --exclusive benchmarks/scripts/slurm_gpu_analysis_bench.sh
 
 ### Recommended execution order
 
+The comprehensive harness is the committed entrypoint. Legacy wrappers
+under `benchmarks/scripts/slurm_*.sh` are deprecated (see
+`benchmarks/scripts/README.md` for the migration table).
+
 ```
 1. Prepare datasets (run first — benchmarks depend on these):
    sbatch benchmarks/scripts/slurm_prep_datasets.sh
    sbatch benchmarks/scripts/slurm_build_census_5m.sh    # (optional, high-memory)
    sbatch benchmarks/scripts/slurm_build_census_10m.sh   # (optional, high-memory)
 
-2. CPU benchmarks (after datasets are ready):
-   bash benchmarks/scripts/run_benchmarks_slurm.sh
-   sbatch benchmarks/scripts/slurm_fused_bench.sh
-   sbatch benchmarks/scripts/slurm_lazy_preprocess_bench.sh
+2. Run benchmarks via the unified comprehensive launcher
+   (one submitit job per benchmark × format × dataset triple):
+   python benchmarks/comprehensive/scripts/run_parallel.py \
+       --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
+   python benchmarks/comprehensive/scripts/run_parallel.py \
+       --datasets census_500k census_1m census_5m --tier large
 
-3. GPU benchmarks (require preemptible partition with GPUs):
-   sbatch benchmarks/scripts/slurm_gpu_analysis_bench.sh
-   sbatch benchmarks/scripts/slurm_gpu_bench.sh
-   sbatch benchmarks/scripts/slurm_gpu_knn_bench.sh
-   sbatch benchmarks/scripts/slurm_gpu_pca_opt_bench.sh
+3. Cloud benchmarks (GCP — requires GOOGLE_APPLICATION_CREDENTIALS;
+   see check_gcp_auth.py preflight):
+   python benchmarks/comprehensive/scripts/check_gcp_auth.py
+   python benchmarks/comprehensive/scripts/run_parallel.py \
+       --benchmarks cloud_push cloud_pull cloud_read cloud_metadata \
+                    cloud_filtered cloud_reader_vs_pull cost_model \
+       --datasets pbmc3k tabula_sapiens_100k
+
+4. Regression gate (on-demand — per PR, pre-release, on-suspicion):
+   bash benchmarks/comprehensive/scripts/gate_candidate.sh
 ```
 
 > [!IMPORTANT]
-> Always run dataset preparation jobs first. The benchmark scripts assume datasets exist at the `SCX_DATA_DIR` path (configured via `.env` at the repo root; defaults to `$SCX_WORK_DIR/benchmarks/datasets`).
+> Always run dataset preparation jobs first. The comprehensive harness
+> expects datasets at `SCX_DATA_DIR` (configured via `.env`; defaults to
+> `$SCX_WORK_DIR/benchmarks/datasets`). Cloud benchmarks additionally
+> require one-time fixture staging via
+> `benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`.
 
 ---
 
@@ -543,6 +629,154 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 
 ---
 
+## Regression Gating
+
+Regression gating is **on-demand, not scheduled**. No nightly cron runs —
+operators invoke the gate per PR, pre-release, or on suspicion of
+regression. No wasted compute when nothing has changed, and every gate
+result is tied to a specific commit the operator cares about.
+
+### On-demand workflow (one command)
+
+```bash
+bash benchmarks/comprehensive/scripts/gate_candidate.sh
+```
+
+That captures a snapshot named `candidate_<git-sha>_<YYYYMMDD>` at the
+`small` tier and runs the gate against `results/baselines/LATEST`
+(maintained by `promote_baseline.py`). Exit code bubbles up: `0` = pass,
+`1` = unjustified regression / floor violation / fingerprint mismatch,
+`2` = missing inputs.
+
+Common options:
+
+```bash
+# Larger tier (full dataset set)
+bash benchmarks/comprehensive/scripts/gate_candidate.sh --tier full
+
+# Reuse an already-captured candidate (skips the capture step)
+bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+    --skip-capture --name candidate_abc1234_20260420
+
+# Pin a specific historical baseline instead of LATEST
+bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+    --baseline benchmarks/comprehensive/results/baselines/v0.4.0
+
+# Anything after known flags is passed through to compare_against_baseline.py
+bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+    --timing-tolerance 0.05 --report-json /tmp/gate.json
+```
+
+**Recommended trigger points:**
+
+- Pre-PR: run on your topic branch before opening the PR.
+- Pre-merge: re-run on the merge candidate if CPU / memory-sensitive code changed.
+- Pre-release: run at the `xl` tier; promote the candidate as the new
+  baseline if the gate passes (see "Promoting" below).
+- On-suspicion: after a suspicious benchmark result, landed profiler
+  change, or upstream dependency bump.
+
+### Direct gate invocation (advanced)
+
+The wrapper is a thin convenience layer over
+`compare_against_baseline.py`; invoke it directly when you need finer
+control:
+
+```bash
+python benchmarks/comprehensive/scripts/compare_against_baseline.py \
+    --current benchmarks/comprehensive/results/candidate_$(date +%Y_%m_%d) \
+    --gate
+```
+
+Under `--gate`, these flags auto-default and can be omitted:
+- `--baseline` → `results/baselines/LATEST`
+- `--justifications` → `results/justifications/`
+- `--thresholds` → `benchmarks/comprehensive/thresholds.yaml`
+
+Override any of them by passing the flag explicitly. Without `--gate` the
+script stays in pure-diff mode — no justification or floor logic, no
+disappeared-benchmark flagging.
+
+Exit codes: `0` = pass, `1` = unjustified regression / floor violation /
+fingerprint mismatch, `2` = baseline or current directory missing or no
+canonical baseline promoted yet.
+
+### Promoting a canonical baseline
+
+Snapshots land in `benchmarks/comprehensive/results/<name>/` from
+`capture_baseline.py` (or via the `gate_candidate.sh` wrapper). To
+promote one as the canonical release baseline:
+
+```bash
+python benchmarks/comprehensive/scripts/promote_baseline.py \
+    --snapshot benchmarks/comprehensive/results/candidate_2026_04_18_batch_d_t3 \
+    --version v0.5.0-phase5
+```
+
+This copies only `summary.json` + `environment.json` + `MANIFEST.sha256`
+into `results/baselines/v0.5.0-phase5/`, and updates `results/baselines/LATEST`
+to point at the new version (relative symlink, pointer-file fallback on
+filesystems that reject symlinks). The gate's `--baseline` auto-resolves
+to `LATEST`, so no follow-up configuration is needed — next
+`gate_candidate.sh` run compares against the newly-promoted baseline.
+
+Raw per-run JSONs stay gitignored; the manifest provides tamper-evidence.
+Pass `--no-latest` to promote without touching the `LATEST` pointer
+(useful for backfilling historical baselines out-of-order).
+
+### Justification markdown format
+
+Add a new file under `benchmarks/comprehensive/results/justifications/`
+whenever a flagged regression has been investigated and deliberately
+accepted:
+
+```markdown
+---
+triples:
+  - benchmark: cloud_push
+    format: scx_auto
+    dataset: pbmc3k
+reason: Upstream gcsfs 2025.10.0 HTTP/2 header canonicalization (~4%).
+expires: 2026-06-01
+---
+
+One or more paragraphs of prose explaining the tradeoff. Shown in the
+gate's failure summary so reviewers see the reason inline.
+```
+
+`expires` is optional. When present and past `date.today()`, the
+justification stops suppressing and the gate fails again — forces
+periodic review. Multiple triples per file are fine; one file per PR is
+typical.
+
+### Rolling dashboard
+
+`write_report()` emits `BENCHMARK_REPORT.html` alongside the markdown
+report, with a "← previous snapshot" link threaded through
+`dashboard_history.json`. Publish to a static-hosting target via:
+
+```bash
+export DASHBOARD_PUBLISH_TARGET="user@host:/var/www/scx-bench/"   # or gs://bucket/path/
+python benchmarks/comprehensive/scripts/publish_dashboard.py
+```
+
+With `DASHBOARD_PUBLISH_TARGET` unset, the publish script is a no-op
+and exits 0 — safe for unconditional CI invocation.
+
+### Gate self-test
+
+A hermetic pytest suite validates every transition (regression fails,
+justification suppresses, expired justification stops suppressing,
+disappearing benchmarks flagged, absolute-floor violations fail):
+
+```bash
+.venv/bin/pytest benchmarks/comprehensive/tests/test_gate_self_test.py -v
+```
+
+Run it locally before opening a PR that touches the gate.
+
+---
+
 ## Individual Benchmark Scripts
 
 | Script | What it measures |
@@ -558,7 +792,7 @@ ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 | `benchmark_auto_codec.py` | Auto-codec selection accuracy and performance |
 | `benchmark_cli.py` | CLI command performance |
 | `benchmark_python_bindings.py` | Python bindings overhead |
-| `benchmark_cloud.py` | Cloud storage read performance |
+| `benchmark_cloud.py` | **DEPRECATED** — forwards to `comprehensive/benchmarks/cloud_*.py` (see Phase C below) |
 | `benchmark_compressed_h5ad.py` | Compressed h5ad baseline (gzip, lzf) |
 | `benchmark_gpu_decode.py` | GPU decode microbenchmarks (cuSPARSE, bitstream) |
 | `benchmark_gpu_pca.py` | GPU PCA validation + timing |

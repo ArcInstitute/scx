@@ -26,7 +26,11 @@ from benchmarks.comprehensive.reporting.tables import (
     compression_ratio_table,
     scx_parallel_write_callout_table,
     datasets_table,
+    cloud_filtered_table,
+    cloud_reader_vs_pull_table,
+    cost_model_table,
     fragment_ops_table,
+    gcp_matrix_table,
     harmony_scaling_table,
     harmony_validation_table,
     lisi_comparison_table,
@@ -349,6 +353,104 @@ their formats.
 - `rollback` is a single root-catalog `pwrite()` and should be
   near-instant at any scale; a regression here indicates manifest-load
   bloat.
+""")
+
+    # -----------------------------------------------------------------------
+    # 8c. Cloud Query Parity (cross-format GCS filtered reads)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8c. Cloud Query Parity (GCS)
+
+The same standardized predicate set (`cell_type == "T cell"`,
+`n_counts > 1000`, `random 1% sample`) executed directly against GCS for
+every format that declares the `cloud_filtered` capability. Each cell
+shows median wall-clock with p95 in parentheses over n runs.
+
+Runners declare the capability only if they can push the predicate
+through natively: SCX pulls then applies catalog-pushdown locally
+(`scx_pull_and_filter` — Phase F.1 adds a native cloud-pushdown
+variant); TileDB-SOMA uses `AxisQuery(value_filter=...)` on the
+`Experiment.open(gs://…)` handle (`tiledb_cloud_value_filter`); SLAF
+issues the SQL ``WHERE`` against its cloud-backed DuckDB engine
+(`slaf_cloud_sql`). Zarr variants (`zarr_zstd`, `zarr_lz4`,
+`anndata_zarr_backed`) do not declare the capability — the raw-CSR
+converters don't preserve obs metadata, so they are omitted from this
+table rather than silently skipped as dashes.
+
+Bytes-transferred and GET-count columns are deferred to Phase F.2 when
+the object-store telemetry shim lands.
+
+{cloud_filtered_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8d. GCP Compute-Node Matrix
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8d. GCP Compute-Node Matrix
+
+Cloud-read latency and throughput vs GCP instance type, collected by
+`benchmarks/comprehensive/scripts/submit_gcp_matrix.py`. The launcher
+provisions each instance in the bucket's region, runs the cloud
+benchmarks with `SCX_BENCH_GCP_INSTANCE` / `SCX_BENCH_GCP_REGION`
+exported, and tears the VM down. Result JSONs carry `system.gcp` tags
+so the table pivots across instances automatically.
+
+Only results with a `system.gcp.instance_type` label are shown; on-cluster
+runs without the label are excluded to keep the matrix view clean.
+
+{gcp_matrix_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8e. CloudReader vs full Pull
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8e. CloudReader vs Full Pull
+
+Scored by `cloud_reader_vs_pull`: for each dataset, compares
+`pyscx.open_cloud` (single-GET metadata open) against a full
+`pyscx.pull`, and then sweeps `pyscx.pull_filtered` at ~5% / 20% / 80%
+cell selectivity against a full pull. The break-even selectivity where
+full-pull starts beating predicate-pushdown is visible in the table
+below (as selectivity approaches ~100%, `pull_filtered` downloads every
+shard and the bytes-downloaded column equalizes).
+
+`open_cloud` does not yet surface `bytes_downloaded`; a Rust-side
+object-store counting middleware (Phase F.2 follow-up) will close this
+gap so the metadata row reports non-zero bytes.
+
+{cloud_reader_vs_pull_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 8f. Cost model
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 8f. Cost Model (GCS pricing)
+
+Cents per 1 million cells queried, computed from GCS Standard-class
+pricing pinned in `benchmarks/comprehensive/config.py::GCS_PRICING`.
+Egress is priced at the same-region rate ($0.00/GB today — the Phase E
+launcher pins the VM region to the bucket region so this is the
+committed regime); request cost follows the Class-B $0.004/10k GET
+schedule.
+
+Scenarios: `metadata` (catalog open), `selective_5pct` / `selective_20pct`
+(predicate-pushdown pull), `full_read` (complete pull). Only the
+exploded `.scxd/` cloud layout is wired today; packed `.scx` with a
+front catalog will appear as additional rows once the benchmark's
+`_LAYOUTS` list grows.
+
+{cost_model_table()}
 """)
 
     # -----------------------------------------------------------------------
@@ -853,9 +955,11 @@ def _generate_pdf(md_path: Path, pdf_path: Path) -> Path:
 
 
 def write_report(output_dir: Path | None = None) -> Path:
-    """Generate and write the full benchmark report (markdown + PDF).
+    """Generate and write the full benchmark report (markdown + PDF + HTML).
 
-    Returns the path to the written markdown file.
+    Returns the path to the written markdown file. An HTML snapshot is
+    emitted alongside via ``write_html_snapshot`` (Phase G.4) so rolling-
+    dashboard navigation works without server-side state.
     """
     if output_dir is None:
         output_dir = REPORTS_DIR
@@ -870,4 +974,43 @@ def write_report(output_dir: Path | None = None) -> Path:
     pdf_path = output_dir / "BENCHMARK_REPORT.pdf"
     _generate_pdf(md_path, pdf_path)
 
+    # Emit HTML snapshot + append to dashboard history (Phase G.4).
+    try:
+        write_html_snapshot(report, output_dir)
+    except Exception as exc:  # noqa: BLE001 — snapshot is best-effort
+        logger.warning("HTML snapshot emission failed: %s", exc)
+
     return md_path
+
+
+def write_html_snapshot(
+    markdown_body: str,
+    output_dir: Path,
+    *,
+    title: str = "SCX Benchmark Report",
+) -> Path:
+    """Write a browsable HTML snapshot alongside the markdown report.
+
+    Records the snapshot's URL in ``dashboard_history.json`` so the next
+    snapshot can link back to it via "← previous snapshot". The URL is
+    the filename (relative to ``output_dir``); the static-hosting publish
+    step (``publish_dashboard.py``) preserves the same path structure so
+    relative links work unchanged on the published site.
+    """
+    from benchmarks.comprehensive.reporting import dashboard
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prev_url = dashboard.previous_url(output_dir)
+
+    html_body = dashboard.render_html(
+        markdown_body, title=title, prev_url=prev_url,
+    )
+    html_path = output_dir / "BENCHMARK_REPORT.html"
+    html_path.write_text(html_body)
+    logger.info("Wrote HTML snapshot to %s", html_path)
+
+    # Record this snapshot so the *next* render links back to it.
+    dashboard.append_history(
+        output_dir, url=html_path.name, title=title,
+    )
+    return html_path

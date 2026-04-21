@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,15 @@ _CODEC_NAMES = {
 class ScxRunner(FormatRunner):
     """Benchmark runner for the SCX format with configurable codec."""
 
-    capabilities: frozenset[str] = frozenset({"filtered_query", "backed_mode"})
+    capabilities: frozenset[str] = frozenset({
+        "filtered_query",
+        "backed_mode",
+        "cloud_read",
+        "cloud_subset",
+        "cloud_push",
+        "cloud_pull",
+        "cloud_filtered",
+    })
 
     def __init__(self, codec: str = "auto") -> None:
         if codec not in _CODEC_NAMES:
@@ -237,5 +246,204 @@ class ScxRunner(FormatRunner):
             if expr is not None
             else "scx_backed_index",
             "predicate": predicate.name,
+        }
+        return timing
+
+    # ------------------------------------------------------------------
+    # Cloud operations (Phase C — GCP only)
+    # ------------------------------------------------------------------
+
+    def push(self, local_path: str | Path, cloud_url: str) -> TimingResult:
+        """Upload a local ``.scx`` file to ``cloud_url`` via ``pyscx.push``.
+
+        ``pyscx.push`` returns a stats dict that already includes
+        ``elapsed_secs`` / ``throughput_mbps``; we capture those via
+        ``timed_run`` for uniform wall/RSS reporting but forward the native
+        numbers under ``extra`` so downstream analysis can compare.
+        """
+        self._check_pyscx()
+        stats_holder: dict = {}
+
+        def _push():
+            stats_holder["stats"] = pyscx.push(str(local_path), cloud_url)
+
+        _, timing = self.timed_run(_push)
+        stats = stats_holder["stats"]
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_push",
+            "bytes_uploaded": int(stats.get("bytes_uploaded", 0)),
+            "sections_uploaded": int(stats.get("sections_uploaded", 0)),
+            "pyscx_elapsed_secs": float(stats.get("elapsed_secs", timing.wall_s)),
+            "throughput_mbps": float(stats.get("throughput_mbps", 0.0)),
+        }
+        return timing
+
+    def pull(self, cloud_url: str, local_path: str | Path) -> TimingResult:
+        """Download ``cloud_url`` to a local ``.scx`` file via ``pyscx.pull``."""
+        self._check_pyscx()
+        stats_holder: dict = {}
+
+        def _pull():
+            stats_holder["stats"] = pyscx.pull(cloud_url, str(local_path))
+
+        _, timing = self.timed_run(_pull)
+        stats = stats_holder["stats"]
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_pull",
+            "bytes_downloaded": int(stats.get("bytes_downloaded", 0)),
+            "sections_downloaded": int(stats.get("sections_downloaded", 0)),
+            "pyscx_elapsed_secs": float(stats.get("elapsed_secs", timing.wall_s)),
+            "throughput_mbps": float(stats.get("throughput_mbps", 0.0)),
+        }
+        return timing
+
+    def read_cloud(self, cloud_url: str) -> TimingResult:
+        """Pull the full dataset and materialize it in-memory.
+
+        SCX's native cloud read path is pull-then-read: exploded ``.scxd/``
+        shards stream into a local ``.scx`` which ``read_full`` then
+        decompresses into an in-memory CSR. The timing includes both phases
+        so the benchmark reflects the end-to-end user experience.
+
+        Tmpdir creation/teardown happens OUTSIDE the timed region so
+        filesystem cleanup of the pulled file does not inflate SCX's
+        wall-clock against competitors that don't pay that cost.
+        """
+        import tempfile
+
+        self._check_pyscx()
+
+        tmp = tempfile.mkdtemp(prefix="scx_cloud_read_")
+        try:
+            local = os.path.join(tmp, "pulled.scx")
+
+            def _read_cloud():
+                pyscx.pull(cloud_url, local)
+                ds = pyscx.open(local)
+                adata = ds.to_anndata()
+                _ = adata.X
+
+            _, timing = self.timed_run(_read_cloud)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_pull_and_read",
+            "telemetry": "phase_f_deferred",
+        }
+        return timing
+
+    def read_cloud_subset(
+        self,
+        cloud_url: str,
+        cell_indices: np.ndarray | list[int] | None = None,
+        gene_indices: np.ndarray | list[int] | None = None,
+    ) -> TimingResult:
+        """Subset read from cloud via pull-then-local-subset.
+
+        Phase C intentionally keeps this simple — full pull then local
+        subset. Phase F (``cloud_reader_vs_pull``) measures the
+        ``pyscx.open_cloud`` range-read path explicitly.
+        """
+        import tempfile
+
+        self._check_pyscx()
+
+        tmp = tempfile.mkdtemp(prefix="scx_cloud_subset_")
+        try:
+            local = os.path.join(tmp, "pulled.scx")
+
+            def _subset():
+                pyscx.pull(cloud_url, local)
+                ds = pyscx.open(local)
+                if cell_indices is not None:
+                    adata = ds.to_anndata(backed=True)
+                    X = adata.X[cell_indices]
+                    if gene_indices is not None:
+                        X = X[:, gene_indices]
+                elif gene_indices is not None:
+                    q = ds.query().select_genes(gene_indices)
+                    X = q.collect().to_csr()
+                else:
+                    X = ds.query().collect().to_csr()
+                _ = X
+
+            _, timing = self.timed_run(_subset)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_pull_and_subset",
+            "telemetry": "phase_f_deferred",
+        }
+        return timing
+
+    def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
+        """Metadata-only open via ``pyscx.open_cloud`` (no full pull).
+
+        Used by the ``cloud_metadata`` benchmark to measure single-GET
+        latency on cloud-optimized ``.scx`` / exploded ``.scxd``.
+        """
+        self._check_pyscx()
+
+        def _open():
+            handle = pyscx.open_cloud(cloud_url)
+            # Touch the common metadata accessors so the timing reflects the
+            # full open + catalog-parse rather than just URL resolution.
+            _ = handle.n_obs
+            _ = handle.n_vars
+            _ = handle.nnz
+            _ = handle.shard_count
+
+        _, timing = self.timed_run(_open)
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_open_cloud",
+            "telemetry": "phase_f_deferred",
+        }
+        return timing
+
+    def read_cloud_filtered_query(
+        self,
+        cloud_url: str,
+        predicate,
+    ) -> TimingResult:
+        """Pull the dataset then apply the predicate locally.
+
+        SCX's catalog-pushdown filter is designed for local reads; pushing
+        predicates through a range-read on ``pyscx.open_cloud`` is explicitly
+        scoped to Phase F.1. For Phase D.4 parity, the benchmark measures
+        the honest end-to-end wall-clock a user would see today: pull then
+        local filter. Mechanism tag ``scx_pull_and_filter`` distinguishes
+        this from the future native-pushdown variant.
+        """
+        import tempfile
+
+        self._check_pyscx()
+
+        tmp = tempfile.mkdtemp(prefix="scx_cloud_filter_")
+        try:
+            local = os.path.join(tmp, "pulled.scx")
+
+            def _pull_and_filter():
+                pyscx.pull(cloud_url, local)
+                # Re-enter the local filtered_query via ``self`` so mechanism
+                # tagging and error-handling stay centralized.
+                return self.read_filtered_query(local, predicate)
+
+            local_timing, timing = self.timed_run(_pull_and_filter)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        # The timing returned by timed_run covers pull+filter; the inner
+        # local_timing is informational. Carry the predicate name through.
+        local_extra = local_timing.extra or {}
+        timing.extra = {
+            "provider": "gcs",
+            "native_mechanism": "scx_pull_and_filter",
+            "predicate": local_extra.get("predicate", predicate.name),
+            "inner_filter_wall_s": round(local_timing.wall_s, 6),
+            "telemetry": "phase_f_deferred",
         }
         return timing

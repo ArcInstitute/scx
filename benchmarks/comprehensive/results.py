@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from benchmarks.comprehensive.config import RAW_RESULTS_DIR
+from benchmarks.comprehensive.provenance import capture_run_provenance
 from benchmarks.comprehensive.sysinfo import collect_system_info
+
+# Bumped on any additive field to ``BenchmarkResult`` / ``RunRecord``. Readers
+# that hard-code the schema (the gate, reports) verify this and refuse to
+# diff across incompatible versions. Migration helper lives at
+# `scripts/migrate_results.py`.
+SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -67,6 +74,11 @@ class BenchmarkResult:
             self.timestamp = datetime.datetime.now().isoformat(timespec="seconds")
         if not self.system:
             self.system = collect_system_info()
+        # Embed per-run provenance (git SHA, thread pinning, run_id) under
+        # system.provenance. Always overwrites even for pre-populated system
+        # dicts — provenance should reflect THIS run, not whatever was
+        # pickled / inherited from a prior invocation.
+        self.system["provenance"] = capture_run_provenance()
 
     @property
     def median_wall_s(self) -> float | None:
@@ -99,6 +111,7 @@ class BenchmarkResult:
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dict."""
         d: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
             "benchmark": self.benchmark,
             "format": self.format,
             "dataset": self.dataset,

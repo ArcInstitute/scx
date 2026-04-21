@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
@@ -28,6 +28,84 @@ use crate::explode::section_name_to_path;
 
 /// Offset where sections begin: 256 (header) + 4096 (root catalog placeholder).
 const SECTIONS_START_OFFSET: u64 = 4352;
+
+/// Age threshold above which a `{stem}.tmp.*` file whose owning pid is
+/// no longer running (or unparseable) is considered orphaned and safe to
+/// delete. One hour comfortably exceeds any legitimate in-flight pull.
+const STALE_TMP_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Return true if a pid is still live according to `/proc/{pid}` (Linux).
+///
+/// Non-Linux platforms have no `/proc` — the function returns `false` so
+/// the caller falls back to the mtime heuristic. Benchmarks and cloud
+/// operations run on Linux, so the proc path is exercised in practice.
+fn pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Remove stale `{dest}.tmp.*` files left behind by prior interrupted pulls.
+///
+/// Pull writes to `{dest}.tmp.{pid}` and atomically renames on completion.
+/// If a pull is interrupted (SIGTERM, crash), the `.tmp.{pid}` file remains
+/// orphaned. The current run picks a different PID-keyed path so it's not
+/// blocked, but the orphan accumulates disk usage on repeated retries.
+/// This helper sweeps orphaned `{stem}.tmp.*` siblings of `dest` before we
+/// start downloading. Called at the top of both `pull` and `pull_filtered`.
+///
+/// A file is treated as orphaned and deleted only if BOTH hold:
+///   1. Its owning pid (the trailing numeric suffix) is not live on
+///      `/proc`, OR the suffix does not parse as a pid.
+///   2. Its mtime is older than `STALE_TMP_AGE`.
+///
+/// This keeps the sweep safe when multiple concurrent pulls target the
+/// same `dest` — a live sibling's tmp file is preserved regardless of
+/// filename patterns. Deliberately best-effort: a directory-listing
+/// failure is not a pull failure (the worst case is orphans persist;
+/// they never block retries).
+fn cleanup_stale_tmp_files(dest: &Path) {
+    let parent = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let stem = match dest.file_name().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let prefix = format!("{stem}.tmp.");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with(&prefix) {
+            continue;
+        }
+        // Bail out cheaply if the suffix parses to a pid that is still alive.
+        let suffix = &name_str[prefix.len()..];
+        if let Ok(pid) = suffix.parse::<u32>() {
+            if pid_is_alive(pid) {
+                continue;
+            }
+        }
+        // Only delete files that look abandoned. Files younger than
+        // STALE_TMP_AGE might belong to a sibling whose pid we couldn't
+        // confirm (e.g. wrapped around, or non-Linux without /proc).
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
+        if age < STALE_TMP_AGE {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
 
 /// Options for the pull operation.
 pub struct PullOptions {
@@ -64,6 +142,11 @@ pub struct PullStats {
 /// exploded `.scxd` directory.
 pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<PullStats> {
     let start = Instant::now();
+
+    // Sweep any `.tmp.*` orphans left behind by a previously interrupted
+    // pull targeting the same destination. Best-effort; a failure here is
+    // not a pull failure (see ``cleanup_stale_tmp_files``).
+    cleanup_stale_tmp_files(dest);
 
     // 1. Parse location and create backend
     let location = crate::backend::parse_location(source)?;
@@ -431,6 +514,10 @@ pub async fn pull_filtered(
     options: PullOptions,
 ) -> Result<PullFilteredStats> {
     let start = Instant::now();
+
+    // Same orphan-sweep as `pull`: any `.tmp.{pid}` files left by a
+    // prior interrupted run are removed before we start downloading.
+    cleanup_stale_tmp_files(dest);
 
     // 1. Parse location and create backend
     let location = crate::backend::parse_location(source)?;
@@ -1222,6 +1309,134 @@ mod tests {
 
         let reader = ScxReader::open(&output).unwrap();
         assert_eq!(reader.n_obs(), 0);
+    }
+
+    /// Force the mtime on `path` to `STALE_TMP_AGE + 60s` in the past so
+    /// the cleanup helper treats it as orphaned. Uses `File::set_times`
+    /// (stable since Rust 1.75) and `FileTimes::set_modified`.
+    fn age_file(path: &std::path::Path) {
+        let past =
+            std::time::SystemTime::now() - STALE_TMP_AGE - std::time::Duration::from_secs(60);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file for set_times");
+        let times = std::fs::FileTimes::new().set_modified(past);
+        f.set_times(times).expect("set_times failed");
+    }
+
+    #[test]
+    fn test_cleanup_stale_tmp_files_removes_dead_pid_and_old_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("output.scx");
+
+        // u32::MAX exceeds the kernel's pid_max (default 2^22 on Linux)
+        // so /proc/4294967295 cannot exist. Also age the files past
+        // STALE_TMP_AGE so the mtime guard clears in both branches.
+        let stale_dead_pid = dir.path().join("output.scx.tmp.4294967295");
+        let stale_unparseable = dir.path().join("output.scx.tmp.abcd");
+        let unrelated = dir.path().join("other.scx");
+        for p in &[&stale_dead_pid, &stale_unparseable, &unrelated] {
+            std::fs::write(p, b"stale").unwrap();
+        }
+        age_file(&stale_dead_pid);
+        age_file(&stale_unparseable);
+
+        cleanup_stale_tmp_files(&dest);
+
+        assert!(
+            !stale_dead_pid.exists(),
+            "dead-pid orphan past age should be removed",
+        );
+        assert!(
+            !stale_unparseable.exists(),
+            "unparseable-suffix orphan past age should be removed",
+        );
+        assert!(unrelated.exists(), "unrelated file must not be touched");
+    }
+
+    #[test]
+    fn test_cleanup_stale_tmp_files_preserves_live_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("output.scx");
+
+        // Our own pid is provably alive; even with an aged mtime the
+        // helper must leave it alone (concurrent-pull safety).
+        let live_pid = std::process::id();
+        let live = dir.path().join(format!("output.scx.tmp.{live_pid}"));
+        std::fs::write(&live, b"in-flight").unwrap();
+        age_file(&live);
+
+        cleanup_stale_tmp_files(&dest);
+
+        assert!(
+            live.exists(),
+            "tmp file owned by a live pid must never be unlinked",
+        );
+    }
+
+    #[test]
+    fn test_cleanup_stale_tmp_files_preserves_fresh_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("output.scx");
+
+        // Dead pid but fresh mtime: could be a sibling that spawned
+        // moments ago on a system where /proc/{pid} hasn't materialized
+        // yet, or a pid we can't confirm. Skip deletion to stay safe.
+        let fresh_dead = dir.path().join("output.scx.tmp.4294967295");
+        std::fs::write(&fresh_dead, b"very recent").unwrap();
+
+        cleanup_stale_tmp_files(&dest);
+
+        assert!(
+            fresh_dead.exists(),
+            "fresh orphan should not be unlinked; mtime guard must hold",
+        );
+    }
+
+    #[test]
+    fn test_cleanup_stale_tmp_files_handles_missing_parent() {
+        // Should not panic on a destination whose parent directory doesn't exist.
+        let nonexistent = std::path::Path::new("/tmp/scx-cloud-nonexistent-xyz/foo.scx");
+        cleanup_stale_tmp_files(nonexistent);
+    }
+
+    #[tokio::test]
+    async fn test_pull_retry_after_orphan_tmp_is_idempotent() {
+        // Simulates an interrupted pull by leaving an orphan `.tmp.*` file
+        // before starting a fresh pull; the fresh pull must succeed and
+        // produce a byte-identical output to a clean pull.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let source = exploded_dir.to_string_lossy().to_string();
+        let output = dir.path().join("pulled.scx");
+
+        // Plant an orphan `.tmp.*` as if a prior pull crashed. Use
+        // u32::MAX (above pid_max) AND age the file beyond STALE_TMP_AGE
+        // so the sweeper's pid+mtime guard both fire and the orphan is
+        // unlinked. A fresh-mtime orphan is preserved by design — that
+        // path is covered by ``test_cleanup_stale_tmp_files_preserves_fresh_mtime``.
+        let orphan = dir.path().join("pulled.scx.tmp.4294967295");
+        std::fs::write(&orphan, b"junk from an interrupted prior run").unwrap();
+        age_file(&orphan);
+
+        let opts = PullOptions::default();
+        let stats = pull(&source, &output, opts).await.unwrap();
+
+        assert!(stats.bytes_downloaded > 0);
+        assert!(output.exists(), "pull output should exist after retry");
+        assert!(
+            !orphan.exists(),
+            "aged orphan tmp file should have been swept"
+        );
+
+        // Verify the output is a valid SCX file.
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.n_obs(), 100);
+        assert_eq!(reader.n_vars(), 50);
     }
 
     #[tokio::test]
