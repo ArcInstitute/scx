@@ -298,7 +298,12 @@ _FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
     "scx_lz4": ".scxd",
     "scx_pcodec": ".scxd",
     "zarr_zstd": ".zarr",
-    "zarr_lz4": ".zarr",
+    # zarr_lz4 uses a codec-qualified suffix so it doesn't collide with
+    # zarr_zstd on the shared `{dataset}.zarr/` cloud path — ``ensure_cloud_fixture``
+    # would otherwise treat the already-uploaded zstd fixture as a cache hit for
+    # the lz4 variant and skip the upload, silently producing wrong numbers
+    # (cloud_read would decode zstd-compressed chunks as if they were lz4).
+    "zarr_lz4": "_lz4.zarr",
     "tiledb_soma": ".soma",
     "slaf": ".slaf",
     "anndata_zarr_backed": "_anndata.zarr",

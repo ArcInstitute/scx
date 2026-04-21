@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from benchmarks.comprehensive.config import (
@@ -149,6 +150,32 @@ def _gsutil_rsync(local_dir: Path, cloud_url: str) -> None:
     )
 
 
+def _upload_lock_path(dataset: DatasetConfig, format_variant: FormatVariant) -> Path:
+    """Per-fixture lock file under /tmp so parallel submitit jobs serialize."""
+    return Path(tempfile.gettempdir()) / (
+        f"scx_bench_cloud_upload__{dataset.name}__{format_variant.key}.lock"
+    )
+
+
+def _is_fixture_complete(url: str, timeout_s: float = 15.0) -> bool:
+    """Return True if the fixture URL + its ``.blake3`` sidecar both exist.
+
+    The sidecar is written by ``_write_blake3_sidecar`` AFTER the main
+    upload succeeds, so it functions as a "upload complete" marker.
+    Distinguishes a partial upload in progress (url populated, no sidecar)
+    from a finished upload ready to read (url populated + sidecar present).
+    """
+    sidecar = url.rstrip("/") + ".blake3"
+    try:
+        result = subprocess.run(
+            ["gsutil", "ls", sidecar],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() != ""
+
+
 def ensure_cloud_fixture(
     dataset: DatasetConfig,
     format_variant: FormatVariant,
@@ -161,11 +188,25 @@ def ensure_cloud_fixture(
     the exploded ``.scxd/`` layout the readers expect). For Zarr / TileDB /
     SLAF the local directory is rsynced with ``gsutil -m``.
 
+    Concurrency: parallel submitit jobs all reach this function at once.
+    Without coordination the shape was a TOCTOU race — every job saw
+    ``cloud_path_exists(url) == False`` (fixture not yet uploaded) and
+    launched its own ``gsutil rsync`` against the same GCS path. gsutil
+    doesn't coordinate writes across processes, so chunks got partially
+    overwritten (observed: zarr chunk 1 inflated from 585 KB to 1058 KB —
+    two overlapping uploads interleaved). An ``fcntl.flock`` on a
+    per-fixture lock file under ``/tmp`` makes uploads strictly serial:
+    the first job acquires the lock and uploads, later jobs block on the
+    lock, then re-check completion and skip. Completion is probed via the
+    ``.blake3`` sidecar (written last) rather than the fixture URL itself
+    — a partial upload has the URL populated but no sidecar, so readers
+    correctly wait rather than race an unfinished upload.
+
     Assumes ``require_gcp_credentials`` has already been called.
     """
     url = cloud_url_for(dataset, format_variant, provider=provider)
-    if cloud_path_exists(url):
-        logger.info("Fixture present, skipping upload: %s", url)
+    if _is_fixture_complete(url):
+        logger.info("Fixture present and complete, skipping upload: %s", url)
         return url
 
     local_path = Path(local_path)
@@ -175,14 +216,30 @@ def ensure_cloud_fixture(
             f"{local_path}"
         )
 
-    if format_variant.key.startswith("scx_"):
-        import pyscx
+    import fcntl
+    lock_path = _upload_lock_path(dataset, format_variant)
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r") as lock_fh:
+        logger.info(
+            "Acquiring upload lock %s (may block on concurrent jobs)…", lock_path,
+        )
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        # Re-check after acquiring the lock — a sibling job may have just
+        # completed the upload while we were waiting.
+        if _is_fixture_complete(url):
+            logger.info(
+                "Fixture uploaded by another job while we waited: %s", url,
+            )
+            return url
 
-        logger.info("Uploading SCX fixture %s → %s via pyscx.push",
-                    local_path, url)
-        pyscx.push(str(local_path), url)
-    else:
-        _gsutil_rsync(local_path, url)
+        if format_variant.key.startswith("scx_"):
+            import pyscx
+
+            logger.info("Uploading SCX fixture %s → %s via pyscx.push",
+                        local_path, url)
+            pyscx.push(str(local_path), url)
+        else:
+            _gsutil_rsync(local_path, url)
 
     # Write a BLAKE3 fingerprint sidecar alongside the fixture so
     # `setup_cloud_test_data.sh` and `cloud_fixtures_doctor.py` can detect
