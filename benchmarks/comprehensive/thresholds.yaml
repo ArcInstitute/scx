@@ -3,8 +3,8 @@
 # Consumed by ``compare_against_baseline.py --gate --thresholds <this-file>``.
 # For each entry, the gate reads the named metric out of every run's
 # ``extra`` dict in ``<current_run>/raw/<benchmark>__<format>__<dataset>.json``,
-# takes the median across runs, and fails when the median is below ``min``
-# (or the metric is missing entirely).
+# takes the median across runs, and fails when the median violates the
+# declared bound (or the metric is missing entirely).
 #
 # These floors are absolute — they don't depend on the baseline snapshot,
 # and they survive baseline promotion. Use them for hard contracts: "a
@@ -18,7 +18,10 @@
 #       format:    <format key>       # e.g. scx_auto
 #       dataset:   <dataset name>
 #       metric:    <field name in runs[].extra>
-#       min:       <float>
+#       min:       <float>            # observed must be >= min (higher-is-better)
+#       # --- OR ---
+#       max:       <float>            # observed must be <= max (lower-is-better, e.g. wall_s)
+#       # direction is inferred from min/max; set explicitly only to disambiguate.
 
 absolute_floors:
   # Cloud push/pull throughput — migrated from the retired

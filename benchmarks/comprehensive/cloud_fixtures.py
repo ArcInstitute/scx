@@ -150,10 +150,37 @@ def _gsutil_rsync(local_dir: Path, cloud_url: str) -> None:
     )
 
 
+def _upload_lock_dir() -> Path:
+    """Directory holding per-fixture upload locks.
+
+    Prefers ``$SCX_WORK_DIR/locks`` (typically shared NFS/Lustre in SLURM
+    setups) so locks coordinate across hosts via the FS lock manager. Falls
+    back to the system tempdir when ``SCX_WORK_DIR`` is unset — that fallback
+    is **host-local only** and cannot serialize multi-host submissions.
+    """
+    work_dir = os.environ.get("SCX_WORK_DIR")
+    base = Path(work_dir) / "locks" if work_dir else Path(tempfile.gettempdir())
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def _upload_lock_path(dataset: DatasetConfig, format_variant: FormatVariant) -> Path:
-    """Per-fixture lock file under /tmp so parallel submitit jobs serialize."""
-    return Path(tempfile.gettempdir()) / (
+    """Per-fixture lock file; see ``_upload_lock_dir`` for location rules."""
+    return _upload_lock_dir() / (
         f"scx_bench_cloud_upload__{dataset.name}__{format_variant.key}.lock"
+    )
+
+
+def _uploaded_marker_path(dataset: DatasetConfig, format_variant: FormatVariant) -> Path:
+    """Local "main upload complete, sidecar may be pending" marker.
+
+    Created after ``pyscx.push`` / ``gsutil rsync`` succeeds and cleared only
+    when the ``.blake3`` sidecar has been confirmed uploaded. Lets a crash
+    between main upload and sidecar write be recovered with a sidecar-only
+    retry instead of a full re-upload.
+    """
+    return _upload_lock_dir() / (
+        f"scx_bench_cloud_upload__{dataset.name}__{format_variant.key}.uploaded"
     )
 
 
@@ -195,12 +222,30 @@ def ensure_cloud_fixture(
     doesn't coordinate writes across processes, so chunks got partially
     overwritten (observed: zarr chunk 1 inflated from 585 KB to 1058 KB —
     two overlapping uploads interleaved). An ``fcntl.flock`` on a
-    per-fixture lock file under ``/tmp`` makes uploads strictly serial:
-    the first job acquires the lock and uploads, later jobs block on the
-    lock, then re-check completion and skip. Completion is probed via the
-    ``.blake3`` sidecar (written last) rather than the fixture URL itself
-    — a partial upload has the URL populated but no sidecar, so readers
-    correctly wait rather than race an unfinished upload.
+    per-fixture lock file makes uploads strictly serial: the first job
+    acquires the lock and uploads, later jobs block on the lock, then
+    re-check completion and skip. Completion is probed via the ``.blake3``
+    sidecar (written last) rather than the fixture URL itself — a partial
+    upload has the URL populated but no sidecar, so readers correctly
+    wait rather than race an unfinished upload.
+
+    **Multi-host note**: ``fcntl.flock`` is keyed on inode, so the lock
+    only serializes workers that see the same inode. When
+    ``SCX_WORK_DIR`` points at a shared filesystem (NFSv3+ with ``lockd``,
+    Lustre, GPFS — the normal SLURM shape), the lock coordinates across
+    hosts. When ``SCX_WORK_DIR`` is unset the lock falls back to the
+    system tempdir, which is typically host-local — in that case parallel
+    workers on DIFFERENT hosts can still race. The BLAKE3 sidecar is
+    written with identical content regardless of uploader, so in the
+    multi-host race the last write wins with the same bytes; the harm is
+    wasted bandwidth, not corruption.
+
+    **Crash recovery**: a crash between the main upload and the sidecar
+    write leaves a complete fixture whose sidecar is absent. Rather than
+    re-upload from scratch, this function writes a local "uploaded"
+    marker before the sidecar attempt; on the next call, if the marker
+    exists AND the main URL is present on GCS, only the sidecar is
+    retried.
 
     Assumes ``require_gcp_credentials`` has already been called.
     """
@@ -218,6 +263,7 @@ def ensure_cloud_fixture(
 
     import fcntl
     lock_path = _upload_lock_path(dataset, format_variant)
+    uploaded_marker = _uploaded_marker_path(dataset, format_variant)
     lock_path.touch(exist_ok=True)
     with open(lock_path, "r") as lock_fh:
         logger.info(
@@ -232,20 +278,40 @@ def ensure_cloud_fixture(
             )
             return url
 
-        if format_variant.key.startswith("scx_"):
-            import pyscx
-
-            logger.info("Uploading SCX fixture %s → %s via pyscx.push",
-                        local_path, url)
-            pyscx.push(str(local_path), url)
+        # Crash-recovery path: main upload already succeeded (marker
+        # present, main URL present on GCS), only the sidecar is missing.
+        main_on_gcs = uploaded_marker.exists() and cloud_path_exists(url)
+        if main_on_gcs:
+            logger.info(
+                "Local upload marker present; main upload already complete "
+                "for %s — retrying sidecar only", url,
+            )
         else:
-            _gsutil_rsync(local_path, url)
+            if format_variant.key.startswith("scx_"):
+                import pyscx
+
+                logger.info("Uploading SCX fixture %s → %s via pyscx.push",
+                            local_path, url)
+                pyscx.push(str(local_path), url)
+            else:
+                _gsutil_rsync(local_path, url)
+            # Mark the main upload as done BEFORE the sidecar write so a
+            # crash in the next step is recoverable without a re-upload.
+            try:
+                uploaded_marker.touch(exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "failed to write uploaded marker for %s: %s", url, exc,
+                )
 
     # Write a BLAKE3 fingerprint sidecar alongside the fixture so
     # `setup_cloud_test_data.sh` and `cloud_fixtures_doctor.py` can detect
     # stale cloud copies without re-uploading to find out.
     try:
         _write_blake3_sidecar(local_path, url)
+        # Sidecar is up; clear the local marker so future runs don't
+        # keep treating this fixture as "recovery pending".
+        uploaded_marker.unlink(missing_ok=True)
     except Exception as exc:  # noqa: BLE001 — sidecar is best-effort
         logger.warning("failed to write BLAKE3 sidecar for %s: %s", url, exc)
 

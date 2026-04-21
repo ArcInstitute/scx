@@ -45,10 +45,13 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 # _justifications lives beside this script — add parent to sys.path so
 # `python scripts/compare_against_baseline.py` works without a package
@@ -248,65 +251,90 @@ class FloorViolation:
     fmt: str
     dataset: str
     metric: str
-    minimum: float
+    threshold: float
     observed: float | None
+    direction: str = "min"  # "min" => observed must be >= threshold; "max" => <=
+
+
+_VALID_DIRECTIONS = ("min", "max")
+_FLOOR_REQUIRED_FIELDS = ("benchmark", "format", "dataset", "metric")
 
 
 def _load_thresholds_yaml(path: Path) -> list[dict[str, Any]]:
-    """Load ``thresholds.yaml`` as a list of floor dicts.
+    """Load ``thresholds.yaml`` and return a list of validated floor dicts.
 
-    Keeps the parser tiny (no PyYAML dep in minimal envs). Supports only the
-    narrow shape used by ``thresholds.yaml``:
+    Expected shape:
 
         absolute_floors:
           - benchmark: cloud_push
             format: scx_auto
+            dataset: tabula_sapiens_100k
             metric: throughput_mbps
             min: 50.0
+            # direction: min  # default; use "max" for lower-is-better metrics
 
-    Every top-level line must be ``absolute_floors:`` or whitespace/comment;
-    entries are consumed as a list of dicts with string scalar values.
+    Each entry must declare ``benchmark``, ``format``, ``dataset``, ``metric``,
+    and EITHER ``min`` (lower floor) OR ``max`` (upper floor). ``direction``
+    is optional and inferred from ``min``/``max`` presence; when both are
+    present ``direction`` resolves ambiguity. Malformed entries raise
+    ``ValueError`` at load time.
     """
     if not path.exists():
         raise FileNotFoundError(f"thresholds file not found: {path}")
-    text = path.read_text()
-    lines = text.splitlines()
+    raw = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: top-level must be a mapping")
+    floors_raw = raw.get("absolute_floors", [])
+    if floors_raw is None:
+        return []
+    if not isinstance(floors_raw, list):
+        raise ValueError(f"{path}: absolute_floors must be a list")
     floors: list[dict[str, Any]] = []
-    in_list = False
-    current: dict[str, Any] | None = None
-    for raw in lines:
-        line = raw.rstrip()
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if not line.startswith(" ") and not line.startswith("\t"):
-            in_list = stripped == "absolute_floors:"
-            continue
-        if not in_list:
-            continue
-        inner = stripped
-        if inner.startswith("- "):
-            if current is not None:
-                floors.append(current)
-            current = {}
-            inner = inner[2:]
-        if ":" not in inner:
-            continue
-        k, _, v = inner.partition(":")
-        k = k.strip()
-        v = v.strip()
-        if v.startswith("'") and v.endswith("'"):
-            v = v[1:-1]
-        elif v.startswith('"') and v.endswith('"'):
-            v = v[1:-1]
-        if current is None:
-            continue
+    for idx, spec in enumerate(floors_raw):
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"{path}: absolute_floors[{idx}] must be a mapping, got {type(spec).__name__}"
+            )
+        missing = [f for f in _FLOOR_REQUIRED_FIELDS if spec.get(f) is None]
+        if missing:
+            raise ValueError(
+                f"{path}: absolute_floors[{idx}] missing fields: {missing}"
+            )
+        has_min = "min" in spec and spec["min"] is not None
+        has_max = "max" in spec and spec["max"] is not None
+        if not (has_min or has_max):
+            raise ValueError(
+                f"{path}: absolute_floors[{idx}] must declare either 'min' or 'max'"
+            )
+        direction = spec.get("direction")
+        if direction is None:
+            direction = "min" if has_min else "max"
+        if direction not in _VALID_DIRECTIONS:
+            raise ValueError(
+                f"{path}: absolute_floors[{idx}] direction={direction!r} "
+                f"must be one of {_VALID_DIRECTIONS}"
+            )
+        threshold_key = "min" if direction == "min" else "max"
+        if spec.get(threshold_key) is None:
+            raise ValueError(
+                f"{path}: absolute_floors[{idx}] direction={direction!r} "
+                f"requires a {threshold_key!r} value"
+            )
         try:
-            current[k] = float(v)
-        except ValueError:
-            current[k] = v
-    if current is not None:
-        floors.append(current)
+            threshold = float(spec[threshold_key])
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"{path}: absolute_floors[{idx}] {threshold_key}={spec[threshold_key]!r} "
+                f"must be numeric"
+            ) from e
+        floors.append({
+            "benchmark": str(spec["benchmark"]),
+            "format": str(spec["format"]),
+            "dataset": str(spec["dataset"]),
+            "metric": str(spec["metric"]),
+            "threshold": threshold,
+            "direction": direction,
+        })
     return floors
 
 
@@ -340,8 +368,7 @@ def _load_current_raw_metric(
             continue
     if not values:
         return None
-    values.sort()
-    return values[len(values) // 2]
+    return statistics.median(values)
 
 
 def check_absolute_floors(
@@ -349,24 +376,34 @@ def check_absolute_floors(
     floors: list[dict[str, Any]],
 ) -> list[FloorViolation]:
     """Return one FloorViolation per (benchmark, format, dataset) whose
-    named metric is missing, NaN, or below the configured minimum.
+    named metric is missing, NaN, or violates the configured threshold.
+
+    Each spec carries a ``direction`` ("min" or "max") — for ``direction="min"``
+    the observed value must be >= threshold (e.g. throughput floors); for
+    ``direction="max"`` it must be <= threshold (e.g. wall-time ceilings).
     """
     violations: list[FloorViolation] = []
     for spec in floors:
-        benchmark = spec.get("benchmark")
-        fmt = spec.get("format")
-        dataset = spec.get("dataset")
-        metric = spec.get("metric")
-        minimum = spec.get("min")
-        if not all([benchmark, fmt, dataset, metric]) or minimum is None:
-            continue
+        benchmark = spec["benchmark"]
+        fmt = spec["format"]
+        dataset = spec["dataset"]
+        metric = spec["metric"]
+        threshold = spec["threshold"]
+        direction = spec["direction"]
         observed = _load_current_raw_metric(
             current_dir, benchmark, fmt, dataset, metric,
         )
-        if observed is None or observed < float(minimum):
+        if observed is None:
+            violated = True
+        elif direction == "min":
+            violated = observed < threshold
+        else:  # direction == "max"
+            violated = observed > threshold
+        if violated:
             violations.append(FloorViolation(
                 benchmark=benchmark, fmt=fmt, dataset=dataset,
-                metric=metric, minimum=float(minimum), observed=observed,
+                metric=metric, threshold=threshold, observed=observed,
+                direction=direction,
             ))
     return violations
 
@@ -462,13 +499,14 @@ def render_markdown(
     if floor_violations:
         lines.append("## Absolute-floor violations")
         lines.append("")
-        lines.append("| Benchmark | Format | Dataset | Metric | Min | Observed |")
+        lines.append("| Benchmark | Format | Dataset | Metric | Threshold | Observed |")
         lines.append("|---|---|---|---|---:|---:|")
         for v in floor_violations:
             obs = "missing" if v.observed is None else f"{v.observed:.3f}"
+            op = ">=" if v.direction == "min" else "<="
             lines.append(
                 f"| {v.benchmark} | {v.fmt} | {v.dataset} | {v.metric} | "
-                f"{v.minimum:.3f} | {obs} |"
+                f"{op} {v.threshold:.3f} | {obs} |"
             )
         lines.append("")
 
@@ -504,10 +542,7 @@ def to_json_payload(
         "fingerprint_missing": fp_missing,
     }
     if suppressed_triples is not None:
-        payload["suppressed_triples"] = sorted(
-            {"benchmark": b, "format": f, "dataset": d}
-            for (b, f, d) in suppressed_triples
-        ) if False else [
+        payload["suppressed_triples"] = [
             {"benchmark": b, "format": f, "dataset": d}
             for (b, f, d) in sorted(suppressed_triples)
         ]
@@ -520,7 +555,8 @@ def to_json_payload(
         payload["floor_violations"] = [
             {
                 "benchmark": v.benchmark, "format": v.fmt, "dataset": v.dataset,
-                "metric": v.metric, "min": v.minimum, "observed": v.observed,
+                "metric": v.metric, "threshold": v.threshold,
+                "direction": v.direction, "observed": v.observed,
             }
             for v in floor_violations
         ]

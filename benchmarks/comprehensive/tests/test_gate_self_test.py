@@ -194,3 +194,117 @@ def test_absolute_floor_violation_fails_gate(tmp_path: Path) -> None:
         f"absolute-floor violation must fail gate; stdout={result.stdout!r}"
     )
     assert "Absolute-floor" in result.stdout or "floor" in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# Loader / median / direction unit tests (hermetic, no subprocess).
+# ---------------------------------------------------------------------------
+
+
+def _import_gate_module():
+    """Import the gate script as a module for unit-level tests.
+
+    The module must be registered in ``sys.modules`` before execution
+    because dataclass forward-reference resolution looks the module up
+    via ``sys.modules[cls.__module__]``.
+    """
+    import importlib.util
+
+    name = "compare_against_baseline"
+    spec = importlib.util.spec_from_file_location(name, str(GATE_SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_load_current_raw_metric_true_median(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "cloud_push__scx_auto__ds.json").write_text(json.dumps({
+        "runs": [
+            {"extra": {"throughput_mbps": 1.0}},
+            {"extra": {"throughput_mbps": 2.0}},
+            {"extra": {"throughput_mbps": 3.0}},
+            {"extra": {"throughput_mbps": 4.0}},
+        ],
+    }))
+    value = mod._load_current_raw_metric(
+        tmp_path, "cloud_push", "scx_auto", "ds", "throughput_mbps",
+    )
+    # Four values: the true median is 2.5, not values[len//2] == 3.0.
+    assert value == pytest.approx(2.5)
+
+
+def test_thresholds_yaml_rejects_missing_required_fields(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    thresh = tmp_path / "thresholds.yaml"
+    thresh.write_text(
+        "absolute_floors:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    # missing dataset and metric\n"
+        "    min: 50.0\n"
+    )
+    with pytest.raises(ValueError, match="missing fields"):
+        mod._load_thresholds_yaml(thresh)
+
+
+def test_thresholds_yaml_rejects_unknown_direction(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    thresh = tmp_path / "thresholds.yaml"
+    thresh.write_text(
+        "absolute_floors:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    metric: throughput_mbps\n"
+        "    min: 50.0\n"
+        "    direction: sideways\n"
+    )
+    with pytest.raises(ValueError, match="direction="):
+        mod._load_thresholds_yaml(thresh)
+
+
+def test_thresholds_yaml_requires_min_or_max(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    thresh = tmp_path / "thresholds.yaml"
+    thresh.write_text(
+        "absolute_floors:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    metric: throughput_mbps\n"
+    )
+    with pytest.raises(ValueError, match="must declare either 'min' or 'max'"):
+        mod._load_thresholds_yaml(thresh)
+
+
+def test_absolute_floor_max_direction_flags_overrun(tmp_path: Path) -> None:
+    """direction=max ⇒ observed above the ceiling is a violation."""
+    mod = _import_gate_module()
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    # Observed 12.0 > ceiling 10.0 — must violate.
+    (raw_dir / "cloud_pull__scx_auto__pbmc3k.json").write_text(json.dumps({
+        "runs": [{"extra": {"wall_s": 12.0}}, {"extra": {"wall_s": 12.0}}],
+    }))
+    floors = [{
+        "benchmark": "cloud_pull",
+        "format": "scx_auto",
+        "dataset": "pbmc3k",
+        "metric": "wall_s",
+        "threshold": 10.0,
+        "direction": "max",
+    }]
+    violations = mod.check_absolute_floors(tmp_path, floors)
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.direction == "max"
+    assert v.observed == pytest.approx(12.0)
+    # Below the ceiling ⇒ no violation.
+    (raw_dir / "cloud_pull__scx_auto__pbmc3k.json").write_text(json.dumps({
+        "runs": [{"extra": {"wall_s": 3.0}}, {"extra": {"wall_s": 4.0}}],
+    }))
+    assert mod.check_absolute_floors(tmp_path, floors) == []

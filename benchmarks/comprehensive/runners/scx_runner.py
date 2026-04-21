@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -305,20 +306,28 @@ class ScxRunner(FormatRunner):
         shards stream into a local ``.scx`` which ``read_full`` then
         decompresses into an in-memory CSR. The timing includes both phases
         so the benchmark reflects the end-to-end user experience.
+
+        Tmpdir creation/teardown happens OUTSIDE the timed region so
+        filesystem cleanup of the pulled file does not inflate SCX's
+        wall-clock against competitors that don't pay that cost.
         """
         import tempfile
 
         self._check_pyscx()
 
-        def _read_cloud():
-            with tempfile.TemporaryDirectory(prefix="scx_cloud_read_") as tmp:
-                local = os.path.join(tmp, "pulled.scx")
+        tmp = tempfile.mkdtemp(prefix="scx_cloud_read_")
+        try:
+            local = os.path.join(tmp, "pulled.scx")
+
+            def _read_cloud():
                 pyscx.pull(cloud_url, local)
                 ds = pyscx.open(local)
                 adata = ds.to_anndata()
                 _ = adata.X
 
-        _, timing = self.timed_run(_read_cloud)
+            _, timing = self.timed_run(_read_cloud)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         timing.extra = {
             "provider": "gcs",
             "native_mechanism": "scx_pull_and_read",
@@ -342,9 +351,11 @@ class ScxRunner(FormatRunner):
 
         self._check_pyscx()
 
-        def _subset():
-            with tempfile.TemporaryDirectory(prefix="scx_cloud_subset_") as tmp:
-                local = os.path.join(tmp, "pulled.scx")
+        tmp = tempfile.mkdtemp(prefix="scx_cloud_subset_")
+        try:
+            local = os.path.join(tmp, "pulled.scx")
+
+            def _subset():
                 pyscx.pull(cloud_url, local)
                 ds = pyscx.open(local)
                 if cell_indices is not None:
@@ -359,7 +370,9 @@ class ScxRunner(FormatRunner):
                     X = ds.query().collect().to_csr()
                 _ = X
 
-        _, timing = self.timed_run(_subset)
+            _, timing = self.timed_run(_subset)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         timing.extra = {
             "provider": "gcs",
             "native_mechanism": "scx_pull_and_subset",
@@ -410,17 +423,19 @@ class ScxRunner(FormatRunner):
 
         self._check_pyscx()
 
-        def _pull_and_filter():
-            with tempfile.TemporaryDirectory(prefix="scx_cloud_filter_") as tmp:
-                local = os.path.join(tmp, "pulled.scx")
+        tmp = tempfile.mkdtemp(prefix="scx_cloud_filter_")
+        try:
+            local = os.path.join(tmp, "pulled.scx")
+
+            def _pull_and_filter():
                 pyscx.pull(cloud_url, local)
                 # Re-enter the local filtered_query via ``self`` so mechanism
                 # tagging and error-handling stay centralized.
-                local_timing = self.read_filtered_query(local, predicate)
+                return self.read_filtered_query(local, predicate)
 
-            return local_timing
-
-        local_timing, timing = self.timed_run(_pull_and_filter)
+            local_timing, timing = self.timed_run(_pull_and_filter)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         # The timing returned by timed_run covers pull+filter; the inner
         # local_timing is informational. Carry the predicate name through.
         local_extra = local_timing.extra or {}

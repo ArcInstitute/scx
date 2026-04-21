@@ -237,6 +237,9 @@ def _build_remote_bench_cmd(
     env_prefix = " ".join(
         f"{k}={shlex.quote(v)}" for k, v in env.items()
     )
+    bench_args = " ".join(shlex.quote(b) for b in benchmarks)
+    dataset_args = " ".join(shlex.quote(d) for d in datasets)
+    format_args = " ".join(shlex.quote(f) for f in formats)
     inner = [
         "cd $HOME/scx",
         "source ~/.bashrc",
@@ -244,9 +247,9 @@ def _build_remote_bench_cmd(
         (
             f"{env_prefix} python -m benchmarks.comprehensive.scripts.run_parallel "
             "--launcher local "
-            f"--benchmarks {' '.join(benchmarks)} "
-            f"--datasets {' '.join(datasets)} "
-            f"--formats {' '.join(formats)}"
+            f"--benchmarks {bench_args} "
+            f"--datasets {dataset_args} "
+            f"--formats {format_args}"
         ),
     ]
     return " && ".join(inner)
