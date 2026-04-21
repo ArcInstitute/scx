@@ -11,6 +11,7 @@ import gc
 import logging
 import os
 import resource
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -358,7 +359,7 @@ class FormatRunner(ABC):
         specific file(s) and works unprivileged.
         """
         try:
-            os.system("sync")
+            subprocess.run(["sync"], check=False)
             with open("/proc/sys/vm/drop_caches", "w") as f:
                 f.write("3\n")
             return True
@@ -397,7 +398,7 @@ class FormatRunner(ABC):
         if not path.exists():
             return "warm"
         try:
-            os.system("sync")  # best-effort — no error surfaced on failure
+            subprocess.run(["sync"], check=False)  # best-effort — no error surfaced on failure
             files: list[Path] = (
                 [path] if path.is_file()
                 else [p for p in path.rglob("*") if p.is_file()]
