@@ -45,3 +45,9 @@ dependencies:
     - slafdb==0.5.2
     # DuckDB + polars + lance come in as slafdb transitive deps; let the pin
     # resolve rather than double-pinning here.
+    # SLAF's cloud-path support (``SLAFArray("gs://...")``) routes through
+    # ``smart_open`` — which ships the GCS backend under a ``[gcs]`` extra
+    # backed by ``google-cloud-storage``. Without this pull, SLAF's
+    # ``_path_exists`` catches the ImportError and returns False, surfacing
+    # as a misleading ``FileNotFoundError: SLAF dataset not found``.
+    - google-cloud-storage>=2.6.0
