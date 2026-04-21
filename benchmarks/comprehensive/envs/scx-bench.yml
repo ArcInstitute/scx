@@ -48,6 +48,11 @@ dependencies:
   # System monitoring
   - psutil=7.2.2
 
+  # Cloud fixture fingerprinting (see cloud_fixtures.compute_blake3). The
+  # fallback to hashlib.blake2b was removed because it produced hashes
+  # that silently disagreed with the Rust writer — blake3 is now required.
+  - blake3=0.4
+
   # Build tooling (for pyscx from source)
   - maturin>=1.5.0
 

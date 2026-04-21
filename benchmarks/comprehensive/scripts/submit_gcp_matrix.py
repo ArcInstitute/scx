@@ -209,14 +209,21 @@ def _ssh_cmd(plan: InstancePlan, remote_cmd: str) -> list[str]:
 
 
 def _scp_from_vm_cmd(
-    plan: InstancePlan, remote_glob: str, local_dir: Path,
+    plan: InstancePlan, remote_globs: list[str], local_dir: Path,
 ) -> list[str]:
+    """Single ``gcloud compute scp`` invocation pulling every glob at once.
+
+    One batched call replaces the previous loop-per-benchmark pattern;
+    connection + auth handshake amortizes across all globs instead of
+    paying per benchmark.
+    """
+    sources = [f"{plan.vm_name}:{g}" for g in remote_globs]
     return [
         "gcloud", "compute", "scp",
         "--recurse",
         f"--project={GCP_PROJECT}",
         f"--zone={plan.zone}",
-        f"{plan.vm_name}:{remote_glob}",
+        *sources,
         str(local_dir),
     ]
 
@@ -298,17 +305,19 @@ def run_one_instance(
 
         # Collect only the cloud_* JSONs — this avoids slurping an entire
         # ``results/raw/`` tree if the remote has unrelated leftovers.
+        # Batched into a single scp call (see ``_scp_from_vm_cmd``).
         results_dir.mkdir(parents=True, exist_ok=True)
-        for bench in benchmarks:
-            glob = f"~/scx/benchmarks/comprehensive/results/raw/{bench}__*.json"
-            scp_rc = _run_or_print(
-                _scp_from_vm_cmd(plan, glob, results_dir), dry_run=dry_run,
+        remote_globs = [
+            f"~/scx/benchmarks/comprehensive/results/raw/{bench}__*.json"
+            for bench in benchmarks
+        ]
+        scp_rc = _run_or_print(
+            _scp_from_vm_cmd(plan, remote_globs, results_dir), dry_run=dry_run,
+        )
+        if scp_rc != 0 and not dry_run:
+            logger.warning(
+                "scp from %s returned %d; continuing", plan.vm_name, scp_rc,
             )
-            if scp_rc != 0 and not dry_run:
-                logger.warning(
-                    "scp %s from %s returned %d; continuing",
-                    glob, plan.vm_name, scp_rc,
-                )
     finally:
         _run_or_print(_delete_vm_cmd(plan), dry_run=dry_run)
 

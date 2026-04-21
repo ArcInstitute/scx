@@ -13,7 +13,7 @@ gate. Example file::
       - benchmark: cloud_push
         format: scx_auto
         dataset: pbmc3k
-    reason: Upstream GCS client added a mandatory HTTP/2 header (issue #1234).
+    reason: "Upstream GCS client added a mandatory HTTP/2 header (issue #1234)."
     expires: 2026-06-01
     ---
 
@@ -24,10 +24,14 @@ gate. Example file::
 present and in the past relative to ``date.today()`` the justification is
 treated as inactive and its triples are NOT suppressed.
 
-This module is intentionally dependency-free — no PyYAML requirement — so
-the regression gate runs even on minimal envs (the harness env always has
-yaml, but self-tests and CI shells should not need to pip-install). The
-parser only handles the narrow YAML shape used by justification files.
+Uses ``yaml.safe_load`` for the front-matter so the full YAML syntax
+(quoted values, multi-line strings, typed dates) is supported. PyYAML is
+already a hard dep of the regression gate via
+``compare_against_baseline.py``, so this does not add a new requirement.
+
+Note: because ``yaml.safe_load`` treats ``#`` as a comment marker,
+reasons or prose containing ``#`` must be quoted (the ``reason:`` line
+in the example above shows the recommended quoting).
 """
 
 from __future__ import annotations
@@ -37,6 +41,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -68,84 +75,42 @@ class Justification:
 _FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n(.*))?\Z", re.DOTALL)
 
 
-def _parse_scalar(value: str) -> str:
-    v = value.strip()
-    if (v.startswith("'") and v.endswith("'")) or (
-        v.startswith('"') and v.endswith('"')
-    ):
-        return v[1:-1]
-    return v
+def _coerce_date(value: Any) -> _dt.date | None:
+    """Normalize the ``expires:`` field into a ``date`` or ``None``.
 
-
-def _parse_date(value: str) -> _dt.date | None:
-    v = _parse_scalar(value)
-    if not v:
-        return None
-    return _dt.date.fromisoformat(v)
-
-
-def _parse_front_matter(block: str) -> dict:
-    """Parse the narrow YAML shape justification files use.
-
-    Supports:
-      - top-level ``key: scalar``
-      - ``triples:`` followed by ``- benchmark: x\\n    format: y\\n    dataset: z``
-
-    Does NOT attempt general YAML. Raises ValueError on any unexpected shape.
+    ``yaml.safe_load`` natively parses ``YYYY-MM-DD`` into ``date``, but
+    quoted strings and whitespace-only values still arrive as ``str`` so
+    we handle both.
     """
-    lines = block.splitlines()
-    out: dict = {}
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        line = raw.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            i += 1
-            continue
-        if line.startswith(" "):
-            raise ValueError(f"unexpected indent at top level: {raw!r}")
-        if ":" not in line:
-            raise ValueError(f"expected 'key:' line, got: {raw!r}")
-        key, _, rest = line.partition(":")
-        key = key.strip()
-        rest = rest.strip()
-        if key == "triples":
-            # Consume indented list entries.
-            triples: list[dict] = []
-            i += 1
-            current: dict | None = None
-            while i < len(lines):
-                entry_raw = lines[i]
-                entry = entry_raw.rstrip()
-                if not entry.strip():
-                    i += 1
-                    continue
-                if not entry.startswith(" ") and not entry.startswith("\t"):
-                    break
-                stripped = entry.lstrip()
-                if stripped.startswith("- "):
-                    if current is not None:
-                        triples.append(current)
-                    current = {}
-                    stripped = stripped[2:]
-                if ":" not in stripped:
-                    raise ValueError(
-                        f"triples entry missing ':' — got: {entry_raw!r}"
-                    )
-                ek, _, ev = stripped.partition(":")
-                if current is None:
-                    raise ValueError(
-                        f"triples entry before any '- ' marker: {entry_raw!r}"
-                    )
-                current[ek.strip()] = _parse_scalar(ev)
-                i += 1
-            if current is not None:
-                triples.append(current)
-            out["triples"] = triples
-            continue
-        out[key] = rest
-        i += 1
-    return out
+    if value is None:
+        return None
+    if isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None
+        return _dt.date.fromisoformat(v)
+    raise ValueError(f"unsupported type for 'expires': {type(value).__name__}")
+
+
+def _parse_front_matter(block: str) -> dict[str, Any]:
+    """Parse the justification front-matter block via ``yaml.safe_load``.
+
+    Raises ``ValueError`` (not ``yaml.YAMLError``) so downstream callers
+    see a uniform error type regardless of parser substitutions.
+    """
+    try:
+        data = yaml.safe_load(block)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"malformed YAML front-matter: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"front-matter must be a YAML mapping, got {type(data).__name__}"
+        )
+    return data
 
 
 def parse_justification(path: Path) -> Justification | None:
@@ -161,23 +126,42 @@ def parse_justification(path: Path) -> Justification | None:
     if m is None:
         return None
     block, prose = m.group(1), (m.group(2) or "")
-    data = _parse_front_matter(block)
-    triples = []
-    for entry in data.get("triples", []) or []:
+    try:
+        data = _parse_front_matter(block)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+
+    triples: list[Triple] = []
+    raw_triples = data.get("triples") or []
+    if not isinstance(raw_triples, list):
+        raise ValueError(f"{path}: 'triples' must be a list")
+    for entry in raw_triples:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{path}: triple entry must be a mapping, got {entry!r}"
+            )
         missing = [k for k in ("benchmark", "format", "dataset") if k not in entry]
         if missing:
             raise ValueError(
                 f"{path}: triple entry missing keys {missing}: {entry!r}"
             )
-        triples.append((entry["benchmark"], entry["format"], entry["dataset"]))
+        triples.append(
+            (str(entry["benchmark"]), str(entry["format"]), str(entry["dataset"]))
+        )
 
-    expires_val = data.get("expires")
-    expires = _parse_date(expires_val) if expires_val else None
+    try:
+        expires = _coerce_date(data.get("expires"))
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+
+    reason = data.get("reason", "")
+    if reason is None:
+        reason = ""
 
     return Justification(
         path=path,
         triples=triples,
-        reason=_parse_scalar(data.get("reason", "")),
+        reason=str(reason).strip(),
         expires=expires,
         prose=prose.strip(),
     )

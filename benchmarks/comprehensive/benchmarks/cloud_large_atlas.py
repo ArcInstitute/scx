@@ -126,6 +126,10 @@ def run(
             local = os.path.join(tmp, "atlas.scx")
             sampler = _RssSampler()
             sampler.start()
+            # Pre-initialize so an exception inside pyscx.pull doesn't
+            # shadow the real error with an UnboundLocalError when the
+            # finally/record_pull_stats branch runs below.
+            stats: dict = {}
             t0 = time.perf_counter()
             try:
                 stats = pyscx.pull(cloud_url, local)

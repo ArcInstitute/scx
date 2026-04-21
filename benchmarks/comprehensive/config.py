@@ -28,18 +28,30 @@ FIGURES_DIR = REPORTS_DIR / "figures"
 sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
 from bench_env import DATA_DIR
 
-# Expand tildes on path-valued env vars loaded from .env. python-dotenv
-# doesn't do this, so `GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json`
-# in .env would otherwise reach downstream consumers (gcsfs, gsutil subprocess,
-# pyscx's Rust cloud backend) as a literal `~` — gcsfs in particular silently
-# falls back to anonymous auth when the cred file path doesn't exist, which
-# surfaces as cryptic "Zstd decompression error: invalid input data" on reads
-# (it's actually getting 401-HTML back, not zstd bytes). Expanding once at
-# import keeps downstream consumers honest.
-for _env_key in ("GOOGLE_APPLICATION_CREDENTIALS",):
-    _raw = os.environ.get(_env_key, "")
-    if _raw and (_raw.startswith("~") or "~" in _raw):
-        os.environ[_env_key] = os.path.expanduser(_raw)
+def _expand_path_env_vars() -> None:
+    """Expand ``~`` in path-valued env vars loaded from ``.env``.
+
+    ``python-dotenv`` does not tilde-expand values, so entries like
+    ``GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/scx-bench.json`` would otherwise
+    reach downstream consumers (``gcsfs``, ``gsutil`` subprocess, pyscx's
+    Rust cloud backend) as a literal ``~``. ``gcsfs`` in particular silently
+    falls back to anonymous auth when the cred file path doesn't exist,
+    surfacing as cryptic ``Zstd decompression error: invalid input data`` on
+    reads (it's actually getting 401-HTML back, not zstd bytes).
+
+    ``require_gcp_credentials`` also performs this expansion, but callers
+    of the cloud stack that bypass it (notably the repro scripts under
+    ``scripts/repro_*_cloud_read.py`` — which by design hit the bug paths
+    without explicit setup) rely on this early normalization. The function
+    is idempotent, so re-invocation from test fixtures is safe.
+    """
+    for env_key in ("GOOGLE_APPLICATION_CREDENTIALS",):
+        raw = os.environ.get(env_key, "")
+        if raw and "~" in raw:
+            os.environ[env_key] = os.path.expanduser(raw)
+
+
+_expand_path_env_vars()
 
 # Conda environments for benchmarking (isolated from dev .venv/)
 # These are created by: bash benchmarks/comprehensive/scripts/install_dependencies.sh

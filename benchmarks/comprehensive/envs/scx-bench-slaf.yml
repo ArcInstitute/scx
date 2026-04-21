@@ -33,6 +33,7 @@ dependencies:
   # Benchmark orchestration
   - psutil=7.2.2
   - maturin>=1.5.0
+  - blake3=0.4  # Required by cloud_fixtures.compute_blake3 (no fallback).
 
   # PyTorch (CPU-only — for SLAFDataLoader ml_loader scenarios)
   - pytorch-cpu>=2.0

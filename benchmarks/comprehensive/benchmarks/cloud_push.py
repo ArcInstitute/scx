@@ -32,12 +32,17 @@ logger = logging.getLogger(__name__)
 _SCX_TRIGGER_KEY = "scx_auto"
 
 
-def _gsutil_rm_tree(url: str) -> None:
-    """Best-effort cleanup of a cloud directory."""
-    if shutil.which("gsutil") is None:
+def _gsutil_rm_trees(urls: list[str]) -> None:
+    """Best-effort cleanup of one or more cloud directories.
+
+    Batched so the per-call ``gsutil`` startup cost amortizes — with
+    ``n_runs=3`` the sequential pattern paid the ~1s Python-launch +
+    auth-handshake 3 times per benchmark invocation.
+    """
+    if not urls or shutil.which("gsutil") is None:
         return
     subprocess.run(
-        ["gsutil", "-m", "rm", "-r", url],
+        ["gsutil", "-m", "rm", "-r", *urls],
         capture_output=True, text=True, timeout=300,
     )
 
@@ -104,8 +109,7 @@ def run(
             mbps = (timing.extra or {}).get("throughput_mbps", 0.0)
             logger.info("  wall=%.3fs  throughput=%.1f MB/s", timing.wall_s, mbps)
     finally:
-        for url in upload_urls:
-            _gsutil_rm_tree(url)
+        _gsutil_rm_trees(upload_urls)
 
     logger.info(
         "cloud_push complete: %s — median %.3fs",

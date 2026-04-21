@@ -149,7 +149,13 @@ def render_html(
     auto-built from ``##``/``###`` headings anchors each section.
     """
     toc = _extract_toc(markdown_body)
-    body_with_anchors = _annotate_body(markdown_body, toc)
+    # Escape HTML-special chars in the markdown BEFORE injecting anchor
+    # <span> tags. If we escape after annotation, the span tags themselves
+    # are rendered as literal text and in-page navigation breaks.
+    # ``_HEADING_RE`` only matches leading ``##``, which is preserved by
+    # ``html.escape`` verbatim, so post-escape substitution still finds
+    # every heading.
+    body_with_anchors = _annotate_body(_html.escape(markdown_body), toc)
     generated_at = generated_at or _dt.datetime.now()
 
     toc_html = ""
@@ -187,7 +193,7 @@ def render_html(
   {prev_link_html}
 </header>
 {toc_html}
-<pre class="report">{_html.escape(body_with_anchors)}</pre>
+<pre class="report">{body_with_anchors}</pre>
 </body>
 </html>
 """

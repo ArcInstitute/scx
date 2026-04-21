@@ -330,16 +330,23 @@ def compute_blake3(path: Path, _chunk_size: int = 1 << 20) -> str:
     content — the same algorithm used by ``MANIFEST.sha256`` semantics,
     adapted to BLAKE3 for speed. Stable across file-order changes since
     the recursion is sorted.
+
+    ``blake3`` is a hard requirement: the sidecar is compared across
+    environments (developer laptop, CI, remote VM) and the Rust writer
+    uses the ``blake3`` crate, so a Python-side fallback to a different
+    algorithm would silently produce digests that never match. If the
+    module is missing, raise a clear ImportError pointing at the conda
+    envs that already pin it.
     """
     try:
         import blake3  # type: ignore[import-not-found]
-        hasher = blake3.blake3()
-    except ImportError:
-        # Fallback to hashlib.blake2b — 64-bit digest truncated so the
-        # string shape matches BLAKE3's 32-byte digest. The harness env
-        # has blake3 via pyscx's deps; the fallback is for clean envs.
-        import hashlib
-        hasher = hashlib.blake2b(digest_size=32)
+    except ImportError as exc:
+        raise ImportError(
+            "the 'blake3' Python package is required for cloud-fixture "
+            "fingerprinting; install via the scx-bench / scx-bench-slaf "
+            "conda envs (both pin `blake3=0.4`) or `pip install blake3`."
+        ) from exc
+    hasher = blake3.blake3()
 
     if path.is_file():
         with open(path, "rb") as f:

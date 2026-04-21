@@ -194,8 +194,18 @@ def run(
             "median_s": round(statistics.median(walls), 6),
             "min_s": round(min(walls), 6),
             "max_s": round(max(walls), 6),
+            # ``statistics.quantiles`` requires >=2 datapoints and uses
+            # linear interpolation — that gives a more faithful p95 than
+            # the legacy ``sorted(walls)[int(0.95*n)-1]`` index trick,
+            # which degenerates to a middle sample at the default n_runs=3
+            # (it returned walls[1] rather than max(walls)). For n<4 the
+            # sample is too small for meaningful quantile interpolation
+            # so we fall back to the observed max.
             "p95_s": round(
-                sorted(walls)[max(0, int(0.95 * len(walls)) - 1)], 6,
+                statistics.quantiles(walls, n=100)[94]
+                if len(walls) >= 4
+                else max(walls),
+                6,
             ),
             "n_runs": len(walls),
         }
