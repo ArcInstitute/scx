@@ -13,7 +13,6 @@ benchmarks/logs/
 benchmarks/comprehensive/results/raw/
 benchmarks/comprehensive/results/raw_archive_*/
 benchmarks/comprehensive/results/reports/figures/
-benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md
 benchmarks/comprehensive/results/reports_archive_*/
 benchmarks/comprehensive/logs/
 benchmarks/comprehensive/results/baseline_*/

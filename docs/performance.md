@@ -347,9 +347,11 @@ SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 ## Phase 5
 
 Phase 5 closes SLAF parity, cloud validation on GCS, fragment-ops
-throughput, and the regression gate. Numbers below come from the
-comprehensive benchmark suite under `benchmarks/comprehensive/`; see
-`docs/cloud.md` for cloud-specific operational notes.
+throughput, and the regression gate. Numbers below come from live
+benchmark runs on a Chimera CPU node (scx_auto + tiledb_soma + zarr
+against `gs://arc-ctc-nextflow/scx-test/`). See `docs/cloud.md` for
+cloud-specific operational notes and `PHASE5-FINISH.md` for the known
+issues currently gating full 4-format cloud parity.
 
 ### SLAF parity
 
@@ -368,39 +370,87 @@ SLAF's Mixture-of-Scanners prefetcher returns 0 batches at 10M scale
 with the default config — flagged as a SLAF-upstream tuning issue, not
 a harness fix.
 
-### Cloud parity on GCS
+### Cloud push / pull throughput (SCX → GCS)
 
-Identical user-facing queries executed across SCX, Zarr v3,
-TileDB-SOMA, and SLAF on the same `gs://arc-ctc-nextflow/scx-test/`
-fixtures. The predicate set — `cell_type == "T cell"`, `n_counts > 1000`,
-random 1% sample — pushes down through each format's native cloud
-mechanism:
+`pyscx.push` / `pyscx.pull` streaming throughput on the default
+`.scxd/` layout. Per-request overhead dominates on tiny files; the
+100K-cell dataset is where bandwidth matters:
 
-- **SCX**: pull-then-local-filter (`scx_pull_and_filter`). A native
-  `open_cloud`-range-read variant is scoped for a future pass.
-- **TileDB-SOMA**: `AxisQuery(value_filter=…)` on the cloud-opened
-  Experiment (`tiledb_cloud_value_filter`).
-- **SLAF**: SQL `WHERE` against the cloud-backed DuckDB engine
-  (`slaf_cloud_sql` / `slaf_cloud_stride_hash`).
-- **Zarr**: silently skipped — the raw-CSR converter doesn't preserve
-  obs. `anndata_zarr_backed` gets consolidated-metadata detection and
-  single-GET catalog opens via `zarr.open_consolidated`.
+| Dataset | Size | Push | Pull |
+|---|---:|---:|---:|
+| pbmc3k | 4 MB | 12.4 MB/s | 0.7 MB/s |
+| tabula_sapiens_100k | 428 MB | **114.7 MB/s** | **181.1 MB/s** |
 
-Full cross-format tables are generated into §8c of
-`BENCHMARK_REPORT.md` ("Cloud Query Parity (GCS)") and surfaced on the
-landing page.
+The 50 MB/s absolute floor in `thresholds.yaml` is keyed on
+tabula_sapiens_100k (pbmc3k is deliberately below the bandwidth
+regime). Comfortable ~2× headroom vs the floor.
 
-### Cost model (GCS pricing)
+### Cloud full-dataset read (cross-format)
 
-The cost model benchmark reports cents per 1 M cells queried across
-metadata / selective-5% / selective-20% / full_read workloads, priced
-against the pinned `GCS_PRICING` table (Class-B $0.004/10k GETs,
-same-region egress $0.00/GB on intra-region GCE ↔ GCS).
+| Dataset | SCX | TileDB-SOMA | SCX speedup |
+|---|---:|---:|---:|
+| pbmc3k | **0.165s** | 0.913s | 5.5× |
+| tabula_sapiens_100k | **2.815s** | — | — |
 
-On SCX's exploded `.scxd/` layout the full-read term dominates cost on
-large datasets; metadata-only opens are effectively free
-(single-digit GET count, zero egress in-region). Precise numbers live
-in §8f "Cost Model (GCS pricing)" of the benchmark report.
+SCX's `pyscx.pull` + local read path is 5.5× faster than
+`tiledbsoma.Experiment.open(gs://…).to_anndata()` at the pbmc3k size.
+Zarr `cloud_read` is blocked on a zarr-python-3 + gcsfs + numcodecs-zstd
+decompression bug (see `PHASE5-FINISH.md` Known Issues).
+
+### Cloud metadata open — single-GET catalog parse
+
+| Dataset | SCX (`open_cloud`) | TileDB-SOMA | SCX speedup |
+|---|---:|---:|---:|
+| pbmc3k | **0.097s** | 0.240s | 2.5× |
+| tabula_sapiens_100k | **0.114s** | — | — |
+
+SCX metadata latency is essentially dataset-size-independent
+(0.097 → 0.114s going from 2.7K to 100K cells), as expected for a
+single-GET catalog fetch against the exploded `.scxd/` front catalog.
+
+### Cloud filtered query (predicate pushdown)
+
+| Dataset | SCX (`scx_pull_and_filter`) | TileDB (`tiledb_cloud_value_filter`) | SCX speedup |
+|---|---:|---:|---:|
+| pbmc3k | **0.223s** | 0.853s | 3.8× |
+| tabula_sapiens_100k | **2.951s** | — | — |
+
+SCX still wins on predicate-selective reads at pbmc3k scale via the
+pull-then-local-filter path. A native `pyscx.open_cloud` +
+range-read-pushdown variant is scoped as a Phase 5 follow-up (see
+Known Issues in `PHASE5-FINISH.md`). Zarr variants silently skip — the
+raw-CSR converter doesn't preserve obs.
+
+### CloudReader vs full Pull (metadata workloads)
+
+| Dataset | `open_cloud` | `pull_full` wall | `pull_full` bytes | Bytes saved |
+|---|---:|---:|---:|---:|
+| pbmc3k | 0.105s | 0.184s | 119 KB | 119 KB |
+| tabula_sapiens_100k | **0.115s** | **1.85s** | **408 MB** | **408 MB** |
+
+For metadata-only workloads (`scx info` style), `open_cloud` is ~16×
+faster than a full pull on tabula_sapiens_100k (0.115s vs 1.85s) and
+avoids transferring 408 MB. This is the core "cloud-aware access" win
+that justifies the exploded `.scxd/` layout.
+
+### Cost model — USD per 1M cells queried (GCS same-region pricing)
+
+Priced against the pinned `GCS_PRICING` table
+(Class-B $0.004/10k GETs, same-region egress $0.00/GB on intra-region
+GCE ↔ GCS). Cost is dominated by full-read egress at large scale;
+metadata opens are effectively free in the committed regime:
+
+| Dataset | Metadata | Full read |
+|---|---:|---:|
+| pbmc3k | $0.000000 | $0.001185 |
+| tabula_sapiens_100k | $0.000000 | $0.000040 |
+
+Per-1M-cells cost *decreases* with dataset size because the per-GET
+overhead amortizes over more cells. Selective-read scenarios are
+omitted pending a predicate harness fix — neither test dataset ships
+with an `n_counts` obs column (the fallback threshold predicate), and
+SCX's `filter_obs` parser doesn't support arithmetic-modulo predicates
+(see `PHASE5-FINISH.md` Known Issues).
 
 ### GCP compute-node matrix
 
@@ -408,9 +458,9 @@ Cloud-read throughput characterized across `n2-standard-8`,
 `c3-standard-8`, and `a3-highgpu-1g`. Per-VM egress bandwidth class
 (16 / 23 / 200 Gbps) is the dominant predictor for full-read wall
 clock on atlases that fit the streaming-pull envelope. The launcher
-(`submit_gcp_matrix.py`) pins every VM to the bucket region so cross-
-region egress is impossible by construction. Results in §8d of the
-benchmark report; raw numbers require `--yes-spend` to generate.
+(`submit_gcp_matrix.py`) pins every VM to the bucket region so
+cross-region egress is impossible by construction. Results in §8d of
+the benchmark report; raw numbers require `--yes-spend` to generate.
 
 ### Fragment operations throughput
 
@@ -427,13 +477,19 @@ pbmc3k (see §8b):
 ### Regression gating
 
 All benchmark results now carry a `schema_version=1` stamp + full
-provenance (git SHA, thread pinning, run_id) in their `system.provenance`
-block. The on-demand gate (`scripts/gate_candidate.sh` + `scripts/
-compare_against_baseline.py --gate`) evaluates relative tolerances
-(3% wall / 10% RSS / 1% size), absolute floors from `thresholds.yaml`
-(e.g. cloud throughput ≥ 50 MB/s), and disappeared-benchmark
+provenance (git SHA, thread pinning, run_id) in their
+`system.provenance` block. The on-demand gate
+(`scripts/gate_candidate.sh` + `scripts/compare_against_baseline.py
+--gate`) evaluates relative tolerances (3% wall / 10% RSS / 1% size),
+absolute floors from `thresholds.yaml` (e.g. cloud throughput ≥ 50
+MB/s, keyed on tabula_sapiens_100k), and disappeared-benchmark
 detection. Justification markdown files under
 `results/justifications/` suppress accepted regressions with an
 optional expiry date. The dashboard (`reporting/dashboard.py`) emits a
 browsable HTML snapshot alongside the markdown report, threaded with
 "← previous snapshot" navigation via `dashboard_history.json`.
+
+The canonical baseline sits at
+`benchmarks/comprehensive/results/baselines/v0.5.0-phase5/` (371 raw
+JSONs archived, manifest + environment committed). `LATEST` symlink
+makes on-demand gate runs (`gate_candidate.sh`) work with no flags.
