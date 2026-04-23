@@ -18,7 +18,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
 - **[docs/cloud.md](docs/cloud.md)** — Using SCX in cloud environments: auth, layouts, tuning, provider-specific notes.
-- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts.
+- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts. See [Regression Gating](benchmarks/README.md#regression-gating) for the canonical format-level gate (`gate_candidate.sh` against `comprehensive/results/baselines/LATEST`) and [GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow) for PCA/kNN/UMAP/Leiden/preprocessing/HVG pre-vs-post diffing (the comprehensive gate doesn't cover those surfaces yet).
 - **[tasks/](tasks/)** — Historical phase specs and code reviews.
 
 ## Build and Test
@@ -129,12 +129,17 @@ Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standar
 
 All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Requires `scx-gpu` conda env with RAPIDS. See [docs/gpu-setup.md](docs/gpu-setup.md).
 
-- **GPU PCA**: cuSPARSE SpMM + cuSOLVER QR + cuRAND.
+- **GPU PCA**: Two dispatch paths auto-routed by `n_vars`:
+  - *Covariance* (`n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000`): cuSPARSE + cuBLAS `sgemm`/`sger` builds the Gram matrix on-device; cuSOLVER `syevd` eigendecomposes; embeddings via a second streaming `matmat`. No host round-trip.
+  - *Randomized SVD* (`n_vars > 8000`): cuSPARSE SpMM + cuSOLVER QR + cuRAND + cuBLAS. Fully GPU-resident final embedding (cuBLAS `sgemm` + broadcast-scale).
+  - Override via `method="auto"|"covariance"|"randomized"` on `pyscx.accel.pca`.
+  - Randomized path accepts `qr_method="householder"` (default, stable) or `"cholesky"` (CholeskyQR2 — `potrf` + `strsm`, ~3× faster on well-conditioned inputs; surfaces `RuntimeError` on non-SPD Gram so callers can retry with Householder).
 - **GPU kNN**: cuVS CAGRA (9.4x standalone on 1M cells).
 - **GPU UMAP**: Native CUDA SGD (7.7x on 1M cells).
-- **GPU Leiden**: cuGraph (16x on 1M cells).
-- **GPU preprocessing**: Fused normalize_total + log1p.
-- **Fallback**: Graceful CPU fallback when GPU unavailable.
+- **GPU Leiden**: cuGraph (16x on 1M cells). New `theta` kwarg (cuGraph-only) on `pyscx.accel.leiden`; Rust-native path still runs first regardless of `device`.
+- **GPU preprocessing**: `pyscx.accel.normalize_total`, `log1p`, `highly_variable_genes` accept `device="auto"|"cpu"|"gpu"`. **Eager on GPU** — materializes `adata.X` to scipy CSR, breaking the lazy chain (emits `UserWarning`). The `normalize_total → log1p` chain fuses on GPU via an `adata.uns` marker (single fused pass over the original backed source). HVG GPU dispatch is narrowed to single-batch seurat_v3; batched/seurat flavors fall back to CPU.
+- **Async shard I/O**: `DoubleBufferedShardLoader` overlaps shard decode (worker thread) with GPU kernel launches (compute stream). Feeds the randomized / covariance PCA paths, preprocessing, and HVG.
+- **Fallback**: Graceful CPU fallback when GPU unavailable (`device="auto"`).
 
 ### Lazy Preprocessing
 
@@ -239,8 +244,9 @@ See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
 ## Known Limitations
 
-- **GPU pipeline speedup**: 3.8x median achieved on 1M cells (10x target not met). Best individual: kNN 9.4x, UMAP 7.7x, Leiden 16x.
+- **GPU pipeline speedup**: 3.8x median achieved on 1M cells (10x target not met). Best individual: kNN 9.4x, UMAP 7.7x, Leiden 16x. Pending re-measurement after the Phase 1–7 GPU work in `GPU-ACC-SPEED-UP.md` — see that spec's Phase 8 for the cluster run + pre/post diff procedure, and [benchmarks/README.md § GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow) for the concrete commands.
 - **GPU Leiden correctness**: ARI 0.92 vs Python leidenalg (Go/No-Go: 3/4 gates pass).
+- **Benchmark baseline scope**: the canonical gated baseline at `benchmarks/comprehensive/results/baselines/LATEST` covers format-level benchmarks (compression / read / write / parallel scaling / memory / ml_loader / cloud). Phase 9 (see `GPU-ACC-SPEED-UP.md`) extends this to the `pyscx.accel.*` GPU accelerator surface via new `accel_*` modules in `benchmarks/comprehensive/benchmarks/`. `accel_pca.py` has landed as the reference; `accel_{knn,umap,leiden,preprocess,hvg}.py` follow the same pattern and are tracked in that spec. Until all accelerator modules are migrated + a new `v0.6.0-gpu` baseline is promoted, GPU-accel PRs can additionally use the stopgap standalone workflow at `benchmarks/scripts/gpu_regression_{driver,diff}.py`.
 - **CSC storage**: Gene-major (CscShard) not yet implemented — CSR only.
 - **Multimodal**: CITE-seq, spatial transcriptomics not yet supported.
 - **GDS**: GPUDirect Storage requires local NVMe + nvidia-fs drivers + ext4/XFS; always falls back to CPU path.

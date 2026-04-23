@@ -286,17 +286,33 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 ### GPU Analysis Pipeline
 
-GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB with 1M cells:
+GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuBLAS, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB with 1M cells:
 
 | Operation | CPU (s) | GPU (s) | Speedup | Backend |
 |-----------|---------|---------|---------|---------|
 | kNN (k=15, 50 PCs) | 288 | 31 | **9.4x** | cuVS CAGRA |
 | UMAP (2D) | 560 | 74 | **7.6x** | native CUDA SGD |
 | Leiden | 45 | 3 | **16.0x** | cuGraph |
-| PCA (50 PCs, 2K HVGs) | 22 | 24 | 0.9x | cuSPARSE SpMM |
+| PCA — covariance (50 PCs, ≤8K HVGs) | 22 | _pending bench_ | _pending_ | cuSOLVER `syevd` on sparse-built Gram |
+| PCA — randomized + Householder QR | 22 | 24 | 0.9x | cuSPARSE SpMM + cuSOLVER `geqrf/orgqr` |
+| PCA — randomized + CholeskyQR2 (opt-in) | 22 | _pending bench_ | _pending_ | cuSPARSE SpMM + cuSOLVER `potrf` + cuBLAS `strsm` |
 | **End-to-end pipeline** | **1077** | **286** | **3.8x** | all above |
 
-GPU PCA streams shards from disk -> GPU SpMM shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM.
+**Dispatch logic:** `pyscx.accel.pca(device="gpu")` now auto-routes by `n_vars` — the covariance path handles HVG-shaped inputs (`n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000`) and the randomized path handles the long-tail. Users can force one or the other with `method="covariance"` / `"randomized"`. The randomized path accepts `qr_method="householder"` (default, always-stable) or `"cholesky"` (CholeskyQR2, ~3× faster on well-conditioned inputs; surfaces a `RuntimeError` on non-SPD Gram so callers can retry with Householder).
+
+**Preprocessing on GPU:** `pyscx.accel.normalize_total(device="gpu")`, `log1p(device="gpu")`, and `highly_variable_genes(device="gpu")` stream shards through GPU kernels (fused normalize+log1p, thread-per-nonzero atomicAdd for HVG mean/var/clipped-square-sum). **Eager**: the GPU path materializes `adata.X` to scipy CSR, breaking the lazy chain (see [docs/scanpy.md](scanpy.md#lazy-vs-eager-preprocessing)).
+
+GPU PCA (both variants) streams shards from disk → GPU kernels shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM.
+
+#### Changes vs previous version
+
+- New covariance-PCA dispatch path on GPU (threshold `n_vars ≤ 8000`), targeting the 0.9× randomized-PCA regression at 2K HVGs. Routing controlled by `method="auto"` on `pyscx.accel.pca`.
+- Kept randomized PCA's critical path fully GPU-resident — the prior `Q → host → f64` SVD tail and per-iteration `d_m` download round-trip are gone (cuBLAS `sgemv` + `sgemm`).
+- Opt-in CholeskyQR2 (`qr_method="cholesky"`) for the randomized path. Default behaviour (`qr_method="householder"`) is bit-identical to pre-Phase-4.
+- Standalone GPU preprocessing ops (`normalize_total`, `log1p`, `highly_variable_genes`) gain a `device` kwarg. The `normalize_total → log1p` chain fuses on GPU via an adata.uns marker (single pass over the original backed source).
+- cuGraph Leiden exposes the `theta` knob via `pyscx.accel.leiden(theta=...)`.
+
+Specific GPU speedup numbers will be updated after the next cluster benchmark run — see `benchmarks/scripts/benchmark_gpu_pipeline.py --pca-variants --attribute-preprocessing`.
 
 ### Go/No-Go Status
 

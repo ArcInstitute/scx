@@ -21,14 +21,23 @@ with a `device="gpu"` parameter.
 
 | SCX operation | CUDA Toolkit (`nvcc`) | cuVS | cuGraph |
 |---------------|----------------------|------|---------|
-| GPU PCA (cuSPARSE SpMM + cuSOLVER) | required | — | — |
+| GPU PCA — randomized (cuSPARSE SpMM + cuSOLVER QR + cuBLAS) | required | — | — |
+| GPU PCA — covariance (cuSPARSE + cuSOLVER `syevd` + cuBLAS) | required | — | — |
+| GPU CholeskyQR2 (cuSOLVER `potrf` + cuBLAS `strsm`) | required | — | — |
 | GPU UMAP (native CUDA SGD kernel) | required | — | — |
-| GPU fused preprocessing (normalize+log1p) | required | — | — |
+| GPU preprocessing (`normalize_total` / `log1p` / `highly_variable_genes` with `device="gpu"`) | required | — | — |
 | GPU kNN (CAGRA) | required | required | — |
 | GPU Leiden clustering | — | — | required |
 
 Operations without their required dependencies fall back to CPU automatically
 with a warning — no crashes.
+
+**Note on cuBLAS:** Phase 2+ (covariance PCA, GPU-resident final-embedding
+multiply, CholeskyQR2, preprocessing Gram correction) depend on **cuBLAS**.
+`libcublas.so` ships alongside `libcusparse.so` / `libcusolver.so` inside
+every CUDA Toolkit 12.x install, so no new runtime library path or env-var
+setup is required — any working `scx-gpu` env from prior releases continues
+to work out of the box.
 
 ## Option A: conda (recommended)
 

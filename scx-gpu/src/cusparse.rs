@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! let handle = CusparseHandle::new()?;
-//! let a_desc = gpu_csr.to_cusparse_csr(dev.stream())?;
+//! let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream())?;
 //! // B is column-major dense (k × n), C is column-major dense (m × n)
 //! spmm_csr(&handle, dev.stream(), &a_desc, &b_device, &mut c_device,
 //!          m, k, n, 1.0, 0.0)?;
@@ -23,6 +23,7 @@ use cudarc::cusparse::sys::{
 };
 use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
+use crate::cast_gpu::cast_i64_to_i32_gpu;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::shard_decode::GpuCsr;
@@ -86,6 +87,12 @@ unsafe impl Sync for CusparseHandle {}
 /// is copied. The `GpuCsr` must outlive this descriptor.
 pub struct CusparseSpMatDescr {
     raw: cusparseSpMatDescr_t,
+    /// Downcast i32 indptr buffer owned by this descriptor — cuSPARSE
+    /// captured raw pointers inside `raw`, so the buffer must live as long
+    /// as the descriptor. Kept private; only [`to_cusparse_csr`] creates it.
+    /// See `to_cusparse_csr` docs for why this downcast is needed.
+    #[allow(dead_code)]
+    _i32_indptr: Option<CudaSlice<i32>>,
 }
 
 impl CusparseSpMatDescr {
@@ -358,50 +365,74 @@ pub struct GpuCsrPointers {
 }
 
 impl GpuCsr {
-    /// Create a cuSPARSE CSR sparse matrix descriptor (zero-copy).
+    /// Create a cuSPARSE CSR sparse matrix descriptor.
     ///
-    /// The descriptor references the existing GPU memory in this `GpuCsr`.
-    /// This `GpuCsr` **must outlive** the returned descriptor — the descriptor
-    /// holds raw pointers into `self`'s device buffers.
+    /// The descriptor references the **column indices**, **values**, and a
+    /// **downcast i32 copy of indptr** that is owned by the returned
+    /// descriptor. The original i64 indptr is NOT referenced. This `GpuCsr`
+    /// **must outlive** the returned descriptor for `indices` / `data`; the
+    /// downcast indptr lives as long as the descriptor itself.
     ///
     /// Type mapping:
-    /// - indptr: `CUSPARSE_INDEX_64I` (i64)
+    /// - indptr: `CUSPARSE_INDEX_32I` (downcast from i64; per-shard nnz is
+    ///   always < 2^31 for single-cell data)
     /// - indices: `CUSPARSE_INDEX_32I` (i32)
     /// - data: `CUDA_R_32F` (f32)
     /// - index base: zero-based
-    pub fn to_cusparse_csr(&self, stream: &CudaStream) -> Result<CusparseSpMatDescr, GpuError> {
+    ///
+    /// # Why the downcast?
+    ///
+    /// Some cuSPARSE releases (observed on CUDA 12.1.2.141 — driver 535 /
+    /// cuda-version 12.2 conda env) return
+    /// `CUSPARSE_STATUS_NOT_SUPPORTED` when `csrRowOffsetsType` and
+    /// `csrColIndType` disagree (mixed 64I/32I). Matching them on 32I is
+    /// safe because per-shard nnz fits in i32 for all realistic workloads
+    /// (census_1m ≈ 10⁸ nnz/shard at most, well below 2^31 ≈ 2.1 × 10⁹).
+    pub fn to_cusparse_csr(
+        &self,
+        dev: &GpuDevice,
+        stream: &CudaStream,
+    ) -> Result<CusparseSpMatDescr, GpuError> {
         let (n_rows, n_cols) = self.shape;
         let nnz = self.indices.len();
 
-        // Get raw device pointers. The SyncOnDrop guards ensure proper
-        // synchronization — they are dropped at the end of this scope,
-        // after cusparseCreateCsr has captured the pointers.
-        let (indptr_ptr, _guard_indptr) = self.indptr.device_ptr(stream);
-        let (indices_ptr, _guard_indices) = self.indices.device_ptr(stream);
-        let (data_ptr, _guard_data) = self.data.device_ptr(stream);
+        // Downcast indptr i64 → i32 on-device (cheap — O(n_rows+1), one pass).
+        // Stored inside the descriptor so cuSPARSE's captured pointer remains
+        // valid for the descriptor's lifetime.
+        let i32_indptr = cast_i64_to_i32_gpu(dev, &self.indptr)?;
 
-        let mut desc = MaybeUninit::uninit();
-        unsafe {
-            csp::cusparseCreateCsr(
-                desc.as_mut_ptr(),
-                n_rows as i64,
-                n_cols as i64,
-                nnz as i64,
-                indptr_ptr as *mut core::ffi::c_void,
-                indices_ptr as *mut core::ffi::c_void,
-                data_ptr as *mut core::ffi::c_void,
-                cusparseIndexType_t::CUSPARSE_INDEX_64I,
-                cusparseIndexType_t::CUSPARSE_INDEX_32I,
-                cusparseIndexBase_t::CUSPARSE_INDEX_BASE_ZERO,
-                cudaDataType::CUDA_R_32F,
-            )
-            .result()
-            .map_err(|e| GpuError::CuSparseError(format!("cusparseCreateCsr: {e:?}")))?;
+        // Capture the raw device pointers inside an inner scope so the
+        // SyncOnDrop guards (which borrow from `i32_indptr` / `self.*`)
+        // are released before we move `i32_indptr` into the descriptor.
+        let desc_raw = {
+            let (indptr_ptr, _guard_indptr) = i32_indptr.device_ptr(stream);
+            let (indices_ptr, _guard_indices) = self.indices.device_ptr(stream);
+            let (data_ptr, _guard_data) = self.data.device_ptr(stream);
+            let mut desc = MaybeUninit::uninit();
+            unsafe {
+                csp::cusparseCreateCsr(
+                    desc.as_mut_ptr(),
+                    n_rows as i64,
+                    n_cols as i64,
+                    nnz as i64,
+                    indptr_ptr as *mut core::ffi::c_void,
+                    indices_ptr as *mut core::ffi::c_void,
+                    data_ptr as *mut core::ffi::c_void,
+                    cusparseIndexType_t::CUSPARSE_INDEX_32I,
+                    cusparseIndexType_t::CUSPARSE_INDEX_32I,
+                    cusparseIndexBase_t::CUSPARSE_INDEX_BASE_ZERO,
+                    cudaDataType::CUDA_R_32F,
+                )
+                .result()
+                .map_err(|e| GpuError::CuSparseError(format!("cusparseCreateCsr: {e:?}")))?;
+                desc.assume_init()
+            }
+        };
 
-            Ok(CusparseSpMatDescr {
-                raw: desc.assume_init(),
-            })
-        }
+        Ok(CusparseSpMatDescr {
+            raw: desc_raw,
+            _i32_indptr: Some(i32_indptr),
+        })
     }
 
     /// Expose raw device pointers for cupy `__cuda_array_interface__` interop.
@@ -471,7 +502,7 @@ mod tests {
         let _handle = CusparseHandle::new().unwrap();
 
         // Create CSR descriptor — this is zero-copy, just wraps the pointers
-        let desc = gpu_csr.to_cusparse_csr(dev.stream()).unwrap();
+        let desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
         // The descriptor should be non-null
         assert!(
@@ -621,7 +652,7 @@ mod tests {
 
         let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
         let handle = CusparseHandle::new().unwrap();
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream()).unwrap();
+        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
         let d_b = dev.htod_copy(&b_host).unwrap();
         let mut d_c = dev.alloc_zeros::<f32>(m * n).unwrap();
@@ -673,7 +704,7 @@ mod tests {
 
         let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
         let handle = CusparseHandle::new().unwrap();
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream()).unwrap();
+        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
         let d_b = dev.htod_copy(&b_host).unwrap();
         let mut d_c = dev.alloc_zeros::<f32>(k * n).unwrap();
@@ -726,7 +757,7 @@ mod tests {
 
         let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
         let handle = CusparseHandle::new().unwrap();
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream()).unwrap();
+        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
         let d_b = dev.htod_copy(&b_host).unwrap();
         let mut d_c = dev.htod_copy(&c_init).unwrap();

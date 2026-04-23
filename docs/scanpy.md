@@ -585,6 +585,28 @@ Instead of loading the entire expression matrix into RAM, `pyscx.accel.normalize
 and `pyscx.accel.log1p()` create a **lazy transform wrapper** that applies
 transformations on-read — data stays on disk.
 
+### Lazy vs eager preprocessing
+
+| `device=` | Behaviour |
+|-----------|-----------|
+| `"cpu"` / `"auto"` (no GPU) | **Lazy**: wraps `adata.X` in an `ScxLazyTransformedDataset` (see below). No materialization. |
+| `"gpu"` / `"auto"` (GPU available) | **Eager**: streams shards through GPU kernels (`gpu_preprocess_to_csr`) and replaces `adata.X` with a materialized scipy CSR. A `UserWarning` is emitted when the prior X was already lazy so the broken chain is visible. |
+
+**Fusion detection** — `normalize_total(device="gpu")` stashes a marker on
+`adata.uns["__scx_gpu_pending_normalize__"]`. A subsequent
+`log1p(device="gpu")` on the same AnnData consumes the marker and re-runs a
+**single fused normalize+log1p pass over the original backed source** rather
+than reading the already-materialized scipy CSR. Any intervening op (PCA,
+kNN, …) silently forfeits the fusion, producing correct — but 1× redundant —
+results.
+
+**HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
+through GPU atomicAdd kernels for `streaming_mean_var` and
+`streaming_clip_square_sum`. GPU dispatch is active only for single-batch
+seurat_v3 flavors today; `batch_key` set or `flavor="seurat"` falls back to
+CPU with a `UserWarning`.
+
+
 ### Quick example
 
 ```python
@@ -784,13 +806,19 @@ All accelerators support a `device` parameter for GPU acceleration:
 
 Two methods, auto-routed by the number of variables:
 
-- **Covariance PCA** (n_vars ≤ 5,000): Builds the covariance matrix `X^T @ X`
-  directly from CSR nonzeros via sparse outer product accumulation (exploiting
-  symmetry), then eigendecomposes. Exact results, faster than randomized SVD
-  for HVG-selected data. Parallel accumulation via rayon thread-local matrices.
-- **Randomized SVD** (n_vars > 5,000): Streaming shard-by-shard SpMM with
-  zero-copy `MatRef::from_row_major_slice` views. Skips intermediate QR on
-  transpose results for n_power_iterations ≤ 2 (matching sklearn's default).
+- **Covariance PCA** (CPU: n_vars ≤ 5,000; GPU: n_vars ≤ 8,000): Builds the
+  covariance matrix `X^T @ X` directly from CSR nonzeros via sparse outer
+  product accumulation (exploiting symmetry), then eigendecomposes. Exact
+  results, faster than randomized SVD for HVG-selected data. Parallel
+  accumulation via rayon thread-local matrices on CPU; GPU path streams shards
+  through `CenteredSparseOperator` (implicit mean-centering) into a dense
+  on-device Gram matrix, then `cusolverDnSsyevd`.
+- **Randomized SVD** (CPU: n_vars > 5,000; GPU: n_vars > 8,000): Streaming
+  shard-by-shard SpMM with zero-copy `MatRef::from_row_major_slice` views.
+  Skips intermediate QR on transpose results for n_power_iterations ≤ 2
+  (matching sklearn's default). GPU path uses cuSPARSE SpMM + cuSOLVER QR and
+  stays fully GPU-resident through the final embedding (cuBLAS `sgemm` +
+  broadcast-scale) — no host round-trip.
 
 Both methods work in backed mode without materializing the full matrix.
 
@@ -815,13 +843,16 @@ pyscx.accel.pca(adata, n_comps=50)
 | `n_oversamples` | 10 | Extra dimensions for accuracy (randomized SVD only) |
 | `n_power_iterations` | 2 | Power iterations for spectral accuracy (randomized SVD only) |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
+| `method` | `"auto"` | `"auto"`, `"covariance"`, or `"randomized"`. `"auto"` routes by `n_vars` (covariance when small, randomized otherwise). Explicit override is useful when benchmarking or when the auto threshold doesn't fit your data. |
+| `qr_method` | `"householder"` | Randomized-path QR algorithm: `"householder"` (cuSOLVER `geqrf`/`orgqr` — always stable) or `"cholesky"` (CholeskyQR2 via `potrf` + `strsm` — ~3× faster on well-conditioned inputs). **Ignored** by the covariance path. Non-SPD failures surface as `RuntimeError` with a clear "retry with qr_method='householder'" hint. |
 
 **Key advantage:** On HVG-selected data (2,000 genes), covariance PCA
 completes in 4.2s on 1M cells — 5× faster than the previous randomized
 SVD and 1.9× faster than scanpy. The method is auto-selected based on
 `n_vars`; no user configuration needed. On GPU, the pipeline uses
-cuSPARSE SpMM + cuSOLVER QR. Peak memory is one shard plus working matrices
-(plus ~30 MB covariance matrix for 2K genes).
+cuSPARSE SpMM + cuSOLVER (QR for randomized, `syevd` for covariance) with
+cuBLAS for the Gram accumulation and post-QR multiplies. Peak memory is one
+shard plus working matrices (plus ~30 MB covariance matrix for 2K genes).
 
 ### kNN graph (`pyscx.accel.neighbors`)
 

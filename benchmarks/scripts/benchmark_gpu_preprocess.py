@@ -246,11 +246,119 @@ def run_timing_benchmark(datasets: list[str] | None = None,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Mode 3: Device-dispatch timing (Phase 7.3)
+#
+# Times `pyscx.accel.normalize_total`, `log1p`, fused `normalize+log1p`, and
+# `highly_variable_genes` with `device="cpu"` vs `device="gpu"` on backed SCX
+# data. Each run reopens the SCX file so the GPU eager-materialization path
+# starts from a fresh backed source.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _reopen_backed(scx_path: Path):
+    """Return a fresh `ScxBackedSparseDataset`-wrapped AnnData."""
+    import pyscx
+    return pyscx.open(str(scx_path)).to_anndata()
+
+
+def _time_accel_op(op: str, scx_path: Path, device: str, target_sum: float = 1e4) -> float:
+    """Time one pyscx.accel op on a fresh backed AnnData, return wall-seconds.
+
+    `op` ∈ {"normalize_total", "log1p", "fused", "highly_variable_genes"}.
+    `"fused"` calls `normalize_total` then `log1p` sequentially (which, on GPU,
+    triggers the fusion-marker path — see Phase 5.4).
+    """
+    import pyscx
+
+    adata = _reopen_backed(scx_path)
+    t0 = time.perf_counter()
+    if op == "normalize_total":
+        pyscx.accel.normalize_total(adata, target_sum=target_sum, device=device)
+    elif op == "log1p":
+        pyscx.accel.log1p(adata, device=device)
+    elif op == "fused":
+        pyscx.accel.normalize_total(adata, target_sum=target_sum, device=device)
+        pyscx.accel.log1p(adata, device=device)
+    elif op == "highly_variable_genes":
+        # Requires log-normalized input — inline the prereq so this op isolates
+        # the HVG kernel cost.
+        pyscx.accel.normalize_total(adata, target_sum=target_sum, device=device)
+        pyscx.accel.log1p(adata, device=device)
+        t0 = time.perf_counter()  # reset: measure only the HVG call
+        n_top = min(2000, adata.n_vars)
+        pyscx.accel.highly_variable_genes(
+            adata, n_top_genes=n_top, flavor="seurat_v3", device=device,
+        )
+    else:
+        raise ValueError(f"unknown op: {op}")
+    elapsed = time.perf_counter() - t0
+    del adata
+    gc.collect()
+    return elapsed
+
+
+def run_device_benchmark(datasets: list[str] | None = None,
+                        n_runs: int = 3) -> list[dict]:
+    """Benchmark CPU vs GPU device-dispatch for each preprocessing op."""
+    if datasets is None:
+        datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+
+    print(f"\n{'='*60}")
+    print(f"Device Dispatch Benchmark (CPU vs GPU, median of {n_runs} runs)")
+    print(f"{'='*60}")
+
+    results = []
+    for ds_name in datasets:
+        info = DATASETS.get(ds_name)
+        if info is None:
+            continue
+        scx_path = ensure_scx_file(ds_name)
+        if scx_path is None:
+            print(f"  SKIP: {ds_name} not found")
+            continue
+
+        print(f"\n  --- {ds_name} ({info['cells']:,} cells) ---")
+        per_op: dict = {}
+        for op in ["normalize_total", "log1p", "fused", "highly_variable_genes"]:
+            per_op[op] = {}
+            for device in ["cpu", "gpu"]:
+                times = []
+                for _ in range(n_runs):
+                    try:
+                        times.append(_time_accel_op(op, scx_path, device))
+                    except Exception as e:
+                        per_op[op][f"{device}_error"] = str(e)
+                        break
+                if times:
+                    med = sorted(times)[len(times) // 2]
+                    per_op[op][device] = {
+                        "times_s": [round(t, 3) for t in times],
+                        "median_s": round(med, 3),
+                    }
+            cpu = per_op[op].get("cpu", {}).get("median_s")
+            gpu = per_op[op].get("gpu", {}).get("median_s")
+            if cpu and gpu and gpu > 0:
+                per_op[op]["speedup"] = round(cpu / gpu, 1)
+                print(f"    {op}: CPU={cpu:.3f}s  GPU={gpu:.3f}s  speedup={cpu/gpu:.1f}x")
+            elif cpu:
+                print(f"    {op}: CPU={cpu:.3f}s  GPU=n/a")
+
+        results.append({
+            "benchmark": "gpu_preprocess_device_dispatch",
+            "dataset": ds_name,
+            "n_obs": info["cells"],
+            "ops": per_op,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Report generation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_report(validation_results: list[dict] | None,
-                    timing_results: list[dict] | None) -> str:
+                    timing_results: list[dict] | None,
+                    device_results: list[dict] | None = None) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# GPU Preprocessing Benchmark Report",
@@ -297,6 +405,25 @@ def generate_report(validation_results: list[dict] | None,
             )
         lines.append("")
 
+    if device_results:
+        lines += [
+            "## 3. CPU vs GPU Device Dispatch",
+            "",
+            "| Dataset | Op | CPU (s) | GPU (s) | Speedup |",
+            "|---------|----|---------|---------|---------|",
+        ]
+        for r in device_results:
+            ds = r["dataset"]
+            for op, rec in r["ops"].items():
+                cpu = rec.get("cpu", {}).get("median_s", "—")
+                gpu = rec.get("gpu", {}).get("median_s", "—")
+                sp = rec.get("speedup", "—")
+                cpu_str = f"{cpu:.3f}" if isinstance(cpu, (int, float)) else str(cpu)
+                gpu_str = f"{gpu:.3f}" if isinstance(gpu, (int, float)) else str(gpu)
+                sp_str = f"{sp:.1f}x" if isinstance(sp, (int, float)) else str(sp)
+                lines.append(f"| {ds} | {op} | {cpu_str} | {gpu_str} | {sp_str} |")
+        lines.append("")
+
     lines += ["## Summary", ""]
     all_pass = True
     if validation_results:
@@ -319,7 +446,10 @@ def main():
     )
     parser.add_argument(
         "--mode", default="all",
-        choices=["validate", "bench", "all"],
+        choices=["validate", "bench", "device", "all"],
+        help="validate: output equivalence; bench: scanpy vs SCX CPU timing; "
+             "device: CPU vs GPU device-dispatch per op (Phase 7.3); "
+             "all: run validate + bench + device.",
     )
     parser.add_argument(
         "--dataset", default=None, choices=list(DATASETS.keys()),
@@ -351,9 +481,22 @@ def main():
         json_path.write_text(json.dumps(timing_results, indent=2))
         print(f"\n  JSON saved: {json_path}")
 
+    if args.mode in ("device", "all"):
+        device_datasets = (
+            [args.dataset] if args.dataset
+            else ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
+        )
+        device_results = run_device_benchmark(device_datasets, args.n_runs)
+        all_results["device"] = device_results
+
+        json_path = RESULTS_DIR / "gpu_preprocess_device.json"
+        json_path.write_text(json.dumps(device_results, indent=2))
+        print(f"\n  JSON saved: {json_path}")
+
     report = generate_report(
         all_results.get("validation"),
         all_results.get("timing"),
+        all_results.get("device"),
     )
     md_path = RESULTS_DIR / "gpu_preprocess_benchmark.md"
     md_path.write_text(report)

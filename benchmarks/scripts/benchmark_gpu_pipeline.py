@@ -125,19 +125,54 @@ def load_adata_in_memory(dataset_name: str):
     return adata
 
 
+def load_adata_in_memory_raw(dataset_name: str):
+    """Load raw h5ad (no preprocessing) — feeds `run_preprocessing` when
+    `--attribute-preprocessing` is enabled so the preprocessing cost is timed
+    in isolation.
+    """
+    import anndata
+
+    info = DATASETS[dataset_name]
+    h5ad_path = info["h5ad"]
+    if not h5ad_path.exists():
+        return None
+    return anndata.read_h5ad(str(h5ad_path))
+
+
+def load_backed_raw(dataset_name: str):
+    """Open the raw (unpreprocessed) SCX file as a backed AnnData — feeds
+    `run_preprocessing(device="gpu")` which expects an SCX-backed source so
+    the GPU `gpu_preprocess_to_csr` streaming path is exercised.
+    """
+    import pyscx
+
+    scx_path = ensure_scx_file(dataset_name)
+    if scx_path is None:
+        return None
+    return pyscx.open(str(scx_path)).to_anndata()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline timing
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline(adata, device: str, n_comps: int = 50,
-                 n_neighbors: int = 15) -> dict:
-    """Run full PCA -> kNN -> UMAP -> Leiden pipeline, return per-op timing."""
+                 n_neighbors: int = 15, method: str = "auto",
+                 qr_method: str = "householder") -> dict:
+    """Run full PCA -> kNN -> UMAP -> Leiden pipeline, return per-op timing.
+
+    `method` and `qr_method` forward to `pyscx.accel.pca`. Defaults preserve
+    the pre-Phase-2/4 behaviour (auto-route by n_vars, Householder QR).
+    """
     import pyscx
 
     timings = {}
 
     t0 = time.perf_counter()
-    pyscx.accel.pca(adata, n_comps=n_comps, device=device)
+    pyscx.accel.pca(
+        adata, n_comps=n_comps, device=device,
+        method=method, qr_method=qr_method,
+    )
     timings["pca"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -156,9 +191,95 @@ def run_pipeline(adata, device: str, n_comps: int = 50,
     return timings
 
 
+def run_preprocessing(adata, device: str) -> dict:
+    """Time `normalize_total` + `log1p` + `highly_variable_genes` on the given
+    AnnData with the specified device. Preprocessing is attributed separately
+    so the downstream PCA/kNN/UMAP/Leiden table doesn't hide a whole-pipeline
+    asymmetry between CPU and GPU baselines.
+    """
+    import pyscx
+
+    timings = {}
+    t0 = time.perf_counter()
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device=device)
+    timings["normalize_total"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    pyscx.accel.log1p(adata, device=device)
+    timings["log1p"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    n_top = min(2000, adata.n_vars)
+    try:
+        pyscx.accel.highly_variable_genes(
+            adata, n_top_genes=n_top, flavor="seurat_v3",
+            subset=True, device=device,
+        )
+    except Exception:
+        # HVG can fail on tiny fixtures; surface but don't abort the benchmark.
+        timings["hvg_error"] = True
+    timings["highly_variable_genes"] = time.perf_counter() - t0
+    timings["total"] = timings["normalize_total"] + timings["log1p"] + timings["highly_variable_genes"]
+    return timings
+
+
+def run_pca_variants_benchmark(adata_factory, n_comps: int = 50,
+                               n_runs: int = 3) -> dict:
+    """Sweep GPU PCA dispatch variants (covariance / randomized householder /
+    randomized cholesky) on a prepared AnnData to fill the per-op rows called
+    out in Phase 7.2. `adata_factory` is a zero-arg callable that returns a
+    fresh backed/materialized AnnData each call (so each run starts clean).
+    """
+    import pyscx
+
+    variants = [
+        ("gpu_cov_pca", {"method": "covariance", "qr_method": "householder"}),
+        ("gpu_randomized_pca_householder", {"method": "randomized", "qr_method": "householder"}),
+        ("gpu_randomized_pca_chol", {"method": "randomized", "qr_method": "cholesky"}),
+    ]
+    out: dict = {}
+    for name, kwargs in variants:
+        times = []
+        for _ in range(n_runs):
+            adata = adata_factory()
+            if adata is None:
+                break
+            try:
+                t0 = time.perf_counter()
+                pyscx.accel.pca(adata, n_comps=n_comps, device="gpu", **kwargs)
+                times.append(time.perf_counter() - t0)
+            except Exception as e:
+                times.append(None)
+                out.setdefault("errors", {})[name] = str(e)
+                break
+            finally:
+                del adata
+                gc.collect()
+        finite = [t for t in times if t is not None]
+        if finite:
+            out[name] = {
+                "times_s": [round(t, 3) for t in finite],
+                "median_s": round(sorted(finite)[len(finite) // 2], 3),
+            }
+    return out
+
+
 def run_pipeline_benchmark(dataset_name: str = "census_1m",
-                           n_runs: int = 3) -> dict:
-    """Benchmark end-to-end GPU vs CPU pipeline."""
+                           n_runs: int = 3,
+                           attribute_preprocessing: bool = False,
+                           pca_variants: bool = False) -> dict:
+    """Benchmark end-to-end GPU vs CPU pipeline.
+
+    With `attribute_preprocessing=True`, also times
+    `normalize_total`/`log1p`/`highly_variable_genes` separately on both CPU
+    and GPU baselines — this exposes the preprocessing cost that would
+    otherwise be hidden inside the CPU baseline's "load preprocessed data"
+    step (see Phase 7.2 in GPU-ACC-SPEED-UP.md).
+
+    With `pca_variants=True`, sweeps `gpu_cov_pca`, `gpu_randomized_pca_chol`,
+    and `gpu_randomized_pca_householder` timings on the GPU side and records
+    them under `result["gpu_pca_variants"]`.
+    """
     import pyscx
 
     print(f"\n{'='*60}")
@@ -198,6 +319,26 @@ def run_pipeline_benchmark(dataset_name: str = "census_1m",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+    # Optional preprocessing attribution (CPU baseline).
+    if attribute_preprocessing:
+        print(f"\n  Attributing preprocessing cost (CPU, {n_runs} runs)...")
+        cpu_prep_runs = []
+        for run in range(n_runs):
+            a = load_adata_in_memory_raw(dataset_name)
+            if a is None:
+                break
+            cpu_prep_runs.append(run_preprocessing(a, device="cpu"))
+            del a
+            gc.collect()
+        if cpu_prep_runs:
+            cpu_prep_totals = [r["total"] for r in cpu_prep_runs]
+            cpu_prep_median = cpu_prep_runs[sorted(range(len(cpu_prep_totals)),
+                                                   key=lambda i: cpu_prep_totals[i])[len(cpu_prep_totals) // 2]]
+            result["cpu_preprocessing_runs"] = cpu_prep_runs
+            result["cpu_preprocessing_median_breakdown"] = {
+                k: round(v, 3) for k, v in cpu_prep_median.items() if isinstance(v, (int, float))
+            }
+
     # GPU pipeline
     print(f"\n  Running GPU pipeline ({n_runs} runs)...")
     gpu_runs = []
@@ -233,6 +374,39 @@ def run_pipeline_benchmark(dataset_name: str = "census_1m",
             gpu_v = gpu_best[op]
             per_op_speedup[op] = round(cpu_v / gpu_v, 1) if gpu_v > 0 else 0
         result["per_op_speedup"] = per_op_speedup
+
+        # Phase 7.2: attribute preprocessing cost on the GPU side too.
+        if attribute_preprocessing:
+            print(f"\n  Attributing preprocessing cost (GPU, {n_runs} runs)...")
+            gpu_prep_runs = []
+            for run in range(n_runs):
+                a = load_backed_raw(dataset_name)
+                if a is None:
+                    break
+                gpu_prep_runs.append(run_preprocessing(a, device="gpu"))
+                del a
+                gc.collect()
+            if gpu_prep_runs:
+                gpu_prep_totals = [r["total"] for r in gpu_prep_runs]
+                gpu_prep_median = gpu_prep_runs[sorted(range(len(gpu_prep_totals)),
+                                                       key=lambda i: gpu_prep_totals[i])[len(gpu_prep_totals) // 2]]
+                result["gpu_preprocessing_runs"] = gpu_prep_runs
+                result["gpu_preprocessing_median_breakdown"] = {
+                    k: round(v, 3) for k, v in gpu_prep_median.items() if isinstance(v, (int, float))
+                }
+
+        # Phase 7.2: sweep GPU PCA dispatch variants.
+        if pca_variants:
+            print(f"\n  Sweeping GPU PCA variants (cov / rand-H / rand-C)...")
+            variants = run_pca_variants_benchmark(
+                lambda: load_preprocessed_backed(dataset_name),
+                n_comps=50, n_runs=n_runs,
+            )
+            if variants:
+                result["gpu_pca_variants"] = variants
+                for name, rec in variants.items():
+                    if isinstance(rec, dict) and "median_s" in rec:
+                        print(f"    {name}: {rec['median_s']:.3f}s")
 
     except Exception as e:
         print(f"  GPU pipeline FAILED: {e}")
@@ -452,6 +626,43 @@ def generate_report(pipeline_result: dict | None,
                 "",
             ]
 
+        # Preprocessing attribution (optional, Phase 7.2).
+        cpu_prep = pipeline_result.get("cpu_preprocessing_median_breakdown")
+        gpu_prep = pipeline_result.get("gpu_preprocessing_median_breakdown")
+        if cpu_prep or gpu_prep:
+            lines += [
+                "### Preprocessing (normalize_total → log1p → HVG)",
+                "",
+                "| Op | CPU (s) | GPU (s) | Speedup |",
+                "|----|---------|---------|---------|",
+            ]
+            for op in ["normalize_total", "log1p", "highly_variable_genes", "total"]:
+                c = (cpu_prep or {}).get(op, float("nan"))
+                g = (gpu_prep or {}).get(op, float("nan"))
+                if g and g > 0 and c == c and c > 0:
+                    sp = f"{c / g:.1f}x"
+                else:
+                    sp = "—"
+                lines.append(f"| {op} | {c:.3f} | {g:.3f} | {sp} |")
+            lines.append("")
+
+        # GPU PCA dispatch variants (optional, Phase 7.2).
+        variants = pipeline_result.get("gpu_pca_variants")
+        if variants:
+            lines += [
+                "### GPU PCA dispatch variants",
+                "",
+                "| Variant | Median (s) |",
+                "|---------|-----------|",
+            ]
+            for name in ["gpu_cov_pca", "gpu_randomized_pca_householder", "gpu_randomized_pca_chol"]:
+                rec = variants.get(name)
+                if isinstance(rec, dict) and "median_s" in rec:
+                    lines.append(f"| {name} | {rec['median_s']:.3f} |")
+                else:
+                    lines.append(f"| {name} | — |")
+            lines.append("")
+
     if gate_result:
         lines += [
             "## 2. Go/No-Go Gate",
@@ -490,6 +701,18 @@ def main():
         help="Dataset for pipeline benchmark (default: census_1m)",
     )
     parser.add_argument("--n-runs", type=int, default=3)
+    parser.add_argument(
+        "--attribute-preprocessing", action="store_true",
+        help="Time normalize_total + log1p + highly_variable_genes separately "
+             "on CPU and GPU baselines so preprocessing cost is attributed "
+             "symmetrically (Phase 7.2).",
+    )
+    parser.add_argument(
+        "--pca-variants", action="store_true",
+        help="Sweep GPU PCA dispatch variants: gpu_cov_pca, "
+             "gpu_randomized_pca_householder, gpu_randomized_pca_chol "
+             "(Phase 7.2).",
+    )
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -498,7 +721,12 @@ def main():
     gate_result = None
 
     if args.mode in ("pipeline", "all"):
-        pipeline_result = run_pipeline_benchmark(args.dataset, args.n_runs)
+        pipeline_result = run_pipeline_benchmark(
+            args.dataset,
+            args.n_runs,
+            attribute_preprocessing=args.attribute_preprocessing,
+            pca_variants=args.pca_variants,
+        )
 
         json_path = RESULTS_DIR / "gpu_pipeline_timing.json"
         json_path.write_text(json.dumps(pipeline_result, indent=2))

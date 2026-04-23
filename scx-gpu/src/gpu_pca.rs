@@ -407,7 +407,7 @@ fn streaming_gpu_spmm_forward(
         let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
 
         // Create cuSPARSE descriptor
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream())?;
+        let a_desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
 
         // Y_shard is a slice of Y starting at row `global_row`.
         // cuSPARSE SpMM: C = α·A·B + β·C
@@ -479,7 +479,7 @@ fn streaming_gpu_spmm_transpose(
 
         // Upload CSR to GPU
         let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream())?;
+        let a_desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
 
         // Extract Q_shard on GPU: Q[global_row..global_row+shard_rows, :]
         // col-major Q: Q[i, j] = d_q[j * n_obs + i]

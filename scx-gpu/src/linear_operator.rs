@@ -111,7 +111,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 return Ok(());
             }
 
-            let a_desc = gpu_csr.to_cusparse_csr(self.dev.stream())?;
+            let a_desc = gpu_csr.to_cusparse_csr(self.dev, self.dev.stream())?;
             let mut d_y_shard = self.dev.alloc_zeros::<f32>(shard_rows * k)?;
 
             // Y_shard = A · V   (β = 0 → overwrite)
@@ -169,7 +169,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 return Ok(());
             }
 
-            let a_desc = gpu_csr.to_cusparse_csr(self.dev.stream())?;
+            let a_desc = gpu_csr.to_cusparse_csr(self.dev, self.dev.stream())?;
             let d_y_shard = gpu_gather_colmajor(self.dev, d_y, shard_rows, k, global_row, n_obs)?;
 
             // out += Aᵀ · Y_shard   (β = 1 → accumulate)

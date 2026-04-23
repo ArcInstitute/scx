@@ -481,11 +481,54 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
 ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS
 
 
-def get_formats(include_additional: bool = False) -> list[FormatVariant]:
-    """Return the list of format variants to benchmark."""
+# ---------------------------------------------------------------------------
+# Accelerator variants — Phase 9.1+
+#
+# These are NOT file-format variants; they're accelerator implementations
+# for PCA / kNN / UMAP / Leiden / preprocessing / HVG. Each registers as a
+# `FormatVariant` so the per-cell parallel launcher (`run_parallel.py`) can
+# schedule one SLURM job per (benchmark × implementation × dataset) — e.g.
+# (accel_pca, accel_pca__pyscx_gpu_cov, census_1m). Runner is `noop_runner`
+# because these benchmarks don't depend on file conversion.
+# ---------------------------------------------------------------------------
+
+def accel_formats() -> list[FormatVariant]:
+    """Lazily discover accelerator variants from each `accel_*.py` module.
+
+    Imported on demand (not at `config.py` module-load) so the
+    accelerator modules — which import from `config.py` — don't create
+    a circular import. Each accelerator benchmark module exports a
+    `<bench>_variants()` callable; append it here when it lands.
+    """
+    out: list[FormatVariant] = []
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_pca import (
+            accel_pca_variants,
+        )
+        out.extend(accel_pca_variants())
+    except ImportError:
+        pass
+    # Other accel_* modules (knn, umap, leiden, preprocess, hvg) follow
+    # the same pattern — append here when they land.
+    return out
+
+
+def get_formats(
+    include_additional: bool = False,
+    include_accel: bool = False,
+) -> list[FormatVariant]:
+    """Return the list of format variants to benchmark.
+
+    `include_accel` adds accelerator implementations (PCA / kNN / UMAP /
+    Leiden / preprocessing / HVG variants). Enable this only when the
+    orchestrator is also scheduling `accel_*` benchmark modules.
+    """
+    out = list(PRIMARY_FORMATS)
     if include_additional:
-        return ALL_FORMATS
-    return PRIMARY_FORMATS
+        out.extend(ADDITIONAL_FORMATS)
+    if include_accel:
+        out.extend(accel_formats())
+    return out
 
 
 # ---------------------------------------------------------------------------
