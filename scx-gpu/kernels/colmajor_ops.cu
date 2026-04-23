@@ -190,6 +190,28 @@ extern "C" __global__ void reverse_tail_vec_kernel(
     dst[j] = src[n - 1 - j];
 }
 
+// Broadcast-scale each column of a col-major matrix by a scalar.
+//
+// U[r, c] *= s[c]   for all (r, c)
+//
+// U: (m × k) col-major, in-place
+// s: [k] per-column scale factors
+//
+// total threads = m × k
+extern "C" __global__ void scale_columns_kernel(
+    float* __restrict__ U,           // [m × k], col-major, in-place
+    const float* __restrict__ s,     // [k]
+    int m,
+    int k
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * k;
+    if (idx >= total) return;
+
+    int col = idx / m;
+    U[idx] *= s[col];
+}
+
 // Outer product subtraction: Z[v, j] -= mu[v] * sum_q[j]
 //
 // Z: (n_vars × k) col-major
