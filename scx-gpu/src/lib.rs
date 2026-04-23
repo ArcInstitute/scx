@@ -66,7 +66,7 @@ pub mod sparse_dense;
 // Re-export primary types for convenience.
 pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, CublasHandle};
 pub use curand::random_gaussian_gpu;
-pub use cusolver::{gpu_eigh_sym, gpu_qr_q, CusolverHandle};
+pub use cusolver::{gpu_cholesky_qr2, gpu_eigh_sym, gpu_qr_q, CusolverHandle, QrMethod};
 pub use cusparse::{
     spmm_csr, spmm_csr_transpose, CusparseHandle, CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };

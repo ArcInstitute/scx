@@ -28,7 +28,7 @@ use scx_format::ShardSource;
 
 use crate::cublas::{gpu_sgemm, gpu_sgemv, CublasHandle};
 use crate::curand::random_gaussian_gpu;
-use crate::cusolver::{gpu_qr_q, CusolverHandle};
+use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
 use crate::cusparse::{spmm_csr, spmm_csr_transpose, CusparseHandle};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -89,6 +89,7 @@ pub fn gpu_randomized_pca(
     n_power_iterations: usize,
     zero_center: bool,
     seed: u64,
+    qr_method: QrMethod,
 ) -> Result<GpuPcaResult, GpuError> {
     let (n_obs, n_vars) = source.shape();
 
@@ -160,9 +161,24 @@ pub fn gpu_randomized_pca(
         k,
     )?;
 
+    // QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in).
+    // The closure borrows each handle by reference, so it can be invoked at
+    // each of the three QR call-sites without taking ownership.
+    let qr = |a: &mut CudaSlice<f32>,
+              rows: usize,
+              cols: usize|
+     -> Result<CudaSlice<f32>, GpuError> {
+        match qr_method {
+            QrMethod::Householder => gpu_qr_q(&cusolver_handle, dev.stream(), dev, a, rows, cols),
+            QrMethod::Cholesky => {
+                gpu_cholesky_qr2(&cublas_handle, &cusolver_handle, dev, a, rows, cols)
+            }
+        }
+    };
+
     // Step 4: Q = qr(Y)
     let mut d_y_mut = d_y;
-    let mut d_q = gpu_qr_q(&cusolver_handle, dev.stream(), dev, &mut d_y_mut, n_obs, k)?;
+    let mut d_q = qr(&mut d_y_mut, n_obs, k)?;
 
     // Step 5: Power iterations
     for _ in 0..n_power_iterations {
@@ -180,7 +196,7 @@ pub fn gpu_randomized_pca(
 
         // Q_B = qr(B)
         let mut d_b_mut = d_b;
-        let d_q_b = gpu_qr_q(&cusolver_handle, dev.stream(), dev, &mut d_b_mut, n_vars, k)?;
+        let d_q_b = qr(&mut d_b_mut, n_vars, k)?;
 
         // Y = X @ Q_B
         let d_y2 = streaming_gpu_spmm_forward(
@@ -197,7 +213,7 @@ pub fn gpu_randomized_pca(
 
         // Q = qr(Y)
         let mut d_y2_mut = d_y2;
-        d_q = gpu_qr_q(&cusolver_handle, dev.stream(), dev, &mut d_y2_mut, n_obs, k)?;
+        d_q = qr(&mut d_y2_mut, n_obs, k)?;
     }
 
     // Step 6: B = X^T @ Q (final, n_vars × k)
@@ -1100,7 +1116,8 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let gpu_rand = gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42).unwrap();
+        let gpu_rand =
+            gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::default()).unwrap();
         let gpu_cov = gpu_covariance_pca(&dev, &source, k, true).unwrap();
 
         // Loadings must agree (sign-agnostic) with the covariance reference.
@@ -1125,6 +1142,128 @@ mod tests {
             assert!(
                 curr <= prev + 1e-6,
                 "variance_ratio not monotone at PC {j}: prev={prev}, curr={curr}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_randomized_pca_cholesky_vs_householder() {
+        // Phase 4.5 — opt-in CholeskyQR2 must produce the same PCA as the
+        // default Householder path on well-conditioned inputs. Both paths
+        // share the same RNG (matched seed), so cosine ≥ 0.999 is the right
+        // bar — tighter than the GPU-vs-CPU Phase-3 parity (0.99) because
+        // the only algorithmic difference is the QR step.
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use scx_format::ShardSource;
+        use scx_sparse::ScxCsr;
+
+        let dev = require_gpu!();
+
+        struct InMemorySource {
+            shards: Vec<ScxCsr>,
+            n_obs: usize,
+            n_vars: usize,
+        }
+        impl ShardSource for InMemorySource {
+            fn n_shards(&self) -> usize {
+                self.shards.len()
+            }
+            fn n_obs(&self) -> usize {
+                self.n_obs
+            }
+            fn n_vars(&self) -> usize {
+                self.n_vars
+            }
+            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+                Ok(self.shards[i].clone())
+            }
+        }
+
+        fn random_csr(n_rows: usize, n_cols: usize, density: f32, seed: u64) -> ScxCsr {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+            let mut indices: Vec<i32> = Vec::new();
+            let mut data: Vec<f32> = Vec::new();
+            indptr.push(0);
+            for _ in 0..n_rows {
+                for c in 0..n_cols {
+                    if rng.gen_bool(density as f64) {
+                        indices.push(c as i32);
+                        data.push(rng.gen_range(-1.0..1.0));
+                    }
+                }
+                indptr.push(indices.len() as i64);
+            }
+            ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+        }
+
+        fn split_into_shards(csr: &ScxCsr, n_shards: usize) -> Vec<ScxCsr> {
+            let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
+            let rows_per = n_rows.div_ceil(n_shards);
+            let mut out = Vec::new();
+            let mut row_start = 0;
+            while row_start < n_rows {
+                let row_end = (row_start + rows_per).min(n_rows);
+                let p0 = csr.indptr[row_start] as usize;
+                let p1 = csr.indptr[row_end] as usize;
+                let shard_indptr: Vec<i64> = csr.indptr[row_start..=row_end]
+                    .iter()
+                    .map(|&p| p - csr.indptr[row_start])
+                    .collect();
+                let shard_indices = csr.indices[p0..p1].to_vec();
+                let shard_data = csr.data[p0..p1].to_vec();
+                out.push(ScxCsr::new_unchecked(
+                    (row_end - row_start, n_cols),
+                    shard_indptr,
+                    shard_indices,
+                    shard_data,
+                ));
+                row_start = row_end;
+            }
+            out
+        }
+
+        fn row_abs_cosine(a: &[f32], b: &[f32], k: usize, d: usize) -> f32 {
+            let mut total = 0.0f32;
+            for i in 0..k {
+                let ra = &a[i * d..(i + 1) * d];
+                let rb = &b[i * d..(i + 1) * d];
+                let dot: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+                let na: f32 = ra.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb: f32 = rb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                total += (dot / (na * nb).max(1e-12)).abs();
+            }
+            total / k as f32
+        }
+
+        let n_rows = 800;
+        let n_cols = 120;
+        let k = 15;
+        let csr = random_csr(n_rows, n_cols, 0.08, 2025);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let hh =
+            gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::Householder).unwrap();
+        let ch = gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::Cholesky).unwrap();
+
+        let cos = row_abs_cosine(&ch.components, &hh.components, k, n_cols);
+        assert!(
+            cos > 0.999,
+            "CholeskyQR2 vs Householder: cosine = {cos} (want > 0.999)"
+        );
+
+        // Variance ratios should be close between the two QR methods.
+        for j in 0..k {
+            let diff = (ch.variance_ratio[j] - hh.variance_ratio[j]).abs();
+            assert!(
+                diff < 1e-3,
+                "variance_ratio[{j}] diff = {diff} between cholesky and householder"
             );
         }
     }

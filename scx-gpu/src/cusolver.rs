@@ -15,9 +15,11 @@
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
+use cudarc::cublas::sys as cbs;
 use cudarc::cusolver::sys as csol;
 use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtrMut};
 
+use crate::cublas::{gpu_sgemm, gpu_strsm, CublasHandle};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 
@@ -332,6 +334,175 @@ pub fn gpu_eigh_sym(
     Ok(eigvals)
 }
 
+// ---------------------------------------------------------------------------
+// QR method selector (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// QR algorithm choice for the randomized-PCA power iterations.
+///
+/// - [`QrMethod::Householder`] (default) — uses [`gpu_qr_q`] (`cusolverDnSgeqrf` +
+///   `cusolverDnSorgqr`). Slower but numerically the most robust; the fallback
+///   when an input is nearly rank-deficient.
+/// - [`QrMethod::Cholesky`] — uses [`gpu_cholesky_qr2`] (CholeskyQR2). ~3× faster
+///   for the power-iteration QR and produces `Q` orthonormal to f32 precision
+///   on well-conditioned inputs. Fails with [`GpuError::CuSolverError`] if the
+///   Gram matrix is not positive-definite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QrMethod {
+    /// Householder QR via `gpu_qr_q` (default; always-stable).
+    #[default]
+    Householder,
+    /// CholeskyQR2 via `gpu_cholesky_qr2` (opt-in, faster, requires SPD Gram).
+    Cholesky,
+}
+
+// ---------------------------------------------------------------------------
+// CholeskyQR2 (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// CholeskyQR2 on GPU — two iterations of Cholesky-based QR.
+///
+/// Computes `A = Q · R` where `Q` is orthonormal (to f32 precision) and
+/// `R` is upper-triangular, overwriting the input buffer `a` with `Q`. The
+/// caller receives the same buffer back via an ownership-transfer pattern
+/// mirroring [`gpu_qr_q`].
+///
+/// ## Algorithm
+///
+/// For `iter in 0..2`:
+///   1. `G = Aᵀ A`                   (cuBLAS `sgemm`, trans_a=T, trans_b=N)
+///   2. `G = Rᵀ R` (upper triangle)  (`cusolverDnSpotrf`, UPLO=UPPER)
+///   3. `A = A · R⁻¹`                (cuBLAS `strsm`, side=RIGHT, uplo=UPPER)
+///
+/// Two iterations reliably refine `Q` to near-machine f32 orthonormality on
+/// well-conditioned inputs (Tomás et al., 2013; used as the default in
+/// rapids-singlecell's randomized-PCA path).
+///
+/// ## Failure
+///
+/// If `Aᵀ A` is not positive-definite (near-rank-deficient input, condition
+/// number > ~1e8 in f32), `cusolverDnSpotrf` reports `devInfo > 0` and this
+/// function returns
+/// `GpuError::CuSolverError("CholeskyQR2 failed: non-SPD; retry with qr_method='householder'")`.
+/// No silent fallback — callers must explicitly switch to Householder.
+///
+/// ## Requirements
+///
+/// `m >= k > 0`. The returned `Q` has shape `(m × k)` col-major.
+pub fn gpu_cholesky_qr2(
+    cublas: &CublasHandle,
+    cusolver: &CusolverHandle,
+    dev: &GpuDevice,
+    a: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+) -> Result<CudaSlice<f32>, GpuError> {
+    if m == 0 || k == 0 {
+        return Err(GpuError::CuSolverError(
+            "CholeskyQR2 requires m > 0 and k > 0".into(),
+        ));
+    }
+    if m < k {
+        return Err(GpuError::CuSolverError(format!(
+            "CholeskyQR2 requires m >= k, got m={m}, k={k}"
+        )));
+    }
+
+    let stream = dev.stream();
+
+    // Allocate the Gram matrix (k × k) on GPU once, reused across both iterations.
+    let mut d_g = dev.alloc_zeros::<f32>(k * k)?;
+
+    // Query potrf workspace size (shape-dependent; k × k identical across both iters).
+    let k_i32 = k as i32;
+    let uplo = csol::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER;
+    let mut potrf_lwork: i32 = 0;
+    {
+        let (g_ptr, _gg) = d_g.device_ptr_mut(stream);
+        unsafe {
+            csol::cusolverDnSpotrf_bufferSize(
+                cusolver.raw(),
+                uplo,
+                k_i32,
+                g_ptr as *mut f32,
+                k_i32,
+                &mut potrf_lwork as *mut i32,
+            )
+            .result()
+            .map_err(|e| GpuError::CuSolverError(format!("cusolverDnSpotrf_bufferSize: {e:?}")))?;
+        }
+    }
+    let mut workspace = dev.alloc_zeros::<f32>(potrf_lwork.max(1) as usize)?;
+
+    for _iter in 0..2 {
+        // Step 1: G = Aᵀ · A   (k × k col-major, via sgemm with trans_a=T).
+        gpu_sgemm(
+            cublas,
+            stream,
+            a,
+            a,
+            &mut d_g,
+            k,
+            k,
+            m,
+            1.0,
+            0.0,
+            cbs::cublasOperation_t::CUBLAS_OP_T,
+            cbs::cublasOperation_t::CUBLAS_OP_N,
+        )?;
+
+        // Step 2: Cholesky G = Rᵀ R (R stored in upper triangle of G).
+        cusolver.set_stream(stream)?;
+        let mut dev_info = dev.alloc_zeros::<i32>(1)?;
+        {
+            let (g_ptr, _gg) = d_g.device_ptr_mut(stream);
+            let (ws_ptr, _gws) = workspace.device_ptr_mut(stream);
+            let (info_ptr, _gi) = dev_info.device_ptr_mut(stream);
+            unsafe {
+                csol::cusolverDnSpotrf(
+                    cusolver.raw(),
+                    uplo,
+                    k_i32,
+                    g_ptr as *mut f32,
+                    k_i32,
+                    ws_ptr as *mut f32,
+                    potrf_lwork,
+                    info_ptr as *mut i32,
+                )
+                .result()
+                .map_err(|e| GpuError::CuSolverError(format!("cusolverDnSpotrf: {e:?}")))?;
+            }
+        }
+        let info_host = dev.dtoh_copy(&dev_info)?;
+        if info_host[0] != 0 {
+            return Err(GpuError::CuSolverError(
+                "CholeskyQR2 failed: non-SPD; retry with qr_method='householder'".into(),
+            ));
+        }
+
+        // Step 3: A = A · R⁻¹  via strsm(side=RIGHT, uplo=UPPER, trans=N, diag=NON_UNIT).
+        // Solves X · R = A with X overwriting A; R lives in the upper triangle of d_g.
+        gpu_strsm(
+            cublas,
+            stream,
+            &d_g,
+            a,
+            m,
+            k,
+            cbs::cublasSideMode_t::CUBLAS_SIDE_RIGHT,
+            cbs::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+            cbs::cublasOperation_t::CUBLAS_OP_N,
+            cbs::cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
+            1.0,
+        )?;
+    }
+
+    // Ownership-transfer — return the input buffer (now Q) to the caller.
+    let mut q = dev.alloc_zeros::<f32>(0)?;
+    std::mem::swap(a, &mut q);
+    Ok(q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +592,96 @@ mod tests {
                     "Q^TQ[{c1},{c2}] = {dot}, expected {expected}"
                 );
             }
+        }
+    }
+
+    // ---- CholeskyQR2 (Phase 4) ----
+
+    /// Compute ||Q^T Q − I||_F on a col-major `(m × n)` Q downloaded to host.
+    fn qtq_minus_i_frobenius(q_host: &[f32], m: usize, n: usize) -> f32 {
+        let mut sumsq = 0.0f32;
+        for c1 in 0..n {
+            for c2 in 0..n {
+                let mut dot = 0.0f32;
+                for r in 0..m {
+                    dot += q_host[c1 * m + r] * q_host[c2 * m + r];
+                }
+                let target = if c1 == c2 { 1.0 } else { 0.0 };
+                let d = dot - target;
+                sumsq += d * d;
+            }
+        }
+        sumsq.sqrt()
+    }
+
+    #[test]
+    fn test_gpu_cholesky_qr2_orthonormal() {
+        // Phase 4.3 — CQR2 on a well-conditioned 10_000 × 60 Gaussian matrix.
+        // Expect ||Q^T Q − I||_F < 1e-4. Random Gaussian matrices have
+        // condition number O(sqrt(m/n)) which is far from the SPD failure line.
+        use crate::curand::random_gaussian_gpu;
+
+        let dev = require_gpu!();
+        let cublas = CublasHandle::new().unwrap();
+        let cusolver = CusolverHandle::new().unwrap();
+
+        let m = 10_000;
+        let n = 60;
+        let mut d_a = random_gaussian_gpu(&dev, dev.stream(), m, n, 42).unwrap();
+
+        let q = gpu_cholesky_qr2(&cublas, &cusolver, &dev, &mut d_a, m, n).unwrap();
+        dev.synchronize().unwrap();
+
+        let q_host = dev.dtoh_copy(&q).unwrap();
+        assert_eq!(q_host.len(), m * n);
+        let err = qtq_minus_i_frobenius(&q_host, m, n);
+        assert!(
+            err < 1e-4,
+            "CQR2 orthonormality: ||Q^T Q - I||_F = {err} (want < 1e-4)"
+        );
+    }
+
+    #[test]
+    fn test_gpu_cholesky_qr2_ill_conditioned() {
+        // Phase 4.4 — deliberately non-SPD input: stack near-duplicate columns
+        // (col 0 and col 1 differ by 1e-8-scale noise). A^T A is effectively
+        // rank-deficient in f32, so cusolverDnSpotrf reports devInfo > 0 and
+        // `gpu_cholesky_qr2` must surface a CuSolverError — no silent fallback.
+        let dev = require_gpu!();
+        let cublas = CublasHandle::new().unwrap();
+        let cusolver = CusolverHandle::new().unwrap();
+
+        let m = 1000;
+        let n = 10;
+        let mut a_host = vec![0.0f32; m * n];
+
+        // Column 0: deterministic gradient.
+        for r in 0..m {
+            a_host[r] = (r as f32) * 0.001 + 1.0;
+        }
+        // Column 1: col 0 + tiny noise (far below f32 precision for col 0's norm).
+        for r in 0..m {
+            a_host[m + r] = a_host[r] + 1e-8 * ((r % 7) as f32 - 3.0);
+        }
+        // Columns 2..n: independent, non-pathological — so n_cols > 2 still
+        // gets a reasonable SPD matrix if only col 0 / col 1 weren't twins.
+        for j in 2..n {
+            for r in 0..m {
+                a_host[j * m + r] = ((r + j * 17) as f32).sin();
+            }
+        }
+
+        let mut d_a = dev.htod_copy(&a_host).unwrap();
+        let result = gpu_cholesky_qr2(&cublas, &cusolver, &dev, &mut d_a, m, n);
+        match result {
+            Err(GpuError::CuSolverError(msg)) => {
+                assert!(
+                    msg.contains("non-SPD"),
+                    "expected 'non-SPD' in error message, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected CuSolverError, got: {other:?}"),
+            Ok(_) => panic!("expected CQR2 to fail on near-rank-deficient input"),
         }
     }
 }

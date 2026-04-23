@@ -66,4 +66,6 @@ pub use pca::{
     GPU_COVARIANCE_PCA_THRESHOLD,
 };
 #[cfg(feature = "gpu")]
+pub use scx_gpu::QrMethod;
+#[cfg(feature = "gpu")]
 pub use umap::compute_umap_gpu;

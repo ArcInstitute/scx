@@ -71,16 +71,13 @@ fn resolve_gpu_method(method: &str, n_vars: usize) -> PyResult<&'static str> {
     }
 }
 
-/// Validate `qr_method`. Phase-4 CholeskyQR2 is not yet wired through — for
-/// now only `"householder"` is accepted. `"cholesky"` raises a clear error
-/// pointing at the Phase-4 tracking task.
+/// Parse a `qr_method` string into a [`scx_gpu::QrMethod`]. Both values are
+/// valid now (Phase 4 wired up CholeskyQR2 behind `"cholesky"`).
 #[cfg(feature = "gpu")]
-fn validate_qr_method(qr_method: &str) -> PyResult<()> {
+fn parse_qr_method(qr_method: &str) -> PyResult<scx_accel::QrMethod> {
     match qr_method {
-        "householder" => Ok(()),
-        "cholesky" => Err(PyValueError::new_err(
-            "qr_method='cholesky' (CholeskyQR2) is not yet implemented — see Phase 4 of GPU-ACC-SPEED-UP.md",
-        )),
+        "householder" => Ok(scx_accel::QrMethod::Householder),
+        "cholesky" => Ok(scx_accel::QrMethod::Cholesky),
         other => Err(PyValueError::new_err(format!(
             "Invalid qr_method={other:?}; expected 'householder' or 'cholesky'"
         ))),
@@ -89,6 +86,10 @@ fn validate_qr_method(qr_method: &str) -> PyResult<()> {
 
 /// Dispatch to either `covariance_pca_gpu` or `randomized_pca_gpu` based on
 /// the resolved method. All GPU-branch call-sites funnel through this helper.
+///
+/// `qr_method` is threaded to `randomized_pca_gpu` (Householder default,
+/// Cholesky opt-in) and **silently ignored** on the covariance path — the
+/// Python docstring already documents that covariance PCA has no QR step.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_pca_dispatch<S: ShardSource + Sync>(
@@ -99,6 +100,7 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
     zero_center: bool,
     random_state: u64,
     method: &str,
+    qr_method: scx_accel::QrMethod,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
     match method {
         "covariance" => scx_accel::covariance_pca_gpu(0, source, n_comps, zero_center),
@@ -110,6 +112,7 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
             n_power_iterations,
             zero_center,
             random_state,
+            qr_method,
         ),
         // Unreachable after resolve_gpu_method() normalisation.
         _ => Err(scx_accel::AccelError::LinAlg(format!(
@@ -175,7 +178,7 @@ pub fn pca(
     // ------- GPU path -------
     #[cfg(feature = "gpu")]
     if _use_gpu {
-        validate_qr_method(qr_method)?;
+        let qr = parse_qr_method(qr_method)?;
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             let reader = &*backed.backed;
@@ -189,6 +192,7 @@ pub fn pca(
                 zero_center,
                 random_state,
                 m,
+                qr,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
@@ -207,6 +211,7 @@ pub fn pca(
                 zero_center,
                 random_state,
                 m,
+                qr,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
@@ -226,6 +231,7 @@ pub fn pca(
             zero_center,
             random_state,
             m,
+            qr,
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
         write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;

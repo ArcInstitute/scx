@@ -1206,7 +1206,10 @@ pub const GPU_COVARIANCE_PCA_THRESHOLD: usize = 8_000;
 /// * `n_power_iterations` — Power iterations for spectral accuracy (default: 2)
 /// * `zero_center` — Whether to mean-center the data (default: true)
 /// * `seed` — Random seed for reproducibility
+/// * `qr_method` — Householder (default, always-stable) or CholeskyQR2 (opt-in,
+///   faster but fails with `CuSolverError` on non-SPD Gram matrices)
 #[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
 pub fn randomized_pca_gpu<S: ShardSource + Sync>(
     device_id: usize,
     source: &S,
@@ -1215,6 +1218,7 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
     n_power_iterations: usize,
     zero_center: bool,
     seed: u64,
+    qr_method: scx_gpu::QrMethod,
 ) -> Result<PcaResult> {
     let dev = scx_gpu::GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
@@ -1227,6 +1231,7 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
         n_power_iterations,
         zero_center,
         seed,
+        qr_method,
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
 
