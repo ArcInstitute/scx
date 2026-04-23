@@ -70,6 +70,14 @@ pub fn estimate_gpu_memory<'py>(
         }
         Ok(default)
     };
+    let get_kwarg_str = |key: &str, default: &'static str| -> PyResult<String> {
+        if let Some(kw) = kwargs {
+            if let Some(val) = kw.get_item(key)? {
+                return val.extract::<String>();
+            }
+        }
+        Ok(default.to_string())
+    };
 
     // Extract shape from adata
     let n_obs: usize = adata.getattr("n_obs")?.extract()?;
@@ -103,16 +111,49 @@ pub fn estimate_gpu_memory<'py>(
             let shard_size = get_kwarg_usize("shard_size", 16384)?;
             let shard_rows = shard_size.min(n_obs);
 
-            // Y matrix on GPU: n_obs × k × 4 (f32)
-            let y_bytes = n_obs * k * 4;
-            // Ω and B matrices: n_vars × k × 4 each
-            let omega_b_bytes = 2 * n_vars * k * 4;
-            // One decoded shard for cuSPARSE SpMM: shard_rows × n_vars × 4
-            let shard_dense_bytes = shard_rows * n_vars * 4;
-            // cuSOLVER QR workspace: ~2 × n_obs × k × 4
-            let qr_workspace = 2 * n_obs * k * 4;
+            // Select PCA method — respects explicit user choice, else picks
+            // covariance when n_vars is small (HVG-shaped) and randomized
+            // otherwise. Keep threshold in lock-step with
+            // `scx_accel::GPU_COVARIANCE_PCA_THRESHOLD` (8000).
+            let method = get_kwarg_str("method", "auto")?;
+            #[cfg(feature = "gpu")]
+            let gpu_cov_threshold = scx_accel::GPU_COVARIANCE_PCA_THRESHOLD;
+            #[cfg(not(feature = "gpu"))]
+            let gpu_cov_threshold = 8_000usize;
+            let use_covariance = match method.as_str() {
+                "covariance" => true,
+                "randomized" => false,
+                _ => n_vars <= gpu_cov_threshold, // "auto"
+            };
 
-            y_bytes + omega_b_bytes + shard_dense_bytes + qr_workspace
+            // Randomized footprint: Y/Q (n_obs × k), Ω + B (n_vars × k), one
+            // decoded shard, cuSOLVER QR workspace.
+            let rand_bytes = {
+                let y_bytes = n_obs * k * 4;
+                let omega_b_bytes = 2 * n_vars * k * 4;
+                let shard_dense_bytes = shard_rows * n_vars * 4;
+                let qr_workspace = 2 * n_obs * k * 4;
+                y_bytes + omega_b_bytes + shard_dense_bytes + qr_workspace
+            };
+
+            // Covariance footprint: Gram matrix (n_vars²), embeddings
+            // (n_obs × n_components), dense-shard scratch for Gram
+            // accumulation (shard_rows × n_vars), means (n_vars), and a
+            // cuSOLVER syevd workspace (~3 × n_vars² — generous budget).
+            let cov_bytes = {
+                let gram = n_vars * n_vars * 4;
+                let emb = n_obs * n_components * 4;
+                let dense_scratch = shard_rows * n_vars * 4;
+                let means = n_vars * 4;
+                let syevd = 3 * n_vars * n_vars * 4;
+                gram + emb + dense_scratch + means + syevd
+            };
+
+            if use_covariance {
+                cov_bytes
+            } else {
+                rand_bytes
+            }
         }
         "knn" => {
             let n_neighbors = get_kwarg_usize("n_neighbors", 15)?;

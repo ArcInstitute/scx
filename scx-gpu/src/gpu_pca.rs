@@ -1,7 +1,7 @@
 //! GPU-accelerated randomized PCA pipeline.
 //!
 //! Provides the mean-correction CUDA kernel and the full GPU PCA pipeline
-//! that streams shards from [`BackedCsrReader`], performing SpMM on GPU via
+//! that streams shards from any [`ShardSource`], performing SpMM on GPU via
 //! cuSPARSE, QR via cuSOLVER, and the final SVD via CPU `faer`.
 //!
 //! ## Pipeline
@@ -22,8 +22,8 @@ use cudarc::driver::safe::LaunchConfig;
 use cudarc::driver::PushKernelArg;
 use faer::Mat;
 
-use scx_format::backed::BackedCsrReader;
 use scx_format::total_variance_from_col_sq;
+use scx_format::ShardSource;
 
 use crate::curand::random_gaussian_gpu;
 use crate::cusolver::{gpu_qr_q, CusolverHandle};
@@ -60,7 +60,7 @@ pub struct GpuPcaResult {
 
 /// GPU-accelerated randomized PCA.
 ///
-/// Streams data shard-by-shard from `reader`, performing SpMM on GPU via
+/// Streams data shard-by-shard from `source`, performing SpMM on GPU via
 /// cuSPARSE, QR via cuSOLVER, and the final SVD on CPU via `faer`.
 ///
 /// # Algorithm (matching scx-accel CPU version)
@@ -74,19 +74,21 @@ pub struct GpuPcaResult {
 /// 7. SVD of B (small matrix, CPU faer in f64) → Û, Σ, V^T
 /// 8. Embeddings = Q @ V × Σ (CPU — Q downloaded, small multiply)
 ///
-/// Steps 3-6 stream from BackedCsrReader without materializing full X.
+/// Steps 3-6 stream from any `ShardSource` without materializing full X.
+/// The `Sync` bound is required so that a future refactor to
+/// `DoubleBufferedShardLoader` (Phase 2+) works without signature churn.
 /// Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices).
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_randomized_pca(
     dev: &GpuDevice,
-    reader: &BackedCsrReader,
+    source: &(dyn ShardSource + Sync),
     n_components: usize,
     n_oversamples: usize,
     n_power_iterations: usize,
     zero_center: bool,
     seed: u64,
 ) -> Result<GpuPcaResult, GpuError> {
-    let (n_obs, n_vars) = reader.shape();
+    let (n_obs, n_vars) = source.shape();
 
     // Validate inputs
     if n_components == 0 || n_obs == 0 || n_vars == 0 {
@@ -107,12 +109,7 @@ pub fn gpu_randomized_pca(
     // Pre-flight GPU memory check: estimate peak usage and compare to free memory.
     // Peak = Y(n_obs*k) + Q(n_obs*k) + Z(n_vars*k) + shard_buf + means, all f32.
     {
-        let idx = reader.index();
-        let max_shard_rows = (0..idx.n_shards())
-            .filter_map(|i| idx.shard_range(i))
-            .map(|(s, e)| (e - s) as usize)
-            .max()
-            .unwrap_or(n_obs);
+        let max_shard_rows = source.max_shard_rows().map_err(format_scx_error)?.max(1);
         let peak_bytes = (2 * n_obs * k + n_vars * k + max_shard_rows * k + n_vars) * 4;
         let peak_with_headroom = (peak_bytes as f64 * 1.1) as usize;
         let (free, _total) = dev.free_memory()?;
@@ -130,7 +127,7 @@ pub fn gpu_randomized_pca(
     let cusolver_handle = CusolverHandle::new()?;
 
     // Step 1: Compute column means and sum-of-squares (CPU-side, 1 pass)
-    let (means, col_sum_sq) = reader
+    let (means, col_sum_sq) = source
         .col_means_and_sum_sq(zero_center)
         .map_err(format_scx_error)?;
 
@@ -151,7 +148,7 @@ pub fn gpu_randomized_pca(
     let d_y = streaming_gpu_spmm_forward(
         dev,
         &cusparse_handle,
-        reader,
+        source,
         &d_omega,
         d_means.as_ref(),
         n_obs,
@@ -169,7 +166,7 @@ pub fn gpu_randomized_pca(
         let d_b = streaming_gpu_spmm_transpose(
             dev,
             &cusparse_handle,
-            reader,
+            source,
             &d_q,
             d_means.as_ref(),
             n_obs,
@@ -185,7 +182,7 @@ pub fn gpu_randomized_pca(
         let d_y2 = streaming_gpu_spmm_forward(
             dev,
             &cusparse_handle,
-            reader,
+            source,
             &d_q_b,
             d_means.as_ref(),
             n_obs,
@@ -202,7 +199,7 @@ pub fn gpu_randomized_pca(
     let d_b_final = streaming_gpu_spmm_transpose(
         dev,
         &cusparse_handle,
-        reader,
+        source,
         &d_q,
         d_means.as_ref(),
         n_obs,
@@ -295,7 +292,7 @@ pub fn gpu_randomized_pca(
 /// Streaming forward SpMM on GPU: Y = (X - μ) @ M, shard-by-shard.
 ///
 /// For each shard:
-///   1. Read shard to host (BackedCsrReader)
+///   1. Read shard to host (via ShardSource)
 ///   2. Upload indptr/indices/data to GPU → GpuCsr
 ///   3. GpuCsr → CusparseSpMatDescr (zero-copy on GPU)
 ///   4. cuSPARSE SpMM: Y_slice = A_shard @ M (accumulated with beta=1.0)
@@ -306,7 +303,7 @@ pub fn gpu_randomized_pca(
 fn streaming_gpu_spmm_forward(
     dev: &GpuDevice,
     cusparse: &CusparseHandle,
-    reader: &BackedCsrReader,
+    source: &dyn ShardSource,
     d_m: &CudaSlice<f32>, // (n_vars × k) col-major on GPU
     d_means: Option<&CudaSlice<f32>>,
     n_obs: usize,
@@ -314,7 +311,7 @@ fn streaming_gpu_spmm_forward(
     k: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
     let mut d_y = dev.alloc_zeros::<f32>(n_obs * k)?;
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
 
     // Pre-compute mean correction vector on GPU: mc = M^T @ means (k × 1)
     // Actually mc = means^T @ M = (1 × k), stored as (k,)
@@ -339,9 +336,7 @@ fn streaming_gpu_spmm_forward(
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = reader
-            .read_shard_uncached(shard_idx)
-            .map_err(format_scx_error)?;
+        let csr = source.read_shard(shard_idx).map_err(format_scx_error)?;
         let shard_rows = csr.n_rows();
 
         if shard_rows == 0 {
@@ -403,7 +398,7 @@ fn streaming_gpu_spmm_forward(
 fn streaming_gpu_spmm_transpose(
     dev: &GpuDevice,
     cusparse: &CusparseHandle,
-    reader: &BackedCsrReader,
+    source: &dyn ShardSource,
     d_q: &CudaSlice<f32>, // (n_obs × k) col-major on GPU
     d_means: Option<&CudaSlice<f32>>,
     n_obs: usize,
@@ -411,13 +406,11 @@ fn streaming_gpu_spmm_transpose(
     k: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
     let mut d_z = dev.alloc_zeros::<f32>(n_vars * k)?;
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = reader
-            .read_shard_uncached(shard_idx)
-            .map_err(format_scx_error)?;
+        let csr = source.read_shard(shard_idx).map_err(format_scx_error)?;
         let shard_rows = csr.n_rows();
 
         if shard_rows == 0 {

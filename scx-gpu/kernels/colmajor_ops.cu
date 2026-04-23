@@ -149,6 +149,47 @@ extern "C" __global__ void column_sum_kernel(
     }
 }
 
+// Select the top-k eigenvectors (in descending eigenvalue order) from an
+// ascending-ordered (n × n) column-major eigenvector matrix, writing them
+// into an (n × k) column-major output.
+//
+// src: (n × n) col-major eigvecs, eigenvalues ascending by column index.
+// dst: (n × k) col-major, column j of dst ← column (n-1-j) of src.
+//
+// Element (row, col=j) in dst corresponds to (row, src_col = n-1-j) in src.
+// total threads = n × k
+extern "C" __global__ void select_top_eigvecs_desc_kernel(
+    const float* __restrict__ src,   // [n × n], col-major
+    float* __restrict__ dst,         // [n × k], col-major
+    int n,
+    int k
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * k;
+    if (idx >= total) return;
+
+    int col = idx / n;           // output column 0..k
+    int row = idx % n;
+    int src_col = n - 1 - col;   // descending: largest first
+
+    dst[col * n + row] = src[src_col * n + row];
+}
+
+// Copy the last `k` entries of a length-`n` vector into a length-`k` output
+// in reversed order — i.e. out[j] = in[n - 1 - j] for j in [0, k).
+//
+// total threads = k
+extern "C" __global__ void reverse_tail_vec_kernel(
+    const float* __restrict__ src,   // [n]
+    float* __restrict__ dst,         // [k]
+    int n,
+    int k
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) return;
+    dst[j] = src[n - 1 - j];
+}
+
 // Outer product subtraction: Z[v, j] -= mu[v] * sum_q[j]
 //
 // Z: (n_vars × k) col-major

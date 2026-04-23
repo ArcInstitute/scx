@@ -229,6 +229,109 @@ pub fn gpu_qr_q(
     Ok(q)
 }
 
+// ---------------------------------------------------------------------------
+// Symmetric eigendecomposition (cusolverDnSsyevd)
+// ---------------------------------------------------------------------------
+
+/// Dense symmetric eigendecomposition on GPU (single-precision).
+///
+/// Solves `A · V = V · diag(Λ)` for a real symmetric `A`, in place on `A`:
+/// on return, `A` holds the eigenvectors as a column-major `n × n` matrix and
+/// the returned `CudaSlice<f32>` holds the eigenvalues.
+///
+/// Eigenvalues come back in **ascending** order (standard cuSOLVER / LAPACK
+/// `ssyevd` behaviour). Callers that want the top-k PCs should take the last
+/// `k` eigenpairs and reverse them.
+///
+/// The input `A` is expected to be symmetric col-major (we only inspect the
+/// upper triangle per `CUBLAS_FILL_MODE_UPPER`; the lower triangle is ignored).
+///
+/// Uses the divide-and-conquer algorithm under the hood.
+pub fn gpu_eigh_sym(
+    handle: &CusolverHandle,
+    stream: &Arc<CudaStream>,
+    dev: &GpuDevice,
+    a: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<CudaSlice<f32>, GpuError> {
+    if n == 0 {
+        return Err(GpuError::CuSolverError("eigh requires n > 0".into()));
+    }
+    if a.len() < n * n {
+        return Err(GpuError::CuSolverError(format!(
+            "eigh input too small: got {} elements, need {}",
+            a.len(),
+            n * n
+        )));
+    }
+
+    let n_i32 = n as i32;
+    let lda = n_i32;
+    let jobz = csol::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
+    let uplo = csol::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER;
+
+    handle.set_stream(stream)?;
+
+    let mut eigvals = dev.alloc_zeros::<f32>(n)?;
+
+    // Query workspace size.
+    let mut lwork: i32 = 0;
+    {
+        let (a_ptr, _ga) = a.device_ptr_mut(stream);
+        let (w_ptr, _gw) = eigvals.device_ptr_mut(stream);
+        unsafe {
+            csol::cusolverDnSsyevd_bufferSize(
+                handle.raw(),
+                jobz,
+                uplo,
+                n_i32,
+                a_ptr as *const f32,
+                lda,
+                w_ptr as *const f32,
+                &mut lwork as *mut i32,
+            )
+            .result()
+            .map_err(|e| GpuError::CuSolverError(format!("cusolverDnSsyevd_bufferSize: {e:?}")))?;
+        }
+    }
+
+    let mut workspace = dev.alloc_zeros::<f32>(lwork.max(1) as usize)?;
+    let mut dev_info = dev.alloc_zeros::<i32>(1)?;
+
+    {
+        let (a_ptr, _ga) = a.device_ptr_mut(stream);
+        let (w_ptr, _gw) = eigvals.device_ptr_mut(stream);
+        let (ws_ptr, _gws) = workspace.device_ptr_mut(stream);
+        let (info_ptr, _gi) = dev_info.device_ptr_mut(stream);
+        unsafe {
+            csol::cusolverDnSsyevd(
+                handle.raw(),
+                jobz,
+                uplo,
+                n_i32,
+                a_ptr as *mut f32,
+                lda,
+                w_ptr as *mut f32,
+                ws_ptr as *mut f32,
+                lwork,
+                info_ptr as *mut i32,
+            )
+            .result()
+            .map_err(|e| GpuError::CuSolverError(format!("cusolverDnSsyevd: {e:?}")))?;
+        }
+    }
+
+    let info_host = dev.dtoh_copy(&dev_info)?;
+    if info_host[0] != 0 {
+        return Err(GpuError::CuSolverError(format!(
+            "cusolverDnSsyevd failed: devInfo = {}",
+            info_host[0]
+        )));
+    }
+
+    Ok(eigvals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

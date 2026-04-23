@@ -30,8 +30,6 @@ use thread_local::ThreadLocal;
 use scx_format::total_variance_from_col_sq;
 use scx_format::ShardSource;
 
-#[cfg(feature = "gpu")]
-use scx_format::BackedCsrReader;
 use scx_sparse::ScxCsr;
 
 use crate::error::{AccelError, Result};
@@ -1135,7 +1133,62 @@ pub fn covariance_pca_inmemory(
 // GPU PCA dispatch (behind "gpu" feature)
 // ---------------------------------------------------------------------------
 
-/// GPU-accelerated randomized PCA from a backed SCX reader.
+/// GPU-accelerated **covariance PCA** — the companion entry point to
+/// [`covariance_pca`] that dispatches to `scx_gpu::gpu_covariance_pca`.
+///
+/// Intended for small `n_vars` (HVG-shaped inputs) — see
+/// [`GPU_COVARIANCE_PCA_THRESHOLD`]. For larger `n_vars` use
+/// [`randomized_pca_gpu`] instead.
+///
+/// # Arguments
+///
+/// * `device_id` — CUDA device ordinal (typically `0`).
+/// * `source` — any `ShardSource + Sync` (backed reader, lazy transform, or
+///   in-memory `ScxCsr` wrapper).
+/// * `n_components` — number of principal components to return.
+/// * `zero_center` — subtract per-column means before computing the Gram matrix.
+#[cfg(feature = "gpu")]
+pub fn covariance_pca_gpu<S: ShardSource + Sync>(
+    device_id: usize,
+    source: &S,
+    n_components: usize,
+    zero_center: bool,
+) -> Result<PcaResult> {
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+    let gpu_result = scx_gpu::gpu_covariance_pca(&dev, source, n_components, zero_center)
+        .map_err(|e| AccelError::LinAlg(format!("GPU covariance PCA failed: {e}")))?;
+
+    let embeddings: Vec<f64> = gpu_result.embeddings.iter().map(|&v| v as f64).collect();
+    let components: Vec<f64> = gpu_result.components.iter().map(|&v| v as f64).collect();
+
+    Ok(PcaResult {
+        embeddings,
+        components,
+        variance_explained: gpu_result.variance_explained,
+        variance_ratio: gpu_result.variance_ratio,
+        mean: gpu_result.mean,
+        n_components: gpu_result.n_components,
+        n_obs: gpu_result.n_obs,
+        n_vars: gpu_result.n_vars,
+    })
+}
+
+/// GPU routing threshold for covariance vs randomized PCA.
+///
+/// When `n_vars <= GPU_COVARIANCE_PCA_THRESHOLD`, prefer
+/// [`covariance_pca_gpu`] (dense eigh on a `n_vars × n_vars` Gram matrix).
+/// When `n_vars > GPU_COVARIANCE_PCA_THRESHOLD`, prefer [`randomized_pca_gpu`]
+/// (streaming randomized SVD via Halko iterations).
+///
+/// Kept separate from the CPU-side [`COVARIANCE_PCA_THRESHOLD`] (5_000) until
+/// benchmarking confirms whether raising the CPU threshold to 8_000 is safe —
+/// see Phase 2 Decision 1 in `GPU-ACC-SPEED-UP.md`.
+#[cfg(feature = "gpu")]
+pub const GPU_COVARIANCE_PCA_THRESHOLD: usize = 8_000;
+
+/// GPU-accelerated randomized PCA from any `ShardSource`.
 ///
 /// Wraps [`scx_gpu::gpu_randomized_pca`] to stream data shard-by-shard on GPU
 /// (cuSPARSE SpMM, cuSOLVER QR) and returns a [`PcaResult`] with host-side
@@ -1146,16 +1199,17 @@ pub fn covariance_pca_inmemory(
 /// # Arguments
 ///
 /// * `device_id` — CUDA device ordinal (0 for first GPU)
-/// * `reader` — Backed CSR reader (provides shard-by-shard access)
+/// * `source` — any `ShardSource + Sync` (backed reader, lazy transform, or
+///   in-memory CSR wrapper)
 /// * `n_components` — Number of principal components to compute
 /// * `n_oversamples` — Extra dimensions for accuracy (default: 10)
 /// * `n_power_iterations` — Power iterations for spectral accuracy (default: 2)
 /// * `zero_center` — Whether to mean-center the data (default: true)
 /// * `seed` — Random seed for reproducibility
 #[cfg(feature = "gpu")]
-pub fn randomized_pca_gpu(
+pub fn randomized_pca_gpu<S: ShardSource + Sync>(
     device_id: usize,
-    reader: &BackedCsrReader,
+    source: &S,
     n_components: usize,
     n_oversamples: usize,
     n_power_iterations: usize,
@@ -1167,7 +1221,7 @@ pub fn randomized_pca_gpu(
 
     let gpu_result = scx_gpu::gpu_randomized_pca(
         &dev,
-        reader,
+        source,
         n_components,
         n_oversamples,
         n_power_iterations,
