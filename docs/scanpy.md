@@ -895,13 +895,16 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `resolution` | 1.0 | Resolution parameter γ — higher values yield more communities |
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
-| `n_iterations` | -1 | Outer iterations: -1 = run until convergence (default, matches scanpy), >0 = fixed count |
+| `n_iterations` | -1 | Outer iterations: -1 = run until convergence (default, matches scanpy), >0 = fixed count. On the cuGraph path this can be raised safely (rapids-singlecell defaults to 100) — each additional iteration is cheap and gives better modularity convergence. |
 | `parallel` | `False` | Use parallel (conflict-free batched) local moving. `False` (default) uses sequential moving that matches C++ leidenalg. `True` is faster on large graphs but converges to a different local optimum. |
-| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. Only gates whether the cuGraph backend is **attempted** — see Dispatch priority below. |
+| `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored** by the Rust-native and leidenalg backends. |
 
 **Dispatch priority:** Rust-native → GPU cuGraph → Python leidenalg (fallback).
-The Rust path is tried first; if it fails, a warning is issued and the next
-backend is tried.
+The Rust path is tried first regardless of `device`; if it succeeds, GPU is
+not invoked even when `device="gpu"`. If Rust-native fails, a warning is
+issued and — if `device` resolves to GPU — the cuGraph path is tried next,
+then leidenalg as a final fallback.
 
 Benchmarked at 55s on 1M cells (**40× faster** than Python leidenalg's 2,226s
 in same-conditions comparison).

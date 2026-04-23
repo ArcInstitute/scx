@@ -13,9 +13,18 @@ use super::gpu::resolve_device;
 /// Results are written to `adata.obs[key_added]` (cluster labels as strings)
 /// and `adata.uns["leiden"]` (parameters and backend metadata).
 ///
-/// When `device="gpu"`, tries cuGraph Leiden (GPU-accelerated, up to 47×
-/// faster than igraph on million-cell datasets). Falls back to CPU leidenalg
-/// via igraph if cuGraph is unavailable.
+/// ## Backend priority
+///
+/// Three implementations are tried in order; the first that succeeds wins:
+///
+/// 1. **Rust-native** (`scx_accel::leiden`) — always attempted first. Fastest
+///    on single-node workloads and has no Python dependencies. Ignores
+///    `device`; setting `device="gpu"` does **not** guarantee GPU execution
+///    if the Rust-native path succeeds.
+/// 2. **cuGraph** (`cugraph.leiden`) — attempted only when `device="gpu"` (or
+///    `device="auto"` on a GPU-available host) AND the Rust-native path
+///    raised an error. Requires `cugraph` installed.
+/// 3. **leidenalg** — Python fallback via `igraph` + `leidenalg`.
 ///
 /// Args:
 ///     adata: AnnData with obsp["connectivities"] (CSR, n_obs × n_obs)
@@ -23,8 +32,15 @@ use super::gpu::resolve_device;
 ///     key_added: Column name in adata.obs for cluster labels (default: "leiden")
 ///     random_state: Random seed for reproducibility (default: 0)
 ///     n_iterations: Maximum optimization iterations; 2 runs two outer passes
-///         (matching leidenalg package default), -1 for until convergence (default: 2)
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///         (matching leidenalg package default), -1 for until convergence (default: 2).
+///         On the cuGraph path this can safely be raised — rapids-singlecell
+///         defaults to 100 and convergence is cheap; see docs/scanpy.md.
+///     device: Device selection — "auto" (default), "cpu", or "gpu". Only
+///         gates the cuGraph attempt (see Backend priority above).
+///     parallel: Run the Rust-native Leiden in parallel mode (conflict-free
+///         graph coloring). Default `False`.
+///     theta: Resolution scaling knob for cuGraph Leiden only (default 1.0).
+///         **Ignored** by the Rust-native and leidenalg backends.
 ///
 /// Notes:
 ///     GPU and CPU Leiden may produce different partitions on the same graph
@@ -32,7 +48,7 @@ use super::gpu::resolve_device;
 ///     strategy than leidenalg). Both produce valid, high-quality community
 ///     structures. Compare results via ARI or NMI when switching backends.
 #[pyfunction]
-#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=2, device="auto", parallel=false))]
+#[pyo3(signature = (adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=2, device="auto", parallel=false, theta=1.0))]
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     py: Python<'_>,
@@ -43,6 +59,7 @@ pub fn leiden(
     n_iterations: i64,
     device: &str,
     parallel: bool,
+    theta: f64,
 ) -> PyResult<()> {
     // Determine effective device
     let use_gpu = resolve_device(device)?;
@@ -56,7 +73,8 @@ pub fn leiden(
         )
     })?;
 
-    // Priority 1: Rust-native Leiden (fastest, no Python dependencies)
+    // Priority 1: Rust-native Leiden (fastest, no Python dependencies).
+    // `theta` is cuGraph-only and is not forwarded here.
     match run_rust_leiden(
         py,
         adata,
@@ -89,6 +107,7 @@ pub fn leiden(
             key_added,
             random_state,
             n_iterations,
+            theta,
         ) {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -106,7 +125,8 @@ pub fn leiden(
         }
     }
 
-    // Priority 3: Python leidenalg via igraph (fallback)
+    // Priority 3: Python leidenalg via igraph (fallback).
+    // `theta` is cuGraph-only and is not forwarded here.
     run_cpu_leiden(
         py,
         adata,
@@ -205,7 +225,9 @@ fn run_rust_leiden(
 /// Try GPU Leiden via cuGraph Python import.
 ///
 /// Converts the connectivities CSR matrix to a cuGraph Graph, runs
-/// `cugraph.leiden()`, and writes results to adata.
+/// `cugraph.leiden()`, and writes results to adata. `theta` is forwarded as
+/// the optional cuGraph-specific resolution scaling kwarg.
+#[allow(clippy::too_many_arguments)]
 fn try_cugraph_leiden(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -214,6 +236,7 @@ fn try_cugraph_leiden(
     key_added: &str,
     random_state: u64,
     max_iter: i64,
+    theta: f64,
 ) -> PyResult<()> {
     // Import cuGraph — if not installed, return error immediately
     let cugraph = py
@@ -268,6 +291,7 @@ fn try_cugraph_leiden(
     let leiden_kwargs = PyDict::new(py);
     leiden_kwargs.set_item("resolution", resolution)?;
     leiden_kwargs.set_item("random_state", random_state as i32)?;
+    leiden_kwargs.set_item("theta", theta)?;
     if max_iter > 0 {
         leiden_kwargs.set_item("max_iter", max_iter)?;
     }
@@ -304,6 +328,7 @@ fn try_cugraph_leiden(
     params_dict.set_item("resolution", resolution)?;
     params_dict.set_item("random_state", random_state)?;
     params_dict.set_item("n_iterations", max_iter)?;
+    params_dict.set_item("theta", theta)?;
     leiden_dict.set_item("params", params_dict)?;
     leiden_dict.set_item("backend", "cugraph")?;
     leiden_dict.set_item("modularity", modularity)?;
