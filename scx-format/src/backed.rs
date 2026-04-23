@@ -1044,6 +1044,16 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
         self.read_shard_uncached(shard_idx)
     }
 
+    /// O(1) override: shard row counts live in `BackedCsrIndex`, no decode needed.
+    fn max_shard_rows(&self) -> Result<usize> {
+        let idx = &self.index;
+        Ok((0..idx.n_shards())
+            .filter_map(|i| idx.shard_range(i))
+            .map(|(s, e)| (e - s) as usize)
+            .max()
+            .unwrap_or(0))
+    }
+
     // col_means_and_sum_sq: use the default trait impl which iterates
     // read_shard() — functionally identical to the inherent method above.
 }

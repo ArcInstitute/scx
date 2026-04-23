@@ -1730,6 +1730,12 @@ impl scx_format::ShardSource for LazyShardSource {
         }
     }
 
+    /// Row counts are unchanged by transforms and column projection — delegate
+    /// to the wrapped reader's O(1) implementation.
+    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+        self.backed.max_shard_rows()
+    }
+
     fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
         let (s_start, _) = self.backed.index().shard_range(shard_idx).ok_or_else(|| {
             scx_format::ScxError::ShardIndexOutOfBounds {

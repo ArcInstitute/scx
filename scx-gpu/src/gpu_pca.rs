@@ -472,7 +472,10 @@ fn streaming_gpu_spmm_transpose(
 // ---------------------------------------------------------------------------
 
 /// Upload an ScxCsr to GPU as GpuCsr.
-fn upload_csr_to_gpu(dev: &GpuDevice, csr: &scx_sparse::ScxCsr) -> Result<GpuCsr, GpuError> {
+pub(crate) fn upload_csr_to_gpu(
+    dev: &GpuDevice,
+    csr: &scx_sparse::ScxCsr,
+) -> Result<GpuCsr, GpuError> {
     let d_indptr = dev.htod_copy(&csr.indptr)?;
     let d_indices = dev.htod_copy(&csr.indices)?;
     let d_data = dev.htod_copy(&csr.data)?;
@@ -489,7 +492,7 @@ fn upload_csr_to_gpu(dev: &GpuDevice, csr: &scx_sparse::ScxCsr) -> Result<GpuCsr
 ///
 /// Replaces the CPU round-trip version that downloaded the entire n_obs×k
 /// matrix to host per shard (240 MB for 1M cells × 60 PCs).
-fn gpu_scatter_colmajor(
+pub(crate) fn gpu_scatter_colmajor(
     dev: &GpuDevice,
     src: &CudaSlice<f32>,     // (shard_rows × k) col-major
     dst: &mut CudaSlice<f32>, // (n_obs × k) col-major
@@ -540,7 +543,7 @@ fn gpu_scatter_colmajor(
 ///
 /// Replaces the CPU round-trip version that downloaded the entire n_obs×k
 /// matrix to host per shard.
-fn gpu_gather_colmajor(
+pub(crate) fn gpu_gather_colmajor(
     dev: &GpuDevice,
     src: &CudaSlice<f32>, // (n_obs × k) col-major
     shard_rows: usize,
@@ -591,7 +594,7 @@ fn gpu_gather_colmajor(
 /// Mean-correct a col-major matrix on GPU: Y[r, j] -= mc[j].
 ///
 /// Replaces the CPU round-trip version that downloaded shard-sized data.
-fn gpu_mean_correct_colmajor(
+pub(crate) fn gpu_mean_correct_colmajor(
     dev: &GpuDevice,
     y: &mut CudaSlice<f32>,
     mc: &CudaSlice<f32>,
@@ -635,7 +638,7 @@ fn gpu_mean_correct_colmajor(
 /// Compute column sums of a col-major matrix on GPU.
 ///
 /// Returns a vector of k column sums.
-fn gpu_column_sums(
+pub(crate) fn gpu_column_sums(
     dev: &GpuDevice,
     x: &CudaSlice<f32>, // (m × k) col-major
     m: usize,
@@ -681,7 +684,7 @@ fn gpu_column_sums(
 }
 
 /// Outer product subtraction on GPU: Z[v, j] -= mu[v] * sum_q[j].
-fn gpu_outer_sub(
+pub(crate) fn gpu_outer_sub(
     dev: &GpuDevice,
     z: &mut CudaSlice<f32>, // (n_vars × k) col-major
     mu: &CudaSlice<f32>,    // [n_vars]
