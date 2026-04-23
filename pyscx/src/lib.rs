@@ -307,6 +307,8 @@ fn register_preprocessing(m: &Bound<'_, PyModule>) -> PyResult<()> {
         accel::preprocessing::calculate_qc_metrics,
         m
     )?)?;
+    #[cfg(feature = "gpu")]
+    m.add_class::<accel::preprocessing::ScxGpuNormalizeMarker>()?;
     Ok(())
 }
 

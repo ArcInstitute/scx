@@ -29,8 +29,12 @@
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
+use scx_format::{concatenate_csr, ShardSource};
+use scx_sparse::ScxCsr;
+
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::shard_pipeline::DoubleBufferedShardLoader;
 
 /// PTX source for the normalize+log1p kernels, compiled at build time.
 const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normalize_log1p.ptx"));
@@ -215,6 +219,84 @@ pub fn gpu_apply_fused_ops(
         (None, true) => gpu_log1p(dev, indptr, data, n_rows),
         (None, false) => Ok(()), // no-op
     }
+}
+
+/// Stream a [`ShardSource`] through [`gpu_apply_fused_ops`] and return a
+/// single concatenated [`ScxCsr`] on the host.
+///
+/// This is the eager GPU path used by `pyscx.accel.normalize_total(device="gpu")`
+/// and `log1p(device="gpu")`. It uses [`DoubleBufferedShardLoader`] to overlap
+/// shard decode with GPU kernel launches. Per shard:
+///
+/// 1. Clone the shard's data buffer on-device (kernels mutate in-place; the
+///    loader hands out shared references).
+/// 2. Apply `gpu_apply_fused_ops` to the clone.
+/// 3. D→H copy `(indptr, indices, data)` for that shard.
+/// 4. Append to a host-side `Vec<ScxCsr>`.
+///
+/// After the stream completes, the per-shard CSRs are concatenated into a
+/// single `ScxCsr` via [`scx_format::concatenate_csr`].
+///
+/// # Arguments
+///
+/// * `dev` — GPU device handle.
+/// * `source` — shard-wise CSR source; must be `Sync` (required by the loader).
+/// * `normalize` — `Some(target_sum)` to apply per-row normalization; `None` to
+///   skip normalization.
+/// * `log1p` — apply `log1p` elementwise after any normalization.
+///
+/// When both `normalize` and `log1p` are `None`/`false`, each shard is simply
+/// downloaded and concatenated (no kernel launched). Callers can avoid that
+/// overhead by not calling this function for the no-op case.
+pub fn gpu_preprocess_to_csr(
+    dev: &GpuDevice,
+    source: &(dyn ShardSource + Sync),
+    normalize: Option<f32>,
+    log1p: bool,
+) -> Result<ScxCsr, GpuError> {
+    let n_vars = source.n_vars();
+    let n_shards = source.n_shards();
+
+    // Empty-source fast path: return a (0 × n_vars) CSR without spinning up
+    // the streaming loader.
+    if n_shards == 0 || source.n_obs() == 0 {
+        return Ok(ScxCsr::new_unchecked((0, n_vars), vec![0], vec![], vec![]));
+    }
+
+    let loader = DoubleBufferedShardLoader::new(dev, source)?;
+    let shard_csrs = std::sync::Mutex::new(Vec::<(usize, ScxCsr)>::with_capacity(n_shards));
+
+    loader.for_each_shard(|shard_idx, gpu_csr| {
+        let (n_rows, _) = gpu_csr.shape;
+
+        // Apply fused ops in-place on a cloned data buffer. The loader hands
+        // out a `&GpuCsr`; we must not mutate the underlying device memory
+        // because subsequent passes (if any) would see the post-transform
+        // values. Cloning is a small device-to-device copy and keeps the
+        // API composable.
+        let mut d_data = gpu_csr
+            .data
+            .try_clone()
+            .map_err(|e| GpuError::CudaError(format!("clone shard data: {e}")))?;
+        gpu_apply_fused_ops(dev, &gpu_csr.indptr, &mut d_data, n_rows, normalize, log1p)?;
+
+        // Synchronize before D→H copies so the kernel output is visible.
+        dev.synchronize()?;
+
+        let indptr = dev.dtoh_copy(&gpu_csr.indptr)?;
+        let indices = dev.dtoh_copy(&gpu_csr.indices)?;
+        let data = dev.dtoh_copy(&d_data)?;
+        let csr = ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
+        shard_csrs.lock().unwrap().push((shard_idx, csr));
+        Ok(())
+    })?;
+
+    let mut shard_csrs = shard_csrs.into_inner().unwrap();
+    shard_csrs.sort_by_key(|&(idx, _)| idx);
+    let ordered: Vec<ScxCsr> = shard_csrs.into_iter().map(|(_, csr)| csr).collect();
+
+    concatenate_csr(&ordered, n_vars)
+        .map_err(|e| GpuError::InvalidShard(format!("concatenate_csr: {e}")))
 }
 
 #[cfg(test)]
@@ -517,5 +599,219 @@ mod tests {
             max_rel_err < 1e-5,
             "max relative error = {max_rel_err} (threshold: 1e-5)"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Task 5.1 — `gpu_preprocess_to_csr` streaming driver tests
+    // -------------------------------------------------------------------
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use scx_sparse::ScxCsr;
+
+    struct InMemorySource {
+        shards: Vec<ScxCsr>,
+        n_obs: usize,
+        n_vars: usize,
+    }
+
+    impl ShardSource for InMemorySource {
+        fn n_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+            Ok(self.shards[shard_idx].clone())
+        }
+    }
+
+    /// Build a random CSR with ~`density` fraction of nonzeros and strictly
+    /// positive f32 values in `[0.5, 20.5)` (UMI-like).
+    fn random_pos_csr(n_rows: usize, n_cols: usize, density: f32, seed: u64) -> ScxCsr {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        indptr.push(0);
+        for _ in 0..n_rows {
+            for c in 0..n_cols {
+                if rng.gen_bool(density as f64) {
+                    indices.push(c as i32);
+                    data.push(rng.gen_range(0.5..20.5));
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+    }
+
+    fn split_into_shards(csr: &ScxCsr, n_shards: usize) -> Vec<ScxCsr> {
+        let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
+        let rows_per = n_rows.div_ceil(n_shards);
+        let mut out = Vec::new();
+        let mut row_start = 0;
+        while row_start < n_rows {
+            let row_end = (row_start + rows_per).min(n_rows);
+            let p0 = csr.indptr[row_start] as usize;
+            let p1 = csr.indptr[row_end] as usize;
+            let shard_indptr: Vec<i64> = csr.indptr[row_start..=row_end]
+                .iter()
+                .map(|&p| p - csr.indptr[row_start])
+                .collect();
+            let shard_indices = csr.indices[p0..p1].to_vec();
+            let shard_data = csr.data[p0..p1].to_vec();
+            out.push(ScxCsr::new_unchecked(
+                (row_end - row_start, n_cols),
+                shard_indptr,
+                shard_indices,
+                shard_data,
+            ));
+            row_start = row_end;
+        }
+        out
+    }
+
+    #[test]
+    fn test_gpu_preprocess_to_csr_normalize_matches_cpu() {
+        let dev = require_gpu!();
+        let n_rows = 500;
+        let n_cols = 100;
+        let target_sum = 1e4f32;
+        let csr = random_pos_csr(n_rows, n_cols, 0.1, 11);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let result =
+            gpu_preprocess_to_csr(&dev, &source, Some(target_sum), false).expect("gpu preprocess");
+        assert_eq!(result.n_rows(), n_rows);
+        assert_eq!(result.n_cols(), n_cols);
+        assert_eq!(result.nnz(), csr.nnz());
+        assert_eq!(result.indices, csr.indices);
+        assert_eq!(result.indptr, csr.indptr);
+
+        // CPU reference: apply normalize on the full concatenated CSR.
+        let mut cpu_data = csr.data.clone();
+        cpu_normalize(&csr.indptr, &mut cpu_data, target_sum as f64);
+
+        // Elementwise rel-err < 1e-5.
+        let mut max_rel_err = 0.0f64;
+        for i in 0..cpu_data.len() {
+            let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
+            let denom = (cpu_data[i] as f64).abs().max(1e-10);
+            max_rel_err = max_rel_err.max(diff / denom);
+        }
+        assert!(max_rel_err < 1e-5, "normalize max rel err = {max_rel_err}");
+
+        // Per-row sums equal target_sum (within 1e-3 rel).
+        for r in 0..n_rows {
+            let p0 = result.indptr[r] as usize;
+            let p1 = result.indptr[r + 1] as usize;
+            if p0 == p1 {
+                continue;
+            }
+            let row_sum: f32 = result.data[p0..p1].iter().sum();
+            let rel = (row_sum - target_sum).abs() / target_sum;
+            assert!(rel < 1e-3, "row {r} sum {row_sum} != {target_sum}");
+        }
+    }
+
+    #[test]
+    fn test_gpu_preprocess_to_csr_log1p_matches_cpu() {
+        let dev = require_gpu!();
+        let n_rows = 500;
+        let n_cols = 100;
+        let csr = random_pos_csr(n_rows, n_cols, 0.1, 22);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let result = gpu_preprocess_to_csr(&dev, &source, None, true).expect("gpu preprocess");
+        assert_eq!(result.indices, csr.indices);
+        assert_eq!(result.indptr, csr.indptr);
+
+        let mut cpu_data = csr.data.clone();
+        cpu_log1p(&csr.indptr, &mut cpu_data);
+
+        for i in 0..cpu_data.len() {
+            let diff = (result.data[i] - cpu_data[i]).abs();
+            assert!(diff < 1e-6, "log1p mismatch at [{i}]: {diff}");
+        }
+    }
+
+    #[test]
+    fn test_gpu_preprocess_to_csr_fused_matches_cpu() {
+        let dev = require_gpu!();
+        let n_rows = 500;
+        let n_cols = 100;
+        let target_sum = 1e4f32;
+        let csr = random_pos_csr(n_rows, n_cols, 0.1, 33);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let result =
+            gpu_preprocess_to_csr(&dev, &source, Some(target_sum), true).expect("gpu preprocess");
+        assert_eq!(result.indices, csr.indices);
+        assert_eq!(result.indptr, csr.indptr);
+
+        let mut cpu_data = csr.data.clone();
+        cpu_fused_normalize_log1p(&csr.indptr, &mut cpu_data, target_sum as f64);
+
+        let mut max_rel_err = 0.0f64;
+        for i in 0..cpu_data.len() {
+            let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
+            let denom = (cpu_data[i] as f64).abs().max(1e-10);
+            max_rel_err = max_rel_err.max(diff / denom);
+        }
+        // GPU f32 vs CPU f64 intermediates — same tolerance as the fused kernel test above.
+        assert!(
+            max_rel_err < 1e-4,
+            "fused max rel err = {max_rel_err} (threshold 1e-4)"
+        );
+    }
+
+    #[test]
+    fn test_gpu_preprocess_to_csr_single_shard() {
+        // Exercises the single-buffered fallback in DoubleBufferedShardLoader.
+        let dev = require_gpu!();
+        let n_rows = 100;
+        let n_cols = 40;
+        let target_sum = 1.0f32;
+        let csr = random_pos_csr(n_rows, n_cols, 0.1, 44);
+        let source = InMemorySource {
+            shards: vec![csr.clone()],
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let result =
+            gpu_preprocess_to_csr(&dev, &source, Some(target_sum), false).expect("gpu preprocess");
+        assert_eq!(result.n_rows(), n_rows);
+        assert_eq!(result.n_cols(), n_cols);
+        // Per-row sums should be ~1.0.
+        for r in 0..n_rows {
+            let p0 = result.indptr[r] as usize;
+            let p1 = result.indptr[r + 1] as usize;
+            if p0 == p1 {
+                continue;
+            }
+            let row_sum: f32 = result.data[p0..p1].iter().sum();
+            assert!((row_sum - 1.0).abs() < 1e-4, "row {r} sum = {row_sum}");
+        }
     }
 }

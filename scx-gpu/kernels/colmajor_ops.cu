@@ -212,6 +212,59 @@ extern "C" __global__ void scale_columns_kernel(
     U[idx] *= s[col];
 }
 
+// Per-column nonzero accumulation: Σ x and Σ x² in f64.
+//
+// indices: [nnz] column index per nonzero
+// data:    [nnz] f32 value per nonzero
+// col_sum, col_sum_sq: [n_vars] f64 accumulators (must be zero-initialized by caller)
+//
+// Thread-per-nonzero, using atomicAdd on f64 (requires compute 6.x+).
+//
+// total threads = nnz
+extern "C" __global__ void col_sum_sq_nonzeros_kernel(
+    const int* __restrict__ indices,
+    const float* __restrict__ data,
+    long long nnz,
+    double* __restrict__ col_sum,
+    double* __restrict__ col_sum_sq
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    int c = indices[i];
+    double v = (double)data[i];
+    atomicAdd(&col_sum[c], v);
+    atomicAdd(&col_sum_sq[c], v * v);
+}
+
+// Per-column clipped nonzero accumulation: Σ min(x, clip[c]) and Σ min(x, clip[c])²
+//
+// indices: [nnz] column index per nonzero
+// data:    [nnz] f32 value per nonzero
+// clip_val: [n_vars] per-column clip threshold (f64)
+// batch_count_sum:    [n_vars] Σ clipped_v
+// sq_batch_count_sum: [n_vars] Σ clipped_v²
+//
+// Thread-per-nonzero, using atomicAdd on f64.
+//
+// total threads = nnz
+extern "C" __global__ void col_clip_sq_nonzeros_kernel(
+    const int* __restrict__ indices,
+    const float* __restrict__ data,
+    long long nnz,
+    const double* __restrict__ clip_val,
+    double* __restrict__ batch_count_sum,
+    double* __restrict__ sq_batch_count_sum
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    int c = indices[i];
+    double v = (double)data[i];
+    double cv = clip_val[c];
+    double vc = v > cv ? cv : v;
+    atomicAdd(&batch_count_sum[c], vc);
+    atomicAdd(&sq_batch_count_sum[c], vc * vc);
+}
+
 // Outer product subtraction: Z[v, j] -= mu[v] * sum_q[j]
 //
 // Z: (n_vars × k) col-major
