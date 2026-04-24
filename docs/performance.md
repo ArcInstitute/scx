@@ -307,9 +307,40 @@ Numbers below are from the Phase 8 cluster run on 2026-04-23 (SLURM job 2211369)
 | Leiden | census_1m | 55.0 | 56.9 | **1.0×** | Rust-native (via `pyscx.accel.leiden` priority) |
 | **End-to-end pipeline** | **census_1m** | **837.9** | **120.6** | **6.9×** | all above — **up from 3.8× pre-Phase-1** |
 
-The Leiden row at 1.0× is **by design, not a regression** — per [Phase 6 of `GPU-ACC-SPEED-UP.md`](../GPU-ACC-SPEED-UP.md#phase-6--cugraph-leiden-knob-exposure), `pyscx.accel.leiden(device="gpu")` runs Rust-native Leiden first; cuGraph is only reached when Rust-native fails. Rust-native Leiden on 1M cells is ~56 s, comparable to leidenalg's 55 s. To actually exercise the cuGraph GPU path, use `pyscx.accel.leiden(device="gpu", parallel=True)` (forces the Rust-native parallel mode to potentially fail, falling through to cuGraph) or invoke cuGraph directly. A previous "16×" number for GPU Leiden came from direct cuGraph invocation — kept in the pre-Phase-1 baseline snapshot for historical comparison.
-
 The pipeline 6.9× speedup is headlined by UMAP (18.8×, up from 7.7×) and kNN (5.4× in-pipeline, up from 2.3×). PCA at 2K HVGs × 1M cells shows 1.0× because CPU covariance PCA already takes ~3 s — there's no headroom for a speedup. At `n_vars = 100 K` (tabula_sapiens_100k without HVG subsetting) PCA lands at 1.7×.
+
+#### Leiden: Rust-native vs cuGraph (by design)
+
+The Leiden row at 1.0× is **not a regression, it's a design choice.** `pyscx.accel.leiden(device="gpu")` runs the Rust-native implementation first; cuGraph is only reached when Rust-native fails to converge. A previous headline of **16× for GPU Leiden** came from direct cuGraph invocation — it is still reachable, but opt-in. Here's why the default is not cuGraph.
+
+**Performance vs correctness**
+
+| Implementation | Wall on census_1m | ARI vs leidenalg |
+|---|---:|---:|
+| Rust-native Leiden (default for `device="gpu"`) | ~56 s | ≈ 1.0 |
+| cuGraph Leiden (opt-in) | ~3.5 s | **0.92** |
+
+cuGraph is ~16× faster. It also produces clusters that differ in ~8 % of label assignments from the CPU reference — the ARI 0.92 number recorded in `CLAUDE.md` § Known Limitations. The divergence is not an implementation bug; cuGraph's Leiden uses a different refinement step and seed-handling scheme from leidenalg, and the Rust-native implementation is a direct port of Traag et al. 2019 with RB configuration model that matches leidenalg to ARI ≈ 1.0 by construction.
+
+**Why not default to cuGraph**
+
+The `device="gpu"` kwarg has a consistent contract across the rest of SCX: PCA, kNN, UMAP, HVG, and preprocessing all return results that are numerically close to the CPU path (cosine ≥ 0.9999 for PCA, recall@15 ≥ 0.95 for kNN, trustworthiness within 0.001 for UMAP). Flipping to cuGraph on `device="gpu"` would silently shift every downstream artifact — marker-gene DE, annotation-transfer scores, cluster-colored UMAPs — for every existing user of `pyscx.accel.leiden`. Leiden is the one op where the GPU backend is a genuinely different algorithm, so it sits behind a convergence fallback to preserve the contract.
+
+**How to opt into cuGraph**
+
+```python
+# Option 1: force Rust-native parallel mode. It is more likely to
+# fail convergence on irregular graphs and fall through to cuGraph.
+pyscx.accel.leiden(adata, device="gpu", parallel=True)
+
+# Option 2: bypass dispatch entirely and call cuGraph directly
+# (e.g. `cugraph.leiden` on a cugraph.Graph built from your kNN).
+```
+
+**When is each the right choice**
+
+- **Stick with the default** when Leiden clusters feed a downstream pipeline (marker-gene DE, annotation transfer, anything you've validated on CPU outputs). Reproducibility against the CPU reference matters more than ~50 s of wall time on a 1M-cell graph.
+- **Opt into cuGraph** for throughput-bound exploratory work — resolution sweeps, clustering under many random seeds, one-shot visualizations — where ARI 0.92 parity is acceptable.
 
 #### Preprocessing device dispatch (Phase 5)
 
