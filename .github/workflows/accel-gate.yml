@@ -1,0 +1,76 @@
+name: Accel gate
+
+# Phase 9.9: GPU/accelerator regression gate.
+#
+# Runs `gate_candidate.sh --tier small` on PRs that touch
+# accelerator or GPU code paths, using the canonical baseline under
+# `benchmarks/comprehensive/results/baselines/LATEST`. Exit code gates
+# the merge: 0 = pass, 1 = regression / floor violation / fingerprint
+# drift, 2 = infra failure.
+#
+# Runner requirement: a self-hosted runner labelled `gpu` with the
+# `scx-gpu` conda env installed at the path configured via
+# `CONDA_PREFIX_OVERRIDE` (see benchmarks/comprehensive/README.md).
+# Without a matching runner the workflow will queue until one is
+# available — this is intentional: the gate is authoritative and
+# cannot be satisfied by a CPU-only host.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pyscx/src/accel/**'
+      - 'scx-accel/**'
+      - 'scx-gpu/**'
+      - 'benchmarks/comprehensive/**'
+      - '.github/workflows/accel-gate.yml'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Gate tier (small | full)'
+        required: false
+        default: 'small'
+
+jobs:
+  gate:
+    name: Gate (tier=${{ github.event.inputs.tier || 'small' }})
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 180
+    env:
+      CONDA_PREFIX_OVERRIDE: /home/nickyoungblut/miniforge3/envs/scx-gpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show GPU
+        run: nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+
+      - name: Bind scx-gpu conda env
+        run: |
+          echo "CONDA_PREFIX=$CONDA_PREFIX_OVERRIDE" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$CONDA_PREFIX_OVERRIDE" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=$CONDA_PREFIX_OVERRIDE" >> "$GITHUB_ENV"
+          echo "$CONDA_PREFIX_OVERRIDE/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$CONDA_PREFIX_OVERRIDE/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Build pyscx --features gpu
+        run: |
+          "$CONDA_PREFIX_OVERRIDE/bin/maturin" develop \
+            --manifest-path pyscx/Cargo.toml \
+            --release \
+            --features gpu
+
+      - name: Run gate_candidate.sh --tier small
+        run: |
+          bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+            --tier "${{ github.event.inputs.tier || 'small' }}" \
+            --python "$CONDA_PREFIX_OVERRIDE/bin/python"
+
+      - name: Upload candidate snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accel-gate-candidate-${{ github.sha }}
+          path: benchmarks/comprehensive/results/candidate_*
+          retention-days: 14

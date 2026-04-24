@@ -47,10 +47,7 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
-import resource
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -60,108 +57,78 @@ from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
     N_WARMUP_RUNS,
-    QUERY_N_HVGS,
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.runners.accel_runner import (
+    AcceleratorRunner,
+    PreprocessedFixture,
+)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Availability detection — each variant is only runnable when its deps exist
-# ---------------------------------------------------------------------------
 
-_HAS_PYSCX = False
-_HAS_PYSCX_GPU = False
-try:
-    import pyscx  # noqa: F401
-
-    _HAS_PYSCX = True
-    try:
-        # `gpu_info` returns None on CPU-only builds or CPU-only hosts.
-        _HAS_PYSCX_GPU = bool(pyscx.accel.gpu_info())
-    except Exception:
-        _HAS_PYSCX_GPU = False
-except ImportError:
-    pass
-
-
-# Public variant registry — included in `config.FORMATS` so run_parallel /
-# run_all discover them. Keys use the `accel_pca__<impl>` convention so
-# result files sort together.
+# Public variant registry — included in `config.get_formats(include_accel=True)`
+# so run_parallel / run_all discover them. Keys use the `accel_pca__<impl>`
+# convention so result files sort together.
 def accel_pca_variants() -> list[FormatVariant]:
     return [
         FormatVariant(
             name="scanpy PCA (CPU)", key="accel_pca__scanpy_cpu",
-            category="accel", runner="noop_runner",
+            category="accel", runner="accel_runner",
         ),
         FormatVariant(
             name="pyscx PCA (CPU auto)", key="accel_pca__pyscx_cpu_auto",
-            category="accel", runner="noop_runner",
+            category="accel", runner="accel_runner",
         ),
         FormatVariant(
             name="pyscx PCA (GPU covariance)", key="accel_pca__pyscx_gpu_cov",
-            category="accel", runner="noop_runner",
+            category="accel", runner="accel_runner",
         ),
         FormatVariant(
             name="pyscx PCA (GPU randomized, Householder)",
             key="accel_pca__pyscx_gpu_rand_hh",
-            category="accel", runner="noop_runner",
+            category="accel", runner="accel_runner",
         ),
         FormatVariant(
             name="pyscx PCA (GPU randomized, Cholesky)",
             key="accel_pca__pyscx_gpu_rand_chol",
-            category="accel", runner="noop_runner",
+            category="accel", runner="accel_runner",
         ),
     ]
 
 
-# ---------------------------------------------------------------------------
-# Fixture loader — shared across variants, cached per worker process
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PcaFixture:
-    adata: Any  # anndata.AnnData
-    n_comps: int
-    n_obs: int
-    n_vars: int
+# Backwards-compat re-exports — earlier accel_* modules import these names
+# directly from accel_pca. Point them at AcceleratorRunner instead of the
+# removed module-level helpers. The aliases can be removed once every
+# accel_*.py has migrated to the runner-instance API (Phase 9.2 follow-up).
+PcaFixture = PreprocessedFixture
 
 
-_fixture_cache: dict[tuple[str, int], PcaFixture] = {}
+def _load_preprocessed(dataset: DatasetConfig, n_comps: int) -> PreprocessedFixture:
+    """Back-compat shim — sibling `accel_*.py` modules import this by name."""
+    return AcceleratorRunner.instance().load_preprocessed(dataset, n_comps)
 
 
-def _load_preprocessed(dataset: DatasetConfig, n_comps: int) -> PcaFixture:
-    """Load h5ad, normalize + log1p + HVG, cache per (dataset, n_comps)."""
-    key = (dataset.name, n_comps)
-    if key in _fixture_cache:
-        return _fixture_cache[key]
+# Fixture cache and timing helpers used to live here; now owned by
+# `AcceleratorRunner.instance()`. Back-compat aliases so existing sibling
+# modules keep working — they pass the runner's dict by reference.
+_fixture_cache = AcceleratorRunner.instance()._cache
 
-    import anndata
-    import scanpy as sc
 
-    h5ad_path = dataset.h5ad_path
-    if not h5ad_path.exists():
-        raise FileNotFoundError(f"Source h5ad not found: {h5ad_path}")
+def _get_rss_mb() -> float:
+    return AcceleratorRunner.get_rss_mb()
 
-    logger.info("Loading + preprocessing %s for PCA fixture …", dataset.name)
-    adata = anndata.read_h5ad(str(h5ad_path))
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    n_top = min(QUERY_N_HVGS, adata.n_vars)
-    try:
-        sc.pp.highly_variable_genes(
-            adata, n_top_genes=n_top, flavor="seurat_v3",
-            subset=True, span=0.3 if adata.n_obs < 10_000 else 1.0,
-        )
-    except Exception:
-        sc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
 
-    fixture = PcaFixture(
-        adata=adata, n_comps=n_comps, n_obs=adata.n_obs, n_vars=adata.n_vars,
-    )
-    _fixture_cache[key] = fixture
-    return fixture
+def _get_cpu_times() -> tuple[float, float]:
+    return AcceleratorRunner.get_cpu_times()
+
+
+# Availability flags — exposed as module-level names for back-compat with
+# sibling modules that cache them at import time. These read through to the
+# runner's cached probes.
+_HAS_PYSCX = AcceleratorRunner.instance().has_pyscx()
+_HAS_PYSCX_GPU = AcceleratorRunner.instance().has_gpu()
 
 
 # ---------------------------------------------------------------------------
@@ -372,20 +339,6 @@ def run(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Shared timing helpers (copied from runners/base.py to avoid pulling a
-# FormatRunner in — accelerator benchmarks don't need format conversion)
-# ---------------------------------------------------------------------------
-
-def _get_rss_mb() -> float:
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except (OSError, IndexError, ValueError):
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-
-
-def _get_cpu_times() -> tuple[float, float]:
-    r = resource.getrusage(resource.RUSAGE_SELF)
-    return r.ru_utime, r.ru_stime
+# Timing helpers live on `AcceleratorRunner`; the back-compat shims
+# (`_get_rss_mb`, `_get_cpu_times`) near the top of this module delegate
+# to them.

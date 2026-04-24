@@ -151,7 +151,16 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
     def path_for_format(self, format_key: str) -> Path:
-        """Return the persistent on-disk path for a given format key."""
+        """Return the persistent on-disk path for a given format key.
+
+        Accelerator variants (`accel_*__<impl>`) don't correspond to a
+        file format — they run on the source h5ad directly via
+        `pyscx.accel.*` / `scanpy.*`. For those keys we return the
+        source h5ad path itself, which is what the `accel_*.py`
+        benchmark modules already use through `dataset.h5ad_path`.
+        """
+        if format_key.startswith("accel_"):
+            return self.h5ad_path
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
         if prop is None:
             raise ValueError(f"No persistent path for format key {format_key!r}")
@@ -508,8 +517,41 @@ def accel_formats() -> list[FormatVariant]:
         out.extend(accel_pca_variants())
     except ImportError:
         pass
-    # Other accel_* modules (knn, umap, leiden, preprocess, hvg) follow
-    # the same pattern — append here when they land.
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_knn import (
+            accel_knn_variants,
+        )
+        out.extend(accel_knn_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_umap import (
+            accel_umap_variants,
+        )
+        out.extend(accel_umap_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_leiden import (
+            accel_leiden_variants,
+        )
+        out.extend(accel_leiden_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_preprocess import (
+            accel_preproc_variants,
+        )
+        out.extend(accel_preproc_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_hvg import (
+            accel_hvg_variants,
+        )
+        out.extend(accel_hvg_variants())
+    except ImportError:
+        pass
     return out
 
 

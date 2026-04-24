@@ -245,19 +245,36 @@ def _per_job_slurm_params(
 
     partition = partition_for_memory(mem, default=args.partition)
 
+    # Phase 9.3 — route accelerator benchmarks to the GPU partition and
+    # attach `--gres=gpu:1`. Detection is by benchmark name prefix so
+    # adding a new `accel_*` module later is automatic. The existing
+    # `accel_*__scanpy_cpu` / `__pyscx_cpu` variants don't need a GPU —
+    # detection via format_key prefix would spare them, but submitit
+    # doesn't conditionally allocate based on format, so we over-request.
+    # Operators who want to run only CPU variants can use
+    # `--formats accel_*_cpu` to filter.
+    extra_slurm: dict = {}
+    if benchmark and benchmark.startswith("accel_"):
+        partition = "preemptible"  # GPU partition on chimera
+        extra_slurm["slurm_gres"] = "gpu:1"
+
     logger.info(
-        "Sized %s__%s__%s: mem=%dG time=%dm partition=%s (scale=%.2f)",
+        "Sized %s__%s__%s: mem=%dG time=%dm partition=%s%s (scale=%.2f)",
         benchmark or "convert", format_key, dataset_name,
-        mem, timeout_min, partition, scale,
+        mem, timeout_min, partition,
+        " gres=gpu:1" if extra_slurm.get("slurm_gres") else "",
+        scale,
     )
 
-    return {
+    params: dict = {
         "slurm_partition": partition,
         "cpus_per_task": args.cpus,
         "mem_gb": mem,
         "timeout_min": timeout_min,
         "slurm_setup": _slurm_setup_cmds(),
     }
+    params.update(extra_slurm)
+    return params
 
 
 def main() -> None:
@@ -276,11 +293,30 @@ def main() -> None:
         datasets = [name for name, cfg in DATASETS.items() if cfg.h5ad_path.exists()]
 
     # Resolve formats
+    # `accel_formats()` is lazy-loaded — pulls in the `FormatVariant` entries
+    # for each `accel_*.py` module's implementation variants (PCA: scanpy_cpu,
+    # pyscx_cpu_auto, pyscx_gpu_cov, pyscx_gpu_rand_hh, pyscx_gpu_rand_chol;
+    # kNN / UMAP / Leiden / preprocess / HVG similarly). Included whenever
+    # --include-accel is set, when --formats explicitly names an accel key,
+    # or when --benchmarks names any accel_* benchmark.
+    from benchmarks.comprehensive.config import accel_formats
+    need_accel = (
+        args.include_accel
+        or any((fk or "").startswith("accel_") for fk in (args.formats or []))
+        or any((b or "").startswith("accel_") for b in (args.benchmarks or []))
+    )
+    pool = list(ALL_FORMATS)
+    if need_accel:
+        pool.extend(accel_formats())
     if args.formats:
-        all_by_key = {f.key: f for f in ALL_FORMATS}
+        all_by_key = {f.key: f for f in pool}
         formats = [all_by_key[k] for k in args.formats if k in all_by_key]
+    elif args.include_additional and need_accel:
+        formats = pool
     elif args.include_additional:
         formats = list(ALL_FORMATS)
+    elif need_accel:
+        formats = list(PRIMARY_FORMATS) + accel_formats()
     else:
         formats = list(PRIMARY_FORMATS)
 
@@ -399,6 +435,20 @@ def main() -> None:
         for ds_name in datasets:
             n_runs = n_runs_for_dataset(ds_name)
             for fmt in formats:
+                # Accelerator benchmarks are self-contained: each
+                # `accel_X` module owns its own set of variants
+                # (`accel_X__<impl>`). Pairing `accel_pca` with an
+                # `accel_knn__*` format — or with any non-accel format —
+                # schedules a cell whose `run()` returns None (waste).
+                # Skip those pairings at the launcher level.
+                if bench_name.startswith("accel_"):
+                    if not fmt.key.startswith(f"{bench_name}__"):
+                        continue
+                elif fmt.key.startswith("accel_"):
+                    # Non-accel benchmarks (read_full, etc.) don't pair
+                    # with accel variants either.
+                    continue
+
                 key = (ds_name, fmt.key)
                 label = f"{bench_name}/{ds_name}/{fmt.key}"
 
@@ -536,6 +586,12 @@ def parse_args() -> argparse.Namespace:
                         help="Format keys. Default: all primary formats.")
     parser.add_argument("--include-additional", action="store_true",
                         help="Include additional formats (BPCells, Parquet).")
+    parser.add_argument("--include-accel", action="store_true",
+                        help="Include accelerator-variant formats (accel_pca__*, "
+                             "accel_knn__*, etc.) registered via "
+                             "config.accel_formats(). Auto-enabled when "
+                             "--benchmarks names any accel_* benchmark or "
+                             "--formats names any accel_* key.")
     parser.add_argument("--cold-cache", action="store_true",
                         help="Drop OS caches between runs.")
     parser.add_argument("--skip-convert", action="store_true",
