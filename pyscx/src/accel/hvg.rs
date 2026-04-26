@@ -47,10 +47,11 @@ pub fn highly_variable_genes<'py>(
     n_bins: usize,
     device: &str,
 ) -> PyResult<()> {
-    let use_gpu = super::gpu::resolve_device(device)?;
+    let resolved = super::gpu::resolve_device(device)?;
     // GPU path is only supported for single-batch seurat_v3; emit a warning
     // and fall back to CPU otherwise so the call succeeds with correct results.
-    let effective_device = if use_gpu {
+    #[cfg(feature = "gpu")]
+    let effective_gpu_id: Option<usize> = if let Some(gid) = resolved.gpu_id() {
         let seurat_v3 = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
         if batch_key.is_some() || !seurat_v3 {
             let warnings = py.import("warnings")?;
@@ -62,12 +63,17 @@ pub fn highly_variable_genes<'py>(
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
             )?;
-            "cpu"
+            None
         } else {
-            "gpu"
+            Some(gid)
         }
     } else {
-        "cpu"
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    let effective_gpu_id: Option<usize> = {
+        let _ = resolved;
+        None
     };
 
     let x = adata.getattr("X")?;
@@ -98,7 +104,7 @@ pub fn highly_variable_genes<'py>(
             span,
             subset,
             n_bins,
-            effective_device,
+            effective_gpu_id,
         );
     }
 
@@ -129,7 +135,7 @@ pub fn highly_variable_genes<'py>(
             span,
             subset,
             n_bins,
-            effective_device,
+            effective_gpu_id,
         );
     }
 
@@ -167,7 +173,7 @@ fn hvg_on_source<'py>(
     span: f64,
     subset: bool,
     n_bins: usize,
-    device: &str,
+    device_id: Option<usize>,
 ) -> PyResult<()> {
     match flavor {
         "seurat_v3" | "seurat_v3_paper" => hvg_seurat_v3(
@@ -185,7 +191,7 @@ fn hvg_on_source<'py>(
             span,
             subset,
             flavor,
-            device,
+            device_id,
         ),
         "seurat" => hvg_seurat(
             py,
@@ -271,7 +277,7 @@ fn hvg_seurat_v3<'py>(
     span: f64,
     subset: bool,
     flavor: &str,
-    _device: &str,
+    _device_id: Option<usize>,
 ) -> PyResult<()> {
     // ── 1. Determine batches ────────────────────────────────────────────
     let batches: Vec<Vec<usize>> = match batch_key {
@@ -323,8 +329,8 @@ fn hvg_seurat_v3<'py>(
     // GPU atomicAdd accumulation path. Multi-batch stays on CPU because the
     // GPU kernel doesn't carry per-cell batch membership today.
     #[cfg(feature = "gpu")]
-    let batched_stats = if _device == "gpu" && n_batches_actual == 1 {
-        let single = scx_accel::streaming_mean_var_with_device(&source, "gpu")
+    let batched_stats = if let (Some(dev_id), 1) = (_device_id, n_batches_actual) {
+        let single = scx_accel::streaming_mean_var_with_device(&source, "gpu", dev_id)
             .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var: {e}")))?;
         scx_accel::BatchedHvgStats {
             per_batch: vec![single.clone()],
@@ -414,12 +420,14 @@ fn hvg_seurat_v3<'py>(
 
     // ── 4. Batched streaming clipped sums (single pass for ALL batches) ──
     #[cfg(feature = "gpu")]
-    let all_clipped = if _device == "gpu" && n_batches_actual == 1 {
-        let single =
-            scx_accel::streaming_clip_square_sum_with_device(&source, &all_clip_vals[0], "gpu")
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum: {e}"))
-                })?;
+    let all_clipped = if let (Some(dev_id), 1) = (_device_id, n_batches_actual) {
+        let single = scx_accel::streaming_clip_square_sum_with_device(
+            &source,
+            &all_clip_vals[0],
+            "gpu",
+            dev_id,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum: {e}")))?;
         vec![single]
     } else {
         scx_accel::streaming_clip_square_sum_batched(

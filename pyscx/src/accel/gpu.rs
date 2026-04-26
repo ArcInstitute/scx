@@ -227,45 +227,115 @@ pub fn estimate_gpu_memory<'py>(
     Ok(dict.into_any().unbind())
 }
 
-/// Resolve the device string to a boolean (true = GPU, false = CPU).
+/// Resolution of a `device=` string to either CPU or a specific GPU index.
 ///
-/// "auto" → GPU if available (feature enabled + device found), else CPU.
-/// "cpu" → always CPU.
-/// "gpu" / "gpu:N" → always GPU (errors if unavailable).
-pub(super) fn resolve_device(device: &str) -> PyResult<bool> {
-    match device {
-        "cpu" => Ok(false),
-        "auto" => {
-            #[cfg(feature = "gpu")]
-            {
-                Ok(scx_accel::gpu_available())
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                Ok(false)
-            }
+/// Returned by [`resolve_device`] / [`validate_device_or_default`]. Callers
+/// extract the GPU index via [`ResolvedDevice::gpu_id`] and forward it into
+/// `GpuDevice::new(device_id)` / scx-accel `*_gpu(device_id, …)` functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedDevice {
+    Cpu,
+    #[cfg(feature = "gpu")]
+    Gpu(usize),
+}
+
+impl ResolvedDevice {
+    pub(crate) fn is_gpu(self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            matches!(self, ResolvedDevice::Gpu(_))
         }
-        d if d.starts_with("gpu") => {
-            #[cfg(feature = "gpu")]
-            {
-                if scx_accel::gpu_available() {
-                    Ok(true)
-                } else {
-                    Err(PyRuntimeError::new_err(
-                        "device='gpu' requested but no CUDA GPU found",
-                    ))
-                }
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                Err(PyRuntimeError::new_err(
-                    "device='gpu' requested but pyscx was built without the 'gpu' feature",
-                ))
-            }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
         }
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown device: '{}'. Use 'auto', 'cpu', or 'gpu'",
-            device
-        ))),
     }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_id(self) -> Option<usize> {
+        match self {
+            ResolvedDevice::Gpu(i) => Some(i),
+            ResolvedDevice::Cpu => None,
+        }
+    }
+}
+
+/// Resolve the device string to a [`ResolvedDevice`].
+///
+/// Accepted forms:
+/// * `"cpu"` → [`ResolvedDevice::Cpu`].
+/// * `"auto"` → GPU 0 if the `gpu` feature is enabled and a CUDA device is
+///   visible, else [`ResolvedDevice::Cpu`].
+/// * `"gpu"` → GPU 0 (errors if no CUDA device is available, or if pyscx was
+///   built without the `gpu` feature).
+/// * `"gpu:N"` for `N: usize` → GPU N (validated against
+///   [`scx_gpu::GpuDevice::count()`]; out-of-range errors with `RuntimeError`).
+pub(crate) fn resolve_device(device: &str) -> PyResult<ResolvedDevice> {
+    if device == "cpu" {
+        return Ok(ResolvedDevice::Cpu);
+    }
+    if device == "auto" {
+        #[cfg(feature = "gpu")]
+        {
+            return Ok(if scx_accel::gpu_available() {
+                ResolvedDevice::Gpu(0)
+            } else {
+                ResolvedDevice::Cpu
+            });
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            return Ok(ResolvedDevice::Cpu);
+        }
+    }
+    if let Some(suffix) = device.strip_prefix("gpu") {
+        let device_id = parse_gpu_suffix(device, suffix)?;
+        #[cfg(feature = "gpu")]
+        {
+            if !scx_accel::gpu_available() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "device='{device}' requested but no CUDA GPU found"
+                )));
+            }
+            let count = scx_accel::GpuDevice::count().map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to query CUDA device count: {e}"))
+            })?;
+            if device_id >= count {
+                return Err(PyRuntimeError::new_err(format!(
+                    "device='{device}' but only {count} CUDA device{} visible",
+                    if count == 1 { " is" } else { "s are" }
+                )));
+            }
+            return Ok(ResolvedDevice::Gpu(device_id));
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = device_id;
+            return Err(PyRuntimeError::new_err(format!(
+                "device='{device}' requested but pyscx was built without the 'gpu' feature"
+            )));
+        }
+    }
+    Err(PyValueError::new_err(format!(
+        "unknown device: '{device}'. Use 'auto', 'cpu', 'gpu', or 'gpu:N'."
+    )))
+}
+
+/// Parse the `:N` suffix of a `"gpu[:N]"` device string. `""` (bare `"gpu"`)
+/// resolves to device 0; `":N"` parses `N` as `usize`. Anything else is a
+/// `ValueError`.
+fn parse_gpu_suffix(full: &str, suffix: &str) -> PyResult<usize> {
+    if suffix.is_empty() {
+        return Ok(0);
+    }
+    let Some(rest) = suffix.strip_prefix(':') else {
+        return Err(PyValueError::new_err(format!(
+            "unknown device: '{full}'. Use 'auto', 'cpu', 'gpu', or 'gpu:N'."
+        )));
+    };
+    rest.parse::<usize>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "device='{full}' has a non-integer suffix; expected 'gpu:N' with N a non-negative integer."
+        ))
+    })
 }

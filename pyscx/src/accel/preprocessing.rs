@@ -10,9 +10,6 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::projected_agg;
 
-#[cfg(feature = "gpu")]
-use super::gpu::resolve_device;
-
 // Fusion marker key stashed on `adata.uns` by `normalize_total(device="gpu")`
 // so that a subsequent `log1p(device="gpu")` can re-run a fused normalize+log1p
 // pass over the ORIGINAL backed source instead of reading the already-
@@ -76,11 +73,11 @@ pub fn normalize_total(
     target_sum: f64,
     device: &str,
 ) -> PyResult<()> {
-    let _use_gpu = validate_device_or_default(device)?;
+    let _device = validate_device_or_default(device)?;
 
     #[cfg(feature = "gpu")]
-    if _use_gpu {
-        return gpu_normalize_total(py, adata, target_sum);
+    if let Some(device_id) = _device.gpu_id() {
+        return gpu_normalize_total(py, adata, target_sum, device_id);
     }
 
     let x = adata.getattr("X")?;
@@ -179,11 +176,11 @@ pub fn normalize_total(
 #[pyfunction]
 #[pyo3(signature = (adata, device="auto"))]
 pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult<()> {
-    let _use_gpu = validate_device_or_default(device)?;
+    let _device = validate_device_or_default(device)?;
 
     #[cfg(feature = "gpu")]
-    if _use_gpu {
-        return gpu_log1p_dispatch(py, adata);
+    if let Some(device_id) = _device.gpu_id() {
+        return gpu_log1p_dispatch(py, adata, device_id);
     }
 
     let x = adata.getattr("X")?;
@@ -493,28 +490,12 @@ pub fn calculate_qc_metrics<'py>(
 // Device resolution + GPU eager dispatch (Phase 5)
 // ---------------------------------------------------------------------------
 
-/// Parse `device` into a bool. Returns `Ok(false)` on CPU-only builds even
-/// when the user passes `device="gpu"` to avoid losing user input silently —
-/// actually delegates to [`resolve_device`] when the GPU feature is enabled.
-#[cfg(feature = "gpu")]
-fn validate_device_or_default(device: &str) -> PyResult<bool> {
-    resolve_device(device)
-}
-
-/// Fallback used when compiled without the `gpu` feature: only "cpu" / "auto"
-/// are accepted. "gpu" raises a RuntimeError, matching `resolve_device`.
-#[cfg(not(feature = "gpu"))]
-fn validate_device_or_default(device: &str) -> PyResult<bool> {
-    match device {
-        "cpu" | "auto" => Ok(false),
-        d if d.starts_with("gpu") => Err(PyRuntimeError::new_err(
-            "device='gpu' requested but pyscx was built without the 'gpu' feature",
-        )),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown device: '{}'. Use 'auto', 'cpu', or 'gpu'",
-            device
-        ))),
-    }
+/// Parse `device` into a [`ResolvedDevice`]. Delegates to [`resolve_device`]
+/// in both feature configurations — the CPU-only build's parser already
+/// rejects `gpu*` requests with a `RuntimeError`, so no separate
+/// implementation is needed.
+fn validate_device_or_default(device: &str) -> PyResult<super::gpu::ResolvedDevice> {
+    super::gpu::resolve_device(device)
 }
 
 #[cfg(feature = "gpu")]
@@ -631,7 +612,12 @@ fn source_from_x(x: &Bound<'_, PyAny>) -> PyResult<Option<GpuShardSource>> {
 
 /// GPU-eager `normalize_total` dispatch.
 #[cfg(feature = "gpu")]
-fn gpu_normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64) -> PyResult<()> {
+fn gpu_normalize_total(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    target_sum: f64,
+    device_id: usize,
+) -> PyResult<()> {
     let x = adata.getattr("X")?;
 
     let Some(gs) = source_from_x(&x)? else {
@@ -654,7 +640,7 @@ fn gpu_normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
         n_vars,
     } = gs;
 
-    let dev = scx_accel::GpuDevice::new(0)
+    let dev = scx_accel::GpuDevice::new(device_id)
         .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
     let csr = scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), false)
         .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
@@ -687,7 +673,7 @@ fn gpu_normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
 /// materialization. Materialised scipy/dense X warns and falls back to
 /// `sc.pp.log1p` (the H→D / D→H round-trip dominates the kernel cost).
 #[cfg(feature = "gpu")]
-fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
+fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>, device_id: usize) -> PyResult<()> {
     let uns = adata.getattr("uns")?;
 
     // 1) Fusion marker path: re-run fused normalize+log1p over ORIGINAL source.
@@ -706,7 +692,7 @@ fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> 
             let target_sum = m.target_sum;
             drop(m);
 
-            let dev = scx_accel::GpuDevice::new(0)
+            let dev = scx_accel::GpuDevice::new(device_id)
                 .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
             let csr =
                 scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), true)
@@ -726,7 +712,7 @@ fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> 
     let x = adata.getattr("X")?;
     if let Some(gs) = source_from_x(&x)? {
         let was_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
-        let dev = scx_accel::GpuDevice::new(0)
+        let dev = scx_accel::GpuDevice::new(device_id)
             .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
         let csr = scx_accel::gpu_preprocess_to_csr(&dev, &gs.source, None, true)
             .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;

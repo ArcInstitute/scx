@@ -93,6 +93,7 @@ fn parse_qr_method(qr_method: &str) -> PyResult<scx_accel::QrMethod> {
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_pca_dispatch<S: ShardSource + Sync>(
+    device_id: usize,
     source: &S,
     n_comps: usize,
     n_oversamples: usize,
@@ -103,9 +104,9 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
     qr_method: scx_accel::QrMethod,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
     match method {
-        "covariance" => scx_accel::covariance_pca_gpu(0, source, n_comps, zero_center),
+        "covariance" => scx_accel::covariance_pca_gpu(device_id, source, n_comps, zero_center),
         "randomized" => scx_accel::randomized_pca_gpu(
-            0,
+            device_id,
             source,
             n_comps,
             n_oversamples,
@@ -158,7 +159,7 @@ pub fn pca(
     method: &str,
     qr_method: &str,
 ) -> PyResult<()> {
-    let _use_gpu = resolve_device(device)?;
+    let _device = resolve_device(device)?;
     // Validate user args even on CPU path — catches typos regardless of device.
     if !matches!(method, "auto" | "covariance" | "randomized") {
         return Err(PyValueError::new_err(format!(
@@ -177,7 +178,7 @@ pub fn pca(
 
     // ------- GPU path -------
     #[cfg(feature = "gpu")]
-    if _use_gpu {
+    if let Some(device_id) = _device.gpu_id() {
         let qr = parse_qr_method(qr_method)?;
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
@@ -185,6 +186,7 @@ pub fn pca(
             let (_n_obs, n_vars) = reader.shape();
             let m = resolve_gpu_method(method, n_vars)?;
             let result = gpu_pca_dispatch(
+                device_id,
                 reader,
                 n_comps,
                 n_oversamples,
@@ -204,6 +206,7 @@ pub fn pca(
             let (_n_obs, n_vars) = source.shape();
             let m = resolve_gpu_method(method, n_vars)?;
             let result = gpu_pca_dispatch(
+                device_id,
                 &source,
                 n_comps,
                 n_oversamples,
@@ -224,6 +227,7 @@ pub fn pca(
         let n_vars = source.n_vars();
         let m = resolve_gpu_method(method, n_vars)?;
         let result = gpu_pca_dispatch(
+            device_id,
             &source,
             n_comps,
             n_oversamples,

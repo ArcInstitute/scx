@@ -285,12 +285,13 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource>(
 pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
     source: &S,
     device: &str,
+    device_id: usize,
 ) -> Result<HvgStats> {
     if device != "gpu" {
         return streaming_mean_var(source);
     }
 
-    let dev = match scx_gpu::GpuDevice::new(0) {
+    let dev = match scx_gpu::GpuDevice::new(device_id) {
         Ok(d) => d,
         Err(_) => return streaming_mean_var(source),
     };
@@ -309,12 +310,13 @@ pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
     source: &S,
     clip_val: &[f64],
     device: &str,
+    device_id: usize,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
     if device != "gpu" {
         return streaming_clip_square_sum(source, clip_val);
     }
 
-    let dev = match scx_gpu::GpuDevice::new(0) {
+    let dev = match scx_gpu::GpuDevice::new(device_id) {
         Ok(d) => d,
         Err(_) => return streaming_clip_square_sum(source, clip_val),
     };

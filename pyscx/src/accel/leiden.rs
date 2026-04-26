@@ -61,8 +61,10 @@ pub fn leiden(
     parallel: bool,
     theta: f64,
 ) -> PyResult<()> {
-    // Determine effective device
-    let use_gpu = resolve_device(device)?;
+    // Determine effective device. The cuGraph backend selects its CUDA device
+    // via `CUDA_VISIBLE_DEVICES` (set on the Python side), so the resolved
+    // index here only gates whether the GPU branch is attempted.
+    let use_gpu = resolve_device(device)?.is_gpu();
 
     // Extract connectivities CSR from adata.obsp["connectivities"]
     let obsp = adata.getattr("obsp")?;

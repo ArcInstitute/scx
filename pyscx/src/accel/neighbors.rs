@@ -43,7 +43,9 @@ pub fn neighbors(
     let numpy = py.import("numpy")?;
 
     // Determine effective device
-    let use_gpu = resolve_device(device)?;
+    let _device = resolve_device(device)?;
+    #[cfg(feature = "gpu")]
+    let _gpu_id = _device.gpu_id();
 
     // Extract representation matrix from adata.obsm[use_rep]
     let obsm = adata.getattr("obsm")?;
@@ -66,17 +68,12 @@ pub fn neighbors(
 
     // GPU path
     #[cfg(feature = "gpu")]
-    if use_gpu {
+    if let Some(device_id) = _gpu_id {
         // Check if cuVS CAGRA is available
         if scx_accel::cuvs_available() {
-            let result = scx_accel::build_knn_graph_gpu(
-                0, // device_id = 0 (first GPU)
-                &data,
-                n_obs,
-                n_vars,
-                n_neighbors,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            let result =
+                scx_accel::build_knn_graph_gpu(device_id, &data, n_obs, n_vars, n_neighbors)
+                    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
 
             write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "cagra")?;
             return Ok(());
@@ -92,8 +89,7 @@ pub fn neighbors(
     }
 
     // Suppress unused variable warning when gpu feature is not enabled
-    #[cfg(not(feature = "gpu"))]
-    let _ = use_gpu;
+    let _ = _device;
 
     // CPU path (default or fallback)
     let result = scx_accel::build_knn_graph(

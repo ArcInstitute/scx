@@ -48,7 +48,9 @@ pub fn umap(
     let numpy = py.import("numpy")?;
 
     // Determine effective device
-    let use_gpu = resolve_device(device)?;
+    let _device = resolve_device(device)?;
+    #[cfg(feature = "gpu")]
+    let _gpu_id = _device.gpu_id();
 
     // Extract connectivities CSR from adata.obsp["connectivities"]
     let obsp = adata.getattr("obsp")?;
@@ -78,10 +80,10 @@ pub fn umap(
 
     // GPU path
     #[cfg(feature = "gpu")]
-    if use_gpu {
+    if let Some(device_id) = _gpu_id {
         // Try native CUDA SGD kernel first
         match scx_accel::compute_umap_gpu(
-            0, // device_id = 0
+            device_id,
             &indptr,
             &indices,
             &data,
@@ -128,8 +130,7 @@ pub fn umap(
     }
 
     // Suppress unused variable warning when gpu feature is not enabled
-    #[cfg(not(feature = "gpu"))]
-    let _ = use_gpu;
+    let _ = _device;
 
     // CPU path (default or fallback)
     let result = scx_accel::compute_umap(

@@ -88,8 +88,11 @@ pub fn harmony_integrate(
     random_state: u64,
     device: &str,
 ) -> PyResult<()> {
-    // Resolve device (true = GPU, false = CPU).
-    let use_gpu = resolve_device(device)?;
+    // Resolve device. `_device.gpu_id()` is the CUDA index that GPU dispatch
+    // forwards to `scx_accel::harmony_integrate_gpu(device_id, ...)`.
+    let _device = resolve_device(device)?;
+    #[cfg(feature = "gpu")]
+    let _gpu_id = _device.gpu_id();
 
     // --- Extract embeddings (N x d, f32 row-major) ---
     let obsm = adata.getattr("obsm")?;
@@ -203,10 +206,17 @@ pub fn harmony_integrate(
     // --- Dispatch Rust core with GIL released ---
     // GPU path is only compiled when pyscx is built with `--features gpu`.
     #[cfg(feature = "gpu")]
-    let (result, backend) = if use_gpu {
+    let (result, backend) = if let Some(device_id) = _gpu_id {
         let r = py
             .allow_threads(|| {
-                scx_accel::harmony_integrate_gpu(&embeddings, n_obs, n_pcs, &covariates, &config)
+                scx_accel::harmony_integrate_gpu(
+                    device_id,
+                    &embeddings,
+                    n_obs,
+                    n_pcs,
+                    &covariates,
+                    &config,
+                )
             })
             .map_err(|e: scx_accel::AccelError| {
                 PyRuntimeError::new_err(format!("harmony_integrate_gpu: {e}"))
@@ -226,8 +236,8 @@ pub fn harmony_integrate(
     #[cfg(not(feature = "gpu"))]
     let (result, backend) = {
         // Without the `gpu` feature, `resolve_device` rejects device="gpu";
-        // "auto" collapses to CPU. `use_gpu` can only be false here.
-        let _ = use_gpu;
+        // "auto" collapses to CPU.
+        let _ = _device;
         let r = py
             .allow_threads(|| {
                 scx_accel::harmony_integrate(&embeddings, n_obs, n_pcs, &covariates, &config)
