@@ -32,7 +32,8 @@ use super::filtering::update_layers_col_projection;
 ///     span: Loess span for seurat_v3 (default: 0.3)
 ///     subset: If True, subset adata to HVG via column projection (default: False)
 ///     n_bins: Number of bins for seurat flavor (default: 20)
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 #[pyfunction]
 #[pyo3(signature = (adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=false, n_bins=20, device="auto"))]
 #[allow(clippy::too_many_arguments)]

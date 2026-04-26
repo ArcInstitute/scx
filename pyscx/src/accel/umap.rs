@@ -25,7 +25,8 @@ use super::gpu::resolve_device;
 ///     negative_sample_rate: Negative samples per positive edge (default: 5)
 ///     learning_rate: Initial learning rate (default: 1.0)
 ///     random_state: Random seed (default: 0)
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 ///
 /// Note: GPU UMAP is non-deterministic due to intentional atomicAdd race
 /// conditions on embedding updates (matches cuML). Embeddings will differ

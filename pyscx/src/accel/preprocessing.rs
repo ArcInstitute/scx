@@ -64,7 +64,8 @@ pub struct ScxGpuNormalizeMarker {
 /// Args:
 ///     adata: AnnData object
 ///     target_sum: Target total counts per cell (default: 1e4)
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 #[pyfunction]
 #[pyo3(signature = (adata, target_sum=10000.0, device="auto"))]
 pub fn normalize_total(
@@ -172,7 +173,8 @@ pub fn normalize_total(
 ///
 /// Args:
 ///     adata: AnnData object
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 #[pyfunction]
 #[pyo3(signature = (adata, device="auto"))]
 pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult<()> {

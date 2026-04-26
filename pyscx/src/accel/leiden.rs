@@ -35,8 +35,11 @@ use super::gpu::resolve_device;
 ///         (matching leidenalg package default), -1 for until convergence (default: 2).
 ///         On the cuGraph path this can safely be raised — rapids-singlecell
 ///         defaults to 100 and convergence is cheap; see docs/scanpy.md.
-///     device: Device selection — "auto" (default), "cpu", or "gpu". Only
-///         gates the cuGraph attempt (see Backend priority above).
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N". Only gates whether the cuGraph attempt runs (see Backend
+///         priority above); the cuGraph backend itself selects its CUDA
+///         device via `CUDA_VISIBLE_DEVICES`, so the `:N` suffix is parsed
+///         and validated but does not steer cuGraph's device choice.
 ///     parallel: Run the Rust-native Leiden in parallel mode (conflict-free
 ///         graph coloring). Default `False`.
 ///     theta: Resolution scaling knob for cuGraph Leiden only (default 1.0).

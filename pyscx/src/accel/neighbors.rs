@@ -23,7 +23,8 @@ use super::gpu::resolve_device;
 ///     random_state: Random seed for reproducibility (default: 0)
 ///     ef_construction: HNSW construction parameter (default: 200, CPU only)
 ///     ef_search: HNSW search parameter (default: 200, CPU only)
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 ///
 /// Note: GPU mode uses cuVS CAGRA (graph-based ANN) instead of HNSW. Both are
 /// approximate; neighbor sets may differ slightly. See docs/scanpy.md.

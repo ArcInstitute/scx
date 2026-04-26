@@ -134,7 +134,8 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
 ///     random_state: Random seed for reproducibility (default: 0)
 ///     n_oversamples: Extra dimensions for accuracy (default: 10)
 ///     n_power_iterations: Power iterations for spectral accuracy (default: 2)
-///     device: Device selection — "auto" (default), "cpu", or "gpu"
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 ///     method: PCA method — "auto" (default), "covariance", or "randomized".
 ///         "auto" chooses covariance for n_vars <= GPU_COVARIANCE_PCA_THRESHOLD
 ///         (8000) on GPU, and n_vars <= COVARIANCE_PCA_THRESHOLD (5000) on CPU.

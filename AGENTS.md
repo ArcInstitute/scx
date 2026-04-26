@@ -127,7 +127,7 @@ Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standar
 
 ### GPU Acceleration (scx-gpu)
 
-All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Requires `scx-gpu` conda env with RAPIDS. See [docs/gpu-setup.md](docs/gpu-setup.md).
+All accessible via the `device=` parameter on `pyscx.accel.*` ops. Accepted values: `"auto"` (GPU 0 if available else CPU), `"cpu"`, `"gpu"` (= `"gpu:0"`), or `"gpu:N"` to target a specific CUDA device on multi-GPU systems. Out-of-range indices and non-integer suffixes raise (`RuntimeError` / `ValueError` respectively). Requires `scx-gpu` conda env with RAPIDS. See [docs/gpu-setup.md](docs/gpu-setup.md).
 
 - **GPU PCA**: Two dispatch paths auto-routed by `n_vars`:
   - *Covariance* (`n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000`): cuSPARSE + cuBLAS `sgemm`/`sger` builds the Gram matrix on-device; cuSOLVER `syevd` eigendecomposes; embeddings via a second streaming `matmat`. No host round-trip.
@@ -137,7 +137,7 @@ All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Requires `scx-gp
 - **GPU kNN**: cuVS CAGRA (9.4x standalone on 1M cells).
 - **GPU UMAP**: Native CUDA SGD (7.7x on 1M cells).
 - **GPU Leiden**: cuGraph (16x on 1M cells). New `theta` kwarg (cuGraph-only) on `pyscx.accel.leiden`; Rust-native path still runs first regardless of `device`.
-- **GPU preprocessing**: `pyscx.accel.normalize_total`, `log1p`, `highly_variable_genes` accept `device="auto"|"cpu"|"gpu"`. **Eager on GPU** — materializes `adata.X` to scipy CSR, breaking the lazy chain (emits `UserWarning`). The `normalize_total → log1p` chain fuses on GPU via an `adata.uns` marker (single fused pass over the original backed source). HVG GPU dispatch is narrowed to single-batch seurat_v3; batched/seurat flavors fall back to CPU.
+- **GPU preprocessing**: `pyscx.accel.normalize_total`, `log1p`, `highly_variable_genes` accept `device="auto"|"cpu"|"gpu"|"gpu:N"`. **Eager on GPU** — materializes `adata.X` to scipy CSR, breaking the lazy chain (emits `UserWarning`). The `normalize_total → log1p` chain fuses on GPU via an `adata.uns` marker (single fused pass over the original backed source). `log1p(device="gpu")` on an *already-materialised* scipy/dense X warns and falls back to `sc.pp.log1p` because the H→D / D→H round-trip dominates log1p's trivial math; the fast path requires the fusion marker or a backed/lazy source. HVG GPU dispatch is narrowed to single-batch seurat_v3; batched/seurat flavors fall back to CPU.
 - **Async shard I/O**: `DoubleBufferedShardLoader` overlaps shard decode (worker thread) with GPU kernel launches (compute stream). Feeds the randomized / covariance PCA paths, preprocessing, and HVG.
 - **Fallback**: Graceful CPU fallback when GPU unavailable (`device="auto"`).
 

@@ -41,9 +41,12 @@ use super::gpu::resolve_device;
 ///     batch_prop_cutoff: Minimum batch proportion per cluster (default 1e-5).
 ///     tau: Overcorrection protection (default 0.0).
 ///     random_state: RNG seed (default 0).
-///     device: "auto" (default), "cpu", or "gpu". GPU path not yet
-///         implemented for Harmony — CPU is currently used unconditionally,
-///         but the parameter is validated for forward compatibility.
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems. GPU path
+///         routes to `scx_accel::harmony_integrate_gpu` (cuBLAS + custom
+///         CUDA kernels for distance / L2-normalize / batched
+///         scatter-subtract); per-PC Pearson r ≥ 0.99 vs CPU on validation
+///         fixtures (see `pyscx/tests/test_harmony_validation.py`).
 #[pyfunction]
 #[pyo3(signature = (
     adata,
