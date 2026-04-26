@@ -15,10 +15,12 @@
 # diff against a pre-change baseline.  Implements Phase 8 tasks 8.2–8.6 of
 # GPU-ACC-SPEED-UP.md in a single idempotent invocation.
 #
-# Meant to run on a cluster head-node with SLURM access.  Can run everything
-# inline (if already on a GPU node) or submit each GPU benchmark as an
-# individual SLURM job.  Does NOT need to be invoked via sbatch itself; it
-# sbatches its workers.
+# Must run on a node with SLURM submit access — not the login node.  On this
+# cluster, interactive dev work already runs inside an srun-allocated worker
+# node, so just invoke this script directly.  For long runs that need to
+# survive disconnects, wrap this driver in its own sbatch submission instead.
+# Can run the benches inline (if already on a GPU node) or submit each GPU
+# benchmark as an individual SLURM job.
 #
 # Usage:
 #

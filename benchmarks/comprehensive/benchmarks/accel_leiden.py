@@ -189,16 +189,20 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
+        extras: dict[str, float] = {}
         try:
             labels = np.asarray(
                 a.obs["leiden"].astype(str).astype("category").cat.codes.values
             )
             aris.append(_ari(ref_labels, labels))
+            if not np.isnan(aris[-1]):
+                extras["ari_vs_leidenalg"] = aris[-1]
         except Exception as e:
             logger.warning("ARI failed for %s run %d: %s", key, i + 1, e)
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs ARI=%s backend=%s",

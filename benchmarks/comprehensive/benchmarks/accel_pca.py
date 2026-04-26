@@ -295,11 +295,14 @@ def run(
         rss_after = _get_rss_mb()
 
         # Cosine similarity vs scanpy reference (top-k PCs).
+        extras: dict[str, float] = {}
         try:
             emb = np.asarray(t_adata.obsm["X_pca"], dtype=np.float32)
             cos = _sign_agnostic_cosine_per_pc(ref_embedding, emb)
             cos_mean_runs.append(float(np.mean(cos)))
             cos_min_runs.append(float(np.min(cos)))
+            extras["cosine_sim_mean"] = cos_mean_runs[-1]
+            extras["cosine_sim_min"] = cos_min_runs[-1]
         except Exception as e:
             logger.warning("Cosine-sim check failed for %s run %d: %s",
                            variant_key, i + 1, e)
@@ -309,6 +312,7 @@ def run(
             user_s=u1 - u0,
             sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs  rss=%.1fMB  cos_min=%.4f",

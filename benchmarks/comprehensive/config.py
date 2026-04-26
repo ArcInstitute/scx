@@ -727,6 +727,27 @@ def estimate_memory_gb(
         # Assertion-based — peak RSS MUST stay under the 240 MB bound from
         # docs/cloud.md. Give headroom but not much.
         peak_mb = 8 * 1024  # 8 GB ceiling for safety
+    elif benchmark == "accel_preprocess":
+        # Keeps raw AnnData + scanpy reference + per-run copies resident.
+        # scanpy normalize/log1p are sparse-in-place; pyscx's lazy-chain
+        # materialization (a.X[:, :]) and the GPU-eager scipy CSR handoff
+        # can densify intermediate buffers. Observed on census_1m: scanpy
+        # 44 GB, pyscx OOM at 64 GB. Size to dense × 1.0 → census_1m lands
+        # at ~168 GB (below the 200 GB cpu_preemptible ceiling so CPU
+        # variants avoid cpu_high_mem; GPU variants stay on preemptible).
+        peak_mb = max(base_mb * 2, dense_mb * 1.0)
+    elif benchmark == "accel_hvg":
+        # Loess fit uses f64 working arrays + per-gene variance accumulators.
+        # Observed 33 GB peak on 1M cells.
+        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("accel_umap", "accel_leiden"):
+        # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
+        # 1M cells.
+        peak_mb = max(base_mb, dense_mb * 0.2)
+    elif benchmark.startswith("accel_"):
+        # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
+        # on 1M cells.
+        peak_mb = max(base_mb, dense_mb * 0.1)
     else:
         peak_mb = base_mb
 
@@ -782,6 +803,19 @@ def estimate_time_minutes(
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
         "ml_loader":              30,
+        # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
+        # because (a) longer timeouts don't hurt queue priority on this
+        # cluster, (b) over-budgeting once beats serial retries on timeout
+        # flakes. scanpy UMAP on census_1m needed >55 min at 3 runs; give
+        # CPU-reference cells clear headroom. All lines add base + default
+        # slope (8 min/M cells) per (n_obs / 1M) — census_1m hits these
+        # ceilings for the CPU reference implementations.
+        "accel_pca":              30,
+        "accel_knn":              60,
+        "accel_umap":            120,
+        "accel_leiden":           90,
+        "accel_preprocess":       60,
+        "accel_hvg":              45,
     }
     base = base_minutes.get(benchmark, 15)
 

@@ -197,16 +197,20 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
+        extras: dict[str, float] = {}
         try:
             pca = np.asarray(a.obsm["X_pca"], dtype=np.float32)
             um = np.asarray(a.obsm["X_umap"], dtype=np.float32)
             trust.append(_trustworthiness(pca, um, k=n_neighbors))
+            if not np.isnan(trust[-1]):
+                extras["trustworthiness"] = trust[-1]
         except Exception as e:
             logger.warning("trustworthiness failed for %s run %d: %s", key, i + 1, e)
 
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs  trust=%s",

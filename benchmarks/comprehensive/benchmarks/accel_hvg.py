@@ -178,13 +178,17 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
+        extras: dict[str, float] = {}
         try:
             jaccards.append(_hvg_jaccard(ref_var, a.var))
+            if not np.isnan(jaccards[-1]):
+                extras["hvg_overlap_vs_scanpy"] = jaccards[-1]
         except Exception as e:
             logger.warning("HVG overlap failed for %s run %d: %s", key, i + 1, e)
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs overlap=%s",

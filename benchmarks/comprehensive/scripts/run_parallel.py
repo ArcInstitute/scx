@@ -245,18 +245,38 @@ def _per_job_slurm_params(
 
     partition = partition_for_memory(mem, default=args.partition)
 
-    # Phase 9.3 — route accelerator benchmarks to the GPU partition and
-    # attach `--gres=gpu:1`. Detection is by benchmark name prefix so
-    # adding a new `accel_*` module later is automatic. The existing
-    # `accel_*__scanpy_cpu` / `__pyscx_cpu` variants don't need a GPU —
-    # detection via format_key prefix would spare them, but submitit
-    # doesn't conditionally allocate based on format, so we over-request.
-    # Operators who want to run only CPU variants can use
-    # `--formats accel_*_cpu` to filter.
+    # Phase 9.3 (post-Tier-3 finding 2b) — route accelerator benchmarks
+    # to the GPU partition **only for variants that actually use the GPU**.
+    # Variant naming convention: format_key ending in `_gpu` or containing
+    # `_gpu_` indicates GPU dispatch (e.g. `accel_pca__pyscx_gpu_cov`,
+    # `accel_knn__pyscx_gpu_cagra`). CPU-only variants (`accel_*__scanpy_cpu`,
+    # `accel_*__pyscx_cpu*`, `accel_leiden__leidenalg_cpu`) flow through
+    # partition_for_memory which auto-promotes to cpu_high_mem when sizing
+    # exceeds the preemptible-GPU node's RAM ceiling — unblocking
+    # accel_preprocess on census_1m (needs >64 GB).
     extra_slurm: dict = {}
-    if benchmark and benchmark.startswith("accel_"):
+    needs_gpu = (
+        benchmark is not None
+        and benchmark.startswith("accel_")
+        and ("_gpu_" in format_key or format_key.endswith("_gpu"))
+    )
+    if needs_gpu:
         partition = "preemptible"  # GPU partition on chimera
         extra_slurm["slurm_gres"] = "gpu:1"
+        # Chimera's preemptible GPU QOS caps per-job memory at ~128 GB
+        # (matching SLURM_DEFAULTS.gpu.mem_gb). Requests above that fail
+        # with `QOSMaxGRESPerJob`. Clamp so census-scale preprocess cells
+        # that actually use GPU compute don't get rejected at submit time.
+        # (CPU variants have already been routed away via the `needs_gpu`
+        # check and will pick up cpu_high_mem via partition_for_memory.)
+        _GPU_MEM_CEILING_GB = 128
+        if mem > _GPU_MEM_CEILING_GB:
+            logger.warning(
+                "Clamping %s__%s__%s mem from %dG to %dG (GPU QOS cap)",
+                benchmark, format_key, dataset_name,
+                mem, _GPU_MEM_CEILING_GB,
+            )
+            mem = _GPU_MEM_CEILING_GB
 
     logger.info(
         "Sized %s__%s__%s: mem=%dG time=%dm partition=%s%s (scale=%.2f)",

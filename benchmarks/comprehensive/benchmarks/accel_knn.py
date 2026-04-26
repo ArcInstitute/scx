@@ -230,8 +230,10 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
+        extras: dict[str, float] = {}
         try:
             recalls.append(_recall_at_k(ref_conn, a.obsp["connectivities"]))
+            extras["recall_vs_scanpy"] = recalls[-1]
         except Exception as e:
             logger.warning("recall-check failed for %s run %d: %s", key, i + 1, e)
 
@@ -240,6 +242,7 @@ def run(
             user_s=u1 - u0,
             sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs rss=%.1fMB recall=%.3f",

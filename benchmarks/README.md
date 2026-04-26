@@ -9,29 +9,46 @@ This directory contains the benchmarking infrastructure for SCX — scripts, SLU
 ```
 benchmarks/
 ├── README.md              ← You are here
-├── scripts/               # Benchmark scripts and SLURM job definitions
+├── scripts/               # Legacy benchmark scripts and SLURM job definitions
 │   ├── run_benchmarks_slurm.sh          # All-in-one SLURM submission (3 sub-jobs)
 │   ├── submit_benchmarks.py             # Programmatic SLURM submission via submitit
 │   ├── benchmark_all.py                 # Orchestrator: compression + write + read
-│   ├── benchmark_*.py                   # Individual Python benchmark scripts
-│   ├── benchmark_bpcells.R              # BPCells benchmark (R)
-│   ├── slurm_*.sh                       # Standalone SLURM job scripts
+│   ├── benchmark_*.py                   # Individual Python benchmark scripts (accelerators, GPU, harmony, lisi, leiden, lazy_preprocess, ...)
+│   ├── slurm_*.sh                       # Standalone SLURM job scripts (phase0-phase9, GPU, harmony, lazy, parallel-scaling, ...)
 │   ├── download_datasets.sh             # Download & convert benchmark datasets
 │   ├── download_*.py                    # Dataset-specific downloaders
 │   ├── build_census_*.py                # Large dataset builders (5M, 10M cells)
+│   ├── build_harmony_validation_fixtures.py  # Harmony2 validation fixture builder
 │   ├── build_release.py                 # Helper: ensure pyscx release build
 │   ├── verify_datasets.py               # Validate datasets & record metadata
-│   └── setup_cloud_test_data.sh         # Cloud benchmark test data setup
+│   ├── setup_cloud_test_data.sh         # Cloud benchmark test data setup
+│   ├── bench_env.py                     # Shared .env loader (python-dotenv)
+│   ├── generate_compressed_h5ad.py      # Pre-generate gzip/lzf h5ad variants
+│   ├── generate_phase3g_report.py       # Phase 3g report generator
+│   ├── prep_lognorm_datasets.py         # Log-normalized dataset prep
+│   ├── augment_obs_n_counts.py          # Backfill obs.n_counts for legacy fixtures
+│   ├── gpu_regression_driver.sh         # DEPRECATED (Phase 9): use comprehensive/scripts/gate_candidate.sh
+│   ├── gpu_regression_diff.py           # DEPRECATED (Phase 9): superseded by compare_against_baseline.py
+│   └── run_with_rayon_limit.sh          # Wrapper that pins RAYON_NUM_THREADS
+├── r_scripts/             # Top-level R benchmark scripts
+│   └── benchmark_bpcells.R              # BPCells benchmark driver (called via Rscript)
 ├── comprehensive/         # Comprehensive benchmark suite (Phase 3+)
 │   ├── config.py                        # Dataset paths, format configs, constants
 │   ├── sysinfo.py                       # System info collector (CPU, RAM, OS, disk)
 │   ├── results.py                       # BenchmarkResult schema + JSON writer
 │   ├── convert.py                       # Shared conversion cache (convert once, reuse)
+│   ├── cloud_fixtures.py                # GCP fixture self-healing + credential resolution
+│   ├── queries.py                       # Shared query fixtures (HVG lists, filters, row/col slices)
+│   ├── profile.py                       # Per-run peak-RSS / timing profiler helpers
+│   ├── provenance.py                    # Git SHA / env capture for summary.json
+│   ├── thresholds.yaml                  # Hard-floor + tolerance config for the regression gate
+│   ├── requirements.txt                 # pip fallback pins (conda envs are authoritative)
 │   ├── envs/                            # Conda environment definitions
 │   │   ├── scx-bench.yml                # CPU benchmark environment
 │   │   ├── scx-bench-gpu.yml            # GPU benchmark environment (CUDA + RAPIDS)
 │   │   ├── scx-bench-r.yml              # R / BPCells benchmark environment
-│   │   └── scx-bench-slaf.yml           # SLAF (slafdb) benchmark environment
+│   │   ├── scx-bench-slaf.yml           # SLAF (slafdb) benchmark environment
+│   │   └── scx-bench-eval.yml           # Perturbation / cell-eval parity environment
 │   ├── runners/                         # Per-format benchmark runners
 │   │   ├── base.py                      # Abstract FormatRunner interface
 │   │   ├── h5ad_runner.py               # h5ad (uncompressed, gzip, lzf)
@@ -40,22 +57,35 @@ benchmarks/
 │   │   ├── scx_runner.py                # SCX (auto, none, scx1, zstd, pcodec, lz4)
 │   │   ├── bpcells_runner.py            # BPCells (R subprocess)
 │   │   ├── parquet_runner.py            # Parquet (pyarrow)
-│   │   └── slaf_runner.py               # SLAF (slafdb — Lance + DuckDB)
+│   │   ├── slaf_runner.py               # SLAF (slafdb — Lance + DuckDB)
+│   │   └── accel_runner.py              # pyscx.accel.* accelerator runner (CPU + GPU dispatch)
 │   ├── benchmarks/                      # Benchmark modules (one per dimension)
-│   ├── reporting/                       # Report generation (markdown, plots, tables)
+│   │   ├── compression.py, write.py, read_full.py, read_selective.py
+│   │   ├── parallel_scaling.py, parallel_write_scaling.py, memory.py, ml_loader.py
+│   │   ├── fragment_ops.py, correctness.py
+│   │   ├── accel_{pca,knn,umap,leiden,preprocess,hvg}.py   # Phase 9 accel surface
+│   │   ├── cloud_{push,pull,read,metadata,filtered,large_atlas,reader_vs_pull}.py, cost_model.py
+│   │   └── cell_eval_parity_perf.py, _pert_synth.py        # perturbation / cell-eval parity
+│   ├── reporting/                       # Report generation (markdown, plots, tables, dashboard)
+│   │   └── markdown.py, plots.py, tables.py, dashboard.py, landing.py, style.py
 │   ├── scripts/                         # Orchestrators and SLURM launchers
 │   │   ├── run_all.py                   # Serial benchmark orchestrator
 │   │   ├── run_parallel.py              # Parallel SLURM launcher via submitit
 │   │   ├── run_slurm.sh                 # SLURM submission script
 │   │   ├── install_dependencies.sh      # Create conda environments
 │   │   ├── validate_*.py                # Correctness validation scripts
-│   │   ├── slurm_*.sh                   # SLURM job scripts
+│   │   ├── validation_helpers.py        # Shared helpers for validate_*.py
+│   │   ├── smoke_test_runners.py        # Fast per-runner smoke test
+│   │   ├── slurm_*.sh                   # SLURM job scripts (validation suite, capture, parity, ...)
 │   │   │
 │   │   │  # Regression gating (on-demand)
 │   │   ├── gate_candidate.sh            # One-shot: capture + gate against LATEST baseline
 │   │   ├── capture_baseline.py          # Freeze one snapshot (raw/ + summary.json + manifest)
 │   │   ├── promote_baseline.py          # Promote a snapshot to results/baselines/<version>/
 │   │   ├── compare_against_baseline.py  # Relative + absolute-floor + justification gate
+│   │   ├── _justifications.py           # Justification frontmatter loader used by the gate
+│   │   ├── fingerprint_accelerators.py  # Record accelerator library versions into summary.json
+│   │   ├── ooc_rss_table.py             # OOC pipeline peak-RSS table generator
 │   │   ├── publish_dashboard.py         # Rsync HTML snapshot to DASHBOARD_PUBLISH_TARGET
 │   │   │
 │   │   │  # Cloud infrastructure (GCP)
@@ -64,15 +94,24 @@ benchmarks/
 │   │   ├── cloud_fixtures_doctor.py     # Dry-run probe: local vs cloud fixture drift
 │   │   ├── submit_gcp_matrix.py         # Instance-type × benchmark launcher (--yes-spend)
 │   │   ├── gcs_lifecycle.json           # Committed GCS object-lifecycle rules
+│   │   ├── repro_slaf_cloud_read.py     # Standalone SLAF GCS-read repro
+│   │   ├── repro_zarr_cloud_read.py     # Standalone Zarr GCS-read repro
 │   │   │
 │   │   │  # Observability + migrations
 │   │   ├── watch.py                     # Rich TUI tailing run_manifest.json + submitit logs
 │   │   └── migrate_results.py           # Back-stamp schema_version on legacy raw JSONs
-│   ├── r_scripts/                       # BPCells R benchmark scripts
-│   └── results/                         # Raw JSON results + generated reports
+│   ├── tests/                           # Gate self-test + cloud-mechanism pytest suite
+│   ├── r_scripts/                       # BPCells R benchmark scripts (used by bpcells_runner)
+│   ├── logs/                            # submitit / SLURM job logs
+│   └── results/                         # Raw JSON results, candidate snapshots, and baselines
 │       ├── raw/                         # One JSON per benchmark×format×dataset
-│       └── reports/                     # Generated markdown + plots
+│       ├── reports/                     # Generated markdown + plots
+│       ├── baselines/                   # Promoted baselines + LATEST pointer (v0.5.0-phase5, v0.6.0-gpu-phase1-7, ...)
+│       ├── justifications/              # Markdown justifications with frontmatter triples
+│       └── candidate_*/, tier*_*/, baseline_*/  # Dated capture snapshots
 ├── results/               # Per-script benchmark output (JSON + Markdown reports)
+│   ├── pre_phases_1_7_baseline_2026_03/ # Frozen pre-Phase-1-7 GPU baseline (see §GPU workflow)
+│   └── harmony/                         # Harmony2 validation fixtures + run outputs
 └── logs/                  # SLURM job logs (.out, .err, .log)
 ```
 
@@ -502,7 +541,7 @@ Benchmarks use the following partitions:
 | High-memory CPU jobs (≥500 GB) | `cpu_high_mem` | — |
 | GPU jobs | `preemptible` | `gpu_batch` |
 
-Preemptible partitions offer faster scheduling and lower cost. If a job is preempted, resubmit it — benchmark scripts are idempotent. Use the fallback (`cpu_batch` / `gpu_batch`) partitions only when preemptible queues are too congested or when you need guaranteed completion (e.g., multi-day runs).
+Preemptible partitions offer faster scheduling and lower cost. **Preempted jobs on Chimera are automatically requeued back into the preemptible partition by SLURM** — no manual resubmission needed. Because benchmark scripts are idempotent, requeued jobs pick up cleanly (existing converted files are skipped, per-triple result JSONs are unique). Use the fallback (`cpu_batch` / `gpu_batch`) partitions only when preemptible queues are too congested or when you need guaranteed completion without requeue churn (e.g., multi-day runs).
 
 To override the partition for any script that takes a `--partition` flag:
 
@@ -618,7 +657,6 @@ Benchmark outputs are organized into two directories:
 
 - **`benchmarks/results/`** — Per-script benchmark results (JSON + Markdown reports, GPU Go/No-Go gates)
 - **`benchmarks/comprehensive/results/raw/`** — Phase 3 comprehensive benchmarks (500+ JSON files, one per benchmark×format×dataset)
-- **`benchmarks/comprehensive/reporting/phase3_report.md`** — Phase 3 comprehensive report (D1–D7, 12 formats, 6 benchmarks)
 
 To list comprehensive results:
 
@@ -713,6 +751,8 @@ python benchmarks/comprehensive/scripts/promote_baseline.py \
     --version v0.5.0-phase5
 ```
 
+> Change `--version v0.5.0-phase5` as needed
+
 This copies only `summary.json` + `environment.json` + `MANIFEST.sha256`
 into `results/baselines/v0.5.0-phase5/`, and updates `results/baselines/LATEST`
 to point at the new version (relative symlink, pointer-file fallback on
@@ -779,302 +819,143 @@ Run it locally before opening a PR that touches the gate.
 
 ## GPU accelerator regression workflow
 
-> **Scope.** The canonical baseline at
-> `comprehensive/results/baselines/LATEST` gates **format-level**
-> benchmarks — compression, read/write, parallel scaling, memory,
-> ml_loader, cloud. It does **not** currently cover the
-> `pyscx.accel.*` GPU accelerator surface (PCA / kNN / UMAP / Leiden /
-> preprocessing / HVG). Those benchmarks are maintained by the
-> standalone `scripts/benchmark_gpu_*.py` family and dump to
-> `results/gpu_*.json`. This section documents the parallel workflow
-> for GPU-accelerator regression checks until the comprehensive gate
-> learns those dimensions.
+Post-Phase-9, the comprehensive baseline at
+`comprehensive/results/baselines/LATEST` (currently
+`v0.6.0-gpu-phase1-7-multidataset`) covers both format-level **and**
+GPU-accelerator benchmarks (`accel_pca`, `accel_knn`, `accel_umap`,
+`accel_leiden`, `accel_preprocess`, `accel_hvg`) across pbmc3k,
+tabula_sapiens_100k, and census_1m. Per-run correctness metrics
+(`cosine_sim_min`/`mean`, `recall_vs_scanpy`, `trustworthiness`,
+`ari_vs_leidenalg`, `max_abs_diff_vs_scanpy`,
+`hvg_overlap_vs_scanpy`) flow into `runs[].extra` so the absolute
+floors in `thresholds.yaml` evaluate real values, not
+`missing` placeholders.
 
-### Tooling
+**You should not need separate GPU tooling.** The standard
+[Regression Gating workflow](#regression-gating) handles accelerator
+PRs end-to-end. The standalone `benchmarks/scripts/gpu_regression_*.sh`
+/ `gpu_regression_diff.py` wrappers from Phase 8 are **deprecated** —
+kept in-tree one release for rollback convenience and tagged with a
+DEPRECATED header pointing at this section.
 
-Two purpose-built helpers drive this flow end-to-end:
+### When this workflow applies
 
-- `benchmarks/scripts/gpu_regression_driver.sh` — orchestrator that
-  rebuilds pyscx, runs GPU correctness tests, submits SLURM benchmarks
-  in parallel, captures the Phase-7.2 / 7.3 sub-metrics, and calls
-  the diff tool. **Run this on the cluster head-node;** it handles
-  sbatch + wait + diff.
-- `benchmarks/scripts/gpu_regression_diff.py` — Python diff tool that
-  reads a PRE and a POST directory, classifies every row via a
-  configurable tolerance + a hard-floor table, and emits Markdown + JSON
-  reports. Safe to run standalone from any host (CPU-only too — that's
-  how `--diff-only` mode on the driver works).
-
-A frozen pre-Phases-1-7 snapshot lives at
-`benchmarks/results/pre_phases_1_7_baseline_2026_03/` (13 JSONs + 6
-Markdown reports + `MANIFEST.md` + `MANIFEST.sha256`). This is the
-default `--pre` for the driver.
-
-### Quick start — one-shot run
-
-```bash
-# From the cluster head-node:
-bash benchmarks/scripts/gpu_regression_driver.sh
-# → benchmarks/results/phases_1_7_gpu_regression_report.{md,json}
-#   + benchmarks/logs/gpu_regression_driver_<stamp>.log
-```
-
-Exit codes: `0` pass, `1` regression or hard-floor flag, `2` infra
-error (build failure, missing pre, sbatch failure).
-
-Common driver flags:
-
-| Flag | Effect |
-|---|---|
-| `--diff-only` | Skip everything except the final diff. Use when the bench files are already up-to-date. Runs on any host. |
-| `--skip-tests` | Skip step 8.3 (cargo + pytest) when already run. |
-| `--inline` | Run the bench scripts directly on the current node (no sbatch). Prefer sbatch unless iterating on a small fixture. |
-| `--pre DIR` | Alternative baseline directory. Default: `benchmarks/results/pre_phases_1_7_baseline_2026_03`. |
-| `--dataset NAME` | Dataset for the `benchmark_gpu_pipeline.py --attribute-preprocessing --pca-variants` capture. Default: `census_1m`. |
-| `--conda-prefix DIR` | Conda env for Python / maturin / pytest. Default: `/home/nickyoungblut/miniforge3/envs/scx-gpu`. |
-
-### When to run
-
-Run the GPU accelerator workflow whenever a PR touches any of:
+Run the full accel sweep when a PR touches any of:
 
 - `scx-gpu/src/**` — kernels, cuSPARSE / cuSOLVER / cuBLAS wrappers,
   shard pipeline, linear operator.
 - `scx-accel/src/{pca,neighbors,umap,leiden,hvg,harmony}.rs` — Rust-side
-  accelerator entry points (CPU paths too — they gate the CPU baseline).
-- `pyscx/src/accel/**` — Python dispatch, device resolution, preprocessing
-  materialization, fusion markers.
+  accelerator entry points (CPU paths gate the CPU baseline).
+- `pyscx/src/accel/**` — Python dispatch, device resolution,
+  preprocessing materialization, fusion markers.
 - `pyscx/Cargo.toml` / `scx-gpu/Cargo.toml` — dep bumps, feature
   toggles (especially `cudarc` minor-version bumps).
 
-CPU-only PRs that don't touch these paths do not need this workflow;
-the comprehensive `gate_candidate.sh` is sufficient.
+CPU-only PRs that don't touch these paths use the standard
+`gate_candidate.sh` flow and don't need the `--include-accel`
+extension below.
 
-### Step 1 — Capture the pre-change snapshot
-
-Before your post-change runs overwrite `results/gpu_*.json`, copy the
-current state into a dated directory so the diff is unambiguous:
+### One-shot accel + format gate
 
 ```bash
-PRE=benchmarks/results/pre_$(git rev-parse --short HEAD)_$(date +%Y%m%d)
-mkdir -p "$PRE"
-cp benchmarks/results/gpu_*.json benchmarks/results/gpu_*.md "$PRE/" 2>/dev/null || true
-# When no prior run exists at all, capture an empty-but-timestamped dir —
-# the diff script treats missing files as "new benchmark" rather than "regressed".
+# Captures `candidate_<sha>_<date>` at the small tier, gates against
+# LATEST. Pass --include-accel through to capture so accel rows are
+# included.
+bash benchmarks/comprehensive/scripts/gate_candidate.sh
 ```
 
-**If the previous GPU run pre-dates your branch point.** Check the file
-modification times (`stat -c '%y %n' benchmarks/results/gpu_*.json`).
-If the most recent GPU run is older than the branch point of the work
-under review, run the pre-change baseline on the cluster *first* by
-checking out the parent commit:
+`gate_candidate.sh` itself doesn't expose `--include-accel` — the flag
+lives on `run_parallel.py`. For a focused accel-only run, drive
+`run_parallel.py` directly:
 
 ```bash
-git stash --include-untracked
-git checkout <parent-sha>
-# rebuild pyscx with GPU feature (see Step 2), then run the suite.
-cp benchmarks/results/gpu_*.json "$PRE/"
-git checkout -
-git stash pop
+set -a && . .env && set +a
+export CONDA_PREFIX=/home/nickyoungblut/miniforge3/envs/scx-gpu
+export CUDA_HOME=$CONDA_PREFIX CUDA_PATH=$CONDA_PREFIX
+export PATH=$CONDA_PREFIX/bin:$PATH
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
+
+CAND="candidate_$(git rev-parse --short HEAD)_$(date +%Y%m%d)"
+
+# 60-cell accel sweep (skip --datasets to use small-tier defaults).
+$CONDA_PREFIX/bin/python     benchmarks/comprehensive/scripts/run_parallel.py     --benchmarks accel_pca accel_knn accel_umap accel_leiden                  accel_preprocess accel_hvg     --datasets pbmc3k tabula_sapiens_100k census_1m     --include-accel --skip-convert --skip-smoke
+
+# Stage the run-output as a candidate snapshot (raw → summary.json).
+mkdir -p benchmarks/comprehensive/results/$CAND/raw
+cp benchmarks/comprehensive/results/raw/accel_*.json    benchmarks/comprehensive/results/$CAND/raw/
+$CONDA_PREFIX/bin/python -c "
+import json, pathlib
+cand = pathlib.Path('benchmarks/comprehensive/results/$CAND')
+rows = {}
+for src in sorted((cand / 'raw').glob('*.json')):
+    d = json.loads(src.read_text())
+    key = f\"{d['benchmark']}__{d['format']}__{d['dataset']}\"
+    runs = d.get('runs') or []
+    rss = sorted(r.get('peak_rss_mb') for r in runs if r.get('peak_rss_mb') is not None)
+    rss_med = (sorted(rss)[len(rss)//2] if rss else None)
+    rows[key] = {
+        'median_wall_s': d.get('median_wall_s'),
+        'peak_rss_mb_median': rss_med,
+        'file_size_bytes': d.get('file_size_bytes'),
+        'source_file': src.name,
+    }
+(cand / 'summary.json').write_text(json.dumps({'rows': rows}, indent=2))
+"
+
+# Gate against the canonical baseline.
+$CONDA_PREFIX/bin/python     benchmarks/comprehensive/scripts/compare_against_baseline.py     --current benchmarks/comprehensive/results/$CAND     --baseline benchmarks/comprehensive/results/baselines/LATEST     --gate
 ```
 
-### Step 2 — Rebuild pyscx with `--features gpu` on the cluster
+Exit codes match the standard gate: `0` pass, `1` regression / floor
+violation, `2` infra failure.
 
-The dev `.venv/` is typically built without the `gpu` feature. Every
-benchmark script imports the compiled `pyscx` wheel, so rebuild on the
-cluster host before benchmarking:
+### Routing details (no operator action needed)
+
+`run_parallel.py` automatically:
+
+- Routes `accel_*__*_gpu*` formats to `partition=preemptible
+  slurm_gres=gpu:1` and clamps memory at 128 GB to fit the GPU QOS cap.
+- Routes `accel_*__*_cpu*` / `__scanpy_cpu` / `__leidenalg_cpu` formats
+  to `cpu_preemptible`, with `partition_for_memory()` auto-promoting to
+  `cpu_high_mem` when an estimate exceeds 200 GB (e.g.
+  `accel_preprocess` on `census_1m`).
+- Sizes per-cell wall-time budgets via `estimate_time_minutes` (umap
+  120 min base, leiden 90, knn 60, preprocess 60, hvg 45, pca 30) plus
+  a +8 min/M-cells slope. CPU UMAP on census_1m lands at ~130 min.
+- Filters cross-products so `accel_<bench>` only pairs with
+  `accel_<bench>__*` formats (one accel module never schedules another
+  module's variants).
+
+### Promoting a new baseline
+
+When the post-change run shows expected gains (and any threshold
+recalibration in `thresholds.yaml` has landed), promote the snapshot
+the same way as format baselines:
 
 ```bash
-/home/nickyoungblut/miniforge3/envs/scx-gpu/bin/maturin develop \
-    --manifest-path pyscx/Cargo.toml --release --features gpu
+python benchmarks/comprehensive/scripts/promote_baseline.py \
+    --snapshot benchmarks/comprehensive/results/$CAND \
+    --version v0.X.Y-gpu-<descriptor>
 ```
 
-`--release` matters — debug builds produce meaningless bench numbers.
+This copies `summary.json` + `environment.json` + `MANIFEST.sha256`
+into `comprehensive/results/baselines/<version>/` and repoints
+`LATEST`. Add a row to `comprehensive/results/baselines/README.md`'s
+versions table.
 
-### Step 3 — Run the GPU correctness tests first
+### Deprecated tooling (do not use for new work)
 
-Fast signal on any CUDA runtime / driver / kernel-launch issue. If any
-of these fail, fix the root cause before running the (slower, more
-expensive) benchmarks:
+These remain in-tree for one release as rollback convenience:
 
-```bash
-cargo test --workspace --features gpu -- --nocapture 2>&1 \
-    | tee benchmarks/logs/gpu_tests_$(date +%Y%m%d).log
+- `benchmarks/scripts/gpu_regression_driver.sh`
+- `benchmarks/scripts/gpu_regression_diff.py`
+- `benchmarks/scripts/slurm_gpu_regression.sh`
+- `benchmarks/scripts/slurm_gpu_regression_cell.sh`
 
-/home/nickyoungblut/miniforge3/envs/scx-gpu/bin/pytest \
-    pyscx/tests/test_accel_pca_gpu.py \
-    pyscx/tests/test_accel_pipeline_gpu.py \
-    -v 2>&1 | tee benchmarks/logs/pytest_gpu_$(date +%Y%m%d).log
-```
+The frozen pre-Phases-1-7 snapshot at
+`benchmarks/results/pre_phases_1_7_baseline_2026_03/` is also retained
+for historical bisects but is not the gate target.
 
-Expect every `require_gpu!()`-gated Rust test to run (not skip), and
-every `@gpu_only` Python test to pass.
-
-### Step 4 — Submit GPU benchmarks in parallel
-
-One SLURM job per GPU benchmark (per repo-level guidance: parallel
-submission is the default). Each SLURM wrapper rebuilds pyscx
-internally, so parallel submission is safe:
-
-```bash
-sbatch benchmarks/scripts/slurm_gpu_analysis_bench.sh   # PCA + kNN + UMAP + preprocessing + pipeline
-sbatch benchmarks/scripts/slurm_gpu_pca_opt_bench.sh    # PCA sweep
-sbatch benchmarks/scripts/slurm_gpu_knn_bench.sh        # kNN only
-sbatch benchmarks/scripts/slurm_gpu_bench.sh            # decode microbenchmarks
-```
-
-Monitor with `squeue -u $USER` or
-`.venv/bin/python benchmarks/comprehensive/scripts/watch.py`.
-
-Capture the per-PCA-variant rows and the CPU-vs-GPU device-dispatch
-preprocessing rows (Phase 7.2 / 7.3 additions):
-
-```bash
-/home/nickyoungblut/miniforge3/envs/scx-gpu/bin/python \
-    benchmarks/scripts/benchmark_gpu_pipeline.py \
-    --dataset census_1m --attribute-preprocessing --pca-variants
-
-/home/nickyoungblut/miniforge3/envs/scx-gpu/bin/python \
-    benchmarks/scripts/benchmark_gpu_preprocess.py --mode device
-```
-
-These two invocations produce `gpu_pipeline_timing.json` with
-`cpu_preprocessing_*` / `gpu_preprocessing_*` / `gpu_pca_variants`
-sub-keys, and `gpu_preprocess_device.json` with per-op cpu/gpu
-median_s + speedup.
-
-### Step 5 — Diff post vs pre
-
-The driver calls `gpu_regression_diff.py` as its final step. To run the
-diff standalone (e.g., after tweaking thresholds, or for post-hoc
-analysis of an older result set):
-
-```bash
-python benchmarks/scripts/gpu_regression_diff.py \
-    --pre  benchmarks/results/pre_phases_1_7_baseline_2026_03 \
-    --post benchmarks/results \
-    --report    benchmarks/results/phases_1_7_gpu_regression_report.md \
-    --json-out  benchmarks/results/phases_1_7_gpu_regression_report.json \
-    --timing-tolerance 0.10        # ±10% default; use --strict for ±5%
-```
-
-The tool handles every `gpu_*.json` schema produced by the standalone
-benchmark scripts (dict-shaped `gpu_pipeline_timing.json`, list-shaped
-`gpu_{pca,knn,umap,preprocess}_timing.json`, and the Phase-7-only
-`gpu_preprocess_device.json`). Phase-7.2 additions like
-`gpu_pca_variants` are classified as `new` (post-only) rather than
-regressions.
-
-The Markdown report is structured as:
-
-1. Summary header: pre/post paths, tolerance, row counts.
-2. **Hard-floor flags** (from §8.6 threshold table) — these fire
-   regardless of the tolerance and are the first thing to read.
-3. Regressions, improvements, new, disappeared — in that order.
-4. Full row table for exhaustive audits.
-
-Raw side-by-side comparison of the Markdown reports is also useful:
-
-```bash
-diff -u benchmarks/results/pre_phases_1_7_baseline_2026_03/gpu_*.md \
-        benchmarks/results/gpu_*.md | less
-```
-
-### Step 6 — Regression thresholds
-
-Tolerance-based classification (configurable via `--timing-tolerance`,
-default ±10 %):
-
-- `regression` — a higher-is-better metric (speedup, throughput)
-  dropped more than the tolerance below pre, or a lower-is-better metric
-  (wall time) rose more than the tolerance above pre.
-- `improvement` — symmetric in the other direction.
-- `new` — present only in post (e.g. Phase-7.2 `gpu_pca_variants`
-  dispatch rows).
-- `disappeared` — present only in pre (possibly a renamed or removed
-  benchmark).
-
-Hard-floor flags (fire regardless of the tolerance):
-
-| Signal | Hard-floor check |
-|---|---|
-| Covariance PCA on 2K HVGs | `pipeline:pca` post speedup < 1.5× |
-| End-to-end pipeline | post speedup < pre by > 0.1× |
-| CholeskyQR2 vs Householder | Cholesky median > Householder × 1.1 |
-| Unmodified path regression | kNN / UMAP / Leiden regressed past tolerance |
-
-Expected regressions (e.g. a refactor trades throughput for memory or
-correctness) should be documented the same way the comprehensive gate
-handles them — a markdown file under
-`comprehensive/results/justifications/` with frontmatter triples and
-an expiry date. The GPU diff script doesn't auto-suppress justified
-regressions today; manual review remains authoritative. Thresholds
-live in `gpu_regression_diff.py` → `apply_hard_floors()` and should be
-tuned once the first few cluster runs establish real variance bands.
-
-### Step 7 — Update docs and promote (optional)
-
-On a clean pass:
-
-1. Fill in any `_pending bench_` placeholders in `docs/performance.md`
-   with the post-change numbers. Update the "GPU Analysis Pipeline"
-   table and the "Changes vs previous version" note.
-2. Freeze the post-change results as the *next* bisect reference. The
-   standard naming convention is
-   `benchmarks/results/pre_<spec-name>_<YYYY_MM>/`:
-
-   ```bash
-   NEXT=benchmarks/results/pre_next_gpu_phase_$(date +%Y_%m)
-   mkdir -p "$NEXT"
-   cp benchmarks/results/gpu_*.json benchmarks/results/gpu_*.md "$NEXT/"
-   (cd "$NEXT" && sha256sum *.json > MANIFEST.sha256)
-   # Add a MANIFEST.md following the pattern of
-   # benchmarks/results/pre_phases_1_7_baseline_2026_03/MANIFEST.md
-   ```
-3. When the comprehensive gate gains GPU-accelerator coverage, promote
-   the post-change snapshot via `promote_baseline.py --version
-   v0.X.Y-gpu` — same flow as the format baseline.
-
-### Long-term direction: Phase 9 comprehensive-framework integration
-
-The workflow above is a **stopgap**. The strategic home for every
-benchmark — format and accelerator — is the comprehensive framework at
-`benchmarks/comprehensive/`, which already handles parallel SLURM
-submission (`run_parallel.py` / submitit), per-cell result schema
-(`summary.json`), canonical baselines
-(`results/baselines/LATEST → v0.X.Y`), and PR gating
-(`gate_candidate.sh`). Phase 9 of `GPU-ACC-SPEED-UP.md` migrates the
-GPU accelerator benchmarks into this framework. Current status:
-
-- `accel_pca.py` — **landed** as the reference module with 5 variants
-  (scanpy CPU, pyscx CPU, pyscx GPU covariance, pyscx GPU randomized
-  Householder, pyscx GPU randomized Cholesky). Discoverable via
-  `config.accel_formats()` and registered in `ALL_BENCHMARKS`.
-- `accel_{knn,umap,leiden,preprocess,hvg}.py` — **pending**; follow
-  the exact same pattern as `accel_pca.py`.
-- `thresholds.yaml` / `v0.6.0-gpu-phase1-7` baseline — **pending**
-  on post-Phase-7 cluster run.
-
-Once Phase 9 completes, this §GPU-accelerator-regression-workflow
-section collapses into a pointer at the standard `gate_candidate.sh`
-flow — no separate scripts, no separate baselines.
-
-### Known limitations (during the Phase-9 transition)
-
-- **No automated gating for GPU benchmarks.** The
-  `compare_against_baseline.py` gate operates on the comprehensive
-  `summary.json`; the standalone GPU JSONs (and the one `accel_pca`
-  module that's landed so far) don't feed into it. The diff above is
-  manual. Tracking this as Phase 9 Task 9.5 / 9.6 in
-  `GPU-ACC-SPEED-UP.md`.
-- **Reproducibility.** The GPU benchmarks don't record the exact cudarc
-  version, RAPIDS commit, or driver version in the JSON. When diffing,
-  check `environment.json` next to the raw JSON for the comprehensive
-  runs; for the standalone scripts, rely on the SLURM log header
-  (`nvidia-smi`, `nvcc --version`, `conda list`).
-- **Census 1M wall-time variance.** Preemptible GPU jobs can restart
-  mid-run. Every preempted job re-runs from scratch; budget accordingly.
-
----
 
 ## Individual Benchmark Scripts
 

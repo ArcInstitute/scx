@@ -363,22 +363,39 @@ GPU PCA (both variants) streams shards from disk → GPU kernels shard-by-shard 
 
 #### Canonical baseline
 
-As of **v0.6.0-gpu-phase1-7** (promoted 2026-04-23), the GPU accelerator
-benchmarks live in the same comprehensive-framework baseline as the
-format benchmarks:
+As of **v0.6.0-gpu-phase1-7-multidataset** (promoted 2026-04-24), the
+GPU accelerator benchmarks live in the same comprehensive-framework
+baseline as the format benchmarks. The LATEST baseline covers a full
+60-cell sweep across the three reference datasets:
+
+| Dataset | accel cells | Source |
+|---|---:|---|
+| pbmc3k (2.7K cells) | 20 | post-Phase-9 Tier 1 / 3 |
+| tabula_sapiens_100k (100K cells) | 20 | Tier 2 / 3 |
+| census_1m (1M cells) | 20 | Tier 3 + CPU-reference retry |
+
+Per-run correctness metrics (`cosine_sim_min`/`mean`,
+`recall_vs_scanpy`, `trustworthiness`, `ari_vs_leidenalg`,
+`max_abs_diff_vs_scanpy`, `hvg_overlap_vs_scanpy`) flow through
+`runs[].extra` so the floor checks in `thresholds.yaml` evaluate real
+observed values, not `missing` placeholders.
 
 ```bash
 # Gate any post-change head against the canonical baseline (both format and
 # accelerator dimensions). Exit 0 = pass, 1 = unjustified regression.
 bash benchmarks/comprehensive/scripts/gate_candidate.sh
 # → compares current head's captured snapshot against
-#   benchmarks/comprehensive/results/baselines/LATEST → v0.6.0-gpu-phase1-7
+#   benchmarks/comprehensive/results/baselines/LATEST
+#       → v0.6.0-gpu-phase1-7-multidataset
 ```
 
-The standalone `benchmarks/scripts/gpu_regression_{diff,driver}.py`
-wrappers from Phase 8 are **deprecated** — they remain in-tree for
-one release for rollback convenience but new regression runs should
-use `gate_candidate.sh`. See
+The pbmc3k-only `v0.6.0-gpu-phase1-7` baseline (the smoke snapshot
+that briefly held LATEST in late April) remains in-tree for historical
+diff comparison but is no longer the gate target. The standalone
+`benchmarks/scripts/gpu_regression_{diff,driver}.py` wrappers from
+Phase 8 are **deprecated** — they remain in-tree for one release for
+rollback convenience but new regression runs should use
+`gate_candidate.sh`. See
 [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
 
 #### Changes vs previous version

@@ -42,6 +42,13 @@ from benchmarks.comprehensive.results import BenchmarkResult
 
 logger = logging.getLogger(__name__)
 
+# Subsample ceiling for the elementwise correctness diff. Full-matrix
+# compare on census-scale data densifies both operands into 100+ GB
+# arrays via scipy's sparse subtract fallbacks on certain lazy paths;
+# sampling 10K rows keeps the estimate statistically meaningful without
+# the memory cliff. Seeded for reproducibility.
+_MAX_DIFF_SUBSAMPLE_ROWS = 10_000
+
 _HAS_PYSCX = False
 _HAS_PYSCX_GPU = False
 try:
@@ -204,14 +211,25 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
+        extras: dict[str, float] = {}
         try:
-            diffs.append(_max_abs_diff(ref_X, a.X))
+            if raw.n_obs > _MAX_DIFF_SUBSAMPLE_ROWS:
+                rng = np.random.default_rng(RANDOM_SEED)
+                idx = np.sort(
+                    rng.choice(raw.n_obs, _MAX_DIFF_SUBSAMPLE_ROWS, replace=False)
+                )
+                diffs.append(_max_abs_diff(ref_X[idx, :], a.X[idx, :]))
+            else:
+                diffs.append(_max_abs_diff(ref_X, a.X))
+            if not np.isnan(diffs[-1]):
+                extras["max_abs_diff_vs_scanpy"] = diffs[-1]
         except Exception as e:
             logger.warning("max-abs-diff failed for %s run %d: %s", key, i + 1, e)
 
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs max_abs_diff=%s",
