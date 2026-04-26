@@ -473,3 +473,41 @@ class TestLog1pColProjectionRegression:
         assert adata.X.shape == filtered_shape, (
             "Shape changed after log1p in filter→normalize→log1p pipeline"
         )
+
+
+def _gpu_available() -> bool:
+    try:
+        return pyscx.accel.gpu_info() is not None
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — skipping GPU dispatch test",
+)
+def test_log1p_gpu_on_scipy_falls_back_to_cpu():
+    """`log1p(device="gpu")` on a materialised scipy CSR (no fusion marker,
+    no backed/lazy source) emits a `UserWarning` and produces output identical
+    to `sc.pp.log1p`. The slow on-device-materialised path was retired —
+    catastrophically slow per benchmarks (0.00–0.02× vs CPU)."""
+    import anndata
+    import scanpy as sc
+
+    rng = np.random.default_rng(0)
+    dense = rng.poisson(2.0, size=(200, 100)).astype(np.float32)
+    dense[rng.random(dense.shape) > 0.3] = 0
+    x = sp.csr_matrix(dense)
+
+    a_gpu = anndata.AnnData(X=x.copy())
+    a_ref = anndata.AnnData(X=x.copy())
+
+    with pytest.warns(UserWarning, match="falls back to CPU"):
+        pyscx.accel.log1p(a_gpu, device="gpu")
+
+    sc.pp.log1p(a_ref)
+
+    assert sp.issparse(a_gpu.X), "X should remain scipy sparse after fallback"
+    np.testing.assert_allclose(
+        a_gpu.X.toarray(), a_ref.X.toarray(), rtol=1e-6, atol=1e-7
+    )

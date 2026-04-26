@@ -600,6 +600,14 @@ than reading the already-materialized scipy CSR. Any intervening op (PCA,
 kNN, …) silently forfeits the fusion, producing correct — but 1× redundant —
 results.
 
+**`log1p(device="gpu")` standalone** — when there is no fusion marker AND the
+input X is already a materialized scipy/dense matrix, GPU dispatch is 50–100×
+slower than CPU (H→D + D→H copies dominate log1p's trivial math). `pyscx`
+detects this case, emits a `UserWarning`, and runs `sc.pp.log1p` on the host
+instead. To get the GPU fast path, either run
+`pyscx.accel.normalize_total(device="gpu")` first (the fusion marker enables
+a single fused pass), or operate on a backed SCX dataset.
+
 **HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
 through GPU atomicAdd kernels for `streaming_mean_var` and
 `streaming_clip_square_sum`. GPU dispatch is active only for single-batch

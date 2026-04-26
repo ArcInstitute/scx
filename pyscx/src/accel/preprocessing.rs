@@ -164,8 +164,9 @@ pub fn normalize_total(
 ///   fused result.
 /// * Else if X is still backed/lazy, stream through `gpu_preprocess_to_csr`
 ///   with log1p only and materialize into scipy CSR.
-/// * Else (X is already scipy/dense), upload data to GPU, apply log1p, and
-///   write back into `adata.X`.
+/// * Else (X is already scipy/dense), GPU dispatch is slower than CPU
+///   (H→D + D→H copies dominate log1p's trivial math), so `pyscx` emits a
+///   `UserWarning` and falls back to `sc.pp.log1p`.
 ///
 /// CPU path (three cases):
 /// 1. X is `ScxBackedSparseDataset` → create new `ScxLazyTransformedDataset`
@@ -530,6 +531,24 @@ fn emit_laziness_break_warning(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
+fn emit_gpu_log1p_fallback_warning(py: Python<'_>) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    warnings.call_method1(
+        "warn",
+        (
+            "pyscx.accel.log1p(device=\"gpu\") on a materialized scipy/dense X \
+             falls back to CPU: H→D and D→H copies dominate log1p's trivial math, \
+             making GPU dispatch 50–100× slower than scanpy.pp.log1p. To get the \
+             GPU fast path, call pyscx.accel.normalize_total(device=\"gpu\") first \
+             (the fusion marker on adata.uns enables a single fused pass), or \
+             operate on a backed SCX dataset.",
+            py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        ),
+    )?;
+    Ok(())
+}
+
 /// Build a scipy `csr_matrix((data, indices, indptr), shape=...)` on the Python side.
 #[cfg(feature = "gpu")]
 fn scx_csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<Bound<'py, PyAny>> {
@@ -664,8 +683,9 @@ fn gpu_normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
     Ok(())
 }
 
-/// GPU-eager `log1p` dispatch — handles the fusion-marker path, backed/lazy
-/// materialization, and in-place scipy CSR log1p.
+/// GPU-eager `log1p` dispatch — handles the fusion-marker path and backed/lazy
+/// materialization. Materialised scipy/dense X warns and falls back to
+/// `sc.pp.log1p` (the H→D / D→H round-trip dominates the kernel cost).
 #[cfg(feature = "gpu")]
 fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
     let uns = adata.getattr("uns")?;
@@ -719,74 +739,10 @@ fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> 
         return Ok(());
     }
 
-    // 3) Scipy/dense X: apply gpu_log1p in place on the data buffer.
-    gpu_log1p_on_materialized(py, adata)
-}
-
-/// Upload the `data` array of a materialized scipy/dense X, apply the
-/// GPU log1p kernel, and write back.
-#[cfg(feature = "gpu")]
-fn gpu_log1p_on_materialized(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
-    let scipy_sparse = py.import("scipy.sparse")?;
-    let x = adata.getattr("X")?;
-    let is_sparse = scipy_sparse
-        .call_method1("issparse", (&x,))?
-        .extract::<bool>()?;
-    if !is_sparse {
-        // Dense X: defer to scanpy (small code path; not worth a GPU kernel).
-        let sc = py.import("scanpy")?;
-        sc.getattr("pp")?.call_method1("log1p", (adata,))?;
-        return Ok(());
-    }
-
-    // Ensure CSR for predictable layout.
-    let csr_py = scipy_sparse.call_method1("csr_matrix", (&x,))?;
-    let np = py.import("numpy")?;
-    let indptr: Vec<i64> = np
-        .call_method1("asarray", (csr_py.getattr("indptr")?,))?
-        .call_method1("astype", ("int64",))?
-        .extract()?;
-    let data: Vec<f32> = np
-        .call_method1("asarray", (csr_py.getattr("data")?,))?
-        .call_method1("astype", ("float32",))?
-        .extract()?;
-    let n_rows = indptr.len().saturating_sub(1);
-
-    let dev = scx_accel::GpuDevice::new(0)
-        .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
-    let d_indptr = dev
-        .htod_copy(&indptr)
-        .map_err(|e| PyRuntimeError::new_err(format!("htod indptr: {e}")))?;
-    let mut d_data = dev
-        .htod_copy(&data)
-        .map_err(|e| PyRuntimeError::new_err(format!("htod data: {e}")))?;
-    scx_accel::gpu_log1p(&dev, &d_indptr, &mut d_data, n_rows)
-        .map_err(|e| PyRuntimeError::new_err(format!("gpu_log1p: {e}")))?;
-    dev.synchronize()
-        .map_err(|e| PyRuntimeError::new_err(format!("sync: {e}")))?;
-    let new_data: Vec<f32> = dev
-        .dtoh_copy(&d_data)
-        .map_err(|e| PyRuntimeError::new_err(format!("dtoh data: {e}")))?;
-
-    // Write back: rebuild csr_matrix with the transformed data and the
-    // existing structural arrays. This is cheaper than mutating
-    // `csr_py.data[:] = new_data` because we avoid the Python-side
-    // buffer-reshape machinery.
-    let shape: (usize, usize) = csr_py.getattr("shape")?.extract()?;
-    let indices = csr_py.getattr("indices")?;
-    let new_data_np = numpy::PyArray::from_vec(py, new_data);
-    let indptr_np = numpy::PyArray::from_vec(py, indptr);
-    let args = pyo3::types::PyTuple::new(
-        py,
-        &[
-            new_data_np.into_any(),
-            indices.clone(),
-            indptr_np.into_any(),
-        ],
-    )?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("shape", shape)?;
-    let new_csr = scipy_sparse.call_method("csr_matrix", (args,), Some(&kwargs))?;
-    adata.setattr("X", new_csr)?;
+    // 3) Scipy/dense X: GPU dispatch is slower than CPU here (H→D + D→H
+    //    copies dominate log1p's trivial math). Warn and fall back to scanpy.
+    emit_gpu_log1p_fallback_warning(py)?;
+    let sc = py.import("scanpy")?;
+    sc.getattr("pp")?.call_method1("log1p", (adata,))?;
     Ok(())
 }

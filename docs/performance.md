@@ -344,16 +344,16 @@ pyscx.accel.leiden(adata, device="gpu", parallel=True)
 
 #### Preprocessing device dispatch (Phase 5)
 
-`pyscx.accel.{normalize_total, log1p, highly_variable_genes}` now accept `device="cpu|gpu|auto"`. The GPU path is eager (materializes to scipy CSR). **Standalone GPU log1p is catastrophically slow** — upload/kernel/download round-trip dominates log1p's trivial compute:
+`pyscx.accel.{normalize_total, log1p, highly_variable_genes}` now accept `device="cpu|gpu|auto"`. The GPU path is eager (materializes to scipy CSR). **`log1p(device="gpu")` on a materialised scipy/dense X warns and falls back to CPU** — the H→D + kernel + D→H round-trip dominates log1p's trivial math. The pre-fallback measurement (retained as motivation):
 
 | Op | pbmc3k CPU / GPU | tabula_sapiens_100k CPU / GPU | census_1m CPU / GPU |
 |---|---|---|---|
 | normalize_total | 0.004s / 0.004s (1.0×) | 0.61s / 0.43s (**1.4×**) | 3.27s / 3.00s (**1.1×**) |
-| log1p | 0.003s / 0.41s (**0.01×**) | 0.20s / 9.23s (**0.02×**) | 1.46s / 63.78s (**0.02×**) |
+| log1p (pre-fallback) | 0.003s / 0.41s (**0.01×**) | 0.20s / 9.23s (**0.02×**) | 1.46s / 63.78s (**0.02×**) |
 | fused normalize+log1p | 0.006s / 0.41s (0.01×) | 0.83s / 9.73s (0.09×) | 4.50s / 67.45s (0.07×) |
 | highly_variable_genes (seurat_v3) | 0.06s / 0.07s (0.9×) | 3.42s / 3.40s (1.0×) | 25.77s / 28.31s (0.9×) |
 
-Practical recommendation: **use the GPU preprocessing path only via the `normalize_total → log1p` fusion-marker chain on backed SCX data, and only when the downstream consumer is also GPU**. The per-op CPU-vs-GPU table above is a lower bound on GPU preprocessing cost (materialization + D2H round-trip to scipy CSR); in-place scanpy preprocessing is faster for every standalone op. The fused-chain optimization exists because that's the only case where GPU preprocessing doesn't round-trip through the host.
+Practical recommendation: **use the GPU preprocessing path only via the `normalize_total → log1p` fusion-marker chain on backed SCX data, and only when the downstream consumer is also GPU**. The fused-chain optimization is the only case where GPU preprocessing doesn't round-trip through the host. Standalone `log1p(device="gpu")` on materialised X now emits a `UserWarning` and runs `sc.pp.log1p` instead; the GPU fast path is preserved when log1p sees the fusion marker planted by `normalize_total(device="gpu")`, or when X is still backed/lazy.
 
 **Dispatch logic:** `pyscx.accel.pca(device="gpu")` auto-routes by `n_vars` — the covariance path handles HVG-shaped inputs (`n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000`) and the randomized path handles the long-tail. Users can force one or the other with `method="covariance"` / `"randomized"`. The randomized path accepts `qr_method="householder"` (default, always-stable) or `"cholesky"` (CholeskyQR2 — opt-in, surfaces `RuntimeError` on non-SPD Gram so callers can retry with Householder).
 
