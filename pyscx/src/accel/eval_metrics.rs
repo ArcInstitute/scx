@@ -683,6 +683,10 @@ pub fn perturbation_metrics<'py>(
 ///     control: Label for control perturbation (default: "control")
 ///     metric: Distance metric — "euclidean" (default), "l1", or "cosine"
 ///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None)
+///     backend: Distance kernel backend — "auto" (default), "gemm", or "scalar".
+///         "auto" uses faer-backed gemm for euclidean/cosine and the scalar
+///         row-by-row path for L1. "gemm" forces the gemm path (errors on L1).
+///         "scalar" forces the scalar path (matches the historical implementation).
 ///
 /// Returns:
 ///     float — Pearson correlation of per-perturbation e-distances
@@ -691,7 +695,20 @@ pub fn perturbation_metrics<'py>(
 ///     corr = pyscx.accel.energy_distance(adata_real, adata_pred)
 ///     # corr ≈ 0.85 means real and predicted perturbation effects
 ///     # have similar relative magnitudes
+/// Parse `backend` kwarg into `DistanceBackend`.
+fn parse_backend(backend: Option<&str>) -> PyResult<scx_accel::DistanceBackend> {
+    match backend.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("auto") => Ok(scx_accel::DistanceBackend::Auto),
+        Some("gemm") | Some("blas") => Ok(scx_accel::DistanceBackend::Gemm),
+        Some("scalar") => Ok(scx_accel::DistanceBackend::Scalar),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "unknown backend '{other}'. Valid: auto, gemm, scalar"
+        ))),
+    }
+}
+
 /// Shared prep + compute for energy_distance / energy_distance_details.
+#[allow(clippy::too_many_arguments)]
 fn run_energy_distance<'py>(
     py: Python<'py>,
     adata_real: &Bound<'py, PyAny>,
@@ -700,6 +717,7 @@ fn run_energy_distance<'py>(
     control: &str,
     metric: &str,
     embed_key: Option<&str>,
+    backend: Option<&str>,
 ) -> PyResult<scx_accel::EDistanceResult> {
     let np = py.import("numpy")?;
 
@@ -715,6 +733,8 @@ fn run_energy_distance<'py>(
             )))
         }
     };
+
+    let dist_backend = parse_backend(backend)?;
 
     // ── Extract dense matrices from both AnnData objects ────────────
     let (real_flat, n_real, n_dims_real) = extract_dense_matrix(py, &np, adata_real, embed_key)?;
@@ -803,13 +823,14 @@ fn run_energy_distance<'py>(
             &pert_group_indices,
             n_dims,
             dist_metric,
+            dist_backend,
         )
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance<'py>(
     py: Python<'py>,
@@ -819,9 +840,10 @@ pub fn energy_distance<'py>(
     control: &str,
     metric: &str,
     embed_key: Option<&str>,
+    backend: Option<&str>,
 ) -> PyResult<f64> {
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend,
     )?;
     Ok(result.correlation)
 }
@@ -843,7 +865,7 @@ pub fn energy_distance<'py>(
 ///     # out["correlation"] ≈ 0.85
 ///     # out["d_real"]["drug_A"] == 12.34
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance_details<'py>(
     py: Python<'py>,
@@ -853,9 +875,10 @@ pub fn energy_distance_details<'py>(
     control: &str,
     metric: &str,
     embed_key: Option<&str>,
+    backend: Option<&str>,
 ) -> PyResult<PyObject> {
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend,
     )?;
 
     let d_real = PyDict::new(py);

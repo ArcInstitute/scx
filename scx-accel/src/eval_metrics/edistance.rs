@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use super::distances::{mean_pairwise_distance, mean_pairwise_distance_self};
+use super::distances::{mean_pairwise_distance, mean_pairwise_distance_self, DistanceBackend};
 use super::DistanceMetric;
 use crate::eval_metrics::bulk_metrics::pearson_correlation;
 use rayon::prelude::*;
@@ -35,6 +35,7 @@ pub struct EDistanceResult {
 ///
 /// This avoids computing the control self-distance repeatedly across
 /// perturbations.
+#[allow(clippy::too_many_arguments)]
 pub fn fused_edistance(
     x: &[f64],
     y: &[f64],
@@ -43,10 +44,11 @@ pub fn fused_edistance(
     n_dims: usize,
     sigma_y: f64,
     metric: DistanceMetric,
-) -> f64 {
-    let sigma_x = mean_pairwise_distance_self(x, n_x, n_dims, metric);
-    let delta = mean_pairwise_distance(x, y, n_x, n_y, n_dims, metric);
-    2.0 * delta - sigma_x - sigma_y
+    backend: DistanceBackend,
+) -> crate::Result<f64> {
+    let sigma_x = mean_pairwise_distance_self(x, n_x, n_dims, metric, backend)?;
+    let delta = mean_pairwise_distance(x, y, n_x, n_y, n_dims, metric, backend)?;
+    Ok(2.0 * delta - sigma_x - sigma_y)
 }
 
 /// Compute energy distances for all perturbations, returning per-perturbation
@@ -77,6 +79,7 @@ pub fn compute_energy_distance(
     pert_group_indices: &[u32],
     n_dims: usize,
     metric: DistanceMetric,
+    backend: DistanceBackend,
 ) -> crate::Result<EDistanceResult> {
     if pert_names.len() != pert_group_indices.len() {
         return Err(crate::AccelError::InvalidInput(
@@ -126,13 +129,15 @@ pub fn compute_energy_distance(
     }
 
     // ── 3. Precompute control self-distances (once each) ────────────
-    let sigma_ctrl_real = mean_pairwise_distance_self(&ctrl_real, n_ctrl_real, n_dims, metric);
-    let sigma_ctrl_pred = mean_pairwise_distance_self(&ctrl_pred, n_ctrl_pred, n_dims, metric);
+    let sigma_ctrl_real =
+        mean_pairwise_distance_self(&ctrl_real, n_ctrl_real, n_dims, metric, backend)?;
+    let sigma_ctrl_pred =
+        mean_pairwise_distance_self(&ctrl_pred, n_ctrl_pred, n_dims, metric, backend)?;
 
     // ── 4. Compute per-perturbation e-distances in parallel ─────────
-    let results: Vec<(f64, f64)> = pert_group_indices
+    let results: Vec<crate::Result<(f64, f64)>> = pert_group_indices
         .par_iter()
-        .map(|&gi| {
+        .map(|&gi| -> crate::Result<(f64, f64)> {
             let pert_real = extract_group_rows_indexed(real_cells, real_index.get(&gi), n_dims);
             let pert_pred = extract_group_rows_indexed(pred_cells, pred_index.get(&gi), n_dims);
 
@@ -148,7 +153,8 @@ pub fn compute_energy_distance(
                     n_dims,
                     sigma_ctrl_real,
                     metric,
-                )
+                    backend,
+                )?
             } else {
                 f64::NAN
             };
@@ -162,14 +168,16 @@ pub fn compute_energy_distance(
                     n_dims,
                     sigma_ctrl_pred,
                     metric,
-                )
+                    backend,
+                )?
             } else {
                 f64::NAN
             };
 
-            (e_real, e_pred)
+            Ok((e_real, e_pred))
         })
         .collect();
+    let results: Vec<(f64, f64)> = results.into_iter().collect::<crate::Result<Vec<_>>>()?;
 
     let d_real: Vec<f64> = results.iter().map(|(r, _)| *r).collect();
     let d_pred: Vec<f64> = results.iter().map(|(_, p)| *p).collect();
@@ -277,7 +285,17 @@ mod tests {
         let x = vec![5.0, 0.0];
         let y = vec![0.0, 0.0];
         let sigma_y = 0.0;
-        let e = fused_edistance(&x, &y, 1, 1, 2, sigma_y, DistanceMetric::Euclidean);
+        let e = fused_edistance(
+            &x,
+            &y,
+            1,
+            1,
+            2,
+            sigma_y,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
+        )
+        .unwrap();
         assert!((e - 10.0).abs() < 1e-12, "expected 10.0, got {e}");
     }
 
@@ -287,8 +305,25 @@ mod tests {
         let data = vec![0.0, 0.0, 1.0, 1.0, 2.0, 0.0];
         let n = 3;
         let d = 2;
-        let sigma = mean_pairwise_distance_self(&data, n, d, DistanceMetric::Euclidean);
-        let e = fused_edistance(&data, &data, n, n, d, sigma, DistanceMetric::Euclidean);
+        let sigma = mean_pairwise_distance_self(
+            &data,
+            n,
+            d,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
+        )
+        .unwrap();
+        let e = fused_edistance(
+            &data,
+            &data,
+            n,
+            n,
+            d,
+            sigma,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
+        )
+        .unwrap();
         assert!(e.abs() < 1e-12, "identical distributions → e ≈ 0, got {e}");
     }
 
@@ -308,6 +343,7 @@ mod tests {
             &pert_indices,
             2,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         )
         .unwrap();
 
@@ -347,6 +383,7 @@ mod tests {
             &pert_indices,
             n_dims,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         )
         .unwrap();
 
@@ -380,6 +417,7 @@ mod tests {
             &[],
             2,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         );
         assert!(result.is_err());
 
@@ -394,6 +432,7 @@ mod tests {
             &[1, 2], // length mismatch
             2,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         );
         assert!(result.is_err());
     }
@@ -411,6 +450,7 @@ mod tests {
             &[1],
             2,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         );
         assert!(result.is_err());
     }
@@ -442,6 +482,7 @@ mod tests {
             &[1],
             n_dims,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         )
         .unwrap();
 
@@ -509,6 +550,7 @@ mod tests {
             &[1],
             n_dims,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         )
         .unwrap();
 
@@ -566,6 +608,7 @@ mod tests {
             &pert_indices,
             n_dims,
             DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
         )
         .unwrap();
 

@@ -23,6 +23,7 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 rand_distr = { workspace = true }
 instant-distance = "0.6"
+num-traits = "0.2"
 rayon = { workspace = true }
 thread_local = "1.1"
 libc = "0.2"
