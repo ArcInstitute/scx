@@ -19,6 +19,9 @@ scx-format = { path = "../scx-format" }
 scx-sparse = { path = "../scx-sparse" }
 scx-gpu = { path = "../scx-gpu", optional = true }
 faer = { workspace = true }
+# `faer` re-exports `faer_traits::ComplexField` privately; depend on the crate
+# directly to use it as a trait bound on the generic distance kernels.
+faer-traits = "0.24"
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rand_distr = { workspace = true }

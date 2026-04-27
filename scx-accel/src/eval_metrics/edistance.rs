@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 
-use super::distances::{mean_pairwise_distance, mean_pairwise_distance_self, DistanceBackend};
+use super::distances::{
+    mean_pairwise_distance, mean_pairwise_distance_self, DistanceBackend, PairwiseFloat,
+};
 use super::DistanceMetric;
 use crate::eval_metrics::bulk_metrics::pearson_correlation;
 use rayon::prelude::*;
@@ -35,10 +37,13 @@ pub struct EDistanceResult {
 ///
 /// This avoids computing the control self-distance repeatedly across
 /// perturbations.
+///
+/// Generic over `F: PairwiseFloat` (`f32` or `f64`). `sigma_y` and the return
+/// value are always `f64` regardless of `F` — reductions accumulate in `f64`.
 #[allow(clippy::too_many_arguments)]
-pub fn fused_edistance(
-    x: &[f64],
-    y: &[f64],
+pub fn fused_edistance<F: PairwiseFloat>(
+    x: &[F],
+    y: &[F],
     n_x: usize,
     n_y: usize,
     n_dims: usize,
@@ -69,9 +74,9 @@ pub fn fused_edistance(
 /// # Returns
 /// `EDistanceResult` with per-perturbation e-distances and their correlation.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_energy_distance(
-    real_cells: &[f64],
-    pred_cells: &[f64],
+pub fn compute_energy_distance<F: PairwiseFloat>(
+    real_cells: &[F],
+    pred_cells: &[F],
     real_groups: &[u32],
     pred_groups: &[u32],
     ctrl_group_idx: u32,
@@ -220,12 +225,12 @@ fn build_group_index(groups: &[u32]) -> HashMap<u32, Vec<usize>> {
 
 /// Extract rows from a `[N × D]` matrix using a pre-built group index.
 ///
-/// Returns a new dense `Vec<f64>` containing the selected rows contiguously.
-fn extract_group_rows_indexed(
-    data: &[f64],
+/// Returns a new dense `Vec<F>` containing the selected rows contiguously.
+fn extract_group_rows_indexed<F: PairwiseFloat>(
+    data: &[F],
     row_indices: Option<&Vec<usize>>,
     n_dims: usize,
-) -> Vec<f64> {
+) -> Vec<F> {
     let indices = match row_indices {
         Some(v) => v,
         None => return Vec::new(),
@@ -646,5 +651,149 @@ mod tests {
             "correlation should be 1.0 for identical data, got {}",
             result.correlation
         );
+    }
+
+    // ── f32 vs f64 parity (Phase 2) ───────────────────────────────────
+
+    /// Build a synthetic 1000 × 100 dataset with 5 perts (200 cells each)
+    /// in f64, plus an exact f32 cast.
+    fn make_parity_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<String>, Vec<u32>) {
+        let n_perts: usize = 5; // groups 1..=5; 0 is control
+        let cells_per_group = 200;
+        let n_total = (n_perts + 1) * cells_per_group;
+        let n_dims = 100;
+
+        // LCG-driven deterministic synthetic data — values in roughly the
+        // same range as log-normalized counts.
+        let mut state: u64 = 0xDEAD_BEEF;
+        let mut next = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 32) as f64 / u32::MAX as f64) * 4.0 // ~ U[0, 4]
+        };
+
+        let mut cells = Vec::with_capacity(n_total * n_dims);
+        let mut groups = Vec::with_capacity(n_total);
+        for g in 0..=n_perts {
+            for _ in 0..cells_per_group {
+                let shift = g as f64 * 0.4; // small per-pert mean shift
+                for _ in 0..n_dims {
+                    cells.push(next() + shift);
+                }
+                groups.push(g as u32);
+            }
+        }
+
+        let pert_names: Vec<String> = (1..=n_perts).map(|p| format!("pert_{p}")).collect();
+        let pert_indices: Vec<u32> = (1..=n_perts as u32).collect();
+        let pred = cells.clone();
+        (cells, pred, groups, pert_names, pert_indices)
+    }
+
+    #[test]
+    fn test_compute_energy_distance_f32_matches_f64() {
+        let (real_f64, pred_f64, groups, pert_names, pert_indices) = make_parity_dataset();
+        let real_f32: Vec<f32> = real_f64.iter().map(|&x| x as f32).collect();
+        let pred_f32: Vec<f32> = pred_f64.iter().map(|&x| x as f32).collect();
+        let n_dims = 100;
+
+        let r64 = compute_energy_distance::<f64>(
+            &real_f64,
+            &pred_f64,
+            &groups,
+            &groups,
+            0,
+            &pert_names,
+            &pert_indices,
+            n_dims,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Gemm,
+        )
+        .unwrap();
+
+        let r32 = compute_energy_distance::<f32>(
+            &real_f32,
+            &pred_f32,
+            &groups,
+            &groups,
+            0,
+            &pert_names,
+            &pert_indices,
+            n_dims,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Gemm,
+        )
+        .unwrap();
+
+        // Correlation should match within atol=1e-4 (the spec's parity bound).
+        assert!(
+            (r32.correlation - r64.correlation).abs() < 1e-4,
+            "correlation: f32={} vs f64={} (diff={})",
+            r32.correlation,
+            r64.correlation,
+            (r32.correlation - r64.correlation).abs(),
+        );
+
+        // Per-pert e-distances within atol=1e-3 (log-normalised values are
+        // ~1, so 1e-3 absolute is tight).
+        for i in 0..pert_names.len() {
+            assert!(
+                (r32.d_real[i] - r64.d_real[i]).abs() < 1e-3,
+                "d_real[{i}]: f32={} vs f64={}",
+                r32.d_real[i],
+                r64.d_real[i],
+            );
+            assert!(
+                (r32.d_pred[i] - r64.d_pred[i]).abs() < 1e-3,
+                "d_pred[{i}]: f32={} vs f64={}",
+                r32.d_pred[i],
+                r64.d_pred[i],
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_energy_distance_f32_scalar_matches_f64_scalar() {
+        // Same parity check on the scalar (non-gemm) path — confirms the
+        // generic point_distance_generic helper accumulates correctly in f64
+        // even on f32 inputs.
+        let (real_f64, pred_f64, groups, pert_names, pert_indices) = make_parity_dataset();
+        let real_f32: Vec<f32> = real_f64.iter().map(|&x| x as f32).collect();
+        let pred_f32: Vec<f32> = pred_f64.iter().map(|&x| x as f32).collect();
+        let n_dims = 100;
+
+        let r64 = compute_energy_distance::<f64>(
+            &real_f64,
+            &pred_f64,
+            &groups,
+            &groups,
+            0,
+            &pert_names,
+            &pert_indices,
+            n_dims,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
+        )
+        .unwrap();
+
+        let r32 = compute_energy_distance::<f32>(
+            &real_f32,
+            &pred_f32,
+            &groups,
+            &groups,
+            0,
+            &pert_names,
+            &pert_indices,
+            n_dims,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
+        )
+        .unwrap();
+
+        assert!((r32.correlation - r64.correlation).abs() < 1e-4);
+        for i in 0..pert_names.len() {
+            assert!((r32.d_real[i] - r64.d_real[i]).abs() < 1e-3);
+        }
     }
 }

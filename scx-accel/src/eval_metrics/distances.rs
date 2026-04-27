@@ -8,13 +8,62 @@
 //! that materialises the `[N_A, N_B]` Gram matrix in one BLAS-level call
 //! and expands it to distances. This is much faster than the row-by-row
 //! scalar path on dense, low-dimensional embeddings (e.g. PCA outputs).
+//!
+//! Both kernels are generic over [`PairwiseFloat`] (`f32` or `f64`).
+//! Reductions always accumulate in `f64` regardless of the input precision,
+//! so the parity tolerances stay tight even when callers feed `f32` inputs.
 
 use faer::linalg::matmul::matmul;
 use faer::{Mat, MatRef};
+use num_traits::{Float, One};
 use rayon::prelude::*;
 
 use super::DistanceMetric;
 use crate::AccelError;
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// Sealed marker bundle for floating-point element types usable in the
+/// generic pairwise-distance kernels. Implemented for `f32` and `f64`.
+///
+/// Sealed because the implementation relies on faer's `ComplexField` impls
+/// which only exist for `f32`/`f64` here, and external impls would silently
+/// route through the wrong matmul kernel.
+pub trait PairwiseFloat:
+    sealed::Sealed + Float + One + Send + Sync + Copy + faer_traits::ComplexField + 'static
+{
+    /// Widen to `f64` for reduction. The `f64` impl is a no-op.
+    fn as_f64(self) -> f64;
+    /// Narrow `f64` → Self. Used to apply an `f64` scaling factor (e.g. an
+    /// inverse norm) back into an `F`-typed buffer.
+    fn from_f64(x: f64) -> Self;
+}
+
+impl PairwiseFloat for f32 {
+    #[inline]
+    fn as_f64(self) -> f64 {
+        self as f64
+    }
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        x as f32
+    }
+}
+
+impl PairwiseFloat for f64 {
+    #[inline]
+    fn as_f64(self) -> f64 {
+        self
+    }
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        x
+    }
+}
 
 /// Backend selection for `mean_pairwise_distance` and friends.
 ///
@@ -107,6 +156,67 @@ pub fn point_distance(a: &[f64], b: &[f64], n_dims: usize, metric: DistanceMetri
     }
 }
 
+// ── Generic scalar distance helpers ─────────────────────────────────────
+//
+// These widen each element to `f64` before accumulation so f32 inputs do not
+// lose precision in the inner reduction. For `F = f64` the `as_f64` calls
+// monomorphise to no-ops, so these are equivalent to the existing f64 fns.
+
+#[inline]
+fn euclidean_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) -> f64 {
+    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+    let mut sum_sq = 0.0f64;
+    for k in 0..n_dims {
+        let diff = a[k].as_f64() - b[k].as_f64();
+        sum_sq += diff * diff;
+    }
+    sum_sq.sqrt()
+}
+
+#[inline]
+fn l1_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) -> f64 {
+    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+    let mut sum_abs = 0.0f64;
+    for k in 0..n_dims {
+        sum_abs += (a[k].as_f64() - b[k].as_f64()).abs();
+    }
+    sum_abs
+}
+
+#[inline]
+fn cosine_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) -> f64 {
+    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for k in 0..n_dims {
+        let ak = a[k].as_f64();
+        let bk = b[k].as_f64();
+        dot += ak * bk;
+        norm_a += ak * ak;
+        norm_b += bk * bk;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 {
+        return 1.0;
+    }
+    (1.0 - dot / denom).clamp(0.0, 2.0)
+}
+
+#[inline]
+fn point_distance_generic<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
+    n_dims: usize,
+    metric: DistanceMetric,
+) -> f64 {
+    match metric {
+        DistanceMetric::Euclidean => euclidean_distance_generic(a, b, n_dims),
+        DistanceMetric::L1 => l1_distance_generic(a, b, n_dims),
+        DistanceMetric::Cosine => cosine_distance_generic(a, b, n_dims),
+    }
+}
+
 /// Compute per-row distance sums for `(a, b)` via faer's gemm.
 ///
 /// Returns a `Vec<f64>` of length `n_a` where `row_sums[i] = sum_j d(a_i, b_j)`.
@@ -116,9 +226,14 @@ pub fn point_distance(a: &[f64], b: &[f64], n_dims: usize, metric: DistanceMetri
 /// rounding, well below the `atol=1e-4` parity tolerance).
 ///
 /// `metric` must be `Euclidean` or `Cosine`; `L1` has no gemm formulation.
-fn pairwise_gemm_row_sums(
-    a: &[f64],
-    b: &[f64],
+///
+/// The matmul runs at the input precision `F` (so f32 inputs use a single-precision
+/// gemm — the throughput win that motivates the f32 path) but the row-norm² and
+/// final distance expansion always run in `f64`, so the reduction stays tight
+/// against the `atol=1e-4` parity bound regardless of input precision.
+fn pairwise_gemm_row_sums<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
     n_a: usize,
     n_b: usize,
     n_dims: usize,
@@ -138,37 +253,42 @@ fn pairwise_gemm_row_sums(
         DistanceMetric::Cosine => {
             a_buf = normalize_rows(a, n_a, n_dims);
             b_buf = normalize_rows(b, n_b, n_dims);
-            a_ref = MatRef::from_row_major_slice(&a_buf, n_a, n_dims);
-            b_ref = MatRef::from_row_major_slice(&b_buf, n_b, n_dims);
+            a_ref = MatRef::<F>::from_row_major_slice(&a_buf, n_a, n_dims);
+            b_ref = MatRef::<F>::from_row_major_slice(&b_buf, n_b, n_dims);
             (a_ref, b_ref)
         }
         DistanceMetric::Euclidean => {
-            let a_ref = MatRef::from_row_major_slice(a, n_a, n_dims);
-            let b_ref = MatRef::from_row_major_slice(b, n_b, n_dims);
+            let a_ref = MatRef::<F>::from_row_major_slice(a, n_a, n_dims);
+            let b_ref = MatRef::<F>::from_row_major_slice(b, n_b, n_dims);
             (a_ref, b_ref)
         }
         DistanceMetric::L1 => unreachable!("L1 is not supported for gemm path"),
     };
 
-    let mut gram = Mat::<f64>::zeros(n_a, n_b);
+    let mut gram = Mat::<F>::zeros(n_a, n_b);
     matmul(
         gram.as_mut(),
         faer::Accum::Replace,
         a_view,
         b_view.transpose(),
-        1.0_f64,
+        F::one(),
         faer::Par::rayon(0),
     );
 
     match metric {
         DistanceMetric::Euclidean => {
-            // Precompute squared row norms.
+            // Precompute squared row norms in f64 (widening from F as needed).
             let a_sq: Vec<f64> = (0..n_a)
                 .into_par_iter()
                 .with_min_len(64)
                 .map(|i| {
                     let row = &a[i * n_dims..(i + 1) * n_dims];
-                    row.iter().map(|&x| x * x).sum::<f64>()
+                    row.iter()
+                        .map(|&x| {
+                            let xf = x.as_f64();
+                            xf * xf
+                        })
+                        .sum::<f64>()
                 })
                 .collect();
             let b_sq: Vec<f64> = (0..n_b)
@@ -176,7 +296,12 @@ fn pairwise_gemm_row_sums(
                 .with_min_len(64)
                 .map(|j| {
                     let row = &b[j * n_dims..(j + 1) * n_dims];
-                    row.iter().map(|&x| x * x).sum::<f64>()
+                    row.iter()
+                        .map(|&x| {
+                            let xf = x.as_f64();
+                            xf * xf
+                        })
+                        .sum::<f64>()
                 })
                 .collect();
 
@@ -189,7 +314,8 @@ fn pairwise_gemm_row_sums(
                     for j in 0..n_b {
                         // max(0, ·) clamps tiny negatives from FP cancellation
                         // for near-identical rows.
-                        let d_sq = (ai_sq + b_sq[j] - 2.0 * gram[(i, j)]).max(0.0);
+                        let g = gram[(i, j)].as_f64();
+                        let d_sq = (ai_sq + b_sq[j] - 2.0 * g).max(0.0);
                         row_sum += d_sq.sqrt();
                     }
                     row_sum
@@ -203,7 +329,7 @@ fn pairwise_gemm_row_sums(
                 let mut row_sum = 0.0f64;
                 for j in 0..n_b {
                     // Clamp to [0, 2] to match scalar cosine_distance behavior.
-                    let d = (1.0 - gram[(i, j)]).clamp(0.0, 2.0);
+                    let d = (1.0 - gram[(i, j)].as_f64()).clamp(0.0, 2.0);
                     row_sum += d;
                 }
                 row_sum
@@ -216,16 +342,26 @@ fn pairwise_gemm_row_sums(
 /// Allocate a row-normalized copy of `[n_rows × n_dims]` row-major matrix.
 /// Zero-norm rows are left as zeros — `cosine_distance(zero, x) = 1.0` falls
 /// out naturally from the dot product being zero.
-fn normalize_rows(data: &[f64], n_rows: usize, n_dims: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; n_rows * n_dims];
+///
+/// The norm² accumulator runs in `f64` to avoid f32 overflow on rows with
+/// many large entries; the inverse-norm scaling is then narrowed back to `F`
+/// before applying to each element.
+fn normalize_rows<F: PairwiseFloat>(data: &[F], n_rows: usize, n_dims: usize) -> Vec<F> {
+    let mut out = vec![F::from_f64(0.0); n_rows * n_dims];
     out.par_chunks_mut(n_dims)
         .enumerate()
         .with_min_len(64)
         .for_each(|(i, dst)| {
             let src = &data[i * n_dims..(i + 1) * n_dims];
-            let norm_sq: f64 = src.iter().map(|&x| x * x).sum();
+            let norm_sq: f64 = src
+                .iter()
+                .map(|&x| {
+                    let xf = x.as_f64();
+                    xf * xf
+                })
+                .sum();
             if norm_sq > 0.0 {
-                let inv = norm_sq.sqrt().recip();
+                let inv = F::from_f64(norm_sq.sqrt().recip());
                 for k in 0..n_dims {
                     dst[k] = src[k] * inv;
                 }
@@ -255,9 +391,9 @@ fn normalize_rows(data: &[f64], n_rows: usize, n_dims: usize) -> Vec<f64> {
 /// # Errors
 /// Returns `AccelError::InvalidInput` if `backend=Gemm` is combined with
 /// `metric=L1` (L1 has no gemm formulation).
-pub fn mean_pairwise_distance(
-    a: &[f64],
-    b: &[f64],
+pub fn mean_pairwise_distance<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
     n_a: usize,
     n_b: usize,
     n_dims: usize,
@@ -292,7 +428,7 @@ pub fn mean_pairwise_distance(
                 let mut row_sum = 0.0f64;
                 for j in 0..n_b {
                     let row_b = &b[j * n_dims..(j + 1) * n_dims];
-                    row_sum += point_distance(row_a, row_b, n_dims, metric);
+                    row_sum += point_distance_generic(row_a, row_b, n_dims, metric);
                 }
                 row_sum
             })
@@ -322,8 +458,8 @@ pub fn mean_pairwise_distance(
 /// the diagonal entries are 0 and the matrix is symmetric.
 ///
 /// Returns 0.0 if `n < 2`.
-pub fn mean_pairwise_distance_self(
-    a: &[f64],
+pub fn mean_pairwise_distance_self<F: PairwiseFloat>(
+    a: &[F],
     n: usize,
     n_dims: usize,
     metric: DistanceMetric,
@@ -345,14 +481,28 @@ pub fn mean_pairwise_distance_self(
             mean_pairwise_distance(a, a, n, n, n_dims, metric, DistanceBackend::Gemm)
         }
         DistanceBackend::Scalar => {
-            let mut total = 0.0f64;
-            for i in 0..n {
-                let row_i = &a[i * n_dims..(i + 1) * n_dims];
-                for j in (i + 1)..n {
-                    let row_j = &a[j * n_dims..(j + 1) * n_dims];
-                    total += point_distance(row_i, row_j, n_dims, metric);
-                }
-            }
+            // Parallelise the upper-triangle sum across rows. Each row `i`
+            // has `n - i - 1` pairs to compute, so the work is uneven; the
+            // `with_min_len((n * 16).max(1))` chunking matches the cross
+            // path's heuristic and prevents oversubscription when this runs
+            // inside `compute_energy_distance`'s pert-level par_iter.
+            //
+            // Reduction is sequential over the per-row sums for bit-stable
+            // output across thread counts.
+            let row_sums: Vec<f64> = (0..n)
+                .into_par_iter()
+                .with_min_len((n * 16).max(1))
+                .map(|i| {
+                    let row_i = &a[i * n_dims..(i + 1) * n_dims];
+                    let mut row_sum = 0.0f64;
+                    for j in (i + 1)..n {
+                        let row_j = &a[j * n_dims..(j + 1) * n_dims];
+                        row_sum += point_distance_generic(row_i, row_j, n_dims, metric);
+                    }
+                    row_sum
+                })
+                .collect();
+            let total: f64 = row_sums.iter().sum();
             // Upper triangle has n*(n-1)/2 pairs. The full n×n matrix has these
             // pairs twice plus n zero-diagonal entries, so:
             //   full_sum = 2 * total

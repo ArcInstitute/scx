@@ -448,17 +448,43 @@ fn compute_obsm_pseudobulk<'py>(
     Ok((means_2d, group_names))
 }
 
-/// Extract a dense `[N, D]` matrix from adata.X (or adata.obsm[embed_key])
-/// as a flat `Vec<f64>`.
+/// Trait bridging Rust `f32`/`f64` to numpy dtype strings for
+/// `materialize_dense`. Sealed in spirit (only impls in this module).
+trait NumpyDtype: numpy::Element + Sized {
+    /// numpy `dtype` string passed to `.astype(...)`.
+    const NUMPY_NAME: &'static str;
+    /// Bytes per element — used to gate the "large materialization" warning.
+    const BYTES: usize;
+}
+
+impl NumpyDtype for f32 {
+    const NUMPY_NAME: &'static str = "float32";
+    const BYTES: usize = 4;
+}
+
+impl NumpyDtype for f64 {
+    const NUMPY_NAME: &'static str = "float64";
+    const BYTES: usize = 8;
+}
+
+/// Extract a dense `[N, D]` matrix from `adata.X` (or `adata.obsm[embed_key]`)
+/// as a flat `Vec<F>`, narrowing to F via numpy's `.astype(...)`.
 ///
 /// Handles scipy sparse (converts to dense), numpy arrays, and SCX backed types.
-/// Emits a Python warning for large materializations (>2 GB estimated).
-fn extract_dense_matrix<'py>(
+/// Emits a Python warning for large materializations (> 2 GB estimated).
+///
+/// Generic over `F: PairwiseFloat + NumpyDtype` — the dtype string passed to
+/// `.astype(...)` is inferred from `F::NUMPY_NAME`. This stops the historical
+/// unconditional upcast to f64 and lets f32-native callers stay in f32.
+fn materialize_dense<'py, F>(
     py: Python<'py>,
     np: &Bound<'py, PyModule>,
     adata: &Bound<'py, PyAny>,
     embed_key: Option<&str>,
-) -> PyResult<(Vec<f64>, usize, usize)> {
+) -> PyResult<(Vec<F>, usize, usize)>
+where
+    F: scx_accel::PairwiseFloat + NumpyDtype,
+{
     let matrix_obj = if let Some(key) = embed_key {
         let obsm = adata.getattr("obsm")?;
         obsm.get_item(key).map_err(|_| {
@@ -473,7 +499,7 @@ fn extract_dense_matrix<'py>(
         || matrix_obj.is_instance_of::<ScxLazyTransformedDataset>()
     {
         let arr = matrix_obj.call_method0("toarray")?;
-        arr.call_method1("astype", ("float64",))?
+        arr.call_method1("astype", (F::NUMPY_NAME,))?
     } else {
         // Check for scipy sparse.
         let scipy_sparse = py.import("scipy.sparse")?;
@@ -483,31 +509,38 @@ fn extract_dense_matrix<'py>(
 
         if is_sparse {
             let arr = matrix_obj.call_method0("toarray")?;
-            arr.call_method1("astype", ("float64",))?
+            arr.call_method1("astype", (F::NUMPY_NAME,))?
         } else {
             np.call_method1("asarray", (&matrix_obj,))?
-                .call_method1("astype", ("float64",))?
+                .call_method1("astype", (F::NUMPY_NAME,))?
         }
     };
 
     let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
 
     // Warn if the dense matrix is very large (> 2 GB).
-    let estimated_bytes = shape.0 * shape.1 * 8; // f64 = 8 bytes
+    let estimated_bytes = shape.0 * shape.1 * F::BYTES;
     if estimated_bytes > 2_000_000_000 {
         let gb = estimated_bytes as f64 / 1e9;
         let warnings = py.import("warnings")?;
         warnings.call_method1(
             "warn",
             (format!(
-                "energy_distance: materializing a {:.1} GB dense matrix ({} × {} × 8 bytes). \
+                "energy_distance: materializing a {:.1} GB dense matrix ({} × {} × {} bytes). \
                  Consider using embed_key='X_pca' or subsetting the data.",
-                gb, shape.0, shape.1
+                gb,
+                shape.0,
+                shape.1,
+                F::BYTES,
             ),),
         )?;
     }
 
-    let flat: Vec<f64> = dense.call_method0("ravel")?.extract()?;
+    // Use numpy's typed array protocol to extract a Vec<F> without going
+    // through pyo3's `extract::<Vec<F>>` (which has no generic impl).
+    let raveled = dense.call_method0("ravel")?;
+    let arr: numpy::PyReadonlyArray1<F> = raveled.extract()?;
+    let flat: Vec<F> = arr.as_slice()?.to_vec();
 
     Ok((flat, shape.0, shape.1))
 }
@@ -687,6 +720,10 @@ pub fn perturbation_metrics<'py>(
 ///         "auto" uses faer-backed gemm for euclidean/cosine and the scalar
 ///         row-by-row path for L1. "gemm" forces the gemm path (errors on L1).
 ///         "scalar" forces the scalar path (matches the historical implementation).
+///     dtype: Element precision for the dense kernel — "f32" (default) or "f64".
+///         Reductions always accumulate in f64; the dtype only controls the
+///         matmul / per-pair compute precision. f32 is ~1.5–2× faster on AVX2
+///         and matches f64 within atol=1e-4 on log-normalised inputs.
 ///
 /// Returns:
 ///     float — Pearson correlation of per-perturbation e-distances
@@ -707,38 +744,45 @@ fn parse_backend(backend: Option<&str>) -> PyResult<scx_accel::DistanceBackend> 
     }
 }
 
-/// Shared prep + compute for energy_distance / energy_distance_details.
+/// Dtype dispatch tag, picked out of the `dtype` kwarg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dtype {
+    F32,
+    F64,
+}
+
+/// Parse `dtype` kwarg. Default is `f32` to maximise throughput.
+fn parse_dtype(dtype: Option<&str>) -> PyResult<Dtype> {
+    match dtype.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("f32") | Some("float32") => Ok(Dtype::F32),
+        Some("f64") | Some("float64") => Ok(Dtype::F64),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "unknown dtype '{other}'. Valid: f32, f64"
+        ))),
+    }
+}
+
+/// Inner generic implementation of `run_energy_distance`. Materialises both
+/// AnnData matrices in the chosen `F` precision, then dispatches to the
+/// generic `compute_energy_distance::<F>` kernel.
 #[allow(clippy::too_many_arguments)]
-fn run_energy_distance<'py>(
+fn run_energy_distance_inner<'py, F>(
     py: Python<'py>,
+    np: &Bound<'py, PyModule>,
     adata_real: &Bound<'py, PyAny>,
     adata_pred: &Bound<'py, PyAny>,
     pert_col: &str,
     control: &str,
-    metric: &str,
+    dist_metric: scx_accel::DistanceMetric,
     embed_key: Option<&str>,
-    backend: Option<&str>,
-) -> PyResult<scx_accel::EDistanceResult> {
-    let np = py.import("numpy")?;
-
-    // Parse distance metric.
-    let dist_metric = match metric.to_lowercase().as_str() {
-        "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
-        "l1" | "manhattan" | "cityblock" => scx_accel::DistanceMetric::L1,
-        "cosine" => scx_accel::DistanceMetric::Cosine,
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "unknown metric '{}'. Valid: euclidean, l1, cosine",
-                metric
-            )))
-        }
-    };
-
-    let dist_backend = parse_backend(backend)?;
-
+    dist_backend: scx_accel::DistanceBackend,
+) -> PyResult<scx_accel::EDistanceResult>
+where
+    F: scx_accel::PairwiseFloat + NumpyDtype,
+{
     // ── Extract dense matrices from both AnnData objects ────────────
-    let (real_flat, n_real, n_dims_real) = extract_dense_matrix(py, &np, adata_real, embed_key)?;
-    let (pred_flat, n_pred, n_dims_pred) = extract_dense_matrix(py, &np, adata_pred, embed_key)?;
+    let (real_flat, n_real, n_dims_real) = materialize_dense::<F>(py, np, adata_real, embed_key)?;
+    let (pred_flat, n_pred, n_dims_pred) = materialize_dense::<F>(py, np, adata_pred, embed_key)?;
 
     if n_dims_real != n_dims_pred {
         return Err(PyValueError::new_err(format!(
@@ -813,7 +857,7 @@ fn run_energy_distance<'py>(
     // Release the GIL for the O(N²) rayon-parallel kernel. All arguments are
     // owned Vecs or plain scalars.
     py.allow_threads(|| {
-        scx_accel::compute_energy_distance(
+        scx_accel::compute_energy_distance::<F>(
             &real_flat,
             &pred_flat,
             &real_groups,
@@ -829,8 +873,65 @@ fn run_energy_distance<'py>(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Shared prep + compute for energy_distance / energy_distance_details.
+#[allow(clippy::too_many_arguments)]
+fn run_energy_distance<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    embed_key: Option<&str>,
+    backend: Option<&str>,
+    dtype: Option<&str>,
+) -> PyResult<scx_accel::EDistanceResult> {
+    let np = py.import("numpy")?;
+
+    // Parse distance metric.
+    let dist_metric = match metric.to_lowercase().as_str() {
+        "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
+        "l1" | "manhattan" | "cityblock" => scx_accel::DistanceMetric::L1,
+        "cosine" => scx_accel::DistanceMetric::Cosine,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unknown metric '{}'. Valid: euclidean, l1, cosine",
+                metric
+            )))
+        }
+    };
+
+    let dist_backend = parse_backend(backend)?;
+    let dtype = parse_dtype(dtype)?;
+
+    match dtype {
+        Dtype::F32 => run_energy_distance_inner::<f32>(
+            py,
+            &np,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            dist_metric,
+            embed_key,
+            dist_backend,
+        ),
+        Dtype::F64 => run_energy_distance_inner::<f64>(
+            py,
+            &np,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            dist_metric,
+            embed_key,
+            dist_backend,
+        ),
+    }
+}
+
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance<'py>(
     py: Python<'py>,
@@ -841,9 +942,10 @@ pub fn energy_distance<'py>(
     metric: &str,
     embed_key: Option<&str>,
     backend: Option<&str>,
+    dtype: Option<&str>,
 ) -> PyResult<f64> {
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
     Ok(result.correlation)
 }
@@ -865,7 +967,7 @@ pub fn energy_distance<'py>(
 ///     # out["correlation"] ≈ 0.85
 ///     # out["d_real"]["drug_A"] == 12.34
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance_details<'py>(
     py: Python<'py>,
@@ -876,9 +978,10 @@ pub fn energy_distance_details<'py>(
     metric: &str,
     embed_key: Option<&str>,
     backend: Option<&str>,
+    dtype: Option<&str>,
 ) -> PyResult<PyObject> {
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
 
     let d_real = PyDict::new(py);

@@ -43,7 +43,7 @@ pub use clustering::{
     normalized_mutual_info, ClusteringMetric,
 };
 pub use discrimination::{compute_discrimination_score, DiscriminationResult};
-pub use distances::DistanceBackend;
+pub use distances::{DistanceBackend, PairwiseFloat};
 pub use edistance::{compute_energy_distance, fused_edistance, EDistanceResult};
 pub use knockdown::{
     compute_control_baseline, compute_knockdown_efficiency, compute_log_deviation,
