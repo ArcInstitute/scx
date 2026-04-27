@@ -674,30 +674,61 @@ operators invoke the gate per PR, pre-release, or on suspicion of
 regression. No wasted compute when nothing has changed, and every gate
 result is tied to a specific commit the operator cares about.
 
-### Which script? `gate_candidate.py` vs `submit_benchmarks.py`
+### Which script? `gate_candidate.py` is the canonical benchmark entry point
 
-The repository ships two SLURM-aware benchmark submitters. They look
-similar (both use submitit, both target Chimera) but answer different
-questions:
+`gate_candidate.py` (which orchestrates `capture_baseline.py` →
+`run_parallel.py` → `compare_against_baseline.py`) is **the
+comprehensive SCX benchmark**. It covers every aspect of SCX
+performance currently under regression governance:
+
+| Surface | Benchmarks |
+|---|---|
+| **Codec / file-format size** | `compression` |
+| **I/O — bulk and projected reads, writes** | `write`, `read_full`, `read_selective` |
+| **Parallel scaling** | `parallel_scaling`, `parallel_write_scaling` |
+| **Memory** | `memory` |
+| **SCX-only fragment / manifest ops** | `fragment_ops` |
+| **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
+| **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
+
+That is 22 benchmarks across 6 distinct domains, each expanded across the
+relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
+plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
+and the tier's dataset list (pbmc3k → census_10m). The canonical list
+lives in [`benchmarks/comprehensive/benchmarks/__init__.py::ALL_BENCHMARKS`](comprehensive/benchmarks/__init__.py).
+Adding a new benchmark to the suite is a one-line edit there — every
+gate run picks it up automatically.
+
+**`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
+peer of `gate_candidate.py`. It exclusively drives
+[`benchmark_loader.py`](scripts/benchmark_loader.py), which targets the
+one performance surface the comprehensive suite doesn't yet cover: the
+SCX **ML training loader** (`pyscx.TrainingDataset` throughput, latency,
+peak RSS, HVG-projection impact, GPU utilization under an scVI-style
+VAE loop, multi-GPU scaling, and side-by-side comparisons against
+AnnData / SOMA / scdataloader / BPCells loaders). It produces a
+stand-alone report (`benchmarks/results/training_loader_benchmark.{md,json}`)
+with no baseline diff and no gate semantics. There is a placeholder
+`ml_loader` time-budget slot in [`comprehensive/config.py`](comprehensive/config.py)
+hinting at future integration, but the benchmarks live outside the
+gate's scope today.
+
+**Choosing between them:**
 
 | | `comprehensive/scripts/gate_candidate.py` | `scripts/submit_benchmarks.py` |
 |---|---|---|
-| **Question it answers** | "Did this commit regress the canonical benchmark surface?" | "How does the SCX `TrainingDataset` perform end-to-end on this dataset / GPU config, and how does it compare to alternative data loaders?" |
-| **Scope** | Full comprehensive suite — format + accel CPU + accel GPU | Training-loader-driven workloads via `benchmark_loader.run_all_benchmarks`: SCX throughput, time-to-first-batch, peak-RSS, HVG-projection impact, **GPU utilization under an actual scVI VAE training loop** (`bench_gpu_utilization`), **multi-GPU scaling** (`bench_multi_gpu_scaling`), and **side-by-side baselines against AnnData / SOMA / scdataloader / BPCells loaders** |
-| **Compares against a baseline?** | **Yes** — diffs the captured snapshot against `results/baselines/LATEST` via `compare_against_baseline.py --gate`, applies justifications and absolute floors | **No regression baseline** — but each run produces a stand-alone report (`benchmarks/results/training_loader_benchmark.{md,json}`) that ranks SCX against the four alternative loaders for the same workload |
-| **Exit codes** | Gate-shaped: `0` pass / `1` regression / `2` missing inputs / `130` SIGINT | Per-job loader-benchmark exit codes only; no gate semantics |
-| **Output location** | `benchmarks/comprehensive/results/<candidate>/` (snapshot) + `comprehensive/logs/gate_candidate_<sha>_<TS>.{log,summary.json}` | `benchmarks/results/training_loader_benchmark.{md,json}` (overwrites in place) |
+| **What it benchmarks** | Everything in the canonical SCX surface — codec, I/O, parallel scaling, memory, cloud, analysis accelerators | One surface only: the ML training loader and its competitive baselines |
+| **Compares against a baseline?** | Yes — diffs the captured snapshot against `results/baselines/LATEST` via `compare_against_baseline.py --gate`, applies justifications and absolute floors | No baseline diff; produces a stand-alone report each run |
+| **Exit codes** | Gate-shaped: `0` pass / `1` regression / `2` missing inputs / `130` SIGINT | Per-job loader-benchmark exit codes only |
+| **Output** | `benchmarks/comprehensive/results/<candidate>/` (snapshot, gitignored) + `comprehensive/logs/gate_candidate_<sha>_<TS>.{log,summary.json}` | `benchmarks/results/training_loader_benchmark.{md,json}` (overwrites in place) |
 | **GPU pre-flight** | Submits a SLURM probe job to validate `nvidia-smi` / `cupy` / `pyscx.accel` on a real GPU node before scheduling work | None — assumes the partition the operator picked has GPUs |
-| **Use when** | Pre-PR / pre-merge / pre-release validation; deciding whether a change is shippable | Characterising training-loader behaviour on a new dataset, sweeping `n_gpus` for scaling curves, or measuring how a loader change moves the SCX-vs-competitor delta on a real VAE-style training loop |
+| **Use when** | Pre-PR / pre-merge / pre-release validation of any SCX change; characterising codec / I/O / cloud / accel performance against the canonical baseline | Iterating on a `TrainingDataset` change, sweeping `n_gpus` for loader scaling curves, or producing a loader-vs-competitor comparison report |
 
-Rule of thumb: if the question is *"is this safe to merge?"* run
-`gate_candidate.py`. If the question is *"how does the training loader
-(and the GPU pipeline it feeds) behave on this dataset, and where does
-SCX sit relative to AnnData / SOMA / scdataloader / BPCells?"* run
-`submit_benchmarks.py`. They are complementary — loader-specific perf
-work typically uses `submit_benchmarks.py` for the fast iteration loop
-and then runs `gate_candidate.py` once before opening the PR to confirm
-the rest of the surface didn't regress.
+If you're unsure which to run, the answer is `gate_candidate.py`. It is
+the only tool that sees the whole SCX performance surface.
+`submit_benchmarks.py` is a focused profiler for the training loader
+specifically — useful when iterating on loader internals, but not a
+substitute for running the gate before opening a PR.
 
 ### On-demand workflow (one command)
 
