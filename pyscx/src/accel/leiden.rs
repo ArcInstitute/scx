@@ -318,6 +318,11 @@ fn try_cugraph_leiden(
         let parts_sorted = parts_df.call_method1("sort_values", ("vertex",))?;
         let cluster_col = parts_sorted.get_item("partition")?;
 
+        // Count distinct communities. nunique() works on both pandas and cudf
+        // Series; running on the cudf Series before to_pandas() avoids an
+        // extra host transfer.
+        let n_communities: usize = cluster_col.call_method0("nunique")?.extract()?;
+
         // Convert to pandas if needed (cudf → pandas)
         // Note: .values is a property (not a method) on both pandas and cudf Series
         let cluster_labels = if cudf_available {
@@ -352,6 +357,7 @@ fn try_cugraph_leiden(
         leiden_dict.set_item("params", params_dict)?;
         leiden_dict.set_item("backend", "cugraph")?;
         leiden_dict.set_item("modularity", modularity)?;
+        leiden_dict.set_item("n_communities", n_communities)?;
 
         let uns = adata.getattr("uns")?;
         uns.set_item(key_added, leiden_dict)?;

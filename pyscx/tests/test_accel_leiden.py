@@ -69,6 +69,8 @@ def test_device_cpu_uses_rust_native(adata_with_neighbors):
     pyscx.accel.leiden(adata, device="cpu")
     assert adata.uns["leiden"]["backend"] == "scx-accel"
     assert adata.uns["leiden"]["params"]["device"] == "cpu"
+    assert isinstance(adata.uns["leiden"]["n_communities"], int)
+    assert adata.uns["leiden"]["n_communities"] > 0
 
 
 def test_device_auto_resolution_cpu_host(adata_with_neighbors):
@@ -107,7 +109,10 @@ def test_device_gpu_on_cpu_only_host_raises(adata_with_neighbors):
 
 @gpu_only
 def test_device_gpu_uses_cugraph(adata_with_neighbors):
-    """`device="gpu"` runs cuGraph and records `gpu_id == 0`."""
+    """`device="gpu"` runs cuGraph and records `gpu_id == 0`. The cuGraph
+    branch must also write `uns["leiden"]["n_communities"]` for parity with
+    the Rust-native branch (downstream benchmarks read this key).
+    """
     import pyscx
 
     adata = adata_with_neighbors
@@ -115,6 +120,8 @@ def test_device_gpu_uses_cugraph(adata_with_neighbors):
     assert adata.uns["leiden"]["backend"] == "cugraph"
     assert adata.uns["leiden"]["params"]["device"] == "gpu"
     assert adata.uns["leiden"]["params"]["gpu_id"] == 0
+    assert isinstance(adata.uns["leiden"]["n_communities"], int)
+    assert adata.uns["leiden"]["n_communities"] > 0
 
 
 @gpu_only

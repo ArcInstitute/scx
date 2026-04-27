@@ -14,8 +14,25 @@ use crate::projected_agg;
 // so that a subsequent `log1p(device="gpu")` can re-run a fused normalize+log1p
 // pass over the ORIGINAL backed source instead of reading the already-
 // materialized `adata.X`. See Phase 5 Task 5.4.
-#[cfg(feature = "gpu")]
-const GPU_NORMALIZE_MARKER_KEY: &str = "__scx_gpu_pending_normalize__";
+//
+// Lifecycle contract: the marker is **valid only while X and its row/col
+// dimensions are unchanged**. It MUST be cleared by any op that mutates X or
+// changes obs/var shape (normalize_total, CPU log1p, filter_*, subset_obs).
+// Ops that don't mutate X (PCA, kNN, UMAP, Leiden, Harmony, HVG,
+// calculate_qc_metrics) leave it intact. New call sites that mutate X must
+// call `clear_gpu_normalize_marker`.
+pub(crate) const GPU_NORMALIZE_MARKER_KEY: &str = "__scx_gpu_pending_normalize__";
+
+/// Pop the GPU `normalize_total → log1p` fusion marker off `adata.uns` if
+/// present. No-op if absent. Always available (independent of `gpu` feature)
+/// so non-GPU builds can clear stale markers left by a prior GPU build.
+pub(crate) fn clear_gpu_normalize_marker(adata: &Bound<'_, PyAny>) -> PyResult<()> {
+    let uns = adata.getattr("uns")?;
+    // dict.pop(key, None) returns None on absence rather than raising KeyError.
+    let py = adata.py();
+    uns.call_method1("pop", (GPU_NORMALIZE_MARKER_KEY, py.None()))?;
+    Ok(())
+}
 
 /// Opaque marker stored on `adata.uns` after `normalize_total(device="gpu")`.
 ///
@@ -75,6 +92,11 @@ pub fn normalize_total(
     device: &str,
 ) -> PyResult<()> {
     let _device = validate_device_or_default(device)?;
+
+    // Any prior fusion marker is now stale: this normalize call supersedes it.
+    // The GPU success path will stash a fresh marker; CPU / scipy-fallback
+    // paths leave it cleared.
+    clear_gpu_normalize_marker(adata)?;
 
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
@@ -182,8 +204,13 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
-        return gpu_log1p_dispatch(py, adata, device_id);
+        return gpu_log1p_dispatch(py, adata, device_id, device);
     }
+
+    // CPU log1p invalidates any pending GPU fusion: a later log1p(device="gpu")
+    // must NOT replay a fused normalize+log1p over the original source (it
+    // would silently overwrite the result of this CPU log1p call).
+    clear_gpu_normalize_marker(adata)?;
 
     let x = adata.getattr("X")?;
 
@@ -515,17 +542,19 @@ fn emit_laziness_break_warning(py: Python<'_>) -> PyResult<()> {
 }
 
 #[cfg(feature = "gpu")]
-fn emit_gpu_log1p_fallback_warning(py: Python<'_>) -> PyResult<()> {
+fn emit_gpu_log1p_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()> {
     let warnings = py.import("warnings")?;
     warnings.call_method1(
         "warn",
         (
-            "pyscx.accel.log1p(device=\"gpu\") on a materialized scipy/dense X \
-             falls back to CPU: H→D and D→H copies dominate log1p's trivial math, \
-             making GPU dispatch 50–100× slower than scanpy.pp.log1p. To get the \
-             GPU fast path, call pyscx.accel.normalize_total(device=\"gpu\") first \
-             (the fusion marker on adata.uns enables a single fused pass), or \
-             operate on a backed SCX dataset.",
+            format!(
+                "pyscx.accel.log1p(device={device:?}) on a materialized scipy/dense \
+                 X falls back to CPU: H→D and D→H copies dominate log1p's trivial \
+                 math, making GPU dispatch 50–100× slower than scanpy.pp.log1p. To \
+                 get the GPU fast path, call pyscx.accel.normalize_total(device=\"gpu\") \
+                 first (the fusion marker on adata.uns enables a single fused pass), \
+                 or operate on a backed SCX dataset."
+            ),
             py.get_type::<pyo3::exceptions::PyUserWarning>(),
         ),
     )?;
@@ -675,7 +704,12 @@ fn gpu_normalize_total(
 /// materialization. Materialised scipy/dense X warns and falls back to
 /// `sc.pp.log1p` (the H→D / D→H round-trip dominates the kernel cost).
 #[cfg(feature = "gpu")]
-fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>, device_id: usize) -> PyResult<()> {
+fn gpu_log1p_dispatch(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    device_id: usize,
+    device: &str,
+) -> PyResult<()> {
     let uns = adata.getattr("uns")?;
 
     // 1) Fusion marker path: re-run fused normalize+log1p over ORIGINAL source.
@@ -710,6 +744,11 @@ fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>, device_id: usize
         }
     }
 
+    // Reaching here means Path 1 was not consumed (marker absent or downcast
+    // failed). Any leftover marker is now stale — defensively clear before the
+    // remaining paths mutate X.
+    clear_gpu_normalize_marker(adata)?;
+
     // 2) Backed/lazy X: stream through gpu_preprocess_to_csr with log1p only.
     let x = adata.getattr("X")?;
     if let Some(gs) = source_from_x(&x)? {
@@ -729,7 +768,7 @@ fn gpu_log1p_dispatch(py: Python<'_>, adata: &Bound<'_, PyAny>, device_id: usize
 
     // 3) Scipy/dense X: GPU dispatch is slower than CPU here (H→D + D→H
     //    copies dominate log1p's trivial math). Warn and fall back to scanpy.
-    emit_gpu_log1p_fallback_warning(py)?;
+    emit_gpu_log1p_fallback_warning(py, device)?;
     let sc = py.import("scanpy")?;
     sc.getattr("pp")?.call_method1("log1p", (adata,))?;
     Ok(())

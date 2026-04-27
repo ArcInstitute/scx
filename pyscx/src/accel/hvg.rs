@@ -59,8 +59,12 @@ pub fn highly_variable_genes<'py>(
             warnings.call_method1(
                 "warn",
                 (
-                    "highly_variable_genes(device=\"gpu\") is only implemented for \
-                     single-batch seurat_v3 flavors; falling back to CPU.",
+                    format!(
+                        "highly_variable_genes(device={device:?}) is only implemented \
+                         for single-batch seurat_v3 flavors; falling back to CPU \
+                         (the requested GPU index is ignored). To use the GPU path, \
+                         pass flavor=\"seurat_v3\" with batch_key=None."
+                    ),
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
             )?;

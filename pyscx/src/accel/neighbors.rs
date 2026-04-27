@@ -83,9 +83,11 @@ pub fn neighbors(
         let warnings = py.import("warnings")?;
         warnings.call_method1(
             "warn",
-            ("cuVS library not found — falling back to CPU HNSW. \
-              Install cuVS for GPU-accelerated kNN: \
-              conda install -c rapidsai -c conda-forge libcuvs",),
+            (format!(
+                "neighbors(device={device:?}): cuVS library not found — falling \
+                 back to CPU HNSW (the requested GPU is ignored). Install cuVS \
+                 for GPU-accelerated kNN: conda install -c rapidsai -c conda-forge libcuvs"
+            ),),
         )?;
     }
 
