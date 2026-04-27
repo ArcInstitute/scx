@@ -1235,8 +1235,8 @@ for numbers at 10K / 100K / 500K / 1M cells).
 |---|---|---|
 | AMI / NMI / ARI on label vectors | `atol=1e-10` | Integer-label inputs; limited by double-precision floor (~2.2e-16). |
 | pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. |
-| energy_distance / pearson_edistance | `atol=1e-4` | O(N²) pairwise streaming mean; reduction order differs from sklearn BLAS GEMM (observed ≤5e-5 at 10K). |
-| clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Leiden is RNG-seeded but not bit-identical across implementations; AMI is bounded in `[0, 1]`. |
+| energy_distance / pearson_edistance | `atol=1e-4` correlation, `atol=1e-3` per-pert | O(N²) pairwise reduction; faer-gemm reduction order differs from sklearn BLAS GEMM. f32 + gemm matches f64 + scalar within these bounds (test parametrised over both dtypes). |
+| clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Native-Rust kNN (HNSW) + Leiden replaces scanpy under the hood; the two algorithms produce within-permutation labels on graphs with `n_perts ≥ 16` (parity test scaffold uses `n_perts=30`). |
 | discrimination_score rank | exact (`abs=0`) | Integer rank computation; any non-zero diff is a correctness regression. |
 
 All functions accept in-memory, backed, or lazy-transformed inputs. They
@@ -1312,7 +1312,13 @@ both real and predicted sides, returning the Pearson correlation of the
 two e-distance vectors.
 
 ```python
-corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+corr = pyscx.accel.energy_distance(
+    adata_real, adata_pred,
+    pert_col="perturbation", control="control",
+    metric="euclidean",          # "euclidean" | "l1" | "cosine"
+    backend="auto",              # "auto" (default) | "gemm" | "scalar"
+    dtype="f32",                 # "f32" (default) | "f64"
+)
 
 # For per-perturbation details (individual e_real / e_pred values):
 details = pyscx.accel.energy_distance_details(adata_real, adata_pred)
@@ -1324,11 +1330,30 @@ details = pyscx.accel.energy_distance_details(adata_real, adata_pred)
 # }
 ```
 
+SCX's pairwise kernel runs in two backend modes:
+
+- **`backend="gemm"`** (the `auto` default for euclidean / cosine): a
+  faer-dispatched matmul builds the `‖a‖² + ‖b‖² − 2·aᵀb` decomposition
+  per pert, with row-norm² and the `sqrt(max(0, ·))` expansion in `f64`.
+  L1 has no gemm formulation and `backend="gemm"` with `metric="l1"`
+  raises `RuntimeError`.
+- **`backend="scalar"`**: row-by-row `point_distance` reduction. Always
+  valid; matches the pre-Phase-1 implementation and serves as the legacy
+  back-compat path for callers that need bit-stable historical numbers.
+
+The `dtype` kwarg controls the matmul / per-pair arithmetic precision —
+reductions always accumulate in `f64` regardless. Default `"f32"` is
+~2× faster than `"f64"` on AVX2 and matches `f64` within `atol=1e-4`
+(verified by `pyscx/tests/test_cell_eval_parity.py::TestEdistanceParity`,
+parametrised over `dtype ∈ {"f32", "f64"}`).
+
 SCX's implementation avoids materializing the `[N, N]` distance matrix per
-perturbation (streaming accumulation), precomputes control self-distance
-once, and parallelizes across perturbations with rayon. At 100K cells it's
-~14× faster than cell-eval's `sklearn.metrics.pairwise_distances` path;
-above ~500K the reference becomes infeasible while SCX remains usable.
+perturbation (streaming accumulation of per-row sums even on the gemm
+path), precomputes control self-distance once, and parallelizes across
+perturbations with rayon. At 20K cells × 2K genes × 50 perturbations the
+default `gemm + f32` path is **52×** faster than cell-eval's
+`sklearn.metrics.pairwise_distances`; above ~500K the reference becomes
+infeasible while SCX remains usable.
 
 #### Knockdown efficiency (`pyscx.accel.knockdown_efficiency`)
 
@@ -1356,7 +1381,32 @@ isn't in `var_names` get `NaN` in both columns — matching `arc-bench`.
 Builds perturbation-centroid matrices (pseudobulks excluding control), runs
 kNN + Leiden at multiple resolutions, and scores the real-vs-predicted
 cluster assignments via AMI / NMI / ARI. Matches
-`cell_eval.metrics._anndata.ClusteringAgreement`.
+`cell_eval.metrics._anndata.ClusteringAgreement` within `atol=0.15`.
+
+The implementation is **all native Rust** — no scanpy / anndata / igraph
+calls. The kNN graph uses `scx_accel::neighbors::build_knn_graph` (HNSW
+via `instant-distance`, with `ef_construction=200`, `ef_search=50`,
+`seed=0` baked in to match scanpy's exact-kNN reference within > 99 %
+recall on small centroid graphs); Leiden uses `scx_accel::leiden`
+sequential mode (`max_iterations=2`, `parallel=false`, `seed=0` —
+matches scanpy's `flavor="igraph", n_iterations=2`). The pred-side kNN
+graph is built once and reused across the resolution sweep, so only the
+Leiden pass re-runs per resolution. The whole hot path runs under
+`py.allow_threads`.
+
+**Caveat — small-graph divergence (`n_perts ≲ 10`).** The Rust-native
+Leiden's RB-modularity tie-break differs from scanpy's
+`flavor="igraph"` on graphs with very few nodes. On centroid graphs
+with ≤ ~10 perturbations the two algorithms can produce different
+community counts at `resolution=1.0`, and AMI / NMI are not
+permutation-invariant across different partition cardinalities, so
+scores can diverge by > 0.15 vs the scanpy-based reference. The
+algorithms agree exactly at `n_perts ≥ 16` on the synthetic parity
+fixtures (test scaffold uses `n_perts=30` for a comfortable margin).
+If you have a small-perturbation experiment and need bit-stable
+comparison against an existing scanpy-based pipeline, hand the
+centroid matrices to `scanpy.tl.leiden` directly and feed the labels
+into `pyscx.accel.adjusted_mutual_info` for the scoring step.
 
 ```python
 score = pyscx.accel.clustering_agreement(

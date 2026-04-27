@@ -205,7 +205,7 @@ SCX ships Rust-accelerated equivalents of the metrics in
 bundled bulk metrics (pearson_delta / mse / mae / mse_delta / mae_delta),
 discrimination score, energy distance, knockdown efficiency, and clustering
 agreement. Output is numerically equivalent to the Python references
-(30/30 parity tests pass), so you can swap in `pyscx.accel.*` without changing
+(32/32 parity tests pass), so you can swap in `pyscx.accel.*` without changing
 the rest of your pipeline.
 
 ```python
@@ -215,16 +215,27 @@ results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
 # Per-cell knockdown efficiency vs control (arc-bench equivalent)
 pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation", control="control")
 # → adata.obs["KnockDownEfficiency"], adata.obs["KnockDownGeneFC"]
+
+# Energy distance: faer-gemm + f32 default (use backend="scalar" / dtype="f64"
+# for legacy bit-exact reproduction).
+corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+
+# Clustering agreement: native-Rust HNSW + Leiden (no scanpy under the hood).
+score = pyscx.accel.clustering_agreement(adata_real, adata_pred, metric="ami")
 ```
 
-| Operation | 100K cells | 500K cells | 1M cells |
-|---|---:|---:|---:|
-| Pseudobulk means | **11.6×** | **13.8×** | **19.4×** |
-| Bulk metrics (5 bundled) | **12.1×** | **13.6×** | **21.9×** |
-| Discrimination score | **12.0×** | **12.9×** | **20.1×** |
-| Energy distance | **14.4×** | — ¹ | — ¹ |
+| Operation | 20K × 2K × 50 ² | 100K cells | 500K cells | 1M cells |
+|---|---:|---:|---:|---:|
+| Pseudobulk means | 11.8× | **11.6×** | **13.8×** | **19.4×** |
+| Bulk metrics (5 bundled) | 10.5× | **12.1×** | **13.6×** | **21.9×** |
+| Discrimination score | 11.8× | **12.0×** | **12.9×** | **20.1×** |
+| Energy distance (gemm + f32, default) | **52.1×** | re-bench TBD ² | — ¹ | — ¹ |
+| Energy distance (scalar + f64, legacy) | 10.2× | **14.4×** | — ¹ | — ¹ |
+| Clustering agreement (native Rust Leiden) | 3.0× ³ | **10–13×** | **24.6×** | **10.0×** |
 
 ¹ Reference's `sklearn.metrics.pairwise_distances` doesn't scale above 100K.
+² 20K column captured 2026-04-27 with the Phase 1+2 `(backend, dtype)` matrix; 100K–1M columns are pre-Phase-1 historical baselines pending a re-run.
+³ Speedup grows with `n_perts` × embedding-dim; at 200 perts × 300 genes the ratio is 12.8×.
 
 See [`docs/scanpy.md`](docs/scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)
 for the full API and [`docs/performance.md`](docs/performance.md#perturbation-metrics-cell-eval--arc-bench-parity)

@@ -22,8 +22,18 @@ infeasible):
     + ``mae_delta``
   * ``discrimination_l1`` — SCX ``discrimination_score(metric="l1")``
     vs ``cell_eval.metrics._anndata.discrimination_score``
-  * ``energy_distance`` — SCX ``energy_distance`` vs cell-eval ``edistance``
-    (skipped at >= 500K cells — O(N^2) pairwise distances infeasible)
+  * ``energy_distance_blas_f32`` — SCX ``energy_distance(backend="gemm",
+    dtype="f32")`` (the default, headline combo) vs cell-eval ``edistance``
+  * ``energy_distance_blas_f64`` — SCX ``energy_distance(backend="gemm",
+    dtype="f64")`` vs cell-eval ``edistance``
+  * ``energy_distance_scalar_f32`` — SCX ``energy_distance(backend="scalar",
+    dtype="f32")`` vs cell-eval ``edistance``
+  * ``energy_distance`` — alias for the slowest combo
+    (``backend="scalar", dtype="f64"``); preserved so historical numbers
+    in summaries stay comparable
+    (all four skipped at >= 500K cells — the cell-eval reference's O(N^2)
+    pairwise distances are infeasible there; SCX's gemm-fused path is
+    tracked by the standalone Rust microbench at ``scx-accel/benches/distances.rs``)
   * ``knockdown_efficiency`` — SCX ``knockdown_efficiency`` vs
     arc-bench ``compute_control_baseline`` + ``compute_knockdown_efficiency``
     + ``compute_log_deviation``
@@ -63,6 +73,12 @@ logger = logging.getLogger(__name__)
 _SKIP_RULES: list[tuple[int, str, str]] = [
     (500_000, "energy_distance",
      "O(N^2) pairwise distance at n_obs >= 500K is infeasible"),
+    (500_000, "energy_distance_blas_f32",
+     "O(N^2) pairwise distance at n_obs >= 500K is infeasible (cell-eval ref)"),
+    (500_000, "energy_distance_blas_f64",
+     "O(N^2) pairwise distance at n_obs >= 500K is infeasible (cell-eval ref)"),
+    (500_000, "energy_distance_scalar_f32",
+     "O(N^2) pairwise distance at n_obs >= 500K is infeasible (cell-eval ref)"),
     (5_000_000, "clustering_agreement",
      "stochastic Leiden + kNN on centroid matrix is too slow at n_obs >= 5M"),
 ]
@@ -300,12 +316,51 @@ def run(
         lambda: ce_discrimination_score(_cold_pair(), metric="l1"),
     )
 
+    # ── energy_distance: 4 (backend × dtype) combinations ──────────────
+    #
+    # SCX's energy_distance kernel is generic over `backend ∈ {"scalar",
+    # "gemm"}` and `dtype ∈ {"f32", "f64"}` (Phase 1 + Phase 2 of
+    # SCX-EVAL-METRIC-IMPROVE.md). The cell-eval reference is the same
+    # cold ce_edistance call regardless of the SCX combo. Keep the
+    # legacy ``energy_distance`` op as an alias for the slowest combo
+    # (scalar+f64) so historical numbers in summaries stay comparable;
+    # ``energy_distance_blas_f32`` is the new default headline.
+    #
+    # All four share the cell-eval reference, so a single ref-side cold
+    # pair lookup per repeat is enough — but _run_operation re-times the
+    # ref alongside each SCX call (matches existing pattern; warmup makes
+    # this cheap on the second+ visit because cell-eval caches some
+    # internals on the pair).
+    def _ref_edistance() -> Any:
+        return ce_edistance(_cold_pair())
+
     _op(
-        "energy_distance",
-        lambda: acc.energy_distance(adata_real, adata_pred),
-        # edistance reads the raw AnnData (not cached pseudobulk), so a
-        # fresh pair isn't strictly required; building it is cheap either way.
-        lambda: ce_edistance(_cold_pair()),
+        "energy_distance_blas_f32",
+        lambda: acc.energy_distance(
+            adata_real, adata_pred, backend="gemm", dtype="f32",
+        ),
+        _ref_edistance,
+    )
+    _op(
+        "energy_distance_blas_f64",
+        lambda: acc.energy_distance(
+            adata_real, adata_pred, backend="gemm", dtype="f64",
+        ),
+        _ref_edistance,
+    )
+    _op(
+        "energy_distance_scalar_f32",
+        lambda: acc.energy_distance(
+            adata_real, adata_pred, backend="scalar", dtype="f32",
+        ),
+        _ref_edistance,
+    )
+    _op(
+        "energy_distance",  # back-compat alias for scalar+f64 (slowest)
+        lambda: acc.energy_distance(
+            adata_real, adata_pred, backend="scalar", dtype="f64",
+        ),
+        _ref_edistance,
     )
 
     def _scx_knockdown() -> None:

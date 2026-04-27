@@ -33,6 +33,7 @@ pub use eval_metrics::{
         normalized_mutual_info, ClusteringMetric,
     },
     discrimination::{compute_discrimination_score, DiscriminationResult},
+    distances::{DistanceBackend, PairwiseFloat},
     edistance::{compute_energy_distance, fused_edistance, EDistanceResult},
     knockdown::{compute_control_baseline, compute_knockdown_efficiency, compute_log_deviation},
     DistanceMetric,

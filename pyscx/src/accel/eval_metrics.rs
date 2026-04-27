@@ -448,17 +448,43 @@ fn compute_obsm_pseudobulk<'py>(
     Ok((means_2d, group_names))
 }
 
-/// Extract a dense `[N, D]` matrix from adata.X (or adata.obsm[embed_key])
-/// as a flat `Vec<f64>`.
+/// Trait bridging Rust `f32`/`f64` to numpy dtype strings for
+/// `materialize_dense`. Sealed in spirit (only impls in this module).
+trait NumpyDtype: numpy::Element + Sized {
+    /// numpy `dtype` string passed to `.astype(...)`.
+    const NUMPY_NAME: &'static str;
+    /// Bytes per element — used to gate the "large materialization" warning.
+    const BYTES: usize;
+}
+
+impl NumpyDtype for f32 {
+    const NUMPY_NAME: &'static str = "float32";
+    const BYTES: usize = 4;
+}
+
+impl NumpyDtype for f64 {
+    const NUMPY_NAME: &'static str = "float64";
+    const BYTES: usize = 8;
+}
+
+/// Extract a dense `[N, D]` matrix from `adata.X` (or `adata.obsm[embed_key]`)
+/// as a flat `Vec<F>`, narrowing to F via numpy's `.astype(...)`.
 ///
 /// Handles scipy sparse (converts to dense), numpy arrays, and SCX backed types.
-/// Emits a Python warning for large materializations (>2 GB estimated).
-fn extract_dense_matrix<'py>(
+/// Emits a Python warning for large materializations (> 2 GB estimated).
+///
+/// Generic over `F: PairwiseFloat + NumpyDtype` — the dtype string passed to
+/// `.astype(...)` is inferred from `F::NUMPY_NAME`. This stops the historical
+/// unconditional upcast to f64 and lets f32-native callers stay in f32.
+fn materialize_dense<'py, F>(
     py: Python<'py>,
     np: &Bound<'py, PyModule>,
     adata: &Bound<'py, PyAny>,
     embed_key: Option<&str>,
-) -> PyResult<(Vec<f64>, usize, usize)> {
+) -> PyResult<(Vec<F>, usize, usize)>
+where
+    F: scx_accel::PairwiseFloat + NumpyDtype,
+{
     let matrix_obj = if let Some(key) = embed_key {
         let obsm = adata.getattr("obsm")?;
         obsm.get_item(key).map_err(|_| {
@@ -473,7 +499,7 @@ fn extract_dense_matrix<'py>(
         || matrix_obj.is_instance_of::<ScxLazyTransformedDataset>()
     {
         let arr = matrix_obj.call_method0("toarray")?;
-        arr.call_method1("astype", ("float64",))?
+        arr.call_method1("astype", (F::NUMPY_NAME,))?
     } else {
         // Check for scipy sparse.
         let scipy_sparse = py.import("scipy.sparse")?;
@@ -483,31 +509,38 @@ fn extract_dense_matrix<'py>(
 
         if is_sparse {
             let arr = matrix_obj.call_method0("toarray")?;
-            arr.call_method1("astype", ("float64",))?
+            arr.call_method1("astype", (F::NUMPY_NAME,))?
         } else {
             np.call_method1("asarray", (&matrix_obj,))?
-                .call_method1("astype", ("float64",))?
+                .call_method1("astype", (F::NUMPY_NAME,))?
         }
     };
 
     let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
 
     // Warn if the dense matrix is very large (> 2 GB).
-    let estimated_bytes = shape.0 * shape.1 * 8; // f64 = 8 bytes
+    let estimated_bytes = shape.0 * shape.1 * F::BYTES;
     if estimated_bytes > 2_000_000_000 {
         let gb = estimated_bytes as f64 / 1e9;
         let warnings = py.import("warnings")?;
         warnings.call_method1(
             "warn",
             (format!(
-                "energy_distance: materializing a {:.1} GB dense matrix ({} × {} × 8 bytes). \
+                "energy_distance: materializing a {:.1} GB dense matrix ({} × {} × {} bytes). \
                  Consider using embed_key='X_pca' or subsetting the data.",
-                gb, shape.0, shape.1
+                gb,
+                shape.0,
+                shape.1,
+                F::BYTES,
             ),),
         )?;
     }
 
-    let flat: Vec<f64> = dense.call_method0("ravel")?.extract()?;
+    // Use numpy's typed array protocol to extract a Vec<F> without going
+    // through pyo3's `extract::<Vec<F>>` (which has no generic impl).
+    let raveled = dense.call_method0("ravel")?;
+    let arr: numpy::PyReadonlyArray1<F> = raveled.extract()?;
+    let flat: Vec<F> = arr.as_slice()?.to_vec();
 
     Ok((flat, shape.0, shape.1))
 }
@@ -683,6 +716,14 @@ pub fn perturbation_metrics<'py>(
 ///     control: Label for control perturbation (default: "control")
 ///     metric: Distance metric — "euclidean" (default), "l1", or "cosine"
 ///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None)
+///     backend: Distance kernel backend — "auto" (default), "gemm", or "scalar".
+///         "auto" uses faer-backed gemm for euclidean/cosine and the scalar
+///         row-by-row path for L1. "gemm" forces the gemm path (errors on L1).
+///         "scalar" forces the scalar path (matches the historical implementation).
+///     dtype: Element precision for the dense kernel — "f32" (default) or "f64".
+///         Reductions always accumulate in f64; the dtype only controls the
+///         matmul / per-pair compute precision. f32 is ~1.5–2× faster on AVX2
+///         and matches f64 within atol=1e-4 on log-normalised inputs.
 ///
 /// Returns:
 ///     float — Pearson correlation of per-perturbation e-distances
@@ -691,34 +732,57 @@ pub fn perturbation_metrics<'py>(
 ///     corr = pyscx.accel.energy_distance(adata_real, adata_pred)
 ///     # corr ≈ 0.85 means real and predicted perturbation effects
 ///     # have similar relative magnitudes
-/// Shared prep + compute for energy_distance / energy_distance_details.
-fn run_energy_distance<'py>(
+/// Parse `backend` kwarg into `DistanceBackend`.
+fn parse_backend(backend: Option<&str>) -> PyResult<scx_accel::DistanceBackend> {
+    match backend.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("auto") => Ok(scx_accel::DistanceBackend::Auto),
+        Some("gemm") | Some("blas") => Ok(scx_accel::DistanceBackend::Gemm),
+        Some("scalar") => Ok(scx_accel::DistanceBackend::Scalar),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "unknown backend '{other}'. Valid: auto, gemm, scalar"
+        ))),
+    }
+}
+
+/// Dtype dispatch tag, picked out of the `dtype` kwarg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dtype {
+    F32,
+    F64,
+}
+
+/// Parse `dtype` kwarg. Default is `f32` to maximise throughput.
+fn parse_dtype(dtype: Option<&str>) -> PyResult<Dtype> {
+    match dtype.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("f32") | Some("float32") => Ok(Dtype::F32),
+        Some("f64") | Some("float64") => Ok(Dtype::F64),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "unknown dtype '{other}'. Valid: f32, f64"
+        ))),
+    }
+}
+
+/// Inner generic implementation of `run_energy_distance`. Materialises both
+/// AnnData matrices in the chosen `F` precision, then dispatches to the
+/// generic `compute_energy_distance::<F>` kernel.
+#[allow(clippy::too_many_arguments)]
+fn run_energy_distance_inner<'py, F>(
     py: Python<'py>,
+    np: &Bound<'py, PyModule>,
     adata_real: &Bound<'py, PyAny>,
     adata_pred: &Bound<'py, PyAny>,
     pert_col: &str,
     control: &str,
-    metric: &str,
+    dist_metric: scx_accel::DistanceMetric,
     embed_key: Option<&str>,
-) -> PyResult<scx_accel::EDistanceResult> {
-    let np = py.import("numpy")?;
-
-    // Parse distance metric.
-    let dist_metric = match metric.to_lowercase().as_str() {
-        "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
-        "l1" | "manhattan" | "cityblock" => scx_accel::DistanceMetric::L1,
-        "cosine" => scx_accel::DistanceMetric::Cosine,
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "unknown metric '{}'. Valid: euclidean, l1, cosine",
-                metric
-            )))
-        }
-    };
-
+    dist_backend: scx_accel::DistanceBackend,
+) -> PyResult<scx_accel::EDistanceResult>
+where
+    F: scx_accel::PairwiseFloat + NumpyDtype,
+{
     // ── Extract dense matrices from both AnnData objects ────────────
-    let (real_flat, n_real, n_dims_real) = extract_dense_matrix(py, &np, adata_real, embed_key)?;
-    let (pred_flat, n_pred, n_dims_pred) = extract_dense_matrix(py, &np, adata_pred, embed_key)?;
+    let (real_flat, n_real, n_dims_real) = materialize_dense::<F>(py, np, adata_real, embed_key)?;
+    let (pred_flat, n_pred, n_dims_pred) = materialize_dense::<F>(py, np, adata_pred, embed_key)?;
 
     if n_dims_real != n_dims_pred {
         return Err(PyValueError::new_err(format!(
@@ -793,7 +857,7 @@ fn run_energy_distance<'py>(
     // Release the GIL for the O(N²) rayon-parallel kernel. All arguments are
     // owned Vecs or plain scalars.
     py.allow_threads(|| {
-        scx_accel::compute_energy_distance(
+        scx_accel::compute_energy_distance::<F>(
             &real_flat,
             &pred_flat,
             &real_groups,
@@ -803,13 +867,71 @@ fn run_energy_distance<'py>(
             &pert_group_indices,
             n_dims,
             dist_metric,
+            dist_backend,
         )
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Shared prep + compute for energy_distance / energy_distance_details.
+#[allow(clippy::too_many_arguments)]
+fn run_energy_distance<'py>(
+    py: Python<'py>,
+    adata_real: &Bound<'py, PyAny>,
+    adata_pred: &Bound<'py, PyAny>,
+    pert_col: &str,
+    control: &str,
+    metric: &str,
+    embed_key: Option<&str>,
+    backend: Option<&str>,
+    dtype: Option<&str>,
+) -> PyResult<scx_accel::EDistanceResult> {
+    let np = py.import("numpy")?;
+
+    // Parse distance metric.
+    let dist_metric = match metric.to_lowercase().as_str() {
+        "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
+        "l1" | "manhattan" | "cityblock" => scx_accel::DistanceMetric::L1,
+        "cosine" => scx_accel::DistanceMetric::Cosine,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unknown metric '{}'. Valid: euclidean, l1, cosine",
+                metric
+            )))
+        }
+    };
+
+    let dist_backend = parse_backend(backend)?;
+    let dtype = parse_dtype(dtype)?;
+
+    match dtype {
+        Dtype::F32 => run_energy_distance_inner::<f32>(
+            py,
+            &np,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            dist_metric,
+            embed_key,
+            dist_backend,
+        ),
+        Dtype::F64 => run_energy_distance_inner::<f64>(
+            py,
+            &np,
+            adata_real,
+            adata_pred,
+            pert_col,
+            control,
+            dist_metric,
+            embed_key,
+            dist_backend,
+        ),
+    }
+}
+
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance<'py>(
     py: Python<'py>,
@@ -819,9 +941,11 @@ pub fn energy_distance<'py>(
     control: &str,
     metric: &str,
     embed_key: Option<&str>,
+    backend: Option<&str>,
+    dtype: Option<&str>,
 ) -> PyResult<f64> {
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
     Ok(result.correlation)
 }
@@ -843,7 +967,7 @@ pub fn energy_distance<'py>(
 ///     # out["correlation"] ≈ 0.85
 ///     # out["d_real"]["drug_A"] == 12.34
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance_details<'py>(
     py: Python<'py>,
@@ -853,9 +977,11 @@ pub fn energy_distance_details<'py>(
     control: &str,
     metric: &str,
     embed_key: Option<&str>,
+    backend: Option<&str>,
+    dtype: Option<&str>,
 ) -> PyResult<PyObject> {
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
 
     let d_real = PyDict::new(py);
@@ -1237,13 +1363,14 @@ pub fn clustering_agreement<'py>(
     embed_key: Option<&str>,
     min_cells_per_group: usize,
 ) -> PyResult<f64> {
-    // Note: this function intentionally holds the GIL throughout. Its per-
-    // resolution loop calls `sc.pp.neighbors` and `sc.tl.leiden` (Python
-    // scanpy), which require the GIL. Pushing clustering into pure Rust
-    // would let us release — that refactor is tracked as a follow-up.
-    let np = py.import("numpy")?;
-    let sc = py.import("scanpy")?;
-    let ad_mod = py.import("anndata")?;
+    // Native-Rust path: kNN graph + Leiden clustering live entirely in
+    // `scx_accel`, so the entire hot path runs under `py.allow_threads`.
+    // No scanpy / anndata / igraph imports — the Leiden defaults
+    // (`seed=0`, `parallel=false`, `max_iterations=2`) are calibrated
+    // against the C++ leidenalg / python-igraph references; HNSW defaults
+    // (`ef_construction=200`, `ef_search=50`) are kept hidden inside the
+    // implementation since scanpy's `sc.pp.neighbors` similarly hides the
+    // exact-vs-approx knobs from this caller.
 
     // Parse clustering metric.
     let clustering_metric = scx_accel::ClusteringMetric::parse(metric).ok_or_else(|| {
@@ -1300,149 +1427,113 @@ pub fn clustering_agreement<'py>(
     let mut sorted_indices: Vec<usize> = (0..n_output).collect();
     sorted_indices.sort_by(|&a, &b| pert_names[a].cmp(&pert_names[b]));
 
-    let mut sorted_real = vec![0.0f64; n_output * n_genes];
-    let mut sorted_pred = vec![0.0f64; n_output * n_genes];
-
+    // `scx_accel::neighbors::build_knn_graph` takes `&[f32]` only. Cast
+    // centroids row-by-row in the same step that reorders by pert name.
+    // Log-normalised counts are well below `f32::MAX`, but flag overflow
+    // defensively in case a caller passes raw counts via `embed_key`.
+    let mut sorted_real_f32 = vec![0.0f32; n_output * n_genes];
+    let mut sorted_pred_f32 = vec![0.0f32; n_output * n_genes];
+    let mut overflow_seen = false;
     for (new_idx, &old_idx) in sorted_indices.iter().enumerate() {
-        sorted_real[new_idx * n_genes..(new_idx + 1) * n_genes]
-            .copy_from_slice(&centroids_real[old_idx * n_genes..(old_idx + 1) * n_genes]);
-        sorted_pred[new_idx * n_genes..(new_idx + 1) * n_genes]
-            .copy_from_slice(&centroids_pred[old_idx * n_genes..(old_idx + 1) * n_genes]);
+        let dst_real = &mut sorted_real_f32[new_idx * n_genes..(new_idx + 1) * n_genes];
+        let dst_pred = &mut sorted_pred_f32[new_idx * n_genes..(new_idx + 1) * n_genes];
+        let src_real = &centroids_real[old_idx * n_genes..(old_idx + 1) * n_genes];
+        let src_pred = &centroids_pred[old_idx * n_genes..(old_idx + 1) * n_genes];
+        for (d, &s) in dst_real.iter_mut().zip(src_real.iter()) {
+            if !overflow_seen && s.abs() > f32::MAX as f64 {
+                overflow_seen = true;
+            }
+            *d = s as f32;
+        }
+        for (d, &s) in dst_pred.iter_mut().zip(src_pred.iter()) {
+            if !overflow_seen && s.abs() > f32::MAX as f64 {
+                overflow_seen = true;
+            }
+            *d = s as f32;
+        }
+    }
+    if overflow_seen {
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            (
+                "clustering_agreement: centroid value exceeds f32::MAX during \
+              cast — affected entries become +/- infinity (f64-as-f32 in Rust \
+              does not saturate), which will poison HNSW distance computations. \
+              Consider supplying log-normalised counts via embed_key.",
+            ),
+        )?;
     }
 
-    // ── Build AnnData centroid objects for scanpy ────────────────────
-    let real_arr = np.call_method1("array", (sorted_real,))?;
-    let real_2d = real_arr.call_method1("reshape", ((n_output, n_genes),))?;
-    let real_2d_f64 = real_2d.call_method1("astype", ("float64",))?;
-    let ad_real_cent = ad_mod.call_method(
-        "AnnData",
-        (),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("X", &real_2d_f64)?;
-            kw
-        }),
-    )?;
-
-    let pred_arr = np.call_method1("array", (sorted_pred,))?;
-    let pred_2d = pred_arr.call_method1("reshape", ((n_output, n_genes),))?;
-    let pred_2d_f64 = pred_2d.call_method1("astype", ("float64",))?;
-    let ad_pred_cent = ad_mod.call_method(
-        "AnnData",
-        (),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("X", &pred_2d_f64)?;
-            kw
-        }),
-    )?;
-
-    // ── Build kNN graphs and cluster ────────────────────────────────
     let effective_n_neighbors = n_neighbors.min(n_output - 1);
 
-    // Build kNN graph + Leiden for real centroids.
-    let sc_pp = sc.getattr("pp")?;
-    let sc_tl = sc.getattr("tl")?;
+    // ── Build kNN + run Leiden, all in Rust, GIL released ───────────
+    let resolutions_owned = resolutions.clone();
+    let best_score: scx_accel::Result<f64> = py.allow_threads(|| {
+        // Build real-side kNN once.
+        let real_knn = scx_accel::build_knn_graph(
+            &sorted_real_f32,
+            n_output,
+            n_genes,
+            effective_n_neighbors,
+            /*ef_construction=*/ 200,
+            /*ef_search=*/ 50,
+            /*seed=*/ 0,
+        )?;
+        let real_leiden = scx_accel::leiden(
+            &real_knn.conn_indptr,
+            &real_knn.conn_indices,
+            &real_knn.conn_data,
+            n_output,
+            real_resolution,
+            /*seed=*/ 0,
+            /*max_iterations=*/ 2,
+            /*parallel=*/ false,
+        )?;
+        // `LeidenResult.membership` is `Vec<usize>`; the AMI/NMI/ARI scoring
+        // signature is `&[u32]`. Cast row-by-row — community counts in the
+        // centroid graph (≤ 3000 nodes) cannot exceed u32::MAX.
+        let real_labels_u32: Vec<u32> = real_leiden.membership.iter().map(|&c| c as u32).collect();
 
-    sc_pp.call_method(
-        "neighbors",
-        (&ad_real_cent,),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("n_neighbors", effective_n_neighbors)?;
-            kw.set_item("use_rep", "X")?;
-            kw
-        }),
-    )?;
-
-    sc_tl.call_method(
-        "leiden",
-        (&ad_real_cent,),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("resolution", real_resolution)?;
-            kw.set_item("key_added", "real_clusters")?;
-            kw.set_item("flavor", "igraph")?;
-            kw.set_item("n_iterations", 2)?;
-            kw
-        }),
-    )?;
-
-    // Extract real cluster labels as u32 array.
-    let real_obs = ad_real_cent.getattr("obs")?;
-    let real_labels_series = real_obs.get_item("real_clusters")?;
-    let real_label_codes: Vec<i64> = real_labels_series
-        .getattr("cat")?
-        .getattr("codes")?
-        .call_method0("tolist")?
-        .extract()?;
-    // Validate and convert label codes. Pandas categorical codes use -1 for
-    // missing/NA values, which would silently become u32::MAX.
-    if real_label_codes.iter().any(|&c| c < 0) {
-        return Err(PyRuntimeError::new_err(
-            "Leiden produced NA cluster labels for real centroids",
-        ));
-    }
-    let real_labels_u32: Vec<u32> = real_label_codes.iter().map(|&c| c as u32).collect();
-
-    // Build kNN graph for predicted centroids (reusable across resolutions).
-    sc_pp.call_method(
-        "neighbors",
-        (&ad_pred_cent,),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("n_neighbors", effective_n_neighbors)?;
-            kw.set_item("use_rep", "X")?;
-            kw
-        }),
-    )?;
-
-    // ── Sweep predicted resolutions and compute best score ──────────
-    // Initialize to NEG_INFINITY so that even if all scores are negative
-    // (possible with AMI), we return an actual computed value.
-    let mut best_score = f64::NEG_INFINITY;
-
-    for &r in &resolutions {
-        let pred_key = format!("pred_clusters_{}", r);
-
-        sc_tl.call_method(
-            "leiden",
-            (&ad_pred_cent,),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("resolution", r)?;
-                kw.set_item("key_added", pred_key.as_str())?;
-                kw.set_item("flavor", "igraph")?;
-                kw.set_item("n_iterations", 2)?;
-                kw
-            }),
+        // Build pred-side kNN once and reuse across the resolution sweep —
+        // only the Leiden pass re-runs per resolution.
+        let pred_knn = scx_accel::build_knn_graph(
+            &sorted_pred_f32,
+            n_output,
+            n_genes,
+            effective_n_neighbors,
+            200,
+            50,
+            0,
         )?;
 
-        // Extract predicted cluster labels.
-        let pred_obs = ad_pred_cent.getattr("obs")?;
-        let pred_labels_series = pred_obs.get_item(pred_key.as_str())?;
-        let pred_label_codes: Vec<i64> = pred_labels_series
-            .getattr("cat")?
-            .getattr("codes")?
-            .call_method0("tolist")?
-            .extract()?;
-        // Validate and convert predicted label codes.
-        if pred_label_codes.iter().any(|&c| c < 0) {
-            return Err(PyRuntimeError::new_err(format!(
-                "Leiden produced NA cluster labels for predicted centroids at resolution {}",
-                r
-            )));
-        }
-        let pred_labels_u32: Vec<u32> = pred_label_codes.iter().map(|&c| c as u32).collect();
+        // Resolutions are independent — fan out across rayon. Inner Leiden
+        // is `parallel=false`, so the only nested rayon use is matmul-free
+        // graph-coloring; safe to parallelise across the (typically 7)
+        // resolutions. `try_reduce` short-circuits on the first error.
+        use rayon::prelude::*;
+        let best = resolutions_owned
+            .par_iter()
+            .map(|&r| -> scx_accel::Result<f64> {
+                let pred_leiden = scx_accel::leiden(
+                    &pred_knn.conn_indptr,
+                    &pred_knn.conn_indices,
+                    &pred_knn.conn_data,
+                    n_output,
+                    r,
+                    /*seed=*/ 0,
+                    /*max_iterations=*/ 2,
+                    /*parallel=*/ false,
+                )?;
+                let pred_labels_u32: Vec<u32> =
+                    pred_leiden.membership.iter().map(|&c| c as u32).collect();
+                Ok(clustering_metric.score(&real_labels_u32, &pred_labels_u32))
+            })
+            .try_reduce(|| f64::NEG_INFINITY, |a, b| Ok(a.max(b)))?;
+        Ok(best)
+    });
 
-        // Compute scoring metric in Rust.
-        let score = clustering_metric.score(&real_labels_u32, &pred_labels_u32);
-        if score > best_score {
-            best_score = score;
-        }
-    }
-
-    Ok(best_score)
+    best_score.map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
