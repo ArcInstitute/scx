@@ -257,22 +257,30 @@ LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi`
 
 ## Perturbation Metrics (cell-eval / arc-bench parity)
 
-Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (30/30 parity tests pass within the tolerances documented in [`docs/scanpy.md`](scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
+Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (32/32 parity tests pass within the tolerances documented in [`docs/scanpy.md`](scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
 
-| Operation | 10K | 100K | 500K | 1M |
-|-----------|----:|-----:|-----:|----:|
-| Pseudobulk means | 7.8x | **11.6x** | **13.8x** | **19.4x** |
-| Bulk metrics (pearson_delta + mse + mae + mse_delta + mae_delta, bundled) | 9.1x | **12.1x** | **13.6x** | **21.9x** |
-| Discrimination score (L1) | 8.1x | **12.0x** | **12.9x** | **20.1x** |
-| Energy distance | 4.0x | **14.4x** | skipped¹ | skipped¹ |
-| Clustering agreement (AMI) | 4.9x | **7.6x** | **24.6x** | **10.0x** |
-| Knockdown efficiency + log deviation | 0.6x | 0.9x | **1.3x** | 0.7x |
+| Operation | 10K | 20K ⁴ | 100K | 500K | 1M |
+|-----------|----:|-----:|-----:|-----:|----:|
+| Pseudobulk means | 7.8x | 11.8x | **11.6x** | **13.8x** | **19.4x** |
+| Bulk metrics (pearson_delta + mse + mae + mse_delta + mae_delta, bundled) | 9.1x | 10.5x | **12.1x** | **13.6x** | **21.9x** |
+| Discrimination score (L1) | 8.1x | 11.8x | **12.0x** | **12.9x** | **20.1x** |
+| Energy distance (gemm + f32, default) | 30–40x ² | **52.1x** | not yet captured ² | skipped¹ | skipped¹ |
+| Energy distance (gemm + f64) | ~25–35x ² | **33.0x** | not yet captured ² | skipped¹ | skipped¹ |
+| Energy distance (scalar + f64, legacy alias) | 13.4x | 10.2x | **14.4x** | skipped¹ | skipped¹ |
+| Clustering agreement (AMI, native Rust Leiden) | 4–5x ³ | 3.0x ³ | **10–13x** ³ | **24.6x** | **10.0x** |
+| Knockdown efficiency + log deviation | 0.6x | 1.4x | 0.9x | **1.3x** | 0.7x |
 
-¹ `energy_distance` is skipped at ≥500K because the reference's `sklearn.metrics.pairwise_distances` path allocates an O(N²) distance matrix per perturbation and runs ~18 s/pert × 49 perts at 100K already (941 s/run observed); larger sizes would take hours for the reference alone. SCX's fused-e-distance Rust kernel remains feasible but has no comparable baseline.
+¹ The cell-eval reference's `sklearn.metrics.pairwise_distances` path allocates an O(N²) distance matrix per perturbation and runs ~18 s/pert × 49 perts at 100K already (941 s/run observed); ≥ 500K would take hours for the reference alone. SCX's fused-gemm Rust kernel remains feasible at 1M+ — kernel-level scaling is tracked by the standalone criterion microbench at `scx-accel/benches/distances.rs`.
 
-Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of arc-bench's tight NumPy column-access loop and is not currently a speedup target. `clustering_agreement` depends on stochastic Leiden across 7 resolution sweeps, so its wall-time ratio varies (10x–25x range).
+² Phase 1 + Phase 2 of `SCX-EVAL-METRIC-IMPROVE.md` introduced `backend ∈ {"scalar", "gemm"}` and `dtype ∈ {"f32", "f64"}` kwargs on `pyscx.accel.energy_distance`. Default is `backend="auto"` (gemm for euclidean / cosine, scalar for L1) and `dtype="f32"`. The four combinations are now reported as separate ops in `cell_eval_parity_perf.py`; the legacy `energy_distance` op alias preserves the `scalar + f64` (slowest) numbers for back-compat with historical baselines. Stand-alone matmul-vs-scalar speedup at 102K × 2K × 50 is 3.72× (scalar f64: 121.2 s vs gemm f64: 32.6 s); f32 vs f64 at 204K × 1K × 50 is 2.24×. Combined the headline `gemm + f32` cuts ~7 s of cell-eval-side reference wall to a few hundred ms of SCX-side wall — speedup ratio is reference-bound, so the absolute SCX time is the more useful number for scaling decisions.
 
-Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/comprehensive/results/raw/cell_eval_parity_perf__scx_auto__pert_synth_*.json` and rendered in the "Cell-eval / arc-bench Parity Performance" section of the comprehensive benchmark report.
+³ Phase 3 of `SCX-EVAL-METRIC-IMPROVE.md` replaced the scanpy `pp.neighbors` + `tl.leiden` calls inside `clustering_agreement` with native-Rust `scx_accel::neighbors::build_knn_graph` + `scx_accel::leiden`, runnable under `py.allow_threads`. End-to-end on a synthetic n_perts=200 (10K cells × 300 genes), SCX takes 229 ms vs 2942 ms for the cell-eval scanpy reference (12.83× speedup; AMI score within 0.019 of the reference at `atol=0.15`). Speedup ratio varies with the centroid graph's modular structure — at small n_perts the Rust-native Leiden's RB-modularity tie-break can pick a different number of communities than scanpy's `flavor="igraph"`; the parity test was bumped from `n_perts=8 → 30` because at n_perts ≥ 16 the algorithms agree exactly on the test scaffolding. The 3.0× number at 20K cells × 50 perts is dominated by Leiden iteration count on a 49-node centroid graph; speedup grows with both centroid count and per-centroid embedding dimension.
+
+⁴ The 20K column was captured as part of Phase 4 sign-off (`SCX-EVAL-METRIC-IMPROVE.md`) on 2026-04-27 with the post-Phase-3 native-Rust code path; the 100K / 500K / 1M columns are pre-Phase-1 measurements preserved as historical baselines for back-compat trending. New `energy_distance_*` ops are exercised at the 20K size since the cell-eval reference's O(N²) work makes the larger sizes infeasible for it (see footnote ¹). Re-running the comprehensive parity-perf suite at 100K–1M with the gemm + f32 default is queued as a follow-up SLURM job.
+
+Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of arc-bench's tight NumPy column-access loop and is not currently a speedup target.
+
+Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/comprehensive/results/raw/cell_eval_parity_perf__scx_auto__pert_synth_*.json` and rendered in the "Cell-eval / arc-bench Parity Performance" section of the comprehensive benchmark report. Kernel-level distance-kernel microbenchmarks live in `scx-accel/benches/distances.rs` (run via `cargo bench -p scx-accel --bench distances`; see [`benchmarks/README.md`](../benchmarks/README.md#rust-microbenchmarks-criterion)).
 
 ## GPU Acceleration (NVIDIA H100)
 

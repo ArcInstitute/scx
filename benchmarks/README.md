@@ -1055,3 +1055,28 @@ for historical bisects but is not the gate target.
 | `benchmark_accel_preprocessing.py` | pyscx.preprocess() vs scanpy normalize+log1p |
 | `benchmark_bpcells.R` | BPCells comparison (R) |
 | `comprehensive/benchmarks/cell_eval_parity_perf.py` | cell-eval / arc-bench parity perf (pseudobulk, perturbation metrics, energy distance, discrimination score, knockdown efficiency, clustering agreement) at synthetic 100K–1M scale |
+
+## Rust microbenchmarks (criterion)
+
+Kernel-level benches live alongside the crates they exercise. Run via
+`cargo bench`:
+
+| Bench | Crate | What it measures |
+|-------|-------|-----------------|
+| `codec_bench` | `scx-codec` | Encode/decode throughput per codec (Rice, FOR-BP, Delta-Golomb, LZ4-shuffle, Zstd) |
+| `distances` | `scx-accel` | `mean_pairwise_distance` and `mean_pairwise_distance_self` across `(n_a, n_b, n_dims)` shapes × `metric ∈ {euclidean, l1, cosine}` × `backend ∈ {scalar, gemm}` × `dtype ∈ {f32, f64}` (Phase 4 of `SCX-EVAL-METRIC-IMPROVE.md`). Filter by criterion regex, e.g. `cargo bench -p scx-accel --bench distances -- 'gemm/cosine'`. |
+
+```bash
+# All distance microbenches (full grid takes ~30 minutes)
+cargo bench -p scx-accel --bench distances
+
+# Just the f32 + gemm + euclidean cross combos (a few minutes)
+cargo bench -p scx-accel --bench distances -- 'mean_pairwise_distance/f32/.*/euclidean/gemm'
+
+# Ad-hoc: print without measuring (target enumeration)
+cargo bench -p scx-accel --bench distances -- --list
+```
+
+Sample budgets are tuned per shape so the full grid stays under tens of
+minutes; the heaviest combos (5000×2000×18000 scalar f64) drop to
+`sample_size=10` / `measurement_time=30s` to stay tractable.
