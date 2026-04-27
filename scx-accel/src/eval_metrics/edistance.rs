@@ -140,7 +140,10 @@ pub fn compute_energy_distance<F: PairwiseFloat>(
         mean_pairwise_distance_self(&ctrl_pred, n_ctrl_pred, n_dims, metric, backend)?;
 
     // ── 4. Compute per-perturbation e-distances in parallel ─────────
-    let results: Vec<crate::Result<(f64, f64)>> = pert_group_indices
+    // Collecting directly into `Result<Vec<_>>` makes rayon stop scheduling
+    // new work as soon as one task returns `Err`, instead of running every
+    // pert and then surfacing the first failure post-hoc.
+    let results: Vec<(f64, f64)> = pert_group_indices
         .par_iter()
         .map(|&gi| -> crate::Result<(f64, f64)> {
             let pert_real = extract_group_rows_indexed(real_cells, real_index.get(&gi), n_dims);
@@ -181,8 +184,7 @@ pub fn compute_energy_distance<F: PairwiseFloat>(
 
             Ok((e_real, e_pred))
         })
-        .collect();
-    let results: Vec<(f64, f64)> = results.into_iter().collect::<crate::Result<Vec<_>>>()?;
+        .collect::<crate::Result<Vec<_>>>()?;
 
     let d_real: Vec<f64> = results.iter().map(|(r, _)| *r).collect();
     let d_pred: Vec<f64> = results.iter().map(|(_, p)| *p).collect();

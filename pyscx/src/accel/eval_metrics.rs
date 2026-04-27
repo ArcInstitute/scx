@@ -1458,7 +1458,8 @@ pub fn clustering_agreement<'py>(
             "warn",
             (
                 "clustering_agreement: centroid value exceeds f32::MAX during \
-              cast — kNN graph construction will use saturating values. \
+              cast — affected entries become +/- infinity (f64-as-f32 in Rust \
+              does not saturate), which will poison HNSW distance computations. \
               Consider supplying log-normalised counts via embed_key.",
             ),
         )?;

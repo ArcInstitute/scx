@@ -1394,6 +1394,20 @@ graph is built once and reused across the resolution sweep, so only the
 Leiden pass re-runs per resolution. The whole hot path runs under
 `py.allow_threads`.
 
+**Caveat — small-graph divergence (`n_perts ≲ 10`).** The Rust-native
+Leiden's RB-modularity tie-break differs from scanpy's
+`flavor="igraph"` on graphs with very few nodes. On centroid graphs
+with ≤ ~10 perturbations the two algorithms can produce different
+community counts at `resolution=1.0`, and AMI / NMI are not
+permutation-invariant across different partition cardinalities, so
+scores can diverge by > 0.15 vs the scanpy-based reference. The
+algorithms agree exactly at `n_perts ≥ 16` on the synthetic parity
+fixtures (test scaffold uses `n_perts=30` for a comfortable margin).
+If you have a small-perturbation experiment and need bit-stable
+comparison against an existing scanpy-based pipeline, hand the
+centroid matrices to `scanpy.tl.leiden` directly and feed the labels
+into `pyscx.accel.adjusted_mutual_info` for the scoring step.
+
 ```python
 score = pyscx.accel.clustering_agreement(
     adata_real, adata_pred,
