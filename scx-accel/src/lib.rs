@@ -51,8 +51,8 @@ pub use pca::{
     COVARIANCE_PCA_THRESHOLD,
 };
 pub use pseudobulk::{
-    pseudobulk_aggregate, pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory,
-    AggregationMethod, PseudobulkResult,
+    pseudobulk_aggregate, pseudobulk_aggregate_dense, pseudobulk_aggregate_from_slices,
+    pseudobulk_aggregate_inmemory, AggregationMethod, PseudobulkResult,
 };
 pub use umap::{compute_umap, UmapResult};
 
