@@ -2,13 +2,13 @@
 # ============================================================================
 # DEPRECATED as of Phase 9 (2026-04-23). Use the comprehensive framework:
 #
-#     bash benchmarks/comprehensive/scripts/gate_candidate.sh
+#     python benchmarks/comprehensive/scripts/gate_candidate.py
 #
 # That gates the current head against the canonical baseline at
 # benchmarks/comprehensive/results/baselines/LATEST → v0.6.0-gpu-phase1-7,
 # which now covers both format-level AND accelerator benchmarks. This
 # script remains in-tree for one release for rollback convenience; future
-# regression runs should use gate_candidate.sh instead.
+# regression runs should use gate_candidate.py instead.
 # ============================================================================
 #
 # gpu_regression_driver.sh — orchestrate GPU accelerator regression bench +

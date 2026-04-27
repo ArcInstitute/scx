@@ -340,6 +340,17 @@ def main() -> None:
     else:
         formats = list(PRIMARY_FORMATS)
 
+    # --no-gpu: drop accel GPU variants. By convention accel format keys are
+    # `<bench>__<impl>_<device>[_<extra>]`, e.g. `accel_pca__pyscx_gpu_cov`.
+    # The substring "_gpu" is unique to GPU variants — CPU keys use "_cpu" and
+    # format-benchmark keys (zarr_zstd, scx_auto, …) don't include "_gpu".
+    if args.no_gpu:
+        before = len(formats)
+        formats = [f for f in formats if "_gpu" not in f.key]
+        dropped = before - len(formats)
+        if dropped:
+            logger.info("--no-gpu: dropped %d GPU accel format variants", dropped)
+
     # Resolve benchmarks
     benchmarks = args.benchmarks or BENCHMARK_NAMES
 
@@ -555,7 +566,7 @@ def main() -> None:
         # Auto-run the regression gate when a canonical baseline exists
         # (Phase I.6). Non-fatal — reports the gate outcome and returns
         # normally; use the gate's own exit code elsewhere if blocking is
-        # desired (the `gate_candidate.sh` wrapper does this).
+        # desired (the `gate_candidate.py` wrapper does this).
         if getattr(args, "auto_diff", True):
             _maybe_auto_diff(run_id)
 
@@ -579,9 +590,9 @@ def _maybe_auto_diff(run_id: str) -> None:
         return
     # The current snapshot for this run isn't a capture_baseline.py tree —
     # auto-diff works on the *last* captured snapshot. Operators who want a
-    # scored PR should use scripts/gate_candidate.sh instead.
+    # scored PR should use scripts/gate_candidate.py instead.
     logger.info(
-        "Auto-diff: run_id=%s — use scripts/gate_candidate.sh to compare "
+        "Auto-diff: run_id=%s — use scripts/gate_candidate.py to compare "
         "against baselines/LATEST; raw results landed in results/raw/.",
         run_id,
     )
@@ -612,6 +623,13 @@ def parse_args() -> argparse.Namespace:
                              "config.accel_formats(). Auto-enabled when "
                              "--benchmarks names any accel_* benchmark or "
                              "--formats names any accel_* key.")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="Drop accel formats whose key matches *_gpu* "
+                             "(e.g. accel_pca__pyscx_gpu_cov, "
+                             "accel_knn__pyscx_gpu). Use on CPU-only hosts or "
+                             "when validating CPU-only changes on a GPU box. "
+                             "CPU accel variants and format benchmarks are "
+                             "unaffected.")
     parser.add_argument("--cold-cache", action="store_true",
                         help="Drop OS caches between runs.")
     parser.add_argument("--skip-convert", action="store_true",

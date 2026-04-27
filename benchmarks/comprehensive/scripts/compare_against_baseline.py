@@ -66,7 +66,7 @@ except ImportError:
 
 # Default locations used by the on-demand gate workflow. All overridable
 # via CLI flags; surfaced as module-level constants so the one-shot
-# ``gate_candidate.sh`` wrapper and the tests can reference them.
+# ``gate_candidate.py`` wrapper and the tests can reference them.
 _COMPREHENSIVE_DIR = Path(__file__).resolve().parents[1]
 _DEFAULT_BASELINES_DIR = _COMPREHENSIVE_DIR / "results" / "baselines"
 _DEFAULT_LATEST_LINK = _DEFAULT_BASELINES_DIR / "LATEST"

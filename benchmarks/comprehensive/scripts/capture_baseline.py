@@ -169,27 +169,58 @@ def submit_benchmarks(
     dry_run: bool,
     skip_convert: bool,
     overwrite: bool,
+    include_accel: bool = False,
+    no_accel: bool = False,
+    accel_only: bool = False,
+    no_gpu: bool = False,
 ) -> int:
     """Invoke run_parallel.py with the selected tier's settings.
 
     run_parallel.py submits one SLURM job per (benchmark, dataset, format)
     triple and blocks until all of them finish.  Returns its exit code.
+
+    Coverage flags (mutually exclusive: at most one of include_accel / no_accel /
+    accel_only is honored, with accel_only > no_accel > include_accel):
+      include_accel  forwards --include-accel so accel_* formats are scheduled
+                     alongside format benchmarks.
+      no_accel       drops every accel_* benchmark from the submitted list.
+      accel_only     keeps only accel_* benchmarks (drops compression / read /
+                     write / parallel_scaling / memory / ml_loader / cloud_*).
+      no_gpu         forwards --no-gpu so accel formats matching *_gpu* are
+                     filtered out of the cross-product.
     """
+    if accel_only:
+        bench_list = [b for b in BENCHMARKS if b.startswith("accel_")]
+    elif no_accel:
+        bench_list = [b for b in BENCHMARKS if not b.startswith("accel_")]
+    else:
+        bench_list = list(BENCHMARKS)
+
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts" / "run_parallel.py"),
         "--datasets", *tier_cfg["datasets"],
-        "--benchmarks", *BENCHMARKS,
+        "--benchmarks", *bench_list,
         "--partition", tier_cfg["partition"],
         "--mem-gb",    str(tier_cfg["mem_gb"]),
         "--timeout",   str(tier_cfg["timeout"]),
     ]
     if dry_run:
-        cmd.append("--dry-run")
+        # In dry-run we just want to print the schedule. The runner contract
+        # check (smoke_test_runners) belongs to real submission paths.
+        cmd.extend(["--dry-run", "--skip-smoke"])
     if skip_convert:
         cmd.append("--skip-convert")
     if overwrite:
         cmd.append("--overwrite")
+    # `accel_only` already restricted bench_list to accel_*; --include-accel is
+    # auto-enabled in run_parallel.py when --benchmarks names any accel_* entry.
+    # We still pass it explicitly when requested for parity with the gate's
+    # coverage banner.
+    if include_accel or accel_only:
+        cmd.append("--include-accel")
+    if no_gpu:
+        cmd.append("--no-gpu")
 
     print("[baseline] submitting benchmarks:")
     print("           " + " ".join(cmd))
@@ -333,6 +364,26 @@ def main() -> int:
             "to this."
         ),
     )
+    # Coverage flags — drive the gate's CPU/GPU/accel mode selection. Mutually
+    # exclusive at most one of {--include-accel, --no-accel, --accel-only}.
+    coverage = parser.add_mutually_exclusive_group()
+    coverage.add_argument(
+        "--include-accel", action="store_true",
+        help="Schedule accel_* benchmarks alongside format benchmarks.",
+    )
+    coverage.add_argument(
+        "--no-accel", action="store_true",
+        help="Drop accel_* benchmarks (format benchmarks only).",
+    )
+    coverage.add_argument(
+        "--accel-only", action="store_true",
+        help="Run only accel_* benchmarks (skip compression/read/write/etc.).",
+    )
+    parser.add_argument(
+        "--no-gpu", action="store_true",
+        help="Drop GPU accel format variants (*_gpu*). Use on CPU-only hosts "
+             "or to validate CPU-only changes.",
+    )
     args = parser.parse_args()
 
     tier_cfg = TIERS[args.tier]
@@ -361,12 +412,22 @@ def main() -> int:
             dry_run=False,
             skip_convert=args.skip_convert,
             overwrite=args.overwrite,
+            include_accel=args.include_accel,
+            no_accel=args.no_accel,
+            accel_only=args.accel_only,
+            no_gpu=args.no_gpu,
         )
         if rc != 0:
             print(f"[baseline] WARNING: run_parallel.py exited with {rc}; archiving whatever landed")
     elif args.mode == "dry-run":
-        submit_benchmarks(tier_cfg, dry_run=True,
-                          skip_convert=args.skip_convert, overwrite=False)
+        submit_benchmarks(
+            tier_cfg, dry_run=True,
+            skip_convert=args.skip_convert, overwrite=False,
+            include_accel=args.include_accel,
+            no_accel=args.no_accel,
+            accel_only=args.accel_only,
+            no_gpu=args.no_gpu,
+        )
         return 0
 
     # 3. Archive raw JSON + write summary.json.

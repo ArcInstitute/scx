@@ -366,7 +366,7 @@ observed values, not `missing` placeholders.
 ```bash
 # Gate any post-change head against the canonical baseline (both format and
 # accelerator dimensions). Exit 0 = pass, 1 = unjustified regression.
-bash benchmarks/comprehensive/scripts/gate_candidate.sh
+python benchmarks/comprehensive/scripts/gate_candidate.py
 # → compares current head's captured snapshot against
 #   benchmarks/comprehensive/results/baselines/LATEST
 #       → v0.6.0-gpu-phase1-7-multidataset
@@ -378,7 +378,7 @@ diff comparison but is no longer the gate target. The standalone
 `benchmarks/scripts/gpu_regression_{diff,driver}.py` wrappers from
 Phase 8 are **deprecated** — they remain in-tree for one release for
 rollback convenience but new regression runs should use
-`gate_candidate.sh`. See
+`gate_candidate.py`. See
 [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
 
 #### Changes vs previous version
@@ -622,7 +622,7 @@ pbmc3k (see §8b):
 All benchmark results now carry a `schema_version=1` stamp + full
 provenance (git SHA, thread pinning, run_id) in their
 `system.provenance` block. The on-demand gate
-(`scripts/gate_candidate.sh` + `scripts/compare_against_baseline.py
+(`scripts/gate_candidate.py` + `scripts/compare_against_baseline.py
 --gate`) evaluates relative tolerances (3% wall / 10% RSS / 1% size),
 absolute floors from `thresholds.yaml` (e.g. cloud throughput ≥ 50
 MB/s, keyed on tabula_sapiens_100k), and disappeared-benchmark
@@ -635,4 +635,4 @@ browsable HTML snapshot alongside the markdown report, threaded with
 The canonical baseline sits at
 `benchmarks/comprehensive/results/baselines/v0.5.0-phase5/` (371 raw
 JSONs archived, manifest + environment committed). `LATEST` symlink
-makes on-demand gate runs (`gate_candidate.sh`) work with no flags.
+makes on-demand gate runs (`gate_candidate.py`) work with no flags.
