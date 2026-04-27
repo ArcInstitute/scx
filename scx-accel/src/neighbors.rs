@@ -322,6 +322,12 @@ fn build_knn_exact(
     // ascending so `compute_connectivities` sees the same ordering as the
     // HNSW path (which iterates the search results in distance-ascending
     // order via `take(n_neighbors + 1)`).
+    //
+    // Memory access: `gram` is column-major (faer default) and `G = X·Xᵀ`
+    // is symmetric, so reading `gram[(j, i)]` for fixed `i` and varying `j`
+    // walks down column `i` — contiguous in memory — instead of striding
+    // across rows. At n_obs ≈ 5K the gram is ~100 MB (>> L2), so contiguous
+    // access is a measurable win over the symmetric `gram[(i, j)]`.
     let per_row: Vec<Vec<(usize, f64)>> = (0..n_obs)
         .into_par_iter()
         .with_min_len(8)
@@ -332,7 +338,10 @@ fn build_knn_exact(
                 if j == i {
                     continue;
                 }
-                let g = gram[(i, j)] as f64;
+                // gram[(j, i)] == gram[(i, j)] (symmetric); the (j, i) form
+                // walks contiguously down column `i` in faer's column-major
+                // layout.
+                let g = gram[(j, i)] as f64;
                 // max(0, ·) clamps tiny negatives from FP cancellation on
                 // near-identical rows. Same guard as `pairwise_gemm_row_sums`.
                 let d_sq = (ai_sq + row_norm_sq[j] - 2.0 * g).max(0.0);

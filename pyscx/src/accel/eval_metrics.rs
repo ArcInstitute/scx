@@ -152,10 +152,11 @@ pub fn pseudobulk_means<'py>(
             } else {
                 np.call_method1("asarray", (&x,))?
             };
-            // Force C-contiguous f32. `astype` with copy=False is a no-op
-            // when dtype already matches; `ascontiguousarray` guarantees
-            // row-major layout for the row-major Rust kernel.
-            let arr = arr.call_method1("astype", ("float32",))?;
+            // Force C-contiguous f32. `astype_no_copy` skips the copy when
+            // dtype already matches; `ascontiguousarray` guarantees row-major
+            // layout for the row-major Rust kernel (also a no-op when the
+            // array is already C-contiguous).
+            let arr = astype_no_copy(py, &arr, "float32")?;
             let arr = np.call_method1("ascontiguousarray", (&arr,))?;
             let arr_ro: numpy::PyReadonlyArray2<'_, f32> = arr.extract()?;
             let shape_ndarray = arr_ro.shape();

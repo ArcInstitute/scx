@@ -885,7 +885,13 @@ pyscx.accel.neighbors(adata, n_neighbors=15)
 | `ef_search` | 200 | HNSW search parameter (higher = more accurate) |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
-On CPU, uses HNSW (instant-distance) with Euclidean distance.
+On CPU, uses HNSW (instant-distance) with Euclidean distance — except at
+`n_obs ≤ 5,000`, where the CPU path silently dispatches to an exact kNN
+via a faer matmul + per-row partial top-k sort (Phase 6 of
+`SCX-EVAL-METRIC-IMPROVE.md`); `ef_construction` / `ef_search` are
+ignored on the exact path. The exact path allocates an `n_obs × n_obs`
+f32 Gram matrix (~100 MB at the threshold) — keep this in mind if
+calling at the boundary on memory-constrained hosts.
 On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
 
 ### UMAP (`pyscx.accel.umap`)

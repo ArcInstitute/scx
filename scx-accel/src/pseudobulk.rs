@@ -402,9 +402,13 @@ pub fn pseudobulk_aggregate_dense(
     let cell_counts: Vec<usize> = cells_by_group.iter().map(|c| c.len()).collect();
 
     // Allocate the result `[n_groups × n_vars]` matrix once, then have each
-    // group sum its own cells into its dedicated row in parallel. No shared
-    // mutable state across threads: each thread owns a disjoint row range.
+    // group sum (and optionally mean-normalise) its own cells into its
+    // dedicated row in parallel. No shared mutable state across threads:
+    // each thread owns a disjoint row range. Folding the divide into the
+    // same loop avoids a sequential `n_groups × n_vars` post-pass (~432M
+    // divisions at Replogle scale).
     let mut counts = vec![0.0f64; n_groups * n_vars];
+    let want_mean = method == AggregationMethod::Mean;
     counts
         .par_chunks_mut(n_vars)
         .zip(cells_by_group.par_iter())
@@ -416,18 +420,13 @@ pub fn pseudobulk_aggregate_dense(
                     *d += s as f64;
                 }
             }
-        });
-
-    if method == AggregationMethod::Mean {
-        for g in 0..n_groups {
-            if cell_counts[g] > 0 {
-                let cc = cell_counts[g] as f64;
-                for v in 0..n_vars {
-                    counts[g * n_vars + v] /= cc;
+            if want_mean && !cells.is_empty() {
+                let cc = cells.len() as f64;
+                for d in dst.iter_mut() {
+                    *d /= cc;
                 }
             }
-        }
-    }
+        });
 
     filter_and_build_result(
         counts,
