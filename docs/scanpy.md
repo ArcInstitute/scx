@@ -918,15 +918,20 @@ Falls back to cuML UMAP if available for maximum performance.
 
 Rust-native implementation of the Leiden algorithm (Traag, Waltman & van
 Eck, 2019) with the Reichardt-Bornholdt (RB) configuration model quality
-function. Operates directly on the kNN connectivities CSR matrix — no
-Python `igraph` or `leidenalg` dependency required.
+function on the CPU path; cuGraph on the GPU path. Operates directly on
+the kNN connectivities CSR — no Python `igraph` / `leidenalg` dependency
+required.
 
 ```python
 pyscx.accel.leiden(adata, resolution=1.0)
 
 # Results written to:
 #   adata.obs["leiden"]              — categorical community labels
-#   adata.uns["leiden"]["params"]    — resolution, random_state, backend
+#   adata.uns["leiden"]["params"]    — resolution, random_state, device,
+#                                     parallel, theta (cugraph), gpu_id
+#                                     (cugraph), and `ignored` list of
+#                                     kwargs the chosen backend dropped
+#   adata.uns["leiden"]["backend"]   — "scx-accel" or "cugraph"
 ```
 
 | Parameter | Default | Description |
@@ -934,23 +939,36 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `resolution` | 1.0 | Resolution parameter γ — higher values yield more communities |
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
-| `n_iterations` | -1 | Outer iterations: -1 = run until convergence (default, matches scanpy), >0 = fixed count. On the cuGraph path this can be raised safely (rapids-singlecell defaults to 100) — each additional iteration is cheap and gives better modularity convergence. |
-| `parallel` | `False` | Use parallel (conflict-free batched) local moving. `False` (default) uses sequential moving that matches C++ leidenalg. `True` is faster on large graphs but converges to a different local optimum. |
-| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. Only gates whether the cuGraph backend is **attempted** — see Dispatch priority below. |
-| `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored** by the Rust-native and leidenalg backends. |
+| `n_iterations` | 2 | Outer iterations: 2 matches the leidenalg package default; raise to e.g. 100 on the cuGraph path for tighter modularity convergence (rapids-singlecell's default). |
+| `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) matches C++ leidenalg sequential moving. **Ignored on the cuGraph path** (warns when `True`). |
+| `device` | `"auto"` | `"auto"` (cuGraph if available, else Rust-native), `"cpu"` (Rust-native), `"gpu"` / `"gpu:N"` (cuGraph on CUDA device 0 or N — `gpu:N` pins via `cupy.cuda.Device(N)`). |
+| `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored on the Rust-native path** (warns when non-default). |
 
-**Dispatch priority:** Rust-native → GPU cuGraph → Python leidenalg (fallback).
-The Rust path is tried first regardless of `device`; if it succeeds, GPU is
-not invoked even when `device="gpu"`. If Rust-native fails, a warning is
-issued and — if `device` resolves to GPU — the cuGraph path is tried next,
-then leidenalg as a final fallback.
+**Dispatch (post-spec):** two backends as peers, selected by `device`:
+
+* `device="cpu"` → Rust-native (`scx_accel::leiden`). ARI ≈ 0.97 vs
+  leidenalg on pbmc3k. Always available.
+* `device="gpu"` → cuGraph. ARI ≈ 0.92 vs leidenalg, by design (different
+  refinement strategy). Hard error if cuGraph is missing — no fallback.
+* `device="auto"` (default) → cuGraph when a CUDA device is visible and
+  `cugraph` imports cleanly, else Rust-native. Matches the rest of
+  `pyscx.accel.*`.
+
+**Migration note (vs the pre-spec dispatcher):** `device="auto"` previously
+ran Rust-native first regardless of host. After the spec it runs cuGraph
+on GPU hosts where cuGraph is installed, which produces a different
+partition (ARI 0.97 → 0.92 vs leidenalg). Pin `device="cpu"` to preserve
+the old behavior — required when downstream DE / annotation transfer /
+UMAP coloring is keyed on specific cluster IDs from previous runs. The
+Python `leidenalg` fallback has been deleted; callers who want it run
+`scanpy.tl.leiden(flavor="leidenalg")` directly.
 
 Benchmarked at 55s on 1M cells (**40× faster** than Python leidenalg's 2,226s
-in same-conditions comparison).
-ARI 0.92 vs Python leidenalg on census_1m. The Rust implementation may
-converge to a different local optimum than Python leidenalg — both produce
-valid, high-quality community structures. Compare via ARI or NMI when
-switching backends.
+in same-conditions comparison) on the Rust-native path; ~3.5s on the cuGraph
+path. ARI 0.92 vs Python leidenalg on census_1m for the cuGraph path. The
+two backends converge to different local optima — both produce valid
+high-quality community structures. Compare via ARI or NMI when switching
+backends.
 
 ### Batch integration / Harmony2 (`pyscx.accel.harmony_integrate`)
 
