@@ -11,6 +11,8 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
 use super::gpu::resolve_device;
+#[cfg(feature = "gpu")]
+use super::util::{extract_csr_slices, CsrSlices};
 
 /// Single-shard `ShardSource` adapter wrapping a borrowed `ScxCsr`.
 ///
@@ -46,6 +48,83 @@ impl ShardSource for ScxCsrSource<'_> {
     fn max_shard_rows(&self) -> scx_format::Result<usize> {
         Ok(self.csr.n_rows())
     }
+}
+
+/// Single-shard `ShardSource` adapter over **borrowed** numpy slices
+/// (Phase 10).
+///
+/// `extract_materialized_csr` + [`ScxCsrSource`] performs two full host
+/// copies of `indptr` / `indices` / `data`: one when `extract::<Vec<T>>`
+/// converts numpy → Rust `Vec`, and a second when `read_shard` clones
+/// the resulting `ScxCsr` for dispatch. For 1M × 2K HVGs that doubles
+/// host RSS during upload.
+///
+/// `BorrowedCsrSource` skips the first copy by holding `&[T]` views into
+/// numpy buffers (kept alive by the [`CsrSlices`] handle held by the
+/// caller). `read_shard` is invoked exactly once by
+/// `DoubleBufferedShardLoader::for_each_shard` for a single-shard source,
+/// so `slice.to_vec()` here replaces *both* the original `extract::<Vec>`
+/// step and the `ScxCsrSource::read_shard` clone — net one memcpy per
+/// dispatch instead of two.
+#[cfg(feature = "gpu")]
+struct BorrowedCsrSource<'a> {
+    indptr: &'a [i64],
+    indices: &'a [i32],
+    data: &'a [f32],
+    shape: (usize, usize),
+}
+
+#[cfg(feature = "gpu")]
+impl ShardSource for BorrowedCsrSource<'_> {
+    fn n_shards(&self) -> usize {
+        1
+    }
+    fn n_obs(&self) -> usize {
+        self.shape.0
+    }
+    fn n_vars(&self) -> usize {
+        self.shape.1
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<scx_sparse::ScxCsr> {
+        if shard_idx != 0 {
+            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: 1,
+            });
+        }
+        Ok(scx_sparse::ScxCsr::new_unchecked(
+            self.shape,
+            self.indptr.to_vec(),
+            self.indices.to_vec(),
+            self.data.to_vec(),
+        ))
+    }
+    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+        Ok(self.shape.0)
+    }
+}
+
+/// Try to obtain borrowed `&[T]` views over a materialised scipy / dense `X`
+/// for the GPU PCA fast-lane.
+///
+/// Returns `Ok(Some(...))` on success — caller holds the [`CsrSlices`] for
+/// the duration of dispatch so the underlying numpy buffers stay alive.
+/// Returns `Ok(None)` if `X` cannot be presented as a scipy CSR (e.g. a type
+/// scipy refuses to convert); callers fall through to the owned-`Vec` path.
+#[cfg(feature = "gpu")]
+fn try_extract_borrowed_csr<'py>(
+    py: Python<'py>,
+    x: &Bound<'py, PyAny>,
+) -> PyResult<Option<(CsrSlices<'py>, (usize, usize))>> {
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let csr_py = match scipy_sparse.call_method1("csr_matrix", (x,)) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let shape: (usize, usize) = csr_py.getattr("shape")?.extract()?;
+    let np = py.import("numpy")?;
+    let slices = extract_csr_slices(py, &np, &csr_py, "pca(device=\"gpu\")", 0)?;
+    Ok(Some((slices, shape)))
 }
 
 /// Pick the GPU PCA method: explicit user override, or auto-route by `n_vars`.
@@ -222,7 +301,36 @@ pub fn pca(
             return Ok(());
         }
 
-        // Materialized scipy/dense → ScxCsr → ScxCsrSource (single-shard).
+        // Materialised scipy / dense X. Phase 10 fast-lane: borrow numpy
+        // buffers via PyReadonlyArray1 instead of copying them into owned
+        // `Vec`s (halves the host RSS spike during dispatch). Falls back to
+        // the owned-Vec path if scipy cannot produce a CSR view.
+        if let Some((slices, shape)) = try_extract_borrowed_csr(py, &x)? {
+            let source = BorrowedCsrSource {
+                indptr: slices.indptr(),
+                indices: slices.indices(),
+                data: slices.data(),
+                shape,
+            };
+            let n_vars = source.n_vars();
+            let m = resolve_gpu_method(method, n_vars)?;
+            let result = gpu_pca_dispatch(
+                device_id,
+                &source,
+                n_comps,
+                n_oversamples,
+                n_power_iterations,
+                zero_center,
+                random_state,
+                m,
+                qr,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
+            return Ok(());
+        }
+
+        // Fallback: owned-Vec path (e.g. exotic X types scipy can't view).
         let csr = extract_materialized_csr(py, &x)?;
         let source = ScxCsrSource { csr: &csr };
         let n_vars = source.n_vars();

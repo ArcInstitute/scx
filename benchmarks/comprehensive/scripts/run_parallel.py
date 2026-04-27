@@ -363,8 +363,17 @@ def main() -> None:
 
     # Pre-submit runner contract check (Phase I.8). Catches capability
     # manifest violations before a 400-job fleet hits the scheduler.
-    # Gated off with --skip-smoke for exploratory runs.
-    if not getattr(args, "skip_smoke", False):
+    # Gated off with --skip-smoke for exploratory runs. Skipped automatically
+    # when no non-accel benchmarks are scheduled (accel benchmarks never
+    # touch the `runners/*_runner.py` contract surface — they go through
+    # `accel_*.py` modules in `comprehensive/benchmarks/`, which the smoke
+    # gate doesn't validate).
+    non_accel_benchmarks = [b for b in benchmarks if not b.startswith("accel_")]
+    needs_smoke = (
+        not getattr(args, "skip_smoke", False)
+        and len(non_accel_benchmarks) > 0
+    )
+    if needs_smoke:
         logger.info("Pre-submit smoke (use --skip-smoke to bypass) …")
         import subprocess as _sp
         rc = _sp.call([
@@ -376,7 +385,12 @@ def main() -> None:
                 "Runner contract check failed (rc=%d). Submit blocked. "
                 "Fix the runner or re-run with --skip-smoke.", rc,
             )
-            return
+            sys.exit(1)
+    elif not getattr(args, "skip_smoke", False):
+        logger.info(
+            "Pre-submit smoke skipped: no non-accel benchmarks scheduled. "
+            "Pass --skip-smoke to suppress this notice."
+        )
     logger.info("Datasets:   %s", datasets)
     logger.info("Formats:    %s", [f.key for f in formats])
     logger.info("Benchmarks: %s", benchmarks)

@@ -90,7 +90,7 @@ pub use linear_operator::CenteredSparseOperator;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
 pub use shard_pipeline::DoubleBufferedShardLoader;
-pub use sparse_dense::sparse_to_dense_gpu;
+pub use sparse_dense::{sparse_to_dense_gpu, sparse_to_dense_gpu_into};
 
 // Re-export cudarc types used in public API signatures.
 pub use cudarc::driver::safe::{CudaModule, CudaSlice, CudaStream};

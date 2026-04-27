@@ -14,7 +14,8 @@ use crate::shard_decode::GpuCsr;
 /// Compiled PTX for the sparse-to-dense kernel (produced by build.rs via nvcc --ptx).
 const SPARSE_DENSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sparse_dense.ptx"));
 
-/// Convert a GPU-resident CSR matrix to a dense row-major matrix.
+/// Convert a GPU-resident CSR matrix to a dense row-major matrix, allocating
+/// a fresh zero-initialised output buffer.
 ///
 /// # Arguments
 ///
@@ -31,6 +32,10 @@ const SPARSE_DENSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sparse_de
 ///
 /// A `CudaSlice<f32>` of size `n_rows × n_output_cols`, row-major, zero-filled
 /// for absent entries.
+///
+/// Thin wrapper around [`sparse_to_dense_gpu_into`] for one-shot callers that
+/// don't reuse a scratch buffer. Loop callers (e.g. `accumulate_gram`) should
+/// hoist the buffer and call [`sparse_to_dense_gpu_into`] directly.
 pub fn sparse_to_dense_gpu(
     device: &GpuDevice,
     gpu_csr: &GpuCsr,
@@ -43,9 +48,55 @@ pub fn sparse_to_dense_gpu(
         return device.alloc_zeros::<f32>(0);
     }
 
-    // Allocate zero-initialized output matrix
-    let total_elements = n_rows * n_output_cols;
-    let mut d_output = device.alloc_zeros::<f32>(total_elements)?;
+    let mut d_output = device.alloc_zeros::<f32>(n_rows * n_output_cols)?;
+    sparse_to_dense_gpu_into(device, gpu_csr, hvg_map, n_output_cols, &mut d_output)?;
+    Ok(d_output)
+}
+
+/// Convert a GPU-resident CSR matrix to a dense row-major matrix, writing into
+/// a caller-supplied scratch buffer instead of allocating.
+///
+/// # Buffer contract
+///
+/// `scratch` must satisfy `scratch.len() >= n_rows * n_output_cols`. The
+/// kernel only writes positions corresponding to nonzeros (and, with
+/// `hvg_map`, mapped output columns); empty rows and unmapped columns are
+/// left **unchanged**. Callers who reuse the same scratch across multiple
+/// CSRs must therefore zero the leading `n_rows * n_output_cols` region
+/// before each call to avoid carrying over stale values from a previous
+/// shard. `cudarc::driver::safe::CudaStream::memset_zeros` on a
+/// `slice_mut(0..n_rows * n_output_cols)` view is the cheapest way to do
+/// this.
+///
+/// Allocator-allocated buffers (e.g. via `alloc_zeros`) are zero-filled by
+/// construction; the first call after allocation does not need an explicit
+/// zero pass.
+///
+/// # Arguments
+///
+/// Same as [`sparse_to_dense_gpu`], plus `scratch` — the caller-owned output
+/// buffer.
+pub fn sparse_to_dense_gpu_into(
+    device: &GpuDevice,
+    gpu_csr: &GpuCsr,
+    hvg_map: Option<&CudaSlice<u32>>,
+    n_output_cols: usize,
+    scratch: &mut CudaSlice<f32>,
+) -> Result<(), GpuError> {
+    let (n_rows, _n_cols) = gpu_csr.shape;
+
+    if n_rows == 0 || n_output_cols == 0 {
+        return Ok(());
+    }
+
+    let needed = n_rows * n_output_cols;
+    if scratch.len() < needed {
+        return Err(GpuError::KernelLaunchFailed(format!(
+            "sparse_to_dense_gpu_into: scratch buffer too small ({} < {})",
+            scratch.len(),
+            needed
+        )));
+    }
 
     // Load PTX module (cached) and get kernel function
     let module = device.load_module_cached(SPARSE_DENSE_PTX)?;
@@ -78,7 +129,7 @@ pub fn sparse_to_dense_gpu(
                 .arg(&gpu_csr.indptr)
                 .arg(&gpu_csr.indices)
                 .arg(&gpu_csr.data)
-                .arg(&mut d_output)
+                .arg(scratch)
                 .arg(hmap)
                 .arg(&n_rows_i32)
                 .arg(&n_output_cols_i32)
@@ -94,7 +145,7 @@ pub fn sparse_to_dense_gpu(
                     .arg(&gpu_csr.indptr)
                     .arg(&gpu_csr.indices)
                     .arg(&gpu_csr.data)
-                    .arg(&mut d_output)
+                    .arg(scratch)
                     .arg(&null_ptr)
                     .arg(&n_rows_i32)
                     .arg(&n_output_cols_i32)
@@ -104,7 +155,7 @@ pub fn sparse_to_dense_gpu(
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("sparse_to_dense_kernel: {e}")))?;
 
-    Ok(d_output)
+    Ok(())
 }
 
 #[cfg(test)]
