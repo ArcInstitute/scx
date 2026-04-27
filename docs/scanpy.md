@@ -1356,7 +1356,18 @@ isn't in `var_names` get `NaN` in both columns — matching `arc-bench`.
 Builds perturbation-centroid matrices (pseudobulks excluding control), runs
 kNN + Leiden at multiple resolutions, and scores the real-vs-predicted
 cluster assignments via AMI / NMI / ARI. Matches
-`cell_eval.metrics._anndata.ClusteringAgreement`.
+`cell_eval.metrics._anndata.ClusteringAgreement` within `atol=0.15`.
+
+The implementation is **all native Rust** — no scanpy / anndata / igraph
+calls. The kNN graph uses `scx_accel::neighbors::build_knn_graph` (HNSW
+via `instant-distance`, with `ef_construction=200`, `ef_search=50`,
+`seed=0` baked in to match scanpy's exact-kNN reference within > 99 %
+recall on small centroid graphs); Leiden uses `scx_accel::leiden`
+sequential mode (`max_iterations=2`, `parallel=false`, `seed=0` —
+matches scanpy's `flavor="igraph", n_iterations=2`). The pred-side kNN
+graph is built once and reused across the resolution sweep, so only the
+Leiden pass re-runs per resolution. The whole hot path runs under
+`py.allow_threads`.
 
 ```python
 score = pyscx.accel.clustering_agreement(

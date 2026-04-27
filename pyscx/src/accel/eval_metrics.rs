@@ -1363,13 +1363,14 @@ pub fn clustering_agreement<'py>(
     embed_key: Option<&str>,
     min_cells_per_group: usize,
 ) -> PyResult<f64> {
-    // Note: this function intentionally holds the GIL throughout. Its per-
-    // resolution loop calls `sc.pp.neighbors` and `sc.tl.leiden` (Python
-    // scanpy), which require the GIL. Pushing clustering into pure Rust
-    // would let us release — that refactor is tracked as a follow-up.
-    let np = py.import("numpy")?;
-    let sc = py.import("scanpy")?;
-    let ad_mod = py.import("anndata")?;
+    // Native-Rust path: kNN graph + Leiden clustering live entirely in
+    // `scx_accel`, so the entire hot path runs under `py.allow_threads`.
+    // No scanpy / anndata / igraph imports — the Leiden defaults
+    // (`seed=0`, `parallel=false`, `max_iterations=2`) are calibrated
+    // against the C++ leidenalg / python-igraph references; HNSW defaults
+    // (`ef_construction=200`, `ef_search=50`) are kept hidden inside the
+    // implementation since scanpy's `sc.pp.neighbors` similarly hides the
+    // exact-vs-approx knobs from this caller.
 
     // Parse clustering metric.
     let clustering_metric = scx_accel::ClusteringMetric::parse(metric).ok_or_else(|| {
@@ -1426,149 +1427,109 @@ pub fn clustering_agreement<'py>(
     let mut sorted_indices: Vec<usize> = (0..n_output).collect();
     sorted_indices.sort_by(|&a, &b| pert_names[a].cmp(&pert_names[b]));
 
-    let mut sorted_real = vec![0.0f64; n_output * n_genes];
-    let mut sorted_pred = vec![0.0f64; n_output * n_genes];
-
+    // `scx_accel::neighbors::build_knn_graph` takes `&[f32]` only. Cast
+    // centroids row-by-row in the same step that reorders by pert name.
+    // Log-normalised counts are well below `f32::MAX`, but flag overflow
+    // defensively in case a caller passes raw counts via `embed_key`.
+    let mut sorted_real_f32 = vec![0.0f32; n_output * n_genes];
+    let mut sorted_pred_f32 = vec![0.0f32; n_output * n_genes];
+    let mut overflow_seen = false;
     for (new_idx, &old_idx) in sorted_indices.iter().enumerate() {
-        sorted_real[new_idx * n_genes..(new_idx + 1) * n_genes]
-            .copy_from_slice(&centroids_real[old_idx * n_genes..(old_idx + 1) * n_genes]);
-        sorted_pred[new_idx * n_genes..(new_idx + 1) * n_genes]
-            .copy_from_slice(&centroids_pred[old_idx * n_genes..(old_idx + 1) * n_genes]);
+        let dst_real = &mut sorted_real_f32[new_idx * n_genes..(new_idx + 1) * n_genes];
+        let dst_pred = &mut sorted_pred_f32[new_idx * n_genes..(new_idx + 1) * n_genes];
+        let src_real = &centroids_real[old_idx * n_genes..(old_idx + 1) * n_genes];
+        let src_pred = &centroids_pred[old_idx * n_genes..(old_idx + 1) * n_genes];
+        for (d, &s) in dst_real.iter_mut().zip(src_real.iter()) {
+            if !overflow_seen && s.abs() > f32::MAX as f64 {
+                overflow_seen = true;
+            }
+            *d = s as f32;
+        }
+        for (d, &s) in dst_pred.iter_mut().zip(src_pred.iter()) {
+            if !overflow_seen && s.abs() > f32::MAX as f64 {
+                overflow_seen = true;
+            }
+            *d = s as f32;
+        }
+    }
+    if overflow_seen {
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            (
+                "clustering_agreement: centroid value exceeds f32::MAX during \
+              cast — kNN graph construction will use saturating values. \
+              Consider supplying log-normalised counts via embed_key.",
+            ),
+        )?;
     }
 
-    // ── Build AnnData centroid objects for scanpy ────────────────────
-    let real_arr = np.call_method1("array", (sorted_real,))?;
-    let real_2d = real_arr.call_method1("reshape", ((n_output, n_genes),))?;
-    let real_2d_f64 = real_2d.call_method1("astype", ("float64",))?;
-    let ad_real_cent = ad_mod.call_method(
-        "AnnData",
-        (),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("X", &real_2d_f64)?;
-            kw
-        }),
-    )?;
-
-    let pred_arr = np.call_method1("array", (sorted_pred,))?;
-    let pred_2d = pred_arr.call_method1("reshape", ((n_output, n_genes),))?;
-    let pred_2d_f64 = pred_2d.call_method1("astype", ("float64",))?;
-    let ad_pred_cent = ad_mod.call_method(
-        "AnnData",
-        (),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("X", &pred_2d_f64)?;
-            kw
-        }),
-    )?;
-
-    // ── Build kNN graphs and cluster ────────────────────────────────
     let effective_n_neighbors = n_neighbors.min(n_output - 1);
 
-    // Build kNN graph + Leiden for real centroids.
-    let sc_pp = sc.getattr("pp")?;
-    let sc_tl = sc.getattr("tl")?;
+    // ── Build kNN + run Leiden, all in Rust, GIL released ───────────
+    let resolutions_owned = resolutions.clone();
+    let best_score: scx_accel::Result<f64> = py.allow_threads(|| {
+        // Build real-side kNN once.
+        let real_knn = scx_accel::build_knn_graph(
+            &sorted_real_f32,
+            n_output,
+            n_genes,
+            effective_n_neighbors,
+            /*ef_construction=*/ 200,
+            /*ef_search=*/ 50,
+            /*seed=*/ 0,
+        )?;
+        let real_leiden = scx_accel::leiden(
+            &real_knn.conn_indptr,
+            &real_knn.conn_indices,
+            &real_knn.conn_data,
+            n_output,
+            real_resolution,
+            /*seed=*/ 0,
+            /*max_iterations=*/ 2,
+            /*parallel=*/ false,
+        )?;
+        // `LeidenResult.membership` is `Vec<usize>`; the AMI/NMI/ARI scoring
+        // signature is `&[u32]`. Cast row-by-row — community counts in the
+        // centroid graph (≤ 3000 nodes) cannot exceed u32::MAX.
+        let real_labels_u32: Vec<u32> = real_leiden.membership.iter().map(|&c| c as u32).collect();
 
-    sc_pp.call_method(
-        "neighbors",
-        (&ad_real_cent,),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("n_neighbors", effective_n_neighbors)?;
-            kw.set_item("use_rep", "X")?;
-            kw
-        }),
-    )?;
-
-    sc_tl.call_method(
-        "leiden",
-        (&ad_real_cent,),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("resolution", real_resolution)?;
-            kw.set_item("key_added", "real_clusters")?;
-            kw.set_item("flavor", "igraph")?;
-            kw.set_item("n_iterations", 2)?;
-            kw
-        }),
-    )?;
-
-    // Extract real cluster labels as u32 array.
-    let real_obs = ad_real_cent.getattr("obs")?;
-    let real_labels_series = real_obs.get_item("real_clusters")?;
-    let real_label_codes: Vec<i64> = real_labels_series
-        .getattr("cat")?
-        .getattr("codes")?
-        .call_method0("tolist")?
-        .extract()?;
-    // Validate and convert label codes. Pandas categorical codes use -1 for
-    // missing/NA values, which would silently become u32::MAX.
-    if real_label_codes.iter().any(|&c| c < 0) {
-        return Err(PyRuntimeError::new_err(
-            "Leiden produced NA cluster labels for real centroids",
-        ));
-    }
-    let real_labels_u32: Vec<u32> = real_label_codes.iter().map(|&c| c as u32).collect();
-
-    // Build kNN graph for predicted centroids (reusable across resolutions).
-    sc_pp.call_method(
-        "neighbors",
-        (&ad_pred_cent,),
-        Some(&{
-            let kw = PyDict::new(py);
-            kw.set_item("n_neighbors", effective_n_neighbors)?;
-            kw.set_item("use_rep", "X")?;
-            kw
-        }),
-    )?;
-
-    // ── Sweep predicted resolutions and compute best score ──────────
-    // Initialize to NEG_INFINITY so that even if all scores are negative
-    // (possible with AMI), we return an actual computed value.
-    let mut best_score = f64::NEG_INFINITY;
-
-    for &r in &resolutions {
-        let pred_key = format!("pred_clusters_{}", r);
-
-        sc_tl.call_method(
-            "leiden",
-            (&ad_pred_cent,),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("resolution", r)?;
-                kw.set_item("key_added", pred_key.as_str())?;
-                kw.set_item("flavor", "igraph")?;
-                kw.set_item("n_iterations", 2)?;
-                kw
-            }),
+        // Build pred-side kNN once and reuse across the resolution sweep —
+        // only the Leiden pass re-runs per resolution.
+        let pred_knn = scx_accel::build_knn_graph(
+            &sorted_pred_f32,
+            n_output,
+            n_genes,
+            effective_n_neighbors,
+            200,
+            50,
+            0,
         )?;
 
-        // Extract predicted cluster labels.
-        let pred_obs = ad_pred_cent.getattr("obs")?;
-        let pred_labels_series = pred_obs.get_item(pred_key.as_str())?;
-        let pred_label_codes: Vec<i64> = pred_labels_series
-            .getattr("cat")?
-            .getattr("codes")?
-            .call_method0("tolist")?
-            .extract()?;
-        // Validate and convert predicted label codes.
-        if pred_label_codes.iter().any(|&c| c < 0) {
-            return Err(PyRuntimeError::new_err(format!(
-                "Leiden produced NA cluster labels for predicted centroids at resolution {}",
-                r
-            )));
-        }
-        let pred_labels_u32: Vec<u32> = pred_label_codes.iter().map(|&c| c as u32).collect();
+        let mut best = f64::NEG_INFINITY;
+        for &r in &resolutions_owned {
+            let pred_leiden = scx_accel::leiden(
+                &pred_knn.conn_indptr,
+                &pred_knn.conn_indices,
+                &pred_knn.conn_data,
+                n_output,
+                r,
+                /*seed=*/ 0,
+                /*max_iterations=*/ 2,
+                /*parallel=*/ false,
+            )?;
+            let pred_labels_u32: Vec<u32> =
+                pred_leiden.membership.iter().map(|&c| c as u32).collect();
 
-        // Compute scoring metric in Rust.
-        let score = clustering_metric.score(&real_labels_u32, &pred_labels_u32);
-        if score > best_score {
-            best_score = score;
+            let score = clustering_metric.score(&real_labels_u32, &pred_labels_u32);
+            if score > best {
+                best = score;
+            }
         }
-    }
+        Ok(best)
+    });
 
-    Ok(best_score)
+    best_score.map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
