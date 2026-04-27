@@ -473,3 +473,211 @@ class TestLog1pColProjectionRegression:
         assert adata.X.shape == filtered_shape, (
             "Shape changed after log1p in filter→normalize→log1p pipeline"
         )
+
+
+def _gpu_available() -> bool:
+    try:
+        return pyscx.accel.gpu_info() is not None
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — skipping GPU dispatch test",
+)
+def test_log1p_gpu_on_scipy_falls_back_to_cpu():
+    """`log1p(device="gpu")` on a materialised scipy CSR (no fusion marker,
+    no backed/lazy source) emits a `UserWarning` and produces output identical
+    to `sc.pp.log1p`. The slow on-device-materialised path was retired —
+    catastrophically slow per benchmarks (0.00–0.02× vs CPU)."""
+    import anndata
+    import scanpy as sc
+
+    rng = np.random.default_rng(0)
+    dense = rng.poisson(2.0, size=(200, 100)).astype(np.float32)
+    dense[rng.random(dense.shape) > 0.3] = 0
+    x = sp.csr_matrix(dense)
+
+    a_gpu = anndata.AnnData(X=x.copy())
+    a_ref = anndata.AnnData(X=x.copy())
+
+    with pytest.warns(UserWarning, match="falls back to CPU"):
+        pyscx.accel.log1p(a_gpu, device="gpu")
+
+    sc.pp.log1p(a_ref)
+
+    assert sp.issparse(a_gpu.X), "X should remain scipy sparse after fallback"
+    np.testing.assert_allclose(
+        a_gpu.X.toarray(), a_ref.X.toarray(), rtol=1e-6, atol=1e-7
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fusion-marker lifecycle (Phase 5 follow-up)
+#
+# `normalize_total(device="gpu")` stashes a marker on `adata.uns` so a
+# subsequent `log1p(device="gpu")` can re-fuse normalize+log1p over the
+# original backed source. The marker is **valid only while X and its
+# row/col dimensions are unchanged**. Anything that mutates X or changes
+# obs/var shape MUST clear it; otherwise the next GPU log1p replays the
+# fused pass and silently overwrites whatever happened in between.
+# ---------------------------------------------------------------------------
+
+_MARKER_KEY = "__scx_gpu_pending_normalize__"
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_marker_stashed_after_gpu_normalize_on_backed(scx_file):
+    """Sanity baseline: backed X + GPU normalize stashes the marker."""
+    path, _ = scx_file
+    adata = pyscx.open(path).to_anndata(backed=True)
+
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+    assert _MARKER_KEY in adata.uns, (
+        "GPU normalize on backed data must stash the fusion marker"
+    )
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_marker_cleared_by_filter_genes(scx_file):
+    """`filter_genes` changes n_vars and MUST clear any stale marker — a
+    subsequent GPU log1p replay over the original source would otherwise
+    produce a wrong-shape X.
+    """
+    path, _ = scx_file
+    adata = pyscx.open(path).to_anndata(backed=True)
+
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+    assert _MARKER_KEY in adata.uns
+
+    pyscx.accel.filter_genes(adata, min_cells=1)
+    assert _MARKER_KEY not in adata.uns, (
+        "filter_genes must clear the fusion marker (n_vars changed)"
+    )
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_marker_cleared_by_filter_cells(scx_file):
+    """`filter_cells` changes n_obs and MUST clear any stale marker."""
+    path, _ = scx_file
+    adata = pyscx.open(path).to_anndata(backed=True)
+
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+    assert _MARKER_KEY in adata.uns
+
+    pyscx.accel.filter_cells(adata, min_counts=0.0)
+    assert _MARKER_KEY not in adata.uns, (
+        "filter_cells must clear the fusion marker (n_obs changed)"
+    )
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_marker_cleared_by_cpu_log1p(scx_file):
+    """CPU `log1p` MUST clear the marker — otherwise a follow-up GPU log1p
+    would silently re-fuse from the original source and overwrite the CPU
+    log1p result.
+    """
+    path, _ = scx_file
+    adata = pyscx.open(path).to_anndata(backed=True)
+
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+    assert _MARKER_KEY in adata.uns
+
+    pyscx.accel.log1p(adata, device="cpu")
+    assert _MARKER_KEY not in adata.uns, (
+        "CPU log1p must clear the fusion marker"
+    )
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_marker_cleared_by_second_normalize(scx_file):
+    """A second `normalize_total` call (any device) supersedes the prior
+    marker. The CPU/scipy-fallback branch must leave it cleared; the GPU
+    branch re-stashes a fresh one.
+    """
+    path, _ = scx_file
+    adata = pyscx.open(path).to_anndata(backed=True)
+
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+    first = adata.uns[_MARKER_KEY]
+
+    # X is now scipy CSR; CPU normalize falls through to scanpy and must clear.
+    pyscx.accel.normalize_total(adata, target_sum=5e3, device="cpu")
+    assert _MARKER_KEY not in adata.uns, (
+        "CPU normalize_total after GPU normalize must clear the stale marker"
+    )
+    del first  # silence linters — we asserted presence above by indexing
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_marker_preserved_through_pca(scx_file):
+    """Ops that don't mutate X (PCA) must leave the marker intact — a
+    follow-up GPU log1p can still take the fast fusion path.
+    """
+    path, _ = scx_file
+    adata = pyscx.open(path).to_anndata(backed=True)
+
+    pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+    assert _MARKER_KEY in adata.uns
+
+    pyscx.accel.pca(adata, n_comps=10, device="cpu")
+    assert _MARKER_KEY in adata.uns, (
+        "PCA does not mutate X — fusion marker must remain valid"
+    )
+
+
+@pytest.mark.skipif(
+    not _gpu_available(),
+    reason="CUDA GPU not available — marker is only stashed by GPU normalize",
+)
+def test_no_marker_for_scipy_normalize_then_gpu_log1p_falls_back():
+    """Issue 4: when X is already scipy CSR, `normalize_total(device="gpu")`
+    falls through to scanpy and does NOT stash a marker. A subsequent
+    `log1p(device="gpu")` must therefore hit the slow scipy-fallback path
+    (UserWarning + scanpy delegation) and produce the same result as
+    `sc.pp.normalize_total` then `sc.pp.log1p`.
+    """
+    import anndata
+    import scanpy as sc
+
+    rng = np.random.default_rng(0)
+    dense = rng.poisson(2.0, size=(200, 100)).astype(np.float32)
+    dense[rng.random(dense.shape) > 0.3] = 0
+    x = sp.csr_matrix(dense)
+
+    a_gpu = anndata.AnnData(X=x.copy())
+    a_ref = anndata.AnnData(X=x.copy())
+
+    pyscx.accel.normalize_total(a_gpu, target_sum=1e4, device="gpu")
+    assert _MARKER_KEY not in a_gpu.uns, (
+        "scipy-fallback normalize must NOT stash a fusion marker"
+    )
+
+    with pytest.warns(UserWarning, match="falls back to CPU"):
+        pyscx.accel.log1p(a_gpu, device="gpu")
+
+    sc.pp.normalize_total(a_ref, target_sum=1e4)
+    sc.pp.log1p(a_ref)
+
+    np.testing.assert_allclose(
+        a_gpu.X.toarray(), a_ref.X.toarray(), rtol=1e-5, atol=1e-6
+    )

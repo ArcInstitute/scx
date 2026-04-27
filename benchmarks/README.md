@@ -9,29 +9,46 @@ This directory contains the benchmarking infrastructure for SCX — scripts, SLU
 ```
 benchmarks/
 ├── README.md              ← You are here
-├── scripts/               # Benchmark scripts and SLURM job definitions
+├── scripts/               # Legacy benchmark scripts and SLURM job definitions
 │   ├── run_benchmarks_slurm.sh          # All-in-one SLURM submission (3 sub-jobs)
 │   ├── submit_benchmarks.py             # Programmatic SLURM submission via submitit
 │   ├── benchmark_all.py                 # Orchestrator: compression + write + read
-│   ├── benchmark_*.py                   # Individual Python benchmark scripts
-│   ├── benchmark_bpcells.R              # BPCells benchmark (R)
-│   ├── slurm_*.sh                       # Standalone SLURM job scripts
+│   ├── benchmark_*.py                   # Individual Python benchmark scripts (accelerators, GPU, harmony, lisi, leiden, lazy_preprocess, ...)
+│   ├── slurm_*.sh                       # Standalone SLURM job scripts (phase0-phase9, GPU, harmony, lazy, parallel-scaling, ...)
 │   ├── download_datasets.sh             # Download & convert benchmark datasets
 │   ├── download_*.py                    # Dataset-specific downloaders
 │   ├── build_census_*.py                # Large dataset builders (5M, 10M cells)
+│   ├── build_harmony_validation_fixtures.py  # Harmony2 validation fixture builder
 │   ├── build_release.py                 # Helper: ensure pyscx release build
 │   ├── verify_datasets.py               # Validate datasets & record metadata
-│   └── setup_cloud_test_data.sh         # Cloud benchmark test data setup
+│   ├── setup_cloud_test_data.sh         # Cloud benchmark test data setup
+│   ├── bench_env.py                     # Shared .env loader (python-dotenv)
+│   ├── generate_compressed_h5ad.py      # Pre-generate gzip/lzf h5ad variants
+│   ├── generate_phase3g_report.py       # Phase 3g report generator
+│   ├── prep_lognorm_datasets.py         # Log-normalized dataset prep
+│   ├── augment_obs_n_counts.py          # Backfill obs.n_counts for legacy fixtures
+│   ├── gpu_regression_driver.sh         # DEPRECATED (Phase 9): use comprehensive/scripts/gate_candidate.py
+│   ├── gpu_regression_diff.py           # DEPRECATED (Phase 9): superseded by compare_against_baseline.py
+│   └── run_with_rayon_limit.sh          # Wrapper that pins RAYON_NUM_THREADS
+├── r_scripts/             # Top-level R benchmark scripts
+│   └── benchmark_bpcells.R              # BPCells benchmark driver (called via Rscript)
 ├── comprehensive/         # Comprehensive benchmark suite (Phase 3+)
 │   ├── config.py                        # Dataset paths, format configs, constants
 │   ├── sysinfo.py                       # System info collector (CPU, RAM, OS, disk)
 │   ├── results.py                       # BenchmarkResult schema + JSON writer
 │   ├── convert.py                       # Shared conversion cache (convert once, reuse)
+│   ├── cloud_fixtures.py                # GCP fixture self-healing + credential resolution
+│   ├── queries.py                       # Shared query fixtures (HVG lists, filters, row/col slices)
+│   ├── profile.py                       # Per-run peak-RSS / timing profiler helpers
+│   ├── provenance.py                    # Git SHA / env capture for summary.json
+│   ├── thresholds.yaml                  # Hard-floor + tolerance config for the regression gate
+│   ├── requirements.txt                 # pip fallback pins (conda envs are authoritative)
 │   ├── envs/                            # Conda environment definitions
 │   │   ├── scx-bench.yml                # CPU benchmark environment
 │   │   ├── scx-bench-gpu.yml            # GPU benchmark environment (CUDA + RAPIDS)
 │   │   ├── scx-bench-r.yml              # R / BPCells benchmark environment
-│   │   └── scx-bench-slaf.yml           # SLAF (slafdb) benchmark environment
+│   │   ├── scx-bench-slaf.yml           # SLAF (slafdb) benchmark environment
+│   │   └── scx-bench-eval.yml           # Perturbation / cell-eval parity environment
 │   ├── runners/                         # Per-format benchmark runners
 │   │   ├── base.py                      # Abstract FormatRunner interface
 │   │   ├── h5ad_runner.py               # h5ad (uncompressed, gzip, lzf)
@@ -40,22 +57,35 @@ benchmarks/
 │   │   ├── scx_runner.py                # SCX (auto, none, scx1, zstd, pcodec, lz4)
 │   │   ├── bpcells_runner.py            # BPCells (R subprocess)
 │   │   ├── parquet_runner.py            # Parquet (pyarrow)
-│   │   └── slaf_runner.py               # SLAF (slafdb — Lance + DuckDB)
+│   │   ├── slaf_runner.py               # SLAF (slafdb — Lance + DuckDB)
+│   │   └── accel_runner.py              # pyscx.accel.* accelerator runner (CPU + GPU dispatch)
 │   ├── benchmarks/                      # Benchmark modules (one per dimension)
-│   ├── reporting/                       # Report generation (markdown, plots, tables)
+│   │   ├── compression.py, write.py, read_full.py, read_selective.py
+│   │   ├── parallel_scaling.py, parallel_write_scaling.py, memory.py, ml_loader.py
+│   │   ├── fragment_ops.py, correctness.py
+│   │   ├── accel_{pca,knn,umap,leiden,preprocess,hvg}.py   # Phase 9 accel surface
+│   │   ├── cloud_{push,pull,read,metadata,filtered,large_atlas,reader_vs_pull}.py, cost_model.py
+│   │   └── cell_eval_parity_perf.py, _pert_synth.py        # perturbation / cell-eval parity
+│   ├── reporting/                       # Report generation (markdown, plots, tables, dashboard)
+│   │   └── markdown.py, plots.py, tables.py, dashboard.py, landing.py, style.py
 │   ├── scripts/                         # Orchestrators and SLURM launchers
 │   │   ├── run_all.py                   # Serial benchmark orchestrator
 │   │   ├── run_parallel.py              # Parallel SLURM launcher via submitit
 │   │   ├── run_slurm.sh                 # SLURM submission script
 │   │   ├── install_dependencies.sh      # Create conda environments
 │   │   ├── validate_*.py                # Correctness validation scripts
-│   │   ├── slurm_*.sh                   # SLURM job scripts
+│   │   ├── validation_helpers.py        # Shared helpers for validate_*.py
+│   │   ├── smoke_test_runners.py        # Fast per-runner smoke test
+│   │   ├── slurm_*.sh                   # SLURM job scripts (validation suite, capture, parity, ...)
 │   │   │
 │   │   │  # Regression gating (on-demand)
-│   │   ├── gate_candidate.sh            # One-shot: capture + gate against LATEST baseline
+│   │   ├── gate_candidate.py            # One-shot: capture + gate against LATEST baseline
 │   │   ├── capture_baseline.py          # Freeze one snapshot (raw/ + summary.json + manifest)
 │   │   ├── promote_baseline.py          # Promote a snapshot to results/baselines/<version>/
 │   │   ├── compare_against_baseline.py  # Relative + absolute-floor + justification gate
+│   │   ├── _justifications.py           # Justification frontmatter loader used by the gate
+│   │   ├── fingerprint_accelerators.py  # Record accelerator library versions into summary.json
+│   │   ├── ooc_rss_table.py             # OOC pipeline peak-RSS table generator
 │   │   ├── publish_dashboard.py         # Rsync HTML snapshot to DASHBOARD_PUBLISH_TARGET
 │   │   │
 │   │   │  # Cloud infrastructure (GCP)
@@ -64,15 +94,24 @@ benchmarks/
 │   │   ├── cloud_fixtures_doctor.py     # Dry-run probe: local vs cloud fixture drift
 │   │   ├── submit_gcp_matrix.py         # Instance-type × benchmark launcher (--yes-spend)
 │   │   ├── gcs_lifecycle.json           # Committed GCS object-lifecycle rules
+│   │   ├── repro_slaf_cloud_read.py     # Standalone SLAF GCS-read repro
+│   │   ├── repro_zarr_cloud_read.py     # Standalone Zarr GCS-read repro
 │   │   │
 │   │   │  # Observability + migrations
 │   │   ├── watch.py                     # Rich TUI tailing run_manifest.json + submitit logs
 │   │   └── migrate_results.py           # Back-stamp schema_version on legacy raw JSONs
-│   ├── r_scripts/                       # BPCells R benchmark scripts
-│   └── results/                         # Raw JSON results + generated reports
+│   ├── tests/                           # Gate self-test + cloud-mechanism pytest suite
+│   ├── r_scripts/                       # BPCells R benchmark scripts (used by bpcells_runner)
+│   ├── logs/                            # submitit / SLURM job logs
+│   └── results/                         # Raw JSON results, candidate snapshots, and baselines
 │       ├── raw/                         # One JSON per benchmark×format×dataset
-│       └── reports/                     # Generated markdown + plots
+│       ├── reports/                     # Generated markdown + plots
+│       ├── baselines/                   # Promoted baselines + LATEST pointer (v0.5.0-phase5, v0.6.0-gpu-phase1-7, ...)
+│       ├── justifications/              # Markdown justifications with frontmatter triples
+│       └── candidate_*/, tier*_*/, baseline_*/  # Dated capture snapshots
 ├── results/               # Per-script benchmark output (JSON + Markdown reports)
+│   ├── pre_phases_1_7_baseline_2026_03/ # Frozen pre-Phase-1-7 GPU baseline (see §GPU workflow)
+│   └── harmony/                         # Harmony2 validation fixtures + run outputs
 └── logs/                  # SLURM job logs (.out, .err, .log)
 ```
 
@@ -502,7 +541,7 @@ Benchmarks use the following partitions:
 | High-memory CPU jobs (≥500 GB) | `cpu_high_mem` | — |
 | GPU jobs | `preemptible` | `gpu_batch` |
 
-Preemptible partitions offer faster scheduling and lower cost. If a job is preempted, resubmit it — benchmark scripts are idempotent. Use the fallback (`cpu_batch` / `gpu_batch`) partitions only when preemptible queues are too congested or when you need guaranteed completion (e.g., multi-day runs).
+Preemptible partitions offer faster scheduling and lower cost. **Preempted jobs on Chimera are automatically requeued back into the preemptible partition by SLURM** — no manual resubmission needed. Because benchmark scripts are idempotent, requeued jobs pick up cleanly (existing converted files are skipped, per-triple result JSONs are unique). Use the fallback (`cpu_batch` / `gpu_batch`) partitions only when preemptible queues are too congested or when you need guaranteed completion without requeue churn (e.g., multi-day runs).
 
 To override the partition for any script that takes a `--partition` flag:
 
@@ -558,7 +597,7 @@ under `benchmarks/scripts/slurm_*.sh` are deprecated (see
        --datasets pbmc3k tabula_sapiens_100k
 
 4. Regression gate (on-demand — per PR, pre-release, on-suspicion):
-   bash benchmarks/comprehensive/scripts/gate_candidate.sh
+   python benchmarks/comprehensive/scripts/gate_candidate.py
 ```
 
 > [!IMPORTANT]
@@ -618,7 +657,6 @@ Benchmark outputs are organized into two directories:
 
 - **`benchmarks/results/`** — Per-script benchmark results (JSON + Markdown reports, GPU Go/No-Go gates)
 - **`benchmarks/comprehensive/results/raw/`** — Phase 3 comprehensive benchmarks (500+ JSON files, one per benchmark×format×dataset)
-- **`benchmarks/comprehensive/reporting/phase3_report.md`** — Phase 3 comprehensive report (D1–D7, 12 formats, 6 benchmarks)
 
 To list comprehensive results:
 
@@ -639,33 +677,69 @@ result is tied to a specific commit the operator cares about.
 ### On-demand workflow (one command)
 
 ```bash
-bash benchmarks/comprehensive/scripts/gate_candidate.sh
+python benchmarks/comprehensive/scripts/gate_candidate.py
 ```
 
 That captures a snapshot named `candidate_<git-sha>_<YYYYMMDD>` at the
 `small` tier and runs the gate against `results/baselines/LATEST`
-(maintained by `promote_baseline.py`). Exit code bubbles up: `0` = pass,
+(maintained by `promote_baseline.py`). The default coverage matrix is
+**format + accel CPU + accel GPU**. Exit code bubbles up: `0` = pass,
 `1` = unjustified regression / floor violation / fingerprint mismatch,
-`2` = missing inputs.
+`2` = pre-flight failure / missing inputs, `130` = SIGINT.
+
+Each invocation writes a timestamped log to
+`benchmarks/comprehensive/logs/gate_candidate_<sha>_<TS>.log` plus a
+sidecar `*.summary.json` with the phase / exit / elapsed / coverage
+plan for downstream tooling.
+
+The script is also executable directly:
+`benchmarks/comprehensive/scripts/gate_candidate.py`.
 
 Common options:
 
 ```bash
 # Larger tier (full dataset set)
-bash benchmarks/comprehensive/scripts/gate_candidate.sh --tier full
+python benchmarks/comprehensive/scripts/gate_candidate.py --tier full
 
 # Reuse an already-captured candidate (skips the capture step)
-bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+python benchmarks/comprehensive/scripts/gate_candidate.py \
     --skip-capture --name candidate_abc1234_20260420
 
 # Pin a specific historical baseline instead of LATEST
-bash benchmarks/comprehensive/scripts/gate_candidate.sh \
+python benchmarks/comprehensive/scripts/gate_candidate.py \
     --baseline benchmarks/comprehensive/results/baselines/v0.4.0
 
-# Anything after known flags is passed through to compare_against_baseline.py
-bash benchmarks/comprehensive/scripts/gate_candidate.sh \
-    --timing-tolerance 0.05 --report-json /tmp/gate.json
+# Anything after `--` is forwarded to compare_against_baseline.py
+python benchmarks/comprehensive/scripts/gate_candidate.py \
+    -- --timing-tolerance 0.05 --report-json /tmp/gate.json
 ```
+
+#### CPU / GPU / accel modes
+
+The gate covers three benchmark axes — pick a subset when iterating
+locally to shorten turnaround. Pre-flight checks fail fast if the host
+can't satisfy the requested mode (e.g. `--no-gpu` was not set but
+`nvidia-smi` reports no GPUs).
+
+```bash
+# CPU-only (skip accel GPU variants — useful on a GPU host validating
+# a CPU-only refactor, or on a CPU-only laptop):
+python benchmarks/comprehensive/scripts/gate_candidate.py --no-gpu
+
+# Accel only — fast iteration on PCA / kNN / UMAP / Leiden kernels:
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only
+
+# Accel CPU only (CPU-only laptop, no GPU coverage at all):
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only --no-gpu
+
+# Format only (skip accel — older default; useful for codec / sharding work):
+python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel
+```
+
+`--no-accel` and `--accel-only` are mutually exclusive; `--no-gpu` is
+orthogonal and composes with either. The coverage banner the script
+prints before capture (`format benchmarks ✓ / accel CPU ✓ / accel GPU ✗`)
+is the source of truth for what was actually exercised.
 
 **Recommended trigger points:**
 
@@ -675,6 +749,11 @@ bash benchmarks/comprehensive/scripts/gate_candidate.sh \
   baseline if the gate passes (see "Promoting" below).
 - On-suspicion: after a suspicious benchmark result, landed profiler
   change, or upstream dependency bump.
+
+There is no CI-side gate — the prior `.github/workflows/accel-gate.yml`
+was removed because the self-hosted GPU runner queue made the loop
+unworkable. Run the gate locally before merging any PR that touches
+accelerator paths.
 
 ### Direct gate invocation (advanced)
 
@@ -704,7 +783,7 @@ canonical baseline promoted yet.
 ### Promoting a canonical baseline
 
 Snapshots land in `benchmarks/comprehensive/results/<name>/` from
-`capture_baseline.py` (or via the `gate_candidate.sh` wrapper). To
+`capture_baseline.py` (or via the `gate_candidate.py` wrapper). To
 promote one as the canonical release baseline:
 
 ```bash
@@ -713,12 +792,14 @@ python benchmarks/comprehensive/scripts/promote_baseline.py \
     --version v0.5.0-phase5
 ```
 
+> Change `--version v0.5.0-phase5` as needed
+
 This copies only `summary.json` + `environment.json` + `MANIFEST.sha256`
 into `results/baselines/v0.5.0-phase5/`, and updates `results/baselines/LATEST`
 to point at the new version (relative symlink, pointer-file fallback on
 filesystems that reject symlinks). The gate's `--baseline` auto-resolves
 to `LATEST`, so no follow-up configuration is needed — next
-`gate_candidate.sh` run compares against the newly-promoted baseline.
+`gate_candidate.py` run compares against the newly-promoted baseline.
 
 Raw per-run JSONs stay gitignored; the manifest provides tamper-evidence.
 Pass `--no-latest` to promote without touching the `LATEST` pointer
@@ -776,6 +857,116 @@ disappearing benchmarks flagged, absolute-floor violations fail):
 Run it locally before opening a PR that touches the gate.
 
 ---
+
+## GPU accelerator regression workflow
+
+Post-Phase-9, the comprehensive baseline at
+`comprehensive/results/baselines/LATEST` (currently
+`v0.6.0-gpu-phase1-7-multidataset`) covers both format-level **and**
+GPU-accelerator benchmarks (`accel_pca`, `accel_knn`, `accel_umap`,
+`accel_leiden`, `accel_preprocess`, `accel_hvg`) across pbmc3k,
+tabula_sapiens_100k, and census_1m. Per-run correctness metrics
+(`cosine_sim_min`/`mean`, `recall_vs_scanpy`, `trustworthiness`,
+`ari_vs_leidenalg`, `max_abs_diff_vs_scanpy`,
+`hvg_overlap_vs_scanpy`) flow into `runs[].extra` so the absolute
+floors in `thresholds.yaml` evaluate real values, not
+`missing` placeholders.
+
+**You should not need separate GPU tooling.** The standard
+[Regression Gating workflow](#regression-gating) handles accelerator
+PRs end-to-end. The standalone `benchmarks/scripts/gpu_regression_*.sh`
+/ `gpu_regression_diff.py` wrappers from Phase 8 are **deprecated** —
+kept in-tree one release for rollback convenience and tagged with a
+DEPRECATED header pointing at this section.
+
+### When this workflow applies
+
+Run the full accel sweep when a PR touches any of:
+
+- `scx-gpu/src/**` — kernels, cuSPARSE / cuSOLVER / cuBLAS wrappers,
+  shard pipeline, linear operator.
+- `scx-accel/src/{pca,neighbors,umap,leiden,hvg,harmony}.rs` — Rust-side
+  accelerator entry points (CPU paths gate the CPU baseline).
+- `pyscx/src/accel/**` — Python dispatch, device resolution,
+  preprocessing materialization, fusion markers.
+- `pyscx/Cargo.toml` / `scx-gpu/Cargo.toml` — dep bumps, feature
+  toggles (especially `cudarc` minor-version bumps).
+
+PRs that don't touch these paths can pass `--no-accel` to keep the gate
+to format benchmarks only.
+
+### One-shot accel + format gate
+
+```bash
+# Default coverage = format + accel CPU + accel GPU. Captures
+# candidate_<sha>_<date> at the small tier and gates against LATEST.
+python benchmarks/comprehensive/scripts/gate_candidate.py
+
+# Accel-only iteration (skip format benchmarks, full GPU coverage):
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only
+
+# Accel CPU only (CPU-only host or CPU-only refactor on a GPU box):
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only --no-gpu
+```
+
+The script writes a structured log under
+`benchmarks/comprehensive/logs/gate_candidate_<sha>_<TS>.log` with the
+full subprocess output and a sidecar `*.summary.json` recording the
+phase, exit code, elapsed time, and coverage matrix. Pre-flight checks
+fail fast (exit 2) if `nvidia-smi`, `cupy`, or `pyscx.accel` isn't
+reachable when GPU/accel coverage was requested — the error message
+points at the missing piece.
+
+Exit codes match the standard gate: `0` pass, `1` regression / floor
+violation, `2` pre-flight failure / missing inputs.
+
+### Routing details (no operator action needed)
+
+`run_parallel.py` automatically:
+
+- Routes `accel_*__*_gpu*` formats to `partition=preemptible
+  slurm_gres=gpu:1` and clamps memory at 128 GB to fit the GPU QOS cap.
+- Routes `accel_*__*_cpu*` / `__scanpy_cpu` / `__leidenalg_cpu` formats
+  to `cpu_preemptible`, with `partition_for_memory()` auto-promoting to
+  `cpu_high_mem` when an estimate exceeds 200 GB (e.g.
+  `accel_preprocess` on `census_1m`).
+- Sizes per-cell wall-time budgets via `estimate_time_minutes` (umap
+  120 min base, leiden 90, knn 60, preprocess 60, hvg 45, pca 30) plus
+  a +8 min/M-cells slope. CPU UMAP on census_1m lands at ~130 min.
+- Filters cross-products so `accel_<bench>` only pairs with
+  `accel_<bench>__*` formats (one accel module never schedules another
+  module's variants).
+
+### Promoting a new baseline
+
+When the post-change run shows expected gains (and any threshold
+recalibration in `thresholds.yaml` has landed), promote the snapshot
+the same way as format baselines:
+
+```bash
+python benchmarks/comprehensive/scripts/promote_baseline.py \
+    --snapshot benchmarks/comprehensive/results/$CAND \
+    --version v0.X.Y-gpu-<descriptor>
+```
+
+This copies `summary.json` + `environment.json` + `MANIFEST.sha256`
+into `comprehensive/results/baselines/<version>/` and repoints
+`LATEST`. Add a row to `comprehensive/results/baselines/README.md`'s
+versions table.
+
+### Deprecated tooling (do not use for new work)
+
+These remain in-tree for one release as rollback convenience:
+
+- `benchmarks/scripts/gpu_regression_driver.sh`
+- `benchmarks/scripts/gpu_regression_diff.py`
+- `benchmarks/scripts/slurm_gpu_regression.sh`
+- `benchmarks/scripts/slurm_gpu_regression_cell.sh`
+
+The frozen pre-Phases-1-7 snapshot at
+`benchmarks/results/pre_phases_1_7_baseline_2026_03/` is also retained
+for historical bisects but is not the gate target.
+
 
 ## Individual Benchmark Scripts
 

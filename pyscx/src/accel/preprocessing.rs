@@ -10,23 +10,99 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::projected_agg;
 
-/// Normalize total counts per cell without materialization.
+// Fusion marker key stashed on `adata.uns` by `normalize_total(device="gpu")`
+// so that a subsequent `log1p(device="gpu")` can re-run a fused normalize+log1p
+// pass over the ORIGINAL backed source instead of reading the already-
+// materialized `adata.X`. See Phase 5 Task 5.4.
+//
+// Lifecycle contract: the marker is **valid only while X and its row/col
+// dimensions are unchanged**. It MUST be cleared by any op that mutates X or
+// changes obs/var shape (normalize_total, CPU log1p, filter_*, subset_obs).
+// Ops that don't mutate X (PCA, kNN, UMAP, Leiden, Harmony, HVG,
+// calculate_qc_metrics) leave it intact. New call sites that mutate X must
+// call `clear_gpu_normalize_marker`.
+pub(crate) const GPU_NORMALIZE_MARKER_KEY: &str = "__scx_gpu_pending_normalize__";
+
+/// Pop the GPU `normalize_total → log1p` fusion marker off `adata.uns` if
+/// present. No-op if absent. Always available (independent of `gpu` feature)
+/// so non-GPU builds can clear stale markers left by a prior GPU build.
+pub(crate) fn clear_gpu_normalize_marker(adata: &Bound<'_, PyAny>) -> PyResult<()> {
+    let uns = adata.getattr("uns")?;
+    // dict.pop(key, None) returns None on absence rather than raising KeyError.
+    let py = adata.py();
+    uns.call_method1("pop", (GPU_NORMALIZE_MARKER_KEY, py.None()))?;
+    Ok(())
+}
+
+/// Opaque marker stored on `adata.uns` after `normalize_total(device="gpu")`.
 ///
-/// Replaces `adata.X` with a lazy wrapper that applies row normalization
-/// during `__getitem__`. The row sums are precomputed via streaming and
-/// cached in the wrapper.
+/// Carries everything needed to rebuild a `LazyShardSource` over the original
+/// backed reader and re-run a fused normalize+log1p in a single GPU pass from
+/// a later `log1p(device="gpu")` call.
 ///
-/// Three cases:
+/// The marker is consumed by `log1p(device="gpu")` on first hit; it is **not**
+/// inspected by any other operation, so users who call `pca()` (or anything
+/// else) between the two will get the non-fused (already-materialized) result.
+/// Correct, just 1× redundant pass.
+#[cfg(feature = "gpu")]
+#[pyclass(name = "ScxGpuNormalizeMarker", module = "pyscx")]
+pub struct ScxGpuNormalizeMarker {
+    backed: Arc<scx_format::BackedCsrReader>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
+    col_projection: Option<Arc<Vec<u32>>>,
+    target_sum: f64,
+    n_obs: usize,
+    n_vars: usize,
+}
+
+/// Normalize total counts per cell.
+///
+/// By default (`device="auto"` or `device="cpu"`), replaces `adata.X` with a
+/// lazy wrapper that applies row normalization during `__getitem__`. The row
+/// sums are precomputed via streaming and cached in the wrapper.
+///
+/// With `device="gpu"`, the operation is **eager**: the normalized CSR is
+/// streamed through GPU kernels shard-by-shard and materialized into a scipy
+/// sparse CSR matrix that replaces `adata.X`. This breaks the lazy chain,
+/// which is reported via a `UserWarning`.
+///
+/// Four cases (CPU path):
 /// 1. X is `ScxBackedSparseDataset` → create new `ScxLazyTransformedDataset`
 /// 2. X is `ScxLazyTransformedDataset` → append NormalizeTotal transform
 /// 3. X is scipy sparse/dense → delegate to `sc.pp.normalize_total()`
 ///
+/// GPU path (requires `pyscx` built with `--features gpu`):
+/// * Backed/lazy X → stream through `scx_accel::gpu_preprocess_to_csr`, replace
+///   `adata.X` with the materialized scipy CSR, and stash a fusion marker on
+///   `adata.uns` so a subsequent `log1p(device="gpu")` can re-run a fused
+///   pass over the ORIGINAL source.
+/// * Scipy/dense X → defer to the CPU path (delegates to `sc.pp.normalize_total`).
+///
 /// Args:
 ///     adata: AnnData object
 ///     target_sum: Target total counts per cell (default: 1e4)
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 #[pyfunction]
-#[pyo3(signature = (adata, target_sum=10000.0))]
-pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64) -> PyResult<()> {
+#[pyo3(signature = (adata, target_sum=10000.0, device="auto"))]
+pub fn normalize_total(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    target_sum: f64,
+    device: &str,
+) -> PyResult<()> {
+    let _device = validate_device_or_default(device)?;
+
+    // Any prior fusion marker is now stale: this normalize call supersedes it.
+    // The GPU success path will stash a fresh marker; CPU / scipy-fallback
+    // paths leave it cleared.
+    clear_gpu_normalize_marker(adata)?;
+
+    #[cfg(feature = "gpu")]
+    if let Some(device_id) = _device.gpu_id() {
+        return gpu_normalize_total(py, adata, target_sum, device_id);
+    }
+
     let x = adata.getattr("X")?;
 
     // Case 1: X is ScxBackedSparseDataset — create new lazy wrapper
@@ -94,23 +170,48 @@ pub fn normalize_total(py: Python<'_>, adata: &Bound<'_, PyAny>, target_sum: f64
     Ok(())
 }
 
-/// Apply log1p (ln(x + 1)) element-wise without materialization.
+/// Apply log1p (ln(x + 1)) element-wise.
 ///
-/// Replaces `adata.X` with a lazy wrapper that applies log1p during
-/// `__getitem__`. When chained after `normalize_total`, the fused
-/// optimization in `ScxLazyTransformedDataset` computes
-/// `ln(x * target_sum / row_sum + 1)` in a single pass.
+/// By default (`device="auto"` or `device="cpu"`), replaces `adata.X` with a
+/// lazy wrapper that applies log1p during `__getitem__`. When chained after
+/// `normalize_total`, the fused optimization in `ScxLazyTransformedDataset`
+/// computes `ln(x * target_sum / row_sum + 1)` in a single pass.
 ///
-/// Three cases:
+/// With `device="gpu"`, the operation is **eager**. Three GPU sub-cases:
+/// * If `adata.uns` carries a fusion marker from a preceding
+///   `normalize_total(device="gpu")`, re-run a single fused normalize+log1p
+///   pass over the original backed source and overwrite `adata.X` with the
+///   fused result.
+/// * Else if X is still backed/lazy, stream through `gpu_preprocess_to_csr`
+///   with log1p only and materialize into scipy CSR.
+/// * Else (X is already scipy/dense), GPU dispatch is slower than CPU
+///   (H→D + D→H copies dominate log1p's trivial math), so `pyscx` emits a
+///   `UserWarning` and falls back to `sc.pp.log1p`.
+///
+/// CPU path (three cases):
 /// 1. X is `ScxBackedSparseDataset` → create new `ScxLazyTransformedDataset`
 /// 2. X is `ScxLazyTransformedDataset` → append Log1p transform
 /// 3. X is scipy sparse/dense → delegate to `sc.pp.log1p()`
 ///
 /// Args:
 ///     adata: AnnData object
+///     device: Device selection — "auto" (default), "cpu", "gpu", or
+///         "gpu:N" to target CUDA device N on multi-GPU systems.
 #[pyfunction]
-#[pyo3(signature = (adata,))]
-pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<()> {
+#[pyo3(signature = (adata, device="auto"))]
+pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult<()> {
+    let _device = validate_device_or_default(device)?;
+
+    #[cfg(feature = "gpu")]
+    if let Some(device_id) = _device.gpu_id() {
+        return gpu_log1p_dispatch(py, adata, device_id, device);
+    }
+
+    // CPU log1p invalidates any pending GPU fusion: a later log1p(device="gpu")
+    // must NOT replay a fused normalize+log1p over the original source (it
+    // would silently overwrite the result of this CPU log1p call).
+    clear_gpu_normalize_marker(adata)?;
+
     let x = adata.getattr("X")?;
 
     // Case 1: X is ScxBackedSparseDataset — create new lazy wrapper with Log1p
@@ -412,4 +513,263 @@ pub fn calculate_qc_metrics<'py>(
         let tuple = pyo3::types::PyTuple::new(py, &[obs_df, var_df])?;
         Ok(tuple.into_any())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Device resolution + GPU eager dispatch (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Parse `device` into a [`ResolvedDevice`]. Delegates to [`resolve_device`]
+/// in both feature configurations — the CPU-only build's parser already
+/// rejects `gpu*` requests with a `RuntimeError`, so no separate
+/// implementation is needed.
+fn validate_device_or_default(device: &str) -> PyResult<super::gpu::ResolvedDevice> {
+    super::gpu::resolve_device(device)
+}
+
+#[cfg(feature = "gpu")]
+fn emit_laziness_break_warning(py: Python<'_>) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    warnings.call_method1(
+        "warn",
+        (
+            "pyscx preprocessing device='gpu' is eager: adata.X will be \
+             materialized as scipy.sparse.csr_matrix, breaking the lazy chain.",
+            py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn emit_gpu_log1p_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    warnings.call_method1(
+        "warn",
+        (
+            format!(
+                "pyscx.accel.log1p(device={device:?}) on a materialized scipy/dense \
+                 X falls back to CPU: H→D and D→H copies dominate log1p's trivial \
+                 math, making GPU dispatch 50–100× slower than scanpy.pp.log1p. To \
+                 get the GPU fast path, call pyscx.accel.normalize_total(device=\"gpu\") \
+                 first (the fusion marker on adata.uns enables a single fused pass), \
+                 or operate on a backed SCX dataset."
+            ),
+            py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Build a scipy `csr_matrix((data, indices, indptr), shape=...)` on the Python side.
+#[cfg(feature = "gpu")]
+fn scx_csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<Bound<'py, PyAny>> {
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let data = numpy::PyArray::from_vec(py, csr.data);
+    let indices = numpy::PyArray::from_vec(py, csr.indices);
+    let indptr = numpy::PyArray::from_vec(py, csr.indptr);
+    let args = pyo3::types::PyTuple::new(
+        py,
+        &[data.into_any(), indices.into_any(), indptr.into_any()],
+    )?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("shape", csr.shape)?;
+    scipy_sparse.call_method("csr_matrix", (args,), Some(&kwargs))
+}
+
+/// Everything `gpu_normalize_total` needs from an AnnData's `X`: a live
+/// `LazyShardSource` plus the raw handles required to rebuild an equivalent
+/// source later (fusion marker). Returned by [`source_from_x`].
+#[cfg(feature = "gpu")]
+struct GpuShardSource {
+    source: crate::lazy_transform::LazyShardSource,
+    backed: Arc<scx_format::BackedCsrReader>,
+    kept_to_global: Option<Arc<Vec<u64>>>,
+    col_projection: Option<Arc<Vec<u32>>>,
+    n_obs: usize,
+    n_vars: usize,
+}
+
+/// Extract a [`GpuShardSource`] from either a backed or lazy X. Returns
+/// `None` when `x` is neither (i.e. scipy/dense), signalling that the caller
+/// should fall back to the CPU path.
+#[cfg(feature = "gpu")]
+fn source_from_x(x: &Bound<'_, PyAny>) -> PyResult<Option<GpuShardSource>> {
+    use crate::lazy_transform::LazyShardSource;
+
+    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+        let r = backed.borrow();
+        let backed_arc = Arc::clone(&r.backed);
+        let kept = r.kept_to_global.clone();
+        let col_proj = r.col_projection_arc();
+        let (n_obs, n_vars) = r.shape_val;
+        let source = LazyShardSource::new(
+            Arc::clone(&backed_arc),
+            vec![],
+            kept.clone(),
+            col_proj.clone(),
+            n_obs,
+            n_vars,
+        );
+        return Ok(Some(GpuShardSource {
+            source,
+            backed: backed_arc,
+            kept_to_global: kept,
+            col_projection: col_proj,
+            n_obs,
+            n_vars,
+        }));
+    }
+
+    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+        let r = lazy.borrow();
+        let source = r.as_shard_source();
+        let backed_arc = Arc::clone(&r.backed);
+        let kept = r.kept_to_global.clone();
+        let col_proj = r.col_projection.clone();
+        let (n_obs, n_vars) = r.shape_val;
+        return Ok(Some(GpuShardSource {
+            source,
+            backed: backed_arc,
+            kept_to_global: kept,
+            col_projection: col_proj,
+            n_obs,
+            n_vars,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// GPU-eager `normalize_total` dispatch.
+#[cfg(feature = "gpu")]
+fn gpu_normalize_total(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    target_sum: f64,
+    device_id: usize,
+) -> PyResult<()> {
+    let x = adata.getattr("X")?;
+
+    let Some(gs) = source_from_x(&x)? else {
+        // Scipy/dense X: fall back to CPU path (scanpy's normalize_total).
+        let sc = py.import("scanpy")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("target_sum", target_sum)?;
+        sc.getattr("pp")?
+            .call_method("normalize_total", (adata,), Some(&kwargs))?;
+        return Ok(());
+    };
+
+    let was_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
+    let GpuShardSource {
+        source,
+        backed,
+        kept_to_global,
+        col_projection,
+        n_obs,
+        n_vars,
+    } = gs;
+
+    let dev = scx_accel::GpuDevice::new(device_id)
+        .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
+    let csr = scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), false)
+        .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
+    drop(source);
+
+    // Replace adata.X with materialized scipy CSR.
+    let scipy_csr = scx_csr_to_scipy(py, csr)?;
+    adata.setattr("X", scipy_csr)?;
+
+    // Stash fusion marker on adata.uns so a subsequent log1p(device="gpu")
+    // can re-run a fused normalize+log1p pass over the original source.
+    let marker = ScxGpuNormalizeMarker {
+        backed,
+        kept_to_global,
+        col_projection,
+        target_sum,
+        n_obs,
+        n_vars,
+    };
+    let uns = adata.getattr("uns")?;
+    uns.set_item(GPU_NORMALIZE_MARKER_KEY, Bound::new(py, marker)?)?;
+
+    if was_lazy {
+        emit_laziness_break_warning(py)?;
+    }
+    Ok(())
+}
+
+/// GPU-eager `log1p` dispatch — handles the fusion-marker path and backed/lazy
+/// materialization. Materialised scipy/dense X warns and falls back to
+/// `sc.pp.log1p` (the H→D / D→H round-trip dominates the kernel cost).
+#[cfg(feature = "gpu")]
+fn gpu_log1p_dispatch(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    device_id: usize,
+    device: &str,
+) -> PyResult<()> {
+    let uns = adata.getattr("uns")?;
+
+    // 1) Fusion marker path: re-run fused normalize+log1p over ORIGINAL source.
+    let marker_obj = uns.call_method1("get", (GPU_NORMALIZE_MARKER_KEY,))?;
+    if !marker_obj.is_none() {
+        if let Ok(marker_ref) = marker_obj.downcast::<ScxGpuNormalizeMarker>() {
+            let m = marker_ref.borrow();
+            let source = crate::lazy_transform::LazyShardSource::new(
+                Arc::clone(&m.backed),
+                vec![],
+                m.kept_to_global.clone(),
+                m.col_projection.clone(),
+                m.n_obs,
+                m.n_vars,
+            );
+            let target_sum = m.target_sum;
+            drop(m);
+
+            let dev = scx_accel::GpuDevice::new(device_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
+            let csr =
+                scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), true)
+                    .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
+            drop(source);
+
+            let scipy_csr = scx_csr_to_scipy(py, csr)?;
+            adata.setattr("X", scipy_csr)?;
+
+            // Invalidate marker after consuming it.
+            uns.call_method1("pop", (GPU_NORMALIZE_MARKER_KEY,))?;
+            return Ok(());
+        }
+    }
+
+    // Reaching here means Path 1 was not consumed (marker absent or downcast
+    // failed). Any leftover marker is now stale — defensively clear before the
+    // remaining paths mutate X.
+    clear_gpu_normalize_marker(adata)?;
+
+    // 2) Backed/lazy X: stream through gpu_preprocess_to_csr with log1p only.
+    let x = adata.getattr("X")?;
+    if let Some(gs) = source_from_x(&x)? {
+        let was_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
+        let dev = scx_accel::GpuDevice::new(device_id)
+            .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
+        let csr = scx_accel::gpu_preprocess_to_csr(&dev, &gs.source, None, true)
+            .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
+        drop(gs);
+        let scipy_csr = scx_csr_to_scipy(py, csr)?;
+        adata.setattr("X", scipy_csr)?;
+        if was_lazy {
+            emit_laziness_break_warning(py)?;
+        }
+        return Ok(());
+    }
+
+    // 3) Scipy/dense X: GPU dispatch is slower than CPU here (H→D + D→H
+    //    copies dominate log1p's trivial math). Warn and fall back to scanpy.
+    emit_gpu_log1p_fallback_warning(py, device)?;
+    let sc = py.import("scanpy")?;
+    sc.getattr("pp")?.call_method1("log1p", (adata,))?;
+    Ok(())
 }

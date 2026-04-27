@@ -70,6 +70,14 @@ pub fn estimate_gpu_memory<'py>(
         }
         Ok(default)
     };
+    let get_kwarg_str = |key: &str, default: &'static str| -> PyResult<String> {
+        if let Some(kw) = kwargs {
+            if let Some(val) = kw.get_item(key)? {
+                return val.extract::<String>();
+            }
+        }
+        Ok(default.to_string())
+    };
 
     // Extract shape from adata
     let n_obs: usize = adata.getattr("n_obs")?.extract()?;
@@ -103,16 +111,49 @@ pub fn estimate_gpu_memory<'py>(
             let shard_size = get_kwarg_usize("shard_size", 16384)?;
             let shard_rows = shard_size.min(n_obs);
 
-            // Y matrix on GPU: n_obs × k × 4 (f32)
-            let y_bytes = n_obs * k * 4;
-            // Ω and B matrices: n_vars × k × 4 each
-            let omega_b_bytes = 2 * n_vars * k * 4;
-            // One decoded shard for cuSPARSE SpMM: shard_rows × n_vars × 4
-            let shard_dense_bytes = shard_rows * n_vars * 4;
-            // cuSOLVER QR workspace: ~2 × n_obs × k × 4
-            let qr_workspace = 2 * n_obs * k * 4;
+            // Select PCA method — respects explicit user choice, else picks
+            // covariance when n_vars is small (HVG-shaped) and randomized
+            // otherwise. Keep threshold in lock-step with
+            // `scx_accel::GPU_COVARIANCE_PCA_THRESHOLD` (8000).
+            let method = get_kwarg_str("method", "auto")?;
+            #[cfg(feature = "gpu")]
+            let gpu_cov_threshold = scx_accel::GPU_COVARIANCE_PCA_THRESHOLD;
+            #[cfg(not(feature = "gpu"))]
+            let gpu_cov_threshold = 8_000usize;
+            let use_covariance = match method.as_str() {
+                "covariance" => true,
+                "randomized" => false,
+                _ => n_vars <= gpu_cov_threshold, // "auto"
+            };
 
-            y_bytes + omega_b_bytes + shard_dense_bytes + qr_workspace
+            // Randomized footprint: Y/Q (n_obs × k), Ω + B (n_vars × k), one
+            // decoded shard, cuSOLVER QR workspace.
+            let rand_bytes = {
+                let y_bytes = n_obs * k * 4;
+                let omega_b_bytes = 2 * n_vars * k * 4;
+                let shard_dense_bytes = shard_rows * n_vars * 4;
+                let qr_workspace = 2 * n_obs * k * 4;
+                y_bytes + omega_b_bytes + shard_dense_bytes + qr_workspace
+            };
+
+            // Covariance footprint: Gram matrix (n_vars²), embeddings
+            // (n_obs × n_components), dense-shard scratch for Gram
+            // accumulation (shard_rows × n_vars), means (n_vars), and a
+            // cuSOLVER syevd workspace (~3 × n_vars² — generous budget).
+            let cov_bytes = {
+                let gram = n_vars * n_vars * 4;
+                let emb = n_obs * n_components * 4;
+                let dense_scratch = shard_rows * n_vars * 4;
+                let means = n_vars * 4;
+                let syevd = 3 * n_vars * n_vars * 4;
+                gram + emb + dense_scratch + means + syevd
+            };
+
+            if use_covariance {
+                cov_bytes
+            } else {
+                rand_bytes
+            }
         }
         "knn" => {
             let n_neighbors = get_kwarg_usize("n_neighbors", 15)?;
@@ -186,45 +227,115 @@ pub fn estimate_gpu_memory<'py>(
     Ok(dict.into_any().unbind())
 }
 
-/// Resolve the device string to a boolean (true = GPU, false = CPU).
+/// Resolution of a `device=` string to either CPU or a specific GPU index.
 ///
-/// "auto" → GPU if available (feature enabled + device found), else CPU.
-/// "cpu" → always CPU.
-/// "gpu" / "gpu:N" → always GPU (errors if unavailable).
-pub(super) fn resolve_device(device: &str) -> PyResult<bool> {
-    match device {
-        "cpu" => Ok(false),
-        "auto" => {
-            #[cfg(feature = "gpu")]
-            {
-                Ok(scx_accel::gpu_available())
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                Ok(false)
-            }
+/// Returned by [`resolve_device`] / [`validate_device_or_default`]. Callers
+/// extract the GPU index via [`ResolvedDevice::gpu_id`] and forward it into
+/// `GpuDevice::new(device_id)` / scx-accel `*_gpu(device_id, …)` functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedDevice {
+    Cpu,
+    #[cfg(feature = "gpu")]
+    Gpu(usize),
+}
+
+impl ResolvedDevice {
+    pub(crate) fn is_gpu(self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            matches!(self, ResolvedDevice::Gpu(_))
         }
-        d if d.starts_with("gpu") => {
-            #[cfg(feature = "gpu")]
-            {
-                if scx_accel::gpu_available() {
-                    Ok(true)
-                } else {
-                    Err(PyRuntimeError::new_err(
-                        "device='gpu' requested but no CUDA GPU found",
-                    ))
-                }
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                Err(PyRuntimeError::new_err(
-                    "device='gpu' requested but pyscx was built without the 'gpu' feature",
-                ))
-            }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
         }
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown device: '{}'. Use 'auto', 'cpu', or 'gpu'",
-            device
-        ))),
     }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_id(self) -> Option<usize> {
+        match self {
+            ResolvedDevice::Gpu(i) => Some(i),
+            ResolvedDevice::Cpu => None,
+        }
+    }
+}
+
+/// Resolve the device string to a [`ResolvedDevice`].
+///
+/// Accepted forms:
+/// * `"cpu"` → [`ResolvedDevice::Cpu`].
+/// * `"auto"` → GPU 0 if the `gpu` feature is enabled and a CUDA device is
+///   visible, else [`ResolvedDevice::Cpu`].
+/// * `"gpu"` → GPU 0 (errors if no CUDA device is available, or if pyscx was
+///   built without the `gpu` feature).
+/// * `"gpu:N"` for `N: usize` → GPU N (validated against
+///   [`scx_gpu::GpuDevice::count()`]; out-of-range errors with `RuntimeError`).
+pub(crate) fn resolve_device(device: &str) -> PyResult<ResolvedDevice> {
+    if device == "cpu" {
+        return Ok(ResolvedDevice::Cpu);
+    }
+    if device == "auto" {
+        #[cfg(feature = "gpu")]
+        {
+            return Ok(if scx_accel::gpu_available() {
+                ResolvedDevice::Gpu(0)
+            } else {
+                ResolvedDevice::Cpu
+            });
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            return Ok(ResolvedDevice::Cpu);
+        }
+    }
+    if let Some(suffix) = device.strip_prefix("gpu") {
+        let device_id = parse_gpu_suffix(device, suffix)?;
+        #[cfg(feature = "gpu")]
+        {
+            if !scx_accel::gpu_available() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "device='{device}' requested but no CUDA GPU found"
+                )));
+            }
+            let count = scx_accel::GpuDevice::count().map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to query CUDA device count: {e}"))
+            })?;
+            if device_id >= count {
+                return Err(PyRuntimeError::new_err(format!(
+                    "device='{device}' but only {count} CUDA device{} visible",
+                    if count == 1 { " is" } else { "s are" }
+                )));
+            }
+            return Ok(ResolvedDevice::Gpu(device_id));
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = device_id;
+            return Err(PyRuntimeError::new_err(format!(
+                "device='{device}' requested but pyscx was built without the 'gpu' feature"
+            )));
+        }
+    }
+    Err(PyValueError::new_err(format!(
+        "unknown device: '{device}'. Use 'auto', 'cpu', 'gpu', or 'gpu:N'."
+    )))
+}
+
+/// Parse the `:N` suffix of a `"gpu[:N]"` device string. `""` (bare `"gpu"`)
+/// resolves to device 0; `":N"` parses `N` as `usize`. Anything else is a
+/// `ValueError`.
+fn parse_gpu_suffix(full: &str, suffix: &str) -> PyResult<usize> {
+    if suffix.is_empty() {
+        return Ok(0);
+    }
+    let Some(rest) = suffix.strip_prefix(':') else {
+        return Err(PyValueError::new_err(format!(
+            "unknown device: '{full}'. Use 'auto', 'cpu', 'gpu', or 'gpu:N'."
+        )));
+    };
+    rest.parse::<usize>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "device='{full}' has a non-integer suffix; expected 'gpu:N' with N a non-negative integer."
+        ))
+    })
 }

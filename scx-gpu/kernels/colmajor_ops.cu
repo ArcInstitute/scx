@@ -149,6 +149,122 @@ extern "C" __global__ void column_sum_kernel(
     }
 }
 
+// Select the top-k eigenvectors (in descending eigenvalue order) from an
+// ascending-ordered (n × n) column-major eigenvector matrix, writing them
+// into an (n × k) column-major output.
+//
+// src: (n × n) col-major eigvecs, eigenvalues ascending by column index.
+// dst: (n × k) col-major, column j of dst ← column (n-1-j) of src.
+//
+// Element (row, col=j) in dst corresponds to (row, src_col = n-1-j) in src.
+// total threads = n × k
+extern "C" __global__ void select_top_eigvecs_desc_kernel(
+    const float* __restrict__ src,   // [n × n], col-major
+    float* __restrict__ dst,         // [n × k], col-major
+    int n,
+    int k
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * k;
+    if (idx >= total) return;
+
+    int col = idx / n;           // output column 0..k
+    int row = idx % n;
+    int src_col = n - 1 - col;   // descending: largest first
+
+    dst[col * n + row] = src[src_col * n + row];
+}
+
+// Copy the last `k` entries of a length-`n` vector into a length-`k` output
+// in reversed order — i.e. out[j] = in[n - 1 - j] for j in [0, k).
+//
+// total threads = k
+extern "C" __global__ void reverse_tail_vec_kernel(
+    const float* __restrict__ src,   // [n]
+    float* __restrict__ dst,         // [k]
+    int n,
+    int k
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) return;
+    dst[j] = src[n - 1 - j];
+}
+
+// Broadcast-scale each column of a col-major matrix by a scalar.
+//
+// U[r, c] *= s[c]   for all (r, c)
+//
+// U: (m × k) col-major, in-place
+// s: [k] per-column scale factors
+//
+// total threads = m × k
+extern "C" __global__ void scale_columns_kernel(
+    float* __restrict__ U,           // [m × k], col-major, in-place
+    const float* __restrict__ s,     // [k]
+    int m,
+    int k
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * k;
+    if (idx >= total) return;
+
+    int col = idx / m;
+    U[idx] *= s[col];
+}
+
+// Per-column nonzero accumulation: Σ x and Σ x² in f64.
+//
+// indices: [nnz] column index per nonzero
+// data:    [nnz] f32 value per nonzero
+// col_sum, col_sum_sq: [n_vars] f64 accumulators (must be zero-initialized by caller)
+//
+// Thread-per-nonzero, using atomicAdd on f64 (requires compute 6.x+).
+//
+// total threads = nnz
+extern "C" __global__ void col_sum_sq_nonzeros_kernel(
+    const int* __restrict__ indices,
+    const float* __restrict__ data,
+    long long nnz,
+    double* __restrict__ col_sum,
+    double* __restrict__ col_sum_sq
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    int c = indices[i];
+    double v = (double)data[i];
+    atomicAdd(&col_sum[c], v);
+    atomicAdd(&col_sum_sq[c], v * v);
+}
+
+// Per-column clipped nonzero accumulation: Σ min(x, clip[c]) and Σ min(x, clip[c])²
+//
+// indices: [nnz] column index per nonzero
+// data:    [nnz] f32 value per nonzero
+// clip_val: [n_vars] per-column clip threshold (f64)
+// batch_count_sum:    [n_vars] Σ clipped_v
+// sq_batch_count_sum: [n_vars] Σ clipped_v²
+//
+// Thread-per-nonzero, using atomicAdd on f64.
+//
+// total threads = nnz
+extern "C" __global__ void col_clip_sq_nonzeros_kernel(
+    const int* __restrict__ indices,
+    const float* __restrict__ data,
+    long long nnz,
+    const double* __restrict__ clip_val,
+    double* __restrict__ batch_count_sum,
+    double* __restrict__ sq_batch_count_sum
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    int c = indices[i];
+    double v = (double)data[i];
+    double cv = clip_val[c];
+    double vc = v > cv ? cv : v;
+    atomicAdd(&batch_count_sum[c], vc);
+    atomicAdd(&sq_batch_count_sum[c], vc * vc);
+}
+
 // Outer product subtraction: Z[v, j] -= mu[v] * sum_q[j]
 //
 // Z: (n_vars × k) col-major

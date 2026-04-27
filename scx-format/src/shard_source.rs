@@ -34,6 +34,27 @@ pub trait ShardSource {
     /// and/or deletion vector filtering before returning.
     fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr>;
 
+    /// Maximum number of rows across all shards.
+    ///
+    /// Used by GPU callers to size per-shard scratch buffers up-front
+    /// (e.g., `DoubleBufferedShardLoader` pinned slots, covariance-PCA
+    /// Gram densification scratch).
+    ///
+    /// The default implementation reads every shard once — correct but
+    /// potentially expensive. Implementors with O(1) access to shard
+    /// metadata (e.g., `BackedCsrReader` via its `BackedCsrIndex`) should
+    /// override with a cheap version.
+    fn max_shard_rows(&self) -> Result<usize> {
+        let mut max_rows = 0usize;
+        for shard_idx in 0..self.n_shards() {
+            let rows = self.read_shard(shard_idx)?.n_rows();
+            if rows > max_rows {
+                max_rows = rows;
+            }
+        }
+        Ok(max_rows)
+    }
+
     /// Compute column means and per-column sum-of-squares in a single
     /// streaming pass over all shards.
     ///
@@ -66,5 +87,57 @@ pub trait ShardSource {
         };
 
         Ok((means, col_sum_sq))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubSource {
+        shards: Vec<ScxCsr>,
+        n_obs: usize,
+        n_vars: usize,
+    }
+
+    impl ShardSource for StubSource {
+        fn n_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr> {
+            Ok(self.shards[shard_idx].clone())
+        }
+    }
+
+    #[test]
+    fn max_shard_rows_default_impl() {
+        // 3 shards with row counts 2, 5, 3 → max = 5.
+        let shards = vec![
+            ScxCsr::new_unchecked((2, 3), vec![0, 1, 1], vec![0], vec![1.0]),
+            ScxCsr::new_unchecked((5, 3), vec![0, 0, 0, 0, 0, 0], vec![], vec![]),
+            ScxCsr::new_unchecked((3, 3), vec![0, 1, 1, 2], vec![2, 0], vec![1.0, 2.0]),
+        ];
+        let src = StubSource {
+            shards,
+            n_obs: 10,
+            n_vars: 3,
+        };
+        assert_eq!(src.max_shard_rows().unwrap(), 5);
+    }
+
+    #[test]
+    fn max_shard_rows_empty() {
+        let src = StubSource {
+            shards: vec![],
+            n_obs: 0,
+            n_vars: 3,
+        };
+        assert_eq!(src.max_shard_rows().unwrap(), 0);
     }
 }

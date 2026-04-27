@@ -46,3 +46,136 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: throughput_mbps
     min: 50.0
+
+  # ─── Phase 9 accelerator thresholds ──────────────────────────────────
+  #
+  # Gate the `pyscx.accel.*` surface migrated into the comprehensive
+  # framework (Phase 9 of GPU-ACC-SPEED-UP.md). Supersedes (once
+  # Phase-8 stopgap deprecated) the hard-floor table in
+  # `benchmarks/scripts/gpu_regression_diff.py::apply_hard_floors`.
+  # Floors are tight for CORRECTNESS (cosine sim, ARI, Jaccard) and
+  # loose for TIMING (we only gate "not catastrophically regressed").
+  # Correctness is measured against scanpy / leidenalg references
+  # inside each `accel_*.py` module and stored in the run's `extra`
+  # dict — see the module docstrings for metric keys.
+
+  # --- accel_pca: correctness vs scanpy ---
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_cpu_auto
+    dataset: pbmc3k
+    metric: cosine_sim_min
+    min: 0.99
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_cov
+    dataset: pbmc3k
+    metric: cosine_sim_min
+    min: 0.99
+  # Randomized PCA's per-PC cosine is unreliable by construction — the
+  # randomized subspace iteration agrees with scanpy's subspace but
+  # returns axes rotated/permuted vs the deterministic reference. The
+  # covariance-path floor above (0.99 min) already catches real PCA
+  # correctness regressions; these floors on the randomized variants
+  # serve as sanity checks (are we producing non-trivial embeddings at
+  # all) rather than strict numerical agreement. Observed across the
+  # post-findings Tier-3 run: pbmc3k ~0.42, tabula_sapiens_100k ~0.79,
+  # census_1m ~0.83 — floors sit ~0.05 below observed to catch a true
+  # collapse (e.g., all-zero embedding) without tripping on normal
+  # subspace rotation.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: pbmc3k
+    metric: cosine_sim_mean
+    min: 0.35
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: pbmc3k
+    metric: cosine_sim_mean
+    min: 0.35
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: tabula_sapiens_100k
+    metric: cosine_sim_mean
+    min: 0.70
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: tabula_sapiens_100k
+    metric: cosine_sim_mean
+    min: 0.70
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: census_1m
+    metric: cosine_sim_mean
+    min: 0.75
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: census_1m
+    metric: cosine_sim_mean
+    min: 0.75
+  # Covariance path at census_1m — f32 GPU vs f64 CPU tail-PC drift is real
+  # but bounded; observed 0.9999+. Keep 0.90 floor for safety headroom.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_cov
+    dataset: census_1m
+    metric: cosine_sim_min
+    min: 0.90
+
+  # --- accel_knn: recall vs scanpy ---
+  - benchmark: accel_knn
+    format: accel_knn__pyscx_gpu_cagra
+    dataset: pbmc3k
+    metric: recall_vs_scanpy
+    min: 0.90
+  - benchmark: accel_knn
+    format: accel_knn__pyscx_gpu_cagra
+    dataset: tabula_sapiens_100k
+    metric: recall_vs_scanpy
+    min: 0.90
+
+  # --- accel_umap: trustworthiness ---
+  - benchmark: accel_umap
+    format: accel_umap__pyscx_gpu
+    dataset: pbmc3k
+    metric: trustworthiness
+    min: 0.90
+  - benchmark: accel_umap
+    format: accel_umap__pyscx_gpu
+    dataset: tabula_sapiens_100k
+    metric: trustworthiness
+    min: 0.90
+
+  # --- accel_leiden: ARI vs leidenalg ---
+  # First comprehensive run on pbmc3k produced ARI=0.893 for pyscx_cpu,
+  # 0.895 for pyscx_gpu — consistent with AGENTS.md's "ARI 0.92 vs
+  # leidenalg" target at larger scale, with small-dataset noise pulling
+  # pbmc3k down. Floor set at 0.85 to accommodate that variance.
+  - benchmark: accel_leiden
+    format: accel_leiden__pyscx_gpu
+    dataset: pbmc3k
+    metric: ari_vs_leidenalg
+    min: 0.85
+  - benchmark: accel_leiden
+    format: accel_leiden__pyscx_cpu
+    dataset: pbmc3k
+    metric: ari_vs_leidenalg
+    min: 0.85
+
+  # --- accel_preprocess: numerical equivalence to scanpy ---
+  # GPU f32 vs CPU f64 intermediate drift on normalize+log1p is ~1e-5
+  # on typical counts; 1e-3 provides ~2 orders of magnitude headroom.
+  - benchmark: accel_preprocess
+    format: accel_preprocess__pyscx_gpu
+    dataset: pbmc3k
+    metric: max_abs_diff_vs_scanpy
+    max: 1.0e-3
+
+  # --- accel_hvg: HVG set overlap vs scanpy seurat_v3 ---
+  - benchmark: accel_hvg
+    format: accel_hvg__pyscx_gpu
+    dataset: pbmc3k
+    metric: hvg_overlap_vs_scanpy
+    min: 0.95
+  - benchmark: accel_hvg
+    format: accel_hvg__pyscx_cpu
+    dataset: pbmc3k
+    metric: hvg_overlap_vs_scanpy
+    min: 0.99

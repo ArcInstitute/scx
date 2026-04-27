@@ -24,3 +24,17 @@ extern "C" __global__ void cast_u32_to_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) output[i] = (float)input[i];
 }
+
+/// Cast i64 → i32 (element-wise, one thread per element).
+/// Used to downcast per-shard CSR row-pointers (indptr) so they can be
+/// paired with i32 column indices in cuSPARSE descriptors — some cuSPARSE
+/// releases (observed: 12.1.2.141) reject mixed 64I indptr / 32I indices.
+/// Per-shard nnz is bounded well below 2^31 for single-cell data.
+extern "C" __global__ void cast_i64_to_i32(
+    const long long* __restrict__ input,
+    int*             __restrict__ output,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = (int)input[i];
+}

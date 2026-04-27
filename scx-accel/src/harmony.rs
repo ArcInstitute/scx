@@ -1443,6 +1443,7 @@ mod gpu_impl {
     /// on GPU vs. f64 on CPU. Per-PC Pearson correlation with the CPU
     /// reference should be >= 0.99.
     pub fn harmony_integrate_gpu(
+        device_id: usize,
         embeddings: &[f32],
         n_obs: usize,
         n_pcs: usize,
@@ -1459,8 +1460,8 @@ mod gpu_impl {
         let b = state.layout.b;
         let c_count = state.layout.c;
 
-        let dev =
-            GpuDevice::new(0).map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+        let dev = GpuDevice::new(device_id)
+            .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
 
         // Upload Z_orig once — it never changes.
         let d_z_orig = dev
@@ -2209,7 +2210,7 @@ mod tests {
             ..Default::default()
         };
         let result =
-            harmony_integrate_gpu(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+            harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
         assert_eq!(result.n_obs, n);
         assert_eq!(result.n_pcs, d);
         assert_eq!(result.z_corrected.len(), n * d);
@@ -2240,7 +2241,8 @@ mod tests {
             ..Default::default()
         };
         let cpu = harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
-        let gpu = harmony_integrate_gpu(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+        let gpu =
+            harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
 
         // Compare per-PC Pearson correlation (f32 rounding → expect ~0.99+).
         for pc in 0..d {

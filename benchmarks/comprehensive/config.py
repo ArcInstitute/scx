@@ -151,7 +151,16 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
     def path_for_format(self, format_key: str) -> Path:
-        """Return the persistent on-disk path for a given format key."""
+        """Return the persistent on-disk path for a given format key.
+
+        Accelerator variants (`accel_*__<impl>`) don't correspond to a
+        file format — they run on the source h5ad directly via
+        `pyscx.accel.*` / `scanpy.*`. For those keys we return the
+        source h5ad path itself, which is what the `accel_*.py`
+        benchmark modules already use through `dataset.h5ad_path`.
+        """
+        if format_key.startswith("accel_"):
+            return self.h5ad_path
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
         if prop is None:
             raise ValueError(f"No persistent path for format key {format_key!r}")
@@ -481,11 +490,87 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
 ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS
 
 
-def get_formats(include_additional: bool = False) -> list[FormatVariant]:
-    """Return the list of format variants to benchmark."""
+# ---------------------------------------------------------------------------
+# Accelerator variants — Phase 9.1+
+#
+# These are NOT file-format variants; they're accelerator implementations
+# for PCA / kNN / UMAP / Leiden / preprocessing / HVG. Each registers as a
+# `FormatVariant` so the per-cell parallel launcher (`run_parallel.py`) can
+# schedule one SLURM job per (benchmark × implementation × dataset) — e.g.
+# (accel_pca, accel_pca__pyscx_gpu_cov, census_1m). Runner is `noop_runner`
+# because these benchmarks don't depend on file conversion.
+# ---------------------------------------------------------------------------
+
+def accel_formats() -> list[FormatVariant]:
+    """Lazily discover accelerator variants from each `accel_*.py` module.
+
+    Imported on demand (not at `config.py` module-load) so the
+    accelerator modules — which import from `config.py` — don't create
+    a circular import. Each accelerator benchmark module exports a
+    `<bench>_variants()` callable; append it here when it lands.
+    """
+    out: list[FormatVariant] = []
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_pca import (
+            accel_pca_variants,
+        )
+        out.extend(accel_pca_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_knn import (
+            accel_knn_variants,
+        )
+        out.extend(accel_knn_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_umap import (
+            accel_umap_variants,
+        )
+        out.extend(accel_umap_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_leiden import (
+            accel_leiden_variants,
+        )
+        out.extend(accel_leiden_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_preprocess import (
+            accel_preproc_variants,
+        )
+        out.extend(accel_preproc_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_hvg import (
+            accel_hvg_variants,
+        )
+        out.extend(accel_hvg_variants())
+    except ImportError:
+        pass
+    return out
+
+
+def get_formats(
+    include_additional: bool = False,
+    include_accel: bool = False,
+) -> list[FormatVariant]:
+    """Return the list of format variants to benchmark.
+
+    `include_accel` adds accelerator implementations (PCA / kNN / UMAP /
+    Leiden / preprocessing / HVG variants). Enable this only when the
+    orchestrator is also scheduling `accel_*` benchmark modules.
+    """
+    out = list(PRIMARY_FORMATS)
     if include_additional:
-        return ALL_FORMATS
-    return PRIMARY_FORMATS
+        out.extend(ADDITIONAL_FORMATS)
+    if include_accel:
+        out.extend(accel_formats())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +727,27 @@ def estimate_memory_gb(
         # Assertion-based — peak RSS MUST stay under the 240 MB bound from
         # docs/cloud.md. Give headroom but not much.
         peak_mb = 8 * 1024  # 8 GB ceiling for safety
+    elif benchmark == "accel_preprocess":
+        # Keeps raw AnnData + scanpy reference + per-run copies resident.
+        # scanpy normalize/log1p are sparse-in-place; pyscx's lazy-chain
+        # materialization (a.X[:, :]) and the GPU-eager scipy CSR handoff
+        # can densify intermediate buffers. Observed on census_1m: scanpy
+        # 44 GB, pyscx OOM at 64 GB. Size to dense × 1.0 → census_1m lands
+        # at ~168 GB (below the 200 GB cpu_preemptible ceiling so CPU
+        # variants avoid cpu_high_mem; GPU variants stay on preemptible).
+        peak_mb = max(base_mb * 2, dense_mb * 1.0)
+    elif benchmark == "accel_hvg":
+        # Loess fit uses f64 working arrays + per-gene variance accumulators.
+        # Observed 33 GB peak on 1M cells.
+        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("accel_umap", "accel_leiden"):
+        # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
+        # 1M cells.
+        peak_mb = max(base_mb, dense_mb * 0.2)
+    elif benchmark.startswith("accel_"):
+        # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
+        # on 1M cells.
+        peak_mb = max(base_mb, dense_mb * 0.1)
     else:
         peak_mb = base_mb
 
@@ -697,6 +803,19 @@ def estimate_time_minutes(
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
         "ml_loader":              30,
+        # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
+        # because (a) longer timeouts don't hurt queue priority on this
+        # cluster, (b) over-budgeting once beats serial retries on timeout
+        # flakes. scanpy UMAP on census_1m needed >55 min at 3 runs; give
+        # CPU-reference cells clear headroom. All lines add base + default
+        # slope (8 min/M cells) per (n_obs / 1M) — census_1m hits these
+        # ceilings for the CPU reference implementations.
+        "accel_pca":              30,
+        "accel_knn":              60,
+        "accel_umap":            120,
+        "accel_leiden":           90,
+        "accel_preprocess":       60,
+        "accel_hvg":              45,
     }
     base = base_minutes.get(benchmark, 15)
 

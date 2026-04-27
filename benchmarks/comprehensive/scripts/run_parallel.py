@@ -245,19 +245,56 @@ def _per_job_slurm_params(
 
     partition = partition_for_memory(mem, default=args.partition)
 
+    # Phase 9.3 (post-Tier-3 finding 2b) — route accelerator benchmarks
+    # to the GPU partition **only for variants that actually use the GPU**.
+    # Variant naming convention: format_key ending in `_gpu` or containing
+    # `_gpu_` indicates GPU dispatch (e.g. `accel_pca__pyscx_gpu_cov`,
+    # `accel_knn__pyscx_gpu_cagra`). CPU-only variants (`accel_*__scanpy_cpu`,
+    # `accel_*__pyscx_cpu*`, `accel_leiden__leidenalg_cpu`) flow through
+    # partition_for_memory which auto-promotes to cpu_high_mem when sizing
+    # exceeds the preemptible-GPU node's RAM ceiling — unblocking
+    # accel_preprocess on census_1m (needs >64 GB).
+    extra_slurm: dict = {}
+    needs_gpu = (
+        benchmark is not None
+        and benchmark.startswith("accel_")
+        and ("_gpu_" in format_key or format_key.endswith("_gpu"))
+    )
+    if needs_gpu:
+        partition = "preemptible"  # GPU partition on chimera
+        extra_slurm["slurm_gres"] = "gpu:1"
+        # Chimera's preemptible GPU QOS caps per-job memory at ~128 GB
+        # (matching SLURM_DEFAULTS.gpu.mem_gb). Requests above that fail
+        # with `QOSMaxGRESPerJob`. Clamp so census-scale preprocess cells
+        # that actually use GPU compute don't get rejected at submit time.
+        # (CPU variants have already been routed away via the `needs_gpu`
+        # check and will pick up cpu_high_mem via partition_for_memory.)
+        _GPU_MEM_CEILING_GB = 128
+        if mem > _GPU_MEM_CEILING_GB:
+            logger.warning(
+                "Clamping %s__%s__%s mem from %dG to %dG (GPU QOS cap)",
+                benchmark, format_key, dataset_name,
+                mem, _GPU_MEM_CEILING_GB,
+            )
+            mem = _GPU_MEM_CEILING_GB
+
     logger.info(
-        "Sized %s__%s__%s: mem=%dG time=%dm partition=%s (scale=%.2f)",
+        "Sized %s__%s__%s: mem=%dG time=%dm partition=%s%s (scale=%.2f)",
         benchmark or "convert", format_key, dataset_name,
-        mem, timeout_min, partition, scale,
+        mem, timeout_min, partition,
+        " gres=gpu:1" if extra_slurm.get("slurm_gres") else "",
+        scale,
     )
 
-    return {
+    params: dict = {
         "slurm_partition": partition,
         "cpus_per_task": args.cpus,
         "mem_gb": mem,
         "timeout_min": timeout_min,
         "slurm_setup": _slurm_setup_cmds(),
     }
+    params.update(extra_slurm)
+    return params
 
 
 def main() -> None:
@@ -276,13 +313,43 @@ def main() -> None:
         datasets = [name for name, cfg in DATASETS.items() if cfg.h5ad_path.exists()]
 
     # Resolve formats
+    # `accel_formats()` is lazy-loaded — pulls in the `FormatVariant` entries
+    # for each `accel_*.py` module's implementation variants (PCA: scanpy_cpu,
+    # pyscx_cpu_auto, pyscx_gpu_cov, pyscx_gpu_rand_hh, pyscx_gpu_rand_chol;
+    # kNN / UMAP / Leiden / preprocess / HVG similarly). Included whenever
+    # --include-accel is set, when --formats explicitly names an accel key,
+    # or when --benchmarks names any accel_* benchmark.
+    from benchmarks.comprehensive.config import accel_formats
+    need_accel = (
+        args.include_accel
+        or any((fk or "").startswith("accel_") for fk in (args.formats or []))
+        or any((b or "").startswith("accel_") for b in (args.benchmarks or []))
+    )
+    pool = list(ALL_FORMATS)
+    if need_accel:
+        pool.extend(accel_formats())
     if args.formats:
-        all_by_key = {f.key: f for f in ALL_FORMATS}
+        all_by_key = {f.key: f for f in pool}
         formats = [all_by_key[k] for k in args.formats if k in all_by_key]
+    elif args.include_additional and need_accel:
+        formats = pool
     elif args.include_additional:
         formats = list(ALL_FORMATS)
+    elif need_accel:
+        formats = list(PRIMARY_FORMATS) + accel_formats()
     else:
         formats = list(PRIMARY_FORMATS)
+
+    # --no-gpu: drop accel GPU variants. By convention accel format keys are
+    # `<bench>__<impl>_<device>[_<extra>]`, e.g. `accel_pca__pyscx_gpu_cov`.
+    # The substring "_gpu" is unique to GPU variants — CPU keys use "_cpu" and
+    # format-benchmark keys (zarr_zstd, scx_auto, …) don't include "_gpu".
+    if args.no_gpu:
+        before = len(formats)
+        formats = [f for f in formats if "_gpu" not in f.key]
+        dropped = before - len(formats)
+        if dropped:
+            logger.info("--no-gpu: dropped %d GPU accel format variants", dropped)
 
     # Resolve benchmarks
     benchmarks = args.benchmarks or BENCHMARK_NAMES
@@ -399,6 +466,20 @@ def main() -> None:
         for ds_name in datasets:
             n_runs = n_runs_for_dataset(ds_name)
             for fmt in formats:
+                # Accelerator benchmarks are self-contained: each
+                # `accel_X` module owns its own set of variants
+                # (`accel_X__<impl>`). Pairing `accel_pca` with an
+                # `accel_knn__*` format — or with any non-accel format —
+                # schedules a cell whose `run()` returns None (waste).
+                # Skip those pairings at the launcher level.
+                if bench_name.startswith("accel_"):
+                    if not fmt.key.startswith(f"{bench_name}__"):
+                        continue
+                elif fmt.key.startswith("accel_"):
+                    # Non-accel benchmarks (read_full, etc.) don't pair
+                    # with accel variants either.
+                    continue
+
                 key = (ds_name, fmt.key)
                 label = f"{bench_name}/{ds_name}/{fmt.key}"
 
@@ -485,7 +566,7 @@ def main() -> None:
         # Auto-run the regression gate when a canonical baseline exists
         # (Phase I.6). Non-fatal — reports the gate outcome and returns
         # normally; use the gate's own exit code elsewhere if blocking is
-        # desired (the `gate_candidate.sh` wrapper does this).
+        # desired (the `gate_candidate.py` wrapper does this).
         if getattr(args, "auto_diff", True):
             _maybe_auto_diff(run_id)
 
@@ -509,9 +590,9 @@ def _maybe_auto_diff(run_id: str) -> None:
         return
     # The current snapshot for this run isn't a capture_baseline.py tree —
     # auto-diff works on the *last* captured snapshot. Operators who want a
-    # scored PR should use scripts/gate_candidate.sh instead.
+    # scored PR should use scripts/gate_candidate.py instead.
     logger.info(
-        "Auto-diff: run_id=%s — use scripts/gate_candidate.sh to compare "
+        "Auto-diff: run_id=%s — use scripts/gate_candidate.py to compare "
         "against baselines/LATEST; raw results landed in results/raw/.",
         run_id,
     )
@@ -536,6 +617,19 @@ def parse_args() -> argparse.Namespace:
                         help="Format keys. Default: all primary formats.")
     parser.add_argument("--include-additional", action="store_true",
                         help="Include additional formats (BPCells, Parquet).")
+    parser.add_argument("--include-accel", action="store_true",
+                        help="Include accelerator-variant formats (accel_pca__*, "
+                             "accel_knn__*, etc.) registered via "
+                             "config.accel_formats(). Auto-enabled when "
+                             "--benchmarks names any accel_* benchmark or "
+                             "--formats names any accel_* key.")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="Drop accel formats whose key matches *_gpu* "
+                             "(e.g. accel_pca__pyscx_gpu_cov, "
+                             "accel_knn__pyscx_gpu). Use on CPU-only hosts or "
+                             "when validating CPU-only changes on a GPU box. "
+                             "CPU accel variants and format benchmarks are "
+                             "unaffected.")
     parser.add_argument("--cold-cache", action="store_true",
                         help="Drop OS caches between runs.")
     parser.add_argument("--skip-convert", action="store_true",

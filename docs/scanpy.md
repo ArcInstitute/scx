@@ -585,6 +585,36 @@ Instead of loading the entire expression matrix into RAM, `pyscx.accel.normalize
 and `pyscx.accel.log1p()` create a **lazy transform wrapper** that applies
 transformations on-read — data stays on disk.
 
+### Lazy vs eager preprocessing
+
+| `device=` | Behaviour |
+|-----------|-----------|
+| `"cpu"` / `"auto"` (no GPU) | **Lazy**: wraps `adata.X` in an `ScxLazyTransformedDataset` (see below). No materialization. |
+| `"gpu"` / `"auto"` (GPU available) | **Eager**: streams shards through GPU kernels (`gpu_preprocess_to_csr`) and replaces `adata.X` with a materialized scipy CSR. A `UserWarning` is emitted when the prior X was already lazy so the broken chain is visible. |
+
+**Fusion detection** — `normalize_total(device="gpu")` stashes a marker on
+`adata.uns["__scx_gpu_pending_normalize__"]`. A subsequent
+`log1p(device="gpu")` on the same AnnData consumes the marker and re-runs a
+**single fused normalize+log1p pass over the original backed source** rather
+than reading the already-materialized scipy CSR. Any intervening op (PCA,
+kNN, …) silently forfeits the fusion, producing correct — but 1× redundant —
+results.
+
+**`log1p(device="gpu")` standalone** — when there is no fusion marker AND the
+input X is already a materialized scipy/dense matrix, GPU dispatch is 50–100×
+slower than CPU (H→D + D→H copies dominate log1p's trivial math). `pyscx`
+detects this case, emits a `UserWarning`, and runs `sc.pp.log1p` on the host
+instead. To get the GPU fast path, either run
+`pyscx.accel.normalize_total(device="gpu")` first (the fusion marker enables
+a single fused pass), or operate on a backed SCX dataset.
+
+**HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
+through GPU atomicAdd kernels for `streaming_mean_var` and
+`streaming_clip_square_sum`. GPU dispatch is active only for single-batch
+seurat_v3 flavors today; `batch_key` set or `flavor="seurat"` falls back to
+CPU with a `UserWarning`.
+
+
 ### Quick example
 
 ```python
@@ -784,13 +814,19 @@ All accelerators support a `device` parameter for GPU acceleration:
 
 Two methods, auto-routed by the number of variables:
 
-- **Covariance PCA** (n_vars ≤ 5,000): Builds the covariance matrix `X^T @ X`
-  directly from CSR nonzeros via sparse outer product accumulation (exploiting
-  symmetry), then eigendecomposes. Exact results, faster than randomized SVD
-  for HVG-selected data. Parallel accumulation via rayon thread-local matrices.
-- **Randomized SVD** (n_vars > 5,000): Streaming shard-by-shard SpMM with
-  zero-copy `MatRef::from_row_major_slice` views. Skips intermediate QR on
-  transpose results for n_power_iterations ≤ 2 (matching sklearn's default).
+- **Covariance PCA** (CPU: n_vars ≤ 5,000; GPU: n_vars ≤ 8,000): Builds the
+  covariance matrix `X^T @ X` directly from CSR nonzeros via sparse outer
+  product accumulation (exploiting symmetry), then eigendecomposes. Exact
+  results, faster than randomized SVD for HVG-selected data. Parallel
+  accumulation via rayon thread-local matrices on CPU; GPU path streams shards
+  through `CenteredSparseOperator` (implicit mean-centering) into a dense
+  on-device Gram matrix, then `cusolverDnSsyevd`.
+- **Randomized SVD** (CPU: n_vars > 5,000; GPU: n_vars > 8,000): Streaming
+  shard-by-shard SpMM with zero-copy `MatRef::from_row_major_slice` views.
+  Skips intermediate QR on transpose results for n_power_iterations ≤ 2
+  (matching sklearn's default). GPU path uses cuSPARSE SpMM + cuSOLVER QR and
+  stays fully GPU-resident through the final embedding (cuBLAS `sgemm` +
+  broadcast-scale) — no host round-trip.
 
 Both methods work in backed mode without materializing the full matrix.
 
@@ -815,13 +851,16 @@ pyscx.accel.pca(adata, n_comps=50)
 | `n_oversamples` | 10 | Extra dimensions for accuracy (randomized SVD only) |
 | `n_power_iterations` | 2 | Power iterations for spectral accuracy (randomized SVD only) |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
+| `method` | `"auto"` | `"auto"`, `"covariance"`, or `"randomized"`. `"auto"` routes by `n_vars` (covariance when small, randomized otherwise). Explicit override is useful when benchmarking or when the auto threshold doesn't fit your data. |
+| `qr_method` | `"householder"` | Randomized-path QR algorithm: `"householder"` (cuSOLVER `geqrf`/`orgqr` — always stable) or `"cholesky"` (CholeskyQR2 via `potrf` + `strsm` — ~3× faster on well-conditioned inputs). **Ignored** by the covariance path. Non-SPD failures surface as `RuntimeError` with a clear "retry with qr_method='householder'" hint. |
 
 **Key advantage:** On HVG-selected data (2,000 genes), covariance PCA
 completes in 4.2s on 1M cells — 5× faster than the previous randomized
 SVD and 1.9× faster than scanpy. The method is auto-selected based on
 `n_vars`; no user configuration needed. On GPU, the pipeline uses
-cuSPARSE SpMM + cuSOLVER QR. Peak memory is one shard plus working matrices
-(plus ~30 MB covariance matrix for 2K genes).
+cuSPARSE SpMM + cuSOLVER (QR for randomized, `syevd` for covariance) with
+cuBLAS for the Gram accumulation and post-QR multiplies. Peak memory is one
+shard plus working matrices (plus ~30 MB covariance matrix for 2K genes).
 
 ### kNN graph (`pyscx.accel.neighbors`)
 
@@ -879,15 +918,20 @@ Falls back to cuML UMAP if available for maximum performance.
 
 Rust-native implementation of the Leiden algorithm (Traag, Waltman & van
 Eck, 2019) with the Reichardt-Bornholdt (RB) configuration model quality
-function. Operates directly on the kNN connectivities CSR matrix — no
-Python `igraph` or `leidenalg` dependency required.
+function on the CPU path; cuGraph on the GPU path. Operates directly on
+the kNN connectivities CSR — no Python `igraph` / `leidenalg` dependency
+required.
 
 ```python
 pyscx.accel.leiden(adata, resolution=1.0)
 
 # Results written to:
 #   adata.obs["leiden"]              — categorical community labels
-#   adata.uns["leiden"]["params"]    — resolution, random_state, backend
+#   adata.uns["leiden"]["params"]    — resolution, random_state, device,
+#                                     parallel, theta (cugraph), gpu_id
+#                                     (cugraph), and `ignored` list of
+#                                     kwargs the chosen backend dropped
+#   adata.uns["leiden"]["backend"]   — "scx-accel" or "cugraph"
 ```
 
 | Parameter | Default | Description |
@@ -895,20 +939,36 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `resolution` | 1.0 | Resolution parameter γ — higher values yield more communities |
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
-| `n_iterations` | -1 | Outer iterations: -1 = run until convergence (default, matches scanpy), >0 = fixed count |
-| `parallel` | `False` | Use parallel (conflict-free batched) local moving. `False` (default) uses sequential moving that matches C++ leidenalg. `True` is faster on large graphs but converges to a different local optimum. |
-| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
+| `n_iterations` | 2 | Outer iterations: 2 matches the leidenalg package default; raise to e.g. 100 on the cuGraph path for tighter modularity convergence (rapids-singlecell's default). |
+| `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) matches C++ leidenalg sequential moving. **Ignored on the cuGraph path** (warns when `True`). |
+| `device` | `"auto"` | `"auto"` (cuGraph if available, else Rust-native), `"cpu"` (Rust-native), `"gpu"` / `"gpu:N"` (cuGraph on CUDA device 0 or N — `gpu:N` pins via `cupy.cuda.Device(N)`). |
+| `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored on the Rust-native path** (warns when non-default). |
 
-**Dispatch priority:** Rust-native → GPU cuGraph → Python leidenalg (fallback).
-The Rust path is tried first; if it fails, a warning is issued and the next
-backend is tried.
+**Dispatch (post-spec):** two backends as peers, selected by `device`:
+
+* `device="cpu"` → Rust-native (`scx_accel::leiden`). ARI ≈ 0.97 vs
+  leidenalg on pbmc3k. Always available.
+* `device="gpu"` → cuGraph. ARI ≈ 0.92 vs leidenalg, by design (different
+  refinement strategy). Hard error if cuGraph is missing — no fallback.
+* `device="auto"` (default) → cuGraph when a CUDA device is visible and
+  `cugraph` imports cleanly, else Rust-native. Matches the rest of
+  `pyscx.accel.*`.
+
+**Migration note (vs the pre-spec dispatcher):** `device="auto"` previously
+ran Rust-native first regardless of host. After the spec it runs cuGraph
+on GPU hosts where cuGraph is installed, which produces a different
+partition (ARI 0.97 → 0.92 vs leidenalg). Pin `device="cpu"` to preserve
+the old behavior — required when downstream DE / annotation transfer /
+UMAP coloring is keyed on specific cluster IDs from previous runs. The
+Python `leidenalg` fallback has been deleted; callers who want it run
+`scanpy.tl.leiden(flavor="leidenalg")` directly.
 
 Benchmarked at 55s on 1M cells (**40× faster** than Python leidenalg's 2,226s
-in same-conditions comparison).
-ARI 0.92 vs Python leidenalg on census_1m. The Rust implementation may
-converge to a different local optimum than Python leidenalg — both produce
-valid, high-quality community structures. Compare via ARI or NMI when
-switching backends.
+in same-conditions comparison) on the Rust-native path; ~3.5s on the cuGraph
+path. ARI 0.92 vs Python leidenalg on census_1m for the cuGraph path. The
+two backends converge to different local optima — both produce valid
+high-quality community structures. Compare via ARI or NMI when switching
+backends.
 
 ### Batch integration / Harmony2 (`pyscx.accel.harmony_integrate`)
 

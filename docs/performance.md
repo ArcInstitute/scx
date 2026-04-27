@@ -286,17 +286,109 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 ### GPU Analysis Pipeline
 
-GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB with 1M cells:
+GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuBLAS, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB (driver 535.161.08, CUDA 12.2, scx-gpu conda env).
 
-| Operation | CPU (s) | GPU (s) | Speedup | Backend |
-|-----------|---------|---------|---------|---------|
-| kNN (k=15, 50 PCs) | 288 | 31 | **9.4x** | cuVS CAGRA |
-| UMAP (2D) | 560 | 74 | **7.6x** | native CUDA SGD |
-| Leiden | 45 | 3 | **16.0x** | cuGraph |
-| PCA (50 PCs, 2K HVGs) | 22 | 24 | 0.9x | cuSPARSE SpMM |
-| **End-to-end pipeline** | **1077** | **286** | **3.8x** | all above |
+Numbers below are from the Phase 8 cluster run on 2026-04-23 (SLURM job 2211369). Pipeline end-to-end row is marked _pending bench_ until the census_1m pipeline completes.
 
-GPU PCA streams shards from disk -> GPU SpMM shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM.
+#### Per-operation timing
+
+| Operation | Dataset | CPU (s) | GPU (s) | Speedup | Backend |
+|-----------|---------|---------|---------|---------|---------|
+| PCA (50 PCs, 2K HVGs) | pbmc3k (2.7K) | — | — | 0.7x | auto-routed (covariance) |
+| PCA (50 PCs, 2K HVGs) | tabula_sapiens_100k | 2.8 | 1.6 | **1.7x** | auto-routed |
+| PCA (50 PCs, 2K HVGs) | census_1m | 3.0 | 3.3 | 0.9x | auto-routed |
+| PCA correctness (cos sim vs scanpy, top-50) | pbmc3k | — | — | **min=0.999911** | — |
+| PCA correctness (cos sim vs scanpy, top-50) | census_1m | — | — | **min=1.0** | — |
+| kNN (k=15, 50 PCs) | tabula_sapiens_100k | 8.8 | 3.0 | **2.9x** | cuVS CAGRA |
+| kNN (k=15, 50 PCs) | census_1m | 130.8 | 27.0 | **4.8x** | cuVS CAGRA |
+| UMAP (2D) | tabula_sapiens_100k | 49.2 | 3.1 | **16.1x** | native CUDA SGD |
+| UMAP (2D) | census_1m | 641.5 | 29.3 | **21.9x** | native CUDA SGD |
+| UMAP trustworthiness | pbmc3k | 0.9238 | 0.9233 | — | vs PCA space |
+| Leiden (`device="cpu"`) | census_1m | 55.0 | 56.9 | **1.0×** | Rust-native (`scx_accel::leiden`) |
+| Leiden (`device="gpu"`) | census_1m | 55.0 | ~3.5 | **~16×** | cuGraph (reached directly post-spec — see "Choosing a Leiden backend" below) |
+| **End-to-end pipeline** | **census_1m** | **837.9** | **120.6** | **6.9×** | all above — **up from 3.8× pre-Phase-1** |
+
+The pipeline 6.9× speedup is headlined by UMAP (18.8×, up from 7.7×) and kNN (5.4× in-pipeline, up from 2.3×). PCA at 2K HVGs × 1M cells shows 1.0× because CPU covariance PCA already takes ~3 s — there's no headroom for a speedup. At `n_vars = 100 K` (tabula_sapiens_100k without HVG subsetting) PCA lands at 1.7×.
+
+#### Choosing a Leiden backend
+
+The two Leiden backends produce different partitions by design — they are not interchangeable. `device` is authoritative; there is no silent cross-backend fallback.
+
+| Backend | `device` | Wall on census_1m | ARI vs leidenalg | Pick when |
+|---|---|---:|---:|---|
+| Rust-native (`scx_accel::leiden`) | `"cpu"` | ~56 s | ≈ 0.97 | Cluster IDs feed a downstream pipeline (marker-gene DE, annotation transfer, anything keyed on specific labels). Reproducibility against the CPU reference matters more than ~50 s on a 1M-cell graph. |
+| cuGraph | `"gpu"` / `"gpu:N"` | ~3.5 s | **0.92** | Throughput-bound exploratory work — resolution sweeps, clustering under many random seeds, one-shot visualizations — where ARI 0.92 parity is acceptable. |
+
+`device="auto"` (default) follows the rest of `pyscx.accel.*`: cuGraph if a CUDA device is visible and `cugraph` imports cleanly, else Rust-native. **Migration**: this differs from the pre-spec dispatcher, which always tried Rust-native first. Pin `device="cpu"` to preserve pre-spec cluster IDs. The cluster-assignment shift (ARI 0.97 → 0.92 vs leidenalg) is real for any user on a host with cuGraph installed.
+
+cuGraph's Leiden uses a different refinement step and seed-handling scheme from leidenalg; the Rust-native implementation is a direct port of Traag et al. 2019 with the RB configuration model. The divergence is not an implementation bug — see `CLAUDE.md` § Known Limitations.
+
+`device="gpu:N"` pins the cuGraph call to CUDA device `N` via `cupy.cuda.Device(N)`. Bare `"gpu"` is `"gpu:0"`. Out-of-range indices are rejected by `resolve_device`'s validation against `cudarc::GpuDevice::count()`. The Python `leidenalg` shim has been removed — callers who want it run `scanpy.tl.leiden(flavor="leidenalg")` directly.
+
+#### Preprocessing device dispatch (Phase 5)
+
+`pyscx.accel.{normalize_total, log1p, highly_variable_genes}` now accept `device="cpu|gpu|auto"`. The GPU path is eager (materializes to scipy CSR). **`log1p(device="gpu")` on a materialised scipy/dense X warns and falls back to CPU** — the H→D + kernel + D→H round-trip dominates log1p's trivial math. The pre-fallback measurement (retained as motivation):
+
+| Op | pbmc3k CPU / GPU | tabula_sapiens_100k CPU / GPU | census_1m CPU / GPU |
+|---|---|---|---|
+| normalize_total | 0.004s / 0.004s (1.0×) | 0.61s / 0.43s (**1.4×**) | 3.27s / 3.00s (**1.1×**) |
+| log1p (pre-fallback) | 0.003s / 0.41s (**0.01×**) | 0.20s / 9.23s (**0.02×**) | 1.46s / 63.78s (**0.02×**) |
+| fused normalize+log1p | 0.006s / 0.41s (0.01×) | 0.83s / 9.73s (0.09×) | 4.50s / 67.45s (0.07×) |
+| highly_variable_genes (seurat_v3) | 0.06s / 0.07s (0.9×) | 3.42s / 3.40s (1.0×) | 25.77s / 28.31s (0.9×) |
+
+Practical recommendation: **use the GPU preprocessing path only via the `normalize_total → log1p` fusion-marker chain on backed SCX data, and only when the downstream consumer is also GPU**. The fused-chain optimization is the only case where GPU preprocessing doesn't round-trip through the host. Standalone `log1p(device="gpu")` on materialised X now emits a `UserWarning` and runs `sc.pp.log1p` instead; the GPU fast path is preserved when log1p sees the fusion marker planted by `normalize_total(device="gpu")`, or when X is still backed/lazy.
+
+**Dispatch logic:** `pyscx.accel.pca(device="gpu")` auto-routes by `n_vars` — the covariance path handles HVG-shaped inputs (`n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000`) and the randomized path handles the long-tail. Users can force one or the other with `method="covariance"` / `"randomized"`. The randomized path accepts `qr_method="householder"` (default, always-stable) or `"cholesky"` (CholeskyQR2 — opt-in, surfaces `RuntimeError` on non-SPD Gram so callers can retry with Householder).
+
+**Correctness.** On pbmc3k + census_1m, GPU PCA's 50 leading PCs match scanpy's reference to cosine ≥ 0.9999 sign-agnostic (`gpu_pca_validation.json`). kNN GPU CAGRA matches scanpy-neighbors at recall = 1.0 on pbmc3k and ARI 0.91 against a downstream Leiden on tabula_sapiens_100k. UMAP trustworthiness 0.9233 (vs CPU 0.9238) on pbmc3k.
+
+GPU PCA (both variants) streams shards from disk → GPU kernels shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM.
+
+#### Canonical baseline
+
+As of **v0.6.0-gpu-phase1-7-multidataset** (promoted 2026-04-24), the
+GPU accelerator benchmarks live in the same comprehensive-framework
+baseline as the format benchmarks. The LATEST baseline covers a full
+60-cell sweep across the three reference datasets:
+
+| Dataset | accel cells | Source |
+|---|---:|---|
+| pbmc3k (2.7K cells) | 20 | post-Phase-9 Tier 1 / 3 |
+| tabula_sapiens_100k (100K cells) | 20 | Tier 2 / 3 |
+| census_1m (1M cells) | 20 | Tier 3 + CPU-reference retry |
+
+Per-run correctness metrics (`cosine_sim_min`/`mean`,
+`recall_vs_scanpy`, `trustworthiness`, `ari_vs_leidenalg`,
+`max_abs_diff_vs_scanpy`, `hvg_overlap_vs_scanpy`) flow through
+`runs[].extra` so the floor checks in `thresholds.yaml` evaluate real
+observed values, not `missing` placeholders.
+
+```bash
+# Gate any post-change head against the canonical baseline (both format and
+# accelerator dimensions). Exit 0 = pass, 1 = unjustified regression.
+python benchmarks/comprehensive/scripts/gate_candidate.py
+# → compares current head's captured snapshot against
+#   benchmarks/comprehensive/results/baselines/LATEST
+#       → v0.6.0-gpu-phase1-7-multidataset
+```
+
+The pbmc3k-only `v0.6.0-gpu-phase1-7` baseline (the smoke snapshot
+that briefly held LATEST in late April) remains in-tree for historical
+diff comparison but is no longer the gate target. The standalone
+`benchmarks/scripts/gpu_regression_{diff,driver}.py` wrappers from
+Phase 8 are **deprecated** — they remain in-tree for one release for
+rollback convenience but new regression runs should use
+`gate_candidate.py`. See
+[benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
+
+#### Changes vs previous version
+
+- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) implemented. On tabula_sapiens_100k (HVG-shaped input) GPU PCA now runs 1.7× vs CPU, up from 0.9× in the pre-Phase-1 baseline. On census_1m at the same n_vars, the speedup remained 0.9× — the covariance-PCA's Gram-matrix cost on 1M cells doesn't currently outperform CPU's block-partitioned outer-product accumulation. Tracked as a follow-up optimization (streaming Gram into a sparse intermediate rather than densifying per shard).
+- **Randomized PCA's critical path** now fully GPU-resident — the prior `Q → host → f64` SVD tail and per-iteration `d_m` download round-trip are gone (cuBLAS `sgemv` + `sgemm`). Correctness preserved (cosine ≥ 0.9999 on real data).
+- **Opt-in CholeskyQR2** (`qr_method="cholesky"`) for the randomized path; benchmark-suite variants `gpu_randomized_pca_chol` vs `gpu_randomized_pca_householder` pending from the current cluster run.
+- **Standalone GPU preprocessing ops** (`normalize_total`, `log1p`, `highly_variable_genes`) gain a `device` kwarg. In isolation they are slower than the CPU path (see table above — `log1p` is ~40× slower on tabula due to H2D/D2H round-trips); the `normalize_total → log1p` fusion marker is the only fast path.
+- **cuGraph Leiden** exposes the `theta` knob via `pyscx.accel.leiden(theta=...)`.
+- **Frozen pre-Phase-1 baseline** committed at `benchmarks/results/pre_phases_1_7_baseline_2026_03/` with BLAKE-equivalent integrity (`MANIFEST.sha256`). The Phase-8 diff tool (`benchmarks/scripts/gpu_regression_diff.py`) compares any post-change SLURM run against this reference.
 
 ### Go/No-Go Status
 
@@ -530,7 +622,7 @@ pbmc3k (see §8b):
 All benchmark results now carry a `schema_version=1` stamp + full
 provenance (git SHA, thread pinning, run_id) in their
 `system.provenance` block. The on-demand gate
-(`scripts/gate_candidate.sh` + `scripts/compare_against_baseline.py
+(`scripts/gate_candidate.py` + `scripts/compare_against_baseline.py
 --gate`) evaluates relative tolerances (3% wall / 10% RSS / 1% size),
 absolute floors from `thresholds.yaml` (e.g. cloud throughput ≥ 50
 MB/s, keyed on tabula_sapiens_100k), and disappeared-benchmark
@@ -543,4 +635,4 @@ browsable HTML snapshot alongside the markdown report, threaded with
 The canonical baseline sits at
 `benchmarks/comprehensive/results/baselines/v0.5.0-phase5/` (371 raw
 JSONs archived, manifest + environment committed). `LATEST` symlink
-makes on-demand gate runs (`gate_candidate.sh`) work with no flags.
+makes on-demand gate runs (`gate_candidate.py`) work with no flags.

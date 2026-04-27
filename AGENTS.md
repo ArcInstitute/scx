@@ -18,7 +18,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
 - **[docs/cloud.md](docs/cloud.md)** — Using SCX in cloud environments: auth, layouts, tuning, provider-specific notes.
-- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts.
+- **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts. See [Regression Gating](benchmarks/README.md#regression-gating) for the canonical local gate (`python benchmarks/comprehensive/scripts/gate_candidate.py` against `comprehensive/results/baselines/LATEST`) — covers format + accel CPU + accel GPU by default; opt out with `--no-gpu` / `--no-accel` / `--accel-only`. There is no CI-side gate (the prior `accel-gate.yml` workflow was removed because the self-hosted GPU runner queue made it unworkable). [GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow) covers the routing details (which accel jobs land on which partitions).
 - **[tasks/](tasks/)** — Historical phase specs and code reviews.
 
 ## Build and Test
@@ -118,7 +118,7 @@ Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standar
 - **kNN**: HNSW-based approximate nearest neighbors via `instant-distance`.
 - **UMAP**: SGD-based layout optimization.
 - **Differential expression**: Pre-ranking Wilcoxon test — ranks all cells once per gene, reuses across groups (10x fewer sorts). `rankby_abs` parameter matches scanpy's signed-score ranking.
-- **Leiden clustering**: Rust-native implementation (Traag et al. 2019) with RB configuration model. Sequential mode (default) matches C++ leidenalg convergence; parallel mode uses conflict-free graph coloring. Uses `rand_chacha` for deterministic seeding.
+- **Leiden clustering**: Rust-native implementation (Traag et al. 2019) with RB configuration model on the CPU path; cuGraph on the GPU path. Selected by `device` (`"cpu"` / `"gpu"` / `"gpu:N"` / `"auto"`); no silent cross-backend fallback, no Python `leidenalg` shim. Sequential mode (default) matches C++ leidenalg convergence; `parallel=True` uses conflict-free graph coloring (Rust-native only — ignored with `UserWarning` on the cuGraph path). Uses `rand_chacha` for deterministic seeding.
 - **Harmony2 batch integration**: Clean-room Rust port of Harmony2 (Korsunsky et al. 2019) — soft k-means with diversity penalty + ridge-regression correction on PCA embeddings. Exposed as `pyscx.accel.harmony_integrate` (scanpy-compatible signature) and `rscx::scx_harmony_integrate`. GPU path accelerates distance / L2-normalize / batched scatter-subtract kernels. Mean per-PC Pearson r 0.989–0.999 vs R `harmony` v2.x on the validation fixtures (full parity limited by RNG stream divergence — see `pyscx/tests/test_harmony_validation.py`).
 - **LISI**: Local Inverse Simpson Index via exact brute-force kNN + t-SNE-style Gaussian-bandwidth search + Simpson reduction. Exposed as `pyscx.accel.compute_lisi` and `rscx::scx_compute_lisi`. ~10× faster than the R `lisi` reference with mean-LISI agreement within 0.8–2.4 % on D1–D4.
 - **HVG**: Streaming `highly_variable_genes()` via `ShardSource` — `streaming_mean_var()` and `streaming_clip_square_sum()`, loess fit via Python `skmisc.loess`, seurat_v3 and seurat flavors. `subset=True` uses column projection (no materialization).
@@ -127,14 +127,19 @@ Rust-native accelerators exposed via `pyscx.accel.*`, writing results to standar
 
 ### GPU Acceleration (scx-gpu)
 
-All accessible via `device="gpu"` parameter in `pyscx.accel.*`. Requires `scx-gpu` conda env with RAPIDS. See [docs/gpu-setup.md](docs/gpu-setup.md).
+All accessible via the `device=` parameter on `pyscx.accel.*` ops. Accepted values: `"auto"` (GPU 0 if available else CPU), `"cpu"`, `"gpu"` (= `"gpu:0"`), or `"gpu:N"` to target a specific CUDA device on multi-GPU systems. Out-of-range indices and non-integer suffixes raise (`RuntimeError` / `ValueError` respectively). Requires `scx-gpu` conda env with RAPIDS. See [docs/gpu-setup.md](docs/gpu-setup.md).
 
-- **GPU PCA**: cuSPARSE SpMM + cuSOLVER QR + cuRAND.
+- **GPU PCA**: Two dispatch paths auto-routed by `n_vars`:
+  - *Covariance* (`n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000`): cuSPARSE + cuBLAS `sgemm`/`sger` builds the Gram matrix on-device; cuSOLVER `syevd` eigendecomposes; embeddings via a second streaming `matmat`. No host round-trip.
+  - *Randomized SVD* (`n_vars > 8000`): cuSPARSE SpMM + cuSOLVER QR + cuRAND + cuBLAS. Fully GPU-resident final embedding (cuBLAS `sgemm` + broadcast-scale).
+  - Override via `method="auto"|"covariance"|"randomized"` on `pyscx.accel.pca`.
+  - Randomized path accepts `qr_method="householder"` (default, stable) or `"cholesky"` (CholeskyQR2 — `potrf` + `strsm`, ~3× faster on well-conditioned inputs; surfaces `RuntimeError` on non-SPD Gram so callers can retry with Householder).
 - **GPU kNN**: cuVS CAGRA (9.4x standalone on 1M cells).
 - **GPU UMAP**: Native CUDA SGD (7.7x on 1M cells).
-- **GPU Leiden**: cuGraph (16x on 1M cells).
-- **GPU preprocessing**: Fused normalize_total + log1p.
-- **Fallback**: Graceful CPU fallback when GPU unavailable.
+- **GPU Leiden**: cuGraph (16x on 1M cells). Reached directly via `device="gpu"` / `"gpu:N"` (post dispatch reframe — Rust-native no longer runs first). `theta` kwarg is cuGraph-only; `parallel` kwarg is Rust-native-only; mismatched kwargs emit `UserWarning`. `gpu:N` pins the call to CUDA device `N` via `cupy.cuda.Device(N)`.
+- **GPU preprocessing**: `pyscx.accel.normalize_total`, `log1p`, `highly_variable_genes` accept `device="auto"|"cpu"|"gpu"|"gpu:N"`. **Eager on GPU** — materializes `adata.X` to scipy CSR, breaking the lazy chain (emits `UserWarning`). The `normalize_total → log1p` chain fuses on GPU via an `adata.uns` marker (single fused pass over the original backed source). `log1p(device="gpu")` on an *already-materialised* scipy/dense X warns and falls back to `sc.pp.log1p` because the H→D / D→H round-trip dominates log1p's trivial math; the fast path requires the fusion marker or a backed/lazy source. HVG GPU dispatch is narrowed to single-batch seurat_v3; batched/seurat flavors fall back to CPU.
+- **Async shard I/O**: `DoubleBufferedShardLoader` overlaps shard decode (worker thread) with GPU kernel launches (compute stream). Feeds the randomized / covariance PCA paths, preprocessing, and HVG.
+- **Fallback**: Graceful CPU fallback when GPU unavailable (`device="auto"`).
 
 ### Lazy Preprocessing
 
@@ -239,8 +244,9 @@ See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
 ## Known Limitations
 
-- **GPU pipeline speedup**: 3.8x median achieved on 1M cells (10x target not met). Best individual: kNN 9.4x, UMAP 7.7x, Leiden 16x.
-- **GPU Leiden correctness**: ARI 0.92 vs Python leidenalg (Go/No-Go: 3/4 gates pass).
+- **GPU pipeline speedup**: 6.9x median achieved on 1M cells post-Phase-7 (up from 3.8x pre-Phase-1; 10x target still not met). Best individual after Phase 1-7: UMAP 18.8x on census_1m (21.9x standalone), kNN 5.4x in-pipeline (4.8x standalone). PCA at 2K HVGs × 1M is 1.0x — CPU covariance PCA already ~3s, no GPU headroom; at n_vars=100K PCA reaches 1.7x. Leiden post-dispatch-reframe reaches cuGraph directly via `device="gpu"` (~16× on 1M cells); end-to-end pipeline gain from this is bounded by Leiden's share of total wall-time (~50 s of ~120 s pre-reframe). Full regression report at `benchmarks/results/phases_1_7_gpu_regression_report.md` from Phase 8 cluster run (job 2211369, 2026-04-23). See `GPU-ACC-SPEED-UP.md` Phase 8 and [benchmarks/README.md § GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow).
+- **GPU Leiden correctness**: ARI ≈ 0.92 vs Python leidenalg — documented behavior of `device="gpu"` (and of `device="auto"` on GPU hosts), not a regression. cuGraph uses a different refinement strategy than leidenalg. Pin `device="cpu"` to preserve label stability for downstream DE / annotation transfer.
+- **Benchmark baseline scope**: the canonical gated baseline at `benchmarks/comprehensive/results/baselines/LATEST` covers format-level benchmarks (compression / read / write / parallel scaling / memory / ml_loader / cloud). Phase 9 (see `GPU-ACC-SPEED-UP.md`) extends this to the `pyscx.accel.*` GPU accelerator surface via new `accel_*` modules in `benchmarks/comprehensive/benchmarks/`. `accel_pca.py` has landed as the reference; `accel_{knn,umap,leiden,preprocess,hvg}.py` follow the same pattern and are tracked in that spec. Until all accelerator modules are migrated + a new `v0.6.0-gpu` baseline is promoted, GPU-accel PRs can additionally use the stopgap standalone workflow at `benchmarks/scripts/gpu_regression_{driver,diff}.py`.
 - **CSC storage**: Gene-major (CscShard) not yet implemented — CSR only.
 - **Multimodal**: CITE-seq, spatial transcriptomics not yet supported.
 - **GDS**: GPUDirect Storage requires local NVMe + nvidia-fs drivers + ext4/XFS; always falls back to CPU path.

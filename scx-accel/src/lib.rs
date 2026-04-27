@@ -59,8 +59,15 @@ pub use umap::{compute_umap, UmapResult};
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]
+pub use hvg::{streaming_clip_square_sum_with_device, streaming_mean_var_with_device};
+#[cfg(feature = "gpu")]
 pub use neighbors::{build_knn_graph_gpu, cuvs_available};
 #[cfg(feature = "gpu")]
-pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
+pub use pca::{
+    covariance_pca_gpu, gpu_available, gpu_info, randomized_pca_gpu, GpuInfo,
+    GPU_COVARIANCE_PCA_THRESHOLD,
+};
+#[cfg(feature = "gpu")]
+pub use scx_gpu::{gpu_log1p, gpu_preprocess_to_csr, GpuDevice, QrMethod};
 #[cfg(feature = "gpu")]
 pub use umap::compute_umap_gpu;

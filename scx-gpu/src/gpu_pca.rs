@@ -1,7 +1,7 @@
 //! GPU-accelerated randomized PCA pipeline.
 //!
 //! Provides the mean-correction CUDA kernel and the full GPU PCA pipeline
-//! that streams shards from [`BackedCsrReader`], performing SpMM on GPU via
+//! that streams shards from any [`ShardSource`], performing SpMM on GPU via
 //! cuSPARSE, QR via cuSOLVER, and the final SVD via CPU `faer`.
 //!
 //! ## Pipeline
@@ -17,16 +17,18 @@
 //!
 //! Peak GPU memory: ~500 MB for 1M cells (Y, Q matrices + 1 decoded shard).
 
+use cudarc::cublas::sys as cbs;
 use cudarc::driver::safe::CudaSlice;
 use cudarc::driver::safe::LaunchConfig;
 use cudarc::driver::PushKernelArg;
 use faer::Mat;
 
-use scx_format::backed::BackedCsrReader;
 use scx_format::total_variance_from_col_sq;
+use scx_format::ShardSource;
 
+use crate::cublas::{gpu_sgemm, gpu_sgemv, CublasHandle};
 use crate::curand::random_gaussian_gpu;
-use crate::cusolver::{gpu_qr_q, CusolverHandle};
+use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
 use crate::cusparse::{spmm_csr, spmm_csr_transpose, CusparseHandle};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -60,7 +62,7 @@ pub struct GpuPcaResult {
 
 /// GPU-accelerated randomized PCA.
 ///
-/// Streams data shard-by-shard from `reader`, performing SpMM on GPU via
+/// Streams data shard-by-shard from `source`, performing SpMM on GPU via
 /// cuSPARSE, QR via cuSOLVER, and the final SVD on CPU via `faer`.
 ///
 /// # Algorithm (matching scx-accel CPU version)
@@ -74,19 +76,22 @@ pub struct GpuPcaResult {
 /// 7. SVD of B (small matrix, CPU faer in f64) → Û, Σ, V^T
 /// 8. Embeddings = Q @ V × Σ (CPU — Q downloaded, small multiply)
 ///
-/// Steps 3-6 stream from BackedCsrReader without materializing full X.
+/// Steps 3-6 stream from any `ShardSource` without materializing full X.
+/// The `Sync` bound is required so that a future refactor to
+/// `DoubleBufferedShardLoader` (Phase 2+) works without signature churn.
 /// Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices).
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_randomized_pca(
     dev: &GpuDevice,
-    reader: &BackedCsrReader,
+    source: &(dyn ShardSource + Sync),
     n_components: usize,
     n_oversamples: usize,
     n_power_iterations: usize,
     zero_center: bool,
     seed: u64,
+    qr_method: QrMethod,
 ) -> Result<GpuPcaResult, GpuError> {
-    let (n_obs, n_vars) = reader.shape();
+    let (n_obs, n_vars) = source.shape();
 
     // Validate inputs
     if n_components == 0 || n_obs == 0 || n_vars == 0 {
@@ -107,12 +112,7 @@ pub fn gpu_randomized_pca(
     // Pre-flight GPU memory check: estimate peak usage and compare to free memory.
     // Peak = Y(n_obs*k) + Q(n_obs*k) + Z(n_vars*k) + shard_buf + means, all f32.
     {
-        let idx = reader.index();
-        let max_shard_rows = (0..idx.n_shards())
-            .filter_map(|i| idx.shard_range(i))
-            .map(|(s, e)| (e - s) as usize)
-            .max()
-            .unwrap_or(n_obs);
+        let max_shard_rows = source.max_shard_rows().map_err(format_scx_error)?.max(1);
         let peak_bytes = (2 * n_obs * k + n_vars * k + max_shard_rows * k + n_vars) * 4;
         let peak_with_headroom = (peak_bytes as f64 * 1.1) as usize;
         let (free, _total) = dev.free_memory()?;
@@ -128,9 +128,10 @@ pub fn gpu_randomized_pca(
     // Create handles
     let cusparse_handle = CusparseHandle::new()?;
     let cusolver_handle = CusolverHandle::new()?;
+    let cublas_handle = CublasHandle::new()?;
 
     // Step 1: Compute column means and sum-of-squares (CPU-side, 1 pass)
-    let (means, col_sum_sq) = reader
+    let (means, col_sum_sq) = source
         .col_means_and_sum_sq(zero_center)
         .map_err(format_scx_error)?;
 
@@ -151,7 +152,8 @@ pub fn gpu_randomized_pca(
     let d_y = streaming_gpu_spmm_forward(
         dev,
         &cusparse_handle,
-        reader,
+        &cublas_handle,
+        source,
         &d_omega,
         d_means.as_ref(),
         n_obs,
@@ -159,9 +161,24 @@ pub fn gpu_randomized_pca(
         k,
     )?;
 
+    // QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in).
+    // The closure borrows each handle by reference, so it can be invoked at
+    // each of the three QR call-sites without taking ownership.
+    let qr = |a: &mut CudaSlice<f32>,
+              rows: usize,
+              cols: usize|
+     -> Result<CudaSlice<f32>, GpuError> {
+        match qr_method {
+            QrMethod::Householder => gpu_qr_q(&cusolver_handle, dev.stream(), dev, a, rows, cols),
+            QrMethod::Cholesky => {
+                gpu_cholesky_qr2(&cublas_handle, &cusolver_handle, dev, a, rows, cols)
+            }
+        }
+    };
+
     // Step 4: Q = qr(Y)
     let mut d_y_mut = d_y;
-    let mut d_q = gpu_qr_q(&cusolver_handle, dev.stream(), dev, &mut d_y_mut, n_obs, k)?;
+    let mut d_q = qr(&mut d_y_mut, n_obs, k)?;
 
     // Step 5: Power iterations
     for _ in 0..n_power_iterations {
@@ -169,7 +186,7 @@ pub fn gpu_randomized_pca(
         let d_b = streaming_gpu_spmm_transpose(
             dev,
             &cusparse_handle,
-            reader,
+            source,
             &d_q,
             d_means.as_ref(),
             n_obs,
@@ -179,13 +196,14 @@ pub fn gpu_randomized_pca(
 
         // Q_B = qr(B)
         let mut d_b_mut = d_b;
-        let d_q_b = gpu_qr_q(&cusolver_handle, dev.stream(), dev, &mut d_b_mut, n_vars, k)?;
+        let d_q_b = qr(&mut d_b_mut, n_vars, k)?;
 
         // Y = X @ Q_B
         let d_y2 = streaming_gpu_spmm_forward(
             dev,
             &cusparse_handle,
-            reader,
+            &cublas_handle,
+            source,
             &d_q_b,
             d_means.as_ref(),
             n_obs,
@@ -195,14 +213,14 @@ pub fn gpu_randomized_pca(
 
         // Q = qr(Y)
         let mut d_y2_mut = d_y2;
-        d_q = gpu_qr_q(&cusolver_handle, dev.stream(), dev, &mut d_y2_mut, n_obs, k)?;
+        d_q = qr(&mut d_y2_mut, n_obs, k)?;
     }
 
     // Step 6: B = X^T @ Q (final, n_vars × k)
     let d_b_final = streaming_gpu_spmm_transpose(
         dev,
         &cusparse_handle,
-        reader,
+        source,
         &d_q,
         d_means.as_ref(),
         n_obs,
@@ -231,27 +249,61 @@ pub fn gpu_randomized_pca(
     let sigma: Vec<f64> = (0..k.min(n_vars)).map(|i| s_col[i]).collect();
     let v = svd.V().to_owned();
 
-    // Step 8: Embeddings = Q @ V × Σ (download Q, compute on CPU)
-    // Q is (n_obs × k) col-major on GPU
-    let q_host_f32 = dev.dtoh_copy(&d_q)?;
+    // Step 8: Embeddings = Q @ V × Σ — kept GPU-resident (Phase 3.2–3.4).
+    //
+    // Q is col-major (n_obs × k) on GPU. V is (k × k) on host from faer; we
+    // slice V[:, 0..n_components] into a flat Vec<f32> (col-major, length
+    // k × n_components) and upload once. Similarly upload sigma[0..n_components].
+    // Compute `U = Q @ V` via cuBLAS sgemm on GPU, then broadcast-scale
+    // columns by σ via `gpu_scale_columns`. Single D→H copy of the final
+    // (n_obs × n_components) embedding replaces the previous triple-loop
+    // over the full downloaded Q (≈240 MB at 1M × 60).
+    let eff_k = k.min(sigma.len());
+    let mut v_slice_f32: Vec<f32> = Vec::with_capacity(eff_k * n_components);
+    for pc in 0..n_components {
+        for j in 0..eff_k {
+            v_slice_f32.push(v[(j, pc)] as f32);
+        }
+    }
+    let d_v_top = dev.htod_copy(&v_slice_f32)?;
+    let sigma_f32: Vec<f32> = sigma.iter().take(n_components).map(|&s| s as f32).collect();
+    let d_sigma = dev.htod_copy(&sigma_f32)?;
 
-    // Convert Q to f64 row-major for multiply
-    // Q col-major: Q[i,j] = q_host_f32[j * n_obs + i]
+    let mut d_u = dev.alloc_zeros::<f32>(n_obs * n_components)?;
+    // U = Q @ V  →  sgemm with A=Q (n_obs × k col-major), B=V (k × n_components
+    // col-major), C=U (n_obs × n_components col-major). Inner dim = eff_k.
+    gpu_sgemm(
+        &cublas_handle,
+        dev.stream(),
+        &d_q,
+        &d_v_top,
+        &mut d_u,
+        n_obs,
+        n_components,
+        eff_k,
+        1.0,
+        0.0,
+        cbs::cublasOperation_t::CUBLAS_OP_N,
+        cbs::cublasOperation_t::CUBLAS_OP_N,
+    )?;
+    // U[:, j] *= σ[j] — one kernel launch, broadcast column scaling.
+    gpu_scale_columns(dev, &mut d_u, &d_sigma, n_obs, n_components)?;
+
+    // Single D→H copy of the final embedding, col-major (n_obs × n_components).
+    dev.synchronize()?;
+    let u_host_colmajor = dev.dtoh_copy(&d_u)?;
+
+    // Transpose col-major → row-major for the scanpy-compatible layout.
     let mut embeddings = vec![0.0f32; n_obs * n_components];
-    for i in 0..n_obs {
-        for pc in 0..n_components {
-            let mut val = 0.0f64;
-            for j in 0..k.min(sigma.len()) {
-                // Q[i, j] * V[j, pc] * sigma[pc]
-                let q_ij = q_host_f32[j * n_obs + i] as f64;
-                let v_jpc = v[(j, pc)];
-                val += q_ij * v_jpc;
-            }
-            embeddings[i * n_components + pc] = (val * sigma[pc]) as f32;
+    for pc in 0..n_components {
+        for i in 0..n_obs {
+            embeddings[i * n_components + pc] = u_host_colmajor[pc * n_obs + i];
         }
     }
 
-    // Components: rows of U_hat^T → (n_components × n_vars)
+    // Components: rows of U_hat^T → (n_components × n_vars).
+    // U_hat is already on host (from the CPU SVD of B — B is small, so this
+    // stays on CPU per the Phase 3 plan).
     let mut components = vec![0.0f32; n_components * n_vars];
     for pc in 0..n_components {
         for v in 0..n_vars {
@@ -295,7 +347,7 @@ pub fn gpu_randomized_pca(
 /// Streaming forward SpMM on GPU: Y = (X - μ) @ M, shard-by-shard.
 ///
 /// For each shard:
-///   1. Read shard to host (BackedCsrReader)
+///   1. Read shard to host (via ShardSource)
 ///   2. Upload indptr/indices/data to GPU → GpuCsr
 ///   3. GpuCsr → CusparseSpMatDescr (zero-copy on GPU)
 ///   4. cuSPARSE SpMM: Y_slice = A_shard @ M (accumulated with beta=1.0)
@@ -306,7 +358,8 @@ pub fn gpu_randomized_pca(
 fn streaming_gpu_spmm_forward(
     dev: &GpuDevice,
     cusparse: &CusparseHandle,
-    reader: &BackedCsrReader,
+    cublas: &CublasHandle,
+    source: &dyn ShardSource,
     d_m: &CudaSlice<f32>, // (n_vars × k) col-major on GPU
     d_means: Option<&CudaSlice<f32>>,
     n_obs: usize,
@@ -314,24 +367,28 @@ fn streaming_gpu_spmm_forward(
     k: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
     let mut d_y = dev.alloc_zeros::<f32>(n_obs * k)?;
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
 
-    // Pre-compute mean correction vector on GPU: mc = M^T @ means (k × 1)
-    // Actually mc = means^T @ M = (1 × k), stored as (k,)
+    // Pre-compute mean correction vector on GPU: mc = Mᵀ · μ   (length k).
+    // M is col-major (n_vars × k). cuBLAS sgemv with op_A = T gives y = Aᵀ · x
+    // where A has backing shape (m, n) = (n_vars, k) and x length n_vars,
+    // producing y of length k. Replaces the D→H round-trip that previously
+    // downloaded the full `d_m` (n_vars × k) to host once per power iteration.
     let d_mc: Option<CudaSlice<f32>> = if let Some(d_mu) = d_means {
-        // mc[j] = Σ_v means[v] * M[v, j] for v in 0..n_vars
-        // M is col-major (n_vars × k): M[v, j] = d_m[j * n_vars + v]
-        // This is a simple GEMV: mc = M^T @ means
-        // For simplicity, compute on CPU (means is small)
-        let mu_host = dev.dtoh_copy(d_mu)?;
-        let m_host = dev.dtoh_copy(d_m)?;
-        let mut mc = vec![0.0f32; k];
-        for j in 0..k {
-            for v in 0..n_vars {
-                mc[j] += mu_host[v] * m_host[j * n_vars + v];
-            }
-        }
-        Some(dev.htod_copy(&mc)?)
+        let mut mc = dev.alloc_zeros::<f32>(k)?;
+        gpu_sgemv(
+            cublas,
+            dev.stream(),
+            d_m,
+            d_mu,
+            &mut mc,
+            n_vars,
+            k,
+            1.0,
+            0.0,
+            cbs::cublasOperation_t::CUBLAS_OP_T,
+        )?;
+        Some(mc)
     } else {
         None
     };
@@ -339,9 +396,7 @@ fn streaming_gpu_spmm_forward(
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = reader
-            .read_shard_uncached(shard_idx)
-            .map_err(format_scx_error)?;
+        let csr = source.read_shard(shard_idx).map_err(format_scx_error)?;
         let shard_rows = csr.n_rows();
 
         if shard_rows == 0 {
@@ -352,7 +407,7 @@ fn streaming_gpu_spmm_forward(
         let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
 
         // Create cuSPARSE descriptor
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream())?;
+        let a_desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
 
         // Y_shard is a slice of Y starting at row `global_row`.
         // cuSPARSE SpMM: C = α·A·B + β·C
@@ -403,7 +458,7 @@ fn streaming_gpu_spmm_forward(
 fn streaming_gpu_spmm_transpose(
     dev: &GpuDevice,
     cusparse: &CusparseHandle,
-    reader: &BackedCsrReader,
+    source: &dyn ShardSource,
     d_q: &CudaSlice<f32>, // (n_obs × k) col-major on GPU
     d_means: Option<&CudaSlice<f32>>,
     n_obs: usize,
@@ -411,13 +466,11 @@ fn streaming_gpu_spmm_transpose(
     k: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
     let mut d_z = dev.alloc_zeros::<f32>(n_vars * k)?;
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = reader
-            .read_shard_uncached(shard_idx)
-            .map_err(format_scx_error)?;
+        let csr = source.read_shard(shard_idx).map_err(format_scx_error)?;
         let shard_rows = csr.n_rows();
 
         if shard_rows == 0 {
@@ -426,7 +479,7 @@ fn streaming_gpu_spmm_transpose(
 
         // Upload CSR to GPU
         let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
-        let a_desc = gpu_csr.to_cusparse_csr(dev.stream())?;
+        let a_desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
 
         // Extract Q_shard on GPU: Q[global_row..global_row+shard_rows, :]
         // col-major Q: Q[i, j] = d_q[j * n_obs + i]
@@ -472,7 +525,10 @@ fn streaming_gpu_spmm_transpose(
 // ---------------------------------------------------------------------------
 
 /// Upload an ScxCsr to GPU as GpuCsr.
-fn upload_csr_to_gpu(dev: &GpuDevice, csr: &scx_sparse::ScxCsr) -> Result<GpuCsr, GpuError> {
+pub(crate) fn upload_csr_to_gpu(
+    dev: &GpuDevice,
+    csr: &scx_sparse::ScxCsr,
+) -> Result<GpuCsr, GpuError> {
     let d_indptr = dev.htod_copy(&csr.indptr)?;
     let d_indices = dev.htod_copy(&csr.indices)?;
     let d_data = dev.htod_copy(&csr.data)?;
@@ -489,7 +545,7 @@ fn upload_csr_to_gpu(dev: &GpuDevice, csr: &scx_sparse::ScxCsr) -> Result<GpuCsr
 ///
 /// Replaces the CPU round-trip version that downloaded the entire n_obs×k
 /// matrix to host per shard (240 MB for 1M cells × 60 PCs).
-fn gpu_scatter_colmajor(
+pub(crate) fn gpu_scatter_colmajor(
     dev: &GpuDevice,
     src: &CudaSlice<f32>,     // (shard_rows × k) col-major
     dst: &mut CudaSlice<f32>, // (n_obs × k) col-major
@@ -540,7 +596,7 @@ fn gpu_scatter_colmajor(
 ///
 /// Replaces the CPU round-trip version that downloaded the entire n_obs×k
 /// matrix to host per shard.
-fn gpu_gather_colmajor(
+pub(crate) fn gpu_gather_colmajor(
     dev: &GpuDevice,
     src: &CudaSlice<f32>, // (n_obs × k) col-major
     shard_rows: usize,
@@ -591,7 +647,7 @@ fn gpu_gather_colmajor(
 /// Mean-correct a col-major matrix on GPU: Y[r, j] -= mc[j].
 ///
 /// Replaces the CPU round-trip version that downloaded shard-sized data.
-fn gpu_mean_correct_colmajor(
+pub(crate) fn gpu_mean_correct_colmajor(
     dev: &GpuDevice,
     y: &mut CudaSlice<f32>,
     mc: &CudaSlice<f32>,
@@ -635,7 +691,7 @@ fn gpu_mean_correct_colmajor(
 /// Compute column sums of a col-major matrix on GPU.
 ///
 /// Returns a vector of k column sums.
-fn gpu_column_sums(
+pub(crate) fn gpu_column_sums(
     dev: &GpuDevice,
     x: &CudaSlice<f32>, // (m × k) col-major
     m: usize,
@@ -681,7 +737,7 @@ fn gpu_column_sums(
 }
 
 /// Outer product subtraction on GPU: Z[v, j] -= mu[v] * sum_q[j].
-fn gpu_outer_sub(
+pub(crate) fn gpu_outer_sub(
     dev: &GpuDevice,
     z: &mut CudaSlice<f32>, // (n_vars × k) col-major
     mu: &CudaSlice<f32>,    // [n_vars]
@@ -720,6 +776,53 @@ fn gpu_outer_sub(
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("outer_sub: {e}")))?;
+
+    Ok(())
+}
+
+/// Broadcast-scale the columns of a col-major matrix on GPU.
+///
+/// `U[r, c] *= sigma[c]` in place, for all `(r, c)`.
+/// Used by the GPU-resident final-embedding step in `gpu_randomized_pca`
+/// (Phase 3.3): after computing `U = Q @ V` via cuBLAS `sgemm`, scale each
+/// column by the corresponding singular value in one kernel launch.
+pub(crate) fn gpu_scale_columns(
+    dev: &GpuDevice,
+    u: &mut CudaSlice<f32>,
+    sigma: &CudaSlice<f32>,
+    m: usize,
+    k: usize,
+) -> Result<(), GpuError> {
+    let total = m * k;
+    if total == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("scale_columns_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("scale_columns: {e}")))?;
+
+    let m_i32 = m as i32;
+    let k_i32 = k as i32;
+
+    let threads: u32 = 256;
+    let blocks = (total as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(u)
+            .arg(sigma)
+            .arg(&m_i32)
+            .arg(&k_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("scale_columns: {e}")))?;
 
     Ok(())
 }
@@ -859,5 +962,309 @@ mod tests {
         assert_eq!(gpu_csr.shape, (3, 4));
         assert_eq!(gpu_csr.indices.len(), 5);
         assert_eq!(gpu_csr.indptr.len(), 4);
+    }
+
+    #[test]
+    fn test_gpu_scale_columns() {
+        // Phase 3.3 — broadcast-scale columns of a col-major matrix.
+        let dev = require_gpu!();
+
+        // U (col-major 4×3):
+        //   col 0 = [1, 2, 3, 4]
+        //   col 1 = [5, 6, 7, 8]
+        //   col 2 = [9, 10, 11, 12]
+        let u_host: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+        let sigma_host: Vec<f32> = vec![2.0, -1.0, 0.5];
+
+        let mut d_u = dev.htod_copy(&u_host).unwrap();
+        let d_sigma = dev.htod_copy(&sigma_host).unwrap();
+
+        gpu_scale_columns(&dev, &mut d_u, &d_sigma, 4, 3).unwrap();
+        dev.synchronize().unwrap();
+        let out = dev.dtoh_copy(&d_u).unwrap();
+
+        // Expected: col 0 × 2, col 1 × -1, col 2 × 0.5
+        let expected: Vec<f32> = vec![
+            2.0, 4.0, 6.0, 8.0, // col 0
+            -5.0, -6.0, -7.0, -8.0, // col 1
+            4.5, 5.0, 5.5, 6.0, // col 2
+        ];
+        for i in 0..out.len() {
+            assert!(
+                (out[i] - expected[i]).abs() < 1e-5,
+                "scale_columns mismatch at {i}: got {}, expected {}",
+                out[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_randomized_pca_phase3_parity() {
+        // Phase 3.5 — after the GPU-resident-embedding refactor, verify:
+        //
+        //   * variance_ratio is non-negative, monotone-descending by PC index,
+        //     and sums to ≤ 1 + ε — catches a σ-scaling bug in the new
+        //     sgemm + `gpu_scale_columns` tail.
+        //   * loadings match `gpu_covariance_pca` on a small fixture (cosine ≥
+        //     0.99). This cross-checks the Halko path against the dense-eigh
+        //     reference (Phase 2) on shared ground truth, substituting for the
+        //     "pre/post refactor snapshot" called out in the spec — we don't
+        //     have access to a pre-refactor binary, but Phase 2's GPU
+        //     covariance PCA is independently verified against a CPU reference
+        //     (see `gpu_pca_covariance::tests`), so it is a valid regression
+        //     oracle here.
+        //
+        // scx-gpu cannot depend on scx-accel (cycle), so CPU-vs-GPU parity
+        // against `scx_accel::randomized_pca` is deferred to the Python-side
+        // test suite (Phase 7.1).
+        use crate::gpu_pca_covariance::gpu_covariance_pca;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use scx_format::ShardSource;
+        use scx_sparse::ScxCsr;
+
+        let dev = require_gpu!();
+
+        struct InMemorySource {
+            shards: Vec<ScxCsr>,
+            n_obs: usize,
+            n_vars: usize,
+        }
+        impl ShardSource for InMemorySource {
+            fn n_shards(&self) -> usize {
+                self.shards.len()
+            }
+            fn n_obs(&self) -> usize {
+                self.n_obs
+            }
+            fn n_vars(&self) -> usize {
+                self.n_vars
+            }
+            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+                Ok(self.shards[i].clone())
+            }
+        }
+
+        fn random_csr(n_rows: usize, n_cols: usize, density: f32, seed: u64) -> ScxCsr {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+            let mut indices: Vec<i32> = Vec::new();
+            let mut data: Vec<f32> = Vec::new();
+            indptr.push(0);
+            for _ in 0..n_rows {
+                for c in 0..n_cols {
+                    if rng.gen_bool(density as f64) {
+                        indices.push(c as i32);
+                        data.push(rng.gen_range(-1.0..1.0));
+                    }
+                }
+                indptr.push(indices.len() as i64);
+            }
+            ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+        }
+
+        fn split_into_shards(csr: &ScxCsr, n_shards: usize) -> Vec<ScxCsr> {
+            let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
+            let rows_per = n_rows.div_ceil(n_shards);
+            let mut out = Vec::new();
+            let mut row_start = 0;
+            while row_start < n_rows {
+                let row_end = (row_start + rows_per).min(n_rows);
+                let p0 = csr.indptr[row_start] as usize;
+                let p1 = csr.indptr[row_end] as usize;
+                let shard_indptr: Vec<i64> = csr.indptr[row_start..=row_end]
+                    .iter()
+                    .map(|&p| p - csr.indptr[row_start])
+                    .collect();
+                let shard_indices = csr.indices[p0..p1].to_vec();
+                let shard_data = csr.data[p0..p1].to_vec();
+                out.push(ScxCsr::new_unchecked(
+                    (row_end - row_start, n_cols),
+                    shard_indptr,
+                    shard_indices,
+                    shard_data,
+                ));
+                row_start = row_end;
+            }
+            out
+        }
+
+        fn row_abs_cosine(a: &[f32], b: &[f32], k: usize, d: usize) -> f32 {
+            assert_eq!(a.len(), k * d);
+            assert_eq!(b.len(), k * d);
+            let mut total = 0.0f32;
+            for i in 0..k {
+                let ra = &a[i * d..(i + 1) * d];
+                let rb = &b[i * d..(i + 1) * d];
+                let dot: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+                let na: f32 = ra.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb: f32 = rb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                total += (dot / (na * nb).max(1e-12)).abs();
+            }
+            total / k as f32
+        }
+
+        let n_rows = 800;
+        let n_cols = 120;
+        let k = 15;
+        let csr = random_csr(n_rows, n_cols, 0.08, 314);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let gpu_rand =
+            gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::default()).unwrap();
+        let gpu_cov = gpu_covariance_pca(&dev, &source, k, true).unwrap();
+
+        // Loadings must agree (sign-agnostic) with the covariance reference.
+        let cos = row_abs_cosine(&gpu_rand.components, &gpu_cov.components, k, n_cols);
+        assert!(
+            cos > 0.99,
+            "Phase-3 gpu_randomized_pca vs gpu_covariance_pca: cosine = {cos}"
+        );
+
+        // Variance ratios: non-negative, monotone-descending within tolerance,
+        // and sum ≤ 1 + ε (a σ-scaling bug would easily violate this).
+        let sum_ratio: f64 = gpu_rand.variance_ratio.iter().sum();
+        assert!(
+            (0.0..=1.0 + 1e-3).contains(&sum_ratio),
+            "variance_ratio sum out of range: {sum_ratio}"
+        );
+        for j in 1..gpu_rand.variance_ratio.len() {
+            let prev = gpu_rand.variance_ratio[j - 1];
+            let curr = gpu_rand.variance_ratio[j];
+            assert!(prev >= 0.0 && curr >= 0.0);
+            // Allow small numerical wiggle between adjacent PCs.
+            assert!(
+                curr <= prev + 1e-6,
+                "variance_ratio not monotone at PC {j}: prev={prev}, curr={curr}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_randomized_pca_cholesky_vs_householder() {
+        // Phase 4.5 — opt-in CholeskyQR2 must produce the same PCA as the
+        // default Householder path on well-conditioned inputs. Both paths
+        // share the same RNG (matched seed), so cosine ≥ 0.999 is the right
+        // bar — tighter than the GPU-vs-CPU Phase-3 parity (0.99) because
+        // the only algorithmic difference is the QR step.
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use scx_format::ShardSource;
+        use scx_sparse::ScxCsr;
+
+        let dev = require_gpu!();
+
+        struct InMemorySource {
+            shards: Vec<ScxCsr>,
+            n_obs: usize,
+            n_vars: usize,
+        }
+        impl ShardSource for InMemorySource {
+            fn n_shards(&self) -> usize {
+                self.shards.len()
+            }
+            fn n_obs(&self) -> usize {
+                self.n_obs
+            }
+            fn n_vars(&self) -> usize {
+                self.n_vars
+            }
+            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+                Ok(self.shards[i].clone())
+            }
+        }
+
+        fn random_csr(n_rows: usize, n_cols: usize, density: f32, seed: u64) -> ScxCsr {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+            let mut indices: Vec<i32> = Vec::new();
+            let mut data: Vec<f32> = Vec::new();
+            indptr.push(0);
+            for _ in 0..n_rows {
+                for c in 0..n_cols {
+                    if rng.gen_bool(density as f64) {
+                        indices.push(c as i32);
+                        data.push(rng.gen_range(-1.0..1.0));
+                    }
+                }
+                indptr.push(indices.len() as i64);
+            }
+            ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+        }
+
+        fn split_into_shards(csr: &ScxCsr, n_shards: usize) -> Vec<ScxCsr> {
+            let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
+            let rows_per = n_rows.div_ceil(n_shards);
+            let mut out = Vec::new();
+            let mut row_start = 0;
+            while row_start < n_rows {
+                let row_end = (row_start + rows_per).min(n_rows);
+                let p0 = csr.indptr[row_start] as usize;
+                let p1 = csr.indptr[row_end] as usize;
+                let shard_indptr: Vec<i64> = csr.indptr[row_start..=row_end]
+                    .iter()
+                    .map(|&p| p - csr.indptr[row_start])
+                    .collect();
+                let shard_indices = csr.indices[p0..p1].to_vec();
+                let shard_data = csr.data[p0..p1].to_vec();
+                out.push(ScxCsr::new_unchecked(
+                    (row_end - row_start, n_cols),
+                    shard_indptr,
+                    shard_indices,
+                    shard_data,
+                ));
+                row_start = row_end;
+            }
+            out
+        }
+
+        fn row_abs_cosine(a: &[f32], b: &[f32], k: usize, d: usize) -> f32 {
+            let mut total = 0.0f32;
+            for i in 0..k {
+                let ra = &a[i * d..(i + 1) * d];
+                let rb = &b[i * d..(i + 1) * d];
+                let dot: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+                let na: f32 = ra.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb: f32 = rb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                total += (dot / (na * nb).max(1e-12)).abs();
+            }
+            total / k as f32
+        }
+
+        let n_rows = 800;
+        let n_cols = 120;
+        let k = 15;
+        let csr = random_csr(n_rows, n_cols, 0.08, 2025);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let hh =
+            gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::Householder).unwrap();
+        let ch = gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::Cholesky).unwrap();
+
+        let cos = row_abs_cosine(&ch.components, &hh.components, k, n_cols);
+        assert!(
+            cos > 0.999,
+            "CholeskyQR2 vs Householder: cosine = {cos} (want > 0.999)"
+        );
+
+        // Variance ratios should be close between the two QR methods.
+        for j in 0..k {
+            let diff = (ch.variance_ratio[j] - hh.variance_ratio[j]).abs();
+            assert!(
+                diff < 1e-3,
+                "variance_ratio[{j}] diff = {diff} between cholesky and householder"
+            );
+        }
     }
 }

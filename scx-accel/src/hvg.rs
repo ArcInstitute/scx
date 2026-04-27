@@ -264,6 +264,67 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource>(
     Ok(batch_bcs.into_iter().zip(batch_sbcs).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Device-dispatched wrappers (CPU default, GPU behind feature = "gpu")
+// ---------------------------------------------------------------------------
+
+/// Device-dispatched wrapper for [`streaming_mean_var`].
+///
+/// Forwards to the CPU implementation for `device = "cpu"` and to
+/// [`scx_gpu::gpu_streaming_mean_var`] for `device = "gpu"`. The GPU path
+/// accumulates per-column `Σ x` and `Σ x²` directly on-device via atomicAdd,
+/// producing results that agree with the CPU path to ~1e-5 relative error on
+/// typical scRNA-seq densities.
+///
+/// Only available with `feature = "gpu"`.
+///
+/// Falls back to the CPU implementation if GPU initialization fails; callers
+/// who need strict GPU-only execution should check [`crate::gpu_available`]
+/// first.
+#[cfg(feature = "gpu")]
+pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
+    source: &S,
+    device: &str,
+    device_id: usize,
+) -> Result<HvgStats> {
+    if device != "gpu" {
+        return streaming_mean_var(source);
+    }
+
+    let dev = match scx_gpu::GpuDevice::new(device_id) {
+        Ok(d) => d,
+        Err(_) => return streaming_mean_var(source),
+    };
+    let (means, variances) = scx_gpu::gpu_streaming_mean_var(&dev, source).map_err(|e| {
+        crate::error::AccelError::LinAlg(format!("gpu_streaming_mean_var failed: {e}"))
+    })?;
+    Ok(HvgStats { means, variances })
+}
+
+/// Device-dispatched wrapper for [`streaming_clip_square_sum`].
+///
+/// Only available with `feature = "gpu"`. See
+/// [`streaming_mean_var_with_device`] for semantics.
+#[cfg(feature = "gpu")]
+pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
+    source: &S,
+    clip_val: &[f64],
+    device: &str,
+    device_id: usize,
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    if device != "gpu" {
+        return streaming_clip_square_sum(source, clip_val);
+    }
+
+    let dev = match scx_gpu::GpuDevice::new(device_id) {
+        Ok(d) => d,
+        Err(_) => return streaming_clip_square_sum(source, clip_val),
+    };
+    scx_gpu::gpu_streaming_clip_square_sum(&dev, source, clip_val).map_err(|e| {
+        crate::error::AccelError::LinAlg(format!("gpu_streaming_clip_square_sum failed: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

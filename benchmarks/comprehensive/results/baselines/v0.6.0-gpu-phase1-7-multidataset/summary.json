@@ -1,0 +1,364 @@
+{
+  "rows": {
+    "accel_hvg__accel_hvg__pyscx_cpu__census_1m": {
+      "median_wall_s": 25.26249459013343,
+      "peak_rss_mb_median": 33057.53125,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__pyscx_cpu__census_1m.json"
+    },
+    "accel_hvg__accel_hvg__pyscx_cpu__pbmc3k": {
+      "median_wall_s": 0.0670088641345501,
+      "peak_rss_mb_median": 582.68359375,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__pyscx_cpu__pbmc3k.json"
+    },
+    "accel_hvg__accel_hvg__pyscx_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 3.5962723437696695,
+      "peak_rss_mb_median": 5034.953125,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__pyscx_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_hvg__accel_hvg__pyscx_gpu__census_1m": {
+      "median_wall_s": 25.201985113322735,
+      "peak_rss_mb_median": 33059.28515625,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__pyscx_gpu__census_1m.json"
+    },
+    "accel_hvg__accel_hvg__pyscx_gpu__pbmc3k": {
+      "median_wall_s": 0.06916384026408195,
+      "peak_rss_mb_median": 584.97265625,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__pyscx_gpu__pbmc3k.json"
+    },
+    "accel_hvg__accel_hvg__pyscx_gpu__tabula_sapiens_100k": {
+      "median_wall_s": 3.5944342985749245,
+      "peak_rss_mb_median": 5035.40234375,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__pyscx_gpu__tabula_sapiens_100k.json"
+    },
+    "accel_hvg__accel_hvg__scanpy_cpu__census_1m": {
+      "median_wall_s": 25.97953457199037,
+      "peak_rss_mb_median": 33058.046875,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__scanpy_cpu__census_1m.json"
+    },
+    "accel_hvg__accel_hvg__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 0.06768061500042677,
+      "peak_rss_mb_median": 583.04296875,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_hvg__accel_hvg__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 3.5882194209843874,
+      "peak_rss_mb_median": 5034.8984375,
+      "file_size_bytes": null,
+      "source_file": "accel_hvg__accel_hvg__scanpy_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_knn__accel_knn__pyscx_cpu__census_1m": {
+      "median_wall_s": 255.44413300137967,
+      "peak_rss_mb_median": 9253.3984375,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__pyscx_cpu__census_1m.json"
+    },
+    "accel_knn__accel_knn__pyscx_cpu__pbmc3k": {
+      "median_wall_s": 0.4385980386286974,
+      "peak_rss_mb_median": 576.7578125,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__pyscx_cpu__pbmc3k.json"
+    },
+    "accel_knn__accel_knn__pyscx_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 16.05601785518229,
+      "peak_rss_mb_median": 1548.13671875,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__pyscx_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_knn__accel_knn__pyscx_gpu_cagra__census_1m": {
+      "median_wall_s": 27.714018031023443,
+      "peak_rss_mb_median": 9606.8359375,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__pyscx_gpu_cagra__census_1m.json"
+    },
+    "accel_knn__accel_knn__pyscx_gpu_cagra__pbmc3k": {
+      "median_wall_s": 0.3549145730212331,
+      "peak_rss_mb_median": 1008.6328125,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__pyscx_gpu_cagra__pbmc3k.json"
+    },
+    "accel_knn__accel_knn__pyscx_gpu_cagra__tabula_sapiens_100k": {
+      "median_wall_s": 3.61226430721581,
+      "peak_rss_mb_median": 1888.62890625,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__pyscx_gpu_cagra__tabula_sapiens_100k.json"
+    },
+    "accel_knn__accel_knn__scanpy_cpu__census_1m": {
+      "median_wall_s": 202.4033292736858,
+      "peak_rss_mb_median": 9235.77734375,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__scanpy_cpu__census_1m.json"
+    },
+    "accel_knn__accel_knn__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 0.14922826923429966,
+      "peak_rss_mb_median": 576.15625,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_knn__accel_knn__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 9.39676835667342,
+      "peak_rss_mb_median": 1481.51953125,
+      "file_size_bytes": null,
+      "source_file": "accel_knn__accel_knn__scanpy_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_leiden__accel_leiden__leidenalg_cpu__census_1m": {
+      "median_wall_s": 552.3610842349881,
+      "peak_rss_mb_median": 9701.30078125,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__leidenalg_cpu__census_1m.json"
+    },
+    "accel_leiden__accel_leiden__leidenalg_cpu__pbmc3k": {
+      "median_wall_s": 0.10312411499762675,
+      "peak_rss_mb_median": 590.78515625,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__leidenalg_cpu__pbmc3k.json"
+    },
+    "accel_leiden__accel_leiden__leidenalg_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 20.122917435131967,
+      "peak_rss_mb_median": 1771.2890625,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__leidenalg_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_leiden__accel_leiden__pyscx_cpu__census_1m": {
+      "median_wall_s": 49.70709316153079,
+      "peak_rss_mb_median": 4051.859375,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__pyscx_cpu__census_1m.json"
+    },
+    "accel_leiden__accel_leiden__pyscx_cpu__pbmc3k": {
+      "median_wall_s": 0.06315037491731346,
+      "peak_rss_mb_median": 580.89453125,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__pyscx_cpu__pbmc3k.json"
+    },
+    "accel_leiden__accel_leiden__pyscx_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 3.6000180219998583,
+      "peak_rss_mb_median": 1394.66015625,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__pyscx_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_leiden__accel_leiden__pyscx_gpu__census_1m": {
+      "median_wall_s": 50.21751485578716,
+      "peak_rss_mb_median": 4051.26953125,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__pyscx_gpu__census_1m.json"
+    },
+    "accel_leiden__accel_leiden__pyscx_gpu__pbmc3k": {
+      "median_wall_s": 0.06348992884159088,
+      "peak_rss_mb_median": 580.75,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__pyscx_gpu__pbmc3k.json"
+    },
+    "accel_leiden__accel_leiden__pyscx_gpu__tabula_sapiens_100k": {
+      "median_wall_s": 3.669278827495873,
+      "peak_rss_mb_median": 1389.5234375,
+      "file_size_bytes": null,
+      "source_file": "accel_leiden__accel_leiden__pyscx_gpu__tabula_sapiens_100k.json"
+    },
+    "accel_pca__accel_pca__pyscx_cpu_auto__census_1m": {
+      "median_wall_s": 3.2976635955274105,
+      "peak_rss_mb_median": 3261.703125,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_cpu_auto__census_1m.json"
+    },
+    "accel_pca__accel_pca__pyscx_cpu_auto__pbmc3k": {
+      "median_wall_s": 0.695622794002702,
+      "peak_rss_mb_median": 1582.265625,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_cpu_auto__pbmc3k.json"
+    },
+    "accel_pca__accel_pca__pyscx_cpu_auto__tabula_sapiens_100k": {
+      "median_wall_s": 3.189778609201312,
+      "peak_rss_mb_median": 2401.23828125,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_cpu_auto__tabula_sapiens_100k.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_cov__census_1m": {
+      "median_wall_s": 3.424614852294326,
+      "peak_rss_mb_median": 2381.85546875,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_cov__census_1m.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_cov__pbmc3k": {
+      "median_wall_s": 0.08837137091904879,
+      "peak_rss_mb_median": 923.81640625,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_cov__pbmc3k.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_cov__tabula_sapiens_100k": {
+      "median_wall_s": 1.6759457467123866,
+      "peak_rss_mb_median": 1366.11328125,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_cov__tabula_sapiens_100k.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_rand_chol__census_1m": {
+      "median_wall_s": 3.776742758229375,
+      "peak_rss_mb_median": 2384.4609375,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_rand_chol__census_1m.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_rand_chol__pbmc3k": {
+      "median_wall_s": 0.073471674695611,
+      "peak_rss_mb_median": 916.76171875,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_rand_chol__pbmc3k.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_rand_chol__tabula_sapiens_100k": {
+      "median_wall_s": 2.0045234030112624,
+      "peak_rss_mb_median": 1316.07421875,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_rand_chol__tabula_sapiens_100k.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_rand_hh__census_1m": {
+      "median_wall_s": 3.923565987497568,
+      "peak_rss_mb_median": 2392.2734375,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_rand_hh__census_1m.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_rand_hh__pbmc3k": {
+      "median_wall_s": 0.0726176779717207,
+      "peak_rss_mb_median": 918.41796875,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_rand_hh__pbmc3k.json"
+    },
+    "accel_pca__accel_pca__pyscx_gpu_rand_hh__tabula_sapiens_100k": {
+      "median_wall_s": 1.9432866643182933,
+      "peak_rss_mb_median": 1370.1640625,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__pyscx_gpu_rand_hh__tabula_sapiens_100k.json"
+    },
+    "accel_pca__accel_pca__scanpy_cpu__census_1m": {
+      "median_wall_s": 7.619628901593387,
+      "peak_rss_mb_median": 1987.0078125,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__scanpy_cpu__census_1m.json"
+    },
+    "accel_pca__accel_pca__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 0.22773050237447023,
+      "peak_rss_mb_median": 548.2890625,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_pca__accel_pca__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 2.833229461997689,
+      "peak_rss_mb_median": 1009.7265625,
+      "file_size_bytes": null,
+      "source_file": "accel_pca__accel_pca__scanpy_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_preprocess__accel_preprocess__pyscx_cpu__census_1m": {
+      "median_wall_s": 7.972155845724046,
+      "peak_rss_mb_median": 54447.75390625,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__pyscx_cpu__census_1m.json"
+    },
+    "accel_preprocess__accel_preprocess__pyscx_cpu__pbmc3k": {
+      "median_wall_s": 0.008250492624938488,
+      "peak_rss_mb_median": 607.3125,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__pyscx_cpu__pbmc3k.json"
+    },
+    "accel_preprocess__accel_preprocess__pyscx_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 1.0785223711282015,
+      "peak_rss_mb_median": 7993.66015625,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__pyscx_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_preprocess__accel_preprocess__pyscx_gpu__census_1m": {
+      "median_wall_s": 68.69505295716226,
+      "peak_rss_mb_median": 43778.3203125,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__pyscx_gpu__census_1m.json"
+    },
+    "accel_preprocess__accel_preprocess__pyscx_gpu__pbmc3k": {
+      "median_wall_s": 0.4215089352801442,
+      "peak_rss_mb_median": 635.47265625,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__pyscx_gpu__pbmc3k.json"
+    },
+    "accel_preprocess__accel_preprocess__pyscx_gpu__tabula_sapiens_100k": {
+      "median_wall_s": 9.566393447108567,
+      "peak_rss_mb_median": 6543.22265625,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__pyscx_gpu__tabula_sapiens_100k.json"
+    },
+    "accel_preprocess__accel_preprocess__scanpy_cpu__census_1m": {
+      "median_wall_s": 4.795834901742637,
+      "peak_rss_mb_median": 43744.1875,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__scanpy_cpu__census_1m.json"
+    },
+    "accel_preprocess__accel_preprocess__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 0.009472066536545753,
+      "peak_rss_mb_median": 589.79296875,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_preprocess__accel_preprocess__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 0.6630211686715484,
+      "peak_rss_mb_median": 6507.07421875,
+      "file_size_bytes": null,
+      "source_file": "accel_preprocess__accel_preprocess__scanpy_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_umap__accel_umap__pyscx_cpu__census_1m": {
+      "median_wall_s": 653.3359011961147,
+      "peak_rss_mb_median": 9236.78125,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__pyscx_cpu__census_1m.json"
+    },
+    "accel_umap__accel_umap__pyscx_cpu__pbmc3k": {
+      "median_wall_s": 1.2580343140289187,
+      "peak_rss_mb_median": 570.32421875,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__pyscx_cpu__pbmc3k.json"
+    },
+    "accel_umap__accel_umap__pyscx_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 47.91591606196016,
+      "peak_rss_mb_median": 1423.09375,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__pyscx_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_umap__accel_umap__pyscx_gpu__census_1m": {
+      "median_wall_s": 27.353608215227723,
+      "peak_rss_mb_median": 9243.83203125,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__pyscx_gpu__census_1m.json"
+    },
+    "accel_umap__accel_umap__pyscx_gpu__pbmc3k": {
+      "median_wall_s": 0.3531746994704008,
+      "peak_rss_mb_median": 601.80078125,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__pyscx_gpu__pbmc3k.json"
+    },
+    "accel_umap__accel_umap__pyscx_gpu__tabula_sapiens_100k": {
+      "median_wall_s": 4.293668849393725,
+      "peak_rss_mb_median": 1448.11328125,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__pyscx_gpu__tabula_sapiens_100k.json"
+    },
+    "accel_umap__accel_umap__scanpy_cpu__census_1m": {
+      "median_wall_s": 816.0102675139933,
+      "peak_rss_mb_median": 9229.21875,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__scanpy_cpu__census_1m.json"
+    },
+    "accel_umap__accel_umap__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 3.2297746632248163,
+      "peak_rss_mb_median": 574.24609375,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_umap__accel_umap__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 51.2982144409325,
+      "peak_rss_mb_median": 1377.68359375,
+      "file_size_bytes": null,
+      "source_file": "accel_umap__accel_umap__scanpy_cpu__tabula_sapiens_100k.json"
+    }
+  }
+}

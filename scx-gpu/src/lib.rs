@@ -44,6 +44,7 @@ macro_rules! require_gpu {
 pub mod test_utils;
 
 pub mod cast_gpu;
+pub mod cublas;
 pub mod curand;
 pub mod cusolver;
 pub mod cusparse;
@@ -51,17 +52,22 @@ pub mod device;
 pub mod error;
 pub mod forbp_gpu;
 pub mod gpu_harmony;
+pub mod gpu_hvg;
 pub mod gpu_knn;
 pub mod gpu_pca;
+pub mod gpu_pca_covariance;
 pub mod gpu_preprocess;
 pub mod gpu_umap;
+pub mod linear_operator;
 pub mod rice_gpu;
 pub mod shard_decode;
+pub mod shard_pipeline;
 pub mod sparse_dense;
 
 // Re-export primary types for convenience.
+pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, CublasHandle};
 pub use curand::random_gaussian_gpu;
-pub use cusolver::{gpu_qr_q, CusolverHandle};
+pub use cusolver::{gpu_cholesky_qr2, gpu_eigh_sym, gpu_qr_q, CusolverHandle, QrMethod};
 pub use cusparse::{
     spmm_csr, spmm_csr_transpose, CusparseHandle, CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
@@ -72,12 +78,18 @@ pub use gpu_harmony::{
     gpu_harmony_correction, gpu_harmony_distances, gpu_harmony_l2_normalize_cols,
     gpu_harmony_memory_bytes, gpu_harmony_softmax_penalty,
 };
+pub use gpu_hvg::{gpu_streaming_clip_square_sum, gpu_streaming_mean_var};
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
 pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
-pub use gpu_preprocess::{gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p};
+pub use gpu_pca_covariance::gpu_covariance_pca;
+pub use gpu_preprocess::{
+    gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
+};
 pub use gpu_umap::{gpu_umap_native, GpuUmapResult};
+pub use linear_operator::CenteredSparseOperator;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
+pub use shard_pipeline::DoubleBufferedShardLoader;
 pub use sparse_dense::sparse_to_dense_gpu;
 
 // Re-export cudarc types used in public API signatures.

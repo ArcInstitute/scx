@@ -34,9 +34,17 @@ Run the gate against a committed baseline with:
 
 ```bash
 python benchmarks/comprehensive/scripts/compare_against_baseline.py \
-    --baseline benchmarks/comprehensive/results/baselines/v0.5.0-phase5 \
+    --baseline benchmarks/comprehensive/results/baselines/LATEST \
     --current  benchmarks/comprehensive/results/candidate_$(date +%Y_%m_%d) \
     --gate \
     --justifications benchmarks/comprehensive/results/justifications \
     --thresholds    benchmarks/comprehensive/thresholds.yaml
 ```
+
+## Versions
+
+| Version | Date | Coverage | Notes |
+|---|---|---|---|
+| `v0.5.0-phase5` | 2026-04-18 | format-level only | Pre-Phase-9; cloud + compression + read/write/memory across 6 datasets |
+| `v0.6.0-gpu-phase1-7` | 2026-04-23 | format + accel pbmc3k smoke | First baseline with `accel_*` rows; pbmc3k only, 20 accel cells. Captured from `accel_smoke_2026_04_23` |
+| `v0.6.0-gpu-phase1-7-multidataset` (LATEST) | 2026-04-24 | format + accel × {pbmc3k, tabula_sapiens_100k, census_1m} | 60/60 accel cells. Surfaces real correctness floors via `runs[].extra` (Phase 9 follow-up findings 1-4) |

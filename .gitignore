@@ -6,6 +6,7 @@ archive/
 tasks/
 tmp/
 learn/
+.claude/skills/scx-dev/
 data/*.h5ad
 *.proptest-regressions
 external-repos/
@@ -17,6 +18,8 @@ benchmarks/comprehensive/results/reports_archive_*/
 benchmarks/comprehensive/logs/
 benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/
+benchmarks/comprehensive/results/accel_smoke_*/
+benchmarks/comprehensive/results/tier*/
 
 # Generated report artifacts — regenerable via write_report() / write_landing()
 # from results/raw/ or a promoted baseline snapshot. Publish via

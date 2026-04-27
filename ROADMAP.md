@@ -489,7 +489,7 @@ to the comprehensive launcher).
 - [x] **Large atlas (50 GB+) streaming pull** — `cloud_large_atlas.py` runs `pyscx.pull` with a background RSS sampler (100 ms cadence); asserts `peak_rss_mb <= 240` per the `docs/cloud.md` performance model. Fails loudly on violation.
 
 ### 5.6 Regression Gating — COMPLETE (on-demand, not scheduled)
-- [x] On-demand gate runs: `scripts/gate_candidate.sh` one-shot captures a candidate snapshot and runs the gate against `results/baselines/LATEST`. Recommended trigger points (pre-PR / pre-merge / pre-release / on-suspicion) documented in `benchmarks/README.md`. Cron-based scheduling was explicitly deferred — no wasted compute when nothing changed, every gate result ties to a specific commit.
+- [x] On-demand gate runs: `scripts/gate_candidate.py` one-shot captures a candidate snapshot and runs the gate against `results/baselines/LATEST`. Recommended trigger points (pre-PR / pre-merge / pre-release / on-suspicion) documented in `benchmarks/README.md`. Cron-based scheduling was explicitly deferred — no wasted compute when nothing changed, every gate result ties to a specific commit.
 - [x] JSON result diff against the canonical baseline via `compare_against_baseline.py --gate` (3% wall / 10% RSS / 1% size tolerances; absolute floors from `thresholds.yaml`; disappearing-benchmark detection; justification-markdown suppression with expiry dates).
 - [x] Rolling performance dashboard: `reporting/dashboard.py` emits `BENCHMARK_REPORT.html` alongside the markdown; `dashboard_history.json` threads "← previous snapshot" navigation. `publish_dashboard.py` rsyncs to a configurable static-hosting target (no-op when unset).
 

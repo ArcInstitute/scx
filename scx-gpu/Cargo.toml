@@ -10,7 +10,7 @@ authors.workspace = true
 scx-format = { path = "../scx-format" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
-cudarc = { workspace = true, features = ["cusparse", "cusolver", "curand"] }
+cudarc = { workspace = true, features = ["cublas", "cusparse", "cusolver", "curand"] }
 faer = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }

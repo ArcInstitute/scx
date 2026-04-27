@@ -17,6 +17,8 @@ pub enum GpuError {
     ShapeMismatch { expected: String, got: String },
     #[error("codec error: {0}")]
     CodecError(#[from] scx_codec::CodecError),
+    #[error("cuBLAS error: {0}")]
+    CuBlasError(String),
     #[error("cuSPARSE error: {0}")]
     CuSparseError(String),
     #[error("cuSOLVER error: {0}")]

@@ -58,7 +58,7 @@ python benchmarks/comprehensive/scripts/run_parallel.py \
 For regression gating, use the on-demand wrapper:
 
 ```bash
-bash benchmarks/comprehensive/scripts/gate_candidate.sh
+python benchmarks/comprehensive/scripts/gate_candidate.py
 ```
 
 See `benchmarks/README.md` for the full workflow docs.
