@@ -618,28 +618,39 @@ mod tests {
 
     /// Phase 10 regression: hoisting the densification scratch out of the
     /// shard loop means the same `d_dense` buffer is reused across shards.
-    /// If the per-shard zero pass were ever dropped, stale values from a
-    /// prior larger shard would corrupt the Gram contribution. Running the
-    /// same operator twice into a fresh `d_gram` must produce bit-identical
-    /// output.
+    /// If the per-shard zero pass were ever dropped, nonzero positions
+    /// written by shard *i* would survive into shard *(i+1)*'s leading
+    /// region at coordinates the new shard happens to leave empty (no
+    /// nonzero), and `gpu_sgemm` would fold that stale data into the Gram.
     ///
-    /// Uses heterogeneous shard sizes so the second pass writes into a
-    /// region that the first pass already touched — without per-shard
-    /// zeroing the second result would diverge.
+    /// Uses heterogeneous shard sizes (`221 / 4` → 56, 56, 56, 53 via
+    /// ceil-div) and verifies *both* bit-identical determinism across
+    /// runs *and* approximate equality against a CPU reference. The
+    /// determinism check alone is insufficient — under a dropped
+    /// zero-pass, both runs allocate fresh `d_dense` and corrupt
+    /// identically, so `gram_a == gram_b` would still hold. The CPU
+    /// reference is what actually catches the bug.
     #[test]
     fn test_accumulate_gram_scratch_reuse() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
         let cublas = CublasHandle::new().unwrap();
 
-        let n_rows = 220;
+        let n_rows = 221;
         let n_cols = 35;
         let csr = random_csr(n_rows, n_cols, 0.12, 99);
-        let means = col_means(&densify(&csr), n_rows, n_cols);
+        let x_dense = densify(&csr);
+        let means = col_means(&x_dense, n_rows, n_cols);
 
-        // Heterogeneous shard sizes (split_into_shards rounds up by ceil-div,
-        // which already gives uneven shards on this size).
         let shards = split_into_shards(&csr, 4);
+        // Sanity: the test premise depends on at least one shard boundary
+        // being heterogeneous. If split_into_shards' rounding ever changes
+        // and produces uniform shards on these dimensions, surface it here
+        // rather than silently weakening the test.
+        assert!(
+            shards.windows(2).any(|w| w[0].n_rows() != w[1].n_rows()),
+            "test precondition: shards must have at least one heterogeneous boundary"
+        );
         let source = InMemorySource {
             shards,
             n_obs: n_rows,
@@ -661,7 +672,24 @@ mod tests {
 
         assert_eq!(
             gram_a, gram_b,
-            "accumulate_gram must be bit-identical across runs (scratch reuse must not leak state)"
+            "accumulate_gram must be bit-identical across runs"
         );
+
+        // CPU reference: Gram[a, b] = Σ_r (x[r, a] − μ[a]) (x[r, b] − μ[b]),
+        // col-major. This is the check that actually catches a dropped
+        // per-shard zero pass — determinism alone holds under that bug.
+        let mut gram_cpu = vec![0.0f32; n_cols * n_cols];
+        for b in 0..n_cols {
+            for a in 0..n_cols {
+                let mut acc = 0.0f32;
+                for r in 0..n_rows {
+                    acc +=
+                        (x_dense[r * n_cols + a] - means[a]) * (x_dense[r * n_cols + b] - means[b]);
+                }
+                gram_cpu[b * n_cols + a] = acc;
+            }
+        }
+        let err = rel_error(&gram_a, &gram_cpu);
+        assert!(err < 1e-3, "scratch reuse rel_error vs CPU = {err}");
     }
 }

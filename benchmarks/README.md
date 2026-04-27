@@ -691,7 +691,7 @@ performance currently under regression governance:
 | **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
 | **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
 
-That is 22 benchmarks across 6 distinct domains, each expanded across the
+That is 22 benchmarks across 7 distinct domains, each expanded across the
 relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
 plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
 and the tier's dataset list (pbmc3k → census_10m). The canonical list
