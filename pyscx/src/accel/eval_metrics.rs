@@ -1507,26 +1507,29 @@ pub fn clustering_agreement<'py>(
             0,
         )?;
 
-        let mut best = f64::NEG_INFINITY;
-        for &r in &resolutions_owned {
-            let pred_leiden = scx_accel::leiden(
-                &pred_knn.conn_indptr,
-                &pred_knn.conn_indices,
-                &pred_knn.conn_data,
-                n_output,
-                r,
-                /*seed=*/ 0,
-                /*max_iterations=*/ 2,
-                /*parallel=*/ false,
-            )?;
-            let pred_labels_u32: Vec<u32> =
-                pred_leiden.membership.iter().map(|&c| c as u32).collect();
-
-            let score = clustering_metric.score(&real_labels_u32, &pred_labels_u32);
-            if score > best {
-                best = score;
-            }
-        }
+        // Resolutions are independent — fan out across rayon. Inner Leiden
+        // is `parallel=false`, so the only nested rayon use is matmul-free
+        // graph-coloring; safe to parallelise across the (typically 7)
+        // resolutions. `try_reduce` short-circuits on the first error.
+        use rayon::prelude::*;
+        let best = resolutions_owned
+            .par_iter()
+            .map(|&r| -> scx_accel::Result<f64> {
+                let pred_leiden = scx_accel::leiden(
+                    &pred_knn.conn_indptr,
+                    &pred_knn.conn_indices,
+                    &pred_knn.conn_data,
+                    n_output,
+                    r,
+                    /*seed=*/ 0,
+                    /*max_iterations=*/ 2,
+                    /*parallel=*/ false,
+                )?;
+                let pred_labels_u32: Vec<u32> =
+                    pred_leiden.membership.iter().map(|&c| c as u32).collect();
+                Ok(clustering_metric.score(&real_labels_u32, &pred_labels_u32))
+            })
+            .try_reduce(|| f64::NEG_INFINITY, |a, b| Ok(a.max(b)))?;
         Ok(best)
     });
 

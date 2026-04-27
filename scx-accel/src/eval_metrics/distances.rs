@@ -265,12 +265,17 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
         DistanceMetric::L1 => unreachable!("L1 is not supported for gemm path"),
     };
 
-    let mut gram = Mat::<F>::zeros(n_a, n_b);
+    // Compute the Gram as `B · Aᵀ` of shape `(n_b, n_a)` rather than
+    // `A · Bᵀ` of shape `(n_a, n_b)`. faer's `Mat` is column-major, so the
+    // inner reduction loop (fixed `i`, varying `j`) walks down a single
+    // column — contiguous access. The transposed layout gives the same
+    // values: `(B·Aᵀ)[j, i] = b_j · a_i = (A·Bᵀ)[i, j]`.
+    let mut gram = Mat::<F>::zeros(n_b, n_a);
     matmul(
         gram.as_mut(),
         faer::Accum::Replace,
-        a_view,
-        b_view.transpose(),
+        b_view,
+        a_view.transpose(),
         F::one(),
         faer::Par::rayon(0),
     );
@@ -312,9 +317,11 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
                     let ai_sq = a_sq[i];
                     let mut row_sum = 0.0f64;
                     for j in 0..n_b {
+                        // `gram[(j, i)]` walks down column `i` of the
+                        // column-major matrix — contiguous in memory.
                         // max(0, ·) clamps tiny negatives from FP cancellation
                         // for near-identical rows.
-                        let g = gram[(i, j)].as_f64();
+                        let g = gram[(j, i)].as_f64();
                         let d_sq = (ai_sq + b_sq[j] - 2.0 * g).max(0.0);
                         row_sum += d_sq.sqrt();
                     }
@@ -328,8 +335,9 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
             .map(|i| {
                 let mut row_sum = 0.0f64;
                 for j in 0..n_b {
+                    // `gram[(j, i)]` is contiguous along `j` (column-major).
                     // Clamp to [0, 2] to match scalar cosine_distance behavior.
-                    let d = (1.0 - gram[(i, j)].as_f64()).clamp(0.0, 2.0);
+                    let d = (1.0 - gram[(j, i)].as_f64()).clamp(0.0, 2.0);
                     row_sum += d;
                 }
                 row_sum
