@@ -885,7 +885,13 @@ pyscx.accel.neighbors(adata, n_neighbors=15)
 | `ef_search` | 200 | HNSW search parameter (higher = more accurate) |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
-On CPU, uses HNSW (instant-distance) with Euclidean distance.
+On CPU, uses HNSW (instant-distance) with Euclidean distance — except at
+`n_obs ≤ 5,000`, where the CPU path silently dispatches to an exact kNN
+via a faer matmul + per-row partial top-k sort (Phase 6 of
+`SCX-EVAL-METRIC-IMPROVE.md`); `ef_construction` / `ef_search` are
+ignored on the exact path. The exact path allocates an `n_obs × n_obs`
+f32 Gram matrix (~100 MB at the threshold) — keep this in mind if
+calling at the boundary on memory-constrained hosts.
 On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
 
 ### UMAP (`pyscx.accel.umap`)
@@ -1257,7 +1263,12 @@ means, groups = pyscx.accel.pseudobulk_means(adata, "perturbation")
 
 Streams directly from CSR shards with no full-matrix materialization. On
 backed data, processes shard-by-shard; on lazy-transformed data, applies
-the transform stack before aggregation.
+the transform stack before aggregation. **Dense fast-path** (Phase 6 of
+`SCX-EVAL-METRIC-IMPROVE.md`): when `adata.X` is a dense numpy array (the
+common shape after `pp.normalize_total + log1p`), the in-memory aggregation
+runs through `scx_accel::pseudobulk_aggregate_dense` directly, bypassing
+the historical `scipy.sparse.csr_matrix(dense_array)` round-trip. At
+24K-cell × 18K-gene shapes this cut `pseudobulk_means` from ~22 s to ~5 s.
 
 #### Bulk perturbation metrics (`pyscx.accel.perturbation_metrics`)
 
@@ -1384,15 +1395,29 @@ cluster assignments via AMI / NMI / ARI. Matches
 `cell_eval.metrics._anndata.ClusteringAgreement` within `atol=0.15`.
 
 The implementation is **all native Rust** — no scanpy / anndata / igraph
-calls. The kNN graph uses `scx_accel::neighbors::build_knn_graph` (HNSW
-via `instant-distance`, with `ef_construction=200`, `ef_search=50`,
-`seed=0` baked in to match scanpy's exact-kNN reference within > 99 %
-recall on small centroid graphs); Leiden uses `scx_accel::leiden`
-sequential mode (`max_iterations=2`, `parallel=false`, `seed=0` —
-matches scanpy's `flavor="igraph", n_iterations=2`). The pred-side kNN
-graph is built once and reused across the resolution sweep, so only the
-Leiden pass re-runs per resolution. The whole hot path runs under
-`py.allow_threads`.
+calls. The kNN graph uses `scx_accel::neighbors::build_knn_graph`, which
+auto-dispatches between two backends based on `n_obs` (the perturbation
+count after filtering control):
+
+- **`n_obs ≤ 5,000` (Phase 6 default)** — exact kNN via a faer matmul of
+  `Centroids · Centroidsᵀ`, per-row partial top-k sort. Wins at small
+  `n_obs` because the matmul runs at AVX-GEMM throughput while HNSW's
+  inner loops are scalar. This is the active path on every realistic
+  perturbation-evaluation workload (Replogle-scale n_perts ≈ 2–3K);
+- **`n_obs > 5,000`** — HNSW via `instant-distance`
+  (`ef_construction=200`, `ef_search=50`, `seed=0`).
+
+Leiden uses `scx_accel::leiden` sequential mode (`max_iterations=2`,
+`parallel=false`, `seed=0` — matches scanpy's
+`flavor="igraph", n_iterations=2`). The pred-side kNN graph is built
+once and reused across the resolution sweep, so only the Leiden pass
+re-runs per resolution. Resolutions are evaluated in parallel via
+rayon's `par_iter`. The whole hot path runs under `py.allow_threads`.
+
+Per-phase profile timers can be enabled at runtime — set the env var
+`RUST_LOG=pyscx::accel::eval_metrics::clustering_agreement=debug` and
+the function logs `real_knn / real_leiden / pred_knn / sweep / total`
+walls in milliseconds, alongside their fraction of total time.
 
 **Caveat — small-graph divergence (`n_perts ≲ 10`).** The Rust-native
 Leiden's RB-modularity tie-break differs from scanpy's

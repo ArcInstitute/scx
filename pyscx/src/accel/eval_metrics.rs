@@ -1,6 +1,7 @@
 //! Perturbation evaluation metrics — pseudobulk means, perturbation_metrics,
 //! energy_distance, discrimination_score, knockdown_efficiency, clustering_agreement.
 
+use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -133,66 +134,96 @@ pub fn pseudobulk_means<'py>(
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else {
-        // In-memory: extract scipy CSR → zero-copy slices.
+        // In-memory: dense fast-path for non-sparse inputs (Phase 6 of
+        // SCX-EVAL-METRIC-IMPROVE.md). At Replogle scale (24K cells × 18K
+        // genes log-normalised) the old `scipy.sparse.csr_matrix(dense)`
+        // path was 22 s — dominated by densify-then-CSR-construct churn,
+        // not the actual aggregation. The dense kernel skips that.
         let scipy_sparse = py.import("scipy.sparse")?;
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
             .extract::<bool>()?;
 
-        let csr_obj = if is_sparse {
-            scipy_sparse.call_method1("csr_matrix", (&x,))?
-        } else if x.hasattr("toarray")? {
-            let arr = x.call_method0("toarray")?;
-            scipy_sparse.call_method1("csr_matrix", (&arr,))?
+        if !is_sparse {
+            // Dense path: extract a contiguous f32 PyReadonlyArray2 and run
+            // pseudobulk_aggregate_dense directly.
+            let arr = if x.hasattr("toarray")? {
+                x.call_method0("toarray")?
+            } else {
+                np.call_method1("asarray", (&x,))?
+            };
+            // Force C-contiguous f32. `astype_no_copy` skips the copy when
+            // dtype already matches; `ascontiguousarray` guarantees row-major
+            // layout for the row-major Rust kernel (also a no-op when the
+            // array is already C-contiguous).
+            let arr = astype_no_copy(py, &arr, "float32")?;
+            let arr = np.call_method1("ascontiguousarray", (&arr,))?;
+            let arr_ro: numpy::PyReadonlyArray2<'_, f32> = arr.extract()?;
+            let shape_ndarray = arr_ro.shape();
+            let shape: (usize, usize) = (shape_ndarray[0], shape_ndarray[1]);
+            let data_slice = arr_ro
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            py.allow_threads(|| {
+                scx_accel::pseudobulk_aggregate_dense(
+                    data_slice,
+                    shape,
+                    &obs_groups,
+                    &groupby_columns,
+                    &gene_names,
+                    scx_accel::AggregationMethod::Mean,
+                    min_cells_per_group,
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
-            let arr = np
-                .call_method1("asarray", (&x,))?
-                .call_method1("astype", ("float32",))?;
-            scipy_sparse.call_method1("csr_matrix", (&arr,))?
-        };
+            // True sparse input: extract scipy CSR → zero-copy slices.
+            let csr_obj = scipy_sparse.call_method1("csr_matrix", (&x,))?;
 
-        let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
+            let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
 
-        // Use astype with copy=False to avoid redundant copies when dtypes match,
-        // then borrow via PyReadonlyArray1 for zero-copy slice access.
-        let indptr_obj = csr_obj.getattr("indptr")?;
-        let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
-        let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
-        let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
-        let indptr_slice = indptr_ro
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Use astype with copy=False to avoid redundant copies when dtypes match,
+            // then borrow via PyReadonlyArray1 for zero-copy slice access.
+            let indptr_obj = csr_obj.getattr("indptr")?;
+            let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
+            let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
+            let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
+            let indptr_slice = indptr_ro
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let indices_obj = csr_obj.getattr("indices")?;
-        let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
-        let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
-        let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
-        let indices_slice = indices_ro
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let indices_obj = csr_obj.getattr("indices")?;
+            let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
+            let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
+            let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
+            let indices_slice = indices_ro
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let data_obj = csr_obj.getattr("data")?;
-        let data_arr = np.call_method1("asarray", (&data_obj,))?;
-        let data_arr = astype_no_copy(py, &data_arr, "float32")?;
-        let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
-        let data_slice = data_ro
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let data_obj = csr_obj.getattr("data")?;
+            let data_arr = np.call_method1("asarray", (&data_obj,))?;
+            let data_arr = astype_no_copy(py, &data_arr, "float32")?;
+            let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
+            let data_slice = data_ro
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        py.allow_threads(|| {
-            scx_accel::pseudobulk_aggregate_from_slices(
-                shape,
-                indptr_slice,
-                indices_slice,
-                data_slice,
-                &obs_groups,
-                &groupby_columns,
-                &gene_names,
-                scx_accel::AggregationMethod::Mean,
-                min_cells_per_group,
-            )
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            py.allow_threads(|| {
+                scx_accel::pseudobulk_aggregate_from_slices(
+                    shape,
+                    indptr_slice,
+                    indices_slice,
+                    data_slice,
+                    &obs_groups,
+                    &groupby_columns,
+                    &gene_names,
+                    scx_accel::AggregationMethod::Mean,
+                    min_cells_per_group,
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        }
     };
 
     if result.n_groups == 0 {
@@ -1468,9 +1499,20 @@ pub fn clustering_agreement<'py>(
     let effective_n_neighbors = n_neighbors.min(n_output - 1);
 
     // ── Build kNN + run Leiden, all in Rust, GIL released ───────────
+    //
+    // Per-phase profiling (Phase 6 of `SCX-EVAL-METRIC-IMPROVE.md`): timers
+    // log to `pyscx::accel::eval_metrics::clustering_agreement` at debug.
+    // Enable via `RUST_LOG=pyscx::accel::eval_metrics=debug`. Production
+    // callers see no output; the cost of one `Instant::now()` per phase is
+    // negligible (~30 ns total) compared to the kNN / Leiden work.
+    use std::time::Instant;
     let resolutions_owned = resolutions.clone();
+    let n_resolutions = resolutions_owned.len();
     let best_score: scx_accel::Result<f64> = py.allow_threads(|| {
-        // Build real-side kNN once.
+        let t_total = Instant::now();
+
+        // Phase: real-side kNN graph build.
+        let t = Instant::now();
         let real_knn = scx_accel::build_knn_graph(
             &sorted_real_f32,
             n_output,
@@ -1480,6 +1522,10 @@ pub fn clustering_agreement<'py>(
             /*ef_search=*/ 50,
             /*seed=*/ 0,
         )?;
+        let real_knn_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase: real-side Leiden.
+        let t = Instant::now();
         let real_leiden = scx_accel::leiden(
             &real_knn.conn_indptr,
             &real_knn.conn_indices,
@@ -1490,13 +1536,14 @@ pub fn clustering_agreement<'py>(
             /*max_iterations=*/ 2,
             /*parallel=*/ false,
         )?;
+        let real_leiden_ms = t.elapsed().as_secs_f64() * 1000.0;
         // `LeidenResult.membership` is `Vec<usize>`; the AMI/NMI/ARI scoring
         // signature is `&[u32]`. Cast row-by-row — community counts in the
         // centroid graph (≤ 3000 nodes) cannot exceed u32::MAX.
         let real_labels_u32: Vec<u32> = real_leiden.membership.iter().map(|&c| c as u32).collect();
 
-        // Build pred-side kNN once and reuse across the resolution sweep —
-        // only the Leiden pass re-runs per resolution.
+        // Phase: pred-side kNN graph build.
+        let t = Instant::now();
         let pred_knn = scx_accel::build_knn_graph(
             &sorted_pred_f32,
             n_output,
@@ -1506,11 +1553,14 @@ pub fn clustering_agreement<'py>(
             50,
             0,
         )?;
+        let pred_knn_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+        // Phase: pred-side resolution sweep (Leiden + AMI scoring fused).
         // Resolutions are independent — fan out across rayon. Inner Leiden
         // is `parallel=false`, so the only nested rayon use is matmul-free
         // graph-coloring; safe to parallelise across the (typically 7)
         // resolutions. `try_reduce` short-circuits on the first error.
+        let t = Instant::now();
         use rayon::prelude::*;
         let best = resolutions_owned
             .par_iter()
@@ -1530,6 +1580,22 @@ pub fn clustering_agreement<'py>(
                 Ok(clustering_metric.score(&real_labels_u32, &pred_labels_u32))
             })
             .try_reduce(|| f64::NEG_INFINITY, |a, b| Ok(a.max(b)))?;
+        let sweep_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+        log::debug!(
+            target: "pyscx::accel::eval_metrics::clustering_agreement",
+            "n_obs={n_output} n_dims={n_genes} n_resolutions={n_resolutions} | \
+             real_knn={real_knn_ms:.1}ms ({real_pct:.0}%) \
+             real_leiden={real_leiden_ms:.1}ms ({real_leiden_pct:.0}%) \
+             pred_knn={pred_knn_ms:.1}ms ({pred_pct:.0}%) \
+             sweep={sweep_ms:.1}ms ({sweep_pct:.0}%) \
+             total={total_ms:.1}ms",
+            real_pct = 100.0 * real_knn_ms / total_ms,
+            real_leiden_pct = 100.0 * real_leiden_ms / total_ms,
+            pred_pct = 100.0 * pred_knn_ms / total_ms,
+            sweep_pct = 100.0 * sweep_ms / total_ms,
+        );
         Ok(best)
     });
 

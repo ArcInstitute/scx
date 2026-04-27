@@ -347,6 +347,99 @@ pub fn pseudobulk_aggregate_from_slices(
     )
 }
 
+/// In-memory pseudobulk aggregation from a row-major dense `f32` matrix.
+///
+/// Avoids the `scipy.sparse.csr_matrix(dense_array)` densification round-trip
+/// that the CSR-based paths pay when the caller's `X` is already dense.
+/// Builds the same `PseudobulkResult` shape as `pseudobulk_aggregate_inmemory`
+/// / `pseudobulk_aggregate_from_slices`.
+///
+/// At Replogle scale (n_obs ≈ 24K cells × n_vars ≈ 18K genes) the dense path
+/// is ~50–100× faster than going through `scipy.sparse.csr_matrix`, because
+/// the CSR conversion scans every f32 looking for non-zeros and materialises
+/// 1.7 GB of `(indices, data)` arrays just to be summed back into a dense
+/// per-group means matrix. The dense path skips that intermediate altogether
+/// — see Phase 6 of `SCX-EVAL-METRIC-IMPROVE.md`.
+///
+/// Parallelisation is over groups (each thread writes to its own contiguous
+/// row of `means`, so no shared-accumulator contention or thread-local
+/// `n_groups × n_vars` blow-up — the per-thread allocator pattern would have
+/// allocated ~11 GB across 32 threads for typical Replogle shapes).
+#[allow(clippy::too_many_arguments)]
+pub fn pseudobulk_aggregate_dense(
+    data: &[f32],
+    shape: (usize, usize),
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    method: AggregationMethod,
+    min_cells_per_group: usize,
+) -> Result<PseudobulkResult> {
+    use rayon::prelude::*;
+
+    let (n_obs, n_vars) = shape;
+    if data.len() != n_obs * n_vars {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "data length {} != n_obs ({}) × n_vars ({}) = {}",
+            data.len(),
+            n_obs,
+            n_vars,
+            n_obs * n_vars,
+        )));
+    }
+
+    validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
+
+    let (cell_to_group, group_labels) = build_group_mapping(obs_groups, n_obs);
+    let n_groups = group_labels.len();
+
+    // Invert cell_to_group → per-group list of cell row indices. One pass,
+    // O(n_obs) time + O(n_obs + n_groups) memory.
+    let mut cells_by_group: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
+    for (cell, &g) in cell_to_group.iter().enumerate() {
+        cells_by_group[g].push(cell as u32);
+    }
+    let cell_counts: Vec<usize> = cells_by_group.iter().map(|c| c.len()).collect();
+
+    // Allocate the result `[n_groups × n_vars]` matrix once, then have each
+    // group sum (and optionally mean-normalise) its own cells into its
+    // dedicated row in parallel. No shared mutable state across threads:
+    // each thread owns a disjoint row range. Folding the divide into the
+    // same loop avoids a sequential `n_groups × n_vars` post-pass (~432M
+    // divisions at Replogle scale).
+    let mut counts = vec![0.0f64; n_groups * n_vars];
+    let want_mean = method == AggregationMethod::Mean;
+    counts
+        .par_chunks_mut(n_vars)
+        .zip(cells_by_group.par_iter())
+        .with_min_len(1)
+        .for_each(|(dst, cells)| {
+            for &cell in cells {
+                let src = &data[cell as usize * n_vars..(cell as usize + 1) * n_vars];
+                for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                    *d += s as f64;
+                }
+            }
+            if want_mean && !cells.is_empty() {
+                let cc = cells.len() as f64;
+                for d in dst.iter_mut() {
+                    *d /= cc;
+                }
+            }
+        });
+
+    filter_and_build_result(
+        counts,
+        group_labels,
+        groupby_columns,
+        cell_counts,
+        gene_names,
+        n_groups,
+        n_vars,
+        min_cells_per_group,
+    )
+}
+
 /// Validate common inputs for both streaming and in-memory paths.
 fn validate_inputs(
     obs_groups: &[Vec<String>],
@@ -681,5 +774,64 @@ mod tests {
             0,
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_pseudobulk_dense_matches_csr_inmemory() {
+        // The dense kernel should produce bit-identical sums to the CSR
+        // kernel when given the dense expansion of the same matrix.
+        let csr = make_test_csr();
+        let (n_obs, n_vars) = csr.shape;
+        let mut dense = vec![0.0f32; n_obs * n_vars];
+        for row in 0..n_obs {
+            let s = csr.indptr[row] as usize;
+            let e = csr.indptr[row + 1] as usize;
+            for j in s..e {
+                let col = csr.indices[j] as usize;
+                dense[row * n_vars + col] = csr.data[j];
+            }
+        }
+
+        let obs_groups = vec![vec![
+            "A".to_string(),
+            "A".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "B".to_string(),
+            "B".to_string(),
+        ]];
+        let groupby = vec!["group".to_string()];
+        let genes = vec![
+            "g0".to_string(),
+            "g1".to_string(),
+            "g2".to_string(),
+            "g3".to_string(),
+        ];
+
+        for method in [AggregationMethod::Sum, AggregationMethod::Mean] {
+            let csr_res =
+                pseudobulk_aggregate_inmemory(&csr, &obs_groups, &groupby, &genes, method, 0)
+                    .unwrap();
+            let dense_res = pseudobulk_aggregate_dense(
+                &dense,
+                (n_obs, n_vars),
+                &obs_groups,
+                &groupby,
+                &genes,
+                method,
+                0,
+            )
+            .unwrap();
+            assert_eq!(csr_res.n_groups, dense_res.n_groups);
+            assert_eq!(csr_res.cell_counts, dense_res.cell_counts);
+            assert_eq!(csr_res.group_labels, dense_res.group_labels);
+            // f64 sums of the exact same f32 values; bit-identical.
+            for (a, b) in csr_res.counts.iter().zip(dense_res.counts.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "method={method:?} mismatch: csr={a} dense={b}"
+                );
+            }
+        }
     }
 }
