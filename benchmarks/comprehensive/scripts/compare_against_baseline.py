@@ -610,6 +610,16 @@ def main() -> int:
              "defaults to `benchmarks/comprehensive/thresholds.yaml` "
              "when that file exists.",
     )
+    parser.add_argument(
+        "--only-benchmarks", nargs="+", default=None, metavar="BENCH",
+        help="Restrict the diff to baseline rows whose benchmark is in "
+             "this list (e.g. `--only-benchmarks accel_pca`). Without this "
+             "flag, every benchmark in the baseline is compared and any "
+             "missing in the candidate is flagged as DISAPPEARED under "
+             "--gate. Use for narrow spot-check gates over a subset of the "
+             "canonical surface. Floor specs whose benchmark isn't in the "
+             "list are also dropped.",
+    )
     args = parser.parse_args()
 
     # On-demand workflow: auto-resolve --baseline from LATEST if omitted.
@@ -642,6 +652,25 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    # --only-benchmarks: filter both baseline and current row dicts so the
+    # diff (and the gate's DISAPPEARED check) only operates on the requested
+    # benchmark slice. Keeps narrow spot-check gates honest — the canonical
+    # baseline covers the full surface, but a candidate captured with
+    # `--benchmarks accel_pca` shouldn't be flagged for everything else
+    # going missing.
+    if args.only_benchmarks:
+        allow = set(args.only_benchmarks)
+        baseline_summary = dict(baseline_summary)
+        baseline_summary["rows"] = {
+            k: v for k, v in baseline_summary.get("rows", {}).items()
+            if k.split("__", 2)[0] in allow
+        }
+        current_summary = dict(current_summary)
+        current_summary["rows"] = {
+            k: v for k, v in current_summary.get("rows", {}).items()
+            if k.split("__", 2)[0] in allow
+        }
+
     baseline_fp = _load_fingerprints(args.baseline)
     current_fp  = _load_fingerprints(args.current)
 
@@ -668,6 +697,9 @@ def main() -> int:
             except FileNotFoundError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 2
+            if args.only_benchmarks:
+                allow = set(args.only_benchmarks)
+                floors = [f for f in floors if f.get("benchmark") in allow]
             floor_violations = check_absolute_floors(args.current, floors)
         # New benchmarks: current has the key, baseline doesn't.
         base_keys = set(baseline_summary.get("rows", {}).keys())

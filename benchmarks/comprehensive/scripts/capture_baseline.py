@@ -173,6 +173,9 @@ def submit_benchmarks(
     no_accel: bool = False,
     accel_only: bool = False,
     no_gpu: bool = False,
+    benchmarks: list[str] | None = None,
+    datasets: list[str] | None = None,
+    skip_smoke: bool = False,
 ) -> int:
     """Invoke run_parallel.py with the selected tier's settings.
 
@@ -196,10 +199,25 @@ def submit_benchmarks(
     else:
         bench_list = list(BENCHMARKS)
 
+    # Optional explicit narrowing — must be a strict subset of bench_list so
+    # the gate's coverage banner stays accurate. Rejects unknown names.
+    if benchmarks:
+        unknown = [b for b in benchmarks if b not in BENCHMARKS]
+        if unknown:
+            raise SystemExit(f"[baseline] unknown --benchmarks: {unknown}")
+        bench_list = [b for b in bench_list if b in benchmarks]
+        if not bench_list:
+            raise SystemExit(
+                f"[baseline] --benchmarks {benchmarks} produced an empty list "
+                "after coverage filters (--accel-only / --no-accel)"
+            )
+
+    ds_list = list(datasets) if datasets else list(tier_cfg["datasets"])
+
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts" / "run_parallel.py"),
-        "--datasets", *tier_cfg["datasets"],
+        "--datasets", *ds_list,
         "--benchmarks", *bench_list,
         "--partition", tier_cfg["partition"],
         "--mem-gb",    str(tier_cfg["mem_gb"]),
@@ -209,6 +227,8 @@ def submit_benchmarks(
         # In dry-run we just want to print the schedule. The runner contract
         # check (smoke_test_runners) belongs to real submission paths.
         cmd.extend(["--dry-run", "--skip-smoke"])
+    elif skip_smoke:
+        cmd.append("--skip-smoke")
     if skip_convert:
         cmd.append("--skip-convert")
     if overwrite:
@@ -246,8 +266,17 @@ def _tier_matches(filename: str, tier_cfg: dict[str, Any]) -> bool:
 def archive_raw_results(
     tier_cfg: dict[str, Any],
     baseline_dir: Path,
+    *,
+    since_mtime: float | None = None,
 ) -> dict[str, Any]:
     """Copy result JSONs for the selected tier into baseline/raw/.
+
+    ``since_mtime`` (epoch seconds), when set, filters out files written
+    before this run started — without it, ``RAW_DIR`` accumulates results
+    from every prior invocation and would silently archive a mix of fresh
+    and stale results into the candidate snapshot. The gate would then
+    diff against that mix and report regressions that have nothing to do
+    with the current commit.
 
     Returns a per-file summary dict suitable for summary.json.
     """
@@ -257,8 +286,12 @@ def archive_raw_results(
     summary: dict[str, Any] = {}
     copied = 0
     skipped = 0
+    stale_filtered = 0
     for src in sorted(RAW_DIR.glob("*.json")):
         if not _tier_matches(src.name, tier_cfg):
+            continue
+        if since_mtime is not None and src.stat().st_mtime < since_mtime:
+            stale_filtered += 1
             continue
         shutil.copy2(src, dst / src.name)
         copied += 1
@@ -277,7 +310,13 @@ def archive_raw_results(
             "source_file": src.name,
         }
 
-    print(f"[baseline] archived {copied} result files ({skipped} unparseable)")
+    if stale_filtered:
+        print(
+            f"[baseline] archived {copied} result files ({skipped} unparseable, "
+            f"{stale_filtered} pre-run files skipped)"
+        )
+    else:
+        print(f"[baseline] archived {copied} result files ({skipped} unparseable)")
     return summary
 
 
@@ -384,6 +423,23 @@ def main() -> int:
         help="Drop GPU accel format variants (*_gpu*). Use on CPU-only hosts "
              "or to validate CPU-only changes.",
     )
+    parser.add_argument(
+        "--benchmarks", nargs="+", default=None,
+        help="Restrict to a subset of the canonical benchmark list "
+             "(e.g. `--benchmarks accel_pca`). Must be a strict subset; "
+             "unknown names raise. Combined with the coverage flags.",
+    )
+    parser.add_argument(
+        "--datasets", nargs="+", default=None,
+        help="Override the tier's dataset list (e.g. "
+             "`--datasets pbmc3k tabula_sapiens_100k`).",
+    )
+    parser.add_argument(
+        "--skip-smoke", action="store_true",
+        help="Skip the pre-submit format-runner contract check. Useful for "
+             "narrow accel-only runs or when known-broken format runners "
+             "(BPCells / Parquet) are blocking submission of unrelated work.",
+    )
     args = parser.parse_args()
 
     tier_cfg = TIERS[args.tier]
@@ -406,7 +462,15 @@ def main() -> int:
 
     # 2. Run the comprehensive suite (unless we're just archiving or
     #    fingerprinting what already exists).
+    # Capture start time so the archive step can filter out stale RAW_DIR
+    # entries from prior invocations. ``time.time()`` is wall-clock seconds
+    # matching ``stat().st_mtime``.
+    submission_start: float | None = None
+
     if args.mode == "submit":
+        # Margin: subtract 1s so we don't lose results written within the
+        # same second by a fast-running benchmark.
+        submission_start = time.time() - 1.0
         rc = submit_benchmarks(
             tier_cfg,
             dry_run=False,
@@ -416,9 +480,17 @@ def main() -> int:
             no_accel=args.no_accel,
             accel_only=args.accel_only,
             no_gpu=args.no_gpu,
+            benchmarks=args.benchmarks,
+            datasets=args.datasets,
+            skip_smoke=args.skip_smoke,
         )
         if rc != 0:
-            print(f"[baseline] WARNING: run_parallel.py exited with {rc}; archiving whatever landed")
+            print(
+                f"[baseline] ERROR: run_parallel.py exited with {rc}; "
+                f"refusing to archive stale RAW_DIR contents. Re-run after "
+                f"fixing the underlying failure."
+            )
+            return rc
     elif args.mode == "dry-run":
         submit_benchmarks(
             tier_cfg, dry_run=True,
@@ -427,12 +499,19 @@ def main() -> int:
             no_accel=args.no_accel,
             accel_only=args.accel_only,
             no_gpu=args.no_gpu,
+            benchmarks=args.benchmarks,
+            datasets=args.datasets,
+            skip_smoke=args.skip_smoke,
         )
         return 0
 
-    # 3. Archive raw JSON + write summary.json.
+    # 3. Archive raw JSON + write summary.json. ``since_mtime`` filters
+    #    stale entries from prior runs out of ``RAW_DIR`` so only fresh
+    #    results land in the candidate snapshot.
     if args.mode != "fingerprint-only":
-        summary = archive_raw_results(tier_cfg, baseline_dir)
+        summary = archive_raw_results(
+            tier_cfg, baseline_dir, since_mtime=submission_start,
+        )
         (baseline_dir / "summary.json").write_text(json.dumps(
             {
                 "snapshot_name": args.name,

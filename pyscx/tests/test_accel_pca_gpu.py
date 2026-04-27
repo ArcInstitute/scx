@@ -265,3 +265,57 @@ def test_device_gating_cpu_build_rejects_gpu():
     adata = _random_count_adata(n_obs=50, n_vars=40, density=0.2, seed=0)
     with pytest.raises((RuntimeError, ValueError)):
         pyscx.accel.pca(adata, n_comps=4, device="gpu")
+
+
+# --------------------------------------------------------------------- #
+# Phase 10 — memory-spike regression for the materialised-CSR fast-lane
+# --------------------------------------------------------------------- #
+
+@gpu_only
+@pytest.mark.skipif(
+    not __import__("sys").platform.startswith("linux"),
+    reason="ru_maxrss reporting differs by platform; only assert on Linux",
+)
+def test_gpu_pca_materialized_csr_host_spike():
+    """The Phase-10 borrow fast-lane must keep the host RSS spike under
+    ~1.5× the input CSR's nbytes when feeding a materialised scipy CSR to
+    `pyscx.accel.pca(device="gpu")`.
+
+    Pre-Phase-10 the path was numpy → `extract::<Vec<T>>` (copy 1) → `ScxCsr`
+    → `read_shard` clone (copy 2), which pushed peak RSS to ≈ 2× input. The
+    borrow path replaces the first copy with a `PyReadonlyArray1` view, so
+    only one transient `Vec` materialises during dispatch. This test
+    catches accidental re-introduction of the double-copy pattern.
+
+    The 1.5× ceiling is loose on purpose — Python and CUDA driver state
+    contribute non-trivial baseline RSS noise.
+    """
+    import gc
+    import resource
+
+    import pyscx
+
+    # 100K × 200 @ 10% density: small enough to run in a CI test, large
+    # enough that the input dominates baseline RSS noise.
+    adata = _random_count_adata(n_obs=100_000, n_vars=200, density=0.10, seed=42)
+    x = adata.X
+    input_nbytes = int(x.indptr.nbytes + x.indices.nbytes + x.data.nbytes)
+
+    gc.collect()
+    baseline = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # Linux: kB
+
+    pyscx.accel.pca(
+        adata, n_comps=20, device="gpu", method="randomized", random_state=0,
+    )
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    spike = max(peak - baseline, 0)
+
+    # Loose 1.5× ceiling — a regression to the double-copy path would land
+    # near 2× input_nbytes once Vec + cloned-ScxCsr coexist on the heap.
+    assert spike < int(1.5 * input_nbytes), (
+        f"PCA(device='gpu') materialised-CSR fast-lane regressed: "
+        f"host RSS spike {spike / 1e6:.1f} MB exceeds 1.5× input "
+        f"{input_nbytes / 1e6:.1f} MB. Phase-10 borrow path may be broken."
+    )
+    assert adata.obsm["X_pca"].shape == (adata.n_obs, 20)

@@ -674,6 +674,31 @@ operators invoke the gate per PR, pre-release, or on suspicion of
 regression. No wasted compute when nothing has changed, and every gate
 result is tied to a specific commit the operator cares about.
 
+### Which script? `gate_candidate.py` vs `submit_benchmarks.py`
+
+The repository ships two SLURM-aware benchmark submitters. They look
+similar (both use submitit, both target Chimera) but answer different
+questions:
+
+| | `comprehensive/scripts/gate_candidate.py` | `scripts/submit_benchmarks.py` |
+|---|---|---|
+| **Question it answers** | "Did this commit regress the canonical benchmark surface?" | "How does the SCX `TrainingDataset` perform end-to-end on this dataset / GPU config, and how does it compare to alternative data loaders?" |
+| **Scope** | Full comprehensive suite — format + accel CPU + accel GPU | Training-loader-driven workloads via `benchmark_loader.run_all_benchmarks`: SCX throughput, time-to-first-batch, peak-RSS, HVG-projection impact, **GPU utilization under an actual scVI VAE training loop** (`bench_gpu_utilization`), **multi-GPU scaling** (`bench_multi_gpu_scaling`), and **side-by-side baselines against AnnData / SOMA / scdataloader / BPCells loaders** |
+| **Compares against a baseline?** | **Yes** — diffs the captured snapshot against `results/baselines/LATEST` via `compare_against_baseline.py --gate`, applies justifications and absolute floors | **No regression baseline** — but each run produces a stand-alone report (`benchmarks/results/training_loader_benchmark.{md,json}`) that ranks SCX against the four alternative loaders for the same workload |
+| **Exit codes** | Gate-shaped: `0` pass / `1` regression / `2` missing inputs / `130` SIGINT | Per-job loader-benchmark exit codes only; no gate semantics |
+| **Output location** | `benchmarks/comprehensive/results/<candidate>/` (snapshot) + `comprehensive/logs/gate_candidate_<sha>_<TS>.{log,summary.json}` | `benchmarks/results/training_loader_benchmark.{md,json}` (overwrites in place) |
+| **GPU pre-flight** | Submits a SLURM probe job to validate `nvidia-smi` / `cupy` / `pyscx.accel` on a real GPU node before scheduling work | None — assumes the partition the operator picked has GPUs |
+| **Use when** | Pre-PR / pre-merge / pre-release validation; deciding whether a change is shippable | Characterising training-loader behaviour on a new dataset, sweeping `n_gpus` for scaling curves, or measuring how a loader change moves the SCX-vs-competitor delta on a real VAE-style training loop |
+
+Rule of thumb: if the question is *"is this safe to merge?"* run
+`gate_candidate.py`. If the question is *"how does the training loader
+(and the GPU pipeline it feeds) behave on this dataset, and where does
+SCX sit relative to AnnData / SOMA / scdataloader / BPCells?"* run
+`submit_benchmarks.py`. They are complementary — loader-specific perf
+work typically uses `submit_benchmarks.py` for the fast iteration loop
+and then runs `gate_candidate.py` once before opening the PR to confirm
+the rest of the surface didn't regress.
+
 ### On-demand workflow (one command)
 
 ```bash
