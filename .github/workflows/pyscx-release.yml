@@ -1,0 +1,84 @@
+name: pyscx release wheels
+
+on:
+  push:
+    tags:
+      - "pyscx-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to attach the release to (e.g. pyscx-v0.1.0). Required for workflow_dispatch."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build manylinux wheel (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          working-directory: pyscx
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2014"
+          args: >-
+            --release
+            --strip
+            --out dist
+            --interpreter python${{ matrix.python-version }}
+            --features cloud
+
+      - name: List built wheels
+        run: ls -lh pyscx/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyscx-wheel-py${{ matrix.python-version }}
+          path: pyscx/dist/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pyscx-wheel-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          files: dist/*.whl
+          fail_on_unmatched_files: true
+          generate_release_notes: true
