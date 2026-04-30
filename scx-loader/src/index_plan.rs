@@ -624,28 +624,36 @@ impl Iterator for IndexPlanIter {
     type Item = Result<IndexPlanBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Top up the queue (no-op once stream is done or errored).
-        self.refill();
-
-        if let Some(head) = self.in_flight.pop_front() {
-            // Refill again so the queue stays warm during the upcoming
-            // process_plan call. Errors latched here drain through later.
+        // Loop so empty plans are silently skipped (spec: "Plan list is empty
+        // → yield no batch for that plan; continue to the next").
+        loop {
             self.refill();
 
-            if let Err(e) = self.await_head(head.prefetches) {
+            if let Some(head) = self.in_flight.pop_front() {
+                // Refill again so the queue stays warm during the upcoming
+                // process_plan call. Errors latched here drain through later.
+                self.refill();
+
+                if head.plan.is_empty() {
+                    // Skip empty plan; loop to pull the next.
+                    continue;
+                }
+
+                if let Err(e) = self.await_head(head.prefetches) {
+                    return Some(Err(e));
+                }
+                return Some(self.loader.process_plan(head.plan));
+            }
+
+            // Queue empty — surface a deferred plan-stream error one-shot,
+            // then mark stream done so subsequent next() calls return None.
+            if let Some(e) = self.plan_stream_error.take() {
+                self.plan_stream_done = true;
                 return Some(Err(e));
             }
-            return Some(self.loader.process_plan(head.plan));
-        }
 
-        // Queue empty — surface a deferred plan-stream error one-shot, then
-        // mark stream done so subsequent next() calls return None.
-        if let Some(e) = self.plan_stream_error.take() {
-            self.plan_stream_done = true;
-            return Some(Err(e));
+            return None;
         }
-
-        None
     }
 }
 
