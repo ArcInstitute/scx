@@ -9,27 +9,41 @@ This directory contains the benchmarking infrastructure for SCX — scripts, SLU
 ```
 benchmarks/
 ├── README.md              ← You are here
-├── scripts/               # Legacy benchmark scripts and SLURM job definitions
-│   ├── run_benchmarks_slurm.sh          # All-in-one SLURM submission (3 sub-jobs)
-│   ├── submit_benchmarks.py             # Programmatic SLURM submission via submitit
-│   ├── benchmark_all.py                 # Orchestrator: compression + write + read
-│   ├── benchmark_*.py                   # Individual Python benchmark scripts (accelerators, GPU, harmony, lisi, leiden, lazy_preprocess, ...)
-│   ├── slurm_*.sh                       # Standalone SLURM job scripts (phase0-phase9, GPU, harmony, lazy, parallel-scaling, ...)
+├── scripts/               # Dataset prep + ML loader + standalone GPU/Harmony benches
+│   │   # Dataset preparation
 │   ├── download_datasets.sh             # Download & convert benchmark datasets
 │   ├── download_*.py                    # Dataset-specific downloaders
-│   ├── build_census_*.py                # Large dataset builders (5M, 10M cells)
-│   ├── build_harmony_validation_fixtures.py  # Harmony2 validation fixture builder
-│   ├── build_release.py                 # Helper: ensure pyscx release build
+│   ├── build_census_*.py                # Large dataset builders (500K, 5M, 10M cells)
+│   ├── slurm_prep_datasets.sh           # SLURM wrapper for D1–D6 prep
+│   ├── slurm_build_census_*.sh          # High-mem SLURM wrappers for D7 / D8
 │   ├── verify_datasets.py               # Validate datasets & record metadata
-│   ├── setup_cloud_test_data.sh         # Cloud benchmark test data setup
-│   ├── bench_env.py                     # Shared .env loader (python-dotenv)
 │   ├── generate_compressed_h5ad.py      # Pre-generate gzip/lzf h5ad variants
-│   ├── generate_phase3g_report.py       # Phase 3g report generator
 │   ├── prep_lognorm_datasets.py         # Log-normalized dataset prep
 │   ├── augment_obs_n_counts.py          # Backfill obs.n_counts for legacy fixtures
-│   ├── gpu_regression_driver.sh         # DEPRECATED (Phase 9): use comprehensive/scripts/gate_candidate.py
-│   ├── gpu_regression_diff.py           # DEPRECATED (Phase 9): superseded by compare_against_baseline.py
+│   ├── setup_cloud_test_data.sh         # Initial GCS test-data upload (one-time bootstrap)
+│   │   # ML training loader (only path covering pyscx.TrainingDataset)
+│   ├── submit_benchmarks.py             # submitit launcher for the loader benchmark
+│   ├── benchmark_loader.py              # Loader throughput vs SOTA baselines
+│   ├── benchmark_bpcells.R              # Driver invoked by benchmark_loader.py
+│   │   # Active dev surfaces — GPU
+│   ├── slurm_gpu_*_bench.sh             # Standalone GPU benchmark drivers
+│   ├── benchmark_gpu_{decode,pca,knn,umap,preprocess,pipeline,scvi}.py  # Backing implementations
+│   │   # Active dev surfaces — Harmony / LISI
+│   ├── slurm_harmony_bench.sh           # Harmony2 driver
+│   ├── benchmark_{harmony,lisi}.py      # Harmony2 / LISI performance
+│   ├── harmony_bench_worker.py          # Per-config worker
+│   ├── report_harmony.py                # Markdown / plot generator
+│   ├── build_harmony_validation_fixtures.py  # Test-fixture builder (used by pyscx tests)
+│   ├── generate_harmony_reference.R     # R-harmony reference
+│   │   # Helpers
+│   ├── benchmark_cli.py                 # CLI command latency
+│   ├── benchmark_python_bindings.py     # PyO3 binding overhead
+│   ├── build_release.py                 # Helper: ensure pyscx release build
 │   └── run_with_rayon_limit.sh          # Wrapper that pins RAYON_NUM_THREADS
+│   #
+│   # Phase wrappers (slurm_phase*_*.sh), the original benchmark_*.py one-off
+│   # entrypoints, gpu_regression_*, and benchmark_cloud.py have been deleted —
+│   # use comprehensive/scripts/run_parallel.py instead. See scripts/README.md.
 ├── r_scripts/             # Top-level R benchmark scripts
 │   └── benchmark_bpcells.R              # BPCells benchmark driver (called via Rscript)
 ├── comprehensive/         # Comprehensive benchmark suite (Phase 3+)
@@ -326,7 +340,7 @@ The comprehensive suite validates cloud behavior against GCP only — AWS S3 and
    ```
    Rotate the key every 90 days; never commit it or paste it into chat.
 2. Point the harness at the key via the repo-root `.env` file — it's
-   auto-loaded by `benchmarks/scripts/bench_env.py` through
+   auto-loaded by `benchmarks/comprehensive/bench_env.py` through
    `python-dotenv`, so no shell export is required. Tildes are expanded.
    `cloud_fixtures.require_gcp_credentials` falls back to `~/.gcp/scx-bench.json`
    automatically if the env var is unset.
@@ -349,7 +363,7 @@ python benchmarks/comprehensive/scripts/run_parallel.py \
 
 Fixtures self-heal on first run: if the expected cloud object doesn't exist, `cloud_fixtures.ensure_cloud_fixture` uploads it from the local converted file via `pyscx.push` (SCX) or `gsutil -m rsync` (other formats). SCX-only benchmarks return `None` for non-SCX formats so the orchestrator silently skips those triples.
 
-The legacy `benchmarks/scripts/benchmark_cloud.py` is a thin deprecation shim — it prints a banner and forwards to the launcher above.
+The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted; use the launcher above.
 
 ---
 
@@ -401,21 +415,30 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` is a thin deprecation shim �
 
 ## Quick Start
 
-### Run all CPU benchmarks via SLURM
+### Run all CPU benchmarks (parallel, one job per triple)
 
 ```bash
-# Submits 3 sub-jobs: (A-C) compression/write/read, (D-E) ops/query, (F) ML loader
-bash benchmarks/scripts/run_benchmarks_slurm.sh
+# Small datasets (D1–D4)
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
+
+# Large datasets — high-mem partition
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets census_500k census_1m --partition cpu_preemptible
 ```
 
-### Run locally (no SLURM)
+### One-shot regression gate
 
 ```bash
-# Smoke test on pbmc3k
-.venv/bin/python benchmarks/scripts/submit_benchmarks.py --local --smoke
+# Capture a candidate snapshot and diff against results/baselines/LATEST
+.venv/bin/python benchmarks/comprehensive/scripts/gate_candidate.py
+```
 
-# Full suite
-.venv/bin/python benchmarks/scripts/benchmark_all.py --all
+### Smoke test (pbmc3k only)
+
+```bash
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k --benchmarks read_full --formats scx_auto h5ad_gzip
 ```
 
 ---
@@ -477,20 +500,25 @@ Dataset paths are configured via the `.env` file at the repo root (or environmen
 
 ### CPU Benchmarks
 
-| Script | Partition | Resources | Time | Purpose |
-|--------|-----------|-----------|------|---------|
-| `run_benchmarks_slurm.sh` | `cpu_preemptible` | 16 CPUs, 80 GB | 4 h | All-in-one (compression + write + read + ops + query + ML loader; submits 3 sub-jobs) |
-| `slurm_phase0_baseline.sh` | `cpu_preemptible` | 32 CPUs, 80 GB | 2 h/job | Phase 0 regression baseline D1–D4 (submits 24 parallel jobs + archival) |
-| `slurm_phase0_baseline_large.sh` | varies | 32 CPUs, 80–500 GB | 2–4 h/job | Phase 0 regression baseline D5–D7 (submits 18 parallel jobs + archival) |
-| `slurm_phase3_small.sh` | `cpu_preemptible` | 32 CPUs, 80 GB | 6 h | Phase 3 benchmarks D1–D4 (sequential, single job) |
-| `slurm_phase3_large.sh` | `cpu_high_mem` | 32 CPUs, 500 GB | 12 h | Phase 3 benchmarks D5–D7 (sequential, single job) |
-| `slurm_phase3_parallel_large.sh` | varies | 32 CPUs, 80–500 GB | 4–12 h/job | Phase 3 D5–D7 parallel submission (one job per benchmark×dataset) |
-| `slurm_phase3_parallel_scaling_d5d7.sh` | varies | 32 CPUs, 80–500 GB | 6–16 h/job | Phase 3 parallel read scaling only, D5–D7 |
-| `slurm_parallel_write_scaling.sh` | varies | 32 CPUs, 80–500 GB | 2–24 h/job | Parallel write scaling (§3.5.2), D1–D7 (one job per dataset) |
-| `slurm_fused_bench.sh` | `cpu_preemptible` | 8 CPUs, 32 GB | 30 min | Fused normalize+log1p microbenchmarks |
-| `slurm_lazy_preprocess_bench.sh` | `cpu_preemptible` | 16–32 CPUs, 80–256 GB | 6–16 h/job | Phase 5c lazy preprocessing benchmarks (§3.13.1–3.13.6; submits ~15 parallel jobs) |
-| `slurm_phase4_ml_loader.sh` | `cpu_preemptible`+`preemptible` | 16–32 CPUs, 32–200 GB | 1–6 h/job | Phase 4 ML loader throughput (submits parallel CPU + GPU jobs per dataset) |
-| `slurm_phase5_accel_bench.sh` | `cpu_preemptible` | 16 CPUs, 16–256 GB | 1–16 h/job | Phase 5 accelerator benchmarks (PCA, kNN, UMAP, DE, pipeline; submits ~20 parallel jobs) |
+The phase-numbered SLURM wrappers (`slurm_phase*_*.sh`,
+`run_benchmarks_slurm.sh`, `slurm_parallel_write_scaling.sh`,
+`slurm_lazy_preprocess_bench.sh`, `slurm_fused_bench.sh`) have been
+deleted. Submit benchmarks through the comprehensive launcher:
+
+```bash
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
+
+# Large datasets — the launcher auto-routes to cpu_high_mem when
+# estimate_memory_gb exceeds 200 GB:
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets census_500k census_1m census_5m
+```
+
+The launcher submits one SLURM job per (benchmark × format × dataset)
+triple via submitit, sized per-job by `estimate_memory_gb` /
+`estimate_time_minutes` (`comprehensive/config.py`), with
+`partition_for_memory` auto-routing to `cpu_high_mem` past 200 GB.
 
 ### Correctness Validation
 
@@ -510,7 +538,13 @@ See the "Correctness Validation Suite" section in [docs/testing.md](../docs/test
 | `slurm_gpu_pca_opt_bench.sh` | `preemptible` | 1 GPU, 16 CPUs, 128 GB | 2 h | GPU PCA optimization benchmark |
 | `slurm_gpu_analysis_bench.sh` | `preemptible` | 1 GPU, 16 CPUs, 128 GB | 4 h | Full GPU suite: PCA + kNN + UMAP + preprocessing + pipeline |
 
-### Programmatic Submission (submitit)
+### ML training loader (standalone — not in the gate)
+
+`scripts/submit_benchmarks.py` is the only path that exercises
+`pyscx.TrainingDataset` against competitor loaders (TileDB-SOMA-ML,
+scDataLoader, BPCells). It produces a stand-alone report at
+`benchmarks/results/training_loader_benchmark.{md,json}` and is **not**
+part of the regression gate (see `2026-04-29_SCX-BENCH-REVIEW.md` §3.1).
 
 ```bash
 # Smoke test (pbmc3k, CPU-only)
@@ -555,7 +589,7 @@ bash benchmarks/comprehensive/scripts/run_slurm.sh --partition cpu_batch
 ## Submitting SLURM Jobs
 
 > [!IMPORTANT]
-> **Always prefer parallel job submission over sequential single-job scripts.** Each independent (benchmark, dataset) combination should be submitted as a separate SLURM job so they run concurrently across cluster nodes. This dramatically reduces wall-clock time (e.g., 24 parallel jobs finishing in ~2h vs one sequential job taking ~4h). Use `--dependency=afterok:$JOB1:$JOB2:...` for any post-processing that must wait for all benchmarks to complete (e.g., archiving results). Scale memory per dataset — not every job needs the largest allocation. See `slurm_phase0_baseline.sh` and `slurm_phase0_baseline_large.sh` for the reference pattern.
+> **Always prefer parallel job submission over sequential single-job scripts.** Each independent (benchmark, dataset) combination should be submitted as a separate SLURM job so they run concurrently across cluster nodes. This dramatically reduces wall-clock time (e.g., 24 parallel jobs finishing in ~2h vs one sequential job taking ~4h). Use `--dependency=afterok:$JOB1:$JOB2:...` for any post-processing that must wait for all benchmarks to complete (e.g., archiving results). Scale memory per dataset — not every job needs the largest allocation. The reference pattern is `comprehensive/scripts/run_parallel.py` (one submitit job per triple, sized via `estimate_memory_gb` / `estimate_time_minutes`).
 
 ### Basic submission
 
@@ -571,9 +605,10 @@ sbatch --exclusive benchmarks/scripts/slurm_gpu_analysis_bench.sh
 
 ### Recommended execution order
 
-The comprehensive harness is the committed entrypoint. Legacy wrappers
-under `benchmarks/scripts/slurm_*.sh` are deprecated (see
-`benchmarks/scripts/README.md` for the migration table).
+The comprehensive harness is the committed entrypoint. The phase-numbered
+legacy wrappers under `benchmarks/scripts/` have been deleted; only
+dataset-prep, ML-loader, and standalone GPU/Harmony scripts remain
+(see [`scripts/README.md`](scripts/README.md)).
 
 ```
 1. Prepare datasets (run first — benchmarks depend on these):
@@ -930,10 +965,10 @@ floors in `thresholds.yaml` evaluate real values, not
 
 **You should not need separate GPU tooling.** The standard
 [Regression Gating workflow](#regression-gating) handles accelerator
-PRs end-to-end. The standalone `benchmarks/scripts/gpu_regression_*.sh`
-/ `gpu_regression_diff.py` wrappers from Phase 8 are **deprecated** —
-kept in-tree one release for rollback convenience and tagged with a
-DEPRECATED header pointing at this section.
+PRs end-to-end. The Phase-8 stop-gap wrappers
+(`gpu_regression_driver.sh`, `gpu_regression_diff.py`,
+`slurm_gpu_regression*.sh`) have been deleted — use
+`gate_candidate.py` for everything below.
 
 ### When this workflow applies
 
@@ -1010,50 +1045,37 @@ into `comprehensive/results/baselines/<version>/` and repoints
 `LATEST`. Add a row to `comprehensive/results/baselines/README.md`'s
 versions table.
 
-### Deprecated tooling (do not use for new work)
-
-These remain in-tree for one release as rollback convenience:
-
-- `benchmarks/scripts/gpu_regression_driver.sh`
-- `benchmarks/scripts/gpu_regression_diff.py`
-- `benchmarks/scripts/slurm_gpu_regression.sh`
-- `benchmarks/scripts/slurm_gpu_regression_cell.sh`
+### Historical baselines
 
 The frozen pre-Phases-1-7 snapshot at
-`benchmarks/results/pre_phases_1_7_baseline_2026_03/` is also retained
-for historical bisects but is not the gate target.
+`benchmarks/results/pre_phases_1_7_baseline_2026_03/` is retained for
+historical bisects but is not the gate target.
 
 
 ## Individual Benchmark Scripts
 
+The legacy `benchmarks/scripts/benchmark_*.py` one-off entrypoints have
+been deleted; their measurements live under
+`benchmarks/comprehensive/benchmarks/`. The remaining scripts in
+`benchmarks/scripts/` are dataset prep, the standalone ML training
+loader, and active-development GPU / Harmony surfaces — see
+[`scripts/README.md`](scripts/README.md).
+
 | Script | What it measures |
 |--------|-----------------|
-| `benchmark_all.py` | Orchestrator for compression + write + read (A-C) |
-| `benchmark_compression.py` | On-disk sizes across codecs and formats |
-| `benchmark_write.py` | h5ad → SCX conversion throughput |
-| `benchmark_read.py` | Full-file read performance |
-| `benchmark_query.py` | Query engine (selective reads, metadata filters) |
-| `benchmark_ops.py` | File operations (append, compact, merge) |
-| `benchmark_loader.py` | ML data loader throughput vs SOTA baselines |
-| `benchmark_parallel_read.py` | Parallel read scaling (1–32 threads) |
-| `benchmark_auto_codec.py` | Auto-codec selection accuracy and performance |
-| `benchmark_cli.py` | CLI command performance |
-| `benchmark_python_bindings.py` | Python bindings overhead |
-| `benchmark_cloud.py` | **DEPRECATED** — forwards to `comprehensive/benchmarks/cloud_*.py` (see Phase C below) |
-| `benchmark_compressed_h5ad.py` | Compressed h5ad baseline (gzip, lzf) |
-| `benchmark_gpu_decode.py` | GPU decode microbenchmarks (cuSPARSE, bitstream) |
-| `benchmark_gpu_pca.py` | GPU PCA validation + timing |
-| `benchmark_gpu_knn.py` | GPU kNN (CAGRA) validation + timing |
-| `benchmark_gpu_umap.py` | GPU UMAP validation + timing |
-| `benchmark_gpu_preprocess.py` | GPU fused preprocessing (normalize+log1p) |
-| `benchmark_gpu_pipeline.py` | End-to-end GPU pipeline + Go/No-Go gate |
-| `benchmark_gpu_scvi.py` | GPU scVI training benchmark |
-| `benchmark_lazy_preprocess.py` | Phase 4d/5c lazy transforms, memory, column projection, fused opt, E2E OOC pipeline |
-| `benchmark_lazy_preprocess_rss_worker.py` | RSS time-series subprocess worker for lazy preprocessing benchmarks |
-| `benchmark_accelerators.py` | Phase 4b CPU accelerators: PCA, kNN, UMAP, DE vs scanpy |
-| `benchmark_accel_pipeline.py` | Full pipeline (3 variants: SCX OOC, SCX preprocess, scanpy) |
-| `benchmark_accel_preprocessing.py` | pyscx.preprocess() vs scanpy normalize+log1p |
-| `benchmark_bpcells.R` | BPCells comparison (R) |
+| `scripts/benchmark_loader.py` | ML data loader throughput vs SOTA baselines (TileDB-SOMA-ML, scDataLoader, BPCells). **Not in the gate** — see `2026-04-29_SCX-BENCH-REVIEW.md` §3.1 |
+| `scripts/benchmark_cli.py` | CLI command performance |
+| `scripts/benchmark_python_bindings.py` | Python bindings overhead |
+| `scripts/benchmark_gpu_decode.py` | GPU decode microbenchmarks (cuSPARSE, bitstream) |
+| `scripts/benchmark_gpu_pca.py` | GPU PCA validation + timing (kernel-level optimization) |
+| `scripts/benchmark_gpu_knn.py` | GPU kNN (CAGRA) validation + timing |
+| `scripts/benchmark_gpu_umap.py` | GPU UMAP validation + timing |
+| `scripts/benchmark_gpu_preprocess.py` | GPU fused preprocessing (normalize+log1p) |
+| `scripts/benchmark_gpu_pipeline.py` | End-to-end GPU pipeline + Go/No-Go gate |
+| `scripts/benchmark_gpu_scvi.py` | GPU scVI training benchmark |
+| `scripts/benchmark_harmony.py` | Harmony2 batch correction performance |
+| `scripts/benchmark_lisi.py` | LISI metric performance |
+| `scripts/benchmark_bpcells.R` | BPCells comparison (R) — driver for `benchmark_loader.py --include-bpcells` |
 | `comprehensive/benchmarks/cell_eval_parity_perf.py` | cell-eval / arc-bench parity perf (pseudobulk, perturbation metrics, energy distance, discrimination score, knockdown efficiency, clustering agreement) at synthetic 100K–1M scale |
 
 ## Rust microbenchmarks (criterion)

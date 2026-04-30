@@ -382,11 +382,10 @@ python benchmarks/comprehensive/scripts/gate_candidate.py
 
 The pbmc3k-only `v0.6.0-gpu-phase1-7` baseline (the smoke snapshot
 that briefly held LATEST in late April) remains in-tree for historical
-diff comparison but is no longer the gate target. The standalone
-`benchmarks/scripts/gpu_regression_{diff,driver}.py` wrappers from
-Phase 8 are **deprecated** — they remain in-tree for one release for
-rollback convenience but new regression runs should use
-`gate_candidate.py`. See
+diff comparison but is no longer the gate target. The Phase-8 stop-gap
+wrappers (`benchmarks/scripts/gpu_regression_{diff,driver}.py` and
+`slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py`
+for accelerator regression runs. See
 [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
 
 #### Changes vs previous version
@@ -396,7 +395,7 @@ rollback convenience but new regression runs should use
 - **Opt-in CholeskyQR2** (`qr_method="cholesky"`) for the randomized path; benchmark-suite variants `gpu_randomized_pca_chol` vs `gpu_randomized_pca_householder` pending from the current cluster run.
 - **Standalone GPU preprocessing ops** (`normalize_total`, `log1p`, `highly_variable_genes`) gain a `device` kwarg. In isolation they are slower than the CPU path (see table above — `log1p` is ~40× slower on tabula due to H2D/D2H round-trips); the `normalize_total → log1p` fusion marker is the only fast path.
 - **cuGraph Leiden** exposes the `theta` knob via `pyscx.accel.leiden(theta=...)`.
-- **Frozen pre-Phase-1 baseline** committed at `benchmarks/results/pre_phases_1_7_baseline_2026_03/` with BLAKE-equivalent integrity (`MANIFEST.sha256`). The Phase-8 diff tool (`benchmarks/scripts/gpu_regression_diff.py`) compares any post-change SLURM run against this reference.
+- **Frozen pre-Phase-1 baseline** committed at `benchmarks/results/pre_phases_1_7_baseline_2026_03/` with BLAKE-equivalent integrity (`MANIFEST.sha256`). Historical bisects can diff against this reference via `compare_against_baseline.py --baseline benchmarks/results/pre_phases_1_7_baseline_2026_03/`.
 
 ### Go/No-Go Status
 

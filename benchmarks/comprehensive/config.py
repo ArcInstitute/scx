@@ -25,8 +25,7 @@ RAW_RESULTS_DIR = RESULTS_DIR / "raw"
 REPORTS_DIR = RESULTS_DIR / "reports"
 FIGURES_DIR = REPORTS_DIR / "figures"
 
-sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
-from bench_env import DATA_DIR
+from benchmarks.comprehensive.bench_env import DATA_DIR
 
 def _expand_path_env_vars() -> None:
     """Expand ``~`` in path-valued env vars loaded from ``.env``.
