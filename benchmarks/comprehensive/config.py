@@ -726,6 +726,16 @@ def estimate_memory_gb(
         # Assertion-based — peak RSS MUST stay under the 240 MB bound from
         # docs/cloud.md. Give headroom but not much.
         peak_mb = 8 * 1024  # 8 GB ceiling for safety
+    elif benchmark == "ml_loader":
+        # Streaming loaders (SCX/SOMA/SLAF) hold a few batches resident plus
+        # the source CSR; full-load loaders (anndata h5ad path, scDataLoader)
+        # materialize the entire matrix before iterating. The GPU training
+        # scenario adds the model + activations on-device — host RAM stays
+        # bounded by the streaming side.
+        if is_dense_path:
+            peak_mb = max(base_mb * 2, dense_mb * 1.3)
+        else:
+            peak_mb = max(base_mb * 2, dense_mb * 0.5)
     elif benchmark == "accel_preprocess":
         # Keeps raw AnnData + scanpy reference + per-run copies resident.
         # scanpy normalize/log1p are sparse-in-place; pyscx's lazy-chain
@@ -801,7 +811,7 @@ def estimate_time_minutes(
         "cloud_reader_vs_pull":   25,
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
-        "ml_loader":              30,
+        "ml_loader":              45,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
         # cluster, (b) over-budgeting once beats serial retries on timeout
@@ -830,6 +840,10 @@ def estimate_time_minutes(
         slope_minutes_per_million = 4
     elif benchmark in ("compression", "read_selective"):
         slope_minutes_per_million = 2
+    elif benchmark == "ml_loader":
+        # 4 CPU scenarios + 1 GPU scenario × n_runs each; epoch wall time
+        # scales near-linearly with n_obs for streaming loaders.
+        slope_minutes_per_million = 12
 
     total = base + int(slope_minutes_per_million * per_million)
     # Dense-path formats (h5ad / zarr) take longer at census scale.

@@ -245,7 +245,7 @@ def _per_job_slurm_params(
 
     partition = partition_for_memory(mem, default=args.partition)
 
-    # Phase 9.3 (post-Tier-3 finding 2b) — route accelerator benchmarks
+    # Route accelerator benchmarks
     # to the GPU partition **only for variants that actually use the GPU**.
     # Variant naming convention: format_key ending in `_gpu` or containing
     # `_gpu_` indicates GPU dispatch (e.g. `accel_pca__pyscx_gpu_cov`,
@@ -254,11 +254,21 @@ def _per_job_slurm_params(
     # partition_for_memory which auto-promotes to cpu_high_mem when sizing
     # exceeds the preemptible-GPU node's RAM ceiling — unblocking
     # accel_preprocess on census_1m (needs >64 GB).
+    #
+    # ml_loader on SCX formats also routes to GPU so the SCX-only
+    # `gpu_train` scenario in benchmarks/ml_loader.py:949 can fire (it
+    # silently no-ops on hosts without CUDA). Non-SCX ml_loader variants
+    # have no GPU scenario and stay on CPU.
     extra_slurm: dict = {}
     needs_gpu = (
         benchmark is not None
-        and benchmark.startswith("accel_")
-        and ("_gpu_" in format_key or format_key.endswith("_gpu"))
+        and (
+            (
+                benchmark.startswith("accel_")
+                and ("_gpu_" in format_key or format_key.endswith("_gpu"))
+            )
+            or (benchmark == "ml_loader" and format_key.startswith("scx_"))
+        )
     )
     if needs_gpu:
         partition = "preemptible"  # GPU partition on chimera

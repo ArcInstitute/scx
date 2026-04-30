@@ -24,6 +24,7 @@ ALL_BENCHMARKS: list[str] = [
     "parallel_scaling",
     "parallel_write_scaling",
     "memory",
+    "ml_loader",
     # SCX-only fragment / manifest operations
     "fragment_ops",
     # Cloud (GCP) — Phase C through F
@@ -35,7 +36,7 @@ ALL_BENCHMARKS: list[str] = [
     "cloud_reader_vs_pull",
     "cost_model",
     "cloud_large_atlas",
-    # Accelerator benchmarks — Phase 9 (GPU-ACC-SPEED-UP.md).
+    # Accelerator benchmarks
     # These don't vary by file format; each accelerator module expands
     # internally into several implementation variants (one `FormatVariant`
     # slot per impl, e.g. accel_pca__scanpy_cpu vs accel_pca__pyscx_gpu_cov).
