@@ -179,3 +179,60 @@ absolute_floors:
     dataset: pbmc3k
     metric: hvg_overlap_vs_scanpy
     min: 0.99
+
+  # --- ml_loader throughput floors (§3.1) ----------------------------
+  # Floors at 0.5x observed Phase-1 baseline median (0.6x on pbmc3k
+  # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).
+  # Per-scenario keys (batches_per_sec__<scenario>) are emitted only
+  # on that scenario's runs, so the gate's median is over scenario-
+  # coherent runs (not aliased across raw/hvg/norm/hvg_norm).
+  #
+  # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader,
+  # 1,405 batches/sec on 1M cells") is in docs/performance.md; these
+  # floors protect that claim at the small / medium tier.
+  #
+  # GPU utilization (avg_gpu_util_pct__gpu_train) is intentionally
+  # NOT gated yet — `nvidia-smi dmon` polls at 1 Hz but pbmc3k epochs
+  # finish in ~0.15s and tabula_sapiens_100k epochs in ~0.8s, so the
+  # samples miss peak compute. Throughput is reliable; util% needs an
+  # in-process sampler before it can be a floor.
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__raw
+    min: 38.6
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__hvg_norm
+    min: 11.7
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__gpu_train
+    min: 12.1
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__raw
+    min: 66.3
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 66.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__gpu_train
+    min: 63.3
+  - benchmark: ml_loader
+    format: h5ad_none
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 7.5
+  - benchmark: ml_loader
+    format: tiledb_soma
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 10.0
