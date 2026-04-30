@@ -411,8 +411,11 @@ Parquet, [SLAF](https://github.com/slaf-project/slaf)), and extends
 coverage to cloud object storage. This is what the public performance
 claims in `docs/performance.md` cite.
 
-**Location**: [`benchmarks/comprehensive/`](benchmarks/comprehensive/) plus
-single-purpose scripts in [`benchmarks/scripts/`](benchmarks/scripts/).
+**Location**: [`benchmarks/comprehensive/`](benchmarks/comprehensive/) (the
+gated suite). [`benchmarks/scripts/`](benchmarks/scripts/) holds dataset
+prep, the standalone ML training loader, and active-development GPU /
+Harmony benches; the legacy phase wrappers and one-off
+`benchmark_*.py` entrypoints have been deleted.
 Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 
 ### 5.1 Benchmark Harness Infrastructure — COMPLETE
@@ -467,9 +470,8 @@ the cost and latency models in `docs/cloud.md` hold end-to-end.
 **Reference**: [`docs/cloud.md`](docs/cloud.md) for operator guidance on layouts, auth,
 and tuning knobs. The full harness now lives under
 [`benchmarks/comprehensive/benchmarks/cloud_*.py`](benchmarks/comprehensive/benchmarks/) with
-one-time fixture staging via [`benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`](benchmarks/comprehensive/scripts/setup_cloud_test_data.sh)
-(the legacy `benchmarks/scripts/benchmark_cloud.py` is a deprecated shim forwarding
-to the comprehensive launcher).
+one-time fixture staging via [`benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`](benchmarks/comprehensive/scripts/setup_cloud_test_data.sh).
+The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 
 - [x] GCS bucket + service-account setup (`setup_cloud_test_data.sh`) + `check_gcp_auth.py` preflight (env var + JSON identity + healthcheck round-trip)
 - [x] `scx push` — local `.scx` → `gs://…/.scxd/` throughput (`cloud_push.py`)

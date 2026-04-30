@@ -907,16 +907,30 @@ def run(
                     epoch_result.n_cells / wall_s if wall_s > 0 else 0.0
                 )
 
+                # Per-scenario keys are emitted only on this scenario's runs
+                # (sparse), so the gate's median over runs[].extra[metric]
+                # naturally focuses on one scenario per threshold entry.
+                # TTFB is added to the first run only — sparse but present.
+                run_extra: dict[str, Any] = {
+                    "scenario": scenario_name,
+                    "n_batches": epoch_result.n_batches,
+                    "n_cells": epoch_result.n_cells,
+                    "batches_per_sec": round(bps, 1),
+                    "cells_per_sec": round(cps, 0),
+                    f"batches_per_sec__{scenario_name}": round(bps, 1),
+                    f"cells_per_sec__{scenario_name}": round(cps, 0),
+                }
+                if i == 0 and ttfb_median is not None:
+                    run_extra[f"ttfb_median_s__{scenario_name}"] = round(
+                        ttfb_median, 4
+                    )
+
                 result.add_run(
                     wall_s=wall_s,
                     user_s=user_s,
                     sys_s=sys_s,
                     peak_rss_mb=peak_rss,
-                    scenario=scenario_name,
-                    n_batches=epoch_result.n_batches,
-                    n_cells=epoch_result.n_cells,
-                    batches_per_sec=round(bps, 1),
-                    cells_per_sec=round(cps, 0),
+                    **run_extra,
                 )
 
                 run_bps.append(bps)
@@ -973,6 +987,9 @@ def run(
                         avg_gpu_util_pct=round(gpu_res.avg_gpu_util_pct, 1),
                         gpu_util_samples=gpu_res.gpu_util_samples,
                         model="scVI-equivalent VAE (2L, 128h, 128z)",
+                        batches_per_sec__gpu_train=round(gpu_res.batches_per_sec, 1),
+                        cells_per_sec__gpu_train=round(gpu_res.cells_per_sec, 0),
+                        avg_gpu_util_pct__gpu_train=round(gpu_res.avg_gpu_util_pct, 1),
                     )
 
                     logger.info(

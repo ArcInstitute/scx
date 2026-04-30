@@ -179,3 +179,167 @@ absolute_floors:
     dataset: pbmc3k
     metric: hvg_overlap_vs_scanpy
     min: 0.99
+
+  # --- ml_loader throughput floors (§3.1) ----------------------------
+  # Floors at 0.5x observed Phase-1 baseline median (0.6x on pbmc3k
+  # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).
+  # Per-scenario keys (batches_per_sec__<scenario>) are emitted only
+  # on that scenario's runs, so the gate's median is over scenario-
+  # coherent runs (not aliased across raw/hvg/norm/hvg_norm).
+  #
+  # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader,
+  # 1,405 batches/sec on 1M cells") is in docs/performance.md; these
+  # floors protect that claim at the small / medium tier.
+  #
+  # GPU utilization (avg_gpu_util_pct__gpu_train) is intentionally
+  # NOT gated yet — `nvidia-smi dmon` polls at 1 Hz but pbmc3k epochs
+  # finish in ~0.15s and tabula_sapiens_100k epochs in ~0.8s, so the
+  # samples miss peak compute. Throughput is reliable; util% needs an
+  # in-process sampler before it can be a floor.
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__raw
+    min: 38.6
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__hvg_norm
+    min: 11.7
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__gpu_train
+    min: 12.1
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__raw
+    min: 66.3
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 66.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__gpu_train
+    min: 63.3
+  - benchmark: ml_loader
+    format: h5ad_none
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 7.5
+  - benchmark: ml_loader
+    format: tiledb_soma
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 10.0
+
+  # --- correctness validation suite (§3.2) ---------------------------
+  # Hard parity gate: any failure in scanpy-equivalence,
+  # backed-mode-equivalence, preprocessing-paths, or SLAF round-trip
+  # blocks the gate. Per-suite floors localize a failure to one
+  # validator without forcing the operator to dig into
+  # metadata.suite_counts.
+  #
+  # n_failed counts only `c.passed=False, c.error=None` checks
+  # (genuine parity violations). Errors (import failures, missing
+  # dependencies) are captured by *_n_skipped and do NOT trip these
+  # floors — the SLAF suite is empty when slafdb is missing, which
+  # is an acceptable env-dependent skip.
+  #
+  # overall_passed_int floors a single rolled-up bool so the gate's
+  # one-liner failure message is human-readable when *any* suite
+  # breaks. Per-suite floors below provide the attribution.
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: scanpy_equivalence_n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: backed_equivalence_n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: preprocessing_paths_n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: slaf_equivalence_n_failed
+    max: 0
+
+  # --- cell_eval_parity_perf marquee floors (§3.3) -------------------
+  # AGENTS.md headline claims:
+  #   - energy_distance(backend="gemm", dtype="f32"): 52x at 20K x 2K x 50 perts
+  #   - clustering_agreement: 12.83x at 200 perts
+  #
+  # Floors are calibrated below observed Phase-1 medians (0.6x for min,
+  # 2.0x for max), NOT against the marquee claims directly — this
+  # protects against a same-axis cell-eval slowdown faking a "free win"
+  # while still catching real SCX regressions.
+  #
+  # Per-op keys are emitted sparsely (only for non-skipped operations);
+  # the gate's median-over-non-None values picks them up cleanly.
+  #
+  # Coverage scope:
+  #   - pert_synth_10k and pert_synth_100k are both gated. census_1m and
+  #     larger remain excluded: _SKIP_RULES in cell_eval_parity_perf.py
+  #     skips energy_distance variants at n_obs >= 500K, and routine
+  #     gating at census scale needs a separate budget tier.
+  #   - speedup__clustering_agreement is NOT gated — at 50 perts (the
+  #     pert_synth_* config) SCX is ~0.8x of cell-eval. The 12.83x claim
+  #     lives at 200 perts (a config we don't ship yet). The
+  #     scx_median_s__clustering_agreement floor still catches SCX-side
+  #     regressions on the clustering path independent of cell-eval.
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_10k
+    metric: speedup__energy_distance_blas_f32
+    min: 11.0
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_10k
+    metric: scx_median_s__energy_distance_blas_f32
+    max: 1.4
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_10k
+    metric: scx_median_s__clustering_agreement
+    max: 1.0
+  # pert_synth_100k floors (n=3 internal repeats, 0.5x speedup / 2.0x
+  # wall envelope). Non-marquee energy_distance variants (f64,
+  # scalar_f32, alias) skip at n_obs >= 100K — see _SKIP_RULES in
+  # cell_eval_parity_perf.py:73-95. clustering_agreement still doesn't
+  # surpass cell-eval at 50 perts (observed 0.84x); only the
+  # scx_median_s envelope is gated.
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_100k
+    metric: speedup__energy_distance_blas_f32
+    min: 8.5
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_100k
+    metric: scx_median_s__energy_distance_blas_f32
+    max: 105.0
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_100k
+    metric: scx_median_s__clustering_agreement
+    max: 8.5

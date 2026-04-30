@@ -14,9 +14,9 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks" / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 try:
-    from bench_env import DATA_DIR
+    from benchmarks.comprehensive.bench_env import DATA_DIR
 except (RuntimeError, ModuleNotFoundError):
     # SCX_WORK_DIR not set or python-dotenv not installed — skip this module
     pytest.skip(

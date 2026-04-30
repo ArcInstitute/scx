@@ -25,8 +25,7 @@ RAW_RESULTS_DIR = RESULTS_DIR / "raw"
 REPORTS_DIR = RESULTS_DIR / "reports"
 FIGURES_DIR = REPORTS_DIR / "figures"
 
-sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
-from bench_env import DATA_DIR
+from benchmarks.comprehensive.bench_env import DATA_DIR
 
 def _expand_path_env_vars() -> None:
     """Expand ``~`` in path-valued env vars loaded from ``.env``.
@@ -727,6 +726,30 @@ def estimate_memory_gb(
         # Assertion-based — peak RSS MUST stay under the 240 MB bound from
         # docs/cloud.md. Give headroom but not much.
         peak_mb = 8 * 1024  # 8 GB ceiling for safety
+    elif benchmark == "ml_loader":
+        # Streaming loaders (SCX/SOMA/SLAF) hold a few batches resident plus
+        # the source CSR; full-load loaders (anndata h5ad path, scDataLoader)
+        # materialize the entire matrix before iterating. The GPU training
+        # scenario adds the model + activations on-device — host RAM stays
+        # bounded by the streaming side.
+        if is_dense_path:
+            peak_mb = max(base_mb * 2, dense_mb * 1.3)
+        else:
+            peak_mb = max(base_mb * 2, dense_mb * 0.5)
+    elif benchmark == "correctness":
+        # Correctness keeps the scanpy-reference AnnData + SCX backed view
+        # + SLAF round-trip materialization simultaneously while running
+        # 14+ scanpy-equivalence checks (PCA, kNN, UMAP, leiden, DE).
+        # slurm_validation_suite.sh allocates 80 GB for pbmc3k and 250 GB
+        # for the pbmc3k+tabula_sapiens_100k combined run; size like
+        # read_full but with a 1.5x safety multiplier on top.
+        peak_mb = max(base_mb * 2, dense_mb * 1.5)
+    elif benchmark == "cell_eval_parity_perf":
+        # Holds adata_real + adata_pred + raw_adata simultaneously, plus
+        # per-op working buffers (clustering_agreement materialises a
+        # centroid kNN graph; energy_distance allocates an O(n_perts^2)
+        # GEMM staging area). Observed ~14 GB at 100K — size for headroom.
+        peak_mb = max(base_mb * 2, dense_mb * 2.5)
     elif benchmark == "accel_preprocess":
         # Keeps raw AnnData + scanpy reference + per-run copies resident.
         # scanpy normalize/log1p are sparse-in-place; pyscx's lazy-chain
@@ -802,7 +825,9 @@ def estimate_time_minutes(
         "cloud_reader_vs_pull":   25,
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
-        "ml_loader":              30,
+        "ml_loader":              45,
+        "correctness":            60,
+        "cell_eval_parity_perf":  60,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
         # cluster, (b) over-budgeting once beats serial retries on timeout
@@ -831,6 +856,23 @@ def estimate_time_minutes(
         slope_minutes_per_million = 4
     elif benchmark in ("compression", "read_selective"):
         slope_minutes_per_million = 2
+    elif benchmark == "ml_loader":
+        # 4 CPU scenarios + 1 GPU scenario × n_runs each; epoch wall time
+        # scales near-linearly with n_obs for streaming loaders.
+        slope_minutes_per_million = 12
+    elif benchmark == "correctness":
+        # 14+ scanpy-equivalence checks plus SCX backed-mode and SLAF
+        # round-trip — UMAP/Leiden/DE pipelines dominate at scale.
+        # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
+        slope_minutes_per_million = 240
+    elif benchmark == "cell_eval_parity_perf":
+        # cell-eval's edistance reference is O(n_obs^2) pairwise distance
+        # × n_perts × n_runs, so wall-time scales near-quadratically with
+        # n_obs even at fixed n_perts=50. Empirical: 10K is ~30 min total,
+        # 100K is ~150 min for blas_f32 alone. The non-marquee
+        # energy_distance variants skip at >= 100K (see _SKIP_RULES).
+        # 10K → 72 min, 100K → 180 min, 1M → blas_f32 also skipped at 500K.
+        slope_minutes_per_million = 1200
 
     total = base + int(slope_minutes_per_million * per_million)
     # Dense-path formats (h5ad / zarr) take longer at census scale.
