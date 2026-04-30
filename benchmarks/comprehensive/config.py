@@ -745,10 +745,14 @@ def estimate_memory_gb(
         # read_full but with a 1.5x safety multiplier on top.
         peak_mb = max(base_mb * 2, dense_mb * 1.5)
     elif benchmark == "roundtrip":
-        # Holds source AnnData + SCX-materialised AnnData simultaneously,
-        # plus the (a - b) CSR diff scratch during comparison. No scanpy
-        # pipeline (cheaper than correctness's dense_mb * 1.5).
-        peak_mb = max(base_mb * 2, dense_mb * 1.0)
+        # Holds source AnnData + SCX-materialised AnnData resident at the
+        # same time, plus the (a - b) CSR diff scratch and a second copy
+        # per side from the f32 cast / canonicalisation in
+        # roundtrip._normalize_csr. dense_mb * 2.0 covers two full
+        # matrices with margin for the diff buffer; on highly-sparse
+        # inputs this is over-estimated (sparse << dense), but
+        # over-budgeting beats OOM-then-resubmit.
+        peak_mb = max(base_mb * 2, dense_mb * 2.0)
     elif benchmark == "cell_eval_parity_perf":
         # Holds adata_real + adata_pred + raw_adata simultaneously, plus
         # per-op working buffers (clustering_agreement materialises a
@@ -872,10 +876,14 @@ def estimate_time_minutes(
         # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
         slope_minutes_per_million = 240
     elif benchmark == "roundtrip":
-        # Two reads (h5ad + SCX) + one CSR diff. Faster than read_full's
-        # default 8 min/M because no preprocessing; bounded by anndata's
-        # h5ad parse and pyscx's f32 materialisation.
-        slope_minutes_per_million = 4
+        # Two full reads (anndata.read_h5ad + pyscx.open(...).to_anndata())
+        # plus a CSR diff. Bounded by anndata's h5ad parse on the source
+        # side, which dominates at census scale. Sized at 2× read_full's
+        # default 8 min/M slope to cover both reads with headroom — the
+        # earlier 4 min/M was anchored on the small (≤100K) datasets in
+        # the floor list and would clip if anyone extends roundtrip to
+        # 1M+ datasets.
+        slope_minutes_per_million = 16
     elif benchmark == "cell_eval_parity_perf":
         # cell-eval's edistance reference is O(n_obs^2) pairwise distance
         # × n_perts × n_runs, so wall-time scales near-quadratically with
