@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use numpy::{PyArray1, PyArrayMethods};
-use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::batch::{Batch, ObsColumn};
 use crate::error::LoaderError;
-use crate::index_plan::{IndexPlanBatch, IndexPlanLoader};
+use crate::index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};
 use crate::pipeline::{LoaderConfig, TrainingPipeline};
 
 /// A PyTorch-compatible iterable dataset for SCX training data.
@@ -322,14 +322,58 @@ impl IndexPlanDataset {
         self.loader.n_output_cols()
     }
 
+    /// Drive the loader from a Python iterable of `(pert_idx, ctrl_idx)`
+    /// pair lists; return an iterator of paired-batch dicts.
+    ///
+    /// Args:
+    ///     plans: any iterable yielding `list[tuple[int, int]]` (or any
+    ///         sequence of (int, int) pairs).
+    ///     lookahead: number of upcoming plans to shard-prefetch concurrently
+    ///         with the current batch's decode (default: 4). 0 disables
+    ///         prefetch (decoded synchronously per plan). Larger values trade
+    ///         RAM (~1 prefetch slot per lookahead) for I/O hiding. The
+    ///         default of 4 will be revisited against the Phase 7 throughput
+    ///         benchmark.
+    ///
+    /// Returns: an `IndexPlanBatchIter` (Python iterator) whose `__next__`
+    /// yields `{"X", "X_paired", "pairs", "obs", "obs_paired"}` dicts.
+    /// Plan iteration is lazy: the loader pulls the next plan only when it
+    /// is ready to schedule a prefetch for it.
+    #[pyo3(signature = (plans, lookahead=None))]
+    fn iter_with_plans(
+        &self,
+        plans: Py<PyAny>,
+        lookahead: Option<usize>,
+    ) -> PyResult<IndexPlanBatchIter> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.IndexPlanDataset requires num_workers=0 (or lazy per-worker \
+                 construction). The Rust shard cache and mmap state are not fork-safe.",
+            ));
+        }
+        let lookahead = lookahead.unwrap_or(4);
+
+        // Bind plans → its iter, hold an owned Py<PyAny> Send-safe handle.
+        let py_iter: Py<PyAny> = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+            Ok(plans.bind(py).call_method0("__iter__")?.unbind())
+        })?;
+
+        let plan_stream = PyPlanIterator { py_iter };
+        let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
+        Ok(IndexPlanBatchIter {
+            inner: Some(inner),
+            lookahead,
+        })
+    }
+
     /// Process one plan and return a paired dense batch dict.
     ///
-    /// Returns: `{"X": ndarray[B, G], "X_paired": ndarray[B, G],
-    /// "pairs": list[tuple[int, int]], "obs": {...}, "obs_paired": {...}}`.
-    ///
-    /// Phase 1 stepping-stone API; the iterator surface (`iter_with_plans`)
-    /// lands in Phase 4.
-    fn next_batch<'py>(
+    /// **Unstable / debug helper.** Superseded by `iter_with_plans` (Phase 4
+    /// onwards). Retained so unit tests can drive the loader synchronously
+    /// without iterator setup; do not depend on this method from production
+    /// code — it may be removed in a future release.
+    #[pyo3(name = "_next_batch_for_test")]
+    fn next_batch_for_test<'py>(
         &self,
         py: Python<'py>,
         plan: Vec<(u64, u64)>,
@@ -355,6 +399,93 @@ impl IndexPlanDataset {
             self.loader.n_obs(),
             self.loader.n_vars(),
             self.loader.n_output_cols(),
+        )
+    }
+}
+
+/// Adapter: Python iterator → Rust `Iterator<Item = Result<Vec<(u64,u64)>, _>>`.
+///
+/// `Py<PyAny>` is `Send` + `Sync`, so this struct can cross the thread boundary
+/// to the plan-pull worker. Each `next` reacquires the GIL just for the
+/// `__next__` call so the GIL is freely available between pulls.
+struct PyPlanIterator {
+    py_iter: Py<PyAny>,
+}
+
+impl Iterator for PyPlanIterator {
+    type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::with_gil(|py| {
+            let bound = self.py_iter.bind(py);
+            match bound.call_method0("__next__") {
+                Ok(obj) => match obj.extract::<Vec<(u64, u64)>>() {
+                    Ok(plan) => Some(Ok(plan)),
+                    Err(e) => Some(Err(LoaderError::ConfigError {
+                        reason: format!("plan extraction failed: {e}"),
+                    })),
+                },
+                Err(e) => {
+                    if e.is_instance_of::<PyStopIteration>(py) {
+                        None
+                    } else {
+                        // Forward the Python exception text. We can't pass
+                        // a PyErr through to the consumer's Result type, so
+                        // wrap as a ChannelError carrying the message.
+                        Some(Err(LoaderError::ChannelError(format!(
+                            "plan iterator raised: {e}"
+                        ))))
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Python iterator that wraps an [`IndexPlanIter`] and converts each yielded
+/// `IndexPlanBatch` into the standard pyscx batch dict.
+#[pyclass]
+pub struct IndexPlanBatchIter {
+    inner: Option<IndexPlanIter>,
+    #[allow(dead_code)] // surfaced via __repr__ / future docs
+    lookahead: usize,
+}
+
+#[pymethods]
+impl IndexPlanBatchIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        // Release the GIL for both the prefetch await and the decode work,
+        // so the plan-pull worker can call __next__ on the user iterator
+        // without contention.
+        let next = py.allow_threads(|| inner.next());
+        match next {
+            Some(Ok(batch)) => Ok(Some(index_plan_batch_to_dict(py, batch)?)),
+            Some(Err(e)) => Err(loader_err_to_py(e)),
+            None => {
+                // Drop the inner iterator to release the plan-pull thread
+                // and tokio runtime references; subsequent next calls return
+                // None without re-entering Rust.
+                self.inner = None;
+                Ok(None)
+            }
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexPlanBatchIter(lookahead={}, exhausted={})",
+            self.lookahead,
+            self.inner.is_none()
         )
     }
 }

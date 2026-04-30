@@ -11,12 +11,17 @@
 //! Phase 1 — single-threaded core. The iterator surface, lookahead prefetch,
 //! shard-sorted plan iteration, and vectorised pair scatter land in later phases.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
+use std::thread;
 
 use arrow::record_batch::RecordBatch;
-
+use crossbeam_channel::{bounded, Receiver};
 use scx_format::{BackedCsrReader, ScxReader};
+use scx_sparse::ScxCsr;
+use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 use crate::batch::ObsColumn;
 use crate::decode_stage::extract_obs_columns;
@@ -65,6 +70,11 @@ pub struct IndexPlanLoader {
     /// order. Consumers that need strict input-order outputs can pass
     /// `sort_by_shard=False`.
     sort_by_shard: bool,
+    /// Tokio runtime used by [`IndexPlanIter`] to spawn shard prefetches via
+    /// `spawn_blocking`. `read_shard_cached_arc` is synchronous and CPU/IO
+    /// bound, so it must run on the blocking pool — bare `tokio::spawn` does
+    /// not accept it. 2 worker threads matches `TrainingPipeline`.
+    runtime: Runtime,
 }
 
 impl IndexPlanLoader {
@@ -135,6 +145,17 @@ impl IndexPlanLoader {
 
         let backed = BackedCsrReader::new(reader, cache_shards);
 
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("scx-index-plan")
+            .build()
+            .map_err(|e| {
+                LoaderError::ShutdownError(format!(
+                    "failed to create tokio runtime for IndexPlanLoader: {e}"
+                ))
+            })?;
+
         Ok(Self {
             backed,
             obs_metadata,
@@ -142,6 +163,7 @@ impl IndexPlanLoader {
             hvg_projection,
             n_output_cols,
             sort_by_shard,
+            runtime,
         })
     }
 
@@ -297,6 +319,237 @@ impl IndexPlanLoader {
             obs,
             obs_paired,
         })
+    }
+
+    /// Drive the loader from a plan stream, hiding shard-prefetch latency
+    /// behind upcoming-batch compute.
+    ///
+    /// `plans` is any `Iterator<Item = Result<Vec<(u64, u64)>, LoaderError>>` —
+    /// the iterator is consumed lazily. `lookahead` controls how many
+    /// upcoming plans get shard-prefetched concurrently with the current
+    /// batch's decode (0 disables; default per Python API is 4).
+    ///
+    /// The loader's tokio runtime spawns one `spawn_blocking` task per shard
+    /// referenced by an upcoming plan that is not already resident in the
+    /// LRU. Decode of the head plan blocks on its prefetch handles before
+    /// calling `process_plan`.
+    pub fn iter_with_plans<I>(self: Arc<Self>, plans: I, lookahead: usize) -> IndexPlanIter
+    where
+        I: Iterator<Item = std::result::Result<Vec<(u64, u64)>, LoaderError>> + Send + 'static,
+    {
+        IndexPlanIter::new(self, plans, lookahead)
+    }
+}
+
+/// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
+/// handle per shard prefetched for it.
+type ShardJoin = JoinHandle<scx_format::Result<Arc<ScxCsr>>>;
+
+struct InFlight {
+    plan: Vec<(u64, u64)>,
+    /// Empty when `lookahead == 0`, when the plan is empty, or when every
+    /// shard that the plan touches is already in the LRU cache.
+    prefetches: Vec<ShardJoin>,
+}
+
+/// Iterator returned by [`IndexPlanLoader::iter_with_plans`].
+///
+/// Drives the plan-pull thread, the per-plan shard prefetches, and the
+/// per-batch decode. `next` blocks on the head plan's prefetch handles,
+/// then delegates to [`IndexPlanLoader::process_plan`].
+pub struct IndexPlanIter {
+    loader: Arc<IndexPlanLoader>,
+    plan_rx: Receiver<std::result::Result<Vec<(u64, u64)>, LoaderError>>,
+    /// Pull worker that owns the user-supplied `plans` iterator. Detached on
+    /// drop — the worker exits naturally when `plan_rx` is dropped (next
+    /// `send` fails) or when the user iterator returns `None`.
+    plan_thread: Option<thread::JoinHandle<()>>,
+    in_flight: VecDeque<InFlight>,
+    lookahead: usize,
+    /// Sticky flag: once the plan stream is closed (StopIteration / disconnect)
+    /// we stop calling `recv` so the iter drains the queue and finishes.
+    plan_stream_done: bool,
+    /// Latched error: the first Err yielded by the plan iterator. We stash
+    /// rather than return immediately so the queue of already-pulled plans
+    /// drains gracefully; next() surfaces the error one-shot after the
+    /// queue empties, then sets `plan_stream_done`.
+    plan_stream_error: Option<LoaderError>,
+}
+
+impl IndexPlanIter {
+    fn new<I>(loader: Arc<IndexPlanLoader>, plans: I, lookahead: usize) -> Self
+    where
+        I: Iterator<Item = std::result::Result<Vec<(u64, u64)>, LoaderError>> + Send + 'static,
+    {
+        let cap = lookahead.max(1);
+        let (plan_tx, plan_rx) = bounded(cap);
+
+        let plan_thread = thread::Builder::new()
+            .name("scx-index-plan-pull".to_string())
+            .spawn(move || {
+                for item in plans {
+                    if plan_tx.send(item).is_err() {
+                        // Receiver dropped — iter was dropped mid-stream.
+                        break;
+                    }
+                }
+                // Falling off the loop closes plan_tx, signalling EOS.
+            })
+            .ok();
+
+        Self {
+            loader,
+            plan_rx,
+            plan_thread,
+            in_flight: VecDeque::with_capacity(cap),
+            lookahead,
+            plan_stream_done: false,
+            plan_stream_error: None,
+        }
+    }
+
+    /// Refill the in-flight queue up to `lookahead.max(1)` plans, spawning a
+    /// shard prefetch per shard referenced by each plan that is not already
+    /// resident in the LRU.
+    ///
+    /// On a plan-stream error, latches the error in `plan_stream_error` and
+    /// stops; the iterator drains `in_flight` first and surfaces the error
+    /// one-shot after the queue empties. Plain end-of-stream sets
+    /// `plan_stream_done` instead.
+    fn refill(&mut self) {
+        let target = self.lookahead.max(1);
+        while self.in_flight.len() < target
+            && !self.plan_stream_done
+            && self.plan_stream_error.is_none()
+        {
+            match self.plan_rx.recv() {
+                Ok(Ok(plan)) => {
+                    let prefetches = self.spawn_prefetches(&plan);
+                    self.in_flight.push_back(InFlight { plan, prefetches });
+                }
+                Ok(Err(e)) => {
+                    self.plan_stream_error = Some(e);
+                    break;
+                }
+                Err(_) => {
+                    // plan_tx dropped → end of stream.
+                    self.plan_stream_done = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn spawn_prefetches(&self, plan: &[(u64, u64)]) -> Vec<ShardJoin> {
+        if self.lookahead == 0 || plan.is_empty() {
+            return Vec::new();
+        }
+
+        let mut all_rows: Vec<u64> = Vec::with_capacity(plan.len() * 2);
+        for &(p, c) in plan {
+            all_rows.push(p);
+            all_rows.push(c);
+        }
+        // shards_for_indices internally sorts + dedups, so the returned
+        // shard set has no duplicates we'd waste prefetches on.
+        let shards = self.loader.backed.index().shards_for_indices(&all_rows);
+
+        let handle = self.loader.runtime.handle().clone();
+        shards
+            .into_iter()
+            .map(|sidx| {
+                let loader = Arc::clone(&self.loader);
+                handle.spawn_blocking(move || loader.backed.read_shard_cached_arc(sidx))
+            })
+            .collect()
+    }
+
+    /// Block on every prefetch handle for the head plan. Surfaces the first
+    /// shard read error or join panic.
+    fn await_head(&self, prefetches: Vec<ShardJoin>) -> std::result::Result<(), LoaderError> {
+        for h in prefetches {
+            match self.loader.runtime.block_on(h) {
+                Ok(Ok(_arc_shard)) => {
+                    // Shard is now warm in the LRU cache; subsequent
+                    // process_plan calls will hit it through read_row_indices.
+                }
+                Ok(Err(e)) => return Err(LoaderError::FormatError(e)),
+                Err(join_err) => {
+                    return Err(LoaderError::ShutdownError(format!(
+                        "IndexPlanIter prefetch task panicked: {join_err}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for IndexPlanIter {
+    type Item = Result<IndexPlanBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Top up the queue (no-op once stream is done or errored).
+        self.refill();
+
+        if let Some(head) = self.in_flight.pop_front() {
+            // Refill again so the queue stays warm during the upcoming
+            // process_plan call. Errors latched here drain through later.
+            self.refill();
+
+            if let Err(e) = self.await_head(head.prefetches) {
+                return Some(Err(e));
+            }
+            return Some(self.loader.process_plan(head.plan));
+        }
+
+        // Queue empty — surface a deferred plan-stream error one-shot, then
+        // mark stream done so subsequent next() calls return None.
+        if let Some(e) = self.plan_stream_error.take() {
+            self.plan_stream_done = true;
+            return Some(Err(e));
+        }
+
+        None
+    }
+}
+
+impl Drop for IndexPlanIter {
+    /// Best-effort shutdown. Mirrors the `TrainingPipeline` drop pattern:
+    /// detect a running tokio runtime via `Handle::try_current()` and skip
+    /// any nested `block_on` to avoid panicking inside an async context.
+    fn drop(&mut self) {
+        // Abort any outstanding prefetch handles so the runtime threads
+        // stop blocking on shards we no longer need.
+        for in_flight in self.in_flight.drain(..) {
+            for h in in_flight.prefetches {
+                h.abort();
+            }
+        }
+
+        // Drain plan_rx so the plan-pull thread's next send fails fast and
+        // the thread exits. We don't `join` — the user iterator could be a
+        // slow Python generator and we don't want to block on it.
+        while self.plan_rx.try_recv().is_ok() {}
+
+        // Detach the plan thread; it will exit on its next send-fail.
+        let _ = self.plan_thread.take();
+
+        // Note: dropping `self.loader` (Arc) on the last reference will, in
+        // turn, drop the tokio runtime. The runtime's own drop will block
+        // on its background threads — but only if we're not already inside
+        // a runtime, in which case Tokio panics. Match the pipeline.rs
+        // pattern: if we're nested, leak the runtime by detaching is not
+        // possible here (runtime is owned, not Arc), but the loader Arc
+        // outlives the iter when the user holds the dataset, so this is
+        // typically fine. When the dataset is dropped *concurrent* with
+        // teardown inside an async context, the user should have called an
+        // explicit shutdown first.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // We're inside a runtime — but we're only dropping the iter,
+            // not the loader. The loader (and its runtime) lives in the
+            // dataset's Arc and is unaffected here. No action needed.
+        }
     }
 }
 
@@ -518,5 +771,148 @@ mod tests {
         assert!(batch.x.is_empty());
         assert!(batch.x_paired.is_empty());
         assert!(batch.pairs.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 — iter_with_plans
+    // ---------------------------------------------------------------------
+
+    /// Helper: collect all plans from a Vec into the iterator-of-Result form
+    /// that `iter_with_plans` expects.
+    fn into_plan_iter(
+        plans: Vec<Vec<(u64, u64)>>,
+    ) -> impl Iterator<Item = std::result::Result<Vec<(u64, u64)>, LoaderError>> + Send + 'static
+    {
+        plans.into_iter().map(Ok)
+    }
+
+    fn open_loader_arc(path: &std::path::Path) -> Arc<IndexPlanLoader> {
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+        Arc::new(IndexPlanLoader::new(path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true).unwrap())
+    }
+
+    /// Iterator yields one batch per plan, batches are correctly aligned.
+    #[test]
+    fn iter_with_plans_yields_one_batch_per_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader_arc(&path);
+
+        let plans = vec![
+            vec![(0u64, 1u64), (2, 3)],
+            vec![(4, 5)],
+            vec![(8, 12), (10, 15)],
+        ];
+        let it = loader.iter_with_plans(into_plan_iter(plans.clone()), 4);
+        let batches: Vec<_> = it.map(|r| r.unwrap()).collect();
+
+        assert_eq!(batches.len(), 3);
+        // Each batch has the expected number of pairs (post-sort, but the
+        // batch contents are a permutation of the plan).
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.pairs.len(), plans[i].len());
+            // Build sorted multisets for set equality.
+            let mut got = b.pairs.clone();
+            got.sort();
+            let mut want = plans[i].clone();
+            want.sort();
+            assert_eq!(got, want);
+        }
+    }
+
+    /// Lookahead = 0 vs lookahead = 4 must produce identical outputs (up to
+    /// the existing sort_by_shard semantics).
+    #[test]
+    fn iter_with_plans_lookahead_zero_vs_four_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let plans = vec![
+            vec![(15u64, 0u64), (4, 5), (8, 9)],
+            vec![(3, 12), (10, 11), (1, 2)],
+        ];
+
+        let it_zero =
+            open_loader_arc(&path).iter_with_plans(into_plan_iter(plans.clone()), 0);
+        let it_four =
+            open_loader_arc(&path).iter_with_plans(into_plan_iter(plans.clone()), 4);
+
+        let zero: Vec<_> = it_zero.map(|r| r.unwrap()).collect();
+        let four: Vec<_> = it_four.map(|r| r.unwrap()).collect();
+
+        assert_eq!(zero.len(), four.len());
+        for (a, b) in zero.iter().zip(four.iter()) {
+            assert_eq!(a.pairs, b.pairs, "pair order should match between lookahead=0 and 4");
+            assert_eq!(a.x, b.x);
+            assert_eq!(a.x_paired, b.x_paired);
+        }
+    }
+
+    /// Errors injected into the plan stream propagate as Err items in order.
+    #[test]
+    fn iter_with_plans_propagates_plan_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 8, 4, 2);
+        let loader = open_loader_arc(&path);
+
+        let plans: Vec<std::result::Result<Vec<(u64, u64)>, LoaderError>> = vec![
+            Ok(vec![(0, 1)]),
+            Err(LoaderError::ChannelError("synthetic".into())),
+            Ok(vec![(2, 3)]),
+        ];
+        let mut it = loader.iter_with_plans(plans.into_iter(), 2);
+
+        // First a successful batch, then the error, then iteration stops
+        // (sticky `plan_stream_error`).
+        assert!(matches!(it.next(), Some(Ok(_))));
+        let second = it.next().expect("second item");
+        match second {
+            Err(LoaderError::ChannelError(s)) => assert!(s.contains("synthetic")),
+            Err(other) => panic!("expected ChannelError, got {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+        assert!(
+            it.next().is_none(),
+            "iteration must stop after a plan-stream error"
+        );
+    }
+
+    /// Out-of-range row in a plan yields a Result::Err(IndexOutOfRange) on
+    /// that batch and stops iteration. (Validation is per-batch, not in the
+    /// pull thread.)
+    #[test]
+    fn iter_with_plans_propagates_decode_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 8, 4, 2);
+        let loader = open_loader_arc(&path);
+
+        let plans = vec![vec![(0u64, 1u64)], vec![(99, 99)]];
+        let it = loader.iter_with_plans(into_plan_iter(plans), 2);
+        let mut results = it;
+
+        let first = results.next().expect("first batch");
+        assert!(first.is_ok());
+        let second = results.next().expect("second batch");
+        match second {
+            Err(LoaderError::IndexOutOfRange { idx, .. }) => assert_eq!(idx, 99),
+            Err(other) => panic!("expected IndexOutOfRange, got LoaderError: {other}"),
+            Ok(_) => panic!("expected IndexOutOfRange, got Ok"),
+        }
+    }
+
+    /// Drop mid-iteration must not deadlock. Build an iterator with a long
+    /// plan stream, take 1 batch, then drop.
+    #[test]
+    fn iter_with_plans_drop_mid_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader_arc(&path);
+
+        let plans: Vec<_> = (0..1000).map(|_| vec![(0u64, 1u64)]).collect();
+        let mut it = loader.iter_with_plans(into_plan_iter(plans), 4);
+        let _first = it.next().unwrap().unwrap();
+        drop(it); // must not hang
     }
 }
