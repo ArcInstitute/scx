@@ -440,8 +440,7 @@ def main() -> int:
 
     # Resolve dataset path via the shared bench env (.env / SCX_DATA_DIR).
     if args.dataset is None:
-        sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
-        from bench_env import DATA_DIR  # type: ignore
+        from benchmarks.comprehensive.bench_env import DATA_DIR
 
         dataset_path = Path(DATA_DIR) / "pbmc3k.h5ad"
     else:

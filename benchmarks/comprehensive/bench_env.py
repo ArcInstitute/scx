@@ -10,7 +10,7 @@ are responsible for exporting them (e.g. via `source .env` in a SLURM
 wrapper before invoking the benchmark script).
 
 Usage:
-    from bench_env import WORK_DIR, DATA_DIR
+    from benchmarks.comprehensive.bench_env import WORK_DIR, DATA_DIR
 """
 
 import os

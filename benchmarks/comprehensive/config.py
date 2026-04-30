@@ -736,6 +736,14 @@ def estimate_memory_gb(
             peak_mb = max(base_mb * 2, dense_mb * 1.3)
         else:
             peak_mb = max(base_mb * 2, dense_mb * 0.5)
+    elif benchmark == "correctness":
+        # Correctness keeps the scanpy-reference AnnData + SCX backed view
+        # + SLAF round-trip materialization simultaneously while running
+        # 14+ scanpy-equivalence checks (PCA, kNN, UMAP, leiden, DE).
+        # slurm_validation_suite.sh allocates 80 GB for pbmc3k and 250 GB
+        # for the pbmc3k+tabula_sapiens_100k combined run; size like
+        # read_full but with a 1.5x safety multiplier on top.
+        peak_mb = max(base_mb * 2, dense_mb * 1.5)
     elif benchmark == "accel_preprocess":
         # Keeps raw AnnData + scanpy reference + per-run copies resident.
         # scanpy normalize/log1p are sparse-in-place; pyscx's lazy-chain
@@ -812,6 +820,7 @@ def estimate_time_minutes(
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
         "ml_loader":              45,
+        "correctness":            60,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
         # cluster, (b) over-budgeting once beats serial retries on timeout
@@ -844,6 +853,11 @@ def estimate_time_minutes(
         # 4 CPU scenarios + 1 GPU scenario × n_runs each; epoch wall time
         # scales near-linearly with n_obs for streaming loaders.
         slope_minutes_per_million = 12
+    elif benchmark == "correctness":
+        # 14+ scanpy-equivalence checks plus SCX backed-mode and SLAF
+        # round-trip — UMAP/Leiden/DE pipelines dominate at scale.
+        # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
+        slope_minutes_per_million = 240
 
     total = base + int(slope_minutes_per_million * per_million)
     # Dense-path formats (h5ad / zarr) take longer at census scale.

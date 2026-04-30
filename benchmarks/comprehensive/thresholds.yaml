@@ -236,3 +236,50 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
     min: 10.0
+
+  # --- correctness validation suite (§3.2) ---------------------------
+  # Hard parity gate: any failure in scanpy-equivalence,
+  # backed-mode-equivalence, preprocessing-paths, or SLAF round-trip
+  # blocks the gate. Per-suite floors localize a failure to one
+  # validator without forcing the operator to dig into
+  # metadata.suite_counts.
+  #
+  # n_failed counts only `c.passed=False, c.error=None` checks
+  # (genuine parity violations). Errors (import failures, missing
+  # dependencies) are captured by *_n_skipped and do NOT trip these
+  # floors — the SLAF suite is empty when slafdb is missing, which
+  # is an acceptable env-dependent skip.
+  #
+  # overall_passed_int floors a single rolled-up bool so the gate's
+  # one-liner failure message is human-readable when *any* suite
+  # breaks. Per-suite floors below provide the attribution.
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: scanpy_equivalence_n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: backed_equivalence_n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: preprocessing_paths_n_failed
+    max: 0
+  - benchmark: correctness
+    format: scx_auto
+    dataset: pbmc3k
+    metric: slaf_equivalence_n_failed
+    max: 0

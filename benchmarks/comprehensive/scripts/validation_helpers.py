@@ -30,9 +30,8 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "scripts"))
 
-from bench_env import DATA_DIR  # noqa: E402
+from benchmarks.comprehensive.bench_env import DATA_DIR  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,9 @@ ALL_BENCHMARKS: list[str] = [
     "parallel_write_scaling",
     "memory",
     "ml_loader",
+    # Correctness validation — scanpy / backed / preprocessing parity.
+    # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
+    "correctness",
     # SCX-only fragment / manifest operations
     "fragment_ops",
     # Cloud (GCP) — Phase C through F
