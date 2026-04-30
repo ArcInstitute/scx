@@ -28,6 +28,9 @@ ALL_BENCHMARKS: list[str] = [
     # Correctness validation — scanpy / backed / preprocessing parity.
     # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
     "correctness",
+    # Cell-eval / arc-bench parity perf — SCX-only (gated on scx_auto).
+    # Requires the scx-bench-eval conda env (cell_eval / arc_bench / pdex).
+    "cell_eval_parity_perf",
     # SCX-only fragment / manifest operations
     "fragment_ops",
     # Cloud (GCP) — Phase C through F

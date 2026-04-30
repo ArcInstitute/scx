@@ -69,7 +69,9 @@ from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS  # noqa: E402
 BENCHMARK_NAMES = list(ALL_BENCHMARKS)
 
 # Benchmarks that work from h5ad source and don't need pre-converted files.
-_NO_CONVERSION = {"write", "parallel_write_scaling"}
+# cell_eval_parity_perf generates synthetic data in-process (no source
+# .h5ad on disk for pert_synth_*), so Phase A would fail — skip it.
+_NO_CONVERSION = {"write", "parallel_write_scaling", "cell_eval_parity_perf"}
 
 LOGS_DIR = PROJECT_ROOT / "benchmarks" / "comprehensive" / "logs" / "submitit"
 

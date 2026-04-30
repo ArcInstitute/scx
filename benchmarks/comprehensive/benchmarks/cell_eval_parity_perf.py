@@ -190,39 +190,56 @@ def run(
     format_variant: FormatVariant,
     n_runs: int,
     cold_cache: bool = False,
+    converted_path: Path | None = None,
 ) -> BenchmarkResult | None:
     """Run the cell-eval / arc-bench parity performance benchmark.
 
     Only executes for ``scx_auto`` — the on-disk codec does not affect this
     benchmark (operates on in-memory AnnData from the synthetic generator).
+
+    ``converted_path`` is accepted to match the canonical benchmark contract
+    but unused — synthetic datasets are generated in-process via
+    ``_pert_synth.make_paired_adata()``.
     """
     if format_variant.key != "scx_auto":
         return None
 
     # Lazy-import heavy deps so ``--list`` and non-parity benchmarks don't
-    # need cell-eval / arc-bench installed.
+    # need cell-eval / arc-bench installed. Wrap in try/except so dev
+    # machines without the scx-bench-eval env skip gracefully (rather than
+    # crash) — the gate then reports a missing-metric floor violation,
+    # which surfaces the env mistake clearly on Chimera / CI.
     #
     # pyscx.accel is exposed as an attribute by the Rust binding, not a real
     # submodule — ``import pyscx.accel`` fails, but ``import pyscx; pyscx.accel``
     # works. Match the pattern used in pyscx/tests/test_cell_eval_parity.py.
-    import pyscx
-    acc = pyscx.accel
-    from cell_eval import PerturbationAnndataPair
-    from cell_eval.metrics._anndata import (
-        ClusteringAgreement,
-        discrimination_score as ce_discrimination_score,
-        edistance as ce_edistance,
-        mae as ce_mae,
-        mae_delta as ce_mae_delta,
-        mse as ce_mse,
-        mse_delta as ce_mse_delta,
-        pearson_delta as ce_pearson_delta,
-    )
-    from arc_bench.tools.normalize_transform.core import (
-        compute_control_baseline,
-        compute_knockdown_efficiency,
-        compute_log_deviation,
-    )
+    try:
+        import pyscx
+        acc = pyscx.accel
+        from cell_eval import PerturbationAnndataPair
+        from cell_eval.metrics._anndata import (
+            ClusteringAgreement,
+            discrimination_score as ce_discrimination_score,
+            edistance as ce_edistance,
+            mae as ce_mae,
+            mae_delta as ce_mae_delta,
+            mse as ce_mse,
+            mse_delta as ce_mse_delta,
+            pearson_delta as ce_pearson_delta,
+        )
+        from arc_bench.tools.normalize_transform.core import (
+            compute_control_baseline,
+            compute_knockdown_efficiency,
+            compute_log_deviation,
+        )
+    except ImportError as e:
+        logger.warning(
+            "Skipping cell_eval_parity_perf: %s. Required packages "
+            "(cell_eval, arc_bench, pdex) live in the scx-bench-eval "
+            "conda env — activate it before running this benchmark.",
+            e,
+        )
+        return None
 
     from benchmarks.comprehensive.benchmarks import _pert_synth
 
@@ -420,5 +437,21 @@ def run(
             "operations": operations,
         },
     )
-    result.add_run(wall_s=total_scx_s, peak_rss_mb=peak_rss)
+    # Lift per-operation metrics from metadata.operations[] into runs[].extra
+    # so the gate's _load_current_raw_metric (which reads only runs[].extra)
+    # can floor them. Sparse keys: present only for non-skipped operations
+    # that produced both SCX and reference timings.
+    extra: dict[str, float] = {}
+    for op in operations:
+        if op.get("skipped"):
+            continue
+        name = op["name"]
+        if "scx_median_s" in op:
+            extra[f"scx_median_s__{name}"] = op["scx_median_s"]
+            extra[f"scx_peak_rss_mb__{name}"] = op["scx_peak_rss_mb"]
+        if "ref_median_s" in op:
+            extra[f"ref_median_s__{name}"] = op["ref_median_s"]
+        if "speedup" in op:
+            extra[f"speedup__{name}"] = op["speedup"]
+    result.add_run(wall_s=total_scx_s, peak_rss_mb=peak_rss, **extra)
     return result

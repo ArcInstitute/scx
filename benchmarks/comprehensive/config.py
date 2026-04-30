@@ -744,6 +744,12 @@ def estimate_memory_gb(
         # for the pbmc3k+tabula_sapiens_100k combined run; size like
         # read_full but with a 1.5x safety multiplier on top.
         peak_mb = max(base_mb * 2, dense_mb * 1.5)
+    elif benchmark == "cell_eval_parity_perf":
+        # Holds adata_real + adata_pred + raw_adata simultaneously, plus
+        # per-op working buffers (clustering_agreement materialises a
+        # centroid kNN graph; energy_distance allocates an O(n_perts^2)
+        # GEMM staging area). Observed ~14 GB at 100K — size for headroom.
+        peak_mb = max(base_mb * 2, dense_mb * 2.5)
     elif benchmark == "accel_preprocess":
         # Keeps raw AnnData + scanpy reference + per-run copies resident.
         # scanpy normalize/log1p are sparse-in-place; pyscx's lazy-chain
@@ -821,6 +827,7 @@ def estimate_time_minutes(
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
         "ml_loader":              45,
         "correctness":            60,
+        "cell_eval_parity_perf":  60,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
         # cluster, (b) over-budgeting once beats serial retries on timeout
@@ -858,6 +865,11 @@ def estimate_time_minutes(
         # round-trip — UMAP/Leiden/DE pipelines dominate at scale.
         # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
         slope_minutes_per_million = 240
+    elif benchmark == "cell_eval_parity_perf":
+        # n_perts is fixed at 50 for pert_synth_*; clustering_agreement's
+        # super-linear scaling on perturbations doesn't kick in.
+        # Linear-with-n_obs: 10K → ~61 min, 100K → ~66 min, 1M → ~120 min.
+        slope_minutes_per_million = 60
 
     total = base + int(slope_minutes_per_million * per_million)
     # Dense-path formats (h5ad / zarr) take longer at census scale.
