@@ -63,8 +63,6 @@ def _normalize_csr(X: Any):
 
     if sp.issparse(X):
         csr = X.tocsr()
-    elif isinstance(X, np.matrix):
-        csr = sp.csr_matrix(np.asarray(X))
     else:
         csr = sp.csr_matrix(np.asarray(X))
     if csr.dtype != np.float32:
@@ -140,7 +138,7 @@ def run(
     sparsity_match = int(a.nnz == b.nnz)
 
     if shape_match and sparsity_match:
-        diff = (a - b)
+        diff = a - b
         diff.eliminate_zeros()
         n_value_mismatches = int(diff.nnz)
         if n_value_mismatches > 0:
@@ -152,11 +150,16 @@ def run(
             max_rel_diff = 0.0
         csr_exact_equal_int = int(csr_equal(a, b, rtol=0.0))
     else:
-        # Sentinel values surface a clear floor breach even when the diff
-        # is undefined (shape / nnz mismatch).
-        n_value_mismatches = -1
-        max_abs_diff = float("inf")
-        max_rel_diff = float("inf")
+        # Shape / nnz mismatch — exact mismatch count is undefined, but
+        # we know it's >= 1. Use a positive sentinel so the
+        # n_value_mismatches max: 0 floor in thresholds.yaml actually
+        # trips (a -1 sentinel would silently satisfy max: 0).
+        # max(a.nnz, b.nnz, 1) is a defensible upper bound and >= 1.
+        # max_abs_diff / max_rel_diff stay None (rather than inf) so the
+        # persisted runs[].extra is strict JSON.
+        n_value_mismatches = max(int(a.nnz), int(b.nnz), 1)
+        max_abs_diff = None
+        max_rel_diff = None
         csr_exact_equal_int = 0
 
     overall_passed = bool(
@@ -179,8 +182,8 @@ def run(
             "source_nnz": int(a.nnz),
             "scx_nnz": int(b.nnz),
             "n_value_mismatches": n_value_mismatches,
-            "max_abs_diff": max_abs_diff if max_abs_diff != float("inf") else None,
-            "max_rel_diff": max_rel_diff if max_rel_diff != float("inf") else None,
+            "max_abs_diff": max_abs_diff,
+            "max_rel_diff": max_rel_diff,
             "csr_exact_equal": bool(csr_exact_equal_int),
             "source_h5ad_path": str(src_path),
             "scx_path": str(converted_path),
@@ -209,7 +212,7 @@ def run(
         format_variant.key,
         dataset.name,
         n_value_mismatches,
-        f"{max_abs_diff:.3g}" if max_abs_diff != float("inf") else "inf",
+        f"{max_abs_diff:.3g}" if max_abs_diff is not None else "n/a",
         wall_s,
     )
 
