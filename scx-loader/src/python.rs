@@ -242,6 +242,10 @@ impl IndexPlanDataset {
     ///         on this path, mirroring `TrainingDataset`.
     ///     target_sum: Normalization target sum (default: 1e4).
     ///     cache_shards: LRU shard cache budget (default: 128). Must be >= 1.
+    ///     sort_by_shard: Reorder each plan by shard-of-min-row before
+    ///         gathering, so the returned rows of X/X_paired are in shard
+    ///         locality order (default: True). Disable to preserve the
+    ///         caller's input pair order.
     ///     max_memory_mb: Memory budget in MB (default: 512). Currently
     ///         informational on this path; auto-tuning lands in Phase 5.
     #[new]
@@ -254,6 +258,7 @@ impl IndexPlanDataset {
         log1p=None,
         target_sum=None,
         cache_shards=None,
+        sort_by_shard=None,
         max_memory_mb=None,
     ))]
     fn new(
@@ -264,6 +269,7 @@ impl IndexPlanDataset {
         log1p: Option<bool>,
         target_sum: Option<f64>,
         cache_shards: Option<usize>,
+        sort_by_shard: Option<bool>,
         max_memory_mb: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = LoaderConfig::default();
@@ -287,8 +293,10 @@ impl IndexPlanDataset {
         }
 
         let cache_shards = cache_shards.unwrap_or(128);
+        let sort_by_shard = sort_by_shard.unwrap_or(true);
 
-        let loader = IndexPlanLoader::new(path, config, cache_shards).map_err(loader_err_to_py)?;
+        let loader = IndexPlanLoader::new(path, config, cache_shards, sort_by_shard)
+            .map_err(loader_err_to_py)?;
 
         Ok(Self {
             loader: Arc::new(loader),
