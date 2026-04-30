@@ -206,6 +206,31 @@ impl TrainingDataset {
     }
 }
 
+/// Plan-driven paired-batch reader for `(perturbed, control)` ML training.
+///
+/// Sibling to `TrainingDataset`: instead of streaming shards in catalog order,
+/// `IndexPlanDataset` consumes a stream of caller-supplied `(pert_idx, ctrl_idx)`
+/// plans and yields paired dense batches. See `PER-CELL-CONTROL-PAIRING.md` at
+/// the workspace root for the full design.
+///
+/// **Phase 0 — scaffolding only.** Construction raises `NotImplementedError`;
+/// the implementation lands in Phase 1.
+#[pyclass]
+pub struct IndexPlanDataset {
+    _stub: (),
+}
+
+#[pymethods]
+impl IndexPlanDataset {
+    #[new]
+    fn new() -> PyResult<Self> {
+        Err(PyRuntimeError::new_err(
+            "IndexPlanDataset is not yet implemented (scaffolding stub from Phase 0; \
+             implementation lands in Phase 1 — see PER-CELL-CONTROL-PAIRING.md).",
+        ))
+    }
+}
+
 /// Convert a `Batch` into a Python dict: `{"X": ndarray, "obs": {...}, "cell_indices": ndarray}`.
 ///
 /// Uses `PyArray::from_vec()` for zero-copy transfer of Rust Vecs to numpy arrays.
