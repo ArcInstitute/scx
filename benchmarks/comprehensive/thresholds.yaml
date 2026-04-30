@@ -321,3 +321,24 @@ absolute_floors:
     dataset: pert_synth_10k
     metric: scx_median_s__clustering_agreement
     max: 1.0
+  # pert_synth_100k floors (n=3 internal repeats, 0.5x speedup / 2.0x
+  # wall envelope). Non-marquee energy_distance variants (f64,
+  # scalar_f32, alias) skip at n_obs >= 100K — see _SKIP_RULES in
+  # cell_eval_parity_perf.py:73-95. clustering_agreement still doesn't
+  # surpass cell-eval at 50 perts (observed 0.84x); only the
+  # scx_median_s envelope is gated.
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_100k
+    metric: speedup__energy_distance_blas_f32
+    min: 8.5
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_100k
+    metric: scx_median_s__energy_distance_blas_f32
+    max: 105.0
+  - benchmark: cell_eval_parity_perf
+    format: scx_auto
+    dataset: pert_synth_100k
+    metric: scx_median_s__clustering_agreement
+    max: 8.5

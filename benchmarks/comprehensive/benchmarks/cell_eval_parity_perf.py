@@ -71,6 +71,17 @@ logger = logging.getLogger(__name__)
 # a single operation can appear in multiple entries; it is skipped if any
 # match. The string after ``:`` is the reason recorded in the result JSON.
 _SKIP_RULES: list[tuple[int, str, str]] = [
+    # Non-marquee energy_distance variants are diagnostic only. At n_obs
+    # >= 100K, cell-eval's reference O(N^2) pairwise loop takes ~15 min
+    # per run, and we'd otherwise pay 4x that across the 3 variants.
+    # The marquee `energy_distance_blas_f32` keeps running at 100K — it
+    # is the floored metric in `thresholds.yaml`.
+    (100_000, "energy_distance",
+     "non-marquee variant; O(N^2) cell-eval ref too slow at n_obs >= 100K"),
+    (100_000, "energy_distance_blas_f64",
+     "non-marquee variant; O(N^2) cell-eval ref too slow at n_obs >= 100K"),
+    (100_000, "energy_distance_scalar_f32",
+     "non-marquee variant; O(N^2) cell-eval ref too slow at n_obs >= 100K"),
     (500_000, "energy_distance",
      "O(N^2) pairwise distance at n_obs >= 500K is infeasible"),
     (500_000, "energy_distance_blas_f32",

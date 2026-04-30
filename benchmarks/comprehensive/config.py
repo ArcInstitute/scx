@@ -866,10 +866,13 @@ def estimate_time_minutes(
         # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
         slope_minutes_per_million = 240
     elif benchmark == "cell_eval_parity_perf":
-        # n_perts is fixed at 50 for pert_synth_*; clustering_agreement's
-        # super-linear scaling on perturbations doesn't kick in.
-        # Linear-with-n_obs: 10K → ~61 min, 100K → ~66 min, 1M → ~120 min.
-        slope_minutes_per_million = 60
+        # cell-eval's edistance reference is O(n_obs^2) pairwise distance
+        # × n_perts × n_runs, so wall-time scales near-quadratically with
+        # n_obs even at fixed n_perts=50. Empirical: 10K is ~30 min total,
+        # 100K is ~150 min for blas_f32 alone. The non-marquee
+        # energy_distance variants skip at >= 100K (see _SKIP_RULES).
+        # 10K → 72 min, 100K → 180 min, 1M → blas_f32 also skipped at 500K.
+        slope_minutes_per_million = 1200
 
     total = base + int(slope_minutes_per_million * per_million)
     # Dense-path formats (h5ad / zarr) take longer at census scale.
