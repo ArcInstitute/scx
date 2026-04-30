@@ -75,6 +75,13 @@ pub struct IndexPlanLoader {
     /// bound, so it must run on the blocking pool — bare `tokio::spawn` does
     /// not accept it. 2 worker threads matches `TrainingPipeline`.
     runtime: Runtime,
+    /// Effective LRU shard cache size after auto-tuning to fit
+    /// `max_memory_mb`. May be less than the user-requested `cache_shards`.
+    effective_cache_shards: usize,
+    /// Effective default lookahead after auto-tuning. `iter_with_plans`
+    /// uses this when the caller passes `lookahead=None`. May be less than
+    /// the user-requested `lookahead`.
+    effective_lookahead: usize,
 }
 
 impl IndexPlanLoader {
@@ -85,7 +92,17 @@ impl IndexPlanLoader {
     ///
     /// `cache_shards` sizes the LRU shard cache inside `BackedCsrReader`; the
     /// shard cache hit rate is the dominant performance lever for plan-driven
-    /// access patterns. Must be `>= 1`.
+    /// access patterns. Must be `>= 1`. The value passed here is the *target*;
+    /// auto-tuning may reduce it to fit `config.max_memory_mb` (visible via
+    /// [`Self::effective_cache_shards`]).
+    ///
+    /// `lookahead` is the *target* default lookahead used by `iter_with_plans`
+    /// when the caller passes `lookahead=None`; auto-tuning may reduce it to
+    /// fit `config.max_memory_mb` (visible via [`Self::effective_lookahead`]).
+    /// `lookahead=0` disables the prefetch path entirely.
+    ///
+    /// `max_plan_size` is the upper bound on rows-per-batch used for the
+    /// memory-budget calculation. Default 16384.
     ///
     /// Sequential-pipeline-only fields on `LoaderConfig` (`batch_size`,
     /// `shard_group_size`, `prefetch_batches`, `seed`) are silently ignored on
@@ -95,10 +112,17 @@ impl IndexPlanLoader {
         config: LoaderConfig,
         cache_shards: usize,
         sort_by_shard: bool,
+        lookahead: usize,
+        max_plan_size: usize,
     ) -> Result<Self> {
         if cache_shards < 1 {
             return Err(LoaderError::ConfigError {
                 reason: "cache_shards must be >= 1".to_string(),
+            });
+        }
+        if max_plan_size < 1 {
+            return Err(LoaderError::ConfigError {
+                reason: "max_plan_size must be >= 1".to_string(),
             });
         }
 
@@ -143,7 +167,104 @@ impl IndexPlanLoader {
             .map(|p| p.n_output_cols())
             .unwrap_or(n_vars as usize);
 
-        let backed = BackedCsrReader::new(reader, cache_shards);
+        // ----- Phase 5: memory budget auto-tune --------------------------
+        //
+        // Per-component model (see PER-CELL-CONTROL-PAIRING.md "Memory budget"):
+        //   shard_decoded_bytes = (avg_nnz_per_shard × 8) + (avg_rows_per_shard × 8)
+        //                                    ^^^ i32 indices (4) + f32 data (4)
+        //                                                                ^^^ i64 indptr (8)
+        //   cache              = effective_cache_shards × shard_decoded_bytes
+        //   batch_buffers      = 2 × max_plan_size × n_output_cols × 4
+        //   lookahead_overhead = effective_lookahead × max_plan_size × 16
+        //                                                          ^^^ (u64, u64) plan tuple
+        //   python_overhead    = 50 MB (constant)
+        //
+        // Mmap'd file is in the kernel page cache (evicted under pressure)
+        // and intentionally NOT counted against the budget.
+        let (avg_nnz_per_shard, avg_rows_per_shard) = {
+            let csr_shards = reader.catalog().shards_sorted();
+            let n_csr_shards = csr_shards.len();
+            if n_csr_shards == 0 {
+                (0u64, 0u64)
+            } else {
+                let total_nnz: u64 = csr_shards
+                    .iter()
+                    .map(|e| e.stats.as_ref().map(|s| s.nnz).unwrap_or(0))
+                    .sum();
+                let total_rows: u64 = csr_shards
+                    .iter()
+                    .map(|e| {
+                        e.stats
+                            .as_ref()
+                            .map(|s| s.row_end - s.row_start)
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                (
+                    total_nnz / n_csr_shards as u64,
+                    total_rows / n_csr_shards as u64,
+                )
+            }
+        };
+        let shard_decoded_bytes = (avg_nnz_per_shard.saturating_mul(8)
+            + avg_rows_per_shard.saturating_mul(8)) as usize;
+
+        let batch_buffer_bytes = 2usize
+            .saturating_mul(max_plan_size)
+            .saturating_mul(n_output_cols)
+            .saturating_mul(4);
+        const PYTHON_OVERHEAD_BYTES: usize = 50 * 1024 * 1024;
+        const PLAN_TUPLE_BYTES: usize = 16; // sizeof((u64, u64))
+
+        let budget_bytes = config
+            .max_memory_mb
+            .saturating_mul(1024)
+            .saturating_mul(1024);
+
+        let mut effective_cache_shards = cache_shards;
+        let mut effective_lookahead = lookahead;
+
+        let estimate = |cache: usize, la: usize| -> usize {
+            cache
+                .saturating_mul(shard_decoded_bytes)
+                .saturating_add(batch_buffer_bytes)
+                .saturating_add(la.saturating_mul(max_plan_size).saturating_mul(PLAN_TUPLE_BYTES))
+                .saturating_add(PYTHON_OVERHEAD_BYTES)
+        };
+
+        // Reduce lookahead first (down to 1, NOT 0 — we want the iterator
+        // path to remain functional even under tight memory; 0 is a user
+        // choice). Then reduce cache_shards down to 1.
+        while estimate(effective_cache_shards, effective_lookahead) > budget_bytes {
+            if effective_lookahead > 1 {
+                effective_lookahead -= 1;
+            } else if effective_cache_shards > 1 {
+                effective_cache_shards -= 1;
+            } else {
+                let est = estimate(effective_cache_shards, effective_lookahead);
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "max_memory_mb={} is below the floor for this file: \
+                         estimated {} MB at cache_shards=1, lookahead=1 \
+                         (shard_decoded={} KB, batch_buffer={} MB, py_overhead=50 MB). \
+                         Increase max_memory_mb.",
+                        config.max_memory_mb,
+                        est / (1024 * 1024),
+                        shard_decoded_bytes / 1024,
+                        batch_buffer_bytes / (1024 * 1024),
+                    ),
+                });
+            }
+        }
+
+        // Special case: caller asked for lookahead=0; the loop above won't
+        // visit 0 (it stops at >1), so honor the explicit request only if
+        // it fits the budget too. Re-check.
+        if lookahead == 0 && estimate(effective_cache_shards, 0) <= budget_bytes {
+            effective_lookahead = 0;
+        }
+
+        let backed = BackedCsrReader::new(reader, effective_cache_shards);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -164,6 +285,8 @@ impl IndexPlanLoader {
             n_output_cols,
             sort_by_shard,
             runtime,
+            effective_cache_shards,
+            effective_lookahead,
         })
     }
 
@@ -183,6 +306,18 @@ impl IndexPlanLoader {
     /// before gathering.
     pub fn sort_by_shard(&self) -> bool {
         self.sort_by_shard
+    }
+
+    /// Effective LRU shard cache size after auto-tuning to fit
+    /// `config.max_memory_mb`. May be less than the user-requested value.
+    pub fn effective_cache_shards(&self) -> usize {
+        self.effective_cache_shards
+    }
+
+    /// Effective default lookahead after auto-tuning. Used by
+    /// `iter_with_plans` when the caller passes `lookahead=None`.
+    pub fn effective_lookahead(&self) -> usize {
+        self.effective_lookahead
     }
 
     /// O(log n_shards) lookup of the shard containing `row`. Returns `None`
@@ -664,7 +799,15 @@ mod tests {
         config.normalize = false;
         config.log1p = false;
         config.obs_columns = vec!["cell_id".to_string()];
-        IndexPlanLoader::new(path, config, /*cache_shards*/ 4, sort_by_shard).unwrap()
+        IndexPlanLoader::new(
+            path,
+            config,
+            /*cache_shards*/ 4,
+            sort_by_shard,
+            /*lookahead*/ 4,
+            /*max_plan_size*/ 16384,
+        )
+        .unwrap()
     }
 
     /// Phase 2.4: post-sort invariant — `pairs[i]` aligns with `x[i]` and
@@ -791,7 +934,17 @@ mod tests {
         config.normalize = false;
         config.log1p = false;
         config.obs_columns = vec!["cell_id".to_string()];
-        Arc::new(IndexPlanLoader::new(path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true).unwrap())
+        Arc::new(
+            IndexPlanLoader::new(
+                path,
+                config,
+                /*cache_shards*/ 4,
+                /*sort_by_shard*/ true,
+                /*lookahead*/ 4,
+                /*max_plan_size*/ 16384,
+            )
+            .unwrap(),
+        )
     }
 
     /// Iterator yields one batch per plan, batches are correctly aligned.
@@ -914,5 +1067,287 @@ mod tests {
         let mut it = loader.iter_with_plans(into_plan_iter(plans), 4);
         let _first = it.next().unwrap().unwrap();
         drop(it); // must not hang
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 5 — memory budget + auto-tuning
+    // ---------------------------------------------------------------------
+
+    /// Build a multi-shard fixture with a tunable nnz_per_row, so the
+    /// memory-budget tests can dial in the relative weight of the LRU cache.
+    fn write_dense_fixture(
+        path: &std::path::Path,
+        n_obs: usize,
+        n_vars: usize,
+        n_shards: usize,
+        nnz_per_row: usize,
+    ) -> std::path::PathBuf {
+        assert!(n_obs % n_shards == 0);
+        assert!(nnz_per_row <= n_vars);
+        let rows_per_shard = n_obs / n_shards;
+        let total_nnz = (n_obs * nnz_per_row) as u64;
+
+        let header = FileHeader {
+            magic: MAGIC,
+            format_version: 1,
+            header_length: 256,
+            flags: 0,
+            n_obs: n_obs as u64,
+            n_vars: n_vars as u64,
+            nnz: total_nnz,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: rows_per_shard as u32,
+            codec_id: 0,
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            reserved: [0u8; 132],
+        };
+        let mut writer = ScxWriter::new(path, header).unwrap();
+
+        let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let obs = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(obs_schema),
+            vec![StdArc::new(StringArray::from(
+                cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+
+        let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+        let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+        let var = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(var_schema),
+            vec![StdArc::new(StringArray::from(
+                gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_var(&var).unwrap();
+
+        for s in 0..n_shards {
+            let row_start = s * rows_per_shard;
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for local in 0..rows_per_shard {
+                let row = row_start + local;
+                for k in 0..nnz_per_row {
+                    let col = ((row + k * 7919) % n_vars) as u32;
+                    indices.push(col);
+                    values.push(((row + k + 1) & 0xFF) as u8);
+                }
+                indptr.push(*indptr.last().unwrap() + nnz_per_row as u64);
+            }
+            // Indices must be sorted within each row for the CSR format;
+            // sort each row's slice.
+            for local in 0..rows_per_shard {
+                let lo = indptr[local] as usize;
+                let hi = indptr[local + 1] as usize;
+                let mut pairs: Vec<(u32, u8)> = (lo..hi)
+                    .map(|j| (indices[j], values[j]))
+                    .collect();
+                pairs.sort_by_key(|&(c, _)| c);
+                pairs.dedup_by_key(|&mut (c, _)| c);
+                let new_lo = lo;
+                for (j, (c, v)) in pairs.iter().enumerate() {
+                    indices[new_lo + j] = *c;
+                    values[new_lo + j] = *v;
+                }
+                // dedup may shorten — fix the indptr accordingly by rebuilding
+                // (rare; skip for simplicity if no dups).
+                let _ = (new_lo,);
+            }
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        path.to_path_buf()
+    }
+
+    /// Generous memory budget — both effective values match the requested.
+    #[test]
+    fn budget_generous_no_autotune() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+        let mut config = LoaderConfig::default();
+        config.max_memory_mb = 4096; // way over budget needed for this tiny file
+        let loader = IndexPlanLoader::new(
+            &path,
+            config,
+            /*cache_shards*/ 8,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 4,
+            /*max_plan_size*/ 1024,
+        )
+        .unwrap();
+        assert_eq!(loader.effective_cache_shards(), 8);
+        assert_eq!(loader.effective_lookahead(), 4);
+    }
+
+    /// Tight budget — auto-tune kicks in, lookahead reduced first.
+    /// Sized so the lookahead overhead dominates the over-budget margin
+    /// (max_plan_size=65536 → 1 MB per lookahead unit).
+    #[test]
+    fn budget_tight_reduces_lookahead_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 256, 8, 4);
+
+        let mut config = LoaderConfig::default();
+        // Budget components at requested settings:
+        //   python       = 50 MB
+        //   batch buffer = 2 × 65536 × 8 × 4 ≈ 4 MB
+        //   lookahead    = 8 × 65536 × 16    ≈ 8 MB
+        //   shard cache  = ~negligible (sparse fixture)
+        // Total ≈ 62 MB. A 56 MB budget forces lookahead reduction.
+        config.max_memory_mb = 56;
+        let loader = IndexPlanLoader::new(
+            &path,
+            config,
+            /*cache_shards*/ 8,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 8,
+            /*max_plan_size*/ 65536,
+        )
+        .unwrap();
+        assert!(
+            loader.effective_lookahead() < 8,
+            "lookahead should be reduced under tight budget; got {}",
+            loader.effective_lookahead()
+        );
+        assert!(
+            loader.effective_lookahead() >= 1,
+            "lookahead floor is 1; got {}",
+            loader.effective_lookahead()
+        );
+        // Cache shards should NOT have been touched yet.
+        assert_eq!(loader.effective_cache_shards(), 8);
+    }
+
+    /// Even tighter budget — lookahead at the floor (1), cache_shards reduced
+    /// further. Verifies the "reduce cache_shards next" branch using a dense
+    /// fixture so the LRU shard cache has meaningful weight.
+    #[test]
+    fn budget_very_tight_reduces_cache_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1024 rows × 64 vars × 8 shards × 32 nnz/row.
+        // shard_decoded ≈ (32 × 128 × 8) + (128 × 8) ≈ 33 KB per shard.
+        // 16 cache shards ≈ 528 KB.
+        //
+        // Actually for a meaningful cache contribution we need much higher
+        // density. Bump nnz_per_row.
+        let path = write_dense_fixture(&dir.path().join("f.scx"), 1024, 4096, 8, 2048);
+        // shard_decoded ≈ (2048 × 128 × 8) + (128 × 8) ≈ 2.1 MB per shard.
+        // 16 cache shards ≈ 33 MB.
+        //
+        // Budget at requested settings:
+        //   python       = 50 MB
+        //   batch buffer = 2 × 1024 × 4096 × 4 ≈ 32 MB
+        //   lookahead    = 4 × 1024 × 16       ≈ 64 KB
+        //   shard cache  = 16 × 2.1 MB         ≈ 33 MB
+        // Total ≈ 115 MB. Budget 96 forces lookahead → 1, then cache_shards.
+
+        let mut config = LoaderConfig::default();
+        config.max_memory_mb = 96;
+        let loader = IndexPlanLoader::new(
+            &path,
+            config,
+            /*cache_shards*/ 16,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 4,
+            /*max_plan_size*/ 1024,
+        )
+        .unwrap();
+        assert_eq!(
+            loader.effective_lookahead(),
+            1,
+            "lookahead should be at the floor (got {})",
+            loader.effective_lookahead()
+        );
+        assert!(
+            loader.effective_cache_shards() < 16,
+            "cache_shards should also be reduced; got {}",
+            loader.effective_cache_shards()
+        );
+        assert!(
+            loader.effective_cache_shards() >= 1,
+            "cache_shards floor is 1; got {}",
+            loader.effective_cache_shards()
+        );
+    }
+
+    /// Budget below the floor — construction must fail with a clear ConfigError.
+    #[test]
+    fn budget_below_floor_refuses_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 4096, 4096, 4);
+
+        let mut config = LoaderConfig::default();
+        config.max_memory_mb = 40; // below the 50 MB python overhead alone
+        let result = IndexPlanLoader::new(
+            &path,
+            config,
+            /*cache_shards*/ 4,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 2,
+            /*max_plan_size*/ 4096,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected ConfigError, got Ok"),
+            Err(e) => e,
+        };
+        match err {
+            LoaderError::ConfigError { reason } => {
+                assert!(
+                    reason.contains("max_memory_mb=40"),
+                    "error should mention requested budget: {reason}"
+                );
+                assert!(
+                    reason.contains("Increase max_memory_mb"),
+                    "error should suggest the fix: {reason}"
+                );
+            }
+            other => panic!("expected ConfigError, got {other}"),
+        }
+    }
+
+    /// Caller explicitly chooses lookahead=0 — honored when it fits the
+    /// budget (no prefetch path activated).
+    #[test]
+    fn budget_lookahead_zero_honored_when_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+        let mut config = LoaderConfig::default();
+        config.max_memory_mb = 256;
+        let loader = IndexPlanLoader::new(
+            &path,
+            config,
+            /*cache_shards*/ 4,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 0,
+            /*max_plan_size*/ 1024,
+        )
+        .unwrap();
+        assert_eq!(loader.effective_lookahead(), 0);
     }
 }

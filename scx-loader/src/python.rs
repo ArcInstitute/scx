@@ -242,12 +242,23 @@ impl IndexPlanDataset {
     ///         on this path, mirroring `TrainingDataset`.
     ///     target_sum: Normalization target sum (default: 1e4).
     ///     cache_shards: LRU shard cache budget (default: 128). Must be >= 1.
+    ///         Auto-tuned downward to fit `max_memory_mb`; check the resolved
+    ///         value via `effective_cache_shards()`.
     ///     sort_by_shard: Reorder each plan by shard-of-min-row before
     ///         gathering, so the returned rows of X/X_paired are in shard
     ///         locality order (default: True). Disable to preserve the
     ///         caller's input pair order.
-    ///     max_memory_mb: Memory budget in MB (default: 512). Currently
-    ///         informational on this path; auto-tuning lands in Phase 5.
+    ///     lookahead: Default lookahead used by `iter_with_plans` when the
+    ///         caller does not pass an explicit value (default: 4). 0 disables
+    ///         shard prefetching. Auto-tuned downward to fit `max_memory_mb`;
+    ///         check the resolved value via `effective_lookahead()`.
+    ///     max_plan_size: Upper bound on rows-per-batch for the memory budget
+    ///         calculation (default: 16384). Sets the ceiling on the dense
+    ///         X / X_paired buffers so the loader can refuse pathological
+    ///         plans early.
+    ///     max_memory_mb: Memory budget in MB (default: 512). On overflow,
+    ///         lookahead is reduced first (down to 1), then cache_shards
+    ///         (down to 1); construction fails if neither fits.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -259,6 +270,8 @@ impl IndexPlanDataset {
         target_sum=None,
         cache_shards=None,
         sort_by_shard=None,
+        lookahead=None,
+        max_plan_size=None,
         max_memory_mb=None,
     ))]
     fn new(
@@ -270,6 +283,8 @@ impl IndexPlanDataset {
         target_sum: Option<f64>,
         cache_shards: Option<usize>,
         sort_by_shard: Option<bool>,
+        lookahead: Option<usize>,
+        max_plan_size: Option<usize>,
         max_memory_mb: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = LoaderConfig::default();
@@ -294,9 +309,18 @@ impl IndexPlanDataset {
 
         let cache_shards = cache_shards.unwrap_or(128);
         let sort_by_shard = sort_by_shard.unwrap_or(true);
+        let lookahead = lookahead.unwrap_or(4);
+        let max_plan_size = max_plan_size.unwrap_or(16384);
 
-        let loader = IndexPlanLoader::new(path, config, cache_shards, sort_by_shard)
-            .map_err(loader_err_to_py)?;
+        let loader = IndexPlanLoader::new(
+            path,
+            config,
+            cache_shards,
+            sort_by_shard,
+            lookahead,
+            max_plan_size,
+        )
+        .map_err(loader_err_to_py)?;
 
         Ok(Self {
             loader: Arc::new(loader),
@@ -328,12 +352,11 @@ impl IndexPlanDataset {
     /// Args:
     ///     plans: any iterable yielding `list[tuple[int, int]]` (or any
     ///         sequence of (int, int) pairs).
-    ///     lookahead: number of upcoming plans to shard-prefetch concurrently
-    ///         with the current batch's decode (default: 4). 0 disables
-    ///         prefetch (decoded synchronously per plan). Larger values trade
-    ///         RAM (~1 prefetch slot per lookahead) for I/O hiding. The
-    ///         default of 4 will be revisited against the Phase 7 throughput
-    ///         benchmark.
+    ///     lookahead: override the loader's default lookahead. None (the
+    ///         default) uses `effective_lookahead()` — the constructor's
+    ///         auto-tuned value. 0 disables prefetch entirely (decoded
+    ///         synchronously per plan). Larger values trade RAM (~1
+    ///         prefetch slot per lookahead) for I/O hiding.
     ///
     /// Returns: an `IndexPlanBatchIter` (Python iterator) whose `__next__`
     /// yields `{"X", "X_paired", "pairs", "obs", "obs_paired"}` dicts.
@@ -351,7 +374,7 @@ impl IndexPlanDataset {
                  construction). The Rust shard cache and mmap state are not fork-safe.",
             ));
         }
-        let lookahead = lookahead.unwrap_or(4);
+        let lookahead = lookahead.unwrap_or_else(|| self.loader.effective_lookahead());
 
         // Bind plans → its iter, hold an owned Py<PyAny> Send-safe handle.
         let py_iter: Py<PyAny> = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
@@ -364,6 +387,19 @@ impl IndexPlanDataset {
             inner: Some(inner),
             lookahead,
         })
+    }
+
+    /// Effective LRU shard cache size after auto-tuning to fit
+    /// `max_memory_mb`. May be less than the user-requested `cache_shards`.
+    fn effective_cache_shards(&self) -> usize {
+        self.loader.effective_cache_shards()
+    }
+
+    /// Effective default lookahead after auto-tuning to fit `max_memory_mb`.
+    /// May be less than the user-requested `lookahead`. Used by
+    /// `iter_with_plans` when the caller does not pass an explicit override.
+    fn effective_lookahead(&self) -> usize {
+        self.loader.effective_lookahead()
     }
 
     /// Process one plan and return a paired dense batch dict.
