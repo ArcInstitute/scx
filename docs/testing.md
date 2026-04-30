@@ -207,17 +207,18 @@ Helper utilities in `validation_helpers.py`: `max_abs_error`, `max_rel_error`, `
 # Download test datasets first:
 bash benchmarks/scripts/download_datasets.sh
 
-# Run all Phase 1 benchmarks:
-.venv/bin/python benchmarks/scripts/benchmark_all.py
+# Run the comprehensive suite (one submitit job per benchmark × format × dataset):
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
 
-# Run individual benchmarks:
-.venv/bin/python benchmarks/scripts/benchmark_compression.py
-.venv/bin/python benchmarks/scripts/benchmark_read.py
-.venv/bin/python benchmarks/scripts/benchmark_query.py
-.venv/bin/python benchmarks/scripts/benchmark_loader.py
+# Narrow to specific benchmarks / formats:
+.venv/bin/python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks compression read_full read_selective \
+    --formats scx_auto h5ad_gzip zarr_zstd \
+    --datasets pbmc3k
 
-# Run on HPC (SLURM):
-python benchmarks/scripts/submit_benchmarks.py
+# Run the standalone ML training-loader benchmark (not in the gate):
+.venv/bin/python benchmarks/scripts/submit_benchmarks.py
 ```
 
 ### Key Benchmark Results
