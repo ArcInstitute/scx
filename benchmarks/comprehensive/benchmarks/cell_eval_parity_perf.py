@@ -215,18 +215,24 @@ def run(
     if format_variant.key != "scx_auto":
         return None
 
-    # Lazy-import heavy deps so ``--list`` and non-parity benchmarks don't
-    # need cell-eval / arc-bench installed. Wrap in try/except so dev
-    # machines without the scx-bench-eval env skip gracefully (rather than
-    # crash) — the gate then reports a missing-metric floor violation,
-    # which surfaces the env mistake clearly on Chimera / CI.
+    # pyscx is a hard project dependency — import unconditionally so a
+    # missing build fails loudly (developer-environment bug) rather than
+    # being swallowed as a soft skip.
     #
     # pyscx.accel is exposed as an attribute by the Rust binding, not a real
     # submodule — ``import pyscx.accel`` fails, but ``import pyscx; pyscx.accel``
     # works. Match the pattern used in pyscx/tests/test_cell_eval_parity.py.
+    import pyscx
+    acc = pyscx.accel
+
+    # Lazy-import the bench-eval optional deps so ``--list`` and non-parity
+    # benchmarks don't need cell-eval / arc-bench / pdex installed. Wrap in
+    # try/except so dev machines without the scx-bench-eval conda env skip
+    # gracefully (rather than crash) — the gate then reports a missing-
+    # metric floor violation, which surfaces the env mistake clearly on
+    # Chimera / CI. Mirrors the scoped optional-import pattern in
+    # correctness.py for SLAF round-trip checks.
     try:
-        import pyscx
-        acc = pyscx.accel
         from cell_eval import PerturbationAnndataPair
         from cell_eval.metrics._anndata import (
             ClusteringAgreement,

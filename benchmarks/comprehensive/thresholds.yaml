@@ -298,9 +298,10 @@ absolute_floors:
   # the gate's median-over-non-None values picks them up cleanly.
   #
   # Coverage scope:
-  #   - Only pert_synth_10k for now. pert_synth_100k preempted repeatedly
-  #     on cpu_preemptible during Phase-1 calibration; deferred to a
-  #     follow-up PR running on cpu_batch.
+  #   - pert_synth_10k and pert_synth_100k are both gated. census_1m and
+  #     larger remain excluded: _SKIP_RULES in cell_eval_parity_perf.py
+  #     skips energy_distance variants at n_obs >= 500K, and routine
+  #     gating at census scale needs a separate budget tier.
   #   - speedup__clustering_agreement is NOT gated — at 50 perts (the
   #     pert_synth_* config) SCX is ~0.8x of cell-eval. The 12.83x claim
   #     lives at 200 perts (a config we don't ship yet). The

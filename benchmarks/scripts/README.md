@@ -51,10 +51,13 @@ deleted. For format-level / accel benchmarks use
 | `benchmark_loader.py` | Loader throughput vs SOTA (TileDB-SOMA-ML, scDataLoader, …) |
 | `benchmark_bpcells.R` | Driver invoked by `benchmark_loader.py --include-bpcells` |
 
-These are the only path that measures `pyscx.TrainingDataset`; the
-comprehensive suite ships a `ml_loader.py` module but it is not yet in
-`ALL_BENCHMARKS` (gate gap — see `2026-04-29_SCX-BENCH-REVIEW.md` §3.1).
-Output: `benchmarks/results/training_loader_benchmark.{md,json}`.
+The comprehensive suite's `ml_loader.py` module is now wired into
+`ALL_BENCHMARKS` and gated via `thresholds.yaml`, so the comprehensive
+harness covers SCX/h5ad/SOMA loader throughput. The standalone scripts
+here remain because they drive the SOTA loader comparison
+(TileDB-SOMA-ML, scDataLoader, BPCells) which the comprehensive suite
+does not currently host. Output:
+`benchmarks/results/training_loader_benchmark.{md,json}`.
 
 ### Active dev surfaces — GPU benches
 
