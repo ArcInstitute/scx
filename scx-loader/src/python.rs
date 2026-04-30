@@ -17,12 +17,17 @@
 //!     # ... training step ...
 //! ```
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use numpy::{PyArray1, PyArrayMethods};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::batch::{Batch, ObsColumn};
+use crate::error::LoaderError;
+use crate::index_plan::{IndexPlanBatch, IndexPlanLoader};
 use crate::pipeline::{LoaderConfig, TrainingPipeline};
 
 /// A PyTorch-compatible iterable dataset for SCX training data.
@@ -209,26 +214,226 @@ impl TrainingDataset {
 /// Plan-driven paired-batch reader for `(perturbed, control)` ML training.
 ///
 /// Sibling to `TrainingDataset`: instead of streaming shards in catalog order,
-/// `IndexPlanDataset` consumes a stream of caller-supplied `(pert_idx, ctrl_idx)`
-/// plans and yields paired dense batches. See `PER-CELL-CONTROL-PAIRING.md` at
-/// the workspace root for the full design.
+/// `IndexPlanDataset` consumes caller-supplied `(pert_idx, ctrl_idx)` plans
+/// and returns paired dense batches. See `PER-CELL-CONTROL-PAIRING.md` at the
+/// workspace root for the full design.
 ///
-/// **Phase 0 — scaffolding only.** Construction raises `NotImplementedError`;
-/// the implementation lands in Phase 1.
+/// Phase 1 surface: `next_batch(plan)` is the only batch entry point. The
+/// streaming `iter_with_plans` API lands in Phase 4.
 #[pyclass]
 pub struct IndexPlanDataset {
-    _stub: (),
+    loader: Arc<IndexPlanLoader>,
+    /// PID at construction time — used to detect forking. The shard cache and
+    /// mmap state are not fork-safe; consumers must lazily construct the
+    /// dataset post-fork in each DataLoader worker.
+    creation_pid: u32,
 }
 
 #[pymethods]
 impl IndexPlanDataset {
+    /// Construct a plan-driven paired-batch reader.
+    ///
+    /// Args:
+    ///     path: Path to the .scx file.
+    ///     hvg_indices: Gene indices for HVG projection. None = all genes.
+    ///     obs_columns: Obs metadata column names to include in each batch.
+    ///     normalize: Apply total-count normalization (default: True).
+    ///     log1p: Reserved (default: True). Currently fused with `normalize`
+    ///         on this path, mirroring `TrainingDataset`.
+    ///     target_sum: Normalization target sum (default: 1e4).
+    ///     cache_shards: LRU shard cache budget (default: 128). Must be >= 1.
+    ///     max_memory_mb: Memory budget in MB (default: 512). Currently
+    ///         informational on this path; auto-tuning lands in Phase 5.
     #[new]
-    fn new() -> PyResult<Self> {
-        Err(PyRuntimeError::new_err(
-            "IndexPlanDataset is not yet implemented (scaffolding stub from Phase 0; \
-             implementation lands in Phase 1 — see PER-CELL-CONTROL-PAIRING.md).",
-        ))
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        path,
+        hvg_indices=None,
+        obs_columns=None,
+        normalize=None,
+        log1p=None,
+        target_sum=None,
+        cache_shards=None,
+        max_memory_mb=None,
+    ))]
+    fn new(
+        path: &str,
+        hvg_indices: Option<Vec<u32>>,
+        obs_columns: Option<Vec<String>>,
+        normalize: Option<bool>,
+        log1p: Option<bool>,
+        target_sum: Option<f64>,
+        cache_shards: Option<usize>,
+        max_memory_mb: Option<usize>,
+    ) -> PyResult<Self> {
+        let mut config = LoaderConfig::default();
+        if let Some(v) = hvg_indices {
+            config.hvg_indices = Some(v);
+        }
+        if let Some(v) = obs_columns {
+            config.obs_columns = v;
+        }
+        if let Some(v) = normalize {
+            config.normalize = v;
+        }
+        if let Some(v) = log1p {
+            config.log1p = v;
+        }
+        if let Some(v) = target_sum {
+            config.target_sum = v;
+        }
+        if let Some(v) = max_memory_mb {
+            config.max_memory_mb = v;
+        }
+
+        let cache_shards = cache_shards.unwrap_or(128);
+
+        let loader = IndexPlanLoader::new(path, config, cache_shards).map_err(loader_err_to_py)?;
+
+        Ok(Self {
+            loader: Arc::new(loader),
+            creation_pid: std::process::id(),
+        })
     }
+
+    /// Total number of observations (cells) in the dataset.
+    #[getter]
+    fn n_obs(&self) -> u64 {
+        self.loader.n_obs()
+    }
+
+    /// Total number of variables (genes) in the dataset.
+    #[getter]
+    fn n_vars(&self) -> u64 {
+        self.loader.n_vars()
+    }
+
+    /// Number of output genes per batch (HVG count if projection active).
+    #[getter]
+    fn n_output_genes(&self) -> usize {
+        self.loader.n_output_cols()
+    }
+
+    /// Process one plan and return a paired dense batch dict.
+    ///
+    /// Returns: `{"X": ndarray[B, G], "X_paired": ndarray[B, G],
+    /// "pairs": list[tuple[int, int]], "obs": {...}, "obs_paired": {...}}`.
+    ///
+    /// Phase 1 stepping-stone API; the iterator surface (`iter_with_plans`)
+    /// lands in Phase 4.
+    fn next_batch<'py>(
+        &self,
+        py: Python<'py>,
+        plan: Vec<(u64, u64)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.IndexPlanDataset requires num_workers=0 (or lazy per-worker \
+                 construction). The Rust shard cache and mmap state are not fork-safe.",
+            ));
+        }
+
+        let loader = Arc::clone(&self.loader);
+        let batch = py
+            .allow_threads(move || loader.process_plan(plan))
+            .map_err(loader_err_to_py)?;
+
+        index_plan_batch_to_dict(py, batch)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexPlanDataset(n_obs={}, n_vars={}, n_output_genes={})",
+            self.loader.n_obs(),
+            self.loader.n_vars(),
+            self.loader.n_output_cols(),
+        )
+    }
+}
+
+/// Map `LoaderError` → Python exception, picking the most precise type.
+fn loader_err_to_py(err: LoaderError) -> PyErr {
+    match err {
+        LoaderError::IndexOutOfRange { .. } => PyIndexError::new_err(err.to_string()),
+        LoaderError::ConfigError { ref reason } if reason.contains("not found in RecordBatch") => {
+            PyKeyError::new_err(err.to_string())
+        }
+        _ => PyRuntimeError::new_err(err.to_string()),
+    }
+}
+
+/// Encode a `HashMap<String, ObsColumn>` into a Python dict using the same
+/// schema as `TrainingDataset`'s batch dict (numeric → ndarray; categorical →
+/// `{"codes": ndarray, "categories": list[str]}`).
+fn obs_to_pydict<'py>(
+    py: Python<'py>,
+    obs: HashMap<String, ObsColumn>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let obs_dict = PyDict::new(py);
+    for (name, column) in obs {
+        match column {
+            ObsColumn::Int64(values) => {
+                let arr = PyArray1::from_vec(py, values);
+                obs_dict.set_item(&name, arr)?;
+            }
+            ObsColumn::Float64(values) => {
+                let arr = PyArray1::from_vec(py, values);
+                obs_dict.set_item(&name, arr)?;
+            }
+            ObsColumn::Categorical(codes, categories) => {
+                let cat_dict = PyDict::new(py);
+                let codes_i32: Vec<i32> = codes.into_iter().map(|c| c as i32).collect();
+                let codes_arr = PyArray1::from_vec(py, codes_i32);
+                cat_dict.set_item("codes", codes_arr)?;
+                let cat_list = PyList::new(py, &categories).map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create category list: {e}"))
+                })?;
+                cat_dict.set_item("categories", cat_list)?;
+                obs_dict.set_item(&name, cat_dict)?;
+            }
+        }
+    }
+    Ok(obs_dict)
+}
+
+/// Convert an `IndexPlanBatch` into the Python dict shape:
+/// `{"X", "X_paired", "pairs", "obs", "obs_paired"}`.
+fn index_plan_batch_to_dict<'py>(
+    py: Python<'py>,
+    batch: IndexPlanBatch,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+
+    let n_pairs = batch.n_pairs();
+    let n_cols = if n_pairs == 0 {
+        0
+    } else {
+        batch.x.len() / n_pairs
+    };
+
+    let x_array = PyArray1::from_vec(py, batch.x)
+        .reshape([n_pairs, n_cols])
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to reshape X array: {e}")))?;
+    dict.set_item("X", x_array)?;
+
+    let xp_array = PyArray1::from_vec(py, batch.x_paired)
+        .reshape([n_pairs, n_cols])
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to reshape X_paired array: {e}")))?;
+    dict.set_item("X_paired", xp_array)?;
+
+    let pairs_list = PyList::empty(py);
+    for (p, c) in &batch.pairs {
+        let tup = PyTuple::new(py, [*p, *c]).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to build pair tuple: {e}"))
+        })?;
+        pairs_list.append(tup)?;
+    }
+    dict.set_item("pairs", pairs_list)?;
+
+    dict.set_item("obs", obs_to_pydict(py, batch.obs)?)?;
+    dict.set_item("obs_paired", obs_to_pydict(py, batch.obs_paired)?)?;
+
+    Ok(dict)
 }
 
 /// Convert a `Batch` into a Python dict: `{"X": ndarray, "obs": {...}, "cell_indices": ndarray}`.
@@ -244,34 +449,7 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: Batch) -> PyResult<Bound<'py, PyDi
         .map_err(|e| PyRuntimeError::new_err(format!("failed to reshape X array: {e}")))?;
     dict.set_item("X", x_array)?;
 
-    // obs: dict of metadata columns
-    let obs_dict = PyDict::new(py);
-    for (name, column) in batch.obs {
-        match column {
-            ObsColumn::Int64(values) => {
-                let arr = PyArray1::from_vec(py, values);
-                obs_dict.set_item(&name, arr)?;
-            }
-            ObsColumn::Float64(values) => {
-                let arr = PyArray1::from_vec(py, values);
-                obs_dict.set_item(&name, arr)?;
-            }
-            ObsColumn::Categorical(codes, categories) => {
-                let cat_dict = PyDict::new(py);
-                // Codes as int32 (u32 → i32 for numpy compatibility)
-                let codes_i32: Vec<i32> = codes.into_iter().map(|c| c as i32).collect();
-                let codes_arr = PyArray1::from_vec(py, codes_i32);
-                cat_dict.set_item("codes", codes_arr)?;
-                // Categories as Python list of strings
-                let cat_list = PyList::new(py, &categories).map_err(|e| {
-                    PyRuntimeError::new_err(format!("failed to create category list: {e}"))
-                })?;
-                cat_dict.set_item("categories", cat_list)?;
-                obs_dict.set_item(&name, cat_dict)?;
-            }
-        }
-    }
-    dict.set_item("obs", obs_dict)?;
+    dict.set_item("obs", obs_to_pydict(py, batch.obs)?)?;
 
     // cell_indices: u64 → i64 for numpy compatibility
     let cell_indices_i64: Vec<i64> = batch
