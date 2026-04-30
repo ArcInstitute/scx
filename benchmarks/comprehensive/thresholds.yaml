@@ -284,6 +284,157 @@ absolute_floors:
     metric: slaf_equivalence_n_failed
     max: 0
 
+  # --- roundtrip codec parity (§3.5) ---------------------------------
+  # Catches silent value corruption in any of the SCX codecs: scx_auto
+  # (auto-selector), scx_none (raw LE), scx_scx1 (Delta-Golomb-Rice /
+  # FOR-BP / Rice), scx_zstd, scx_lz4 (byte-shuffle + LZ4), and
+  # scx_pcodec. correctness.py does NOT cover this — every check there
+  # writes and reads through the same codec, so a symmetric corruption
+  # (encode-then-decode that loses bits identically) goes undetected.
+  #
+  # All current SCX codecs are lossless by design, so the floor is
+  # exact equality. Comparison happens in float32 (pyscx always
+  # materialises X as f32, regardless of on-disk encoding) on a
+  # canonicalised CSR (sort_indices + eliminate_zeros on both sides) —
+  # see roundtrip.py module docstring.
+  #
+  # max_abs_diff / max_rel_diff are emitted as diagnostics but NOT
+  # floor-gated: redundant with n_value_mismatches == 0 for lossless
+  # codecs, and would need a non-zero tolerance once a future lossy
+  # variant lands.
+  #
+  # Coverage scope: pbmc3k + tabula_sapiens_100k for all 6 SCX
+  # variants. The benchmark still RUNS on whatever larger datasets the
+  # launcher passes (rows appear in the summary), but isn't floor-gated
+  # there — codec contracts are dataset-independent and these two
+  # datasets cover the u16 and u32 index paths (n_vars boundary at
+  # 65535).
+  #
+  # The scx_auto rows partly overlap with the explicit codec rows
+  # (auto-selector picks scx1 for pbmc3k's u8 counts), but keeping
+  # both catches a regression where scx_auto STOPS picking the right
+  # codec — the unmeasured selector-drift gap from §4.4 of the review.
+  - benchmark: roundtrip
+    format: scx_auto
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_auto
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_none
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_none
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_scx1
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_scx1
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_zstd
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_zstd
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_lz4
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_lz4
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_pcodec
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_pcodec
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_none
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_none
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_scx1
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_scx1
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_zstd
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_zstd
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_lz4
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_lz4
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_pcodec
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_pcodec
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+
   # --- cell_eval_parity_perf marquee floors (§3.3) -------------------
   # AGENTS.md headline claims:
   #   - energy_distance(backend="gemm", dtype="f32"): 52x at 20K x 2K x 50 perts

@@ -28,6 +28,11 @@ ALL_BENCHMARKS: list[str] = [
     # Correctness validation — scanpy / backed / preprocessing parity.
     # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
     "correctness",
+    # Codec write→read round-trip parity (§3.5). Compares the
+    # SCX-materialised matrix against the source h5ad to catch silent
+    # value-corruption regressions in any of the 6 SCX codecs. Format-gated
+    # to scx_* variants inside the module.
+    "roundtrip",
     # Cell-eval / arc-bench parity perf — SCX-only (gated on scx_auto).
     # Requires the scx-bench-eval conda env (cell_eval / arc_bench / pdex).
     "cell_eval_parity_perf",

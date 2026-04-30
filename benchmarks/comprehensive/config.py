@@ -744,6 +744,11 @@ def estimate_memory_gb(
         # for the pbmc3k+tabula_sapiens_100k combined run; size like
         # read_full but with a 1.5x safety multiplier on top.
         peak_mb = max(base_mb * 2, dense_mb * 1.5)
+    elif benchmark == "roundtrip":
+        # Holds source AnnData + SCX-materialised AnnData simultaneously,
+        # plus the (a - b) CSR diff scratch during comparison. No scanpy
+        # pipeline (cheaper than correctness's dense_mb * 1.5).
+        peak_mb = max(base_mb * 2, dense_mb * 1.0)
     elif benchmark == "cell_eval_parity_perf":
         # Holds adata_real + adata_pred + raw_adata simultaneously, plus
         # per-op working buffers (clustering_agreement materialises a
@@ -827,6 +832,7 @@ def estimate_time_minutes(
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
         "ml_loader":              45,
         "correctness":            60,
+        "roundtrip":              10,
         "cell_eval_parity_perf":  60,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
@@ -865,6 +871,11 @@ def estimate_time_minutes(
         # round-trip — UMAP/Leiden/DE pipelines dominate at scale.
         # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
         slope_minutes_per_million = 240
+    elif benchmark == "roundtrip":
+        # Two reads (h5ad + SCX) + one CSR diff. Faster than read_full's
+        # default 8 min/M because no preprocessing; bounded by anndata's
+        # h5ad parse and pyscx's f32 materialisation.
+        slope_minutes_per_million = 4
     elif benchmark == "cell_eval_parity_perf":
         # cell-eval's edistance reference is O(n_obs^2) pairwise distance
         # × n_perts × n_runs, so wall-time scales near-quadratically with
