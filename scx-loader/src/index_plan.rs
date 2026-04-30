@@ -255,14 +255,14 @@ impl IndexPlanLoader {
 
             match &self.hvg_projection {
                 Some(hvg) => {
-                    hvg.scatter_row(
+                    // Phase 3: walk gene_indices once, write both outputs in a
+                    // single pass; bit-identical to two scatter_row calls.
+                    hvg.scatter_pair_rows(
                         &pert_csr.indices[pi_lo..pi_hi],
                         &pert_csr.data[pi_lo..pi_hi],
-                        p_out,
-                    );
-                    hvg.scatter_row(
                         &ctrl_csr.indices[ci_lo..ci_hi],
                         &ctrl_csr.data[ci_lo..ci_hi],
+                        p_out,
                         c_out,
                     );
                 }
