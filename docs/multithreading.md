@@ -81,9 +81,8 @@ Shard groups are sent through a bounded `tokio::sync::mpsc` channel
 lifetime is bounded by the I/O thread — it is constructed inside the thread
 closure on each `start_epoch` call and dropped when the thread exits, so
 `TrainingPipeline` itself holds no long-lived runtime between epochs. This
-restructuring (DEADLOCK-ISSUE.md §2.1 / §2.2) replaces the original
-`new_multi_thread().worker_threads(2)` field-on-pipeline runtime with a model
-that is fork-safe by construction.
+restructuring replaces the original `new_multi_thread().worker_threads(2)`
+field-on-pipeline runtime with a model that is fork-safe by construction.
 
 ### Stage 2: Decode (std::thread + per-pipeline rayon pool)
 
@@ -103,8 +102,7 @@ persisted across epochs for the same `TrainingPipeline`, and dropped in
 > duplicated by `fork()` — dispatch deadlocks forever in
 > `LockLatch::wait_and_reset`. The per-pipeline pool sidesteps this entirely:
 > it is constructed *inside the worker process* on the first `start_epoch`
-> call. See DEADLOCK-ISSUE.md Phase 1 Diagnosis for the gdb stack trace and
-> the smallest reproducer.
+> call.
 
 ### Stage 3: Consumer (Python main thread)
 
@@ -123,7 +121,7 @@ rayon pool. `Drop` runs the same flow as a fallback. Both stages return
 (consumer drops `batch_rx` → decode's crossbeam send fails → decode exits
 → tokio mpsc closes → I/O thread's send fails → I/O exits → runtime
 drops); that error is filtered out at `join_epoch_handles` so it never
-reaches callers (DEADLOCK-ISSUE.md §2.4).
+reaches callers.
 
 ### Fork safety
 
@@ -139,9 +137,9 @@ fork-hostile state from the parent. The eager-construct-then-fork case is
 caught by the PID check in `__next__` (`scx-loader/src/python.rs:134-141`).
 
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
-post-fix Lambda HPC measurements (DEADLOCK-ISSUE.md §5.2) confirm the
-workers0 / workers2 paths run cleanly end-to-end. See
-`comprehensive/results/baselines/LATEST/summary.json` for the canonical
+post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
+run cleanly end-to-end. 
+See `comprehensive/results/baselines/LATEST/summary.json` for the canonical
 `ml_loader` floors once the next baseline is promoted (the Lambda-side
 Phase-5 calibration sets `pyscx_training_dataset_workers2{,_persistent}`
 floors to 0.5× the post-fix median per the gate's convention).
