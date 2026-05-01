@@ -1,0 +1,72 @@
+[
+  {
+    "dataset": "pbmc3k",
+    "sysinfo": {
+      "hostname": "vci-steady-state-node-018",
+      "cpu": "Intel(R) Xeon(R) Platinum 8480+",
+      "ram_gb": 1771.7,
+      "gpus": [],
+      "pyscx": "available",
+      "torch": "2.11.0+cu128",
+      "cuda_available": false,
+      "tiledbsoma": "missing"
+    },
+    "timestamp": "2026-05-01 15:34:46",
+    "benchmarks": {
+      "throughput": {
+        "benchmark": "throughput",
+        "dataset": "pbmc3k",
+        "batch_size": 1024,
+        "n_hvg": 2000,
+        "normalize": true,
+        "n_epochs": 1,
+        "total_batches": 3,
+        "total_cells": 2700,
+        "total_time_s": 0.033,
+        "batches_per_sec": 90.9,
+        "cells_per_sec": 81808.0,
+        "epoch_times_s": [
+          0.033
+        ]
+      },
+      "time_to_first_batch": {
+        "benchmark": "time_to_first_batch",
+        "dataset": "pbmc3k",
+        "n_runs": 3,
+        "median_s": 0.0214,
+        "min_s": 0.015,
+        "max_s": 0.0258,
+        "p95_s": 0.0258,
+        "all_s": [
+          0.015,
+          0.0214,
+          0.0258
+        ],
+        "target_s": 2.0,
+        "pass": true
+      },
+      "memory": {
+        "benchmark": "memory",
+        "dataset": "pbmc3k",
+        "max_memory_mb": 512,
+        "peak_rss_mb": 777.2,
+        "rss_before_mb": 744.8,
+        "file_size_mb": 4.2,
+        "adjusted_rss_mb": 773.0,
+        "n_batches": 11,
+        "effective_batch_size": 256,
+        "budget_exceeded": false,
+        "within_budget": false
+      },
+      "baseline_anndata": {
+        "benchmark": "baseline_anndata",
+        "dataset": "pbmc3k",
+        "load_time_s": 0.044,
+        "iter_time_s": 0.246,
+        "total_time_s": 0.29,
+        "n_batches": 3,
+        "batches_per_sec": 10.3
+      }
+    }
+  }
+]

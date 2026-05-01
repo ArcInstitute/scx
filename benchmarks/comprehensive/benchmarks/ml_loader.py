@@ -241,6 +241,127 @@ def _run_scx_epoch(
     return _EpochResult(n_batches=n_batches, n_cells=n_cells)
 
 
+# ---------------------------------------------------------------------------
+# `num_workers > 0` scenarios (DEADLOCK-ISSUE.md §5.3)
+#
+# `pyscx_training_dataset_workers2` and `pyscx_training_dataset_workers2_persistent`
+# wrap `pyscx.TrainingDataset` in a tiny `IterableDataset` shim that
+# constructs the inner dataset lazily inside `__iter__` (the pattern used by
+# `cell-load-scx/ScxTrainingDataset`). Each worker shards by batch index
+# (`i % info.num_workers == info.id`) so every cell is yielded exactly once
+# across workers — same scope as `num_workers=0` for direct throughput
+# comparison.
+#
+# Pre-Phase-2: this code path deadlocked at the first batch. Post-Phase-2:
+# emits `batches_per_sec__*`, `peak_rss_mb__*`, `cells_per_sec__*` for the
+# regression gate (`thresholds.yaml`).
+# ---------------------------------------------------------------------------
+
+
+if _HAS_TORCH:
+    import torch.utils.data as _td_for_shim
+
+    class _LazyShardedShim(_td_for_shim.IterableDataset):  # type: ignore[misc]
+        """Top-level (picklable under spawn) IterableDataset shim around
+        `pyscx.TrainingDataset`. Mirrors the `cell-load-scx` lazy-construct
+        pattern exactly so the benchmark exercises the production code
+        path. Defined at module level (inside the `_HAS_TORCH` guard) so
+        `multiprocessing.spawn` workers can pickle it by qualified name."""
+
+        def __init__(
+            self,
+            path: str,
+            batch_size: int,
+            hvg: bool,
+            normalize: bool,
+            seed: int,
+        ) -> None:
+            super().__init__()
+            self.path = path
+            self.batch_size = batch_size
+            self.hvg = hvg
+            self.normalize = normalize
+            self.seed = seed
+
+        def __iter__(self):
+            import pyscx
+            import torch.utils.data as _td
+
+            info = _td.get_worker_info()
+            worker_id = info.id if info is not None else 0
+            num_workers = info.num_workers if info is not None else 1
+
+            hvg_indices = list(range(QUERY_N_HVGS)) if self.hvg else None
+            ds = pyscx.TrainingDataset(
+                self.path,
+                batch_size=self.batch_size,
+                hvg_indices=hvg_indices,
+                normalize=self.normalize,
+                log1p=self.normalize,
+                seed=self.seed,
+            )
+            try:
+                for i, batch in enumerate(ds):
+                    if i % num_workers == worker_id:
+                        yield batch
+            finally:
+                # Phase 2.5 close() — release the per-pipeline rayon pool +
+                # tokio runtime promptly between epochs / workers.
+                ds.close()
+
+
+def _make_workers2_iterable_dataset(
+    path: str, batch_size: int, hvg: bool, normalize: bool, seed: int
+):
+    """Construct the lazy-sharded shim. Requires torch to be installed —
+    callers gate on `_HAS_TORCH` before invoking."""
+    if not _HAS_TORCH:
+        raise RuntimeError(
+            "_make_workers2_iterable_dataset requires torch.utils.data; "
+            "callers must gate on _HAS_TORCH"
+        )
+    return _LazyShardedShim(path, batch_size, hvg, normalize, seed)
+
+
+def _run_scx_dataloader_workers_epoch(
+    path: str,
+    batch_size: int,
+    hvg: bool,
+    normalize: bool,
+    seed: int,
+    num_workers: int,
+    persistent_workers: bool,
+    n_epochs: int,
+) -> _EpochResult:
+    """Drive a full epoch (or `n_epochs`) through
+    `torch.utils.data.DataLoader(num_workers>0)` against the lazy-construct
+    shim. Returns aggregate counts across all epochs."""
+    import torch.utils.data as _td
+
+    ds = _make_workers2_iterable_dataset(path, batch_size, hvg, normalize, seed)
+    loader = _td.DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        collate_fn=_passthrough_collate,
+    )
+    n_batches = 0
+    n_cells = 0
+    for _ in range(n_epochs):
+        for batch in loader:
+            n_batches += 1
+            n_cells += batch["X"].shape[0]
+    return _EpochResult(n_batches=n_batches, n_cells=n_cells)
+
+
+def _passthrough_collate(batch):
+    """Top-level passthrough collate (lambdas are not picklable under spawn).
+    The DataLoader calls this with a single yielded batch; we return it
+    unchanged so the consumer sees the same dict shape as `num_workers=0`."""
+    return batch
+
+
 def _run_anndata_epoch(
     h5ad_path: str, batch_size: int, hvg: bool, normalize: bool, seed: int
 ) -> _EpochResult:
@@ -1017,6 +1138,143 @@ def run(
                 logger.error("  GPU training failed: %s", e)
                 scenario_summary["gpu_train"] = {"error": str(e)}
             gc.collect()
+
+        # ---------------------------------------------------------------
+        # `num_workers > 0` DataLoader scenarios (SCX-only, post-fix)
+        # DEADLOCK-ISSUE.md §5.3
+        # ---------------------------------------------------------------
+        if loader_type == "scx" and _HAS_TORCH:
+            for scenario_name, persistent_workers, n_epochs_per_run in (
+                ("pyscx_training_dataset_workers2", False, 1),
+                ("pyscx_training_dataset_workers2_persistent", True, 2),
+            ):
+                logger.info(
+                    "--- Scenario: %s (format=%s, dataset=%s) ---",
+                    scenario_name,
+                    format_variant.key,
+                    dataset.name,
+                )
+                # Use the `hvg_norm` configuration so this scenario's
+                # throughput is directly comparable to the existing
+                # `batches_per_sec__hvg_norm` floor under num_workers=0.
+                hvg, normalize = True, True
+                epoch_fn = (
+                    lambda hvg=hvg,
+                    normalize=normalize,
+                    persistent_workers=persistent_workers,
+                    n_epochs_per_run=n_epochs_per_run: _run_scx_dataloader_workers_epoch(
+                        data_path,
+                        ML_BATCH_SIZE,
+                        hvg,
+                        normalize,
+                        RANDOM_SEED,
+                        num_workers=2,
+                        persistent_workers=persistent_workers,
+                        n_epochs=n_epochs_per_run,
+                    )
+                )
+
+                # Warmup
+                try:
+                    for _ in range(N_WARMUP_RUNS):
+                        logger.info("  Warmup epoch")
+                        epoch_fn()
+                        gc.collect()
+                except Exception as e:
+                    logger.error(
+                        "  Warmup failed for scenario %s: %s",
+                        scenario_name,
+                        e,
+                    )
+                    scenario_summary[scenario_name] = {"error": str(e)}
+                    continue
+
+                # Timed runs (no separate TTFB measurement — the
+                # DataLoader-spawn overhead is part of "first batch latency"
+                # in the workers2 scenario by definition; tracking it
+                # separately would double-count the same delay).
+                run_bps_w2: list[float] = []
+                run_cps_w2: list[float] = []
+                run_rss_w2: list[float] = []
+
+                for i in range(n_runs):
+                    logger.info("  Timed run %d/%d", i + 1, n_runs)
+                    try:
+                        epoch_result, wall_s, user_s, sys_s, peak_rss = (
+                            _timed_epoch(epoch_fn)
+                        )
+                    except Exception as e:
+                        logger.error("  Run %d failed: %s", i + 1, e)
+                        continue
+
+                    # Normalise by `n_epochs_per_run` so the metric is
+                    # per-epoch throughput regardless of how many epochs
+                    # the persistent variant ran (apples-to-apples vs
+                    # the non-persistent variant).
+                    bps_per_epoch = (
+                        (epoch_result.n_batches / n_epochs_per_run) / wall_s
+                        if wall_s > 0
+                        else 0.0
+                    )
+                    cps_per_epoch = (
+                        (epoch_result.n_cells / n_epochs_per_run) / wall_s
+                        if wall_s > 0
+                        else 0.0
+                    )
+                    # The wall-clock for the persistent variant covers
+                    # multiple epochs; report wall_s_per_epoch for sanity.
+                    wall_s_per_epoch = wall_s / n_epochs_per_run
+
+                    run_extra = {
+                        "scenario": scenario_name,
+                        "n_batches": epoch_result.n_batches,
+                        "n_cells": epoch_result.n_cells,
+                        "n_epochs_per_run": n_epochs_per_run,
+                        "wall_s_per_epoch": round(wall_s_per_epoch, 4),
+                        "batches_per_sec": round(bps_per_epoch, 1),
+                        "cells_per_sec": round(cps_per_epoch, 0),
+                        f"batches_per_sec__{scenario_name}": round(
+                            bps_per_epoch, 1
+                        ),
+                        f"cells_per_sec__{scenario_name}": round(cps_per_epoch, 0),
+                        f"peak_rss_mb__{scenario_name}": round(peak_rss, 1),
+                    }
+
+                    result.add_run(
+                        wall_s=wall_s,
+                        user_s=user_s,
+                        sys_s=sys_s,
+                        peak_rss_mb=peak_rss,
+                        **run_extra,
+                    )
+
+                    run_bps_w2.append(bps_per_epoch)
+                    run_cps_w2.append(cps_per_epoch)
+                    run_rss_w2.append(peak_rss)
+
+                    logger.info(
+                        "    wall=%.3fs/epoch  bps=%.1f  rss=%.1fMB",
+                        wall_s_per_epoch,
+                        bps_per_epoch,
+                        peak_rss,
+                    )
+
+                summary_w2: dict[str, Any] = {"n_runs": len(run_bps_w2)}
+                if run_bps_w2:
+                    summary_w2["median_batches_per_sec"] = round(
+                        statistics.median(run_bps_w2), 1
+                    )
+                    summary_w2["median_cells_per_sec"] = round(
+                        statistics.median(run_cps_w2), 0
+                    )
+                    summary_w2["median_peak_rss_mb"] = round(
+                        statistics.median(run_rss_w2), 1
+                    )
+                summary_w2["num_workers"] = 2
+                summary_w2["persistent_workers"] = persistent_workers
+                summary_w2["n_epochs_per_run"] = n_epochs_per_run
+                scenario_summary[scenario_name] = summary_w2
+                gc.collect()
 
     finally:
         if _cleanup is not None:

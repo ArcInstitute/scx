@@ -66,24 +66,43 @@ saturated by overlapping I/O, decode, and consumption:
 ```
 ┌──────────────────┐    tokio::mpsc     ┌──────────────────┐   crossbeam   ┌───────────────┐
 │  Stage 1: I/O    │ ─────────────────→ │  Stage 2: Decode │ ───────────→  │  Stage 3:     │
-│  (tokio async,   │   ShardGroup       │  (std::thread +  │   Batch       │  Consumer     │
-│   2 workers)     │                    │   rayon par_*)   │               │  (Python/GPU) │
+│  (std::thread +  │   ShardGroup       │  (std::thread +  │   Batch       │  Consumer     │
+│   tokio current_ │                    │   per-pipeline   │               │  (Python/GPU) │
+│   thread RT)     │                    │   rayon pool)    │               │               │
 └──────────────────┘                    └──────────────────┘               └───────────────┘
 ```
 
-### Stage 1: I/O (tokio)
+### Stage 1: I/O (dedicated `std::thread` + tokio current-thread runtime)
 
-A tokio runtime with 2 worker threads reads shard groups from the memory-mapped
-file. Shard groups are sent through a bounded `tokio::sync::mpsc` channel
-(capacity 2) to provide read-ahead without unbounded buffering.
+The I/O stage runs on a dedicated OS thread (`scx-io`) that builds and drives
+its own `tokio::runtime::Builder::new_current_thread()` runtime via `block_on`.
+Shard groups are sent through a bounded `tokio::sync::mpsc` channel
+(capacity 2) to provide read-ahead without unbounded buffering. The runtime's
+lifetime is bounded by the I/O thread — it is constructed inside the thread
+closure on each `start_epoch` call and dropped when the thread exits, so
+`TrainingPipeline` itself holds no long-lived runtime between epochs. This
+restructuring replaces the original `new_multi_thread().worker_threads(2)`
+field-on-pipeline runtime with a model that is fork-safe by construction.
 
-### Stage 2: Decode (std::thread + rayon)
+### Stage 2: Decode (std::thread + per-pipeline rayon pool)
 
-A dedicated OS thread (`scx-decode`) receives shard groups and uses rayon's
-`par_chunks_mut` to fill the output batch in parallel — each rayon thread
-handles one row's sparse-to-dense conversion, HVG projection, and
-normalize+log1p in a single fused pass. Completed batches are sent through a
-bounded `crossbeam` channel (capacity = `prefetch_batches`, minimum 2).
+A dedicated OS thread (`scx-decode`) receives shard groups and dispatches
+the per-row sparse-to-dense scatter + HVG projection + fused normalize+log1p
+to a **per-`TrainingPipeline` `rayon::ThreadPool`** via `pool.install(...)`.
+The pool is built lazily inside `start_epoch` via
+`rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get_physical().min(8))`,
+persisted across epochs for the same `TrainingPipeline`, and dropped in
+`shutdown()` / `Drop`. Completed batches are sent through a bounded
+`crossbeam` channel (capacity = `prefetch_batches`, minimum 2).
+
+> [!IMPORTANT]
+> The decode stage **must not** call `rayon::par_*` against the process-global
+> registry. Under PyTorch fork-mode DataLoader workers, the parent's global
+> rayon pool is inherited as a data structure but its worker threads are not
+> duplicated by `fork()` — dispatch deadlocks forever in
+> `LockLatch::wait_and_reset`. The per-pipeline pool sidesteps this entirely:
+> it is constructed *inside the worker process* on the first `start_epoch`
+> call.
 
 ### Stage 3: Consumer (Python main thread)
 
@@ -91,12 +110,46 @@ bounded `crossbeam` channel (capacity = `prefetch_batches`, minimum 2).
 while pulling the next batch from the channel, allowing PyTorch CUDA threads to
 run concurrently.
 
+### Shutdown contract
+
+`TrainingDataset.close()` (Python) calls `TrainingPipeline::shutdown()`
+(Rust), which drops the batch receiver, joins the I/O and decode threads
+under a 5 s deadline (`join_handle_bounded`; on timeout the thread is
+detached and a `tracing::warn!` is logged), and drops the per-pipeline
+rayon pool. `Drop` runs the same flow as a fallback. Both stages return
+`LoaderError::ChannelError` on the natural shutdown propagation chain
+(consumer drops `batch_rx` → decode's crossbeam send fails → decode exits
+→ tokio mpsc closes → I/O thread's send fails → I/O exits → runtime
+drops); that error is filtered out at `join_epoch_handles` so it never
+reaches callers.
+
+### Fork safety
+
+The pipeline is fork-safe under
+`torch.utils.data.DataLoader(num_workers > 0, start_method="fork")` **when
+the dataset is constructed lazily inside the worker's `__iter__`**. Both
+the tokio current-thread runtime (per-epoch, lives on the I/O thread) and
+the rayon `ThreadPool` (per-instance, lazily built on first
+`start_epoch`) are constructed inside the worker process, so the
+`TrainingPipeline` value contains no live runtime, registry, or worker
+threads at construction time. A forked child therefore inherits no
+fork-hostile state from the parent. The eager-construct-then-fork case is
+caught by the PID check in `__next__` (`scx-loader/src/python.rs:134-141`).
+
+`pyscx/tests/test_fork_safety.py` is the durable regression test;
+post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
+run cleanly end-to-end. 
+See `comprehensive/results/baselines/LATEST/summary.json` for the canonical
+`ml_loader` floors once the next baseline is promoted (the Lambda-side
+Phase-5 calibration sets `pyscx_training_dataset_workers2{,_persistent}`
+floors to 0.5× the post-fix median per the gate's convention).
+
 ### Why three runtimes?
 
 | Runtime | Reason |
 |---------|--------|
-| tokio | Async I/O with efficient epoll/io_uring integration |
-| rayon | Work-stealing for CPU-bound decode/normalize |
+| tokio (current-thread, per I/O thread) | Async I/O with efficient epoll/io_uring integration; per-thread runtime keeps the fork-hostile thread count at zero |
+| rayon (per-pipeline pool) | Work-stealing for CPU-bound decode/normalize, isolated from the global registry |
 | std::thread | Bridges async and sync worlds without blocking the tokio reactor |
 
 > [!IMPORTANT]

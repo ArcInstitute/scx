@@ -212,6 +212,24 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // a subsequent re-import is a no-op.
     let _ = pyo3_log::try_init();
 
+    // Route Rust-side `tracing::*!` events to stderr when RUST_LOG is set
+    // (DEADLOCK-ISSUE.md §2.7). Off by default — `try_init()` is a no-op
+    // on subsequent imports and silent without RUST_LOG. The
+    // `TrainingPipeline::{new, start_epoch, next_batch, drop, shutdown}`
+    // spans + `decode` / `I/O` thread entry/exit traces from Phase 1.4
+    // surface here. We use stderr rather than Python `logging` because
+    // `tracing-subscriber → log → pyo3-log` would require an extra bridge
+    // layer for negligible gain on a diagnostic path that is already
+    // gated.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_target(true)
+        .with_thread_names(true)
+        .try_init();
+
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.
     // Best-effort: if anndata isn't installed we skip silently (common on

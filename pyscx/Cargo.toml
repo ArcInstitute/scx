@@ -30,6 +30,8 @@ rayon = { workspace = true }
 blake3 = { workspace = true }
 log = { workspace = true }
 pyo3-log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 cloud = ["scx-cloud", "tokio"]

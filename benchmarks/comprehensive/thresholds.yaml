@@ -237,6 +237,40 @@ absolute_floors:
     metric: batches_per_sec__hvg_norm
     min: 10.0
 
+  # `num_workers > 0` floors (DEADLOCK-ISSUE.md §5.3). Activated post
+  # Phase-2 — pre-fix this path deadlocked, so no historical baseline
+  # exists. Floors are seeded conservatively at 0.0 (any non-zero
+  # throughput is an improvement over an infinite hang) and will be
+  # re-baselined to 0.5× the post-fix median by Phase 5.5
+  # (`promote_baseline.py --version v0.X.Y-fork-safety`). Once that
+  # baseline lands, replace `min: 0.0` with the calibrated floors and
+  # write a justification under
+  # `benchmarks/comprehensive/results/justifications/`.
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__pyscx_training_dataset_workers2
+    min: 647.2
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__pyscx_training_dataset_workers2_persistent
+    min: 680.8
+
+  # DEADLOCK-ISSUE.md §7.4 — IndexPlanDataset workers2 floor. Same
+  # 0.5×-of-post-fix-median convention as the workers2 entries above.
+  # Calibrated 2026-05-01 from SLURM job 113080 (Lambda HPC, H100, 100k
+  # synthetic fixture): median workers2 throughput 144.64 bps; floor =
+  # 0.5 × 144.64 ≈ 72.3 bps. Workers2 is ~0.36× workers0 (404.4 bps) —
+  # lower than the TrainingDataset workers2 ratio (~0.50×) because each
+  # worker thrashes the shard cache on a non-locality-sorted random
+  # plan stream.
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__pyscx_index_plan_dataset_workers2
+    min: 72.3
+
   # --- correctness validation suite (§3.2) ---------------------------
   # Hard parity gate: any failure in scanpy-equivalence,
   # backed-mode-equivalence, preprocessing-paths, or SLAF round-trip

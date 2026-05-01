@@ -905,9 +905,14 @@ def estimate_time_minutes(
 def partition_for_memory(mem_gb: int, default: str = "cpu_preemptible") -> str:
     """Auto-route to ``cpu_high_mem`` when ``mem_gb`` exceeds the preemptible
     cap, otherwise stay on ``default``.
+
+    Honours `SCX_BENCH_HIGH_MEM_PARTITION` env var (default: ``cpu_high_mem``)
+    so clusters without a `cpu_high_mem` partition (e.g. Lambda HPC, where
+    the equivalent role is filled by `large_batch`) can redirect the
+    auto-promotion target without touching the call sites.
     """
     if mem_gb > MEM_HIGH_MEM_THRESHOLD_GB:
-        return "cpu_high_mem"
+        return os.environ.get("SCX_BENCH_HIGH_MEM_PARTITION", "cpu_high_mem")
     return default
 
 

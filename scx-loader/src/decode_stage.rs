@@ -9,7 +9,6 @@
 //! and [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use arrow::array::{
@@ -103,6 +102,14 @@ impl ShardGroupIndex {
 
 // ---------------------------------------------------------------------------
 // D3: Parallel row scatter with rayon
+//
+// **Pool ownership.** All parallel-iterator dispatch in this module runs
+// inside `pool.install(|| { ... })` against a per-`TrainingPipeline`
+// `rayon::ThreadPool` passed in from `start_epoch`. Do *not* call
+// `rayon::par_*` against the global registry from any code reachable on
+// the worker hot path — under fork-mode DataLoader workers the global
+// pool's worker threads do not survive `fork()` and the dispatch hangs
+// forever. See `fill_batch_parallel` doc + DEADLOCK-ISSUE.md Phase 2.
 // ---------------------------------------------------------------------------
 
 /// Fill a batch by scattering CSR rows into a dense matrix in parallel.
@@ -110,6 +117,19 @@ impl ShardGroupIndex {
 /// Each row in the batch is filled by an independent rayon thread via
 /// `par_chunks_mut`, providing safe non-overlapping mutable slices without
 /// `unsafe` code.
+///
+/// **Fork-safety contract** (DEADLOCK-ISSUE.md §2.0b). `pool` MUST be a
+/// per-`TrainingPipeline` `rayon::ThreadPool` constructed *after* any fork
+/// (i.e. inside the worker process, in `start_epoch`). The function dispatches
+/// its `par_chunks_mut().zip(par_iter()).for_each(...)` via `pool.install`
+/// so rayon routes the work to *that* pool's worker queue rather than the
+/// process-global registry. If this function is ever called against rayon's
+/// global pool from a forked child whose parent had already initialised that
+/// pool (which is the common case under PyTorch DataLoader workers), the
+/// inherited pool's worker threads do not exist post-fork and the dispatch
+/// hangs forever in `LockLatch::wait_and_reset`. See Phase 1 Diagnosis in
+/// DEADLOCK-ISSUE.md for the gdb stack trace and reproducer.
+#[allow(clippy::too_many_arguments)]
 fn fill_batch_parallel(
     batch_cell_indices: &[u64],
     group_index: &ShardGroupIndex,
@@ -118,6 +138,7 @@ fn fill_batch_parallel(
     normalize: Option<f64>,
     log1p: bool,
     n_output_genes: usize,
+    pool: &rayon::ThreadPool,
 ) -> Result<Vec<f32>> {
     let n_rows = batch_cell_indices.len();
     let mut x = vec![0.0f32; n_rows * n_output_genes];
@@ -126,63 +147,42 @@ fn fill_batch_parallel(
         return Ok(x);
     }
 
-    // Capture the first error from rayon threads (if any).
-    let first_error: Mutex<Option<LoaderError>> = Mutex::new(None);
-
     // Split the output buffer into per-row chunks and process in parallel.
-    // Pair each row chunk with its corresponding cell index.
-    x.par_chunks_mut(n_output_genes)
-        .zip(batch_cell_indices.par_iter())
-        .for_each(|(output_row, &global_cell_idx)| {
-            // Skip work if a previous iteration already failed.
-            if first_error.lock().unwrap().is_some() {
-                return;
-            }
+    // Pair each row chunk with its corresponding cell index. `pool.install`
+    // routes the parallel work to the per-pipeline pool — *not* the global
+    // registry, which would deadlock under fork (see doc comment).
+    //
+    // `try_for_each` short-circuits on the first `Err` and propagates it as
+    // the closure's return value, so we avoid a per-row mutex check on the
+    // hot path.
+    pool.install(|| {
+        x.par_chunks_mut(n_output_genes)
+            .zip(batch_cell_indices.par_iter())
+            .try_for_each(|(output_row, &global_cell_idx)| -> Result<()> {
+                let (csr_indices, csr_data) = group_index.get_row(global_cell_idx, group)?;
 
-            let (csr_indices, csr_data) = match group_index.get_row(global_cell_idx, group) {
-                Ok(row) => row,
-                Err(e) => {
-                    let mut guard = first_error.lock().unwrap();
-                    if guard.is_none() {
-                        *guard = Some(e);
+                // Scatter CSR row into dense output row (with or without projection)
+                match projection {
+                    Some(proj) => proj.scatter_row(csr_indices, csr_data, output_row),
+                    None => scatter_row_full(csr_indices, csr_data, output_row)?,
+                }
+
+                // Apply fused normalize+log1p if configured
+                match (normalize, log1p) {
+                    (Some(target_sum), true) => {
+                        fused_normalize_log1p_dense(output_row, target_sum);
                     }
-                    return;
-                }
-            };
-
-            // Scatter CSR row into dense output row (with or without projection)
-            match projection {
-                Some(proj) => proj.scatter_row(csr_indices, csr_data, output_row),
-                None => {
-                    if let Err(e) = scatter_row_full(csr_indices, csr_data, output_row) {
-                        let mut guard = first_error.lock().unwrap();
-                        if guard.is_none() {
-                            *guard = Some(e);
-                        }
-                        return;
+                    (Some(target_sum), false) => {
+                        crate::normalize::normalize_dense_row(output_row, target_sum);
                     }
+                    (None, true) => {
+                        crate::normalize::log1p_dense_row(output_row);
+                    }
+                    (None, false) => {} // no-op
                 }
-            }
-
-            // Apply fused normalize+log1p if configured
-            match (normalize, log1p) {
-                (Some(target_sum), true) => {
-                    fused_normalize_log1p_dense(output_row, target_sum);
-                }
-                (Some(target_sum), false) => {
-                    crate::normalize::normalize_dense_row(output_row, target_sum);
-                }
-                (None, true) => {
-                    crate::normalize::log1p_dense_row(output_row);
-                }
-                (None, false) => {} // no-op
-            }
-        });
-
-    // Check if any rayon thread encountered an error.
-    if let Some(err) = first_error.into_inner().unwrap() {
-        return Err(err);
-    }
+                Ok(())
+            })
+    })?;
 
     Ok(x)
 }
@@ -403,6 +403,12 @@ fn extract_single_column(
 /// 8. Sending completed `Batch` via bounded channel
 ///
 /// The last batch in a shard group may be shorter than `batch_size`.
+///
+/// `pool` is the per-pipeline rayon pool that drives `fill_batch_parallel`'s
+/// parallel scatter — see `fill_batch_parallel`'s doc comment for the
+/// fork-safety rationale. The pool is owned by the `TrainingPipeline` and
+/// lives across epochs; the decode thread only borrows it.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_stage(
     mut rx: tokio::sync::mpsc::Receiver<ShardGroup>,
     tx: crossbeam_channel::Sender<Batch>,
@@ -411,6 +417,7 @@ pub fn decode_stage(
     projection: Option<HvgProjection>,
     obs_metadata: &RecordBatch,
     epoch: u64,
+    pool: &rayon::ThreadPool,
 ) -> Result<()> {
     let n_output_genes = match &projection {
         Some(proj) => proj.n_output_cols(),
@@ -471,6 +478,7 @@ pub fn decode_stage(
                 normalize_target,
                 config.log1p,
                 n_output_genes,
+                pool,
             )?;
             total_scatter_us += t_scatter.elapsed().as_micros();
 
@@ -523,6 +531,17 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    /// Build a small per-test rayon `ThreadPool` for `decode_stage` /
+    /// `fill_batch_parallel` calls. Mirrors the fork-safe per-pipeline pool
+    /// construction in `TrainingPipeline::start_epoch` (DEADLOCK-ISSUE.md
+    /// §2.0a) so tests exercise the same dispatch path as production.
+    fn test_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+    }
 
     /// Helper: create a simple ShardData with known CSR data.
     /// Each row has 2 nonzeros at known column positions.
@@ -661,8 +680,17 @@ mod tests {
         let n_genes = 10;
 
         // Parallel fill
-        let parallel_x =
-            fill_batch_parallel(&cell_indices, &index, &group, None, None, false, n_genes).unwrap();
+        let parallel_x = fill_batch_parallel(
+            &cell_indices,
+            &index,
+            &group,
+            None,
+            None,
+            false,
+            n_genes,
+            &test_pool(),
+        )
+        .unwrap();
 
         // Sequential fill (manual)
         let mut sequential_x = vec![0.0f32; 4 * n_genes];
@@ -696,6 +724,7 @@ mod tests {
             None,
             false,
             n_output,
+            &test_pool(),
         )
         .unwrap();
 
@@ -726,8 +755,17 @@ mod tests {
         let cell_indices: Vec<u64> = vec![0, 1, 2];
         let n_genes = 10;
 
-        let x =
-            fill_batch_parallel(&cell_indices, &index, &group, None, None, false, n_genes).unwrap();
+        let x = fill_batch_parallel(
+            &cell_indices,
+            &index,
+            &group,
+            None,
+            None,
+            false,
+            n_genes,
+            &test_pool(),
+        )
+        .unwrap();
 
         // Row 1 (offset 10..20) should be all zeros
         let row1 = &x[n_genes..2 * n_genes];
@@ -760,6 +798,7 @@ mod tests {
             Some(target_sum),
             true,
             n_genes,
+            &test_pool(),
         )
         .unwrap();
 
@@ -906,7 +945,16 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                None,
+                &obs,
+                0,
+                &test_pool(),
+            )
         });
 
         // Collect all batches
@@ -959,7 +1007,16 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                None,
+                &obs,
+                0,
+                &test_pool(),
+            )
         });
 
         let mut all_cells: Vec<u64> = Vec::new();
@@ -1003,7 +1060,16 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                None,
+                &obs,
+                0,
+                &test_pool(),
+            )
         });
 
         let mut batch_sizes: Vec<usize> = Vec::new();
@@ -1050,7 +1116,16 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, Some(proj), &obs, 0)
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                Some(proj),
+                &obs,
+                0,
+                &test_pool(),
+            )
         });
 
         let batch = batch_rx.recv().unwrap();
@@ -1088,7 +1163,16 @@ mod tests {
         });
 
         let handle = std::thread::spawn(move || {
-            decode_stage(io_rx, batch_tx, &config, n_vars as u64, None, &obs, 0)
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                None,
+                &obs,
+                0,
+                &test_pool(),
+            )
         });
 
         let batch = batch_rx.recv().unwrap();

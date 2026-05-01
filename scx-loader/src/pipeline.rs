@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use scx_format::deletion_vectors::DeletionVectors;
@@ -12,6 +12,23 @@ use crate::error::{LoaderError, Result};
 use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
 use crate::shuffle::ShardShuffler;
+
+/// Hard upper bound on per-pipeline rayon worker threads (DEADLOCK-ISSUE.md
+/// §2.0a). On many-core hosts the decode work is embarrassingly parallel but
+/// memory-bound; more than ~8 workers does not pay off and increases the
+/// fork-hostile thread count for downstream callers that use spawn-mode
+/// multiprocessing.
+const DEFAULT_DECODE_POOL_MAX_THREADS: usize = 8;
+
+/// Bounded join deadline for `Drop` and `join_epoch_handles` shutdown
+/// (DEADLOCK-ISSUE.md §2.3 / §2.4). If the I/O or decode thread does not
+/// finish within this window the join is abandoned and the thread handle is
+/// detached — preferable to wedging the worker process exit forever.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Polling interval for `JoinHandle::is_finished()` waits during bounded
+/// shutdown.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
 /// Returns true if SCX_LOADER_PROFILE env var is set to "1" or "true".
 fn profiling_enabled() -> bool {
@@ -272,9 +289,21 @@ fn estimate_memory(
 /// Triple-buffered training pipeline coordinator.
 ///
 /// Orchestrates three concurrent stages:
-/// 1. **I/O stage** (tokio async): Reads shard groups from the SCX file
-/// 2. **Decode stage** (std::thread + rayon): Shuffles, projects, densifies, normalizes
-/// 3. **GPU stage** (caller): Consumes pre-built `Batch`es via `next_batch()`
+/// 1. **I/O stage** (`std::thread` driving a `tokio::runtime::Builder::new_current_thread()`
+///    runtime via `block_on`): reads shard groups from the SCX file
+/// 2. **Decode stage** (`std::thread` + a per-pipeline `rayon::ThreadPool`):
+///    shuffles, projects, densifies, normalizes
+/// 3. **GPU stage** (caller): consumes pre-built `Batch`es via `next_batch()`
+///
+/// **Fork-safety contract** (DEADLOCK-ISSUE.md Phase 2). Both the tokio
+/// current-thread runtime (§2.1 / §2.2) and the rayon `ThreadPool` (§2.0a)
+/// are constructed *lazily inside `start_epoch`*, i.e. after any fork has
+/// happened. The `TrainingPipeline` value itself contains no live runtime,
+/// rayon registry, or worker threads at construction time, so a forked child
+/// that constructs its own pipeline does not inherit fork-hostile state from
+/// the parent. `pyscx.from_anndata` in the parent — which lazily initialises
+/// rayon's *global* pool as a side-effect — is the historical wedge case;
+/// this design eliminates dependence on that pool entirely.
 ///
 /// See [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 pub struct TrainingPipeline {
@@ -287,11 +316,20 @@ pub struct TrainingPipeline {
     shard_target_rows: u32,
     projection: Option<HvgProjection>,
     memory_budget: MemoryBudget,
-    // Runtime state
+    // Runtime state — all lazy / per-epoch:
     batch_rx: Option<crossbeam_channel::Receiver<Batch>>,
-    io_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// I/O stage runs on a dedicated `std::thread` that owns a
+    /// `tokio::runtime::Builder::new_current_thread()` runtime. The runtime
+    /// lives only as long as the I/O thread; nothing in `TrainingPipeline`
+    /// holds the runtime across fork boundaries (DEADLOCK-ISSUE.md §2.1 /
+    /// §2.2).
+    io_handle: Option<std::thread::JoinHandle<Result<()>>>,
     decode_handle: Option<std::thread::JoinHandle<Result<()>>>,
-    runtime: tokio::runtime::Runtime,
+    /// Per-pipeline rayon thread pool (DEADLOCK-ISSUE.md §2.0a). `None`
+    /// before the first `start_epoch()`; once built, persists across epochs
+    /// for the same `TrainingPipeline` and is dropped in `shutdown()` /
+    /// `Drop`. Workers are *not* shared with rayon's global registry.
+    decode_pool: Option<Arc<rayon::ThreadPool>>,
     shuffler: ShardShuffler,
     epoch_active: bool,
 }
@@ -306,11 +344,19 @@ impl TrainingPipeline {
         let profile = profiling_enabled();
         let t_start = Instant::now();
 
+        let _new_span =
+            tracing::trace_span!("TrainingPipeline::new", pid = std::process::id(),).entered();
+        tracing::trace!("entry");
+
         config.validate()?;
 
         // Open SCX file
         let t0 = Instant::now();
         let reader = Arc::new(ScxReader::open(path)?);
+        tracing::trace!(
+            elapsed_us = t0.elapsed().as_micros() as u64,
+            "ScxReader::open"
+        );
         if profile {
             eprintln!("[scx-loader profile] open: {:?}", t0.elapsed());
         }
@@ -384,14 +430,10 @@ impl TrainingPipeline {
         let shuffler =
             ShardShuffler::new(n_csr_shards, memory_budget.shard_group_size, config.seed)?;
 
-        // Create tokio runtime for async I/O
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                LoaderError::ShutdownError(format!("failed to create tokio runtime: {e}"))
-            })?;
+        // NOTE: tokio runtime construction has moved to `start_epoch` (§2.1)
+        // and the rayon thread pool to `ensure_decode_pool` (§2.0a). Both are
+        // built lazily, post-fork, so a forked child that constructs its own
+        // pipeline does not inherit any worker threads from the parent.
 
         if profile {
             eprintln!(
@@ -415,10 +457,36 @@ impl TrainingPipeline {
             batch_rx: None,
             io_handle: None,
             decode_handle: None,
-            runtime,
+            decode_pool: None,
             shuffler,
             epoch_active: false,
         })
+    }
+
+    /// Lazily build the per-pipeline rayon `ThreadPool` (DEADLOCK-ISSUE.md
+    /// §2.0a). Called from `start_epoch` so the pool is constructed inside
+    /// the worker process, after any fork. Reused across epochs.
+    fn ensure_decode_pool(&mut self) -> Result<&Arc<rayon::ThreadPool>> {
+        if self.decode_pool.is_none() {
+            let n_threads = num_cpus::get_physical().clamp(1, DEFAULT_DECODE_POOL_MAX_THREADS);
+            let t = Instant::now();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(n_threads)
+                .thread_name(|i| format!("scx-decode-rayon-{i}"))
+                .build()
+                .map_err(|e| {
+                    LoaderError::ShutdownError(format!(
+                        "failed to build per-pipeline rayon pool: {e}"
+                    ))
+                })?;
+            tracing::trace!(
+                elapsed_us = t.elapsed().as_micros() as u64,
+                num_threads = n_threads,
+                "per-pipeline rayon pool constructed",
+            );
+            self.decode_pool = Some(Arc::new(pool));
+        }
+        Ok(self.decode_pool.as_ref().unwrap())
     }
 
     /// Start a new training epoch.
@@ -429,21 +497,97 @@ impl TrainingPipeline {
     ///
     /// If a previous epoch is still active, joins its handles first.
     pub fn start_epoch(&mut self) -> Result<()> {
+        let _start_span = tracing::trace_span!(
+            "TrainingPipeline::start_epoch",
+            pid = std::process::id(),
+            epoch = self.shuffler.epoch(),
+        )
+        .entered();
+        tracing::trace!("entry");
+
         // Join previous epoch handles if they exist
         self.join_epoch_handles()?;
+        tracing::trace!("prior epoch handles joined");
+
+        // Phase 3.1 invariant: after `join_epoch_handles`, all per-epoch
+        // channel state must be reset. If this fires, a future edit broke
+        // the contract that `join_epoch_handles` is the single owner of
+        // `batch_rx` teardown — and `tx.send` from the decode stage that
+        // about to be respawned would race with the prior epoch's receiver.
+        debug_assert!(
+            self.batch_rx.is_none(),
+            "batch_rx must be None after join_epoch_handles before re-spawning"
+        );
+        debug_assert!(
+            self.io_handle.is_none() && self.decode_handle.is_none(),
+            "epoch handles must be None after join_epoch_handles before re-spawning"
+        );
 
         // Generate offset-sorted shard groups for this epoch.
         // Shard groups are randomly composed (stochastic across epochs) but
         // sorted by file offset within and across groups for sequential I/O.
-        let sorted_entries = self.reader.catalog().shards_sorted();
-        let shard_offsets: Vec<u64> = sorted_entries.iter().map(|e| e.offset).collect();
+        // Collect into owned `Vec<u64>` first so the catalog borrow ends
+        // before `ensure_decode_pool` (which needs `&mut self`).
+        let shard_offsets: Vec<u64> = self
+            .reader
+            .catalog()
+            .shards_sorted()
+            .iter()
+            .map(|e| e.offset)
+            .collect();
+
+        // Phase 3.3 mmap smoke-read. Touch one byte of the first CSR shard's
+        // backing region before spawning the I/O / decode threads. If the
+        // mmap'd file has been poisoned (truncated, unmapped via outer
+        // munmap, or unmapped because the underlying file was deleted by
+        // another process and the kernel reaped the pages), the load below
+        // raises SIGBUS *here*, on the consumer thread — far better than
+        // hanging the I/O stage on an unreproducible read after the workers
+        // have spawned. Cheap: a single byte fault on a region the I/O
+        // stage was about to fault anyway.
+        if let Some(&first_offset) = shard_offsets.first() {
+            let mmap = self.reader.mmap();
+            let off = first_offset as usize;
+            if off >= mmap.len() {
+                return Err(LoaderError::ShutdownError(format!(
+                    "first shard offset {off} exceeds mmap length {}",
+                    mmap.len()
+                )));
+            }
+            // `black_box` forces the load to be observable and prevents the
+            // optimizer from eliding the smoke-read as dead code. The slice
+            // index is bounds-checked just above.
+            let _ = std::hint::black_box(mmap[off]);
+        }
+
+        // Build the per-pipeline rayon pool (lazy, post-fork) before
+        // spawning the decode thread that uses it (§2.0a).
+        let decode_pool = Arc::clone(self.ensure_decode_pool()?);
+
         let shard_groups = self.shuffler.shuffle_epoch_sorted(&shard_offsets);
 
         // Create bounded channels
+        //
         // I/O → Decode: tokio mpsc channel. Each item is a ShardGroup containing
         // shard_group_size decoded shards. Cap at 2 for pipeline overlap (one
         // being decoded + one read-ahead), not shard_group_size which would allow
         // shard_group_size * shard_group_size decoded shards in flight.
+        //
+        // **Shutdown propagation chain** (Phase 3.4 — DEADLOCK-ISSUE.md):
+        // 1. Consumer drops `self.batch_rx` (in `join_epoch_handles`).
+        // 2. Decode stage's `crossbeam tx.send(batch)` returns Err. Decode
+        //    stage exits with `LoaderError::ChannelError`, dropping its
+        //    end of the tokio mpsc (`io_rx`).
+        // 3. I/O stage's `tokio tx.send(group).await` returns Err (receiver
+        //    closed). `io_stage` exits with `LoaderError::ChannelError`.
+        // 4. The current-thread runtime's `block_on(io_stage(...))` returns;
+        //    the I/O thread exits, dropping its tokio runtime cleanly.
+        //
+        // Both stages' ChannelError return values are filtered out as
+        // expected-on-shutdown by `join_epoch_handles` (§2.4) — the chain
+        // only surfaces real errors (panics, ShutdownError, ConfigError).
+        // No explicit cancellation token is needed; channel close is the
+        // signal.
         let (io_tx, io_rx) = tokio::sync::mpsc::channel(2);
 
         // Decode → Consumer: crossbeam bounded channel, capacity = prefetch_batches
@@ -451,12 +595,40 @@ impl TrainingPipeline {
         let batch_channel_cap = self.memory_budget.prefetch_batches.max(2);
         let (batch_tx, batch_rx) = crossbeam_channel::bounded(batch_channel_cap);
 
-        // Spawn I/O stage as a tokio task
+        // Spawn I/O stage as a dedicated `std::thread` that owns a tokio
+        // current-thread runtime (§2.1, §2.2). The runtime lives only as
+        // long as the I/O thread, so the `TrainingPipeline` value never
+        // holds a long-lived multi-threaded tokio runtime that fork would
+        // inherit. `spawn_blocking` inside `io_stage` still works because
+        // the current-thread runtime drives a separate blocking thread pool.
+        let t_spawn_io = Instant::now();
         let io_reader = Arc::clone(&self.reader);
         let io_dv = self.deletion_vectors.clone();
-        let io_handle = self
-            .runtime
-            .spawn(async move { io_stage(io_reader, shard_groups, io_dv, io_tx).await });
+        let io_handle = std::thread::Builder::new()
+            .name("scx-io".to_string())
+            .spawn(move || -> Result<()> {
+                tracing::trace!(pid = std::process::id(), "I/O thread entered");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        LoaderError::ShutdownError(format!(
+                            "I/O thread: failed to build current-thread runtime: {e}"
+                        ))
+                    })?;
+                let res = rt.block_on(io_stage(io_reader, shard_groups, io_dv, io_tx));
+                tracing::trace!(
+                    pid = std::process::id(),
+                    ok = res.is_ok(),
+                    "I/O thread exiting"
+                );
+                res
+            })
+            .map_err(|e| LoaderError::ShutdownError(format!("failed to spawn I/O thread: {e}")))?;
+        tracing::trace!(
+            elapsed_us = t_spawn_io.elapsed().as_micros() as u64,
+            "I/O stage spawned",
+        );
 
         // Spawn decode stage as a standard thread (CPU-bound work)
         let decode_config = self.config.clone();
@@ -464,9 +636,11 @@ impl TrainingPipeline {
         let decode_projection = self.projection.clone();
         let decode_obs = self.obs_metadata.clone();
         let decode_epoch = self.shuffler.epoch().saturating_sub(1); // epoch was already incremented by shuffle_epoch()
+        let t_spawn_decode = Instant::now();
         let decode_handle = std::thread::Builder::new()
             .name("scx-decode".to_string())
             .spawn(move || {
+                tracing::trace!(pid = std::process::id(), "decode stage entered");
                 decode_stage(
                     io_rx,
                     batch_tx,
@@ -475,11 +649,16 @@ impl TrainingPipeline {
                     decode_projection,
                     &decode_obs,
                     decode_epoch,
+                    &decode_pool,
                 )
             })
             .map_err(|e| {
                 LoaderError::ShutdownError(format!("failed to spawn decode thread: {e}"))
             })?;
+        tracing::trace!(
+            elapsed_us = t_spawn_decode.elapsed().as_micros() as u64,
+            "decode stage spawned",
+        );
 
         self.batch_rx = Some(batch_rx);
         self.io_handle = Some(io_handle);
@@ -498,11 +677,24 @@ impl TrainingPipeline {
     /// Returns `None` if no epoch is active.
     pub fn next_batch(&mut self) -> Option<Batch> {
         let rx = self.batch_rx.as_ref()?;
+        let t_recv = Instant::now();
         match rx.recv() {
-            Ok(batch) => Some(batch),
+            Ok(batch) => {
+                tracing::trace!(
+                    pid = std::process::id(),
+                    wait_us = t_recv.elapsed().as_micros() as u64,
+                    n_rows = batch.n_rows(),
+                    "next_batch: received",
+                );
+                Some(batch)
+            }
             Err(_) => {
                 // Channel closed — epoch is complete
                 // Join handles to propagate any errors (logged, not returned)
+                tracing::trace!(
+                    pid = std::process::id(),
+                    "next_batch: channel closed (epoch end)"
+                );
                 let _ = self.join_epoch_handles();
                 self.epoch_active = false;
                 None
@@ -541,38 +733,66 @@ impl TrainingPipeline {
     }
 
     /// Join the I/O and decode handles from a previous epoch, propagating errors.
+    ///
+    /// Drops the batch receiver first to propagate channel-close back through
+    /// the decode and I/O threads, then joins each handle with a bounded
+    /// deadline (§2.4). A timed-out join is logged as a warning rather than
+    /// returned as an error — once the consumer has dropped its receivers
+    /// the only remaining sin is leaving worker threads alive, and that's a
+    /// strictly better outcome than wedging the caller.
     fn join_epoch_handles(&mut self) -> Result<()> {
         // Drop the batch receiver first to unblock the decode stage
-        // if it's trying to send.
+        // if it's trying to send. This propagates: decode → io_rx drop →
+        // io_tx.send returns Err → io_stage exits → I/O thread's block_on
+        // returns → I/O thread exits. End-to-end shutdown without
+        // requiring a separate abort signal.
         self.batch_rx = None;
 
-        // Join the I/O handle
+        // Join the I/O thread (bounded — see §2.3 / §2.4).
+        //
+        // ChannelError is treated as Ok on the shutdown path: it means the
+        // I/O stage observed its downstream channel closing (because the
+        // decode stage dropped `io_rx` after we dropped `batch_rx` above —
+        // the natural propagation chain) and exited with that as its
+        // return value. That is the *intended* shutdown signal, not a
+        // failure mode worth surfacing.
         if let Some(handle) = self.io_handle.take() {
-            // Block on the tokio task. We use block_on here because this
-            // method is called from sync context.
-            match self.runtime.block_on(handle) {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+            match join_handle_bounded(handle, "I/O thread", SHUTDOWN_DEADLINE) {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(LoaderError::ChannelError(_)))) => {}
+                Ok(Some(Err(e))) => {
                     return Err(LoaderError::ShutdownError(format!("I/O stage error: {e}")));
                 }
-                Err(e) => {
-                    return Err(LoaderError::ShutdownError(format!(
-                        "I/O stage panicked: {e}"
-                    )));
+                Ok(None) => {
+                    // Timed out — the thread is still running; we've detached
+                    // its handle and accept the leak.
+                }
+                Err(()) => {
+                    return Err(LoaderError::ShutdownError(
+                        "I/O thread panicked".to_string(),
+                    ));
                 }
             }
         }
 
-        // Join the decode handle
+        // Join the decode thread (bounded). Same ChannelError-is-shutdown
+        // semantics as the I/O thread above: if the consumer dropped
+        // `batch_rx` mid-iteration the decode stage's `tx.send` returns
+        // Err and the stage exits with `LoaderError::ChannelError`. That
+        // is the cancellation path, not a fault.
         if let Some(handle) = self.decode_handle.take() {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+            match join_handle_bounded(handle, "decode thread", SHUTDOWN_DEADLINE) {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(LoaderError::ChannelError(_)))) => {}
+                Ok(Some(Err(e))) => {
                     return Err(LoaderError::ShutdownError(format!(
                         "decode stage error: {e}"
                     )));
                 }
-                Err(_) => {
+                Ok(None) => {
+                    // Timed out.
+                }
+                Err(()) => {
                     return Err(LoaderError::ShutdownError(
                         "decode stage panicked".to_string(),
                     ));
@@ -583,37 +803,101 @@ impl TrainingPipeline {
         self.epoch_active = false;
         Ok(())
     }
+
+    /// Explicit shutdown: drop channels, join I/O + decode threads (bounded),
+    /// and release the per-pipeline rayon pool (DEADLOCK-ISSUE.md §2.5).
+    ///
+    /// Idempotent — safe to call multiple times. `Drop` calls this
+    /// internally, but callers running under PyTorch DataLoader workers
+    /// should call this from a `weakref.finalize` hook before interpreter
+    /// teardown so shutdown happens while the GIL state is still healthy
+    /// (§2.6).
+    pub fn shutdown(&mut self) {
+        let _span =
+            tracing::trace_span!("TrainingPipeline::shutdown", pid = std::process::id()).entered();
+        tracing::trace!("entry");
+
+        // Best-effort join of any in-flight epoch. Errors are logged, not
+        // returned, since shutdown is best-effort.
+        if let Err(e) = self.join_epoch_handles() {
+            tracing::warn!(error = %e, "join_epoch_handles error during shutdown");
+        }
+
+        // Drop the rayon pool. Its workers exit when the last `Arc` is
+        // dropped — `decode_pool` here is the only strong ref outside the
+        // (now-joined) decode thread.
+        if self.decode_pool.take().is_some() {
+            tracing::trace!("rayon pool dropped");
+        }
+
+        tracing::trace!("exit");
+    }
+}
+
+/// Join a `std::thread::JoinHandle<Result<T>>` with a bounded deadline.
+///
+/// - `Ok(Some(Ok(value)))` — thread finished cleanly with `Ok(value)`.
+/// - `Ok(Some(Err(e)))` — thread finished cleanly returning `Err(e)`.
+/// - `Ok(None)` — deadline expired; the handle has been detached
+///   (the thread continues running until it exits naturally).
+/// - `Err(())` — thread panicked.
+///
+/// `label` is used in the timeout-warning log line to identify which thread
+/// was abandoned.
+fn join_handle_bounded<T>(
+    handle: std::thread::JoinHandle<T>,
+    label: &str,
+    deadline: Duration,
+) -> std::result::Result<Option<T>, ()> {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() >= deadline {
+            tracing::warn!(
+                label = %label,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "thread did not finish within shutdown deadline; detaching",
+            );
+            // Drop the handle without joining → thread is detached.
+            // The thread continues to run until it exits on its own; if
+            // the worker process is exiting anyway, the OS reclaims it.
+            return Ok(None);
+        }
+        std::thread::sleep(SHUTDOWN_POLL);
+    }
+    match handle.join() {
+        Ok(value) => {
+            tracing::trace!(
+                label = %label,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "thread joined"
+            );
+            Ok(Some(value))
+        }
+        Err(_) => Err(()),
+    }
 }
 
 impl Drop for TrainingPipeline {
     /// Best-effort shutdown when a pipeline is dropped without an explicit
-    /// `shutdown()`.
+    /// `shutdown()` call.
     ///
-    /// **Async-context caveat:** `Drop` calls `self.runtime.block_on(...)` to
-    /// join the tokio I/O task. If the pipeline is dropped from inside a
-    /// running tokio runtime (e.g. an `async fn`), the nested `block_on` will
-    /// panic. Callers running inside an async context MUST call
-    /// `.shutdown().await` before dropping. When `block_on` is unsafe to call
-    /// here, we detect the running runtime via `Handle::try_current()` and
-    /// skip the join — the task will simply continue until the pipeline's
-    /// channel receivers are dropped and it exits on its own.
+    /// **Interpreter-teardown probe** (DEADLOCK-ISSUE.md §2.6). When `Drop`
+    /// runs during Python interpreter teardown — which can happen if a
+    /// `TrainingDataset` outlives the worker process's normal lifecycle and
+    /// is dropped during `_atexit` — the GIL state is partially gone and
+    /// any code path that acquires it can crash the process. There is no
+    /// pyo3 dependency in this crate, so we detect the hazard structurally:
+    /// the I/O and decode threads are bounded by `SHUTDOWN_DEADLINE` and
+    /// detach on timeout (`join_handle_bounded`), and we never call into
+    /// Python during Drop. The rayon pool drops cleanly on its own; tokio
+    /// has no surviving handles in `TrainingPipeline` after Phase 2's
+    /// restructure.
     fn drop(&mut self) {
-        // Drop channels first to signal shutdown to stages
-        self.batch_rx = None;
-
-        // Best-effort join of handles — don't propagate errors in Drop
-        if let Some(handle) = self.io_handle.take() {
-            // Cancel the tokio task if it's still running
-            handle.abort();
-            if tokio::runtime::Handle::try_current().is_err() {
-                let _ = self.runtime.block_on(handle);
-            }
-            // else: we're in an async context; the aborted task will wind down
-            // on its own. Dropping the handle detaches it.
-        }
-        if let Some(handle) = self.decode_handle.take() {
-            let _ = handle.join();
-        }
+        let _drop_span =
+            tracing::trace_span!("TrainingPipeline::drop", pid = std::process::id()).entered();
+        tracing::trace!("entry");
+        self.shutdown();
+        tracing::trace!("exit");
     }
 }
 

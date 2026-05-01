@@ -1,0 +1,87 @@
+{
+  "node": "vci-steady-state-node-017",
+  "slurm_job_id": "113074",
+  "n_obs": 100000,
+  "n_vars": 2000,
+  "batch_size": 64,
+  "n_warmup": 1,
+  "n_runs": 3,
+  "fixture_size_bytes": 102086222,
+  "scenarios": {
+    "raw_workers0": {
+      "label": "raw_workers0",
+      "n_runs": 3,
+      "median_batches_per_sec": 2627.29,
+      "median_cells_per_sec": 168093.0,
+      "median_peak_rss_mb": 4430.1,
+      "median_wall_s": 0.595,
+      "all_bps": [
+        2803.83,
+        2612.69,
+        2627.29
+      ],
+      "all_wall_s": [
+        0.557,
+        0.598,
+        0.595
+      ]
+    },
+    "hvg_norm_workers0": {
+      "label": "hvg_norm_workers0",
+      "n_runs": 3,
+      "median_batches_per_sec": 2722.12,
+      "median_cells_per_sec": 174160.0,
+      "median_peak_rss_mb": 4430.1,
+      "median_wall_s": 0.574,
+      "all_bps": [
+        2722.12,
+        2725.29,
+        2713.85
+      ],
+      "all_wall_s": [
+        0.574,
+        0.574,
+        0.576
+      ]
+    },
+    "pyscx_training_dataset_workers2": {
+      "label": "pyscx_training_dataset_workers2",
+      "n_runs": 3,
+      "median_batches_per_sec": 1294.32,
+      "median_cells_per_sec": 82810.0,
+      "median_peak_rss_mb": 4430.1,
+      "median_wall_s": 1.208,
+      "all_bps": [
+        1294.94,
+        1293.29,
+        1294.32
+      ],
+      "all_wall_s": [
+        1.207,
+        1.209,
+        1.208
+      ],
+      "bps_ratio_vs_workers0": 0.475
+    },
+    "pyscx_training_dataset_workers2_persistent": {
+      "label": "pyscx_training_dataset_workers2_persistent",
+      "n_runs": 3,
+      "median_batches_per_sec": 1361.6,
+      "median_cells_per_sec": 87114.0,
+      "median_peak_rss_mb": 4430.1,
+      "median_wall_s": 2.296,
+      "all_bps": [
+        1361.6,
+        1361.42,
+        1363.27
+      ],
+      "all_wall_s": [
+        2.296,
+        2.296,
+        2.293
+      ],
+      "per_epoch_normalised": true,
+      "bps_ratio_vs_workers0": 0.5
+    }
+  }
+}
