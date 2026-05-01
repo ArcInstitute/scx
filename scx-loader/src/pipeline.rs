@@ -306,11 +306,19 @@ impl TrainingPipeline {
         let profile = profiling_enabled();
         let t_start = Instant::now();
 
+        let _new_span =
+            tracing::trace_span!("TrainingPipeline::new", pid = std::process::id(),).entered();
+        tracing::trace!("entry");
+
         config.validate()?;
 
         // Open SCX file
         let t0 = Instant::now();
         let reader = Arc::new(ScxReader::open(path)?);
+        tracing::trace!(
+            elapsed_us = t0.elapsed().as_micros() as u64,
+            "ScxReader::open"
+        );
         if profile {
             eprintln!("[scx-loader profile] open: {:?}", t0.elapsed());
         }
@@ -385,6 +393,7 @@ impl TrainingPipeline {
             ShardShuffler::new(n_csr_shards, memory_budget.shard_group_size, config.seed)?;
 
         // Create tokio runtime for async I/O
+        let t_rt = Instant::now();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -392,6 +401,11 @@ impl TrainingPipeline {
             .map_err(|e| {
                 LoaderError::ShutdownError(format!("failed to create tokio runtime: {e}"))
             })?;
+        tracing::trace!(
+            elapsed_us = t_rt.elapsed().as_micros() as u64,
+            worker_threads = 2u8,
+            "tokio runtime constructed",
+        );
 
         if profile {
             eprintln!(
@@ -429,8 +443,17 @@ impl TrainingPipeline {
     ///
     /// If a previous epoch is still active, joins its handles first.
     pub fn start_epoch(&mut self) -> Result<()> {
+        let _start_span = tracing::trace_span!(
+            "TrainingPipeline::start_epoch",
+            pid = std::process::id(),
+            epoch = self.shuffler.epoch(),
+        )
+        .entered();
+        tracing::trace!("entry");
+
         // Join previous epoch handles if they exist
         self.join_epoch_handles()?;
+        tracing::trace!("prior epoch handles joined");
 
         // Generate offset-sorted shard groups for this epoch.
         // Shard groups are randomly composed (stochastic across epochs) but
@@ -452,11 +475,17 @@ impl TrainingPipeline {
         let (batch_tx, batch_rx) = crossbeam_channel::bounded(batch_channel_cap);
 
         // Spawn I/O stage as a tokio task
+        let t_spawn_io = Instant::now();
         let io_reader = Arc::clone(&self.reader);
         let io_dv = self.deletion_vectors.clone();
-        let io_handle = self
-            .runtime
-            .spawn(async move { io_stage(io_reader, shard_groups, io_dv, io_tx).await });
+        let io_handle = self.runtime.spawn(async move {
+            tracing::trace!(pid = std::process::id(), "I/O stage scheduled");
+            io_stage(io_reader, shard_groups, io_dv, io_tx).await
+        });
+        tracing::trace!(
+            elapsed_us = t_spawn_io.elapsed().as_micros() as u64,
+            "I/O stage spawned",
+        );
 
         // Spawn decode stage as a standard thread (CPU-bound work)
         let decode_config = self.config.clone();
@@ -464,9 +493,11 @@ impl TrainingPipeline {
         let decode_projection = self.projection.clone();
         let decode_obs = self.obs_metadata.clone();
         let decode_epoch = self.shuffler.epoch().saturating_sub(1); // epoch was already incremented by shuffle_epoch()
+        let t_spawn_decode = Instant::now();
         let decode_handle = std::thread::Builder::new()
             .name("scx-decode".to_string())
             .spawn(move || {
+                tracing::trace!(pid = std::process::id(), "decode stage entered");
                 decode_stage(
                     io_rx,
                     batch_tx,
@@ -480,6 +511,10 @@ impl TrainingPipeline {
             .map_err(|e| {
                 LoaderError::ShutdownError(format!("failed to spawn decode thread: {e}"))
             })?;
+        tracing::trace!(
+            elapsed_us = t_spawn_decode.elapsed().as_micros() as u64,
+            "decode stage spawned",
+        );
 
         self.batch_rx = Some(batch_rx);
         self.io_handle = Some(io_handle);
@@ -498,11 +533,24 @@ impl TrainingPipeline {
     /// Returns `None` if no epoch is active.
     pub fn next_batch(&mut self) -> Option<Batch> {
         let rx = self.batch_rx.as_ref()?;
+        let t_recv = Instant::now();
         match rx.recv() {
-            Ok(batch) => Some(batch),
+            Ok(batch) => {
+                tracing::trace!(
+                    pid = std::process::id(),
+                    wait_us = t_recv.elapsed().as_micros() as u64,
+                    n_rows = batch.n_rows(),
+                    "next_batch: received",
+                );
+                Some(batch)
+            }
             Err(_) => {
                 // Channel closed — epoch is complete
                 // Join handles to propagate any errors (logged, not returned)
+                tracing::trace!(
+                    pid = std::process::id(),
+                    "next_batch: channel closed (epoch end)"
+                );
                 let _ = self.join_epoch_handles();
                 self.epoch_active = false;
                 None
@@ -598,22 +646,41 @@ impl Drop for TrainingPipeline {
     /// skip the join — the task will simply continue until the pipeline's
     /// channel receivers are dropped and it exits on its own.
     fn drop(&mut self) {
+        let _drop_span =
+            tracing::trace_span!("TrainingPipeline::drop", pid = std::process::id()).entered();
+        tracing::trace!("entry");
+
         // Drop channels first to signal shutdown to stages
         self.batch_rx = None;
+        tracing::trace!("batch_rx dropped");
 
         // Best-effort join of handles — don't propagate errors in Drop
         if let Some(handle) = self.io_handle.take() {
             // Cancel the tokio task if it's still running
             handle.abort();
+            tracing::trace!("io_handle aborted");
             if tokio::runtime::Handle::try_current().is_err() {
+                let t = Instant::now();
                 let _ = self.runtime.block_on(handle);
+                tracing::trace!(
+                    elapsed_us = t.elapsed().as_micros() as u64,
+                    "io_handle joined via block_on"
+                );
+            } else {
+                tracing::trace!("skipping block_on — Handle::try_current() detected outer runtime");
             }
             // else: we're in an async context; the aborted task will wind down
             // on its own. Dropping the handle detaches it.
         }
         if let Some(handle) = self.decode_handle.take() {
+            let t = Instant::now();
             let _ = handle.join();
+            tracing::trace!(
+                elapsed_us = t.elapsed().as_micros() as u64,
+                "decode_handle joined"
+            );
         }
+        tracing::trace!("exit");
     }
 }
 

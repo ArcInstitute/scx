@@ -63,6 +63,15 @@ log = "0.4"
 env_logger = "0.11"
 pyo3-log = "0.12"
 
+# Tracing (Phase-1 deadlock diagnostics — see DEADLOCK-ISSUE.md §1.4).
+# Off by default; enable via `RUST_LOG=trace` with a subscriber wired up.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Phase-1 fork-deadlock diagnostics (DEADLOCK-ISSUE.md §1.1) — used in
+# `scx-loader/tests/test_fork_deadlock.rs` only.
+nix = { version = "0.29", features = ["process", "signal"] }
+
 # Python bindings
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"
