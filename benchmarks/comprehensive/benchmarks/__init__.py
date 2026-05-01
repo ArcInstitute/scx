@@ -33,6 +33,9 @@ ALL_BENCHMARKS: list[str] = [
     "cell_eval_parity_perf",
     # SCX-only fragment / manifest operations
     "fragment_ops",
+    # IndexPlanDataset throughput (plan-driven paired reads).
+    # SCX-only (gated on scx_auto inside the module).
+    "index_plan",
     # Cloud (GCP) — Phase C through F
     "cloud_push",
     "cloud_pull",

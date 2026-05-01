@@ -1,0 +1,103 @@
+{
+  "args": {
+    "n_cells": 1000000,
+    "n_vars": 2000,
+    "n_pairs_per_batch": 1024,
+    "n_batches": 1000,
+    "hvg_size": 2000,
+    "normalize": true,
+    "fixture_dir": "/scratch/10011/scx_index_plan_1m",
+    "output": "/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/results/index_plan_phase7/index_plan_1m_indexed.json",
+    "config": "index_plan_random,index_plan_locality,sort_off,sort_on,lookahead0,lookahead4,lookahead8,training_seq"
+  },
+  "results": [
+    {
+      "name": "index_plan_random",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 100.67981217987835,
+      "batches_per_sec": 9.932477806110347,
+      "cells_per_sec": 20341.71454691399,
+      "peak_rss_mb": 3840.28515625,
+      "notes": "Mode A (random pairing)"
+    },
+    {
+      "name": "index_plan_locality",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 101.9471950083971,
+      "batches_per_sec": 9.808999648471278,
+      "cells_per_sec": 20088.83128006918,
+      "peak_rss_mb": 1447.89453125,
+      "notes": "Mode B (cell_type+batch keyed)"
+    },
+    {
+      "name": "phase2_sort_off",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 98.62811377830803,
+      "batches_per_sec": 10.139096873004753,
+      "cells_per_sec": 20764.870395913735,
+      "peak_rss_mb": 61.83984375,
+      "notes": "Phase 2 baseline"
+    },
+    {
+      "name": "phase2_sort_on",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 102.23253175616264,
+      "batches_per_sec": 9.781622178595018,
+      "cells_per_sec": 20032.762221762598,
+      "peak_rss_mb": 51.2578125,
+      "notes": "Phase 2 +shard sort"
+    },
+    {
+      "name": "phase4_lookahead0",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 105.88462461717427,
+      "batches_per_sec": 9.444241820901748,
+      "cells_per_sec": 19341.80724920678,
+      "peak_rss_mb": 796.7265625,
+      "notes": "Phase 4 baseline (sync decode)"
+    },
+    {
+      "name": "phase4_lookahead4",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 101.94540964998305,
+      "batches_per_sec": 9.809171432371269,
+      "cells_per_sec": 20089.18309349636,
+      "peak_rss_mb": 0.0,
+      "notes": "Phase 4 lookahead=4"
+    },
+    {
+      "name": "phase4_lookahead8",
+      "n_batches": 1000,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 103.50615420378745,
+      "batches_per_sec": 9.661261281441838,
+      "cells_per_sec": 19786.263104392885,
+      "peak_rss_mb": 728.33203125,
+      "notes": "Phase 4 lookahead=8"
+    },
+    {
+      "name": "training_seq_ceiling",
+      "n_batches": 489,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 13.353756161406636,
+      "batches_per_sec": 36.61891037169354,
+      "cells_per_sec": 74995.52844122837,
+      "peak_rss_mb": 143.6171875,
+      "notes": "TrainingDataset ceiling (sequential, different access pattern)"
+    }
+  ]
+}
