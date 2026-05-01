@@ -1,0 +1,26 @@
+{
+  "args": {
+    "n_cells": 1000000,
+    "n_vars": 2000,
+    "n_pairs_per_batch": 1024,
+    "n_batches": 50,
+    "hvg_size": 2000,
+    "normalize": true,
+    "fixture_dir": "/scratch/10011/scx_index_plan_1m",
+    "output": "/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/results/index_plan_phase7/index_plan_1m_backed_python.json",
+    "config": "backed_python"
+  },
+  "results": [
+    {
+      "name": "backed_python_baseline",
+      "n_batches": 50,
+      "n_pairs_per_batch": 1024,
+      "n_output_cols": 2000,
+      "elapsed_s": 540.6272171232849,
+      "batches_per_sec": 0.09248516984781766,
+      "cells_per_sec": 189.40962784833056,
+      "peak_rss_mb": 637.0234375,
+      "notes": "ScxBackedSparseDataset + Python loop (current cell-load-scx path)"
+    }
+  ]
+}

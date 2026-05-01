@@ -561,6 +561,121 @@ for batch in dataset:
     obs = batch["obs"]   # dict of obs columns
 ```
 
+### IndexPlanDataset
+
+Plan-driven paired-batch reader for ML workloads where each batch is a list
+of `(perturbed_cell, control_cell)` index pairs (perturbation training,
+contrastive learning, donor-matched designs). Sibling to `TrainingDataset`:
+`TrainingDataset` streams shards in catalog order for the highest possible
+sequential throughput; `IndexPlanDataset` consumes a Python iterator of
+plans and yields paired dense batches, trading sequential streaming for
+per-cell pairing flexibility.
+
+**Constructor kwargs**
+
+| Argument | Default | Notes |
+|---|---|---|
+| `path` | — | Path to `.scx` file. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
+| `obs_columns` | `[]` | Obs metadata column names included in each batch. |
+| `normalize` | `True` | Total-count normalize (fused with `log1p`). |
+| `log1p` | `True` | Apply `log1p` after normalize. |
+| `target_sum` | `1e4` | Normalization target sum. |
+| `cache_shards` | `128` | LRU shard cache budget. Auto-tuned downward to fit `max_memory_mb`; check via `effective_cache_shards()`. |
+| `sort_by_shard` | `True` | Reorder each plan by `min(shard_of(p), shard_of(c))` so the returned `X`/`X_paired` rows land in shard locality order. Disable to preserve caller's input pair order. |
+| `lookahead` | `4` | Default lookahead for `iter_with_plans` when not overridden. `0` disables shard prefetching; auto-tuned downward to fit `max_memory_mb`; check via `effective_lookahead()`. |
+| `max_plan_size` | `16384` | Upper bound on rows-per-batch for the memory budget calculation. |
+| `max_memory_mb` | `512` | On overflow, `lookahead` is reduced first (down to 1), then `cache_shards` (down to 1); construction fails with `RuntimeError` if neither fits. |
+
+**Batch dict schema** (yielded by `iter_with_plans`):
+
+```python
+{
+    "X":          np.ndarray[B, n_output_genes, float32],   # perturbed rows
+    "X_paired":   np.ndarray[B, n_output_genes, float32],   # control rows
+    "pairs":      list[tuple[int, int]],                    # post-sort plan
+    "obs":        dict[str, np.ndarray | {"codes", "categories"}],
+    "obs_paired": dict[str, np.ndarray | {"codes", "categories"}],
+}
+```
+
+`pairs[i]` always corresponds to `X[i]` and `X_paired[i]`. Categorical obs
+columns encode as `{"codes": ndarray[i32], "categories": list[str]}` —
+schema matches `TrainingDataset`.
+
+**Iterator semantics**
+
+- `plans` is any Python iterable yielding `list[tuple[int, int]]` (plain lists,
+  generators, queues all work).
+- Plan iteration is lazy: the loader pulls the next plan only when it is
+  ready to schedule a prefetch for it.
+- The loader keeps `lookahead` plans in flight at once: the head plan is
+  decoding while shards for the next `lookahead - 1` are being warmed via
+  `tokio::task::spawn_blocking` calls into `BackedCsrReader::read_shard_cached_arc`.
+- `StopIteration` from `plans` ends the batch stream cleanly. Other Python
+  exceptions from `plans` propagate as `RuntimeError("plan iterator raised: ...")`.
+- Empty plans inside a stream are silently skipped.
+- Out-of-range row indices raise `IndexError` immediately when validating
+  the offending plan; missing obs columns raise `KeyError` at construction.
+- `os.fork()` after construction raises `RuntimeError` with `num_workers=0`
+  guidance — the shard cache and mmap state are not fork-safe; consumers
+  must lazily construct the dataset post-fork in each DataLoader worker.
+
+**Example — bare iterator**
+
+```python
+import pyscx
+
+ds = pyscx.IndexPlanDataset(
+    "atlas.scx",
+    hvg_indices=hvg_array,
+    obs_columns=["cell_type", "perturbation"],
+    normalize=True,
+    target_sum=1e4,
+)
+
+plans = [
+    [(0, 5), (2, 7)],
+    [(10, 100), (50, 75)],
+]
+for batch in ds.iter_with_plans(iter(plans)):
+    X, X_paired = batch["X"], batch["X_paired"]
+    pairs = batch["pairs"]
+    # ... training step ...
+```
+
+**Example — paired with a `BaseMappingStrategy`-style plan generator** (the
+cell-load-scx pattern):
+
+```python
+def plan_generator(strategy, perturbed_indices, batch_size):
+    """Wrap any pairing policy that exposes `get_control_index(idx) -> int`."""
+    buf = []
+    for p_idx in perturbed_indices:
+        c_idx = strategy.get_control_index(p_idx)
+        if c_idx is not None:
+            buf.append((p_idx, c_idx))
+        if len(buf) == batch_size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+ds = pyscx.IndexPlanDataset("atlas.scx", obs_columns=["cell_type"])
+for batch in ds.iter_with_plans(plan_generator(my_strategy, perm, 1024),
+                                lookahead=4):
+    ...
+```
+
+**Memory budget surfaces**
+
+```python
+ds = pyscx.IndexPlanDataset("atlas.scx", cache_shards=128, lookahead=4,
+                            max_plan_size=16384, max_memory_mb=256)
+print(ds.effective_cache_shards(), ds.effective_lookahead())
+# Detects when auto-tuning kicked in.
+```
+
 ## CLI (`scx-cli`)
 
 ### Core

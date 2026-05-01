@@ -494,3 +494,50 @@ absolute_floors:
     dataset: pert_synth_100k
     metric: scx_median_s__clustering_agreement
     max: 8.5
+
+  # --- index_plan throughput floors -----------------------------------
+  # Phase 7.4 (PER-CELL-CONTROL-PAIRING.md). Floors set at 0.5x of the
+  # 1M-cell synthetic-fixture medians captured during Phase 7.2 on
+  # vci-steady-state-node-020 (Lambda HPC, --cpus-per-task=16
+  # --mem=64G, --partition=standard). 1M x 2K x 5% density x HVG=2000 x
+  # 1024 pairs/batch x 1000 batches. Source JSONs:
+  #   benchmarks/comprehensive/results/index_plan_phase7/index_plan_1m_*.json
+  # The locality scenario is gated; the random scenario is informational
+  # only (a target estimate, not a regression gate, per spec). The
+  # training_dataset ceiling is gated to catch upstream regressions in
+  # the sequential pipeline that would otherwise leave index_plan looking
+  # healthy.
+  #
+  # Smaller-dataset floors derived by scaling: pbmc3k (~3K cells) and
+  # tabula_sapiens_100k (~100K cells) shouldn't see worse cps than the
+  # 1M result × 0.5 safety margin, since smaller fixtures fit in cache
+  # better and don't exercise shard-decode misses.
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: pbmc3k
+    metric: batches_per_sec__pyscx_index_plan_locality
+    min: 5.0
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__pyscx_index_plan_locality
+    min: 12.0
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__pyscx_training_dataset
+    min: 23.0
+  # 1M synthetic floors at 0.5x observed median (9.81 / 36.62 → 4.9 / 18.3).
+  # Note: census_1m may use a different fixture than the synthetic 1M one,
+  # so this floor is conservative. Drop or re-tune if the dataset
+  # mismatch causes spurious failures.
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: census_1m
+    metric: batches_per_sec__pyscx_index_plan_locality
+    min: 4.9
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: census_1m
+    metric: batches_per_sec__pyscx_training_dataset
+    min: 18.3

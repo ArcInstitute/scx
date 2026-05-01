@@ -172,6 +172,25 @@ impl BackedCsrIndex {
             .get(shard_idx)
             .map(|r| (r.row_start, r.row_end))
     }
+
+    /// Find the shard index containing a single row, or `None` if the row
+    /// falls outside every shard's range.
+    ///
+    /// O(log n) over `shard_ranges` via `partition_point`. Equivalent to a
+    /// `shards_for_indices(&[row])` call without the sort/dedup overhead —
+    /// useful when sorting plans by shard locality on a per-row basis.
+    pub fn shard_for_row(&self, row: u64) -> Option<usize> {
+        let pos = self.shard_ranges.partition_point(|r| r.row_start <= row);
+        if pos == 0 {
+            return None;
+        }
+        let r = &self.shard_ranges[pos - 1];
+        if row >= r.row_start && row < r.row_end {
+            Some(r.sorted_shard_idx)
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

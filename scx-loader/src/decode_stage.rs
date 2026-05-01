@@ -206,20 +206,18 @@ pub fn extract_obs_columns(
     let mut result = HashMap::with_capacity(obs_columns.len());
 
     for col_name in obs_columns {
-        let col_idx = obs
-            .schema()
-            .index_of(col_name)
-            .map_err(|_| LoaderError::ConfigError {
-                reason: format!(
-                    "obs column '{}' not found in RecordBatch (available: {:?})",
-                    col_name,
-                    obs.schema()
+        let col_idx =
+            obs.schema()
+                .index_of(col_name)
+                .map_err(|_| LoaderError::ObsColumnNotFound {
+                    name: col_name.clone(),
+                    available: obs
+                        .schema()
                         .fields()
                         .iter()
                         .map(|f| f.name().clone())
-                        .collect::<Vec<_>>()
-                ),
-            })?;
+                        .collect(),
+                })?;
 
         let array = obs.column(col_idx);
         let obs_col = extract_single_column(array, cell_indices, col_name)?;
@@ -833,11 +831,16 @@ mod tests {
 
         let result = extract_obs_columns(&obs, &cell_indices, &["nonexistent".to_string()]);
 
-        assert!(result.is_err());
-        if let Err(LoaderError::ConfigError { reason }) = result {
-            assert!(reason.contains("nonexistent"));
-        } else {
-            panic!("expected ConfigError");
+        match result {
+            Err(LoaderError::ObsColumnNotFound { name, available }) => {
+                assert_eq!(name, "nonexistent");
+                assert!(
+                    !available.is_empty(),
+                    "available list should be non-empty: {available:?}"
+                );
+            }
+            Err(other) => panic!("expected ObsColumnNotFound, got {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
