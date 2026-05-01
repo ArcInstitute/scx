@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -165,11 +164,11 @@ def _verify_cloud_matches_local(
         return {"correctness_n_skipped": 1}
 
     logger.info("cloud_read correctness check: pulling fresh copy for compare")
-    tmp = tempfile.mkdtemp(prefix="scx_cloud_read_verify_")
+    tmp = Path(tempfile.mkdtemp(prefix="scx_cloud_read_verify_"))
     try:
-        pulled = os.path.join(tmp, "pulled.scx")
-        pyscx.pull(cloud_url, pulled)
-        adata_cloud = pyscx.open(pulled).to_anndata()
+        pulled = tmp / "pulled.scx"
+        pyscx.pull(cloud_url, str(pulled))
+        adata_cloud = pyscx.open(str(pulled)).to_anndata()
         adata_local = pyscx.open(str(local_path)).to_anndata()
 
         X_cloud = adata_cloud.X
@@ -185,14 +184,19 @@ def _verify_cloud_matches_local(
         n_obs = int(adata_local.n_obs)
         csr_skipped = n_obs > _FULL_CSR_EQUAL_MAX_OBS
         if csr_skipped:
-            # Row-sum equality — O(nnz) memory, no double dense
-            # materialisation. Catches layout / codec corruption that
-            # would shift values across rows or zero them out.
-            sum_cloud = np.asarray(X_cloud.sum(axis=1)).ravel()
-            sum_local = np.asarray(X_local.sum(axis=1)).ravel()
+            # Row-sum + column-sum equality — O(nnz) memory, no double
+            # dense materialisation. Catches layout / codec corruption
+            # that would shift values across rows or zero them out;
+            # adding the axis=0 sums also catches intra-row index
+            # permutations that preserve the per-row total.
+            row_sum_cloud = np.asarray(X_cloud.sum(axis=1)).ravel()
+            row_sum_local = np.asarray(X_local.sum(axis=1)).ravel()
+            col_sum_cloud = np.asarray(X_cloud.sum(axis=0)).ravel()
+            col_sum_local = np.asarray(X_local.sum(axis=0)).ravel()
             csr_equal_result = bool(
                 shape_match
-                and np.allclose(sum_cloud, sum_local, rtol=1e-6, atol=0)
+                and np.allclose(row_sum_cloud, row_sum_local, rtol=1e-6, atol=0)
+                and np.allclose(col_sum_cloud, col_sum_local, rtol=1e-6, atol=0)
             )
         else:
             from benchmarks.comprehensive.scripts.validation_helpers import (
