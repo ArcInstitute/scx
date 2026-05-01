@@ -53,15 +53,17 @@ from typing import Any
 
 import yaml
 
-# _justifications lives beside this script — add parent to sys.path so
-# `python scripts/compare_against_baseline.py` works without a package
-# install. When invoked as `-m`, relative import works; otherwise fall back
-# to path-based import.
+# _justifications and _flakiness live beside this script — add parent
+# to sys.path so `python scripts/compare_against_baseline.py` works
+# without a package install. When invoked as `-m`, relative import works;
+# otherwise fall back to path-based import.
 try:
     from . import _justifications
+    from . import _flakiness
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import _justifications  # type: ignore[no-redef]
+    import _flakiness  # type: ignore[no-redef]
 
 
 # Default locations used by the on-demand gate workflow. All overridable
@@ -71,7 +73,14 @@ _COMPREHENSIVE_DIR = Path(__file__).resolve().parents[1]
 _DEFAULT_BASELINES_DIR = _COMPREHENSIVE_DIR / "results" / "baselines"
 _DEFAULT_LATEST_LINK = _DEFAULT_BASELINES_DIR / "LATEST"
 _DEFAULT_JUSTIFICATIONS_DIR = _COMPREHENSIVE_DIR / "results" / "justifications"
+_DEFAULT_FLAKINESS_DIR = _COMPREHENSIVE_DIR / "results" / "flakiness"
 _DEFAULT_THRESHOLDS_YAML = _COMPREHENSIVE_DIR / "thresholds.yaml"
+
+# Wall-time CV threshold above which a row is surfaced in the gate's
+# "High-variance rows" informational section. Picked so a row whose
+# observed RSD is comparable to the default 3% timing tolerance is
+# flagged as a likely flakiness-ledger candidate.
+_HIGH_CV_THRESHOLD = 0.05
 
 
 def _resolve_default_baseline() -> Path | None:
@@ -113,6 +122,16 @@ class Delta:
     current: float | None
     relative_change: float | None  # (current - baseline) / baseline
     is_regression: bool
+    # Tolerance actually applied to this row — global default unless a
+    # flakiness override matched.
+    effective_tolerance: float | None = None
+    # True iff a flakiness override raised this row's tolerance above
+    # the global default; informational, used for status labelling.
+    tolerance_relaxed: bool = False
+    # Coefficient of variation (stdev/mean) of ``runs[].wall_s`` from
+    # the candidate raw JSON. Populated only for ``median_wall_s`` rows;
+    # ``None`` everywhere else (including when n<2 or mean=0).
+    wall_cv: float | None = None
 
 
 def _load_summary(path: Path) -> dict[str, Any]:
@@ -161,6 +180,8 @@ def diff_summaries(
     size_tol: float,
     *,
     gate: bool = False,
+    tolerance_overrides: dict[_flakiness.Quad, float] | None = None,
+    wall_cvs: dict[tuple[str, str, str], float | None] | None = None,
 ) -> list[Delta]:
     """One Delta row per (benchmark, format, dataset, metric) tuple.
 
@@ -171,7 +192,21 @@ def diff_summaries(
     regression — a disappeared benchmark is a silent gap the gate must
     surface. Appearing benchmarks (baseline=None, current!=None) stay
     non-regressions; ``render_markdown`` logs them informationally.
+
+    ``tolerance_overrides`` maps ``(benchmark, format, dataset, metric)``
+    to a relaxed bound. When a row matches an override the per-row
+    tolerance is the override's value instead of the global default;
+    the row's ``effective_tolerance`` and ``tolerance_relaxed`` fields
+    record what was actually applied. Overrides are loaded by the
+    flakiness-ledger module from ``results/flakiness/`` markdown files.
+
+    ``wall_cvs`` maps ``(benchmark, format, dataset)`` to the
+    coefficient of variation of ``runs[].wall_s`` in the candidate
+    snapshot. Stamped onto the matching ``median_wall_s`` deltas for
+    reporting; never affects regression status.
     """
+    overrides = tolerance_overrides or {}
+    cvs = wall_cvs or {}
     deltas: list[Delta] = []
     base_rows = baseline_summary.get("rows", {})
     cur_rows = current_summary.get("rows", {})
@@ -188,22 +223,35 @@ def diff_summaries(
         base = base_rows.get(key, {})
         cur = cur_rows.get(key, {})
 
-        for metric, tol in [
+        for metric, default_tol in [
             ("median_wall_s",      timing_tol),
             ("peak_rss_mb_median", rss_tol),
             ("file_size_bytes",    size_tol),
         ]:
             b, c = base.get(metric), cur.get(metric)
             rel = _relative(b, c)
+            quad = (bench, fmt, dataset, metric)
+            override_tol = overrides.get(quad)
+            # Overrides only relax (the loader rejects negative values);
+            # if an entry is somehow at or below the default we let the
+            # default win so a stale ledger entry can't tighten the gate.
+            relaxed = override_tol is not None and override_tol > default_tol
+            tol = override_tol if relaxed else default_tol
             regressed = rel is not None and rel > tol
             if gate and b is not None and c is None:
                 # Disappeared benchmark — only surface this once per triple
                 # so the report doesn't double-count each metric. Use the
                 # timing row as the canonical signal.
                 regressed = regressed or (metric == "median_wall_s")
-            deltas.append(
-                Delta(bench, fmt, dataset, metric, b, c, rel, regressed)
-            )
+            wall_cv = cvs.get((bench, fmt, dataset)) if metric == "median_wall_s" else None
+            deltas.append(Delta(
+                benchmark=bench, fmt=fmt, dataset=dataset, metric=metric,
+                baseline=b, current=c, relative_change=rel,
+                is_regression=regressed,
+                effective_tolerance=tol,
+                tolerance_relaxed=relaxed,
+                wall_cv=wall_cv,
+            ))
 
     return deltas
 
@@ -338,6 +386,65 @@ def _load_thresholds_yaml(path: Path) -> list[dict[str, Any]]:
     return floors
 
 
+def _load_current_wall_cv(
+    current_dir: Path,
+    benchmark: str,
+    fmt: str,
+    dataset: str,
+) -> float | None:
+    """Coefficient of variation (stdev/mean) of ``runs[].wall_s`` in the
+    candidate raw JSON. Returns ``None`` when the file is absent, n<2, or
+    mean is non-positive (median-vs-zero protection mirroring
+    ``_relative``). Surfaces run-to-run noise to the gate report so
+    operators can identify ledger candidates without spelunking through
+    raw JSON.
+    """
+    raw = current_dir / "raw" / f"{benchmark}__{fmt}__{dataset}.json"
+    if not raw.exists():
+        return None
+    try:
+        data = json.loads(raw.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    walls: list[float] = []
+    for run in data.get("runs", []) or []:
+        val = run.get("wall_s")
+        if val is None:
+            continue
+        try:
+            walls.append(float(val))
+        except (TypeError, ValueError):
+            continue
+    if len(walls) < 2:
+        return None
+    mean = statistics.fmean(walls)
+    if mean <= 0:
+        return None
+    return statistics.stdev(walls) / mean
+
+
+def _collect_wall_cvs(
+    current_dir: Path,
+    keys: list[str],
+) -> dict[tuple[str, str, str], float | None]:
+    """Compute wall-time CV for each ``benchmark__format__dataset`` key.
+
+    Skips keys whose triple is malformed or whose raw JSON is absent.
+    Returns a dict that ``diff_summaries`` consumes for stamping CVs
+    onto matching deltas.
+    """
+    out: dict[tuple[str, str, str], float | None] = {}
+    for key in keys:
+        try:
+            bench, fmt, dataset = key.split("__", 2)
+        except ValueError:
+            continue
+        out[(bench, fmt, dataset)] = _load_current_wall_cv(
+            current_dir, bench, fmt, dataset,
+        )
+    return out
+
+
 def _load_current_raw_metric(
     current_dir: Path,
     benchmark: str,
@@ -427,6 +534,19 @@ def _fmt_num(x: float | None) -> str:
     return f"{x:.3f}"
 
 
+def _fmt_cv(cv: float | None) -> str:
+    if cv is None:
+        return "—"
+    return f"{cv * 100:.1f}%"
+
+
+def _fmt_tol(tol: float | None, relaxed: bool) -> str:
+    if tol is None:
+        return "—"
+    suffix = " ⚠" if relaxed else ""
+    return f"{tol * 100:.1f}%{suffix}"
+
+
 def render_markdown(
     deltas: list[Delta],
     fp_mismatches: list[str],
@@ -437,6 +557,8 @@ def render_markdown(
     suppressed_triples: set[_justifications.Triple] | None = None,
     new_benchmarks: list[tuple[str, str, str]] | None = None,
     floor_violations: list[FloorViolation] | None = None,
+    flakiness_overrides_loaded: int = 0,
+    high_cv_threshold: float = _HIGH_CV_THRESHOLD,
 ) -> str:
     timing_regs = [d for d in deltas if d.metric == "median_wall_s" and d.is_regression]
     rss_regs    = [d for d in deltas if d.metric == "peak_rss_mb_median" and d.is_regression]
@@ -457,6 +579,8 @@ def render_markdown(
     lines.append(f"- Fingerprint missing:    {len(fp_missing)}")
     if suppressed_triples:
         lines.append(f"- Justification-suppressed triples: {len(suppressed_triples)}")
+    if flakiness_overrides_loaded:
+        lines.append(f"- Flakiness overrides loaded: {flakiness_overrides_loaded}")
     if floor_violations:
         lines.append(f"- Absolute-floor violations: {len(floor_violations)}")
     if new_benchmarks:
@@ -480,19 +604,59 @@ def render_markdown(
     if timing_regs or rss_regs or size_regs:
         lines.append("## Metric regressions")
         lines.append("")
-        lines.append("| Benchmark | Format | Dataset | Metric | Baseline | Current | Δ | Status |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append(
+            "| Benchmark | Format | Dataset | Metric | Baseline | Current "
+            "| Δ | CV | Tol | Status |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for d in sorted(timing_regs + rss_regs + size_regs,
                         key=lambda x: (x.metric, -(x.relative_change or 0))):
             suppressed = (d.benchmark, d.fmt, d.dataset) in suppressed_triples
-            status = "suppressed" if suppressed else (
-                "DISAPPEARED" if d.current is None and d.baseline is not None
-                else "regressed"
-            )
+            if suppressed:
+                status = "suppressed"
+            elif d.current is None and d.baseline is not None:
+                status = "DISAPPEARED"
+            elif d.tolerance_relaxed:
+                status = "regressed (over relaxed)"
+            else:
+                status = "regressed"
             lines.append(
                 f"| {d.benchmark} | {d.fmt} | {d.dataset} | {d.metric} | "
                 f"{_fmt_num(d.baseline)} | {_fmt_num(d.current)} | "
-                f"**{_fmt_pct(d.relative_change)}** | {status} |"
+                f"**{_fmt_pct(d.relative_change)}** | "
+                f"{_fmt_cv(d.wall_cv)} | "
+                f"{_fmt_tol(d.effective_tolerance, d.tolerance_relaxed)} | "
+                f"{status} |"
+            )
+        lines.append("")
+
+    # Informational: timing rows with high run-to-run RSD that aren't
+    # already in the regressions table. Helps operators spot ledger
+    # candidates without trawling raw JSON.
+    high_cv_rows = sorted(
+        [d for d in deltas
+         if d.metric == "median_wall_s"
+         and d.wall_cv is not None
+         and d.wall_cv > high_cv_threshold
+         and not d.is_regression],
+        key=lambda x: -(x.wall_cv or 0),
+    )
+    if high_cv_rows:
+        lines.append("## High-variance rows (informational)")
+        lines.append("")
+        lines.append(
+            f"Wall-time CV > {high_cv_threshold * 100:.0f}% in the candidate "
+            f"snapshot. These rows passed the gate but may be flakiness-"
+            f"ledger candidates if they keep tripping it on subsequent runs."
+        )
+        lines.append("")
+        lines.append("| Benchmark | Format | Dataset | CV | Tol |")
+        lines.append("|---|---|---|---:|---:|")
+        for d in high_cv_rows:
+            lines.append(
+                f"| {d.benchmark} | {d.fmt} | {d.dataset} | "
+                f"{_fmt_cv(d.wall_cv)} | "
+                f"{_fmt_tol(d.effective_tolerance, d.tolerance_relaxed)} |"
             )
         lines.append("")
 
@@ -528,6 +692,8 @@ def to_json_payload(
     suppressed_triples: set[_justifications.Triple] | None = None,
     new_benchmarks: list[tuple[str, str, str]] | None = None,
     floor_violations: list[FloorViolation] | None = None,
+    flakiness_overrides_loaded: int = 0,
+    flakiness_overrides_applied: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "deltas": [
@@ -535,6 +701,9 @@ def to_json_payload(
                 "benchmark": d.benchmark, "format": d.fmt, "dataset": d.dataset,
                 "metric": d.metric, "baseline": d.baseline, "current": d.current,
                 "relative_change": d.relative_change, "is_regression": d.is_regression,
+                "effective_tolerance": d.effective_tolerance,
+                "tolerance_relaxed": d.tolerance_relaxed,
+                "wall_cv": d.wall_cv,
             }
             for d in deltas
         ],
@@ -560,6 +729,9 @@ def to_json_payload(
             }
             for v in floor_violations
         ]
+    payload["flakiness_overrides_loaded"] = flakiness_overrides_loaded
+    if flakiness_overrides_applied is not None:
+        payload["flakiness_overrides_applied"] = flakiness_overrides_applied
     return payload
 
 
@@ -611,6 +783,17 @@ def main() -> int:
              "when that file exists.",
     )
     parser.add_argument(
+        "--flakiness", type=Path, default=None,
+        help="Directory of flakiness-ledger markdown files declaring "
+             "per-row relaxed tolerances. Under --gate, defaults to "
+             "`benchmarks/comprehensive/results/flakiness/` when that "
+             "exists. Each (benchmark, format, dataset, metric) row "
+             "matched by an active override is gated at the override's "
+             "tolerance instead of the global --timing-tolerance / "
+             "--rss-tolerance / --size-tolerance. See "
+             "benchmarks/README.md for the markdown front-matter format.",
+    )
+    parser.add_argument(
         "--only-benchmarks", nargs="+", default=None, metavar="BENCH",
         help="Restrict the diff to baseline rows whose benchmark is in "
              "this list (e.g. `--only-benchmarks accel_pca`). Without this "
@@ -637,13 +820,15 @@ def main() -> int:
         args.baseline = resolved
 
     # Under --gate, auto-default the committed justifications + thresholds
-    # paths when the operator didn't pass them. Keeps on-demand invocations
-    # to a single flag.
+    # + flakiness paths when the operator didn't pass them. Keeps on-demand
+    # invocations to a single flag.
     if args.gate:
         if args.justifications is None and _DEFAULT_JUSTIFICATIONS_DIR.is_dir():
             args.justifications = _DEFAULT_JUSTIFICATIONS_DIR
         if args.thresholds is None and _DEFAULT_THRESHOLDS_YAML.is_file():
             args.thresholds = _DEFAULT_THRESHOLDS_YAML
+        if args.flakiness is None and _DEFAULT_FLAKINESS_DIR.is_dir():
+            args.flakiness = _DEFAULT_FLAKINESS_DIR
 
     try:
         baseline_summary = _load_summary(args.baseline)
@@ -674,23 +859,27 @@ def main() -> int:
     baseline_fp = _load_fingerprints(args.baseline)
     current_fp  = _load_fingerprints(args.current)
 
-    deltas = diff_summaries(
-        baseline_summary, current_summary,
-        args.timing_tolerance, args.rss_tolerance, args.size_tolerance,
-        gate=args.gate,
-    )
-    fp_mismatches, fp_missing = diff_fingerprints(baseline_fp, current_fp)
-
-    # Under --gate: load justifications + absolute floors, and surface new
-    # benchmarks informationally.
+    # Under --gate: load justifications, flakiness overrides, and
+    # absolute-floor specs; surface new benchmarks informationally.
     suppressed: set[_justifications.Triple] = set()
     floor_violations: list[FloorViolation] = []
     new_benchmarks: list[tuple[str, str, str]] = []
+    tolerance_overrides: dict[_flakiness.Quad, float] = {}
     if args.gate:
         if args.justifications is not None:
             suppressed, _loaded = _justifications.load_active_triples(
                 args.justifications,
             )
+        if args.flakiness is not None:
+            tolerance_overrides, _loaded_flaky = _flakiness.load_active_overrides(
+                args.flakiness,
+            )
+            if args.only_benchmarks:
+                allow = set(args.only_benchmarks)
+                tolerance_overrides = {
+                    quad: tol for quad, tol in tolerance_overrides.items()
+                    if quad[0] in allow
+                }
         if args.thresholds is not None:
             try:
                 floors = _load_thresholds_yaml(args.thresholds)
@@ -711,12 +900,44 @@ def main() -> int:
                 continue
             new_benchmarks.append((bench, fmt, ds))
 
+    # Compute per-row wall-time CV from the candidate raw JSONs. Cheap
+    # (one extra read per (benchmark, format, dataset)) and only used
+    # for reporting — never affects regression status.
+    wall_cvs = _collect_wall_cvs(
+        args.current, list(current_summary.get("rows", {}).keys()),
+    )
+
+    deltas = diff_summaries(
+        baseline_summary, current_summary,
+        args.timing_tolerance, args.rss_tolerance, args.size_tolerance,
+        gate=args.gate,
+        tolerance_overrides=tolerance_overrides,
+        wall_cvs=wall_cvs,
+    )
+    fp_mismatches, fp_missing = diff_fingerprints(baseline_fp, current_fp)
+
+    # Build the "applied" list — overrides that matched at least one
+    # delta — so the JSON payload distinguishes "loaded but inert" from
+    # "loaded and used".
+    applied_quads = {
+        (d.benchmark, d.fmt, d.dataset, d.metric)
+        for d in deltas if d.tolerance_relaxed
+    }
+    flakiness_applied = [
+        {
+            "benchmark": q[0], "format": q[1], "dataset": q[2],
+            "metric": q[3], "tolerance": tolerance_overrides[q],
+        }
+        for q in sorted(applied_quads)
+    ]
+
     report = render_markdown(
         deltas, fp_mismatches, fp_missing,
         args.timing_tolerance, args.allow_fingerprint_drift,
         suppressed_triples=suppressed,
         new_benchmarks=new_benchmarks,
         floor_violations=floor_violations,
+        flakiness_overrides_loaded=len(tolerance_overrides),
     )
     print(report)
 
@@ -727,6 +948,8 @@ def main() -> int:
                 suppressed_triples=suppressed,
                 new_benchmarks=new_benchmarks,
                 floor_violations=floor_violations,
+                flakiness_overrides_loaded=len(tolerance_overrides),
+                flakiness_overrides_applied=flakiness_applied,
             ),
             indent=2, default=str,
         ))

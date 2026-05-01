@@ -96,8 +96,9 @@ benchmarks/
 │   │   ├── gate_candidate.py            # One-shot: capture + gate against LATEST baseline
 │   │   ├── capture_baseline.py          # Freeze one snapshot (raw/ + summary.json + manifest)
 │   │   ├── promote_baseline.py          # Promote a snapshot to results/baselines/<version>/
-│   │   ├── compare_against_baseline.py  # Relative + absolute-floor + justification gate
+│   │   ├── compare_against_baseline.py  # Relative + absolute-floor + justification + flakiness gate
 │   │   ├── _justifications.py           # Justification frontmatter loader used by the gate
+│   │   ├── _flakiness.py                # Flakiness-ledger frontmatter loader (per-row tolerance overrides)
 │   │   ├── fingerprint_accelerators.py  # Record accelerator library versions into summary.json
 │   │   ├── ooc_rss_table.py             # OOC pipeline peak-RSS table generator
 │   │   ├── publish_dashboard.py         # Rsync HTML snapshot to DASHBOARD_PUBLISH_TARGET
@@ -122,6 +123,7 @@ benchmarks/
 │       ├── reports/                     # Generated markdown + plots
 │       ├── baselines/                   # Promoted baselines + LATEST pointer (v0.5.0-phase5, v0.6.0-gpu-phase1-7, ...)
 │       ├── justifications/              # Markdown justifications with frontmatter triples
+│       ├── flakiness/                   # Markdown flakiness ledger (per-row relaxed tolerances)
 │       └── candidate_*/, tier*_*/, baseline_*/  # Dated capture snapshots
 ├── results/               # Per-script benchmark output (JSON + Markdown reports)
 │   ├── pre_phases_1_7_baseline_2026_03/ # Frozen pre-Phase-1-7 GPU baseline (see §GPU workflow)
@@ -861,6 +863,7 @@ python benchmarks/comprehensive/scripts/compare_against_baseline.py \
 Under `--gate`, these flags auto-default and can be omitted:
 - `--baseline` → `results/baselines/LATEST`
 - `--justifications` → `results/justifications/`
+- `--flakiness` → `results/flakiness/`
 - `--thresholds` → `benchmarks/comprehensive/thresholds.yaml`
 
 Override any of them by passing the flag explicitly. Without `--gate` the
@@ -921,6 +924,55 @@ justification stops suppressing and the gate fails again — forces
 periodic review. Multiple triples per file are fine; one file per PR is
 typical.
 
+### Flakiness ledger
+
+Use a flakiness override (instead of a justification) when a row's
+underlying performance is fine but its run-to-run wall-time has
+measurable RSD on this hardware — preemption, shared cache, NUMA
+placement, oversubscribed threads. The override raises the per-row
+tolerance without weakening the rest of the gate; a real regression that
+crosses the relaxed bound still trips. Reach for this whenever you'd
+otherwise be tempted to bump the global `--timing-tolerance` to make a
+PR pass.
+
+Each entry lives in `benchmarks/comprehensive/results/flakiness/`:
+
+```markdown
+---
+overrides:
+  - benchmark: cloud_pull
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: median_wall_s   # optional; defaults to median_wall_s
+    tolerance: 0.08         # required; relaxed bound for this row
+reason: "Shared SLURM node — 7% wall-time RSD across 10 runs (issue #1234)."
+expires: 2026-07-01
+---
+
+Optional prose explaining what would let the override expire (e.g.
+``--exclusive`` SLURM allocation, NUMA pinning, switching the queue).
+```
+
+Set `metric:` explicitly to `peak_rss_mb_median` or `file_size_bytes`
+to relax those rows; otherwise the entry applies to `median_wall_s`
+only. `tolerance` must be non-negative — overrides relax, they don't
+tighten. Two entries for the same `(benchmark, format, dataset, metric)`
+quad keep the **stricter** tolerance and log a warning, so overlapping
+files should be collapsed during cleanup.
+
+The gate report annotates every `median_wall_s` row with its observed
+coefficient of variation (`stdev/mean`) computed from the candidate's
+`runs[].wall_s`, and surfaces a "High-variance rows" section listing
+rows with CV > 5% — those are the natural candidates for a ledger
+entry.
+
+|                  | Justification              | Flakiness override                        |
+|------------------|----------------------------|-------------------------------------------|
+| Effect           | Drops row from regression tally entirely | Raises the row's per-metric tolerance     |
+| Use when         | Real regression accepted   | Underlying perf is fine, runtime is noisy |
+| Real regression beyond the bound | Hidden        | Still trips the gate                      |
+| Per-metric scope | All metrics for the triple | One metric (defaults to `median_wall_s`)  |
+
 ### Rolling dashboard
 
 `write_report()` emits `BENCHMARK_REPORT.html` alongside the markdown
@@ -939,7 +991,8 @@ and exits 0 — safe for unconditional CI invocation.
 
 A hermetic pytest suite validates every transition (regression fails,
 justification suppresses, expired justification stops suppressing,
-disappearing benchmarks flagged, absolute-floor violations fail):
+disappearing benchmarks flagged, absolute-floor violations fail,
+flakiness override relaxes per-row tolerance):
 
 ```bash
 .venv/bin/pytest benchmarks/comprehensive/tests/test_gate_self_test.py -v
