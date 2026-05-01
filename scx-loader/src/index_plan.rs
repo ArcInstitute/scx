@@ -87,6 +87,11 @@ pub struct IndexPlanLoader {
     /// uses this when the caller passes `lookahead=None`. May be less than
     /// the user-requested `lookahead`.
     effective_lookahead: usize,
+    /// Hard ceiling on rows-per-batch. The constructor sizes the dense
+    /// `x` / `x_paired` budget against this value, and `process_plan`
+    /// rejects plans larger than it so a misbehaving consumer can't
+    /// silently exceed `max_memory_mb`.
+    max_plan_size: usize,
 }
 
 impl IndexPlanLoader {
@@ -106,8 +111,12 @@ impl IndexPlanLoader {
     /// fit `config.max_memory_mb` (visible via [`Self::effective_lookahead`]).
     /// `lookahead=0` disables the prefetch path entirely.
     ///
-    /// `max_plan_size` is the upper bound on rows-per-batch used for the
-    /// memory-budget calculation. Default 16384.
+    /// `max_plan_size` is the hard ceiling on rows-per-batch. It is both
+    /// used as the upper bound for the memory-budget calculation at
+    /// construction and enforced at every `process_plan` / `iter_with_plans`
+    /// call — plans longer than this are rejected with a `ConfigError` so a
+    /// misbehaving consumer cannot silently exceed `max_memory_mb`.
+    /// Default 16384.
     ///
     /// Sequential-pipeline-only fields on `LoaderConfig` (`batch_size`,
     /// `shard_group_size`, `prefetch_batches`, `seed`) are silently ignored on
@@ -237,9 +246,11 @@ impl IndexPlanLoader {
                 .saturating_add(PYTHON_OVERHEAD_BYTES)
         };
 
-        // Reduce lookahead first (down to 1, NOT 0 — we want the iterator
-        // path to remain functional even under tight memory; 0 is a user
-        // choice). Then reduce cache_shards down to 1.
+        // Reduce lookahead first (down to 1 — we want the iterator path to
+        // remain functional even under tight memory; an explicit
+        // `lookahead == 0` is preserved through the loop because the
+        // `> 1` guard never decrements it). Then reduce cache_shards down
+        // to 1.
         while estimate(effective_cache_shards, effective_lookahead) > budget_bytes {
             if effective_lookahead > 1 {
                 effective_lookahead -= 1;
@@ -260,13 +271,6 @@ impl IndexPlanLoader {
                     ),
                 });
             }
-        }
-
-        // Special case: caller asked for lookahead=0; the loop above won't
-        // visit 0 (it stops at >1), so honor the explicit request only if
-        // it fits the budget too. Re-check.
-        if lookahead == 0 && estimate(effective_cache_shards, 0) <= budget_bytes {
-            effective_lookahead = 0;
         }
 
         let backed = BackedCsrReader::new(reader, effective_cache_shards);
@@ -292,6 +296,7 @@ impl IndexPlanLoader {
             runtime,
             effective_cache_shards,
             effective_lookahead,
+            max_plan_size,
         })
     }
 
@@ -346,6 +351,17 @@ impl IndexPlanLoader {
     /// `pairs` field reflects the post-sort order: row `i` of `x` / `x_paired`
     /// always corresponds to `pairs[i]`, regardless of the input order.
     pub fn process_plan(&self, mut plan: Vec<(u64, u64)>) -> Result<IndexPlanBatch> {
+        if plan.len() > self.max_plan_size {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "plan size {} exceeds max_plan_size {} (raise max_plan_size at \
+                     construction or split the plan)",
+                    plan.len(),
+                    self.max_plan_size,
+                ),
+            });
+        }
+
         let n_obs = self.n_obs();
 
         for &(p, c) in &plan {
@@ -385,8 +401,11 @@ impl IndexPlanLoader {
         // Stable sort preserves the original plan order for ties (same shard).
         // `shard_of` is `None` only for malformed files; treat that as
         // `usize::MAX` so problematic pairs sink to the end without bailing.
+        // Use `sort_by_cached_key` so each pair's two binary-search lookups
+        // run exactly once — `sort_by_key` may re-invoke the closure during
+        // merges, doubling the lookup cost for larger plans.
         if self.sort_by_shard {
-            plan.sort_by_key(|&(p, c)| {
+            plan.sort_by_cached_key(|&(p, c)| {
                 let sp = self.shard_of(p).unwrap_or(usize::MAX);
                 let sc = self.shard_of(c).unwrap_or(usize::MAX);
                 sp.min(sc)
@@ -1347,5 +1366,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loader.effective_lookahead(), 0);
+    }
+
+    /// `process_plan` must reject plans larger than `max_plan_size` so a
+    /// misbehaving consumer cannot silently exceed the memory budget.
+    /// Plans at or below the ceiling are accepted as before.
+    #[test]
+    fn process_plan_rejects_oversize_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+
+        let loader = IndexPlanLoader::new(
+            &path,
+            config,
+            /*cache_shards*/ 4,
+            /*sort_by_shard*/ false,
+            /*lookahead*/ 1,
+            /*max_plan_size*/ 4,
+        )
+        .unwrap();
+
+        // At-the-ceiling plan succeeds.
+        let ok_plan = vec![(0u64, 1u64), (2, 3), (4, 5), (6, 7)];
+        let batch = loader.process_plan(ok_plan).unwrap();
+        assert_eq!(batch.pairs.len(), 4);
+
+        // Over-the-ceiling plan rejects with a ConfigError naming both numbers.
+        let big_plan: Vec<(u64, u64)> =
+            (0..5u64).map(|i| (i, (i + 1) % 32)).collect();
+        match loader.process_plan(big_plan) {
+            Err(LoaderError::ConfigError { reason }) => {
+                assert!(reason.contains("plan size 5"), "got: {reason}");
+                assert!(reason.contains("max_plan_size 4"), "got: {reason}");
+            }
+            Err(other) => panic!("expected ConfigError, got {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 }
