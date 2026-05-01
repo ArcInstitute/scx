@@ -702,11 +702,13 @@ def estimate_memory_gb(
         peak_mb = max(base_mb, 4 * 1024)  # 4 GB ceiling for the streaming path
     elif benchmark == "cloud_read":
         # SCX pull+read needs the dense matrix at end; other runners (zarr,
-        # tiledb, slaf) materialize in-memory too. Size like read_full.
+        # tiledb, slaf) materialize in-memory too. Size like read_full,
+        # then 2.0× to cover the post-loop verification pass (§3.6) which
+        # transiently double-materialises cloud + local CSRs to compare.
         if is_dense_path:
-            peak_mb = max(base_mb, dense_mb * 1.3)
+            peak_mb = max(base_mb, dense_mb * 2.0)
         else:
-            peak_mb = max(base_mb, dense_mb * 0.5)
+            peak_mb = max(base_mb, dense_mb * 1.0)
     elif benchmark == "cloud_metadata":
         # Catalog-only open — single GET + a few small parses. Trivial.
         peak_mb = max(base_mb * 0.25, 2 * 1024)  # 2 GB floor for Python baseline
