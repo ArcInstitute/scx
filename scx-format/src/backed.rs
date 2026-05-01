@@ -220,6 +220,19 @@ enum AggOp {
 /// `ScxReader` contains a `memmap2::Mmap` which is `Send + Sync`.
 /// The reader itself is safe to share immutably.  Only the LRU cache
 /// requires interior mutability via [`Mutex`].
+///
+/// # Fork safety
+///
+/// **Invariant** (DEADLOCK-ISSUE.md §3.2): the shard `cache` is
+/// per-`BackedCsrReader` instance, *not* a process-global `OnceCell` /
+/// `static` / `lazy_static`. Per-instance state is the contract that
+/// keeps this type fork-safe: a forked child that constructs its own
+/// `BackedCsrReader` (e.g. via `pyscx.TrainingDataset` lazy construction
+/// inside a `DataLoader` worker's `__iter__`) gets a fresh `Mutex` that
+/// has no chance of being inherited from the parent in a poisoned-locked
+/// state. If a future edit moves any of these fields into a global, the
+/// fork-mode regression test (`pyscx/tests/test_fork_deadlock.py`) will
+/// catch the resulting hang on the first cache access in the child.
 pub struct BackedCsrReader {
     reader: ScxReader,
     index: BackedCsrIndex,
@@ -231,6 +244,8 @@ pub struct BackedCsrReader {
     x_sorted_entries: Vec<FullCatalogEntry>,
     /// Pre-sorted catalog entries for layer shards (empty for X shards).
     sorted_entries: Vec<FullCatalogEntry>,
+    /// Per-instance shard cache. **Must remain per-instance** — see the
+    /// "Fork safety" section in the type doc above.
     cache: Option<Mutex<LruCache<usize, Arc<ScxCsr>>>>,
     /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
     prefetch_count: usize,

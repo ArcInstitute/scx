@@ -511,22 +511,85 @@ impl TrainingPipeline {
         self.join_epoch_handles()?;
         tracing::trace!("prior epoch handles joined");
 
-        // Build the per-pipeline rayon pool (lazy, post-fork) before
-        // spawning the decode thread that uses it (§2.0a).
-        let decode_pool = Arc::clone(self.ensure_decode_pool()?);
+        // Phase 3.1 invariant: after `join_epoch_handles`, all per-epoch
+        // channel state must be reset. If this fires, a future edit broke
+        // the contract that `join_epoch_handles` is the single owner of
+        // `batch_rx` teardown — and `tx.send` from the decode stage that
+        // about to be respawned would race with the prior epoch's receiver.
+        debug_assert!(
+            self.batch_rx.is_none(),
+            "batch_rx must be None after join_epoch_handles before re-spawning"
+        );
+        debug_assert!(
+            self.io_handle.is_none() && self.decode_handle.is_none(),
+            "epoch handles must be None after join_epoch_handles before re-spawning"
+        );
 
         // Generate offset-sorted shard groups for this epoch.
         // Shard groups are randomly composed (stochastic across epochs) but
         // sorted by file offset within and across groups for sequential I/O.
-        let sorted_entries = self.reader.catalog().shards_sorted();
-        let shard_offsets: Vec<u64> = sorted_entries.iter().map(|e| e.offset).collect();
+        // Collect into owned `Vec<u64>` first so the catalog borrow ends
+        // before `ensure_decode_pool` (which needs `&mut self`).
+        let shard_offsets: Vec<u64> = self
+            .reader
+            .catalog()
+            .shards_sorted()
+            .iter()
+            .map(|e| e.offset)
+            .collect();
+
+        // Phase 3.3 mmap smoke-read. Touch one byte of the first CSR shard's
+        // backing region before spawning the I/O / decode threads. If the
+        // mmap'd file has been poisoned (truncated, unmapped via outer
+        // munmap, or unmapped because the underlying file was deleted by
+        // another process and the kernel reaped the pages), the load below
+        // raises SIGBUS *here*, on the consumer thread — far better than
+        // hanging the I/O stage on an unreproducible read after the workers
+        // have spawned. Cheap: a single byte fault on a region the I/O
+        // stage was about to fault anyway.
+        if let Some(&first_offset) = shard_offsets.first() {
+            let mmap = self.reader.mmap();
+            let off = first_offset as usize;
+            if off >= mmap.len() {
+                return Err(LoaderError::ShutdownError(format!(
+                    "first shard offset {off} exceeds mmap length {}",
+                    mmap.len()
+                )));
+            }
+            // `black_box` forces the load to be observable and prevents the
+            // optimizer from eliding the smoke-read as dead code. The slice
+            // index is bounds-checked just above.
+            let _ = std::hint::black_box(mmap[off]);
+        }
+
+        // Build the per-pipeline rayon pool (lazy, post-fork) before
+        // spawning the decode thread that uses it (§2.0a).
+        let decode_pool = Arc::clone(self.ensure_decode_pool()?);
+
         let shard_groups = self.shuffler.shuffle_epoch_sorted(&shard_offsets);
 
         // Create bounded channels
+        //
         // I/O → Decode: tokio mpsc channel. Each item is a ShardGroup containing
         // shard_group_size decoded shards. Cap at 2 for pipeline overlap (one
         // being decoded + one read-ahead), not shard_group_size which would allow
         // shard_group_size * shard_group_size decoded shards in flight.
+        //
+        // **Shutdown propagation chain** (Phase 3.4 — DEADLOCK-ISSUE.md):
+        // 1. Consumer drops `self.batch_rx` (in `join_epoch_handles`).
+        // 2. Decode stage's `crossbeam tx.send(batch)` returns Err. Decode
+        //    stage exits with `LoaderError::ChannelError`, dropping its
+        //    end of the tokio mpsc (`io_rx`).
+        // 3. I/O stage's `tokio tx.send(group).await` returns Err (receiver
+        //    closed). `io_stage` exits with `LoaderError::ChannelError`.
+        // 4. The current-thread runtime's `block_on(io_stage(...))` returns;
+        //    the I/O thread exits, dropping its tokio runtime cleanly.
+        //
+        // Both stages' ChannelError return values are filtered out as
+        // expected-on-shutdown by `join_epoch_handles` (§2.4) — the chain
+        // only surfaces real errors (panics, ShutdownError, ConfigError).
+        // No explicit cancellation token is needed; channel close is the
+        // signal.
         let (io_tx, io_rx) = tokio::sync::mpsc::channel(2);
 
         // Decode → Consumer: crossbeam bounded channel, capacity = prefetch_batches
