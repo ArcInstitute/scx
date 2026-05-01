@@ -35,9 +35,37 @@ use crate::pipeline::{LoaderConfig, TrainingPipeline};
 /// Wraps the Rust `TrainingPipeline` and exposes it as a Python iterator.
 /// Each call to `__next__` returns a dict `{"X": ndarray, "obs": {...}, "cell_indices": ndarray}`.
 ///
-/// **Important**: Must be used with `num_workers=0` in `torch.utils.data.DataLoader`.
-/// The Rust pipeline manages its own threads; forking after CUDA initialization
-/// causes deadlocks.
+/// # Fork safety (DEADLOCK-ISSUE.md Phase 2)
+///
+/// `TrainingDataset` is fork-safe under PyTorch
+/// `DataLoader(num_workers > 0, start_method="fork")` **when the dataset is
+/// constructed lazily inside the worker's `__iter__`** (the pattern used by
+/// `cell-load-scx`'s `ScxTrainingDataset` and `state-scx`'s
+/// `ScxStateAdapter`). The pipeline's internal tokio current-thread runtime
+/// (per-epoch, owned by a dedicated I/O `std::thread`) and per-pipeline
+/// `rayon::ThreadPool` (per-instance, lazily built on first `start_epoch()`)
+/// are constructed *inside the worker process* and therefore never inherit
+/// fork-hostile thread state from the parent.
+///
+/// **Constraints that still apply:**
+/// - Eager-construct in parent + fork = unsupported. The PID check in
+///   `__next__` raises `RuntimeError` if a `TrainingDataset` constructed
+///   in the parent is used from a forked child.
+/// - CUDA-initialised parent + fork = unsupported (PyTorch / driver
+///   territory; no scx-side fix possible).
+/// - Don't share a `TrainingDataset` across processes via pickle / Manager
+///   handles — it owns thread handles that don't survive transfer.
+///
+/// **Recommended for environments that allow it:** use
+/// `multiprocessing.set_start_method("spawn")`, which re-execs Python in
+/// the child and eliminates fork hazards entirely.
+///
+/// **Recommended for clean shutdown:** call `dataset.close()` (or register
+/// `weakref.finalize(dataset, dataset.close)` at construction time) before
+/// process exit so the rayon pool and I/O thread shut down while the
+/// interpreter is still healthy. `Drop` runs at interpreter teardown as a
+/// fallback but is bounded by a 5-second deadline per thread to avoid
+/// hangs (DEADLOCK-ISSUE.md §2.3).
 #[pyclass]
 pub struct TrainingDataset {
     pipeline: TrainingPipeline,
@@ -199,6 +227,23 @@ impl TrainingDataset {
         dict.set_item("mmap_mb", mb.mmap_bytes / (1024 * 1024))?;
         dict.set_item("budget_exceeded", mb.budget_exceeded)?;
         Ok(dict)
+    }
+
+    /// Explicitly shut the pipeline down: drop channels, join I/O + decode
+    /// threads (bounded by `SHUTDOWN_DEADLINE`), and release the
+    /// per-pipeline rayon pool (DEADLOCK-ISSUE.md §2.5).
+    ///
+    /// Idempotent. Safe to call multiple times. Once `close()` has been
+    /// called, subsequent `__iter__` / `__next__` calls behave as if no
+    /// epoch were active — the next `__iter__` re-builds the rayon pool
+    /// and runtime lazily.
+    ///
+    /// Recommended pattern under PyTorch DataLoader workers: register a
+    /// `weakref.finalize(self, lambda: ds.close())` at construction time
+    /// so the pool / runtime are torn down before interpreter teardown
+    /// (where `Drop`'s GIL probe might still be too late).
+    fn close(&mut self, py: Python<'_>) {
+        py.allow_threads(|| self.pipeline.shutdown());
     }
 
     fn __repr__(&self) -> String {
