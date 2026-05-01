@@ -47,6 +47,105 @@ absolute_floors:
     metric: throughput_mbps
     min: 50.0
 
+  # --- cloud_read correctness (§3.6) ---------------------------------
+  # Hard parity gate: the cloud-pulled SCX matrix must equal the local
+  # source SCX. Catches silent corruption in the cloud-fixture pipeline
+  # (BLAKE3 sidecar drift, exploded-shard layout regression on push or
+  # pull). cloud_read previously measured wall-time + RSS only — a
+  # post-pull layout corruption would have surfaced as a timing
+  # anomaly, not a hard failure.
+  #
+  # The verification pass in cloud_read.py runs once per (dataset,
+  # format, cloud_url) — outside the timed loop — and broadcasts its
+  # result into every run's extra so the gate's median-across-runs
+  # collapses cleanly to the underlying 0/1 value.
+  #
+  # On census-tier datasets (n_obs > 1M) the full `csr_equal` path is
+  # skipped to avoid double-materialising at 40+ GB RSS; the helper
+  # falls back to row-sum equality and exposes
+  # `csr_equal_rowsum_int` instead of `csr_equal_int`. Floors below
+  # gate the aggregate (`correctness_n_failed <= 0`) which folds in
+  # whichever variant ran.
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: pbmc3k
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: pbmc3k
+    metric: correctness_n_failed
+    max: 0
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: pbmc3k
+    metric: shape_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: pbmc3k
+    metric: nnz_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: pbmc3k
+    metric: obs_var_dims_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: correctness_n_failed
+    max: 0
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: shape_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: nnz_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: obs_var_dims_match_int
+    min: 1
+  # census_10m runs the row-sum fallback (n_obs > 1M); the per-check
+  # floors below gate that variant via `correctness_n_failed`. No
+  # explicit `csr_equal_int` floor here — would be `missing → fail`
+  # because the helper emits `csr_equal_rowsum_int` instead.
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: census_10m
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: census_10m
+    metric: correctness_n_failed
+    max: 0
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: census_10m
+    metric: shape_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: census_10m
+    metric: nnz_match_int
+    min: 1
+  - benchmark: cloud_read
+    format: scx_auto
+    dataset: census_10m
+    metric: obs_var_dims_match_int
+    min: 1
+
   # ─── Phase 9 accelerator thresholds ──────────────────────────────────
   #
   # Gate the `pyscx.accel.*` surface migrated into the comprehensive

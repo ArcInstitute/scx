@@ -7,13 +7,23 @@ without that capability (silent skip).
 
 Runners that *declare* the capability but fail to implement it propagate
 ``NotImplementedError`` loudly, per the base-class contract.
+
+After the timed loop, an untimed verification pass for SCX formats pulls
+the cloud fixture once more and compares the materialised matrix against
+the local ``converted_path``. Result counts land in every run's
+``extra`` so ``thresholds.yaml`` can floor them — addresses §3.6 of
+``2026-04-29_SCX-BENCH-REVIEW.md``.
 """
 
 from __future__ import annotations
 
 import gc
 import logging
+import os
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from benchmarks.comprehensive.cloud_fixtures import (
     ensure_cloud_fixture,
@@ -29,6 +39,13 @@ from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
+
+# Skip full csr_equal above this row count — materialising both matrices
+# at census-tier scale doubles peak RSS during verification. Above the
+# threshold we fall back to row-sum equality (cheap, catches layout /
+# codec corruption). pbmc3k (2.7K) and tabula_sapiens_100k (100K) stay
+# in the full-equality path; census_10m (10M) takes the row-sum path.
+_FULL_CSR_EQUAL_MAX_OBS = 1_000_000
 
 
 def run(
@@ -99,6 +116,17 @@ def run(
         )
         logger.info("  wall=%.3fs  rss=%.1fMB", timing.wall_s, timing.peak_rss_mb)
 
+    correctness_extra = _verify_cloud_matches_local(
+        cloud_url=cloud_url,
+        local_path=Path(converted_path),
+        format_variant=format_variant,
+        dataset=dataset,
+    )
+    if correctness_extra:
+        for run_record in result.runs:
+            run_record.extra.update(correctness_extra)
+        result.metadata["correctness"] = correctness_extra
+
     logger.info(
         "cloud_read complete: %s / %s — median %.3fs",
         format_variant.key,
@@ -106,3 +134,114 @@ def run(
         result.median_wall_s or 0.0,
     )
     return result
+
+
+def _verify_cloud_matches_local(
+    cloud_url: str,
+    local_path: Path,
+    format_variant: FormatVariant,
+    dataset: DatasetConfig,
+) -> dict[str, Any]:
+    """Pull the cloud fixture once more (untimed) and compare the
+    materialised matrix against the local source.
+
+    Returns a dict of int metrics for ``runs[].extra``. Empty dict when
+    the format is not SCX (other backends would need their own
+    local-source comparison logic). Sparse-by-design: missing keys mean
+    "the check wasn't run", not "0 failures" — mirrors the convention
+    in ``correctness.py``.
+    """
+    if not format_variant.key.startswith("scx"):
+        return {}
+
+    try:
+        import numpy as np
+        import pyscx
+    except ImportError as exc:
+        logger.warning(
+            "cloud_read correctness check skipped — pyscx import failed: %s",
+            exc,
+        )
+        return {"correctness_n_skipped": 1}
+
+    logger.info("cloud_read correctness check: pulling fresh copy for compare")
+    tmp = tempfile.mkdtemp(prefix="scx_cloud_read_verify_")
+    try:
+        pulled = os.path.join(tmp, "pulled.scx")
+        pyscx.pull(cloud_url, pulled)
+        adata_cloud = pyscx.open(pulled).to_anndata()
+        adata_local = pyscx.open(str(local_path)).to_anndata()
+
+        X_cloud = adata_cloud.X
+        X_local = adata_local.X
+
+        shape_match = bool(X_cloud.shape == X_local.shape)
+        nnz_match = bool(int(X_cloud.nnz) == int(X_local.nnz))
+        dims_match = bool(
+            adata_cloud.n_obs == adata_local.n_obs
+            and adata_cloud.n_vars == adata_local.n_vars
+        )
+
+        n_obs = int(adata_local.n_obs)
+        csr_skipped = n_obs > _FULL_CSR_EQUAL_MAX_OBS
+        if csr_skipped:
+            # Row-sum equality — O(nnz) memory, no double dense
+            # materialisation. Catches layout / codec corruption that
+            # would shift values across rows or zero them out.
+            sum_cloud = np.asarray(X_cloud.sum(axis=1)).ravel()
+            sum_local = np.asarray(X_local.sum(axis=1)).ravel()
+            csr_equal_result = bool(
+                shape_match
+                and np.allclose(sum_cloud, sum_local, rtol=1e-6, atol=0)
+            )
+        else:
+            from benchmarks.comprehensive.scripts.validation_helpers import (
+                csr_equal,
+            )
+            csr_equal_result = bool(
+                shape_match and csr_equal(X_cloud, X_local, rtol=1e-6)
+            )
+
+        checks = {
+            "shape_match": shape_match,
+            "nnz_match": nnz_match,
+            "csr_equal": csr_equal_result,
+            "obs_var_dims_match": dims_match,
+        }
+        n_passed = sum(1 for v in checks.values() if v)
+        n_failed = sum(1 for v in checks.values() if not v)
+        n_total = len(checks)
+        n_skipped = 1 if csr_skipped else 0
+
+        out: dict[str, Any] = {
+            "correctness_n_passed": n_passed,
+            "correctness_n_failed": n_failed,
+            "correctness_n_skipped": n_skipped,
+            "correctness_n_total": n_total,
+            "correctness_passed_int": 1 if n_failed == 0 else 0,
+            "shape_match_int": 1 if shape_match else 0,
+            "nnz_match_int": 1 if nnz_match else 0,
+            "obs_var_dims_match_int": 1 if dims_match else 0,
+        }
+        if csr_skipped:
+            out["csr_equal_rowsum_int"] = 1 if csr_equal_result else 0
+        else:
+            out["csr_equal_int"] = 1 if csr_equal_result else 0
+
+        logger.info(
+            "cloud_read correctness: %d/%d passed (failed=%d, skipped_full_csr=%s)",
+            n_passed,
+            n_total,
+            n_failed,
+            csr_skipped,
+        )
+        if n_failed:
+            logger.warning(
+                "cloud_read correctness FAILED for %s/%s: %s",
+                format_variant.key,
+                dataset.name,
+                {k: v for k, v in checks.items() if not v},
+            )
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
