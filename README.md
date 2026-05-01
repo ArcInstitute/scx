@@ -113,6 +113,16 @@ for batch in dataset:
     # model.forward(), loss.backward(), ...
 ```
 
+For ML workloads where each batch is a list of `(perturbed_cell, control_cell)`
+pairs (perturbation training, contrastive learning, donor-matched designs),
+`pyscx.IndexPlanDataset` is the sibling row-source: consumer-supplied plans,
+paired dense `{X, X_paired, pairs, obs, obs_paired}` batches, optional
+shard prefetch lookahead. Plan-driven access is intentionally random — at
+1M cells it reaches **20K cells/s** (3.7× slower than the sequential
+`TrainingDataset` ceiling) but is **106× faster** than the cell-load-scx
+`ScxBackedSparseDataset` Python-loop baseline. See
+[`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
+
 ### You want to query without loading everything
 
 SCX includes a lazy query engine with two-level predicate pushdown. Filter by cell type,

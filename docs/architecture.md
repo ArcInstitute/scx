@@ -299,7 +299,36 @@ normalize(target_sum=1e4)          ← fused with log1p when possible
 The loader is a **triple-buffered Rust pipeline** designed to keep the GPU
 saturated during model training. It does **not** go through `to_anndata()`.
 
-### Pipeline Architecture
+### Two row-source models
+
+`scx-loader` exposes two parallel row-source types for ML training. They
+share lower-level decode / projection / normalize primitives but use
+different I/O orchestration tuned for different access patterns:
+
+- **`TrainingDataset`** — catalog-order streaming. Sequential triple-buffered
+  pipeline (tokio I/O → rayon decode → Python). Optimised for highest
+  per-thread throughput (peak ~75K cells/s on 1M-cell synthetic; 82× faster
+  than TileDB-SOMA-ML at scale). Right primitive for single-cell pretraining,
+  classification, embedding extraction.
+
+- **`IndexPlanDataset`** — consumer-supplied plans. Each batch is a
+  `list[tuple[pert_idx, ctrl_idx]]` and the loader gathers paired rows via
+  the cached `BackedCsrReader::read_row_indices`. Optimised for plan-driven
+  pairing (perturbation training, contrastive learning, donor-matched
+  designs). Random by definition — breaks the catalog-order I/O optimisation
+  in exchange for per-cell pairing flexibility. Reaches ~20K cells/s at 1M
+  cells (~3.7× slower than the sequential ceiling), 106× faster than the
+  current cell-load-scx `ScxBackedSparseDataset` Python-loop baseline.
+
+The two types share `BackedCsrReader::read_row_indices`,
+`HvgProjection::scatter_pair_rows` / `scatter_row_full`,
+`fused_normalize_log1p_dense`, and `extract_obs_columns`. They do **not**
+share `pipeline.rs` — the streaming pipeline's I/O stage sorts shard groups
+by file offset, an optimisation that doesn't apply to plan-driven access.
+See `PER-CELL-CONTROL-PAIRING.md` and `docs/api.md` § `IndexPlanDataset` for
+details.
+
+### Pipeline Architecture (TrainingDataset)
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌──────────────┐
@@ -330,7 +359,8 @@ and the forward/backward pass.
 | `projection.rs` | `HvgProjection` — gene subset at decode time (~15× data reduction) |
 | `normalize.rs` | Dense-row fused normalize + log1p |
 | `batch.rs` | `Batch` struct — dense f32 matrix + obs columns |
-| `python.rs` | `TrainingDataset` PyO3 class (implements `__iter__`/`__next__`) |
+| `index_plan.rs` | `IndexPlanLoader` + `IndexPlanIter` — plan-driven paired-batch reader (sibling row-source model; see above) |
+| `python.rs` | `TrainingDataset` + `IndexPlanDataset` PyO3 classes (both implement `__iter__`/`__next__`) |
 
 ### Memory Budget
 

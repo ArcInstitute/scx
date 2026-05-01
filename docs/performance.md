@@ -425,6 +425,56 @@ returns 0 batches per scenario (TTFB 90.2 s then timeout) — flagged as a
 SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 `benchmarks/comprehensive/results/raw/ml_loader__slaf__census_{1m,10m}.json`.
 
+### IndexPlanDataset (plan-driven paired reads)
+
+`pyscx.IndexPlanDataset` is the sibling type for perturbation training and
+other workloads where each batch is a list of `(perturbed_cell, control_cell)`
+pairs. It consumes a Python iterator of plans, gathers rows via the cached
+`BackedCsrReader`, and yields paired dense `{X, X_paired, pairs, obs, obs_paired}`
+batches. Spec: [`PER-CELL-CONTROL-PAIRING.md`](../PER-CELL-CONTROL-PAIRING.md).
+
+**1M-cell synthetic fixture** (Lambda HPC, `vci-steady-state-node-020`,
+`--cpus-per-task=16 --mem=64G`; 1M × 2K × 5%-density × 8 nnz/row × HVG=2000 ×
+1024 pairs/batch × 1000 batches.
+
+| Scenario | batches/s | cells/s | Notes |
+|---|---|---|---|
+| `pyscx_index_plan_random` | 9.93 | 20,342 | uniformly-random pairs (Mode A) |
+| `pyscx_index_plan_locality` | 9.81 | 20,089 | shard-locality keyed (Mode B) |
+| `pyscx_backed_python_loop` | 0.09 | 189 | current cell-load-scx baseline (50 batches) |
+| `pyscx_training_dataset` | 36.62 | 74,996 | sequential ceiling |
+
+Headline: **`IndexPlanDataset` is 106× faster than the current
+`ScxBackedSparseDataset` Python-loop path** (20,089 vs 189 cells/s) that
+cell-load-scx consumes today. The `TrainingDataset` ceiling is 3.7× higher
+because sequential reads can stream shards in catalog order; plan-driven
+access is intentionally random and trades that for per-cell pairing
+flexibility.
+
+**Locality optimisations (1M cells, same fixture):**
+
+| Lever | Delta | Notes |
+|---|---|---|
+| Phase 2 — shard sort | 0.96× | break-even (fixture fits in 1.4 TB RAM, page-cache hot) |
+| Phase 3 — vectorised pair scatter | 1.07–1.08× | CPU-bound microbench, scale-independent |
+| Phase 4 — lookahead 0→4 | **1.04×** | small but consistent at 1M scale |
+| Phase 4 — lookahead 4→8 | 0.98× | beyond 4 doesn't help on this fixture |
+
+Phase 2 and Phase 4 deltas are scale-dependent — they should grow once the
+fixture exceeds RAM and shard-cache misses start dominating wall time. The
+default `lookahead=4` is justified by the 1M result; `cache_shards=128` is
+the more important lever.
+
+Comprehensive-suite module: `benchmarks/comprehensive/benchmarks/index_plan.py`
+(SCX-only, gated on `scx_auto`). Run via
+`python benchmarks/comprehensive/scripts/gate_candidate.py --benchmarks index_plan`.
+Standalone driver for fast iteration: `benchmarks/index_plan_bench.py`. Cluster
+sbatch script: `benchmarks/index_plan_bench_1m.sbatch`. Result JSONs from the
+1M run live at
+`benchmarks/comprehensive/results/index_plan_phase7/index_plan_1m_{indexed,backed_python}.json`.
+Floors in `thresholds.yaml` set at 0.5× the 1M medians — re-pin if/when
+fixtures grow beyond memory.
+
 ## Query Engine
 
 | Metric | Result |
