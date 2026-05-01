@@ -9,6 +9,14 @@ Two-phase execution:
 Each (benchmark, dataset, format) triple is submitted as an independent SLURM
 job, enabling massive parallelism across the cluster.
 
+Phase A and Phase B overlap: as soon as a conversion job is submitted,
+its dependent benchmark jobs are submitted with a SLURM
+``--dependency=afterok:<jid>`` directive. SLURM holds them in PENDING until
+the conversion lands, then releases them — so a fast conversion (pbmc3k)
+unblocks its benchmarks long before a slow conversion (census_5m, h5ad_lzf)
+finishes. Benchmarks whose target file already exists, and ones in
+``_NO_CONVERSION``, submit with no dependency at all.
+
 Usage:
     # Full run on small datasets
     python benchmarks/comprehensive/scripts/run_parallel.py \\
@@ -43,6 +51,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -409,12 +418,18 @@ def main() -> None:
 
     # Determine which benchmarks need pre-converted files
     needs_conversion = [b for b in benchmarks if b not in _NO_CONVERSION]
-    needs_write = "write" in benchmarks
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- Phase A: Conversion ---
+    # `conversion_paths` records files already on disk; `conv_jobs` records
+    # conversions submitted this run (whose Phase-B dependents will gate on
+    # `afterok:<jid>`). A `(ds, fmt)` key appears in at most one of the two.
+    # `dry_run_conv_keys` mirrors `conv_jobs` for --dry-run so Phase B can
+    # report would-be afterok edges without actually submitting anything.
     conversion_paths: dict[tuple[str, str], str] = {}
+    conv_jobs: dict[tuple[str, str], submitit.Job] = {}
+    dry_run_conv_keys: set[tuple[str, str]] = set()
 
     if needs_conversion and not args.skip_convert:
         logger.info("=" * 60)
@@ -422,8 +437,6 @@ def main() -> None:
         logger.info("=" * 60)
 
         executor = submitit.AutoExecutor(folder=str(LOGS_DIR / "convert"))
-
-        conv_jobs: dict[tuple[str, str], submitit.Job] = {}
 
         for ds_name in datasets:
             cfg = DATASETS[ds_name]
@@ -444,6 +457,7 @@ def main() -> None:
                         "  [DRY RUN] Would convert: %s / %s [%dG, %s]",
                         ds_name, fmt.key, params["mem_gb"], params["slurm_partition"],
                     )
+                    dry_run_conv_keys.add(key)
                     continue
 
                 params = _per_job_slurm_params(
@@ -460,16 +474,11 @@ def main() -> None:
                     ds_name, fmt.key, params["mem_gb"], params["slurm_partition"], job.job_id,
                 )
 
-        # Wait for conversion jobs to complete
         if conv_jobs and not args.dry_run:
-            logger.info("Waiting for %d conversion jobs...", len(conv_jobs))
-            for key, job in conv_jobs.items():
-                try:
-                    path = job.result()
-                    conversion_paths[key] = path
-                    logger.info("  Done: %s / %s -> %s", key[0], key[1], path)
-                except Exception as e:
-                    logger.error("  FAILED: %s / %s -> %s", key[0], key[1], e)
+            logger.info(
+                "Submitted %d conversion job(s); benchmarks will release as each lands.",
+                len(conv_jobs),
+            )
     elif needs_conversion:
         # --skip-convert: assume files exist at persistent paths
         for ds_name in datasets:
@@ -486,7 +495,11 @@ def main() -> None:
 
     executor = submitit.AutoExecutor(folder=str(LOGS_DIR / "bench"))
 
-    bench_jobs: list[tuple[str, submitit.Job]] = []
+    # Each entry: (label, bench_job, conv_key | None). conv_key points back
+    # at conv_jobs so the post-hoc wait loop can attribute a benchmark
+    # failure to a cancelled-by-dependency state vs a real benchmark crash.
+    bench_jobs: list[tuple[str, submitit.Job, tuple[str, str] | None]] = []
+    dep_jobid_for_label: dict[str, str | None] = {}
 
     for bench_name in benchmarks:
         for ds_name in datasets:
@@ -509,9 +522,24 @@ def main() -> None:
                 key = (ds_name, fmt.key)
                 label = f"{bench_name}/{ds_name}/{fmt.key}"
 
-                # write and parallel_write_scaling don't need pre-converted files
+                # Decide the conversion source and the SLURM dependency.
+                # Three states: (a) bench needs no conversion → no dep,
+                # path is None; (b) conversion was submitted this run →
+                # afterok dep on its job_id, path is the deterministic
+                # on-disk target (visible after the conv job lands);
+                # (c) converted file already on disk → no dep.
+                dep_jobid: str | None = None
                 if bench_name in _NO_CONVERSION:
                     conv_path = None
+                elif key in conv_jobs:
+                    dep_jobid = conv_jobs[key].job_id
+                    conv_path = str(DATASETS[ds_name].path_for_format(fmt.key))
+                elif args.dry_run and key in dry_run_conv_keys:
+                    # In --dry-run we never actually submit Phase A,
+                    # so use a placeholder jobid to surface the would-be
+                    # afterok edge in the per-cell log.
+                    dep_jobid = "<conv-pending>"
+                    conv_path = str(DATASETS[ds_name].path_for_format(fmt.key))
                 else:
                     conv_path = conversion_paths.get(key)
                     if conv_path is None:
@@ -521,22 +549,30 @@ def main() -> None:
                 params = _per_job_slurm_params(args, ds_name, fmt.key, bench_name)
 
                 if args.dry_run:
+                    dep_str = f" deps=afterok:{dep_jobid}" if dep_jobid else ""
                     logger.info(
-                        "  [DRY RUN] Would run: %s [%dG, %s]",
-                        label, params["mem_gb"], params["slurm_partition"],
+                        "  [DRY RUN] Would run: %s [%dG, %s]%s",
+                        label, params["mem_gb"], params["slurm_partition"], dep_str,
                     )
                     continue
 
-                executor.update_parameters(**params)
+                update_kwargs: dict[str, Any] = dict(params)
+                if dep_jobid is not None:
+                    extra = update_kwargs.get("slurm_additional_parameters", {}) or {}
+                    extra = {**extra, "dependency": f"afterok:{dep_jobid}"}
+                    update_kwargs["slurm_additional_parameters"] = extra
+                executor.update_parameters(**update_kwargs)
                 job = executor.submit(
                     _run_benchmark,
                     bench_name, ds_name, fmt.key, fmt.runner, fmt.params,
                     n_runs, args.cold_cache, conv_path,
                 )
-                bench_jobs.append((label, job))
+                bench_jobs.append((label, job, key if dep_jobid is not None else None))
+                dep_jobid_for_label[label] = dep_jobid
+                dep_str = f" deps=afterok:{dep_jobid}" if dep_jobid else ""
                 logger.info(
-                    "  Submitted: %s [%dG, %s] -> job %s",
-                    label, params["mem_gb"], params["slurm_partition"], job.job_id,
+                    "  Submitted: %s [%dG, %s]%s -> job %s",
+                    label, params["mem_gb"], params["slurm_partition"], dep_str, job.job_id,
                 )
 
     # Emit run_manifest.json — an authoritative list of submitted triples so
@@ -552,8 +588,9 @@ def main() -> None:
                     "label": label,
                     "job_id": job.job_id,
                     "submitit_folder": str(job.paths.folder),
+                    "dependency": dep_jobid_for_label.get(label),
                 }
-                for label, job in bench_jobs
+                for label, job, _conv_key in bench_jobs
             ],
         }
         import json as _json
@@ -561,33 +598,94 @@ def main() -> None:
         logger.info("Run manifest: %s", manifest_path)
 
     if args.dry_run:
-        n_conv = sum(1 for ds in datasets for fmt in formats
-                     if not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite)
-        n_bench = len(benchmarks) * len(datasets) * len(formats)
+        # Mirror the pairing filter from the Phase-B loop so dry-run
+        # counts match what an actual submission would produce.
+        def _pairs_ok(b: str, fk: str) -> bool:
+            if b.startswith("accel_"):
+                return fk.startswith(f"{b}__")
+            return not fk.startswith("accel_")
+
+        n_conv = sum(
+            1 for ds in datasets for fmt in formats
+            if not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite
+        )
+        n_bench = sum(
+            1 for b in benchmarks for ds in datasets for fmt in formats
+            if _pairs_ok(b, fmt.key)
+        )
+        n_dep = sum(
+            1 for b in benchmarks for ds in datasets for fmt in formats
+            if _pairs_ok(b, fmt.key)
+            and b not in _NO_CONVERSION
+            and (
+                not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite
+            )
+        )
         logger.info(
-            "DRY RUN: would submit %d conversion + %d benchmark = %d total SLURM jobs",
-            n_conv, n_bench, n_conv + n_bench,
+            "DRY RUN: would submit %d conversion + %d benchmark "
+            "(%d benchmark→conversion afterok edges) = %d total SLURM jobs",
+            n_conv, n_bench, n_dep, n_conv + n_bench,
         )
         return
 
-    # Wait for benchmark jobs
+    # Wait for benchmark jobs. With afterok dependencies in play, the wait
+    # loop sees three outcomes per job: success, failure (the benchmark
+    # itself crashed), and dep_failed (SLURM cancelled the job because its
+    # upstream conversion never succeeded — DependencyNeverSatisfied).
+    # Distinguish the latter so dependency-cascade noise doesn't masquerade
+    # as benchmark regressions in the operator's eye.
     if bench_jobs:
         logger.info("Waiting for %d benchmark jobs...", len(bench_jobs))
         t0 = time.perf_counter()
-        done, failed = 0, 0
-        for label, job in bench_jobs:
+        done, failed, dep_failed = 0, 0, 0
+        for label, job, conv_key in bench_jobs:
             try:
                 job.result()
                 done += 1
             except Exception as e:
-                logger.error("  FAILED: %s -> %s", label, e)
-                failed += 1
+                upstream_failed = False
+                if conv_key is not None and conv_key in conv_jobs:
+                    try:
+                        conv_jobs[conv_key].result()
+                    except Exception:
+                        upstream_failed = True
+                if upstream_failed:
+                    logger.warning(
+                        "  DEP_FAILED: %s -> upstream conversion %s (job %s) failed",
+                        label, conv_key, conv_jobs[conv_key].job_id,
+                    )
+                    dep_failed += 1
+                else:
+                    logger.error("  FAILED: %s -> %s", label, e)
+                    failed += 1
+
+        # Surface conversion failures top-level. Without this, a conv crash
+        # is only visible indirectly through `dep_failed` counts on its
+        # dependents — operators have no top-level signal of *which*
+        # conversion failed. By the time we get here every bench job is
+        # terminal, so its upstream conv is terminal too; .result() is
+        # cached and won't block.
+        conv_done, conv_failed = 0, 0
+        for conv_key, conv_job in conv_jobs.items():
+            try:
+                conv_job.result()
+                conv_done += 1
+            except Exception as e:
+                logger.error(
+                    "  CONV_FAILED: %s / %s (job %s) -> %s",
+                    conv_key[0], conv_key[1], conv_job.job_id, e,
+                )
+                conv_failed += 1
 
         elapsed = time.perf_counter() - t0
-        logger.info(
-            "All done: %d succeeded, %d failed in %.1fs (wall)",
-            done, failed, elapsed,
-        )
+        summary = f"{done} succeeded, {failed} failed"
+        if dep_failed:
+            summary += f", {dep_failed} dep_failed"
+        if conv_failed:
+            summary += f" (+{conv_failed} conversion failures)"
+        elif conv_jobs:
+            summary += f" (+{conv_done} conversions OK)"
+        logger.info("All done: %s in %.1fs (wall)", summary, elapsed)
 
         # Auto-run the regression gate when a canonical baseline exists
         # (Phase I.6). Non-fatal — reports the gate outcome and returns
