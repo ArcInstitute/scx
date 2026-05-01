@@ -51,6 +51,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -417,7 +418,6 @@ def main() -> None:
 
     # Determine which benchmarks need pre-converted files
     needs_conversion = [b for b in benchmarks if b not in _NO_CONVERSION]
-    needs_write = "write" in benchmarks
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -556,7 +556,7 @@ def main() -> None:
                     )
                     continue
 
-                update_kwargs: dict = dict(params)
+                update_kwargs: dict[str, Any] = dict(params)
                 if dep_jobid is not None:
                     extra = update_kwargs.get("slurm_additional_parameters", {}) or {}
                     extra = {**extra, "dependency": f"afterok:{dep_jobid}"}
@@ -651,25 +651,41 @@ def main() -> None:
                         upstream_failed = True
                 if upstream_failed:
                     logger.warning(
-                        "  DEP_FAILED: %s -> upstream conversion %s failed",
-                        label, conv_key,
+                        "  DEP_FAILED: %s -> upstream conversion %s (job %s) failed",
+                        label, conv_key, conv_jobs[conv_key].job_id,
                     )
                     dep_failed += 1
                 else:
                     logger.error("  FAILED: %s -> %s", label, e)
                     failed += 1
 
+        # Surface conversion failures top-level. Without this, a conv crash
+        # is only visible indirectly through `dep_failed` counts on its
+        # dependents — operators have no top-level signal of *which*
+        # conversion failed. By the time we get here every bench job is
+        # terminal, so its upstream conv is terminal too; .result() is
+        # cached and won't block.
+        conv_done, conv_failed = 0, 0
+        for conv_key, conv_job in conv_jobs.items():
+            try:
+                conv_job.result()
+                conv_done += 1
+            except Exception as e:
+                logger.error(
+                    "  CONV_FAILED: %s / %s (job %s) -> %s",
+                    conv_key[0], conv_key[1], conv_job.job_id, e,
+                )
+                conv_failed += 1
+
         elapsed = time.perf_counter() - t0
+        summary = f"{done} succeeded, {failed} failed"
         if dep_failed:
-            logger.info(
-                "All done: %d succeeded, %d failed, %d dep_failed in %.1fs (wall)",
-                done, failed, dep_failed, elapsed,
-            )
-        else:
-            logger.info(
-                "All done: %d succeeded, %d failed in %.1fs (wall)",
-                done, failed, elapsed,
-            )
+            summary += f", {dep_failed} dep_failed"
+        if conv_failed:
+            summary += f" (+{conv_failed} conversion failures)"
+        elif conv_jobs:
+            summary += f" (+{conv_done} conversions OK)"
+        logger.info("All done: %s in %.1fs (wall)", summary, elapsed)
 
         # Auto-run the regression gate when a canonical baseline exists
         # (Phase I.6). Non-fatal — reports the gate outcome and returns
