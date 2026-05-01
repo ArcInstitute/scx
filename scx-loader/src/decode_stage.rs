@@ -9,7 +9,6 @@
 //! and [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use arrow::array::{
@@ -130,6 +129,7 @@ impl ShardGroupIndex {
 /// inherited pool's worker threads do not exist post-fork and the dispatch
 /// hangs forever in `LockLatch::wait_and_reset`. See Phase 1 Diagnosis in
 /// DEADLOCK-ISSUE.md for the gdb stack trace and reproducer.
+#[allow(clippy::too_many_arguments)]
 fn fill_batch_parallel(
     batch_cell_indices: &[u64],
     group_index: &ShardGroupIndex,
@@ -147,45 +147,24 @@ fn fill_batch_parallel(
         return Ok(x);
     }
 
-    // Capture the first error from rayon threads (if any).
-    let first_error: Mutex<Option<LoaderError>> = Mutex::new(None);
-
     // Split the output buffer into per-row chunks and process in parallel.
     // Pair each row chunk with its corresponding cell index. `pool.install`
     // routes the parallel work to the per-pipeline pool — *not* the global
     // registry, which would deadlock under fork (see doc comment).
+    //
+    // `try_for_each` short-circuits on the first `Err` and propagates it as
+    // the closure's return value, so we avoid a per-row mutex check on the
+    // hot path.
     pool.install(|| {
         x.par_chunks_mut(n_output_genes)
             .zip(batch_cell_indices.par_iter())
-            .for_each(|(output_row, &global_cell_idx)| {
-                // Skip work if a previous iteration already failed.
-                if first_error.lock().unwrap().is_some() {
-                    return;
-                }
-
-                let (csr_indices, csr_data) = match group_index.get_row(global_cell_idx, group) {
-                    Ok(row) => row,
-                    Err(e) => {
-                        let mut guard = first_error.lock().unwrap();
-                        if guard.is_none() {
-                            *guard = Some(e);
-                        }
-                        return;
-                    }
-                };
+            .try_for_each(|(output_row, &global_cell_idx)| -> Result<()> {
+                let (csr_indices, csr_data) = group_index.get_row(global_cell_idx, group)?;
 
                 // Scatter CSR row into dense output row (with or without projection)
                 match projection {
                     Some(proj) => proj.scatter_row(csr_indices, csr_data, output_row),
-                    None => {
-                        if let Err(e) = scatter_row_full(csr_indices, csr_data, output_row) {
-                            let mut guard = first_error.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = Some(e);
-                            }
-                            return;
-                        }
-                    }
+                    None => scatter_row_full(csr_indices, csr_data, output_row)?,
                 }
 
                 // Apply fused normalize+log1p if configured
@@ -201,13 +180,9 @@ fn fill_batch_parallel(
                     }
                     (None, false) => {} // no-op
                 }
-            });
-    });
-
-    // Check if any rayon thread encountered an error.
-    if let Some(err) = first_error.into_inner().unwrap() {
-        return Err(err);
-    }
+                Ok(())
+            })
+    })?;
 
     Ok(x)
 }
@@ -433,6 +408,7 @@ fn extract_single_column(
 /// parallel scatter — see `fill_batch_parallel`'s doc comment for the
 /// fork-safety rationale. The pool is owned by the `TrainingPipeline` and
 /// lives across epochs; the decode thread only borrows it.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_stage(
     mut rx: tokio::sync::mpsc::Receiver<ShardGroup>,
     tx: crossbeam_channel::Sender<Batch>,

@@ -468,9 +468,7 @@ impl TrainingPipeline {
     /// the worker process, after any fork. Reused across epochs.
     fn ensure_decode_pool(&mut self) -> Result<&Arc<rayon::ThreadPool>> {
         if self.decode_pool.is_none() {
-            let n_threads = num_cpus::get_physical()
-                .min(DEFAULT_DECODE_POOL_MAX_THREADS)
-                .max(1);
+            let n_threads = num_cpus::get_physical().clamp(1, DEFAULT_DECODE_POOL_MAX_THREADS);
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(n_threads)
