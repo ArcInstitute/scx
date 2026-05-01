@@ -123,6 +123,62 @@ shard prefetch lookahead. Plan-driven access is intentionally random — at
 `ScxBackedSparseDataset` Python-loop baseline. See
 [`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
 
+#### Fork safety under PyTorch `DataLoader(num_workers > 0)`
+
+`pyscx.TrainingDataset` and `pyscx.IndexPlanDataset` are fork-safe under
+`torch.utils.data.DataLoader(num_workers > 0, start_method="fork")` —
+the Linux PyTorch default — when the dataset is **constructed lazily
+inside the worker's `__iter__`** (the pattern `cell-load-scx` and
+`state-scx` already use). Both the per-pipeline tokio runtime (current-
+thread, per-epoch) and per-pipeline `rayon::ThreadPool` (lazily built on
+first iteration) are constructed inside the worker process, so a forked
+child inherits no fork-hostile state from the parent.
+
+```python
+# Recommended IterableDataset wrapper for DataLoader(num_workers=2)
+import torch.utils.data as data
+
+class TrainingShim(data.IterableDataset):
+    def __init__(self, scx_path):
+        self.scx_path = scx_path  # paths only — no inner dataset yet
+
+    def __iter__(self):
+        # Construct the inner dataset HERE (in the worker process, post-fork).
+        ds = pyscx.TrainingDataset(self.scx_path, batch_size=1024, hvg_indices=...)
+        try:
+            yield from ds
+        finally:
+            ds.close()  # release the per-pipeline rayon pool / tokio runtime
+
+loader = torch.utils.data.DataLoader(
+    TrainingShim("atlas.scx"),
+    batch_size=None,
+    num_workers=2,
+    persistent_workers=False,
+)
+```
+
+**Do**: construct lazily inside `__iter__`; call `dataset.close()` (or
+register `weakref.finalize(dataset, dataset.close)`) before process exit;
+prefer `multiprocessing.set_start_method("spawn")` if your workload
+allows — spawn re-execs Python in the child and is genuinely fork-safe
+because there is no fork.
+
+**Don't**: construct a `TrainingDataset` / `IndexPlanDataset` in the
+parent and share it across forked workers — the PID check in `__next__`
+raises `RuntimeError`. Don't pickle a constructed dataset across
+processes either; it owns thread handles that don't survive transfer.
+
+> [!IMPORTANT]
+> Calling **any** `rayon::par_*`-using pyscx API in the parent before
+> fork (e.g., `pyscx.from_anndata(...)` to write the fixture) initialises
+> rayon's process-global pool. Pre-fix this prerequisite was sufficient
+> to wedge `DataLoader(num_workers=2)` indefinitely; the per-pipeline
+> rayon pool fix in `scx-loader` removed that hazard. See
+> [`DEADLOCK-ISSUE.md`](DEADLOCK-ISSUE.md) for the full root-cause
+> analysis and `pyscx/tests/test_fork_safety.py` for the durable
+> regression test.
+
 ### You want to query without loading everything
 
 SCX includes a lazy query engine with two-level predicate pushdown. Filter by cell type,
