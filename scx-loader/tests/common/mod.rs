@@ -60,7 +60,11 @@ pub fn write_multi_shard_fixture(
 
     let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
     let obs = RecordBatch::try_new(
-        StdArc::new(Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)])),
+        StdArc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
         vec![StdArc::new(StringArray::from(
             cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         ))],
@@ -70,7 +74,11 @@ pub fn write_multi_shard_fixture(
 
     let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
     let var = RecordBatch::try_new(
-        StdArc::new(Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)])),
+        StdArc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
         vec![StdArc::new(StringArray::from(
             gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         ))],

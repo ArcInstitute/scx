@@ -493,10 +493,7 @@ impl IndexPlanBatchIter {
         slf
     }
 
-    fn __next__<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(None);
         };
@@ -578,11 +575,7 @@ fn index_plan_batch_to_dict<'py>(
     let dict = PyDict::new(py);
 
     let n_pairs = batch.n_pairs();
-    let n_cols = if n_pairs == 0 {
-        0
-    } else {
-        batch.x.len() / n_pairs
-    };
+    let n_cols = batch.x.len().checked_div(n_pairs).unwrap_or(0);
 
     let x_array = PyArray1::from_vec(py, batch.x)
         .reshape([n_pairs, n_cols])
@@ -596,9 +589,8 @@ fn index_plan_batch_to_dict<'py>(
 
     let pairs_list = PyList::empty(py);
     for (p, c) in &batch.pairs {
-        let tup = PyTuple::new(py, [*p, *c]).map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to build pair tuple: {e}"))
-        })?;
+        let tup = PyTuple::new(py, [*p, *c])
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to build pair tuple: {e}")))?;
         pairs_list.append(tup)?;
     }
     dict.set_item("pairs", pairs_list)?;

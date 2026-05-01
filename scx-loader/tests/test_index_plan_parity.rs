@@ -92,14 +92,7 @@ fn parity_full_gene_no_normalize() {
     let loader = build_loader(&path, None, false, 1e4, false);
     let backed = open_backed(&path);
 
-    let plan: Vec<(u64, u64)> = vec![
-        (0, 5),
-        (50, 99),
-        (123, 1),
-        (180, 75),
-        (10, 130),
-        (199, 0),
-    ];
+    let plan: Vec<(u64, u64)> = vec![(0, 5), (50, 99), (123, 1), (180, 75), (10, 130), (199, 0)];
     let batch = loader.process_plan(plan.clone()).unwrap();
     let n_cols = loader.n_output_cols();
 

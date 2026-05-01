@@ -157,18 +157,13 @@ impl IndexPlanLoader {
         // in scatter_row.
         let hvg_projection = match &config.hvg_indices {
             Some(idxs) => {
-                let n_vars_u32: u32 = u32::try_from(n_vars).map_err(|_| {
-                    LoaderError::ConfigError {
-                        reason: format!(
-                            "n_vars={n_vars} exceeds u32::MAX; HVG indices use u32"
-                        ),
-                    }
-                })?;
+                let n_vars_u32: u32 =
+                    u32::try_from(n_vars).map_err(|_| LoaderError::ConfigError {
+                        reason: format!("n_vars={n_vars} exceeds u32::MAX; HVG indices use u32"),
+                    })?;
                 if let Some(&bad) = idxs.iter().find(|&&i| i >= n_vars_u32) {
                     return Err(LoaderError::ConfigError {
-                        reason: format!(
-                            "HVG index {bad} is out of range (n_vars={n_vars})"
-                        ),
+                        reason: format!("HVG index {bad} is out of range (n_vars={n_vars})"),
                     });
                 }
                 Some(HvgProjection::new(idxs.clone()))
@@ -220,8 +215,8 @@ impl IndexPlanLoader {
                 )
             }
         };
-        let shard_decoded_bytes = (avg_nnz_per_shard.saturating_mul(8)
-            + avg_rows_per_shard.saturating_mul(8)) as usize;
+        let shard_decoded_bytes =
+            (avg_nnz_per_shard.saturating_mul(8) + avg_rows_per_shard.saturating_mul(8)) as usize;
 
         let batch_buffer_bytes = 2usize
             .saturating_mul(max_plan_size)
@@ -242,7 +237,10 @@ impl IndexPlanLoader {
             cache
                 .saturating_mul(shard_decoded_bytes)
                 .saturating_add(batch_buffer_bytes)
-                .saturating_add(la.saturating_mul(max_plan_size).saturating_mul(PLAN_TUPLE_BYTES))
+                .saturating_add(
+                    la.saturating_mul(max_plan_size)
+                        .saturating_mul(PLAN_TUPLE_BYTES),
+                )
                 .saturating_add(PYTHON_OVERHEAD_BYTES)
         };
 
@@ -726,7 +724,10 @@ mod tests {
         n_vars: usize,
         n_shards: usize,
     ) -> std::path::PathBuf {
-        assert!(n_obs % n_shards == 0, "n_obs must divide n_shards in this fixture");
+        assert!(
+            n_obs % n_shards == 0,
+            "n_obs must divide n_shards in this fixture"
+        );
         let rows_per_shard = n_obs / n_shards;
 
         let header = FileHeader {
@@ -808,10 +809,7 @@ mod tests {
         path.to_path_buf()
     }
 
-    fn open_loader(
-        path: &std::path::Path,
-        sort_by_shard: bool,
-    ) -> IndexPlanLoader {
+    fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoader {
         let mut config = LoaderConfig::default();
         config.normalize = false;
         config.log1p = false;
@@ -872,7 +870,10 @@ mod tests {
             })
             .collect();
         for w in keys.windows(2) {
-            assert!(w[0] <= w[1], "post-sort plan must be non-decreasing in min-shard");
+            assert!(
+                w[0] <= w[1],
+                "post-sort plan must be non-decreasing in min-shard"
+            );
         }
     }
 
@@ -884,16 +885,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
 
-        let plan: Vec<(u64, u64)> = vec![
-            (15, 0),
-            (4, 5),
-            (8, 9),
-            (3, 12),
-            (10, 11),
-            (1, 2),
-        ];
+        let plan: Vec<(u64, u64)> = vec![(15, 0), (4, 5), (8, 9), (3, 12), (10, 11), (1, 2)];
 
-        let unsorted = open_loader(&path, false).process_plan(plan.clone()).unwrap();
+        let unsorted = open_loader(&path, false)
+            .process_plan(plan.clone())
+            .unwrap();
         let sorted = open_loader(&path, true).process_plan(plan.clone()).unwrap();
 
         // Unsorted preserves input plan order (sanity).
@@ -904,8 +900,10 @@ mod tests {
         let triples = |b: &IndexPlanBatch| -> Vec<((u64, u64), Vec<u32>, Vec<u32>)> {
             (0..b.pairs.len())
                 .map(|i| {
-                    let r: Vec<u32> =
-                        b.x[i * n_cols..][..n_cols].iter().map(|v| v.to_bits()).collect();
+                    let r: Vec<u32> = b.x[i * n_cols..][..n_cols]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
                     let pr: Vec<u32> = b.x_paired[i * n_cols..][..n_cols]
                         .iter()
                         .map(|v| v.to_bits())
@@ -953,12 +951,8 @@ mod tests {
         config.obs_columns = vec!["cell_id".to_string()];
         Arc::new(
             IndexPlanLoader::new(
-                path,
-                config,
-                /*cache_shards*/ 4,
-                /*sort_by_shard*/ true,
-                /*lookahead*/ 4,
-                /*max_plan_size*/ 16384,
+                path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true,
+                /*lookahead*/ 4, /*max_plan_size*/ 16384,
             )
             .unwrap(),
         )
@@ -1004,17 +998,18 @@ mod tests {
             vec![(3, 12), (10, 11), (1, 2)],
         ];
 
-        let it_zero =
-            open_loader_arc(&path).iter_with_plans(into_plan_iter(plans.clone()), 0);
-        let it_four =
-            open_loader_arc(&path).iter_with_plans(into_plan_iter(plans.clone()), 4);
+        let it_zero = open_loader_arc(&path).iter_with_plans(into_plan_iter(plans.clone()), 0);
+        let it_four = open_loader_arc(&path).iter_with_plans(into_plan_iter(plans.clone()), 4);
 
         let zero: Vec<_> = it_zero.map(|r| r.unwrap()).collect();
         let four: Vec<_> = it_four.map(|r| r.unwrap()).collect();
 
         assert_eq!(zero.len(), four.len());
         for (a, b) in zero.iter().zip(four.iter()) {
-            assert_eq!(a.pairs, b.pairs, "pair order should match between lookahead=0 and 4");
+            assert_eq!(
+                a.pairs, b.pairs,
+                "pair order should match between lookahead=0 and 4"
+            );
             assert_eq!(a.x, b.x);
             assert_eq!(a.x_paired, b.x_paired);
         }
@@ -1173,9 +1168,7 @@ mod tests {
             for local in 0..rows_per_shard {
                 let lo = indptr[local] as usize;
                 let hi = indptr[local + 1] as usize;
-                let mut pairs: Vec<(u32, u8)> = (lo..hi)
-                    .map(|j| (indices[j], values[j]))
-                    .collect();
+                let mut pairs: Vec<(u32, u8)> = (lo..hi).map(|j| (indices[j], values[j])).collect();
                 pairs.sort_by_key(|&(c, _)| c);
                 pairs.dedup_by_key(|&mut (c, _)| c);
                 let new_lo = lo;
@@ -1210,12 +1203,8 @@ mod tests {
         let mut config = LoaderConfig::default();
         config.max_memory_mb = 4096; // way over budget needed for this tiny file
         let loader = IndexPlanLoader::new(
-            &path,
-            config,
-            /*cache_shards*/ 8,
-            /*sort_by_shard*/ true,
-            /*lookahead*/ 4,
-            /*max_plan_size*/ 1024,
+            &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true,
+            /*lookahead*/ 4, /*max_plan_size*/ 1024,
         )
         .unwrap();
         assert_eq!(loader.effective_cache_shards(), 8);
@@ -1239,12 +1228,8 @@ mod tests {
         // Total ≈ 62 MB. A 56 MB budget forces lookahead reduction.
         config.max_memory_mb = 56;
         let loader = IndexPlanLoader::new(
-            &path,
-            config,
-            /*cache_shards*/ 8,
-            /*sort_by_shard*/ true,
-            /*lookahead*/ 8,
-            /*max_plan_size*/ 65536,
+            &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true,
+            /*lookahead*/ 8, /*max_plan_size*/ 65536,
         )
         .unwrap();
         assert!(
@@ -1287,12 +1272,8 @@ mod tests {
         let mut config = LoaderConfig::default();
         config.max_memory_mb = 96;
         let loader = IndexPlanLoader::new(
-            &path,
-            config,
-            /*cache_shards*/ 16,
-            /*sort_by_shard*/ true,
-            /*lookahead*/ 4,
-            /*max_plan_size*/ 1024,
+            &path, config, /*cache_shards*/ 16, /*sort_by_shard*/ true,
+            /*lookahead*/ 4, /*max_plan_size*/ 1024,
         )
         .unwrap();
         assert_eq!(
@@ -1322,12 +1303,8 @@ mod tests {
         let mut config = LoaderConfig::default();
         config.max_memory_mb = 40; // below the 50 MB python overhead alone
         let result = IndexPlanLoader::new(
-            &path,
-            config,
-            /*cache_shards*/ 4,
-            /*sort_by_shard*/ true,
-            /*lookahead*/ 2,
-            /*max_plan_size*/ 4096,
+            &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true,
+            /*lookahead*/ 2, /*max_plan_size*/ 4096,
         );
         let err = match result {
             Ok(_) => panic!("expected ConfigError, got Ok"),
@@ -1357,12 +1334,8 @@ mod tests {
         let mut config = LoaderConfig::default();
         config.max_memory_mb = 256;
         let loader = IndexPlanLoader::new(
-            &path,
-            config,
-            /*cache_shards*/ 4,
-            /*sort_by_shard*/ true,
-            /*lookahead*/ 0,
-            /*max_plan_size*/ 1024,
+            &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true,
+            /*lookahead*/ 0, /*max_plan_size*/ 1024,
         )
         .unwrap();
         assert_eq!(loader.effective_lookahead(), 0);
@@ -1381,12 +1354,8 @@ mod tests {
         config.obs_columns = vec!["cell_id".to_string()];
 
         let loader = IndexPlanLoader::new(
-            &path,
-            config,
-            /*cache_shards*/ 4,
-            /*sort_by_shard*/ false,
-            /*lookahead*/ 1,
-            /*max_plan_size*/ 4,
+            &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ false,
+            /*lookahead*/ 1, /*max_plan_size*/ 4,
         )
         .unwrap();
 
@@ -1396,8 +1365,7 @@ mod tests {
         assert_eq!(batch.pairs.len(), 4);
 
         // Over-the-ceiling plan rejects with a ConfigError naming both numbers.
-        let big_plan: Vec<(u64, u64)> =
-            (0..5u64).map(|i| (i, (i + 1) % 32)).collect();
+        let big_plan: Vec<(u64, u64)> = (0..5u64).map(|i| (i, (i + 1) % 32)).collect();
         match loader.process_plan(big_plan) {
             Err(LoaderError::ConfigError { reason }) => {
                 assert!(reason.contains("plan size 5"), "got: {reason}");

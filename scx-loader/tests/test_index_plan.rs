@@ -228,8 +228,12 @@ fn scatter_pair_rows_via_process_plan() {
         let p_row = &batch.x[i * n_cols..(i + 1) * n_cols];
         let c_row = &batch.x_paired[i * n_cols..(i + 1) * n_cols];
 
-        let p_pos = hvg.iter().position(|&g| g as usize == (p as usize) % N_VARS);
-        let c_pos = hvg.iter().position(|&g| g as usize == (c as usize) % N_VARS);
+        let p_pos = hvg
+            .iter()
+            .position(|&g| g as usize == (p as usize) % N_VARS);
+        let c_pos = hvg
+            .iter()
+            .position(|&g| g as usize == (c as usize) % N_VARS);
 
         match p_pos {
             Some(pos) => {

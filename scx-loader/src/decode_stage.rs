@@ -206,18 +206,18 @@ pub fn extract_obs_columns(
     let mut result = HashMap::with_capacity(obs_columns.len());
 
     for col_name in obs_columns {
-        let col_idx = obs
-            .schema()
-            .index_of(col_name)
-            .map_err(|_| LoaderError::ObsColumnNotFound {
-                name: col_name.clone(),
-                available: obs
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect(),
-            })?;
+        let col_idx =
+            obs.schema()
+                .index_of(col_name)
+                .map_err(|_| LoaderError::ObsColumnNotFound {
+                    name: col_name.clone(),
+                    available: obs
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                })?;
 
         let array = obs.column(col_idx);
         let obs_col = extract_single_column(array, cell_indices, col_name)?;

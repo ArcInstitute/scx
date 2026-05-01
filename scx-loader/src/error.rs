@@ -37,7 +37,10 @@ pub enum LoaderError {
 
     /// Requested obs column is not present in the file's metadata.
     #[error("obs column '{name}' not found in file (available: {available:?})")]
-    ObsColumnNotFound { name: String, available: Vec<String> },
+    ObsColumnNotFound {
+        name: String,
+        available: Vec<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, LoaderError>;
