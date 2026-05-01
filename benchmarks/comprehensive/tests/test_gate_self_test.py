@@ -11,6 +11,12 @@ runs ``compare_against_baseline.py --gate`` in a subprocess. Verifies:
      is flagged as a regression under ``--gate``.
   5. An absolute-floor violation from ``--thresholds`` fails the gate
      even when the relative diff is clean.
+  6. A flakiness override raises the per-row tolerance, flipping a
+     small-but-over-default regression to PASS while keeping bigger
+     regressions on the same row failing.
+  7. A flakiness override whose tolerance is at or below the global
+     default emits a warning so the dead entry doesn't silently rot in
+     the ledger.
 """
 
 from __future__ import annotations
@@ -56,7 +62,9 @@ def _run_gate(*extra: str, baseline: Path, current: Path) -> subprocess.Complete
     """
     empty_just = baseline.parent / "_test_empty_justifications"
     empty_thresh = baseline.parent / "_test_empty_thresholds.yaml"
+    empty_flaky = baseline.parent / "_test_empty_flakiness"
     empty_just.mkdir(exist_ok=True)
+    empty_flaky.mkdir(exist_ok=True)
     if not empty_thresh.exists():
         empty_thresh.write_text("absolute_floors: []\n")
     flags = list(extra)
@@ -64,6 +72,8 @@ def _run_gate(*extra: str, baseline: Path, current: Path) -> subprocess.Complete
         flags += ["--justifications", str(empty_just)]
     if "--thresholds" not in flags:
         flags += ["--thresholds", str(empty_thresh)]
+    if "--flakiness" not in flags:
+        flags += ["--flakiness", str(empty_flaky)]
     cmd = [
         sys.executable, str(GATE_SCRIPT),
         "--baseline", str(baseline),
@@ -279,6 +289,271 @@ def test_thresholds_yaml_requires_min_or_max(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="must declare either 'min' or 'max'"):
         mod._load_thresholds_yaml(thresh)
+
+
+# ---------------------------------------------------------------------------
+# §3.7 flakiness ledger.
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_runs(current: Path, key: str, walls: list[float]) -> None:
+    """Drop a raw JSON next to ``current/summary.json`` so the gate can
+    compute wall-time CV. Mirrors the shape ``capture_baseline`` archives.
+    """
+    raw = current / "raw"
+    raw.mkdir(exist_ok=True)
+    benchmark, fmt, dataset = key.split("__", 2)
+    (raw / f"{key}.json").write_text(json.dumps({
+        "benchmark": benchmark, "format": fmt, "dataset": dataset,
+        "runs": [{"wall_s": w} for w in walls],
+    }))
+
+
+def test_flakiness_override_relaxes_tolerance(tmp_path: Path) -> None:
+    """A 6% timing regression fails the default 3% gate but passes when
+    a flakiness override raises the per-row tolerance to 10%.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.00)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.06)})
+
+    # Default gate: 6% > 3% tolerance ⇒ fail.
+    result = _run_gate(baseline=base, current=cur)
+    assert result.returncode != 0, (
+        f"baseline expectation: 6% regression must fail default gate; "
+        f"stdout={result.stdout!r}"
+    )
+
+    # Adding a flakiness override raising tolerance to 10% ⇒ pass.
+    flaky.mkdir()
+    (flaky / "noisy_pbmc3k.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.10\n"
+        "reason: \"Shared SLURM node — observed 7% wall-time RSD.\"\n"
+        "---\n"
+        "Until --exclusive is wired into the queue this row is noisy.\n"
+    )
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        baseline=base, current=cur,
+    )
+    assert result.returncode == 0, (
+        f"flakiness override must flip 6% gate to pass; stdout={result.stdout!r}"
+    )
+
+
+def test_flakiness_override_does_not_mask_real_regression(tmp_path: Path) -> None:
+    """A 12% regression on a row whose override is 10% still fails — the
+    override relaxes, it doesn't suppress.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.00)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.12)})
+    flaky.mkdir()
+    (flaky / "noisy_pbmc3k.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.10\n"
+        "reason: \"Shared SLURM node — 7% RSD observed.\"\n"
+        "---\n"
+    )
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        baseline=base, current=cur,
+    )
+    assert result.returncode != 0, (
+        f"override must not mask a regression past the relaxed bound; "
+        f"stdout={result.stdout!r}"
+    )
+    assert "regressed (over relaxed)" in result.stdout, (
+        f"status must label the row as overrunning the relaxed bound; "
+        f"stdout={result.stdout!r}"
+    )
+
+
+def test_flakiness_expired_does_not_relax(tmp_path: Path) -> None:
+    """Expired flakiness file does not raise the per-row tolerance — the
+    gate still fails on a 6% regression with the default 3% bound.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.00)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.06)})
+    flaky.mkdir()
+    (flaky / "expired.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.10\n"
+        "reason: Stale — should not relax anymore.\n"
+        "expires: 2000-01-01\n"
+        "---\n"
+    )
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        baseline=base, current=cur,
+    )
+    assert result.returncode != 0, (
+        f"expired flakiness file must not relax the gate; stdout={result.stdout!r}"
+    )
+
+
+def test_flakiness_metric_scoping(tmp_path: Path) -> None:
+    """An override for ``median_wall_s`` does not relax the
+    ``peak_rss_mb_median`` row for the same triple.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    # Timing flat, RSS up 25% (default rss tolerance is 10%).
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.0, rss=100.0)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.0, rss=125.0)})
+    flaky.mkdir()
+    (flaky / "wall_only.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    metric: median_wall_s\n"
+        "    tolerance: 0.50\n"
+        "reason: Wall-time noise only; RSS contract unchanged.\n"
+        "---\n"
+    )
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        baseline=base, current=cur,
+    )
+    assert result.returncode != 0, (
+        f"wall-only override must not relax the RSS gate; stdout={result.stdout!r}"
+    )
+
+
+def test_flakiness_report_surfaces_cv_and_tolerance(tmp_path: Path) -> None:
+    """Smoke-test the report shape: CV column populated for the timing
+    row when raw runs are present, and the override is reported in the
+    JSON payload's flakiness_overrides_applied list.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.00)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.06)})
+    # 6% delta with a high-CV sample set.
+    _write_raw_runs(cur, "read_full__scx_auto__pbmc3k", [0.95, 1.06, 1.20])
+    flaky.mkdir()
+    (flaky / "noisy.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.10\n"
+        "reason: noisy.\n"
+        "---\n"
+    )
+    payload_path = tmp_path / "payload.json"
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        "--report-json", str(payload_path),
+        baseline=base, current=cur,
+    )
+    assert result.returncode == 0, result.stdout
+    payload = json.loads(payload_path.read_text())
+    assert payload["flakiness_overrides_loaded"] == 1
+    applied = payload["flakiness_overrides_applied"]
+    assert len(applied) == 1
+    assert applied[0] == {
+        "benchmark": "read_full", "format": "scx_auto",
+        "dataset": "pbmc3k", "metric": "median_wall_s",
+        "tolerance": 0.10,
+    }
+    timing_delta = next(
+        d for d in payload["deltas"]
+        if d["benchmark"] == "read_full" and d["metric"] == "median_wall_s"
+    )
+    assert timing_delta["effective_tolerance"] == pytest.approx(0.10)
+    assert timing_delta["tolerance_relaxed"] is True
+    assert timing_delta["wall_cv"] is not None
+    assert timing_delta["wall_cv"] > 0
+
+
+def test_flakiness_loader_rejects_negative_tolerance(tmp_path: Path) -> None:
+    """``_flakiness.parse_flakiness_file`` must refuse a tightening (negative)
+    tolerance — overrides relax, they don't tighten.
+    """
+    sys.path.insert(0, str(GATE_SCRIPT.parent))
+    try:
+        import importlib
+
+        flakiness = importlib.import_module("_flakiness")
+    finally:
+        # Clean up sys.path so other tests don't see the added entry.
+        sys.path[:] = [p for p in sys.path if p != str(GATE_SCRIPT.parent)]
+    bad = tmp_path / "bad.md"
+    bad.write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: -0.01\n"
+        "reason: Tightening is not allowed.\n"
+        "---\n"
+    )
+    with pytest.raises(ValueError, match="non-negative"):
+        flakiness.parse_flakiness_file(bad)
+
+
+def test_flakiness_override_at_or_below_default_warns(tmp_path: Path) -> None:
+    """An override whose tolerance is at or below the global default has
+    no effect — the gate must surface a warning so the entry doesn't
+    silently rot in the ledger.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.00)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.01)})
+    flaky.mkdir()
+    # Default --timing-tolerance is 0.03; an override at 0.02 cannot
+    # relax (overrides only relax, never tighten).
+    (flaky / "ineffective.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.02\n"
+        "reason: Tighter than the default — has no effect.\n"
+        "---\n"
+    )
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        baseline=base, current=cur,
+    )
+    assert result.returncode == 0, (
+        f"1% delta must pass default gate even with an ineffective override; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "override has no effect" in result.stderr, (
+        f"ineffective override must emit a stderr warning so the entry "
+        f"doesn't silently rot in the ledger; stderr={result.stderr!r}"
+    )
 
 
 def test_absolute_floor_max_direction_flags_overrun(tmp_path: Path) -> None:
