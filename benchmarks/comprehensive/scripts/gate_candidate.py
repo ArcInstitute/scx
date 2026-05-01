@@ -704,6 +704,8 @@ def _capture_argv(args: argparse.Namespace, candidate_dir: Path, *, dry_run: boo
         cmd.extend(["--datasets", *args.datasets])
     if args.skip_smoke:
         cmd.append("--skip-smoke")
+    if args.partition is not None:
+        cmd.extend(["--partition", args.partition])
     return cmd
 
 
@@ -839,6 +841,19 @@ def parse_args() -> argparse.Namespace:
                              "accel-only runs or when known-broken format "
                              "runners (BPCells/Parquet) are blocking unrelated "
                              "submissions. Forwarded to capture_baseline.py.")
+
+    parser.add_argument(
+        "--partition",
+        default=None,
+        help=(
+            "SLURM partition forwarded to capture_baseline.py for the "
+            "per-(benchmark, dataset, format) jobs. Defaults to the tier's "
+            "configured partition (Chimera's `cpu_preemptible` historically; "
+            "overridable via the `SCX_BENCH_PARTITION` env var). Pass an "
+            "explicit value when running on a cluster whose partition names "
+            "differ — e.g. `--partition preemptible` on Lambda HPC."
+        ),
+    )
 
     # SLURM probe settings — controls the cluster-side GPU pre-flight job.
     probe = parser.add_argument_group(

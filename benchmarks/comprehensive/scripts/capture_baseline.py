@@ -85,10 +85,20 @@ RAW_DIR = RESULTS_ROOT / "raw"
 # sized per-(benchmark, dataset, format) by `estimate_memory_gb`. Partition is
 # the DEFAULT and is auto-overridden to `cpu_high_mem` for jobs whose estimate
 # exceeds 200 GB. (Pre-fix, both values were applied uniformly to every job.)
+#
+# `DEFAULT_PARTITION` is the SLURM partition used by every tier unless
+# overridden via `--partition`. Defaults to Chimera's `cpu_preemptible`
+# (the historical config); pass `--partition preemptible` (or any other
+# value) for clusters where that partition does not exist (e.g. Lambda
+# HPC, which has `preemptible` / `standard` / `large_batch` instead).
+# The `SCX_BENCH_PARTITION` env var also overrides the default — useful
+# for outer SLURM wrappers that already know the cluster.
+DEFAULT_PARTITION = os.environ.get("SCX_BENCH_PARTITION", "cpu_preemptible")
+
 TIERS = {
     "small": {
         "datasets": ["pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k"],
-        "partition": "cpu_preemptible",
+        "partition": DEFAULT_PARTITION,
         "mem_gb": 8,
         "timeout": 240,
     },
@@ -97,7 +107,7 @@ TIERS = {
             "pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k",
             "census_500k", "census_1m",
         ],
-        "partition": "cpu_preemptible",
+        "partition": DEFAULT_PARTITION,
         "mem_gb": 8,
         "timeout": 480,
     },
@@ -106,7 +116,7 @@ TIERS = {
             "pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k",
             "census_500k", "census_1m", "census_5m",
         ],
-        "partition": "cpu_preemptible",
+        "partition": DEFAULT_PARTITION,
         "mem_gb": 8,
         "timeout": 960,
     },
@@ -440,9 +450,23 @@ def main() -> int:
              "narrow accel-only runs or when known-broken format runners "
              "(BPCells / Parquet) are blocking submission of unrelated work.",
     )
+    parser.add_argument(
+        "--partition",
+        default=None,
+        help=(
+            "SLURM partition for the per-(benchmark, dataset, format) jobs "
+            "this script dispatches via run_parallel.py. Overrides the "
+            "tier's default partition (and the `SCX_BENCH_PARTITION` env "
+            f"var). Default: {DEFAULT_PARTITION!r}. Use this when running "
+            "on a cluster whose partition names differ from Chimera's "
+            "(e.g. Lambda HPC: --partition preemptible)."
+        ),
+    )
     args = parser.parse_args()
 
-    tier_cfg = TIERS[args.tier]
+    tier_cfg = dict(TIERS[args.tier])  # shallow copy so we can override
+    if args.partition is not None:
+        tier_cfg["partition"] = args.partition
     results_root = Path(args.results_dir) if args.results_dir else RESULTS_ROOT
     baseline_dir = results_root / args.name
     baseline_dir.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,30 @@
+{
+  "node": "vci-steady-state-node-017",
+  "slurm_job_id": "113079",
+  "n_obs": 100000,
+  "n_vars": 2000,
+  "batch_size": 64,
+  "pyscx_file": "/home/nickyoungblut/dev/scx-main/pyscx/python/pyscx/__init__.py",
+  "scenarios": {
+    "raw_workers0": {
+      "median_bps": 2429.66,
+      "median_cps": 155448.0,
+      "median_wall_s": 0.643,
+      "all_bps": [
+        2423.95,
+        2429.66,
+        2431.05
+      ]
+    },
+    "hvg_norm_workers0": {
+      "median_bps": 2500.3,
+      "median_cps": 159968.0,
+      "median_wall_s": 0.625,
+      "all_bps": [
+        2528.02,
+        2492.78,
+        2500.3
+      ]
+    }
+  }
+}

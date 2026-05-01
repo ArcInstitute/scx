@@ -369,3 +369,107 @@ def test_spawn_num_workers_2(fixture_paths: list[str]) -> None:
     )
     assert len(epochs) == 1
     _assert_one_epoch_covers_every_cell_once(epochs[0])
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.2 — IndexPlanDataset fork-safety analogue
+# ---------------------------------------------------------------------------
+#
+# IndexPlanDataset shares the tokio multi-thread runtime + std::thread +
+# crossbeam primitives with TrainingDataset (it owns its own runtime built
+# eagerly in `IndexPlanLoader::new`), but does *not* use rayon directly —
+# its prefetch goes via `tokio::spawn_blocking` and `std::thread::spawn`.
+# So the rayon-after-fork hazard from Phase 1 does not apply; the only
+# remaining concern is the tokio runtime's fork-hostility (#2/#3/#5 in
+# "Why fork is hard"). Phase 1 evidence shows tokio's multi-thread runtime
+# constructs cleanly in a forked child, so this test is expected to pass
+# without any Phase-2-style fix.
+
+
+def _child_iterate_index_plan_dataset(scx_path: str, conn) -> None:
+    """Construct IndexPlanDataset in a forked child, drive
+    `iter_with_plans` over a small fixed plan list, push the observed
+    pairs back over the pipe."""
+    try:
+        import pyscx
+
+        ds = pyscx.IndexPlanDataset(
+            scx_path,
+            normalize=False,
+            log1p=False,
+            obs_columns=["global_cell_id"],
+        )
+        # 4 plans × 4 pairs each = 16 pairs total. Each pair is
+        # (pert_idx, ctrl_idx) — both are global cell indices into the
+        # single fixture file.
+        plans = [
+            [(0, 1), (2, 3), (4, 5), (6, 7)],
+            [(8, 9), (10, 11), (12, 13), (14, 15)],
+            [(0, 8), (1, 9), (2, 10), (3, 11)],
+            [(15, 0), (14, 1), (13, 2), (12, 3)],
+        ]
+        seen_pairs: list[tuple[int, int]] = []
+        for batch in ds.iter_with_plans(iter(plans)):
+            seen_pairs.extend((int(p), int(c)) for p, c in batch["pairs"])
+        conn.send(("ok", seen_pairs))
+    except BaseException as exc:
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_index_plan_dataset(fixture_paths: list[str]) -> None:
+    """Phase 7.2 acceptance: a forked child can construct
+    `IndexPlanDataset` and iterate `iter_with_plans` to completion. Same
+    test surface as Phase 1.2 (`test_forked_child_iterates_training_dataset`)
+    but for the index-plan loader.
+
+    Expected outcome: child returns the 16 (pert, ctrl) pairs we sent in
+    (sort_by_shard may permute their order within a batch but not the
+    set). Hangs are surfaced as `pytest.fail` after `TEST_DEADLINE_SEC`.
+    """
+    # Use the first fixture file (it has 16 cells, plenty for the plans
+    # above which reference indices 0..15).
+    scx_path = fixture_paths[0]
+
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_child_iterate_index_plan_dataset,
+        args=(scx_path, child_conn),
+        daemon=False,
+    )
+    proc.start()
+    child_conn.close()
+    proc.join(timeout=TEST_DEADLINE_SEC)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2.0)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2.0)
+        pytest.fail(
+            f"IndexPlanDataset child did not finish within {TEST_DEADLINE_SEC}s "
+            "(fork-mode hang — see DEADLOCK-ISSUE.md §7.1/7.2)"
+        )
+
+    if not parent_conn.poll(0.0):
+        pytest.fail(
+            f"IndexPlanDataset child exited (rc={proc.exitcode}) without sending status"
+        )
+    status, payload = parent_conn.recv()
+    parent_conn.close()
+    if status == "err":
+        pytest.fail(f"IndexPlanDataset child raised: {payload}")
+    assert status == "ok"
+    seen = payload
+    expected = {
+        (0, 1), (2, 3), (4, 5), (6, 7),
+        (8, 9), (10, 11), (12, 13), (14, 15),
+        (0, 8), (1, 9), (2, 10), (3, 11),
+        (15, 0), (14, 1), (13, 2), (12, 3),
+    }
+    assert set(seen) == expected, (
+        f"missing={expected - set(seen)} extra={set(seen) - expected}"
+    )

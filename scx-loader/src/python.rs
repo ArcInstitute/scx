@@ -265,6 +265,29 @@ impl TrainingDataset {
 ///
 /// Phase 1 surface: `next_batch(plan)` is the only batch entry point. The
 /// streaming `iter_with_plans` API lands in Phase 4.
+///
+/// # Fork safety (DEADLOCK-ISSUE.md §7.1–7.3)
+///
+/// `IndexPlanDataset` is fork-safe under PyTorch
+/// `DataLoader(num_workers > 0, start_method="fork")` **when the dataset is
+/// constructed lazily inside the worker's `__iter__`** — same contract as
+/// `TrainingDataset`. Because `IndexPlanLoader` does *not* use rayon's
+/// global pool (its prefetch goes via `tokio::spawn_blocking` and
+/// `std::thread::spawn`), the rayon-after-fork hazard that motivated
+/// Phase 2.0 for `TrainingDataset` does **not** apply here. The remaining
+/// concern is the eager `tokio::runtime::Builder::new_multi_thread()` built
+/// in `IndexPlanLoader::new()` (`scx-loader/src/index_plan.rs:276`); under
+/// the lazy-construct-in-worker pattern that runtime is built fresh in the
+/// worker process, so the parent's runtime threads are never inherited.
+/// The eager-construct-then-fork case is caught by the PID check in
+/// `iter_with_plans` / `next_batch_for_test`.
+///
+/// **Acceptance test**: `pyscx/tests/test_fork_safety.py::test_fork_index_plan_dataset`
+/// pins this contract end-to-end (multiprocessing.fork + lazy worker
+/// construction + plan iteration to completion).
+///
+/// Recommended: call `start_method="spawn"` for the same reason it is
+/// recommended on `TrainingDataset` — no fork hazards at all.
 #[pyclass]
 pub struct IndexPlanDataset {
     loader: Arc<IndexPlanLoader>,

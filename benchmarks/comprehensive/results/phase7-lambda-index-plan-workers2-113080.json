@@ -1,0 +1,39 @@
+{
+  "node": "vci-steady-state-node-017",
+  "slurm_job_id": "113080",
+  "n_obs": 100000,
+  "n_vars": 2000,
+  "pairs_per_batch": 64,
+  "n_batches": 200,
+  "n_warmup": 1,
+  "n_runs": 3,
+  "scenarios": {
+    "pyscx_index_plan_dataset_workers0": {
+      "label": "workers0_reference",
+      "n_runs": 3,
+      "median_bps": 404.36,
+      "median_cps": 51757.0,
+      "median_peak_rss_mb": 4823.5,
+      "median_wall_s": 0.495,
+      "all_bps": [
+        404.67,
+        402.22,
+        404.36
+      ]
+    },
+    "pyscx_index_plan_dataset_workers2": {
+      "label": "workers2",
+      "n_runs": 3,
+      "median_bps": 144.64,
+      "median_cps": 18514.0,
+      "median_peak_rss_mb": 4823.5,
+      "median_wall_s": 1.383,
+      "all_bps": [
+        144.64,
+        145.97,
+        141.78
+      ],
+      "bps_ratio_vs_workers0": 0.358
+    }
+  }
+}

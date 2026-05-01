@@ -232,6 +232,161 @@ def _run_backed_python(
     )
 
 
+_HAS_TORCH = False
+try:
+    import torch  # noqa: F401
+
+    _HAS_TORCH = True
+except ImportError:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# DEADLOCK-ISSUE.md §7.4 — `num_workers > 0` IndexPlanDataset scenario
+# ---------------------------------------------------------------------------
+#
+# Mirrors the `pyscx_training_dataset_workers2` scenario from
+# `ml_loader.py`: wraps `pyscx.IndexPlanDataset` in a lazy-construct
+# IterableDataset shim and drives it via `DataLoader(num_workers=2)`.
+# The shim shards by plan index (`i % num_workers == worker_id`) so each
+# pair is yielded exactly once across workers. Pre-Phase-2 this path
+# was unsafe under fork-mode workers (same family of hazards as
+# TrainingDataset, sans rayon); post-Phase-2 it runs cleanly — see
+# `pyscx/tests/test_fork_safety.py::test_fork_index_plan_dataset`.
+
+if _HAS_TORCH:
+    import torch.utils.data as _td_for_ipds_shim
+
+    class _LazyIndexPlanShardedShim(_td_for_ipds_shim.IterableDataset):  # type: ignore[misc]
+        """Top-level (picklable under spawn) IterableDataset shim around
+        `pyscx.IndexPlanDataset`. Constructs the inner dataset lazily
+        inside `__iter__` so the eager fork-detection check at
+        `python.rs:416-421` does not fire."""
+
+        def __init__(
+            self,
+            scx_path: str,
+            n_obs: int,
+            pairs_per_batch: int,
+            n_batches: int,
+            hvg_indices: np.ndarray | None,
+            normalize: bool,
+            sort_by_shard: bool,
+            lookahead: int,
+            cache_shards: int,
+            max_plan_size: int,
+        ) -> None:
+            super().__init__()
+            self.scx_path = scx_path
+            self.n_obs = n_obs
+            self.pairs_per_batch = pairs_per_batch
+            self.n_batches = n_batches
+            self.hvg_indices = hvg_indices
+            self.normalize = normalize
+            self.sort_by_shard = sort_by_shard
+            self.lookahead = lookahead
+            self.cache_shards = cache_shards
+            self.max_plan_size = max_plan_size
+
+        def __iter__(self):
+            import pyscx
+            import torch.utils.data as _td
+
+            info = _td.get_worker_info()
+            worker_id = info.id if info is not None else 0
+            num_workers = info.num_workers if info is not None else 1
+
+            # Each worker generates the same plans (deterministic seed)
+            # and emits only the ones whose index matches its worker_id.
+            # Direct comparability with `pyscx_index_plan_random` under
+            # `num_workers=0`.
+            plans = _random_plans(
+                self.n_obs, self.pairs_per_batch, self.n_batches, seed=0
+            )
+
+            ds = pyscx.IndexPlanDataset(
+                self.scx_path,
+                hvg_indices=self.hvg_indices,
+                normalize=self.normalize,
+                cache_shards=self.cache_shards,
+                sort_by_shard=self.sort_by_shard,
+                lookahead=self.lookahead,
+                max_plan_size=self.max_plan_size,
+                max_memory_mb=8192,
+            )
+            for i, batch in enumerate(
+                ds.iter_with_plans(plans, lookahead=self.lookahead)
+            ):
+                if i % num_workers == worker_id:
+                    yield batch
+
+
+def _passthrough_collate(batch):
+    """Top-level passthrough collate (lambdas are not picklable under spawn)."""
+    return batch
+
+
+def _run_index_plan_workers2(
+    scx_path: str,
+    n_obs: int,
+    pairs_per_batch: int,
+    n_batches: int,
+    *,
+    hvg_indices: np.ndarray | None,
+    normalize: bool,
+    sort_by_shard: bool,
+    lookahead: int,
+    cache_shards: int,
+    max_plan_size: int,
+    persistent_workers: bool = False,
+) -> _ScenarioOutcome:
+    """Drive `pyscx.IndexPlanDataset` through `DataLoader(num_workers=2)`
+    via the lazy-construct shim. The cell count reported is `2 × pairs ×
+    batches_yielded` (matches `_run_index_plan`)."""
+    if not _HAS_TORCH:
+        return _ScenarioOutcome(
+            n_batches=0, n_cells=0, wall_s=0.0, peak_rss_mb=0.0
+        )
+    import torch.utils.data as _td
+
+    gc.collect()
+    rss0 = _peak_rss_mb()
+
+    shim = _LazyIndexPlanShardedShim(
+        scx_path=scx_path,
+        n_obs=n_obs,
+        pairs_per_batch=pairs_per_batch,
+        n_batches=n_batches,
+        hvg_indices=hvg_indices,
+        normalize=normalize,
+        sort_by_shard=sort_by_shard,
+        lookahead=lookahead,
+        cache_shards=cache_shards,
+        max_plan_size=max_plan_size,
+    )
+    loader = _td.DataLoader(
+        shim,
+        batch_size=None,
+        num_workers=2,
+        persistent_workers=persistent_workers,
+        collate_fn=_passthrough_collate,
+    )
+
+    t0 = time.perf_counter()
+    seen = 0
+    cells = 0
+    for batch in loader:
+        seen += 1
+        cells += 2 * batch["X"].shape[0]
+    wall = time.perf_counter() - t0
+    return _ScenarioOutcome(
+        n_batches=seen,
+        n_cells=cells,
+        wall_s=wall,
+        peak_rss_mb=max(rss0, _peak_rss_mb()),
+    )
+
+
 def _run_training_dataset(
     scx_path: str,
     pairs_per_batch: int,
@@ -401,6 +556,23 @@ def run(
             ),
         ),
     ]
+
+    # DEADLOCK-ISSUE.md §7.4 — `num_workers > 0` IndexPlanDataset scenario.
+    # Gated on `_HAS_TORCH` because pyscx ships without torch as a direct
+    # dep; only ml-flavoured callers have it installed.
+    if _HAS_TORCH:
+        scenarios.append(
+            (
+                "pyscx_index_plan_dataset_workers2",
+                lambda: _run_index_plan_workers2(
+                    scx_path,
+                    n_obs=n_obs,
+                    pairs_per_batch=pairs_per_batch,
+                    n_batches=n_batches,
+                    **common_index_plan,
+                ),
+            )
+        )
 
     for scenario_name, runner in scenarios:
         # Single untimed warm-up per scenario to drive page caches + lazy
