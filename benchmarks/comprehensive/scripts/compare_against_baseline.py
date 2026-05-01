@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import logging
 import statistics
 import sys
 from dataclasses import dataclass
@@ -52,6 +53,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # _justifications and _flakiness live beside this script — add parent
 # to sys.path so `python scripts/compare_against_baseline.py` works
@@ -237,6 +240,18 @@ def diff_summaries(
             # default win so a stale ledger entry can't tighten the gate.
             relaxed = override_tol is not None and override_tol > default_tol
             tol = override_tol if relaxed else default_tol
+            if override_tol is not None and not relaxed:
+                # Surface silent no-ops: the operator committed an
+                # override but it's at or below the global default, so it
+                # has no effect. Without this warning the entry is dead
+                # weight that quietly accumulates in the ledger.
+                logger.warning(
+                    "Flakiness override for %s (tolerance=%.4f) is at or "
+                    "below the global default (%.4f); override has no "
+                    "effect — overrides only relax. Either raise the "
+                    "tolerance or delete the entry.",
+                    quad, override_tol, default_tol,
+                )
             regressed = rel is not None and rel > tol
             if gate and b is not None and c is None:
                 # Disappeared benchmark — only surface this once per triple

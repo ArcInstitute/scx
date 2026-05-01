@@ -14,6 +14,9 @@ runs ``compare_against_baseline.py --gate`` in a subprocess. Verifies:
   6. A flakiness override raises the per-row tolerance, flipping a
      small-but-over-default regression to PASS while keeping bigger
      regressions on the same row failing.
+  7. A flakiness override whose tolerance is at or below the global
+     default emits a warning so the dead entry doesn't silently rot in
+     the ledger.
 """
 
 from __future__ import annotations
@@ -514,6 +517,43 @@ def test_flakiness_loader_rejects_negative_tolerance(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="non-negative"):
         flakiness.parse_flakiness_file(bad)
+
+
+def test_flakiness_override_at_or_below_default_warns(tmp_path: Path) -> None:
+    """An override whose tolerance is at or below the global default has
+    no effect — the gate must surface a warning so the entry doesn't
+    silently rot in the ledger.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    flaky = tmp_path / "flaky"
+    _write_summary(base, {"read_full__scx_auto__pbmc3k": _row(1.00)})
+    _write_summary(cur,  {"read_full__scx_auto__pbmc3k": _row(1.01)})
+    flaky.mkdir()
+    # Default --timing-tolerance is 0.03; an override at 0.02 cannot
+    # relax (overrides only relax, never tighten).
+    (flaky / "ineffective.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.02\n"
+        "reason: Tighter than the default — has no effect.\n"
+        "---\n"
+    )
+    result = _run_gate(
+        "--flakiness", str(flaky),
+        baseline=base, current=cur,
+    )
+    assert result.returncode == 0, (
+        f"1% delta must pass default gate even with an ineffective override; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "override has no effect" in result.stderr, (
+        f"ineffective override must emit a stderr warning so the entry "
+        f"doesn't silently rot in the ledger; stderr={result.stderr!r}"
+    )
 
 
 def test_absolute_floor_max_direction_flags_overrun(tmp_path: Path) -> None:
