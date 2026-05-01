@@ -8,8 +8,13 @@
 //!
 //! See `PER-CELL-CONTROL-PAIRING.md` at the workspace root for the full design.
 //!
-//! Phase 1 — single-threaded core. The iterator surface, lookahead prefetch,
-//! shard-sorted plan iteration, and vectorised pair scatter land in later phases.
+//! Surface: synchronous [`IndexPlanLoader::process_plan`] for one-shot batch
+//! gathering, plus an async [`IndexPlanLoader::iter_with_plans`] iterator that
+//! pipelines per-plan shard prefetch (via tokio `spawn_blocking`) ahead of the
+//! consumer. Plans are reordered by `min(shard_of(p), shard_of(c))` for
+//! locality when `sort_by_shard=true` (the default), and the HVG path uses a
+//! fused [`HvgProjection::scatter_pair_rows`] to share the gene-index walk
+//! across the perturbed and control sides.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -658,9 +663,10 @@ impl Iterator for IndexPlanIter {
 }
 
 impl Drop for IndexPlanIter {
-    /// Best-effort shutdown. Mirrors the `TrainingPipeline` drop pattern:
-    /// detect a running tokio runtime via `Handle::try_current()` and skip
-    /// any nested `block_on` to avoid panicking inside an async context.
+    /// Best-effort shutdown. The loader's tokio runtime is owned by the
+    /// `Arc<IndexPlanLoader>` (which the dataset, not this iter, holds), so
+    /// dropping the iter does not tear down the runtime — we only need to
+    /// release the prefetch tasks and the plan-pull thread.
     fn drop(&mut self) {
         // Abort any outstanding prefetch handles so the runtime threads
         // stop blocking on shards we no longer need.
@@ -677,22 +683,6 @@ impl Drop for IndexPlanIter {
 
         // Detach the plan thread; it will exit on its next send-fail.
         let _ = self.plan_thread.take();
-
-        // Note: dropping `self.loader` (Arc) on the last reference will, in
-        // turn, drop the tokio runtime. The runtime's own drop will block
-        // on its background threads — but only if we're not already inside
-        // a runtime, in which case Tokio panics. Match the pipeline.rs
-        // pattern: if we're nested, leak the runtime by detaching is not
-        // possible here (runtime is owned, not Arc), but the loader Arc
-        // outlives the iter when the user holds the dataset, so this is
-        // typically fine. When the dataset is dropped *concurrent* with
-        // teardown inside an async context, the user should have called an
-        // explicit shutdown first.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // We're inside a runtime — but we're only dropping the iter,
-            // not the loader. The loader (and its runtime) lives in the
-            // dataset's Arc and is unaffected here. No action needed.
-        }
     }
 }
 

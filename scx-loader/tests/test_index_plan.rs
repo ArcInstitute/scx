@@ -260,9 +260,10 @@ fn ctor_rejects_zero_cache_shards() {
     assert!(matches!(r, Err(LoaderError::ConfigError { .. })));
 }
 
-/// Constructor surfaces missing-obs-column as a ConfigError whose message
-/// names the missing column. Python wrapper maps this to KeyError; that's
-/// covered in the Python integration tests.
+/// Constructor surfaces missing-obs-column as the typed `ObsColumnNotFound`
+/// variant carrying the requested name and the available columns. Python
+/// wrapper maps this to KeyError; that's covered in the Python integration
+/// tests.
 #[test]
 fn ctor_rejects_missing_obs_column() {
     let dir = tempfile::tempdir().unwrap();
@@ -273,11 +274,14 @@ fn ctor_rejects_missing_obs_column() {
     config.max_memory_mb = 1024;
     let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024);
     match r {
-        Err(LoaderError::ConfigError { reason }) => {
-            assert!(reason.contains("nonexistent_column"));
-            assert!(reason.contains("not found in RecordBatch"));
+        Err(LoaderError::ObsColumnNotFound { name, available }) => {
+            assert_eq!(name, "nonexistent_column");
+            assert!(
+                available.iter().any(|c| c == "cell_id"),
+                "available list should include the fixture's cell_id column; got {available:?}"
+            );
         }
-        Err(other) => panic!("expected ConfigError, got {other}"),
+        Err(other) => panic!("expected ObsColumnNotFound, got {other}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }

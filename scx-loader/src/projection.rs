@@ -70,7 +70,7 @@ impl HvgProjection {
 
         // Merge-scan: two pointers over sorted csr_indices and gene_indices
         let mut gi = 0; // pointer into self.gene_indices
-        for (ci, (&col_idx, &value)) in csr_indices.iter().zip(csr_data.iter()).enumerate() {
+        for (&col_idx, &value) in csr_indices.iter().zip(csr_data.iter()) {
             let col = col_idx as u32;
 
             // Advance gene pointer to catch up with current CSR column
@@ -78,14 +78,12 @@ impl HvgProjection {
                 gi += 1;
             }
 
-            // If match, write to output at the projected position
+            // If match, write to output at the projected position. CSR indices
+            // are unique per row in well-formed data; if a duplicate slipped
+            // in, the last write wins (we don't advance gi).
             if gi < self.gene_indices.len() && self.gene_indices[gi] == col {
                 output_row[gi] = value;
-                // Don't advance gi here — CSR indices should be unique per row,
-                // but if there were duplicates, the last value wins. In normal
-                // CSR data, indices are unique so this is fine.
             }
-            let _ = ci; // suppress unused variable warning
         }
     }
 
@@ -95,6 +93,18 @@ impl HvgProjection {
     /// Pair-aware variant of [`scatter_row`]: walks `gene_indices` once and
     /// advances both CSR pointers in parallel, sharing the gene-index lookup
     /// cost between the two outputs. Bit-identical to two `scatter_row` calls.
+    ///
+    /// # Complexity trade-off
+    /// This routine is O(|`gene_indices`|) per pair (one outer step per HVG
+    /// gene), whereas calling [`scatter_row`] twice is O(|`p_csr_indices`| +
+    /// |`c_csr_indices`|). The pair-scatter wins when the two CSR rows are
+    /// at least as long as the HVG set — roughly,
+    /// `|p_nnz| + |c_nnz| >~ 2 × |gene_indices|`. Outside that regime the
+    /// extra outer steps cost more than the gene-index sharing saves.
+    /// Empirical measurements across representative single-cell sparsities
+    /// live in the `bench_scatter_pair_rows_*` `#[ignore]` tests below;
+    /// run them with
+    /// `cargo test --release -p scx-loader projection::tests::bench_scatter_pair_rows -- --ignored --nocapture`.
     ///
     /// # Arguments
     /// - `p_csr_indices`, `p_csr_data`: CSR row for the perturbed cell.
@@ -518,26 +528,26 @@ mod tests {
         }
     }
 
-    /// Phase 3.4 — Microbenchmark gate, run with:
-    ///     cargo test --release -p scx-loader projection::tests::bench_scatter_pair_rows -- --ignored --nocapture
-    /// Compares scatter_row × 2 vs scatter_pair_rows on a realistic-sparsity
-    /// workload (n_vars=20K, ~5% density, 2K HVGs). 1024 pairs per repetition,
-    /// 16 alternating reps to dampen scheduler / thermal noise; reports the
-    /// median ratio. Spec gates: revert if median speedup < 5%.
-    #[test]
-    #[ignore]
-    fn bench_scatter_pair_rows_vs_two_scatter_row() {
+    /// Compare `scatter_row × 2` vs `scatter_pair_rows` on a synthetic
+    /// workload sized by the caller. Used by the `bench_scatter_pair_rows_*`
+    /// `#[ignore]` regressions below to map out the complexity-trade-off
+    /// curve. Reports median wall-clock + min/max speedup ratio over `reps`
+    /// alternating reps, with a warm-up pass to settle caches / predictors.
+    fn run_pair_scatter_bench(
+        label: &str,
+        n_vars: u32,
+        n_hvg: usize,
+        nnz_per_row: usize,
+        n_pairs: usize,
+        reps: usize,
+    ) {
         use std::time::Instant;
-
-        let n_vars: u32 = 20_000;
-        let n_hvg: usize = 2_000;
-        let nnz_per_row: usize = 1_000;
-        let n_pairs: usize = 1024;
-        let reps: usize = 16;
 
         let mut state: u64 = 0xDEADBEEFCAFEBABE;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state
         };
 
@@ -572,7 +582,8 @@ mod tests {
         let mut c_out = vec![0f32; n_cols];
 
         // Warm-up — caches, branch predictor.
-        for (p_idx, p_dat, c_idx, c_dat) in &pairs[..32] {
+        let warm = pairs.len().min(32);
+        for (p_idx, p_dat, c_idx, c_dat) in &pairs[..warm] {
             p_out.fill(0.0);
             c_out.fill(0.0);
             proj.scatter_row(p_idx, p_dat, &mut p_out);
@@ -622,10 +633,63 @@ mod tests {
         let max_r = ratios[reps - 1];
 
         eprintln!(
-            "[bench_scatter_pair_rows] {n_pairs} pairs, n_vars={n_vars}, n_hvg={n_hvg}, ~{nnz_per_row} nnz/row, {reps} reps\n\
+            "[{label}] {n_pairs} pairs, n_vars={n_vars}, n_hvg={n_hvg}, ~{nnz_per_row} nnz/row, {reps} reps\n\
              scatter_row × 2   median: {med_b:.3} ms\n\
              scatter_pair_rows median: {med_p:.3} ms\n\
              speedup           median: {med_r:.3}× (min {min_r:.3}×, max {max_r:.3}×) (sink={sink})",
+        );
+    }
+
+    /// Phase 3.4 — original microbenchmark regime. Roughly square workload
+    /// (`n_vars=20K, n_hvg=2K, ~1K nnz/row`) where pair-scatter and two
+    /// scatter_row calls do comparable work. Spec gate: revert if median
+    /// speedup < 5%.
+    ///     cargo test --release -p scx-loader projection::tests::bench_scatter_pair_rows -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_scatter_pair_rows_vs_two_scatter_row() {
+        run_pair_scatter_bench(
+            "bench_scatter_pair_rows",
+            /* n_vars */ 20_000,
+            /* n_hvg */ 2_000,
+            /* nnz_per_row */ 1_000,
+            /* n_pairs */ 1024,
+            /* reps */ 16,
+        );
+    }
+
+    /// Sparse rows × large HVG set — typical scRNA-seq sparsity with HVG
+    /// selection (`n_vars=30K, n_hvg=2K, ~500 nnz/row`). The outer walk over
+    /// `gene_indices` does ~4× more steps than the combined CSR walks, so
+    /// pair-scatter is expected to be at or below parity with two
+    /// `scatter_row` calls in this regime.
+    #[test]
+    #[ignore]
+    fn bench_scatter_pair_rows_sparse_rows_large_hvg() {
+        run_pair_scatter_bench(
+            "bench_scatter_pair_rows_sparse_rows_large_hvg",
+            /* n_vars */ 30_000,
+            /* n_hvg */ 2_000,
+            /* nnz_per_row */ 500,
+            /* n_pairs */ 1024,
+            /* reps */ 16,
+        );
+    }
+
+    /// Dense rows × small HVG set — the inverse regime
+    /// (`n_vars=20K, n_hvg=500, ~2K nnz/row`). Combined CSR walks cost ~8×
+    /// the gene-index walk, so pair-scatter's shared outer pass is expected
+    /// to dominate.
+    #[test]
+    #[ignore]
+    fn bench_scatter_pair_rows_dense_rows_small_hvg() {
+        run_pair_scatter_bench(
+            "bench_scatter_pair_rows_dense_rows_small_hvg",
+            /* n_vars */ 20_000,
+            /* n_hvg */ 500,
+            /* nnz_per_row */ 2_000,
+            /* n_pairs */ 1024,
+            /* reps */ 16,
         );
     }
 }

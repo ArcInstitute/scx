@@ -530,9 +530,7 @@ impl IndexPlanBatchIter {
 fn loader_err_to_py(err: LoaderError) -> PyErr {
     match err {
         LoaderError::IndexOutOfRange { .. } => PyIndexError::new_err(err.to_string()),
-        LoaderError::ConfigError { ref reason } if reason.contains("not found in RecordBatch") => {
-            PyKeyError::new_err(err.to_string())
-        }
+        LoaderError::ObsColumnNotFound { .. } => PyKeyError::new_err(err.to_string()),
         _ => PyRuntimeError::new_err(err.to_string()),
     }
 }
