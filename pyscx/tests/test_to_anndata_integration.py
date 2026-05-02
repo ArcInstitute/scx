@@ -273,3 +273,137 @@ def test_to_anndata_deleted_rows_filters_layers(tmp_dir):
     np.testing.assert_array_equal(
         adata_loaded.layers["raw"].toarray(), expected_raw
     )
+
+
+def _gene_symbol_adata():
+    """AnnData with var.index = ENSG IDs and var['gene_symbol'] = symbols.
+
+    Index values and symbol values are disjoint, so a query against a symbol
+    only resolves through the non-index gene_symbol column.
+    """
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    np.random.seed(123)
+    n_obs, n_vars = 30, 8
+    # Distinct integer values per (cell, gene) so we can verify column ordering
+    dense = (np.arange(n_obs * n_vars).reshape(n_obs, n_vars) + 1).astype(np.float32)
+
+    obs = pd.DataFrame(
+        {"cell_type": pd.Categorical(["A"] * 15 + ["B"] * 15)},
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(
+        {"gene_symbol": [f"SYM_{i}" for i in range(n_vars)]},
+        index=[f"ENSG_{i:04d}" for i in range(n_vars)],
+    )
+    return anndata.AnnData(X=sp.csr_matrix(dense), obs=obs, var=var)
+
+
+def test_var_names_symbol_column_eager(tmp_dir):
+    """Eager to_anndata(var_names=[symbol]) resolves through non-index columns.
+
+    Before the fix, the eager-no-obs_filter path matched only var.index, so
+    gene symbols stored in var['gene_symbol'] were silently dropped (or all-
+    missing → error). This asserts symbol-column resolution now works and
+    that X / var stay aligned.
+    """
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "varnames_symbol_eager.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_5", "SYM_2"]  # non-index, intentionally unsorted
+    out = pyscx.open(path).to_anndata(var_names=requested)
+
+    assert out.n_vars == 2
+    assert out.X.shape == (adata.n_obs, 2)
+    assert out.var.shape[0] == 2
+    # Sorted by original column position -> SYM_2 then SYM_5
+    assert list(out.var["gene_symbol"]) == ["SYM_2", "SYM_5"]
+    assert list(out.var.index) == ["ENSG_0002", "ENSG_0005"]
+    # X column values match the source columns at positions 2 and 5
+    np.testing.assert_array_equal(
+        out.X.toarray(), adata.X.toarray()[:, [2, 5]]
+    )
+
+
+def test_var_names_symbol_column_backed(tmp_dir):
+    """Backed to_anndata(var_names=[symbol]) keeps X and var aligned.
+
+    Before the fix, X was projected by resolved positional indices but var
+    was filtered via var.index.isin(names). When names matched a non-index
+    column, var came back empty and AnnData rejected the assembly. This
+    asserts the backed path now slices var positionally.
+    """
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "varnames_symbol_backed.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_5", "SYM_2"]
+    out = pyscx.open(path).to_anndata(backed=True, var_names=requested)
+
+    assert out.n_vars == 2
+    assert out.X.shape == (adata.n_obs, 2)
+    assert out.var.shape[0] == 2
+    assert list(out.var["gene_symbol"]) == ["SYM_2", "SYM_5"]
+    assert list(out.var.index) == ["ENSG_0002", "ENSG_0005"]
+
+    # Materialize X and verify column data
+    x_dense = out.X[:].toarray() if hasattr(out.X, "to_memory") else out.X.toarray()
+    np.testing.assert_array_equal(x_dense, adata.X.toarray()[:, [2, 5]])
+
+
+def test_var_names_symbol_column_query(tmp_dir):
+    """obs_filter + var_names (query-engine path) resolves symbols correctly."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "varnames_symbol_query.scx")
+    pyscx.from_anndata(adata, path)
+
+    out = pyscx.open(path).to_anndata(
+        obs_filter="cell_type == 'A'",
+        var_names=["SYM_5", "SYM_2"],
+    )
+    assert out.n_obs == 15
+    assert out.n_vars == 2
+    assert list(out.var["gene_symbol"]) == ["SYM_2", "SYM_5"]
+    assert list(out.var.index) == ["ENSG_0002", "ENSG_0005"]
+
+
+def test_var_names_consistent_across_paths(tmp_dir):
+    """Eager / backed / query paths return identical X and var for the same names.
+
+    Locks in the alignment fix: regardless of which path resolves var_names,
+    the resulting X column data and var rows must agree.
+    """
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "varnames_consistent.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_5", "SYM_2"]
+
+    eager = pyscx.open(path).to_anndata(var_names=requested)
+    backed = pyscx.open(path).to_anndata(backed=True, var_names=requested)
+    backed_x = (
+        backed.X[:].toarray() if hasattr(backed.X, "to_memory") else backed.X.toarray()
+    )
+    query = pyscx.open(path).to_anndata(
+        obs_filter="cell_type == 'A' or cell_type == 'B'", var_names=requested
+    )
+
+    np.testing.assert_array_equal(eager.X.toarray(), backed_x)
+    np.testing.assert_array_equal(eager.X.toarray(), query.X.toarray())
+    assert list(eager.var.index) == list(backed.var.index) == list(query.var.index)
+    assert (
+        list(eager.var["gene_symbol"])
+        == list(backed.var["gene_symbol"])
+        == list(query.var["gene_symbol"])
+    )
