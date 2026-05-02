@@ -664,3 +664,108 @@ def test_from_anndata_uns_non_string_dict_keys_stringified(tmp_dir):
     out = pyscx.open(path).to_anndata()
 
     assert out.uns["by_int"] == {"1": "a", "2": "b"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #5: ensure_csr() must not mutate caller-owned CSR matrices by default.
+# ---------------------------------------------------------------------------
+
+
+def _unsorted_csr_adata():
+    """AnnData whose X is a CSR with explicitly unsorted column indices."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    # Two rows; row 0 has indices [2, 0], row 1 has [3, 1] — both unsorted.
+    data = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+    indices = np.array([2, 0, 3, 1], dtype=np.int32)
+    indptr = np.array([0, 2, 4], dtype=np.int64)
+    x = sp.csr_matrix((data, indices, indptr), shape=(2, 4))
+    assert x.has_sorted_indices is False  # fixture invariant
+    return anndata.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+
+
+def test_from_anndata_does_not_mutate_unsorted_csr(tmp_dir):
+    """Default in_place=False must leave adata.X.indices/data byte-identical."""
+    import pyscx
+
+    adata = _unsorted_csr_adata()
+    indices_before = adata.X.indices.copy()
+    data_before = adata.X.data.copy()
+    indptr_before = adata.X.indptr.copy()
+
+    path = str(tmp_dir / "no_mutate.scx")
+    pyscx.from_anndata(adata, path)
+
+    # Caller's CSR is unchanged.
+    assert (adata.X.indices == indices_before).all()
+    assert (adata.X.data == data_before).all()
+    assert (adata.X.indptr == indptr_before).all()
+    assert adata.X.has_sorted_indices is False
+
+    # On-disk values must still be correct (writer sorts internally).
+    rt = pyscx.open(path).to_anndata()
+    expected = np.zeros((2, 4), dtype=np.float32)
+    expected[0, 2] = 10.0
+    expected[0, 0] = 20.0
+    expected[1, 3] = 30.0
+    expected[1, 1] = 40.0
+    assert np.array_equal(rt.X.toarray(), expected)
+
+
+def test_from_anndata_in_place_sorts_unsorted_csr(tmp_dir):
+    """in_place=True opts in to the historical behavior: sort caller's CSR."""
+    import pyscx
+
+    adata = _unsorted_csr_adata()
+    assert adata.X.has_sorted_indices is False
+
+    path = str(tmp_dir / "in_place.scx")
+    pyscx.from_anndata(adata, path, in_place=True)
+
+    # Caller's CSR has been sorted in place.
+    assert adata.X.has_sorted_indices is True
+    # Row 0: [2,0] -> [0,2] with data [10,20] -> [20,10]
+    assert adata.X.indices.tolist() == [0, 2, 1, 3]
+    assert adata.X.data.tolist() == [20.0, 10.0, 40.0, 30.0]
+
+
+def test_from_anndata_does_not_mutate_unsorted_layer(tmp_dir):
+    """Layers with unsorted CSR indices must also be preserved by default."""
+    import anndata
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    # X is sorted (so X is unchanged trivially); layer is the interesting case.
+    x = sp.csr_matrix(np.eye(2, 4, dtype=np.float32))
+    layer = sp.csr_matrix(
+        (
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+            np.array([2, 0, 3, 1], dtype=np.int32),
+            np.array([0, 2, 4], dtype=np.int64),
+        ),
+        shape=(2, 4),
+    )
+    assert layer.has_sorted_indices is False
+
+    adata = anndata.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+        layers={"raw": layer},
+    )
+    indices_before = adata.layers["raw"].indices.copy()
+    data_before = adata.layers["raw"].data.copy()
+
+    path = str(tmp_dir / "layer_no_mutate.scx")
+    pyscx.from_anndata(adata, path)
+
+    assert (adata.layers["raw"].indices == indices_before).all()
+    assert (adata.layers["raw"].data == data_before).all()
+    assert adata.layers["raw"].has_sorted_indices is False

@@ -809,9 +809,21 @@ pub(crate) fn pandas_to_record_batch(
 /// - `pre_validated`: If true, the input was already CSR and the caller can
 ///   skip per-element validation in the shard loop (after calling
 ///   [`validate_csr_arrays`]).
+///
+/// `in_place` controls whether unsorted CSR inputs may be sorted in-place:
+/// - `false` (default for write paths): use `.sorted_indices()`, which
+///   returns a fresh CSR; the caller's matrix is never mutated.
+/// - `true`: use `.sort_indices()`, which sorts the caller's CSR in place.
+///   Avoids an allocation but mutates user input — only appropriate for
+///   benchmark/conversion workflows that explicitly opt in.
+///
+/// Already-sorted CSR, dense, and CSC inputs are unaffected by `in_place`
+/// — they take paths that either return the input unchanged or produce a
+/// fresh allocation regardless.
 pub(crate) fn ensure_csr<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
+    in_place: bool,
 ) -> PyResult<(Bound<'py, PyAny>, bool)> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let is_sparse = scipy_sparse
@@ -831,15 +843,21 @@ pub(crate) fn ensure_csr<'py>(
         return Ok((csr, false));
     }
 
-    // Already CSR — ensure sorted indices without copying.
-    // .sort_indices() sorts in-place (no copy) vs .sorted_indices() which
-    // creates a full copy of the sparse matrix.
+    // Already CSR — ensure sorted indices.
+    // .sort_indices() sorts in-place (mutates caller's CSR; no allocation).
+    // .sorted_indices() returns a fresh CSR with sorted indices and no
+    // aliasing of the input's data/indices/indptr arrays.
     let has_sorted: bool = x.getattr("has_sorted_indices")?.extract()?;
-    if !has_sorted {
-        x.call_method0("sort_indices")?;
+    if has_sorted {
+        return Ok((x.clone(), true));
     }
-
-    Ok((x.clone(), true))
+    if in_place {
+        x.call_method0("sort_indices")?;
+        Ok((x.clone(), true))
+    } else {
+        let csr = x.call_method0("sorted_indices")?;
+        Ok((csr, true))
+    }
 }
 
 /// Call `.astype(target_dtype)` only if the array's dtype doesn't already match.
@@ -1297,19 +1315,27 @@ fn parallel_encode_csr_shards(
 }
 
 /// Implementation of from_anndata: extract data from AnnData and write SCX.
+///
+/// `in_place`: when true, allow [`ensure_csr`] to sort caller-owned CSR
+/// indices in place (mutates `adata.X` / `adata.layers[*]`). When false
+/// (default), unsorted CSR inputs are copied via `.sorted_indices()` so
+/// the caller's matrices are untouched.
 pub fn from_anndata_impl(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    in_place: bool,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
 
-    // Extract X as CSR (1C.1: smart extraction avoids .sorted_indices() copy)
+    // Extract X as CSR. By default we do not mutate caller-owned CSR
+    // matrices; pass `in_place=true` to opt into the original in-place
+    // sort behavior for speed/memory.
     let x = adata.getattr("X")?;
-    let (x_csr, csr_validated) = ensure_csr(py, &x)?;
+    let (x_csr, csr_validated) = ensure_csr(py, &x, in_place)?;
 
     // Get shape
     let shape: (u64, u64) = x_csr.getattr("shape")?.extract()?;
@@ -1543,7 +1569,7 @@ pub fn from_anndata_impl(
         .extract()?;
     for layer_name in &layer_keys {
         let layer_x = layers.call_method1("__getitem__", (layer_name,))?;
-        let (layer_csr, l_csr_validated) = ensure_csr(py, &layer_x)?;
+        let (layer_csr, l_csr_validated) = ensure_csr(py, &layer_x, in_place)?;
 
         let l_shape: (u64, u64) = layer_csr.getattr("shape")?.extract()?;
         if l_shape != (n_obs, n_vars) {
