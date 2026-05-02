@@ -70,6 +70,12 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// distribution (Scx1 for small UMI counts, Zstd for large values or floats).
 /// Explicit options: "none", "scx1", "zstd".
 ///
+/// `adata.uns` is serialized as JSON. NumPy arrays/scalars, pandas
+/// Index/Series/Categorical, lists, tuples, and dicts of these are converted
+/// recursively. NumPy arrays become plain Python lists on readback (lossy:
+/// dtype/shape are not preserved). Non-finite floats and `bytes` raise
+/// `ValueError` rather than being silently coerced.
+///
 /// Example:
 ///     pyscx.from_anndata(adata, "output.scx")
 ///     pyscx.from_anndata(adata, "output.scx", codec="scx1", shard_size=8192)

@@ -4,7 +4,7 @@ use arrow::array::RecordBatch;
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -895,6 +895,151 @@ fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult
 }
 
 // ---------------------------------------------------------------------------
+// uns serialization
+// ---------------------------------------------------------------------------
+
+/// Recursively normalize a Python value into a `serde_json::Value` so it can
+/// be written into the SCX `uns` section. Replaces a previous `json.dumps`
+/// call that errored on common AnnData payloads (NumPy arrays/scalars,
+/// pandas Index/Series).
+///
+/// Conversion rules:
+/// - `None` → `null`
+/// - `bool` → `bool` (checked before `int`, since Python `bool` ⊂ `int`)
+/// - `int` → JSON number (i64 or u64; out-of-range integers error)
+/// - `float` → JSON number (non-finite values error rather than become null,
+///   to avoid silent data loss in scientific metadata)
+/// - `str` → string
+/// - `dict` → object; non-string keys are stringified via `str(k)`
+/// - `list` / `tuple` → array
+/// - `bytes` → error (no portable JSON representation)
+/// - NumPy scalar (`np.generic`) → recurse on `.item()`
+/// - NumPy array (`np.ndarray`) → recurse on `.tolist()` (multi-dim arrays
+///   produce nested lists; object arrays are recursed element-wise)
+/// - Other objects exposing a callable `.tolist()` (pandas `Index`,
+///   `Series`, `Categorical`) → recurse on `.tolist()`
+/// - Anything else → error naming the offending type and key path
+///
+/// `key_path` accumulates a Python-style accessor (e.g.
+/// `uns['rank_genes_groups']['names'][0]`) for inclusion in error messages.
+///
+/// Note: this is one-way. Round-tripping through SCX converts NumPy arrays
+/// to plain Python lists on readback, since the `uns` section stores JSON.
+fn normalize_uns_value<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    np_generic: &Bound<'py, PyAny>,
+    np_ndarray: &Bound<'py, PyAny>,
+) -> PyResult<serde_json::Value> {
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    // NumPy scalar / array first: in NumPy 1.x some scalars subclass Python
+    // numeric types, so we must dispatch on np.generic before bool/int/float.
+    if obj.is_instance(np_generic)? {
+        let item = obj.call_method0("item")?;
+        return normalize_uns_value(&item, key_path, np_generic, np_ndarray);
+    }
+    if obj.is_instance(np_ndarray)? {
+        let lst = obj.call_method0("tolist")?;
+        return normalize_uns_value(&lst, key_path, np_generic, np_ndarray);
+    }
+
+    // bool before int: Python bool is a subclass of int.
+    if obj.downcast::<PyBool>().is_ok() {
+        return Ok(serde_json::Value::Bool(obj.extract::<bool>()?));
+    }
+
+    if obj.downcast::<PyInt>().is_ok() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(serde_json::Value::Number(i.into()));
+        }
+        if let Ok(u) = obj.extract::<u64>() {
+            return Ok(serde_json::Value::Number(u.into()));
+        }
+        return Err(PyValueError::new_err(format!(
+            "uns at {key_path}: integer is too large for JSON (must fit in i64 or u64)"
+        )));
+    }
+
+    if obj.downcast::<PyFloat>().is_ok() {
+        let f: f64 = obj.extract()?;
+        if !f.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "uns at {key_path}: non-finite float ({f}) cannot be serialized to JSON"
+            )));
+        }
+        return serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "uns at {key_path}: float {f} cannot be represented in JSON"
+                ))
+            });
+    }
+
+    if let Ok(s) = obj.downcast::<PyString>() {
+        return Ok(serde_json::Value::String(s.extract()?));
+    }
+
+    if obj.downcast::<PyBytes>().is_ok() {
+        return Err(PyValueError::new_err(format!(
+            "uns at {key_path}: bytes are not JSON-serializable"
+        )));
+    }
+
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = serde_json::Map::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let key_str: String = k.str()?.extract()?;
+            let new_path = format!("{key_path}['{key_str}']");
+            map.insert(
+                key_str,
+                normalize_uns_value(&v, &new_path, np_generic, np_ndarray)?,
+            );
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+
+    if let Ok(lst) = obj.downcast::<PyList>() {
+        let mut arr = Vec::with_capacity(lst.len());
+        for (i, item) in lst.iter().enumerate() {
+            let new_path = format!("{key_path}[{i}]");
+            arr.push(normalize_uns_value(
+                &item, &new_path, np_generic, np_ndarray,
+            )?);
+        }
+        return Ok(serde_json::Value::Array(arr));
+    }
+
+    if let Ok(tup) = obj.downcast::<PyTuple>() {
+        let mut arr = Vec::with_capacity(tup.len());
+        for (i, item) in tup.iter().enumerate() {
+            let new_path = format!("{key_path}[{i}]");
+            arr.push(normalize_uns_value(
+                &item, &new_path, np_generic, np_ndarray,
+            )?);
+        }
+        return Ok(serde_json::Value::Array(arr));
+    }
+
+    // Generic fallback for pandas Index / Series / Categorical and similar
+    // array-like objects: anything exposing a callable `.tolist()`.
+    if let Ok(method) = obj.getattr("tolist") {
+        if method.is_callable() {
+            let lst = method.call0()?;
+            return normalize_uns_value(&lst, key_path, np_generic, np_ndarray);
+        }
+    }
+
+    let type_name: String = obj.get_type().getattr("__name__")?.extract()?;
+    Err(PyValueError::new_err(format!(
+        "uns at {key_path}: cannot serialize {type_name} to JSON; supported types are None, bool, int, float, str, dict, list, tuple, NumPy arrays/scalars, and pandas Series/Index/Categorical"
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // 1D: Parallel shard encoding helpers
 // ---------------------------------------------------------------------------
 
@@ -1321,16 +1466,16 @@ pub fn from_anndata_impl(
         })
         .collect::<PyResult<Vec<_>>>()?;
 
-    // 1E.2: Collect uns JSON under GIL
+    // 1E.2: Collect uns JSON under GIL.
+    // Use a recursive Python-side normalizer so common AnnData payloads
+    // (NumPy arrays/scalars, pandas Index/Series/Categorical) survive the
+    // JSON boundary instead of erroring out of `json.dumps`.
     let uns = adata.getattr("uns")?;
     let uns_len: usize = uns.call_method0("__len__")?.extract()?;
     let uns_json: Option<serde_json::Value> = if uns_len > 0 {
-        let json_mod = py.import("json")?;
-        let json_str: String = json_mod.call_method1("dumps", (&uns,))?.extract()?;
-        Some(
-            serde_json::from_str(&json_str)
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse uns JSON: {}", e)))?,
-        )
+        let np_generic = np.getattr("generic")?;
+        let np_ndarray = np.getattr("ndarray")?;
+        Some(normalize_uns_value(&uns, "uns", &np_generic, &np_ndarray)?)
     } else {
         None
     };

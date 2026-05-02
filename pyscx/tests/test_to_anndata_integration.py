@@ -452,3 +452,159 @@ def test_from_anndata_bad_layer_shape_returns_value_error(tmp_dir):
         match=r"Layer 'bad' has shape \(2, 4\), expected \(3, 4\)",
     ):
         pyscx.from_anndata(fake, path)
+
+
+def _adata_with_uns(uns):
+    """Build a minimal AnnData carrying the given `uns` payload."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    n_obs, n_vars = 2, 2
+    a = anndata.AnnData(
+        X=sp.csr_matrix(np.zeros((n_obs, n_vars), dtype=np.float32)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+    )
+    a.uns.update(uns)
+    return a
+
+
+def test_from_anndata_uns_numpy_arrays_roundtrip(tmp_dir):
+    """Numeric and object NumPy arrays in `uns` survive the JSON boundary.
+
+    Regression for issue #4: prior code called json.dumps(adata.uns) which
+    raised TypeError on NumPy arrays. STATE/State Designer store HVG names
+    as np.ndarray(dtype=object) in adata.uns['X_hvg_var_names']; Scanpy
+    writes structured arrays into adata.uns['rank_genes_groups'].
+    """
+    import pyscx
+
+    rgg = {
+        "names": np.array(
+            [("g0", "g1"), ("g2", "g0")], dtype=[("A", "U4"), ("B", "U4")]
+        ),
+        "pvals": np.array([1e-3, 1e-2], dtype=np.float32),
+    }
+    adata = _adata_with_uns({
+        "X_hvg_var_names": np.array(["g0", "g1", "g2"], dtype=object),
+        "rank_genes_groups": rgg,
+        "numeric_arr": np.array([[1, 2], [3, 4]], dtype=np.int32),
+    })
+
+    path = str(tmp_dir / "uns_arrays.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["X_hvg_var_names"] == ["g0", "g1", "g2"]
+    assert out.uns["numeric_arr"] == [[1, 2], [3, 4]]
+    assert out.uns["rank_genes_groups"]["names"] == [["g0", "g1"], ["g2", "g0"]]
+    assert len(out.uns["rank_genes_groups"]["pvals"]) == 2
+
+
+def test_from_anndata_uns_numpy_scalars_roundtrip(tmp_dir):
+    """NumPy scalars (np.int64, np.float32, np.bool_) collapse to Python scalars."""
+    import pyscx
+
+    adata = _adata_with_uns({
+        "i": np.int64(42),
+        "f": np.float32(2.5),
+        "b": np.bool_(True),
+        "u": np.uint32(7),
+    })
+
+    path = str(tmp_dir / "uns_scalars.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["i"] == 42 and isinstance(out.uns["i"], int)
+    assert abs(out.uns["f"] - 2.5) < 1e-6 and isinstance(out.uns["f"], float)
+    assert out.uns["b"] is True
+    assert out.uns["u"] == 7 and isinstance(out.uns["u"], int)
+
+
+def test_from_anndata_uns_nested_dicts_roundtrip(tmp_dir):
+    """Nested dicts mixing dict / list / tuple / NumPy survive the round-trip."""
+    import pyscx
+
+    adata = _adata_with_uns({
+        "level1": {
+            "level2": {
+                "arr": np.array([1, 2, 3]),
+                "tup": (np.int64(1), "two", 3.5),
+                "list_of_dicts": [{"k": np.float32(0.5)}, {"k": np.float32(1.5)}],
+            }
+        }
+    })
+
+    path = str(tmp_dir / "uns_nested.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    inner = out.uns["level1"]["level2"]
+    assert inner["arr"] == [1, 2, 3]
+    assert inner["tup"] == [1, "two", 3.5]
+    assert [d["k"] for d in inner["list_of_dicts"]] == pytest.approx([0.5, 1.5])
+
+
+def test_from_anndata_uns_pandas_categorical_roundtrip(tmp_dir):
+    """pandas Index / Categorical / Series in `uns` collapse to lists."""
+    import pandas as pd
+    import pyscx
+
+    adata = _adata_with_uns({
+        "idx": pd.Index(["x", "y", "z"]),
+        "cat": pd.Categorical(["a", "b", "a"], categories=["a", "b"], ordered=True),
+        "series": pd.Series([10, 20, 30]),
+    })
+
+    path = str(tmp_dir / "uns_pandas.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["idx"] == ["x", "y", "z"]
+    assert out.uns["cat"] == ["a", "b", "a"]
+    assert out.uns["series"] == [10, 20, 30]
+
+
+def test_from_anndata_uns_bytes_raises(tmp_dir):
+    """`bytes` are not JSON-serializable and should error explicitly."""
+    import pyscx
+
+    adata = _adata_with_uns({"k": b"hello"})
+    path = str(tmp_dir / "uns_bytes.scx")
+    with pytest.raises(ValueError, match=r"uns at uns\['k'\]: bytes are not JSON-serializable"):
+        pyscx.from_anndata(adata, path)
+
+
+def test_from_anndata_uns_non_finite_float_raises(tmp_dir):
+    """NaN / inf in floats fail loudly with a key path, even when nested in arrays."""
+    import pyscx
+
+    # Top-level NaN
+    adata = _adata_with_uns({"top": float("nan")})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['top'\]: non-finite float \(NaN\) cannot be serialized",
+    ):
+        pyscx.from_anndata(adata, str(tmp_dir / "nan.scx"))
+
+    # NaN inside a NumPy array — error path includes the index.
+    adata2 = _adata_with_uns({"arr": np.array([1.0, float("nan"), 3.0])})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['arr'\]\[1\]: non-finite float \(NaN\) cannot be serialized",
+    ):
+        pyscx.from_anndata(adata2, str(tmp_dir / "nan_arr.scx"))
+
+
+def test_from_anndata_uns_unsupported_type_reports_path(tmp_dir):
+    """Unsupported types (e.g. set) raise ValueError naming type and key path."""
+    import pyscx
+
+    adata = _adata_with_uns({"outer": {"inner": [1, 2, {3, 4}]}})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['outer'\]\['inner'\]\[2\]: cannot serialize set to JSON",
+    ):
+        pyscx.from_anndata(adata, str(tmp_dir / "unsupported.scx"))
