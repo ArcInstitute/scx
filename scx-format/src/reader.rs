@@ -595,10 +595,12 @@ impl ScxReader {
     /// Read and decode a single shard from a catalog entry.
     ///
     /// Skips per-shard checksum verification for performance. The catalog
-    /// checksum verified at `ScxReader::open()` already provides file-level
-    /// integrity, making per-shard checksums redundant for most reads.
-    /// Use [`read_shard_from_entry_verified`] when explicit per-shard
-    /// verification is needed (e.g., `scx validate`).
+    /// checksum verified at `ScxReader::open()` authenticates the catalog
+    /// payload (offsets, lengths, per-section checksums) but does **not**
+    /// re-hash section bytes — a corrupted shard payload will not be
+    /// detected here. Use [`read_shard_from_entry_verified`] or
+    /// [`ScxReader::validate`] when section-level integrity must be
+    /// confirmed (e.g., `scx validate`).
     pub fn read_shard_from_entry(
         &self,
         entry: &FullCatalogEntry,

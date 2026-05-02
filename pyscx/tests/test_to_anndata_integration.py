@@ -769,3 +769,181 @@ def test_from_anndata_does_not_mutate_unsorted_layer(tmp_dir):
     assert (adata.layers["raw"].indices == indices_before).all()
     assert (adata.layers["raw"].data == data_before).all()
     assert adata.layers["raw"].has_sorted_indices is False
+
+
+# ---------------------------------------------------------------------------
+# Review issue #8: preserve_slots=True opt-in for non-backed obs_filter
+# ---------------------------------------------------------------------------
+
+
+def _adata_with_obsm_and_layer():
+    """6×4 AnnData with cell_type column, X_umap obsm, and a `raw` layer."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    x = sp.csr_matrix(
+        np.array(
+            [
+                [1, 0, 0, 0],
+                [0, 2, 0, 0],
+                [0, 0, 3, 0],
+                [0, 0, 0, 4],
+                [5, 0, 0, 0],
+                [0, 6, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    raw = sp.csr_matrix(
+        np.array(
+            [
+                [10, 0, 0, 0],
+                [0, 20, 0, 0],
+                [0, 0, 30, 0],
+                [0, 0, 0, 40],
+                [50, 0, 0, 0],
+                [0, 60, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    obs = pd.DataFrame(
+        {
+            "cell_type": pd.Categorical(
+                ["T cell", "B cell", "T cell", "B cell", "T cell", "NK cell"]
+            ),
+        },
+        index=[f"c{i}" for i in range(6)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(4)])
+    obsm = {"X_umap": np.arange(12, dtype=np.float32).reshape(6, 2)}
+    return anndata.AnnData(X=x, obs=obs, var=var, obsm=obsm, layers={"raw": raw})
+
+
+def test_obs_filter_preserve_slots_keeps_obsm_and_layers(tmp_dir):
+    """preserve_slots=True with obs_filter materializes obsm + layers."""
+    import warnings as warnings_mod
+
+    import pyscx
+
+    adata = _adata_with_obsm_and_layer()
+    path = str(tmp_dir / "preserve_slots.scx")
+    pyscx.from_anndata(adata, path)
+
+    with warnings_mod.catch_warnings(record=True) as caught:
+        warnings_mod.simplefilter("always")
+        result = pyscx.open(path).to_anndata(
+            obs_filter="cell_type == 'T cell'", preserve_slots=True
+        )
+
+    # obs_filter selects rows 0, 2, 4 (the T cells)
+    assert result.n_obs == 3
+    assert result.n_vars == 4
+    assert list(result.obs["cell_type"]) == ["T cell"] * 3
+
+    # obsm and layers must be present and shape-aligned with filtered X
+    assert "X_umap" in result.obsm
+    assert result.obsm["X_umap"].shape == (3, 2)
+    np.testing.assert_array_equal(
+        result.obsm["X_umap"],
+        np.array([[0, 1], [4, 5], [8, 9]], dtype=np.float32),
+    )
+    assert "raw" in result.layers
+    assert result.layers["raw"].shape == (3, 4)
+    expected_raw = np.array(
+        [[10, 0, 0, 0], [0, 0, 30, 0], [50, 0, 0, 0]], dtype=np.float32
+    )
+    np.testing.assert_array_equal(result.layers["raw"].toarray(), expected_raw)
+
+    # The "non-backed mode" warning must NOT fire when preserve_slots=True.
+    assert not any(
+        "non-backed mode" in str(w.message) for w in caught
+    ), [str(w.message) for w in caught]
+
+
+def test_obs_filter_preserve_slots_default_drops_with_warning(tmp_dir):
+    """Default preserve_slots=False keeps query-engine path + warning."""
+    import warnings as warnings_mod
+
+    import pyscx
+
+    adata = _adata_with_obsm_and_layer()
+    path = str(tmp_dir / "preserve_slots_default.scx")
+    pyscx.from_anndata(adata, path)
+
+    with warnings_mod.catch_warnings(record=True) as caught:
+        warnings_mod.simplefilter("always")
+        result = pyscx.open(path).to_anndata(obs_filter="cell_type == 'T cell'")
+
+    # obsm and layers must be dropped
+    assert len(result.obsm) == 0
+    assert len(result.layers) == 0
+    # Documented warning fires (matches "non-backed mode" + lists obsm/layers)
+    matching = [w for w in caught if "non-backed mode" in str(w.message)]
+    assert matching, [str(w.message) for w in caught]
+    msg = str(matching[0].message)
+    assert "obsm" in msg or "layers" in msg
+    assert "preserve_slots" in msg
+
+
+def test_obs_filter_preserve_slots_with_var_names(tmp_dir):
+    """preserve_slots=True composes with var_names column projection."""
+    import pyscx
+
+    adata = _adata_with_obsm_and_layer()
+    path = str(tmp_dir / "preserve_slots_varnames.scx")
+    pyscx.from_anndata(adata, path)
+
+    result = pyscx.open(path).to_anndata(
+        obs_filter="cell_type == 'T cell'",
+        var_names=["g0", "g2"],
+        preserve_slots=True,
+    )
+
+    # Rows: T cells = 3. Cols: g0, g2 (sorted positional, matches existing
+    # var_names contract).
+    assert result.shape == (3, 2)
+    assert list(result.var.index) == ["g0", "g2"]
+    # Layers must be column-projected to the same gene set
+    assert result.layers["raw"].shape == (3, 2)
+    np.testing.assert_array_equal(
+        result.layers["raw"].toarray(),
+        np.array([[10, 0], [0, 30], [50, 0]], dtype=np.float32),
+    )
+    # X projection
+    np.testing.assert_array_equal(
+        result.X.toarray(),
+        np.array([[1, 0], [0, 3], [5, 0]], dtype=np.float32),
+    )
+    # obsm is row-only and is preserved unchanged
+    assert result.obsm["X_umap"].shape == (3, 2)
+
+
+def test_obs_filter_preserve_slots_rejects_non_boolean_expression(tmp_dir):
+    """preserve_slots=True must reject obs_filter exprs that don't yield a bool mask.
+
+    Without this guard, a numeric expression like ``"n_counts"`` would be
+    handed to AnnData's ``__getitem__`` as positional indices and silently
+    reorder rows (or raise an opaque IndexError). The guard surfaces a
+    clear PyValueError instead.
+    """
+    import anndata
+    import pandas as pd
+    import pyscx
+    import pytest
+    import scipy.sparse as sp
+
+    x = sp.csr_matrix(np.eye(4, dtype=np.float32))
+    obs = pd.DataFrame(
+        {"n_counts": np.array([10, 20, 30, 40], dtype=np.int64)},
+        index=[f"c{i}" for i in range(4)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(4)])
+    adata = anndata.AnnData(X=x, obs=obs, var=var)
+
+    path = str(tmp_dir / "preserve_slots_non_bool.scx")
+    pyscx.from_anndata(adata, path)
+
+    with pytest.raises(ValueError, match="boolean mask"):
+        pyscx.open(path).to_anndata(obs_filter="n_counts", preserve_slots=True)
