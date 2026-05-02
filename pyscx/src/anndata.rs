@@ -300,13 +300,12 @@ pub fn to_anndata_filtered<'py>(
         // sorted positional indices. Slicing adata[:, np_indices] then projects
         // X, layers, var, varm, and varp consistently.
         let indices = resolve_var_names_to_indices(reader, names)?;
-        let py_indices = pyo3::types::PyList::new(py, &indices)?;
-        let np = py.import("numpy")?;
-        let np_indices = np.call_method1("asarray", (py_indices,))?;
+        let np_indices = PyArray1::from_vec(py, indices);
 
         let builtins = py.import("builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
-        let idx = pyo3::types::PyTuple::new(py, &[slice_all.unbind(), np_indices.unbind()])?;
+        let idx =
+            pyo3::types::PyTuple::new(py, &[slice_all.unbind(), np_indices.into_any().unbind()])?;
         let sliced = adata.get_item(idx)?;
         let copied = sliced.call_method0("copy")?;
         return Ok(copied);
@@ -317,7 +316,17 @@ pub fn to_anndata_filtered<'py>(
 
 /// Resolve gene names to column indices using the var metadata.
 fn resolve_var_names_to_indices(reader: &ScxReader, names: &[String]) -> PyResult<Vec<u32>> {
-    let var_batch = reader.read_var().map_err(to_pyerr)?;
+    let var_batch = match reader.read_var() {
+        Ok(batch) => batch,
+        Err(scx_format::ScxError::SectionNotFound(_)) => {
+            return Err(PyRuntimeError::new_err(
+                "Cannot resolve var_names: this SCX file has no var metadata. \
+                 Open without var_names to load all genes."
+                    .to_string(),
+            ));
+        }
+        Err(e) => return Err(to_pyerr(e)),
+    };
 
     // Try to find gene names in the var DataFrame index.
     // The index column is typically the first column (or named "gene_id").
@@ -482,9 +491,7 @@ pub fn to_anndata_backed<'py>(
                 // with X when names match a non-index column like gene_symbol;
                 // the prior var.index.isin(names) approach produced an empty
                 // var when symbols were resolved from non-index columns.
-                let py_indices = pyo3::types::PyList::new(py, indices)?;
-                let np = py.import("numpy")?;
-                let np_indices = np.call_method1("asarray", (py_indices,))?;
+                let np_indices = PyArray1::from_slice(py, indices);
                 let iloc = df.getattr("iloc")?;
                 let filtered = iloc.get_item(np_indices)?;
                 Some(filtered)
