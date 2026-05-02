@@ -208,21 +208,21 @@ pub fn append_from_anndata(
     let np = py.import("numpy")?;
 
     let indptr_obj = x_csr.getattr("indptr")?;
-    let indptr_arr = indptr_obj.call_method1("astype", (np.getattr("int64")?,))?;
+    let indptr_arr = anndata::astype_if_needed(&indptr_obj, &np, "int64")?;
     let indptr_ro: PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
     let indptr_slice = indptr_ro
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let indices_obj = x_csr.getattr("indices")?;
-    let indices_arr = indices_obj.call_method1("astype", (np.getattr("int32")?,))?;
+    let indices_arr = anndata::astype_if_needed(&indices_obj, &np, "int32")?;
     let indices_ro: PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
     let indices_slice = indices_ro
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let data_obj = x_csr.getattr("data")?;
-    let data_arr = data_obj.call_method1("astype", (np.getattr("float32")?,))?;
+    let data_arr = anndata::astype_if_needed(&data_obj, &np, "float32")?;
     let data_ro: PyReadonlyArray1<'_, f32> = data_arr.extract()?;
     let data_slice = data_ro
         .as_slice()

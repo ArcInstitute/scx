@@ -862,7 +862,7 @@ pub(crate) fn ensure_csr<'py>(
 
 /// Call `.astype(target_dtype)` only if the array's dtype doesn't already match.
 /// Avoids Python call overhead when dtype is already correct (common for h5ad CSR).
-fn astype_if_needed<'py>(
+pub(crate) fn astype_if_needed<'py>(
     arr: &Bound<'py, PyAny>,
     np: &Bound<'py, PyModule>,
     target_dtype: &str,
