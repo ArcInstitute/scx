@@ -27,7 +27,13 @@ from benchmarks.comprehensive.sysinfo import collect_system_info
 # that hard-code the schema (the gate, reports) verify this and refuse to
 # diff across incompatible versions. Migration helper lives at
 # `scripts/migrate_results.py`.
-SCHEMA_VERSION = 1
+#
+# v2: adds ``wall_s_iqr`` / ``n_runs`` to BenchmarkResult.to_dict() and to the
+# rows of capture_baseline.py's summary.json so the gate can widen
+# ``median_wall_s`` tolerance by the baseline's own measured noise (review
+# §1.1). Older v1 raw JSONs and pre-bump promoted baselines just lack the
+# field and the gate falls back to the fixed --timing-tolerance.
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -94,6 +100,34 @@ class BenchmarkResult:
             return None
         return statistics.median(r.peak_rss_mb for r in self.runs)
 
+    @property
+    def wall_s_iqr(self) -> float | None:
+        """Inter-quartile range (p75 - p25) of wall_s across runs.
+
+        Used by the gate to widen the per-row timing tolerance: a noisy
+        baseline gets a relaxed bound proportional to its own measured
+        dispersion (review §1.1). Returns None for fewer than 2 runs —
+        IQR isn't meaningful, and the gate falls back to the fixed
+        --timing-tolerance.
+        """
+        if len(self.runs) < 2:
+            return None
+        walls = [r.wall_s for r in self.runs]
+        if len(walls) == 2:
+            # statistics.quantiles requires n >= 2 but with exactly 2 it
+            # returns p25/p50/p75 = same value if both are equal; otherwise
+            # the spread is exactly |a - b| / 2. Use the range as a robust
+            # stand-in to keep semantics defined for the cell_eval_parity_perf
+            # path (N_RUNS_LARGE=3) when one run is dropped upstream.
+            return float(abs(walls[0] - walls[1]))
+        q = statistics.quantiles(walls, n=4, method="exclusive")
+        return float(q[2] - q[0])
+
+    @property
+    def n_runs(self) -> int:
+        """Number of recorded timed runs (warmup excluded)."""
+        return len(self.runs)
+
     def add_run(
         self,
         wall_s: float,
@@ -119,6 +153,8 @@ class BenchmarkResult:
             "system": self.system,
             "runs": [asdict(r) for r in self.runs],
             "median_wall_s": self.median_wall_s,
+            "wall_s_iqr": self.wall_s_iqr,
+            "n_runs": self.n_runs,
         }
         if self.file_size_bytes is not None:
             d["file_size_bytes"] = self.file_size_bytes

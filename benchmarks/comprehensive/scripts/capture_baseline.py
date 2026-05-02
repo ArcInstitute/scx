@@ -313,9 +313,22 @@ def archive_raw_results(
             continue
 
         key = f"{data.get('benchmark')}__{data.get('format')}__{data.get('dataset')}"
+        runs = data.get("runs") or []
+        # Prefer the in-JSON field (results.py v2+) so ad-hoc edits to a raw
+        # JSON's runs[] don't silently drift from the recorded median; fall
+        # back to recomputing from runs[] for legacy v1 files lacking the
+        # field. Same logic for n_runs.
+        wall_s_iqr = data.get("wall_s_iqr")
+        if wall_s_iqr is None:
+            wall_s_iqr = _wall_s_iqr(runs)
+        n_runs = data.get("n_runs")
+        if n_runs is None:
+            n_runs = len(runs)
         summary[key] = {
             "median_wall_s": data.get("median_wall_s"),
-            "peak_rss_mb_median": _median_rss(data.get("runs") or []),
+            "wall_s_iqr": wall_s_iqr,
+            "n_runs": n_runs,
+            "peak_rss_mb_median": _median_rss(runs),
             "file_size_bytes": data.get("file_size_bytes"),
             "source_file": src.name,
         }
@@ -339,6 +352,21 @@ def _median_rss(runs: list[dict[str, Any]]) -> float | None:
     if n % 2 == 1:
         return float(vals_sorted[n // 2])
     return float((vals_sorted[n // 2 - 1] + vals_sorted[n // 2]) / 2)
+
+
+def _wall_s_iqr(runs: list[dict[str, Any]]) -> float | None:
+    """IQR (p75 - p25) of wall_s across runs, mirroring
+    BenchmarkResult.wall_s_iqr. Used only as the v1 → v2 backfill when the
+    raw JSON predates SCHEMA_VERSION=2 and lacks the field."""
+    import statistics
+    walls = [r.get("wall_s") for r in runs if r.get("wall_s") is not None]
+    if len(walls) < 2:
+        return None
+    walls = [float(w) for w in walls]
+    if len(walls) == 2:
+        return float(abs(walls[0] - walls[1]))
+    q = statistics.quantiles(walls, n=4, method="exclusive")
+    return float(q[2] - q[0])
 
 
 def run_fingerprints(baseline_dir: Path) -> int:
