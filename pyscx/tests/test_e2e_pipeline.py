@@ -161,6 +161,14 @@ class TestE2EPipeline:
     # 5. Memory budget — peak RSS stays within max_memory_mb
     def test_memory_budget_rss(self, scx_path):
         max_mb = 512
+
+        # ru_maxrss is monotonic peak across the whole process, so a raw
+        # absolute check is dominated by pytest + scanpy/torch imports and
+        # prior tests in the session — it has flaked at ~1025/1024 MB on
+        # CI runners. Snapshot peak before the pipeline so we measure only
+        # the rise caused by iteration itself.
+        peak_before_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
         ds = pyscx.TrainingDataset(
             scx_path,
             batch_size=32,
@@ -172,17 +180,14 @@ class TestE2EPipeline:
         for batch in ds:
             pass  # consume all batches
 
-        # ru_maxrss is in KB on Linux
-        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        peak_mb = peak_kb / 1024
+        peak_after_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        delta_mb = (peak_after_kb - peak_before_kb) / 1024
 
-        # The test process itself takes memory, so we just verify the
-        # pipeline didn't blow up to an unreasonable size.  The synthetic
-        # dataset is tiny (100 cells × 50 genes ≈ 20 KB), so 512 MB is
-        # generous.  We check the entire process is under 1 GB as a sanity
-        # check (pipeline overhead + test runner).
-        assert peak_mb < 1024, (
-            f"peak RSS {peak_mb:.0f} MB exceeds 1 GB sanity limit"
+        # Synthetic dataset is tiny (100 cells × 50 genes ≈ 20 KB); the
+        # pipeline shouldn't grow peak RSS anywhere near max_memory_mb.
+        assert delta_mb < max_mb, (
+            f"pipeline raised peak RSS by {delta_mb:.0f} MB "
+            f"(exceeds {max_mb} MB budget)"
         )
 
     # 6. num_workers > 0 raises clear error
