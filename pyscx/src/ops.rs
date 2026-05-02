@@ -165,24 +165,29 @@ pub fn append(
 
 /// Append cells from a Python AnnData object to an existing SCX file.
 ///
+/// By default `adata.X` is not mutated; CSR inputs with unsorted indices
+/// are copied. Pass `in_place=True` to allow `ensure_csr()` to sort the
+/// caller's CSR in place (one fewer allocation; mutates user input).
+///
 /// Example:
 ///     pyscx.append_from_anndata("atlas.scx", new_adata)
 ///     pyscx.append_from_anndata("atlas.scx", new_adata, codec="auto", shard_size=10000)
 #[pyfunction]
-#[pyo3(signature = (target, adata, codec=None, shard_size=None))]
+#[pyo3(signature = (target, adata, codec=None, shard_size=None, in_place=false))]
 pub fn append_from_anndata(
     py: Python<'_>,
     target: &str,
     adata: &Bound<'_, PyAny>,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    in_place: bool,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
 
     // Extract CSR from adata.X
     let x = adata.getattr("X")?;
-    let (x_csr, _csr_validated) = anndata::ensure_csr(py, &x)?;
+    let (x_csr, _csr_validated) = anndata::ensure_csr(py, &x, in_place)?;
 
     // Get shape and validate n_vars match
     let shape: (u64, u64) = x_csr.getattr("shape")?.extract()?;
@@ -203,21 +208,21 @@ pub fn append_from_anndata(
     let np = py.import("numpy")?;
 
     let indptr_obj = x_csr.getattr("indptr")?;
-    let indptr_arr = indptr_obj.call_method1("astype", (np.getattr("int64")?,))?;
+    let indptr_arr = anndata::astype_if_needed(&indptr_obj, &np, "int64")?;
     let indptr_ro: PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
     let indptr_slice = indptr_ro
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let indices_obj = x_csr.getattr("indices")?;
-    let indices_arr = indices_obj.call_method1("astype", (np.getattr("int32")?,))?;
+    let indices_arr = anndata::astype_if_needed(&indices_obj, &np, "int32")?;
     let indices_ro: PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
     let indices_slice = indices_ro
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let data_obj = x_csr.getattr("data")?;
-    let data_arr = data_obj.call_method1("astype", (np.getattr("float32")?,))?;
+    let data_arr = anndata::astype_if_needed(&data_obj, &np, "float32")?;
     let data_ro: PyReadonlyArray1<'_, f32> = data_arr.extract()?;
     let data_slice = data_ro
         .as_slice()

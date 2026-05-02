@@ -76,36 +76,52 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// dtype/shape are not preserved). Non-finite floats and `bytes` raise
 /// `ValueError` rather than being silently coerced.
 ///
+/// By default `from_anndata()` does not mutate `adata.X` or `adata.layers`.
+/// CSR inputs with unsorted indices are copied via
+/// `scipy.sparse.csr_matrix.sorted_indices()` so the caller's matrices are
+/// untouched. Pass `in_place=True` to allow in-place index sorting on the
+/// caller's CSR matrices (saves one allocation per matrix; matches the
+/// historical behavior). Note that even with `in_place=False`, dtype
+/// conversion of `indptr` / `indices` / `data` to SCX's on-disk types
+/// (`int64` / `int32` / `float32`) may allocate fresh numpy arrays — those
+/// allocations never alias or mutate the caller's data.
+///
 /// Example:
 ///     pyscx.from_anndata(adata, "output.scx")
 ///     pyscx.from_anndata(adata, "output.scx", codec="scx1", shard_size=8192)
+///     pyscx.from_anndata(adata, "output.scx", in_place=True)
 #[pyfunction]
-#[pyo3(signature = (adata, path, codec=None, shard_size=None))]
+#[pyo3(signature = (adata, path, codec=None, shard_size=None, in_place=false))]
 fn from_anndata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    in_place: bool,
 ) -> PyResult<()> {
-    anndata::from_anndata_impl(py, adata, path, codec, shard_size)
+    anndata::from_anndata_impl(py, adata, path, codec, shard_size, in_place)
 }
 
 /// Convert a 10x HDF5 file to SCX via scanpy.
 ///
 /// Reads the 10x file with scanpy.read_10x_h5(), then writes via from_anndata.
+/// `in_place` mirrors the `from_anndata()` parameter; it has no observable
+/// effect because the AnnData object returned by scanpy is freshly
+/// constructed and has no other reference.
 #[pyfunction]
-#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None))]
+#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None, in_place=false))]
 fn from_10x(
     py: Python<'_>,
     h5_path: &str,
     scx_path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    in_place: bool,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy")?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
-    anndata::from_anndata_impl(py, &adata, scx_path, codec, shard_size)
+    anndata::from_anndata_impl(py, &adata, scx_path, codec, shard_size, in_place)
 }
 
 /// Convert a Cell Ranger MTX directory to SCX.
