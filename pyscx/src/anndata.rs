@@ -224,8 +224,8 @@ pub fn to_anndata_filtered<'py>(
     }
 
     // preserve_slots=true with obs_filter: load full AnnData, then filter
-    // rows via pandas.eval. Keeps obsm / layers / varm / uns intact at the
-    // cost of skipping query-engine predicate pushdown.
+    // rows via pandas.eval. Keeps obsm / layers / uns intact at the cost
+    // of skipping query-engine predicate pushdown.
     if let (Some(expr), true) = (obs_filter, preserve_slots) {
         let full = to_anndata_with_layers(py, reader, layer_filter)?;
 
@@ -237,22 +237,28 @@ pub fn to_anndata_filtered<'py>(
             ))
         })?;
 
+        // Reject non-boolean results: AnnData treats numeric arrays as
+        // positional indices, which would silently reorder rows instead
+        // of failing on a malformed predicate.
+        let dtype_kind: String = mask.getattr("dtype")?.getattr("kind")?.extract()?;
+        if dtype_kind != "b" {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "preserve_slots=True requires obs_filter to evaluate to a \
+                 boolean mask (e.g. \"cell_type == 'T cell'\"); expression \
+                 {expr:?} produced dtype kind {dtype_kind:?}"
+            )));
+        }
+
         let builtins = py.import("builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
-        let row_idx = pyo3::types::PyTuple::new(py, &[mask.unbind(), slice_all.clone().unbind()])?;
-        let filtered = full.get_item(row_idx)?.call_method0("copy")?;
-
-        if let Some(names) = var_names {
+        let col_idx = if let Some(names) = var_names {
             let indices = resolve_var_names_to_indices(reader, names)?;
-            let np_indices = PyArray1::from_vec(py, indices);
-            let col_idx = pyo3::types::PyTuple::new(
-                py,
-                &[slice_all.unbind(), np_indices.into_any().unbind()],
-            )?;
-            let projected = filtered.get_item(col_idx)?.call_method0("copy")?;
-            return Ok(projected);
-        }
-        return Ok(filtered);
+            PyArray1::from_vec(py, indices).into_any().unbind()
+        } else {
+            slice_all.unbind()
+        };
+        let idx = pyo3::types::PyTuple::new(py, &[mask.unbind(), col_idx])?;
+        return full.get_item(idx)?.call_method0("copy");
     }
 
     // If obs_filter is specified, use the query engine for predicate pushdown

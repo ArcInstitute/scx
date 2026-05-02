@@ -918,3 +918,32 @@ def test_obs_filter_preserve_slots_with_var_names(tmp_dir):
     )
     # obsm is row-only and is preserved unchanged
     assert result.obsm["X_umap"].shape == (3, 2)
+
+
+def test_obs_filter_preserve_slots_rejects_non_boolean_expression(tmp_dir):
+    """preserve_slots=True must reject obs_filter exprs that don't yield a bool mask.
+
+    Without this guard, a numeric expression like ``"n_counts"`` would be
+    handed to AnnData's ``__getitem__`` as positional indices and silently
+    reorder rows (or raise an opaque IndexError). The guard surfaces a
+    clear PyValueError instead.
+    """
+    import anndata
+    import pandas as pd
+    import pyscx
+    import pytest
+    import scipy.sparse as sp
+
+    x = sp.csr_matrix(np.eye(4, dtype=np.float32))
+    obs = pd.DataFrame(
+        {"n_counts": np.array([10, 20, 30, 40], dtype=np.int64)},
+        index=[f"c{i}" for i in range(4)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(4)])
+    adata = anndata.AnnData(X=x, obs=obs, var=var)
+
+    path = str(tmp_dir / "preserve_slots_non_bool.scx")
+    pyscx.from_anndata(adata, path)
+
+    with pytest.raises(ValueError, match="boolean mask"):
+        pyscx.open(path).to_anndata(obs_filter="n_counts", preserve_slots=True)
