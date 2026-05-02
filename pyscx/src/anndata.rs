@@ -2,7 +2,7 @@
 
 use arrow::array::RecordBatch;
 use numpy::{PyArray1, PyReadonlyArray1};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::io::Cursor;
@@ -1152,6 +1152,17 @@ pub fn from_anndata_impl(
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
+    let expected_indptr_len = (n_obs as usize) + 1;
+    if indptr_slice.len() != expected_indptr_len {
+        return Err(PyValueError::new_err(format!(
+            "X indptr has length {}, expected n_obs + 1 = {} (X.shape = ({}, {}))",
+            indptr_slice.len(),
+            expected_indptr_len,
+            n_obs,
+            n_vars
+        )));
+    }
+
     let indices_obj = x_csr.getattr("indices")?;
     let indices_arr = astype_if_needed(&indices_obj, &np, "int32")?;
     let indices: PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
@@ -1346,12 +1357,28 @@ pub fn from_anndata_impl(
         let layer_x = layers.call_method1("__getitem__", (layer_name,))?;
         let (layer_csr, l_csr_validated) = ensure_csr(py, &layer_x)?;
 
+        let l_shape: (u64, u64) = layer_csr.getattr("shape")?.extract()?;
+        if l_shape != (n_obs, n_vars) {
+            return Err(PyValueError::new_err(format!(
+                "Layer '{layer_name}' has shape ({}, {}), expected ({}, {})",
+                l_shape.0, l_shape.1, n_obs, n_vars
+            )));
+        }
+
         let l_indptr_obj = layer_csr.getattr("indptr")?;
         let l_indptr_arr = astype_if_needed(&l_indptr_obj, &np, "int64")?;
         let l_indptr: PyReadonlyArray1<'_, i64> = l_indptr_arr.extract()?;
         let l_indptr_slice = l_indptr
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        if l_indptr_slice.len() != expected_indptr_len {
+            return Err(PyValueError::new_err(format!(
+                "Layer '{layer_name}' indptr has length {}, expected n_obs + 1 = {}",
+                l_indptr_slice.len(),
+                expected_indptr_len
+            )));
+        }
 
         let l_indices_obj = layer_csr.getattr("indices")?;
         let l_indices_arr = astype_if_needed(&l_indices_obj, &np, "int32")?;

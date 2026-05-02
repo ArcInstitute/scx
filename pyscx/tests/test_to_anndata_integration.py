@@ -407,3 +407,48 @@ def test_var_names_consistent_across_paths(tmp_dir):
         == list(backed.var["gene_symbol"])
         == list(query.var["gene_symbol"])
     )
+
+
+class _DuckAnnData:
+    """Minimal AnnData-like shim for duck-typed validation tests.
+
+    Real ``anndata.AnnData`` rejects mismatched layer shapes at assignment
+    time, so we have to bypass it to exercise pyscx's own shape validation.
+    """
+
+    def __init__(self, X, obs, var, layers):
+        self.X = X
+        self.obs = obs
+        self.var = var
+        self.obsm = {}
+        self.uns = {}
+        self.layers = layers
+
+
+def test_from_anndata_bad_layer_shape_returns_value_error(tmp_dir):
+    """from_anndata raises ValueError (not panics) on mismatched layer shape.
+
+    Regression: a duck-typed AnnData-like with X.shape=(3,4) but
+    layers['bad'].shape=(2,4) used to panic in Rust ('index out of bounds')
+    while indexing the layer's indptr in the shard boundary loop.
+    """
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    n_obs, n_vars = 3, 4
+    fake = _DuckAnnData(
+        X=sp.csr_matrix(np.zeros((n_obs, n_vars), dtype=np.float32)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+        layers={
+            "bad": sp.csr_matrix(np.zeros((n_obs - 1, n_vars), dtype=np.float32))
+        },
+    )
+
+    path = str(tmp_dir / "bad_layer.scx")
+    with pytest.raises(
+        ValueError,
+        match=r"Layer 'bad' has shape \(2, 4\), expected \(3, 4\)",
+    ):
+        pyscx.from_anndata(fake, path)
