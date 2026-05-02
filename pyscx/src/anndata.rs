@@ -295,29 +295,18 @@ pub fn to_anndata_filtered<'py>(
     let adata = to_anndata_with_layers(py, reader, layer_filter)?;
 
     if let Some(names) = var_names {
-        // Apply var_names column projection via AnnData slicing
-        let var_df = adata.getattr("var")?;
-        let var_index = var_df.getattr("index")?;
-
-        // Build a boolean mask of which genes to keep
-        let py_names = pyo3::types::PyList::new(py, names)?;
-        let isin = var_index.call_method1("isin", (py_names,))?;
-
-        // Check for names not found
+        // Resolve via the same path as backed / query-engine: scans all string
+        // columns (so gene symbols in non-index columns work) and returns
+        // sorted positional indices. Slicing adata[:, np_indices] then projects
+        // X, layers, var, varm, and varp consistently.
+        let indices = resolve_var_names_to_indices(reader, names)?;
+        let py_indices = pyo3::types::PyList::new(py, &indices)?;
         let np = py.import("numpy")?;
-        let n_found: usize = np.call_method1("sum", (&isin,))?.extract()?;
-        if n_found == 0 {
-            return Err(PyRuntimeError::new_err(
-                "None of the requested var_names were found. \
-                 Available gene names can be seen via exp.to_anndata().var.index"
-                    .to_string(),
-            ));
-        }
+        let np_indices = np.call_method1("asarray", (py_indices,))?;
 
-        // Slice AnnData: adata[:, mask]
         let builtins = py.import("builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
-        let idx = pyo3::types::PyTuple::new(py, &[slice_all.unbind(), isin.unbind()])?;
+        let idx = pyo3::types::PyTuple::new(py, &[slice_all.unbind(), np_indices.unbind()])?;
         let sliced = adata.get_item(idx)?;
         let copied = sliced.call_method0("copy")?;
         return Ok(copied);
@@ -361,6 +350,12 @@ fn resolve_var_names_to_indices(reader: &ScxReader, names: &[String]) -> PyResul
             not_found
         )));
     }
+
+    // Sort + dedup so all callers produce var rows in sorted column-position
+    // order, matching scx-engine::project_var(). Keeps eager / backed /
+    // query-engine paths consistent under reordered or duplicated requests.
+    indices.sort_unstable();
+    indices.dedup();
 
     Ok(indices)
 }
@@ -481,13 +476,17 @@ pub fn to_anndata_backed<'py>(
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
             let df = pyarrow_table_to_pandas(&table)?;
-            if let Some(names) = var_names {
-                // Slice var DataFrame to only the projected genes
-                let py_names = pyo3::types::PyList::new(py, names)?;
-                let var_index = df.getattr("index")?;
-                let isin = var_index.call_method1("isin", (py_names,))?;
-                let loc = df.getattr("loc")?;
-                let filtered = loc.get_item(isin)?;
+            if let Some(ref indices) = col_indices {
+                // Slice var positionally with the same indices used to project
+                // X (set_col_projection above). Using df.iloc keeps var aligned
+                // with X when names match a non-index column like gene_symbol;
+                // the prior var.index.isin(names) approach produced an empty
+                // var when symbols were resolved from non-index columns.
+                let py_indices = pyo3::types::PyList::new(py, indices)?;
+                let np = py.import("numpy")?;
+                let np_indices = np.call_method1("asarray", (py_indices,))?;
+                let iloc = df.getattr("iloc")?;
+                let filtered = iloc.get_item(np_indices)?;
                 Some(filtered)
             } else {
                 Some(df)
