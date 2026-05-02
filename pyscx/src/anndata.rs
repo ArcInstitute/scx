@@ -5,6 +5,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -916,12 +917,26 @@ fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult
 /// - NumPy scalar (`np.generic`) → recurse on `.item()`
 /// - NumPy array (`np.ndarray`) → recurse on `.tolist()` (multi-dim arrays
 ///   produce nested lists; object arrays are recursed element-wise)
-/// - Other objects exposing a callable `.tolist()` (pandas `Index`,
-///   `Series`, `Categorical`) → recurse on `.tolist()`
+/// - Any other object exposing a callable `.tolist()` → recurse on its
+///   result. This covers pandas `Index`, `Series`, and `Categorical`, but
+///   also any duck-typed array-like (e.g. third-party tensors). The
+///   fallback is intentionally broad — narrowing it would reject
+///   legitimate user payloads with no compensating safety win.
 /// - Anything else → error naming the offending type and key path
 ///
 /// `key_path` accumulates a Python-style accessor (e.g.
 /// `uns['rank_genes_groups']['names'][0]`) for inclusion in error messages.
+///
+/// `visiting` tracks PyObject identities currently on the recursion stack
+/// for container branches (dict / list / tuple / `.tolist()` fallback). A
+/// repeat hit means the input contains a cycle (e.g. `d = {}; d["x"] = d`,
+/// or a class whose `.tolist()` returns `self`). We raise `ValueError`
+/// instead of recursing into a Rust stack overflow — the latter would
+/// abort the Python process. NumPy `ndarray.tolist()` always returns a
+/// fresh list, so that branch doesn't need tracking. Scalar leaves
+/// (int/float/str) aren't tracked either: Python's small-int / interned-
+/// string caches share PyObject identity across uses and would produce
+/// false positives.
 ///
 /// Note: this is one-way. Round-tripping through SCX converts NumPy arrays
 /// to plain Python lists on readback, since the `uns` section stores JSON.
@@ -930,6 +945,7 @@ fn normalize_uns_value<'py>(
     key_path: &str,
     np_generic: &Bound<'py, PyAny>,
     np_ndarray: &Bound<'py, PyAny>,
+    visiting: &mut HashSet<usize>,
 ) -> PyResult<serde_json::Value> {
     if obj.is_none() {
         return Ok(serde_json::Value::Null);
@@ -939,11 +955,11 @@ fn normalize_uns_value<'py>(
     // numeric types, so we must dispatch on np.generic before bool/int/float.
     if obj.is_instance(np_generic)? {
         let item = obj.call_method0("item")?;
-        return normalize_uns_value(&item, key_path, np_generic, np_ndarray);
+        return normalize_uns_value(&item, key_path, np_generic, np_ndarray, visiting);
     }
     if obj.is_instance(np_ndarray)? {
         let lst = obj.call_method0("tolist")?;
-        return normalize_uns_value(&lst, key_path, np_generic, np_ndarray);
+        return normalize_uns_value(&lst, key_path, np_generic, np_ndarray, visiting);
     }
 
     // bool before int: Python bool is a subclass of int.
@@ -989,6 +1005,26 @@ fn normalize_uns_value<'py>(
         )));
     }
 
+    let id = obj.as_ptr() as usize;
+    if !visiting.insert(id) {
+        return Err(PyValueError::new_err(format!(
+            "uns at {key_path}: circular reference detected"
+        )));
+    }
+    let result = normalize_container(obj, key_path, np_generic, np_ndarray, visiting);
+    visiting.remove(&id);
+    result
+}
+
+/// Container / fallback dispatch — split out so `normalize_uns_value` can
+/// wrap it with cycle-tracking insert/remove.
+fn normalize_container<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    np_generic: &Bound<'py, PyAny>,
+    np_ndarray: &Bound<'py, PyAny>,
+    visiting: &mut HashSet<usize>,
+) -> PyResult<serde_json::Value> {
     if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (k, v) in dict.iter() {
@@ -996,7 +1032,7 @@ fn normalize_uns_value<'py>(
             let new_path = format!("{key_path}['{key_str}']");
             map.insert(
                 key_str,
-                normalize_uns_value(&v, &new_path, np_generic, np_ndarray)?,
+                normalize_uns_value(&v, &new_path, np_generic, np_ndarray, visiting)?,
             );
         }
         return Ok(serde_json::Value::Object(map));
@@ -1007,7 +1043,7 @@ fn normalize_uns_value<'py>(
         for (i, item) in lst.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
             arr.push(normalize_uns_value(
-                &item, &new_path, np_generic, np_ndarray,
+                &item, &new_path, np_generic, np_ndarray, visiting,
             )?);
         }
         return Ok(serde_json::Value::Array(arr));
@@ -1018,24 +1054,24 @@ fn normalize_uns_value<'py>(
         for (i, item) in tup.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
             arr.push(normalize_uns_value(
-                &item, &new_path, np_generic, np_ndarray,
+                &item, &new_path, np_generic, np_ndarray, visiting,
             )?);
         }
         return Ok(serde_json::Value::Array(arr));
     }
 
-    // Generic fallback for pandas Index / Series / Categorical and similar
-    // array-like objects: anything exposing a callable `.tolist()`.
+    // Generic fallback: any object exposing a callable `.tolist()`. Covers
+    // pandas Index / Series / Categorical and most array-like duck types.
     if let Ok(method) = obj.getattr("tolist") {
         if method.is_callable() {
             let lst = method.call0()?;
-            return normalize_uns_value(&lst, key_path, np_generic, np_ndarray);
+            return normalize_uns_value(&lst, key_path, np_generic, np_ndarray, visiting);
         }
     }
 
     let type_name: String = obj.get_type().getattr("__name__")?.extract()?;
     Err(PyValueError::new_err(format!(
-        "uns at {key_path}: cannot serialize {type_name} to JSON; supported types are None, bool, int, float, str, dict, list, tuple, NumPy arrays/scalars, and pandas Series/Index/Categorical"
+        "uns at {key_path}: cannot serialize {type_name} to JSON; supported types are None, bool, int, float, str, dict, list, tuple, NumPy arrays/scalars, and any object exposing a callable .tolist() (pandas Series/Index/Categorical)"
     )))
 }
 
@@ -1475,7 +1511,14 @@ pub fn from_anndata_impl(
     let uns_json: Option<serde_json::Value> = if uns_len > 0 {
         let np_generic = np.getattr("generic")?;
         let np_ndarray = np.getattr("ndarray")?;
-        Some(normalize_uns_value(&uns, "uns", &np_generic, &np_ndarray)?)
+        let mut visiting = HashSet::new();
+        Some(normalize_uns_value(
+            &uns,
+            "uns",
+            &np_generic,
+            &np_ndarray,
+            &mut visiting,
+        )?)
     } else {
         None
     };

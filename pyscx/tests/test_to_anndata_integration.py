@@ -608,3 +608,59 @@ def test_from_anndata_uns_unsupported_type_reports_path(tmp_dir):
         match=r"uns at uns\['outer'\]\['inner'\]\[2\]: cannot serialize set to JSON",
     ):
         pyscx.from_anndata(adata, str(tmp_dir / "unsupported.scx"))
+
+
+def test_from_anndata_uns_self_referential_dict_raises(tmp_dir):
+    """Cycles in `uns` raise ValueError instead of crashing the interpreter.
+
+    Regression: prior to cycle detection a self-referential dict would
+    recurse until Rust stack overflow and SIGABRT the Python process —
+    a regression vs `json.dumps(check_circular=True)` which raised.
+    """
+    import pyscx
+
+    cyclic = {}
+    cyclic["self"] = cyclic
+    adata = _adata_with_uns({"top": cyclic})
+
+    with pytest.raises(ValueError, match=r"circular reference detected"):
+        pyscx.from_anndata(adata, str(tmp_dir / "cyclic_dict.scx"))
+
+
+def test_from_anndata_uns_indirect_cycle_raises(tmp_dir):
+    """Indirect cycles (list referencing parent dict) also raise."""
+    import pyscx
+
+    parent = {}
+    child = [1, 2, parent]
+    parent["child"] = child
+    adata = _adata_with_uns({"top": parent})
+
+    with pytest.raises(ValueError, match=r"circular reference detected"):
+        pyscx.from_anndata(adata, str(tmp_dir / "cyclic_indirect.scx"))
+
+
+def test_from_anndata_uns_oversized_int_raises(tmp_dir):
+    """Integers outside [i64::MIN, u64::MAX] raise ValueError with key path."""
+    import pyscx
+
+    too_big = (1 << 64) + 1  # > u64::MAX
+    adata = _adata_with_uns({"big": too_big})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['big'\]: integer is too large for JSON",
+    ):
+        pyscx.from_anndata(adata, str(tmp_dir / "uns_big_int.scx"))
+
+
+def test_from_anndata_uns_non_string_dict_keys_stringified(tmp_dir):
+    """Non-string dict keys are stringified via str(k) (documented behavior)."""
+    import pyscx
+
+    adata = _adata_with_uns({"by_int": {1: "a", 2: "b"}})
+
+    path = str(tmp_dir / "uns_int_keys.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["by_int"] == {"1": "a", "2": "b"}
