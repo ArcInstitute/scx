@@ -222,3 +222,54 @@ def test_no_params_unchanged(synthetic_adata, scx_from_adata):
     assert adata.n_obs == synthetic_adata.n_obs
     assert adata.n_vars == synthetic_adata.n_vars
     assert "raw" in adata.layers
+
+
+def test_to_anndata_deleted_rows_filters_layers(tmp_dir):
+    """Eager to_anndata() applies deletion vectors to layers, not just X.
+
+    Regression test for the case where mark_deleted() produced an SCX file
+    that the eager reader could no longer load when layers were present
+    (X had n_kept rows but layers still had n_obs rows -> AnnData rejected).
+    Deletions span at least two shards to exercise per-shard mask handling.
+    """
+    import anndata
+    import pyscx
+    import scipy.sparse as sp
+
+    np.random.seed(7)
+    n_obs, n_vars = 60, 20
+    dense_x = np.random.randint(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+    dense_x[np.random.random((n_obs, n_vars)) > 0.3] = 0
+    dense_raw = np.random.randint(0, 100, size=(n_obs, n_vars)).astype(np.float32)
+    dense_raw[np.random.random((n_obs, n_vars)) > 0.4] = 0
+
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense_x),
+        layers={"raw": sp.csr_matrix(dense_raw)},
+    )
+
+    path = str(tmp_dir / "layers_del.scx")
+    # shard_size=20 -> 3 shards of 20 rows each
+    pyscx.from_anndata(adata, path, shard_size=20)
+
+    # Deletions span 3 shards (rows 1, 25, 55 -> shards 0, 1, 2)
+    delete_mask = np.zeros(n_obs, dtype=bool)
+    delete_mask[1] = True
+    delete_mask[25] = True
+    delete_mask[55] = True
+    n_kept = n_obs - int(delete_mask.sum())
+
+    pyscx.open(path).mark_deleted(delete_mask)
+
+    adata_loaded = pyscx.open(path).to_anndata()
+
+    assert adata_loaded.n_obs == n_kept
+    assert adata_loaded.X.shape == (n_kept, n_vars)
+    assert "raw" in adata_loaded.layers
+    assert adata_loaded.layers["raw"].shape == (n_kept, n_vars)
+
+    # Layer values for the kept rows must match the original layer rows
+    expected_raw = dense_raw[~delete_mask]
+    np.testing.assert_array_equal(
+        adata_loaded.layers["raw"].toarray(), expected_raw
+    )

@@ -162,7 +162,7 @@ fn to_anndata_with_layers<'py>(
                 continue;
             }
         }
-        match reader.read_layer(name) {
+        match reader.read_layer_filtered(name) {
             Ok(layer_csr) => {
                 let scipy_mat = csr_to_scipy(py, layer_csr)?;
                 layers_dict.set_item(name, scipy_mat)?;
