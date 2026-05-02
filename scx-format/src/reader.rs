@@ -401,9 +401,28 @@ impl ScxReader {
     /// If no deletion vectors are present, returns the same result as `read_all_csr_shards()`.
     #[cfg(feature = "deletion-vectors")]
     pub fn read_all_csr_shards_filtered(&self) -> Result<ScxCsr> {
-        let dv_opt = self.read_deletion_vectors()?;
-
         let csr = self.read_all_csr_shards()?;
+        self.filter_csr_rows_by_deletion_vectors(csr)
+    }
+
+    /// Read a named layer with deletion vectors applied.
+    /// Deleted rows are excluded from the returned ScxCsr.
+    /// If no deletion vectors are present, returns the same result as `read_layer()`.
+    ///
+    /// Layers must share X's row count (an AnnData invariant); the row-keep
+    /// mask is built from the X-shard layout and applied to the layer CSR.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_layer_filtered(&self, name: &str) -> Result<ScxCsr> {
+        let csr = self.read_layer(name)?;
+        self.filter_csr_rows_by_deletion_vectors(csr)
+    }
+
+    /// Apply deletion vectors to an already-assembled CSR (X or layer).
+    /// The keep mask is derived from the X-shard layout in the full catalog,
+    /// so the input CSR must share X's row count.
+    #[cfg(feature = "deletion-vectors")]
+    fn filter_csr_rows_by_deletion_vectors(&self, csr: ScxCsr) -> Result<ScxCsr> {
+        let dv_opt = self.read_deletion_vectors()?;
 
         let dv = match dv_opt {
             Some(dv) if dv.total_deleted() > 0 => dv,
