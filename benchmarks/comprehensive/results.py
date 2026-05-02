@@ -106,22 +106,20 @@ class BenchmarkResult:
 
         Used by the gate to widen the per-row timing tolerance: a noisy
         baseline gets a relaxed bound proportional to its own measured
-        dispersion (review §1.1). Returns None for fewer than 2 runs —
-        IQR isn't meaningful, and the gate falls back to the fixed
-        --timing-tolerance.
+        dispersion (review §1.1). Returns ``None`` for fewer than 3 runs
+        — IQR is not reliably estimable and the gate falls back to the
+        fixed ``--timing-tolerance``. The n=2 case is specifically
+        excluded: ``statistics.quantiles(..., method="exclusive")``
+        extrapolates to give IQR = 1.5·|a−b|, and even the range |a−b|
+        easily produces 100%+ widened tolerances that would mask real
+        regressions (e.g. baseline runs of 1.0 s and 2.0 s ⇒ 100%
+        widened bound at the default ``--iqr-k=1.5``). Falling back to
+        the fixed tolerance is safer when the typical big-dataset path
+        (``N_RUNS_LARGE=3``) drops a run upstream.
         """
-        if len(self.runs) < 2:
+        if len(self.runs) < 3:
             return None
         walls = [r.wall_s for r in self.runs]
-        if len(walls) == 2:
-            # The canonical n=2 IQR (via statistics.quantiles, exclusive)
-            # works out to |a - b| / 2. We deliberately return the full
-            # range |a - b| instead — with only two samples the true
-            # dispersion is poorly estimated, so we'd rather over-widen
-            # the gate than under-widen and miss real noise. Keeps
-            # semantics defined for the cell_eval_parity_perf path
-            # (N_RUNS_LARGE=3) when one run is dropped upstream.
-            return float(abs(walls[0] - walls[1]))
         q = statistics.quantiles(walls, n=4, method="exclusive")
         return float(q[2] - q[0])
 

@@ -358,17 +358,14 @@ def _wall_s_iqr(runs: list[dict[str, Any]]) -> float | None:
     """IQR (p75 - p25) of wall_s across runs, mirroring
     BenchmarkResult.wall_s_iqr — keep the two in sync. Used only as the
     v1 → v2 backfill when the raw JSON predates SCHEMA_VERSION=2 and
-    lacks the field. The n=2 branch returns the full range |a - b|
-    (not the canonical IQR of |a - b| / 2) — deliberate conservatism
-    when only two samples are available; see results.py for the full
-    rationale."""
+    lacks the field. Returns ``None`` for n < 3 so the gate falls back
+    to the fixed ``--timing-tolerance`` rather than over-widening on a
+    poorly-estimated 2-sample dispersion (see results.py)."""
     import statistics
     walls = [r.get("wall_s") for r in runs if r.get("wall_s") is not None]
-    if len(walls) < 2:
+    if len(walls) < 3:
         return None
     walls = [float(w) for w in walls]
-    if len(walls) == 2:
-        return float(abs(walls[0] - walls[1]))
     q = statistics.quantiles(walls, n=4, method="exclusive")
     return float(q[2] - q[0])
 
