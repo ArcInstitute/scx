@@ -44,12 +44,26 @@ def _write_summary(dirpath: Path, rows: dict) -> None:
     }))
 
 
-def _row(wall: float, rss: float = 100.0, size: int = 1000) -> dict:
-    return {
+def _row(
+    wall: float,
+    rss: float = 100.0,
+    size: int = 1000,
+    wall_iqr: float | None = None,
+    n_runs: int | None = None,
+) -> dict:
+    out: dict = {
         "median_wall_s": wall,
         "peak_rss_mb_median": rss,
         "file_size_bytes": size,
     }
+    # Omit wall_s_iqr / n_runs entirely when not set so the existing tests
+    # exercise the gate's fallback-to-fixed-tolerance path on legacy
+    # baselines that predate the §1.1 schema bump.
+    if wall_iqr is not None:
+        out["wall_s_iqr"] = wall_iqr
+    if n_runs is not None:
+        out["n_runs"] = n_runs
+    return out
 
 
 def _run_gate(*extra: str, baseline: Path, current: Path) -> subprocess.CompletedProcess:
@@ -553,6 +567,183 @@ def test_flakiness_override_at_or_below_default_warns(tmp_path: Path) -> None:
     assert "override has no effect" in result.stderr, (
         f"ineffective override must emit a stderr warning so the entry "
         f"doesn't silently rot in the ledger; stderr={result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# §1.1 — variance-aware (IQR-widened) timing tolerance
+# ---------------------------------------------------------------------------
+
+
+def test_iqr_widens_marginal_regression_passes(tmp_path: Path) -> None:
+    """A 7% wall-time regression on a baseline whose IQR/median is 10%
+    must PASS once the IQR-based noise widening is applied. Default
+    --iqr-k=1.5 ⇒ effective tol = max(0.03, 1.5 * 0.10/1.0) = 0.15;
+    7% < 15% ⇒ no regression.
+
+    Without the widening, the same 7% would trip the bare 3% gate (which
+    is exactly the false-positive case §1.1 of the review calls out).
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    _write_summary(base, {
+        "read_full__scx_auto__pbmc3k": _row(1.00, wall_iqr=0.10, n_runs=5),
+    })
+    _write_summary(cur, {
+        "read_full__scx_auto__pbmc3k": _row(1.07),
+    })
+
+    result = _run_gate(baseline=base, current=cur)
+    assert result.returncode == 0, (
+        f"7% regression on a baseline with IQR=10% must pass after "
+        f"IQR-widening to 15%; stdout={result.stdout!r}"
+    )
+    # Header should surface the widened-row count so operators can see the
+    # mechanism is active.
+    assert "Timing rows widened by IQR" in result.stdout, (
+        f"report must surface IQR-widened row count; stdout={result.stdout!r}"
+    )
+
+
+def test_iqr_does_not_mask_real_regression(tmp_path: Path) -> None:
+    """A 30% wall-time regression on a baseline with IQR=10% must still
+    FAIL — IQR widening relaxes the bound to 15% but does not suppress a
+    regression that exceeds the relaxed bound. Locks in the rule from the
+    review: noise-widening compensates for measurement noise, not for real
+    regressions.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    _write_summary(base, {
+        "read_full__scx_auto__pbmc3k": _row(1.00, wall_iqr=0.10, n_runs=5),
+    })
+    _write_summary(cur, {
+        "read_full__scx_auto__pbmc3k": _row(1.30),
+    })
+
+    result = _run_gate(baseline=base, current=cur)
+    assert result.returncode != 0, (
+        f"30% regression must still fail even after IQR-widening to 15%; "
+        f"stdout={result.stdout!r}"
+    )
+
+
+def test_missing_wall_iqr_falls_back_to_fixed_tolerance(tmp_path: Path) -> None:
+    """When the baseline summary.json has no ``wall_s_iqr`` (legacy
+    pre-§1.1 capture), the gate falls back to the fixed
+    --timing-tolerance and emits a single WARN. A 5% regression must
+    still fail at the default 3% gate.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    # Two rows, both lacking wall_s_iqr — verifies WARN fires once total,
+    # not once per row.
+    _write_summary(base, {
+        "read_full__scx_auto__pbmc3k": _row(1.00),
+        "read_full__h5ad_none__pbmc3k": _row(2.00),
+    })
+    _write_summary(cur, {
+        "read_full__scx_auto__pbmc3k": _row(1.05),
+        "read_full__h5ad_none__pbmc3k": _row(2.10),
+    })
+
+    result = _run_gate(baseline=base, current=cur)
+    assert result.returncode != 0, (
+        f"5% regression must still fail when IQR is unavailable "
+        f"(fallback to 3%); stdout={result.stdout!r}"
+    )
+    assert "no wall_s_iqr" in result.stderr, (
+        f"missing wall_s_iqr must surface a WARN so operators know to "
+        f"re-capture the baseline; stderr={result.stderr!r}"
+    )
+    # WARN must fire exactly once across both rows.
+    assert result.stderr.count("no wall_s_iqr") == 1, (
+        f"missing-IQR WARN must fire once per gate run, not per row; "
+        f"stderr={result.stderr!r}"
+    )
+
+
+def test_iqr_widening_respects_flakiness_override_precedence(tmp_path: Path) -> None:
+    """Override-vs-IQR-widening precedence: a flakiness override that
+    sits BELOW the IQR-widened tolerance is treated as ineffective (not
+    silently ignored). The "ineffective override" warning must compare
+    against the row's effective tolerance, which here is the
+    IQR-widened bound — otherwise an override at 0.04 on a row whose
+    baseline IQR already widens to 0.15 would silently pose as relaxing
+    when in fact the IQR widening is doing the work.
+
+    Two sub-cases:
+      A. override=0.20 > widened=0.15 ⇒ override wins, row tolerance 0.20.
+      B. override=0.04 < widened=0.15 ⇒ override is ineffective, WARN fires
+         citing the row's effective (widened) tolerance.
+    """
+    base = tmp_path / "baseline"
+    flaky_a = tmp_path / "flaky_a"
+    flaky_b = tmp_path / "flaky_b"
+
+    # Baseline: 1.0 s wall, IQR=0.10 ⇒ widened tol = 0.15.
+    _write_summary(base, {
+        "read_full__scx_auto__pbmc3k": _row(1.00, wall_iqr=0.10, n_runs=5),
+    })
+
+    # Sub-case A: 17% regression > 15% widened bound, but override=0.20
+    # raises the row's tolerance to 0.20 ⇒ pass.
+    cur_a = tmp_path / "current_a"
+    _write_summary(cur_a, {
+        "read_full__scx_auto__pbmc3k": _row(1.17),
+    })
+    flaky_a.mkdir()
+    (flaky_a / "noisy.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.20\n"
+        "reason: \"Override above the IQR-widened bound — should win.\"\n"
+        "---\n"
+    )
+    result_a = _run_gate(
+        "--flakiness", str(flaky_a),
+        baseline=base, current=cur_a,
+    )
+    assert result_a.returncode == 0, (
+        f"override above IQR-widened bound must apply; stdout={result_a.stdout!r}"
+    )
+
+    # Sub-case B: 5% regression < 15% widened bound ⇒ pass even without
+    # the override; an override at 0.04 is below the widened bound, so
+    # the warning fires citing the row's effective tolerance.
+    cur_b = tmp_path / "current_b"
+    _write_summary(cur_b, {
+        "read_full__scx_auto__pbmc3k": _row(1.05),
+    })
+    flaky_b.mkdir()
+    (flaky_b / "ineffective.md").write_text(
+        "---\n"
+        "overrides:\n"
+        "  - benchmark: read_full\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    tolerance: 0.04\n"
+        "reason: \"Override below IQR-widened bound — should warn as ineffective.\"\n"
+        "---\n"
+    )
+    result_b = _run_gate(
+        "--flakiness", str(flaky_b),
+        baseline=base, current=cur_b,
+    )
+    assert result_b.returncode == 0, (
+        f"5% regression must pass under IQR-widened 15% gate even with "
+        f"ineffective sub-widened override; stdout={result_b.stdout!r}"
+    )
+    # The warning must reference the row's effective tolerance (0.15),
+    # not the global default (0.03), so operators see why the override
+    # is dead weight against this particular row.
+    assert "row's effective tolerance" in result_b.stderr, (
+        f"ineffective-override WARN must compare against the row's "
+        f"effective (IQR-widened) tolerance, not the global default; "
+        f"stderr={result_b.stderr!r}"
     )
 
 

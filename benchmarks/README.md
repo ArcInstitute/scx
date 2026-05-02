@@ -924,16 +924,44 @@ justification stops suppressing and the gate fails again — forces
 periodic review. Multiple triples per file are fine; one file per PR is
 typical.
 
+### Variance-aware timing tolerance (IQR widening)
+
+The gate widens the per-row `median_wall_s` tolerance automatically when
+the *baseline's own* run-to-run dispersion exceeds the global
+`--timing-tolerance` floor. Effective tolerance per timing row is
+
+```
+max(--timing-tolerance, --iqr-k * baseline_iqr / baseline_median)
+```
+
+where `baseline_iqr` is the IQR of `runs[].wall_s` recorded at capture
+time (persisted on every `summary.json` row as `wall_s_iqr`). With the
+defaults (`--timing-tolerance 0.03`, `--iqr-k 1.5`), a rock-stable row
+stays gated at 3 %, while a row whose baseline IQR/median is 5 % auto-
+widens to 7.5 % — the bare 3 % gate's false-positive rate on noisy
+shared-node samples (review §1.1) drops without operator intervention.
+The header line "Timing rows widened by IQR" reports how many rows
+crossed the floor; the "Tol" column suffixes widened rows with `~` and
+override-relaxed rows with `⚠`. Set `--iqr-k 0` to disable.
+
+When the baseline predates this mechanism (no `wall_s_iqr` field), the
+gate logs a single WARN and falls back to the fixed `--timing-tolerance`.
+Re-capture and re-promote with `capture_baseline.py` + `promote_baseline.py`
+to enable variance-aware gating.
+
 ### Flakiness ledger
 
-Use a flakiness override (instead of a justification) when a row's
-underlying performance is fine but its run-to-run wall-time has
-measurable RSD on this hardware — preemption, shared cache, NUMA
-placement, oversubscribed threads. The override raises the per-row
-tolerance without weakening the rest of the gate; a real regression that
-crosses the relaxed bound still trips. Reach for this whenever you'd
-otherwise be tempted to bump the global `--timing-tolerance` to make a
-PR pass.
+Use a flakiness override **only** when a row's noise floor is genuinely
+not represented by its baseline IQR — bimodal wall-time across runs,
+periodic GC pauses that fall outside the captured sample window, or a
+benchmark that's known to be unstable beyond what `--iqr-k 1.5` will
+absorb. For ordinary "shared-node noise" the IQR-widening above already
+handles it; reach for the ledger only when that mechanism is itself
+insufficient. The override raises the per-row tolerance above the
+IQR-widened bound; a real regression that crosses the relaxed bound
+still trips. Reach for this only after exhausting `--iqr-k` (and only
+for the rare rows that need it) — never as a substitute for a global
+`--timing-tolerance` bump.
 
 Each entry lives in `benchmarks/comprehensive/results/flakiness/`:
 
@@ -966,12 +994,13 @@ coefficient of variation (`stdev/mean`) computed from the candidate's
 rows with CV > 5% — those are the natural candidates for a ledger
 entry.
 
-|                  | Justification              | Flakiness override                        |
-|------------------|----------------------------|-------------------------------------------|
-| Effect           | Drops row from regression tally entirely | Raises the row's per-metric tolerance     |
-| Use when         | Real regression accepted   | Underlying perf is fine, runtime is noisy |
-| Real regression beyond the bound | Hidden        | Still trips the gate                      |
-| Per-metric scope | All metrics for the triple | One metric (defaults to `median_wall_s`)  |
+|                  | Justification              | IQR widening (`--iqr-k`)                  | Flakiness override                        |
+|------------------|----------------------------|-------------------------------------------|-------------------------------------------|
+| Effect           | Drops row from regression tally entirely | Auto-widens timing tolerance using baseline's own dispersion | Raises the row's per-metric tolerance |
+| Use when         | Real regression accepted   | Default — handles ordinary measurement noise transparently | Bimodal / pathological noise IQR misses |
+| Trigger          | Manual (markdown)          | Automatic (per `summary.json` row)        | Manual (markdown)                         |
+| Real regression beyond the bound | Hidden        | Still trips the gate                      | Still trips the gate                      |
+| Per-metric scope | All metrics for the triple | `median_wall_s` only                      | One metric (defaults to `median_wall_s`)  |
 
 ### Rolling dashboard
 

@@ -11,7 +11,14 @@ This is the regression gate named in 2026-04-17_CODE-REVIEW.md §12.4:
 Given two directories produced by capture_baseline.py, this script reports:
 
   - Timing deltas per (benchmark, format, dataset).  Flags anything outside
-    --timing-tolerance (default 3%) as a regression.
+    the per-row *effective* tolerance as a regression. The effective tolerance
+    is ``max(--timing-tolerance, --iqr-k * baseline_iqr / baseline_median)``
+    so a noisy baseline (high run-to-run dispersion) gets a relaxed bound
+    proportional to its own measured noise. With the default
+    ``--timing-tolerance=0.03`` and ``--iqr-k=1.5``, a row whose baseline
+    has IQR/median ≥ 0.02 (i.e. RSD-equivalent) automatically widens; a
+    rock-stable row stays at the 3% floor. Falls back to the fixed
+    --timing-tolerance against pre-§1.1 baselines that lack ``wall_s_iqr``.
   - Peak RSS deltas.  Flagged at --rss-tolerance (default 10%).
   - File size deltas.  Flagged at --size-tolerance (default 1%) — size should
     be byte-stable across non-format-changing PRs.
@@ -125,12 +132,21 @@ class Delta:
     current: float | None
     relative_change: float | None  # (current - baseline) / baseline
     is_regression: bool
-    # Tolerance actually applied to this row — global default unless a
-    # flakiness override matched.
+    # Tolerance actually applied to this row — global default, possibly
+    # widened by IQR-based noise compensation, possibly further raised by
+    # a flakiness override.
     effective_tolerance: float | None = None
-    # True iff a flakiness override raised this row's tolerance above
-    # the global default; informational, used for status labelling.
+    # True iff a flakiness override raised this row's tolerance above the
+    # IQR-widened bound; informational, used for status labelling.
     tolerance_relaxed: bool = False
+    # True iff the IQR-based noise compensation widened the per-row
+    # tolerance above the global ``--timing-tolerance`` default. Set only
+    # for ``median_wall_s`` rows when the baseline carries ``wall_s_iqr``.
+    noise_widened: bool = False
+    # Baseline IQR / baseline median, the dimensionless dispersion the
+    # gate uses to scale the noise band. ``None`` for non-timing metrics
+    # and for baselines missing ``wall_s_iqr``.
+    iqr_ratio: float | None = None
     # Coefficient of variation (stdev/mean) of ``runs[].wall_s`` from
     # the candidate raw JSON. Populated only for ``median_wall_s`` rows;
     # ``None`` everywhere else (including when n<2 or mean=0).
@@ -185,6 +201,7 @@ def diff_summaries(
     gate: bool = False,
     tolerance_overrides: dict[_flakiness.Quad, float] | None = None,
     wall_cvs: dict[tuple[str, str, str], float | None] | None = None,
+    iqr_k: float = 1.5,
 ) -> list[Delta]:
     """One Delta row per (benchmark, format, dataset, metric) tuple.
 
@@ -207,6 +224,13 @@ def diff_summaries(
     coefficient of variation of ``runs[].wall_s`` in the candidate
     snapshot. Stamped onto the matching ``median_wall_s`` deltas for
     reporting; never affects regression status.
+
+    ``iqr_k`` scales the baseline-IQR contribution to the noise-widened
+    timing tolerance: a ``median_wall_s`` row is gated at
+    ``max(timing_tol, iqr_k * baseline_iqr / baseline_median)``. Falls
+    back to ``timing_tol`` when the baseline lacks ``wall_s_iqr``
+    (pre-§1.1 captures); a single WARN is logged per gate run noting
+    the missing field. Only affects ``median_wall_s``.
     """
     overrides = tolerance_overrides or {}
     cvs = wall_cvs or {}
@@ -214,6 +238,11 @@ def diff_summaries(
     base_rows = baseline_summary.get("rows", {})
     cur_rows = current_summary.get("rows", {})
     all_keys = sorted(set(base_rows) | set(cur_rows))
+
+    # Surface "baseline lacks variance metadata" exactly once, even if
+    # hundreds of rows are missing the field. Spamming per row just makes
+    # the gate output unreadable.
+    iqr_missing_warned = False
 
     for key in all_keys:
         try:
@@ -234,23 +263,52 @@ def diff_summaries(
             b, c = base.get(metric), cur.get(metric)
             rel = _relative(b, c)
             quad = (bench, fmt, dataset, metric)
+
+            # IQR-based noise widening for wall-time only. Other metrics
+            # have their own variance treatment (RSS is a single point
+            # sample today — see review §2.1; file size is deterministic).
+            iqr_ratio: float | None = None
+            noise_widened = False
+            row_default_tol = default_tol
+            if metric == "median_wall_s" and b is not None and b > 0:
+                b_iqr = base.get("wall_s_iqr")
+                if b_iqr is None:
+                    if not iqr_missing_warned:
+                        logger.warning(
+                            "baseline summary.json has no wall_s_iqr — "
+                            "falling back to fixed --timing-tolerance for "
+                            "all median_wall_s rows. Re-capture the baseline "
+                            "with the post-§1.1 capture_baseline.py to enable "
+                            "variance-aware gating."
+                        )
+                        iqr_missing_warned = True
+                else:
+                    iqr_ratio = float(b_iqr) / float(b)
+                    iqr_widened_tol = iqr_k * iqr_ratio
+                    if iqr_widened_tol > row_default_tol:
+                        row_default_tol = iqr_widened_tol
+                        noise_widened = True
+
             override_tol = overrides.get(quad)
             # Overrides only relax (the loader rejects negative values);
-            # if an entry is somehow at or below the default we let the
-            # default win so a stale ledger entry can't tighten the gate.
-            relaxed = override_tol is not None and override_tol > default_tol
-            tol = override_tol if relaxed else default_tol
+            # if an entry is somehow at or below the row's default
+            # (post-IQR-widening) we let the default win so a stale
+            # ledger entry can't tighten the gate.
+            relaxed = override_tol is not None and override_tol > row_default_tol
+            tol = override_tol if relaxed else row_default_tol
             if override_tol is not None and not relaxed:
                 # Surface silent no-ops: the operator committed an
-                # override but it's at or below the global default, so it
-                # has no effect. Without this warning the entry is dead
-                # weight that quietly accumulates in the ledger.
+                # override but it's at or below the row's effective
+                # default (which itself may have been widened by IQR),
+                # so the override has no effect. Without this warning
+                # the entry is dead weight that quietly accumulates
+                # in the ledger.
                 logger.warning(
                     "Flakiness override for %s (tolerance=%.4f) is at or "
-                    "below the global default (%.4f); override has no "
-                    "effect — overrides only relax. Either raise the "
+                    "below the row's effective tolerance (%.4f); override "
+                    "has no effect — overrides only relax. Either raise the "
                     "tolerance or delete the entry.",
-                    quad, override_tol, default_tol,
+                    quad, override_tol, row_default_tol,
                 )
             regressed = rel is not None and rel > tol
             if gate and b is not None and c is None:
@@ -265,6 +323,8 @@ def diff_summaries(
                 is_regression=regressed,
                 effective_tolerance=tol,
                 tolerance_relaxed=relaxed,
+                noise_widened=noise_widened,
+                iqr_ratio=iqr_ratio,
                 wall_cv=wall_cv,
             ))
 
@@ -555,10 +615,19 @@ def _fmt_cv(cv: float | None) -> str:
     return f"{cv * 100:.1f}%"
 
 
-def _fmt_tol(tol: float | None, relaxed: bool) -> str:
+def _fmt_tol(tol: float | None, relaxed: bool, noise_widened: bool = False) -> str:
     if tol is None:
         return "—"
-    suffix = " ⚠" if relaxed else ""
+    # ⚠ = flakiness override raised the bound past everything else.
+    # ~  = automatic IQR-based widening raised the bound past the
+    #      global default. Mutually exclusive in practice (relaxed
+    #      implies override > widened bound), but ⚠ wins on display.
+    if relaxed:
+        suffix = " ⚠"
+    elif noise_widened:
+        suffix = " ~"
+    else:
+        suffix = ""
     return f"{tol * 100:.1f}%{suffix}"
 
 
@@ -582,10 +651,20 @@ def render_markdown(
     new_benchmarks = new_benchmarks or []
     floor_violations = floor_violations or []
 
+    noise_widened_count = sum(
+        1 for d in deltas
+        if d.metric == "median_wall_s" and d.noise_widened
+    )
+
     lines: list[str] = []
     lines.append("# Baseline Regression Report")
     lines.append("")
     lines.append(f"- Timing tolerance: {timing_tol * 100:.1f}%")
+    if noise_widened_count:
+        lines.append(
+            f"- Timing rows widened by IQR (~): {noise_widened_count} "
+            f"(baseline IQR/median exceeded the {timing_tol * 100:.1f}% floor)"
+        )
     lines.append(f"- Timing regressions:     {len(timing_regs)}")
     lines.append(f"- Peak-RSS regressions:   {len(rss_regs)}")
     lines.append(f"- File-size regressions:  {len(size_regs)}")
@@ -640,7 +719,7 @@ def render_markdown(
                 f"{_fmt_num(d.baseline)} | {_fmt_num(d.current)} | "
                 f"**{_fmt_pct(d.relative_change)}** | "
                 f"{_fmt_cv(d.wall_cv)} | "
-                f"{_fmt_tol(d.effective_tolerance, d.tolerance_relaxed)} | "
+                f"{_fmt_tol(d.effective_tolerance, d.tolerance_relaxed, d.noise_widened)} | "
                 f"{status} |"
             )
         lines.append("")
@@ -671,7 +750,7 @@ def render_markdown(
             lines.append(
                 f"| {d.benchmark} | {d.fmt} | {d.dataset} | "
                 f"{_fmt_cv(d.wall_cv)} | "
-                f"{_fmt_tol(d.effective_tolerance, d.tolerance_relaxed)} |"
+                f"{_fmt_tol(d.effective_tolerance, d.tolerance_relaxed, d.noise_widened)} |"
             )
         lines.append("")
 
@@ -718,6 +797,8 @@ def to_json_payload(
                 "relative_change": d.relative_change, "is_regression": d.is_regression,
                 "effective_tolerance": d.effective_tolerance,
                 "tolerance_relaxed": d.tolerance_relaxed,
+                "noise_widened": d.noise_widened,
+                "iqr_ratio": d.iqr_ratio,
                 "wall_cv": d.wall_cv,
             }
             for d in deltas
@@ -768,6 +849,17 @@ def main() -> int:
     parser.add_argument("--timing-tolerance", type=float, default=0.03)
     parser.add_argument("--rss-tolerance",    type=float, default=0.10)
     parser.add_argument("--size-tolerance",   type=float, default=0.01)
+    parser.add_argument(
+        "--iqr-k", type=float, default=1.5,
+        help="Multiplier on the baseline's wall-time IQR/median when "
+             "widening per-row timing tolerance. Effective tol per "
+             "median_wall_s row is max(--timing-tolerance, --iqr-k * "
+             "baseline_iqr / baseline_median). Set 0 to disable noise "
+             "widening (gate falls back to the fixed --timing-tolerance "
+             "everywhere). Default 1.5 matches the standard IQR-based "
+             "outlier multiplier; bump to 2.0 for more permissive "
+             "preemptible-node gating.",
+    )
     parser.add_argument(
         "--allow-fingerprint-drift", action="store_true",
         help="Don't fail on accelerator fingerprint mismatches (use for intentional "
@@ -928,6 +1020,7 @@ def main() -> int:
         gate=args.gate,
         tolerance_overrides=tolerance_overrides,
         wall_cvs=wall_cvs,
+        iqr_k=args.iqr_k,
     )
     fp_mismatches, fp_missing = diff_fingerprints(baseline_fp, current_fp)
 
