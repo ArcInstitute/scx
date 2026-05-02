@@ -114,11 +114,13 @@ class BenchmarkResult:
             return None
         walls = [r.wall_s for r in self.runs]
         if len(walls) == 2:
-            # statistics.quantiles requires n >= 2 but with exactly 2 it
-            # returns p25/p50/p75 = same value if both are equal; otherwise
-            # the spread is exactly |a - b| / 2. Use the range as a robust
-            # stand-in to keep semantics defined for the cell_eval_parity_perf
-            # path (N_RUNS_LARGE=3) when one run is dropped upstream.
+            # The canonical n=2 IQR (via statistics.quantiles, exclusive)
+            # works out to |a - b| / 2. We deliberately return the full
+            # range |a - b| instead — with only two samples the true
+            # dispersion is poorly estimated, so we'd rather over-widen
+            # the gate than under-widen and miss real noise. Keeps
+            # semantics defined for the cell_eval_parity_perf path
+            # (N_RUNS_LARGE=3) when one run is dropped upstream.
             return float(abs(walls[0] - walls[1]))
         q = statistics.quantiles(walls, n=4, method="exclusive")
         return float(q[2] - q[0])
