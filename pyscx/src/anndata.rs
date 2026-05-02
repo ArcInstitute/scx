@@ -201,6 +201,14 @@ fn to_anndata_with_layers<'py>(
 /// For obs_filter: delegates to the QueryPipeline for predicate pushdown.
 /// For var_names: resolves gene names to column indices and applies column slicing.
 /// For layers: filters which layers are loaded.
+///
+/// When `preserve_slots=true` and `obs_filter` is set, the eager path
+/// `to_anndata_with_layers()` is used (loading X / obs / var / obsm /
+/// layers with deletion vectors applied) and then sliced by a pandas.eval
+/// boolean mask. This preserves obsm and layers at the cost of the query
+/// engine's predicate-pushdown shard skipping. When `preserve_slots=false`
+/// (default), the query-engine path runs and emits a warning if obsm or
+/// layers exist on disk (since they are dropped from the result).
 pub fn to_anndata_filtered<'py>(
     py: Python<'py>,
     path: &std::path::Path,
@@ -208,10 +216,43 @@ pub fn to_anndata_filtered<'py>(
     var_names: Option<&[String]>,
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
+    preserve_slots: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Fast path: no filtering → use existing implementation
     if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
         return to_anndata(py, reader);
+    }
+
+    // preserve_slots=true with obs_filter: load full AnnData, then filter
+    // rows via pandas.eval. Keeps obsm / layers / varm / uns intact at the
+    // cost of skipping query-engine predicate pushdown.
+    if let (Some(expr), true) = (obs_filter, preserve_slots) {
+        let full = to_anndata_with_layers(py, reader, layer_filter)?;
+
+        let obs_attr = full.getattr("obs")?;
+        let mask = obs_attr.call_method1("eval", (expr,)).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "preserve_slots=True parses obs_filter via pandas.eval; \
+                 failed to evaluate {expr:?}: {e}"
+            ))
+        })?;
+
+        let builtins = py.import("builtins")?;
+        let slice_all = builtins.call_method1("slice", (py.None(),))?;
+        let row_idx = pyo3::types::PyTuple::new(py, &[mask.unbind(), slice_all.clone().unbind()])?;
+        let filtered = full.get_item(row_idx)?.call_method0("copy")?;
+
+        if let Some(names) = var_names {
+            let indices = resolve_var_names_to_indices(reader, names)?;
+            let np_indices = PyArray1::from_vec(py, indices);
+            let col_idx = pyo3::types::PyTuple::new(
+                py,
+                &[slice_all.unbind(), np_indices.into_any().unbind()],
+            )?;
+            let projected = filtered.get_item(col_idx)?.call_method0("copy")?;
+            return Ok(projected);
+        }
+        return Ok(filtered);
     }
 
     // If obs_filter is specified, use the query engine for predicate pushdown
@@ -280,8 +321,8 @@ pub fn to_anndata_filtered<'py>(
                 "warn",
                 (format!(
                     "obs_filter with non-backed mode uses the query engine, which does not \
-                     load {}. Use backed=True with obs_filter to preserve these, or load \
-                     the full dataset and filter in Python.",
+                     load {}. Pass preserve_slots=True to materialize them (skips predicate \
+                     pushdown), use backed=True, or load the full dataset and filter in Python.",
                     parts.join(" or ")
                 ),),
             )?;

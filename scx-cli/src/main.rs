@@ -55,7 +55,7 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value = "10000")]
         shard_size: u32,
-        /// Compression codec: auto (default), none, scx1, zstd, lz4
+        /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
     },
@@ -70,7 +70,7 @@ enum Commands {
         #[arg(long)]
         history: bool,
     },
-    /// Validate SCX file checksums
+    /// Validate header + per-section BLAKE3 checksums (deeper than `scx info`)
     Validate {
         /// SCX file to validate
         file: PathBuf,

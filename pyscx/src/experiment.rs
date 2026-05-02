@@ -59,7 +59,12 @@ impl PyExperiment {
         self.reader.header().format_version
     }
 
-    /// Codec ID (0=None, 1=Scx1, 2=Zstd).
+    /// File-header codec ID
+    /// (`0=None`, `1=Scx1`, `2=Zstd`, `3=Lz4Shuffle`, `4=Pcodec`).
+    ///
+    /// Per-shard codec overrides are stored in each shard header; readers
+    /// must consult `ShardHeader.codec_id` rather than this value when
+    /// decoding individual shards.
     #[getter]
     fn codec_id(&self) -> u8 {
         self.reader.header().codec_id
@@ -129,10 +134,18 @@ impl PyExperiment {
     ///     obs_filter: Optional predicate expression (e.g., "cell_type == 'T cell'")
     ///                 to filter observations. Uses predicate pushdown for shard skipping.
     ///     layers: Optional list of layer names to load. If None, all layers are loaded.
+    ///     preserve_slots: When True together with obs_filter in non-backed mode,
+    ///                     materialize obsm and layers after filtering instead of
+    ///                     dropping them. Skips query-engine predicate pushdown for X
+    ///                     reads; the obs_filter expression is parsed by pandas.eval
+    ///                     instead of the SCX predicate engine, so syntax must be
+    ///                     pandas-compatible. No effect when obs_filter is None or
+    ///                     when backed=True (backed mode already preserves slots).
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false))]
+    #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
         py: Python<'py>,
@@ -141,6 +154,7 @@ impl PyExperiment {
         var_names: Option<Vec<String>>,
         obs_filter: Option<&str>,
         layers: Option<Vec<String>>,
+        preserve_slots: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if backed {
             anndata::to_anndata_backed(
@@ -159,6 +173,7 @@ impl PyExperiment {
                 var_names.as_deref(),
                 obs_filter,
                 layers.as_deref(),
+                preserve_slots,
             )
         }
     }

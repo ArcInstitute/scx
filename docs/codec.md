@@ -220,7 +220,10 @@ h5ad vs 0.746× uncompressed), while Zstd achieves 0.345×.
 
 ### Heuristic (used by `codec="auto"`)
 
-- Float values → **Zstd** (always).
+Canonical implementation: `scx-format/src/codec_select.rs::select_codec()`.
+
+- Float32 / Float16 values → **Pcodec** (typical 7–16 % better than Zstd
+  on log-normalized data; see `docs/api.md` § "Codec Selection").
 - Integer values with `floor(median) ≤ 8` → **Scx1** (Rice).
 - Integer values with `floor(median) > 8` → **Zstd**.
 

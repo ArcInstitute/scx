@@ -27,15 +27,22 @@ fn to_pyerr(e: ScxError) -> PyErr {
 ///
 /// Args:
 ///     path: Path to the SCX file.
-///     verify: If True (default), verify the catalog BLAKE3 checksum on open.
-///         Set to False for performance-sensitive paths where the file is
-///         trusted (e.g., repeated reads of a file that was already validated).
+///     verify: If True (default), verify the file header magic/version and
+///         the trailing BLAKE3 checksum over the full catalog. This
+///         authenticates the catalog payload (offsets, lengths, per-section
+///         checksums) but does not re-hash section bytes — call
+///         `pyscx.validate(path)` (or `scx validate`) when section-level
+///         payload integrity must be confirmed. Set to False for
+///         performance-sensitive paths where the file is trusted (e.g.,
+///         repeated reads of a file that was already validated).
 ///
 /// Example:
 ///     exp = pyscx.open("data.scx")
 ///     adata = exp.to_anndata()
 ///     # Fast open for trusted files:
 ///     exp = pyscx.open("data.scx", verify=False)
+///     # Full per-section integrity check:
+///     pyscx.validate("data.scx")
 #[pyfunction]
 #[pyo3(signature = (path, verify=true))]
 fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
@@ -50,9 +57,14 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
 
 /// Validate all section checksums in an SCX file.
 ///
-/// Opens the file with full catalog verification, then checks every section's
-/// BLAKE3 checksum against the catalog. Returns a list of (section_name, passed)
-/// tuples. Raises RuntimeError if any essential section (obs, var, CsrShard) fails.
+/// Opens the file with full catalog verification, then computes BLAKE3 of
+/// every section's payload bytes and compares against the catalog's stored
+/// checksum. This is the section-level integrity check — `pyscx.open()`
+/// only verifies the catalog itself. Cost is proportional to the file's
+/// total section bytes.
+///
+/// Returns a list of (section_name, passed) tuples. Raises RuntimeError if
+/// any essential section (obs, var, CsrShard) fails.
 ///
 /// Example:
 ///     results = pyscx.validate("data.scx")
@@ -66,9 +78,11 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 
 /// Convert an AnnData object to an SCX file.
 ///
-/// Codec defaults to "auto", which selects the best codec based on value
-/// distribution (Scx1 for small UMI counts, Zstd for large values or floats).
-/// Explicit options: "none", "scx1", "zstd".
+/// Codec defaults to `"auto"`, which selects per shard via
+/// `scx-format/src/codec_select.rs::select_codec()`:
+/// Float32/Float16 values → Pcodec; integer values with floor-median ≤ 8
+/// → Scx1 (Rice); larger integers → Zstd. Explicit options:
+/// `"none"`, `"scx1"`, `"zstd"`, `"lz4"`, `"pcodec"`.
 ///
 /// `adata.uns` is serialized as JSON. NumPy arrays/scalars, pandas
 /// Index/Series/Categorical, lists, tuples, and dicts of these are converted
