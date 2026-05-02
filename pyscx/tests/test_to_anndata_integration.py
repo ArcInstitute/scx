@@ -407,3 +407,260 @@ def test_var_names_consistent_across_paths(tmp_dir):
         == list(backed.var["gene_symbol"])
         == list(query.var["gene_symbol"])
     )
+
+
+class _DuckAnnData:
+    """Minimal AnnData-like shim for duck-typed validation tests.
+
+    Real ``anndata.AnnData`` rejects mismatched layer shapes at assignment
+    time, so we have to bypass it to exercise pyscx's own shape validation.
+    """
+
+    def __init__(self, X, obs, var, layers):
+        self.X = X
+        self.obs = obs
+        self.var = var
+        self.obsm = {}
+        self.uns = {}
+        self.layers = layers
+
+
+def test_from_anndata_bad_layer_shape_returns_value_error(tmp_dir):
+    """from_anndata raises ValueError (not panics) on mismatched layer shape.
+
+    Regression: a duck-typed AnnData-like with X.shape=(3,4) but
+    layers['bad'].shape=(2,4) used to panic in Rust ('index out of bounds')
+    while indexing the layer's indptr in the shard boundary loop.
+    """
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    n_obs, n_vars = 3, 4
+    fake = _DuckAnnData(
+        X=sp.csr_matrix(np.zeros((n_obs, n_vars), dtype=np.float32)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+        layers={
+            "bad": sp.csr_matrix(np.zeros((n_obs - 1, n_vars), dtype=np.float32))
+        },
+    )
+
+    path = str(tmp_dir / "bad_layer.scx")
+    with pytest.raises(
+        ValueError,
+        match=r"Layer 'bad' has shape \(2, 4\), expected \(3, 4\)",
+    ):
+        pyscx.from_anndata(fake, path)
+
+
+def _adata_with_uns(uns):
+    """Build a minimal AnnData carrying the given `uns` payload."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    n_obs, n_vars = 2, 2
+    a = anndata.AnnData(
+        X=sp.csr_matrix(np.zeros((n_obs, n_vars), dtype=np.float32)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+    )
+    a.uns.update(uns)
+    return a
+
+
+def test_from_anndata_uns_numpy_arrays_roundtrip(tmp_dir):
+    """Numeric and object NumPy arrays in `uns` survive the JSON boundary.
+
+    Regression for issue #4: prior code called json.dumps(adata.uns) which
+    raised TypeError on NumPy arrays. STATE/State Designer store HVG names
+    as np.ndarray(dtype=object) in adata.uns['X_hvg_var_names']; Scanpy
+    writes structured arrays into adata.uns['rank_genes_groups'].
+    """
+    import pyscx
+
+    rgg = {
+        "names": np.array(
+            [("g0", "g1"), ("g2", "g0")], dtype=[("A", "U4"), ("B", "U4")]
+        ),
+        "pvals": np.array([1e-3, 1e-2], dtype=np.float32),
+    }
+    adata = _adata_with_uns({
+        "X_hvg_var_names": np.array(["g0", "g1", "g2"], dtype=object),
+        "rank_genes_groups": rgg,
+        "numeric_arr": np.array([[1, 2], [3, 4]], dtype=np.int32),
+    })
+
+    path = str(tmp_dir / "uns_arrays.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["X_hvg_var_names"] == ["g0", "g1", "g2"]
+    assert out.uns["numeric_arr"] == [[1, 2], [3, 4]]
+    assert out.uns["rank_genes_groups"]["names"] == [["g0", "g1"], ["g2", "g0"]]
+    assert len(out.uns["rank_genes_groups"]["pvals"]) == 2
+
+
+def test_from_anndata_uns_numpy_scalars_roundtrip(tmp_dir):
+    """NumPy scalars (np.int64, np.float32, np.bool_) collapse to Python scalars."""
+    import pyscx
+
+    adata = _adata_with_uns({
+        "i": np.int64(42),
+        "f": np.float32(2.5),
+        "b": np.bool_(True),
+        "u": np.uint32(7),
+    })
+
+    path = str(tmp_dir / "uns_scalars.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["i"] == 42 and isinstance(out.uns["i"], int)
+    assert abs(out.uns["f"] - 2.5) < 1e-6 and isinstance(out.uns["f"], float)
+    assert out.uns["b"] is True
+    assert out.uns["u"] == 7 and isinstance(out.uns["u"], int)
+
+
+def test_from_anndata_uns_nested_dicts_roundtrip(tmp_dir):
+    """Nested dicts mixing dict / list / tuple / NumPy survive the round-trip."""
+    import pyscx
+
+    adata = _adata_with_uns({
+        "level1": {
+            "level2": {
+                "arr": np.array([1, 2, 3]),
+                "tup": (np.int64(1), "two", 3.5),
+                "list_of_dicts": [{"k": np.float32(0.5)}, {"k": np.float32(1.5)}],
+            }
+        }
+    })
+
+    path = str(tmp_dir / "uns_nested.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    inner = out.uns["level1"]["level2"]
+    assert inner["arr"] == [1, 2, 3]
+    assert inner["tup"] == [1, "two", 3.5]
+    assert [d["k"] for d in inner["list_of_dicts"]] == pytest.approx([0.5, 1.5])
+
+
+def test_from_anndata_uns_pandas_categorical_roundtrip(tmp_dir):
+    """pandas Index / Categorical / Series in `uns` collapse to lists."""
+    import pandas as pd
+    import pyscx
+
+    adata = _adata_with_uns({
+        "idx": pd.Index(["x", "y", "z"]),
+        "cat": pd.Categorical(["a", "b", "a"], categories=["a", "b"], ordered=True),
+        "series": pd.Series([10, 20, 30]),
+    })
+
+    path = str(tmp_dir / "uns_pandas.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["idx"] == ["x", "y", "z"]
+    assert out.uns["cat"] == ["a", "b", "a"]
+    assert out.uns["series"] == [10, 20, 30]
+
+
+def test_from_anndata_uns_bytes_raises(tmp_dir):
+    """`bytes` are not JSON-serializable and should error explicitly."""
+    import pyscx
+
+    adata = _adata_with_uns({"k": b"hello"})
+    path = str(tmp_dir / "uns_bytes.scx")
+    with pytest.raises(ValueError, match=r"uns at uns\['k'\]: bytes are not JSON-serializable"):
+        pyscx.from_anndata(adata, path)
+
+
+def test_from_anndata_uns_non_finite_float_raises(tmp_dir):
+    """NaN / inf in floats fail loudly with a key path, even when nested in arrays."""
+    import pyscx
+
+    # Top-level NaN
+    adata = _adata_with_uns({"top": float("nan")})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['top'\]: non-finite float \(NaN\) cannot be serialized",
+    ):
+        pyscx.from_anndata(adata, str(tmp_dir / "nan.scx"))
+
+    # NaN inside a NumPy array — error path includes the index.
+    adata2 = _adata_with_uns({"arr": np.array([1.0, float("nan"), 3.0])})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['arr'\]\[1\]: non-finite float \(NaN\) cannot be serialized",
+    ):
+        pyscx.from_anndata(adata2, str(tmp_dir / "nan_arr.scx"))
+
+
+def test_from_anndata_uns_unsupported_type_reports_path(tmp_dir):
+    """Unsupported types (e.g. set) raise ValueError naming type and key path."""
+    import pyscx
+
+    adata = _adata_with_uns({"outer": {"inner": [1, 2, {3, 4}]}})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['outer'\]\['inner'\]\[2\]: cannot serialize set to JSON",
+    ):
+        pyscx.from_anndata(adata, str(tmp_dir / "unsupported.scx"))
+
+
+def test_from_anndata_uns_self_referential_dict_raises(tmp_dir):
+    """Cycles in `uns` raise ValueError instead of crashing the interpreter.
+
+    Regression: prior to cycle detection a self-referential dict would
+    recurse until Rust stack overflow and SIGABRT the Python process —
+    a regression vs `json.dumps(check_circular=True)` which raised.
+    """
+    import pyscx
+
+    cyclic = {}
+    cyclic["self"] = cyclic
+    adata = _adata_with_uns({"top": cyclic})
+
+    with pytest.raises(ValueError, match=r"circular reference detected"):
+        pyscx.from_anndata(adata, str(tmp_dir / "cyclic_dict.scx"))
+
+
+def test_from_anndata_uns_indirect_cycle_raises(tmp_dir):
+    """Indirect cycles (list referencing parent dict) also raise."""
+    import pyscx
+
+    parent = {}
+    child = [1, 2, parent]
+    parent["child"] = child
+    adata = _adata_with_uns({"top": parent})
+
+    with pytest.raises(ValueError, match=r"circular reference detected"):
+        pyscx.from_anndata(adata, str(tmp_dir / "cyclic_indirect.scx"))
+
+
+def test_from_anndata_uns_oversized_int_raises(tmp_dir):
+    """Integers outside [i64::MIN, u64::MAX] raise ValueError with key path."""
+    import pyscx
+
+    too_big = (1 << 64) + 1  # > u64::MAX
+    adata = _adata_with_uns({"big": too_big})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['big'\]: integer is too large for JSON",
+    ):
+        pyscx.from_anndata(adata, str(tmp_dir / "uns_big_int.scx"))
+
+
+def test_from_anndata_uns_non_string_dict_keys_stringified(tmp_dir):
+    """Non-string dict keys are stringified via str(k) (documented behavior)."""
+    import pyscx
+
+    adata = _adata_with_uns({"by_int": {1: "a", 2: "b"}})
+
+    path = str(tmp_dir / "uns_int_keys.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["by_int"] == {"1": "a", "2": "b"}
