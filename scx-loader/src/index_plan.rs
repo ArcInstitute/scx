@@ -12,9 +12,10 @@
 //! gathering, plus an async [`IndexPlanLoader::iter_with_plans`] iterator that
 //! pipelines per-plan shard prefetch (via tokio `spawn_blocking`) ahead of the
 //! consumer. Plans are reordered by `min(shard_of(p), shard_of(c))` for
-//! locality when `sort_by_shard=true` (the default), and the HVG path uses a
-//! fused [`HvgProjection::scatter_pair_rows`] to share the gene-index walk
-//! across the perturbed and control sides.
+//! locality when `sort_by_shard=true` (the default). Each side gathers
+//! through `BackedCsrReader::read_rows_with`, which scatters directly from
+//! cached shards into the dense output without materialising an intermediate
+//! `ScxCsr`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -410,61 +411,60 @@ impl IndexPlanLoader {
             });
         }
 
-        // One read_row_indices call per side. The reader sorts indices for
-        // shard locality internally, decodes via the LRU shard cache, then
-        // restores caller-supplied order in the returned ScxCsr.
+        // Plan-driven dense gather. Each side calls `BackedCsrReader::
+        // read_rows_with`, which decodes each touched shard once via the LRU
+        // cache, then invokes the scatter closure with zero-copy
+        // `(indices, data)` views into the cached shard. No intermediate
+        // `ScxCsr` is allocated, no `concatenate_csr` runs at the end, and
+        // duplicate plan entries (common for paired controls) share the same
+        // shard decode without re-allocating per-row CSRs.
+        //
+        // The pert and ctrl walks are independent so we lose the
+        // `scatter_pair_rows` HVG fusion — accepted because eliminating
+        // 2 × n_pairs per-row CSR allocations + the final concatenate is
+        // the larger algorithmic win at training-loop scale.
         let pert_indices: Vec<u64> = plan.iter().map(|(p, _)| *p).collect();
         let ctrl_indices: Vec<u64> = plan.iter().map(|(_, c)| *c).collect();
-        let pert_csr = self.backed.read_row_indices(&pert_indices)?;
-        let ctrl_csr = self.backed.read_row_indices(&ctrl_indices)?;
 
         let mut x = vec![0f32; n_pairs * n_cols];
         let mut x_paired = vec![0f32; n_pairs * n_cols];
 
-        // Direct indptr/indices/data slicing — ScxCsr::row_slice would allocate
-        // a fresh i64 indptr per row.
-        for i in 0..n_pairs {
-            let pi_lo = pert_csr.indptr[i] as usize;
-            let pi_hi = pert_csr.indptr[i + 1] as usize;
-            let ci_lo = ctrl_csr.indptr[i] as usize;
-            let ci_hi = ctrl_csr.indptr[i + 1] as usize;
+        let hvg = self.hvg_projection.as_ref();
 
+        self.backed.read_rows_with(&pert_indices, |i, idx, data| {
             let p_out = &mut x[i * n_cols..][..n_cols];
-            let c_out = &mut x_paired[i * n_cols..][..n_cols];
-
-            match &self.hvg_projection {
-                Some(hvg) => {
-                    // Phase 3: walk gene_indices once, write both outputs in a
-                    // single pass; bit-identical to two scatter_row calls.
-                    hvg.scatter_pair_rows(
-                        &pert_csr.indices[pi_lo..pi_hi],
-                        &pert_csr.data[pi_lo..pi_hi],
-                        &ctrl_csr.indices[ci_lo..ci_hi],
-                        &ctrl_csr.data[ci_lo..ci_hi],
-                        p_out,
-                        c_out,
-                    );
-                }
-                None => {
-                    scatter_row_full(
-                        &pert_csr.indices[pi_lo..pi_hi],
-                        &pert_csr.data[pi_lo..pi_hi],
-                        p_out,
-                    )?;
-                    scatter_row_full(
-                        &ctrl_csr.indices[ci_lo..ci_hi],
-                        &ctrl_csr.data[ci_lo..ci_hi],
-                        c_out,
-                    )?;
-                }
+            match hvg {
+                Some(hvg) => hvg.scatter_row(idx, data, p_out),
+                None => scatter_row_full(idx, data, p_out)
+                    .map_err(|e| scx_format::ScxError::Io(std::io::Error::other(e)))?,
             }
+            Ok(())
+        })?;
 
+        self.backed.read_rows_with(&ctrl_indices, |i, idx, data| {
+            let c_out = &mut x_paired[i * n_cols..][..n_cols];
+            match hvg {
+                Some(hvg) => hvg.scatter_row(idx, data, c_out),
+                None => scatter_row_full(idx, data, c_out)
+                    .map_err(|e| scx_format::ScxError::Io(std::io::Error::other(e)))?,
+            }
+            Ok(())
+        })?;
+
+        // Apply configured transforms once both sides are populated. Kept as
+        // a separate pass so the read_rows_with closures stay allocation-free
+        // and infallible w.r.t. transforms.
+        for i in 0..n_pairs {
+            let p_out = &mut x[i * n_cols..][..n_cols];
             apply_dense_transforms(
                 p_out,
                 self.config.normalize,
                 self.config.log1p,
                 self.config.target_sum,
             );
+        }
+        for i in 0..n_pairs {
+            let c_out = &mut x_paired[i * n_cols..][..n_cols];
             apply_dense_transforms(
                 c_out,
                 self.config.normalize,

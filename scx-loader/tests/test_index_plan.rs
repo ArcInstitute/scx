@@ -5,7 +5,7 @@
 //! - Normalize + log1p semantics.
 //! - Empty plan + out-of-range index error paths.
 //! - sort_by_shard: pairs/rows alignment + same-plan-different-order parity.
-//! - `scatter_pair_rows` end-to-end via process_plan (HVG path).
+//! - HVG-projected paired scatter end-to-end via process_plan.
 
 mod common;
 
@@ -309,10 +309,9 @@ fn sort_by_shard_is_pure_permutation() {
     assert_eq!(un, so);
 }
 
-/// HVG-projected pair scatter (the `scatter_pair_rows` code path) reproduces
-/// the expected `(col, value)` tuple per row. Indirectly verifies that
-/// `scatter_pair_rows` and `scatter_row × 2` agree end-to-end inside
-/// `process_plan`.
+/// HVG-projected paired scatter via `process_plan` reproduces the expected
+/// `(col, value)` tuple per row on both sides of the pair, exercising the
+/// `read_rows_with` + `HvgProjection::scatter_row` dense-gather path.
 #[test]
 fn scatter_pair_rows_via_process_plan() {
     let dir = tempfile::tempdir().unwrap();
