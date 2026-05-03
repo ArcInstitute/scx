@@ -63,10 +63,13 @@ jobs:
       - name: Build (release, hdf5-static + cloud)
         run: cargo build -p scx-cli --release --locked --features hdf5-static,cloud --target ${{ matrix.target }}
 
+      # Cargo emits the binary as `scx-cli` (package name). We rename to `scx`
+      # in the staging directory so the tarball matches the user-facing CLI
+      # name documented in the README and used throughout the project.
       - name: Strip binary
         shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/scx"
+          bin="target/${{ matrix.target }}/release/scx-cli"
           if [ "$RUNNER_OS" = "macOS" ]; then
             strip -x "$bin"
           else
@@ -76,7 +79,7 @@ jobs:
       - name: Verify static linkage of libhdf5
         shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/scx"
+          bin="target/${{ matrix.target }}/release/scx-cli"
           if [ "$RUNNER_OS" = "macOS" ]; then
             if otool -L "$bin" | grep -i hdf5; then
               echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
@@ -98,7 +101,7 @@ jobs:
           name="scx-cli-${version}-${target}"
           staging="${RUNNER_TEMP}/${name}"
           mkdir -p "$staging"
-          cp "target/${target}/release/scx" "$staging/"
+          cp "target/${target}/release/scx-cli" "$staging/scx"
           cp README.md "$staging/"
           tar -czvf "${name}.tar.gz" -C "${RUNNER_TEMP}" "$name"
           echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"
