@@ -27,6 +27,7 @@ the "one job per benchmark × dataset pair" model (`AGENTS.md:21`).
 | Wall time per run | standard `BenchmarkResult.runs[i].wall_s` |
 | Peak RSS per run  | standard `peak_rss_mb` |
 | Cosine similarity (min / mean over top-k PCs vs scanpy CPU) | `metadata["cosine_sim_min"]`, `metadata["cosine_sim_mean"]` |
+| Subspace principal-angle cosines (rotation-invariant, §2.5) | `metadata["subspace_cos_min"]`, `metadata["subspace_cos_mean"]`, plus per-run keys in `runs[].extra` for gating |
 | n_comps, n_obs, n_vars, density | `metadata` |
 | backend identifier (`adata.uns["pca"]["backend"]`) | `metadata["backend"]` |
 
@@ -193,6 +194,13 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
 def _sign_agnostic_cosine_per_pc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Column-wise sign-agnostic cosine similarity between two (n_obs × k)
     PCA embeddings. PC signs are arbitrary, so we take abs(dot / norms).
+
+    Note: this metric is sensitive to the basis (rotation, permutation)
+    chosen by each implementation. Randomized PCA returns a rotated
+    subspace by construction, so per-PC cosines drop well below 1.0
+    even when the *subspace* itself is exact. Use
+    ``_subspace_principal_cosines`` for the rotation-invariant
+    correctness gate (review §2.5).
     """
     assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"
     k = a.shape[1]
@@ -205,6 +213,39 @@ def _sign_agnostic_cosine_per_pc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         denom = max(nx * ny, 1e-12)
         cos[j] = float(abs(float(x @ y) / denom))
     return cos
+
+
+def _subspace_principal_cosines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Cosines of the principal angles between the column-spans of ``a``
+    and ``b`` — review §2.5 rotation-invariant correctness metric.
+
+    Given two embeddings of shape (n × k), returns a length-k vector of
+    cosines (descending). All k entries equal 1.0 iff the two
+    column-spans coincide as subspaces — invariant to basis rotation,
+    column permutation, and column-sign flips. The smallest entry is
+    the strict measure: a single component direction missing from
+    ``b`` drops it below 1.0 in proportion to the missing energy.
+
+    Algorithm: orthonormalize each input via QR, form the k×k overlap
+    matrix ``Q_a^T Q_b``, and return its singular values (the cosines
+    of the principal angles between the subspaces).
+
+    Numerical notes
+    ---------------
+    * Computed in float64 regardless of input dtype — float32 PCA
+      embeddings on GPU would otherwise produce a noisy SVD on poorly
+      conditioned columns.
+    * Singular values are clipped into [0.0, 1.0]: SVD of a near-
+      orthonormal product can return ``1.0 + ε`` (or tiny negatives
+      via cancellation). The cosine interpretation is bounded.
+    """
+    assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"
+    a64 = np.ascontiguousarray(a, dtype=np.float64)
+    b64 = np.ascontiguousarray(b, dtype=np.float64)
+    q_a, _ = np.linalg.qr(a64)
+    q_b, _ = np.linalg.qr(b64)
+    s = np.linalg.svd(q_a.T @ q_b, compute_uv=False)
+    return np.clip(s, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +317,8 @@ def run(
     backend = ""
     cos_mean_runs: list[float] = []
     cos_min_runs: list[float] = []
+    subspace_min_runs: list[float] = []
+    subspace_mean_runs: list[float] = []
 
     for i in range(n_runs):
         gc.collect()
@@ -300,6 +343,14 @@ def run(
             cos_min_runs.append(float(np.min(cos)))
             extras["cosine_sim_mean"] = cos_mean_runs[-1]
             extras["cosine_sim_min"] = cos_min_runs[-1]
+            # Rotation/permutation/sign-invariant subspace metric (§2.5).
+            # Catches real correctness regressions on randomized variants
+            # that the per-PC cosine misses by construction.
+            sub = _subspace_principal_cosines(ref_embedding, emb)
+            subspace_min_runs.append(float(np.min(sub)))
+            subspace_mean_runs.append(float(np.mean(sub)))
+            extras["subspace_cos_min"] = subspace_min_runs[-1]
+            extras["subspace_cos_mean"] = subspace_mean_runs[-1]
         except Exception as e:
             logger.warning("Cosine-sim check failed for %s run %d: %s",
                            variant_key, i + 1, e)
@@ -312,9 +363,10 @@ def run(
             **extras,
         )
         logger.info(
-            "  %s run %d: wall=%.3fs  rss=%.1fMB  cos_min=%.4f",
+            "  %s run %d: wall=%.3fs  rss=%.1fMB  cos_min=%.4f  subspace_cos_min=%.4f",
             variant_key, i + 1, wall, max(rss_before, rss_after),
             cos_min_runs[-1] if cos_min_runs else float("nan"),
+            subspace_min_runs[-1] if subspace_min_runs else float("nan"),
         )
         del t_adata
         gc.collect()
@@ -329,13 +381,21 @@ def run(
         result.metadata["cosine_sim_min"] = round(
             float(np.median(cos_min_runs)), 6
         )
+    if subspace_min_runs:
+        result.metadata["subspace_cos_min"] = round(
+            float(np.median(subspace_min_runs)), 6
+        )
+        result.metadata["subspace_cos_mean"] = round(
+            float(np.median(subspace_mean_runs)), 6
+        )
     result.metadata["backend"] = backend
 
     logger.info(
-        "Benchmark complete: %s / %s — median %.3fs, cos_min=%s",
+        "Benchmark complete: %s / %s — median %.3fs, cos_min=%s, subspace_cos_min=%s",
         variant_key, dataset.name,
         result.median_wall_s or 0.0,
         result.metadata.get("cosine_sim_min", "n/a"),
+        result.metadata.get("subspace_cos_min", "n/a"),
     )
     return result
 

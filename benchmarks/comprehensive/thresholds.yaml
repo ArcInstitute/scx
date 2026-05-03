@@ -180,6 +180,14 @@ absolute_floors:
   # census_1m ~0.83 — floors sit ~0.05 below observed to catch a true
   # collapse (e.g., all-zero embedding) without tripping on normal
   # subspace rotation.
+  #
+  # The strict correctness gate for the randomized variants lives on
+  # `subspace_cos_min` below — that metric (the smallest principal-angle
+  # cosine between candidate and reference subspaces) is invariant to
+  # the basis rotation/permutation/sign that defeats per-PC cosine.
+  # Both metrics are kept: cosine_sim_mean for backward continuity with
+  # promoted baselines, subspace_cos_min for the real correctness
+  # contract (review §2.5).
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k
@@ -210,6 +218,49 @@ absolute_floors:
     dataset: census_1m
     metric: cosine_sim_mean
     min: 0.75
+  # --- accel_pca: rotation-invariant subspace floors (§2.5) ---
+  # ``subspace_cos_min`` is the smallest principal-angle cosine between
+  # the candidate and scanpy reference column-spans. By construction:
+  #   * 1.0 iff the two k-dim subspaces coincide (any basis rotation,
+  #     column permutation, or column-sign flip)
+  #   * < 1.0 iff a component direction is genuinely missing or rotated
+  #     out of plane — the failure mode that per-PC cosine cannot detect
+  # Floors are *analytic* (not yet calibrated against an empirical
+  # capture). For a correct randomized-PCA implementation the dominant
+  # subspace cosine is ≥ 0.99 even with float32-on-GPU drift; the floors
+  # below leave headroom for tail-PC noise on degenerate eigenvalues.
+  # Tighten these once we have a Tier-3 capture; loosen if real
+  # measurements undercut them.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.90
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.90
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.95
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.95
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: census_1m
+    metric: subspace_cos_min
+    min: 0.95
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: census_1m
+    metric: subspace_cos_min
+    min: 0.95
   # Covariance path at census_1m — f32 GPU vs f64 CPU tail-PC drift is real
   # but bounded; observed 0.9999+. Keep 0.90 floor for safety headroom.
   - benchmark: accel_pca
