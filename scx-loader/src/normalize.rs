@@ -68,6 +68,20 @@ pub fn fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
     }
 }
 
+/// Apply the configured dense-row transforms in-place.
+///
+/// Single dispatch point shared by `TrainingDataset` (`decode_stage.rs`)
+/// and `IndexPlanDataset` (`index_plan.rs`) so both honour all four
+/// `(normalize, log1p)` combinations identically.
+pub fn apply_dense_transforms(row: &mut [f32], normalize: bool, log1p: bool, target_sum: f64) {
+    match (normalize, log1p) {
+        (true, true) => fused_normalize_log1p_dense(row, target_sum),
+        (true, false) => normalize_dense_row(row, target_sum),
+        (false, true) => log1p_dense_row(row),
+        (false, false) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +235,63 @@ mod tests {
         log1p_dense_row(&mut row);
         fused_normalize_log1p_dense(&mut row, 10_000.0);
         assert!(row.is_empty());
+    }
+
+    // ---- apply_dense_transforms (4-way dispatch) ----
+
+    fn sample_row() -> Vec<f32> {
+        vec![0.0, 5.0, 0.0, 10.0, 0.0, 1.0, 3.0, 7.0, 2.0]
+    }
+
+    #[test]
+    fn test_apply_normalize_and_log1p_matches_fused() {
+        let target = 1e4_f64;
+        let mut a = sample_row();
+        apply_dense_transforms(&mut a, true, true, target);
+
+        let mut b = sample_row();
+        fused_normalize_log1p_dense(&mut b, target);
+
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn test_apply_normalize_only_matches_normalize_dense_row() {
+        let target = 1e4_f64;
+        let mut a = sample_row();
+        apply_dense_transforms(&mut a, true, false, target);
+
+        let mut b = sample_row();
+        normalize_dense_row(&mut b, target);
+
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-7);
+        }
+        // Sanity: row sums to target_sum (no log1p applied).
+        let s: f64 = a.iter().map(|&v| v as f64).sum();
+        assert!((s - target).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_apply_log1p_only_matches_log1p_dense_row() {
+        let mut a = sample_row();
+        apply_dense_transforms(&mut a, false, true, /*ignored*/ 1.0);
+
+        let mut b = sample_row();
+        log1p_dense_row(&mut b);
+
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn test_apply_no_transform_is_identity() {
+        let mut a = sample_row();
+        let original = a.clone();
+        apply_dense_transforms(&mut a, false, false, 0.0);
+        assert_eq!(a, original);
     }
 }

@@ -3,8 +3,9 @@
 //! Sibling to the sequential `TrainingPipeline`. The consumer supplies a stream
 //! of `Vec<(u64, u64)>` plans (perturbed, control row index pairs); this module
 //! gathers the rows via `BackedCsrReader::read_row_indices`, projects + normalizes
-//! them through the existing `HvgProjection` / `fused_normalize_log1p_dense`
-//! primitives, and yields paired dense `IndexPlanBatch` values.
+//! them through the existing `HvgProjection` and the shared
+//! `apply_dense_transforms` dispatcher in `normalize.rs` (the same dispatcher
+//! `TrainingDataset` uses), and yields paired dense `IndexPlanBatch` values.
 //!
 //!
 //! Surface: synchronous [`IndexPlanLoader::process_plan`] for one-shot batch
@@ -30,7 +31,7 @@ use tokio::task::JoinHandle;
 use crate::batch::ObsColumn;
 use crate::decode_stage::extract_obs_columns;
 use crate::error::{LoaderError, Result};
-use crate::normalize::fused_normalize_log1p_dense;
+use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
 use crate::projection::{scatter_row_full, HvgProjection};
 
@@ -458,10 +459,18 @@ impl IndexPlanLoader {
                 }
             }
 
-            if self.config.normalize {
-                fused_normalize_log1p_dense(p_out, self.config.target_sum);
-                fused_normalize_log1p_dense(c_out, self.config.target_sum);
-            }
+            apply_dense_transforms(
+                p_out,
+                self.config.normalize,
+                self.config.log1p,
+                self.config.target_sum,
+            );
+            apply_dense_transforms(
+                c_out,
+                self.config.normalize,
+                self.config.log1p,
+                self.config.target_sum,
+            );
         }
 
         let obs = extract_obs_columns(&self.obs_metadata, &pert_indices, &self.config.obs_columns)?;

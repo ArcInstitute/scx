@@ -305,8 +305,9 @@ impl IndexPlanDataset {
     ///     hvg_indices: Gene indices for HVG projection. None = all genes.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
-    ///     log1p: Reserved (default: True). Currently fused with `normalize`
-    ///         on this path, mirroring `TrainingDataset`.
+    ///     log1p: Apply ln(x+1) to each row (default: True). Independent of
+    ///         `normalize`; all four (normalize, log1p) combinations are
+    ///         honoured, matching `TrainingDataset` semantics.
     ///     target_sum: Normalization target sum (default: 1e4).
     ///     cache_shards: LRU shard cache budget (default: 128). Must be >= 1.
     ///         Auto-tuned downward to fit `max_memory_mb`; check the resolved

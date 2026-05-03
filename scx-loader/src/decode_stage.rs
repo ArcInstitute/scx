@@ -30,7 +30,7 @@ fn profiling_enabled() -> bool {
 use crate::batch::{Batch, ObsColumn};
 use crate::error::{LoaderError, Result};
 use crate::io_stage::ShardGroup;
-use crate::normalize::fused_normalize_log1p_dense;
+use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
 use crate::projection::{scatter_row_full, HvgProjection};
 use crate::shuffle::RowShuffler;
@@ -135,8 +135,9 @@ fn fill_batch_parallel(
     group_index: &ShardGroupIndex,
     group: &ShardGroup,
     projection: Option<&HvgProjection>,
-    normalize: Option<f64>,
+    normalize: bool,
     log1p: bool,
+    target_sum: f64,
     n_output_genes: usize,
     pool: &rayon::ThreadPool,
 ) -> Result<Vec<f32>> {
@@ -167,19 +168,8 @@ fn fill_batch_parallel(
                     None => scatter_row_full(csr_indices, csr_data, output_row)?,
                 }
 
-                // Apply fused normalize+log1p if configured
-                match (normalize, log1p) {
-                    (Some(target_sum), true) => {
-                        fused_normalize_log1p_dense(output_row, target_sum);
-                    }
-                    (Some(target_sum), false) => {
-                        crate::normalize::normalize_dense_row(output_row, target_sum);
-                    }
-                    (None, true) => {
-                        crate::normalize::log1p_dense_row(output_row);
-                    }
-                    (None, false) => {} // no-op
-                }
+                // Apply configured dense-row transforms
+                apply_dense_transforms(output_row, normalize, log1p, target_sum);
                 Ok(())
             })
     })?;
@@ -424,12 +414,6 @@ pub fn decode_stage(
         None => n_vars as usize,
     };
 
-    let normalize_target = if config.normalize {
-        Some(config.target_sum)
-    } else {
-        None
-    };
-
     // Create a seeded RNG for row-level shuffle (Level 2).
     // The shard-level shuffle (Level 1) already happened in shuffle_epoch().
     // Incorporate the epoch number so different epochs produce different row orderings.
@@ -475,8 +459,9 @@ pub fn decode_stage(
                 &group_index,
                 &group,
                 projection.as_ref(),
-                normalize_target,
+                config.normalize,
                 config.log1p,
+                config.target_sum,
                 n_output_genes,
                 pool,
             )?;
@@ -685,8 +670,9 @@ mod tests {
             &index,
             &group,
             None,
-            None,
             false,
+            false,
+            0.0,
             n_genes,
             &test_pool(),
         )
@@ -721,8 +707,9 @@ mod tests {
             &index,
             &group,
             Some(&proj),
-            None,
             false,
+            false,
+            0.0,
             n_output,
             &test_pool(),
         )
@@ -760,8 +747,9 @@ mod tests {
             &index,
             &group,
             None,
-            None,
             false,
+            false,
+            0.0,
             n_genes,
             &test_pool(),
         )
@@ -795,8 +783,9 @@ mod tests {
             &index,
             &group,
             None,
-            Some(target_sum),
             true,
+            true,
+            target_sum,
             n_genes,
             &test_pool(),
         )

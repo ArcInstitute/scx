@@ -9,7 +9,10 @@
 
 mod common;
 
-use common::{open_loader, open_loader_hvg, open_loader_normalized, write_multi_shard_fixture};
+use common::{
+    open_loader, open_loader_hvg, open_loader_normalized, open_loader_with_flags,
+    write_multi_shard_fixture,
+};
 use scx_loader::LoaderError;
 
 const N_OBS: usize = 100;
@@ -86,6 +89,108 @@ fn process_plan_normalize_log1p_semantics() {
         (nonzero - expected).abs() < 1e-3,
         "log1p(target_sum) ≈ {expected}, got {nonzero}"
     );
+}
+
+/// Spec: `(normalize=true, log1p=false)` — row sum equals `target_sum`,
+/// no log1p applied. Regression test for the bug where `IndexPlanLoader`
+/// always called `fused_normalize_log1p_dense` whenever `normalize=true`,
+/// silently applying log1p that the caller did not request.
+#[test]
+fn process_plan_normalize_only_no_log1p() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+    let target_sum = 1.0e4_f64;
+
+    let loader = open_loader_with_flags(
+        &path, /*normalize=*/ true, /*log1p=*/ false, target_sum,
+        /*sort_by_shard=*/ false,
+    );
+    // Pert row 7 -> nonzero at col 7, raw value 8.
+    // Ctrl row 8 -> nonzero at col 8, raw value 9.
+    let batch = loader.process_plan(vec![(7u64, 8u64)]).unwrap();
+
+    let p_row = &batch.x[..N_VARS];
+    let c_row = &batch.x_paired[..N_VARS];
+
+    // Both pert and ctrl rows should sum to target_sum (normalize only).
+    let p_sum: f64 = p_row.iter().map(|&v| v as f64).sum();
+    let c_sum: f64 = c_row.iter().map(|&v| v as f64).sum();
+    assert!(
+        (p_sum - target_sum).abs() < 1e-2,
+        "pert row sum {p_sum} != target {target_sum}"
+    );
+    assert!(
+        (c_sum - target_sum).abs() < 1e-2,
+        "ctrl row sum {c_sum} != target {target_sum}"
+    );
+
+    // Single nonzero per row, equal to target_sum (no log1p).
+    assert_eq!(p_row.iter().filter(|&&v| v != 0.0).count(), 1);
+    assert_eq!(c_row.iter().filter(|&&v| v != 0.0).count(), 1);
+    assert!((p_row[7 % N_VARS] as f64 - target_sum).abs() < 1e-2);
+    assert!((c_row[8 % N_VARS] as f64 - target_sum).abs() < 1e-2);
+}
+
+/// Spec: `(normalize=false, log1p=true)` — `ln(1 + raw)` per element, no
+/// scaling. Regression test for the bug where `IndexPlanLoader` skipped
+/// the transform entirely when `normalize=false`, returning raw rows even
+/// though the caller requested log1p (the state-scx ST default).
+#[test]
+fn process_plan_log1p_only_no_normalize() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    let loader = open_loader_with_flags(
+        &path, /*normalize=*/ false, /*log1p=*/ true, /*target_sum=*/ 0.0,
+        /*sort_by_shard=*/ false,
+    );
+    // Pert row 7 -> col 7, raw value 8 -> ln(9).
+    // Ctrl row 8 -> col 8, raw value 9 -> ln(10).
+    let batch = loader.process_plan(vec![(7u64, 8u64)]).unwrap();
+
+    let p_row = &batch.x[..N_VARS];
+    let c_row = &batch.x_paired[..N_VARS];
+
+    let p_expected = ((8.0_f32) + 1.0).ln();
+    let c_expected = ((9.0_f32) + 1.0).ln();
+
+    assert!(
+        (p_row[7 % N_VARS] - p_expected).abs() < 1e-5,
+        "pert log1p mismatch: got {} expected {}",
+        p_row[7 % N_VARS],
+        p_expected
+    );
+    assert!(
+        (c_row[8 % N_VARS] - c_expected).abs() < 1e-5,
+        "ctrl log1p mismatch: got {} expected {}",
+        c_row[8 % N_VARS],
+        c_expected
+    );
+    // Other columns should be ln(0+1) = 0 — but we wrote zeros into the
+    // dense buffer, so the log1p applies element-wise and yields exactly 0.
+    for (i, &v) in p_row.iter().enumerate() {
+        if i != 7 % N_VARS {
+            assert!(v.abs() < 1e-7);
+        }
+    }
+}
+
+/// Spec: `(normalize=false, log1p=false)` — pass-through, raw values.
+#[test]
+fn process_plan_no_normalize_no_log1p_returns_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    let loader = open_loader(&path, /*sort_by_shard=*/ false);
+    let batch = loader.process_plan(vec![(7u64, 8u64)]).unwrap();
+
+    let p_row = &batch.x[..N_VARS];
+    let c_row = &batch.x_paired[..N_VARS];
+
+    assert_eq!(p_row[7 % N_VARS], 8.0);
+    assert_eq!(c_row[8 % N_VARS], 9.0);
+    assert_eq!(p_row.iter().filter(|&&v| v != 0.0).count(), 1);
+    assert_eq!(c_row.iter().filter(|&&v| v != 0.0).count(), 1);
 }
 
 /// Spec: "Empty plan: yields a zero-row batch."
