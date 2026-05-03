@@ -64,7 +64,13 @@ def _update_latest_symlink(baselines_dir: Path, version: str) -> None:
         link.write_text(f"{version}\n")
 
 
-def promote(snapshot: Path, version: str, *, force: bool = False) -> Path:
+def promote(
+    snapshot: Path,
+    version: str,
+    *,
+    force: bool = False,
+    update_latest: bool = True,
+) -> Path:
     if not snapshot.is_dir():
         raise FileNotFoundError(f"snapshot directory not found: {snapshot}")
 
@@ -89,7 +95,13 @@ def promote(snapshot: Path, version: str, *, force: bool = False) -> Path:
     for name in _REQUIRED_FILES:
         shutil.copy2(snapshot / name, target / name)
 
-    _update_latest_symlink(BASELINES_DIR, version)
+    if update_latest:
+        _update_latest_symlink(BASELINES_DIR, version)
+    else:
+        logger.info(
+            "Skipped %s update (update_latest=False); prior pointer preserved",
+            BASELINES_DIR / LATEST_LINK,
+        )
 
     logger.info("Promoted %s → %s (%d files)", snapshot, target, len(_REQUIRED_FILES))
     return target
@@ -131,18 +143,11 @@ def main(argv: list[str] | None = None) -> int:
         target = promote(
             args.snapshot, args.version,
             force=args.force,
+            update_latest=not args.no_latest,
         )
     except (FileNotFoundError, FileExistsError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    if args.no_latest:
-        # promote() always updates LATEST; if the operator asked to opt out,
-        # revert to whatever was there before (best-effort).
-        latest = BASELINES_DIR / "LATEST"
-        if latest.is_symlink() and latest.resolve().name == args.version:
-            latest.unlink()
-            logger.info("--no-latest: removed %s", latest)
 
     print(f"Promoted snapshot to {target}")
     return 0
