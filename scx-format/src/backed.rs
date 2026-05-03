@@ -1583,10 +1583,7 @@ mod tests {
 
     /// Helper: gather rows via `read_rows_with` into per-request `(indices,
     /// data)` clones in caller order.
-    fn gather_with(
-        backed: &BackedCsrReader,
-        rows: &[u64],
-    ) -> Vec<(Vec<i32>, Vec<f32>)> {
+    fn gather_with(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
         let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
         backed
             .read_rows_with(rows, |i, idx, data| {
