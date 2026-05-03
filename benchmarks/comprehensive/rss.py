@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import resource
+import sys
 
 __all__ = ["current_rss_mb"]
 
@@ -30,13 +31,17 @@ def current_rss_mb() -> float:
     same process.
 
     Non-Linux / read-failure: fall back to
-    ``getrusage(RUSAGE_SELF).ru_maxrss / 1024.0``. The high-water mark
-    is a coarser quantity than instantaneous RSS, but it's better than
-    silently returning ``0.0``.
+    ``getrusage(RUSAGE_SELF).ru_maxrss``. The high-water mark is a
+    coarser quantity than instantaneous RSS, but it's better than
+    silently returning ``0.0``. ``ru_maxrss`` units differ by platform:
+    Linux reports kilobytes, macOS (Darwin) reports bytes.
     """
     try:
         with open("/proc/self/statm") as f:
             pages = int(f.read().split()[1])
         return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
     except (OSError, IndexError, ValueError):
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return ru_maxrss / (1024 * 1024)
+        return ru_maxrss / 1024.0

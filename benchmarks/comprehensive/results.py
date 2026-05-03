@@ -29,8 +29,8 @@ from benchmarks.comprehensive.sysinfo import collect_system_info
 #
 # v2: adds ``wall_s_iqr`` / ``n_runs`` to BenchmarkResult.to_dict() and to the
 # rows of capture_baseline.py's summary.json so the gate can widen
-# ``median_wall_s`` tolerance by the baseline's own measured noise (review
-# §1.1). Older v1 raw JSONs and pre-bump promoted baselines just lack the
+# ``median_wall_s`` tolerance by the baseline's own measured noise.
+# Older v1 raw JSONs and pre-bump promoted baselines just lack the
 # field and the gate falls back to the fixed --timing-tolerance.
 SCHEMA_VERSION = 2
 
@@ -47,7 +47,7 @@ class RunRecord:
 
 @dataclass
 class BenchmarkResult:
-    """Structured benchmark result matching JSON schema from §5.3.
+    """Structured benchmark result.
 
     Example JSON output::
 

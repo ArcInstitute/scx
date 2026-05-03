@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Correctness Validation: Backed-Mode Equivalence (§3.14.2).
+Correctness Validation: Backed-Mode Equivalence.
 
 Verifies that operations on backed-mode (on-disk) data produce identical
 results to the same operations on fully-materialized data.
@@ -517,7 +517,7 @@ def run_all_checks(
     """
     import pyscx
 
-    logger.info("=== Backed-Mode Equivalence Validation (§3.14.2) ===")
+    logger.info("=== Backed-Mode Equivalence Validation ===")
     logger.info("Dataset: %s", dataset_name)
 
     adata_raw = load_dataset(dataset_name)
@@ -581,7 +581,7 @@ def run_all_checks(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_common_args("Correctness Validation: Backed-Mode Equivalence (§3.14.2)")
+    args = parse_common_args("Correctness Validation: Backed-Mode Equivalence")
     report = run_all_checks(args.dataset, args.output)
 
     if args.output is None:

@@ -1,5 +1,5 @@
 """
-§3.1 Storage Efficiency (Compression) benchmark.
+Storage Efficiency (Compression) benchmark.
 
 Measures on-disk file size after converting an h5ad dataset to each format
 variant.  Reports file size, compression ratio relative to the source h5ad,
@@ -50,7 +50,7 @@ def run(
     cold_cache: bool = False,
     converted_path: Path | None = None,
 ) -> BenchmarkResult:
-    """Run the §3.1 compression benchmark for a single format variant.
+    """Run the compression benchmark for a single format variant.
 
     Parameters
     ----------

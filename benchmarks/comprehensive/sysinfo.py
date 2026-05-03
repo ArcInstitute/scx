@@ -45,12 +45,12 @@ def collect_system_info() -> dict[str, Any]:
     info["storage"] = _get_storage_info()
 
     # GPU / CUDA / nvidia-fs (best-effort; only present on GPU nodes). Closes
-    # the ROADMAP §5.1 claim that these are captured — Phase I.2.
+    # the ROADMAP §5.1 claim that these are captured.
     gpu = _get_gpu_info()
     if gpu:
         info["gpu"] = gpu
 
-    # GCP compute-node matrix labels (Phase E). The launcher sets these env
+    # GCP compute-node matrix labels. The launcher sets these env
     # vars on each VM before invoking the benchmark so the emitted JSON
     # self-labels with the instance type + region. Absent off-cloud, so
     # local runs never carry stale GCP tags.

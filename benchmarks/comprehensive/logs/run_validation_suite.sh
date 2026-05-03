@@ -49,21 +49,21 @@ for DATASET in pbmc3k tabula_sapiens_100k; do
     echo "=============================================="
 
     echo ""
-    echo "--- §3.14.1: Scanpy Equivalence ---"
+    echo "--- Scanpy Equivalence ---"
     python benchmarks/comprehensive/scripts/validate_scanpy_equivalence.py \
         --dataset "${DATASET}" \
         --output "${RESULTS_DIR}/correctness__scanpy_equiv__${DATASET}.json" \
         || echo "WARNING: scanpy equivalence validation failed for ${DATASET}"
 
     echo ""
-    echo "--- §3.14.2: Backed-Mode Equivalence ---"
+    echo "--- Backed-Mode Equivalence ---"
     python benchmarks/comprehensive/scripts/validate_backed_equivalence.py \
         --dataset "${DATASET}" \
         --output "${RESULTS_DIR}/correctness__backed_equiv__${DATASET}.json" \
         || echo "WARNING: backed equivalence validation failed for ${DATASET}"
 
     echo ""
-    echo "--- §3.14.3: Preprocessing Path Cross-Validation ---"
+    echo "--- Preprocessing Path Cross-Validation ---"
     python benchmarks/comprehensive/scripts/validate_preprocessing_paths.py \
         --dataset "${DATASET}" \
         --output "${RESULTS_DIR}/correctness__preproc_paths__${DATASET}.json" \

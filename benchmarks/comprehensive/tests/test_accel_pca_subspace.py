@@ -1,18 +1,17 @@
 """
-§2.5 — rotation-invariant subspace metric for randomized PCA.
+Rotation-invariant subspace metric for randomized PCA.
 
-The pre-§2.5 gate floored randomized-PCA `cosine_sim_mean` at ~0.35 on
+The previous gate floored randomized-PCA `cosine_sim_mean` at ~0.35 on
 pbmc3k because the per-PC cosine drops below 1.0 just from the basis
 rotation/permutation that the randomized-SVD path is free to return.
 That floor is a sanity check, not a correctness gate — a real
 regression that left the subspace mostly intact but corrupted one PC
 would still pass.
 
-The new ``_subspace_principal_cosines`` metric IS the strict gate. It
-is invariant to basis rotation, column permutation, and column-sign
-flip (the three free parameters of "same subspace, different basis"),
-but drops below 1.0 the moment a component direction is genuinely
-missing.
+``_subspace_principal_cosines`` IS the strict gate. It is invariant to
+basis rotation, column permutation, and column-sign flip (the three
+free parameters of "same subspace, different basis"), but drops below
+1.0 the moment a component direction is genuinely missing.
 
 These tests cover:
 
@@ -22,8 +21,8 @@ These tests cover:
   3. Column-permuted columns ⇒ all cosines still 1.0 (per-PC cosine
      would FAIL here — this is the rotation invariance).
   4. Random-orthogonal-rotation of the basis ⇒ all cosines still 1.0
-     (the marquee §2.5 case: randomized PCA returns this kind of
-     rotated subspace by construction).
+     (the marquee case: randomized PCA returns this kind of rotated
+     subspace by construction).
   5. One column substituted by an out-of-plane direction ⇒
      ``subspace_cos_min`` drops below 1.0, proving the gate fires on
      a real subspace regression.
@@ -82,8 +81,8 @@ def test_column_permutation_invariant() -> None:
 
 
 def test_random_orthogonal_basis_rotation_invariant() -> None:
-    """Marquee §2.5 case: randomized PCA returns a rotated basis of the
-    same subspace. Per-PC cosine drops; subspace metric does not.
+    """Marquee case: randomized PCA returns a rotated basis of the same
+    subspace. Per-PC cosine drops; subspace metric does not.
     """
     rng = np.random.default_rng(45)
     a = _random_orthonormal_basis(200, 8, seed=45)

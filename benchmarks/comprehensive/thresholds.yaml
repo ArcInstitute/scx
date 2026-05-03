@@ -47,7 +47,7 @@ absolute_floors:
     metric: throughput_mbps
     min: 50.0
 
-  # --- cloud_read correctness (§3.6) ---------------------------------
+  # --- cloud_read correctness ----------------------------------------
   # Hard parity gate: the cloud-pulled SCX matrix must equal the local
   # source SCX. Catches silent corruption in the cloud-fixture pipeline
   # (BLAKE3 sidecar drift, exploded-shard layout regression on push or
@@ -327,8 +327,8 @@ absolute_floors:
     metric: hvg_overlap_vs_scanpy
     min: 0.99
 
-  # --- ml_loader throughput floors (§3.1) ----------------------------
-  # Floors at 0.5x observed Phase-1 baseline median (0.6x on pbmc3k
+  # --- ml_loader throughput floors -----------------------------------
+  # Floors at 0.5x observed baseline median (0.6x on pbmc3k
   # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).
   # Per-scenario keys (batches_per_sec__<scenario>) are emitted only
   # on that scenario's runs, so the gate's median is over scenario-
@@ -418,7 +418,7 @@ absolute_floors:
     metric: batches_per_sec__pyscx_index_plan_dataset_workers2
     min: 72.3
 
-  # --- correctness validation suite (§3.2) ---------------------------
+  # --- correctness validation suite ----------------------------------
   # Hard parity gate: any failure in scanpy-equivalence,
   # backed-mode-equivalence, preprocessing-paths, or SLAF round-trip
   # blocks the gate. Per-suite floors localize a failure to one
@@ -465,7 +465,7 @@ absolute_floors:
     metric: slaf_equivalence_n_failed
     max: 0
 
-  # --- roundtrip codec parity (§3.5) ---------------------------------
+  # --- roundtrip codec parity ----------------------------------------
   # Catches silent value corruption in any of the SCX codecs: scx_auto
   # (auto-selector), scx_none (raw LE), scx_scx1 (Delta-Golomb-Rice /
   # FOR-BP / Rice), scx_zstd, scx_lz4 (byte-shuffle + LZ4), and
@@ -494,7 +494,7 @@ absolute_floors:
   # The scx_auto rows partly overlap with the explicit codec rows
   # (auto-selector picks scx1 for pbmc3k's u8 counts), but keeping
   # both catches a regression where scx_auto STOPS picking the right
-  # codec — the unmeasured selector-drift gap from §4.4 of the review.
+  # codec — the unmeasured selector-drift gap.
   - benchmark: roundtrip
     format: scx_auto
     dataset: pbmc3k
@@ -616,12 +616,12 @@ absolute_floors:
     metric: n_value_mismatches
     max: 0
 
-  # --- cell_eval_parity_perf marquee floors (§3.3) -------------------
+  # --- cell_eval_parity_perf marquee floors --------------------------
   # AGENTS.md headline claims:
   #   - energy_distance(backend="gemm", dtype="f32"): 52x at 20K x 2K x 50 perts
   #   - clustering_agreement: 12.83x at 200 perts
   #
-  # Floors are calibrated below observed Phase-1 medians (0.6x for min,
+  # Floors are calibrated below observed baseline medians (0.6x for min,
   # 2.0x for max), NOT against the marquee claims directly — this
   # protects against a same-axis cell-eval slowdown faking a "free win"
   # while still catching real SCX regressions.

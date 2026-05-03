@@ -428,9 +428,9 @@ impl TrainingPipeline {
         let shuffler =
             ShardShuffler::new(n_csr_shards, memory_budget.shard_group_size, config.seed)?;
 
-        // NOTE: tokio runtime construction has moved to `start_epoch` (§2.1)
-        // and the rayon thread pool to `ensure_decode_pool` (§2.0a). Both are
-        // built lazily, post-fork, so a forked child that constructs its own
+        // NOTE: tokio runtime construction has moved to `start_epoch` and
+        // the rayon thread pool to `ensure_decode_pool`. Both are built
+        // lazily, post-fork, so a forked child that constructs its own
         // pipeline does not inherit any worker threads from the parent.
 
         if profile {
@@ -559,7 +559,7 @@ impl TrainingPipeline {
         }
 
         // Build the per-pipeline rayon pool (lazy, post-fork) before
-        // spawning the decode thread that uses it (§2.0a).
+        // spawning the decode thread that uses it.
         let decode_pool = Arc::clone(self.ensure_decode_pool()?);
 
         let shard_groups = self.shuffler.shuffle_epoch_sorted(&shard_offsets);
@@ -582,7 +582,7 @@ impl TrainingPipeline {
         //    the I/O thread exits, dropping its tokio runtime cleanly.
         //
         // Both stages' ChannelError return values are filtered out as
-        // expected-on-shutdown by `join_epoch_handles` (§2.4) — the chain
+        // expected-on-shutdown by `join_epoch_handles` — the chain
         // only surfaces real errors (panics, ShutdownError, ConfigError).
         // No explicit cancellation token is needed; channel close is the
         // signal.
@@ -594,7 +594,7 @@ impl TrainingPipeline {
         let (batch_tx, batch_rx) = crossbeam_channel::bounded(batch_channel_cap);
 
         // Spawn I/O stage as a dedicated `std::thread` that owns a tokio
-        // current-thread runtime (§2.1, §2.2). The runtime lives only as
+        // current-thread runtime. The runtime lives only as
         // long as the I/O thread, so the `TrainingPipeline` value never
         // holds a long-lived multi-threaded tokio runtime that fork would
         // inherit. `spawn_blocking` inside `io_stage` still works because
@@ -734,7 +734,7 @@ impl TrainingPipeline {
     ///
     /// Drops the batch receiver first to propagate channel-close back through
     /// the decode and I/O threads, then joins each handle with a bounded
-    /// deadline (§2.4). A timed-out join is logged as a warning rather than
+    /// deadline. A timed-out join is logged as a warning rather than
     /// returned as an error — once the consumer has dropped its receivers
     /// the only remaining sin is leaving worker threads alive, and that's a
     /// strictly better outcome than wedging the caller.
@@ -746,7 +746,7 @@ impl TrainingPipeline {
         // requiring a separate abort signal.
         self.batch_rx = None;
 
-        // Join the I/O thread (bounded — see §2.3 / §2.4).
+        // Join the I/O thread (bounded by SHUTDOWN_DEADLINE).
         //
         // ChannelError is treated as Ok on the shutdown path: it means the
         // I/O stage observed its downstream channel closing (because the
@@ -808,8 +808,7 @@ impl TrainingPipeline {
     /// Idempotent — safe to call multiple times. `Drop` calls this
     /// internally, but callers running under PyTorch DataLoader workers
     /// should call this from a `weakref.finalize` hook before interpreter
-    /// teardown so shutdown happens while the GIL state is still healthy
-    /// (§2.6).
+    /// teardown so shutdown happens while the GIL state is still healthy.
     pub fn shutdown(&mut self) {
         let _span =
             tracing::trace_span!("TrainingPipeline::shutdown", pid = std::process::id()).entered();

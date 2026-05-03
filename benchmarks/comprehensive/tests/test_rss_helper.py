@@ -1,11 +1,12 @@
 """
-§2.4 — RSS-reader consolidation.
+RSS-reader consolidation.
 
 Pre-consolidation, seven sites independently re-implemented essentially
 the same ``/proc/self/statm`` reader. This test pins the consolidation
 in place: every benchmark / runner site that needs current RSS must
-route through ``benchmarks.comprehensive.rss.current_rss_mb`` so the
-§2.1 sampler-thread follow-up can land in exactly one file.
+route through ``benchmarks.comprehensive.rss.current_rss_mb`` so any
+future "true peak via sampler thread" upgrade lands in exactly one
+file.
 
 The tests cover:
 
@@ -77,10 +78,10 @@ def test_parallel_write_scaling_worker_script_imports_rss_helper() -> None:
     """The ``_WORKER_SCRIPT`` heredoc must import the canonical helper
     rather than inlining its own ``/proc/self/statm`` body.
 
-    Pre-§2.4 the heredoc carried a stringified copy of the reader that
-    no static analysis or refactor could keep in sync with the runner
-    classes' implementations. Asserting on the script body directly
-    pins this regression closed.
+    Before consolidation, the heredoc carried a stringified copy of the
+    reader that no static analysis or refactor could keep in sync with
+    the runner classes' implementations. Asserting on the script body
+    directly pins this regression closed.
     """
     script = parallel_write_scaling._WORKER_SCRIPT
     assert "from benchmarks.comprehensive.rss import current_rss_mb" in script

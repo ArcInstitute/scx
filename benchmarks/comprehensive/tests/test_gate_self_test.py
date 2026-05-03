@@ -58,7 +58,7 @@ def _row(
     }
     # Omit wall_s_iqr / n_runs entirely when not set so the existing tests
     # exercise the gate's fallback-to-fixed-tolerance path on legacy
-    # baselines that predate the §1.1 schema bump.
+    # baselines that predate the variance-aware tolerance schema bump.
     if wall_iqr is not None:
         out["wall_s_iqr"] = wall_iqr
     if n_runs is not None:
@@ -306,7 +306,7 @@ def test_thresholds_yaml_requires_min_or_max(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §3.7 flakiness ledger.
+# Flakiness ledger.
 # ---------------------------------------------------------------------------
 
 
@@ -571,7 +571,7 @@ def test_flakiness_override_at_or_below_default_warns(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 — variance-aware (IQR-widened) timing tolerance
+# Variance-aware (IQR-widened) timing tolerance
 # ---------------------------------------------------------------------------
 
 
@@ -581,8 +581,8 @@ def test_iqr_widens_marginal_regression_passes(tmp_path: Path) -> None:
     --iqr-k=1.5 ⇒ effective tol = max(0.03, 1.5 * 0.10/1.0) = 0.15;
     7% < 15% ⇒ no regression.
 
-    Without the widening, the same 7% would trip the bare 3% gate (which
-    is exactly the false-positive case §1.1 of the review calls out).
+    Without the widening, the same 7% would trip the bare 3% gate (the
+    false-positive case the variance-aware tolerance was added to fix).
     """
     base = tmp_path / "baseline"
     cur = tmp_path / "current"
@@ -630,9 +630,9 @@ def test_iqr_does_not_mask_real_regression(tmp_path: Path) -> None:
 
 def test_missing_wall_iqr_falls_back_to_fixed_tolerance(tmp_path: Path) -> None:
     """When the baseline summary.json has no ``wall_s_iqr`` (legacy
-    pre-§1.1 capture), the gate falls back to the fixed
-    --timing-tolerance and emits a single WARN. A 5% regression must
-    still fail at the default 3% gate.
+    capture predating the variance-aware tolerance), the gate falls
+    back to the fixed --timing-tolerance and emits a single WARN.
+    A 5% regression must still fail at the default 3% gate.
     """
     base = tmp_path / "baseline"
     cur = tmp_path / "current"
@@ -777,7 +777,7 @@ def test_absolute_floor_max_direction_flags_overrun(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 — schema_version coverage in summary.json
+# schema_version coverage in summary.json
 # ---------------------------------------------------------------------------
 
 
@@ -786,7 +786,8 @@ def _write_summary_with_version(
 ) -> None:
     """Write a minimal summary.json honoring an explicit schema_version.
 
-    ``None`` omits the field entirely (legacy pre-§1.2 baseline shape).
+    ``None`` omits the field entirely (legacy baseline shape from before
+    capture_baseline.py started stamping the field).
     """
     dirpath.mkdir(parents=True, exist_ok=True)
     payload: dict = {
@@ -812,10 +813,9 @@ def test_load_summary_accepts_current_schema(tmp_path: Path) -> None:
 def test_load_summary_rejects_future_schema(tmp_path: Path) -> None:
     """A summary.json stamped with a future SCHEMA_VERSION must refuse.
 
-    This is the §1.2 regression case: capture_baseline.py now stamps
-    summary.json so the gate's future-version refusal branch is reachable
-    on the canonical artefact (previously it was unreachable because
-    summary.json never carried the field).
+    capture_baseline.py stamps summary.json so the gate's future-version
+    refusal branch is reachable on the canonical artefact (previously
+    it was unreachable because summary.json never carried the field).
     """
     from benchmarks.comprehensive.results import SCHEMA_VERSION
 
@@ -826,11 +826,12 @@ def test_load_summary_rejects_future_schema(tmp_path: Path) -> None:
 
 
 def test_load_summary_back_compat_missing_schema(tmp_path: Path) -> None:
-    """Pre-§1.2 promoted baselines omit schema_version — must still load.
+    """Legacy promoted baselines omit schema_version — must still load.
 
-    Promoted baselines captured before this fix do not carry the field.
-    The gate must keep diffing them to avoid orphaning historical
-    baselines committed to the tree.
+    Promoted baselines captured before capture_baseline.py started
+    stamping the field do not carry it. The gate must keep diffing
+    them to avoid orphaning historical baselines committed to the
+    tree.
     """
     mod = _import_gate_module()
     _write_summary_with_version(tmp_path, None)

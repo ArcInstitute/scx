@@ -57,9 +57,9 @@ cudarc = { version = "0.19", features = ["cuda-12020"] }
 # Testing
 proptest = "1"
 
-# Logging (M19 — structured logging across library crates; see §11.6 of the
-# 2026-04-17 code review). `log` is the facade; consumers wire up sinks
-# (env_logger for CLI, pyo3-log for Python).
+# Logging — structured logging across library crates. `log` is the
+# facade; consumers wire up sinks (env_logger for CLI, pyo3-log for
+# Python).
 log = "0.4"
 env_logger = "0.11"
 pyo3-log = "0.12"

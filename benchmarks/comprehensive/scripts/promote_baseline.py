@@ -43,9 +43,9 @@ _REQUIRED_FILES = (
     "MANIFEST.sha256",
     # Per-accelerator BLAKE3 fingerprints. Without this file in the
     # promoted baseline, compare_against_baseline.py's diff_fingerprints
-    # silently degrades to a no-op against the canonical baseline (review
-    # §1.3) — every gate report would say "fingerprint mismatches: 0"
-    # regardless of actual numerical drift on the accel surface.
+    # silently degrades to a no-op against the canonical baseline —
+    # every gate report would say "fingerprint mismatches: 0" regardless
+    # of actual numerical drift on the accel surface.
     "fingerprints/fingerprints.json",
 )
 LATEST_LINK = "LATEST"

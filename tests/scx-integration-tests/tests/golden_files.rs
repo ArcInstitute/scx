@@ -1,7 +1,5 @@
 //! Golden file regression tests for SCX format.
 //!
-//! Phase 0 of the Sprint Regression Baseline (phase3_report.md §0.1–§0.5).
-//!
 //! - The `generate_golden_files` test (#[ignore]) generates 11 golden SCX files,
 //!   JSON sidecars, and a BLAKE3 manifest in `tests/reference_files/`.
 //! - The remaining tests validate those golden files on every `cargo test` run.
@@ -383,7 +381,7 @@ fn scx_path_for(basename: &str) -> PathBuf {
 // Validation tests (always run)
 // ---------------------------------------------------------------------------
 
-/// §0.3(a): `scx validate` passes for every golden file (checksums intact).
+/// `scx validate` passes for every golden file (checksums intact).
 #[test]
 fn test_golden_files_validate() {
     for (basename, _) in load_sidecars() {
@@ -399,7 +397,7 @@ fn test_golden_files_validate() {
     }
 }
 
-/// §0.3(b): CSR arrays match the JSON sidecar exactly (element-by-element).
+/// CSR arrays match the JSON sidecar exactly (element-by-element).
 #[test]
 fn test_golden_files_csr_match() {
     for (basename, sidecar) in load_sidecars() {
@@ -428,7 +426,7 @@ fn test_golden_files_csr_match() {
     }
 }
 
-/// §0.3(c): obs/var metadata matches the sidecar.
+/// obs/var metadata matches the sidecar.
 #[test]
 fn test_golden_files_metadata_match() {
     for (basename, sidecar) in load_sidecars() {
@@ -476,7 +474,7 @@ fn test_golden_files_metadata_match() {
     }
 }
 
-/// §0.5: BLAKE3 hashes in MANIFEST.json match the actual file hashes.
+/// BLAKE3 hashes in MANIFEST.json match the actual file hashes.
 #[test]
 fn test_manifest_hashes() {
     let dir = golden_dir();
@@ -514,10 +512,10 @@ fn test_manifest_hashes() {
 }
 
 // ---------------------------------------------------------------------------
-// Backward compatibility tests (§2G.6)
+// Backward compatibility tests
 // ---------------------------------------------------------------------------
 
-/// §2G.6(b): A reader that only knows codecs 0–2 should reject LZ4+shuffle files
+/// A reader that only knows codecs 0–2 should reject LZ4+shuffle files
 /// with a clear `UnknownCodec` error, not a crash or silent corruption.
 ///
 /// We simulate this by writing an LZ4+shuffle file, then patching the shard header's
@@ -586,11 +584,10 @@ fn test_unknown_codec_rejected_gracefully() {
     );
 }
 
-/// §2G.6(a): Phase 0 golden files (codecs 0–2) must still be readable
-/// after Sprint 2 changes. This is implicitly tested by the above tests
+/// Pre-LZ4 golden files (codecs 0–2) must still be readable after later
+/// codec additions. This is implicitly tested by the above tests
 /// (test_golden_files_validate, test_golden_files_csr_match, etc.) which
-/// run on every `cargo test`. This test explicitly verifies the Phase 0
-/// subset still works.
+/// run on every `cargo test`. This test explicitly verifies that subset.
 #[test]
 fn test_phase0_golden_files_still_readable() {
     let phase0_combinations = vec![

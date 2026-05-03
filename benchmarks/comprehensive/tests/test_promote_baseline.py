@@ -1,5 +1,5 @@
 """
-§1.3 / §1.4 — promote_baseline.py invariants.
+``promote_baseline.py`` invariants.
 
 Hermetic: monkeypatches ``promote_baseline.BASELINES_DIR`` to a tmpdir so
 no real promotion touches ``results/baselines/``. Verifies that:
@@ -10,10 +10,14 @@ no real promotion touches ``results/baselines/``. Verifies that:
     leaves LATEST absent (no symlink, no pointer file).
   * ``promote(..., update_latest=False)`` does NOT clobber a prior
     ``baselines/LATEST → v_old`` — the prior pointer is preserved
-    intact. This is the regression case for §1.4.
+    intact. This is the regression case for the ``--no-latest`` flag,
+    which previously left LATEST broken via a post-hoc unlink.
   * ``promote()`` copies ``fingerprints/fingerprints.json`` into the
     promoted tree and refuses promotion when it's missing — closing
-    the silent ``diff_fingerprints`` no-op called out in §1.3.
+    the silent ``diff_fingerprints`` no-op (without the file in the
+    promoted tree, the gate's per-accelerator fingerprint diff
+    silently degraded to "fingerprint mismatches: 0" regardless of
+    actual numerical drift).
 """
 
 from __future__ import annotations
@@ -76,8 +80,8 @@ def test_no_latest_on_empty_tree_leaves_latest_absent(
 def test_no_latest_preserves_prior_pointer(
     baselines_dir: Path, tmp_path: Path
 ) -> None:
-    """§1.4 regression: backfilling historical baselines must not strip
-    the existing LATEST pointer.
+    """Regression: backfilling historical baselines via --no-latest must
+    not strip the existing LATEST pointer.
 
     Pre-promote v_old so LATEST → v_old/, then promote v_new with
     update_latest=False. LATEST must still point at v_old.
@@ -121,7 +125,7 @@ def test_main_no_latest_flag_routes_through_promote(
 
 
 # ---------------------------------------------------------------------------
-# §1.3 — fingerprints must travel with promoted baselines
+# fingerprints must travel with promoted baselines
 # ---------------------------------------------------------------------------
 
 
@@ -154,7 +158,8 @@ def _import_gate_module():
 
 def test_promote_copies_fingerprints(baselines_dir: Path, tmp_path: Path) -> None:
     """The promoted tree must carry fingerprints/fingerprints.json byte-equal
-    to the snapshot's copy — that's what closes the §1.3 silent no-op."""
+    to the snapshot's copy — that's what makes ``diff_fingerprints``
+    against a canonical baseline non-trivial."""
     snap = _make_snapshot(tmp_path)
     fp_src = snap / "fingerprints" / "fingerprints.json"
     fp_src.write_text(json.dumps(_FINGERPRINT_PAYLOAD))
@@ -172,7 +177,7 @@ def test_promote_fails_when_fingerprints_missing(
     """A snapshot lacking fingerprints/fingerprints.json must be refused.
 
     Otherwise the promoted baseline would silently degrade
-    diff_fingerprints to a no-op (the original §1.3 bug).
+    diff_fingerprints to a no-op.
     """
     snap = _make_snapshot(tmp_path)
     (snap / "fingerprints" / "fingerprints.json").unlink()

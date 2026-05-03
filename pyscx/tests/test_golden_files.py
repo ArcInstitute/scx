@@ -1,7 +1,5 @@
 """Golden file regression tests for SCX format.
 
-Phase 0 of the Sprint Regression Baseline (phase3_report.md §0.4–§0.5).
-
 Reads golden SCX files from tests/reference_files/ and verifies:
   - Checksum validation passes
   - CSR arrays (indptr, indices, data) match JSON sidecars exactly
@@ -47,21 +45,21 @@ class TestGoldenFiles:
     """Validate each golden SCX file against its JSON sidecar."""
 
     def test_validate(self, basename, scx_path, sidecar):
-        """§0.4: All section checksums pass."""
+        """All section checksums pass."""
         exp = pyscx.open(scx_path)
         results = exp.validate()
         for section_name, passed in results:
             assert passed, f"{basename}: checksum failed for section '{section_name}'"
 
     def test_shape_and_nnz(self, basename, scx_path, sidecar):
-        """§0.4: n_obs, n_vars, nnz match expected values."""
+        """n_obs, n_vars, nnz match expected values."""
         exp = pyscx.open(scx_path)
         assert exp.n_obs == sidecar["n_obs"], f"{basename}: n_obs mismatch"
         assert exp.n_vars == sidecar["n_vars"], f"{basename}: n_vars mismatch"
         assert exp.nnz == sidecar["nnz"], f"{basename}: nnz mismatch"
 
     def test_scipy_csr_properties(self, basename, scx_path, sidecar):
-        """§0.4: scipy CSR dtype, shape, and nnz match."""
+        """scipy CSR dtype, shape, and nnz match."""
         adata = pyscx.open(scx_path).to_anndata()
         X = adata.X
 
@@ -70,7 +68,7 @@ class TestGoldenFiles:
         assert X.dtype == np.float32, f"{basename}: X.dtype is {X.dtype}, expected float32"
 
     def test_csr_arrays(self, basename, scx_path, sidecar):
-        """§0.4: indptr, indices, data arrays match sidecar exactly."""
+        """indptr, indices, data arrays match sidecar exactly."""
         adata = pyscx.open(scx_path).to_anndata()
         X = adata.X
 
@@ -91,7 +89,7 @@ class TestGoldenFiles:
         )
 
     def test_metadata(self, basename, scx_path, sidecar):
-        """§0.4: obs and var metadata match sidecar."""
+        """obs and var metadata match sidecar."""
         adata = pyscx.open(scx_path).to_anndata()
 
         assert list(adata.obs["cell_id"]) == sidecar["obs_cell_ids"], (
@@ -106,7 +104,7 @@ class TestGoldenFiles:
 
 
 def test_manifest_hashes():
-    """§0.5: BLAKE3 hashes in MANIFEST.json match actual file hashes."""
+    """BLAKE3 hashes in MANIFEST.json match actual file hashes."""
     try:
         import blake3 as b3
     except ImportError:

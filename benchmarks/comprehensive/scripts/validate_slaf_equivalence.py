@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Correctness Validation: SLAF Round-Trip Equivalence (Phase 5 — §A.5).
+Correctness Validation: SLAF Round-Trip Equivalence.
 
 Converts a dataset through ``h5ad → SLAF → AnnData`` via ``slaf.data.SLAFConverter``
 and ``slaf.integrations.anndata.read_slaf``, then diffs the result against the

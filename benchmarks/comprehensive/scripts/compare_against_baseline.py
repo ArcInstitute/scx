@@ -156,9 +156,9 @@ def _load_summary(path: Path) -> dict[str, Any]:
     if not f.exists():
         raise FileNotFoundError(f"summary.json not found at {f}")
     data = json.loads(f.read_text())
-    # capture_baseline.py stamps summary.json with schema_version since the
-    # §1.2 fix; pre-Phase-X promoted baselines that predate the field omit
-    # it and the check is silently skipped (back-compat). When the field is
+    # capture_baseline.py stamps summary.json with schema_version;
+    # legacy promoted baselines that predate the stamping omit it and
+    # the check is silently skipped (back-compat). When the field is
     # present, refuse to diff against an unknown future version.
     sv = data.get("schema_version")
     if sv is not None:
@@ -277,8 +277,8 @@ def diff_summaries(
                             "baseline summary.json has no wall_s_iqr — "
                             "falling back to fixed --timing-tolerance for "
                             "all median_wall_s rows. Re-capture the baseline "
-                            "with the post-§1.1 capture_baseline.py to enable "
-                            "variance-aware gating."
+                            "with a capture_baseline.py that records "
+                            "wall_s_iqr to enable variance-aware gating."
                         )
                         iqr_missing_warned = True
                 else:
