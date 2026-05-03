@@ -1,8 +1,8 @@
-"""GPU PCA + preprocessing parity tests — Phase 7.1.
+"""GPU PCA + preprocessing parity tests.
 
 Every test in this file is gated on `pyscx.accel.gpu_available()`; on a
 CPU-only host or a build without the `gpu` feature they are silently skipped.
-The covered scenarios follow GPU-ACC-SPEED-UP.md §7.1:
+Covered scenarios:
 
 * GPU covariance PCA vs CPU covariance PCA (cosine ≥ 0.999, top-50)
 * GPU randomized PCA (`qr_method="householder"`) vs CPU randomized PCA at

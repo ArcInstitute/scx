@@ -2,11 +2,9 @@
 """
 Compare a post-change comprehensive benchmark run against the pre-change baseline.
 
-This is the regression gate named in 2026-04-17_CODE-REVIEW.md §12.4:
-
-  "Each PR's acceptance criteria include: all previously-stable benchmarks
-   still within 3% of baseline, and all parity tests pass with unchanged
-   tolerance."
+This is the regression gate. Each PR's acceptance criteria include:
+all previously-stable benchmarks still within 3% of baseline, and all
+parity tests pass with unchanged tolerance.
 
 Given two directories produced by capture_baseline.py, this script reports:
 
@@ -18,7 +16,7 @@ Given two directories produced by capture_baseline.py, this script reports:
     ``--timing-tolerance=0.03`` and ``--iqr-k=1.5``, a row whose baseline
     has IQR/median ≥ 0.02 (i.e. RSD-equivalent) automatically widens; a
     rock-stable row stays at the 3% floor. Falls back to the fixed
-    --timing-tolerance against pre-§1.1 baselines that lack ``wall_s_iqr``.
+    --timing-tolerance against older baselines that lack ``wall_s_iqr``.
   - Peak RSS deltas.  Flagged at --rss-tolerance (default 10%).
   - File size deltas.  Flagged at --size-tolerance (default 1%) — size should
     be byte-stable across non-format-changing PRs.
@@ -230,8 +228,8 @@ def diff_summaries(
     timing tolerance: a ``median_wall_s`` row is gated at
     ``max(timing_tol, iqr_k * baseline_iqr / baseline_median)``. Falls
     back to ``timing_tol`` when the baseline lacks ``wall_s_iqr``
-    (pre-§1.1 captures); a single WARN is logged per gate run noting
-    the missing field. Only affects ``median_wall_s``.
+    (older captures); a single WARN is logged per gate run noting the
+    missing field. Only affects ``median_wall_s``.
     """
     overrides = tolerance_overrides or {}
     cvs = wall_cvs or {}
@@ -267,7 +265,7 @@ def diff_summaries(
 
             # IQR-based noise widening for wall-time only. Other metrics
             # have their own variance treatment (RSS is a single point
-            # sample today — see review §2.1; file size is deterministic).
+            # sample today; file size is deterministic).
             iqr_ratio: float | None = None
             noise_widened = False
             row_default_tol = default_tol

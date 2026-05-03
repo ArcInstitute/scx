@@ -12,8 +12,7 @@
 //! cargo bench -p scx-accel --bench distances -- 'f32'
 //! ```
 //!
-//! Parameter grid per the Phase 4 spec
-//! (`SCX-EVAL-METRIC-IMPROVE.md`):
+//! Parameter grid:
 //!
 //! - `(n_a, n_b) ∈ {(500,500), (2000,2000), (5000,2000), (1000,10000)}`
 //! - `n_dims ∈ {2_000, 18_000}`

@@ -1,5 +1,5 @@
 """
-Leiden clustering accelerator benchmark — Phase 9 of GPU-ACC-SPEED-UP.md.
+Leiden clustering accelerator benchmark.
 
 Same pattern as `accel_pca.py` / `accel_knn.py`. Leiden has three
 backends and pyscx's dispatch priority is Rust-native → cuGraph →

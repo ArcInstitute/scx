@@ -1183,8 +1183,7 @@ pub fn covariance_pca_gpu<S: ShardSource + Sync>(
 /// (streaming randomized SVD via Halko iterations).
 ///
 /// Kept separate from the CPU-side [`COVARIANCE_PCA_THRESHOLD`] (5_000) until
-/// benchmarking confirms whether raising the CPU threshold to 8_000 is safe —
-/// see Phase 2 Decision 1 in `GPU-ACC-SPEED-UP.md`.
+/// benchmarking confirms whether raising the CPU threshold to 8_000 is safe.
 #[cfg(feature = "gpu")]
 pub const GPU_COVARIANCE_PCA_THRESHOLD: usize = 8_000;
 

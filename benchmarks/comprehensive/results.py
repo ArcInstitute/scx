@@ -1,8 +1,7 @@
 """
 Benchmark result schema and JSON writer utilities.
 
-All benchmark results are structured as JSON matching the schema defined in
-COMPREHENSIVE-BENCHMARKING.md §5.3. This module provides:
+This module provides:
 
   - ``BenchmarkResult``: dataclass for a single benchmark result
   - ``write_result()``: write a result to the raw results directory
@@ -106,7 +105,7 @@ class BenchmarkResult:
 
         Used by the gate to widen the per-row timing tolerance: a noisy
         baseline gets a relaxed bound proportional to its own measured
-        dispersion (review §1.1). Returns ``None`` for fewer than 3 runs
+        dispersion. Returns ``None`` for fewer than 3 runs
         — IQR is not reliably estimable and the gate falls back to the
         fixed ``--timing-tolerance``. The n=2 case is specifically
         excluded: ``statistics.quantiles(..., method="exclusive")``

@@ -1,5 +1,5 @@
 """
-GPU / CPU PCA accelerator benchmark — Phase 9.1 of GPU-ACC-SPEED-UP.md.
+GPU / CPU PCA accelerator benchmark.
 
 Reference implementation: first `accel_*` dimension migrated into the
 comprehensive framework. Replaces the standalone
@@ -27,7 +27,7 @@ the "one job per benchmark × dataset pair" model (`AGENTS.md:21`).
 | Wall time per run | standard `BenchmarkResult.runs[i].wall_s` |
 | Peak RSS per run  | standard `peak_rss_mb` |
 | Cosine similarity (min / mean over top-k PCs vs scanpy CPU) | `metadata["cosine_sim_min"]`, `metadata["cosine_sim_mean"]` |
-| Subspace principal-angle cosines (rotation-invariant, §2.5) | `metadata["subspace_cos_min"]`, `metadata["subspace_cos_mean"]`, plus per-run keys in `runs[].extra` for gating |
+| Subspace principal-angle cosines (rotation/permutation/sign invariant) | `metadata["subspace_cos_min"]`, `metadata["subspace_cos_mean"]`, plus per-run keys in `runs[].extra` for gating |
 | n_comps, n_obs, n_vars, density | `metadata` |
 | backend identifier (`adata.uns["pca"]["backend"]`) | `metadata["backend"]` |
 
@@ -200,7 +200,7 @@ def _sign_agnostic_cosine_per_pc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     subspace by construction, so per-PC cosines drop well below 1.0
     even when the *subspace* itself is exact. Use
     ``_subspace_principal_cosines`` for the rotation-invariant
-    correctness gate (review §2.5).
+    correctness metric.
     """
     assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"
     k = a.shape[1]
@@ -217,7 +217,7 @@ def _sign_agnostic_cosine_per_pc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def _subspace_principal_cosines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Cosines of the principal angles between the column-spans of ``a``
-    and ``b`` — review §2.5 rotation-invariant correctness metric.
+    and ``b`` — the rotation-invariant subspace correctness metric.
 
     Given two embeddings of shape (n × k), returns a length-k vector of
     cosines (descending). All k entries equal 1.0 iff the two
@@ -343,9 +343,9 @@ def run(
             cos_min_runs.append(float(np.min(cos)))
             extras["cosine_sim_mean"] = cos_mean_runs[-1]
             extras["cosine_sim_min"] = cos_min_runs[-1]
-            # Rotation/permutation/sign-invariant subspace metric (§2.5).
-            # Catches real correctness regressions on randomized variants
-            # that the per-PC cosine misses by construction.
+            # Rotation/permutation/sign-invariant subspace metric. Catches
+            # real correctness regressions on randomized variants that the
+            # per-PC cosine misses by construction.
             sub = _subspace_principal_cosines(ref_embedding, emb)
             subspace_min_runs.append(float(np.min(sub)))
             subspace_mean_runs.append(float(np.mean(sub)))

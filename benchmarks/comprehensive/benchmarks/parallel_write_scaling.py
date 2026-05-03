@@ -1,5 +1,5 @@
 """
-Parallel Write Scaling benchmark — COMPREHENSIVE-BENCHMARKING.md §3.5.2.
+Parallel Write Scaling benchmark.
 
 Measures how write (h5ad → format conversion) throughput scales with thread
 count. SCX parallelizes shard encoding via rayon, so write speed should
@@ -87,8 +87,8 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         adata = anndata.read_h5ad(h5ad_path)
         codec = runner_params.get("codec", "auto")
 
-    # Single source of truth for RSS sampling — review §2.4 consolidation.
-    # Imported in the subprocess the same way ``make_runner`` is, above.
+    # Imported in the subprocess the same way ``make_runner`` is, above —
+    # the canonical RSS reader for the whole comprehensive suite.
     from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
 
     def do_one_write(out_path):

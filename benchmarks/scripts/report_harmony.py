@@ -7,7 +7,7 @@ Reads every JSON under `benchmarks/results/harmony/runs/`, groups by
     benchmarks/results/harmony/wall_s_vs_N.png
     benchmarks/results/harmony/peak_rss_vs_N.png
 
-Report contents (matching HARMONY2.md §Phase 6 report generation):
+Report contents:
   * Summary table — median `wall_s`, `peak_rss_mb`, `n_iterations`,
     per-PC Pearson r (min across PCs) per (impl x device x dataset).
   * Scaling table — wall + RSS per impl across datasets, with empirical

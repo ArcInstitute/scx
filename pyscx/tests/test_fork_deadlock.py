@@ -1,15 +1,14 @@
-"""Phase 1.2 — pure-multiprocessing fork reproducer for the
-``pyscx.TrainingDataset`` deadlock spec'd in `DEADLOCK-ISSUE.md`.
+"""Pure-multiprocessing fork reproducer for the
+``pyscx.TrainingDataset`` deadlock.
 
 The hypothesis under investigation here is: does a forked child constructing
 and iterating a fresh ``TrainingDataset`` deadlock under bare
 ``multiprocessing.Process(target=..., daemon=False)`` with the default fork
 start method on Linux — independent of PyTorch's ``DataLoader`` queue /
 sentinel machinery? If yes, the root cause is at the pyscx / tokio /
-PyO3 layer (DEADLOCK-ISSUE.md candidates a/b/c/d). If no, the deadlock is
-only triggered under PyTorch's DataLoader (candidate e).
+PyO3 layer. If no, the deadlock is only triggered under PyTorch's DataLoader.
 
-The companion Rust integration test ``test_fork_deadlock.rs`` (Phase 1.1)
+The companion Rust integration test ``test_fork_deadlock.rs``
 already shows that bare ``nix::unistd::fork`` + ``TrainingPipeline``
 iteration in the child does *not* deadlock. This file extends the same
 question one layer up: does adding the Python interpreter, PyO3 binding,
@@ -109,8 +108,7 @@ def _run_in_forked_child(scx_path: str) -> tuple[str, object]:
         pytest.fail(
             "forked child did not finish iterating TrainingDataset within "
             f"{CHILD_TIMEOUT_SEC}s (deadlock reproduces under bare "
-            "multiprocessing.fork — see DEADLOCK-ISSUE.md §1.6 candidates "
-            "a/b/c/d)"
+            "multiprocessing.fork)"
         )
 
     # Read the child's status. If the child crashed before sending, we'll
@@ -166,10 +164,9 @@ def test_forked_child_two_epochs(scx_path: str) -> None:
     """Same as above but exercises a second epoch in the child to cover
     ``start_epoch`` / ``join_epoch_handles`` re-entry under fork.
 
-    `DEADLOCK-ISSUE.md §1.6` candidate (b) (Drop / shutdown race) is
-    distinct from candidate (a) (runtime construction): a steady-state
-    epoch transition stresses different lifecycle paths than the first
-    construction does.
+    The Drop / shutdown race is distinct from runtime construction: a
+    steady-state epoch transition stresses different lifecycle paths than
+    the first construction does.
     """
 
     def child(scx_path: str, conn) -> None:

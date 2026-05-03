@@ -1,4 +1,4 @@
-"""E3: Full Python lifecycle test (Phase2-Step7 §E3)."""
+"""Full Python lifecycle test."""
 
 import numpy as np
 import scipy.sparse as sp

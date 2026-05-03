@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
 # `bench_env` lives under `benchmarks/comprehensive/`, not next to this
 # script; extend sys.path so a fresh clone can resolve the import without
-# needing to mirror the file (DEADLOCK-ISSUE.md §5.4).
+# needing to mirror the file.
 sys.path.insert(0, str(REPO_ROOT / "benchmarks" / "comprehensive"))
 from bench_env import WORK_DIR
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"

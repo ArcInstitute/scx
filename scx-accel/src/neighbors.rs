@@ -21,13 +21,13 @@ use crate::error::{AccelError, Result};
 
 /// kNN backend dispatch threshold: at or below this `n_obs`, `build_knn_graph`
 /// runs an exact-kNN gemm path (faer matmul + per-row partial top-k sort)
-/// instead of HNSW. The trade-off is the same matmul-vs-tree call Phase 1 of
-/// `SCX-EVAL-METRIC-IMPROVE.md` made for `edistance`: at small `n_obs` the
-/// matmul wins because (a) HNSW build is O(n × ef_construction × n_dims) with
-/// scalar inner products in `instant-distance`, while (b) the gemm runs at
-/// AVX2/AVX-512 GEMM throughput. Above ~5K rows HNSW's asymptotic edge starts
-/// to dominate. Tuned against the Replogle clustering_agreement regression
-/// (n_obs ≈ 2.4K, n_dims ≈ 18K) — see Phase 6 of the spec for the analysis.
+/// instead of HNSW. The same matmul-vs-tree trade-off as `edistance`: at
+/// small `n_obs` the matmul wins because (a) HNSW build is
+/// O(n × ef_construction × n_dims) with scalar inner products in
+/// `instant-distance`, while (b) the gemm runs at AVX2/AVX-512 GEMM
+/// throughput. Above ~5K rows HNSW's asymptotic edge starts to dominate.
+/// Tuned against the Replogle clustering_agreement regression
+/// (n_obs ≈ 2.4K, n_dims ≈ 18K).
 const EXACT_KNN_NOBS_THRESHOLD: usize = 5_000;
 
 // ---------------------------------------------------------------------------
@@ -134,10 +134,10 @@ pub fn build_knn_graph(
     }
 
     // Dispatch: exact gemm-based kNN at small `n_obs`, HNSW above the
-    // threshold. See `EXACT_KNN_NOBS_THRESHOLD` doc and Phase 6 of
-    // `SCX-EVAL-METRIC-IMPROVE.md`. Both branches produce the same
-    // `(indices, distances)` flat arrays of length `n_obs * n_neighbors`,
-    // so the downstream CSR + connectivity assembly is shared.
+    // threshold (see `EXACT_KNN_NOBS_THRESHOLD`). Both branches produce
+    // the same `(indices, distances)` flat arrays of length
+    // `n_obs * n_neighbors`, so the downstream CSR + connectivity
+    // assembly is shared.
     let (indices, distances) = if n_obs <= EXACT_KNN_NOBS_THRESHOLD {
         log::debug!("build_knn_graph: exact path (n_obs={n_obs} <= {EXACT_KNN_NOBS_THRESHOLD})");
         build_knn_exact(data, n_obs, n_vars, n_neighbors)

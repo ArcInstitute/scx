@@ -2,7 +2,7 @@
 Generate markdown summary tables from raw benchmark JSON results.
 
 Reads from benchmarks/comprehensive/results/raw/ and produces formatted
-markdown tables for each benchmark dimension (§6.1 of COMPREHENSIVE-BENCHMARKING.md).
+markdown tables for each benchmark dimension.
 """
 
 from __future__ import annotations

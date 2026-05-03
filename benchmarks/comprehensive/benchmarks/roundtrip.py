@@ -1,5 +1,5 @@
 """
-Codec write→read round-trip parity (§3.5 of 2026-04-29_SCX-BENCH-REVIEW.md).
+Codec write→read round-trip parity.
 
 Compares the SCX-materialised matrix against the original h5ad source to
 detect silent value-corruption regressions in any of the SCX codecs:

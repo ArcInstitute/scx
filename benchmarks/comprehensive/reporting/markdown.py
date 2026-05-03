@@ -1,10 +1,9 @@
 """
 Assemble the final comprehensive benchmark report as markdown and PDF.
 
-Follows §6.3 structure from COMPREHENSIVE-BENCHMARKING.md. Pulls data from
-both raw JSON results (via tables.py) and hardcoded benchmark data from the
-spec document for sections not covered by the automated pipeline (GPU, lazy
-preprocessing, accelerators).
+Pulls data from both raw JSON results (via tables.py) and hardcoded
+historical numbers for sections not covered by the automated pipeline
+(GPU, lazy preprocessing, accelerators).
 
 Output:
   - benchmarks/comprehensive/results/reports/BENCHMARK_REPORT.md

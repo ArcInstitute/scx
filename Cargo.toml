@@ -34,7 +34,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "io-util"]
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 
-# HDF5 — see Phase1.md note on crate risk
+# HDF5 — `hdf5-rust` is unmaintained upstream; only used for h5ad
+# conversion. Fallback path is a Python subprocess via h5py.
 hdf5 = "0.8"
 
 half = "2"
@@ -63,7 +64,7 @@ log = "0.4"
 env_logger = "0.11"
 pyo3-log = "0.12"
 
-# Tracing (Phase-1 deadlock diagnostics — see DEADLOCK-ISSUE.md §1.4).
+# Tracing for deadlock diagnostics in the loader pipeline.
 # Off by default; enable via `RUST_LOG=trace` with a subscriber wired up.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

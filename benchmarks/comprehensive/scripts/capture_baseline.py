@@ -3,10 +3,9 @@
 Capture a regression benchmark snapshot into
 benchmarks/comprehensive/results/<name>/ (default <name>: baseline_2026_04_17).
 
-This implements step 2 of the "Systemic Mitigation Strategy" in
-2026-04-17_CODE-REVIEW.md (§12.4).  The initial baseline is captured once;
-every subsequent PR captures its own snapshot into a separately-named
-directory and runs compare_against_baseline.py to diff them.
+The initial baseline is captured once; every subsequent PR captures
+its own snapshot into a separately-named directory and runs
+compare_against_baseline.py to diff them.
 
 Snapshots live in a gitignored directory tree — distinguish runs by the
 --name flag, not by git branch.  Conventional names:

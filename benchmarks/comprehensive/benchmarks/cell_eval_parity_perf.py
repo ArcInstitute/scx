@@ -358,9 +358,8 @@ def run(
     # ── energy_distance: 4 (backend × dtype) combinations ──────────────
     #
     # SCX's energy_distance kernel is generic over `backend ∈ {"scalar",
-    # "gemm"}` and `dtype ∈ {"f32", "f64"}` (Phase 1 + Phase 2 of
-    # SCX-EVAL-METRIC-IMPROVE.md). The cell-eval reference is the same
-    # cold ce_edistance call regardless of the SCX combo. Keep the
+    # "gemm"}` and `dtype ∈ {"f32", "f64"}`. The cell-eval reference is
+    # the same cold ce_edistance call regardless of the SCX combo. Keep the
     # legacy ``energy_distance`` op as an alias for the slowest combo
     # (scalar+f64) so historical numbers in summaries stay comparable;
     # ``energy_distance_blas_f32`` is the new default headline.

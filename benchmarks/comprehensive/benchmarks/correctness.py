@@ -1,5 +1,5 @@
 """
-Correctness Validation Suite — COMPREHENSIVE-BENCHMARKING.md §3.14.
+Correctness Validation Suite.
 
 Integrates the three validation scripts into the benchmark module system
 used by run_all.py. Runs:

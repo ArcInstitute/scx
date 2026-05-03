@@ -1,4 +1,4 @@
-//! Phase 6.1 — integration tests for `scx_loader::IndexPlanLoader`.
+//! Integration tests for `scx_loader::IndexPlanLoader`.
 //!
 //! Covers:
 //! - `process_plan` shape correctness (HVG on/off).
@@ -6,8 +6,6 @@
 //! - Empty plan + out-of-range index error paths.
 //! - sort_by_shard: pairs/rows alignment + same-plan-different-order parity.
 //! - `scatter_pair_rows` end-to-end via process_plan (HVG path).
-//!
-//! Specs in `PER-CELL-CONTROL-PAIRING.md` "Tests > Rust unit tests".
 
 mod common;
 

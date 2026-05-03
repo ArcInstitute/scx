@@ -1,8 +1,8 @@
-"""Phase 1.3 — PyTorch DataLoader fork-mode reproducer for the
-``pyscx.TrainingDataset`` deadlock spec'd in `DEADLOCK-ISSUE.md`.
+"""PyTorch DataLoader fork-mode reproducer for the
+``pyscx.TrainingDataset`` deadlock.
 
-Layered with the Phase 1.1 (pure-Rust fork) and Phase 1.2 (bare
-``multiprocessing.Process`` fork) reproducers, this is the actual failing
+Layered with the pure-Rust fork and bare ``multiprocessing.Process``
+fork reproducers, this is the actual failing
 case from ``state-scx/tests/test_se_scx_adapter.py::test_worker_sharding_partitions_files``:
 ``torch.utils.data.DataLoader(IterableDataset, num_workers=2,
 persistent_workers=False)`` with the lazy-construct-in-``__iter__`` shim
@@ -162,8 +162,7 @@ def _run_with_outer_timeout(
             proc.join(timeout=2.0)
         pytest.fail(
             f"DataLoader(num_workers={num_workers}) did not finish iterating "
-            f"within {TEST_TIMEOUT_SEC}s (deadlock reproduces — see "
-            "DEADLOCK-ISSUE.md §1.6)"
+            f"within {TEST_TIMEOUT_SEC}s (deadlock reproduces)"
         )
 
     if not parent_conn.poll(0.0):

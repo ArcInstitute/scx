@@ -1,7 +1,6 @@
 // File operations Python bindings
 //
 // Wraps scx-ops (append, mark_deleted, compact, rollback, merge) for Python.
-// See Phase2-Step7.md §C1–C8 for design details.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};

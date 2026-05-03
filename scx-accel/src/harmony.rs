@@ -4,8 +4,8 @@
 //! soft k-means clustering + ridge regression. Reference: Korsunsky et al.
 //!
 //! This module is a clean-room implementation derived solely from the
-//! published algorithm description in HARMONY2.md — no code is ported from
-//! harmonypy (GPL-3.0) or the R harmony package.
+//! published Harmony2 algorithm description (Korsunsky et al. 2019) — no
+//! code is ported from harmonypy (GPL-3.0) or the R harmony package.
 
 // The algorithm is index-heavy (cluster × cell × batch × PC loops), where
 // iterator adapters hurt rather than help readability. Allow the pattern.
@@ -991,10 +991,10 @@ fn check_convergence_kmeans(objectives: &[f64], window: usize, epsilon: f64) -> 
 }
 
 /// Harmony convergence check — signed numerator. Convergence fires only
-/// when the objective is *decreasing* (HARMONY2.md:191-195: "If the
-/// objective increases, the ratio is negative and convergence is not
-/// triggered."). That constraint implies the ratio must be non-negative
-/// AND below epsilon, i.e. small improvement.
+/// when the objective is *decreasing*: if the objective increases, the
+/// ratio is negative and convergence is not triggered. That constraint
+/// implies the ratio must be non-negative AND below epsilon, i.e. small
+/// improvement.
 fn check_convergence_harmony(objectives: &[f64], epsilon: f64) -> bool {
     if objectives.len() < 2 {
         return false;
@@ -1370,9 +1370,9 @@ impl HarmonyState {
 
             // Compute per-Harmony objective after correction (recompute R
             // from corrected embeddings first to keep the objective in sync
-            // with the corrected state — HARMONY2.md pseudocode computes
-            // the objective at the clustering step; we track the last
-            // k-means sub-iteration objective, which reflects current R).
+            // with the corrected state — the published Harmony2 pseudocode
+            // computes the objective at the clustering step; we track the
+            // last k-means sub-iteration objective, which reflects current R).
             if let Some(&last) = self.objective_kmeans.last() {
                 self.objective_harmony.push(last);
             }

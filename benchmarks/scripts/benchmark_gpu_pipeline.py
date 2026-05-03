@@ -274,7 +274,7 @@ def run_pipeline_benchmark(dataset_name: str = "census_1m",
     `normalize_total`/`log1p`/`highly_variable_genes` separately on both CPU
     and GPU baselines — this exposes the preprocessing cost that would
     otherwise be hidden inside the CPU baseline's "load preprocessed data"
-    step (see Phase 7.2 in GPU-ACC-SPEED-UP.md).
+    step.
 
     With `pca_variants=True`, sweeps `gpu_cov_pca`, `gpu_randomized_pca_chol`,
     and `gpu_randomized_pca_householder` timings on the GPU side and records

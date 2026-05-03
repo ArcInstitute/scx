@@ -1,19 +1,15 @@
 """
 Single source of truth for resident-set-size sampling in the comprehensive
-benchmark suite (review §2.4).
+benchmark suite.
 
-Pre-consolidation, seven different sites reimplemented essentially the same
-``/proc/self/statm``-based reader (with subtle drift — some fell back to
-``ru_maxrss``, others returned ``0.0`` on failure, the
-``parallel_write_scaling`` worker script even inlined a stringified copy
-inside its ``textwrap.dedent`` heredoc). This module is the one place that
-implementation lives. All six benchmark / runner sites now delegate to
-``current_rss_mb()``; the worker subprocess imports it the same way it
-imports the rest of ``benchmarks.comprehensive``.
+Every benchmark and runner that needs current RSS imports
+``current_rss_mb()`` from here — no inlined ``/proc/self/statm`` reads
+elsewhere. The ``parallel_write_scaling`` worker subprocess imports it
+the same way it imports the rest of ``benchmarks.comprehensive``.
 
-Consolidating here also lets the §2.1 follow-up (true peak via a 100 ms
-sampler thread, currently a TODO in ``runners/base.py::timed_run``) land
-in one place rather than seven.
+Centralising here also keeps a future "true peak via sampler thread"
+upgrade to ``runners/base.py::timed_run`` confined to one file rather
+than spread across the call sites.
 """
 
 from __future__ import annotations
@@ -36,8 +32,7 @@ def current_rss_mb() -> float:
     Non-Linux / read-failure: fall back to
     ``getrusage(RUSAGE_SELF).ru_maxrss / 1024.0``. The high-water mark
     is a coarser quantity than instantaneous RSS, but it's better than
-    silently returning ``0.0`` (one of the pre-consolidation drift
-    points called out in §2.4).
+    silently returning ``0.0``.
     """
     try:
         with open("/proc/self/statm") as f:

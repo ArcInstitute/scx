@@ -1,5 +1,5 @@
 """
-Read Performance (Full File Load) benchmark — COMPREHENSIVE-BENCHMARKING.md §3.3.
+Read Performance (Full File Load) benchmark.
 
 Measures wall-clock time and peak RSS for reading an entire expression matrix
 into an in-memory CSR, across all format variants.

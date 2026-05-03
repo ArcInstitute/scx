@@ -1,8 +1,7 @@
 """
 Generate publication-quality plots from raw benchmark JSON results.
 
-All charts from §6.2 of COMPREHENSIVE-BENCHMARKING.md. Outputs PNG + PDF to
-benchmarks/comprehensive/results/reports/figures/.
+Outputs PNG + PDF to benchmarks/comprehensive/results/reports/figures/.
 
 Requires: matplotlib, seaborn, numpy.
 """
@@ -465,10 +464,10 @@ def plot_memory_scaling(output_dir: Path | None = None):
 # ---------------------------------------------------------------------------
 
 def plot_lazy_vs_materialized_rss(output_dir: Path | None = None):
-    """Bar chart: lazy vs materialized memory comparison from COMPREHENSIVE-BENCHMARKING.md data."""
+    """Bar chart: lazy vs materialized memory comparison (historical baseline data)."""
     _setup_style()
 
-    # Data from §Lazy Preprocessing Benchmarks in COMPREHENSIVE-BENCHMARKING.md
+    # Historical lazy-preprocessing baseline numbers.
     operations = [
         "Lazy preprocess\n(normalize+log1p)",
         "Full pipeline\n(open→Leiden)",
@@ -509,7 +508,7 @@ def plot_column_projection_latency(output_dir: Path | None = None):
     """Bar chart: projected vs unprojected aggregation latency."""
     _setup_style()
 
-    # Data from COMPREHENSIVE-BENCHMARKING.md
+    # Historical column-projection latency baseline (census_1m).
     modes = ["Unprojected\n(61K genes)", "Projected\n(500 genes)"]
     latency = [25.2, 46.8]
     colors = ["#1f77b4", "#ff7f0e"]
@@ -538,10 +537,10 @@ def plot_ooc_pipeline_rss(output_dir: Path | None = None):
     """Stacked bar chart: per-stage RSS for the out-of-core pipeline."""
     _setup_style()
 
-    # Per-stage data from COMPREHENSIVE-BENCHMARKING.md (census_1m, Phase 4e)
+    # Historical per-stage RSS baseline (census_1m).
     stages = ["normalize\n+log1p", "HVG", "PCA", "kNN", "UMAP", "Leiden", "DE"]
 
-    # Out-of-core pipeline times (census_1m, Phase 4e)
+    # Out-of-core pipeline times (census_1m).
     ooc_times = [4.80, 39.39, 18.25, 108.17, 668.66, 2938.54, 193.16]
     scanpy_times = [54.82, 72.62, 8.65, 119.26, 827.95, 2830.84, 92.90]
 
@@ -727,7 +726,7 @@ def plot_accelerator_speedup(output_dir: Path | None = None):
     """Grouped bar chart: SCX vs scanpy per-stage speedup."""
     _setup_style()
 
-    # Data from Phase 5 / Phase 4e results in COMPREHENSIVE-BENCHMARKING.md
+    # Historical accelerator vs. scanpy baseline numbers.
     # tabula_sapiens_100k (100K cells)
     stages_100k = ["PCA", "kNN", "UMAP", "Leiden", "DE"]
     scx_100k = [4.49, 21.86, 47.20, 3.95, 3.58]
@@ -790,8 +789,7 @@ def plot_pipeline_comparison(output_dir: Path | None = None):
     """Stacked bar chart: pipeline total time broken down by stage."""
     _setup_style()
 
-    # Phase 4e data from COMPREHENSIVE-BENCHMARKING.md
-    # tabula_sapiens_100k
+    # Historical out-of-core pipeline baseline (tabula_sapiens_100k).
     stages = ["normalize+log1p", "HVG", "PCA", "kNN", "UMAP", "Leiden", "DE"]
     pipelines_100k = {
         "SCX out-of-core": [0.84, 5.39, 4.49, 21.86, 47.20, 3.95, 3.58],
@@ -862,7 +860,7 @@ def plot_streaming_preprocess_memory(output_dir: Path | None = None):
     """Bar chart: OOC pipeline peak RSS vs scanpy for different datasets."""
     _setup_style()
 
-    # Data from COMPREHENSIVE-BENCHMARKING.md
+    # Historical fragment-ops baseline numbers.
     datasets_names = ["tabula_100k\n(100K)", "census_1m\n(1M)"]
 
     # Phase 4e data

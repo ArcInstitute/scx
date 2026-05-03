@@ -1,10 +1,10 @@
-"""Phase 4 fork-safety acceptance test for ``pyscx.TrainingDataset``.
+"""Fork-safety acceptance test for ``pyscx.TrainingDataset``.
 
-This is the durable regression test mandated by `DEADLOCK-ISSUE.md` Phase 4.
-Phase 1.2 / 1.3's diagnostic reproducers (`test_fork_deadlock*.py`) confirmed
-the deadlock under bare ``multiprocessing.Process`` and (when ``torch`` is
-installed) under ``torch.utils.data.DataLoader``. Those tests still serve as
-narrow probes. **This** test pins the post-fix contract end-to-end: a real
+The diagnostic reproducers (`test_fork_deadlock*.py`) confirmed the
+historical deadlock under bare ``multiprocessing.Process`` and (when
+``torch`` is installed) under ``torch.utils.data.DataLoader``. Those
+tests still serve as narrow probes. **This** test pins the post-fix
+contract end-to-end: a real
 ``DataLoader(num_workers=2)`` driving the lazy-construct-in-``__iter__``
 shim that ``cell-load-scx`` and ``state-scx`` use, asserting every cell
 index appears exactly once across all worker processes.
@@ -257,7 +257,7 @@ def _run_outer_process(
         pytest.fail(
             f"DataLoader(start_method={start_method!r}, num_workers={num_workers}, "
             f"persistent_workers={persistent_workers}, n_epochs={n_epochs}) did not "
-            f"finish within {TEST_DEADLINE_SEC}s — see DEADLOCK-ISSUE.md Phase 2"
+            f"finish within {TEST_DEADLINE_SEC}s — fork-safety regression"
         )
 
     if not parent_conn.poll(0.0):
@@ -451,7 +451,7 @@ def test_fork_index_plan_dataset(fixture_paths: list[str]) -> None:
             proc.join(timeout=2.0)
         pytest.fail(
             f"IndexPlanDataset child did not finish within {TEST_DEADLINE_SEC}s "
-            "(fork-mode hang — see DEADLOCK-ISSUE.md §7.1/7.2)"
+            "(fork-mode hang — IndexPlanDataset fork-safety regression)"
         )
 
     if not parent_conn.poll(0.0):

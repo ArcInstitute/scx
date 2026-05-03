@@ -146,17 +146,14 @@ absolute_floors:
     metric: obs_var_dims_match_int
     min: 1
 
-  # ─── Phase 9 accelerator thresholds ──────────────────────────────────
+  # ─── Accelerator thresholds ─────────────────────────────────────────
   #
-  # Gate the `pyscx.accel.*` surface migrated into the comprehensive
-  # framework (Phase 9 of GPU-ACC-SPEED-UP.md). Supersedes (once
-  # Phase-8 stopgap deprecated) the hard-floor table in
-  # `benchmarks/scripts/gpu_regression_diff.py::apply_hard_floors`.
-  # Floors are tight for CORRECTNESS (cosine sim, ARI, Jaccard) and
-  # loose for TIMING (we only gate "not catastrophically regressed").
-  # Correctness is measured against scanpy / leidenalg references
-  # inside each `accel_*.py` module and stored in the run's `extra`
-  # dict — see the module docstrings for metric keys.
+  # Gate the `pyscx.accel.*` surface routed through the comprehensive
+  # framework. Floors are tight for CORRECTNESS (cosine sim, ARI,
+  # Jaccard) and loose for TIMING (we only gate "not catastrophically
+  # regressed"). Correctness is measured against scanpy / leidenalg
+  # references inside each `accel_*.py` module and stored in the run's
+  # `extra` dict — see the module docstrings for metric keys.
 
   # --- accel_pca: correctness vs scanpy ---
   - benchmark: accel_pca
@@ -187,7 +184,7 @@ absolute_floors:
   # the basis rotation/permutation/sign that defeats per-PC cosine.
   # Both metrics are kept: cosine_sim_mean for backward continuity with
   # promoted baselines, subspace_cos_min for the real correctness
-  # contract (review §2.5).
+  # contract.
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k
@@ -218,7 +215,7 @@ absolute_floors:
     dataset: census_1m
     metric: cosine_sim_mean
     min: 0.75
-  # --- accel_pca: rotation-invariant subspace floors (§2.5) ---
+  # --- accel_pca: rotation-invariant subspace floors ---
   # ``subspace_cos_min`` is the smallest principal-angle cosine between
   # the candidate and scanpy reference column-spans. By construction:
   #   * 1.0 iff the two k-dim subspaces coincide (any basis rotation,
@@ -387,12 +384,12 @@ absolute_floors:
     metric: batches_per_sec__hvg_norm
     min: 10.0
 
-  # `num_workers > 0` floors (DEADLOCK-ISSUE.md §5.3). Activated post
-  # Phase-2 — pre-fix this path deadlocked, so no historical baseline
-  # exists. Floors are seeded conservatively at 0.0 (any non-zero
-  # throughput is an improvement over an infinite hang) and will be
-  # re-baselined to 0.5× the post-fix median by Phase 5.5
-  # (`promote_baseline.py --version v0.X.Y-fork-safety`). Once that
+  # `num_workers > 0` floors. Activated after the fork-safety fix —
+  # pre-fix this path deadlocked, so no historical baseline exists.
+  # Floors are seeded conservatively at 0.0 (any non-zero throughput is
+  # an improvement over an infinite hang) and will be re-baselined to
+  # 0.5× the post-fix median by a future
+  # `promote_baseline.py --version v0.X.Y-fork-safety`. Once that
   # baseline lands, replace `min: 0.0` with the calibrated floors and
   # write a justification under
   # `benchmarks/comprehensive/results/justifications/`.
@@ -407,8 +404,8 @@ absolute_floors:
     metric: batches_per_sec__pyscx_training_dataset_workers2_persistent
     min: 680.8
 
-  # DEADLOCK-ISSUE.md §7.4 — IndexPlanDataset workers2 floor. Same
-  # 0.5×-of-post-fix-median convention as the workers2 entries above.
+  # IndexPlanDataset workers2 floor — same 0.5×-of-post-fix-median
+  # convention as the workers2 entries above.
   # Calibrated 2026-05-01 from SLURM job 113080 (Lambda HPC, H100, 100k
   # synthetic fixture): median workers2 throughput 144.64 bps; floor =
   # 0.5 × 144.64 ≈ 72.3 bps. Workers2 is ~0.36× workers0 (404.4 bps) —
@@ -680,8 +677,8 @@ absolute_floors:
     max: 8.5
 
   # --- index_plan throughput floors -----------------------------------
-  # Phase 7.4 (PER-CELL-CONTROL-PAIRING.md). Floors set at 0.5x of the
-  # 1M-cell synthetic-fixture medians captured during Phase 7.2 on
+  # Floors set at 0.5x of the 1M-cell synthetic-fixture medians
+  # captured on
   # vci-steady-state-node-020 (Lambda HPC, --cpus-per-task=16
   # --mem=64G, --partition=standard). 1M x 2K x 5% density x HVG=2000 x
   # 1024 pairs/batch x 1000 batches. Source JSONs:

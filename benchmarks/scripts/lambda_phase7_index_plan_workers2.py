@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Phase 7.4 GPU benchmark: pyscx_index_plan_dataset_workers2 on Lambda HPC.
+"""GPU benchmark: pyscx_index_plan_dataset_workers2 on Lambda HPC.
 
 Self-contained — generates a synthetic 100 000-cell × 2 000-gene fixture
-(matches the `tabula_sapiens_100k` benchmark scale) and runs the new
-`IndexPlanDataset` workers2 scenario from DEADLOCK-ISSUE.md §7.4 against
-it. Captures per-scenario median throughput, peak RSS, and cells-per-sec
-into a JSON file.
+(matches the `tabula_sapiens_100k` benchmark scale) and runs the
+`IndexPlanDataset` workers2 scenario against it. Captures per-scenario
+median throughput, peak RSS, and cells-per-sec into a JSON file.
 
 Mirrors `lambda_phase5_workers2.py` (which targets the TrainingDataset
 workers2 scenarios) but for the IndexPlanDataset path.

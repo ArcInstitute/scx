@@ -328,8 +328,8 @@ class FormatRunner(ABC):
 
     @staticmethod
     def _get_rss_mb() -> float:
-        """Back-compat shim — delegates to ``benchmarks.comprehensive.rss``
-        (review §2.4 consolidation)."""
+        """Back-compat shim — delegates to
+        ``benchmarks.comprehensive.rss.current_rss_mb``."""
         return current_rss_mb()
 
     @staticmethod

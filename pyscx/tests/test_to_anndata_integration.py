@@ -1,4 +1,4 @@
-"""Tests for improved to_anndata() integration (Phase4 Step 5).
+"""Tests for ``to_anndata()`` integration.
 
 Validates:
 - var_names: gene projection at load time

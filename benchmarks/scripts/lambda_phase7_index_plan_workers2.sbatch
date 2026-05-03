@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Phase 7.4 GPU benchmark on Lambda HPC.
+# GPU benchmark on Lambda HPC.
 #
-# Runs the new `pyscx_index_plan_dataset_workers2` scenario from
-# DEADLOCK-ISSUE.md §7.4 against a synthetic 100k-cell fixture, alongside
-# a `num_workers=0` reference for direct comparison. Captures throughput
-# / cells-per-sec / peak RSS into a JSON file under
-# `benchmarks/comprehensive/results/`.
+# Runs the `pyscx_index_plan_dataset_workers2` scenario against a
+# synthetic 100k-cell fixture, alongside a `num_workers=0` reference for
+# direct comparison. Captures throughput / cells-per-sec / peak RSS into
+# a JSON file under `benchmarks/comprehensive/results/`.
 #
 # Usage:
 #     sbatch benchmarks/scripts/lambda_phase7_index_plan_workers2.sbatch

@@ -1,5 +1,5 @@
 """
-Write Performance (Conversion) benchmark -- COMPREHENSIVE-BENCHMARKING.md S3.2.
+Write Performance (Conversion) benchmark.
 
 Measures h5ad -> format conversion: wall time, peak RSS, output size,
 and write throughput for each format variant.

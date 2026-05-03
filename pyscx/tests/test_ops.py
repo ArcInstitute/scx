@@ -1,4 +1,4 @@
-"""E2: File operations integration tests (Phase2-Step7 §E2)."""
+"""File operations integration tests."""
 
 import numpy as np
 import pytest

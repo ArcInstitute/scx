@@ -5,7 +5,7 @@
 // without materializing the full matrix.
 //
 // Lives in pyscx because it depends on both scx-format and scx-engine,
-// which cannot depend on each other. See Phase4-ACC-ALL.md §3.2.
+// which cannot depend on each other.
 
 use scx_engine::projection::project_csr;
 use scx_format::BackedCsrReader;

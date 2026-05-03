@@ -1,4 +1,4 @@
-"""F1: ScxDataModule integration tests (Phase2-Step7 §F1)."""
+"""ScxDataModule integration tests."""
 
 import pytest
 

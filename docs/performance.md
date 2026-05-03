@@ -272,11 +272,11 @@ Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are
 
 ¹ The cell-eval reference's `sklearn.metrics.pairwise_distances` path allocates an O(N²) distance matrix per perturbation and runs ~18 s/pert × 49 perts at 100K already (941 s/run observed); ≥ 500K would take hours for the reference alone. SCX's fused-gemm Rust kernel remains feasible at 1M+ — kernel-level scaling is tracked by the standalone criterion microbench at `scx-accel/benches/distances.rs`.
 
-² Phase 1 + Phase 2 of `SCX-EVAL-METRIC-IMPROVE.md` introduced `backend ∈ {"scalar", "gemm"}` and `dtype ∈ {"f32", "f64"}` kwargs on `pyscx.accel.energy_distance`. Default is `backend="auto"` (gemm for euclidean / cosine, scalar for L1) and `dtype="f32"`. The four combinations are now reported as separate ops in `cell_eval_parity_perf.py`; the legacy `energy_distance` op alias preserves the `scalar + f64` (slowest) numbers for back-compat with historical baselines. Stand-alone matmul-vs-scalar speedup at 102K × 2K × 50 is 3.72× (scalar f64: 121.2 s vs gemm f64: 32.6 s); f32 vs f64 at 204K × 1K × 50 is 2.24×. Combined the headline `gemm + f32` cuts ~7 s of cell-eval-side reference wall to a few hundred ms of SCX-side wall — speedup ratio is reference-bound, so the absolute SCX time is the more useful number for scaling decisions.
+² `pyscx.accel.energy_distance` exposes `backend ∈ {"scalar", "gemm"}` and `dtype ∈ {"f32", "f64"}` kwargs. Default is `backend="auto"` (gemm for euclidean / cosine, scalar for L1) and `dtype="f32"`. The four combinations are reported as separate ops in `cell_eval_parity_perf.py`; the legacy `energy_distance` op alias preserves the `scalar + f64` (slowest) numbers for back-compat with historical baselines. Stand-alone matmul-vs-scalar speedup at 102K × 2K × 50 is 3.72× (scalar f64: 121.2 s vs gemm f64: 32.6 s); f32 vs f64 at 204K × 1K × 50 is 2.24×. Combined, the headline `gemm + f32` cuts ~7 s of cell-eval-side reference wall to a few hundred ms of SCX-side wall — speedup ratio is reference-bound, so the absolute SCX time is the more useful number for scaling decisions.
 
-³ Phase 3 of `SCX-EVAL-METRIC-IMPROVE.md` replaced the scanpy `pp.neighbors` + `tl.leiden` calls inside `clustering_agreement` with native-Rust `scx_accel::neighbors::build_knn_graph` + `scx_accel::leiden`, runnable under `py.allow_threads`. End-to-end on a synthetic n_perts=200 (10K cells × 300 genes), SCX takes 229 ms vs 2942 ms for the cell-eval scanpy reference (12.83× speedup; AMI score within 0.019 of the reference at `atol=0.15`). Speedup ratio varies with the centroid graph's modular structure — at small n_perts the Rust-native Leiden's RB-modularity tie-break can pick a different number of communities than scanpy's `flavor="igraph"`; the parity test was bumped from `n_perts=8 → 30` because at n_perts ≥ 16 the algorithms agree exactly on the test scaffolding. The 3.0× number at 20K cells × 50 perts is dominated by Leiden iteration count on a 49-node centroid graph; speedup grows with both centroid count and per-centroid embedding dimension.
+³ The scanpy `pp.neighbors` + `tl.leiden` path inside `clustering_agreement` was replaced with native-Rust `scx_accel::neighbors::build_knn_graph` + `scx_accel::leiden`, runnable under `py.allow_threads`. End-to-end on a synthetic n_perts=200 (10K cells × 300 genes), SCX takes 229 ms vs 2942 ms for the cell-eval scanpy reference (12.83× speedup; AMI score within 0.019 of the reference at `atol=0.15`). Speedup ratio varies with the centroid graph's modular structure — at small n_perts the Rust-native Leiden's RB-modularity tie-break can pick a different number of communities than scanpy's `flavor="igraph"`; the parity test was bumped from `n_perts=8 → 30` because at n_perts ≥ 16 the algorithms agree exactly on the test scaffolding. The 3.0× number at 20K cells × 50 perts is dominated by Leiden iteration count on a 49-node centroid graph; speedup grows with both centroid count and per-centroid embedding dimension.
 
-⁴ The 20K column was captured as part of Phase 4 sign-off (`SCX-EVAL-METRIC-IMPROVE.md`) on 2026-04-27 with the post-Phase-3 native-Rust code path; the 100K / 500K / 1M columns are pre-Phase-1 measurements preserved as historical baselines for back-compat trending. New `energy_distance_*` ops are exercised at the 20K size since the cell-eval reference's O(N²) work makes the larger sizes infeasible for it (see footnote ¹). Re-running the comprehensive parity-perf suite at 100K–1M with the gemm + f32 default is queued as a follow-up SLURM job.
+⁴ The 20K column was captured on 2026-04-27 with the native-Rust `clustering_agreement` code path; the 100K / 500K / 1M columns are earlier measurements preserved as historical baselines for back-compat trending. New `energy_distance_*` ops are exercised at the 20K size since the cell-eval reference's O(N²) work makes the larger sizes infeasible for it (see footnote ¹). Re-running the comprehensive parity-perf suite at 100K–1M with the gemm + f32 default is queued as a follow-up SLURM job.
 
 Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of arc-bench's tight NumPy column-access loop and is not currently a speedup target.
 
@@ -431,7 +431,7 @@ SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 other workloads where each batch is a list of `(perturbed_cell, control_cell)`
 pairs. It consumes a Python iterator of plans, gathers rows via the cached
 `BackedCsrReader`, and yields paired dense `{X, X_paired, pairs, obs, obs_paired}`
-batches. Spec: [`PER-CELL-CONTROL-PAIRING.md`](../PER-CELL-CONTROL-PAIRING.md).
+batches.
 
 **1M-cell synthetic fixture** (Lambda HPC, `vci-steady-state-node-020`,
 `--cpus-per-task=16 --mem=64G`; 1M × 2K × 5%-density × 8 nnz/row × HVG=2000 ×
@@ -500,16 +500,15 @@ throughput, and the regression gate. Numbers below come from live
 benchmark runs on a Chimera CPU node against
 `gs://arc-ctc-nextflow/scx-test/` across all four primary cloud
 formats (SCX, Zarr v3, TileDB-SOMA, SLAF). See `docs/cloud.md` for
-cloud-specific operational notes. The original post-ship known-issues
-register (`PHASE5-FINISH.md`) is resolved: the zarr `cloud_read`
-decompression failure (KI.1, a fixture-upload race — fixed with
-fcntl-serialized uploads + BLAKE3 sidecars), the SLAF cloud-path
-probe failure (KI.2, missing `smart_open[gcs]` dep — fixed by
-pinning `google-cloud-storage` in `scx-bench-slaf.yml`), and the
-missing selective-predicate coverage (KI.3, no `n_counts` obs column
-on the staged h5ads — fixed by `benchmarks/scripts/augment_obs_n_counts.py`
-populating `obs["n_counts"] = X.sum(axis=1)` during dataset prep)
-are all closed.
+cloud-specific operational notes. The original post-ship known issues
+are all resolved: the zarr `cloud_read` decompression failure (a
+fixture-upload race — fixed with fcntl-serialized uploads + BLAKE3
+sidecars), the SLAF cloud-path probe failure (missing
+`smart_open[gcs]` dep — fixed by pinning `google-cloud-storage` in
+`scx-bench-slaf.yml`), and the missing selective-predicate coverage
+(no `n_counts` obs column on the staged h5ads — fixed by
+`benchmarks/scripts/augment_obs_n_counts.py` populating
+`obs["n_counts"] = X.sum(axis=1)` during dataset prep).
 
 ### SLAF parity
 

@@ -183,7 +183,7 @@ pub fn forbp_encode(
 }
 
 // ---------------------------------------------------------------------------
-// Batch bit-unpacking (Option A from IMPROVE-FULL-READ.md §1)
+// Batch bit-unpacking
 // ---------------------------------------------------------------------------
 
 /// Bulk-extract `count` fixed-width integers from a packed byte stream.

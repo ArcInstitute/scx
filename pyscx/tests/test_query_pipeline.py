@@ -1,4 +1,4 @@
-"""E1: Query pipeline integration tests (Phase2-Step7 §E1)."""
+"""Query pipeline integration tests."""
 
 import numpy as np
 import pytest

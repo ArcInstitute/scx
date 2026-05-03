@@ -1,5 +1,5 @@
 """
-GPU / CPU UMAP accelerator benchmark — Phase 9 of GPU-ACC-SPEED-UP.md.
+GPU / CPU UMAP accelerator benchmark.
 
 Follows the `accel_pca.py` / `accel_knn.py` pattern. UMAP requires a
 precomputed kNN graph; this module ensures one is built per fixture

@@ -1,5 +1,5 @@
 """
-Memory Efficiency benchmark — COMPREHENSIVE-BENCHMARKING.md SS3.7.
+Memory Efficiency benchmark.
 
 Measures current RSS (not cumulative peak) before and after key operations
 to quantify per-operation memory overhead across all format variants.

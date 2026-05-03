@@ -1,4 +1,4 @@
-"""Tests for __mul__ interception — Fix for §2.1 of IMPLEMENT-GAPS.md.
+"""Tests for __mul__ interception on ``ScxLazyTransformedDataset``.
 
 Verifies that `ScxLazyTransformedDataset.__mul__()` detects per-row scaling
 vectors and returns a lazy `ScxLazyTransformedDataset` with a `RowScale`

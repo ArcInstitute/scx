@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Phase 5 GPU benchmark: pyscx_training_dataset_workers2 + workers2_persistent
+"""GPU benchmark: pyscx_training_dataset_workers2 + workers2_persistent
 on Lambda HPC.
 
-Self-contained — generates a synthetic 100k-cell × 2k-gene fixture (matches
-the ``tabula_sapiens_100k`` benchmark scale) and runs the new ml_loader
-scenarios from DEADLOCK-ISSUE.md §5.3 against it. Captures per-scenario
+Self-contained — generates a synthetic 100k-cell × 2k-gene fixture
+(matches the ``tabula_sapiens_100k`` benchmark scale) and runs the
+``num_workers > 0`` ml_loader scenarios against it. Captures per-scenario
 median throughput, peak RSS, and cells-per-sec into a JSON file.
 
 This bypasses the full Chimera-tuned `gate_candidate.py` orchestration
 (which targets the `cpu_preemptible` partition that does not exist on
-Lambda) and runs the new num_workers > 0 scenario directly. The Chimera
+Lambda) and runs the num_workers > 0 scenario directly. The Chimera
 gate covers comparison-to-baseline; this script covers the post-fix
-verification step that was the actual ask of Phase 5.
+verification step.
 
 Usage::
 

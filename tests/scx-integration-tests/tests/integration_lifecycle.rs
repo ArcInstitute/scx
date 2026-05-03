@@ -2,8 +2,6 @@
 //!
 //! Exercises the full contract across crate boundaries:
 //!   scx-format (write/read) → scx-ops (append/delete/compact/merge) → scx-engine (query)
-//!
-//! Addresses code review §7.1: "No Workspace-Level Integration Tests".
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
