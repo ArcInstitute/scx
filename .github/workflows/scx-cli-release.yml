@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: scx-cli-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -32,6 +36,8 @@ jobs:
             runner: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,7 +61,7 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Build (release, hdf5-static + cloud)
-        run: cargo build -p scx-cli --release --features hdf5-static,cloud --target ${{ matrix.target }}
+        run: cargo build -p scx-cli --release --locked --features hdf5-static,cloud --target ${{ matrix.target }}
 
       - name: Strip binary
         shell: bash
