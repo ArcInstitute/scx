@@ -477,6 +477,90 @@ impl BackedCsrReader {
         concatenate_csr(&ordered, self.n_vars)
     }
 
+    /// Read specific row indices, invoking `scatter` once per row with
+    /// zero-copy `(indices, data)` views into the decoded shard.
+    ///
+    /// For each request `rows[i]`, calls `scatter(i, indices, data)` where
+    /// `(indices, data)` are slices into the cached shard's CSR for that row.
+    /// Each touched shard is decoded once via the LRU cache; scatter calls
+    /// fire in shard-grouped (sorted-by-row) order, but the `i` argument is
+    /// the original position in `rows`, so callers can write to a dense
+    /// output buffer indexed by request order.
+    ///
+    /// Allocates no intermediate `ScxCsr` and does no per-row `row_slice`
+    /// — the per-shard request sub-slice is found via binary search on the
+    /// shard ranges (O(R log S) total grouping cost), avoiding the
+    /// `read_row_indices` inner-scan pattern. Use this for dense-gather
+    /// hot paths (ML training, paired-batch readers) where the consumer
+    /// owns the dense output. Callers that need a `ScxCsr` (scipy interop)
+    /// should keep using [`Self::read_row_indices`].
+    ///
+    /// `rows` may contain duplicates; each occurrence triggers one
+    /// `scatter` call. Empty `rows` is a no-op.
+    ///
+    /// **Out-of-range semantics differ from [`Self::read_row_indices`]**:
+    /// `read_row_indices` filters via `shards_for_indices` and silently
+    /// drops rows that fall outside every shard, whereas `read_rows_with`
+    /// walks shards directly and returns an error on the first row outside
+    /// any shard range. Callers that need silent-skip semantics must
+    /// pre-filter `rows`.
+    pub fn read_rows_with<F>(&self, rows: &[u64], mut scatter: F) -> Result<()>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        // (row, orig_pos) sorted by row so duplicates / requests for the
+        // same shard are contiguous and the shard decode happens once.
+        let mut sorted_pairs: Vec<(u64, usize)> =
+            rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        sorted_pairs.sort_by_key(|&(r, _)| r);
+
+        // Walk by shard. partition_point finds each shard's request
+        // sub-slice in O(log R) instead of the O(R) inner scan that
+        // `read_row_indices` does for every touched shard.
+        let mut start = 0;
+        while start < sorted_pairs.len() {
+            let row = sorted_pairs[start].0;
+            let shard_idx = self.index.shard_for_row(row).ok_or_else(|| {
+                ScxError::Io(std::io::Error::other(format!(
+                    "row index {row} out of range (n_obs={})",
+                    self.n_obs
+                )))
+            })?;
+            let (s_start, s_end) =
+                self.index
+                    .shard_range(shard_idx)
+                    .ok_or(ScxError::ShardIndexOutOfBounds {
+                        index: shard_idx,
+                        count: self.index.n_shards(),
+                    })?;
+
+            // First request index in `sorted_pairs` whose row >= s_end.
+            let group_len = sorted_pairs[start..].partition_point(|&(r, _)| r < s_end);
+            let end = start + group_len;
+
+            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
+
+            for &(row, orig_pos) in &sorted_pairs[start..end] {
+                let local = (row - s_start) as usize;
+                let lo = shard_csr.indptr[local] as usize;
+                let hi = shard_csr.indptr[local + 1] as usize;
+                scatter(
+                    orig_pos,
+                    &shard_csr.indices[lo..hi],
+                    &shard_csr.data[lo..hi],
+                )?;
+            }
+
+            start = end;
+        }
+
+        Ok(())
+    }
+
     /// Read all rows — materializes the full matrix.
     ///
     /// Used by `to_memory()` on the Python side.
@@ -1497,6 +1581,95 @@ mod tests {
 
         let result = backed.read_row_indices(&[]).unwrap();
         assert_eq!(result.n_rows(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // BackedCsrReader::read_rows_with tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: gather rows via `read_rows_with` into per-request `(indices,
+    /// data)` clones in caller order.
+    fn gather_with(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+        backed
+            .read_rows_with(rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn test_read_rows_with_matches_read_row_indices_scattered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+        let indices = [0u64, 5, 11];
+        let dense = gather_with(&backed, &indices);
+
+        for (i, &row) in indices.iter().enumerate() {
+            let expected = full.row_slice(row as usize, row as usize + 1).unwrap();
+            assert_eq!(dense[i].0, expected.indices, "row {row} indices");
+            assert_eq!(dense[i].1, expected.data, "row {row} data");
+        }
+    }
+
+    #[test]
+    fn test_read_rows_with_empty_no_scatter_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+        let mut count = 0;
+        backed
+            .read_rows_with(&[], |_, _, _| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_read_rows_with_duplicates_call_scatter_per_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+        // Same row twice; scatter must fire twice with identical content.
+        let indices = [3u64, 3];
+        let dense = gather_with(&backed, &indices);
+
+        let expected = full.row_slice(3, 4).unwrap();
+        assert_eq!(dense[0].0, expected.indices);
+        assert_eq!(dense[0].1, expected.data);
+        assert_eq!(dense[1].0, expected.indices);
+        assert_eq!(dense[1].1, expected.data);
+    }
+
+    #[test]
+    fn test_read_rows_with_unsorted_caller_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+        // Mixed shard order — the public scatter callback receives `i`
+        // matching the input position, regardless of internal sort.
+        let indices = [11u64, 0, 7, 4, 3];
+        let dense = gather_with(&backed, &indices);
+
+        for (i, &row) in indices.iter().enumerate() {
+            let expected = full.row_slice(row as usize, row as usize + 1).unwrap();
+            assert_eq!(dense[i].0, expected.indices, "i={i} row={row} indices");
+            assert_eq!(dense[i].1, expected.data, "i={i} row={row} data");
+        }
+    }
+
+    #[test]
+    fn test_read_rows_with_out_of_range_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+        let result = backed.read_rows_with(&[5, 99], |_, _, _| Ok(()));
+        assert!(result.is_err(), "OOR row should surface as error");
     }
 
     // -----------------------------------------------------------------------

@@ -459,11 +459,31 @@ flexibility.
 | Phase 3 — vectorised pair scatter | 1.07–1.08× | CPU-bound microbench, scale-independent |
 | Phase 4 — lookahead 0→4 | **1.04×** | small but consistent at 1M scale |
 | Phase 4 — lookahead 4→8 | 0.98× | beyond 4 doesn't help on this fixture |
+| Phase 5 — zero-allocation dense gather | **1.36×** | tabula_sapiens_100k A/B, see below |
 
 Phase 2 and Phase 4 deltas are scale-dependent — they should grow once the
 fixture exceeds RAM and shard-cache misses start dominating wall time. The
 default `lookahead=4` is justified by the 1M result; `cache_shards=128` is
 the more important lever.
+
+**Phase 5 — zero-allocation dense gather** (tabula_sapiens_100k, HVG=2000,
+1024 pairs/batch × 300 batches, page-cache warm; A/B on Chimera CPU node).
+Replaces the `read_row_indices` → per-row `ScxCsr` → `concatenate_csr`
+pipeline with `BackedCsrReader::read_rows_with`, which scatters directly
+from the LRU-cached shard into the dense output (no per-row CSR allocation,
+no final concatenate). Per-shard request grouping uses `partition_point`
+(O(log R) per shard) instead of the old O(R) inner scan.
+
+| Scenario | before (b850e36^) | after (b850e36) | speedup |
+|---|---|---|---|
+| `pyscx_index_plan_random` | 19.42 batches/s | 26.47 batches/s | **1.36×** |
+| `pyscx_index_plan_locality` | 21.38 batches/s | 29.01 batches/s | **1.36×** |
+
+Peak RSS unchanged (~3.8 GB, dominated by HVG-projected output buffers).
+The 1M-cell numbers in the table above predate this change and will refresh
+on the next baseline capture. `read_row_indices` is unchanged — pyscx
+scipy-interop callers in `pyscx/src/backed.rs` and `lazy_transform.rs`
+that need a `ScxCsr` return shape continue to use it.
 
 Comprehensive-suite module: `benchmarks/comprehensive/benchmarks/index_plan.py`
 (SCX-only, gated on `scx_auto`). Run via

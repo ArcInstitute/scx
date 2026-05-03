@@ -171,7 +171,7 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 - [x] scVI DataModule integration (obs covariates in batch)
 - [ ] scGPT DataModule integration — **DEFERRED**
 - [x] Configurable memory budget (`max_loader_memory_mb`)
-- [x] Per-cell control pairing — `pyscx.IndexPlanDataset` (sibling row-source for perturbation training, contrastive learning, donor-matched designs). Plan-driven paired-batch reads via consumer-supplied `(pert_idx, ctrl_idx)` plan iterators; reuses `BackedCsrReader::read_row_indices` + `HvgProjection::scatter_pair_rows` + `fused_normalize_log1p_dense`. Memory-budget auto-tune surfaces `effective_lookahead()` / `effective_cache_shards()`. **106× faster than the cell-load-scx `ScxBackedSparseDataset` Python-loop baseline at 1M cells** (20K vs 189 cells/s). See [`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
+- [x] Per-cell control pairing — `pyscx.IndexPlanDataset` (sibling row-source for perturbation training, contrastive learning, donor-matched designs). Plan-driven paired-batch reads via consumer-supplied `(pert_idx, ctrl_idx)` plan iterators; built on `BackedCsrReader::read_rows_with` (zero-allocation dense gather) + `HvgProjection::scatter_row` + `fused_normalize_log1p_dense`. Memory-budget auto-tune surfaces `effective_lookahead()` / `effective_cache_shards()`. **106× faster than the cell-load-scx `ScxBackedSparseDataset` Python-loop baseline at 1M cells** (20K vs 189 cells/s). See [`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
 
 ### 2.2 scx-engine (query)
 - [x] Lazy pipeline builder: `open → filter → select → collect`

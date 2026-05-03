@@ -725,17 +725,43 @@ performance currently under regression governance:
 | **I/O — bulk and projected reads, writes** | `write`, `read_full`, `read_selective` |
 | **Parallel scaling** | `parallel_scaling`, `parallel_write_scaling` |
 | **Memory** | `memory` |
+| **ML training loader (sequential)** | `ml_loader` |
+| **Plan-driven paired reads (perturbation training)** | `index_plan` |
 | **SCX-only fragment / manifest ops** | `fragment_ops` |
+| **Correctness parity (scanpy / backed / preprocessing)** | `correctness` |
+| **Codec round-trip parity** | `roundtrip` |
+| **Cell-eval / arc-bench parity perf** | `cell_eval_parity_perf` |
 | **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
 | **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
 
-That is 22 benchmarks across 7 distinct domains, each expanded across the
+That is 27 benchmarks across 11 distinct domains, each expanded across the
 relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
 plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
 and the tier's dataset list (pbmc3k → census_10m). The canonical list
 lives in [`benchmarks/comprehensive/benchmarks/__init__.py::ALL_BENCHMARKS`](comprehensive/benchmarks/__init__.py).
 Adding a new benchmark to the suite is a one-line edit there — every
-gate run picks it up automatically.
+capture run picks it up automatically.
+
+> **Capture vs gate coverage are not the same.** The capture phase runs
+> every entry in `ALL_BENCHMARKS`. The gate phase only flags regressions
+> on rows that exist in the chosen baseline. Inspect what your baseline
+> actually contains with:
+>
+> ```bash
+> .venv/bin/python -c "import json; \
+>     keys=set(k.split('__')[0] for k in \
+>         json.load(open('benchmarks/comprehensive/results/baselines/LATEST/summary.json'))['rows']); \
+>     print(sorted(keys))"
+> ```
+>
+> The current `LATEST` symlink points at `v0.6.0-gpu-phase1-7-multidataset`,
+> which is **accel-only** (60 rows: `accel_hvg / knn / leiden / pca /
+> preprocess / umap`). Format / cloud / `ml_loader` / `index_plan` /
+> `correctness` / `roundtrip` / `cell_eval_parity_perf` benchmarks
+> capture cleanly but produce no gate signal against this baseline. The
+> earlier `v0.6.0-gpu-phase1-7` baseline (577 rows) covers format +
+> cloud + `ml_loader` + accel — pin it via `--baseline` for full-surface
+> gating until the next multi-surface baseline is promoted as `LATEST`.
 
 **`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
 peer of `gate_candidate.py`. It exclusively drives
@@ -874,6 +900,43 @@ disappeared-benchmark flagging.
 Exit codes: `0` = pass, `1` = unjustified regression / floor violation /
 fingerprint mismatch, `2` = baseline or current directory missing or no
 canonical baseline promoted yet.
+
+### Ad-hoc A/B for a single benchmark (no baseline rows yet)
+
+When the benchmark you care about isn't in `LATEST` (e.g. `index_plan` and
+`ml_loader` against the current accel-only baseline), the gate produces
+no signal. Use a manual A/B instead — capture the metric on both branches
+and diff. Two pitfalls show up reliably:
+
+1. **Page-cache state dominates the first run.** A 2-3 GB SCX file that
+   isn't in `/proc/sys/vm/drop_caches` makes the first run 3× slower than
+   the second. Always do an untimed warm-up read before timing, and run
+   the same scenarios on both branches in alternating order so neither
+   branch gets the cold-cache run. The two-batch warm-up loop in the
+   benchmark module's `_run_index_plan` (`benchmarks/comprehensive/benchmarks/index_plan.py`)
+   is the pattern to copy for ad-hoc scripts.
+2. **Wheel state must match the checkout.** `maturin develop --release`
+   leaves the previously-built `.so` installed if you only `git checkout`
+   the source. Rebuild after every checkout — both the format crate and
+   any pyscx changes have to land in the wheel before the python harness
+   sees them. A safe template:
+
+   ```bash
+   # On candidate branch
+   (cd pyscx && ../.venv/bin/maturin develop --release)
+   .venv/bin/python my_bench.py --label after  > after.json
+
+   # Switch and rebuild — DO NOT skip the rebuild
+   git checkout <baseline-sha>
+   (cd pyscx && ../.venv/bin/maturin develop --release)
+   .venv/bin/python my_bench.py --label before > before.json
+
+   # Rebuild back to head when done so the working tree's .so matches HEAD
+   git checkout -
+   (cd pyscx && ../.venv/bin/maturin develop --release)
+   ```
+
+   Run each side at least twice (after a warm-up); take the second number.
 
 ### Promoting a canonical baseline
 
