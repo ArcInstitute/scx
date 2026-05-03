@@ -40,8 +40,8 @@ benchmarks/comprehensive/results/reports/dashboard_history.json
 **/fuzz/target/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+**/fuzz/Cargo.lock
 **/*.rs.bk
-Cargo.lock
 **/debug/
 rscx/tests/testthat/fixtures/
 
