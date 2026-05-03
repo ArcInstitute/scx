@@ -123,6 +123,7 @@ TIERS = {
 }
 
 from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS
+from benchmarks.comprehensive.results import SCHEMA_VERSION
 
 # Canonical benchmark list lives in benchmarks/__init__.py::ALL_BENCHMARKS.
 # Alias kept for compatibility with callers that import BENCHMARKS.
@@ -567,6 +568,7 @@ def main() -> int:
         )
         (baseline_dir / "summary.json").write_text(json.dumps(
             {
+                "schema_version": SCHEMA_VERSION,
                 "snapshot_name": args.name,
                 "tier": args.tier,
                 "datasets": tier_cfg["datasets"],

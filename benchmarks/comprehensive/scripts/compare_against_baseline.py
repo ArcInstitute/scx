@@ -158,9 +158,10 @@ def _load_summary(path: Path) -> dict[str, Any]:
     if not f.exists():
         raise FileNotFoundError(f"summary.json not found at {f}")
     data = json.loads(f.read_text())
-    # summary.json itself doesn't carry schema_version today — the shape
-    # stabilized pre-Phase-5. Raw per-run JSONs DO carry schema_version now;
-    # refuse to diff when we detect an unknown future version.
+    # capture_baseline.py stamps summary.json with schema_version since the
+    # §1.2 fix; pre-Phase-X promoted baselines that predate the field omit
+    # it and the check is silently skipped (back-compat). When the field is
+    # present, refuse to diff against an unknown future version.
     sv = data.get("schema_version")
     if sv is not None:
         try:

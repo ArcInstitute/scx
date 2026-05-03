@@ -774,3 +774,65 @@ def test_absolute_floor_max_direction_flags_overrun(tmp_path: Path) -> None:
         "runs": [{"extra": {"wall_s": 3.0}}, {"extra": {"wall_s": 4.0}}],
     }))
     assert mod.check_absolute_floors(tmp_path, floors) == []
+
+
+# ---------------------------------------------------------------------------
+# §1.2 — schema_version coverage in summary.json
+# ---------------------------------------------------------------------------
+
+
+def _write_summary_with_version(
+    dirpath: Path, schema_version: int | None
+) -> None:
+    """Write a minimal summary.json honoring an explicit schema_version.
+
+    ``None`` omits the field entirely (legacy pre-§1.2 baseline shape).
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    payload: dict = {
+        "snapshot_name": dirpath.name,
+        "tier": "small",
+        "rows": {},
+    }
+    if schema_version is not None:
+        payload["schema_version"] = schema_version
+    (dirpath / "summary.json").write_text(json.dumps(payload))
+
+
+def test_load_summary_accepts_current_schema(tmp_path: Path) -> None:
+    """A summary.json stamped with the current SCHEMA_VERSION loads."""
+    from benchmarks.comprehensive.results import SCHEMA_VERSION
+
+    mod = _import_gate_module()
+    _write_summary_with_version(tmp_path, SCHEMA_VERSION)
+    data = mod._load_summary(tmp_path)
+    assert data["schema_version"] == SCHEMA_VERSION
+
+
+def test_load_summary_rejects_future_schema(tmp_path: Path) -> None:
+    """A summary.json stamped with a future SCHEMA_VERSION must refuse.
+
+    This is the §1.2 regression case: capture_baseline.py now stamps
+    summary.json so the gate's future-version refusal branch is reachable
+    on the canonical artefact (previously it was unreachable because
+    summary.json never carried the field).
+    """
+    from benchmarks.comprehensive.results import SCHEMA_VERSION
+
+    mod = _import_gate_module()
+    _write_summary_with_version(tmp_path, SCHEMA_VERSION + 1)
+    with pytest.raises(ValueError, match="schema_version"):
+        mod._load_summary(tmp_path)
+
+
+def test_load_summary_back_compat_missing_schema(tmp_path: Path) -> None:
+    """Pre-§1.2 promoted baselines omit schema_version — must still load.
+
+    Promoted baselines captured before this fix do not carry the field.
+    The gate must keep diffing them to avoid orphaning historical
+    baselines committed to the tree.
+    """
+    mod = _import_gate_module()
+    _write_summary_with_version(tmp_path, None)
+    data = mod._load_summary(tmp_path)
+    assert "schema_version" not in data
