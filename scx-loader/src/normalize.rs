@@ -73,6 +73,18 @@ pub fn fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
 /// Single dispatch point shared by `TrainingDataset` (`decode_stage.rs`)
 /// and `IndexPlanDataset` (`index_plan.rs`) so both honour all four
 /// `(normalize, log1p)` combinations identically.
+///
+/// `LoaderConfig::validate()` rejects non-positive `target_sum` at the
+/// pipeline boundary, but the helper itself does not consult `target_sum`
+/// when `normalize == false` — callers that disable normalization may
+/// pass any value (e.g. `0.0`) without affecting the output.
+///
+/// # Arguments
+/// - `row`: Dense row of f32 values to transform in-place.
+/// - `normalize`: Whether to apply total-count normalization.
+/// - `log1p`: Whether to apply `ln(x + 1)` element-wise.
+/// - `target_sum`: Target sum for normalization (ignored if `normalize` is false).
+#[inline]
 pub fn apply_dense_transforms(row: &mut [f32], normalize: bool, log1p: bool, target_sum: f64) {
     match (normalize, log1p) {
         (true, true) => fused_normalize_log1p_dense(row, target_sum),
