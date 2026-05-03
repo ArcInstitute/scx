@@ -133,9 +133,22 @@ pub fn open_loader_normalized(
     sort_by_shard: bool,
     target_sum: f64,
 ) -> IndexPlanLoader {
+    open_loader_with_flags(path, true, true, target_sum, sort_by_shard)
+}
+
+/// Build an `IndexPlanLoader` with arbitrary `(normalize, log1p)` flags.
+/// Lets per-test parity checks exercise all four combinations through the
+/// public `process_plan` surface without per-test config boilerplate.
+pub fn open_loader_with_flags(
+    path: &std::path::Path,
+    normalize: bool,
+    log1p: bool,
+    target_sum: f64,
+    sort_by_shard: bool,
+) -> IndexPlanLoader {
     let mut config = LoaderConfig::default();
-    config.normalize = true;
-    config.log1p = true;
+    config.normalize = normalize;
+    config.log1p = log1p;
     config.target_sum = target_sum;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;

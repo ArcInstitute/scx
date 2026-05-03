@@ -462,8 +462,76 @@ class TestNormalizeLog1p:
             )
 
     def test_no_normalize_returns_raw(self, scx_path, synthetic_adata):
-        ds = pyscx.IndexPlanDataset(scx_path, normalize=False, sort_by_shard=False)
+        # `log1p=False` is required to actually get raw output — the
+        # default `log1p=True` is now honoured independently of
+        # `normalize` (was silently ignored before the fix).
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, sort_by_shard=False
+        )
         b = ds._next_batch_for_test([(7, 42)])
         dense = _dense_from_adata(synthetic_adata)
         np.testing.assert_array_equal(b["X"][0], dense[7])
         np.testing.assert_array_equal(b["X_paired"][0], dense[42])
+
+    def test_normalize_only_matches_manual(self, scx_path, synthetic_adata):
+        """`normalize=True, log1p=False` — row-sum scaling, no log1p.
+
+        Regression test for the bug where `IndexPlanLoader` always called
+        the fused `normalize+log1p` primitive whenever `normalize=True`,
+        silently applying log1p the caller did not request.
+        """
+        target_sum = 1e4
+        ds = pyscx.IndexPlanDataset(
+            scx_path,
+            normalize=True,
+            log1p=False,
+            target_sum=target_sum,
+            sort_by_shard=False,
+        )
+        plan = [(0, 1), (50, 99)]
+        b = ds._next_batch_for_test(plan)
+
+        dense = _dense_from_adata(synthetic_adata)
+
+        def manual(row):
+            v = row.astype(np.float64)
+            s = v.sum()
+            if s > 0:
+                v = v * (target_sum / s)
+            return v.astype(np.float32)
+
+        for i, (p, c) in enumerate(plan):
+            np.testing.assert_allclose(
+                b["X"][i], manual(dense[p]), rtol=1e-5, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                b["X_paired"][i], manual(dense[c]), rtol=1e-5, atol=1e-6
+            )
+
+    def test_log1p_only_matches_manual(self, scx_path, synthetic_adata):
+        """`normalize=False, log1p=True` — `ln(1+raw)` per element.
+
+        Regression test for the state-scx ST default. The pre-fix
+        `IndexPlanLoader` skipped the transform entirely when
+        `normalize=False`, returning raw rows.
+        """
+        ds = pyscx.IndexPlanDataset(
+            scx_path,
+            normalize=False,
+            log1p=True,
+            sort_by_shard=False,
+        )
+        plan = [(0, 1), (50, 99)]
+        b = ds._next_batch_for_test(plan)
+
+        dense = _dense_from_adata(synthetic_adata)
+
+        for i, (p, c) in enumerate(plan):
+            np.testing.assert_allclose(
+                b["X"][i], np.log1p(dense[p]).astype(np.float32),
+                rtol=1e-5, atol=1e-6,
+            )
+            np.testing.assert_allclose(
+                b["X_paired"][i], np.log1p(dense[c]).astype(np.float32),
+                rtol=1e-5, atol=1e-6,
+            )
