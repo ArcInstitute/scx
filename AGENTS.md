@@ -179,6 +179,31 @@ See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
 ## Coding Conventions
 
+### Documentation in tracked files
+
+Tracked files (code, tests, docs, configs, READMEs) MUST NOT reference
+gitignored markdown documents. In this repo those live at the workspace
+root and under `tasks/` — typically ALL-CAPS or date-prefixed names like
+`*_CODE-REVIEW.md`, `Phase*.md`, `SPEC*.md`, `GPU-ACC-SPEED-UP.md`,
+`HARMONY2.md`, `DEADLOCK-ISSUE.md`, `PER-CELL-CONTROL-PAIRING.md`,
+`SCX-EVAL-METRIC-IMPROVE.md`, etc. They are scratch/working specs and
+do not ship with the repository.
+
+Concretely, in any tracked file, do not:
+
+- Link to a gitignored doc (`[X.md](X.md)`, `see X.md §3`, `(per X.md)`).
+- Cite a "review §1.4" / "Phase 7.2 of X.md" / "spec target (X.md:1037)".
+- Carry inline `// TODO: see X.md` markers pointing at gitignored specs.
+
+Tracked documentation must stand alone. When the gitignored doc carried
+load-bearing context, **inline the substance** (a sentence or two of the
+why / how) into the tracked file instead of citing. When the citation
+was decorative, just delete it.
+
+Cross-references between tracked files (`docs/*.md`, `benchmarks/README.md`,
+`ROADMAP.md`, `AGENTS.md`/`CLAUDE.md`, generated reports under
+`benchmarks/comprehensive/results/reports/`) are fine — they ship together.
+
 ### Serialization
 
 - Do NOT use `#[repr(C)]` for on-disk structs. Serialize field-by-field with `byteorder::WriteBytesExt`/`ReadBytesExt` (little-endian).
