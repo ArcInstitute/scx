@@ -161,21 +161,6 @@ Triple-buffered Rust pipeline (tokio I/O -> rayon decode -> Python consumer). Ze
 
 See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
-| Area | Metric | Result |
-|------|--------|--------|
-| Read | vs Zarr lz4, 1M cells | **1.38x faster** |
-| Read | vs SLAF, 1M cells | **19.3x faster** |
-| Read | Parallel read scaling (32 threads) | **Up to 7x** |
-| Write | Parallel write scaling (32 threads) | **Up to 3.2x** |
-| Column projection | vs all competitors | **4-8x faster** |
-| Memory (OOC pipeline) | Peak RSS, 1M cells | **5.1 GB** (88% reduction) |
-| PCA | vs scanpy, 1M cells (HVG) | **1.9x faster** (4.2s) |
-| DE (Wilcoxon) | vs scanpy, 1M cells | **3.2x faster** (5.4s) |
-| Leiden | vs Python leidenalg, 1M cells | **40x faster** (55s) |
-| Training loader | batches/sec, 1M cells | **1,405** (82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader) |
-| GPU kNN | vs CPU, 1M cells | **9.4x faster** |
-| GPU UMAP | vs CPU, 1M cells | **7.7x faster** |
-| GPU Leiden | vs CPU, 1M cells | **16x faster** |
 
 ## Coding Conventions
 
