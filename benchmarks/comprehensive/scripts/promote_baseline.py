@@ -2,13 +2,14 @@
 """
 Promote a candidate snapshot to a canonical baseline (Phase G.2).
 
-Copies ``summary.json`` + ``environment.json`` + ``MANIFEST.sha256`` from a
-``capture_baseline.py`` snapshot tree into
-``results/baselines/<version>/``. The raw `raw/*.json` files are NOT
-copied — they stay in the original snapshot (or re-generated from the git
-SHA recorded in environment.json), keeping the committed baseline tree
-small enough to live in git while still being tamper-evident via the
-manifest.
+Copies ``summary.json`` + ``environment.json`` + ``MANIFEST.sha256`` +
+``fingerprints/fingerprints.json`` from a ``capture_baseline.py``
+snapshot tree into ``results/baselines/<version>/``. The raw
+`raw/*.json` files and the per-accelerator output `.npy` arrays under
+``fingerprints/arrays/`` are NOT copied — they stay in the original
+snapshot (or re-generated from the git SHA recorded in
+environment.json), keeping the committed baseline tree small enough to
+live in git while still being tamper-evident via the manifest.
 
 Usage:
 
@@ -36,7 +37,17 @@ BASELINES_DIR = (
     PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "baselines"
 )
 
-_REQUIRED_FILES = ("summary.json", "environment.json", "MANIFEST.sha256")
+_REQUIRED_FILES = (
+    "summary.json",
+    "environment.json",
+    "MANIFEST.sha256",
+    # Per-accelerator BLAKE3 fingerprints. Without this file in the
+    # promoted baseline, compare_against_baseline.py's diff_fingerprints
+    # silently degrades to a no-op against the canonical baseline (review
+    # §1.3) — every gate report would say "fingerprint mismatches: 0"
+    # regardless of actual numerical drift on the accel surface.
+    "fingerprints/fingerprints.json",
+)
 LATEST_LINK = "LATEST"
 
 logger = logging.getLogger(__name__)
@@ -93,7 +104,9 @@ def promote(
 
     target.mkdir(parents=True)
     for name in _REQUIRED_FILES:
-        shutil.copy2(snapshot / name, target / name)
+        dst = target / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snapshot / name, dst)
 
     if update_latest:
         _update_latest_symlink(BASELINES_DIR, version)
