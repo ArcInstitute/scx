@@ -313,7 +313,7 @@ fn sort_by_shard_is_pure_permutation() {
 /// `(col, value)` tuple per row on both sides of the pair, exercising the
 /// `read_rows_with` + `HvgProjection::scatter_row` dense-gather path.
 #[test]
-fn scatter_pair_rows_via_process_plan() {
+fn hvg_paired_scatter_via_process_plan() {
     let dir = tempfile::tempdir().unwrap();
     let path = fixture(&dir);
     // Hits HVG positions {0, 1, 2} via cols {7, 17, 27} for rows 7, 17, 27.

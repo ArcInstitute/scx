@@ -419,10 +419,11 @@ impl IndexPlanLoader {
         // duplicate plan entries (common for paired controls) share the same
         // shard decode without re-allocating per-row CSRs.
         //
-        // The pert and ctrl walks are independent so we lose the
-        // `scatter_pair_rows` HVG fusion — accepted because eliminating
-        // 2 × n_pairs per-row CSR allocations + the final concatenate is
-        // the larger algorithmic win at training-loop scale.
+        // Pert and ctrl walks are independent shard-grouped passes; we don't
+        // attempt a fused gather because eliminating 2 × n_pairs per-row CSR
+        // allocations + the final `concatenate_csr` is the larger
+        // training-loop-scale win, and a fused pair walk would re-introduce
+        // per-pair branching across two CSR row pointers for marginal gain.
         let pert_indices: Vec<u64> = plan.iter().map(|(p, _)| *p).collect();
         let ctrl_indices: Vec<u64> = plan.iter().map(|(_, c)| *c).collect();
 

@@ -20,10 +20,10 @@ several minutes; allow ~10 GB disk for the fixture).
 
 Switches surfacing the locality optimisation deltas:
   - shard sort: `--config sort_off` vs `--config sort_on`.
-  - vectorised pair scatter: already exercised by every
-    HVG-projected configuration; the microbench delta is in
-    `cargo test --release -p scx-loader projection::tests::bench_scatter_pair_rows -- --ignored --nocapture`.
   - Phase 4 (lookahead): `--config lookahead0` vs `--config lookahead4`.
+  - Phase 5 (zero-allocation dense gather) is exercised by every
+    HVG-projected configuration; see `docs/performance.md`
+    § "Phase 5 — zero-allocation dense gather" for A/B numbers.
 
 Output goes to stdout (and optional `--output FILE.json`).
 """
@@ -550,11 +550,6 @@ def main() -> int:
         b = by_name["phase4_lookahead8"].batches_per_sec
         if a > 0:
             print(f"  Phase 4 (lookahead 4→8):    {b / a:.2f}× ({a:.1f} → {b:.1f} bps)")
-    print(
-        "  Phase 3 (vectorised pair scatter): see "
-        "`cargo test --release -p scx-loader projection::tests::bench_scatter_pair_rows -- --ignored --nocapture` "
-        "(median 1.07-1.08× across runs; gated above 5%)."
-    )
 
     if args.output:
         Path(args.output).write_text(

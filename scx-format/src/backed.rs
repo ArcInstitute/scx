@@ -496,8 +496,14 @@ impl BackedCsrReader {
     /// should keep using [`Self::read_row_indices`].
     ///
     /// `rows` may contain duplicates; each occurrence triggers one
-    /// `scatter` call. Out-of-range rows propagate as an error from the
-    /// shard lookup. Empty `rows` is a no-op.
+    /// `scatter` call. Empty `rows` is a no-op.
+    ///
+    /// **Out-of-range semantics differ from [`Self::read_row_indices`]**:
+    /// `read_row_indices` filters via `shards_for_indices` and silently
+    /// drops rows that fall outside every shard, whereas `read_rows_with`
+    /// walks shards directly and returns an error on the first row outside
+    /// any shard range. Callers that need silent-skip semantics must
+    /// pre-filter `rows`.
     pub fn read_rows_with<F>(&self, rows: &[u64], mut scatter: F) -> Result<()>
     where
         F: FnMut(usize, &[i32], &[f32]) -> Result<()>,

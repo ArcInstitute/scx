@@ -313,15 +313,17 @@ different I/O orchestration tuned for different access patterns:
 
 - **`IndexPlanDataset`** — consumer-supplied plans. Each batch is a
   `list[tuple[pert_idx, ctrl_idx]]` and the loader gathers paired rows via
-  the cached `BackedCsrReader::read_row_indices`. Optimised for plan-driven
-  pairing (perturbation training, contrastive learning, donor-matched
-  designs). Random by definition — breaks the catalog-order I/O optimisation
-  in exchange for per-cell pairing flexibility. Reaches ~20K cells/s at 1M
+  `BackedCsrReader::read_rows_with` — a zero-allocation dense-gather API
+  that scatters directly from cached shards into the dense output without
+  materialising an intermediate `ScxCsr`. Optimised for plan-driven pairing
+  (perturbation training, contrastive learning, donor-matched designs).
+  Random by definition — breaks the catalog-order I/O optimisation in
+  exchange for per-cell pairing flexibility. Reaches ~20K cells/s at 1M
   cells (~3.7× slower than the sequential ceiling), 106× faster than the
   current cell-load-scx `ScxBackedSparseDataset` Python-loop baseline.
 
-The two types share `BackedCsrReader::read_row_indices`,
-`HvgProjection::scatter_pair_rows` / `scatter_row_full`,
+The two types share LRU shard caching (`BackedCsrReader::read_shard_cached`),
+`HvgProjection::scatter_row` / `scatter_row_full`,
 `fused_normalize_log1p_dense`, and `extract_obs_columns`. They do **not**
 share `pipeline.rs` — the streaming pipeline's I/O stage sorts shard groups
 by file offset, an optimisation that doesn't apply to plan-driven access.
