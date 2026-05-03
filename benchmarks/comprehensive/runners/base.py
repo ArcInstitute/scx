@@ -13,6 +13,8 @@ import os
 import resource
 import subprocess
 import time
+
+from benchmarks.comprehensive.rss import current_rss_mb
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -326,20 +328,9 @@ class FormatRunner(ABC):
 
     @staticmethod
     def _get_rss_mb() -> float:
-        """Current RSS in MB (Linux: /proc/self/statm, fallback: ru_maxrss).
-
-        Uses /proc/self/statm to get the *current* resident set size rather
-        than the process-lifetime high-water mark (ru_maxrss), so that
-        per-operation measurements are not inflated by earlier operations.
-        """
-        try:
-            with open("/proc/self/statm") as f:
-                # Field 1 is resident pages
-                pages = int(f.read().split()[1])
-            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-        except (OSError, IndexError, ValueError):
-            # Fallback for non-Linux platforms
-            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        """Back-compat shim — delegates to ``benchmarks.comprehensive.rss``
+        (review §2.4 consolidation)."""
+        return current_rss_mb()
 
     @staticmethod
     def _get_cpu_times() -> tuple[float, float]:

@@ -60,6 +60,7 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
 from benchmarks.comprehensive.runners.accel_runner import (
     AcceleratorRunner,
     PreprocessedFixture,
@@ -114,10 +115,6 @@ def _load_preprocessed(dataset: DatasetConfig, n_comps: int) -> PreprocessedFixt
 # `AcceleratorRunner.instance()`. Back-compat aliases so existing sibling
 # modules keep working — they pass the runner's dict by reference.
 _fixture_cache = AcceleratorRunner.instance()._cache
-
-
-def _get_rss_mb() -> float:
-    return AcceleratorRunner.get_rss_mb()
 
 
 def _get_cpu_times() -> tuple[float, float]:

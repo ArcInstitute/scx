@@ -131,14 +131,7 @@ class _EpochResult:
 # ---------------------------------------------------------------------------
 
 
-def _current_rss_mb() -> float:
-    """Current RSS in MB via /proc/self/statm (not high-water mark)."""
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except (OSError, IndexError, ValueError):
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+from benchmarks.comprehensive.rss import current_rss_mb as _current_rss_mb
 
 
 def _timed_epoch(fn, *args, **kwargs) -> tuple[_EpochResult, float, float, float, float]:

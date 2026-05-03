@@ -87,13 +87,9 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         adata = anndata.read_h5ad(h5ad_path)
         codec = runner_params.get("codec", "auto")
 
-    def _get_rss_mb():
-        try:
-            with open("/proc/self/statm") as f:
-                pages = int(f.read().split()[1])
-            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-        except Exception:
-            return 0.0
+    # Single source of truth for RSS sampling — review §2.4 consolidation.
+    # Imported in the subprocess the same way ``make_runner`` is, above.
+    from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
 
     def do_one_write(out_path):
         gc.collect()
