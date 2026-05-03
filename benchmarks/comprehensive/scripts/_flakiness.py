@@ -1,5 +1,5 @@
 """
-Flakiness ledger loader (§3.7).
+Flakiness ledger loader.
 
 A *flakiness override* declares that one or more
 ``(benchmark, format, dataset, metric)`` rows are known-noisy on this

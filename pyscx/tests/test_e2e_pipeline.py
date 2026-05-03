@@ -1,11 +1,9 @@
-"""H1: End-to-end pipeline tests for the scx-loader training pipeline.
+"""End-to-end pipeline tests for the scx-loader training pipeline.
 
 These tests validate the full TrainingDataset pipeline from Python, covering
 correctness, shuffle behaviour, HVG projection, normalization, memory budget,
 fork detection, single-shard files, epoch lifecycle, reproducibility, and
 oversized batch sizes.
-
-Spec reference: Phase2-Step5.md §H1.
 """
 
 import numpy as np

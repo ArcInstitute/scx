@@ -53,7 +53,7 @@ from sklearn.metrics import (  # noqa: E402
 
 
 # =============================================================================
-# §7.2 Shared synthetic dataset
+# Shared synthetic dataset
 # =============================================================================
 
 def _make_cell_eval_adata(
@@ -231,11 +231,11 @@ def _build_pair(
 
 
 # =============================================================================
-# §7.2 Shared synthetic dataset validation
+# Shared synthetic dataset validation
 # =============================================================================
 
 class TestSharedDataset:
-    """§7.2.1: Validate _make_cell_eval_adata() meets all constraints."""
+    """Validate _make_cell_eval_adata() meets all constraints."""
 
     def test_gene_names_match_perturbation_names(self):
         """Gene names must match perturbation names for n_perts-1 entries."""
@@ -332,11 +332,11 @@ class TestSharedDataset:
 
 
 # =============================================================================
-# §7.3 Pseudobulk means parity
+# Pseudobulk means parity
 # =============================================================================
 
 class TestPseudobulkParity:
-    """§7.3.1: Verify pseudobulk means match cell-eval's polars group_by().mean()."""
+    """Verify pseudobulk means match cell-eval's polars group_by().mean()."""
 
     def test_pseudobulk_vs_cell_eval(self):
         adata_real, _adata_pred = _make_cell_eval_adata()
@@ -364,11 +364,11 @@ class TestPseudobulkParity:
 
 
 # =============================================================================
-# §7.4 Bulk perturbation metrics parity
+# Bulk perturbation metrics parity
 # =============================================================================
 
 class TestBulkMetricsParity:
-    """§7.4: Verify pearson_delta, mse, mae, mse_delta, mae_delta match cell-eval."""
+    """Verify pearson_delta, mse, mae, mse_delta, mae_delta match cell-eval."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -376,7 +376,6 @@ class TestBulkMetricsParity:
         self.pair = _build_pair(self.adata_real, self.adata_pred)
 
     def test_pearson_delta_vs_cell_eval(self):
-        """§7.4.1"""
         scx_result = pyscx.accel.perturbation_metrics(
             self.adata_real, self.adata_pred, metrics=["pearson_delta"],
         )
@@ -389,7 +388,6 @@ class TestBulkMetricsParity:
             )
 
     def test_mse_mae_vs_cell_eval(self):
-        """§7.4.2"""
         scx_result = pyscx.accel.perturbation_metrics(
             self.adata_real, self.adata_pred,
             metrics=["mse", "mae", "mse_delta", "mae_delta"],
@@ -419,7 +417,7 @@ class TestBulkMetricsParity:
             )
 
     def test_perturbation_metrics_agg_vs_cell_eval(self):
-        """§7.4.3: Compare aggregated (mean across perturbations) metrics."""
+        """Compare aggregated (mean across perturbations) metrics."""
         scx_result = pyscx.accel.perturbation_metrics(
             self.adata_real, self.adata_pred,
         )
@@ -444,11 +442,11 @@ class TestBulkMetricsParity:
 
 
 # =============================================================================
-# §7.5 Energy distance parity
+# Energy distance parity
 # =============================================================================
 
 class TestEdistanceParity:
-    """§7.5: Verify energy distance matches cell-eval."""
+    """Verify energy distance matches cell-eval."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -459,7 +457,7 @@ class TestEdistanceParity:
 
     @pytest.mark.parametrize("dtype", ["f32", "f64"])
     def test_edistance_vs_cell_eval(self, dtype):
-        """§7.5.1: Compare Pearson correlation of e-distance vectors.
+        """Compare Pearson correlation of e-distance vectors.
 
         Parametrised over `dtype ∈ {"f32", "f64"}` (Phase 2). Reductions
         accumulate in f64 regardless of input dtype, so both must agree
@@ -479,7 +477,7 @@ class TestEdistanceParity:
 
     @pytest.mark.parametrize("dtype", ["f32", "f64"])
     def test_edistance_intermediate_values(self, dtype):
-        """§7.5.2: Compare per-perturbation e-distance vectors.
+        """Compare per-perturbation e-distance vectors.
 
         This catches cases where Pearson correlation accidentally matches
         but individual e-distances diverge. Uses
@@ -531,11 +529,11 @@ class TestEdistanceParity:
 
 
 # =============================================================================
-# §7.6 Discrimination score parity
+# Discrimination score parity
 # =============================================================================
 
 class TestDiscriminationScoreParity:
-    """§7.6: Verify discrimination score matches cell-eval."""
+    """Verify discrimination score matches cell-eval."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -543,7 +541,7 @@ class TestDiscriminationScoreParity:
         self.pair = _build_pair(self.adata_real, self.adata_pred)
 
     def test_discrimination_score_l1_vs_cell_eval(self):
-        """§7.6.1: L1 metric — rank scores should match exactly."""
+        """L1 metric — rank scores should match exactly."""
         scx_result = pyscx.accel.discrimination_score(
             self.adata_real, self.adata_pred, metric="l1",
         )
@@ -556,7 +554,7 @@ class TestDiscriminationScoreParity:
             )
 
     def test_discrimination_score_l2_cosine_vs_cell_eval(self):
-        """§7.6.2: L2 and cosine metrics."""
+        """L2 and cosine metrics."""
         for metric, ce_metric in [("l2", "l2"), ("cosine", "cosine")]:
             scx_result = pyscx.accel.discrimination_score(
                 self.adata_real, self.adata_pred, metric=metric,
@@ -570,7 +568,7 @@ class TestDiscriminationScoreParity:
                 )
 
     def test_discrimination_target_exclusion_parity(self):
-        """§7.6.3: Verify exclude_target_gene behavior matches cell-eval."""
+        """Verify exclude_target_gene behavior matches cell-eval."""
         # With target gene exclusion (default in cell-eval)
         scx_with = pyscx.accel.discrimination_score(
             self.adata_real, self.adata_pred, metric="l1",
@@ -610,14 +608,14 @@ class TestDiscriminationScoreParity:
 
 
 # =============================================================================
-# §7.7 Knockdown efficiency parity
+# Knockdown efficiency parity
 # =============================================================================
 
 class TestKnockdownParity:
-    """§7.7: Verify knockdown efficiency matches arc-bench."""
+    """Verify knockdown efficiency matches arc-bench."""
 
     def test_knockdown_vs_arc_bench(self):
-        """§7.7.1: Raw-count knockdown efficiency."""
+        """Raw-count knockdown efficiency."""
         import scanpy as sc
 
         adata = _make_raw_count_adata()
@@ -656,7 +654,7 @@ class TestKnockdownParity:
         )
 
     def test_log_deviation_vs_arc_bench(self):
-        """§7.7.2: Log deviation after normalize+log1p.
+        """Log deviation after normalize+log1p.
 
         SCX's knockdown_efficiency expects normalized (NOT log1p'd) data and
         applies log1p internally to both the data and the baseline. The
@@ -704,7 +702,7 @@ class TestKnockdownParity:
         )
 
     def test_knockdown_missing_gene(self):
-        """§7.7.3: Perturbation name not in var_names → NaN for those cells."""
+        """Perturbation name not in var_names → NaN for those cells."""
         import pandas as pd
         import scanpy as sc
 
@@ -744,14 +742,14 @@ class TestKnockdownParity:
 
 
 # =============================================================================
-# §7.8 Clustering agreement parity
+# Clustering agreement parity
 # =============================================================================
 
 class TestClusteringAgreementParity:
-    """§7.8: Verify clustering agreement metrics."""
+    """Verify clustering agreement metrics."""
 
     def test_clustering_agreement_vs_cell_eval(self):
-        """§7.8.1: Compare clustering agreement scores.
+        """Compare clustering agreement scores.
 
         Note: Exact match not expected due to stochastic Leiden.
 
@@ -785,7 +783,7 @@ class TestClusteringAgreementParity:
         )
 
     def test_clustering_scoring_functions_vs_sklearn(self):
-        """§7.8.2: Verify AMI/NMI/ARI scoring on identical labels match sklearn."""
+        """Verify AMI/NMI/ARI scoring on identical labels match sklearn."""
         rng = np.random.default_rng(42)
         labels_a = rng.integers(0, 5, size=100).tolist()
         labels_b = rng.integers(0, 5, size=100).tolist()
@@ -811,14 +809,14 @@ class TestClusteringAgreementParity:
 
 
 # =============================================================================
-# §7.9 DE result format bridge parity
+# DE result format bridge parity
 # =============================================================================
 
 class TestDEBridgeParity:
-    """§7.9: Verify DE result format bridge."""
+    """Verify DE result format bridge."""
 
     def test_de_dataframe_format(self):
-        """§7.9.1: Verify output DataFrame schema matches cell-eval's DEResults."""
+        """Verify output DataFrame schema matches cell-eval's DEResults."""
         adata_real, _ = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
 
         df = pyscx.accel.rank_genes_groups_df(
@@ -840,7 +838,7 @@ class TestDEBridgeParity:
             assert df[col].dtype == pl.Float64, f"{col} should be Float64, got {df[col].dtype}"
 
     def test_de_bridge_feeds_cell_eval_metrics(self):
-        """§7.9.2: Verify DE bridge output can be consumed by cell-eval DE metrics.
+        """Verify DE bridge output can be consumed by cell-eval DE metrics.
 
         Note: Exact values don't need to match (SCX Wilcoxon vs pdex),
         just format compatibility.
@@ -878,11 +876,11 @@ class TestDEBridgeParity:
 
 
 # =============================================================================
-# §7.10 Full pipeline integration test
+# Full pipeline integration test
 # =============================================================================
 
 class TestFullPipelineParity:
-    """§7.10: Full pipeline integration against cell-eval."""
+    """Full pipeline integration against cell-eval."""
 
     # Tolerance table (see docs/scanpy.md "Perturbation evaluation metrics")
     TOLERANCE = {
@@ -899,7 +897,7 @@ class TestFullPipelineParity:
     }
 
     def test_full_pipeline_vs_cell_eval(self):
-        """§7.10.1: Run complete SCX pipeline vs cell-eval MetricPipeline."""
+        """Run complete SCX pipeline vs cell-eval MetricPipeline."""
         adata_real, adata_pred = _make_cell_eval_adata()
         pair = _build_pair(adata_real, adata_pred)
 
@@ -988,7 +986,7 @@ class TestFullPipelineParity:
             )
 
     def test_full_pipeline_arc_bench_cli_parity(self):
-        """§7.10.2: Simulate arc_bench.tools.pert_eval.cli._run_standard().
+        """Simulate arc_bench.tools.pert_eval.cli._run_standard().
 
         Validates the end-to-end arc-bench integration:
         1. Clip X to [0, 14]
@@ -1026,11 +1024,11 @@ class TestFullPipelineParity:
 
 
 # =============================================================================
-# §7.11 Performance comparison
+# Performance comparison
 # =============================================================================
 
 class TestPerformanceComparison:
-    """§7.11.1: Informational speedup comparison (no assertions on speedup)."""
+    """Informational speedup comparison (no assertions on speedup)."""
 
     @pytest.mark.slow
     def test_performance_vs_cell_eval(self):
@@ -1094,11 +1092,11 @@ class TestPerformanceComparison:
 
 
 # =============================================================================
-# §7.12 Scoring parity
+# Scoring parity
 # =============================================================================
 
 class TestScoringParity:
-    """§7.12.1: Verify score_agg_metrics compatibility."""
+    """Verify score_agg_metrics compatibility."""
 
     def test_score_agg_metrics_parity(self):
         """Verify normalized scores are compatible with cell-eval's scoring."""

@@ -65,22 +65,22 @@ from benchmarks.comprehensive.sysinfo import collect_system_info
 # ---------------------------------------------------------------------------
 
 AVAILABLE_BENCHMARKS = [
-    "compression",         # §3.1 — Storage efficiency
-    "write",               # §3.2 — Write / conversion performance
-    "read_full",           # §3.3 — Full file load
-    "read_selective",      # §3.4 — Selective read (query / subsetting)
-    "parallel_scaling",    # §3.5.1 — Parallel read scaling
-    "parallel_write_scaling",  # §3.5.2 — Parallel write scaling
-    "ml_loader",           # §3.6 — ML data loader throughput
-    "memory",              # §3.7 — Memory efficiency
-    "append_update",       # §3.8 — Append / update (SCX-specific)
-    "backed_mode",         # §3.9 — Backed mode performance
-    "accelerators",        # §3.10 — Analysis accelerators (PCA, kNN, UMAP, DE)
-    "gpu_accelerators",    # §3.11 — GPU accelerators
-    "streaming_preproc",   # §3.12 — Streaming preprocessing pipeline
-    "lazy_preproc",        # §3.13 — Lazy preprocessing & column-projected agg
-    "correctness",         # §3.14 — Correctness validation suite
-    "cell_eval_parity_perf",  # §3.15 — cell-eval / arc-bench parity perf
+    "compression",         # Storage efficiency
+    "write",               # Write / conversion performance
+    "read_full",           # Full file load
+    "read_selective",      # Selective read (query / subsetting)
+    "parallel_scaling",    # Parallel read scaling
+    "parallel_write_scaling",  # Parallel write scaling
+    "ml_loader",           # ML data loader throughput
+    "memory",              # Memory efficiency
+    "append_update",       # Append / update (SCX-specific)
+    "backed_mode",         # Backed mode performance
+    "accelerators",        # Analysis accelerators (PCA, kNN, UMAP, DE)
+    "gpu_accelerators",    # GPU accelerators
+    "streaming_preproc",   # Streaming preprocessing pipeline
+    "lazy_preproc",        # Lazy preprocessing & column-projected agg
+    "correctness",         # Correctness validation suite
+    "cell_eval_parity_perf",  # cell-eval / arc-bench parity perf
 ]
 
 # Benchmarks appropriate for smoke testing

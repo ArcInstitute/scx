@@ -2,13 +2,14 @@
 """
 Promote a candidate snapshot to a canonical baseline (Phase G.2).
 
-Copies ``summary.json`` + ``environment.json`` + ``MANIFEST.sha256`` from a
-``capture_baseline.py`` snapshot tree into
-``results/baselines/<version>/``. The raw `raw/*.json` files are NOT
-copied — they stay in the original snapshot (or re-generated from the git
-SHA recorded in environment.json), keeping the committed baseline tree
-small enough to live in git while still being tamper-evident via the
-manifest.
+Copies ``summary.json`` + ``environment.json`` + ``MANIFEST.sha256`` +
+``fingerprints/fingerprints.json`` from a ``capture_baseline.py``
+snapshot tree into ``results/baselines/<version>/``. The raw
+`raw/*.json` files and the per-accelerator output `.npy` arrays under
+``fingerprints/arrays/`` are NOT copied — they stay in the original
+snapshot (or re-generated from the git SHA recorded in
+environment.json), keeping the committed baseline tree small enough to
+live in git while still being tamper-evident via the manifest.
 
 Usage:
 
@@ -36,7 +37,17 @@ BASELINES_DIR = (
     PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "baselines"
 )
 
-_REQUIRED_FILES = ("summary.json", "environment.json", "MANIFEST.sha256")
+_REQUIRED_FILES = (
+    "summary.json",
+    "environment.json",
+    "MANIFEST.sha256",
+    # Per-accelerator BLAKE3 fingerprints. Without this file in the
+    # promoted baseline, compare_against_baseline.py's diff_fingerprints
+    # silently degrades to a no-op against the canonical baseline —
+    # every gate report would say "fingerprint mismatches: 0" regardless
+    # of actual numerical drift on the accel surface.
+    "fingerprints/fingerprints.json",
+)
 LATEST_LINK = "LATEST"
 
 logger = logging.getLogger(__name__)
@@ -64,7 +75,13 @@ def _update_latest_symlink(baselines_dir: Path, version: str) -> None:
         link.write_text(f"{version}\n")
 
 
-def promote(snapshot: Path, version: str, *, force: bool = False) -> Path:
+def promote(
+    snapshot: Path,
+    version: str,
+    *,
+    force: bool = False,
+    update_latest: bool = True,
+) -> Path:
     if not snapshot.is_dir():
         raise FileNotFoundError(f"snapshot directory not found: {snapshot}")
 
@@ -87,9 +104,17 @@ def promote(snapshot: Path, version: str, *, force: bool = False) -> Path:
 
     target.mkdir(parents=True)
     for name in _REQUIRED_FILES:
-        shutil.copy2(snapshot / name, target / name)
+        dst = target / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snapshot / name, dst)
 
-    _update_latest_symlink(BASELINES_DIR, version)
+    if update_latest:
+        _update_latest_symlink(BASELINES_DIR, version)
+    else:
+        logger.info(
+            "Skipped %s update (update_latest=False); prior pointer preserved",
+            BASELINES_DIR / LATEST_LINK,
+        )
 
     logger.info("Promoted %s → %s (%d files)", snapshot, target, len(_REQUIRED_FILES))
     return target
@@ -131,18 +156,11 @@ def main(argv: list[str] | None = None) -> int:
         target = promote(
             args.snapshot, args.version,
             force=args.force,
+            update_latest=not args.no_latest,
         )
     except (FileNotFoundError, FileExistsError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    if args.no_latest:
-        # promote() always updates LATEST; if the operator asked to opt out,
-        # revert to whatever was there before (best-effort).
-        latest = BASELINES_DIR / "LATEST"
-        if latest.is_symlink() and latest.resolve().name == args.version:
-            latest.unlink()
-            logger.info("--no-latest: removed %s", latest)
 
     print(f"Promoted snapshot to {target}")
     return 0

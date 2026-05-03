@@ -1,5 +1,5 @@
 """
-GPU / CPU kNN accelerator benchmark — Phase 9 of GPU-ACC-SPEED-UP.md.
+GPU / CPU kNN accelerator benchmark.
 
 Follows the `accel_pca.py` pattern. Each variant is one implementation
 of the kNN connectivity graph, scheduled as an independent cell by

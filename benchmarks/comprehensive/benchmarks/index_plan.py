@@ -1,5 +1,5 @@
 """
-IndexPlanDataset Throughput benchmark — `PER-CELL-CONTROL-PAIRING.md` §Phase 7.
+IndexPlanDataset Throughput benchmark.
 
 Plan-driven paired-batch reads (the perturbation-training workload). SCX-only
 (`format_variant.key == "scx_auto"`) — for every other variant `run` returns
@@ -63,9 +63,8 @@ logger = logging.getLogger(__name__)
 # IndexPlanDataset path is codec-agnostic at the API level.
 _SCX_TRIGGER_KEY = "scx_auto"
 
-# Spec defaults (PER-CELL-CONTROL-PAIRING.md §Phase 7.2: "1024 pairs/batch,
-# 1000 batches"). Capped against dataset.n_obs at runtime so a 100-cell test
-# fixture doesn't blow up.
+# Defaults: 1024 pairs/batch, 1000 batches. Capped against dataset.n_obs
+# at runtime so a 100-cell test fixture doesn't blow up.
 _DEFAULT_PAIRS_PER_BATCH = 1024
 _DEFAULT_N_BATCHES = 1000
 
@@ -242,7 +241,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# DEADLOCK-ISSUE.md §7.4 — `num_workers > 0` IndexPlanDataset scenario
+# `num_workers > 0` IndexPlanDataset scenario
 # ---------------------------------------------------------------------------
 #
 # Mirrors the `pyscx_training_dataset_workers2` scenario from
@@ -557,9 +556,9 @@ def run(
         ),
     ]
 
-    # DEADLOCK-ISSUE.md §7.4 — `num_workers > 0` IndexPlanDataset scenario.
-    # Gated on `_HAS_TORCH` because pyscx ships without torch as a direct
-    # dep; only ml-flavoured callers have it installed.
+    # `num_workers > 0` IndexPlanDataset scenario. Gated on `_HAS_TORCH`
+    # because pyscx ships without torch as a direct dep; only
+    # ml-flavoured callers have it installed.
     if _HAS_TORCH:
         scenarios.append(
             (

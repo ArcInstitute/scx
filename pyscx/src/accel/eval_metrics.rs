@@ -134,11 +134,11 @@ pub fn pseudobulk_means<'py>(
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else {
-        // In-memory: dense fast-path for non-sparse inputs (Phase 6 of
-        // SCX-EVAL-METRIC-IMPROVE.md). At Replogle scale (24K cells × 18K
-        // genes log-normalised) the old `scipy.sparse.csr_matrix(dense)`
-        // path was 22 s — dominated by densify-then-CSR-construct churn,
-        // not the actual aggregation. The dense kernel skips that.
+        // In-memory: dense fast-path for non-sparse inputs. At Replogle
+        // scale (24K cells × 18K genes log-normalised) the old
+        // `scipy.sparse.csr_matrix(dense)` path was 22 s — dominated by
+        // densify-then-CSR-construct churn, not the actual aggregation.
+        // The dense kernel skips that.
         let scipy_sparse = py.import("scipy.sparse")?;
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
@@ -1500,8 +1500,8 @@ pub fn clustering_agreement<'py>(
 
     // ── Build kNN + run Leiden, all in Rust, GIL released ───────────
     //
-    // Per-phase profiling (Phase 6 of `SCX-EVAL-METRIC-IMPROVE.md`): timers
-    // log to `pyscx::accel::eval_metrics::clustering_agreement` at debug.
+    // Per-phase profiling: timers log to
+    // `pyscx::accel::eval_metrics::clustering_agreement` at debug.
     // Enable via `RUST_LOG=pyscx::accel::eval_metrics=debug`. Production
     // callers see no output; the cost of one `Instant::now()` per phase is
     // negligible (~30 ns total) compared to the kNN / Leiden work.

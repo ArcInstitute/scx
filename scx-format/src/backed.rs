@@ -223,7 +223,7 @@ enum AggOp {
 ///
 /// # Fork safety
 ///
-/// **Invariant** (DEADLOCK-ISSUE.md §3.2): the shard `cache` is
+/// **Invariant**: the shard `cache` is
 /// per-`BackedCsrReader` instance, *not* a process-global `OnceCell` /
 /// `static` / `lazy_static`. Per-instance state is the contract that
 /// keeps this type fork-safe: a forked child that constructs its own

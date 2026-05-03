@@ -1,5 +1,5 @@
 """
-ML Data Loader Throughput benchmark — COMPREHENSIVE-BENCHMARKING.md §3.6.
+ML Data Loader Throughput benchmark.
 
 Measures batched iteration throughput for ML training workloads across
 four loader implementations:
@@ -131,14 +131,7 @@ class _EpochResult:
 # ---------------------------------------------------------------------------
 
 
-def _current_rss_mb() -> float:
-    """Current RSS in MB via /proc/self/statm (not high-water mark)."""
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except (OSError, IndexError, ValueError):
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+from benchmarks.comprehensive.rss import current_rss_mb as _current_rss_mb
 
 
 def _timed_epoch(fn, *args, **kwargs) -> tuple[_EpochResult, float, float, float, float]:
@@ -242,7 +235,7 @@ def _run_scx_epoch(
 
 
 # ---------------------------------------------------------------------------
-# `num_workers > 0` scenarios (DEADLOCK-ISSUE.md §5.3)
+# `num_workers > 0` scenarios
 #
 # `pyscx_training_dataset_workers2` and `pyscx_training_dataset_workers2_persistent`
 # wrap `pyscx.TrainingDataset` in a tiny `IterableDataset` shim that
@@ -1140,8 +1133,7 @@ def run(
             gc.collect()
 
         # ---------------------------------------------------------------
-        # `num_workers > 0` DataLoader scenarios (SCX-only, post-fix)
-        # DEADLOCK-ISSUE.md §5.3
+        # `num_workers > 0` DataLoader scenarios (SCX-only)
         # ---------------------------------------------------------------
         if loader_type == "scx" and _HAS_TORCH:
             for scenario_name, persistent_workers, n_epochs_per_run in (

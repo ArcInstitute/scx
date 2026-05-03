@@ -62,8 +62,8 @@ except ImportError:  # pragma: no cover — fall back to sha256 if blake3 absent
 PINNED_SEED = 42
 
 # Thread pinning.  Rayon reduction order is not bit-exact across thread
-# counts (see M15 in 2026-04-17_CODE-REVIEW.md), so we pin to 1 thread for
-# fingerprints even though benchmarks run with more.
+# counts, so we pin to 1 thread for fingerprints even though benchmarks
+# run with more.
 PINNED_THREADS = 1
 
 

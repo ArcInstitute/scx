@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Correctness Validation: Preprocessing Path Cross-Validation (§3.14.3).
+Correctness Validation: Preprocessing Path Cross-Validation.
 
 Verifies that the three SCX preprocessing paths — scanpy in-memory (A),
 SCX write-back (B), and SCX lazy (C) — produce numerically equivalent results.
@@ -292,7 +292,7 @@ def run_all_checks(
 
     Returns list of ValidationCheck results.
     """
-    logger.info("=== Preprocessing Path Cross-Validation (§3.14.3) ===")
+    logger.info("=== Preprocessing Path Cross-Validation ===")
     logger.info("Dataset: %s", dataset_name)
 
     adata_raw = load_dataset(dataset_name)
@@ -320,7 +320,7 @@ def run_all_checks(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_common_args("Correctness Validation: Preprocessing Path Cross-Validation (§3.14.3)")
+    args = parse_common_args("Correctness Validation: Preprocessing Path Cross-Validation")
     report = run_all_checks(args.dataset, args.output)
 
     if args.output is None:

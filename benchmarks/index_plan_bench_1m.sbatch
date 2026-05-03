@@ -7,8 +7,7 @@
 #SBATCH --output=/home/%u/scx_index_plan_1m_%j.out
 #SBATCH --error=/home/%u/scx_index_plan_1m_%j.err
 
-# Phase 7.2 — 1M-cell IndexPlanDataset throughput benchmark.
-# Spec: PER-CELL-CONTROL-PAIRING.md §Phase 7.2 (1024 pairs/batch, 1000 batches).
+# 1M-cell IndexPlanDataset throughput benchmark (1024 pairs/batch, 1000 batches).
 # Two passes: the IndexPlanDataset configs at full 1000 batches, then the slow
 # backed_python_baseline at 50 batches (the 200K bench showed it's ~60× slower
 # than the indexed path; full 1000-batch run would take ~5 hours of bench wall

@@ -1,5 +1,5 @@
 """
-Shared utilities for the Correctness Validation Suite (§3.14).
+Shared utilities for the Correctness Validation Suite.
 
 Provides:
   - ``ValidationCheck``: structured result for a single validation check

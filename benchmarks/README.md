@@ -546,7 +546,8 @@ See the "Correctness Validation Suite" section in [docs/testing.md](../docs/test
 `pyscx.TrainingDataset` against competitor loaders (TileDB-SOMA-ML,
 scDataLoader, BPCells). It produces a stand-alone report at
 `benchmarks/results/training_loader_benchmark.{md,json}` and is **not**
-part of the regression gate (see `2026-04-29_SCX-BENCH-REVIEW.md` §3.1).
+part of the regression gate — the gate's `ml_loader` benchmark
+exercises only the SCX-side loader and its scenario throughput floors.
 
 ```bash
 # Smoke test (pbmc3k, CPU-only)
@@ -939,7 +940,7 @@ time (persisted on every `summary.json` row as `wall_s_iqr`). With the
 defaults (`--timing-tolerance 0.03`, `--iqr-k 1.5`), a rock-stable row
 stays gated at 3 %, while a row whose baseline IQR/median is 5 % auto-
 widens to 7.5 % — the bare 3 % gate's false-positive rate on noisy
-shared-node samples (review §1.1) drops without operator intervention.
+shared-node samples drops without operator intervention.
 The header line "Timing rows widened by IQR" reports how many rows
 crossed the floor; the "Tol" column suffixes widened rows with `~` and
 override-relaxed rows with `⚠`. Set `--iqr-k 0` to disable.
@@ -1145,7 +1146,7 @@ loader, and active-development GPU / Harmony surfaces — see
 
 | Script | What it measures |
 |--------|-----------------|
-| `scripts/benchmark_loader.py` | ML data loader throughput vs SOTA baselines (TileDB-SOMA-ML, scDataLoader, BPCells). **Not in the gate** — see `2026-04-29_SCX-BENCH-REVIEW.md` §3.1 |
+| `scripts/benchmark_loader.py` | ML data loader throughput vs SOTA baselines (TileDB-SOMA-ML, scDataLoader, BPCells). **Not in the gate** — the gated `ml_loader` benchmark covers only the SCX-side loader |
 | `scripts/benchmark_cli.py` | CLI command performance |
 | `scripts/benchmark_python_bindings.py` | Python bindings overhead |
 | `scripts/benchmark_gpu_decode.py` | GPU decode microbenchmarks (cuSPARSE, bitstream) |
@@ -1168,7 +1169,7 @@ Kernel-level benches live alongside the crates they exercise. Run via
 | Bench | Crate | What it measures |
 |-------|-------|-----------------|
 | `codec_bench` | `scx-codec` | Encode/decode throughput per codec (Rice, FOR-BP, Delta-Golomb, LZ4-shuffle, Zstd) |
-| `distances` | `scx-accel` | `mean_pairwise_distance` and `mean_pairwise_distance_self` across `(n_a, n_b, n_dims)` shapes × `metric ∈ {euclidean, l1, cosine}` × `backend ∈ {scalar, gemm}` × `dtype ∈ {f32, f64}` (Phase 4 of `SCX-EVAL-METRIC-IMPROVE.md`). Filter by criterion regex, e.g. `cargo bench -p scx-accel --bench distances -- 'gemm/cosine'`. |
+| `distances` | `scx-accel` | `mean_pairwise_distance` and `mean_pairwise_distance_self` across `(n_a, n_b, n_dims)` shapes × `metric ∈ {euclidean, l1, cosine}` × `backend ∈ {scalar, gemm}` × `dtype ∈ {f32, f64}`. Filter by criterion regex, e.g. `cargo bench -p scx-accel --bench distances -- 'gemm/cosine'`. |
 
 ```bash
 # All distance microbenches (full grid takes ~30 minutes)

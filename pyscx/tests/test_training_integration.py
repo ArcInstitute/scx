@@ -1,4 +1,4 @@
-"""E4: TrainingDataset integration tests (Phase2-Step7 §E4)."""
+"""TrainingDataset integration tests."""
 
 
 def test_training_dataset_iterates_epoch(query_adata, scx_from_adata):

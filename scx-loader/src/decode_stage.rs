@@ -109,7 +109,7 @@ impl ShardGroupIndex {
 // `rayon::par_*` against the global registry from any code reachable on
 // the worker hot path — under fork-mode DataLoader workers the global
 // pool's worker threads do not survive `fork()` and the dispatch hangs
-// forever. See `fill_batch_parallel` doc + DEADLOCK-ISSUE.md Phase 2.
+// forever. See `fill_batch_parallel` doc.
 // ---------------------------------------------------------------------------
 
 /// Fill a batch by scattering CSR rows into a dense matrix in parallel.
@@ -118,17 +118,17 @@ impl ShardGroupIndex {
 /// `par_chunks_mut`, providing safe non-overlapping mutable slices without
 /// `unsafe` code.
 ///
-/// **Fork-safety contract** (DEADLOCK-ISSUE.md §2.0b). `pool` MUST be a
-/// per-`TrainingPipeline` `rayon::ThreadPool` constructed *after* any fork
-/// (i.e. inside the worker process, in `start_epoch`). The function dispatches
-/// its `par_chunks_mut().zip(par_iter()).for_each(...)` via `pool.install`
-/// so rayon routes the work to *that* pool's worker queue rather than the
-/// process-global registry. If this function is ever called against rayon's
-/// global pool from a forked child whose parent had already initialised that
-/// pool (which is the common case under PyTorch DataLoader workers), the
-/// inherited pool's worker threads do not exist post-fork and the dispatch
-/// hangs forever in `LockLatch::wait_and_reset`. See Phase 1 Diagnosis in
-/// DEADLOCK-ISSUE.md for the gdb stack trace and reproducer.
+/// **Fork-safety contract**. `pool` MUST be a per-`TrainingPipeline`
+/// `rayon::ThreadPool` constructed *after* any fork (i.e. inside the
+/// worker process, in `start_epoch`). The function dispatches its
+/// `par_chunks_mut().zip(par_iter()).for_each(...)` via `pool.install`
+/// so rayon routes the work to *that* pool's worker queue rather than
+/// the process-global registry. If this function is ever called against
+/// rayon's global pool from a forked child whose parent had already
+/// initialised that pool (which is the common case under PyTorch
+/// DataLoader workers), the inherited pool's worker threads do not
+/// exist post-fork and the dispatch hangs forever in
+/// `LockLatch::wait_and_reset`.
 #[allow(clippy::too_many_arguments)]
 fn fill_batch_parallel(
     batch_cell_indices: &[u64],
@@ -534,8 +534,8 @@ mod tests {
 
     /// Build a small per-test rayon `ThreadPool` for `decode_stage` /
     /// `fill_batch_parallel` calls. Mirrors the fork-safe per-pipeline pool
-    /// construction in `TrainingPipeline::start_epoch` (DEADLOCK-ISSUE.md
-    /// §2.0a) so tests exercise the same dispatch path as production.
+    /// construction in `TrainingPipeline::start_epoch` so tests exercise
+    /// the same dispatch path as production.
     fn test_pool() -> rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(2)

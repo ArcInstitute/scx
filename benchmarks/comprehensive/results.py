@@ -1,8 +1,7 @@
 """
 Benchmark result schema and JSON writer utilities.
 
-All benchmark results are structured as JSON matching the schema defined in
-COMPREHENSIVE-BENCHMARKING.md §5.3. This module provides:
+This module provides:
 
   - ``BenchmarkResult``: dataclass for a single benchmark result
   - ``write_result()``: write a result to the raw results directory
@@ -30,8 +29,8 @@ from benchmarks.comprehensive.sysinfo import collect_system_info
 #
 # v2: adds ``wall_s_iqr`` / ``n_runs`` to BenchmarkResult.to_dict() and to the
 # rows of capture_baseline.py's summary.json so the gate can widen
-# ``median_wall_s`` tolerance by the baseline's own measured noise (review
-# §1.1). Older v1 raw JSONs and pre-bump promoted baselines just lack the
+# ``median_wall_s`` tolerance by the baseline's own measured noise.
+# Older v1 raw JSONs and pre-bump promoted baselines just lack the
 # field and the gate falls back to the fixed --timing-tolerance.
 SCHEMA_VERSION = 2
 
@@ -48,7 +47,7 @@ class RunRecord:
 
 @dataclass
 class BenchmarkResult:
-    """Structured benchmark result matching JSON schema from §5.3.
+    """Structured benchmark result.
 
     Example JSON output::
 
@@ -106,7 +105,7 @@ class BenchmarkResult:
 
         Used by the gate to widen the per-row timing tolerance: a noisy
         baseline gets a relaxed bound proportional to its own measured
-        dispersion (review §1.1). Returns ``None`` for fewer than 3 runs
+        dispersion. Returns ``None`` for fewer than 3 runs
         — IQR is not reliably estimable and the gate falls back to the
         fixed ``--timing-tolerance``. The n=2 case is specifically
         excluded: ``statistics.quantiles(..., method="exclusive")``

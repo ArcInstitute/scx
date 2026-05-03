@@ -358,8 +358,7 @@ pub fn pseudobulk_aggregate_from_slices(
 /// is ~50–100× faster than going through `scipy.sparse.csr_matrix`, because
 /// the CSR conversion scans every f32 looking for non-zeros and materialises
 /// 1.7 GB of `(indices, data)` arrays just to be summed back into a dense
-/// per-group means matrix. The dense path skips that intermediate altogether
-/// — see Phase 6 of `SCX-EVAL-METRIC-IMPROVE.md`.
+/// per-group means matrix. The dense path skips that intermediate altogether.
 ///
 /// Parallelisation is over groups (each thread writes to its own contiguous
 /// row of `means`, so no shared-accumulator contention or thread-local

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify all benchmark datasets and record metadata.
 
-Records §2.3 properties: n_obs, n_vars, NNZ, sparsity, assay/protocol,
+Records dataset properties: n_obs, n_vars, NNZ, sparsity, assay/protocol,
 value distribution (median NZ, max NZ, % uint8/uint16/uint32), source.
 Outputs a summary table.
 """

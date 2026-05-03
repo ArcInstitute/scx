@@ -14,16 +14,13 @@ Self-contained driver covering:
   - **TrainingDataset ceiling**: `pyscx.TrainingDataset` sequential pipeline.
     Different access pattern but the throughput ceiling for SCX reads.
 
-Per spec: `PER-CELL-CONTROL-PAIRING.md` "Phase 7 — benchmarks" + "Performance
-expectations" table.
-
 Default workload is sized for laptop-class quick iteration. The 1M-cell
-workload from the spec is enabled with `--n-cells 1_000_000` (single run takes
+workload is enabled with `--n-cells 1_000_000` (single run takes
 several minutes; allow ~10 GB disk for the fixture).
 
-Phase-specific switches surface the locality optimisation deltas (Phase 7.3):
-  - Phase 2 (shard sort): `--config sort_off` vs `--config sort_on`.
-  - Phase 3 (vectorised pair scatter): already exercised by every
+Switches surfacing the locality optimisation deltas:
+  - shard sort: `--config sort_off` vs `--config sort_on`.
+  - vectorised pair scatter: already exercised by every
     HVG-projected configuration; the microbench delta is in
     `cargo test --release -p scx-loader projection::tests::bench_scatter_pair_rows -- --ignored --nocapture`.
   - Phase 4 (lookahead): `--config lookahead0` vs `--config lookahead4`.

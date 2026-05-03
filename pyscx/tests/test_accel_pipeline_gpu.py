@@ -65,7 +65,7 @@ def test_full_gpu_pipeline(tmp_path):
     # 1. normalize_total — GPU eager; materializes X to scipy CSR.
     pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
     # 2. log1p — fusion-marker path re-runs fused normalize+log1p over the
-    #    original backed source (see Phase 5.4).
+    #    original backed source.
     pyscx.accel.log1p(adata, device="gpu")
 
     # 3. HVG — narrow to single-batch seurat_v3 so the GPU dispatch fires.

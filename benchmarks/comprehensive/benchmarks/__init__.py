@@ -28,7 +28,7 @@ ALL_BENCHMARKS: list[str] = [
     # Correctness validation — scanpy / backed / preprocessing parity.
     # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
     "correctness",
-    # Codec write→read round-trip parity (§3.5). Compares the
+    # Codec write→read round-trip parity. Compares the
     # SCX-materialised matrix against the source h5ad to catch silent
     # value-corruption regressions in any of the 6 SCX codecs. Format-gated
     # to scx_* variants inside the module.

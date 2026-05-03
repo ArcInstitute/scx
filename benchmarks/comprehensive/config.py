@@ -703,7 +703,7 @@ def estimate_memory_gb(
     elif benchmark == "cloud_read":
         # SCX pull+read needs the dense matrix at end; other runners (zarr,
         # tiledb, slaf) materialize in-memory too. Size like read_full,
-        # then 2.0× to cover the post-loop verification pass (§3.6) which
+        # then 2.0× to cover the post-loop verification pass which
         # transiently double-materialises cloud + local CSRs to compare.
         if is_dense_path:
             peak_mb = max(base_mb, dense_mb * 2.0)

@@ -1,17 +1,14 @@
 """
 AcceleratorRunner — shared host for `accel_*.py` benchmark modules.
 
-Task 9.2 of GPU-ACC-SPEED-UP.md. Sibling to `FormatRunner` (not
-subclass — the accelerator dimensions don't convert files / read
-backed / filter queries). Centralises:
+Sibling to `FormatRunner` (not subclass — the accelerator dimensions
+don't convert files / read backed / filter queries). Centralises:
 
 * GPU availability detection (`AcceleratorRunner.has_gpu()`).
 * Fixture loading + caching (`load_preprocessed`, `load_raw`) — one
-  h5ad read per (dataset, n_comps) pair per worker process. Previously
-  lived in `accel_pca.py`'s module-level `_fixture_cache` which every
-  other `accel_*.py` imported from — a layering smell. Now the cache
-  is owned here and keyed by both dataset name and variant-specific
-  hints (e.g. reference embeddings vs preprocessed AnnData).
+  h5ad read per (dataset, n_comps) pair per worker process. Owned here
+  and keyed by both dataset name and variant-specific hints (e.g.
+  reference embeddings vs preprocessed AnnData).
 * Timing utilities (`get_rss_mb`, `get_cpu_times`).
 
 Benchmarks consume this by instantiating one per cell:
@@ -30,10 +27,11 @@ once per dataset).
 from __future__ import annotations
 
 import logging
-import os
 import resource
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from benchmarks.comprehensive.rss import current_rss_mb
 
 logger = logging.getLogger(__name__)
 
@@ -187,12 +185,9 @@ class AcceleratorRunner:
 
     @staticmethod
     def get_rss_mb() -> float:
-        try:
-            with open("/proc/self/statm") as f:
-                pages = int(f.read().split()[1])
-            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-        except (OSError, IndexError, ValueError):
-            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        """Back-compat shim — delegates to
+        ``benchmarks.comprehensive.rss.current_rss_mb``."""
+        return current_rss_mb()
 
     @staticmethod
     def get_cpu_times() -> tuple[float, float]:

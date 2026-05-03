@@ -31,7 +31,6 @@ faster than scanpy. These are optimizations, not prerequisites.
 ## Phase 1: Format + Codec + AnnData Bridge (Months 1-4) — COMPLETE
 
 **Status**: All tasks complete. Go/No-Go gate passed 2026-03-17.
-**Implementation plan**: [Phase1.md](Phase1.md)
 **Benchmark results**: [benchmarks/results/benchmark_results.md](benchmarks/results/benchmark_results.md)
 
 **Goal**: Build the SCX file format, compression codec, and AnnData bridge.
@@ -151,8 +150,6 @@ See `benchmarks/comprehensive/reporting/phase3_report.md` for the full Phase 3 b
 
 ## Phase 2: Training Loader + Query Engine (Months 4-7)
 
-**Implementation plan**: [Phase2.md](Phase2.md), [Phase2-CLOUD.md](Phase2-CLOUD.md)
-
 **Goal**: The ML training data loader (the primary performance thesis) and
 the lazy query engine for efficient subsetting. Also: auto-codec selection
 and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
@@ -174,7 +171,7 @@ and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
 - [x] scVI DataModule integration (obs covariates in batch)
 - [ ] scGPT DataModule integration — **DEFERRED**
 - [x] Configurable memory budget (`max_loader_memory_mb`)
-- [x] Per-cell control pairing — `pyscx.IndexPlanDataset` (sibling row-source for perturbation training, contrastive learning, donor-matched designs). Plan-driven paired-batch reads via consumer-supplied `(pert_idx, ctrl_idx)` plan iterators; reuses `BackedCsrReader::read_row_indices` + `HvgProjection::scatter_pair_rows` + `fused_normalize_log1p_dense`. Memory-budget auto-tune surfaces `effective_lookahead()` / `effective_cache_shards()`. **106× faster than the cell-load-scx `ScxBackedSparseDataset` Python-loop baseline at 1M cells** (20K vs 189 cells/s). See [`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset) and [`PER-CELL-CONTROL-PAIRING.md`](PER-CELL-CONTROL-PAIRING.md).
+- [x] Per-cell control pairing — `pyscx.IndexPlanDataset` (sibling row-source for perturbation training, contrastive learning, donor-matched designs). Plan-driven paired-batch reads via consumer-supplied `(pert_idx, ctrl_idx)` plan iterators; reuses `BackedCsrReader::read_row_indices` + `HvgProjection::scatter_pair_rows` + `fused_normalize_log1p_dense`. Memory-budget auto-tune surfaces `effective_lookahead()` / `effective_cache_shards()`. **106× faster than the cell-load-scx `ScxBackedSparseDataset` Python-loop baseline at 1M cells** (20K vs 189 cells/s). See [`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
 
 ### 2.2 scx-engine (query)
 - [x] Lazy pipeline builder: `open → filter → select → collect`
@@ -351,8 +348,6 @@ GDS deferred). R bindings. Full documentation. Multimodal deferred.
 
 ## Phase 4: Rust-Native Analysis Accelerators — 4a/4b COMPLETE
 
-**Implementation plan**: [Phase4.md](Phase4.md), [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md)
-
 **Goal**: For operations where scanpy is a bottleneck at scale, provide
 faster Rust implementations. These are **optional optimizations** — the
 full scverse pipeline works via AnnData from Phase 1.
@@ -393,8 +388,6 @@ See [docs/gpu-setup.md](docs/gpu-setup.md) and [docs/performance.md](docs/perfor
 - [x] `pyscx.accel.filter_cells()` / `filter_genes()` — non-materializing QC filters
 - [x] `pyscx.accel.subset_obs()` — deletion vector construction from Python
 - [x] `pyscx.accel.calculate_qc_metrics()` — streaming QC metrics
-
-See [Phase4-ACC-ALL.md](Phase4-ACC-ALL.md) for detailed specification.
 
 ---
 

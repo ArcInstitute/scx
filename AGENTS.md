@@ -6,7 +6,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 
 ## Key Documents
 
-- **[ROADMAP.md](ROADMAP.md)** — Historical phased implementation plan (Phases 1-4).
+- **[ROADMAP.md](ROADMAP.md)** — High-level roadmap of capability tiers.
 - **[docs/architecture.md](docs/architecture.md)** — Crate architecture and dependency details.
 - **[docs/format.md](docs/format.md)** — Binary format reference: file header, catalogs, CSR shard layout, fragment/manifest model, checksums.
 - **[docs/codec.md](docs/codec.md)** — Bit-level codec specification: Delta-Golomb-Rice, FOR-BP, Rice, LZ4+shuffle, auto-selection.
@@ -19,7 +19,6 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
 - **[docs/cloud.md](docs/cloud.md)** — Using SCX in cloud environments: auth, layouts, tuning, provider-specific notes.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide to running benchmarks: SLURM job submission, dataset preparation, script reference. **Always use parallel SLURM job submission** (one job per benchmark x dataset pair) rather than sequential single-job scripts. See [Regression Gating](benchmarks/README.md#regression-gating) for the canonical local gate (`python benchmarks/comprehensive/scripts/gate_candidate.py` against `comprehensive/results/baselines/LATEST`) — covers format + accel CPU + accel GPU by default; opt out with `--no-gpu` / `--no-accel` / `--accel-only`. There is no CI-side gate (the prior `accel-gate.yml` workflow was removed because the self-hosted GPU runner queue made it unworkable). [GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow) covers the routing details (which accel jobs land on which partitions).
-- **[tasks/](tasks/)** — Historical phase specs and code reviews.
 
 ## Build and Test
 
@@ -162,23 +161,33 @@ Triple-buffered Rust pipeline (tokio I/O -> rayon decode -> Python consumer). Ze
 
 See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
-| Area | Metric | Result |
-|------|--------|--------|
-| Read | vs Zarr lz4, 1M cells | **1.38x faster** |
-| Read | vs SLAF, 1M cells | **19.3x faster** |
-| Read | Parallel read scaling (32 threads) | **Up to 7x** |
-| Write | Parallel write scaling (32 threads) | **Up to 3.2x** |
-| Column projection | vs all competitors | **4-8x faster** |
-| Memory (OOC pipeline) | Peak RSS, 1M cells | **5.1 GB** (88% reduction) |
-| PCA | vs scanpy, 1M cells (HVG) | **1.9x faster** (4.2s) |
-| DE (Wilcoxon) | vs scanpy, 1M cells | **3.2x faster** (5.4s) |
-| Leiden | vs Python leidenalg, 1M cells | **40x faster** (55s) |
-| Training loader | batches/sec, 1M cells | **1,405** (82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader) |
-| GPU kNN | vs CPU, 1M cells | **9.4x faster** |
-| GPU UMAP | vs CPU, 1M cells | **7.7x faster** |
-| GPU Leiden | vs CPU, 1M cells | **16x faster** |
 
 ## Coding Conventions
+
+### Documentation in tracked files
+
+Tracked files (code, tests, docs, configs, READMEs) MUST NOT reference
+gitignored markdown documents. In this repo those live at the workspace
+root and under `tasks/` — typically ALL-CAPS or date-prefixed names like
+`*_CODE-REVIEW.md`, `Phase*.md`, `SPEC*.md`, `GPU-ACC-SPEED-UP.md`,
+`HARMONY2.md`, `DEADLOCK-ISSUE.md`, `PER-CELL-CONTROL-PAIRING.md`,
+`SCX-EVAL-METRIC-IMPROVE.md`, etc. They are scratch/working specs and
+do not ship with the repository.
+
+Concretely, in any tracked file, do not:
+
+- Link to a gitignored doc (`[X.md](X.md)`, `see X.md §3`, `(per X.md)`).
+- Cite a "review §1.4" / "Phase 7.2 of X.md" / "spec target (X.md:1037)".
+- Carry inline `// TODO: see X.md` markers pointing at gitignored specs.
+
+Tracked documentation must stand alone. When the gitignored doc carried
+load-bearing context, **inline the substance** (a sentence or two of the
+why / how) into the tracked file instead of citing. When the citation
+was decorative, just delete it.
+
+Cross-references between tracked files (`docs/*.md`, `benchmarks/README.md`,
+`ROADMAP.md`, `AGENTS.md`/`CLAUDE.md`, generated reports under
+`benchmarks/comprehensive/results/reports/`) are fine — they ship together.
 
 ### Serialization
 
@@ -244,9 +253,9 @@ See [docs/performance.md](docs/performance.md) for detailed benchmark data.
 
 ## Known Limitations
 
-- **GPU pipeline speedup**: 6.9x median achieved on 1M cells post-Phase-7 (up from 3.8x pre-Phase-1; 10x target still not met). Best individual after Phase 1-7: UMAP 18.8x on census_1m (21.9x standalone), kNN 5.4x in-pipeline (4.8x standalone). PCA at 2K HVGs × 1M is 1.0x — CPU covariance PCA already ~3s, no GPU headroom; at n_vars=100K PCA reaches 1.7x. Leiden post-dispatch-reframe reaches cuGraph directly via `device="gpu"` (~16× on 1M cells); end-to-end pipeline gain from this is bounded by Leiden's share of total wall-time (~50 s of ~120 s pre-reframe). Full regression report at `benchmarks/results/phases_1_7_gpu_regression_report.md` from Phase 8 cluster run (job 2211369, 2026-04-23). See `GPU-ACC-SPEED-UP.md` Phase 8 and [benchmarks/README.md § GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow).
+- **GPU pipeline speedup**: 6.9x median achieved on 1M cells (up from 3.8x in early GPU work; 10x target still not met). Best individual: UMAP 18.8x on census_1m (21.9x standalone), kNN 5.4x in-pipeline (4.8x standalone). PCA at 2K HVGs × 1M is 1.0x — CPU covariance PCA already ~3s, no GPU headroom; at n_vars=100K PCA reaches 1.7x. Post-dispatch-reframe Leiden reaches cuGraph directly via `device="gpu"` (~16× on 1M cells); end-to-end pipeline gain from this is bounded by Leiden's share of total wall-time (~50 s of ~120 s pre-reframe). See [benchmarks/README.md § GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow) for the routing details.
 - **GPU Leiden correctness**: ARI ≈ 0.92 vs Python leidenalg — documented behavior of `device="gpu"` (and of `device="auto"` on GPU hosts), not a regression. cuGraph uses a different refinement strategy than leidenalg. Pin `device="cpu"` to preserve label stability for downstream DE / annotation transfer.
-- **Benchmark baseline scope**: the canonical gated baseline at `benchmarks/comprehensive/results/baselines/LATEST` covers format-level benchmarks (compression / read / write / parallel scaling / memory / cloud) and the `pyscx.accel.*` GPU accelerator surface via the `accel_*` modules in `benchmarks/comprehensive/benchmarks/`. The Phase-8 stopgap wrappers (`benchmarks/scripts/gpu_regression_*`, `slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py` for accelerator regression checks. `ml_loader`, `correctness`, and `cell_eval_parity_perf` are now wired into `ALL_BENCHMARKS` with floors covering training-loader throughput, scanpy/backed/preprocessing parity, and the marquee `energy_distance_blas_f32` speedup. Remaining gaps tracked in `2026-04-29_SCX-BENCH-REVIEW.md`: SLAF floors for `ml_loader` (needs a multi-env orchestrator pass — `slafpy` lives in `scx-bench-slaf`), `avg_gpu_util_pct__gpu_train` floors (1 Hz `nvidia-smi dmon` misses sub-second epochs; needs an in-process sampler), and `census_1m` cell_eval coverage (energy_distance variants skip at n_obs >= 500K).
+- **Benchmark baseline scope**: the canonical gated baseline at `benchmarks/comprehensive/results/baselines/LATEST` covers format-level benchmarks (compression / read / write / parallel scaling / memory / cloud) and the `pyscx.accel.*` GPU accelerator surface via the `accel_*` modules in `benchmarks/comprehensive/benchmarks/`. Use `gate_candidate.py` for accelerator regression checks. `ml_loader`, `correctness`, and `cell_eval_parity_perf` are wired into `ALL_BENCHMARKS` with floors covering training-loader throughput, scanpy/backed/preprocessing parity, and the marquee `energy_distance_blas_f32` speedup. Known gaps: SLAF floors for `ml_loader` (deferred — `slafpy` lives in a separate `scx-bench-slaf` conda env and the orchestrator activates one env per run), `avg_gpu_util_pct__gpu_train` floors (1 Hz `nvidia-smi dmon` misses sub-second epochs; needs an in-process sampler), and `census_1m` `cell_eval_parity_perf` coverage (energy_distance variants skip at `n_obs >= 500K` because the cell-eval reference's O(N²) work is infeasible at that scale).
 - **CSC storage**: Gene-major (CscShard) not yet implemented — CSR only.
 - **Multimodal**: CITE-seq, spatial transcriptomics not yet supported.
 - **GDS**: GPUDirect Storage requires local NVMe + nvidia-fs drivers + ext4/XFS; always falls back to CPU path.

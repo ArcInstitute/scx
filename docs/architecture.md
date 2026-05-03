@@ -325,8 +325,7 @@ The two types share `BackedCsrReader::read_row_indices`,
 `fused_normalize_log1p_dense`, and `extract_obs_columns`. They do **not**
 share `pipeline.rs` — the streaming pipeline's I/O stage sorts shard groups
 by file offset, an optimisation that doesn't apply to plan-driven access.
-See `PER-CELL-CONTROL-PAIRING.md` and `docs/api.md` § `IndexPlanDataset` for
-details.
+See `docs/api.md` § `IndexPlanDataset` for details.
 
 ### Pipeline Architecture (TrainingDataset)
 

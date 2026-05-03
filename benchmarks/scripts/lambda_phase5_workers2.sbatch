@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Phase 5 GPU benchmark on Lambda HPC.
+# GPU benchmark on Lambda HPC.
 #
-# Runs the new `pyscx_training_dataset_workers2` and `..._persistent`
-# scenarios from DEADLOCK-ISSUE.md §5.3 against a synthetic 100k-cell
+# Runs the `pyscx_training_dataset_workers2` and `..._persistent`
+# ``num_workers > 0`` ml_loader scenarios against a synthetic 100k-cell
 # fixture, alongside `num_workers=0` reference scenarios for direct
 # comparison. Captures throughput / cells-per-sec / peak RSS into a
 # JSON file under `benchmarks/comprehensive/results/`.

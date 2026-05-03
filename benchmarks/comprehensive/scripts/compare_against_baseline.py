@@ -2,11 +2,9 @@
 """
 Compare a post-change comprehensive benchmark run against the pre-change baseline.
 
-This is the regression gate named in 2026-04-17_CODE-REVIEW.md §12.4:
-
-  "Each PR's acceptance criteria include: all previously-stable benchmarks
-   still within 3% of baseline, and all parity tests pass with unchanged
-   tolerance."
+This is the regression gate. Each PR's acceptance criteria include:
+all previously-stable benchmarks still within 3% of baseline, and all
+parity tests pass with unchanged tolerance.
 
 Given two directories produced by capture_baseline.py, this script reports:
 
@@ -18,7 +16,7 @@ Given two directories produced by capture_baseline.py, this script reports:
     ``--timing-tolerance=0.03`` and ``--iqr-k=1.5``, a row whose baseline
     has IQR/median ≥ 0.02 (i.e. RSD-equivalent) automatically widens; a
     rock-stable row stays at the 3% floor. Falls back to the fixed
-    --timing-tolerance against pre-§1.1 baselines that lack ``wall_s_iqr``.
+    --timing-tolerance against older baselines that lack ``wall_s_iqr``.
   - Peak RSS deltas.  Flagged at --rss-tolerance (default 10%).
   - File size deltas.  Flagged at --size-tolerance (default 1%) — size should
     be byte-stable across non-format-changing PRs.
@@ -158,9 +156,10 @@ def _load_summary(path: Path) -> dict[str, Any]:
     if not f.exists():
         raise FileNotFoundError(f"summary.json not found at {f}")
     data = json.loads(f.read_text())
-    # summary.json itself doesn't carry schema_version today — the shape
-    # stabilized pre-Phase-5. Raw per-run JSONs DO carry schema_version now;
-    # refuse to diff when we detect an unknown future version.
+    # capture_baseline.py stamps summary.json with schema_version;
+    # legacy promoted baselines that predate the stamping omit it and
+    # the check is silently skipped (back-compat). When the field is
+    # present, refuse to diff against an unknown future version.
     sv = data.get("schema_version")
     if sv is not None:
         try:
@@ -229,8 +228,8 @@ def diff_summaries(
     timing tolerance: a ``median_wall_s`` row is gated at
     ``max(timing_tol, iqr_k * baseline_iqr / baseline_median)``. Falls
     back to ``timing_tol`` when the baseline lacks ``wall_s_iqr``
-    (pre-§1.1 captures); a single WARN is logged per gate run noting
-    the missing field. Only affects ``median_wall_s``.
+    (older captures); a single WARN is logged per gate run noting the
+    missing field. Only affects ``median_wall_s``.
     """
     overrides = tolerance_overrides or {}
     cvs = wall_cvs or {}
@@ -266,7 +265,7 @@ def diff_summaries(
 
             # IQR-based noise widening for wall-time only. Other metrics
             # have their own variance treatment (RSS is a single point
-            # sample today — see review §2.1; file size is deterministic).
+            # sample today; file size is deterministic).
             iqr_ratio: float | None = None
             noise_widened = False
             row_default_tol = default_tol
@@ -278,8 +277,8 @@ def diff_summaries(
                             "baseline summary.json has no wall_s_iqr — "
                             "falling back to fixed --timing-tolerance for "
                             "all median_wall_s rows. Re-capture the baseline "
-                            "with the post-§1.1 capture_baseline.py to enable "
-                            "variance-aware gating."
+                            "with a capture_baseline.py that records "
+                            "wall_s_iqr to enable variance-aware gating."
                         )
                         iqr_missing_warned = True
                 else:

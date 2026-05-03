@@ -13,7 +13,7 @@ they're missing these tests skip gracefully rather than failing, so the
 suite stays green for contributors without access to the validation
 datasets.
 
-The spec target (HARMONY2.md:1037-1041) is
+The original target was:
 
   * Per-PC Pearson r >= 0.998 vs R reference,
   * Convergence iteration count within ±1 of R,

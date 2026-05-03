@@ -1,5 +1,5 @@
 """
-§4.1 — afterok dependency wiring in `run_parallel.py`.
+afterok dependency wiring in `run_parallel.py`.
 
 Hermetic: stubs `submitit.AutoExecutor` to capture every `submit()` call's
 parameter snapshot, sets `SCX_WORK_DIR` to a tmpdir, and runs `main()`
@@ -202,7 +202,7 @@ def test_afterok_dependency_wired_for_fresh_conversion(
 
 def test_phase_a_does_not_block_phase_b(isolated_work_dir):
     """No conversion job's `.result()` should be called BEFORE the bench
-    submissions land — this is the whole point of §4.1."""
+    submissions land — Phase A submitting must not block Phase B."""
     _FakeAutoExecutor.reset()
     _install_fake_submitit()
 

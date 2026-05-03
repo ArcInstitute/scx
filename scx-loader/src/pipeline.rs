@@ -13,17 +13,16 @@ use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
 use crate::shuffle::ShardShuffler;
 
-/// Hard upper bound on per-pipeline rayon worker threads (DEADLOCK-ISSUE.md
-/// §2.0a). On many-core hosts the decode work is embarrassingly parallel but
-/// memory-bound; more than ~8 workers does not pay off and increases the
-/// fork-hostile thread count for downstream callers that use spawn-mode
-/// multiprocessing.
+/// Hard upper bound on per-pipeline rayon worker threads. On many-core hosts
+/// the decode work is embarrassingly parallel but memory-bound; more than
+/// ~8 workers does not pay off and increases the fork-hostile thread count
+/// for downstream callers that use spawn-mode multiprocessing.
 const DEFAULT_DECODE_POOL_MAX_THREADS: usize = 8;
 
-/// Bounded join deadline for `Drop` and `join_epoch_handles` shutdown
-/// (DEADLOCK-ISSUE.md §2.3 / §2.4). If the I/O or decode thread does not
-/// finish within this window the join is abandoned and the thread handle is
-/// detached — preferable to wedging the worker process exit forever.
+/// Bounded join deadline for `Drop` and `join_epoch_handles` shutdown.
+/// If the I/O or decode thread does not finish within this window the join
+/// is abandoned and the thread handle is detached — preferable to wedging
+/// the worker process exit forever.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Polling interval for `JoinHandle::is_finished()` waits during bounded
@@ -295,10 +294,10 @@ fn estimate_memory(
 ///    shuffles, projects, densifies, normalizes
 /// 3. **GPU stage** (caller): consumes pre-built `Batch`es via `next_batch()`
 ///
-/// **Fork-safety contract** (DEADLOCK-ISSUE.md Phase 2). Both the tokio
-/// current-thread runtime (§2.1 / §2.2) and the rayon `ThreadPool` (§2.0a)
-/// are constructed *lazily inside `start_epoch`*, i.e. after any fork has
-/// happened. The `TrainingPipeline` value itself contains no live runtime,
+/// **Fork-safety contract**. Both the tokio current-thread runtime and
+/// the rayon `ThreadPool` are constructed *lazily inside `start_epoch`*,
+/// i.e. after any fork has happened. The `TrainingPipeline` value itself
+/// contains no live runtime,
 /// rayon registry, or worker threads at construction time, so a forked child
 /// that constructs its own pipeline does not inherit fork-hostile state from
 /// the parent. `pyscx.from_anndata` in the parent — which lazily initialises
@@ -321,12 +320,11 @@ pub struct TrainingPipeline {
     /// I/O stage runs on a dedicated `std::thread` that owns a
     /// `tokio::runtime::Builder::new_current_thread()` runtime. The runtime
     /// lives only as long as the I/O thread; nothing in `TrainingPipeline`
-    /// holds the runtime across fork boundaries (DEADLOCK-ISSUE.md §2.1 /
-    /// §2.2).
+    /// holds the runtime across fork boundaries.
     io_handle: Option<std::thread::JoinHandle<Result<()>>>,
     decode_handle: Option<std::thread::JoinHandle<Result<()>>>,
-    /// Per-pipeline rayon thread pool (DEADLOCK-ISSUE.md §2.0a). `None`
-    /// before the first `start_epoch()`; once built, persists across epochs
+    /// Per-pipeline rayon thread pool. `None` before the first
+    /// `start_epoch()`; once built, persists across epochs
     /// for the same `TrainingPipeline` and is dropped in `shutdown()` /
     /// `Drop`. Workers are *not* shared with rayon's global registry.
     decode_pool: Option<Arc<rayon::ThreadPool>>,
@@ -430,9 +428,9 @@ impl TrainingPipeline {
         let shuffler =
             ShardShuffler::new(n_csr_shards, memory_budget.shard_group_size, config.seed)?;
 
-        // NOTE: tokio runtime construction has moved to `start_epoch` (§2.1)
-        // and the rayon thread pool to `ensure_decode_pool` (§2.0a). Both are
-        // built lazily, post-fork, so a forked child that constructs its own
+        // NOTE: tokio runtime construction has moved to `start_epoch` and
+        // the rayon thread pool to `ensure_decode_pool`. Both are built
+        // lazily, post-fork, so a forked child that constructs its own
         // pipeline does not inherit any worker threads from the parent.
 
         if profile {
@@ -463,9 +461,9 @@ impl TrainingPipeline {
         })
     }
 
-    /// Lazily build the per-pipeline rayon `ThreadPool` (DEADLOCK-ISSUE.md
-    /// §2.0a). Called from `start_epoch` so the pool is constructed inside
-    /// the worker process, after any fork. Reused across epochs.
+    /// Lazily build the per-pipeline rayon `ThreadPool`. Called from
+    /// `start_epoch` so the pool is constructed inside the worker
+    /// process, after any fork. Reused across epochs.
     fn ensure_decode_pool(&mut self) -> Result<&Arc<rayon::ThreadPool>> {
         if self.decode_pool.is_none() {
             let n_threads = num_cpus::get_physical().clamp(1, DEFAULT_DECODE_POOL_MAX_THREADS);
@@ -561,7 +559,7 @@ impl TrainingPipeline {
         }
 
         // Build the per-pipeline rayon pool (lazy, post-fork) before
-        // spawning the decode thread that uses it (§2.0a).
+        // spawning the decode thread that uses it.
         let decode_pool = Arc::clone(self.ensure_decode_pool()?);
 
         let shard_groups = self.shuffler.shuffle_epoch_sorted(&shard_offsets);
@@ -573,7 +571,7 @@ impl TrainingPipeline {
         // being decoded + one read-ahead), not shard_group_size which would allow
         // shard_group_size * shard_group_size decoded shards in flight.
         //
-        // **Shutdown propagation chain** (Phase 3.4 — DEADLOCK-ISSUE.md):
+        // **Shutdown propagation chain**:
         // 1. Consumer drops `self.batch_rx` (in `join_epoch_handles`).
         // 2. Decode stage's `crossbeam tx.send(batch)` returns Err. Decode
         //    stage exits with `LoaderError::ChannelError`, dropping its
@@ -584,7 +582,7 @@ impl TrainingPipeline {
         //    the I/O thread exits, dropping its tokio runtime cleanly.
         //
         // Both stages' ChannelError return values are filtered out as
-        // expected-on-shutdown by `join_epoch_handles` (§2.4) — the chain
+        // expected-on-shutdown by `join_epoch_handles` — the chain
         // only surfaces real errors (panics, ShutdownError, ConfigError).
         // No explicit cancellation token is needed; channel close is the
         // signal.
@@ -596,7 +594,7 @@ impl TrainingPipeline {
         let (batch_tx, batch_rx) = crossbeam_channel::bounded(batch_channel_cap);
 
         // Spawn I/O stage as a dedicated `std::thread` that owns a tokio
-        // current-thread runtime (§2.1, §2.2). The runtime lives only as
+        // current-thread runtime. The runtime lives only as
         // long as the I/O thread, so the `TrainingPipeline` value never
         // holds a long-lived multi-threaded tokio runtime that fork would
         // inherit. `spawn_blocking` inside `io_stage` still works because
@@ -736,7 +734,7 @@ impl TrainingPipeline {
     ///
     /// Drops the batch receiver first to propagate channel-close back through
     /// the decode and I/O threads, then joins each handle with a bounded
-    /// deadline (§2.4). A timed-out join is logged as a warning rather than
+    /// deadline. A timed-out join is logged as a warning rather than
     /// returned as an error — once the consumer has dropped its receivers
     /// the only remaining sin is leaving worker threads alive, and that's a
     /// strictly better outcome than wedging the caller.
@@ -748,7 +746,7 @@ impl TrainingPipeline {
         // requiring a separate abort signal.
         self.batch_rx = None;
 
-        // Join the I/O thread (bounded — see §2.3 / §2.4).
+        // Join the I/O thread (bounded by SHUTDOWN_DEADLINE).
         //
         // ChannelError is treated as Ok on the shutdown path: it means the
         // I/O stage observed its downstream channel closing (because the
@@ -805,13 +803,12 @@ impl TrainingPipeline {
     }
 
     /// Explicit shutdown: drop channels, join I/O + decode threads (bounded),
-    /// and release the per-pipeline rayon pool (DEADLOCK-ISSUE.md §2.5).
+    /// and release the per-pipeline rayon pool.
     ///
     /// Idempotent — safe to call multiple times. `Drop` calls this
     /// internally, but callers running under PyTorch DataLoader workers
     /// should call this from a `weakref.finalize` hook before interpreter
-    /// teardown so shutdown happens while the GIL state is still healthy
-    /// (§2.6).
+    /// teardown so shutdown happens while the GIL state is still healthy.
     pub fn shutdown(&mut self) {
         let _span =
             tracing::trace_span!("TrainingPipeline::shutdown", pid = std::process::id()).entered();
@@ -881,7 +878,7 @@ impl Drop for TrainingPipeline {
     /// Best-effort shutdown when a pipeline is dropped without an explicit
     /// `shutdown()` call.
     ///
-    /// **Interpreter-teardown probe** (DEADLOCK-ISSUE.md §2.6). When `Drop`
+    /// **Interpreter-teardown probe**. When `Drop`
     /// runs during Python interpreter teardown — which can happen if a
     /// `TrainingDataset` outlives the worker process's normal lifecycle and
     /// is dropped during `_atexit` — the GIL state is partially gone and

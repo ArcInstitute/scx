@@ -1,5 +1,5 @@
 """
-Selective Read (Query / Subsetting) benchmark -- COMPREHENSIVE-BENCHMARKING.md S3.4.
+Selective Read (Query / Subsetting) benchmark.
 
 Measures sub-matrix extraction performance across four scenarios:
   - row_slice: read a random subset of cells (all genes)

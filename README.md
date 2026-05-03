@@ -174,10 +174,8 @@ processes either; it owns thread handles that don't survive transfer.
 > fork (e.g., `pyscx.from_anndata(...)` to write the fixture) initialises
 > rayon's process-global pool. Pre-fix this prerequisite was sufficient
 > to wedge `DataLoader(num_workers=2)` indefinitely; the per-pipeline
-> rayon pool fix in `scx-loader` removed that hazard. See
-> [`DEADLOCK-ISSUE.md`](DEADLOCK-ISSUE.md) for the full root-cause
-> analysis and `pyscx/tests/test_fork_safety.py` for the durable
-> regression test.
+> rayon pool in `scx-loader` removed that hazard. See
+> `pyscx/tests/test_fork_safety.py` for the durable regression test.
 
 ### You want to query without loading everything
 

@@ -501,7 +501,7 @@ At small scale, all formats fit easily in memory. Peak RSS reflects the benchmar
 
 *† h5ad formats (none, gzip, lzf) have incomplete parallel_scaling data (single-threaded only — worker subprocess timeouts on large datasets).*
 
-### Phase 4: ML Data Loader Throughput (§3.6)
+### Phase 4: ML Data Loader Throughput
 
 Batches/sec with batch_size=1024, HVG=2000, normalize+log1p (hvg_norm scenario):
 

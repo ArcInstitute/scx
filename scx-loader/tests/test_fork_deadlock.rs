@@ -1,18 +1,18 @@
-//! Phase 1.1 — pure-Rust fork reproducer for the `pyscx.TrainingDataset`
-//! fork-mode deadlock spec'd in `DEADLOCK-ISSUE.md`.
+//! Pure-Rust fork reproducer for the historical `pyscx.TrainingDataset`
+//! fork-mode deadlock.
 //!
 //! The hypothesis under investigation is: does a forked child that
 //! constructs and iterates a fresh `TrainingPipeline` deadlock at the
 //! Rust layer alone — independent of Python, PyO3, multiprocessing, or
 //! PyTorch's DataLoader machinery? If yes, the root cause is in the
-//! tokio-runtime / decode-thread / channel lifecycle (DEADLOCK-ISSUE.md
-//! root-cause candidates a/b/c/d). If no, the root cause is upstream of
-//! `TrainingPipeline` (e.g. PyTorch DataLoader-specific — candidate e).
+//! tokio-runtime / decode-thread / channel lifecycle. If no, the root
+//! cause is upstream of `TrainingPipeline` (e.g. PyTorch
+//! DataLoader-specific).
 //!
 //! This test is gated on Linux (`cfg(target_os = "linux")`) since
 //! `nix::unistd::fork` semantics are POSIX-with-Linux-specific glibc
-//! interactions. The full DEADLOCK-ISSUE.md investigation pins fork hazards
-//! to glibc malloc arena state, which is Linux-specific.
+//! interactions. Fork hazards in this codebase are pinned to glibc
+//! malloc arena state, which is Linux-specific.
 //!
 //! On `RUST_LOG=trace`, the structured tracing instrumentation added in
 //! Phase 1.4 (`pipeline.rs`) prints span entry/exit and intermediate
@@ -108,7 +108,7 @@ fn wait_with_timeout(child: Pid, timeout: Duration) -> WaitStatus {
                     let _ = waitpid(child, None);
                     panic!(
                         "child process hung in TrainingPipeline iteration \
-                         (>{timeout:?}); see DEADLOCK-ISSUE.md §1.6 candidates"
+                         (>{timeout:?})"
                     );
                 }
                 std::thread::sleep(POLL_INTERVAL);
@@ -119,7 +119,7 @@ fn wait_with_timeout(child: Pid, timeout: Duration) -> WaitStatus {
     }
 }
 
-/// Phase 1.1 acceptance: fork a child, construct a fresh `TrainingPipeline`
+/// Acceptance: fork a child, construct a fresh `TrainingPipeline`
 /// inside it, run one epoch to completion, exit cleanly.
 ///
 /// **Expected outcome on a green build:** child exits with status 0 and
@@ -128,8 +128,7 @@ fn wait_with_timeout(child: Pid, timeout: Duration) -> WaitStatus {
 /// **Expected outcome if the Rust layer reproduces the deadlock:**
 /// `wait_with_timeout` panics after `CHILD_TIMEOUT` because the child is
 /// stuck in `start_epoch` (tokio runtime construction in the child) or
-/// `next_batch` (I/O / decode / channel deadlock). That panic localizes the
-/// hang to one of DEADLOCK-ISSUE.md's candidates a/b/c/d.
+/// `next_batch` (I/O / decode / channel deadlock).
 #[test]
 fn fork_construct_and_iterate_one_epoch() {
     init_tracing_once();

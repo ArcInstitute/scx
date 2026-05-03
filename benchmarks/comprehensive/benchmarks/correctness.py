@@ -1,11 +1,11 @@
 """
-Correctness Validation Suite — COMPREHENSIVE-BENCHMARKING.md §3.14.
+Correctness Validation Suite.
 
 Integrates the three validation scripts into the benchmark module system
 used by run_all.py. Runs:
-  1. Scanpy equivalence (§3.14.1)
-  2. Backed-mode equivalence (§3.14.2)
-  3. Preprocessing path cross-validation (§3.14.3)
+  1. Scanpy equivalence
+  2. Backed-mode equivalence
+  3. Preprocessing path cross-validation
 
 Results are aggregated into a single BenchmarkResult with per-check details
 stored in the metadata field.

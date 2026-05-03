@@ -75,10 +75,10 @@ jobs:
   python:
     name: Python bindings
     runs-on: ubuntu-latest
-    # Fork-safety regression tests (DEADLOCK-ISSUE.md Phase 4.5) run inside
-    # the same job. `OMP_NUM_THREADS=1` keeps OpenMP-using deps (scanpy,
-    # numpy via OpenBLAS) from spawning extra threads in the parent that
-    # would amplify any future fork-after-pthread regression. `RUST_LOG=warn`
+    # Fork-safety regression tests run inside the same job.
+    # `OMP_NUM_THREADS=1` keeps OpenMP-using deps (scanpy, numpy via
+    # OpenBLAS) from spawning extra threads in the parent that would
+    # amplify any future fork-after-pthread regression. `RUST_LOG=warn`
     # surfaces the bounded-shutdown warnings (`pipeline.rs::join_handle_bounded`)
     # to the CI log without flooding it with trace-level events.
     env:
@@ -90,16 +90,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # `torch` is added so `pyscx/tests/test_fork_safety.py` (Phase 4)
-      # runs instead of being skipped via `pytest.importorskip("torch")`.
+      # `torch` is added so `pyscx/tests/test_fork_safety.py` runs
+      # instead of being skipped via `pytest.importorskip("torch")`.
       # CPU build only — the fork-safety test does no GPU work.
       - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy pyarrow anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
       - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud && pytest --ignore=tests/test_scvi_integration.py
 
-  # NOTE (DEADLOCK-ISSUE.md §4.5): the Phase 4 spec asks for the fork-safety
-  # tests to run on Linux aarch64 in addition to x86_64, since aarch64 +
-  # glibc fork semantics differ subtly enough to be worth covering. GitHub's
-  # `ubuntu-24.04-arm` runners are available for public repos as of 2025;
-  # adding an aarch64 matrix entry here is a follow-up. The fix itself is
-  # architecture-independent (rayon's global pool + fork hazard is generic
-  # POSIX), but a full regression net wants both.
+  # NOTE: the fork-safety tests should also run on Linux aarch64 in
+  # addition to x86_64 — aarch64 + glibc fork semantics differ subtly
+  # enough to be worth covering. GitHub's `ubuntu-24.04-arm` runners
+  # are available for public repos as of 2025; adding an aarch64 matrix
+  # entry here is a follow-up. The fix itself is architecture-
+  # independent (rayon's global pool + fork hazard is generic POSIX),
+  # but a full regression net wants both.

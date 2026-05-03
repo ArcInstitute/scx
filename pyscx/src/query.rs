@@ -1,7 +1,6 @@
 // Query pipeline Python bindings
 //
 // Wraps scx-engine::QueryPipeline and QueryResult for Python.
-// See Phase2-Step7.md §B1–B2 for design details.
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;

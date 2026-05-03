@@ -27,7 +27,7 @@ import numpy as np
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant, RANDOM_SEED
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.runners.base import FormatRunner
+from benchmarks.comprehensive.rss import current_rss_mb as _current_rss_mb
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +38,6 @@ _SCX_TRIGGER_KEY = "scx_auto"
 
 # Number of random cell indices to mark deleted. Capped by n_obs at runtime.
 _DELETE_N = 10_000
-
-
-def _current_rss_mb() -> float:
-    """Current resident-set size in MB (Linux /proc/self/statm)."""
-    return FormatRunner._get_rss_mb()
 
 
 def _gc() -> None:

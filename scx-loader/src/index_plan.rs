@@ -6,7 +6,6 @@
 //! them through the existing `HvgProjection` / `fused_normalize_log1p_dense`
 //! primitives, and yields paired dense `IndexPlanBatch` values.
 //!
-//! See `PER-CELL-CONTROL-PAIRING.md` at the workspace root for the full design.
 //!
 //! Surface: synchronous [`IndexPlanLoader::process_plan`] for one-shot batch
 //! gathering, plus an async [`IndexPlanLoader::iter_with_plans`] iterator that
@@ -176,9 +175,9 @@ impl IndexPlanLoader {
             .map(|p| p.n_output_cols())
             .unwrap_or(n_vars as usize);
 
-        // ----- Phase 5: memory budget auto-tune --------------------------
+        // ----- Memory budget auto-tune -----------------------------------
         //
-        // Per-component model (see PER-CELL-CONTROL-PAIRING.md "Memory budget"):
+        // Per-component model:
         //   shard_decoded_bytes = (avg_nnz_per_shard × 8) + (avg_rows_per_shard × 8)
         //                                    ^^^ i32 indices (4) + f32 data (4)
         //                                                                ^^^ i64 indptr (8)

@@ -1,5 +1,5 @@
 """
-Parallel Read Scaling benchmark — COMPREHENSIVE-BENCHMARKING.md §3.5.
+Parallel Read Scaling benchmark.
 
 Measures how read throughput scales with thread count for formats that
 support parallel I/O (primarily SCX via rayon). For each thread count in

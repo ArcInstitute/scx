@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Correctness Validation: Scanpy Equivalence (§3.14.1).
+Correctness Validation: Scanpy Equivalence.
 
 Runs every ``pyscx.accel.*`` function and its scanpy equivalent side-by-side
 on the same input data, then compares outputs. Reports per-function pass/fail
@@ -784,7 +784,7 @@ def run_all_checks(
 
     Returns list of ValidationCheck results.
     """
-    logger.info("=== Scanpy Equivalence Validation (§3.14.1) ===")
+    logger.info("=== Scanpy Equivalence Validation ===")
     logger.info("Dataset: %s", dataset_name)
 
     # Load and prepare data
@@ -836,7 +836,7 @@ def run_all_checks(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_common_args("Correctness Validation: Scanpy Equivalence (§3.14.1)")
+    args = parse_common_args("Correctness Validation: Scanpy Equivalence")
     report = run_all_checks(args.dataset, args.output)
 
     if args.output is None:

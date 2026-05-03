@@ -248,12 +248,12 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // a subsequent re-import is a no-op.
     let _ = pyo3_log::try_init();
 
-    // Route Rust-side `tracing::*!` events to stderr when RUST_LOG is set
-    // (DEADLOCK-ISSUE.md §2.7). Off by default — `try_init()` is a no-op
-    // on subsequent imports and silent without RUST_LOG. The
+    // Route Rust-side `tracing::*!` events to stderr when RUST_LOG is set.
+    // Off by default — `try_init()` is a no-op on subsequent imports and
+    // silent without RUST_LOG. The
     // `TrainingPipeline::{new, start_epoch, next_batch, drop, shutdown}`
-    // spans + `decode` / `I/O` thread entry/exit traces from Phase 1.4
-    // surface here. We use stderr rather than Python `logging` because
+    // spans + `decode` / `I/O` thread entry/exit traces surface here. We
+    // use stderr rather than Python `logging` because
     // `tracing-subscriber → log → pyo3-log` would require an extra bridge
     // layer for negligible gain on a diagnostic path that is already
     // gated.

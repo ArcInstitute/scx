@@ -1,5 +1,5 @@
 """
-Memory Efficiency benchmark — COMPREHENSIVE-BENCHMARKING.md SS3.7.
+Memory Efficiency benchmark.
 
 Measures current RSS (not cumulative peak) before and after key operations
 to quantify per-operation memory overhead across all format variants.
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import statistics
 import tempfile
 from pathlib import Path
@@ -28,25 +27,10 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.rss import current_rss_mb as _current_rss_mb
 from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
-
-
-def _current_rss_mb() -> float:
-    """Read *current* RSS from /proc/self/statm (Linux only).
-
-    Unlike ``resource.getrusage().ru_maxrss`` which is a monotonically
-    increasing high-water mark, this returns the actual resident set size
-    at the moment of the call.
-    """
-    try:
-        with open("/proc/self/statm") as f:
-            parts = f.read().split()
-            # Field 1 (index 1) is resident set size in pages.
-            return int(parts[1]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except (OSError, ValueError, IndexError):
-        return 0.0
 
 
 def _measure_operation(runner, op_name: str, op_fn, *args, **kwargs):

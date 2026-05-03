@@ -1,6 +1,4 @@
-"""Phase 6.3 — integration tests for `pyscx.IndexPlanDataset`.
-
-Spec reference: `PER-CELL-CONTROL-PAIRING.md` "Tests > Python integration tests".
+"""Integration tests for `pyscx.IndexPlanDataset`.
 
 Coverage:
 - Smoke (dtypes, shapes).

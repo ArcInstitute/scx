@@ -887,9 +887,9 @@ pyscx.accel.neighbors(adata, n_neighbors=15)
 
 On CPU, uses HNSW (instant-distance) with Euclidean distance — except at
 `n_obs ≤ 5,000`, where the CPU path silently dispatches to an exact kNN
-via a faer matmul + per-row partial top-k sort (Phase 6 of
-`SCX-EVAL-METRIC-IMPROVE.md`); `ef_construction` / `ef_search` are
-ignored on the exact path. The exact path allocates an `n_obs × n_obs`
+via a faer matmul + per-row partial top-k sort; `ef_construction` /
+`ef_search` are ignored on the exact path. The exact path allocates an
+`n_obs × n_obs`
 f32 Gram matrix (~100 MB at the threshold) — keep this in mind if
 calling at the boundary on memory-constrained hosts.
 On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
@@ -1263,9 +1263,9 @@ means, groups = pyscx.accel.pseudobulk_means(adata, "perturbation")
 
 Streams directly from CSR shards with no full-matrix materialization. On
 backed data, processes shard-by-shard; on lazy-transformed data, applies
-the transform stack before aggregation. **Dense fast-path** (Phase 6 of
-`SCX-EVAL-METRIC-IMPROVE.md`): when `adata.X` is a dense numpy array (the
-common shape after `pp.normalize_total + log1p`), the in-memory aggregation
+the transform stack before aggregation. **Dense fast-path**: when
+`adata.X` is a dense numpy array (the common shape after
+`pp.normalize_total + log1p`), the in-memory aggregation
 runs through `scx_accel::pseudobulk_aggregate_dense` directly, bypassing
 the historical `scipy.sparse.csr_matrix(dense_array)` round-trip. At
 24K-cell × 18K-gene shapes this cut `pseudobulk_means` from ~22 s to ~5 s.

@@ -35,7 +35,7 @@ use crate::pipeline::{LoaderConfig, TrainingPipeline};
 /// Wraps the Rust `TrainingPipeline` and exposes it as a Python iterator.
 /// Each call to `__next__` returns a dict `{"X": ndarray, "obs": {...}, "cell_indices": ndarray}`.
 ///
-/// # Fork safety (DEADLOCK-ISSUE.md Phase 2)
+/// # Fork safety
 ///
 /// `TrainingDataset` is fork-safe under PyTorch
 /// `DataLoader(num_workers > 0, start_method="fork")` **when the dataset is
@@ -65,7 +65,7 @@ use crate::pipeline::{LoaderConfig, TrainingPipeline};
 /// process exit so the rayon pool and I/O thread shut down while the
 /// interpreter is still healthy. `Drop` runs at interpreter teardown as a
 /// fallback but is bounded by a 5-second deadline per thread to avoid
-/// hangs (DEADLOCK-ISSUE.md §2.3).
+/// hangs.
 #[pyclass]
 pub struct TrainingDataset {
     pipeline: TrainingPipeline,
@@ -231,7 +231,7 @@ impl TrainingDataset {
 
     /// Explicitly shut the pipeline down: drop channels, join I/O + decode
     /// threads (bounded by `SHUTDOWN_DEADLINE`), and release the
-    /// per-pipeline rayon pool (DEADLOCK-ISSUE.md §2.5).
+    /// per-pipeline rayon pool.
     ///
     /// Idempotent. Safe to call multiple times. Once `close()` has been
     /// called, subsequent `__iter__` / `__next__` calls behave as if no
@@ -260,13 +260,12 @@ impl TrainingDataset {
 ///
 /// Sibling to `TrainingDataset`: instead of streaming shards in catalog order,
 /// `IndexPlanDataset` consumes caller-supplied `(pert_idx, ctrl_idx)` plans
-/// and returns paired dense batches. See `PER-CELL-CONTROL-PAIRING.md` at the
-/// workspace root for the full design.
+/// and returns paired dense batches.
 ///
-/// Phase 1 surface: `next_batch(plan)` is the only batch entry point. The
-/// streaming `iter_with_plans` API lands in Phase 4.
+/// Surface: `next_batch(plan)` is the synchronous entry point; the streaming
+/// `iter_with_plans` API exposes a tokio-driven prefetched iterator.
 ///
-/// # Fork safety (DEADLOCK-ISSUE.md §7.1–7.3)
+/// # Fork safety
 ///
 /// `IndexPlanDataset` is fork-safe under PyTorch
 /// `DataLoader(num_workers > 0, start_method="fork")` **when the dataset is

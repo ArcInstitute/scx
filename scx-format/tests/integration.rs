@@ -1,7 +1,6 @@
 //! Integration tests for the SCX format: ScxWriter → ScxReader round-trips.
 //!
-//! These tests exercise the full write-read pipeline as external consumers would,
-//! covering tasks 18.1–18.8 from Phase1.md.
+//! These tests exercise the full write-read pipeline as external consumers would.
 
 use arrow::array::{Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};

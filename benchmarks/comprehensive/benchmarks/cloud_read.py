@@ -11,8 +11,8 @@ Runners that *declare* the capability but fail to implement it propagate
 After the timed loop, an untimed verification pass for SCX formats pulls
 the cloud fixture once more and compares the materialised matrix against
 the local ``converted_path``. Result counts land in every run's
-``extra`` so ``thresholds.yaml`` can floor them — addresses §3.6 of
-``2026-04-29_SCX-BENCH-REVIEW.md``.
+``extra`` so ``thresholds.yaml`` can floor cloud-vs-local matrix parity
+alongside the timing measurements.
 """
 
 from __future__ import annotations

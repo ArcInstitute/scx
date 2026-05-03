@@ -34,7 +34,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "io-util"]
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 
-# HDF5 — see Phase1.md note on crate risk
+# HDF5 — `hdf5-rust` is unmaintained upstream; only used for h5ad
+# conversion. Fallback path is a Python subprocess via h5py.
 hdf5 = "0.8"
 
 half = "2"
@@ -56,14 +57,14 @@ cudarc = { version = "0.19", features = ["cuda-12020"] }
 # Testing
 proptest = "1"
 
-# Logging (M19 — structured logging across library crates; see §11.6 of the
-# 2026-04-17 code review). `log` is the facade; consumers wire up sinks
-# (env_logger for CLI, pyo3-log for Python).
+# Logging — structured logging across library crates. `log` is the
+# facade; consumers wire up sinks (env_logger for CLI, pyo3-log for
+# Python).
 log = "0.4"
 env_logger = "0.11"
 pyo3-log = "0.12"
 
-# Tracing (Phase-1 deadlock diagnostics — see DEADLOCK-ISSUE.md §1.4).
+# Tracing for deadlock diagnostics in the loader pipeline.
 # Off by default; enable via `RUST_LOG=trace` with a subscriber wired up.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
