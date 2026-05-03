@@ -9,12 +9,18 @@ authors.workspace = true
 [features]
 default = []
 hdf5 = ["dep:hdf5", "dep:ndarray"]
+# Bundles libhdf5 + zlib statically into the binary via hdf5-src + libz-sys.
+# Used by the release workflow so downloaded binaries have no system libhdf5
+# runtime requirement. Pulls in CMake at build time.
+hdf5-static = ["hdf5", "hdf5-sys/static", "hdf5-sys/zlib", "libz-sys/static"]
 cloud = ["dep:scx-cloud", "dep:tokio"]
 
 [dependencies]
 clap = { workspace = true }
 indicatif = { workspace = true }
 hdf5 = { workspace = true, optional = true }
+hdf5-sys = { version = "0.8", optional = true }
+libz-sys = { version = "1", optional = true, default-features = false }
 ndarray = { workspace = true, optional = true }
 arrow = { workspace = true }
 serde_json = { workspace = true }

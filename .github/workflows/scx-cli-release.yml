@@ -1,0 +1,135 @@
+name: scx-cli release binaries
+
+on:
+  push:
+    tags:
+      - "scx-cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to attach the release to (e.g. scx-cli-v0.2.0). Required for workflow_dispatch."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Resolve tag and version
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#scx-cli-v}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (release, hdf5-static + cloud)
+        run: cargo build -p scx-cli --release --features hdf5-static,cloud --target ${{ matrix.target }}
+
+      - name: Strip binary
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/scx"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            strip -x "$bin"
+          else
+            strip "$bin"
+          fi
+
+      - name: Verify static linkage of libhdf5
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/scx"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if otool -L "$bin" | grep -i hdf5; then
+              echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
+              exit 1
+            fi
+          else
+            if ldd "$bin" | grep -i hdf5; then
+              echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Package tarball
+        id: pkg
+        shell: bash
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          target="${{ matrix.target }}"
+          name="scx-cli-${version}-${target}"
+          staging="${RUNNER_TEMP}/${name}"
+          mkdir -p "$staging"
+          cp "target/${target}/release/scx" "$staging/"
+          cp README.md "$staging/"
+          tar -czvf "${name}.tar.gz" -C "${RUNNER_TEMP}" "$name"
+          echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scx-cli-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: scx-cli-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
