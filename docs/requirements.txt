@@ -1,0 +1,20 @@
+# Build dependencies for the SCX documentation site.
+# Used by ReadTheDocs (.readthedocs.yaml) and for local `sphinx-build` runs.
+
+sphinx>=7.3,<9
+furo>=2024.5.6
+myst-parser>=3.0
+sphinx-autodoc-typehints>=2.2
+sphinx-copybutton>=0.5.2
+sphinx-design>=0.6
+linkify-it-py>=2.0
+
+# Imported by pyscx/__init__.py and the integration modules. Keeping these
+# real (not mocked) lets autodoc resolve type hints cleanly. Heavy/optional
+# deps (torch, scvi, scanpy, the compiled pyscx.pyscx extension) are mocked
+# in conf.py instead.
+numpy
+scipy
+pandas
+pyarrow
+anndata
