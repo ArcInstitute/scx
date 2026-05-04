@@ -546,15 +546,13 @@ configuration, and driver compatibility details.
 
 ### Rust CLI
 
-**Pre-built binaries (recommended)** — published on each `scx-cli-v*` tag at [GitHub Releases](https://github.com/ArcInstitute/scx/releases). Bundles `hdf5` (h5ad conversion) and `cloud` (S3/GCS/Azure); libhdf5 is statically linked so no system libraries are required at runtime.
+**Pre-built binaries (recommended)** — published on each `scx-cli-v*` tag at [GitHub Releases](https://github.com/ArcInstitute/scx/releases). Linux only (x86_64 and arm64). Bundles `hdf5` (h5ad conversion) and `cloud` (S3/GCS/Azure); libhdf5 is statically linked so no system libraries are required at runtime.
 
 ```bash
 VERSION=0.2.0
 # Pick the matching target for your platform:
 #   linux x86_64 → x86_64-unknown-linux-gnu
 #   linux arm64  → aarch64-unknown-linux-gnu
-#   macOS Intel  → x86_64-apple-darwin
-#   macOS Apple  → aarch64-apple-darwin
 TARGET=x86_64-unknown-linux-gnu
 
 curl -L "https://github.com/ArcInstitute/scx/releases/download/scx-cli-v${VERSION}/scx-cli-${VERSION}-${TARGET}.tar.gz" | tar xz
@@ -564,7 +562,7 @@ curl -L "https://github.com/ArcInstitute/scx/releases/download/scx-cli-v${VERSIO
 install -m 0755 "scx-cli-${VERSION}-${TARGET}/scx" ~/.local/bin/scx
 ```
 
-**Build from source** — for custom feature sets or platforms not in the release matrix (Windows, musl, etc.):
+**Build from source** — for macOS, Windows, musl, or custom feature sets:
 
 ```bash
 # Build the CLI tool
