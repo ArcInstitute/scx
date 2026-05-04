@@ -43,9 +43,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Include matrix.runner in the cache key. Without it, swapping the
+      # runner image (e.g. ubuntu-24.04 → ubuntu-22.04) reuses C build
+      # artifacts (libhdf5 from hdf5-src) compiled against the old runner's
+      # glibc, producing link errors against newer libc symbols (e.g.
+      # __isoc23_sscanf is glibc 2.38+ only).
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.runner }}
 
       - name: Resolve tag and version
         id: meta
