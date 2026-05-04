@@ -30,10 +30,6 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            runner: macos-13
-          - target: aarch64-apple-darwin
-            runner: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,30 +59,18 @@ jobs:
       - name: Build (release, hdf5-static + cloud)
         run: cargo build -p scx-cli --release --locked --features hdf5-static,cloud --target ${{ matrix.target }}
 
+      # Cargo emits the binary as `scx-cli` (package name). We rename to `scx`
+      # in the staging directory so the tarball matches the user-facing CLI
+      # name documented in the README and used throughout the project.
       - name: Strip binary
-        shell: bash
-        run: |
-          bin="target/${{ matrix.target }}/release/scx"
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            strip -x "$bin"
-          else
-            strip "$bin"
-          fi
+        run: strip "target/${{ matrix.target }}/release/scx-cli"
 
       - name: Verify static linkage of libhdf5
-        shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/scx"
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            if otool -L "$bin" | grep -i hdf5; then
-              echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
-              exit 1
-            fi
-          else
-            if ldd "$bin" | grep -i hdf5; then
-              echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
-              exit 1
-            fi
+          bin="target/${{ matrix.target }}/release/scx-cli"
+          if ldd "$bin" | grep -i hdf5; then
+            echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
+            exit 1
           fi
 
       - name: Package tarball
@@ -98,7 +82,7 @@ jobs:
           name="scx-cli-${version}-${target}"
           staging="${RUNNER_TEMP}/${name}"
           mkdir -p "$staging"
-          cp "target/${target}/release/scx" "$staging/"
+          cp "target/${target}/release/scx-cli" "$staging/scx"
           cp README.md "$staging/"
           tar -czvf "${name}.tar.gz" -C "${RUNNER_TEMP}" "$name"
           echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"
