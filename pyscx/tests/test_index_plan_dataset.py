@@ -535,3 +535,114 @@ class TestNormalizeLog1p:
                 b["X_paired"][i], np.log1p(dense[c]).astype(np.float32),
                 rtol=1e-5, atol=1e-6,
             )
+
+
+# ---------------------------------------------------------------------------
+# Cache + prefetch metrics (SCX-OPT issue #5)
+# ---------------------------------------------------------------------------
+
+
+class TestMetrics:
+    def test_dataset_cache_metrics_keys_and_types(self, scx_path):
+        ds = pyscx.IndexPlanDataset(scx_path)
+        m = ds.cache_metrics()
+        assert isinstance(m, dict)
+        assert set(m) == {
+            "hits",
+            "misses",
+            "evictions",
+            "bytes_inserted",
+            "duplicate_waiters",
+        }
+        for k, v in m.items():
+            assert isinstance(v, int), f"{k} should be int, got {type(v)}"
+            assert v >= 0
+
+    def test_cache_metrics_advance_after_iteration(self, scx_path):
+        ds = pyscx.IndexPlanDataset(scx_path)
+        before = ds.cache_metrics()
+
+        plans = [[(0, 1), (2, 3)], [(0, 1), (2, 3)]]
+        for _ in ds.iter_with_plans(iter(plans), lookahead=2):
+            pass
+
+        after = ds.cache_metrics()
+        # First plan touches at least one shard → at least one decode (miss).
+        # Second plan re-touches the same shards → hits or duplicate_waiters
+        # advance. Either way the cache saw activity.
+        delta_misses = after["misses"] - before["misses"]
+        delta_hits = after["hits"] - before["hits"]
+        assert delta_misses >= 1, "expected at least one shard decode"
+        assert delta_hits + delta_misses + (
+            after["duplicate_waiters"] - before["duplicate_waiters"]
+        ) >= 2, "expected at least 2 cache lookups across the two plans"
+        assert after["bytes_inserted"] > before["bytes_inserted"]
+
+    def test_iter_metrics_dict_shape(self, scx_path):
+        ds = pyscx.IndexPlanDataset(scx_path)
+        plans = [[(0, 1)]]
+        it = ds.iter_with_plans(iter(plans), lookahead=2)
+        # Drain.
+        for _ in it:
+            pass
+
+        m = it.metrics()
+        assert set(m) == {"cache", "prefetch"}
+        assert set(m["prefetch"]) == {
+            "prefetch_tasks_spawned",
+            "prefetch_skipped_cache_hit",
+            "prefetch_skipped_in_flight",
+        }
+        assert set(m["cache"]) == {
+            "hits",
+            "misses",
+            "evictions",
+            "bytes_inserted",
+            "duplicate_waiters",
+        }
+
+    def test_iter_skips_prefetch_after_warmup(self, scx_path):
+        """Two iters back-to-back: the second sees fully cached shards and
+        records `prefetch_skipped_cache_hit > 0` with `prefetch_tasks_spawned
+        == 0`. Mirrors the Rust `iter_skips_prefetch_when_cached` integration
+        test through the Python surface."""
+        ds = pyscx.IndexPlanDataset(scx_path)
+        plan = [(i, (i + 1) % 100) for i in range(20)]
+
+        # Warm: first iter populates the LRU.
+        for _ in ds.iter_with_plans(iter([plan]), lookahead=1):
+            pass
+
+        # Second iter: every touched shard is already cached.
+        it2 = ds.iter_with_plans(iter([plan]), lookahead=1)
+        for _ in it2:
+            pass
+        m = it2.metrics()
+        assert m["prefetch"]["prefetch_tasks_spawned"] == 0, (
+            f"warmed iter should not spawn prefetch tasks; got "
+            f"{m['prefetch']['prefetch_tasks_spawned']}"
+        )
+        assert m["prefetch"]["prefetch_skipped_cache_hit"] > 0, (
+            f"warmed iter should skip prefetches via cache hit; got "
+            f"{m['prefetch']['prefetch_skipped_cache_hit']}"
+        )
+
+    def test_iter_metrics_survive_iter_drain(self, scx_path):
+        """`metrics()` must work after the inner iterator is dropped (the
+        Rust side drops `inner` to release the plan-pull thread). Our
+        accessor caches the `Arc<...>` handles at construction so post-drain
+        sampling is still valid."""
+        ds = pyscx.IndexPlanDataset(scx_path)
+        plans = [[(0, 1)]]
+        it = ds.iter_with_plans(iter(plans), lookahead=1)
+        # Fully drain — including the trailing None that drops inner.
+        for _ in it:
+            pass
+        # First metrics() call after drain.
+        m1 = it.metrics()
+        # Second call returns the same snapshot view (still readable).
+        m2 = it.metrics()
+        assert m1["cache"]["misses"] == m2["cache"]["misses"]
+        assert m1["prefetch"]["prefetch_tasks_spawned"] == m2["prefetch"][
+            "prefetch_tasks_spawned"
+        ]

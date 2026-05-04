@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -82,8 +83,10 @@ struct PairedDenseGather {
 
 /// Plan-driven paired-batch reader.
 ///
-/// Phase 1 surface: construct via `new`, drive via `process_plan`. The iterator
-/// API (`iter_with_plans`) lands in Phase 4.
+/// Two surfaces share `process_plan` underneath: the synchronous
+/// [`Self::process_plan`] for one-shot use, and [`Self::iter_with_plans`] —
+/// an async iterator that pipelines per-plan shard prefetch (via tokio
+/// `spawn_blocking`) ahead of the consumer.
 pub struct IndexPlanLoader {
     backed: BackedCsrReader,
     obs_metadata: RecordBatch,
@@ -113,6 +116,11 @@ pub struct IndexPlanLoader {
     /// rejects plans larger than it so a misbehaving consumer can't
     /// silently exceed `max_memory_mb`.
     max_plan_size: usize,
+    /// Shared handle to the underlying `BackedCsrReader`'s cache counters.
+    /// Always populated — `BackedCsrReader::enable_metrics` is called in
+    /// [`Self::new`] so the iter's profile log and the consumer-side
+    /// snapshot accessor have a stable handle.
+    cache_metrics: Arc<scx_format::CacheMetrics>,
 }
 
 impl IndexPlanLoader {
@@ -292,7 +300,19 @@ impl IndexPlanLoader {
             }
         }
 
-        let backed = BackedCsrReader::new(reader, effective_cache_shards);
+        // Tighten the LRU's byte cap to match the auto-tune model, so the
+        // cache can't overshoot `max_memory_mb` when actual shard sizes
+        // diverge from the average used in `shard_decoded_bytes`. The count
+        // cap stays in place too — both are enforced.
+        let cache_bytes_budget = effective_cache_shards.saturating_mul(shard_decoded_bytes);
+        let mut backed = BackedCsrReader::new_with_byte_budget(
+            reader,
+            effective_cache_shards,
+            cache_bytes_budget,
+        );
+        // Always-on metrics on this surface — the iter's profile log and
+        // the per-iter snapshot accessor read from this handle.
+        let cache_metrics = backed.enable_metrics();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -316,6 +336,7 @@ impl IndexPlanLoader {
             effective_cache_shards,
             effective_lookahead,
             max_plan_size,
+            cache_metrics,
         })
     }
 
@@ -335,6 +356,14 @@ impl IndexPlanLoader {
     /// before gathering.
     pub fn sort_by_shard(&self) -> bool {
         self.sort_by_shard
+    }
+
+    /// Shared handle to the underlying `BackedCsrReader`'s cache counters
+    /// (hits / misses / evictions / bytes_inserted / duplicate_waiters).
+    /// Always populated; cloning the `Arc` lets callers sample without
+    /// touching the cache lock.
+    pub fn cache_metrics(&self) -> Arc<scx_format::CacheMetrics> {
+        Arc::clone(&self.cache_metrics)
     }
 
     /// Effective LRU shard cache size after auto-tuning to fit
@@ -601,14 +630,33 @@ impl IndexPlanLoader {
 }
 
 /// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
-/// handle per shard prefetched for it.
+/// handle per shard scheduled for prefetch (cached / in-flight shards are
+/// filtered out by the iter pre-check before this Vec is built).
 type ShardJoin = JoinHandle<scx_format::Result<Arc<ScxCsr>>>;
 
 struct InFlight {
     plan: Vec<(u64, u64)>,
     /// Empty when `lookahead == 0`, when the plan is empty, or when every
-    /// shard that the plan touches is already in the LRU cache.
+    /// shard the plan touches is already cached or being decoded by a peer
+    /// (the iter pre-check skips spawning in those cases — see
+    /// `IndexPlanIter::spawn_prefetches`).
     prefetches: Vec<ShardJoin>,
+}
+
+/// Per-iter prefetch counters. Sampled by `IndexPlanIter::iter_metrics` and
+/// emitted by the Drop-time profile log when `SCX_LOADER_PROFILE=1`.
+///
+/// All atomics use `Relaxed` ordering — values are statistical and not used
+/// for synchronization.
+#[derive(Default, Debug)]
+pub struct IterMetrics {
+    /// `tokio::spawn_blocking` tasks queued onto the runtime's blocking pool.
+    pub prefetch_tasks_spawned: AtomicU64,
+    /// Shards whose prefetch was skipped because the LRU already held them.
+    pub prefetch_skipped_cache_hit: AtomicU64,
+    /// Shards whose prefetch was skipped because a peer leader was already
+    /// decoding them in `BackedCsrReader`'s singleflight table.
+    pub prefetch_skipped_in_flight: AtomicU64,
 }
 
 /// Iterator returned by [`IndexPlanLoader::iter_with_plans`].
@@ -633,6 +681,9 @@ pub struct IndexPlanIter {
     /// drains gracefully; next() surfaces the error one-shot after the
     /// queue empties, then sets `plan_stream_done`.
     plan_stream_error: Option<LoaderError>,
+    /// Per-iter prefetch counters. Cloning the `Arc` lets a consumer sample
+    /// without going through any lock.
+    iter_metrics: Arc<IterMetrics>,
 }
 
 impl IndexPlanIter {
@@ -664,7 +715,14 @@ impl IndexPlanIter {
             lookahead,
             plan_stream_done: false,
             plan_stream_error: None,
+            iter_metrics: Arc::new(IterMetrics::default()),
         }
+    }
+
+    /// Cloneable handle to this iter's prefetch counters. Sample at any
+    /// time — atomics are `Relaxed`, no locks involved.
+    pub fn iter_metrics(&self) -> Arc<IterMetrics> {
+        Arc::clone(&self.iter_metrics)
     }
 
     /// Refill the in-flight queue up to `lookahead.max(1)` plans, spawning a
@@ -713,10 +771,35 @@ impl IndexPlanIter {
         // shard set has no duplicates we'd waste prefetches on.
         let shards = self.loader.backed.index().shards_for_indices(&all_rows);
 
+        // Skip shards that are already cached or whose decode is already in
+        // flight via the BackedCsrReader singleflight table. Without this
+        // filter, a window of N plans touching shard S queues up to N
+        // `spawn_blocking` tasks for S — the singleflight short-circuits
+        // the redundant decode but the per-task tokio overhead and the
+        // associated `runtime.block_on` round-trips are still paid in
+        // `await_head`. Filtering here keeps the queue tight.
         let handle = self.loader.runtime.handle().clone();
         shards
             .into_iter()
+            .filter(|&sidx| {
+                if self.loader.backed.cache_contains(sidx) {
+                    self.iter_metrics
+                        .prefetch_skipped_cache_hit
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                if self.loader.backed.in_flight_contains(sidx) {
+                    self.iter_metrics
+                        .prefetch_skipped_in_flight
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
+            })
             .map(|sidx| {
+                self.iter_metrics
+                    .prefetch_tasks_spawned
+                    .fetch_add(1, Ordering::Relaxed);
                 let loader = Arc::clone(&self.loader);
                 handle.spawn_blocking(move || loader.backed.read_shard_cached_arc(sidx))
             })
@@ -802,6 +885,32 @@ impl Drop for IndexPlanIter {
 
         // Detach the plan thread; it will exit on its next send-fail.
         let _ = self.plan_thread.take();
+
+        // Optional one-shot profile dump. Enabled by `SCX_LOADER_PROFILE=1`
+        // (matches the existing pattern in `pipeline::profiling_enabled`).
+        let profile = std::env::var("SCX_LOADER_PROFILE")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        if profile {
+            let cm = &self.loader.cache_metrics;
+            let im = &self.iter_metrics;
+            let hits = cm.hits.load(Ordering::Relaxed);
+            let misses = cm.misses.load(Ordering::Relaxed);
+            let evictions = cm.evictions.load(Ordering::Relaxed);
+            let bytes_inserted = cm.bytes_inserted.load(Ordering::Relaxed);
+            let dup_waiters = cm.duplicate_waiters.load(Ordering::Relaxed);
+            let spawned = im.prefetch_tasks_spawned.load(Ordering::Relaxed);
+            let skip_hit = im.prefetch_skipped_cache_hit.load(Ordering::Relaxed);
+            let skip_inflight = im.prefetch_skipped_in_flight.load(Ordering::Relaxed);
+            eprintln!(
+                "scx-loader IndexPlanIter cache_metrics: \
+                 hits={hits} misses={misses} evictions={evictions} \
+                 bytes_inserted={bytes_inserted} duplicate_waiters={dup_waiters} \
+                 prefetch_tasks_spawned={spawned} \
+                 prefetch_skipped_cache_hit={skip_hit} \
+                 prefetch_skipped_in_flight={skip_inflight}"
+            );
+        }
     }
 }
 

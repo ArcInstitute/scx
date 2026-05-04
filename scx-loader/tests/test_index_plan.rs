@@ -411,3 +411,177 @@ fn ctor_rejects_hvg_out_of_range() {
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// SCX-OPT issue #5: singleflight + byte-budgeted cache + counters
+// ---------------------------------------------------------------------------
+
+/// N threads racing to decode the same shard go through the singleflight:
+/// only one becomes the leader and decodes; every other thread either waits
+/// on the leader's Condvar (`duplicate_waiters++`) or finds the populated
+/// cache after the leader inserts (`hits++`).
+///
+/// The strongest invariant — and the load-bearing one — is `misses == 1`:
+/// no matter how the N threads interleave with the leader's decode/insert,
+/// the underlying `read_csr_shard` must run exactly once. The
+/// `hits + duplicate_waiters` accounting confirms every non-leader thread
+/// saw a deduplicated result.
+#[test]
+fn singleflight_dedupes_concurrent_decode() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    const N_THREADS: usize = 16;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    let reader = scx_format::ScxReader::open(&path).unwrap();
+    let mut backed = scx_format::BackedCsrReader::new(reader, /*cache_shards=*/ 4);
+    let metrics = backed.enable_metrics();
+    let backed = Arc::new(backed);
+
+    let barrier = Arc::new(Barrier::new(N_THREADS));
+    let mut handles = Vec::new();
+    for _ in 0..N_THREADS {
+        let b = Arc::clone(&backed);
+        let bar = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            bar.wait();
+            b.read_shard_cached_arc(0).unwrap()
+        }));
+    }
+    let arcs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // Every thread observes the same decoded Arc (cached after leader inserts).
+    let leader = &arcs[0];
+    for (i, a) in arcs.iter().enumerate().skip(1) {
+        assert!(
+            Arc::ptr_eq(leader, a),
+            "thread {i} observed a different Arc than the leader — not deduplicated"
+        );
+    }
+
+    let misses = metrics.misses.load(Ordering::Relaxed);
+    let hits = metrics.hits.load(Ordering::Relaxed);
+    let dup = metrics.duplicate_waiters.load(Ordering::Relaxed);
+
+    // Load-bearing: only the leader actually decoded.
+    assert_eq!(misses, 1, "exactly one decode (leader) should run");
+    // Every non-leader thread eventually returns from the cache (either it
+    // arrived after the leader inserted and got a hit on the first check,
+    // or it was a waiter and got a hit on the post-wake re-check). Either
+    // way the hits counter records `N_THREADS - 1`.
+    assert_eq!(
+        hits,
+        (N_THREADS as u64) - 1,
+        "every non-leader thread should observe a cache hit \
+         (hits={hits}, threads={N_THREADS})"
+    );
+    // duplicate_waiters is timing-dependent (some threads are pure cache
+    // hits if they arrive after the leader's insert), but in a 16-way
+    // contention test at least one waiter is overwhelmingly likely.
+    assert!(
+        dup >= 1,
+        "at least one waiter expected with {N_THREADS} threads (got dup={dup})"
+    );
+}
+
+/// `WeightedLruCache` evicts oldest entries when the byte cap is exceeded.
+/// We size the budget so only one shard fits at a time; reading 4 shards
+/// in order should produce 3 evictions and leave only the last in cache.
+#[test]
+fn cache_byte_budget_evicts_when_exceeded() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    // Decoded shard size for this fixture: 1 nonzero per row, 20 rows per
+    // shard (N_OBS=100 / N_SHARDS=5 = 20). So per-shard bytes ≈
+    //   indptr.len()=21 × 8 = 168
+    //   indices.len()=20 × 4 = 80
+    //   data.len()=20 × 4 = 80
+    //   ≈ 328 bytes.
+    // Pick a budget that admits just one entry at a time so eviction is
+    // forced on every insert past the first.
+    let per_shard_bytes_approx: usize = 21 * 8 + 20 * 4 + 20 * 4;
+    let budget = per_shard_bytes_approx; // 1 shard fits
+
+    let reader = scx_format::ScxReader::open(&path).unwrap();
+    let mut backed = scx_format::BackedCsrReader::new_with_byte_budget(
+        reader, /*cache_shards=*/ 10, // count cap loose; byte cap binds
+        budget,
+    );
+    let metrics = backed.enable_metrics();
+
+    for sidx in 0..N_SHARDS {
+        backed.read_shard_cached_arc(sidx).unwrap();
+    }
+
+    let evictions = metrics.evictions.load(Ordering::Relaxed);
+    let misses = metrics.misses.load(Ordering::Relaxed);
+    assert_eq!(misses as usize, N_SHARDS, "every read should miss + decode");
+    assert!(
+        evictions as usize >= N_SHARDS - 1,
+        "byte budget should evict ≥ N-1 entries (got evictions={evictions})"
+    );
+    // Last shard should be present, second-to-last should be evicted.
+    assert!(
+        backed.cache_contains(N_SHARDS - 1),
+        "last-read shard should be the surviving entry"
+    );
+    assert!(
+        !backed.cache_contains(0),
+        "first-read shard should have been evicted"
+    );
+}
+
+/// `IndexPlanIter::spawn_prefetches` skips shards already in the cache.
+///
+/// Strategy: run plan1 to completion through one iter (this populates the
+/// LRU via `process_plan`'s read_rows_with), then start a SECOND iter on
+/// the same `Arc<IndexPlanLoader>` for plan2 — which references the same
+/// shards. The second iter's `spawn_prefetches` finds every touched shard
+/// already cached and skips spawning, recording
+/// `prefetch_skipped_cache_hit > 0` and `prefetch_tasks_spawned == 0`.
+#[test]
+fn iter_skips_prefetch_when_cached() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+    let loader = Arc::new(open_loader(&path, /*sort_by_shard=*/ true));
+
+    let plan: Vec<(u64, u64)> = (0u64..16).map(|i| (i, i + 1)).collect();
+
+    // Iter 1: warm the cache by running plan1 through the loader.
+    {
+        let mut iter1 = Arc::clone(&loader)
+            .iter_with_plans(std::iter::once(Ok(plan.clone())), /*lookahead=*/ 1);
+        let _ = iter1.next().unwrap().unwrap();
+        assert!(iter1.next().is_none(), "iter1 should be drained");
+    }
+
+    // Iter 2: re-run the same plan. Every shard is now cached, so the
+    // pre-check filter should skip every prefetch spawn.
+    let mut iter2 = Arc::clone(&loader)
+        .iter_with_plans(std::iter::once(Ok(plan.clone())), /*lookahead=*/ 1);
+    let im = iter2.iter_metrics();
+    let _ = iter2.next().unwrap().unwrap();
+    assert!(iter2.next().is_none(), "iter2 should be drained");
+
+    let spawned = im.prefetch_tasks_spawned.load(Ordering::Relaxed);
+    let skipped_hit = im.prefetch_skipped_cache_hit.load(Ordering::Relaxed);
+    assert_eq!(
+        spawned, 0,
+        "iter2 should not spawn any prefetch tasks (every shard cached)"
+    );
+    assert!(
+        skipped_hit > 0,
+        "iter2 should record skipped_cache_hit > 0 (got skipped_hit={skipped_hit})"
+    );
+}

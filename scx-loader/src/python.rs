@@ -18,16 +18,18 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use scx_format::CacheMetrics;
 
 use crate::batch::{Batch, ObsColumn};
 use crate::error::LoaderError;
-use crate::index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};
+use crate::index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader, IterMetrics};
 use crate::pipeline::{LoaderConfig, TrainingPipeline};
 
 /// A PyTorch-compatible iterable dataset for SCX training data.
@@ -309,9 +311,11 @@ impl IndexPlanDataset {
     ///         `normalize`; all four (normalize, log1p) combinations are
     ///         honoured, matching `TrainingDataset` semantics.
     ///     target_sum: Normalization target sum (default: 1e4).
-    ///     cache_shards: LRU shard cache budget (default: 128). Must be >= 1.
-    ///         Auto-tuned downward to fit `max_memory_mb`; check the resolved
-    ///         value via `effective_cache_shards()`.
+    ///     cache_shards: LRU shard cache count cap (default: 128). Must be
+    ///         >= 1. Auto-tuned downward to fit `max_memory_mb`; check the
+    ///         resolved value via `effective_cache_shards()`. The cache also
+    ///         enforces a byte cap derived from the memory budget — see
+    ///         `cache_metrics()` for runtime hit/miss/eviction observability.
     ///     sort_by_shard: Reorder each plan by shard-of-min-row before
     ///         gathering, so the returned rows of X/X_paired are in shard
     ///         locality order (default: True). Disable to preserve the
@@ -451,9 +455,13 @@ impl IndexPlanDataset {
 
         let plan_stream = PyPlanIterator { py_iter };
         let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
+        let iter_metrics = inner.iter_metrics();
+        let cache_metrics = self.loader.cache_metrics();
         Ok(IndexPlanBatchIter {
             inner: Some(inner),
             lookahead,
+            iter_metrics,
+            cache_metrics,
         })
     }
 
@@ -470,12 +478,28 @@ impl IndexPlanDataset {
         self.loader.effective_lookahead()
     }
 
+    /// Snapshot of the underlying `BackedCsrReader`'s shard-cache counters,
+    /// cumulative since dataset construction. Returns a dict with keys:
+    ///
+    ///     hits              - cache lookups served without decode
+    ///     misses            - decodes that ran (each shard's first-leader)
+    ///     evictions         - LRU entries dropped to honour the byte/count cap
+    ///     bytes_inserted    - cumulative decoded bytes inserted into the cache
+    ///     duplicate_waiters - waiters that found a peer leader in flight and
+    ///                         skipped redundant decode work
+    ///
+    /// All values are `int`. Counters are atomic and read with `Relaxed`
+    /// ordering. Sample as often as you want — there are no locks involved.
+    fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        cache_metrics_to_pydict(py, &self.loader.cache_metrics())
+    }
+
     /// Process one plan and return a paired dense batch dict.
     ///
-    /// **Unstable / debug helper.** Superseded by `iter_with_plans` (Phase 4
-    /// onwards). Retained so unit tests can drive the loader synchronously
-    /// without iterator setup; do not depend on this method from production
-    /// code — it may be removed in a future release.
+    /// **Unstable / debug helper.** Superseded by `iter_with_plans`. Retained
+    /// so unit tests can drive the loader synchronously without iterator
+    /// setup; do not depend on this method from production code — it may be
+    /// removed in a future release.
     #[pyo3(name = "_next_batch_for_test")]
     fn next_batch_for_test<'py>(
         &self,
@@ -553,6 +577,13 @@ pub struct IndexPlanBatchIter {
     inner: Option<IndexPlanIter>,
     #[allow(dead_code)] // surfaced via __repr__ / future docs
     lookahead: usize,
+    /// Snapshot of the iter's prefetch counters, cloned at construction so
+    /// the Python `metrics()` accessor stays valid after the iterator is
+    /// drained and `inner` is dropped.
+    iter_metrics: Arc<IterMetrics>,
+    /// Loader-level cache counters, cloned at construction for the same
+    /// post-drain stability.
+    cache_metrics: Arc<CacheMetrics>,
 }
 
 #[pymethods]
@@ -589,6 +620,58 @@ impl IndexPlanBatchIter {
             self.inner.is_none()
         )
     }
+
+    /// Snapshot of cache- and prefetch-side counters as a dict-of-dicts:
+    ///
+    ///     {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters},
+    ///      "prefetch": {prefetch_tasks_spawned,
+    ///                   prefetch_skipped_cache_hit,
+    ///                   prefetch_skipped_in_flight}}
+    ///
+    /// `cache` reflects loader-cumulative counters (shared with
+    /// `IndexPlanDataset.cache_metrics()`). `prefetch` is per-iter — counters
+    /// reset across `iter_with_plans` calls. Safe to call after the iterator
+    /// is exhausted; the metrics handles are cloned at construction time.
+    fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("cache", cache_metrics_to_pydict(py, &self.cache_metrics)?)?;
+        dict.set_item("prefetch", iter_metrics_to_pydict(py, &self.iter_metrics)?)?;
+        Ok(dict)
+    }
+}
+
+/// Encode `CacheMetrics` (atomic counters from `BackedCsrReader`) as a Python
+/// dict of `int` keys. Counters are loaded with `Relaxed` ordering — values
+/// are statistical and not used for synchronization on the Python side.
+fn cache_metrics_to_pydict<'py>(py: Python<'py>, m: &CacheMetrics) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("hits", m.hits.load(Ordering::Relaxed))?;
+    dict.set_item("misses", m.misses.load(Ordering::Relaxed))?;
+    dict.set_item("evictions", m.evictions.load(Ordering::Relaxed))?;
+    dict.set_item("bytes_inserted", m.bytes_inserted.load(Ordering::Relaxed))?;
+    dict.set_item(
+        "duplicate_waiters",
+        m.duplicate_waiters.load(Ordering::Relaxed),
+    )?;
+    Ok(dict)
+}
+
+/// Encode `IterMetrics` (per-iter prefetch counters) as a Python dict.
+fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "prefetch_tasks_spawned",
+        m.prefetch_tasks_spawned.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "prefetch_skipped_cache_hit",
+        m.prefetch_skipped_cache_hit.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "prefetch_skipped_in_flight",
+        m.prefetch_skipped_in_flight.load(Ordering::Relaxed),
+    )?;
+    Ok(dict)
 }
 
 /// Map `LoaderError` → Python exception, picking the most precise type.
