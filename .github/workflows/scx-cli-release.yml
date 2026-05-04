@@ -25,11 +25,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Pin to ubuntu-22.04 for both arches so the released binaries inherit
+        # a glibc 2.35 floor — covers Ubuntu 22.04+, Debian 13+, RHEL 10,
+        # Fedora 38+. ubuntu-latest is currently 24.04 (glibc 2.39), which is
+        # too new for typical HPC environments still on 22.04 LTS.
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
