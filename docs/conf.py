@@ -88,11 +88,11 @@ autodoc_default_options = {
 autodoc_typehints = "description"
 autodoc_class_signature = "separated"
 
-# `pyscx.pyscx` is the compiled PyO3 extension — not available on RTD, so we
-# mock it. Heavy optional integrations are mocked too so a slim RTD env can
-# still import the modules for autodoc.
+# Heavy optional integrations are mocked so a slim docs env can import the
+# modules for autodoc. `pyscx.pyscx` (the compiled PyO3 extension) is NOT
+# mocked — it's built into the docs venv via `maturin develop` so autodoc
+# can introspect every Rust-defined function/class with its real docstring.
 autodoc_mock_imports = [
-    "pyscx.pyscx",
     "torch",
     "lightning",
     "pytorch_lightning",
@@ -102,6 +102,23 @@ autodoc_mock_imports = [
     "skmisc",
     "pydeseq2",
 ]
+
+# PyO3 registers `pyscx.accel` as an attribute on the `pyscx` module but
+# does NOT install it in `sys.modules`, so `import pyscx.accel` fails and
+# autodoc's `automodule:: pyscx.accel` can't import it. Register it
+# manually so autodoc can find it.
+try:
+    import sys
+    import pyscx as _pyscx_for_docs
+
+    for _sub in ("accel",):
+        _mod = getattr(_pyscx_for_docs, _sub, None)
+        if _mod is not None:
+            sys.modules.setdefault(f"pyscx.{_sub}", _mod)
+except ImportError:
+    # Compiled extension not built — autodoc entries for Rust-defined
+    # symbols will be empty but the rest of the site still builds.
+    pass
 
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True

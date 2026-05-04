@@ -8,6 +8,7 @@ sphinx-autodoc-typehints>=2.2
 sphinx-copybutton>=0.5.2
 sphinx-design>=0.6
 linkify-it-py>=2.0
+sphinx-autobuild>=2024.4   # local preview server with live reload
 
 # Imported by pyscx/__init__.py and the integration modules. Keeping these
 # real (not mocked) lets autodoc resolve type hints cleanly. Heavy/optional

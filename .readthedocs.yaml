@@ -1,9 +1,10 @@
 # ReadTheDocs build configuration for the SCX documentation site.
 # https://docs.readthedocs.io/en/stable/config-file/v2.html
 #
-# The compiled Rust extension `pyscx.pyscx` is not built on RTD — it is
-# mocked via `autodoc_mock_imports` in `docs/conf.py`, so the build only
-# needs Python deps from `docs/requirements.txt`.
+# RTD builds the Rust extension `pyscx.pyscx` via maturin so Sphinx
+# autodoc can introspect the real (Rust-defined) Python API surface.
+# This makes the build slower (~5–10 min cold; cached after that) but
+# gives the full API tables in the rendered docs.
 
 version: 2
 
@@ -11,6 +12,15 @@ build:
   os: ubuntu-22.04
   tools:
     python: "3.11"
+    rust: "1.78"
+  jobs:
+    pre_install:
+      - pip install maturin
+    post_install:
+      # Build pyscx into the docs build env so autodoc can import it.
+      # `--release` is unnecessary for docs (debug builds are several
+      # times faster to compile and produce identical Python signatures).
+      - cd pyscx && maturin develop
 
 sphinx:
   configuration: docs/conf.py
