@@ -50,6 +50,7 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
+    "sphinx.ext.linkcode",
     "sphinx.ext.intersphinx",
     "sphinx_copybutton",
     "sphinx_design",
@@ -158,3 +159,97 @@ suppress_warnings = [
 
 # Keep build non-fatal on these RTD environments (Rust extension not built).
 nitpicky = False
+
+
+# -- "View source on GitHub" link on each autodoc entry ----------------------
+#
+# `sphinx.ext.linkcode` adds a `[source]` link next to each documented
+# function/class. Our resolver returns a GitHub blob URL for pure-Python
+# symbols (iter_chunks, ScxDataModule, …) and `None` for Rust-defined
+# (PyO3-compiled) symbols, since those have no traceable Python source.
+
+import importlib  # noqa: E402
+import inspect    # noqa: E402
+import os         # noqa: E402
+import subprocess  # noqa: E402
+
+GITHUB_USER = "ArcInstitute"
+GITHUB_REPO = "scx"
+
+
+def _resolve_git_ref() -> str:
+    """Pick the right Git ref for source links.
+
+    Priority:
+      1. ``READTHEDOCS_GIT_IDENTIFIER`` (set by RTD on every build —
+         the branch / tag / commit SHA being built).
+      2. ``git rev-parse HEAD`` against the local checkout.
+      3. ``"main"`` as a last resort.
+    """
+    env_ref = os.environ.get("READTHEDOCS_GIT_IDENTIFIER")
+    if env_ref:
+        return env_ref
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT), text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "main"
+
+
+_GIT_REF = _resolve_git_ref()
+
+
+def linkcode_resolve(domain: str, info: dict) -> str | None:  # noqa: D401
+    """Return a GitHub URL for the source of ``info``, or ``None``.
+
+    Called once per documented Python object. We resolve the object via
+    ``inspect`` and turn its file path + line range into a GitHub blob
+    URL. If the object has no introspectable Python source (typical for
+    PyO3-compiled symbols), return ``None`` so no link is rendered.
+    """
+    if domain != "py" or not info.get("module"):
+        return None
+
+    try:
+        module = importlib.import_module(info["module"])
+    except ImportError:
+        return None
+
+    obj = module
+    for part in info["fullname"].split("."):
+        try:
+            obj = getattr(obj, part)
+        except AttributeError:
+            return None
+
+    # Unwrap descriptors / partials / decorated wrappers where possible.
+    obj = inspect.unwrap(obj) if hasattr(obj, "__wrapped__") else obj
+
+    try:
+        source_file = inspect.getsourcefile(obj)
+    except TypeError:
+        return None
+    if not source_file:
+        return None
+
+    try:
+        rel = os.path.relpath(source_file, str(REPO_ROOT))
+    except ValueError:
+        return None
+    # If the object's source lives outside the repo (e.g. a stdlib type
+    # the user re-exported) skip it.
+    if rel.startswith(".."):
+        return None
+
+    try:
+        source_lines, start_line = inspect.getsourcelines(obj)
+    except (OSError, TypeError):
+        # No line info — link to the file without a fragment.
+        return f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/blob/{_GIT_REF}/{rel}"
+
+    end_line = start_line + len(source_lines) - 1
+    return (
+        f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/blob/{_GIT_REF}/"
+        f"{rel}#L{start_line}-L{end_line}"
+    )
