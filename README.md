@@ -546,7 +546,7 @@ configuration, and driver compatibility details.
 
 ### Rust CLI
 
-**Pre-built binaries (recommended)** — published on each `scx-cli-v*` tag at [GitHub Releases](https://github.com/ArcInstitute/scx/releases). Linux only (x86_64 and arm64). Bundles `hdf5` (h5ad conversion) and `cloud` (S3/GCS/Azure); libhdf5 is statically linked so no system libraries are required at runtime.
+**Pre-built binaries (recommended)** — published on each `scx-cli-v*` tag at [GitHub Releases](https://github.com/ArcInstitute/scx/releases). Linux only (x86_64 and arm64), glibc ≥ 2.35 (Ubuntu 22.04+, Debian 13+, RHEL 10+). Bundles `hdf5` (h5ad conversion) and `cloud` (S3/GCS/Azure); libhdf5 is statically linked so no system libraries are required at runtime.
 
 ```bash
 VERSION=0.2.0
