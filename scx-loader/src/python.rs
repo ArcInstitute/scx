@@ -481,12 +481,14 @@ impl IndexPlanDataset {
     /// Snapshot of the underlying `BackedCsrReader`'s shard-cache counters,
     /// cumulative since dataset construction. Returns a dict with keys:
     ///
-    ///     hits              - cache lookups served without decode
-    ///     misses            - decodes that ran (each shard's first-leader)
-    ///     evictions         - LRU entries dropped to honour the byte/count cap
-    ///     bytes_inserted    - cumulative decoded bytes inserted into the cache
-    ///     duplicate_waiters - waiters that found a peer leader in flight and
-    ///                         skipped redundant decode work
+    /// ```text
+    /// hits              - cache lookups served without decode
+    /// misses            - decodes that ran (each shard's first-leader)
+    /// evictions         - LRU entries dropped to honour the byte/count cap
+    /// bytes_inserted    - cumulative decoded bytes inserted into the cache
+    /// duplicate_waiters - waiters that found a peer leader in flight and
+    ///                     skipped redundant decode work
+    /// ```
     ///
     /// All values are `int`. Counters are atomic and read with `Relaxed`
     /// ordering. Sample as often as you want — there are no locks involved.
@@ -623,10 +625,12 @@ impl IndexPlanBatchIter {
 
     /// Snapshot of cache- and prefetch-side counters as a dict-of-dicts:
     ///
-    ///     {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters},
-    ///      "prefetch": {prefetch_tasks_spawned,
-    ///                   prefetch_skipped_cache_hit,
-    ///                   prefetch_skipped_in_flight}}
+    /// ```text
+    /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters},
+    ///  "prefetch": {prefetch_tasks_spawned,
+    ///               prefetch_skipped_cache_hit,
+    ///               prefetch_skipped_in_flight}}
+    /// ```
     ///
     /// `cache` reflects loader-cumulative counters (shared with
     /// `IndexPlanDataset.cache_metrics()`). `prefetch` is per-iter — counters
