@@ -7,6 +7,7 @@ use scx_format::deletion_vectors::DeletionVectors;
 use scx_format::reader::ScxReader;
 
 use crate::batch::Batch;
+use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
 use crate::decode_stage::decode_stage;
 use crate::error::{LoaderError, Result};
 use crate::io_stage::io_stage;
@@ -28,13 +29,6 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 /// Polling interval for `JoinHandle::is_finished()` waits during bounded
 /// shutdown.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(20);
-
-/// Returns true if SCX_LOADER_PROFILE env var is set to "1" or "true".
-fn profiling_enabled() -> bool {
-    std::env::var("SCX_LOADER_PROFILE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
-}
 
 /// Configuration for the training data loader pipeline.
 ///
@@ -130,6 +124,13 @@ pub struct MemoryBudget {
     pub mmap_bytes: usize,
     /// True if estimated memory exceeds the budget even at all minimums.
     pub budget_exceeded: bool,
+    /// Per-component breakdown (cache, batch buffer, lookahead, transient,
+    /// python overhead). Sequential paths report a zero `lookahead_overhead`
+    /// and a zero `transient` since they don't carry plan-tuple staging or
+    /// per-batch obs scratch. Mmap is tracked separately on
+    /// `mmap_bytes`; the breakdown excludes mmap, matching the index-plan
+    /// path's convention.
+    pub breakdown: BudgetBreakdown,
 }
 
 /// Compute the memory budget for the training pipeline.
@@ -177,6 +178,14 @@ pub fn compute_memory_budget(
         );
 
         if estimated <= max_bytes {
+            let breakdown = estimate_breakdown(
+                shard_group_size,
+                prefetch_batches,
+                batch_size,
+                n_output_genes,
+                shard_target_rows as usize,
+                avg_nnz_per_cell,
+            );
             return MemoryBudget {
                 shard_group_size,
                 prefetch_batches,
@@ -184,6 +193,7 @@ pub fn compute_memory_budget(
                 estimated_bytes: estimated,
                 mmap_bytes: file_size_bytes,
                 budget_exceeded: false,
+                breakdown,
             };
         }
 
@@ -206,6 +216,14 @@ pub fn compute_memory_budget(
         }
 
         // All at minimums — return best-effort estimate with warning
+        let breakdown = estimate_breakdown(
+            shard_group_size,
+            prefetch_batches,
+            batch_size,
+            n_output_genes,
+            shard_target_rows as usize,
+            avg_nnz_per_cell,
+        );
         return MemoryBudget {
             shard_group_size,
             prefetch_batches,
@@ -213,30 +231,28 @@ pub fn compute_memory_budget(
             estimated_bytes: estimated,
             mmap_bytes: file_size_bytes,
             budget_exceeded: true,
+            breakdown,
         };
     }
 }
 
-/// Estimate total memory usage for given parameters.
+/// Estimate the per-component memory breakdown for given parameters.
 ///
-/// Uses a data-driven model that accounts for:
-/// - I/O-decode pipeline overlap (shard_group_size + 1 decoded shards live)
-/// - Batch channel + consumer (prefetch_batches.max(2) + 1 batches live)
-/// - Mmap'd file (entire file faulted into RSS during a full epoch)
-/// - Python/runtime overhead (~50 MB for interpreter, numpy, Arrow, threads)
-fn estimate_memory(
+/// Returns a `BudgetBreakdown` that follows the index-plan convention of
+/// excluding mmap from the budget; the mmap term is returned separately so
+/// the caller can include it in `MemoryBudget.estimated_bytes` for the
+/// sequential path (where the entire file faults into RSS during an
+/// epoch).
+fn estimate_breakdown(
     shard_group_size: usize,
     prefetch_batches: usize,
     batch_size: usize,
     n_output_genes: usize,
     shard_target_rows: usize,
     avg_nnz_per_cell: f64,
-    file_size_bytes: usize,
-) -> usize {
+) -> BudgetBreakdown {
     // Decoded shard stores i64 indptr + i32 indices + f32 values = 12 bytes/nnz
     const BYTES_PER_NNZ_DECODED: usize = 12;
-    // Python interpreter + numpy + Arrow RecordBatch + tokio/rayon stacks
-    const PYTHON_OVERHEAD: usize = 50 * 1024 * 1024;
 
     // Decoded shard size: CSR arrays. Every multiply is done with
     // `checked_mul`/`checked_add` so pathological configs (petabyte shard
@@ -263,22 +279,41 @@ fn estimate_memory(
         .unwrap_or(usize::MAX);
     let batch_buffer = live_batches.saturating_mul(batch_bytes);
 
-    // Mmap'd file: the OS faults pages into RSS as shards are read sequentially.
-    // During a full epoch, most of the file will be resident in page cache.
-    // With MADV_SEQUENTIAL the kernel may reclaim pages, but we conservatively
-    // include the full file size since ru_maxrss captures the high-water mark.
-    //
-    // NOTE: this is an intentional over-estimate of steady-state RSS — the
-    // kernel reclaims sequentially-read pages aggressively under memory pressure,
-    // so a caller that sees this budget fit their memory limit will nearly always
-    // fit at runtime. The mmap_resident term exists to protect against peak
-    // page-cache residency near the end of an epoch, not to reflect steady-state.
-    let mmap_resident = file_size_bytes;
+    BudgetBreakdown::new(
+        shard_buffer,
+        batch_buffer,
+        /* lookahead_overhead_bytes */ 0,
+        /* transient_bytes */ 0,
+        PYTHON_OVERHEAD_BYTES,
+    )
+}
 
-    shard_buffer
-        .saturating_add(batch_buffer)
-        .saturating_add(mmap_resident)
-        .saturating_add(PYTHON_OVERHEAD)
+/// Estimate total memory usage including the mmap-resident term, used by
+/// the auto-tune to decide when to reduce parameters.
+///
+/// **Mmap note**: the OS faults pages into RSS as shards are read
+/// sequentially; with MADV_SEQUENTIAL the kernel may reclaim pages, but we
+/// conservatively include the full file size since `ru_maxrss` captures
+/// the high-water mark. Intentional over-estimate — a caller that sees
+/// this fit will nearly always fit at runtime.
+fn estimate_memory(
+    shard_group_size: usize,
+    prefetch_batches: usize,
+    batch_size: usize,
+    n_output_genes: usize,
+    shard_target_rows: usize,
+    avg_nnz_per_cell: f64,
+    file_size_bytes: usize,
+) -> usize {
+    let breakdown = estimate_breakdown(
+        shard_group_size,
+        prefetch_batches,
+        batch_size,
+        n_output_genes,
+        shard_target_rows,
+        avg_nnz_per_cell,
+    );
+    breakdown.total_bytes.saturating_add(file_size_bytes)
 }
 
 // ---------------------------------------------------------------------------

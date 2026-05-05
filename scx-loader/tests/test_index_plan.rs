@@ -413,7 +413,7 @@ fn ctor_rejects_hvg_out_of_range() {
 }
 
 // ---------------------------------------------------------------------------
-// SCX-OPT issue #5: singleflight + byte-budgeted cache + counters
+// Singleflight + byte-budgeted cache + counters
 // ---------------------------------------------------------------------------
 
 /// N threads racing to decode the same shard go through the singleflight:
@@ -579,5 +579,144 @@ fn iter_skips_prefetch_when_cached() {
     assert!(
         skipped_hit > 0,
         "iter2 should record skipped_cache_hit > 0 (got skipped_hit={skipped_hit})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BudgetBreakdown + peak_bytes_in_cache
+// ---------------------------------------------------------------------------
+
+/// `BudgetBreakdown.total_bytes` is the saturating sum of every component
+/// field. The auto-tune in `IndexPlanLoader::new` produces a breakdown
+/// after possibly reducing `effective_lookahead` / `effective_cache_shards`,
+/// so the constructor's stored breakdown should be self-consistent.
+#[test]
+fn budget_breakdown_components_sum_to_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+    let loader = open_loader(&path, /*sort_by_shard=*/ true);
+    let b = loader.budget_breakdown();
+    let sum = b
+        .cache_bytes
+        .saturating_add(b.batch_buffer_bytes)
+        .saturating_add(b.lookahead_overhead_bytes)
+        .saturating_add(b.transient_bytes)
+        .saturating_add(b.python_overhead_bytes);
+    assert_eq!(
+        sum,
+        b.total_bytes,
+        "components ({} + {} + {} + {} + {}) must equal total_bytes ({})",
+        b.cache_bytes,
+        b.batch_buffer_bytes,
+        b.lookahead_overhead_bytes,
+        b.transient_bytes,
+        b.python_overhead_bytes,
+        b.total_bytes,
+    );
+}
+
+/// `transient_bytes` should account for both per-batch obs Vecs (one per
+/// configured obs column per side) and the `PairRequest` sort scratch
+/// (~24 B per pair × 2). Lower-bound the term against an explicit formula
+/// so a future refactor that removes the obs accounting fails this test.
+#[test]
+fn budget_breakdown_includes_transient_terms() {
+    use scx_loader::{IndexPlanLoader, LoaderConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    // Single obs column (fixture only has `cell_id`), max_plan_size 8192 →
+    // expect transient ≥
+    //   2 × 8192 × 1 × 8        = 128 KiB  (obs Vec, both sides)
+    //   + 2 × 8192 × 24         = 384 KiB  (PairRequest scratch)
+    //   = 512 KiB.
+    // Also verify the no-obs case has request scratch only (smaller bound).
+    let n_obs_cols: usize = 1;
+    let max_plan_size = 8192usize;
+    let mut config = LoaderConfig::default();
+    config.normalize = false;
+    config.log1p = false;
+    config.obs_columns = vec!["cell_id".to_string()];
+    config.max_memory_mb = 1024;
+    let loader = IndexPlanLoader::new(
+        &path,
+        config,
+        /*cache_shards*/ 4,
+        /*sort_by_shard*/ true,
+        /*lookahead*/ 4,
+        max_plan_size,
+    )
+    .unwrap();
+    let lower_bound = (2 * max_plan_size * n_obs_cols * 8) + (2 * max_plan_size * 24);
+    let transient = loader.budget_breakdown().transient_bytes;
+    assert!(
+        transient >= lower_bound,
+        "transient_bytes ({transient}) should be >= obs+request lower bound ({lower_bound})"
+    );
+
+    // No-obs case: should still account for the PairRequest scratch but
+    // not for any obs Vecs. Budget should drop by exactly the obs term.
+    let mut cfg2 = LoaderConfig::default();
+    cfg2.normalize = false;
+    cfg2.log1p = false;
+    cfg2.obs_columns = vec![];
+    cfg2.max_memory_mb = 1024;
+    let loader2 = IndexPlanLoader::new(
+        &path,
+        cfg2,
+        /*cache_shards*/ 4,
+        /*sort_by_shard*/ true,
+        /*lookahead*/ 4,
+        max_plan_size,
+    )
+    .unwrap();
+    let transient2 = loader2.budget_breakdown().transient_bytes;
+    let request_only = 2 * max_plan_size * 24;
+    assert!(
+        transient2 >= request_only,
+        "no-obs transient_bytes ({transient2}) should still cover request scratch ({request_only})"
+    );
+    assert!(
+        transient2 < transient,
+        "removing obs columns should shrink transient_bytes \
+         (with-obs={transient}, no-obs={transient2})"
+    );
+}
+
+/// `CacheMetrics.peak_bytes_in_cache` is a `fetch_max`-updated high-water
+/// gauge. Read N shards in order; the gauge should advance and end at a
+/// value that's both > 0 and consistent with the cumulative
+/// `bytes_inserted` minus what's been evicted.
+#[test]
+fn peak_bytes_in_cache_records_high_water() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    let reader = scx_format::ScxReader::open(&path).unwrap();
+    let mut backed = scx_format::BackedCsrReader::new(reader, /*cache_shards=*/ 16);
+    let metrics = backed.enable_metrics();
+
+    // Touch every shard so the cache fills up (N_SHARDS = 5 well below the
+    // count cap of 16, so no eviction).
+    for sidx in 0..N_SHARDS {
+        backed.read_shard_cached_arc(sidx).unwrap();
+    }
+
+    let peak = metrics.peak_bytes_in_cache.load(Ordering::Relaxed);
+    let inserted = metrics.bytes_inserted.load(Ordering::Relaxed);
+    let evictions = metrics.evictions.load(Ordering::Relaxed);
+
+    assert!(peak > 0, "peak_bytes_in_cache should advance past 0");
+    // No eviction at this size, so peak == inserted at end.
+    assert_eq!(
+        evictions, 0,
+        "no eviction expected with cache_shards=16 > N_SHARDS={N_SHARDS}"
+    );
+    assert_eq!(
+        peak, inserted,
+        "without eviction, peak should equal cumulative bytes_inserted"
     );
 }

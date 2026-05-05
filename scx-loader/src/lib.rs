@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod budget;
 pub mod decode_stage;
 pub mod error;
 pub mod index_plan;
@@ -11,6 +12,7 @@ pub mod python;
 pub mod shuffle;
 
 pub use batch::{Batch, ObsColumn};
+pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
 pub use decode_stage::{decode_stage, extract_obs_columns};
 pub use error::{LoaderError, Result};
 pub use index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};

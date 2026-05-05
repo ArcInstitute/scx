@@ -232,6 +232,11 @@ pub struct CacheMetrics {
     /// Calls that found a peer leader already decoding the same shard and
     /// waited on its Condvar instead of redecoding.
     pub duplicate_waiters: AtomicU64,
+    /// High-water mark of `WeightedLruCache.bytes_used` since
+    /// [`BackedCsrReader::enable_metrics`]. Maintained via `fetch_max` on
+    /// every successful `put_with_budget`. Lets callers see whether the
+    /// byte cap was actually exercised, vs. just configured generously.
+    pub peak_bytes_in_cache: AtomicU64,
 }
 
 /// Per-shard rendezvous slot used by the singleflight in
@@ -365,6 +370,12 @@ impl WeightedLruCache {
         self.bytes_used = self.bytes_used.saturating_add(bytes);
         if let Some(m) = &self.metrics {
             m.bytes_inserted.fetch_add(bytes as u64, Ordering::Relaxed);
+            // High-water gauge: record the post-insert level so callers can
+            // tell whether the byte cap was actually exercised. `fetch_max`
+            // is monotonic so concurrent inserts converge correctly even
+            // without a lock around the load.
+            m.peak_bytes_in_cache
+                .fetch_max(self.bytes_used as u64, Ordering::Relaxed);
         }
     }
 }

@@ -33,6 +33,12 @@ Per-scenario metric keys emitted into ``RunRecord.extra``:
     ``shard_cache_hit_rate__<scenario>`` — None (placeholder; the
         ``BackedCsrReader`` does not expose a hit-rate counter today; will
         appear once that lands).
+    ``memory_budget_total_mb__<scenario>`` — float;
+        ``IndexPlanDataset.memory_budget()["total_bytes"]`` in MB; ``None``
+        for non-IndexPlan scenarios. Lets the harness validate the loader's
+        per-component memory model against the actual RSS at scenario end.
+    ``estimate_overshoot_mb__<scenario>`` — float (peak RSS minus
+        ``memory_budget_total_mb``; positive ⇒ estimator under-counted).
 """
 
 from __future__ import annotations
@@ -139,6 +145,16 @@ class _ScenarioOutcome:
     n_cells: int
     wall_s: float
     peak_rss_mb: float
+    # Estimator validation: `memory_budget_total_mb` mirrors the loader's
+    # `IndexPlanDataset.memory_budget()["total_bytes"]` in MB;
+    # `estimate_overshoot_mb = peak_rss_mb - memory_budget_total_mb` is the
+    # empirical delta between the auto-tune's per-component model and the
+    # actual peak RSS. A positive overshoot means the estimator
+    # under-counted (some allocation isn't in the model); a negative one
+    # means the cache wasn't fully exercised at runtime. `None` for
+    # non-IndexPlan scenarios that don't expose `memory_budget()`.
+    memory_budget_total_mb: float | None = None
+    estimate_overshoot_mb: float | None = None
 
 
 def _run_index_plan(
@@ -168,6 +184,10 @@ def _run_index_plan(
         max_plan_size=max_plan_size,
         max_memory_mb=8192,
     )
+    # Snapshot the estimator's per-component breakdown right after ctor so
+    # the auto-tune output (post-reduction) drives the overshoot delta.
+    budget = ds.memory_budget()
+    budget_total_mb = budget["total_bytes"] / (1024 * 1024)
 
     t0 = time.perf_counter()
     seen = 0
@@ -176,11 +196,14 @@ def _run_index_plan(
         seen += 1
         cells += 2 * batch["X"].shape[0]
     wall = time.perf_counter() - t0
+    peak_rss = max(rss0, _peak_rss_mb())
     return _ScenarioOutcome(
         n_batches=seen,
         n_cells=cells,
         wall_s=wall,
-        peak_rss_mb=max(rss0, _peak_rss_mb()),
+        peak_rss_mb=peak_rss,
+        memory_budget_total_mb=round(budget_total_mb, 1),
+        estimate_overshoot_mb=round(peak_rss - budget_total_mb, 1),
     )
 
 
@@ -615,6 +638,15 @@ def run(
                 # counter. Slot is preserved so the gate's threshold key
                 # remains stable when the counter lands.
                 f"shard_cache_hit_rate__{scenario_name}": None,
+                # Estimator validation: `None` for scenarios that don't
+                # go through `IndexPlanDataset` (no `memory_budget()`
+                # accessor on the manual baselines).
+                f"memory_budget_total_mb__{scenario_name}": (
+                    outcome.memory_budget_total_mb
+                ),
+                f"estimate_overshoot_mb__{scenario_name}": (
+                    outcome.estimate_overshoot_mb
+                ),
             }
             result.add_run(
                 wall_s=wall,
