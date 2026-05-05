@@ -254,6 +254,28 @@ impl InFlightSlot {
     }
 }
 
+/// RAII cleanup for a singleflight leader. Held by the thread that claimed
+/// an `InFlightSlot`; on drop — including via panic unwinding — it marks the
+/// slot done, wakes every waiter, and removes the entry from the in-flight
+/// table. Without this, a panic inside `decode_and_cache` would strand
+/// peers on the Condvar forever.
+struct LeaderGuard<'a> {
+    in_flight: &'a Mutex<HashMap<usize, Arc<InFlightSlot>>>,
+    slot: Arc<InFlightSlot>,
+    key: usize,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = self.slot.state.lock().unwrap();
+            *state = true;
+        }
+        self.slot.cv.notify_all();
+        self.in_flight.lock().unwrap().remove(&self.key);
+    }
+}
+
 /// LRU cache with both a count cap and a byte cap. Evicts oldest entries
 /// until both caps are satisfied for a new insertion.
 ///
@@ -314,8 +336,9 @@ impl WeightedLruCache {
 
         // Evict by byte budget first. The LruCache's count cap is handled
         // by `LruCache::put` returning the displaced entry, which we
-        // account for below.
-        while self.bytes_used + bytes > self.bytes_budget && !self.inner.is_empty() {
+        // account for below. `saturating_add` keeps the comparison sound
+        // even if a degenerate decoded shard pushes the sum past `usize`.
+        while self.bytes_used.saturating_add(bytes) > self.bytes_budget && !self.inner.is_empty() {
             if let Some((_, evicted)) = self.inner.pop_lru() {
                 self.bytes_used = self.bytes_used.saturating_sub(evicted.bytes);
                 if let Some(m) = &self.metrics {
@@ -326,13 +349,17 @@ impl WeightedLruCache {
             }
         }
 
+        // Distinguish a same-key replacement from a true count-cap eviction.
+        // `LruCache::put` returns the displaced entry in both cases; only
+        // the latter should bump the eviction counter.
+        let was_replace = self.inner.contains(&key);
         let entry = CacheEntry { csr, bytes };
         if let Some(displaced) = self.inner.put(key, entry) {
-            // Count-cap eviction (inner LruCache) — keep the byte accounting
-            // in sync.
             self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
-            if let Some(m) = &self.metrics {
-                m.evictions.fetch_add(1, Ordering::Relaxed);
+            if !was_replace {
+                if let Some(m) = &self.metrics {
+                    m.evictions.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         self.bytes_used = self.bytes_used.saturating_add(bytes);
@@ -862,42 +889,56 @@ impl BackedCsrReader {
     /// per-instance singleflight table: the first thread to claim the slot
     /// becomes the leader and decodes; peers wait on the slot's Condvar
     /// until the leader signals, then re-read from the cache. If the
-    /// leader's decode fails, peers fall through and retry — the second
-    /// attempt becomes the new leader, so a transient I/O error does not
-    /// recurse indefinitely.
+    /// leader's decode fails (or panics — see [`LeaderGuard`]), waiters
+    /// loop and the next claimant becomes a fresh leader.
     pub fn read_shard_cached_arc(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
-        // Cache hit fast path.
-        if let Some(ref cache_mutex) = self.cache {
-            let mut cache = cache_mutex.lock().unwrap();
-            if let Some(cached) = cache.get(&shard_idx) {
-                if let Some(m) = &self.metrics {
-                    m.hits.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(cached);
-            }
-        }
-
-        // Singleflight: either claim leadership or wait on a peer leader.
-        // `is_leader == true` means we claimed the slot and must decode.
-        let (slot, is_leader) = match &self.in_flight {
-            Some(in_flight_mutex) => {
-                let mut in_flight = in_flight_mutex.lock().unwrap();
-                if let Some(existing) = in_flight.get(&shard_idx) {
-                    let s = Arc::clone(existing);
-                    drop(in_flight);
+        loop {
+            // Cache hit fast path.
+            if let Some(ref cache_mutex) = self.cache {
+                let mut cache = cache_mutex.lock().unwrap();
+                if let Some(cached) = cache.get(&shard_idx) {
                     if let Some(m) = &self.metrics {
-                        m.duplicate_waiters.fetch_add(1, Ordering::Relaxed);
+                        m.hits.fetch_add(1, Ordering::Relaxed);
                     }
-                    // Wait for the leader to finish (success or fail).
-                    let mut state = s.state.lock().unwrap();
-                    while !*state {
-                        state = s.cv.wait(state).unwrap();
+                    return Ok(cached);
+                }
+            }
+
+            // Singleflight: either claim leadership or wait on a peer leader.
+            // `_guard` (when present) drives the post-decode signal + remove
+            // via its `Drop`, so panic in `decode_and_cache` still wakes
+            // waiters and clears the in-flight slot.
+            let _guard: Option<LeaderGuard> = match &self.in_flight {
+                Some(in_flight_mutex) => {
+                    let mut in_flight = in_flight_mutex.lock().unwrap();
+                    if let Some(existing) = in_flight.get(&shard_idx) {
+                        let slot = Arc::clone(existing);
+                        drop(in_flight);
+                        if let Some(m) = &self.metrics {
+                            m.duplicate_waiters.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Wait for the leader to finish (success, fail, or
+                        // panic — the LeaderGuard's Drop wakes us in all
+                        // three cases).
+                        let mut state = slot.state.lock().unwrap();
+                        while !*state {
+                            state = slot.cv.wait(state).unwrap();
+                        }
+                        drop(state);
+                        // Loop back to re-check the cache. On a leader-success
+                        // path we hit the fast path; on leader-error the next
+                        // iteration claims a fresh slot as the new leader.
+                        continue;
                     }
-                    drop(state);
-                    // Re-check the cache. On hit, return the leader's
-                    // result. On miss (leader errored), fall through and
-                    // retry — re-entering this function lets us claim a
-                    // fresh slot as the new leader.
+                    // Re-check the cache while holding `in_flight`. Closes
+                    // the race where a peer leader finished between our
+                    // initial cache miss and our acquisition of `in_flight`:
+                    // by then the leader has populated the cache *and* its
+                    // `LeaderGuard::drop` has removed the slot, so an
+                    // unguarded check here would re-decode unnecessarily.
+                    // The leader's `decode_and_cache` inserts before its
+                    // guard drops, so any post-removal observer sees the
+                    // entry once it acquires `in_flight`.
                     if let Some(ref cache_mutex) = self.cache {
                         let mut cache = cache_mutex.lock().unwrap();
                         if let Some(cached) = cache.get(&shard_idx) {
@@ -907,38 +948,25 @@ impl BackedCsrReader {
                             return Ok(cached);
                         }
                     }
-                    return self.read_shard_cached_arc(shard_idx);
+                    let slot = Arc::new(InFlightSlot::new());
+                    in_flight.insert(shard_idx, Arc::clone(&slot));
+                    Some(LeaderGuard {
+                        in_flight: in_flight_mutex,
+                        slot,
+                        key: shard_idx,
+                    })
                 }
-                let s = Arc::new(InFlightSlot::new());
-                in_flight.insert(shard_idx, Arc::clone(&s));
-                (Some(s), true)
-            }
-            None => (None, true),
-        };
+                None => None,
+            };
 
-        if is_leader {
             if let Some(m) = &self.metrics {
                 m.misses.fetch_add(1, Ordering::Relaxed);
             }
+
+            // Leader path. `_guard` drops here on every exit (Ok, Err, or
+            // panic), signalling waiters and clearing the in-flight slot.
+            return self.decode_and_cache(shard_idx);
         }
-
-        let result = self.decode_and_cache(shard_idx);
-
-        // Signal waiters and remove the slot regardless of leader's success
-        // or failure. On error the slot's removal lets a retrying waiter
-        // become the next leader.
-        if let Some(s) = slot {
-            {
-                let mut state = s.state.lock().unwrap();
-                *state = true;
-            }
-            s.cv.notify_all();
-            if let Some(in_flight_mutex) = &self.in_flight {
-                in_flight_mutex.lock().unwrap().remove(&shard_idx);
-            }
-        }
-
-        result
     }
 
     /// Decode shard `shard_idx` from the underlying reader, insert into the

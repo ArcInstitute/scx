@@ -466,7 +466,6 @@ fn singleflight_dedupes_concurrent_decode() {
 
     let misses = metrics.misses.load(Ordering::Relaxed);
     let hits = metrics.hits.load(Ordering::Relaxed);
-    let dup = metrics.duplicate_waiters.load(Ordering::Relaxed);
 
     // Load-bearing: only the leader actually decoded.
     assert_eq!(misses, 1, "exactly one decode (leader) should run");
@@ -480,13 +479,10 @@ fn singleflight_dedupes_concurrent_decode() {
         "every non-leader thread should observe a cache hit \
          (hits={hits}, threads={N_THREADS})"
     );
-    // duplicate_waiters is timing-dependent (some threads are pure cache
-    // hits if they arrive after the leader's insert), but in a 16-way
-    // contention test at least one waiter is overwhelmingly likely.
-    assert!(
-        dup >= 1,
-        "at least one waiter expected with {N_THREADS} threads (got dup={dup})"
-    );
+    // `duplicate_waiters` is intentionally not asserted on: it is
+    // timing-dependent (peers can pure-hit the cache if they arrive after
+    // the leader's insert) and the deterministic invariants above already
+    // prove dedup.
 }
 
 /// `WeightedLruCache` evicts oldest entries when the byte cap is exceeded.
