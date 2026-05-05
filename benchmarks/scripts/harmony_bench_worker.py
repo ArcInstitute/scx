@@ -242,8 +242,15 @@ def main() -> int:
     # `docs/performance.md` quotes `harmony_delta_rss_mb` rather than the
     # raw peak — the prior driver measured peak only, which conflated
     # PCA-load overhead (~N·d·4 bytes) with the algorithm's real footprint.
+    #
+    # Use *current* RSS (`_rss_mb`, /proc/self/statm) here, not
+    # `_peak_rss_mb` (`ru_maxrss`). `ru_maxrss` is a process-lifetime
+    # high-water mark, so if h5ad/scanpy import or PCA load briefly
+    # peaked above harmony's working set, `peak_rss - baseline_peak`
+    # would clip to ~0 and silently under-report the real algorithm
+    # footprint.
     gc.collect()
-    baseline_rss = _peak_rss_mb()
+    baseline_rss = _rss_mb()
 
     # Run + time (wall-clock + RSS sweep).
     err_msg: str | None = None
