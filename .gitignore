@@ -20,6 +20,7 @@ benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/
 benchmarks/comprehensive/results/accel_smoke_*/
 benchmarks/comprehensive/results/tier*/
+build_artifacts/
 
 # Generated report artifacts — regenerable via write_report() / write_landing()
 # from results/raw/ or a promoted baseline snapshot. Publish via
