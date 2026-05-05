@@ -10,13 +10,8 @@ use std::time::Instant;
 use roaring::RoaringBitmap;
 use scx_format::reader::ScxReader;
 
+use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
-
-fn profiling_enabled() -> bool {
-    std::env::var("SCX_LOADER_PROFILE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
-}
 
 // Compile-time assertion: ScxReader must be Send + Sync for Arc sharing
 // across tokio tasks and rayon threads.

@@ -219,6 +219,15 @@ impl TrainingDataset {
     }
 
     /// Memory budget diagnostics as a dict.
+    ///
+    /// Legacy fields (`shard_group_size`, `prefetch_batches`, `batch_size`,
+    /// `estimated_mb`, `mmap_mb`, `budget_exceeded`) plus a nested
+    /// `breakdown` dict matching `IndexPlanDataset.memory_budget()`'s
+    /// per-component shape (`cache_bytes`, `batch_buffer_bytes`,
+    /// `lookahead_overhead_bytes`, `transient_bytes`, `python_overhead_bytes`,
+    /// `total_bytes`). Sequential paths report `0` for `lookahead_overhead`
+    /// and `transient` since they don't carry plan-tuple staging or
+    /// per-batch obs scratch.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         let mb = self.pipeline.memory_budget_info();
@@ -228,6 +237,7 @@ impl TrainingDataset {
         dict.set_item("estimated_mb", mb.estimated_bytes / (1024 * 1024))?;
         dict.set_item("mmap_mb", mb.mmap_bytes / (1024 * 1024))?;
         dict.set_item("budget_exceeded", mb.budget_exceeded)?;
+        dict.set_item("breakdown", mb.breakdown.to_pydict(py)?)?;
         Ok(dict)
     }
 
@@ -482,18 +492,49 @@ impl IndexPlanDataset {
     /// cumulative since dataset construction. Returns a dict with keys:
     ///
     /// ```text
-    /// hits              - cache lookups served without decode
-    /// misses            - decodes that ran (each shard's first-leader)
-    /// evictions         - LRU entries dropped to honour the byte/count cap
-    /// bytes_inserted    - cumulative decoded bytes inserted into the cache
-    /// duplicate_waiters - waiters that found a peer leader in flight and
-    ///                     skipped redundant decode work
+    /// hits                - cache lookups served without decode
+    /// misses              - decodes that ran (each shard's first-leader)
+    /// evictions           - LRU entries dropped to honour the byte/count cap
+    /// bytes_inserted      - cumulative decoded bytes inserted into the cache
+    /// duplicate_waiters   - waiters that found a peer leader in flight and
+    ///                       skipped redundant decode work
+    /// peak_bytes_in_cache - high-water mark of the cache's resident byte
+    ///                       budget; useful for sizing `max_memory_mb`
     /// ```
     ///
     /// All values are `int`. Counters are atomic and read with `Relaxed`
     /// ordering. Sample as often as you want — there are no locks involved.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         cache_metrics_to_pydict(py, &self.loader.cache_metrics())
+    }
+
+    /// Per-component memory breakdown estimated at construction. Returns a
+    /// dict with the keys:
+    ///
+    /// ```text
+    /// cache_bytes              - decoded shard cache budget
+    /// batch_buffer_bytes       - dense X / X_paired buffers
+    /// lookahead_overhead_bytes - plan-tuple staging in the iter
+    /// transient_bytes          - per-batch obs Vecs + PairRequest scratch
+    /// python_overhead_bytes    - constant Python/Arrow/numpy overhead
+    /// total_bytes              - sum of the above
+    /// max_memory_mb            - user-supplied budget (LoaderConfig)
+    /// effective_cache_shards   - post-auto-tune cache count cap
+    /// effective_lookahead      - post-auto-tune iter lookahead
+    /// ```
+    ///
+    /// All byte values are `int`. Mirrors `TrainingDataset.memory_budget()`'s
+    /// `breakdown` sub-dict shape, plus the index-plan-specific
+    /// `effective_*` fields.
+    fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = self.loader.budget_breakdown().to_pydict(py)?;
+        dict.set_item("max_memory_mb", self.loader.max_memory_mb())?;
+        dict.set_item(
+            "effective_cache_shards",
+            self.loader.effective_cache_shards(),
+        )?;
+        dict.set_item("effective_lookahead", self.loader.effective_lookahead())?;
+        Ok(dict)
     }
 
     /// Process one plan and return a paired dense batch dict.
@@ -626,7 +667,8 @@ impl IndexPlanBatchIter {
     /// Snapshot of cache- and prefetch-side counters as a dict-of-dicts:
     ///
     /// ```text
-    /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters},
+    /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters,
+    ///            peak_bytes_in_cache},
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight}}
@@ -656,6 +698,10 @@ fn cache_metrics_to_pydict<'py>(py: Python<'py>, m: &CacheMetrics) -> PyResult<B
     dict.set_item(
         "duplicate_waiters",
         m.duplicate_waiters.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "peak_bytes_in_cache",
+        m.peak_bytes_in_cache.load(Ordering::Relaxed),
     )?;
     Ok(dict)
 }

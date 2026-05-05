@@ -31,6 +31,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::batch::ObsColumn;
+use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
 use crate::decode_stage::extract_obs_columns;
 use crate::error::{LoaderError, Result};
 use crate::normalize::apply_dense_transforms;
@@ -121,6 +122,10 @@ pub struct IndexPlanLoader {
     /// [`Self::new`] so the iter's profile log and the consumer-side
     /// snapshot accessor have a stable handle.
     cache_metrics: Arc<scx_format::CacheMetrics>,
+    /// Per-component memory breakdown produced by the auto-tune at
+    /// construction. Surfaced through `IndexPlanDataset.memory_budget()` for
+    /// production sizing.
+    budget_breakdown: BudgetBreakdown,
 }
 
 impl IndexPlanLoader {
@@ -207,15 +212,19 @@ impl IndexPlanLoader {
 
         // ----- Memory budget auto-tune -----------------------------------
         //
-        // Per-component model:
+        // Per-component model (rendered uniformly via `BudgetBreakdown` —
+        // see `crate::budget`):
         //   shard_decoded_bytes = (avg_nnz_per_shard × 8) + (avg_rows_per_shard × 8)
         //                                    ^^^ i32 indices (4) + f32 data (4)
         //                                                                ^^^ i64 indptr (8)
-        //   cache              = effective_cache_shards × shard_decoded_bytes
-        //   batch_buffers      = 2 × max_plan_size × n_output_cols × 4
+        //   cache_bytes        = effective_cache_shards × shard_decoded_bytes
+        //   batch_buffer_bytes = 2 × max_plan_size × n_output_cols × 4
+        //                            (paired x / x_paired)
         //   lookahead_overhead = effective_lookahead × max_plan_size × 16
         //                                                          ^^^ (u64, u64) plan tuple
-        //   python_overhead    = 50 MB (constant)
+        //   transient_bytes    = obs_extraction_bytes + pair_request_buffer_bytes
+        //                            (per-batch, co-resident with batch_buffer)
+        //   python_overhead    = PYTHON_OVERHEAD_BYTES (50 MB constant)
         //
         // Mmap'd file is in the kernel page cache (evicted under pressure)
         // and intentionally NOT counted against the budget.
@@ -251,8 +260,29 @@ impl IndexPlanLoader {
             .saturating_mul(max_plan_size)
             .saturating_mul(n_output_cols)
             .saturating_mul(4);
-        const PYTHON_OVERHEAD_BYTES: usize = 50 * 1024 * 1024;
         const PLAN_TUPLE_BYTES: usize = 16; // sizeof((u64, u64))
+                                            // `gather_pairs_dense` request scratch holds 2 × max_plan_size
+                                            // `PairRequest`s. Use `size_of` so this term tracks struct churn
+                                            // automatically instead of drifting against a hand-derived constant.
+        const PAIR_REQUEST_BYTES: usize = std::mem::size_of::<PairRequest>();
+        // `extract_obs_columns` allocates one `Vec` per configured obs
+        // column per side (pert + ctrl). `ObsColumn` variants store `i64`
+        // (8 B), `f64` (8 B), or `Categorical(Vec<u32>, …)` (4 B/cell —
+        // the per-batch label dictionary is shared, not per-cell, and
+        // intentionally excluded from this term). `8` is the worst-case
+        // per-cell width across the supported variants.
+        const OBS_CELL_BYTES: usize = 8;
+
+        let transient_bytes = {
+            let obs_bytes = 2usize
+                .saturating_mul(max_plan_size)
+                .saturating_mul(config.obs_columns.len())
+                .saturating_mul(OBS_CELL_BYTES);
+            let request_bytes = 2usize
+                .saturating_mul(max_plan_size)
+                .saturating_mul(PAIR_REQUEST_BYTES);
+            obs_bytes.saturating_add(request_bytes)
+        };
 
         let budget_bytes = config
             .max_memory_mb
@@ -262,15 +292,15 @@ impl IndexPlanLoader {
         let mut effective_cache_shards = cache_shards;
         let mut effective_lookahead = lookahead;
 
-        let estimate = |cache: usize, la: usize| -> usize {
-            cache
-                .saturating_mul(shard_decoded_bytes)
-                .saturating_add(batch_buffer_bytes)
-                .saturating_add(
-                    la.saturating_mul(max_plan_size)
-                        .saturating_mul(PLAN_TUPLE_BYTES),
-                )
-                .saturating_add(PYTHON_OVERHEAD_BYTES)
+        let breakdown = |cache: usize, la: usize| -> BudgetBreakdown {
+            BudgetBreakdown::new(
+                cache.saturating_mul(shard_decoded_bytes),
+                batch_buffer_bytes,
+                la.saturating_mul(max_plan_size)
+                    .saturating_mul(PLAN_TUPLE_BYTES),
+                transient_bytes,
+                PYTHON_OVERHEAD_BYTES,
+            )
         };
 
         // Reduce lookahead first (down to 1 — we want the iterator path to
@@ -278,27 +308,29 @@ impl IndexPlanLoader {
         // `lookahead == 0` is preserved through the loop because the
         // `> 1` guard never decrements it). Then reduce cache_shards down
         // to 1.
-        while estimate(effective_cache_shards, effective_lookahead) > budget_bytes {
+        while breakdown(effective_cache_shards, effective_lookahead).total_bytes > budget_bytes {
             if effective_lookahead > 1 {
                 effective_lookahead -= 1;
             } else if effective_cache_shards > 1 {
                 effective_cache_shards -= 1;
             } else {
-                let est = estimate(effective_cache_shards, effective_lookahead);
+                let b = breakdown(effective_cache_shards, effective_lookahead);
                 return Err(LoaderError::ConfigError {
                     reason: format!(
                         "max_memory_mb={} is below the floor for this file: \
                          estimated {} MB at cache_shards=1, lookahead=1 \
-                         (shard_decoded={} KB, batch_buffer={} MB, py_overhead=50 MB). \
-                         Increase max_memory_mb.",
+                         (shard_decoded={} KB, batch_buffer={} MB, transient={} KB, \
+                         py_overhead=50 MB). Increase max_memory_mb.",
                         config.max_memory_mb,
-                        est / (1024 * 1024),
+                        b.total_bytes / (1024 * 1024),
                         shard_decoded_bytes / 1024,
                         batch_buffer_bytes / (1024 * 1024),
+                        transient_bytes / 1024,
                     ),
                 });
             }
         }
+        let budget_breakdown = breakdown(effective_cache_shards, effective_lookahead);
 
         // Tighten the LRU's byte cap to match the auto-tune model, so the
         // cache can't overshoot `max_memory_mb` when actual shard sizes
@@ -337,6 +369,7 @@ impl IndexPlanLoader {
             effective_lookahead,
             max_plan_size,
             cache_metrics,
+            budget_breakdown,
         })
     }
 
@@ -376,6 +409,22 @@ impl IndexPlanLoader {
     /// `iter_with_plans` when the caller passes `lookahead=None`.
     pub fn effective_lookahead(&self) -> usize {
         self.effective_lookahead
+    }
+
+    /// Per-component memory breakdown produced by the auto-tune at
+    /// construction. Surfaces the cache / batch / lookahead / transient /
+    /// python-overhead split that drove the effective `cache_shards` and
+    /// `lookahead` reductions, for production sizing and benchmark
+    /// validation.
+    pub fn budget_breakdown(&self) -> BudgetBreakdown {
+        self.budget_breakdown
+    }
+
+    /// User-facing memory budget in MB (the `max_memory_mb` passed to
+    /// `LoaderConfig`). Convenience accessor — paired with
+    /// [`Self::budget_breakdown`] for sizing diagnostics.
+    pub fn max_memory_mb(&self) -> usize {
+        self.config.max_memory_mb
     }
 
     /// O(log n_shards) lookup of the shard containing `row`. Returns `None`
@@ -887,11 +936,8 @@ impl Drop for IndexPlanIter {
         let _ = self.plan_thread.take();
 
         // Optional one-shot profile dump. Enabled by `SCX_LOADER_PROFILE=1`
-        // (matches the existing pattern in `pipeline::profiling_enabled`).
-        let profile = std::env::var("SCX_LOADER_PROFILE")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-        if profile {
+        // — see `crate::budget::profiling_enabled`.
+        if profiling_enabled() {
             let cm = &self.loader.cache_metrics;
             let im = &self.iter_metrics;
             let hits = cm.hits.load(Ordering::Relaxed);
@@ -1559,13 +1605,15 @@ mod tests {
         let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 256, 8, 4);
 
         let mut config = LoaderConfig::default();
-        // Budget components at requested settings:
+        // Budget components at requested settings (post-issue-#6 model):
         //   python       = 50 MB
-        //   batch buffer = 2 × 65536 × 8 × 4 ≈ 4 MB
-        //   lookahead    = 8 × 65536 × 16    ≈ 8 MB
+        //   batch buffer = 2 × 65536 × 8 × 4         ≈ 4 MB
+        //   lookahead    = 8 × 65536 × 16            ≈ 8 MB
+        //   transient    = 2 × 65536 × 24 (no obs)   ≈ 3 MB  (PairRequest)
         //   shard cache  = ~negligible (sparse fixture)
-        // Total ≈ 62 MB. A 56 MB budget forces lookahead reduction.
-        config.max_memory_mb = 56;
+        // Total ≈ 65 MB. Floor at lookahead=1: 50+4+1+3 ≈ 58 MB.
+        // A 60 MB budget forces lookahead reduction without floor-failure.
+        config.max_memory_mb = 60;
         let loader = IndexPlanLoader::new(
             &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true,
             /*lookahead*/ 8, /*max_plan_size*/ 65536,

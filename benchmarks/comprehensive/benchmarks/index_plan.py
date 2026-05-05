@@ -33,6 +33,18 @@ Per-scenario metric keys emitted into ``RunRecord.extra``:
     ``shard_cache_hit_rate__<scenario>`` — None (placeholder; the
         ``BackedCsrReader`` does not expose a hit-rate counter today; will
         appear once that lands).
+    ``memory_budget_total_mb__<scenario>`` — float;
+        ``IndexPlanDataset.memory_budget()["total_bytes"]`` in MB; ``None``
+        for non-IndexPlan scenarios. Lets the harness validate the loader's
+        per-component memory model against the actual RSS at scenario end.
+    ``estimate_overshoot_mb__<scenario>`` — float; scenario-local
+        ``ru_maxrss`` growth (``post − pre``, floored at 0) minus
+        ``memory_budget_total_mb``. The growth term — not the absolute peak
+        — is used because ``ru_maxrss`` is process-wide and monotonic, so
+        subtracting the baseline isolates this scenario's contribution from
+        prior scenarios' high-water marks. Positive ⇒ estimator
+        under-counted relative to growth; ≤ 0 ⇒ scenario did not push past
+        any prior peak (or under-ran the model).
 """
 
 from __future__ import annotations
@@ -139,6 +151,20 @@ class _ScenarioOutcome:
     n_cells: int
     wall_s: float
     peak_rss_mb: float
+    # Estimator validation: `memory_budget_total_mb` mirrors the loader's
+    # `IndexPlanDataset.memory_budget()["total_bytes"]` in MB;
+    # `estimate_overshoot_mb` is `(scenario-local ru_maxrss growth) -
+    # memory_budget_total_mb`. The growth term is `max(0, ru_maxrss_after -
+    # ru_maxrss_before)`, NOT `peak_rss_mb` — `ru_maxrss` is process-wide
+    # and monotonic, so subtracting the baseline is what isolates *this*
+    # scenario's contribution from the cumulative high-water set by earlier
+    # scenarios in the same process. A positive overshoot means the
+    # estimator under-counted relative to actual growth; a negative or
+    # zero value means the scenario did not push past any prior peak (or
+    # under-ran the model). `None` for non-IndexPlan scenarios that don't
+    # expose `memory_budget()`.
+    memory_budget_total_mb: float | None = None
+    estimate_overshoot_mb: float | None = None
 
 
 def _run_index_plan(
@@ -168,6 +194,10 @@ def _run_index_plan(
         max_plan_size=max_plan_size,
         max_memory_mb=8192,
     )
+    # Snapshot the estimator's per-component breakdown right after ctor so
+    # the auto-tune output (post-reduction) drives the overshoot delta.
+    budget = ds.memory_budget()
+    budget_total_mb = budget["total_bytes"] / (1024 * 1024)
 
     t0 = time.perf_counter()
     seen = 0
@@ -176,11 +206,21 @@ def _run_index_plan(
         seen += 1
         cells += 2 * batch["X"].shape[0]
     wall = time.perf_counter() - t0
+    peak_rss_after = _peak_rss_mb()
+    peak_rss = max(rss0, peak_rss_after)
+    # Scenario-local ru_maxrss growth — eliminates cross-scenario
+    # contamination when `run()` executes multiple scenarios in the same
+    # process (`ru_maxrss` is monotonic for the process lifetime). Reads as
+    # 0 for scenarios that don't push past a prior peak; that's a weaker
+    # but honest signal vs. inheriting an unrelated scenario's high-water.
+    peak_rss_growth = max(0.0, peak_rss_after - rss0)
     return _ScenarioOutcome(
         n_batches=seen,
         n_cells=cells,
         wall_s=wall,
-        peak_rss_mb=max(rss0, _peak_rss_mb()),
+        peak_rss_mb=peak_rss,
+        memory_budget_total_mb=round(budget_total_mb, 1),
+        estimate_overshoot_mb=round(peak_rss_growth - budget_total_mb, 1),
     )
 
 
@@ -615,6 +655,15 @@ def run(
                 # counter. Slot is preserved so the gate's threshold key
                 # remains stable when the counter lands.
                 f"shard_cache_hit_rate__{scenario_name}": None,
+                # Estimator validation: `None` for scenarios that don't
+                # go through `IndexPlanDataset` (no `memory_budget()`
+                # accessor on the manual baselines).
+                f"memory_budget_total_mb__{scenario_name}": (
+                    outcome.memory_budget_total_mb
+                ),
+                f"estimate_overshoot_mb__{scenario_name}": (
+                    outcome.estimate_overshoot_mb
+                ),
             }
             result.add_run(
                 wall_s=wall,

@@ -21,13 +21,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
-fn profiling_enabled() -> bool {
-    std::env::var("SCX_LOADER_PROFILE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
-}
-
 use crate::batch::{Batch, ObsColumn};
+use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
 use crate::io_stage::ShardGroup;
 use crate::normalize::apply_dense_transforms;

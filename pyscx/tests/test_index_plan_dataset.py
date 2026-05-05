@@ -538,7 +538,7 @@ class TestNormalizeLog1p:
 
 
 # ---------------------------------------------------------------------------
-# Cache + prefetch metrics (SCX-OPT issue #5)
+# Cache + prefetch metrics
 # ---------------------------------------------------------------------------
 
 
@@ -553,6 +553,7 @@ class TestMetrics:
             "evictions",
             "bytes_inserted",
             "duplicate_waiters",
+            "peak_bytes_in_cache",
         }
         for k, v in m.items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
@@ -599,6 +600,7 @@ class TestMetrics:
             "evictions",
             "bytes_inserted",
             "duplicate_waiters",
+            "peak_bytes_in_cache",
         }
 
     def test_iter_skips_prefetch_after_warmup(self, scx_path):
@@ -646,3 +648,75 @@ class TestMetrics:
         assert m1["prefetch"]["prefetch_tasks_spawned"] == m2["prefetch"][
             "prefetch_tasks_spawned"
         ]
+
+
+# ---------------------------------------------------------------------------
+# Memory budget breakdown
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryBudget:
+    def test_memory_budget_keys_and_total(self, scx_path):
+        """Schema: every documented key is present, all `int`, and the
+        per-component bytes sum to `total_bytes`."""
+        ds = pyscx.IndexPlanDataset(scx_path)
+        b = ds.memory_budget()
+        expected_keys = {
+            "cache_bytes",
+            "batch_buffer_bytes",
+            "lookahead_overhead_bytes",
+            "transient_bytes",
+            "python_overhead_bytes",
+            "total_bytes",
+            "max_memory_mb",
+            "effective_cache_shards",
+            "effective_lookahead",
+        }
+        assert set(b) == expected_keys
+        for k, v in b.items():
+            assert isinstance(v, int), f"{k} should be int, got {type(v)}"
+            assert v >= 0
+        component_sum = (
+            b["cache_bytes"]
+            + b["batch_buffer_bytes"]
+            + b["lookahead_overhead_bytes"]
+            + b["transient_bytes"]
+            + b["python_overhead_bytes"]
+        )
+        assert component_sum == b["total_bytes"]
+
+    def test_memory_budget_matches_max_memory_mb(self, scx_path):
+        """`total_bytes` must fit inside the user-configured budget — if
+        construction succeeded, the auto-tune found a reduction that fits."""
+        ds = pyscx.IndexPlanDataset(scx_path, max_memory_mb=256)
+        b = ds.memory_budget()
+        max_bytes = b["max_memory_mb"] * 1024 * 1024
+        assert b["total_bytes"] <= max_bytes, (
+            f"total_bytes ({b['total_bytes']}) exceeds budget "
+            f"({max_bytes}) — auto-tune is broken"
+        )
+        # Effective values mirror the loader's accessors.
+        assert b["effective_cache_shards"] == ds.effective_cache_shards()
+        assert b["effective_lookahead"] == ds.effective_lookahead()
+
+    def test_peak_bytes_in_cache_advances(self, scx_path):
+        """The new `peak_bytes_in_cache` gauge in `CacheMetrics` should
+        advance past 0 once at least one shard has been decoded into the
+        cache (driven via an iter)."""
+        ds = pyscx.IndexPlanDataset(scx_path)
+        # Sanity: schema-extended cache_metrics dict.
+        before = ds.cache_metrics()
+        assert "peak_bytes_in_cache" in before
+        assert before["peak_bytes_in_cache"] == 0
+
+        plans = [[(0, 1), (2, 3)]]
+        for _ in ds.iter_with_plans(iter(plans), lookahead=1):
+            pass
+
+        after = ds.cache_metrics()
+        assert after["peak_bytes_in_cache"] > 0, (
+            "peak_bytes_in_cache should advance once any shard is cached"
+        )
+        # Without eviction the peak equals cumulative bytes_inserted.
+        if after["evictions"] == 0:
+            assert after["peak_bytes_in_cache"] == after["bytes_inserted"]
