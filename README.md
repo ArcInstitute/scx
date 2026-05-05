@@ -555,11 +555,21 @@ VERSION=0.2.0
 #   linux arm64  → aarch64-unknown-linux-gnu
 TARGET=x86_64-unknown-linux-gnu
 
-curl -L "https://github.com/ArcInstitute/scx/releases/download/scx-cli-v${VERSION}/scx-cli-${VERSION}-${TARGET}.tar.gz" | tar xz
+# Requires the GitHub CLI (https://cli.github.com/) and `gh auth login`
+# while the repo is private.
+gh release download "scx-cli-v${VERSION}" -R ArcInstitute/scx \
+  -p "scx-cli-${VERSION}-${TARGET}.tar.gz"
+tar xzf "scx-cli-${VERSION}-${TARGET}.tar.gz"
 ./scx-cli-${VERSION}-${TARGET}/scx --version
 
 # Move onto your PATH:
 install -m 0755 "scx-cli-${VERSION}-${TARGET}/scx" ~/.local/bin/scx
+```
+
+Once the repository is public, the asset can also be fetched without `gh`:
+
+```bash
+curl -L "https://github.com/ArcInstitute/scx/releases/download/scx-cli-v${VERSION}/scx-cli-${VERSION}-${TARGET}.tar.gz" | tar xz
 ```
 
 **Build from source** — for macOS, Windows, musl, or custom feature sets:

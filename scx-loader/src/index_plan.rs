@@ -2,7 +2,7 @@
 //!
 //! Sibling to the sequential `TrainingPipeline`. The consumer supplies a stream
 //! of `Vec<(u64, u64)>` plans (perturbed, control row index pairs); this module
-//! gathers the rows via `BackedCsrReader::read_row_indices`, projects + normalizes
+//! gathers both sides through one shard-local dense pass, projects + normalizes
 //! them through the existing `HvgProjection` and the shared
 //! `apply_dense_transforms` dispatcher in `normalize.rs` (the same dispatcher
 //! `TrainingDataset` uses), and yields paired dense `IndexPlanBatch` values.
@@ -12,13 +12,14 @@
 //! gathering, plus an async [`IndexPlanLoader::iter_with_plans`] iterator that
 //! pipelines per-plan shard prefetch (via tokio `spawn_blocking`) ahead of the
 //! consumer. Plans are reordered by `min(shard_of(p), shard_of(c))` for
-//! locality when `sort_by_shard=true` (the default). Each side gathers
-//! through `BackedCsrReader::read_rows_with`, which scatters directly from
-//! cached shards into the dense output without materialising an intermediate
-//! `ScxCsr`.
+//! locality when `sort_by_shard=true` (the default). Perturbed and control
+//! requests are grouped together by shard, so each touched cached shard is
+//! walked once and rows scatter directly into the final dense buffers without
+//! materialising intermediate `ScxCsr` values.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -60,10 +61,32 @@ impl IndexPlanBatch {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PairSide {
+    Perturbed,
+    Control,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PairRequest {
+    row: u64,
+    pair_idx: usize,
+    side: PairSide,
+}
+
+struct PairedDenseGather {
+    x: Vec<f32>,
+    x_paired: Vec<f32>,
+    pert_indices: Vec<u64>,
+    ctrl_indices: Vec<u64>,
+}
+
 /// Plan-driven paired-batch reader.
 ///
-/// Phase 1 surface: construct via `new`, drive via `process_plan`. The iterator
-/// API (`iter_with_plans`) lands in Phase 4.
+/// Two surfaces share `process_plan` underneath: the synchronous
+/// [`Self::process_plan`] for one-shot use, and [`Self::iter_with_plans`] —
+/// an async iterator that pipelines per-plan shard prefetch (via tokio
+/// `spawn_blocking`) ahead of the consumer.
 pub struct IndexPlanLoader {
     backed: BackedCsrReader,
     obs_metadata: RecordBatch,
@@ -93,6 +116,11 @@ pub struct IndexPlanLoader {
     /// rejects plans larger than it so a misbehaving consumer can't
     /// silently exceed `max_memory_mb`.
     max_plan_size: usize,
+    /// Shared handle to the underlying `BackedCsrReader`'s cache counters.
+    /// Always populated — `BackedCsrReader::enable_metrics` is called in
+    /// [`Self::new`] so the iter's profile log and the consumer-side
+    /// snapshot accessor have a stable handle.
+    cache_metrics: Arc<scx_format::CacheMetrics>,
 }
 
 impl IndexPlanLoader {
@@ -272,7 +300,19 @@ impl IndexPlanLoader {
             }
         }
 
-        let backed = BackedCsrReader::new(reader, effective_cache_shards);
+        // Tighten the LRU's byte cap to match the auto-tune model, so the
+        // cache can't overshoot `max_memory_mb` when actual shard sizes
+        // diverge from the average used in `shard_decoded_bytes`. The count
+        // cap stays in place too — both are enforced.
+        let cache_bytes_budget = effective_cache_shards.saturating_mul(shard_decoded_bytes);
+        let mut backed = BackedCsrReader::new_with_byte_budget(
+            reader,
+            effective_cache_shards,
+            cache_bytes_budget,
+        );
+        // Always-on metrics on this surface — the iter's profile log and
+        // the per-iter snapshot accessor read from this handle.
+        let cache_metrics = backed.enable_metrics();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -296,6 +336,7 @@ impl IndexPlanLoader {
             effective_cache_shards,
             effective_lookahead,
             max_plan_size,
+            cache_metrics,
         })
     }
 
@@ -315,6 +356,14 @@ impl IndexPlanLoader {
     /// before gathering.
     pub fn sort_by_shard(&self) -> bool {
         self.sort_by_shard
+    }
+
+    /// Shared handle to the underlying `BackedCsrReader`'s cache counters
+    /// (hits / misses / evictions / bytes_inserted / duplicate_waiters).
+    /// Always populated; cloning the `Arc` lets callers sample without
+    /// touching the cache lock.
+    pub fn cache_metrics(&self) -> Arc<scx_format::CacheMetrics> {
+        Arc::clone(&self.cache_metrics)
     }
 
     /// Effective LRU shard cache size after auto-tuning to fit
@@ -340,10 +389,8 @@ impl IndexPlanLoader {
     /// extract obs.
     ///
     /// Empty plans yield a zero-row `IndexPlanBatch`. Out-of-range indices
-    /// short-circuit before any I/O. Duplicate row indices in the plan are
-    /// passed through to `read_row_indices`, which returns duplicate output
-    /// rows in the same order — consumer is responsible for deduplication if
-    /// it matters.
+    /// short-circuit before any I/O. Duplicate row indices in the plan produce
+    /// duplicate output rows in the same order as the returned `pairs` field.
     ///
     /// If `sort_by_shard` is enabled (default), the plan is reordered by
     /// `min(shard_of(p), shard_of(c))` before gathering. The returned
@@ -379,7 +426,6 @@ impl IndexPlanLoader {
         }
 
         let n_pairs = plan.len();
-        let n_cols = self.n_output_cols;
 
         if n_pairs == 0 {
             return Ok(IndexPlanBatch {
@@ -391,10 +437,10 @@ impl IndexPlanLoader {
             });
         }
 
-        // Phase 2: reorder the plan by shard-of-min-row so consecutive pairs
-        // land on contiguous shards. read_row_indices already sorts internally
-        // for *gather* locality; this sort is for *plan-level coherence* — so
-        // the consumer's `pairs` / `x` / `x_paired` arrays are aligned in the
+        // Reorder the plan by shard-of-min-row so consecutive pairs land on
+        // contiguous shards. The fused gather sorts row requests internally
+        // for shard locality; this sort is for plan-level coherence, so the
+        // consumer's `pairs` / `x` / `x_paired` arrays are aligned in the
         // post-sort order.
         //
         // Stable sort preserves the original plan order for ties (same shard).
@@ -411,50 +457,113 @@ impl IndexPlanLoader {
             });
         }
 
-        // Plan-driven dense gather. Each side calls `BackedCsrReader::
-        // read_rows_with`, which decodes each touched shard once via the LRU
-        // cache, then invokes the scatter closure with zero-copy
-        // `(indices, data)` views into the cached shard. No intermediate
-        // `ScxCsr` is allocated, no `concatenate_csr` runs at the end, and
-        // duplicate plan entries (common for paired controls) share the same
-        // shard decode without re-allocating per-row CSRs.
-        //
-        // Pert and ctrl walks are independent shard-grouped passes; we don't
-        // attempt a fused gather because eliminating 2 × n_pairs per-row CSR
-        // allocations + the final `concatenate_csr` is the larger
-        // training-loop-scale win, and a fused pair walk would re-introduce
-        // per-pair branching across two CSR row pointers for marginal gain.
-        let pert_indices: Vec<u64> = plan.iter().map(|(p, _)| *p).collect();
-        let ctrl_indices: Vec<u64> = plan.iter().map(|(_, c)| *c).collect();
+        let gathered = self.gather_pairs_dense(&plan)?;
+
+        let obs = extract_obs_columns(
+            &self.obs_metadata,
+            &gathered.pert_indices,
+            &self.config.obs_columns,
+        )?;
+        let obs_paired = extract_obs_columns(
+            &self.obs_metadata,
+            &gathered.ctrl_indices,
+            &self.config.obs_columns,
+        )?;
+
+        Ok(IndexPlanBatch {
+            x: gathered.x,
+            x_paired: gathered.x_paired,
+            pairs: plan,
+            obs,
+            obs_paired,
+        })
+    }
+
+    /// Gather both sides of a paired plan in one shard-local pass.
+    ///
+    /// The request list contains perturbed and control rows together, sorted
+    /// by row so all requests for a shard are contiguous. Repeated row indices
+    /// reuse the same CSR row slice and scatter once per destination
+    /// occurrence, preserving duplicate-pair semantics without repeating shard
+    /// lookup or row-pointer work.
+    fn gather_pairs_dense(&self, plan: &[(u64, u64)]) -> Result<PairedDenseGather> {
+        let n_pairs = plan.len();
+        let n_cols = self.n_output_cols;
 
         let mut x = vec![0f32; n_pairs * n_cols];
         let mut x_paired = vec![0f32; n_pairs * n_cols];
+        let mut pert_indices = Vec::with_capacity(n_pairs);
+        let mut ctrl_indices = Vec::with_capacity(n_pairs);
+        let mut requests = Vec::with_capacity(n_pairs * 2);
 
-        let hvg = self.hvg_projection.as_ref();
+        for (pair_idx, &(pert, ctrl)) in plan.iter().enumerate() {
+            pert_indices.push(pert);
+            ctrl_indices.push(ctrl);
+            requests.push(PairRequest {
+                row: pert,
+                pair_idx,
+                side: PairSide::Perturbed,
+            });
+            requests.push(PairRequest {
+                row: ctrl,
+                pair_idx,
+                side: PairSide::Control,
+            });
+        }
 
-        self.backed.read_rows_with(&pert_indices, |i, idx, data| {
-            let p_out = &mut x[i * n_cols..][..n_cols];
-            match hvg {
-                Some(hvg) => hvg.scatter_row(idx, data, p_out),
-                None => scatter_row_full(idx, data, p_out)
-                    .map_err(|e| scx_format::ScxError::Io(std::io::Error::other(e)))?,
+        requests.sort_by_key(|r| r.row);
+
+        let mut start = 0;
+        while start < requests.len() {
+            let row = requests[start].row;
+            let shard_idx = self.backed.index().shard_for_row(row).ok_or_else(|| {
+                scx_format::ScxError::Io(std::io::Error::other(format!(
+                    "row index {row} is not covered by any shard (n_obs={})",
+                    self.n_obs()
+                )))
+            })?;
+            let (s_start, s_end) = self.backed.index().shard_range(shard_idx).ok_or(
+                scx_format::ScxError::ShardIndexOutOfBounds {
+                    index: shard_idx,
+                    count: self.backed.index().n_shards(),
+                },
+            )?;
+
+            let end = start + requests[start..].partition_point(|r| r.row < s_end);
+            let shard = self.backed.read_shard_cached_arc(shard_idx)?;
+
+            let mut row_start = start;
+            while row_start < end {
+                let row = requests[row_start].row;
+                let row_end =
+                    row_start + requests[row_start..end].partition_point(|r| r.row == row);
+                let local = (row - s_start) as usize;
+                let lo = *shard
+                    .indptr
+                    .get(local)
+                    .ok_or(scx_format::ScxError::InconsistentCsr)?
+                    as usize;
+                let hi = *shard
+                    .indptr
+                    .get(local + 1)
+                    .ok_or(scx_format::ScxError::InconsistentCsr)?
+                    as usize;
+                if hi < lo || hi > shard.indices.len() || hi > shard.data.len() {
+                    return Err(scx_format::ScxError::InconsistentCsr.into());
+                }
+                let idx = &shard.indices[lo..hi];
+                let data = &shard.data[lo..hi];
+
+                for &request in &requests[row_start..row_end] {
+                    self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)?;
+                }
+
+                row_start = row_end;
             }
-            Ok(())
-        })?;
 
-        self.backed.read_rows_with(&ctrl_indices, |i, idx, data| {
-            let c_out = &mut x_paired[i * n_cols..][..n_cols];
-            match hvg {
-                Some(hvg) => hvg.scatter_row(idx, data, c_out),
-                None => scatter_row_full(idx, data, c_out)
-                    .map_err(|e| scx_format::ScxError::Io(std::io::Error::other(e)))?,
-            }
-            Ok(())
-        })?;
+            start = end;
+        }
 
-        // Apply configured transforms once both sides are populated. Kept as
-        // a separate pass so the read_rows_with closures stay allocation-free
-        // and infallible w.r.t. transforms.
         for i in 0..n_pairs {
             let p_out = &mut x[i * n_cols..][..n_cols];
             apply_dense_transforms(
@@ -463,8 +572,6 @@ impl IndexPlanLoader {
                 self.config.log1p,
                 self.config.target_sum,
             );
-        }
-        for i in 0..n_pairs {
             let c_out = &mut x_paired[i * n_cols..][..n_cols];
             apply_dense_transforms(
                 c_out,
@@ -474,17 +581,32 @@ impl IndexPlanLoader {
             );
         }
 
-        let obs = extract_obs_columns(&self.obs_metadata, &pert_indices, &self.config.obs_columns)?;
-        let obs_paired =
-            extract_obs_columns(&self.obs_metadata, &ctrl_indices, &self.config.obs_columns)?;
-
-        Ok(IndexPlanBatch {
+        Ok(PairedDenseGather {
             x,
             x_paired,
-            pairs: plan,
-            obs,
-            obs_paired,
+            pert_indices,
+            ctrl_indices,
         })
+    }
+
+    fn scatter_pair_request(
+        &self,
+        request: PairRequest,
+        idx: &[i32],
+        data: &[f32],
+        n_cols: usize,
+        x: &mut [f32],
+        x_paired: &mut [f32],
+    ) -> Result<()> {
+        let out = match request.side {
+            PairSide::Perturbed => &mut x[request.pair_idx * n_cols..][..n_cols],
+            PairSide::Control => &mut x_paired[request.pair_idx * n_cols..][..n_cols],
+        };
+        match self.hvg_projection.as_ref() {
+            Some(hvg) => hvg.scatter_row(idx, data, out),
+            None => scatter_row_full(idx, data, out)?,
+        }
+        Ok(())
     }
 
     /// Drive the loader from a plan stream, hiding shard-prefetch latency
@@ -508,14 +630,33 @@ impl IndexPlanLoader {
 }
 
 /// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
-/// handle per shard prefetched for it.
+/// handle per shard scheduled for prefetch (cached / in-flight shards are
+/// filtered out by the iter pre-check before this Vec is built).
 type ShardJoin = JoinHandle<scx_format::Result<Arc<ScxCsr>>>;
 
 struct InFlight {
     plan: Vec<(u64, u64)>,
     /// Empty when `lookahead == 0`, when the plan is empty, or when every
-    /// shard that the plan touches is already in the LRU cache.
+    /// shard the plan touches is already cached or being decoded by a peer
+    /// (the iter pre-check skips spawning in those cases — see
+    /// `IndexPlanIter::spawn_prefetches`).
     prefetches: Vec<ShardJoin>,
+}
+
+/// Per-iter prefetch counters. Sampled by `IndexPlanIter::iter_metrics` and
+/// emitted by the Drop-time profile log when `SCX_LOADER_PROFILE=1`.
+///
+/// All atomics use `Relaxed` ordering — values are statistical and not used
+/// for synchronization.
+#[derive(Default, Debug)]
+pub struct IterMetrics {
+    /// `tokio::spawn_blocking` tasks queued onto the runtime's blocking pool.
+    pub prefetch_tasks_spawned: AtomicU64,
+    /// Shards whose prefetch was skipped because the LRU already held them.
+    pub prefetch_skipped_cache_hit: AtomicU64,
+    /// Shards whose prefetch was skipped because a peer leader was already
+    /// decoding them in `BackedCsrReader`'s singleflight table.
+    pub prefetch_skipped_in_flight: AtomicU64,
 }
 
 /// Iterator returned by [`IndexPlanLoader::iter_with_plans`].
@@ -540,6 +681,9 @@ pub struct IndexPlanIter {
     /// drains gracefully; next() surfaces the error one-shot after the
     /// queue empties, then sets `plan_stream_done`.
     plan_stream_error: Option<LoaderError>,
+    /// Per-iter prefetch counters. Cloning the `Arc` lets a consumer sample
+    /// without going through any lock.
+    iter_metrics: Arc<IterMetrics>,
 }
 
 impl IndexPlanIter {
@@ -571,7 +715,14 @@ impl IndexPlanIter {
             lookahead,
             plan_stream_done: false,
             plan_stream_error: None,
+            iter_metrics: Arc::new(IterMetrics::default()),
         }
+    }
+
+    /// Cloneable handle to this iter's prefetch counters. Sample at any
+    /// time — atomics are `Relaxed`, no locks involved.
+    pub fn iter_metrics(&self) -> Arc<IterMetrics> {
+        Arc::clone(&self.iter_metrics)
     }
 
     /// Refill the in-flight queue up to `lookahead.max(1)` plans, spawning a
@@ -620,10 +771,35 @@ impl IndexPlanIter {
         // shard set has no duplicates we'd waste prefetches on.
         let shards = self.loader.backed.index().shards_for_indices(&all_rows);
 
+        // Skip shards that are already cached or whose decode is already in
+        // flight via the BackedCsrReader singleflight table. Without this
+        // filter, a window of N plans touching shard S queues up to N
+        // `spawn_blocking` tasks for S — the singleflight short-circuits
+        // the redundant decode but the per-task tokio overhead and the
+        // associated `runtime.block_on` round-trips are still paid in
+        // `await_head`. Filtering here keeps the queue tight.
         let handle = self.loader.runtime.handle().clone();
         shards
             .into_iter()
+            .filter(|&sidx| {
+                if self.loader.backed.cache_contains(sidx) {
+                    self.iter_metrics
+                        .prefetch_skipped_cache_hit
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                if self.loader.backed.in_flight_contains(sidx) {
+                    self.iter_metrics
+                        .prefetch_skipped_in_flight
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
+            })
             .map(|sidx| {
+                self.iter_metrics
+                    .prefetch_tasks_spawned
+                    .fetch_add(1, Ordering::Relaxed);
                 let loader = Arc::clone(&self.loader);
                 handle.spawn_blocking(move || loader.backed.read_shard_cached_arc(sidx))
             })
@@ -637,7 +813,7 @@ impl IndexPlanIter {
             match self.loader.runtime.block_on(h) {
                 Ok(Ok(_arc_shard)) => {
                     // Shard is now warm in the LRU cache; subsequent
-                    // process_plan calls will hit it through read_row_indices.
+                    // process_plan calls will hit it through the dense gather.
                 }
                 Ok(Err(e)) => return Err(LoaderError::FormatError(e)),
                 Err(join_err) => {
@@ -709,6 +885,32 @@ impl Drop for IndexPlanIter {
 
         // Detach the plan thread; it will exit on its next send-fail.
         let _ = self.plan_thread.take();
+
+        // Optional one-shot profile dump. Enabled by `SCX_LOADER_PROFILE=1`
+        // (matches the existing pattern in `pipeline::profiling_enabled`).
+        let profile = std::env::var("SCX_LOADER_PROFILE")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        if profile {
+            let cm = &self.loader.cache_metrics;
+            let im = &self.iter_metrics;
+            let hits = cm.hits.load(Ordering::Relaxed);
+            let misses = cm.misses.load(Ordering::Relaxed);
+            let evictions = cm.evictions.load(Ordering::Relaxed);
+            let bytes_inserted = cm.bytes_inserted.load(Ordering::Relaxed);
+            let dup_waiters = cm.duplicate_waiters.load(Ordering::Relaxed);
+            let spawned = im.prefetch_tasks_spawned.load(Ordering::Relaxed);
+            let skip_hit = im.prefetch_skipped_cache_hit.load(Ordering::Relaxed);
+            let skip_inflight = im.prefetch_skipped_in_flight.load(Ordering::Relaxed);
+            eprintln!(
+                "scx-loader IndexPlanIter cache_metrics: \
+                 hits={hits} misses={misses} evictions={evictions} \
+                 bytes_inserted={bytes_inserted} duplicate_waiters={dup_waiters} \
+                 prefetch_tasks_spawned={spawned} \
+                 prefetch_skipped_cache_hit={skip_hit} \
+                 prefetch_skipped_in_flight={skip_inflight}"
+            );
+        }
     }
 }
 
@@ -832,6 +1034,134 @@ mod tests {
             /*max_plan_size*/ 16384,
         )
         .unwrap()
+    }
+
+    fn open_loader_hvg(
+        path: &std::path::Path,
+        sort_by_shard: bool,
+        hvg_indices: Vec<u32>,
+    ) -> IndexPlanLoader {
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+        config.hvg_indices = Some(hvg_indices);
+        IndexPlanLoader::new(
+            path,
+            config,
+            /*cache_shards*/ 4,
+            sort_by_shard,
+            /*lookahead*/ 4,
+            /*max_plan_size*/ 16384,
+        )
+        .unwrap()
+    }
+
+    fn assert_full_fixture_row(row: u64, dense: &[f32], n_vars: usize) {
+        let col = (row as usize) % n_vars;
+        let val = ((row as usize + 1) & 0xFF) as f32;
+        assert_eq!(dense[col], val, "row {row} expected value at col {col}");
+        assert_eq!(
+            dense.iter().filter(|&&v| v != 0.0).count(),
+            1,
+            "row {row} should have one nonzero"
+        );
+    }
+
+    fn assert_hvg_fixture_row(row: u64, dense: &[f32], hvg_indices: &[u32], n_vars: usize) {
+        let col = ((row as usize) % n_vars) as u32;
+        let expected_pos = hvg_indices.iter().position(|&h| h == col);
+        match expected_pos {
+            Some(pos) => {
+                assert_eq!(
+                    dense[pos],
+                    ((row as usize + 1) & 0xFF) as f32,
+                    "row {row} expected HVG col {col} at projected pos {pos}"
+                );
+                assert_eq!(
+                    dense.iter().filter(|&&v| v != 0.0).count(),
+                    1,
+                    "row {row} should have one projected nonzero"
+                );
+            }
+            None => assert!(
+                dense.iter().all(|&v| v == 0.0),
+                "row {row} should project to an all-zero HVG row"
+            ),
+        }
+    }
+
+    fn categorical_strings(col: &ObsColumn) -> Vec<String> {
+        match col {
+            ObsColumn::Categorical(codes, categories) => codes
+                .iter()
+                .map(|&code| categories[code as usize].clone())
+                .collect(),
+            other => panic!("expected categorical obs column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fused_paired_gather_preserves_duplicate_rows_and_same_row_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader(&path, false);
+
+        let plan: Vec<(u64, u64)> = vec![(1, 5), (2, 5), (5, 5), (9, 1), (1, 9)];
+        let batch = loader.process_plan(plan.clone()).unwrap();
+        let n_cols = loader.n_output_cols();
+
+        assert_eq!(batch.pairs, plan);
+        for (i, &(pert, ctrl)) in batch.pairs.iter().enumerate() {
+            let p_row = &batch.x[i * n_cols..][..n_cols];
+            let c_row = &batch.x_paired[i * n_cols..][..n_cols];
+            assert_full_fixture_row(pert, p_row, n_cols);
+            assert_full_fixture_row(ctrl, c_row, n_cols);
+            if pert == ctrl {
+                let p_bits: Vec<u32> = p_row.iter().map(|v| v.to_bits()).collect();
+                let c_bits: Vec<u32> = c_row.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(p_bits, c_bits, "same-row pair should produce equal rows");
+            }
+        }
+    }
+
+    #[test]
+    fn fused_paired_gather_handles_hvg_projection_and_empty_projected_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let hvg = vec![1u32, 5u32];
+        let loader = open_loader_hvg(&path, false, hvg.clone());
+
+        let plan: Vec<(u64, u64)> = vec![(5, 1), (9, 5), (2, 10), (13, 5)];
+        let batch = loader.process_plan(plan.clone()).unwrap();
+        let n_cols = loader.n_output_cols();
+        assert_eq!(n_cols, hvg.len());
+
+        for (i, &(pert, ctrl)) in batch.pairs.iter().enumerate() {
+            let p_row = &batch.x[i * n_cols..][..n_cols];
+            let c_row = &batch.x_paired[i * n_cols..][..n_cols];
+            assert_hvg_fixture_row(pert, p_row, &hvg, 8);
+            assert_hvg_fixture_row(ctrl, c_row, &hvg, 8);
+        }
+    }
+
+    #[test]
+    fn fused_paired_gather_keeps_obs_aligned_after_shard_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader(&path, true);
+
+        let plan: Vec<(u64, u64)> = vec![(15, 0), (4, 5), (8, 9), (3, 12), (10, 11), (1, 2)];
+        let batch = loader.process_plan(plan).unwrap();
+        let obs = categorical_strings(batch.obs.get("cell_id").unwrap());
+        let obs_paired = categorical_strings(batch.obs_paired.get("cell_id").unwrap());
+
+        assert_eq!(obs.len(), batch.pairs.len());
+        assert_eq!(obs_paired.len(), batch.pairs.len());
+        for (i, &(pert, ctrl)) in batch.pairs.iter().enumerate() {
+            assert_eq!(obs[i], format!("cell_{pert}"));
+            assert_eq!(obs_paired[i], format!("cell_{ctrl}"));
+        }
     }
 
     /// Phase 2.4: post-sort invariant — `pairs[i]` aligns with `x[i]` and
