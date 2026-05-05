@@ -261,14 +261,16 @@ impl IndexPlanLoader {
             .saturating_mul(n_output_cols)
             .saturating_mul(4);
         const PLAN_TUPLE_BYTES: usize = 16; // sizeof((u64, u64))
-                                            // sizeof(PairRequest) on 64-bit: u64 row (8) + usize pair_idx (8)
-                                            // + PairSide enum padded to alignment (8) = 24 B. The
-                                            // `gather_pairs_dense` request scratch holds 2 × max_plan_size of
-                                            // these.
-        const PAIR_REQUEST_BYTES: usize = 24;
-        // i64/f64 cell — `extract_obs_columns` allocates one Vec per
-        // configured obs column per side (pert + ctrl). `8` is the
-        // worst-case per-cell width (numeric or category code).
+                                            // `gather_pairs_dense` request scratch holds 2 × max_plan_size
+                                            // `PairRequest`s. Use `size_of` so this term tracks struct churn
+                                            // automatically instead of drifting against a hand-derived constant.
+        const PAIR_REQUEST_BYTES: usize = std::mem::size_of::<PairRequest>();
+        // `extract_obs_columns` allocates one `Vec` per configured obs
+        // column per side (pert + ctrl). `ObsColumn` variants store `i64`
+        // (8 B), `f64` (8 B), or `Categorical(Vec<u32>, …)` (4 B/cell —
+        // the per-batch label dictionary is shared, not per-cell, and
+        // intentionally excluded from this term). `8` is the worst-case
+        // per-cell width across the supported variants.
         const OBS_CELL_BYTES: usize = 8;
 
         let transient_bytes = {
