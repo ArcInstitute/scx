@@ -235,6 +235,23 @@ def main() -> int:
     pca, batch, batch_str = _load_inputs(args)
     runner = IMPL_RUNNERS[args.impl]
 
+    # Snapshot RSS *after* PCA + batch labels are loaded but *before* the
+    # harmony runner begins. This gives a clean baseline so the eventual
+    # `peak_rss_mb` can be split into the input-load floor (PCA cache,
+    # interpreter, scanpy/anndata imports) and the harmony-only delta.
+    # `docs/performance.md` quotes `harmony_delta_rss_mb` rather than the
+    # raw peak — the prior driver measured peak only, which conflated
+    # PCA-load overhead (~N·d·4 bytes) with the algorithm's real footprint.
+    #
+    # Use *current* RSS (`_rss_mb`, /proc/self/statm) here, not
+    # `_peak_rss_mb` (`ru_maxrss`). `ru_maxrss` is a process-lifetime
+    # high-water mark, so if h5ad/scanpy import or PCA load briefly
+    # peaked above harmony's working set, `peak_rss - baseline_peak`
+    # would clip to ~0 and silently under-report the real algorithm
+    # footprint.
+    gc.collect()
+    baseline_rss = _rss_mb()
+
     # Run + time (wall-clock + RSS sweep).
     err_msg: str | None = None
     out: dict | None = None
@@ -258,6 +275,7 @@ def main() -> int:
         sampler.stop()
 
     peak_rss = _peak_rss_mb()
+    harmony_delta_rss = max(0.0, peak_rss - baseline_rss)
 
     result: dict = {
         "impl": args.impl,
@@ -269,6 +287,8 @@ def main() -> int:
         "seed": args.seed,
         "wall_s": round(wall_s, 3),
         "peak_rss_mb": round(peak_rss, 1),
+        "baseline_rss_mb": round(baseline_rss, 1),
+        "harmony_delta_rss_mb": round(harmony_delta_rss, 1),
         "rss_timeseries": sampler.downsampled(),
         "ok": err_msg is None,
     }

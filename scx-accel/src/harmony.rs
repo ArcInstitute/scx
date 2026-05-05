@@ -89,8 +89,6 @@ pub struct HarmonyResult {
     pub n_obs: usize,
     /// Number of PCs.
     pub n_pcs: usize,
-    /// Final soft cluster assignments, K x N, row-major f64.
-    pub r_matrix: Vec<f64>,
     /// Number of clusters.
     pub n_clusters: usize,
     /// Per-iteration Harmony objective values.
@@ -153,10 +151,14 @@ struct HarmonyState {
     // the k-means and distance paths.
     z_orig: Vec<f64>,
     z_corr: Vec<f64>,
-    // Clustering (f64)
+    // Clustering. `y` stays f64 (d·K is small, accuracy-critical for the
+    // ridge solve / centroid normalization). `r` and `dist_mat` are stored
+    // f32 (K x N is the dominant CPU memory peak; values are bounded —
+    // `r ∈ [0, 1]`, `dist ∈ [0, 4]` — so f32's ~7-digit mantissa is safe);
+    // every reduction promotes to f64 on read.
     y: Vec<f64>,        // d x K, column-major (centroids as columns)
-    r: Vec<f64>,        // K x N, row-major (cluster x cell)
-    dist_mat: Vec<f64>, // K x N, row-major
+    r: Vec<f32>,        // K x N, row-major (cluster x cell)
+    dist_mat: Vec<f32>, // K x N, row-major
     o: Vec<f64>,        // K x B, row-major
     e: Vec<f64>,        // K x B, row-major
     // Batch structure
@@ -164,6 +166,11 @@ struct HarmonyState {
     layout: BatchLayout,
     /// For each covariate c, for each level l, the list of cell indices.
     batch_index: Vec<Vec<Vec<usize>>>,
+    /// For each covariate c, for each cell i, the global batch index
+    /// `cov_offset[c] + labels[c][i]`. Length C × N. Precomputed once so
+    /// the parallel `compute_o_e` cluster pass can scan `r[ku, ·]`
+    /// linearly without recomputing the offset per cell.
+    cell_to_gb: Vec<Vec<usize>>,
     /// Global batch sizes, length B.
     n_b: Vec<f64>,
     /// Global batch proportions, length B.
@@ -317,6 +324,16 @@ impl HarmonyState {
             }
         }
 
+        // Precompute per-cell global-batch lookup (C × N) so the parallel
+        // `compute_o_e` cluster pass can do a single linear scan of the
+        // R row without recomputing `cov_offset[ci] + labels[ci][i]` per cell.
+        let mut cell_to_gb: Vec<Vec<usize>> = Vec::with_capacity(layout.c);
+        for (ci, cov) in covariates.iter().enumerate() {
+            let off = layout.cov_offset[ci];
+            let v: Vec<usize> = cov.labels.iter().map(|&l| off + l as usize).collect();
+            cell_to_gb.push(v);
+        }
+
         let mut n_b = vec![0f64; b];
         let mut pr_b = vec![0f64; b];
         let n_f = n as f64;
@@ -405,7 +422,7 @@ impl HarmonyState {
         // --- Initial distances, R, O, E ---
         let dist_mat = compute_distances(&y, &z_orig, d, k, n);
         let r = softmax_r_from_dist(&dist_mat, &sigma, k, n);
-        let (o, e) = compute_o_e(&r, &batch_index, &layout, &pr_b, k, n);
+        let (o, e) = compute_o_e(&r, &cell_to_gb, &layout, &pr_b, k, n);
 
         let z_corr = z_orig.clone();
 
@@ -420,6 +437,7 @@ impl HarmonyState {
             covariates: covariates.to_vec(),
             layout,
             batch_index,
+            cell_to_gb,
             n_b,
             pr_b,
             theta,
@@ -485,11 +503,13 @@ fn compute_inv_norms(z: &[f64], d: usize, n: usize) -> Vec<f64> {
 /// `z` is the un-normalized d·N embedding (column-major). Per-cell
 /// inverse L2 norms are precomputed once (length N) before the per-cluster
 /// loop so each norm is computed once rather than K times. Output is
-/// row-major (K x N); rows are disjoint slices of length N, so we
+/// row-major (K x N) f32 — the dot product accumulates in f64 and is cast
+/// only on store; values are bounded in `[0, 4]` so f32 storage carries no
+/// meaningful precision loss. Rows are disjoint slices of length N, so we
 /// parallelize across clusters.
-fn compute_distances(y: &[f64], z: &[f64], d: usize, k: usize, n: usize) -> Vec<f64> {
+fn compute_distances(y: &[f64], z: &[f64], d: usize, k: usize, n: usize) -> Vec<f32> {
     let inv_norms = compute_inv_norms(z, d, n);
-    let mut out = vec![0f64; k * n];
+    let mut out = vec![0f32; k * n];
     out.par_chunks_mut(n).enumerate().for_each(|(ku, row)| {
         let y_col = &y[ku * d..(ku + 1) * d];
         for i in 0..n {
@@ -498,33 +518,69 @@ fn compute_distances(y: &[f64], z: &[f64], d: usize, k: usize, n: usize) -> Vec<
             for j in 0..d {
                 dot += y_col[j] * z_col[j];
             }
-            row[i] = 2.0 * (1.0 - dot * inv_norms[i]);
+            row[i] = (2.0 * (1.0 - dot * inv_norms[i])) as f32;
         }
     });
     out
 }
 
+/// Tile size (cells per chunk) for the parallel softmax pass. Chosen so
+/// the per-thread `tile_size × K` f64 scratch (≈ tile_size · K · 8 bytes)
+/// stays well under typical per-core L2/L3 budgets — at K=200 this is
+/// ≈ 6 MB per thread; at K=100 ≈ 3 MB.
+const SOFTMAX_TILE: usize = 4096;
+
 /// R = softmax(-dist / sigma[k]) per column, numerically stabilized.
 ///
-/// `dist` is row-major K x N; sigma has length K; returns row-major K x N.
+/// `dist` is row-major K x N f32; sigma has length K; returns row-major
+/// K x N f32. Per-cell softmax computation accumulates in f64 (max-stabilize,
+/// exp, L1-normalize) and casts to f32 only on store.
 ///
-/// Addresses L16: an earlier review flagged this as a "no-op rayon stub",
-/// reflecting an intermediate refactor state. Both phases (per-cell softmax
-/// and the K×N transpose) are parallelised via `par_chunks_mut`; confirmed
-/// by the cell-count scaling in the T1 Harmony benchmark.
-fn softmax_r_from_dist(dist: &[f64], sigma: &[f64], k: usize, n: usize) -> Vec<f64> {
-    // Two-pass layout: compute each cell's softmax into a col-major
-    // temporary (N contiguous K-blocks) so the hot loop writes are
-    // contiguous and can run per-cell in parallel; then transpose
-    // row-by-row in parallel to the final row-major K x N output.
-    let mut col_major = vec![0f64; k * n];
-    col_major
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(i, cell)| {
+/// Memory: replaces the prior two-pass `K×N` f64 col-major scratch with a
+/// `SOFTMAX_TILE × K` f64 per-thread tile. At N=1M, K=100 that drops the
+/// softmax peak from 800 MB f64 to ~3 MB per thread. Tiles are processed
+/// in-order in fixed-size chunks (`SOFTMAX_TILE`); within each tile the
+/// per-cell scan is sequential and the per-cluster scatter writes a
+/// contiguous slice of the row-major output, so the result is bit-exact
+/// regardless of how rayon schedules tiles across threads (the test
+/// `test_determinism_same_seed` is the regression gate).
+fn softmax_r_from_dist(dist: &[f32], sigma: &[f64], k: usize, n: usize) -> Vec<f32> {
+    let mut r = vec![0f32; k * n];
+
+    let n_tiles = n.div_ceil(SOFTMAX_TILE);
+
+    // Each tile owns disjoint cell-index ranges per row of `r`. We pass
+    // the output base pointer through a `Send + Sync` newtype so each
+    // tile can scatter its `tile_size × K` softmax block into the
+    // row-major output without going through the borrow checker (which
+    // can't see the tile-disjointness invariant).
+    //
+    // Safety: each tile writes only to `r[ku*n + i_start..ku*n + i_end]`
+    // for ku ∈ 0..k, and tiles have non-overlapping `[i_start, i_end)`
+    // ranges, so no two threads ever target the same byte. The base
+    // pointer remains valid for the entire `for_each` because `r` is
+    // borrowed mutably here and not dropped.
+    #[derive(Clone, Copy)]
+    struct OutPtr(*mut f32);
+    unsafe impl Send for OutPtr {}
+    unsafe impl Sync for OutPtr {}
+    let out_ptr = OutPtr(r.as_mut_ptr());
+
+    (0..n_tiles).into_par_iter().for_each(|tile_idx| {
+        let base = out_ptr; // copy the Send+Sync wrapper into the closure
+        let i_start = tile_idx * SOFTMAX_TILE;
+        let i_end = (i_start + SOFTMAX_TILE).min(n);
+        let tile_len = i_end - i_start;
+
+        // Per-tile cell-major scratch: [ cell_0_K, cell_1_K, ..., cell_{tile_len-1}_K ].
+        let mut scratch = vec![0f64; tile_len * k];
+
+        for (li, i) in (i_start..i_end).enumerate() {
+            let cell = &mut scratch[li * k..(li + 1) * k];
+
             let mut max_neg = f64::NEG_INFINITY;
             for ku in 0..k {
-                let v = -dist[ku * n + i] / sigma[ku];
+                let v = -(dist[ku * n + i] as f64) / sigma[ku];
                 cell[ku] = v;
                 if v > max_neg {
                     max_neg = v;
@@ -548,14 +604,22 @@ fn softmax_r_from_dist(dist: &[f64], sigma: &[f64], k: usize, n: usize) -> Vec<f
                     cell[ku] = u;
                 }
             }
-        });
+        }
 
-    let mut r = vec![0f64; k * n];
-    r.par_chunks_mut(n).enumerate().for_each(|(ku, row)| {
-        for i in 0..n {
-            row[i] = col_major[i * k + ku];
+        // Scatter cluster-by-cluster into the row-major output. Each
+        // cluster's destination slice `r[ku*n + i_start..ku*n + i_end]`
+        // is contiguous and disjoint across (ku, tile_idx) pairs.
+        for ku in 0..k {
+            let dst_off = ku * n + i_start;
+            // Safety: see top-of-function doc. `dst_off + tile_len ≤ k*n`
+            // because ku < k and i_end ≤ n.
+            let dst = unsafe { std::slice::from_raw_parts_mut(base.0.add(dst_off), tile_len) };
+            for li in 0..tile_len {
+                dst[li] = scratch[li * k + ku] as f32;
+            }
         }
     });
+
     r
 }
 
@@ -563,9 +627,20 @@ fn softmax_r_from_dist(dist: &[f64], sigma: &[f64], k: usize, n: usize) -> Vec<f
 ///
 /// O[k, b] = sum_{i in batch b} R[k, i]
 /// E[k, b] = pr_b[b] * sum_i R[k, i]
+///
+/// `r` is K x N row-major f32; reductions promote each entry to f64. The
+/// outer loop is parallelised across clusters: each cluster owns disjoint
+/// rows of `o` and `e`, so no shared accumulators are needed. Within a
+/// cluster, `row_sum` and the per-batch O accumulators are computed in a
+/// single linear scan of `r[ku, ·]` using the precomputed `cell_to_gb`
+/// lookup. K up to ~200 ≥ thread count on Chimera, so cluster-level
+/// parallelism saturates available cores.
+///
+/// Sequential summation within a cluster keeps results bit-exact w.r.t.
+/// cell order, preserving the `test_determinism_same_seed` contract.
 fn compute_o_e(
-    r: &[f64],
-    batch_index: &[Vec<Vec<usize>>],
+    r: &[f32],
+    cell_to_gb: &[Vec<usize>],
     layout: &BatchLayout,
     pr_b: &[f64],
     k: usize,
@@ -575,31 +650,26 @@ fn compute_o_e(
     let mut o = vec![0f64; k * b];
     let mut e = vec![0f64; k * b];
 
-    // Row-sums of R (per cluster).
-    let mut row_sum = vec![0f64; k];
-    for ku in 0..k {
-        let mut s = 0f64;
-        for i in 0..n {
-            s += r[ku * n + i];
-        }
-        row_sum[ku] = s;
-    }
-
-    for ci in 0..layout.c {
-        for lvl in 0..batch_index[ci].len() {
-            let gb = layout.cov_offset[ci] + lvl;
-            let cells = &batch_index[ci][lvl];
-            for ku in 0..k {
-                let mut s = 0f64;
-                let row_off = ku * n;
-                for &i in cells {
-                    s += r[row_off + i];
+    // Process clusters in parallel. Each thread owns one row of `o` and `e`.
+    o.par_chunks_mut(b)
+        .zip(e.par_chunks_mut(b))
+        .enumerate()
+        .for_each(|(ku, (o_row, e_row))| {
+            let row_off = ku * n;
+            let mut row_sum = 0f64;
+            // Single pass: accumulate row_sum and per-batch O. Fused so
+            // each entry of `r[ku, ·]` is read exactly once.
+            for i in 0..n {
+                let r_ki = r[row_off + i] as f64;
+                row_sum += r_ki;
+                for cov in cell_to_gb {
+                    o_row[cov[i]] += r_ki;
                 }
-                o[ku * b + gb] = s;
-                e[ku * b + gb] = pr_b[gb] * row_sum[ku];
             }
-        }
-    }
+            for gb in 0..b {
+                e_row[gb] = pr_b[gb] * row_sum;
+            }
+        });
 
     (o, e)
 }
@@ -767,7 +837,7 @@ impl HarmonyState {
         self.r = softmax_r_from_dist(&self.dist_mat, &self.sigma, self.k, self.n);
         let (o, e) = compute_o_e(
             &self.r,
-            &self.batch_index,
+            &self.cell_to_gb,
             &self.layout,
             &self.pr_b,
             self.k,
@@ -807,7 +877,7 @@ impl HarmonyState {
                 for ci in 0..self.layout.c {
                     let gb = self.layout.cov_offset[ci] + self.covariates[ci].labels[i] as usize;
                     for ku in 0..k {
-                        let r_ki = self.r[ku * n + i];
+                        let r_ki = self.r[ku * n + i] as f64;
                         self.o[ku * b + gb] -= r_ki;
                         self.e[ku * b + gb] -= self.pr_b[gb] * r_ki;
                     }
@@ -834,7 +904,7 @@ impl HarmonyState {
                     let mut vals = vec![0f64; k];
                     let mut max_neg = f64::NEG_INFINITY;
                     for ku in 0..k {
-                        let v = -dist_mat[ku * n + i] / sigma[ku];
+                        let v = -(dist_mat[ku * n + i] as f64) / sigma[ku];
                         vals[ku] = v;
                         if v > max_neg {
                             max_neg = v;
@@ -900,9 +970,10 @@ impl HarmonyState {
             // Serial scatter into self.r (different cells → different columns,
             // so writes don't conflict, but rayon can't prove disjointness
             // without unsafe; the scatter is O(block_len * K) which is cheap).
+            // Cast f64 vals to f32 on store to match the K×N storage layout.
             for (i, vals) in &new_r {
                 for ku in 0..k {
-                    self.r[ku * n + i] = vals[ku];
+                    self.r[ku * n + i] = vals[ku] as f32;
                 }
             }
 
@@ -911,7 +982,7 @@ impl HarmonyState {
                 for ci in 0..self.layout.c {
                     let gb = self.layout.cov_offset[ci] + self.covariates[ci].labels[i] as usize;
                     for ku in 0..k {
-                        let r_ki = self.r[ku * n + i];
+                        let r_ki = self.r[ku * n + i] as f64;
                         self.o[ku * b + gb] += r_ki;
                         self.e[ku * b + gb] += self.pr_b[gb] * r_ki;
                     }
@@ -932,12 +1003,14 @@ impl HarmonyState {
 
         let norm_const = 2000.0 / n as f64;
 
-        // kmeans_error = sum(R * dist)
+        // kmeans_error = sum(R * dist). Both buffers are f32; promote
+        // each factor to f64 before multiplying so the K·N reduction
+        // accumulates in full f64 precision.
         let mut kmeans_err = 0f64;
         for ku in 0..k {
             let row_off = ku * n;
             for i in 0..n {
-                kmeans_err += self.r[row_off + i] * self.dist_mat[row_off + i];
+                kmeans_err += (self.r[row_off + i] as f64) * (self.dist_mat[row_off + i] as f64);
             }
         }
 
@@ -949,7 +1022,7 @@ impl HarmonyState {
             let row_off = ku * n;
             let mut row_e = 0f64;
             for i in 0..n {
-                let v = self.r[row_off + i];
+                let v = self.r[row_off + i] as f64;
                 if v > 0.0 {
                     row_e += v * v.ln();
                 }
@@ -1246,23 +1319,34 @@ impl HarmonyState {
 
             // Build z_sum per kept batch: z_sum[j] = sum_{i in batch_gb} Z_orig[:,i] * R[k,i]
             // (Since we reset Z_corr = Z_orig at the start, we use z_orig here.)
+            //
+            // Parallel across kept batches `j` — each writes to its own
+            // disjoint d-row of `z_sum` and reads disjoint cell sets, so
+            // there is no shared state across threads. Inner cell loop
+            // stays sequential to preserve bit-exact summation order.
+            // R is f32; promote to f64 on read.
             let mut z_sum = vec![0f64; b_prime * d]; // (B' x d), row-major
-            for (j, &gb) in kept.iter().enumerate() {
-                // Recover (covariate, level) from global batch index.
-                let (ci, lvl) = self.gb_to_cov_level(gb);
-                let cells = &self.batch_index[ci][lvl];
-                for &i in cells {
-                    let r_ki = self.r[ku * n + i];
-                    if r_ki == 0.0 {
-                        continue;
+            let r_full = &self.r;
+            let z_orig_full = &self.z_orig;
+            let batch_index = &self.batch_index;
+            z_sum
+                .par_chunks_mut(d)
+                .enumerate()
+                .for_each(|(j, z_sum_row)| {
+                    let gb = kept[j];
+                    let (ci, lvl) = self.gb_to_cov_level(gb);
+                    let cells = &batch_index[ci][lvl];
+                    for &i in cells {
+                        let r_ki = r_full[ku * n + i] as f64;
+                        if r_ki == 0.0 {
+                            continue;
+                        }
+                        let z_col = &z_orig_full[i * d..(i + 1) * d];
+                        for t in 0..d {
+                            z_sum_row[t] += z_col[t] * r_ki;
+                        }
                     }
-                    let z_col = &self.z_orig[i * d..(i + 1) * d];
-                    let row_off = j * d;
-                    for t in 0..d {
-                        z_sum[row_off + t] += z_col[t] * r_ki;
-                    }
-                }
-            }
+                });
             // z_sum_all = sum_j z_sum[j]
             let mut z_sum_all = vec![0f64; d];
             for j in 0..b_prime {
@@ -1302,12 +1386,14 @@ impl HarmonyState {
 
             // Apply correction per batch:
             // Z_corr[:, cells_in_b] -= W[j+1, :].T * R[k, cells_in_b]
+            // R is f32; promote to f64 on read for the multiply with
+            // f64 W and z_corr.
             for (j, &gb) in kept.iter().enumerate() {
                 let (ci, lvl) = self.gb_to_cov_level(gb);
                 let cells = &self.batch_index[ci][lvl];
                 let w_off = (j + 1) * d;
                 for &i in cells {
-                    let r_ki = self.r[ku * n + i];
+                    let r_ki = self.r[ku * n + i] as f64;
                     if r_ki == 0.0 {
                         continue;
                     }
@@ -1402,7 +1488,6 @@ impl HarmonyState {
             z_corrected: z_out,
             n_obs: n,
             n_pcs: d,
-            r_matrix: std::mem::take(&mut self.r),
             n_clusters: self.k,
             objective_harmony: std::mem::take(&mut self.objective_harmony),
             n_iterations: iters_used,
@@ -1521,11 +1606,13 @@ mod gpu_impl {
                 // No host-side `z_cos` mirror is kept (H9) — cosine
                 // normalization lives on-device for this iteration and is
                 // recomputed on-the-fly by CPU paths on later iterations.
-                state.dist_mat = dist_f32.iter().map(|&v| v as f64).collect();
+                // CPU `dist_mat` is f32 too — assign directly without the
+                // f32→f64 conversion that the prior path used to do.
+                state.dist_mat = dist_f32;
                 state.r = softmax_r_from_dist(&state.dist_mat, &state.sigma, k, n);
                 let (o, e) = compute_o_e(
                     &state.r,
-                    &state.batch_index,
+                    &state.cell_to_gb,
                     &state.layout,
                     &state.pr_b,
                     k,
@@ -1612,12 +1699,13 @@ mod gpu_impl {
                 };
 
                 // z_sum_all + z_sum[j] from Z_orig (CPU-resident).
+                // R is f32; promote to f64 on read.
                 let mut z_sum = vec![0f64; b_prime * d];
                 for (j, &gb) in kept.iter().enumerate() {
                     let (ci, lvl) = state.gb_to_cov_level(gb);
                     let cells = &state.batch_index[ci][lvl];
                     for &i in cells {
-                        let r_ki = state.r[ku * n + i];
+                        let r_ki = state.r[ku * n + i] as f64;
                         if r_ki == 0.0 {
                             continue;
                         }
@@ -1662,13 +1750,12 @@ mod gpu_impl {
                     w[t] = 0.0;
                 }
 
-                // Upload R[k, :] once for this cluster.
-                let r_row_f32: Vec<f32> = state.r[ku * n..(ku + 1) * n]
-                    .iter()
-                    .map(|&v| v as f32)
-                    .collect();
+                // Upload R[k, :] once for this cluster. CPU R is already
+                // f32 (matches the GPU correction kernel's expected dtype),
+                // so we copy the row slice straight to device — no
+                // intermediate f64→f32 cast needed.
                 let d_r_row = dev
-                    .htod_copy(&r_row_f32)
+                    .htod_copy(&state.r[ku * n..(ku + 1) * n])
                     .map_err(|e| AccelError::LinAlg(format!("upload R row: {e}")))?;
 
                 // Apply each kept batch on the GPU.
@@ -1741,7 +1828,6 @@ mod gpu_impl {
             z_corrected: z_out,
             n_obs: n,
             n_pcs: d,
-            r_matrix: std::mem::take(&mut state.r),
             n_clusters: state.k,
             objective_harmony: std::mem::take(&mut state.objective_harmony),
             n_iterations: iters_used,
@@ -1881,9 +1967,13 @@ mod tests {
         for i in 0..n {
             let mut sum = 0f64;
             for ku in 0..k {
-                sum += s.r[ku * n + i];
+                // R is stored f32 (memory optimisation); promote on read.
+                sum += s.r[ku * n + i] as f64;
             }
-            assert!((sum - 1.0).abs() < 1e-9, "column {} sum={}", i, sum);
+            // Tolerance widened from 1e-9 to 1e-5 to account for rounding
+            // when the f64 softmax output is cast to f32 storage. K rounded
+            // f32 values sum to within ~K · eps_f32 (~3e-7 at K=3) of 1.0.
+            assert!((sum - 1.0).abs() < 1e-5, "column {} sum={}", i, sum);
         }
     }
 
@@ -1897,11 +1987,14 @@ mod tests {
         let k = s.k;
         let b = s.layout.b;
 
-        // For single covariate: sum_b O[k,b] == sum_i R[k,i]
+        // For single covariate: sum_b O[k,b] == sum_i R[k,i]. Both
+        // accumulators promote f32 R to f64 on read; equality is exact
+        // because compute_o_e iterates cells in the same order (i = 0..n
+        // filtered by membership) as this test's sum.
         for ku in 0..k {
             let mut row_sum = 0f64;
             for i in 0..n {
-                row_sum += s.r[ku * n + i];
+                row_sum += s.r[ku * n + i] as f64;
             }
             let mut o_sum = 0f64;
             for gb in 0..b {
@@ -1919,7 +2012,7 @@ mod tests {
         for ku in 0..k {
             let mut row_sum = 0f64;
             for i in 0..n {
-                row_sum += s.r[ku * n + i];
+                row_sum += s.r[ku * n + i] as f64;
             }
             for gb in 0..b {
                 let expected = s.pr_b[gb] * row_sum;
@@ -2180,7 +2273,6 @@ mod tests {
         assert_eq!(result.n_pcs, d);
         assert_eq!(result.z_corrected.len(), n * d);
         assert!(result.z_corrected.iter().all(|v| v.is_finite()));
-        assert_eq!(result.r_matrix.len(), result.n_clusters * n);
     }
 
     // ── GPU tests ─────────────────────────────────────────────────────
