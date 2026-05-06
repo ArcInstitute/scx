@@ -9,7 +9,7 @@
 //! scattered into the dense output tensor, only HVG columns get a write.
 //! This avoids materializing intermediate projected CSR data.
 
-use std::collections::HashMap;
+const DENSE_REMAP_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// HVG gene projection for the training data loader.
 ///
@@ -19,10 +19,11 @@ use std::collections::HashMap;
 pub struct HvgProjection {
     /// Sorted, deduplicated HVG gene indices (original column indices).
     gene_indices: Vec<u32>,
-    /// Lookup table: original column index → position in projected output.
-    /// Returns `None` for non-HVG genes. Kept for validation and future use.
-    #[allow(dead_code)]
-    remap: HashMap<u32, u32>,
+    /// Dense lookup table: original column index -> projected output position.
+    /// Non-HVG genes store `-1`. Built only when the index space is small
+    /// enough to keep the extra memory bounded; otherwise `scatter_row` falls
+    /// back to the merge-scan over `gene_indices`.
+    dense_remap: Option<Vec<i32>>,
     /// Number of output columns.
     n_output_cols: usize,
 }
@@ -32,21 +33,41 @@ impl HvgProjection {
     ///
     /// The input `gene_indices` are sorted and deduplicated. Each unique gene
     /// index is mapped to a contiguous output position `[0..n_hvg)`.
-    pub fn new(mut gene_indices: Vec<u32>) -> Self {
+    pub fn new(gene_indices: Vec<u32>) -> Self {
+        Self::new_with_dense_remap_limit(gene_indices, DENSE_REMAP_MAX_BYTES)
+    }
+
+    fn new_with_dense_remap_limit(
+        mut gene_indices: Vec<u32>,
+        max_dense_remap_bytes: usize,
+    ) -> Self {
         gene_indices.sort_unstable();
         gene_indices.dedup();
 
-        let mut remap = HashMap::with_capacity(gene_indices.len());
-        for (pos, &gene_idx) in gene_indices.iter().enumerate() {
-            remap.insert(gene_idx, pos as u32);
-        }
-
         let n_output_cols = gene_indices.len();
+        let dense_remap = Self::build_dense_remap(&gene_indices, max_dense_remap_bytes);
         HvgProjection {
             gene_indices,
-            remap,
+            dense_remap,
             n_output_cols,
         }
+    }
+
+    fn build_dense_remap(gene_indices: &[u32], max_dense_remap_bytes: usize) -> Option<Vec<i32>> {
+        let max_gene = gene_indices.last().copied()?;
+        let len = usize::try_from(max_gene).ok()?.checked_add(1)?;
+        let bytes = len.checked_mul(std::mem::size_of::<i32>())?;
+        if bytes > max_dense_remap_bytes {
+            return None;
+        }
+
+        let mut dense_remap = vec![-1; len];
+        for (pos, &gene_idx) in gene_indices.iter().enumerate() {
+            let pos = i32::try_from(pos).ok()?;
+            let idx = usize::try_from(gene_idx).ok()?;
+            dense_remap[idx] = pos;
+        }
+        Some(dense_remap)
     }
 
     /// Number of output columns (projected gene count).
@@ -56,9 +77,10 @@ impl HvgProjection {
 
     /// Scatter a CSR row into a dense output row, applying HVG projection.
     ///
-    /// Uses a merge-scan (two-pointer) algorithm for O(n+m) performance with
-    /// good cache locality, since both `csr_indices` and `gene_indices` are
-    /// sorted.
+    /// Uses a dense original-column-to-output-column remap when the selected
+    /// gene index space is small enough, so sparse rows only pay O(row nnz).
+    /// Falls back to a merge-scan over sorted CSR/HVG indices when the dense
+    /// remap would exceed the memory cap.
     ///
     /// # Arguments
     /// - `csr_indices`: Column indices from the CSR row (sorted, i32 per scipy).
@@ -67,6 +89,22 @@ impl HvgProjection {
     ///   Only HVG positions are written; non-HVG values are skipped.
     pub fn scatter_row(&self, csr_indices: &[i32], csr_data: &[f32], output_row: &mut [f32]) {
         debug_assert_eq!(output_row.len(), self.n_output_cols);
+
+        if let Some(dense_remap) = &self.dense_remap {
+            for (&col_idx, &value) in csr_indices.iter().zip(csr_data.iter()) {
+                if col_idx < 0 {
+                    continue;
+                }
+                let idx = col_idx as usize;
+                let Some(&out_idx) = dense_remap.get(idx) else {
+                    continue;
+                };
+                if out_idx >= 0 {
+                    output_row[out_idx as usize] = value;
+                }
+            }
+            return;
+        }
 
         // Merge-scan: two pointers over sorted csr_indices and gene_indices
         let mut gi = 0; // pointer into self.gene_indices
@@ -87,10 +125,9 @@ impl HvgProjection {
         }
     }
 
-    /// Get the remap HashMap (for validation/debugging).
     #[cfg(test)]
-    fn remap(&self) -> &HashMap<u32, u32> {
-        &self.remap
+    fn uses_dense_remap(&self) -> bool {
+        self.dense_remap.is_some()
     }
 }
 
@@ -169,10 +206,15 @@ mod tests {
         let proj = HvgProjection::new(vec![20, 5, 100, 50]);
         // After sort+dedup: [5, 20, 50, 100]
         assert_eq!(proj.n_output_cols(), 4);
-        assert_eq!(proj.remap()[&5], 0);
-        assert_eq!(proj.remap()[&20], 1);
-        assert_eq!(proj.remap()[&50], 2);
-        assert_eq!(proj.remap()[&100], 3);
+        assert!(proj.uses_dense_remap());
+
+        let csr_indices: Vec<i32> = vec![5, 20, 50, 100];
+        let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let mut output = vec![0.0f32; 4];
+
+        proj.scatter_row(&csr_indices, &csr_data, &mut output);
+
+        assert_eq!(output, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -213,9 +255,14 @@ mod tests {
     fn test_duplicate_gene_indices_deduplicated() {
         let proj = HvgProjection::new(vec![5, 5, 10, 10, 10, 20]);
         assert_eq!(proj.n_output_cols(), 3); // only 3 unique: [5, 10, 20]
-        assert_eq!(proj.remap()[&5], 0);
-        assert_eq!(proj.remap()[&10], 1);
-        assert_eq!(proj.remap()[&20], 2);
+
+        let csr_indices: Vec<i32> = vec![5, 10, 20];
+        let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut output = vec![0.0f32; 3];
+
+        proj.scatter_row(&csr_indices, &csr_data, &mut output);
+
+        assert_eq!(output, vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -241,6 +288,40 @@ mod tests {
         proj.scatter_row(&csr_indices, &csr_data, &mut output);
 
         assert_eq!(output, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_dense_remap_handles_sparse_row_and_out_of_range_non_hvg() {
+        let mut genes: Vec<u32> = (0..2000).collect();
+        genes.push(29_999);
+        let proj = HvgProjection::new(genes);
+        assert_eq!(proj.n_output_cols(), 2001);
+        assert!(proj.uses_dense_remap());
+
+        let csr_indices: Vec<i32> = vec![7, 29_999, 40_000];
+        let csr_data: Vec<f32> = vec![1.5, 2.5, 3.5];
+        let mut output = vec![0.0f32; proj.n_output_cols()];
+
+        proj.scatter_row(&csr_indices, &csr_data, &mut output);
+
+        assert_eq!(output[7], 1.5);
+        assert_eq!(output[2000], 2.5);
+        assert_eq!(output.iter().filter(|&&v| v != 0.0).count(), 2);
+    }
+
+    #[test]
+    fn test_merge_scan_fallback_when_dense_remap_exceeds_limit() {
+        let proj = HvgProjection::new_with_dense_remap_limit(vec![5, 20, 100], 0);
+        assert_eq!(proj.n_output_cols(), 3);
+        assert!(!proj.uses_dense_remap());
+
+        let csr_indices: Vec<i32> = vec![1, 5, 7, 20, 100, 200];
+        let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut output = vec![0.0f32; 3];
+
+        proj.scatter_row(&csr_indices, &csr_data, &mut output);
+
+        assert_eq!(output, vec![2.0, 4.0, 5.0]);
     }
 
     #[test]
