@@ -1108,7 +1108,19 @@ mod tests {
         let n_rows = 800;
         let n_cols = 120;
         let k = 15;
-        let csr = random_csr(n_rows, n_cols, 0.08, 314);
+        let mut csr = random_csr(n_rows, n_cols, 0.08, 314);
+        // Inflate column variances geometrically so the top-k eigenvalues are
+        // well-separated. Without this, uniformly random sparse data has
+        // near-Marchenko-Pastur eigenvalues (adjacent ratios ~0.99) and
+        // randomized PCA at 4 power iterations cannot resolve per-PC bases
+        // even though the top-k subspace is recovered correctly. With
+        // decay=0.85, adjacent eigenvalue ratio is ~0.72 — plenty of headroom
+        // for q=4 to converge to per-PC cosine ≥ 0.99.
+        let decay = 0.85f32;
+        for nz in 0..csr.indices.len() {
+            let c = csr.indices[nz] as usize;
+            csr.data[nz] *= decay.powi(c as i32);
+        }
         let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
             shards,

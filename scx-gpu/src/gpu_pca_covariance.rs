@@ -493,8 +493,24 @@ mod tests {
         // the Gram matrix tractable.)
         let n_rows = 2000;
         let n_cols = 200;
-        let k = 50;
-        let csr = random_csr(n_rows, n_cols, 0.05, 7);
+        // k=25 (was 50): with column-variance decay, only the top ~30 PCs have
+        // eigenvalues above the f32 noise floor (PC40 lands at ~1e-8). Beyond
+        // that both methods compute correctly but per-PC orientation is
+        // numerically ill-defined. k=25 stays in the well-resolved regime and
+        // still exercises the full SpMM/QR/SVD dispatch.
+        let k = 25;
+        let mut csr = random_csr(n_rows, n_cols, 0.05, 7);
+        // Inflate column variances geometrically so the top-k eigenvalues are
+        // well-separated. Without this, uniformly random sparse data has
+        // near-Marchenko-Pastur eigenvalues (adjacent ratios ~0.99) and
+        // randomized PCA at 4 power iterations cannot resolve per-PC bases.
+        // With decay=0.85, adjacent eigenvalue ratio is ~0.72 — q=4 power
+        // iterations gives error O(0.72^9) ≈ 0.07 at PC25.
+        let decay = 0.85f32;
+        for nz in 0..csr.indices.len() {
+            let c = csr.indices[nz] as usize;
+            csr.data[nz] *= decay.powi(c as i32);
+        }
         let shards = split_into_shards(&csr, 8);
         let source = InMemorySource {
             shards,
