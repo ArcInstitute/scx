@@ -1501,14 +1501,13 @@ impl HarmonyState {
 #[cfg(feature = "gpu")]
 mod gpu_impl {
     use super::*;
-    // `gpu_harmony_softmax_penalty` is exposed by scx-gpu for future
-    // fusion (one launch for softmax + diversity penalty). With
-    // `update_r` on CPU, dist must come back to host every outer iter
-    // anyway, so the GPU softmax doesn't save PCIe — we keep the CPU
-    // softmax for now and don't import the GPU softmax wrapper.
+    use rand::seq::SliceRandom;
     use scx_gpu::{
-        gpu_harmony_correction_grouped, gpu_harmony_distances, gpu_harmony_distances_gemm,
-        gpu_harmony_l2_normalize_cols, gpu_harmony_z_sum, CublasHandle, CudaSlice, GpuDevice,
+        gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty,
+        gpu_harmony_compute_o_e_full, gpu_harmony_correction_grouped, gpu_harmony_distances,
+        gpu_harmony_distances_gemm, gpu_harmony_l2_normalize_cols, gpu_harmony_obj_cross,
+        gpu_harmony_obj_kmeans_entropy, gpu_harmony_softmax, gpu_harmony_z_sum, CublasHandle,
+        CudaSlice, GpuDevice,
     };
 
     /// cuBLAS sgemm has fixed launch overhead; the hand-written kernel
@@ -1544,20 +1543,49 @@ mod gpu_impl {
         }
     }
 
+    /// Sum `obj_cell` (length N) and `cross_kgb` (length K·B) on CPU
+    /// after a tiny `dtoh` and return the Harmony objective.
+    ///
+    /// Per-iter cost: `(N + K·B) · 4 bytes` PCIe + a sequential
+    /// f32→f64 sum on host. At N=1 M, K=100, B=100 that's ~4 MB /
+    /// 0.1 ms PCIe + 1 ms host sum — negligible compared to the iter's
+    /// GPU work. f32 partials promoted to f64 during accumulation;
+    /// f32 mantissa is sufficient for the per-cell entries
+    /// (R in [0, 1], dist in [0, 4]).
+    fn compute_objective_gpu(
+        dev: &GpuDevice,
+        d_obj_cell: &CudaSlice<f32>,
+        d_cross_kgb: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<f64> {
+        let obj_cell = dev
+            .dtoh_copy(d_obj_cell)
+            .map_err(|e| AccelError::LinAlg(format!("download obj_cell: {e}")))?;
+        let cross_kgb = dev
+            .dtoh_copy(d_cross_kgb)
+            .map_err(|e| AccelError::LinAlg(format!("download cross_kgb: {e}")))?;
+        let kmeans_entropy: f64 = obj_cell.iter().map(|&v| v as f64).sum();
+        let cross: f64 = cross_kgb.iter().map(|&v| v as f64).sum();
+        let norm = 2000.0 / n as f64;
+        Ok((kmeans_entropy + cross) * norm)
+    }
+
     /// GPU-accelerated Harmony2 integration.
     ///
-    /// Reuses the CPU `HarmonyState` for orchestration, substituting GPU
-    /// kernels for the three compute-hot operations: cosine distance
-    /// computation, column L2 normalization, and per-batch correction
-    /// scatter-subtract. K-means++ seeding, soft assignment block updates,
-    /// objective/convergence tracking, and covariance inversion remain on
-    /// CPU — each is either inexpensive or requires branching that fits
-    /// poorly on GPU.
+    /// End-to-end GPU orchestration: distance, plain softmax (cold
+    /// start), block softmax+penalty (k-means inner sub-loop), atomic
+    /// O/E updates, objective reduction, regression z-sum, and
+    /// scatter-subtract correction all run on the device. K-means++
+    /// seeding (HarmonyState::new) and the small `(B'+1) x (B'+1)`
+    /// regression solve stay on CPU.
     ///
-    /// Output is bit-compatible in structure (same `HarmonyResult` shape)
-    /// with the CPU path, but values differ slightly due to f32 rounding
-    /// on GPU vs. f64 on CPU. Per-PC Pearson correlation with the CPU
-    /// reference should be >= 0.99.
+    /// Output is bit-compatible in shape with the CPU path
+    /// (`HarmonyResult`), but values differ from the CPU reference by
+    /// f32 rounding plus atomic-ordering nondeterminism in the O/E
+    /// updates. The validation gate is per-PC Pearson r ≥ 0.95
+    /// (`test_gpu_vs_cpu_per_pc_correlation`); the CPU
+    /// `test_determinism_same_seed` bit-exact contract applies only
+    /// to the CPU path.
     pub fn harmony_integrate_gpu(
         device_id: usize,
         embeddings: &[f32],
@@ -1586,11 +1614,10 @@ mod gpu_impl {
             .htod_copy(&f64_to_f32(&state.z_orig))
             .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}")))?;
 
-        // Persistent device buffers (reused across iterations). Z_corr
-        // starts equal to Z_orig and is reset to Z_orig before each
-        // iter's correction step. We never download it back to CPU
-        // until the final result; the cosine-normalised view used for
-        // distance is built from it on-device via memcpy_dtod.
+        // Persistent device buffers (reused across iterations). All
+        // are kept resident across the iter loop and across the inner
+        // k-means sub-loop. Only the final Z_corr download (after the
+        // loop) round-trips to host.
         let mut d_z_corr = dev
             .htod_copy(&f64_to_f32(&state.z_orig))
             .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}")))?;
@@ -1604,12 +1631,37 @@ mod gpu_impl {
             .alloc_zeros::<f32>(d * k)
             .map_err(|e| AccelError::LinAlg(format!("alloc Y: {e}")))?;
 
-        // Flatten per-covariate labels to (C x N) row-major i32 and upload.
-        // Labels are u32 category indices; the GPU kernel uses i32, so
-        // assert they fit. Batch count per covariate is bounded in practice
-        // by `max_batches` (default 1024), well under i32::MAX. Currently
-        // unused (CPU softmax is the cold-start path) but kept resident
-        // for the future GPU softmax+penalty wiring.
+        // R / O / E persist on GPU across the entire run; CPU mirror
+        // is kept only for the small (B+1)×(B+1) regression solve in
+        // the correction step (O/E downloaded once per outer iter).
+        let mut d_r = dev
+            .htod_copy(&state.r)
+            .map_err(|e| AccelError::LinAlg(format!("upload R: {e}")))?;
+        let mut d_o = dev
+            .htod_copy(&f64_to_f32(&state.o))
+            .map_err(|e| AccelError::LinAlg(format!("upload O: {e}")))?;
+        let mut d_e = dev
+            .htod_copy(&f64_to_f32(&state.e))
+            .map_err(|e| AccelError::LinAlg(format!("upload E: {e}")))?;
+
+        // Read-only constants — uploaded once.
+        let d_sigma = dev
+            .htod_copy(&f64_to_f32(&state.sigma))
+            .map_err(|e| AccelError::LinAlg(format!("upload sigma: {e}")))?;
+        let d_theta = dev
+            .htod_copy(&f64_to_f32(&state.theta))
+            .map_err(|e| AccelError::LinAlg(format!("upload theta: {e}")))?;
+        let d_pr_b = dev
+            .htod_copy(&f64_to_f32(&state.pr_b))
+            .map_err(|e| AccelError::LinAlg(format!("upload pr_b: {e}")))?;
+        let cov_offset_i32: Vec<i32> = state.layout.cov_offset.iter().map(|&v| v as i32).collect();
+        let d_cov_offset = dev
+            .htod_copy(&cov_offset_i32)
+            .map_err(|e| AccelError::LinAlg(format!("upload cov_offset: {e}")))?;
+
+        // Flatten per-covariate labels to (C x N) row-major i32. Batch
+        // count per covariate is bounded by `max_batches` (default
+        // 1024) << i32::MAX.
         let mut labels_flat = vec![0i32; c_count * n];
         for (ci, cov) in covariates.iter().enumerate() {
             for (i, &lab) in cov.labels.iter().enumerate() {
@@ -1617,28 +1669,63 @@ mod gpu_impl {
                 labels_flat[ci * n + i] = lab as i32;
             }
         }
-        let _d_labels = dev
+        let d_labels = dev
             .htod_copy(&labels_flat)
             .map_err(|e| AccelError::LinAlg(format!("upload batch labels: {e}")))?;
 
+        // Per-cluster R-row scratch (size N) — used by z-sum and
+        // grouped correction kernels. Filled per cluster via
+        // memcpy_dtod from `d_r[ku*n..(ku+1)*n]`.
+        let mut d_r_row = dev
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| AccelError::LinAlg(format!("alloc R-row scratch: {e}")))?;
+
+        // Per-sub-iter shuffled cell order (CPU shuffle, GPU consumes
+        // contiguous block ranges). Allocated once at full size N.
+        let mut d_order = dev
+            .alloc_zeros::<i32>(n)
+            .map_err(|e| AccelError::LinAlg(format!("alloc d_order: {e}")))?;
+
+        // Block-cells scratch (size = max possible block_len). Filled
+        // per block via memcpy_dtod from a slice of d_order.
+        let block_size_cfg = state.config.block_size.max(1.0 / n as f64);
+        let n_blocks = (1.0 / block_size_cfg).ceil() as usize;
+        let block_len = n.div_ceil(n_blocks.max(1));
+        let mut d_block_cells = dev
+            .alloc_zeros::<i32>(block_len)
+            .map_err(|e| AccelError::LinAlg(format!("alloc d_block_cells: {e}")))?;
+
+        // Objective scratch.
+        let mut d_obj_cell = dev
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| AccelError::LinAlg(format!("alloc d_obj_cell: {e}")))?;
+        let mut d_cross_kgb = dev
+            .alloc_zeros::<f32>(k * b)
+            .map_err(|e| AccelError::LinAlg(format!("alloc d_cross_kgb: {e}")))?;
+
         let mut converged = false;
         let mut iters_used = 0usize;
+
+        // Reusable CPU-side cell-order buffer (avoids per-sub-iter
+        // allocation). Shuffled deterministically via state.rng.
+        let mut order_usize: Vec<usize> = (0..n).collect();
+        let mut order_i32: Vec<i32> = vec![0i32; n];
 
         for iter in 0..state.config.max_iter {
             iters_used = iter + 1;
 
             if iter > 0 {
-                // Cold-start R on GPU: Z_cos = l2_normalize(Z_corr) using
-                // the persistent on-device d_z_corr (no CPU round-trip),
-                // then dist = 2*(1 - Y^T Z_cos). dist comes back to CPU
-                // because the k-means sub-loop (CPU) reads it per cell.
+                // Cold-start R on GPU: Z_cos = l2_normalize(Z_corr),
+                // then dist = 2 · (1 − Y⊤ Z_cos), then plain softmax
+                // (no penalty) → R, then refresh O/E from the new R.
+                // No CPU round-trip in this branch.
                 dev.stream()
                     .memcpy_dtod(&d_z_corr, &mut d_z_cos)
                     .map_err(|e| AccelError::LinAlg(format!("memcpy Z_corr->Z_cos: {e}")))?;
                 gpu_harmony_l2_normalize_cols(&dev, &mut d_z_cos, d, n)
                     .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize: {e}")))?;
 
-                // Refresh d_y from CPU state.y (just-mutated by previous
+                // Refresh d_y from CPU state.y (mutated by previous
                 // iter's correction step).
                 let y_f32 = f64_to_f32(&state.y);
                 dev.stream()
@@ -1646,33 +1733,141 @@ mod gpu_impl {
                     .map_err(|e| AccelError::LinAlg(format!("upload Y: {e}")))?;
 
                 dispatch_harmony_distances(&dev, &cublas, &d_y, &d_z_cos, &mut d_dist, d, k, n)?;
-                dev.synchronize()
-                    .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
-
-                let dist_f32 = dev
-                    .dtoh_copy(&d_dist)
-                    .map_err(|e| AccelError::LinAlg(format!("download dist: {e}")))?;
-                state.dist_mat = dist_f32;
-                state.r = softmax_r_from_dist(&state.dist_mat, &state.sigma, k, n);
-                let (o, e) = compute_o_e(
-                    &state.r,
-                    &state.cell_to_gb,
-                    &state.layout,
-                    &state.pr_b,
+                gpu_harmony_softmax(&dev, &d_dist, &d_sigma, &mut d_r, k, n)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU softmax: {e}")))?;
+                gpu_harmony_compute_o_e_full(
+                    &dev,
+                    &d_r,
+                    &d_labels,
+                    &d_cov_offset,
+                    &d_pr_b,
+                    &mut d_o,
+                    &mut d_e,
+                    c_count,
                     k,
                     n,
-                );
-                state.o = o;
-                state.e = e;
+                    b,
+                )
+                .map_err(|e| AccelError::LinAlg(format!("GPU compute_o_e: {e}")))?;
             }
 
-            // K-means sub-loop stays on CPU — block-wise R update is branchy
-            // and relies on interleaved O/E increments that aren't a natural
-            // GPU fit at this workload size.
+            // K-means sub-loop on GPU. CPU only shuffles the cell
+            // order (deterministic via state.rng) and checks
+            // convergence after each sub-iter.
             let mut local_obj: Vec<f64> = Vec::new();
             for _sub in 0..state.config.max_iter_kmeans {
-                state.update_r();
-                let obj = state.compute_objective();
+                // Reshuffle order for this sub-iter (mirrors CPU
+                // update_r's per-sub-iter shuffle).
+                order_usize.shuffle(&mut state.rng);
+                for (dst, &src) in order_i32.iter_mut().zip(order_usize.iter()) {
+                    *dst = src as i32;
+                }
+                dev.stream()
+                    .memcpy_htod(&order_i32, &mut d_order)
+                    .map_err(|e| AccelError::LinAlg(format!("upload order: {e}")))?;
+
+                // Block loop (sequential on host; each block kicks 3
+                // GPU kernels and the implicit stream ordering keeps
+                // them in order).
+                for blk in 0..n_blocks {
+                    let start = blk * block_len;
+                    if start >= n {
+                        break;
+                    }
+                    let end = (start + block_len).min(n);
+                    let n_block_cells = end - start;
+
+                    // Slice d_order[start..end] into d_block_cells via
+                    // memcpy_dtod (cheap on-device copy).
+                    let order_view = d_order
+                        .try_slice(start..end)
+                        .ok_or_else(|| AccelError::LinAlg("d_order slice out of bounds".into()))?;
+                    let mut block_view =
+                        d_block_cells
+                            .try_slice_mut(0..n_block_cells)
+                            .ok_or_else(|| {
+                                AccelError::LinAlg("d_block_cells slice out of bounds".into())
+                            })?;
+                    dev.stream()
+                        .memcpy_dtod(&order_view, &mut block_view)
+                        .map_err(|e| AccelError::LinAlg(format!("memcpy block_cells: {e}")))?;
+
+                    // (a) Decrement O/E by current R contributions.
+                    gpu_harmony_block_oe_update(
+                        &dev,
+                        &d_r,
+                        &d_block_cells,
+                        &d_labels,
+                        &d_cov_offset,
+                        &d_pr_b,
+                        &mut d_o,
+                        &mut d_e,
+                        -1.0,
+                        c_count,
+                        k,
+                        n,
+                        b,
+                        n_block_cells,
+                    )
+                    .map_err(|e| AccelError::LinAlg(format!("GPU O/E decrement: {e}")))?;
+
+                    // (b,c,d) Block softmax+penalty using leave-block-out O/E.
+                    gpu_harmony_block_softmax_penalty(
+                        &dev,
+                        &d_dist,
+                        &d_sigma,
+                        &d_o,
+                        &d_e,
+                        &d_theta,
+                        &d_labels,
+                        &d_cov_offset,
+                        &d_block_cells,
+                        &mut d_r,
+                        c_count,
+                        k,
+                        n,
+                        b,
+                        n_block_cells,
+                    )
+                    .map_err(|e| AccelError::LinAlg(format!("GPU block softmax: {e}")))?;
+
+                    // (e) Increment O/E with new R contributions.
+                    gpu_harmony_block_oe_update(
+                        &dev,
+                        &d_r,
+                        &d_block_cells,
+                        &d_labels,
+                        &d_cov_offset,
+                        &d_pr_b,
+                        &mut d_o,
+                        &mut d_e,
+                        1.0,
+                        c_count,
+                        k,
+                        n,
+                        b,
+                        n_block_cells,
+                    )
+                    .map_err(|e| AccelError::LinAlg(format!("GPU O/E increment: {e}")))?;
+                }
+
+                // Per-sub-iter objective: reduce per-cell + per-(k, gb)
+                // partials on host (tiny PCIe + sum).
+                gpu_harmony_obj_kmeans_entropy(
+                    &dev,
+                    &d_r,
+                    &d_dist,
+                    &d_sigma,
+                    &mut d_obj_cell,
+                    k,
+                    n,
+                )
+                .map_err(|e| AccelError::LinAlg(format!("GPU obj k+e: {e}")))?;
+                gpu_harmony_obj_cross(&dev, &d_o, &d_e, &d_sigma, &d_theta, &mut d_cross_kgb, k, b)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU obj cross: {e}")))?;
+                dev.synchronize()
+                    .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
+                let obj = compute_objective_gpu(&dev, &d_obj_cell, &d_cross_kgb, n)?;
                 local_obj.push(obj);
                 state.objective_kmeans.push(obj);
                 if check_convergence_kmeans(
@@ -1684,7 +1879,24 @@ mod gpu_impl {
                 }
             }
 
-            // --- Correction step (GPU scatter-subtract) ---
+            // Sync state.r, state.o, state.e back to CPU for the
+            // correction step's small regression solve. R is needed
+            // implicitly (we slice d_r per cluster on-device, no CPU
+            // R copy needed); O/E feed the per-cluster cov matrix.
+            let o_back = dev
+                .dtoh_copy(&d_o)
+                .map_err(|e| AccelError::LinAlg(format!("download O: {e}")))?;
+            let e_back = dev
+                .dtoh_copy(&d_e)
+                .map_err(|e| AccelError::LinAlg(format!("download E: {e}")))?;
+            for (dst, src) in state.o.iter_mut().zip(o_back.iter()) {
+                *dst = *src as f64;
+            }
+            for (dst, src) in state.e.iter_mut().zip(e_back.iter()) {
+                *dst = *src as f64;
+            }
+
+            // --- Correction step ---
             //
             // Reset Z_corr = Z_orig on device.
             dev.stream()
@@ -1758,12 +1970,15 @@ mod gpu_impl {
                 }
                 let n_kept_total = cells_concat.len();
 
-                // Upload R[k, :] once for this cluster. CPU R is f32
-                // already (after issue #10), so we copy the row slice
-                // straight to device.
-                let d_r_row = dev
-                    .htod_copy(&state.r[ku * n..(ku + 1) * n])
-                    .map_err(|e| AccelError::LinAlg(format!("upload R row: {e}")))?;
+                // R[k, :] is already on device — slice d_r[ku*n..(ku+1)*n]
+                // and memcpy_dtod into the hoisted d_r_row scratch.
+                // No host round-trip.
+                let r_view = d_r
+                    .try_slice(ku * n..(ku + 1) * n)
+                    .ok_or_else(|| AccelError::LinAlg("d_r slice out of bounds".into()))?;
+                dev.stream()
+                    .memcpy_dtod(&r_view, &mut d_r_row)
+                    .map_err(|e| AccelError::LinAlg(format!("memcpy R row: {e}")))?;
                 let d_cells_concat = dev
                     .htod_copy(&cells_concat)
                     .map_err(|e| AccelError::LinAlg(format!("upload cells_concat: {e}")))?;

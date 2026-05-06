@@ -293,6 +293,402 @@ pub fn gpu_harmony_softmax_penalty(
     Ok(())
 }
 
+/// Plain softmax `R[:, i] = softmax(-dist[:, i] / sigma)` for every cell.
+///
+/// No diversity penalty applied — used at iter > 0 cold-start, where the
+/// inner block-decrement softmax inside `update_r` will fold in the
+/// leave-block-out penalty per block.
+pub fn gpu_harmony_softmax(
+    dev: &GpuDevice,
+    dist: &CudaSlice<f32>,
+    sigma: &CudaSlice<f32>,
+    r_out: &mut CudaSlice<f32>,
+    k: usize,
+    n: usize,
+) -> Result<(), GpuError> {
+    if k == 0 || n == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+    let func = module
+        .load_function("harmony_softmax_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_softmax: {e}")))?;
+
+    let threads: u32 = {
+        let mut t = 32u32;
+        while (t as usize) < k && t < 1024 {
+            t <<= 1;
+        }
+        t.min(1024)
+    };
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: (threads as usize * std::mem::size_of::<f32>()) as u32,
+    };
+    let k_i32 = k as i32;
+    let n_i32 = n as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(dist)
+            .arg(sigma)
+            .arg(&k_i32)
+            .arg(&n_i32)
+            .arg(r_out)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_softmax: {e}")))?;
+    Ok(())
+}
+
+/// Block-only softmax+penalty for the k-means `update_r` sub-loop.
+///
+/// Operates on a list of cell indices `block_cells[blockIdx.x]`
+/// instead of all N cells. Callers must pre-compute leave-block-out
+/// O/E (subtract the block's R contributions before launching).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_harmony_block_softmax_penalty(
+    dev: &GpuDevice,
+    dist: &CudaSlice<f32>,
+    sigma: &CudaSlice<f32>,
+    o: &CudaSlice<f32>,
+    e: &CudaSlice<f32>,
+    theta: &CudaSlice<f32>,
+    batch_labels_flat: &CudaSlice<i32>,
+    cov_offset: &CudaSlice<i32>,
+    block_cells: &CudaSlice<i32>,
+    r_out: &mut CudaSlice<f32>,
+    c: usize,
+    k: usize,
+    n: usize,
+    b: usize,
+    n_block_cells: usize,
+) -> Result<(), GpuError> {
+    if k == 0 || n == 0 || c == 0 || n_block_cells == 0 {
+        return Ok(());
+    }
+    if (n_block_cells as u64) > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n_block_cells < 2^31".into(),
+            got: format!("n_block_cells = {n_block_cells}"),
+        });
+    }
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+    let func = module
+        .load_function("harmony_block_softmax_penalty_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_block_softmax_penalty: {e}")))?;
+
+    let threads: u32 = {
+        let mut t = 32u32;
+        while (t as usize) < k && t < 1024 {
+            t <<= 1;
+        }
+        t.min(1024)
+    };
+    let cfg = LaunchConfig {
+        grid_dim: (n_block_cells as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: (threads as usize * std::mem::size_of::<f32>()) as u32,
+    };
+    let c_i32 = c as i32;
+    let k_i32 = k as i32;
+    let n_i32 = n as i32;
+    let b_i32 = b as i32;
+    let n_block_cells_i32 = n_block_cells as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(dist)
+            .arg(sigma)
+            .arg(o)
+            .arg(e)
+            .arg(theta)
+            .arg(batch_labels_flat)
+            .arg(cov_offset)
+            .arg(block_cells)
+            .arg(&c_i32)
+            .arg(&k_i32)
+            .arg(&n_i32)
+            .arg(&b_i32)
+            .arg(&n_block_cells_i32)
+            .arg(r_out)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_block_softmax_penalty: {e}")))?;
+    Ok(())
+}
+
+/// Atomic O/E update for a block of cells (signed).
+///
+/// For each (cell, cluster, covariate), atomicAdds `sign * R[k, cell]`
+/// to `O[k, gb]` and `sign * pr_b[gb] * R[k, cell]` to `E[k, gb]`. Use
+/// `sign = -1.0` to subtract the block's contribution before block
+/// softmax (leave-block-out), and `sign = +1.0` to add the new R
+/// contribution after.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_harmony_block_oe_update(
+    dev: &GpuDevice,
+    r: &CudaSlice<f32>,
+    block_cells: &CudaSlice<i32>,
+    batch_labels_flat: &CudaSlice<i32>,
+    cov_offset: &CudaSlice<i32>,
+    pr_b: &CudaSlice<f32>,
+    o: &mut CudaSlice<f32>,
+    e: &mut CudaSlice<f32>,
+    sign: f32,
+    c: usize,
+    k: usize,
+    n: usize,
+    b: usize,
+    n_block_cells: usize,
+) -> Result<(), GpuError> {
+    if k == 0 || n == 0 || c == 0 || n_block_cells == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+    let func = module
+        .load_function("harmony_block_oe_update_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_block_oe_update: {e}")))?;
+
+    let total: u64 = (n_block_cells as u64) * (k as u64) * (c as u64);
+    let threads: u32 = 256;
+    let blocks_u64 = total.div_ceil(threads as u64);
+    if blocks_u64 > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n_block_cells * K * C / 256 < 2^31".into(),
+            got: format!("blocks = {blocks_u64}"),
+        });
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_u64 as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let c_i32 = c as i32;
+    let k_i32 = k as i32;
+    let n_i32 = n as i32;
+    let b_i32 = b as i32;
+    let n_block_cells_i32 = n_block_cells as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(r)
+            .arg(block_cells)
+            .arg(batch_labels_flat)
+            .arg(cov_offset)
+            .arg(pr_b)
+            .arg(&sign)
+            .arg(&c_i32)
+            .arg(&k_i32)
+            .arg(&n_i32)
+            .arg(&b_i32)
+            .arg(&n_block_cells_i32)
+            .arg(o)
+            .arg(e)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_block_oe_update: {e}")))?;
+    Ok(())
+}
+
+/// Compute O / E from R on GPU (full-N initial reduction).
+///
+/// `O[k, gb] = Σ_i R[k, i]` summed over cells whose batch index is gb;
+/// `E[k, gb] = pr_b[gb] * Σ_i R[k, i]` (per cluster row sum). Used at
+/// iter > 0 cold-start to refresh O/E from a freshly-computed
+/// (penalty-free) R. Allocates a transient row_sum scratch internally.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_harmony_compute_o_e_full(
+    dev: &GpuDevice,
+    r: &CudaSlice<f32>,
+    batch_labels_flat: &CudaSlice<i32>,
+    cov_offset: &CudaSlice<i32>,
+    pr_b: &CudaSlice<f32>,
+    o: &mut CudaSlice<f32>,
+    e: &mut CudaSlice<f32>,
+    c: usize,
+    k: usize,
+    n: usize,
+    b: usize,
+) -> Result<(), GpuError> {
+    if k == 0 || n == 0 || c == 0 {
+        return Ok(());
+    }
+    // Zero O and the row_sum scratch before atomic accumulation.
+    let mut row_sum = dev
+        .alloc_zeros::<f32>(k)
+        .map_err(|e| GpuError::OutOfMemory(format!("alloc row_sum: {e}")))?;
+    dev.stream()
+        .memset_zeros(o)
+        .map_err(|e| GpuError::CudaError(format!("memset O: {e}")))?;
+
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+
+    // Pass 1: harmony_compute_o_kernel — atomicAdd into O and row_sum.
+    let func = module
+        .load_function("harmony_compute_o_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_compute_o: {e}")))?;
+    let total: u64 = (n as u64) * (k as u64) * (c as u64);
+    let threads: u32 = 256;
+    let blocks_u64 = total.div_ceil(threads as u64);
+    if blocks_u64 > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "N * K * C / 256 < 2^31".into(),
+            got: format!("blocks = {blocks_u64}"),
+        });
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_u64 as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let c_i32 = c as i32;
+    let k_i32 = k as i32;
+    let n_i32 = n as i32;
+    let b_i32 = b as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(r)
+            .arg(batch_labels_flat)
+            .arg(cov_offset)
+            .arg(&c_i32)
+            .arg(&k_i32)
+            .arg(&n_i32)
+            .arg(&b_i32)
+            .arg(o)
+            .arg(&mut row_sum)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_compute_o: {e}")))?;
+
+    // Pass 2: harmony_compute_e_finalize_kernel — E[k, gb] = pr_b[gb] * row_sum[k].
+    let func2 = module
+        .load_function("harmony_compute_e_finalize_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_compute_e_finalize: {e}")))?;
+    let threads_x: u32 = 64;
+    let blocks_x = (b as u32).div_ceil(threads_x);
+    let cfg2 = LaunchConfig {
+        grid_dim: (blocks_x, k as u32, 1),
+        block_dim: (threads_x, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        dev.stream()
+            .launch_builder(&func2)
+            .arg(&row_sum)
+            .arg(pr_b)
+            .arg(&k_i32)
+            .arg(&b_i32)
+            .arg(e)
+            .launch(cfg2)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_compute_e_finalize: {e}")))?;
+    Ok(())
+}
+
+/// Per-cell kmeans + entropy objective contribution.
+///
+/// Writes `obj_cell[i] = Σ_k R[k,i] · dist[k,i] + Σ_k σ[k] · R[k,i] ·
+/// log R[k,i]` for i ∈ [0, N). Reducing this vector gives the
+/// `kmeans_err + entropy` portion of the Harmony objective; the
+/// caller then adds the cross-entropy term (see
+/// `gpu_harmony_obj_cross`) and multiplies by `2000 / N`.
+pub fn gpu_harmony_obj_kmeans_entropy(
+    dev: &GpuDevice,
+    r: &CudaSlice<f32>,
+    dist: &CudaSlice<f32>,
+    sigma: &CudaSlice<f32>,
+    obj_cell: &mut CudaSlice<f32>,
+    k: usize,
+    n: usize,
+) -> Result<(), GpuError> {
+    if k == 0 || n == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+    let func = module
+        .load_function("harmony_obj_kmeans_entropy_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_obj_kmeans_entropy: {e}")))?;
+
+    let threads: u32 = {
+        let mut t = 32u32;
+        while (t as usize) < k && t < 1024 {
+            t <<= 1;
+        }
+        t.min(1024)
+    };
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: (threads as usize * std::mem::size_of::<f32>()) as u32,
+    };
+    let k_i32 = k as i32;
+    let n_i32 = n as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(r)
+            .arg(dist)
+            .arg(sigma)
+            .arg(&k_i32)
+            .arg(&n_i32)
+            .arg(obj_cell)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_obj_kmeans_entropy: {e}")))?;
+    Ok(())
+}
+
+/// Per-(k, gb) cross-entropy objective contribution.
+///
+/// Writes `cross[k, gb] = σ[k] · O[k, gb] · θ[gb] · log((O+E+1) /
+/// (2E+1))`. Reducing this matrix gives the cross-entropy term.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_harmony_obj_cross(
+    dev: &GpuDevice,
+    o: &CudaSlice<f32>,
+    e: &CudaSlice<f32>,
+    sigma: &CudaSlice<f32>,
+    theta: &CudaSlice<f32>,
+    cross_kgb: &mut CudaSlice<f32>,
+    k: usize,
+    b: usize,
+) -> Result<(), GpuError> {
+    if k == 0 || b == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+    let func = module
+        .load_function("harmony_obj_cross_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_obj_cross: {e}")))?;
+
+    let threads_x: u32 = 64;
+    let blocks_x = (b as u32).div_ceil(threads_x);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_x, k as u32, 1),
+        block_dim: (threads_x, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let k_i32 = k as i32;
+    let b_i32 = b as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(o)
+            .arg(e)
+            .arg(sigma)
+            .arg(theta)
+            .arg(&k_i32)
+            .arg(&b_i32)
+            .arg(cross_kgb)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_obj_cross: {e}")))?;
+    Ok(())
+}
+
 /// Column-wise L2 normalization of a `(d x N)` col-major matrix in place.
 pub fn gpu_harmony_l2_normalize_cols(
     dev: &GpuDevice,
