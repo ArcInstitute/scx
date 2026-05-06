@@ -668,8 +668,10 @@ extern "C" __global__ void harmony_correction_grouped_kernel(
     int cell_local = blockIdx.x;
     int t = threadIdx.x;
     if (cell_local >= n_kept_total) return;
-    if (t >= d) return;  // block dim padded to warp boundary; mask out extras
 
+    // Block dim is padded to a warp multiple, so threads with t >= d
+    // exist but must stay alive through __syncthreads() — exiting
+    // before the barrier within a warp is UB per the CUDA spec.
     __shared__ int j_shared;
     __shared__ int cell_shared;
     __shared__ float r_shared;
@@ -689,6 +691,7 @@ extern "C" __global__ void harmony_correction_grouped_kernel(
     }
     __syncthreads();
 
+    if (t >= d) return;  // mask out warp-padding threads after the barrier
     float r = r_shared;
     if (r == 0.0f) return;
     int cell = cell_shared;

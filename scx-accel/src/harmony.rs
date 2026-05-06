@@ -1521,8 +1521,8 @@ mod gpu_impl {
 
     /// Auto-route distance computation: GEMM for large N (cuBLAS
     /// dispatches optimised tiles), hand-written kernel for small N
-    /// (avoids GEMM launch overhead) or N >= 2^31 (cuBLAS sgemm
-    /// dimensions are i32).
+    /// (avoids GEMM launch overhead) or whenever either of N / K
+    /// exceeds 2^31 (cuBLAS sgemm dimensions are i32).
     #[allow(clippy::too_many_arguments)]
     fn dispatch_harmony_distances(
         dev: &GpuDevice,
@@ -1534,7 +1534,8 @@ mod gpu_impl {
         k: usize,
         n: usize,
     ) -> Result<()> {
-        if n >= GEMM_N_THRESHOLD && (n as u64) <= i32::MAX as u64 {
+        let gemm_dims_fit = (n as u64) <= i32::MAX as u64 && (k as u64) <= i32::MAX as u64;
+        if n >= GEMM_N_THRESHOLD && gemm_dims_fit {
             gpu_harmony_distances_gemm(dev, handle, d_y, d_z_cos, d_dist, d, k, n)
                 .map_err(|e| AccelError::LinAlg(format!("GPU distances (gemm): {e}")))
         } else {
