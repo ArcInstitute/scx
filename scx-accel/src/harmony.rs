@@ -1501,16 +1501,47 @@ impl HarmonyState {
 #[cfg(feature = "gpu")]
 mod gpu_impl {
     use super::*;
-    // `gpu_harmony_softmax_penalty` is exposed by scx-gpu for future fusion
-    // (one launch for softmax + diversity penalty). This orchestrator keeps
-    // the block-wise R update on CPU for now, so we don't import it here.
+    // `gpu_harmony_softmax_penalty` is exposed by scx-gpu for future
+    // fusion (one launch for softmax + diversity penalty). With
+    // `update_r` on CPU, dist must come back to host every outer iter
+    // anyway, so the GPU softmax doesn't save PCIe — we keep the CPU
+    // softmax for now and don't import the GPU softmax wrapper.
     use scx_gpu::{
-        gpu_harmony_correction, gpu_harmony_distances, gpu_harmony_l2_normalize_cols, GpuDevice,
+        gpu_harmony_correction_grouped, gpu_harmony_distances, gpu_harmony_distances_gemm,
+        gpu_harmony_l2_normalize_cols, gpu_harmony_z_sum, CublasHandle, CudaSlice, GpuDevice,
     };
+
+    /// cuBLAS sgemm has fixed launch overhead; the hand-written kernel
+    /// is faster at small N. Above this threshold the GEMM path wins.
+    const GEMM_N_THRESHOLD: usize = 100_000;
 
     /// Helper: convert a `Vec<f64>` slice to f32 (GPU kernels use f32).
     fn f64_to_f32(v: &[f64]) -> Vec<f32> {
         v.iter().map(|&x| x as f32).collect()
+    }
+
+    /// Auto-route distance computation: GEMM for large N (cuBLAS
+    /// dispatches optimised tiles), hand-written kernel for small N
+    /// (avoids GEMM launch overhead) or N >= 2^31 (cuBLAS sgemm
+    /// dimensions are i32).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_harmony_distances(
+        dev: &GpuDevice,
+        handle: &CublasHandle,
+        d_y: &CudaSlice<f32>,
+        d_z_cos: &CudaSlice<f32>,
+        d_dist: &mut CudaSlice<f32>,
+        d: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        if n >= GEMM_N_THRESHOLD && (n as u64) <= i32::MAX as u64 {
+            gpu_harmony_distances_gemm(dev, handle, d_y, d_z_cos, d_dist, d, k, n)
+                .map_err(|e| AccelError::LinAlg(format!("GPU distances (gemm): {e}")))
+        } else {
+            gpu_harmony_distances(dev, d_y, d_z_cos, d_dist, d, k, n)
+                .map_err(|e| AccelError::LinAlg(format!("GPU distances (kernel): {e}")))
+        }
     }
 
     /// GPU-accelerated Harmony2 integration.
@@ -1547,21 +1578,38 @@ mod gpu_impl {
 
         let dev = GpuDevice::new(device_id)
             .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+        let cublas = CublasHandle::new()
+            .map_err(|e| AccelError::LinAlg(format!("cuBLAS handle init failed: {e}")))?;
 
         // Upload Z_orig once — it never changes.
         let d_z_orig = dev
             .htod_copy(&f64_to_f32(&state.z_orig))
             .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}")))?;
 
-        // Persistent device buffers (reused across iterations).
+        // Persistent device buffers (reused across iterations). Z_corr
+        // starts equal to Z_orig and is reset to Z_orig before each
+        // iter's correction step. We never download it back to CPU
+        // until the final result; the cosine-normalised view used for
+        // distance is built from it on-device via memcpy_dtod.
         let mut d_z_corr = dev
             .htod_copy(&f64_to_f32(&state.z_orig))
             .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}")))?;
+        let mut d_z_cos = dev
+            .alloc_zeros::<f32>(d * n)
+            .map_err(|e| AccelError::LinAlg(format!("alloc Z_cos: {e}")))?;
+        let mut d_dist = dev
+            .alloc_zeros::<f32>(k * n)
+            .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}")))?;
+        let mut d_y = dev
+            .alloc_zeros::<f32>(d * k)
+            .map_err(|e| AccelError::LinAlg(format!("alloc Y: {e}")))?;
 
         // Flatten per-covariate labels to (C x N) row-major i32 and upload.
         // Labels are u32 category indices; the GPU kernel uses i32, so
         // assert they fit. Batch count per covariate is bounded in practice
-        // by `max_batches` (default 1024), well under i32::MAX.
+        // by `max_batches` (default 1024), well under i32::MAX. Currently
+        // unused (CPU softmax is the cold-start path) but kept resident
+        // for the future GPU softmax+penalty wiring.
         let mut labels_flat = vec![0i32; c_count * n];
         for (ci, cov) in covariates.iter().enumerate() {
             for (i, &lab) in cov.labels.iter().enumerate() {
@@ -1580,34 +1628,30 @@ mod gpu_impl {
             iters_used = iter + 1;
 
             if iter > 0 {
-                // Cold-start R on GPU: Z_cos = l2_normalize(Z_corr), then
-                // dist = 2*(1 - Y^T Z_cos). We keep R/dist on CPU once
-                // downloaded so the k-means sub-loop (CPU) can proceed.
-                let mut d_z_cos = dev
-                    .htod_copy(&f64_to_f32(&state.z_corr))
-                    .map_err(|e| AccelError::LinAlg(format!("upload Z_corr->cos: {e}")))?;
+                // Cold-start R on GPU: Z_cos = l2_normalize(Z_corr) using
+                // the persistent on-device d_z_corr (no CPU round-trip),
+                // then dist = 2*(1 - Y^T Z_cos). dist comes back to CPU
+                // because the k-means sub-loop (CPU) reads it per cell.
+                dev.stream()
+                    .memcpy_dtod(&d_z_corr, &mut d_z_cos)
+                    .map_err(|e| AccelError::LinAlg(format!("memcpy Z_corr->Z_cos: {e}")))?;
                 gpu_harmony_l2_normalize_cols(&dev, &mut d_z_cos, d, n)
                     .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize: {e}")))?;
 
-                let d_y = dev
-                    .htod_copy(&f64_to_f32(&state.y))
+                // Refresh d_y from CPU state.y (just-mutated by previous
+                // iter's correction step).
+                let y_f32 = f64_to_f32(&state.y);
+                dev.stream()
+                    .memcpy_htod(&y_f32, &mut d_y)
                     .map_err(|e| AccelError::LinAlg(format!("upload Y: {e}")))?;
-                let mut d_dist = dev
-                    .alloc_zeros::<f32>(k * n)
-                    .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}")))?;
-                gpu_harmony_distances(&dev, &d_y, &d_z_cos, &mut d_dist, d, k, n)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU distances: {e}")))?;
+
+                dispatch_harmony_distances(&dev, &cublas, &d_y, &d_z_cos, &mut d_dist, d, k, n)?;
                 dev.synchronize()
                     .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
 
                 let dist_f32 = dev
                     .dtoh_copy(&d_dist)
                     .map_err(|e| AccelError::LinAlg(format!("download dist: {e}")))?;
-                // No host-side `z_cos` mirror is kept (H9) — cosine
-                // normalization lives on-device for this iteration and is
-                // recomputed on-the-fly by CPU paths on later iterations.
-                // CPU `dist_mat` is f32 too — assign directly without the
-                // f32→f64 conversion that the prior path used to do.
                 state.dist_mat = dist_f32;
                 state.r = softmax_r_from_dist(&state.dist_mat, &state.sigma, k, n);
                 let (o, e) = compute_o_e(
@@ -1698,24 +1742,59 @@ mod gpu_impl {
                     full_matrix_inverse(&cov, size)?
                 };
 
-                // z_sum_all + z_sum[j] from Z_orig (CPU-resident).
-                // R is f32; promote to f64 on read.
-                let mut z_sum = vec![0f64; b_prime * d];
-                for (j, &gb) in kept.iter().enumerate() {
+                // Build flat cells_concat + batch_offsets covering all
+                // kept batches (including empty ones, which contribute
+                // zero-length offset spans). The same arrays drive both
+                // the GPU z-sum reduction below and the grouped
+                // correction kernel afterwards.
+                let mut cells_concat: Vec<i32> = Vec::with_capacity(n);
+                let mut batch_offsets: Vec<i32> = Vec::with_capacity(b_prime + 1);
+                batch_offsets.push(0);
+                for &gb in &kept {
                     let (ci, lvl) = state.gb_to_cov_level(gb);
                     let cells = &state.batch_index[ci][lvl];
-                    for &i in cells {
-                        let r_ki = state.r[ku * n + i] as f64;
-                        if r_ki == 0.0 {
-                            continue;
-                        }
-                        let z_col = &state.z_orig[i * d..(i + 1) * d];
-                        let row_off = j * d;
-                        for t in 0..d {
-                            z_sum[row_off + t] += z_col[t] * r_ki;
-                        }
-                    }
+                    cells_concat.extend(cells.iter().map(|&i| i as i32));
+                    batch_offsets.push(cells_concat.len() as i32);
                 }
+                let n_kept_total = cells_concat.len();
+
+                // Upload R[k, :] once for this cluster. CPU R is f32
+                // already (after issue #10), so we copy the row slice
+                // straight to device.
+                let d_r_row = dev
+                    .htod_copy(&state.r[ku * n..(ku + 1) * n])
+                    .map_err(|e| AccelError::LinAlg(format!("upload R row: {e}")))?;
+                let d_cells_concat = dev
+                    .htod_copy(&cells_concat)
+                    .map_err(|e| AccelError::LinAlg(format!("upload cells_concat: {e}")))?;
+                let d_offsets = dev
+                    .htod_copy(&batch_offsets)
+                    .map_err(|e| AccelError::LinAlg(format!("upload batch_offsets: {e}")))?;
+
+                // GPU z-sum: z_sum[j, t] = Σ_{i in batch j} R[k,i] · Z_orig[t,i].
+                // Replaces the CPU triple-nested loop that was
+                // O(K · N · d) sequential per-cluster work. f32 result
+                // is downloaded and promoted to f64 for the
+                // (small) regression solve below.
+                let mut d_z_sum = dev
+                    .alloc_zeros::<f32>(b_prime * d)
+                    .map_err(|e| AccelError::LinAlg(format!("alloc z_sum: {e}")))?;
+                gpu_harmony_z_sum(
+                    &dev,
+                    &d_r_row,
+                    &d_z_orig,
+                    &d_cells_concat,
+                    &d_offsets,
+                    &mut d_z_sum,
+                    b_prime,
+                    d,
+                    n,
+                )
+                .map_err(|e| AccelError::LinAlg(format!("GPU z-sum: {e}")))?;
+                let z_sum_f32 = dev
+                    .dtoh_copy(&d_z_sum)
+                    .map_err(|e| AccelError::LinAlg(format!("download z_sum: {e}")))?;
+                let z_sum: Vec<f64> = z_sum_f32.iter().map(|&v| v as f64).collect();
                 let mut z_sum_all = vec![0f64; d];
                 for j in 0..b_prime {
                     let row_off = j * d;
@@ -1724,6 +1803,10 @@ mod gpu_impl {
                     }
                 }
 
+                // CPU regression solve: small (B'+1) x (B'+1) inv_cov
+                // times (z_sum_all, z_sum[0..b_prime]) → W of shape
+                // (size, d). Stays on host because B' is small and
+                // inv_cov already lives here.
                 let mut w = vec![0f64; size * d];
                 for r in 0..size {
                     let ic0 = inv_cov[r * size];
@@ -1750,42 +1833,39 @@ mod gpu_impl {
                     w[t] = 0.0;
                 }
 
-                // Upload R[k, :] once for this cluster. CPU R is already
-                // f32 (matches the GPU correction kernel's expected dtype),
-                // so we copy the row slice straight to device — no
-                // intermediate f64→f32 cast needed.
-                let d_r_row = dev
-                    .htod_copy(&state.r[ku * n..(ku + 1) * n])
-                    .map_err(|e| AccelError::LinAlg(format!("upload R row: {e}")))?;
+                // Build w_flat = W rows 1..size (row 0 was the centroid
+                // and is zeroed above). One row per kept batch, including
+                // empties (kernel never reads their slots since
+                // batch_offsets[j+1] == batch_offsets[j] for empties).
+                let w_flat: Vec<f32> = w[d..(b_prime + 1) * d].iter().map(|&v| v as f32).collect();
 
-                // Apply each kept batch on the GPU.
-                for (j, &gb) in kept.iter().enumerate() {
-                    let (ci, lvl) = state.gb_to_cov_level(gb);
-                    let cells_i32: Vec<i32> = state.batch_index[ci][lvl]
-                        .iter()
-                        .map(|&i| i as i32)
-                        .collect();
-                    if cells_i32.is_empty() {
-                        continue;
-                    }
-                    let d_cells = dev
-                        .htod_copy(&cells_i32)
-                        .map_err(|e| AccelError::LinAlg(format!("upload cells: {e}")))?;
-                    let w_row_f32: Vec<f32> = w[(j + 1) * d..(j + 2) * d]
-                        .iter()
-                        .map(|&v| v as f32)
-                        .collect();
-                    let d_w = dev
-                        .htod_copy(&w_row_f32)
-                        .map_err(|e| AccelError::LinAlg(format!("upload W row: {e}")))?;
-                    gpu_harmony_correction(&dev, &mut d_z_corr, d, n, &d_cells, &d_r_row, &d_w)
-                        .map_err(|e| AccelError::LinAlg(format!("GPU correction: {e}")))?;
+                if n_kept_total == 0 {
+                    // All kept batches are empty — nothing to scatter.
+                    continue;
                 }
+                let d_w = dev
+                    .htod_copy(&w_flat)
+                    .map_err(|e| AccelError::LinAlg(format!("upload W: {e}")))?;
+                gpu_harmony_correction_grouped(
+                    &dev,
+                    &mut d_z_corr,
+                    &d_r_row,
+                    &d_w,
+                    &d_cells_concat,
+                    &d_offsets,
+                    b_prime,
+                    n_kept_total,
+                    d,
+                    n,
+                )
+                .map_err(|e| AccelError::LinAlg(format!("GPU correction (grouped): {e}")))?;
             }
 
-            // L2-normalize Y columns on GPU (d x K).
-            let mut d_y = dev
-                .htod_copy(&f64_to_f32(&state.y))
+            // L2-normalize Y columns on GPU (d x K). Y was just mutated
+            // by CPU correction; refresh d_y in place and run the kernel.
+            let y_f32 = f64_to_f32(&state.y);
+            dev.stream()
+                .memcpy_htod(&y_f32, &mut d_y)
                 .map_err(|e| AccelError::LinAlg(format!("upload Y for norm: {e}")))?;
             gpu_harmony_l2_normalize_cols(&dev, &mut d_y, d, k)
                 .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize Y: {e}")))?;
@@ -1798,14 +1878,10 @@ mod gpu_impl {
                 *dst = *src as f64;
             }
 
-            // Sync Z_corr back to CPU state so cold_start_r can consume it
-            // on the next iteration.
-            let z_corr_back = dev
-                .dtoh_copy(&d_z_corr)
-                .map_err(|e| AccelError::LinAlg(format!("download Z_corr: {e}")))?;
-            for (dst, src) in state.z_corr.iter_mut().zip(z_corr_back.iter()) {
-                *dst = *src as f64;
-            }
+            // Z_corr stays on the device. The next iter's distance step
+            // will memcpy_dtod it into d_z_cos and L2-normalize there;
+            // there's no consumer of state.z_corr inside the loop on the
+            // GPU path. We download once at the end of the run.
 
             if let Some(&last) = state.objective_kmeans.last() {
                 state.objective_harmony.push(last);
@@ -1814,6 +1890,16 @@ mod gpu_impl {
                 converged = true;
                 break;
             }
+        }
+
+        // Final download of Z_corr to CPU state so the row-major output
+        // builder below can read it. Saves the per-iter PCIe round-trip
+        // that the previous orchestration did.
+        let z_corr_back = dev
+            .dtoh_copy(&d_z_corr)
+            .map_err(|e| AccelError::LinAlg(format!("download Z_corr: {e}")))?;
+        for (dst, src) in state.z_corr.iter_mut().zip(z_corr_back.iter()) {
+            *dst = *src as f64;
         }
 
         // Build output as (N x d) row-major f64.
