@@ -503,17 +503,7 @@ mod tests {
         };
 
         let cov = gpu_covariance_pca(&dev, &source, k, true).unwrap();
-        let rand = gpu_randomized_pca(
-            &dev,
-            &source,
-            k,
-            10,
-            4,
-            true,
-            123,
-            crate::cusolver::QrMethod::default(),
-        )
-        .unwrap();
+        let rand = gpu_randomized_pca(&dev, &source, k, 10, 4, true, 123).unwrap();
 
         let cos = row_abs_cosine(&cov.components, &rand.components, k, n_cols);
         assert!(
