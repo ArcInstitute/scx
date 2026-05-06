@@ -1643,6 +1643,14 @@ mod gpu_impl {
         let mut d_e = dev
             .htod_copy(&f64_to_f32(&state.e))
             .map_err(|e| AccelError::LinAlg(format!("upload E: {e}")))?;
+        // Upload the cold-start dist matrix from CPU `HarmonyState::new`
+        // so iter 0's GPU update_r has the same dist values that CPU
+        // `update_r` would read from `state.dist_mat`. After iter 0,
+        // d_dist is overwritten by GPU distance at the iter > 0
+        // cold-start branch.
+        dev.stream()
+            .memcpy_htod(&state.dist_mat, &mut d_dist)
+            .map_err(|e| AccelError::LinAlg(format!("upload dist (iter 0 cold-start): {e}")))?;
 
         // Read-only constants — uploaded once.
         let d_sigma = dev
