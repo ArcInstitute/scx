@@ -539,9 +539,24 @@ impl ScxWriter {
             stats: Some(stats),
         });
 
-        if section_type == SectionType::CsrShard {
-            self.csr_shard_count += 1;
-            self.total_nnz += nnz;
+        match section_type {
+            SectionType::CsrShard => {
+                self.csr_shard_count += 1;
+                self.total_nnz += nnz;
+            }
+            SectionType::CscShard => {
+                // CSC shards count toward `n_csc_shards` so that
+                // `finish()` populates the header's `n_csc_shards` and
+                // `has_csc` flag bit. Without this, cloud
+                // pass-through paths (`cloud_optimize`, `pack`,
+                // `push`, `pull`) silently dropped CSC sidecars on
+                // copy. CSC-SUPPORT.md Phase I.1.
+                self.csc_shard_count += 1;
+                // Don't add to total_nnz: CSC shards mirror the same
+                // values as CSR shards (different layout, same
+                // entries). Adding here would double-count nnz.
+            }
+            _ => {}
         }
 
         Ok(())
