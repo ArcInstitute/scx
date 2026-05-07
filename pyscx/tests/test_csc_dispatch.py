@@ -200,6 +200,47 @@ def test_pseudobulk_csc_requires_gene_indices(small_adata, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# calculate_qc_metrics: prefer_format="csc" matches CSR.
+# ---------------------------------------------------------------------------
+
+
+def test_qc_metrics_csc_matches_csr(small_adata, tmp_path):
+    import pyscx
+
+    a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+
+    pyscx.accel.calculate_qc_metrics(a_csr)
+    pyscx.accel.calculate_qc_metrics(a_csc, prefer_format="csc")
+
+    np.testing.assert_allclose(
+        np.asarray(a_csc.var["total_counts"]),
+        np.asarray(a_csr.var["total_counts"]),
+        atol=1e-9,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(a_csc.var["n_cells_by_counts"]),
+        np.asarray(a_csr.var["n_cells_by_counts"]),
+    )
+
+
+def test_qc_metrics_csc_invalid_prefer_format(small_adata, tmp_path):
+    import pyscx
+
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    with pytest.raises(ValueError, match="prefer_format"):
+        pyscx.accel.calculate_qc_metrics(a_csc, prefer_format="auto")
+
+
+def test_qc_metrics_csc_raises_on_csr_only(small_adata, tmp_path):
+    import pyscx
+
+    a_csr = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
+    with pytest.raises(RuntimeError, match="CSC"):
+        pyscx.accel.calculate_qc_metrics(a_csr, prefer_format="csc")
+
+
+# ---------------------------------------------------------------------------
 # PCA: prefer_format="csc" raises ValueError.
 # ---------------------------------------------------------------------------
 
