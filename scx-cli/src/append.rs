@@ -12,6 +12,8 @@ pub fn run_append(
     input: &Path,
     codec: &str,
     shard_size: u32,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open input file
     let input_reader = ScxReader::open(input)?;
@@ -101,6 +103,14 @@ pub fn run_append(
         input.display(),
         target.display()
     );
+
+    // Phase H.1: re-emit the CSC sidecar that scx_ops::append dropped.
+    // We always run when `--rebuild-csc` is set, even if the target
+    // didn't have CSC before — the user opted in explicitly.
+    if rebuild_csc {
+        crate::rebuild_csc::rebuild_csc_inplace(target, csc_cols_per_shard, "4G")?;
+        println!("Rebuilt CSC sidecar on {}", target.display());
+    }
 
     Ok(())
 }

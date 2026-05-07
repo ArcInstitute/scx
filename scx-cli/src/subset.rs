@@ -20,6 +20,8 @@ pub fn run_subset(
     dry_run: bool,
     shard_size: u32,
     codec: &str,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Validate: at least one of --filter or --genes must be specified
     if filter.is_none() && gene_file.is_none() {
@@ -96,6 +98,19 @@ pub fn run_subset(
     if has_obs_pred_idx || has_var_pred_idx {
         eprintln!("Warning: predicate indices dropped (invalid after subsetting)");
     }
+    // CSC sidecars are dropped on subset: row / column projection
+    // changes the global index space, so input CSC `indices` arrays
+    // would silently reference rows / columns that no longer exist.
+    // Caller can opt back in via `--rebuild-csc` to re-run `build-csc`
+    // against the projected output. Phase H.4.
+    if in_header.has_csc() {
+        eprintln!(
+            "Warning: subset dropped CSC shards from {input}: rerun \
+             `scx build-csc` (or pass --rebuild-csc) to restore the \
+             column-major sidecar",
+            input = input.display()
+        );
+    }
 
     if dry_run {
         println!("(dry run — no output written)");
@@ -133,6 +148,13 @@ pub fn run_subset(
     )?;
 
     println!("Wrote {}", output.display());
+
+    // Phase H.4: re-emit the CSC sidecar against the projected output.
+    if rebuild_csc {
+        crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        println!("Rebuilt CSC sidecar on {}", output.display());
+    }
+
     Ok(())
 }
 

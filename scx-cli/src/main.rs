@@ -11,6 +11,7 @@ mod delete;
 mod info;
 mod merge;
 mod query;
+mod rebuild_csc;
 mod rewrite_helpers;
 mod rollback;
 mod subset;
@@ -103,6 +104,15 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value = "10000")]
         shard_size: u32,
+        /// Rebuild the CSC sidecar after appending (drops + re-emits via
+        /// `scx build-csc`). Without this flag, append drops the CSC
+        /// sidecar with a warning — the row layout no longer matches.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc` is
+        /// set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Logically delete cells matching a predicate
     Delete {
@@ -125,6 +135,16 @@ enum Commands {
         /// Overwrite output if it exists
         #[arg(long)]
         force: bool,
+        /// Rebuild the CSC sidecar on the compacted output (drops +
+        /// re-emits via `scx build-csc`). Without this flag, compact
+        /// drops the CSC sidecar with a warning — the row layout no
+        /// longer matches after deletion-vector application.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
+        /// is set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -141,6 +161,15 @@ enum Commands {
         /// Output path for merged file
         #[arg(long)]
         output: PathBuf,
+        /// Rebuild the CSC sidecar on the merged output (drops +
+        /// re-emits via `scx build-csc`). Without this flag, merge
+        /// drops any input CSC sidecars with a warning.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
+        /// is set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Query cells by predicate
     Query {
@@ -282,6 +311,16 @@ enum Commands {
         /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
+        /// Rebuild the CSC sidecar on the subset output (drops +
+        /// re-emits via `scx build-csc` against the projected CSR).
+        /// Without this flag, subset drops any input CSC sidecar
+        /// with a warning — the row/column index space changes.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
+        /// is set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Upgrade an SCX file to the latest format version
     Upgrade {
@@ -342,7 +381,16 @@ fn main() {
             input,
             codec,
             shard_size,
-        } => append::run_append(&target, &input, &codec, shard_size),
+            rebuild_csc,
+            csc_cols_per_shard,
+        } => append::run_append(
+            &target,
+            &input,
+            &codec,
+            shard_size,
+            rebuild_csc,
+            csc_cols_per_shard,
+        ),
         Commands::Delete {
             file,
             filter,
@@ -352,9 +400,16 @@ fn main() {
             input,
             output,
             force,
-        } => compact::run_compact(&input, &output, force),
+            rebuild_csc,
+            csc_cols_per_shard,
+        } => compact::run_compact(&input, &output, force, rebuild_csc, csc_cols_per_shard),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
-        Commands::Merge { inputs, output } => merge::run_merge(&inputs, &output),
+        Commands::Merge {
+            inputs,
+            output,
+            rebuild_csc,
+            csc_cols_per_shard,
+        } => merge::run_merge(&inputs, &output, rebuild_csc, csc_cols_per_shard),
         Commands::Query {
             file,
             filter,
@@ -397,6 +452,8 @@ fn main() {
             dry_run,
             shard_size,
             codec,
+            rebuild_csc,
+            csc_cols_per_shard,
         } => subset::run_subset(
             &input,
             output.as_deref(),
@@ -405,6 +462,8 @@ fn main() {
             dry_run,
             shard_size,
             &codec,
+            rebuild_csc,
+            csc_cols_per_shard,
         ),
         Commands::Upgrade {
             input,
