@@ -7,7 +7,7 @@ use arrow::array::{RecordBatch, UInt32Array};
 use arrow::compute;
 use scx_format::catalog::FullCatalogEntry;
 use scx_format::ScxReader;
-use scx_sparse::ScxCsr;
+use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::error::Result;
 
@@ -143,6 +143,76 @@ pub fn decode_shard_projected(
     }
 
     Ok((new_indptr, new_indices, new_data))
+}
+
+// ---------------------------------------------------------------------------
+// CSC column projection — column-major counterpart to project_csr
+// ---------------------------------------------------------------------------
+
+/// Borrowed-slice view of a single CSC column.
+///
+/// Returns `(indices, data)` for column `col` — the row indices and
+/// values stored under that column. Zero-copy hot path; useful when a
+/// caller iterates one column at a time without materializing a new
+/// `ScxCsc`.
+///
+/// Panics if `col >= indptr.len() - 1`. Callers are expected to bound
+/// `col < n_cols` from a known-correct `ScxCsc`.
+pub fn project_csc_column<'a>(
+    indptr: &[i64],
+    indices: &'a [i32],
+    data: &'a [f32],
+    col: usize,
+) -> (&'a [i32], &'a [f32]) {
+    let start = indptr[col] as usize;
+    let end = indptr[col + 1] as usize;
+    (&indices[start..end], &data[start..end])
+}
+
+/// Project an entire `ScxCsc` matrix to keep only the specified gene
+/// (column) indices.
+///
+/// Mirrors [`project_csr`] for the column axis. `gene_indices` are the
+/// original column indices to retain; sorted internally if not already
+/// sorted, deduplicated. Output column indices are remapped to
+/// `0..gene_indices.len()` (position in the deduplicated/sorted set).
+/// Row indices in the output are unchanged from the input (CSC indices
+/// are already global row IDs).
+pub fn project_csc(csc: &ScxCsc, gene_indices: &[u32]) -> ScxCsc {
+    let mut sorted_genes: Vec<u32> = gene_indices.to_vec();
+    sorted_genes.sort_unstable();
+    sorted_genes.dedup();
+
+    let n_rows = csc.n_rows();
+    let n_cols_out = sorted_genes.len();
+
+    // Pre-compute total nnz to size buffers without growth churn.
+    let mut total_nnz: usize = 0;
+    for &g in &sorted_genes {
+        let g = g as usize;
+        if g >= csc.n_cols() {
+            // Out-of-range gene index contributes nothing; skip.
+            continue;
+        }
+        total_nnz += (csc.indptr[g + 1] - csc.indptr[g]) as usize;
+    }
+
+    let mut new_indptr = Vec::with_capacity(n_cols_out + 1);
+    new_indptr.push(0i64);
+    let mut new_indices = Vec::with_capacity(total_nnz);
+    let mut new_data = Vec::with_capacity(total_nnz);
+
+    for &g in &sorted_genes {
+        let g = g as usize;
+        if g < csc.n_cols() {
+            let (col_idx, col_data) = project_csc_column(&csc.indptr, &csc.indices, &csc.data, g);
+            new_indices.extend_from_slice(col_idx);
+            new_data.extend_from_slice(col_data);
+        }
+        new_indptr.push(new_data.len() as i64);
+    }
+
+    ScxCsc::new_unchecked((n_rows, n_cols_out), new_indptr, new_indices, new_data)
 }
 
 #[cfg(test)]
@@ -504,6 +574,117 @@ mod tests {
         assert_eq!(projected.indptr, indptr2);
         assert_eq!(projected.indices, indices2);
         assert_eq!(projected.data, data2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase E.4: project_csc / project_csc_column
+    // -----------------------------------------------------------------------
+
+    fn sample_csc() -> ScxCsc {
+        // 3×5 matrix (transpose of sample_csr's 3x10 — different fixture
+        // for clarity here):
+        //   col 0: row 1 -> 1.0
+        //   col 1: row 0 -> 5.0
+        //   col 2: row 1 -> 3.0, row 2 -> 2.0
+        //   col 3: row 0 -> 10.0
+        //   col 4: row 1 -> 7.0
+        ScxCsc::new(
+            (3, 5),
+            vec![0, 1, 2, 4, 5, 6],
+            vec![1, 0, 1, 2, 0, 1],
+            vec![1.0, 5.0, 3.0, 2.0, 10.0, 7.0],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn project_csc_column_borrowed_slice() {
+        let csc = sample_csc();
+        let (col2_idx, col2_data) = project_csc_column(&csc.indptr, &csc.indices, &csc.data, 2);
+        assert_eq!(col2_idx, &[1, 2]);
+        assert_eq!(col2_data, &[3.0, 2.0]);
+
+        let (col0_idx, col0_data) = project_csc_column(&csc.indptr, &csc.indices, &csc.data, 0);
+        assert_eq!(col0_idx, &[1]);
+        assert_eq!(col0_data, &[1.0]);
+    }
+
+    #[test]
+    fn project_csc_basic() {
+        let csc = sample_csc();
+        // Select columns {0, 2, 4} → 3 columns of output, in remapped
+        // 0..3 order.
+        let projected = project_csc(&csc, &[0, 2, 4]);
+        assert_eq!(projected.shape, (3, 3));
+        assert_eq!(projected.nnz(), 4);
+        // col 0 (orig 0): row 1 -> 1.0
+        assert_eq!(&projected.indptr[0..2], &[0, 1]);
+        assert_eq!(&projected.indices[0..1], &[1]);
+        assert_eq!(&projected.data[0..1], &[1.0]);
+        // col 1 (orig 2): row 1 -> 3.0, row 2 -> 2.0
+        assert_eq!(projected.indptr[2], 3);
+        assert_eq!(&projected.indices[1..3], &[1, 2]);
+        assert_eq!(&projected.data[1..3], &[3.0, 2.0]);
+        // col 2 (orig 4): row 1 -> 7.0
+        assert_eq!(projected.indptr[3], 4);
+        assert_eq!(projected.indices[3], 1);
+        assert_eq!(projected.data[3], 7.0);
+    }
+
+    #[test]
+    fn project_csc_unsorted_input() {
+        let csc = sample_csc();
+        let a = project_csc(&csc, &[4, 0, 2]);
+        let b = project_csc(&csc, &[0, 2, 4]);
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.indptr, b.indptr);
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.data, b.data);
+    }
+
+    #[test]
+    fn project_csc_dedup() {
+        let csc = sample_csc();
+        let projected = project_csc(&csc, &[2, 2, 2]);
+        // Three duplicates of column 2 should collapse to one.
+        assert_eq!(projected.shape, (3, 1));
+        assert_eq!(projected.nnz(), 2);
+    }
+
+    #[test]
+    fn project_csc_empty_indices() {
+        let csc = sample_csc();
+        let projected = project_csc(&csc, &[]);
+        assert_eq!(projected.shape, (3, 0));
+        assert_eq!(projected.nnz(), 0);
+    }
+
+    #[test]
+    fn project_csc_out_of_range_gene_skipped() {
+        let csc = sample_csc(); // 5 columns
+                                // Gene 99 is past the end; should be skipped, leaving an empty
+                                // projected column.
+        let projected = project_csc(&csc, &[2, 99]);
+        assert_eq!(projected.shape, (3, 2));
+        // Output col 0 (orig 2) has 2 nnz; col 1 (orig 99) has 0.
+        assert_eq!(projected.indptr, vec![0, 2, 2]);
+    }
+
+    /// Densified equivalence: project then to_dense == to_dense then
+    /// column-slice.
+    #[test]
+    fn project_csc_dense_equivalence() {
+        let csc = sample_csc();
+        let dense_full = csc.to_dense().unwrap(); // row-major, 3×5
+        let projected = project_csc(&csc, &[1, 3]);
+        let dense_proj = projected.to_dense().unwrap();
+        // Reference: dense matrix's columns 1 and 3 in column-major sense
+        let mut expected = vec![0.0f32; 3 * 2];
+        for r in 0..3 {
+            expected[r * 2] = dense_full[r * 5 + 1];
+            expected[r * 2 + 1] = dense_full[r * 5 + 3];
+        }
+        assert_eq!(dense_proj, expected);
     }
 
     #[test]

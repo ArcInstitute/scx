@@ -12,8 +12,8 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 
-use scx_format::BackedCsrReader;
-use scx_sparse::ScxCsr;
+use scx_format::{BackedCscReader, BackedCsrReader};
+use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::anndata::csr_to_scipy;
 use crate::backed::ScxComparisonResult;
@@ -39,6 +39,24 @@ pub enum Transform {
     /// Per-row multiply by a scalar vector.
     /// Used by normalize_total(inplace=False) which returns X * (target_sum / row_sums).
     RowScale { factors: Arc<Vec<f64>> },
+}
+
+impl Transform {
+    /// Returns `true` iff the transform's output for a given matrix
+    /// element depends only on its own column (not on row sums or
+    /// per-row factors).
+    ///
+    /// Used by `LazyShardSource`'s `ColumnShardSource` implementation
+    /// and `ScxBackedSparseDataset::as_column_source()` as the
+    /// transform-chain compatibility test for CSC dispatch — see
+    /// CSC-SUPPORT.md Phase E.3.
+    ///
+    /// - `Log1p`: `ln(x + 1)` is element-wise, no row context. **true**
+    /// - `NormalizeTotal`: divides by per-row sum. **false**
+    /// - `RowScale`: multiplies each row by a per-row factor. **false**
+    pub fn is_column_local(&self) -> bool {
+        matches!(self, Transform::Log1p)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,9 +108,15 @@ impl ScxLazyTransformedDataset {
     /// Supports column projection: when active, `LazyShardSource` applies
     /// per-shard column filtering and reports `n_vars()` as the projected
     /// column count.
+    ///
+    /// The lazy CSR-only path retains its existing behavior; the
+    /// `backed_csc` field is initialized to `None` here and populated
+    /// only on dataset-construction paths that explicitly opt into CSC
+    /// (see `ScxBackedSparseDataset::with_csc_reader`, Phase E.3).
     pub(crate) fn as_shard_source(&self) -> LazyShardSource {
         LazyShardSource {
             backed: Arc::clone(&self.backed),
+            backed_csc: None,
             transforms: self.transforms.clone(),
             kept_to_global: self.kept_to_global.clone(),
             col_projection: self.col_projection.clone(),
@@ -1663,6 +1687,11 @@ fn apply_single_transform(csr: &mut ScxCsr, transform: &Transform, global_row_of
 /// lazy-transformed data without materializing the full matrix.
 pub(crate) struct LazyShardSource {
     backed: Arc<BackedCsrReader>,
+    /// Optional CSC sidecar reader. Populated when the underlying file
+    /// has CSC shards AND the open path requests CSC capability.
+    /// `None` ⇒ this `LazyShardSource` cannot serve `ColumnShardSource`
+    /// methods (they will return an error).
+    backed_csc: Option<Arc<BackedCscReader>>,
     transforms: Vec<Transform>,
     kept_to_global: Option<Arc<Vec<u64>>>,
     col_projection: Option<Arc<Vec<u32>>>,
@@ -1685,6 +1714,35 @@ impl LazyShardSource {
     ) -> Self {
         LazyShardSource {
             backed,
+            backed_csc: None,
+            transforms,
+            kept_to_global,
+            col_projection,
+            shape_val: (n_obs, n_vars),
+        }
+    }
+
+    /// Create a shard source with both CSR and CSC backings.
+    ///
+    /// Used by callers that want CSC-capable streaming. The CSC reader
+    /// must already be constructed (typically by the caller after
+    /// inspecting `header.has_csc()`).
+    ///
+    /// Phase E.3 plumbs the field; Phase F's consumer dispatch is the
+    /// first caller. `#[allow(dead_code)]` while waiting for that.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_csc(
+        backed: Arc<BackedCsrReader>,
+        backed_csc: Option<Arc<BackedCscReader>>,
+        transforms: Vec<Transform>,
+        kept_to_global: Option<Arc<Vec<u64>>>,
+        col_projection: Option<Arc<Vec<u32>>>,
+        n_obs: usize,
+        n_vars: usize,
+    ) -> Self {
+        LazyShardSource {
+            backed,
+            backed_csc,
             transforms,
             kept_to_global,
             col_projection,
@@ -1706,11 +1764,28 @@ impl LazyShardSource {
         let n_obs = kept_to_global.len();
         LazyShardSource {
             backed,
+            backed_csc: None,
             transforms,
             kept_to_global: Some(Arc::new(kept_to_global)),
             col_projection,
             shape_val: (n_obs, n_vars),
         }
+    }
+
+    /// Returns `true` if this lazy source can serve CSC reads:
+    /// CSC sidecar present, all transforms column-local, no row
+    /// deletion vector active.
+    ///
+    /// This is the predicate used by Phase F's
+    /// `ScxLazyTransformedDataset::as_column_source()` once it lands
+    /// (the analog to `ScxBackedSparseDataset::as_column_source` for
+    /// the lazy-transformed wrapper). `#[allow(dead_code)]` while
+    /// Phase F is pending.
+    #[allow(dead_code)]
+    pub(crate) fn supports_csc(&self) -> bool {
+        self.backed_csc.is_some()
+            && self.transforms.iter().all(Transform::is_column_local)
+            && self.kept_to_global.is_none()
     }
 }
 
@@ -1779,6 +1854,118 @@ impl scx_format::ShardSource for LazyShardSource {
 
     // col_means_and_sum_sq: use the default trait impl which iterates
     // read_shard() — transforms and col_projection are applied per-shard.
+}
+
+/// Apply column-local transforms in-place on a decoded CSC shard.
+///
+/// The capability gate at `ScxBackedSparseDataset::as_column_source`
+/// usually filters out non-column-local transforms before this path
+/// runs. As a defense in depth, this helper returns an error rather
+/// than silently producing wrong results if a non-column-local
+/// transform sneaks through (e.g., a future caller that bypasses the
+/// gate).
+fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) -> scx_format::Result<()> {
+    for transform in transforms {
+        match transform {
+            Transform::Log1p => {
+                for v in &mut csc.data {
+                    *v = v.ln_1p();
+                }
+            }
+            Transform::NormalizeTotal { .. } | Transform::RowScale { .. } => {
+                return Err(scx_format::ScxError::Io(std::io::Error::other(
+                    "CSC unavailable: chain contains a non-column-local transform \
+                     (NormalizeTotal or RowScale). Use prefer_format='csr' or remove \
+                     the transform.",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl scx_format::ColumnShardSource for LazyShardSource {
+    fn n_csc_shards(&self) -> usize {
+        match &self.backed_csc {
+            Some(b) => b.n_shards(),
+            None => 0,
+        }
+    }
+
+    fn n_obs(&self) -> usize {
+        self.shape_val.0
+    }
+
+    fn n_vars(&self) -> usize {
+        match &self.col_projection {
+            Some(cols) => cols.len(),
+            None => self.shape_val.1,
+        }
+    }
+
+    fn read_csc_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsc> {
+        if self.kept_to_global.is_some() {
+            return Err(scx_format::ScxError::Io(std::io::Error::other(
+                "CSC unavailable: row deletion vector is active",
+            )));
+        }
+        let backed = self.backed_csc.as_ref().ok_or_else(|| {
+            scx_format::ScxError::Io(std::io::Error::other(
+                "CSC unavailable: file has no CSC sidecar (open with CSC enabled)",
+            ))
+        })?;
+        let mut csc = (*backed.read_shard_cached(shard_idx)?).clone();
+        apply_transforms_to_csc(&self.transforms, &mut csc)?;
+        if let Some(ref cols) = self.col_projection {
+            csc = scx_engine::projection::project_csc(&csc, cols);
+        }
+        Ok(csc)
+    }
+
+    fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> scx_format::Result<ScxCsc> {
+        if self.kept_to_global.is_some() {
+            return Err(scx_format::ScxError::Io(std::io::Error::other(
+                "CSC unavailable: row deletion vector is active",
+            )));
+        }
+        let backed = self.backed_csc.as_ref().ok_or_else(|| {
+            scx_format::ScxError::Io(std::io::Error::other(
+                "CSC unavailable: file has no CSC sidecar (open with CSC enabled)",
+            ))
+        })?;
+
+        // When a column projection is active, the user-facing column
+        // axis is the projected one. Translate the projected range into
+        // the underlying global range, fetch via the inner reader, and
+        // re-project the result to the projected axis.
+        let mut csc = match &self.col_projection {
+            Some(proj) => {
+                let lo = col_range.start as usize;
+                let hi = (col_range.end as usize).min(proj.len());
+                if lo >= hi {
+                    // Empty range — return an empty CSC sized to the
+                    // projected n_vars window.
+                    return Ok(ScxCsc::new_unchecked(
+                        (self.shape_val.0, 0),
+                        vec![0],
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+                let global_subset = &proj[lo..hi];
+                backed.read_csc_columns_subset(global_subset)?
+            }
+            None => backed.read_csc_columns(col_range)?,
+        };
+
+        apply_transforms_to_csc(&self.transforms, &mut csc)?;
+        Ok(csc)
+    }
+
+    fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {
+        let backed = self.backed_csc.as_ref()?;
+        scx_format::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)
+    }
 }
 
 /// Extract specific rows from a CSR by local (within-shard) row indices.
