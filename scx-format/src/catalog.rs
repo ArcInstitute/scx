@@ -871,4 +871,105 @@ mod tests {
             .collect();
         assert!(starts.windows(2).all(|w| w[0] <= w[1]));
     }
+
+    /// Phase B.3: 4-shard CSC layout with non-uniform column sizes.
+    /// Confirm csc_shards_for_col_range returns exactly the overlapping
+    /// subset for various queries, and that it sorts the result by
+    /// `major_start()`.
+    #[test]
+    fn csc_shards_for_col_range_filters_overlapping() {
+        // 4 CSC shards covering [0, 100), [100, 250), [250, 260), [260, 1000).
+        let cscs: Vec<(u64, u64)> = vec![(0, 100), (100, 250), (250, 260), (260, 1000)];
+
+        let mut entries = Vec::new();
+        // Insert in shuffled order so we exercise the sort.
+        let order = [2usize, 0, 3, 1];
+        for &i in &order {
+            let (lo, hi) = cscs[i];
+            entries.push(FullCatalogEntry {
+                name: format!("X_csc_shard_{i}"),
+                offset: 4352 + (i as u64) * 1_000_000,
+                length: 50_000,
+                section_type: SectionType::CscShard,
+                checksum: [0u8; 32],
+                stats: Some(ShardStats {
+                    row_start: lo, // axis-overload: col_start
+                    row_end: hi,   // axis-overload: col_end
+                    nnz: 1000,
+                    value_min: 0,
+                    value_max: 0,
+                    value_sum: 0,
+                    n_indexed_columns: 0,
+                    column_stats: vec![],
+                }),
+            });
+        }
+        // Sprinkle in a CSR shard that should never be selected.
+        entries.push(FullCatalogEntry {
+            name: "X_shard_0".to_string(),
+            offset: 0,
+            length: 1,
+            section_type: SectionType::CsrShard,
+            checksum: [0u8; 32],
+            stats: Some(ShardStats {
+                row_start: 0,
+                row_end: 100,
+                nnz: 0,
+                value_min: 0,
+                value_max: 0,
+                value_sum: 0,
+                n_indexed_columns: 0,
+                column_stats: vec![],
+            }),
+        });
+
+        let catalog = FullCatalog {
+            catalog_version: 1,
+            manifest_sequence: 0,
+            prev_catalog_offset: 0,
+            n_obs: 0,
+            entries,
+        };
+
+        // Whole range: all 4 CSC shards in sorted order.
+        let all = catalog.csc_shards_for_col_range(0, 1000);
+        let starts: Vec<u64> = all
+            .iter()
+            .map(|e| e.stats.as_ref().unwrap().major_start())
+            .collect();
+        assert_eq!(starts, vec![0, 100, 250, 260]);
+
+        // Partial overlap on shards 0 and 1.
+        let mid = catalog.csc_shards_for_col_range(50, 200);
+        let starts: Vec<u64> = mid
+            .iter()
+            .map(|e| e.stats.as_ref().unwrap().major_start())
+            .collect();
+        assert_eq!(starts, vec![0, 100]);
+
+        // Hits only the tiny shard 2 (covers [250, 260)) and shard 3.
+        let tiny = catalog.csc_shards_for_col_range(255, 300);
+        let starts: Vec<u64> = tiny
+            .iter()
+            .map(|e| e.stats.as_ref().unwrap().major_start())
+            .collect();
+        assert_eq!(starts, vec![250, 260]);
+
+        // Exact-boundary query: [100, 250) is shard 1 alone (right edge
+        // is exclusive, so shard 2 [250, 260) is NOT included).
+        let exact = catalog.csc_shards_for_col_range(100, 250);
+        let starts: Vec<u64> = exact
+            .iter()
+            .map(|e| e.stats.as_ref().unwrap().major_start())
+            .collect();
+        assert_eq!(starts, vec![100]);
+
+        // Past the end: empty.
+        let past = catalog.csc_shards_for_col_range(2000, 3000);
+        assert!(past.is_empty());
+
+        // Empty range (lo == hi or lo > hi): empty.
+        assert!(catalog.csc_shards_for_col_range(50, 50).is_empty());
+        assert!(catalog.csc_shards_for_col_range(200, 100).is_empty());
+    }
 }
