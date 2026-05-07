@@ -551,6 +551,13 @@ def accel_formats() -> list[FormatVariant]:
         out.extend(accel_hvg_variants())
     except ImportError:
         pass
+    try:
+        from benchmarks.comprehensive.benchmarks.bench_csc_dispatch import (
+            bench_csc_dispatch_variants,
+        )
+        out.extend(bench_csc_dispatch_variants())
+    except ImportError:
+        pass
     return out
 
 
@@ -774,6 +781,12 @@ def estimate_memory_gb(
         # Loess fit uses f64 working arrays + per-gene variance accumulators.
         # Observed 33 GB peak on 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "bench_csc_dispatch":
+        # CSC dispatch benchmark — peak RSS dominated by the operation
+        # being run (qc / hvg / de / pseudobulk). DE chunked dense
+        # buffer is `n_obs × gene_chunk_size`; HVG keeps loess working
+        # arrays. Size roughly like accel_hvg.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark in ("accel_umap", "accel_leiden"):
         # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
         # 1M cells.
@@ -853,6 +866,11 @@ def estimate_time_minutes(
         "accel_leiden":           90,
         "accel_preprocess":       60,
         "accel_hvg":              45,
+        # CSC dispatch sweep runs eight ops (qc/hvg/de/pseudobulk × csr/csc)
+        # against a converted CSC-equipped fixture; one-shot conversion is
+        # cached per dataset so the per-variant work is bounded by the op
+        # itself.
+        "bench_csc_dispatch":     45,
     }
     base = base_minutes.get(benchmark, 15)
 

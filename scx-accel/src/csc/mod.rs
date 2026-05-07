@@ -19,6 +19,9 @@ pub mod wilcoxon;
 #[cfg(test)]
 mod test_helpers;
 
+#[cfg(test)]
+mod parity_test;
+
 pub use dispatch::{require_csc, PreferFormat};
 pub use mean_var::{streaming_clip_square_sum_csc, streaming_mean_var_csc};
 pub use pseudobulk::pseudobulk_aggregate_csc;
