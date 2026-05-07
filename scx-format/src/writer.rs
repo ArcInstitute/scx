@@ -14,7 +14,9 @@ use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::section::{align_to_8, SectionType};
-use crate::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE};
+use crate::shard::{
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE,
+};
 
 use crate::provenance::{Provenance, ProvenanceEntry};
 
@@ -431,7 +433,7 @@ impl ScxWriter {
         let shard_header = ShardHeader {
             magic: crate::shard::SHARD_MAGIC,
             shard_format_version: 1,
-            shard_type: 0, // CSR
+            shard_type: derive_shard_type(section_type),
             codec_id: codec_id as u8,
             value_encoding: value_encoding as u8,
             index_dtype: self.header.index_dtype,
@@ -1360,6 +1362,22 @@ mod tests {
         let csc_stats = csc_entries[0].stats.as_ref().unwrap();
         assert_eq!(csc_stats.nnz, 6);
 
+        // CSC shard's on-disk header byte must be `1` (Phase A.1).
+        let csc_section = &data[csc_entries[0].offset as usize..][..csc_entries[0].length as usize];
+        let csc_sh =
+            ShardHeader::read_from(&mut std::io::Cursor::new(&csc_section[..SHARD_HEADER_SIZE]))
+                .unwrap();
+        assert_eq!(csc_sh.shard_type, 1, "CSC shard_type byte must be 1");
+        assert!(csc_sh.is_csc(SectionType::CscShard));
+
+        // CSR shard byte must remain `0`.
+        let csr_section = &data[csr_entries[0].offset as usize..][..csr_entries[0].length as usize];
+        let csr_sh =
+            ShardHeader::read_from(&mut std::io::Cursor::new(&csr_section[..SHARD_HEADER_SIZE]))
+                .unwrap();
+        assert_eq!(csr_sh.shard_type, 0, "CSR shard_type byte must be 0");
+        assert!(!csr_sh.is_csc(SectionType::CsrShard));
+
         // All sections should be 8-byte aligned
         for entry in &catalog.entries {
             assert_eq!(
@@ -1445,6 +1463,347 @@ mod tests {
                 "has_csc should be true when CSC shards written"
             );
             assert_eq!(hdr.n_csc_shards, 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A.4 — CSC round-trip and codec sweep
+    // -----------------------------------------------------------------------
+
+    /// Build a 4-row, 6-column dense reference matrix with known entries.
+    ///
+    /// Returns `(dense_row_major, n_rows, n_cols)`. Used by the
+    /// multi-shard CSC round-trip test below to sanity-check
+    /// densification.
+    fn dense_4x6() -> (Vec<f32>, usize, usize) {
+        // Hand-picked sparse pattern across 6 columns; row indices in
+        // [0, 4), unsorted within each column to exercise the col_slice
+        // / concatenation paths without assuming sorted input.
+        let n_rows = 4usize;
+        let n_cols = 6usize;
+        #[rustfmt::skip]
+        let dense: Vec<f32> = vec![
+            // col: 0    1    2    3    4    5
+                   1.0, 0.0, 0.0, 4.0, 0.0, 7.0,
+                   0.0, 2.0, 5.0, 0.0, 0.0, 8.0,
+                   0.0, 0.0, 0.0, 0.0, 6.0, 0.0,
+                   3.0, 0.0, 0.0, 0.0, 0.0, 9.0,
+        ];
+        (dense, n_rows, n_cols)
+    }
+
+    /// Build CSC arrays for `cols` (a contiguous range of column
+    /// indices) over a dense row-major matrix. Returns the on-disk
+    /// layout: `(indptr_u64, indices_u32, values_le_bytes)`.
+    fn csc_arrays_for_col_range(
+        dense: &[f32],
+        n_rows: usize,
+        n_cols: usize,
+        col_start: usize,
+        col_end: usize,
+        encoding: ValueEncoding,
+    ) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+        let mut indptr: Vec<u64> = Vec::with_capacity(col_end - col_start + 1);
+        indptr.push(0);
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values_f32: Vec<f32> = Vec::new();
+
+        for col in col_start..col_end {
+            for row in 0..n_rows {
+                let v = dense[row * n_cols + col];
+                if v != 0.0 {
+                    indices.push(row as u32);
+                    values_f32.push(v);
+                }
+            }
+            indptr.push(indices.len() as u64);
+        }
+
+        // Encode values to LE bytes per the requested encoding.
+        let mut values_bytes = Vec::with_capacity(values_f32.len() * encoding.byte_width());
+        for &v in &values_f32 {
+            encoding.encode_f32(&mut values_bytes, v).unwrap();
+        }
+
+        (indptr, indices, values_bytes)
+    }
+
+    /// Build a header for a CSC round-trip test fixture.
+    fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
+        FileHeader {
+            magic: crate::header::MAGIC,
+            format_version: 1,
+            header_length: 256,
+            flags: 0,
+            n_obs,
+            n_vars,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: 16384,
+            codec_id: 0,
+            // u32 indices on disk (Phase A test fixtures use n_vars=6
+            // which fits in u16, but we want index_dtype to track
+            // arrays we hand the writer; the writer reads it from the
+            // header). u16 index_dtype byte = 0; u32 = 1.
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            reserved: [0u8; 132],
+        }
+    }
+
+    /// Round-trip a 2-shard CSC file and verify that
+    /// `read_all_csc_shards` densifies back to the source matrix.
+    #[test]
+    fn test_csc_two_shard_round_trip() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_shard_csc.scx");
+
+        let (dense, n_rows, n_cols) = dense_4x6();
+        let header = csc_test_header(n_rows as u64, n_cols as u64);
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        // Need a CSR shard so the file passes basic invariants
+        // (`n_obs > 0` requires at least one row-shard for downstream
+        // tools); use a tiny 4-row CSR shard with all zeros.
+        let csr_indptr = vec![0u64; n_rows + 1];
+        writer
+            .write_csr_shard(
+                &csr_indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // Shard 1: cols [0..3); shard 2: cols [3..6).
+        let (ip1, ix1, vb1) =
+            csc_arrays_for_col_range(&dense, n_rows, n_cols, 0, 3, ValueEncoding::Uint8);
+        let (ip2, ix2, vb2) =
+            csc_arrays_for_col_range(&dense, n_rows, n_cols, 3, 6, ValueEncoding::Uint8);
+
+        writer
+            .write_csc_shard(&ip1, &ix1, &vb1, CodecId::None, ValueEncoding::Uint8, 0)
+            .unwrap();
+        writer
+            .write_csc_shard(&ip2, &ix2, &vb2, CodecId::None, ValueEncoding::Uint8, 3)
+            .unwrap();
+
+        writer.finish().unwrap();
+
+        // Read back via the high-level CSC API.
+        let reader = ScxReader::open(&path).unwrap();
+        assert_eq!(reader.csc_shard_count(), 2);
+
+        let csc = reader.read_all_csc_shards().unwrap();
+        assert_eq!(csc.shape, (n_rows, n_cols));
+        let densified = csc.to_dense().unwrap();
+        assert_eq!(densified, dense);
+
+        // Per-shard reads also work.
+        let s0 = reader.read_csc_shard(0).unwrap();
+        assert_eq!(s0.n_cols(), 3);
+        let s1 = reader.read_csc_shard(1).unwrap();
+        assert_eq!(s1.n_cols(), 3);
+
+        // CSC entries in the catalog have correct col_start/col_end.
+        let csc_entries = reader.catalog().csc_shards_sorted();
+        assert_eq!(csc_entries.len(), 2);
+        let r0 = csc_entries[0].stats.as_ref().unwrap().col_range();
+        let r1 = csc_entries[1].stats.as_ref().unwrap().col_range();
+        assert_eq!(r0, 0..3);
+        assert_eq!(r1, 3..6);
+    }
+
+    /// Codec sweep: write a single CSC shard under every supported
+    /// codec × value-encoding combination and confirm round-trip
+    /// equality. Pcodec exercises a different decode path than
+    /// None/Zstd/Lz4Shuffle and is included.
+    ///
+    /// Scx1 is integer-only; combinations with Float32/Float16 are
+    /// skipped (they would error at encode time).
+    #[test]
+    fn test_csc_codec_sweep() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (dense, n_rows, n_cols) = dense_4x6();
+
+        let codecs = [
+            CodecId::None,
+            CodecId::Scx1,
+            CodecId::Zstd,
+            CodecId::Lz4Shuffle,
+            CodecId::Pcodec,
+        ];
+        let encodings = [
+            ValueEncoding::Uint8,
+            ValueEncoding::Uint16,
+            ValueEncoding::Uint32,
+            ValueEncoding::Float32,
+            ValueEncoding::Float16,
+        ];
+
+        for &codec in &codecs {
+            for &enc in &encodings {
+                if codec == CodecId::Scx1 && !enc.is_integer() {
+                    continue;
+                }
+                let label = format!("codec={codec:?}/enc={enc:?}");
+                let path = dir
+                    .path()
+                    .join(format!("csc_sweep_{}_{}.scx", codec as u8, enc as u8));
+                let header = csc_test_header(n_rows as u64, n_cols as u64);
+
+                let mut writer = ScxWriter::new(&path, header).unwrap();
+                writer.write_obs(&sample_obs()).unwrap();
+                writer.write_var(&sample_var()).unwrap();
+
+                // Empty CSR shard for the file invariant.
+                let csr_indptr = vec![0u64; n_rows + 1];
+                writer
+                    .write_csr_shard(
+                        &csr_indptr,
+                        &[],
+                        &[],
+                        CodecId::None,
+                        ValueEncoding::Uint8,
+                        0,
+                    )
+                    .unwrap();
+
+                let (ip, ix, vb) = csc_arrays_for_col_range(&dense, n_rows, n_cols, 0, n_cols, enc);
+                writer
+                    .write_csc_shard(&ip, &ix, &vb, codec, enc, 0)
+                    .unwrap();
+                writer.finish().unwrap();
+
+                let reader = ScxReader::open(&path).unwrap();
+                let csc = reader.read_all_csc_shards().unwrap();
+                let densified = csc.to_dense().unwrap();
+                assert_eq!(densified, dense, "round-trip mismatch for {label}");
+            }
+        }
+    }
+
+    /// `read_csc_columns(range)` — verify that arbitrary contiguous
+    /// column slices across a multi-shard layout match the
+    /// densify-then-slice reference. Phase A asserts correctness only;
+    /// shard-skip count assertions are deferred to Phase E.5 once
+    /// `BackedCscReader::enable_metrics()` lands.
+    #[test]
+    fn test_read_csc_columns_range_correctness() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc_range.scx");
+
+        let (dense, n_rows, n_cols) = dense_4x6();
+        let header = csc_test_header(n_rows as u64, n_cols as u64);
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let csr_indptr = vec![0u64; n_rows + 1];
+        writer
+            .write_csr_shard(
+                &csr_indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // Three CSC shards: cols [0..2), [2..4), [4..6).
+        for (col_start, col_end) in [(0usize, 2usize), (2, 4), (4, 6)] {
+            let (ip, ix, vb) = csc_arrays_for_col_range(
+                &dense,
+                n_rows,
+                n_cols,
+                col_start,
+                col_end,
+                ValueEncoding::Uint8,
+            );
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    col_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        assert_eq!(reader.csc_shard_count(), 3);
+
+        // Reference: dense slice for the same column range.
+        let dense_slice = |c_lo: usize, c_hi: usize| -> Vec<f32> {
+            let cols = c_hi - c_lo;
+            let mut out = vec![0.0f32; n_rows * cols];
+            for r in 0..n_rows {
+                for (out_c, src_c) in (c_lo..c_hi).enumerate() {
+                    out[r * cols + out_c] = dense[r * n_cols + src_c];
+                }
+            }
+            out
+        };
+
+        let cases = [
+            (0u32, 6u32),
+            (1, 3), // partial-overlap on shards 0 and 1
+            (2, 5), // partial-overlap on shards 1 and 2
+            (3, 4), // single shard, partial slice
+            (0, 0), // empty range
+            (4, 6), // exact shard boundary
+        ];
+        for (c_lo, c_hi) in cases {
+            let csc = reader.read_csc_columns(c_lo..c_hi).unwrap();
+            assert_eq!(
+                csc.shape,
+                (n_rows, (c_hi - c_lo) as usize),
+                "shape mismatch for cols [{c_lo}..{c_hi})"
+            );
+            let got = csc.to_dense().unwrap();
+            let want = dense_slice(c_lo as usize, c_hi as usize);
+            assert_eq!(got, want, "values mismatch for cols [{c_lo}..{c_hi})");
+        }
+
+        // read_csc_columns_subset over a sorted, non-contiguous selection.
+        let subset = [0u32, 2, 3, 5];
+        let csc = reader.read_csc_columns_subset(&subset).unwrap();
+        assert_eq!(csc.shape, (n_rows, subset.len()));
+        let got = csc.to_dense().unwrap();
+        for (out_c, &src_c) in subset.iter().enumerate() {
+            for r in 0..n_rows {
+                assert_eq!(
+                    got[r * subset.len() + out_c],
+                    dense[r * n_cols + src_c as usize],
+                    "subset mismatch at row {r} col {src_c}"
+                );
+            }
         }
     }
 }

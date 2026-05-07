@@ -202,9 +202,18 @@ pub fn column_name_hash(name: &str) -> u64 {
 /// Per-shard statistics stored in FullCatalogEntry.
 /// Phase 1: n_indexed_columns is always 0, column_stats is empty.
 /// Phase 2: column_stats may contain per-column MinMax or CategoryBitset entries.
+///
+/// Axis-overload: for `CscShard` entries, `row_start` / `row_end` are
+/// reused as `col_start` / `col_end` (the major-axis range of the
+/// shard). The on-disk schema is unchanged — use the
+/// `major_start()` / `major_end()` / `col_range()` / `row_range()`
+/// accessors below to read these fields with the right semantic name
+/// for the section type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShardStats {
+    /// CSR shards: row_start. CSC shards: col_start (axis overload).
     pub row_start: u64,
+    /// CSR shards: row_end. CSC shards: col_end (axis overload).
     pub row_end: u64,
     pub nnz: u64,
     pub value_min: u32,
@@ -220,6 +229,33 @@ pub struct ShardStats {
 pub const SHARD_STATS_BASE_SIZE: usize = 41; // 8+8+8+4+4+8+1
 
 impl ShardStats {
+    /// Generic major-axis start: row_start for CSR/Layer/Obsp, col_start
+    /// for CSC. The on-disk field is `row_start`; this accessor lets
+    /// callers read it with the right semantic name for the section
+    /// type.
+    pub fn major_start(&self) -> u64 {
+        self.row_start
+    }
+
+    /// Generic major-axis end: row_end for CSR/Layer/Obsp, col_end for
+    /// CSC. See [`Self::major_start`] for the rationale.
+    pub fn major_end(&self) -> u64 {
+        self.row_end
+    }
+
+    /// Row range. Pick this method when the entry is known to be a
+    /// row-major shard (CSR / LayerCsr / ObspCsr).
+    pub fn row_range(&self) -> std::ops::Range<u64> {
+        self.row_start..self.row_end
+    }
+
+    /// Column range. Pick this method when the entry is known to be a
+    /// `CscShard`. Returns the same on-disk fields as `row_range`,
+    /// renamed for clarity at the call site.
+    pub fn col_range(&self) -> std::ops::Range<u64> {
+        self.row_start..self.row_end
+    }
+
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u64::<LittleEndian>(self.row_start)?;
         w.write_u64::<LittleEndian>(self.row_end)?;
@@ -433,13 +469,61 @@ impl FullCatalog {
 
     /// Return CSR shard entries sorted by `stats.row_start`.
     /// Entries without stats are placed at the end.
+    ///
+    /// Note: this name is retained for backward compatibility but the
+    /// new `csr_shards_sorted()` form is preferred for readability when
+    /// CSC sidecars are also present.
     pub fn shards_sorted(&self) -> Vec<&FullCatalogEntry> {
+        self.csr_shards_sorted()
+    }
+
+    /// Return CSR shard entries sorted by `stats.row_start`.
+    /// Entries without stats are placed at the end.
+    pub fn csr_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
         let mut shards: Vec<_> = self
             .entries
             .iter()
             .filter(|e| e.section_type == SectionType::CsrShard)
             .collect();
-        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
+        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.major_start()));
+        shards
+    }
+
+    /// Return CSC shard entries sorted by `stats.major_start()`
+    /// (= `col_start` for CSC, by axis-overload). Entries without stats
+    /// go at the end.
+    pub fn csc_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .collect();
+        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.major_start()));
+        shards
+    }
+
+    /// Return CSC shard entries whose `[col_start, col_end)` range
+    /// intersects the requested half-open interval `[c_lo, c_hi)`.
+    /// Sorted by `col_start`. Used for column-range pushdown
+    /// (Phase B.2 / E.2).
+    pub fn csc_shards_for_col_range(&self, c_lo: u64, c_hi: u64) -> Vec<&FullCatalogEntry> {
+        if c_lo >= c_hi {
+            return Vec::new();
+        }
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                if e.section_type != SectionType::CscShard {
+                    return false;
+                }
+                match &e.stats {
+                    Some(s) => s.major_start() < c_hi && s.major_end() > c_lo,
+                    None => false,
+                }
+            })
+            .collect();
+        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.major_start()));
         shards
     }
 }

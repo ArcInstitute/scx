@@ -12,7 +12,9 @@ use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
-use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
+use scx_format::shard::{
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
+};
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
@@ -271,7 +273,7 @@ pub fn append(
         let sh = ShardHeader {
             magic: SHARD_MAGIC,
             shard_format_version: 1,
-            shard_type: 0,
+            shard_type: derive_shard_type(SectionType::CsrShard),
             codec_id: shard_codec as u8,
             value_encoding: value_encoding as u8,
             index_dtype: header.index_dtype,
