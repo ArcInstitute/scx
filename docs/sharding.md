@@ -282,3 +282,84 @@ Each shard can independently override the file-level `codec_id` and `value_encod
 enabling per-shard adaptive codec selection and mixed integer/float layers.
 
 For the full binary specification, see [format.md §CSR Shard Internal Layout](format.md#4-csr-shard-internal-layout).
+
+## CSC sharding
+
+A CSC sidecar is an optional **column-major view** of the same matrix
+data the CSR shards hold. The on-disk shard layout is the same as a
+CSR shard (76-byte header + indptr/indices/values + block index); only
+the field interpretation flips axes (`n_major` is columns,
+`global_offset` is `col_start`, `indices` are global row indices). See
+[format.md §4.1 CSC Shard Internal Layout](format.md#41-csc-shard-internal-layout).
+
+### When to add a CSC sidecar
+
+Add a CSC sidecar when your workload is **column-axis-heavy**:
+
+- **Differential expression** with small gene subsets (`pyscx.accel.rank_genes_groups(prefer_format="csc")`) — the kernel reads each chunk's columns as a single CSC slab instead of decoding every CSR row and projecting.
+- **Highly variable genes** at scale (`pyscx.accel.highly_variable_genes(prefer_format="csc")` for single-batch seurat_v3) — single-pass per-column accumulators with no `O(n_vars)` row-wise scratch.
+- **Per-gene QC** (`pyscx.accel.calculate_qc_metrics(prefer_format="csc")`) — gene-axis aggregations route through CSC.
+- **Filtered pseudobulk** (`pyscx.accel.pseudobulk_dex(prefer_format="csc", gene_indices=...)`) — only the requested gene columns are decoded.
+
+Skip the sidecar when the workload is **row-axis-only** (PCA — CSR
+already streams shards row-major; full-pass HVG without `prefer_format`
+arg; per-cell QC; subsetting by cells; ML training loaders). Both PCA
+methods (covariance and randomized SVD) explicitly reject
+`prefer_format="csc"` on the pyscx side; see
+[api.md §pyscx.accel](api.md#pyscxaccel--rust-native-accelerators).
+
+### `--csc-cols-per-shard`
+
+Multi-shard CSC is the default. Each emitted CSC shard covers a
+contiguous half-open `[col_start, col_end)` column range:
+
+```
+n_vars = 36000, --csc-cols-per-shard 5000 (default)
+                       ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬───┐
+CSC shards (8 total):  │ 0..5K│5..10K│10..15│15..20│20..25│25..30│30..35│..36│
+                       └──────┴──────┴──────┴──────┴──────┴──────┴──────┴───┘
+```
+
+`scx build-csc --csc-cols-per-shard N` and the matching kwargs on
+`pyscx.from_anndata`, `scx convert --csc-cols-per-shard`, and the
+`--rebuild-csc` flag on mutating ops all default to **5000 columns
+per shard**. Pass `0` for no cap (single CSC shard, memory permitting
+— the streaming transpose will still chunk internally to respect the
+`--memory-limit` budget).
+
+### Why multi-shard CSC
+
+Two reasons to split CSC by column range rather than emitting one
+giant shard:
+
+1. **Column-range pushdown.** `BackedCscReader::read_csc_columns(c_lo..c_hi)` consults `BackedCscIndex::shards_for_col_range(c_lo, c_hi)` and skips non-overlapping shards entirely; partial-overlap shards are sliced post-decode. With 5000 cols/shard on a 36K-gene matrix, a single-gene DE query touches one shard out of eight — a 7/8 I/O reduction even before catalog-level pushdown via `ShardStats.col_range`.
+2. **Bounded transpose memory.** The streaming CSR→CSC transpose chunks emitted shards by column range, so peak memory during `build-csc` (and convert-time CSC) scales with `csc_cols_per_shard × n_obs × 8 bytes` rather than the full matrix.
+
+### Cost: write-time transpose, ~equal storage
+
+CSC is an **additive** sidecar — CSR shards stay on disk unchanged,
+and the CSC shards add roughly the same compressed bytes (the same
+nnz, just laid out column-major; codec compression ratios are similar
+under Scx1 / Zstd / Pcodec).
+
+Write-time cost is one full-matrix transpose. The streaming transpose
+in `scx-sparse::transpose::streaming_csr_to_csc_iter_with_cap` keeps
+peak RAM bounded by the `--memory-limit` budget (default 4G).
+Throughput on a typical 1M-cell × 30K-gene file: ~10–20 seconds for
+build-csc on a single core, dominated by codec encoding.
+
+### Inspecting the CSC layout
+
+`scx info` shows the CSC shard count on the Shards line and prints a
+per-shard `cols a..b ({n} cols), nnz N` block when there are multiple
+CSC shards. The JSON output (`scx info --json`) gains a `csc_layout`
+array with `name`, `col_start`, `col_end`, `nnz` per shard.
+
+### Mutating ops drop CSC by default
+
+`scx append`, `scx compact`, `scx merge`, and `scx subset` change the
+row layout (or the column index space, in subset's case), so the
+existing CSC `indices` arrays would silently reference stale rows /
+columns. Each op therefore drops the CSC sidecar by default and emits
+a `log::warn!` message. Pass `--rebuild-csc` to re-emit the sidecar
+against the post-op output via `scx build-csc` + atomic rename.

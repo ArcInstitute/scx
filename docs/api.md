@@ -10,8 +10,13 @@ ObsIndex (1)           — Arrow IPC index for observations
 VarMetadata (2)        — Arrow IPC metadata for variables
 VarIndex (3)           — Arrow IPC index for variables
 CsrShard (4)           — Main expression matrix (row-major)
-CscShard (5)           — Gene-major view (not yet implemented)
-BitmapShard (6)        — Detection bitmap (not yet implemented)
+CscShard (5)           — Column-major (gene-major) sparse shard. Used
+                         for column-axis analytical workloads (DE, HVG,
+                         per-gene QC). Optional sidecar; written via
+                         `scx convert --csc=always` or `scx build-csc`.
+BitmapShard (6)        — Reserved; not produced by the current writer.
+                         Detection-presence bitmap was deferred to a
+                         future release.
 LayerCsrShard (7)      — Alternative expression layers
 ObsmEmbedding (8)      — Embeddings (obsm)
 ObspCsrShard (9)       — Cell-cell graphs (obsp)
@@ -30,6 +35,14 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - `read_obs()`/`read_var()` — Arrow RecordBatch metadata
 - `read_csr_shard(idx)` — Single shard as `(Vec<i64>, Vec<i32>, Vec<f32>)`
 - `read_all_csr_shards()` — Full matrix as `ScxCsr` (parallel via rayon)
+- `read_csc_shard(idx)` — Single CSC sidecar shard as `ScxCsc`
+- `read_all_csc_shards()` — Concatenated CSC matrix as `ScxCsc`
+- `read_csc_columns(col_range)` — CSC columns covering a half-open
+  `Range<u32>`; only shards overlapping the range are decoded
+- `read_csc_columns_subset(cols)` — CSC columns gathered from a sorted
+  unique `&[u32]`; contiguous runs are read in a single decode
+- `csc_shard_count()` — Number of CSC sidecar shards (0 when
+  `header.has_csc()` is false)
 - `read_layer(name)` — Named layer as `ScxCsr`
 - `layer_names()` — List available layer names
 - `read_obsm(name)` / `read_all_obsm()` — Embeddings as Arrow RecordBatch
@@ -54,7 +67,13 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - `write_obsm(name, batch)` — Embeddings
 - `write_uns(json)` — JSON metadata
 - `write_provenance(operations)` — Operation history
-- `write_csc_shard(...)` — CSC (column-major) expression data
+- `write_csc_shard(indptr, indices, values, codec_id, value_encoding, col_start)`
+  — Write a CSC sidecar shard. Fully supported. The catalog
+  `section_type` is `CscShard (5)`; the on-disk shard header carries
+  `shard_type = 1` going forward (readers also accept the legacy
+  `shard_type = 0` when the catalog `section_type` is `CscShard`).
+  `finish()` updates `header.n_csc_shards` from the writer's
+  internal counter and sets the `has_csc` flag bit.
 - `write_obs_predicate_index(data)` / `write_var_predicate_index(data)` — Predicate indexes for pushdown
 - `write_deletion_vectors(dv)` — Roaring Bitmap deletion vectors
 - `write_raw_shard(raw_bytes, section_type, name, stats, nnz)` — Pre-encoded shard passthrough
@@ -130,6 +149,60 @@ pub trait ShardSource {
 **Used by:** `scx-accel::randomized_pca()`, `streaming_spmm_forward()`, `streaming_spmm_transpose()` — all generic over `<S: ShardSource>` for zero-cost abstraction across the crate boundary.
 
 **Design note:** The trait is defined in `scx-format` (not `scx-accel`) so that `pyscx`'s `LazyShardSource` can implement it without creating a dependency on `scx-accel`. PCA functions in `scx-accel` are generic (`<S: ShardSource>`) rather than using `&dyn ShardSource` to allow monomorphization.
+
+## BackedCscReader (`scx-format/src/backed.rs`)
+
+Column-major counterpart to `BackedCsrReader`. Streams CSC sidecar
+shards from disk with an LRU shard cache, parallel to the CSR side.
+
+- `new(reader, cache_shards)` — Create from `ScxReader`. `cache_shards = 0` disables caching (one decode per call)
+- `index()` — Per-shard column-range index, sorted by `col_start`
+- `n_shards()` / `n_obs()` / `n_vars()` — Dimensions
+- `read_shard_uncached(idx)` → `ScxCsc` — Single CSC shard, bypass cache
+- `read_shard_cached(idx)` → `Arc<ScxCsc>` — Single CSC shard, through cache
+- `read_csc_columns(col_range)` → `ScxCsc` — Decode only shards overlapping the half-open range; partial-overlap shards are sliced post-decode
+- `read_csc_columns_subset(cols)` → `ScxCsc` — Gather columns from a sorted unique `&[u32]`; contiguous runs share a single decode
+- `enable_metrics()` / `metrics()` — Per-call hits / misses / decoded-bytes counters
+
+## ColumnShardSource Trait (`scx-format/src/shard_source.rs`)
+
+Sibling to `ShardSource` for column-major streaming. Defined in
+`scx-format` so consumers in `scx-accel` and `pyscx` can take the
+bound generically without depending on each other.
+
+```rust
+pub trait ColumnShardSource {
+    fn n_csc_shards(&self) -> usize;
+    fn n_obs(&self) -> usize;
+    fn n_vars(&self) -> usize;
+    fn shape(&self) -> (usize, usize) { (self.n_obs(), self.n_vars()) }
+    fn read_csc_shard(&self, shard_idx: usize) -> Result<ScxCsc>;
+    fn read_csc_columns(&self, col_range: Range<u32>) -> Result<ScxCsc>;
+    fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)>;
+}
+```
+
+**Implementations:**
+
+| Type | Crate | Behavior |
+|------|-------|---------|
+| `BackedCscReader` | `scx-format` | Reads raw decoded CSC shards from disk (cache + index-driven shard skip) |
+| `LazyShardSource` | `pyscx` (internal) | Applies the column-local subset of transforms (Log1p only) post-decode; honors column projection |
+
+**Capability gate:** the trait is *not* a sub-trait of `ShardSource`.
+Consumers that want CSC dispatch take the bound explicitly (`fn
+require_csc<S: ColumnShardSource>(...)`); the runtime "does this
+dataset support CSC?" question is answered exactly once at
+`ScxBackedSparseDataset::as_column_source()` /
+`ScxLazyTransformedDataset::as_column_source()`. Returns `Some` iff
+the file has a CSC sidecar AND the transform chain is column-local
+AND no row deletion vector is active. See `pyscx.accel.*
+prefer_format` below.
+
+**Used by:** `scx-accel::csc::{streaming_mean_var_csc,
+streaming_clip_square_sum_csc, wilcoxon_rank_sum_streaming_csc,
+pseudobulk_aggregate_csc}` and the `pyscx::projected_agg::*_csc`
+column-aggregation kernels.
 
 ## scx-ops — File Operations
 
@@ -358,11 +431,49 @@ download the file first for full data access.
 
 All accelerators write results to standard AnnData slots (same as scanpy), so downstream functions work identically.
 
+#### `prefer_format="csr"|"csc"` kwarg
+
+The following entries take an explicit `prefer_format` kwarg that
+chooses the row-major CSR path (default) or the column-major CSC
+sidecar path:
+
+- `pyscx.accel.highly_variable_genes`
+- `pyscx.accel.rank_genes_groups`
+- `pyscx.accel.pseudobulk_dex`
+- `pyscx.accel.calculate_qc_metrics`
+- `pyscx.accel.col_sums`, `col_nnz`, `col_min`, `col_max`, `col_var`
+
+Plus `pyscx.accel.pca`, which accepts the kwarg only to reject
+`prefer_format="csc"` with a `ValueError` — PCA's covariance build and
+randomized SpMM are row-major; CSC offers no measurable speed-up.
+
+**Defaults to `"csr"` everywhere.** No `"auto"` — the runtime can't
+guess whether CSC dispatch is safe (depends on the file having a
+sidecar AND the user's transform chain being column-local). No
+thread-local default. No env-var override. Each call sites the
+choice locally so dispatch never changes under the user's feet.
+
+`prefer_format="csc"` requires *all* of:
+
+1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always")`,
+   `scx convert --csc=always`, or `scx build-csc`).
+2. The transform chain on `adata.X` contains only column-local
+   operations. `Log1p` is column-local; `NormalizeTotal` and
+   `RowScale` are not (they reference per-row state). Mixed chains
+   like `normalize_total → log1p` are *not* column-local.
+3. No active row deletion vector (`adata.X.kept_to_global` is
+   `None`). Row deletions break the global-row indices encoded in
+   CSC `indices` arrays.
+
+When any of these is missing, `prefer_format="csc"` raises
+`RuntimeError` with a message naming the missing capability. Invalid
+`prefer_format` values (e.g. `"auto"`) raise `ValueError`.
+
 - `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. On GPU: cuSPARSE SpMM + cuSOLVER QR (f32).
 - `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — kNN graph + UMAP-style connectivities. CPU: HNSW. GPU: CAGRA (cuVS). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
 - `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — Spectral-init SGD UMAP. GPU: native CUDA kernel or cuML fallback. Writes `obsm["X_umap"]`.
-- `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50)` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set.
-- `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency.
+- `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr")` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set. `prefer_format="csc"` routes per-chunk reads through the column-major sidecar (see kwarg docs above).
+- `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency. `prefer_format="csc"` requires a gene subset (either an explicit `gene_indices` argument or a `col_projection` already set on `adata.X`); full-gene CSC pseudobulk has no measurable speed-up.
 - `pyscx.accel.rank_genes_groups_df(adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=False, tie_correct=False) → polars.DataFrame` — Same Wilcoxon as `rank_genes_groups()` but returns a polars DataFrame in cell-eval's `DEResults` schema: `(target, feature, fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change)`. Ready to feed into `cell_eval.initialize_de_comparison()`.
 - `pyscx.accel.pseudobulk_means(adata, groupby, min_cells_per_group=1) → (ndarray, list[str])` — Group-by mean on sparse X, streaming shard-by-shard (works on backed, lazy, scipy CSR, or dense). Returns `(means[P, G] float64, sorted group names)`. Foundation for the perturbation evaluation metrics below.
 - `pyscx.accel.perturbation_metrics(adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1) → dict[str, dict[str, float]]` — Bundled bulk metrics `{pearson_delta, mse, mae, mse_delta, mae_delta}` between paired real/pred AnnData. Matches cell-eval's metrics within atol=1e-6.
@@ -387,7 +498,13 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
   - `"leiden"`: no additional kwargs
 
   Raises `ValueError` for unknown operations. Note: estimates are approximate — cuSOLVER QR workspace may be undercounted by ~1.5×.
-- `pyscx.accel.calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True)` — Streaming QC metrics for backed/lazy data without materialization. Computes per-cell `n_genes_by_counts`, `total_counts` and per-gene `n_cells_by_counts`, `total_counts`. Supports `qc_vars` for gene subsets (e.g., `["mt"]` for mitochondrial percentage). When `inplace=True`, writes to `adata.obs`/`adata.var`; when `False`, returns `(obs_df, var_df)`. Falls back to `sc.pp.calculate_qc_metrics()` for scipy/dense.
+- `pyscx.accel.calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True, prefer_format="csr")` — Streaming QC metrics for backed/lazy data without materialization. Computes per-cell `n_genes_by_counts`, `total_counts` and per-gene `n_cells_by_counts`, `total_counts`. Supports `qc_vars` for gene subsets (e.g., `["mt"]` for mitochondrial percentage). When `inplace=True`, writes to `adata.obs`/`adata.var`; when `False`, returns `(obs_df, var_df)`. `prefer_format="csc"` routes the gene-axis aggregation through the CSC sidecar (cell-axis stays CSR — row aggregations have no CSC win). Falls back to `sc.pp.calculate_qc_metrics()` for scipy/dense.
+- `pyscx.accel.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=False, n_bins=20, device="auto", prefer_format="csr")` — Streaming HVG selection. Default CPU + CSR streams `mean_var` and clipped sums shard-by-shard via `ShardSource`; multi-batch runs CSR. `prefer_format="csc"` routes single-batch seurat_v3 through `streaming_mean_var_csc` and `streaming_clip_square_sum_csc` (multi-batch + GPU + non-seurat_v3 flavors raise on CSC). Writes `var["highly_variable"]`, `var["means"]`, `var["variances"]`, `var["variances_norm"]`, `var["highly_variable_rank"]`.
+- `pyscx.accel.col_sums(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column sums on `ScxBackedSparseDataset`. Honors `col_projection` and `kept_to_global` on the CSR path; CSC dispatch requires no row deletion vector and (currently) only supports `ScxBackedSparseDataset` and `ScxLazyTransformedDataset` (CSR scipy / dense raises a helpful message — use the array-protocol `dataset.sum(axis=0)` for those).
+- `pyscx.accel.col_nnz(dataset, prefer_format="csr") → np.ndarray (i64)` — Streaming per-column NNZ. Same dispatch as `col_sums`.
+- `pyscx.accel.col_min(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column min. Implicit-zero correction (`mins[c] = min(mins[c], 0.0)` when `col_nnz[c] < n_obs`) applied on both paths.
+- `pyscx.accel.col_max(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column max. Symmetric implicit-zero correction.
+- `pyscx.accel.col_var(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column variance. CSR uses a two-pass formulation; CSC uses single-pass `(sum_x² - n·mean²) / n`. Numerically equivalent within f64 epsilon (verified by `pyscx/tests/test_csc_dispatch.py`).
 - `pyscx.accel.filter_cells(adata, min_genes=None, max_genes=None, min_counts=None, max_counts=None)` — Non-materializing cell QC filter for backed/lazy data. Computes row NNZ and/or row sums via streaming, builds a boolean mask, and updates the deletion vector (`kept_to_global`) on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Also slices `adata.obs`, `adata.obsm`, and updates `adata.layers` with the new deletion vector. Falls back to `sc.pp.filter_cells()` for scipy/dense.
 - `pyscx.accel.filter_genes(adata, min_cells=None, max_cells=None, min_counts=None, max_counts=None)` — Non-materializing gene QC filter for backed/lazy data. Computes column NNZ and/or column sums via streaming, builds a boolean mask, and sets `col_projection` on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Slices `adata.var` to match. Composes with existing column projections. Falls back to `sc.pp.filter_genes()` for scipy/dense.
 - `pyscx.accel.subset_obs(adata, mask_or_indices)` — Subset observations (cells) without materializing. Accepts a **boolean numpy mask** or **integer index array**. Creates a new deletion vector (`kept_to_global`) on the backing dataset, slices `adata.obs` and `adata.obsm`, and updates `adata.layers`. Composes correctly with existing deletion vectors. Falls back to numpy slicing for non-SCX data.

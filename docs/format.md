@@ -278,6 +278,79 @@ Default 10,000 cells per CSR shard. At 5% density × 30K genes → ~15M non-zero
 per shard → ~30–60 MB compressed. Rationale and tradeoffs are in
 [docs/sharding.md](sharding.md).
 
+## 4.1 CSC Shard Internal Layout
+
+CSC sidecar shards are an **optional column-major view** of the same
+data the CSR shards hold. They are emitted by `scx convert
+--csc=always`, `pyscx.from_anndata(csc="always")`, `scx build-csc`,
+and the `--rebuild-csc` flag on the mutating ops (`append`, `compact`,
+`merge`, `subset`).
+
+A CSC shard has the **same on-disk structure** as a CSR shard — same
+76-byte shard header, same encoded `indptr` / `indices` / `values`
+sections, same block index. The column-major semantics live in the
+field interpretation:
+
+| Field | CSR semantics | CSC semantics |
+|-------|---------------|---------------|
+| `shard_type` | `0` (legacy: also produced for CSC) | `1` (authoritative) — readers also accept `0` when the catalog `section_type` is `CscShard` (legacy compatibility) |
+| `n_major` | rows in this shard | **columns** in this shard |
+| `n_minor` | columns in full matrix | **rows** in full matrix (`n_obs`) |
+| `global_offset` | first row index | first **column** index covered by this shard |
+| `indptr` (length `n_major + 1`) | row-pointer | **column-pointer** |
+| `indices` (length `nnz`) | column indices in full matrix | **global row** indices in full matrix (CSC indices are NOT shard-local — they reference rows across all shards) |
+
+Catalog `section_type = CscShard (5)` is the authoritative
+discriminator; the in-shard `shard_type` byte exists for self-contained
+shard validation (e.g. exploded `.scxd` files where the catalog and
+shard live in separate files). Going forward writers emit `shard_type
+= 1`; readers also accept `shard_type = 0` for files written before
+the Phase A `derive_shard_type()` fix landed.
+
+### `ShardStats.row_start` / `row_end` axis overload
+
+CSC shards reuse the catalog `ShardStats.row_start` / `row_end` fields
+to record the **major-axis** range, which for CSC means
+`col_start..col_end`. The on-disk schema is unchanged from the CSR-only
+era; only the field interpretation differs.
+
+Code accessing these fields should pick by section type:
+
+| Method | When to use |
+|--------|-------------|
+| `ShardStats::major_start()` / `major_end()` | Generic — works for any shard type, returns the row range for CSR/Layer/Obsp and the col range for CSC. Use when the section type is unknown or when writing axis-agnostic helpers. |
+| `ShardStats::row_range()` | When the entry is known to be a row-major shard (`CsrShard`, `LayerCsrShard`, `ObspCsrShard`). |
+| `ShardStats::col_range()` | When the entry is known to be `CscShard`. |
+| Direct `ShardStats.row_start` field access | Allowed in legacy code paths but discouraged — prefer the accessors above. |
+
+A future format-version bump may rename the underlying fields (e.g. to
+`major_start` / `major_end`) without breaking on-disk compatibility,
+since the byte layout is unchanged. Until then the overload is
+documented but the schema stays put.
+
+### Multi-shard CSC layout
+
+A CSC sidecar may be split into multiple shards by column range
+(controlled by `--csc-cols-per-shard`, default 5000). Each shard
+covers a contiguous half-open `[col_start, col_end)` range; ranges are
+non-overlapping and sorted by `col_start`. The catalog's
+`csc_shards_sorted()` accessor returns the shards in column order.
+
+Column-range pushdown: `BackedCscReader::read_csc_columns(c_lo..c_hi)`
+uses `BackedCscIndex::shards_for_col_range(c_lo, c_hi)` to skip
+non-overlapping shards entirely; partial-overlap shards are sliced
+post-decode. See `docs/sharding.md` § CSC sharding.
+
+### `scx upgrade` preserves CSC
+
+`scx upgrade` (Phase B) re-emits the file through the current writer
+while preserving CSC sidecars: the CSR rewrite loop calls
+`writer.write_csr_shard()`, then the CSC entries are walked via
+`catalog.csc_shards_sorted()` and re-emitted via
+`writer.write_csc_shard()` on the new file. The post-upgrade file has
+identical CSC content (byte-equal under the same codec) and a
+correctly populated `n_csc_shards` count + `has_csc` flag.
+
 ## 5. Arrow IPC Metadata
 
 `obs` and `var` metadata are stored as **Arrow IPC file format** (not the
