@@ -58,6 +58,18 @@ enum Commands {
         /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
+        /// Whether to also emit a CSC sidecar at write time.
+        ///
+        /// `off` (default): CSR-only output, matches existing behavior.
+        /// `always`: also emits a CSC sidecar (column-major shards).
+        /// No `auto` mode — by design, users opt in explicitly.
+        #[arg(long, default_value = "off", value_parser = ["off", "always"])]
+        csc: String,
+        /// Columns per CSC shard when `--csc always` (default 5000).
+        ///
+        /// Pass `0` to disable the cap (single CSC shard, memory permitting).
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Display SCX file information
     Info {
@@ -298,6 +310,8 @@ fn main() {
             to,
             shard_size,
             codec,
+            csc,
+            csc_cols_per_shard,
         } => run_convert(
             &input,
             &output,
@@ -305,6 +319,8 @@ fn main() {
             to.as_deref(),
             shard_size,
             &codec,
+            &csc,
+            csc_cols_per_shard,
         ),
         Commands::Info {
             file,
@@ -431,6 +447,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_convert(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -438,6 +455,8 @@ fn run_convert(
     to: Option<&str>,
     shard_size: u32,
     codec: &str,
+    csc: &str,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine conversion direction from explicit flags or file extensions
     let direction = match (from, to) {
@@ -461,23 +480,54 @@ fn run_convert(
         }
     };
 
+    // CSC mode is meaningful only on input → SCX paths. Reject silently
+    // for output paths (h5ad / mtx) where the destination has no CSC
+    // concept.
+    let csc_always = match csc {
+        "off" => false,
+        "always" => true,
+        // clap value_parser already restricts to {off, always}; this
+        // arm is defensive.
+        other => return Err(format!("invalid --csc value: {other}").into()),
+    };
+
     // MTX conversions are always available (no hdf5 feature needed)
     match direction {
-        "mtx_to_scx" => return dispatch_mtx_to_scx(input, output, shard_size, codec),
+        "mtx_to_scx" => {
+            return dispatch_mtx_to_scx(
+                input,
+                output,
+                shard_size,
+                codec,
+                csc_always,
+                csc_cols_per_shard,
+            );
+        }
         "scx_to_mtx" => return dispatch_scx_to_mtx(input, output),
         _ => {}
     }
 
-    dispatch_convert(direction, input, output, shard_size, codec)
+    dispatch_convert(
+        direction,
+        input,
+        output,
+        shard_size,
+        codec,
+        csc_always,
+        csc_cols_per_shard,
+    )
 }
 
 #[cfg(feature = "hdf5")]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_convert(
     direction: &str,
     input: &std::path::Path,
     output: &std::path::Path,
     shard_size: u32,
     codec: &str,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -502,6 +552,8 @@ fn dispatch_convert(
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
         codec: explicit_codec,
+        csc: csc_always,
+        csc_cols_per_shard,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -531,12 +583,15 @@ fn dispatch_convert(
 }
 
 #[cfg(not(feature = "hdf5"))]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_convert(
     _direction: &str,
     _input: &std::path::Path,
     _output: &std::path::Path,
     _shard_size: u32,
     _codec: &str,
+    _csc_always: bool,
+    _csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
@@ -551,6 +606,8 @@ fn dispatch_mtx_to_scx(
     output: &std::path::Path,
     shard_size: u32,
     codec: &str,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::mtx_pipeline;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -564,8 +621,21 @@ fn dispatch_mtx_to_scx(
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
     mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
-
     pb.finish_and_clear();
+
+    // MTX conversion is delegated to the standalone `scx-mtx` crate,
+    // which doesn't know about CSC. When the user opts in via
+    // `--csc always`, post-process the just-written file with the
+    // existing build-csc machinery: write to `<output>.csc.tmp`, then
+    // atomically rename onto the final path. Costs an extra read pass
+    // but adds the CSC sidecar without modifying scx-mtx.
+    if csc_always {
+        let tmp = output.with_extension("scx.csc.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        build_csc::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard)?;
+        std::fs::rename(&tmp, output)?;
+    }
+
     println!("Converted {} -> {}", input.display(), output.display());
     Ok(())
 }

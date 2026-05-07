@@ -104,8 +104,17 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///     pyscx.from_anndata(adata, "output.scx")
 ///     pyscx.from_anndata(adata, "output.scx", codec="scx1", shard_size=8192)
 ///     pyscx.from_anndata(adata, "output.scx", in_place=True)
+///     pyscx.from_anndata(adata, "output.scx", csc="always")
+///
+/// `csc`: when `"always"`, also writes a CSC (column-major) sidecar.
+///   `"off"` (default) emits CSR shards only. No `"auto"` mode — CSC is
+///   opt-in by design (matches `scx convert --csc`).
+///
+/// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
+///   Pass `0` to disable the cap (single CSC shard, memory permitting).
 #[pyfunction]
-#[pyo3(signature = (adata, path, codec=None, shard_size=None, in_place=false))]
+#[pyo3(signature = (adata, path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000))]
+#[allow(clippy::too_many_arguments)]
 fn from_anndata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -113,8 +122,19 @@ fn from_anndata(
     codec: Option<&str>,
     shard_size: Option<u32>,
     in_place: bool,
+    csc: &str,
+    csc_cols_per_shard: usize,
 ) -> PyResult<()> {
-    anndata::from_anndata_impl(py, adata, path, codec, shard_size, in_place)
+    anndata::from_anndata_impl(
+        py,
+        adata,
+        path,
+        codec,
+        shard_size,
+        in_place,
+        csc,
+        csc_cols_per_shard,
+    )
 }
 
 /// Convert a 10x HDF5 file to SCX via scanpy.
@@ -123,8 +143,11 @@ fn from_anndata(
 /// `in_place` mirrors the `from_anndata()` parameter; it has no observable
 /// effect because the AnnData object returned by scanpy is freshly
 /// constructed and has no other reference.
+///
+/// `csc` and `csc_cols_per_shard` mirror `from_anndata` — see those docs.
 #[pyfunction]
-#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None, in_place=false))]
+#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000))]
+#[allow(clippy::too_many_arguments)]
 fn from_10x(
     py: Python<'_>,
     h5_path: &str,
@@ -132,10 +155,21 @@ fn from_10x(
     codec: Option<&str>,
     shard_size: Option<u32>,
     in_place: bool,
+    csc: &str,
+    csc_cols_per_shard: usize,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy")?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
-    anndata::from_anndata_impl(py, &adata, scx_path, codec, shard_size, in_place)
+    anndata::from_anndata_impl(
+        py,
+        &adata,
+        scx_path,
+        codec,
+        shard_size,
+        in_place,
+        csc,
+        csc_cols_per_shard,
+    )
 }
 
 /// Convert a Cell Ranger MTX directory to SCX.

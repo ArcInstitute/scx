@@ -115,13 +115,29 @@ scx_compute_lisi <- function(embeddings, labels,
 
 # ── Import functions (interop module) ──────────────────────────
 #' @export
-from_seurat <- function(seurat_obj, output_path) {
-  invisible(.Call(wrap__from_seurat, seurat_obj, output_path))
+from_seurat <- function(seurat_obj, output_path, codec = NULL,
+                        csc = FALSE, csc_cols_per_shard = 5000L) {
+  invisible(.Call(
+    wrap__from_seurat,
+    seurat_obj,
+    output_path,
+    if (is.null(codec)) NULL else as.character(codec),
+    as.logical(csc),
+    as.integer(csc_cols_per_shard)
+  ))
 }
 
 #' @export
-from_sce <- function(sce_obj, output_path) {
-  invisible(.Call(wrap__from_sce, sce_obj, output_path))
+from_sce <- function(sce_obj, output_path, codec = NULL,
+                     csc = FALSE, csc_cols_per_shard = 5000L) {
+  invisible(.Call(
+    wrap__from_sce,
+    sce_obj,
+    output_path,
+    if (is.null(codec)) NULL else as.character(codec),
+    as.logical(csc),
+    as.integer(csc_cols_per_shard)
+  ))
 }
 
 # nolint end

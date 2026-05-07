@@ -594,6 +594,14 @@ fn parse_codec_r(codec: Option<&str>) -> Result<Option<scx_codec::CodecId>> {
 ///
 /// Shared by `from_seurat` and `from_sce` — both extract R objects into
 /// the same (indptr, indices, values_bytes) representation, then delegate here.
+///
+/// `csc_always`: when true, also emits a CSC sidecar (multi-shard
+/// column-major). Uses the streaming transpose iterator with the same
+/// `csc_cols_per_shard` cap as `scx convert` and `pyscx.from_anndata`.
+/// Note: the "write dgCMatrix arrays directly via `write_csc_shard`"
+/// short-cut suggested in the original spec is not applicable —
+/// dgCMatrix is genes×cells while SCX-CSC is cells×genes (column-major
+/// over genes), so a full transpose is still required.
 #[allow(clippy::too_many_arguments)]
 fn write_csr_to_scx(
     output_path: &str,
@@ -606,6 +614,8 @@ fn write_csr_to_scx(
     obs_batch: &RecordBatch,
     var_batch: &RecordBatch,
     explicit_codec: Option<scx_codec::CodecId>,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<()> {
     use scx_codec::CodecId;
     use scx_format::header::FileHeader;
@@ -614,7 +624,7 @@ fn write_csr_to_scx(
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
     let shard_target_rows: usize = 16384;
-    let n_shards = (n_obs + shard_target_rows - 1) / shard_target_rows.max(1);
+    let n_shards = n_obs.div_ceil(shard_target_rows.max(1));
 
     let header = FileHeader {
         magic: scx_format::MAGIC,
@@ -655,6 +665,9 @@ fn write_csr_to_scx(
 
     let bw = value_encoding.byte_width();
     let mut row_start: usize = 0;
+    // Track the last shard's resolved codec; reused for the optional
+    // CSC sidecar so the two layouts share encoder semantics.
+    let mut last_csr_codec = CodecId::None;
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
@@ -679,6 +692,7 @@ fn write_csr_to_scx(
             }
             None => select_codec(shard_values, value_encoding),
         };
+        last_csr_codec = codec;
 
         writer
             .write_csr_shard(
@@ -694,11 +708,149 @@ fn write_csr_to_scx(
         row_start = row_end;
     }
 
+    // Optional CSC sidecar — streaming transpose over the full
+    // in-memory CSR matrix.
+    if csc_always && n_obs > 0 && n_vars > 0 {
+        write_csc_shards_from_csr_r(
+            &mut writer,
+            csr_indptr,
+            csr_indices,
+            values_bytes,
+            value_encoding,
+            n_obs,
+            n_vars,
+            last_csr_codec,
+            csc_cols_per_shard,
+        )?;
+    }
+
     writer
         .finish()
         .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
 
     Ok(())
+}
+
+/// Memory budget for the convert-time streaming CSR→CSC transpose
+/// (4 GiB, matches scx-cli and pyscx).
+const RSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Streaming CSR → CSC transpose over the in-memory `(csr_indptr,
+/// csr_indices, values_bytes)` arrays, writing each chunk as one CSC
+/// shard. Mirrors the helpers in `scx-cli::convert` and
+/// `pyscx::anndata` so all three import paths produce structurally
+/// identical CSC sidecars.
+#[allow(clippy::too_many_arguments)]
+fn write_csc_shards_from_csr_r(
+    writer: &mut scx_format::writer::ScxWriter,
+    csr_indptr: &[u64],
+    csr_indices: &[u32],
+    values_bytes: &[u8],
+    value_encoding: ValueEncoding,
+    n_obs: usize,
+    n_vars: usize,
+    codec_id: scx_codec::CodecId,
+    csc_cols_per_shard: usize,
+) -> Result<()> {
+    // Decode raw value bytes to f32 once (the streaming iterator works
+    // on f32 data internally).
+    let nnz = *csr_indptr.last().unwrap_or(&0) as usize;
+    let bw = value_encoding.byte_width();
+    let data_f32 = decode_values_to_f32(&values_bytes[..nnz * bw], value_encoding)?;
+    let indptr_i64: Vec<i64> = csr_indptr.iter().map(|&v| v as i64).collect();
+    let indices_i32: Vec<i32> = csr_indices.iter().map(|&v| v as i32).collect();
+
+    let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr_i64, indices_i32, data_f32);
+    let shards = std::slice::from_ref(&csr);
+
+    let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
+        shards,
+        n_obs,
+        n_vars,
+        RSCX_CSC_MEMORY_BYTES,
+        csc_cols_per_shard,
+    )
+    .map_err(|e| Error::Other(format!("CSC transpose: {}", e)))?;
+
+    loop {
+        let col_start = iter.current_col_start() as u64;
+        let chunk = match iter.next() {
+            Some(c) => c.map_err(|e| Error::Other(format!("CSC chunk: {}", e)))?,
+            None => break,
+        };
+        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
+        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
+        let raw_values = encode_values_from_f32(&chunk.data, value_encoding)?;
+        writer
+            .write_csc_shard(
+                &csc_indptr_u64,
+                &csc_indices_u32,
+                &raw_values,
+                codec_id,
+                value_encoding,
+                col_start,
+            )
+            .map_err(|e| Error::Other(format!("write_csc_shard failed: {}", e)))?;
+    }
+    Ok(())
+}
+
+/// Decode raw little-endian value bytes back to f32.
+fn decode_values_to_f32(values_bytes: &[u8], encoding: ValueEncoding) -> Result<Vec<f32>> {
+    match encoding {
+        ValueEncoding::Uint8 => Ok(values_bytes.iter().map(|&b| b as f32).collect()),
+        ValueEncoding::Uint16 => {
+            let n = values_bytes.len() / 2;
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let v = u16::from_le_bytes([values_bytes[2 * i], values_bytes[2 * i + 1]]);
+                out.push(v as f32);
+            }
+            Ok(out)
+        }
+        ValueEncoding::Uint32 => {
+            let n = values_bytes.len() / 4;
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let v = u32::from_le_bytes([
+                    values_bytes[4 * i],
+                    values_bytes[4 * i + 1],
+                    values_bytes[4 * i + 2],
+                    values_bytes[4 * i + 3],
+                ]);
+                out.push(v as f32);
+            }
+            Ok(out)
+        }
+        ValueEncoding::Float32 => {
+            let n = values_bytes.len() / 4;
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let v = f32::from_le_bytes([
+                    values_bytes[4 * i],
+                    values_bytes[4 * i + 1],
+                    values_bytes[4 * i + 2],
+                    values_bytes[4 * i + 3],
+                ]);
+                out.push(v);
+            }
+            Ok(out)
+        }
+        ValueEncoding::Float16 => Err(Error::Other(
+            "Float16 value encoding not supported by rscx CSC sidecar".into(),
+        )),
+    }
+}
+
+/// Encode f32 values back to the requested LE byte representation.
+fn encode_values_from_f32(values: &[f32], encoding: ValueEncoding) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(values.len() * encoding.byte_width());
+    for &v in values {
+        encoding
+            .encode_f32(&mut buf, v)
+            .map_err(|e| Error::Other(format!("encode_f32 failed: {}", e)))?;
+    }
+    Ok(buf)
 }
 
 // ─── Import from Seurat/SCE ─────────────────────────────────────────────────
@@ -708,10 +860,36 @@ fn write_csr_to_scx(
 /// Extracts the counts dgCMatrix (CSC, genes × cells), transposes to CSR
 /// (cells × genes), and writes via ScxWriter.
 /// Extracts meta.data → obs, feature metadata → var.
+///
+/// `csc`: when `TRUE`, also writes a CSC (column-major) sidecar.
+/// Default `FALSE` matches `scx convert --csc off`.
+///
+/// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
+/// Pass `0L` to disable the cap. Ignored when `csc = FALSE`.
 /// @export
 #[extendr]
-pub fn from_seurat(seurat_obj: Robj, output_path: &str, codec: Option<&str>) -> Result<()> {
+pub fn from_seurat(
+    seurat_obj: Robj,
+    output_path: &str,
+    codec: Option<&str>,
+    csc: Option<bool>,
+    csc_cols_per_shard: Option<i32>,
+) -> Result<()> {
     let explicit_codec = parse_codec_r(codec)?;
+    let csc_always = csc.unwrap_or(false);
+    let csc_cols_per_shard = csc_cols_per_shard
+        .map(|v| {
+            if v < 0 {
+                Err(Error::Other(format!(
+                    "csc_cols_per_shard must be >= 0, got {}",
+                    v
+                )))
+            } else {
+                Ok(v as usize)
+            }
+        })
+        .transpose()?
+        .unwrap_or(5000);
     // Single R!() call — moves seurat_obj once, returns a lightweight list
     let parts = R!("
         if (!requireNamespace('Seurat', quietly = TRUE))
@@ -756,15 +934,39 @@ pub fn from_seurat(seurat_obj: Robj, output_path: &str, codec: Option<&str>) -> 
         &obs_batch,
         &var_batch,
         explicit_codec,
+        csc_always,
+        csc_cols_per_shard,
     )
 }
 
 /// Import a SingleCellExperiment to an SCX file.
 /// Same CSC→CSR transpose as from_seurat.
+///
+/// `csc` and `csc_cols_per_shard` mirror `from_seurat` — see those docs.
 /// @export
 #[extendr]
-pub fn from_sce(sce_obj: Robj, output_path: &str, codec: Option<&str>) -> Result<()> {
+pub fn from_sce(
+    sce_obj: Robj,
+    output_path: &str,
+    codec: Option<&str>,
+    csc: Option<bool>,
+    csc_cols_per_shard: Option<i32>,
+) -> Result<()> {
     let explicit_codec = parse_codec_r(codec)?;
+    let csc_always = csc.unwrap_or(false);
+    let csc_cols_per_shard = csc_cols_per_shard
+        .map(|v| {
+            if v < 0 {
+                Err(Error::Other(format!(
+                    "csc_cols_per_shard must be >= 0, got {}",
+                    v
+                )))
+            } else {
+                Ok(v as usize)
+            }
+        })
+        .transpose()?
+        .unwrap_or(5000);
     // Single R!() call — moves sce_obj once, returns a lightweight list
     let parts = R!("
         if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
@@ -808,6 +1010,8 @@ pub fn from_sce(sce_obj: Robj, output_path: &str, codec: Option<&str>) -> Result
         &obs_batch,
         &var_batch,
         explicit_codec,
+        csc_always,
+        csc_cols_per_shard,
     )
 }
 

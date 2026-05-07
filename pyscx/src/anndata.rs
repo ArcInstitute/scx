@@ -21,6 +21,70 @@ use scx_format::{
 
 use crate::to_pyerr;
 
+/// Memory budget for the convert-time streaming CSR→CSC transpose.
+/// Matches scx-cli's convert pipeline. The full CSR matrix already
+/// lives in RAM at this point, so this only bounds the per-chunk
+/// transpose working set.
+const PYSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Streaming CSR → CSC transpose over the in-memory `(indptr, indices,
+/// data)` arrays, writing each emitted chunk as one CSC shard.
+///
+/// Mirrors `scx-cli::convert::write_csc_shards_from_csr` so the two
+/// import paths produce structurally identical CSC sidecars (same
+/// `csc_cols_per_shard`, same encoder).
+#[allow(clippy::too_many_arguments)]
+fn write_csc_shards_from_csr(
+    writer: &mut ScxWriter,
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    value_encoding: ValueEncoding,
+    codec_id: CodecId,
+    csc_cols_per_shard: usize,
+) -> Result<(), scx_format::ScxError> {
+    let csr = scx_sparse::ScxCsr::new_unchecked(
+        (n_obs, n_vars),
+        indptr.to_vec(),
+        indices.to_vec(),
+        data.to_vec(),
+    );
+    let shards = std::slice::from_ref(&csr);
+
+    let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
+        shards,
+        n_obs,
+        n_vars,
+        PYSCX_CSC_MEMORY_BYTES,
+        csc_cols_per_shard,
+    )
+    .map_err(|e| scx_format::ScxError::Io(std::io::Error::other(format!("CSC transpose: {e}"))))?;
+
+    loop {
+        let col_start = iter.current_col_start() as u64;
+        let chunk = match iter.next() {
+            Some(c) => c.map_err(|e| {
+                scx_format::ScxError::Io(std::io::Error::other(format!("CSC chunk: {e}")))
+            })?,
+            None => break,
+        };
+        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
+        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
+        let raw_values = encode_values(&chunk.data, value_encoding);
+        writer.write_csc_shard(
+            &csc_indptr_u64,
+            &csc_indices_u32,
+            &raw_values,
+            codec_id,
+            value_encoding,
+            col_start,
+        )?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // to_anndata: SCX → AnnData
 // ---------------------------------------------------------------------------
@@ -1367,6 +1431,7 @@ fn parallel_encode_csr_shards(
 /// indices in place (mutates `adata.X` / `adata.layers[*]`). When false
 /// (default), unsorted CSR inputs are copied via `.sorted_indices()` so
 /// the caller's matrices are untouched.
+#[allow(clippy::too_many_arguments)]
 pub fn from_anndata_impl(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -1374,9 +1439,20 @@ pub fn from_anndata_impl(
     codec: Option<&str>,
     shard_size: Option<u32>,
     in_place: bool,
+    csc: &str,
+    csc_cols_per_shard: usize,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
+    let csc_always = match csc {
+        "off" => false,
+        "always" => true,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "invalid csc value '{other}'; expected 'off' or 'always'"
+            )))
+        }
+    };
 
     // Extract X as CSR. By default we do not mutate caller-owned CSR
     // matrices; pass `in_place=true` to opt into the original in-place
@@ -1702,6 +1778,26 @@ pub fn from_anndata_impl(
         for section in l_pre_encoded {
             writer.write_preencoded_shard(section).map_err(to_pyerr)?;
         }
+    }
+
+    // Optional CSC sidecar — streaming transpose over the in-memory
+    // CSR view of X. Layers are CSR-only (no layer-CSC support yet,
+    // see CSC-SUPPORT.md Phase E.2 deferral).
+    if csc_always {
+        py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+            write_csc_shards_from_csr(
+                &mut writer,
+                indptr_slice,
+                indices_slice,
+                data_slice,
+                n_obs as usize,
+                n_vars as usize,
+                first_encoding,
+                header_codec,
+                csc_cols_per_shard,
+            )
+        })
+        .map_err(to_pyerr)?;
     }
 
     // Write provenance
