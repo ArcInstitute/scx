@@ -1793,6 +1793,158 @@ mod tests {
         }
     }
 
+    /// Phase J.2: validate() re-checks BLAKE3 for CSC shards via the
+    /// generic catalog walk. Build a CSR + CSC test file, verify all
+    /// CSC sections appear in the results and pass.
+    #[test]
+    fn test_validate_csc_shards_pass_on_clean_file() {
+        use crate::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc_clean.scx");
+
+        // Build a small CSR + CSC file directly.
+        let n_obs = 8usize;
+        let n_vars = 6usize;
+        let header = sample_header(n_obs as u64, n_vars as u64, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        // CSR (single shard)
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // CSC: two shards of 3 cols each.
+        for chunk_start in (0..n_vars).step_by(3) {
+            let chunk_end = (chunk_start + 3).min(n_vars);
+            let mut ip = vec![0u64];
+            let mut ix: Vec<u32> = Vec::new();
+            let mut vb: Vec<u8> = Vec::new();
+            for c in chunk_start..chunk_end {
+                ix.push((c % n_obs) as u32);
+                vb.push((c as u8) + 1);
+                ip.push(ix.len() as u64);
+            }
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    chunk_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let results = reader.validate().unwrap();
+
+        // Confirm the CSC shards are in the results AND all pass.
+        let csc_results: Vec<_> = results
+            .iter()
+            .filter(|(name, _)| name.starts_with("X_csc_shard_"))
+            .collect();
+        assert_eq!(csc_results.len(), 2, "expected 2 CSC shards in validate()");
+        for (name, passed) in &csc_results {
+            assert!(*passed, "CSC section '{}' failed checksum", name);
+        }
+
+        // Also confirm `validate()` walks every catalog entry: total
+        // results count >= number of catalog entries with CscShard
+        // type, so no CSC entry was silently skipped.
+        let n_csc_entries = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .count();
+        let n_csc_in_results = results
+            .iter()
+            .filter(|(name, _)| name.starts_with("X_csc_shard_"))
+            .count();
+        assert_eq!(n_csc_entries, n_csc_in_results);
+    }
+
+    /// Phase J.2: validate() flags corruption inside a CSC shard.
+    /// CSC is not in the "essential" set (corrupting only CSC
+    /// shouldn't fail the full file), so we expect Ok with a
+    /// `passed=false` row for the corrupted CSC section.
+    #[test]
+    fn test_validate_detects_csc_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc_corrupt.scx");
+
+        let n_obs = 6usize;
+        let n_vars = 4usize;
+        let header = sample_header(n_obs as u64, n_vars as u64, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        // One CSC shard.
+        let ip = vec![0u64, 1, 2, 3, 4];
+        let ix: Vec<u32> = vec![0, 1, 2, 3];
+        let vb: Vec<u8> = vec![10, 20, 30, 40];
+        writer
+            .write_csc_shard(&ip, &ix, &vb, CodecId::None, ValueEncoding::Uint8, 0)
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Find the CSC shard offset in the catalog.
+        let reader = ScxReader::open(&path).unwrap();
+        let csc_entry = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == crate::section::SectionType::CscShard)
+            .unwrap()
+            .clone();
+        let csc_offset = csc_entry.offset as usize;
+        drop(reader);
+
+        // Flip a byte in the CSC payload (after the 76-byte header).
+        let mut data = std::fs::read(&path).unwrap();
+        let corrupt_pos = csc_offset + SHARD_HEADER_SIZE + 1;
+        data[corrupt_pos] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        // validate() should NOT return Err (CSC is not "essential"),
+        // but should report the CSC section as failed.
+        let reader = ScxReader::open(&path).unwrap();
+        let results = reader.validate().expect(
+            "validate() should not error on CSC corruption since CSC is not \
+             in the essential-section set",
+        );
+        let csc_passed: bool = results
+            .iter()
+            .find(|(name, _)| name == &csc_entry.name)
+            .map(|(_, p)| *p)
+            .expect("CSC entry should appear in validate() results");
+        assert!(!csc_passed, "validate() should flag corrupted CSC section");
+    }
+
     // -----------------------------------------------------------------------
     // 16.8: Multi-operation provenance chain
     // -----------------------------------------------------------------------
