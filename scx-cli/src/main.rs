@@ -238,6 +238,15 @@ enum Commands {
         /// Overwrite output if it exists
         #[arg(long)]
         force: bool,
+        /// Maximum columns per emitted CSC shard (default: 5000).
+        ///
+        /// Drives multi-shard CSC layouts: the writer emits ceil(n_vars
+        /// / N) CSC shards, each covering a contiguous column range.
+        /// Smaller values enable finer-grained column-range pushdown at
+        /// read time but produce more shards. Pass 0 for no cap (single
+        /// shard, memory permitting).
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Extract a subset of cells and/or genes into a new SCX file
     Subset {
@@ -362,7 +371,8 @@ fn main() {
             output,
             memory_limit,
             force,
-        } => build_csc::run_build_csc(&input, &output, &memory_limit, force),
+            csc_cols_per_shard,
+        } => build_csc::run_build_csc(&input, &output, &memory_limit, force, csc_cols_per_shard),
         Commands::Subset {
             input,
             output,
