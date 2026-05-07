@@ -579,7 +579,20 @@ pub fn to_anndata_backed<'py>(
 
     // --- X: backed ---
     let x_reader = ScxReader::open(path).map_err(to_pyerr)?;
+    let has_csc = x_reader.header().has_csc();
     let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
+    let x_backed_csc: Option<Arc<scx_format::BackedCscReader>> = if has_csc {
+        // Open a separate ScxReader for the CSC sidecar (BackedCscReader
+        // takes ownership). Header check is cheap; the reader holds a
+        // mmap and per-shard catalog, but no shards decode until we
+        // actually call read_csc_shard().
+        let csc_reader = ScxReader::open(path).map_err(to_pyerr)?;
+        Some(Arc::new(
+            scx_format::BackedCscReader::new(csc_reader, cache_shards).map_err(to_pyerr)?,
+        ))
+    } else {
+        None
+    };
     let mut x_dataset = match &kept_to_global {
         Some(mapping) => ScxBackedSparseDataset::from_reader_with_deletions(
             Arc::clone(&x_backed),
@@ -588,6 +601,7 @@ pub fn to_anndata_backed<'py>(
         ),
         None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed), cache_shards),
     };
+    x_dataset.with_csc_reader(x_backed_csc);
     if let Some(ref indices) = col_indices {
         x_dataset.set_col_projection(indices.clone());
     }

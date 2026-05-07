@@ -225,7 +225,7 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
 /// Note: GPU mode uses f32 precision throughout (CPU uses f64 intermediates),
 /// producing slightly different but equally valid results. See docs/scanpy.md.
 #[pyfunction]
-#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder"))]
+#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", prefer_format="csr"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pca(
     py: Python<'_>,
@@ -238,6 +238,7 @@ pub fn pca(
     device: &str,
     method: &str,
     qr_method: &str,
+    prefer_format: &str,
 ) -> PyResult<()> {
     let _device = resolve_device(device)?;
     // Validate user args even on CPU path — catches typos regardless of device.
@@ -249,6 +250,19 @@ pub fn pca(
     if !matches!(qr_method, "householder" | "cholesky") {
         return Err(PyValueError::new_err(format!(
             "Invalid qr_method={qr_method:?}; expected 'householder' or 'cholesky'"
+        )));
+    }
+    // CSC dispatch is intentionally not implemented for PCA: the
+    // covariance build (`X^T @ X`) and randomized SpMM both consume
+    // shards in row-major order, where CSC offers no measurable
+    // speedup over CSR. Reject `prefer_format="csc"` explicitly so
+    // callers don't silently fall back and get confused.
+    if prefer_format != "csr" {
+        return Err(PyValueError::new_err(format!(
+            "pyscx.accel.pca only supports prefer_format='csr' \
+             (got {prefer_format:?}). The covariance build and \
+             randomized SpMM paths are row-major; CSC offers no \
+             measurable speed-up and is not implemented."
         )));
     }
     let backend: &str;

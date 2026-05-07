@@ -137,7 +137,13 @@ pub fn normalize_total(
                 target_sum,
             }],
             non_negative,
-        );
+        )
+        // Forward CSC sidecar so a later log1p() preserves the
+        // CSC-dispatch capability (NormalizeTotal itself is not
+        // column-local, but a NormalizeTotal+Log1p chain is — the
+        // gate at as_column_source() will reject it for now;
+        // carrying the handle costs nothing).
+        .with_csc_reader(backed_ref.backed_csc.clone());
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;
@@ -227,7 +233,10 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
             backed_ref.col_projection_arc(),
             vec![Transform::Log1p],
             non_negative,
-        );
+        )
+        // Forward CSC sidecar so the resulting log1p()-only chain
+        // remains CSC-dispatchable via as_column_source().
+        .with_csc_reader(backed_ref.backed_csc.clone());
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;

@@ -9,6 +9,7 @@
 //! When built with the `gpu` feature, GPU-accelerated variants are available:
 //! - [`randomized_pca_gpu`] — GPU PCA via cuSPARSE SpMM + cuSOLVER QR
 
+pub mod csc;
 pub mod diffexp;
 pub mod error;
 pub mod eval_metrics;
@@ -21,6 +22,10 @@ pub mod pca;
 pub mod pseudobulk;
 pub mod umap;
 
+pub use csc::{
+    pseudobulk_aggregate_csc, require_csc, streaming_clip_square_sum_csc, streaming_mean_var_csc,
+    wilcoxon_rank_sum_streaming_csc, PreferFormat,
+};
 pub use diffexp::{
     merge_diff_exp_results, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse,
     wilcoxon_rank_sum_streaming, DiffExpResult,
@@ -51,8 +56,9 @@ pub use pca::{
     COVARIANCE_PCA_THRESHOLD,
 };
 pub use pseudobulk::{
-    pseudobulk_aggregate, pseudobulk_aggregate_dense, pseudobulk_aggregate_from_slices,
-    pseudobulk_aggregate_inmemory, AggregationMethod, PseudobulkResult,
+    build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
+    pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,
+    PseudobulkResult,
 };
 pub use umap::{compute_umap, UmapResult};
 

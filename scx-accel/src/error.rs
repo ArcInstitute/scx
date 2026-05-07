@@ -24,6 +24,21 @@ pub enum AccelError {
 
     #[error("numerical instability: {0}")]
     NumericalInstability(String),
+
+    /// `prefer_format="csc"` was requested but the dataset cannot
+    /// service CSC reads. The inner string names the missing
+    /// capability — for example: no CSC sidecar on disk, a
+    /// non-column-local transform in the chain, or an active row
+    /// deletion vector. Surfaced as `RuntimeError` on the Python side.
+    #[error("CSC requested but unavailable: {0}")]
+    CscRequestedNotAvailable(String),
+
+    /// Sentinel returned by `csc::require_csc()` when the caller passed
+    /// `PreferFormat::Csr`. Lets callers branch on the return type
+    /// instead of duplicating the kwarg check at each call site;
+    /// never escapes to Python (callers map this to the CSR path).
+    #[error("CSC not requested (caller chose CSR)")]
+    CscNotRequested,
 }
 
 pub type Result<T> = std::result::Result<T, AccelError>;

@@ -273,6 +273,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_preprocessing(&accel_module)?;
     register_filtering(&accel_module)?;
     register_hvg(&accel_module)?;
+    register_col_aggs(&accel_module)?;
     register_eval_metrics(&accel_module)?;
     m.add_submodule(&accel_module)?;
 
@@ -410,6 +411,15 @@ fn register_filtering(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn register_hvg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::hvg::highly_variable_genes, m)?)?;
+    Ok(())
+}
+
+fn register_col_aggs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::col_aggs::col_sums, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::col_aggs::col_nnz, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::col_aggs::col_min, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::col_aggs::col_max, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::col_aggs::col_var, m)?)?;
     Ok(())
 }
 

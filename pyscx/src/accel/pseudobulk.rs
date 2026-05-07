@@ -27,7 +27,7 @@ use super::de::extract_strata;
 ///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
 ///     lfcSE, stat, pvalue, padj, target, reference
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50))]
+#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pseudobulk_dex(
     py: Python<'_>,
@@ -40,7 +40,14 @@ pub fn pseudobulk_dex(
     min_cells_per_group: usize,
     stratify_by: Option<Vec<String>>,
     min_cells_per_stratum: usize,
+    prefer_format: &str,
+    gene_indices: Option<Vec<u32>>,
 ) -> PyResult<PyObject> {
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+        )));
+    }
     // --- Stratified path ---
     if let Some(ref strat_cols) = stratify_by {
         // Forbidden columns: test_col and all groupby columns.
@@ -70,6 +77,8 @@ pub fn pseudobulk_dex(
                 min_cells_per_group,
                 None, // no nested stratification
                 50,   // unused since stratify_by=None
+                prefer_format,
+                gene_indices.clone(),
             ) {
                 Ok(result_obj) => {
                     let result_df = result_obj.bind(py);
@@ -146,7 +155,104 @@ pub fn pseudobulk_dex(
 
     // Perform aggregation: backed or in-memory.
     let x = adata.getattr("X")?;
-    let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+
+    let result = if prefer_format == "csc" {
+        // CSC dispatch (Phase F.4): requires a gene subset, since
+        // full-gene CSC pseudobulk has no measurable speedup over CSR.
+        // Resolve the gene subset: explicit `gene_indices` kwarg takes
+        // precedence; otherwise fall back to the dataset's
+        // `col_projection` if set.
+        let resolved_indices: Vec<u32> = if let Some(gi) = &gene_indices {
+            if gi.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "prefer_format='csc' requires non-empty gene_indices, \
+                     or a column projection on adata.X (e.g. via X[:, var_mask])",
+                ));
+            }
+            gi.clone()
+        } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            match backed.col_projection() {
+                Some(cols) => cols.to_vec(),
+                None => {
+                    return Err(PyRuntimeError::new_err(
+                        "prefer_format='csc' requires a gene subset; pass \
+                         gene_indices=... or apply a column projection \
+                         via adata[:, mask] / X[:, indices] before calling",
+                    ));
+                }
+            }
+        } else if let Ok(lazy) =
+            x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+        {
+            match lazy.col_projection() {
+                Some(cols) => cols.to_vec(),
+                None => {
+                    return Err(PyRuntimeError::new_err(
+                        "prefer_format='csc' requires a gene subset; pass \
+                         gene_indices=... or apply a column projection",
+                    ));
+                }
+            }
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' requires adata.X to be a backed or lazy \
+                 SCX dataset; got a regular scipy/dense matrix",
+            ));
+        };
+
+        let n_obs = obs_groups[0].len();
+        let (cell_to_group, group_labels) = scx_accel::build_group_mapping(&obs_groups, n_obs);
+        let n_groups = group_labels.len();
+        let projected_gene_names: Vec<String> = resolved_indices
+            .iter()
+            .map(|&c| gene_names[c as usize].clone())
+            .collect();
+
+        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            let source = backed.as_column_source().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar, \
+                     or a row deletion vector is active",
+                )
+            })?;
+            scx_accel::pseudobulk_aggregate_csc(
+                source,
+                &cell_to_group,
+                n_groups,
+                group_labels,
+                &groupby,
+                &projected_gene_names,
+                &resolved_indices,
+                method,
+                min_cells_per_group,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else if let Ok(lazy) =
+            x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+        {
+            let lazy_src = lazy.as_column_source().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar, \
+                     the transform chain contains a non-column-local op, or \
+                     a row deletion vector is active",
+                )
+            })?;
+            scx_accel::pseudobulk_aggregate_csc(
+                &lazy_src,
+                &cell_to_group,
+                n_groups,
+                group_labels,
+                &groupby,
+                &projected_gene_names,
+                &resolved_indices,
+                method,
+                min_cells_per_group,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else {
+            unreachable!("type check above")
+        }
+    } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         scx_accel::pseudobulk_aggregate(
             &backed.backed,
             &obs_groups,

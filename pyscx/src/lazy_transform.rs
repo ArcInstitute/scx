@@ -71,6 +71,12 @@ impl Transform {
 #[pyclass(name = "ScxLazyTransformedDataset")]
 pub struct ScxLazyTransformedDataset {
     pub(crate) backed: Arc<BackedCsrReader>,
+    /// Optional CSC sidecar reader, propagated from the originating
+    /// `ScxBackedSparseDataset`. Carried forward through every
+    /// transform-chain extension (`log1p`, `normalize_total`, etc.) so
+    /// that `as_column_source()` can light up CSC dispatch when the
+    /// transform chain remains column-local. Phase F.0 (CSC-SUPPORT.md).
+    pub(crate) backed_csc: Option<Arc<BackedCscReader>>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) transforms: Vec<Transform>,
     /// Arc-wrapped to avoid O(n) deep clones when constructing new lazy
@@ -95,6 +101,7 @@ impl ScxLazyTransformedDataset {
     ) -> Self {
         Self {
             backed,
+            backed_csc: None,
             shape_val,
             transforms,
             kept_to_global,
@@ -103,25 +110,67 @@ impl ScxLazyTransformedDataset {
         }
     }
 
-    /// Create a `LazyShardSource` for streaming algorithms (PCA).
+    /// Builder method: attach a CSC sidecar reader. Mirrors
+    /// `ScxBackedSparseDataset::with_csc_reader`. After this call,
+    /// `as_column_source()` may return `Some` if the transform chain
+    /// is column-local and no row deletion vector is active.
+    pub fn with_csc_reader(mut self, backed_csc: Option<Arc<BackedCscReader>>) -> Self {
+        self.backed_csc = backed_csc;
+        self
+    }
+
+    /// Capability gate: returns `Some(LazyShardSource)` iff this
+    /// lazy dataset can serve CSC reads. Mirrors
+    /// `ScxBackedSparseDataset::as_column_source` but returns an
+    /// owned `LazyShardSource` (rather than a borrowed `&dyn`) because
+    /// the underlying `LazyShardSource` is materialized fresh per call;
+    /// it's cheap (clones `Arc` handles only).
+    ///
+    /// Returns `Some` iff:
+    /// - `backed_csc` is set (file has a CSC sidecar AND was opened
+    ///   with CSC capability), AND
+    /// - every transform in the chain returns `is_column_local() == true`
+    ///   (NormalizeTotal / RowScale would corrupt CSC reads), AND
+    /// - `kept_to_global` is `None` (row deletions break the global
+    ///   row indices encoded in CSC `indices`).
+    ///
+    /// Callers consume the `LazyShardSource` via the
+    /// `ColumnShardSource` trait impl on `LazyShardSource`. Crate-private
+    /// because `LazyShardSource` itself is `pub(crate)`.
+    ///
+    /// Phase F.2+ wires this; `#[allow(dead_code)]` until those
+    /// consumers land.
+    #[allow(dead_code)]
+    pub(crate) fn as_column_source(&self) -> Option<LazyShardSource> {
+        let source = self.as_shard_source();
+        if source.supports_csc() {
+            Some(source)
+        } else {
+            None
+        }
+    }
+
+    /// Create a `LazyShardSource` for streaming algorithms (PCA, HVG,
+    /// CSC consumers).
     ///
     /// Supports column projection: when active, `LazyShardSource` applies
     /// per-shard column filtering and reports `n_vars()` as the projected
     /// column count.
     ///
-    /// The lazy CSR-only path retains its existing behavior; the
-    /// `backed_csc` field is initialized to `None` here and populated
-    /// only on dataset-construction paths that explicitly opt into CSC
-    /// (see `ScxBackedSparseDataset::with_csc_reader`, Phase E.3).
+    /// Threads `backed_csc` through, so consumers that route via
+    /// `ColumnShardSource` (Phase F) get the CSC plumbing for free.
+    /// Whether CSC is actually serviceable is gated separately by
+    /// `LazyShardSource::supports_csc()` (transform-chain check).
     pub(crate) fn as_shard_source(&self) -> LazyShardSource {
-        LazyShardSource {
-            backed: Arc::clone(&self.backed),
-            backed_csc: None,
-            transforms: self.transforms.clone(),
-            kept_to_global: self.kept_to_global.clone(),
-            col_projection: self.col_projection.clone(),
-            shape_val: self.shape_val,
-        }
+        LazyShardSource::new_with_csc(
+            Arc::clone(&self.backed),
+            self.backed_csc.clone(),
+            self.transforms.clone(),
+            self.kept_to_global.clone(),
+            self.col_projection.clone(),
+            self.shape_val.0,
+            self.shape_val.1,
+        )
     }
 
     /// Replace the deletion vector, adjusting shape.0.
@@ -758,7 +807,8 @@ impl ScxLazyTransformedDataset {
                 self.col_projection.clone(),
                 new_transforms,
                 self.non_negative,
-            );
+            )
+            .with_csc_reader(self.backed_csc.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -798,7 +848,8 @@ impl ScxLazyTransformedDataset {
                 self.col_projection.clone(),
                 new_transforms,
                 self.non_negative,
-            );
+            )
+            .with_csc_reader(self.backed_csc.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -1328,7 +1379,8 @@ impl ScxLazyTransformedDataset {
                     Some(Arc::new(composed)),
                     self.transforms.clone(),
                     self.non_negative,
-                );
+                )
+                .with_csc_reader(self.backed_csc.clone());
                 return Ok(new_ds.into_pyobject(py)?.into_any().unbind().into_bound(py));
             }
         }
@@ -1727,10 +1779,6 @@ impl LazyShardSource {
     /// Used by callers that want CSC-capable streaming. The CSC reader
     /// must already be constructed (typically by the caller after
     /// inspecting `header.has_csc()`).
-    ///
-    /// Phase E.3 plumbs the field; Phase F's consumer dispatch is the
-    /// first caller. `#[allow(dead_code)]` while waiting for that.
-    #[allow(dead_code)]
     pub(crate) fn new_with_csc(
         backed: Arc<BackedCsrReader>,
         backed_csc: Option<Arc<BackedCscReader>>,
@@ -1776,11 +1824,10 @@ impl LazyShardSource {
     /// CSC sidecar present, all transforms column-local, no row
     /// deletion vector active.
     ///
-    /// This is the predicate used by Phase F's
-    /// `ScxLazyTransformedDataset::as_column_source()` once it lands
+    /// Predicate used by `ScxLazyTransformedDataset::as_column_source()`
     /// (the analog to `ScxBackedSparseDataset::as_column_source` for
-    /// the lazy-transformed wrapper). `#[allow(dead_code)]` while
-    /// Phase F is pending.
+    /// the lazy-transformed wrapper). Phase F.0 (CSC-SUPPORT.md);
+    /// `#[allow(dead_code)]` until Phase F.2 consumers reach for it.
     #[allow(dead_code)]
     pub(crate) fn supports_csc(&self) -> bool {
         self.backed_csc.is_some()

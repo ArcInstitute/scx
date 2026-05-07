@@ -410,7 +410,8 @@ impl ScxBackedSparseDataset {
                     factors: Arc::new(global_factors),
                 }],
                 self.non_negative,
-            );
+            )
+            .with_csc_reader(self.backed_csc.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -450,7 +451,8 @@ impl ScxBackedSparseDataset {
                     factors: Arc::new(global_inv),
                 }],
                 self.non_negative,
-            );
+            )
+            .with_csc_reader(self.backed_csc.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 

@@ -136,6 +136,7 @@ pub(super) fn extract_strata<'py>(
 /// Run Wilcoxon rank-sum DE on a single adata (no stratification).
 ///
 /// Returns the DiffExpResult from scx_accel.
+#[allow(clippy::too_many_arguments)]
 fn run_rank_genes_groups_inner(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -144,6 +145,7 @@ fn run_rank_genes_groups_inner(
     gene_chunk_size: Option<usize>,
     rankby_abs: bool,
     tie_correct: bool,
+    prefer_format: &str,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -206,8 +208,67 @@ fn run_rank_genes_groups_inner(
         .map(|v| !v.is_none())
         .unwrap_or(false);
 
-    // Check if X is a ScxBackedSparseDataset for streaming path.
+    // Check if X is a ScxBackedSparseDataset / ScxLazyTransformedDataset
+    // for streaming path. CSC dispatch routes through `as_column_source()`
+    // (Phase F.3 — CSC-SUPPORT.md).
     let x = adata.getattr("X")?;
+
+    if prefer_format == "csc" {
+        // CSC dispatch: works on both backed and lazy datasets via
+        // `as_column_source`. The kernel reads each gene chunk as a
+        // CSC slab once, scatters into a row-major dense buffer, and
+        // hands it to the existing `wilcoxon_rank_sum` kernel.
+        let chunk_size = gene_chunk_size.unwrap_or(500);
+
+        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            let source = backed.as_column_source().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar, \
+                     or a row deletion vector is active",
+                )
+            })?;
+            let result = scx_accel::wilcoxon_rank_sum_streaming_csc(
+                source,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                chunk_size,
+                log_transformed,
+                rankby_abs,
+                tie_correct,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            return Ok((result, unique_groups));
+        }
+        if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+            let lazy_src = lazy.as_column_source().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar, \
+                     the transform chain contains a non-column-local op, or \
+                     a row deletion vector is active",
+                )
+            })?;
+            let result = scx_accel::wilcoxon_rank_sum_streaming_csc(
+                &lazy_src,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                chunk_size,
+                log_transformed,
+                rankby_abs,
+                tie_correct,
+            )
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            return Ok((result, unique_groups));
+        }
+        return Err(PyRuntimeError::new_err(
+            "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
+             dataset; got a regular scipy/dense matrix",
+        ));
+    }
+
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // Backed mode: stream shards with gene-chunked DE.
         let chunk_size = gene_chunk_size.unwrap_or(500);
@@ -354,7 +415,7 @@ fn de_result_to_dataframe<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr"))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -368,10 +429,16 @@ pub fn rank_genes_groups(
     min_cells_per_stratum: usize,
     rankby_abs: bool,
     tie_correct: bool,
+    prefer_format: &str,
 ) -> PyResult<PyObject> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
             "unsupported method '{method}': only 'wilcoxon' is currently supported"
+        )));
+    }
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
 
@@ -399,6 +466,7 @@ pub fn rank_genes_groups(
                 gene_chunk_size,
                 rankby_abs,
                 tie_correct,
+                prefer_format,
             ) {
                 Ok((result, _unique)) => {
                     let df = de_result_to_dataframe(py, &result, n_genes)?;
@@ -445,6 +513,7 @@ pub fn rank_genes_groups(
         gene_chunk_size,
         rankby_abs,
         tie_correct,
+        prefer_format,
     )?;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
@@ -687,6 +756,8 @@ pub fn rank_genes_groups_df(
     rankby_abs: bool,
     tie_correct: bool,
 ) -> PyResult<PyObject> {
+    // `rank_genes_groups_df` is the cell-eval-style entry; CSC dispatch
+    // is reserved for the scanpy-style `rank_genes_groups`. Pin to CSR.
     let (result, _unique_groups) = run_rank_genes_groups_inner(
         py,
         adata,
@@ -695,6 +766,7 @@ pub fn rank_genes_groups_df(
         gene_chunk_size,
         rankby_abs,
         tie_correct,
+        "csr",
     )?;
 
     let df = de_result_to_cell_eval_dataframe(py, &result, n_genes)?;

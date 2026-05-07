@@ -56,7 +56,10 @@ pub struct PseudobulkResult {
 /// - `cell_to_group`: group index for each cell (length = n_obs)
 /// - `group_labels`: per-group label vectors (each Vec has len = n_groupby_cols)
 /// - ordered deterministically (sorted lexicographically by the label tuple)
-fn build_group_mapping(obs_groups: &[Vec<String>], n_obs: usize) -> (Vec<usize>, Vec<Vec<String>>) {
+pub fn build_group_mapping(
+    obs_groups: &[Vec<String>],
+    n_obs: usize,
+) -> (Vec<usize>, Vec<Vec<String>>) {
     let n_cols = obs_groups.len();
 
     // Per-column string interners. Keyed by `&str` borrowed from obs_groups;
