@@ -1,4 +1,4 @@
-"""Phase F integration tests for ``prefer_format="csc"`` dispatch.
+"""Integration tests for ``prefer_format="csc"`` dispatch.
 
 Verifies that the four wired pyscx entries produce the same numerical
 output as the CSR path on a tiny CSC-equipped file:
@@ -9,7 +9,7 @@ output as the CSR path on a tiny CSC-equipped file:
   - ``pyscx.accel.col_sums / col_nnz / col_var(prefer_format="csc")``
 
 …plus the four "CSC unavailable" capability gates and the PCA
-explicit-reject. See CSC-SUPPORT.md Phase F.5.
+explicit-reject.
 """
 
 from __future__ import annotations

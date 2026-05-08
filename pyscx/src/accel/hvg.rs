@@ -56,7 +56,7 @@ pub fn highly_variable_genes<'py>(
     prefer_format: &str,
 ) -> PyResult<()> {
     // Validate prefer_format up front (matches the constraint applied
-    // across all `pyscx.accel.*` entry points — see CSC-SUPPORT.md G.1).
+    // across all `pyscx.accel.*` entry points).
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"

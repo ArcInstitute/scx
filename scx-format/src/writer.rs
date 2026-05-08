@@ -550,7 +550,7 @@ impl ScxWriter {
                 // `has_csc` flag bit. Without this, cloud
                 // pass-through paths (`cloud_optimize`, `pack`,
                 // `push`, `pull`) silently dropped CSC sidecars on
-                // copy. CSC-SUPPORT.md Phase I.1.
+                // copy.
                 self.csc_shard_count += 1;
                 // Don't add to total_nnz: CSC shards mirror the same
                 // values as CSR shards (different layout, same

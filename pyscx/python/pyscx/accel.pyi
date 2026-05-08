@@ -6,8 +6,9 @@ function is typed; everything else falls back to `Any` via the
 trailing `__getattr__`.
 
 `prefer_format: Literal["csr", "csc"] = "csr"` is the explicit
-opt-in surface from CSC-SUPPORT.md Phase G.1. Validation lives in
-the Rust side (`PyValueError` on any other value, including `"auto"`).
+opt-in surface for the column-major sidecar dispatch. Validation
+lives in the Rust side (`PyValueError` on any other value,
+including `"auto"`).
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ def calculate_qc_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Lower-level column aggregations (Phase F.5)
+# Lower-level column aggregations
 # ---------------------------------------------------------------------------
 
 

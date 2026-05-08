@@ -209,8 +209,7 @@ fn run_rank_genes_groups_inner(
         .unwrap_or(false);
 
     // Check if X is a ScxBackedSparseDataset / ScxLazyTransformedDataset
-    // for streaming path. CSC dispatch routes through `as_column_source()`
-    // (Phase F.3 — CSC-SUPPORT.md).
+    // for streaming path. CSC dispatch routes through `as_column_source()`.
     let x = adata.getattr("X")?;
 
     if prefer_format == "csc" {

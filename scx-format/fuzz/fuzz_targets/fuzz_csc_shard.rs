@@ -1,4 +1,4 @@
-// Phase L.4 fuzz target: feed arbitrary bytes to the shard-header
+// fuzz target: feed arbitrary bytes to the shard-header
 // decode path with the section type pinned to CscShard. CSC and CSR
 // share the same 76-byte shard header layout (only `shard_type` and
 // the field interpretation differ), so this is structurally similar

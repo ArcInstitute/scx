@@ -127,7 +127,6 @@ pub(crate) fn section_name_to_path(
             // "X_csc_shard_N" → "Xc/NNNNNN.shard"
             // Parallel naming to CsrShard's `X/` directory; the `c`
             // suffix marks the column-major sidecar.
-            // CSC-SUPPORT.md Phase I.2.
             let idx: u32 = name
                 .strip_prefix("X_csc_shard_")
                 .and_then(|s| s.parse().ok())
@@ -205,7 +204,7 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
             let idx: u32 = idx_str.parse().ok()?;
             Some((format!("X_shard_{idx}"), SectionType::CsrShard))
         }
-        // Reverse of "X_csc_shard_N" → "Xc/NNNNNN.shard". Phase I.2.
+        // Reverse of "X_csc_shard_N" → "Xc/NNNNNN.shard".
         _ if rel_path.starts_with("Xc/") && rel_path.ends_with(".shard") => {
             let idx_str = rel_path
                 .strip_prefix("Xc/")
@@ -318,7 +317,7 @@ mod tests {
         assert!(section_name_to_path("bad_name", SectionType::CsrShard).is_err());
         assert!(section_name_to_path("raw_counts_shard_xyz", SectionType::LayerCsrShard).is_err());
         assert!(section_name_to_path("obsp/dist_shard_xyz", SectionType::ObspCsrShard).is_err());
-        // CSC shard names must follow X_csc_shard_N pattern. Phase I.2.
+        // CSC shard names must follow X_csc_shard_N pattern.
         assert!(section_name_to_path("X_csc_shard_abc", SectionType::CscShard).is_err());
         assert!(section_name_to_path("X_shard_0", SectionType::CscShard).is_err());
     }

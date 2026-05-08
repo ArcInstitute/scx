@@ -31,8 +31,7 @@ pub struct ScxBackedSparseDataset {
     pub(crate) backed: Arc<BackedCsrReader>,
     /// Optional CSC sidecar reader. Populated when the file has CSC
     /// shards AND the open path requested CSC capability. `None` ⇒
-    /// `as_column_source()` always returns `None`. Phase E.3 of
-    /// CSC-SUPPORT.md.
+    /// `as_column_source()` always returns `None`.
     pub(crate) backed_csc: Option<Arc<BackedCscReader>>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) n_shards: usize,
@@ -103,7 +102,7 @@ impl ScxBackedSparseDataset {
 
     /// Capability gate: returns `Some(&dyn ColumnShardSource)` iff this
     /// dataset can serve CSC reads. **Single capability-detection point
-    /// in the codebase** — Phase E.3 of CSC-SUPPORT.md.
+    /// in the codebase** for `prefer_format="csc"` dispatch.
     ///
     /// Returns `Some` iff:
     /// - `backed_csc` is set (file has a CSC sidecar AND the open path

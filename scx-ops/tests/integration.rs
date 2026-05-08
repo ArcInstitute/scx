@@ -1210,7 +1210,7 @@ fn test_append_rejects_oob_indices() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase H: CSC drop on mutating ops (CSC-SUPPORT.md Phase H)
+// CSC drop on mutating ops (`append`, `compact`, `merge`)
 // ---------------------------------------------------------------------------
 
 /// Append on a CSC-equipped file drops the CSC sidecar:

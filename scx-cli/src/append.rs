@@ -104,7 +104,7 @@ pub fn run_append(
         target.display()
     );
 
-    // Phase H.1: re-emit the CSC sidecar that scx_ops::append dropped.
+    // Re-emit the CSC sidecar that scx_ops::append dropped.
     // We always run when `--rebuild-csc` is set, even if the target
     // didn't have CSC before — the user opted in explicitly.
     if rebuild_csc {

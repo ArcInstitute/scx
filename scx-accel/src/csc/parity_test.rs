@@ -1,4 +1,4 @@
-//! Phase L.1 — property-style numerical-equivalence tests for CSR vs CSC kernels.
+//! property-style numerical-equivalence tests for CSR vs CSC kernels.
 //!
 //! Walks a small grid of generated dense reference matrices (varying
 //! shape, density, seed, `cols_per_csc_shard`) and verifies that every

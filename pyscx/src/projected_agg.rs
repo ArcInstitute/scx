@@ -493,7 +493,7 @@ pub fn col_var_masked_projected(
 }
 
 // ---------------------------------------------------------------------------
-// CSC twins (Phase F.5)
+// CSC twins
 //
 // Each `_csc` twin reads `col_indices` directly via the
 // `ColumnShardSource` trait — one CSC slab per contiguous run of

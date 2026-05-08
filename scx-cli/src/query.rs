@@ -172,7 +172,6 @@ fn write_query_result(
     // input file's CSC sidecar (if any) does not match the projected
     // row/column space, so we don't carry it forward. Re-run
     // `scx build-csc` against the output if a CSC sidecar is needed.
-    // CSC-SUPPORT.md Phase I.3.
     let header = FileHeader {
         magic: scx_format::MAGIC,
         format_version: 1,

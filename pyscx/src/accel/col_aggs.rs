@@ -1,4 +1,4 @@
-//! Lower-level column-axis aggregation entry points (Phase F.5).
+//! Lower-level column-axis aggregation entry points.
 //!
 //! `pyscx.accel.{col_sums,col_nnz,col_min,col_max,col_var}` expose the
 //! streaming projected-aggregation kernels with explicit

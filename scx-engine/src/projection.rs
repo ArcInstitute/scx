@@ -577,7 +577,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase E.4: project_csc / project_csc_column
+    // project_csc / project_csc_column
     // -----------------------------------------------------------------------
 
     fn sample_csc() -> ScxCsc {

@@ -34,10 +34,10 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
     let header_bytes = std::fs::read(input_dir.join("_header.bin"))?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_bytes))?;
 
-    // 3. Define section ordering for cloud-optimized layout
-    //    `CscShard` placed adjacent to `CsrShard` (CSC-SUPPORT.md
-    //    Phase I.2) so column-major reads stay in the contiguous
-    //    prefix region of the packed file.
+    // 3. Define section ordering for cloud-optimized layout.
+    //    `CscShard` placed adjacent to `CsrShard` so column-major
+    //    reads stay in the contiguous prefix region of the packed
+    //    file.
     let section_order: &[SectionType] = &[
         SectionType::ObsMetadata,
         SectionType::ObsIndex,
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(dv_read.total_deleted(), 2);
     }
 
-    /// Phase I.4: explode + pack roundtrip on a CSC-equipped file.
+    /// explode + pack roundtrip on a CSC-equipped file.
     /// Verifies that the new `Xc/NNNNNN.shard` paths flow through the
     /// exploded directory and that the writer's `write_raw_shard`
     /// (after the I.1 counter fix) repopulates `n_csc_shards` and

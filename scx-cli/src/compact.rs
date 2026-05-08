@@ -59,7 +59,7 @@ pub fn run_compact(
         reduction,
     );
 
-    // Phase H.2: re-emit the CSC sidecar against the compacted output.
+    // Re-emit the CSC sidecar against the compacted output.
     if rebuild_csc {
         crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", output.display());

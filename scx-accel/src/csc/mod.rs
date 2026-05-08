@@ -9,7 +9,8 @@
 //! `prefer_format` kwarg through their entry points and use
 //! [`require_csc`] to translate that into a CSC-capable source or a
 //! clean error when the dataset doesn't support CSC. There is no
-//! heuristic / thread-local default — see CSC-SUPPORT.md.
+//! heuristic / thread-local default — every CSC dispatch is opt-in
+//! at the call site.
 
 pub mod dispatch;
 pub mod mean_var;

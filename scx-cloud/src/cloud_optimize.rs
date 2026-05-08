@@ -81,8 +81,7 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     //         → DeletionVectors
     //
     // CscShard placed adjacent to CsrShard so column-major reads stay
-    // in a contiguous prefix region of the cloud-optimized file
-    // (CSC-SUPPORT.md Phase I.2).
+    // in a contiguous prefix region of the cloud-optimized file.
     let section_order: &[SectionType] = &[
         SectionType::ObsMetadata,
         SectionType::ObsIndex,
@@ -655,7 +654,7 @@ mod tests {
         assert!(hdr.has_deletion_vectors());
     }
 
-    /// Phase I.2: cloud_optimize on a CSC-equipped file preserves the
+    /// cloud_optimize on a CSC-equipped file preserves the
     /// `n_csc_shards` count and `has_csc` flag bit, and the CscShard
     /// catalog entries survive the section-copy reorder.
     #[test]

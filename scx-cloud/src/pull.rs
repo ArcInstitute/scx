@@ -202,7 +202,7 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     // 3. Define section ordering for cloud-optimized layout.
     //    `CscShard` placed adjacent to `CsrShard` so column-major
     //    reads stay in the contiguous prefix region of the pulled
-    //    file. Phase I.2.
+    //    file.
     let section_order: &[SectionType] = &[
         SectionType::ObsMetadata,
         SectionType::ObsIndex,
@@ -831,7 +831,6 @@ pub async fn pull_filtered(
     // layout, so any input CSC `indices` arrays would reference stale
     // rows. The catalog filter loop (around line 642) excludes
     // CscShard entries; clear the header count + flag to match.
-    // CSC-SUPPORT.md Phase I.2.
     new_header.n_csc_shards = 0;
     new_header.clear_csc();
     new_header.root_catalog_offset = HEADER_SIZE as u64;

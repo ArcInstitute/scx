@@ -48,8 +48,7 @@ impl Transform {
     ///
     /// Used by `LazyShardSource`'s `ColumnShardSource` implementation
     /// and `ScxBackedSparseDataset::as_column_source()` as the
-    /// transform-chain compatibility test for CSC dispatch — see
-    /// CSC-SUPPORT.md Phase E.3.
+    /// transform-chain compatibility test for CSC dispatch.
     ///
     /// - `Log1p`: `ln(x + 1)` is element-wise, no row context. **true**
     /// - `NormalizeTotal`: divides by per-row sum. **false**
@@ -75,7 +74,7 @@ pub struct ScxLazyTransformedDataset {
     /// `ScxBackedSparseDataset`. Carried forward through every
     /// transform-chain extension (`log1p`, `normalize_total`, etc.) so
     /// that `as_column_source()` can light up CSC dispatch when the
-    /// transform chain remains column-local. Phase F.0 (CSC-SUPPORT.md).
+    /// transform chain remains column-local.
     pub(crate) backed_csc: Option<Arc<BackedCscReader>>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) transforms: Vec<Transform>,
@@ -138,8 +137,8 @@ impl ScxLazyTransformedDataset {
     /// `ColumnShardSource` trait impl on `LazyShardSource`. Crate-private
     /// because `LazyShardSource` itself is `pub(crate)`.
     ///
-    /// Phase F.2+ wires this; `#[allow(dead_code)]` until those
-    /// consumers land.
+    /// `#[allow(dead_code)]` until consumers in `pyscx::accel` reach
+    /// for it.
     #[allow(dead_code)]
     pub(crate) fn as_column_source(&self) -> Option<LazyShardSource> {
         let source = self.as_shard_source();
@@ -1826,8 +1825,8 @@ impl LazyShardSource {
     ///
     /// Predicate used by `ScxLazyTransformedDataset::as_column_source()`
     /// (the analog to `ScxBackedSparseDataset::as_column_source` for
-    /// the lazy-transformed wrapper). Phase F.0 (CSC-SUPPORT.md);
-    /// `#[allow(dead_code)]` until Phase F.2 consumers reach for it.
+    /// the lazy-transformed wrapper). `#[allow(dead_code)]` until the
+    /// CSC consumers in `pyscx::accel` reach for it.
     #[allow(dead_code)]
     pub(crate) fn supports_csc(&self) -> bool {
         self.backed_csc.is_some()

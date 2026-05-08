@@ -283,7 +283,7 @@ mod tests {
         assert!(msg.contains("--in-place"));
     }
 
-    /// Phase B.3: write a file with CSR + multi-shard CSC, run
+    /// write a file with CSR + multi-shard CSC, run
     /// rewrite_with_current_version, and confirm the output preserves
     /// has_csc, the CSC shard count, per-shard column ranges, and
     /// densified contents.
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(ranges, vec![0..2, 2..4, 4..6]);
 
         // On-disk shard_type byte must remain `1` for re-emitted CSC
-        // shards (Phase A.1 invariant survives rewrite).
+        // shards (invariant survives rewrite).
         let out_data = std::fs::read(&output).unwrap();
         for entry in &out_csc_entries {
             let section = &out_data[entry.offset as usize..][..entry.length as usize];

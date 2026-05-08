@@ -411,7 +411,7 @@ pub fn append(
     // CSC sidecars index global rows: appending rows shifts the row space
     // but the on-disk CSC `indices` arrays still reference the old row
     // count, so they must be dropped. Caller can opt back in via
-    // `--rebuild-csc` in the CLI (CSC-SUPPORT.md Phase H.1).
+    // `--rebuild-csc` in the CLI.
     let had_csc = header.has_csc();
     let n_dropped_csc = old_catalog
         .entries
@@ -514,7 +514,7 @@ pub fn append(
         .count() as u32;
     // CSC sidecars were filtered out of `new_entries` above; reflect
     // that in the header's count + flag bit so readers don't try to
-    // load shards that are no longer in the catalog. Phase H.1.
+    // load shards that are no longer in the catalog.
     header.n_csc_shards = 0;
     header.clear_csc();
     header.full_catalog_offset = new_catalog_offset;

@@ -1,4 +1,4 @@
-"""Phase L.2 — CSC dispatch on `ScxLazyTransformedDataset`.
+"""CSC dispatch on `ScxLazyTransformedDataset`.
 
 Verifies the column-local capability gate on lazy datasets:
 

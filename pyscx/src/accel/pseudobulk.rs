@@ -157,7 +157,7 @@ pub fn pseudobulk_dex(
     let x = adata.getattr("X")?;
 
     let result = if prefer_format == "csc" {
-        // CSC dispatch (Phase F.4): requires a gene subset, since
+        // CSC dispatch requires a gene subset, since
         // full-gene CSC pseudobulk has no measurable speedup over CSR.
         // Resolve the gene subset: explicit `gene_indices` kwarg takes
         // precedence; otherwise fall back to the dataset's

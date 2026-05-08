@@ -1,4 +1,4 @@
-"""Phase L.2 — targeted DE / pseudobulk on a small gene subset.
+"""Targeted DE / pseudobulk on a small gene subset.
 
 The CSC dispatch should produce the same numerical result as CSR
 when only a handful of genes is queried out of a much wider matrix.

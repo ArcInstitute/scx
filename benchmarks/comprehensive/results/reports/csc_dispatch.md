@@ -1,4 +1,4 @@
-# `bench_csc_dispatch` results — CSC-SUPPORT.md Phase L.3
+# `bench_csc_dispatch` results
 
 Run summary — Chimera HPC, `cpu_preemptible` partition; pyscx built
 `--release`. Per-dataset n_runs: 5 for D1–D2, 3 for D3–D4 (1 for the

@@ -1545,7 +1545,8 @@ pub fn total_variance_from_col_sq(col_sum_sq: &[f64], means: Option<&[f64]>, n_o
 ///
 /// Mirrors `ShardRange` (CSR) but the major axis is columns. The
 /// on-disk fields are still `row_start` / `row_end` in `ShardStats`
-/// (axis-overload — see CSC-SUPPORT.md A.3); we read them via
+/// (axis-overload — for `CscShard` entries those fields hold
+/// `col_start` / `col_end`); we read them via
 /// `ShardStats::major_start()` / `major_end()`.
 #[derive(Debug, Clone, Copy)]
 struct CscShardRange {
@@ -1559,8 +1560,9 @@ struct CscShardRange {
 /// Precomputed column-shard index for O(log n) col-range lookups.
 ///
 /// Built once from a [`FullCatalog`] at open time. Filters
-/// `SectionType::CscShard` only — `LayerCscShard` does not exist in v1
-/// (deferred per Phase E.2 of CSC-SUPPORT.md).
+/// `SectionType::CscShard` only — `LayerCscShard` does not exist in
+/// the current format version (deferred until layer-level CSC
+/// support is needed).
 #[derive(Debug, Clone)]
 pub struct BackedCscIndex {
     /// Sorted by `col_start`.
@@ -2549,7 +2551,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase E.5: BackedCscReader tests
+    // BackedCscReader tests
     // -----------------------------------------------------------------------
 
     /// Build a CSC arrays for a column range from a row-major dense

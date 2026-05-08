@@ -1814,8 +1814,8 @@ pub fn from_anndata_impl(
     }
 
     // Optional CSC sidecar — streaming transpose over the in-memory
-    // CSR view of X. Layers are CSR-only (no layer-CSC support yet,
-    // see CSC-SUPPORT.md Phase E.2 deferral).
+    // CSR view of X. Layers are CSR-only (no layer-CSC support yet —
+    // a `LayerCscShard` section type would need to land first).
     if csc_always {
         py.allow_threads(|| -> Result<(), scx_format::ScxError> {
             write_csc_shards_from_csr(

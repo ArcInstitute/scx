@@ -391,7 +391,7 @@ mod tests {
         assert!(msg.contains("no CSR shards"));
     }
 
-    /// Phase C.3: write a small CSR-only file, run build-csc with
+    /// write a small CSR-only file, run build-csc with
     /// `--csc-cols-per-shard 3` over n_vars=10, and verify that the
     /// output has exactly ceil(10/3) = 4 CSC shards with correct,
     /// non-overlapping `[col_start, col_end)` ranges.
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(csc_concat.to_dense().unwrap(), dense_csr);
     }
 
-    /// Phase C.3: `read_csc_columns(2..7)` over the multi-shard layout
+    /// `read_csc_columns(2..7)` over the multi-shard layout
     /// returns the same densified slice as densifying the full matrix
     /// then column-slicing. Validates that partial-overlap shards are
     /// `col_slice`d post-decode and that fully-skipped shards do not
@@ -499,7 +499,7 @@ mod tests {
         }
     }
 
-    /// Phase C.3 codec parity: rerun the A.4 codec sweep idea
+    ///  codec parity: rerun the A.4 codec sweep idea
     /// (None / Scx1 / Zstd / Lz4Shuffle / Pcodec × Uint8) on a
     /// multi-shard CSC layout. Inputs are integer Uint8 throughout; the
     /// codec from the input shards drives the output codec.

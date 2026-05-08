@@ -1,4 +1,4 @@
-"""Phase D.4: pyscx.from_anndata(csc=...) round-trip tests.
+"""pyscx.from_anndata(csc=...) round-trip tests.
 
 Verifies that the new ``csc`` and ``csc_cols_per_shard`` kwargs on
 ``from_anndata`` correctly emit a CSC sidecar (multi-shard column-major

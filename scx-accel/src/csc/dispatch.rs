@@ -8,8 +8,7 @@ use crate::error::AccelError;
 use scx_format::ColumnShardSource;
 
 /// Caller-requested column format. There is intentionally no `Auto`
-/// variant — CSC dispatch is explicit-opt-in by design (CSC-SUPPORT.md
-/// Phase G.1).
+/// variant — CSC dispatch is explicit-opt-in by design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferFormat {
     Csr,

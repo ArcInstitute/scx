@@ -1,4 +1,4 @@
-"""Phase L.2 — CSC lifecycle: convert, info, mutating ops.
+"""CSC lifecycle: convert, info, mutating ops.
 
 Walks the user-visible end-to-end CSC story:
 

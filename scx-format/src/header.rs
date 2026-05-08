@@ -193,7 +193,7 @@ impl FileHeader {
     /// Clear the CSC flag (bit 0). Used by mutating ops (`append`,
     /// `compact`, `merge`, `subset`) when CSC sidecars are dropped
     /// from the output and the row layout no longer matches the
-    /// previously-stored column-major shards. CSC-SUPPORT.md Phase H.
+    /// previously-stored column-major shards.
     pub fn clear_csc(&mut self) {
         self.flags &= !(1 << 0);
     }

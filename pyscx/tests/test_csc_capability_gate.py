@@ -1,4 +1,4 @@
-"""Phase E.5 — capability-gate sanity tests for the CSC dispatch.
+"""Capability-gate sanity tests for the CSC dispatch.
 
 The Rust-side `as_column_source()` method is internal (not exposed to
 Python), so this file verifies the user-visible properties that the
@@ -6,19 +6,18 @@ gate is meant to protect:
 
 1. A CSC-equipped file (built via `from_anndata(csc='always')`)
    round-trips cleanly through the CSR path. This is a smoke test that
-   the new `backed_csc` field on `ScxBackedSparseDataset` doesn't
-   regress non-CSC consumers.
-2. A CSR-only file behaves identically before and after the Phase E
-   wiring — the new optional `BackedCscReader` field defaults to `None`
-   and shouldn't affect any existing read paths.
+   the `backed_csc` field on `ScxBackedSparseDataset` doesn't regress
+   non-CSC consumers.
+2. A CSR-only file behaves identically — the optional
+   `BackedCscReader` field defaults to `None` and doesn't affect any
+   existing read paths.
 
 Full matrix tests on the gate (Some vs None for each branch — CSC +
 no transforms / CSC + Log1p / CSC + NormalizeTotal / CSC + row deletion
 / no CSC sidecar) live in the Rust-side scx-format tests
 (`backed_csc_*` and the trait independence test in `shard_source.rs`).
-The pyscx-side gate logic is small enough that the existing Rust unit
-coverage plus Phase F's consumer-integration tests (when they land)
-suffice. See CSC-SUPPORT.md Phase E.5.
+The pyscx-side gate logic is small enough that the Rust unit coverage
+plus the consumer-integration tests in `test_csc_dispatch.py` suffice.
 """
 
 from __future__ import annotations

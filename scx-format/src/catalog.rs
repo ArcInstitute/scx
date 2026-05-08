@@ -505,7 +505,7 @@ impl FullCatalog {
     /// Return CSC shard entries whose `[col_start, col_end)` range
     /// intersects the requested half-open interval `[c_lo, c_hi)`.
     /// Sorted by `col_start`. Used for column-range pushdown
-    /// (Phase B.2 / E.2).
+    /// ( / E.2).
     pub fn csc_shards_for_col_range(&self, c_lo: u64, c_hi: u64) -> Vec<&FullCatalogEntry> {
         if c_lo >= c_hi {
             return Vec::new();
@@ -872,7 +872,7 @@ mod tests {
         assert!(starts.windows(2).all(|w| w[0] <= w[1]));
     }
 
-    /// Phase B.3: 4-shard CSC layout with non-uniform column sizes.
+    /// 4-shard CSC layout with non-uniform column sizes.
     /// Confirm csc_shards_for_col_range returns exactly the overlapping
     /// subset for various queries, and that it sorts the result by
     /// `major_start()`.

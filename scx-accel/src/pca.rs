@@ -202,7 +202,7 @@ fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
 /// major layout would force per-column gather scatter with no
 /// measurable speed-up. The covariance variant is similar.
 /// `pyscx.accel.pca` rejects `prefer_format="csc"` with a `ValueError`
-/// for the same reason — see CSC-SUPPORT.md Phase F.6.
+/// for the same reason.
 ///
 /// # Arguments
 ///

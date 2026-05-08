@@ -829,7 +829,7 @@ fn test_float_data_uses_zstd() {
     assert_eq!(reader.header().codec_id, CodecId::Zstd as u8);
 }
 
-/// Phase D.4: convert h5ad → scx with `csc=always`, verify the output
+/// convert h5ad → scx with `csc=always`, verify the output
 /// has `has_csc()`, the expected CSC shard count, contiguous column
 /// ranges, and densified contents matching the CSR data.
 #[test]
@@ -885,7 +885,7 @@ fn test_h5ad_to_scx_csc_always() {
     assert_eq!(dense_csc, dense_csr);
 }
 
-/// Phase D.4: same shape of test for the 10x path.
+/// same shape of test for the 10x path.
 #[test]
 fn test_tenx_to_scx_csc_always() {
     let dir = tempfile::tempdir().unwrap();
@@ -911,7 +911,7 @@ fn test_tenx_to_scx_csc_always() {
     assert_eq!(dense_csc, dense_csr);
 }
 
-/// Phase D.4: default `ConvertOptions` (csc=false) emits no CSC sidecar.
+/// default `ConvertOptions` (csc=false) emits no CSC sidecar.
 #[test]
 fn test_h5ad_default_csc_off() {
     let dir = tempfile::tempdir().unwrap();

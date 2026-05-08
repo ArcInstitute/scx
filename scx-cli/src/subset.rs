@@ -102,7 +102,7 @@ pub fn run_subset(
     // changes the global index space, so input CSC `indices` arrays
     // would silently reference rows / columns that no longer exist.
     // Caller can opt back in via `--rebuild-csc` to re-run `build-csc`
-    // against the projected output. Phase H.4.
+    // against the projected output.
     if in_header.has_csc() {
         eprintln!(
             "Warning: subset dropped CSC shards from {input}: rerun \
@@ -149,7 +149,7 @@ pub fn run_subset(
 
     println!("Wrote {}", output.display());
 
-    // Phase H.4: re-emit the CSC sidecar against the projected output.
+    // Re-emit the CSC sidecar against the projected output.
     if rebuild_csc {
         crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", output.display());

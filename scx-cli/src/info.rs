@@ -144,9 +144,8 @@ pub fn run_info(
 
     // CSC sidecar layout: when more than one CSC shard is present,
     // print the per-shard column range + nnz so users can see the
-    // sharding granularity (CSC-SUPPORT.md Phase J.1). One-shard
-    // files leave it implicit — the count on the Shards line says
-    // it all.
+    // sharding granularity. One-shard files leave it implicit — the
+    // count on the Shards line says it all.
     if header.n_csc_shards > 1 {
         println!();
         println!(
@@ -248,7 +247,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         "sections": sections,
     });
 
-    // Per-CSC-shard layout for files with multiple CSC shards. Phase J.1.
+    // Per-CSC-shard layout for files with multiple CSC shards.
     if header.n_csc_shards > 1 {
         let csc_layout: Vec<_> = catalog
             .csc_shards_sorted()

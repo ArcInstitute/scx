@@ -75,7 +75,7 @@ pub fn run_merge(
     );
     drop(out_reader);
 
-    // Phase H.3: re-emit the CSC sidecar against the merged output.
+    // Re-emit the CSC sidecar against the merged output.
     if rebuild_csc {
         crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", output.display());
