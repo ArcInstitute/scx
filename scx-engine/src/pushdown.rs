@@ -558,6 +558,7 @@ mod tests {
             length: 1000,
             section_type: SectionType::ObsMetadata,
             checksum: [0; 32],
+            modality_id: 0,
             stats: None,
         });
         entries.push(FullCatalogEntry {
@@ -566,6 +567,7 @@ mod tests {
             length: 500,
             section_type: SectionType::VarMetadata,
             checksum: [0; 32],
+            modality_id: 0,
             stats: None,
         });
 
@@ -576,6 +578,7 @@ mod tests {
                 length: 5000,
                 section_type: SectionType::CsrShard,
                 checksum: [0; 32],
+                modality_id: 0,
                 stats: Some(ShardStats {
                     row_start,
                     row_end,

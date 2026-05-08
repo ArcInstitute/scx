@@ -13,6 +13,7 @@ use crate::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntr
 use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
+use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
 use crate::section::{align_to_8, SectionType};
 use crate::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE,
@@ -64,6 +65,16 @@ pub struct ScxWriter {
     total_nnz: u64,
     has_obsm: bool,
     has_obsp: bool,
+    /// The `modality_id` stamped on every catalog entry created by
+    /// the next write call. Defaults to `0` (global / single-modality
+    /// shape). Public `*_for` methods set this for the duration of
+    /// the call and reset it to `0` afterwards via the
+    /// `ModalityScope` RAII guard.
+    current_modality_id: u8,
+    /// Modalities registered via `add_modality()`. When empty, the
+    /// file is single-modality and `finish()` emits no
+    /// `ModalityTable` section.
+    modalities: Vec<crate::modality::ModalityInfo>,
 }
 
 /// Output of parallel shard encoding, ready for sequential write.
@@ -137,6 +148,8 @@ impl ScxWriter {
             total_nnz: 0,
             has_obsm: false,
             has_obsp: false,
+            current_modality_id: 0,
+            modalities: Vec::new(),
         })
     }
 
@@ -186,6 +199,7 @@ impl ScxWriter {
             length,
             section_type,
             checksum,
+            modality_id: self.current_modality_id,
             stats,
         });
 
@@ -521,6 +535,7 @@ impl ScxWriter {
             length: section_length,
             section_type,
             checksum: section_checksum,
+            modality_id: self.current_modality_id,
             stats: Some(stats),
         });
 
@@ -560,6 +575,7 @@ impl ScxWriter {
             length: section_length,
             section_type,
             checksum: section_checksum,
+            modality_id: self.current_modality_id,
             stats: Some(stats),
         });
 
@@ -611,6 +627,7 @@ impl ScxWriter {
             length: section.section_length,
             section_type: section.section_type,
             checksum: section.section_checksum,
+            modality_id: self.current_modality_id,
             stats: Some(section.stats),
         });
 
@@ -645,6 +662,376 @@ impl ScxWriter {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Phase B: per-modality writer API
+    // -----------------------------------------------------------------------
+
+    /// Register a modality and return its 1-based `modality_id`.
+    ///
+    /// Modalities must be registered up-front (before any per-modality
+    /// section writes) so that subsequent `*_for(modality_id, …)`
+    /// calls have a valid id to stamp on catalog entries. The order
+    /// of registration is significant — the on-disk `ModalityTable`
+    /// preserves insertion order, and the assigned `modality_id`
+    /// equals position-in-table + 1.
+    ///
+    /// `modality_id = 0` is reserved for "global" entries (obs,
+    /// obs_index, provenance, …) and cannot be allocated by this
+    /// method.
+    pub fn add_modality(
+        &mut self,
+        name: &str,
+        modality_type: ModalityType,
+        default_codec: CodecId,
+        default_value_encoding: ValueEncoding,
+    ) -> Result<u8> {
+        ModalityTable::validate_name(name)?;
+        if self.modalities.iter().any(|m| m.name == name) {
+            return Err(ScxError::InvalidCatalog(format!(
+                "modality name '{name}' already registered"
+            )));
+        }
+        if self.modalities.len() >= MAX_MODALITIES as usize {
+            return Err(ScxError::InvalidCatalog(format!(
+                "cannot register more than {MAX_MODALITIES} modalities"
+            )));
+        }
+        let info = ModalityInfo {
+            name: name.to_string(),
+            modality_type,
+            default_codec_id: default_codec as u8,
+            default_value_encoding: default_value_encoding as u8,
+            n_vars: 0,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            flags: ModalityFlags::empty(),
+        };
+        self.modalities.push(info);
+        Ok(self.modalities.len() as u8)
+    }
+
+    /// Resolve a registered modality name to its `modality_id`.
+    /// Returns `None` for unknown names.
+    pub fn modality_id(&self, name: &str) -> Option<u8> {
+        self.modalities
+            .iter()
+            .position(|m| m.name == name)
+            .map(|idx| (idx + 1) as u8)
+    }
+
+    /// Number of modalities registered so far.
+    pub fn n_modalities(&self) -> usize {
+        self.modalities.len()
+    }
+
+    /// Run `body` with `current_modality_id` temporarily set to `id`.
+    /// Used internally by every `*_for` method to stamp the right
+    /// modality id on catalog entries created by `body`.
+    fn with_modality<F, R>(&mut self, id: u8, body: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> Result<R>,
+    {
+        if id == 0 {
+            return Err(ScxError::InvalidCatalog(
+                "modality_id 0 is reserved for global entries".to_string(),
+            ));
+        }
+        if id as usize > self.modalities.len() {
+            return Err(ScxError::InvalidCatalog(format!(
+                "modality_id {id} out of range (registered: {})",
+                self.modalities.len()
+            )));
+        }
+        let prev = self.current_modality_id;
+        self.current_modality_id = id;
+        let result = body(self);
+        self.current_modality_id = prev;
+        result
+    }
+
+    /// Per-modality `write_var`. Catalog entry stamped with
+    /// `modality_id`. The section name is `var/{modality_name}` to
+    /// avoid colliding with the global "var" section (used for
+    /// modality_id == 0 / single-modality files).
+    pub fn write_var_for(&mut self, modality_id: u8, var: &RecordBatch) -> Result<()> {
+        let name = self.var_section_name(modality_id)?;
+        let data = Self::write_arrow_ipc(var)?;
+        self.with_modality(modality_id, |this| {
+            this.write_section_bytes(name, SectionType::VarMetadata, &data, None)
+        })
+    }
+
+    fn var_section_name(&self, modality_id: u8) -> Result<String> {
+        if modality_id == 0 {
+            return Ok("var".to_string());
+        }
+        let idx = (modality_id - 1) as usize;
+        let mname = self
+            .modalities
+            .get(idx)
+            .map(|m| m.name.clone())
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
+            })?;
+        Ok(format!("var/{mname}"))
+    }
+
+    /// Per-modality `write_csr_shard`. Section names are
+    /// `X/{modality_name}/shard_{idx}` to avoid the global "X_shard_*"
+    /// namespace. Shard counts accumulate on the registered
+    /// `ModalityInfo` and are flushed to the modality table at
+    /// `finish()` time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_csr_shard_for(
+        &mut self,
+        modality_id: u8,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let shard_idx = self
+            .modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.n_csr_shards)
+            .unwrap_or(0);
+        let name = format!("X/{mname}/shard_{shard_idx}");
+        let nnz = *indptr.last().unwrap_or(&0);
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                row_start,
+                &name,
+                SectionType::CsrShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.n_csr_shards += 1;
+            info.nnz += nnz;
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_csc_shard`. Section names are
+    /// `X_csc/{modality_name}/shard_{idx}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_csc_shard_for(
+        &mut self,
+        modality_id: u8,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        col_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let shard_idx = self
+            .modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.n_csc_shards)
+            .unwrap_or(0);
+        let name = format!("X_csc/{mname}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                col_start,
+                &name,
+                SectionType::CscShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.n_csc_shards += 1;
+            info.flags.set_csc();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_layer_csr_shard`. Section name is
+    /// `layer/{modality_name}/{layer_name}/shard_{idx}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_layer_csr_shard_for(
+        &mut self,
+        modality_id: u8,
+        layer_name: &str,
+        shard_idx: u32,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("layer/{mname}/{layer_name}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                row_start,
+                &name,
+                SectionType::LayerCsrShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_layers();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_layer_csc_shard`. Section name is
+    /// `layer_csc/{modality_name}/{layer_name}/shard_{idx}`.
+    /// Emits `SectionType::LayerCscShard` (id 16, new in v2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_layer_csc_shard_for(
+        &mut self,
+        modality_id: u8,
+        layer_name: &str,
+        shard_idx: u32,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        col_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("layer_csc/{mname}/{layer_name}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                col_start,
+                &name,
+                SectionType::LayerCscShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_layers();
+            info.flags.set_csc();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_obsm`. Section name is
+    /// `obsm/{modality_name}/{key}`.
+    pub fn write_obsm_for(
+        &mut self,
+        modality_id: u8,
+        key: &str,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("obsm/{mname}/{key}");
+        let data = Self::write_arrow_ipc(batch)?;
+        self.with_modality(modality_id, |this| {
+            this.has_obsm = true;
+            this.write_section_bytes(name, SectionType::ObsmEmbedding, &data, None)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_obsm();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_obsp_shard`. Section name is
+    /// `obsp/{modality_name}/{name}/shard_{shard_idx}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_obsp_shard_for(
+        &mut self,
+        modality_id: u8,
+        obsp_name: &str,
+        shard_idx: u32,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("obsp/{mname}/{obsp_name}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.has_obsp = true;
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                row_start,
+                &name,
+                SectionType::ObspCsrShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_obsp();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_uns`. Section name is
+    /// `uns/{modality_name}`.
+    pub fn write_uns_for(&mut self, modality_id: u8, json: &serde_json::Value) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("uns/{mname}");
+        let data = serde_json::to_vec(json)?;
+        self.with_modality(modality_id, |this| {
+            this.write_section_bytes(name, SectionType::UnsBlob, &data, None)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_uns();
+        }
+        Ok(())
+    }
+
+    /// Set the `n_vars` count for an already-registered modality.
+    /// Required before `finish()` so the on-disk `ModalityTable`
+    /// records the correct per-modality variable count.
+    pub fn set_modality_n_vars(&mut self, modality_id: u8, n_vars: u64) -> Result<()> {
+        let idx = (modality_id
+            .checked_sub(1)
+            .ok_or_else(|| ScxError::InvalidCatalog("modality_id must be >= 1".to_string()))?)
+            as usize;
+        let info = self.modalities.get_mut(idx).ok_or_else(|| {
+            ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
+        })?;
+        info.n_vars = n_vars;
+        Ok(())
+    }
+
+    fn modality_name_for(&self, modality_id: u8) -> Result<String> {
+        if modality_id == 0 {
+            return Err(ScxError::InvalidCatalog(
+                "modality_id 0 is reserved for global entries".to_string(),
+            ));
+        }
+        self.modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.name.clone())
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
+            })
+    }
+
     /// Finalize the file: write catalogs, header, fsync, atomic rename.
     ///
     /// Returns the final file path on success.
@@ -652,6 +1039,50 @@ impl ScxWriter {
         // Flush BufWriter and take inner File
         let buf_writer = self.file.take().ok_or(ScxError::WriterAlreadyFinished)?;
         let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
+
+        // 1a. Emit the ModalityTable section (Phase B) if any
+        // modalities were registered. The table is just a normal
+        // section: it has a catalog entry, lives between the last
+        // regular section and the full catalog, and gets covered by
+        // the file checksum like everything else. The header records
+        // its offset/length and bit-7 capability flag.
+        let (modality_table_offset, modality_table_length) = if self.modalities.is_empty() {
+            (0u64, 0u64)
+        } else {
+            let aligned = align_to_8(self.current_offset);
+            let pad = (aligned - self.current_offset) as usize;
+            if pad > 0 {
+                file.write_all(&vec![0u8; pad])?;
+            }
+            self.current_offset = aligned;
+
+            let table = ModalityTable::new(self.modalities.clone());
+            let mut table_buf = Vec::new();
+            table.write_to(&mut table_buf)?;
+            let mt_offset = self.current_offset;
+            let mt_length = table_buf.len() as u64;
+            let mt_checksum = blake3_hash(&table_buf);
+            file.write_all(&table_buf)?;
+            self.current_offset += mt_length;
+
+            self.entries.push(FullCatalogEntry {
+                name: "modality_table".to_string(),
+                offset: mt_offset,
+                length: mt_length,
+                section_type: SectionType::ModalityTable,
+                checksum: mt_checksum,
+                modality_id: 0, // global section
+                stats: None,
+            });
+
+            self.header.n_modalities = self.modalities.len() as u32;
+            self.header.modality_table_offset = mt_offset;
+            self.header.modality_table_length = mt_length;
+            self.header.set_modalities();
+
+            (mt_offset, mt_length)
+        };
+        let _ = (modality_table_offset, modality_table_length); // header already set
 
         // 1. Write full catalog at EOF
         let aligned_offset = align_to_8(self.current_offset);
@@ -1991,5 +2422,276 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B integration tests
+    // -----------------------------------------------------------------------
+
+    /// Full multimodal round-trip: register 3 modalities, write
+    /// distinct var batches per modality, then read everything back
+    /// through the per-modality reader API.
+    #[test]
+    fn test_phase_b_three_modality_round_trip() {
+        use crate::modality::{ModalityFlags, ModalityType};
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multimodal.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        // Register three modalities. Order matters — modality_id is
+        // 1-based and equals position+1.
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        assert_eq!(rna_id, 1);
+        assert_eq!(adt_id, 2);
+        assert_eq!(atac_id, 3);
+
+        // Distinct per-modality var batches. The writer doesn't
+        // enforce a relationship between var.num_rows and the
+        // modality's n_vars; we set that explicitly.
+        let var_rna = sample_var();
+        writer.write_var_for(rna_id, &var_rna).unwrap();
+        writer.write_var_for(adt_id, &var_rna).unwrap();
+        writer.write_var_for(atac_id, &var_rna).unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+        writer.set_modality_n_vars(atac_id, 50).unwrap();
+
+        // One CSR shard per modality.
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                atac_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+
+        // Read back through ScxReader.
+        let reader = ScxReader::open(&final_path).unwrap();
+        assert!(reader.is_multimodal());
+        assert_eq!(reader.n_modalities(), 3);
+        assert_eq!(reader.modality_names(), vec!["rna", "adt", "atac"]);
+
+        assert_eq!(reader.modality_id("rna"), Some(1));
+        assert_eq!(reader.modality_id("adt"), Some(2));
+        assert_eq!(reader.modality_id("atac"), Some(3));
+        assert_eq!(reader.modality_id("missing"), None);
+
+        let info = reader.modality_info(2).unwrap();
+        assert_eq!(info.name, "adt");
+        assert_eq!(info.modality_type, ModalityType::Protein);
+        assert_eq!(info.n_vars, 50);
+        assert_eq!(info.n_csr_shards, 1);
+        assert_eq!(info.n_csc_shards, 0);
+        assert_eq!(info.flags, ModalityFlags::empty());
+
+        // header.has_modalities flag is set.
+        assert!(reader.header().has_modalities());
+
+        // Per-modality var read.
+        let var_back = reader.read_var_for(rna_id).unwrap();
+        assert_eq!(var_back.num_rows(), var_rna.num_rows());
+
+        // Per-modality CSR shard count + read.
+        for id in [rna_id, adt_id, atac_id] {
+            assert_eq!(reader.csr_shard_count_for(id), 1);
+            let (ip, ix, dv) = reader.read_csr_shard_for(id, 0).unwrap();
+            assert_eq!(ip.len(), indptr.len());
+            assert_eq!(ix.len(), indices.len());
+            assert_eq!(dv.len(), values.len());
+        }
+    }
+
+    /// Single-modality v2 file: no `add_modality` calls means no
+    /// `ModalityTable` section is emitted. The on-disk shape and the
+    /// reader-visible accessors match a v1 file.
+    #[test]
+    fn test_phase_b_single_modality_no_modality_table() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single_modality.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        let final_path = writer.finish().unwrap();
+
+        let reader = ScxReader::open(&final_path).unwrap();
+        assert!(!reader.is_multimodal());
+        assert_eq!(reader.n_modalities(), 0);
+        assert!(reader.modality_names().is_empty());
+        assert!(!reader.header().has_modalities());
+        assert_eq!(reader.header().modality_table_offset, 0);
+        assert_eq!(reader.header().modality_table_length, 0);
+        assert_eq!(reader.modality_info(0), None);
+        assert_eq!(reader.modality_info(1), None);
+        // Global accessors continue to work.
+        assert_eq!(reader.read_var_for(0).unwrap().num_rows(), 2);
+    }
+
+    /// Per-modality CSC sidecars produce shard counts on the right
+    /// modality's `ModalityInfo`, and the `BackedCscReader::for_modality`
+    /// constructor scopes shard reads to that modality.
+    #[test]
+    fn test_phase_b_per_modality_csc() {
+        use crate::backed::BackedCscReader;
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multimodal_csc.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+        // RNA gets a CSR shard only.
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        // ADT gets BOTH CSR and CSC.
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csc_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = ScxReader::open(&final_path).unwrap();
+
+        // Per-modality counts reflect the writes.
+        assert_eq!(reader.csc_shard_count_for(rna_id), 0);
+        assert_eq!(reader.csc_shard_count_for(adt_id), 1);
+        let adt_info = reader.modality_info(adt_id).unwrap();
+        assert!(adt_info.flags.has_csc());
+        let rna_info = reader.modality_info(rna_id).unwrap();
+        assert!(!rna_info.flags.has_csc());
+
+        // BackedCscReader scoped to RNA sees zero shards; scoped to
+        // ADT sees the one shard. This is the cache-isolation
+        // guarantee from B.5.
+        let rna_csc =
+            BackedCscReader::for_modality(ScxReader::open(&final_path).unwrap(), rna_id, 4)
+                .unwrap();
+        assert_eq!(rna_csc.n_shards(), 0);
+        let adt_csc =
+            BackedCscReader::for_modality(ScxReader::open(&final_path).unwrap(), adt_id, 4)
+                .unwrap();
+        assert_eq!(adt_csc.n_shards(), 1);
     }
 }

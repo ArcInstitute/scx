@@ -195,6 +195,7 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
             length: entry.length,
             section_type: entry.section_type,
             checksum: entry.checksum,
+            modality_id: entry.modality_id,
             stats: entry.stats.clone(),
         });
     }

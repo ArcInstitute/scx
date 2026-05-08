@@ -7,6 +7,7 @@ pub mod codec_select;
 pub mod deletion_vectors;
 pub mod error;
 pub mod header;
+pub mod modality;
 pub mod provenance;
 pub mod reader;
 pub mod section;
@@ -32,6 +33,10 @@ pub use codec_select::{select_codec, select_codec_with_profile, CodecProfile};
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use error::{Result, ScxError};
 pub use header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
+pub use modality::{
+    ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,
+    MODALITY_NAME_MAX_BYTES, MODALITY_TABLE_MAGIC, MODALITY_TABLE_VERSION,
+};
 pub use provenance::{Provenance, ProvenanceEntry};
 pub use reader::ScxReader;
 pub use section::{align_to_8, SectionType};

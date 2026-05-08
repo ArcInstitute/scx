@@ -370,6 +370,14 @@ pub struct FullCatalogEntry {
     pub section_type: SectionType,
     /// BLAKE3 checksum of the section data.
     pub checksum: [u8; 32],
+    /// Modality routing key (Phase B). `0` is the global / primary
+    /// modality (the implicit modality of every v1 file and the
+    /// default for single-modality v2 files); `1..=n_modalities` are
+    /// 1-based indices into the file's `ModalityTable`.
+    ///
+    /// On v1 catalog reads (no on-disk byte) this is always stamped
+    /// `0`. On v2 reads it is parsed from the per-entry encoding.
+    pub modality_id: u8,
     /// Optional shard statistics (present for CSR/CSC shard entries).
     pub stats: Option<ShardStats>,
 }
@@ -406,7 +414,11 @@ impl FullCatalog {
         buf.write_u64::<LittleEndian>(self.n_obs)?;
         buf.write_u32::<LittleEndian>(self.entries.len() as u32)?;
 
-        // Entries
+        // Entries. v2 layout adds a single `modality_id: u8` between
+        // the per-entry checksum and the stats length prefix. v1
+        // layout omits that byte. Writers emit whichever layout
+        // matches `self.catalog_version`.
+        let v2 = self.catalog_version >= 2;
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
             buf.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
@@ -415,6 +427,10 @@ impl FullCatalog {
             buf.write_u64::<LittleEndian>(entry.length)?;
             buf.write_u8(entry.section_type as u8)?;
             buf.write_all(&entry.checksum)?;
+
+            if v2 {
+                buf.write_u8(entry.modality_id)?;
+            }
 
             // Stats: write length prefix then optional stats bytes
             match &entry.stats {
@@ -486,6 +502,14 @@ impl FullCatalog {
             let mut checksum = [0u8; 32];
             cur.read_exact(&mut checksum)?;
 
+            // v2 catalogs carry a `modality_id: u8` after the
+            // per-entry checksum. v1 catalogs don't — leave at 0.
+            let modality_id = if catalog_version >= 2 {
+                cur.read_u8()?
+            } else {
+                0u8
+            };
+
             let stats_len = cur.read_u16::<LittleEndian>()? as usize;
             let stats = if stats_len > 0 {
                 let mut stats_bytes = vec![0u8; stats_len];
@@ -520,6 +544,7 @@ impl FullCatalog {
                 length,
                 section_type,
                 checksum,
+                modality_id,
                 stats,
             };
             if catalog_version < 2 {
@@ -586,6 +611,104 @@ impl FullCatalog {
     /// CSC sidecars are also present.
     pub fn shards_sorted(&self) -> Vec<&FullCatalogEntry> {
         self.csr_shards_sorted()
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase C.2: per-modality filtering helpers
+    // -----------------------------------------------------------------------
+
+    /// Return all entries belonging to a given modality (any
+    /// section_type). `modality_id == 0` returns global entries (the
+    /// implicit modality of v1 / single-modality v2 files).
+    pub fn shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.modality_id == modality_id)
+            .collect()
+    }
+
+    /// Return CSR shards belonging to a given modality, sorted by
+    /// `row_start`.
+    pub fn csr_shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(SectionType::CsrShard))
+        });
+        shards
+    }
+
+    /// Return CSC shards belonging to a given modality, sorted by
+    /// `col_start`.
+    pub fn csc_shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == modality_id)
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(SectionType::CscShard))
+        });
+        shards
+    }
+
+    /// Return Layer-CSR shards belonging to `(modality_id, layer_name)`.
+    /// Layer section names follow the pattern
+    /// `layer/{modality_name}/{layer_name}/shard_{idx}`. Sorted by
+    /// `row_start`.
+    pub fn layer_csr_shards_for_modality(
+        &self,
+        modality_id: u8,
+        layer_name: &str,
+    ) -> Vec<&FullCatalogEntry> {
+        let needle = format!("/{layer_name}/");
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::LayerCsrShard
+                    && e.modality_id == modality_id
+                    && e.name.contains(&needle)
+            })
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(SectionType::LayerCsrShard))
+        });
+        shards
+    }
+
+    /// Return Layer-CSC shards belonging to `(modality_id, layer_name)`.
+    /// Sorted by `col_start`.
+    pub fn layer_csc_shards_for_modality(
+        &self,
+        modality_id: u8,
+        layer_name: &str,
+    ) -> Vec<&FullCatalogEntry> {
+        let needle = format!("/{layer_name}/");
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::LayerCscShard
+                    && e.modality_id == modality_id
+                    && e.name.contains(&needle)
+            })
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(SectionType::LayerCscShard))
+        });
+        shards
     }
 
     /// Return CSR shard entries sorted by `stats.row_start`.
@@ -966,6 +1089,7 @@ mod tests {
             length: 50_000,
             section_type: stype,
             checksum: [0xCD; 32],
+            modality_id: 0,
             stats: if with_stats {
                 Some(sample_stats())
             } else {
@@ -1135,6 +1259,7 @@ mod tests {
                 length: 50_000,
                 section_type: SectionType::CscShard,
                 checksum: [0u8; 32],
+                modality_id: 0,
                 stats: Some(ShardStats {
                     row_start: 0, // v2 CSC: row pair carries [0, n_obs)
                     row_end: 1000,
@@ -1156,6 +1281,7 @@ mod tests {
             length: 1,
             section_type: SectionType::CsrShard,
             checksum: [0u8; 32],
+            modality_id: 0,
             stats: Some(ShardStats {
                 row_start: 0,
                 row_end: 100,

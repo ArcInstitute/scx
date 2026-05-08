@@ -328,6 +328,9 @@ pub fn append(
             length: section_length,
             section_type: SectionType::CsrShard,
             checksum: section_checksum,
+            // Append always targets the global / primary modality.
+            // Per-modality append is a Phase F.3 follow-on.
+            modality_id: 0,
             stats: Some(stats),
         });
 
@@ -456,6 +459,7 @@ pub fn append(
         length: new_obs_length,
         section_type: SectionType::ObsMetadata,
         checksum: new_obs_checksum,
+        modality_id: 0, // obs is shared across modalities (global)
         stats: None,
     });
     new_entries.push(FullCatalogEntry {
@@ -464,6 +468,7 @@ pub fn append(
         length: prov_length,
         section_type: SectionType::Provenance,
         checksum: prov_checksum,
+        modality_id: 0, // provenance is global
         stats: None,
     });
 

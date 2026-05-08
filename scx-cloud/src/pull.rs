@@ -344,6 +344,7 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
             length: section_data.len() as u64,
             section_type: entry.section_type,
             checksum: entry.checksum,
+            modality_id: entry.modality_id,
             stats: entry.stats.clone(),
         });
     }
@@ -728,6 +729,7 @@ pub async fn pull_filtered(
             length: filtered_obs_bytes.len() as u64,
             section_type: SectionType::ObsMetadata,
             checksum: *obs_checksum.as_bytes(),
+            modality_id: 0,
             stats: None,
         });
         write_offset += filtered_obs_bytes.len() as u64;
@@ -794,6 +796,7 @@ pub async fn pull_filtered(
                 length: data.len() as u64,
                 section_type: entry.section_type,
                 checksum: entry.checksum,
+                modality_id: entry.modality_id,
                 stats: new_stats,
             });
         }

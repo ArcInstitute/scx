@@ -17,6 +17,7 @@ use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
+use crate::modality::{ModalityInfo, ModalityTable};
 use crate::provenance::Provenance;
 use crate::section::SectionType;
 use crate::shard::{ShardHeader, SHARD_HEADER_SIZE};
@@ -32,6 +33,11 @@ pub struct ScxReader {
     header: FileHeader,
     root_catalog: RootCatalog,
     full_catalog: FullCatalog,
+    /// `Some(table)` for v2 multimodal files; `None` for
+    /// single-modality v2 files (`n_modalities == 0`) and all v1
+    /// files. Parsed lazily-eagerly: the table is parsed once during
+    /// `open()` so subsequent `modality_*` accessors are zero-cost.
+    modality_table: Option<ModalityTable>,
 }
 
 impl ScxReader {
@@ -111,11 +117,52 @@ impl ScxReader {
         // v2 catalogs.
         full_catalog.reconcile_v1_csr_col_range(header.n_vars);
 
+        // Phase B: parse the ModalityTable section if the header
+        // points at one. The pointer is `0/0` for single-modality
+        // files (legacy shape and v1 files alike).
+        let modality_table = if header.n_modalities > 0
+            && header.modality_table_offset != 0
+            && header.modality_table_length != 0
+        {
+            let mt_off = header.modality_table_offset as usize;
+            let mt_len = header.modality_table_length as usize;
+            let mt_end = mt_off
+                .checked_add(mt_len)
+                .ok_or(ScxError::SectionOutOfBounds {
+                    offset: header.modality_table_offset,
+                    length: header.modality_table_length,
+                    file_size: mmap.len(),
+                })?;
+            if mt_end > mmap.len() {
+                return Err(ScxError::SectionOutOfBounds {
+                    offset: header.modality_table_offset,
+                    length: header.modality_table_length,
+                    file_size: mmap.len(),
+                });
+            }
+            let mt_slice = &mmap[mt_off..mt_end];
+            let table = ModalityTable::read_from(&mut Cursor::new(mt_slice), mt_len)?;
+            // Cross-check header.n_modalities against the table's
+            // embedded count. Disagreement is corruption, not a v1/v2
+            // mismatch.
+            if table.len() as u32 != header.n_modalities {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "header.n_modalities ({}) != ModalityTable.len() ({})",
+                    header.n_modalities,
+                    table.len()
+                )));
+            }
+            Some(table)
+        } else {
+            None
+        };
+
         Ok(ScxReader {
             mmap,
             header,
             root_catalog,
             full_catalog,
+            modality_table,
         })
     }
 
@@ -290,6 +337,163 @@ impl ScxReader {
             }
         }
         Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: per-modality accessors
+    // -----------------------------------------------------------------------
+
+    /// Number of registered modalities. Returns `0` for v1 files and
+    /// single-modality v2 files (semantically equivalent).
+    pub fn n_modalities(&self) -> u32 {
+        self.header.n_modalities
+    }
+
+    /// Returns true when the file has a `ModalityTable` section
+    /// (v2 multimodal). Mirrors `header.has_modalities()`.
+    pub fn is_multimodal(&self) -> bool {
+        self.modality_table.is_some()
+    }
+
+    /// Returns the ordered list of modality names, in registration
+    /// order. Empty for single-modality files.
+    pub fn modality_names(&self) -> Vec<&str> {
+        self.modality_table
+            .as_ref()
+            .map(|t| t.entries.iter().map(|m| m.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Resolve a modality name to its 1-based `modality_id`. Returns
+    /// `None` for unknown names or for single-modality files.
+    pub fn modality_id(&self, name: &str) -> Option<u8> {
+        self.modality_table.as_ref().and_then(|t| t.id_of(name))
+    }
+
+    /// Look up modality metadata by 1-based id. Returns `None` for
+    /// `id == 0` (global) and for single-modality files.
+    pub fn modality_info(&self, modality_id: u8) -> Option<&ModalityInfo> {
+        self.modality_table
+            .as_ref()
+            .and_then(|t| t.info_of(modality_id))
+    }
+
+    /// Returns the parsed `ModalityTable`, or `None` for
+    /// single-modality files. Useful for tooling that wants to walk
+    /// the table directly (e.g. `scx info`).
+    pub fn modality_table(&self) -> Option<&ModalityTable> {
+        self.modality_table.as_ref()
+    }
+
+    /// Read the `var` metadata batch for a specific modality.
+    /// `modality_id == 0` reads the global / single-modality `var`
+    /// section (matches `read_var()`).
+    pub fn read_var_for(&self, modality_id: u8) -> Result<RecordBatch> {
+        let key = if modality_id == 0 {
+            "var".to_string()
+        } else {
+            let mname = self.modality_name_for_id(modality_id)?;
+            format!("var/{mname}")
+        };
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or_else(|| ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Number of CSR shards belonging to the given modality.
+    /// `modality_id == 0` returns the global CSR shard count
+    /// (matches the legacy single-modality semantics).
+    pub fn csr_shard_count_for(&self, modality_id: u8) -> u32 {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+            .count() as u32
+    }
+
+    /// Number of CSC shards belonging to the given modality.
+    pub fn csc_shard_count_for(&self, modality_id: u8) -> u32 {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == modality_id)
+            .count() as u32
+    }
+
+    /// Read a single CSR shard for the given modality, by 0-based
+    /// index in catalog order (sorted by `row_start`). Returns
+    /// scipy-compatible arrays.
+    pub fn read_csr_shard_for(
+        &self,
+        modality_id: u8,
+        shard_idx: usize,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        let shards = self.full_catalog.csr_shards_for_modality(modality_id);
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_shard_from_entry(shards[shard_idx])
+    }
+
+    /// Read a single CSC shard for the given modality.
+    pub fn read_csc_shard_for(&self, modality_id: u8, shard_idx: usize) -> Result<ScxCsc> {
+        let shards = self.full_catalog.csc_shards_for_modality(modality_id);
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_csc_from_entry(shards[shard_idx])
+    }
+
+    /// Read an obsm batch keyed by `(modality_id, key)`. Section
+    /// names are `obsm/{modality_name}/{key}` for `modality_id >= 1`
+    /// and `obsm/{key}` for `modality_id == 0` (global).
+    pub fn read_obsm_for(&self, modality_id: u8, key: &str) -> Result<RecordBatch> {
+        let section_name = if modality_id == 0 {
+            format!("obsm/{key}")
+        } else {
+            let mname = self.modality_name_for_id(modality_id)?;
+            format!("obsm/{mname}/{key}")
+        };
+        let entry = self
+            .full_catalog
+            .get(&section_name)
+            .ok_or_else(|| ScxError::SectionNotFound(section_name))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Read the per-modality `uns` JSON, decoded to `serde_json::Value`.
+    pub fn read_uns_for(&self, modality_id: u8) -> Result<serde_json::Value> {
+        let section_name = if modality_id == 0 {
+            "uns".to_string()
+        } else {
+            let mname = self.modality_name_for_id(modality_id)?;
+            format!("uns/{mname}")
+        };
+        let entry = self
+            .full_catalog
+            .get(&section_name)
+            .ok_or_else(|| ScxError::SectionNotFound(section_name))?;
+        let bytes = self.section_bytes(entry)?;
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    fn modality_name_for_id(&self, modality_id: u8) -> Result<String> {
+        if modality_id == 0 {
+            return Err(ScxError::InvalidCatalog(
+                "modality_id 0 is reserved for global entries".to_string(),
+            ));
+        }
+        self.modality_info(modality_id)
+            .map(|m| m.name.clone())
+            .ok_or_else(|| ScxError::InvalidCatalog(format!("modality_id {modality_id} not found")))
     }
 
     // -----------------------------------------------------------------------

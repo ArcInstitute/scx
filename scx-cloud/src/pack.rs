@@ -143,6 +143,7 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
             length: section_data.len() as u64,
             section_type: entry.section_type,
             checksum,
+            modality_id: entry.modality_id,
             stats: entry.stats.clone(),
         });
     }

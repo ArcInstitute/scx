@@ -136,6 +136,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         length: dv_section_length,
         section_type: SectionType::DeletionVectors,
         checksum: dv_checksum,
+        modality_id: 0, // deletion vectors operate on the global obs axis
         stats: None,
     });
 
@@ -176,6 +177,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         length: prov_length,
         section_type: SectionType::Provenance,
         checksum: prov_checksum,
+        modality_id: 0, // provenance is global
         stats: None,
     });
 

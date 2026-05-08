@@ -477,6 +477,16 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
         SectionType::DeletionVectors => "deletion_vectors".to_string(),
         SectionType::ObsPredicateIndex => "obs_predicate_index".to_string(),
         SectionType::VarPredicateIndex => "var_predicate_index".to_string(),
+        SectionType::ModalityTable => "modality_table".to_string(),
+        SectionType::LayerCscShard => {
+            // Mirrors the LayerCsrShard naming pattern.
+            if let Some(layer) = name.strip_prefix("layer/") {
+                if let Some(lname) = layer.split('/').next() {
+                    return format!("layer/{lname}/csc");
+                }
+            }
+            format!("layer-csc ({})", name)
+        }
     }
 }
 
