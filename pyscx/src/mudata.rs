@@ -19,7 +19,7 @@ use arrow::array::RecordBatch;
 use pyo3::exceptions::{PyImportError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::CodecId;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
@@ -29,7 +29,8 @@ use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
 use crate::anndata::{
-    csr_to_scipy, obsm_batch_to_numpy, pyarrow_table_to_pandas, record_batch_to_pyarrow,
+    csr_to_scipy, obsm_batch_to_numpy, pandas_to_record_batch, pyarrow_table_to_pandas,
+    record_batch_to_pyarrow,
 };
 use crate::to_pyerr;
 
@@ -280,9 +281,7 @@ pub fn from_mudata_impl(
 
         // var
         let var_pd = adata.getattr("var")?;
-        let var_pa_mod = py.import("pyarrow")?;
-        let var_table_py = var_pa_mod.call_method1("Table.from_pandas", (var_pd,))?;
-        let var_batch = pyarrow_table_to_record_batch(py, &var_table_py)?;
+        let var_batch = pandas_to_record_batch(py, &var_pd)?;
 
         // obsm — dict of (key -> ndarray)
         let mut obsm: HashMap<String, RecordBatch> = HashMap::new();
@@ -296,8 +295,7 @@ pub fn from_mudata_impl(
             let arr = obsm_attr.get_item(&key)?;
             let pd_mod = py.import("pandas")?;
             let df = pd_mod.call_method1("DataFrame", (arr,))?;
-            let table_py = var_pa_mod.call_method1("Table.from_pandas", (df,))?;
-            let batch = pyarrow_table_to_record_batch(py, &table_py)?;
+            let batch = pandas_to_record_batch(py, &df)?;
             obsm.insert(key, batch);
         }
 
@@ -316,9 +314,7 @@ pub fn from_mudata_impl(
     }
 
     // Build outer obs RecordBatch.
-    let pa_mod = py.import("pyarrow")?;
-    let outer_obs_table_py = pa_mod.call_method1("Table.from_pandas", (mu_obs,))?;
-    let outer_obs_batch = pyarrow_table_to_record_batch(py, &outer_obs_table_py)?;
+    let outer_obs_batch = pandas_to_record_batch(py, &mu_obs)?;
 
     let total_nnz: u64 = modalities.iter().map(|m| m.nnz).sum();
     let max_n_vars = modalities.iter().map(|m| m.n_vars).max().unwrap_or(0) as u64;
@@ -374,10 +370,24 @@ pub fn from_mudata_impl(
     };
 
     for payload in &modalities {
-        let value_encoding = ValueEncoding::Float32;
-        let raw_values_bytes = data_to_f32_bytes(&payload.data);
+        // Integer-detect per-modality: small UMI / ADT / ATAC counts
+        // compress dramatically better when stored as uint8/16/32
+        // than as Float32. Mirrors `from_anndata`'s per-shard
+        // `detect_value_encoding(shard_data)` path; without this,
+        // every modality's X would land as Float32 → Pcodec
+        // regardless of `select_codec_for_modality`'s biological
+        // routing.
+        let value_encoding = scx_codec::value_encoding::detect_value_encoding(&payload.data);
+        let raw_values_bytes =
+            scx_codec::value_encoding::values_to_raw_bytes(&payload.data, value_encoding);
         let codec_id = match explicit_codec {
-            Some(c) => c,
+            Some(c) => {
+                if c == CodecId::Scx1 && !value_encoding.is_integer() {
+                    CodecId::Zstd
+                } else {
+                    c
+                }
+            }
             None => {
                 select_codec_for_modality(&raw_values_bytes, value_encoding, payload.modality_type)
             }
@@ -448,60 +458,4 @@ pub fn from_mudata_impl(
 
     writer.finish().map_err(to_pyerr)?;
     Ok(())
-}
-
-/// Convert a pyarrow.Table to an Arrow `RecordBatch`. Mirrors the
-/// approach used by `pyscx::from_anndata_impl`: pyarrow → IPC bytes →
-/// Arrow RecordBatch.
-fn pyarrow_table_to_record_batch(
-    py: Python<'_>,
-    table: &Bound<'_, PyAny>,
-) -> PyResult<RecordBatch> {
-    use arrow::ipc::reader::StreamReader;
-    use std::io::Cursor;
-
-    let pa = py.import("pyarrow")?;
-    let buf = pa.call_method0("BufferOutputStream")?;
-    {
-        let writer = pa.call_method1(
-            "ipc.RecordBatchStreamWriter",
-            (&buf, table.getattr("schema")?),
-        )?;
-        writer.call_method1("write_table", (table,))?;
-        writer.call_method0("close")?;
-    }
-    let bytes = buf
-        .call_method0("getvalue")?
-        .call_method0("to_pybytes")?
-        .extract::<Vec<u8>>()?;
-    let cursor = Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| PyRuntimeError::new_err(format!("Arrow IPC stream open failed: {e}")))?;
-    // Combine all streamed RecordBatches (typically one per Table) into
-    // a single batch via concat.
-    let mut batches = Vec::new();
-    for b in reader {
-        let batch =
-            b.map_err(|e| PyRuntimeError::new_err(format!("Arrow IPC batch decode failed: {e}")))?;
-        batches.push(batch);
-    }
-    if batches.is_empty() {
-        return Err(PyRuntimeError::new_err(
-            "pyarrow Table produced zero RecordBatches",
-        ));
-    }
-    if batches.len() == 1 {
-        return Ok(batches.pop().unwrap());
-    }
-    let schema = batches[0].schema();
-    arrow::compute::concat_batches(&schema, &batches)
-        .map_err(|e| PyRuntimeError::new_err(format!("RecordBatch concat failed: {e}")))
-}
-
-fn data_to_f32_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
 }

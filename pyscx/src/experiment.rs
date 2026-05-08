@@ -211,6 +211,41 @@ impl PyExperiment {
             .collect()
     }
 
+    /// Resolve a modality name to its 1-based `modality_id`.
+    /// Returns `None` for unknown names or single-modality files.
+    fn modality_id(&self, name: &str) -> Option<u8> {
+        self.reader.modality_id(name)
+    }
+
+    /// Per-modality information block for the given 1-based
+    /// `modality_id`. Returns a dict with the on-disk fields of
+    /// `ModalityInfo` (name, modality_type, default_codec_id,
+    /// default_value_encoding, n_vars, nnz, n_csr_shards,
+    /// n_csc_shards, flags). Useful for introspection (e.g. asserting
+    /// per-modality codec routing in tests).
+    fn modality_info<'py>(
+        &self,
+        py: Python<'py>,
+        modality_id: u8,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        use pyo3::types::PyDict;
+        let info = match self.reader.modality_info(modality_id) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let d = PyDict::new(py);
+        d.set_item("name", &info.name)?;
+        d.set_item("modality_type", info.modality_type as u8)?;
+        d.set_item("default_codec_id", info.default_codec_id)?;
+        d.set_item("default_value_encoding", info.default_value_encoding)?;
+        d.set_item("n_vars", info.n_vars)?;
+        d.set_item("nnz", info.nnz)?;
+        d.set_item("n_csr_shards", info.n_csr_shards)?;
+        d.set_item("n_csc_shards", info.n_csc_shards)?;
+        d.set_item("flags", info.flags.bits())?;
+        Ok(Some(d))
+    }
+
     /// Materialise this file as a `mudata.MuData` object.
     ///
     /// Iterates the registered modalities, builds an AnnData per

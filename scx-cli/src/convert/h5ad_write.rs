@@ -106,10 +106,10 @@ fn write_sparse_group(
     write_sparse_arrays(&group, indptr, indices, data, n_obs, n_vars)
 }
 
-/// Module-internal helpers for the h5mu writer (Phase D.2). All
-/// take a parent `hdf5::Group` instead of the root `hdf5::File` so
-/// per-modality blocks under `/mod/{name}/…` can reuse the same
-/// emitters as `/X`, `/obs`, `/var`, `/obsm/…`, `/uns/…`.
+// Module-internal helpers for the h5mu writer (Phase D.2). All
+// take a parent `hdf5::Group` instead of the root `hdf5::File` so
+// per-modality blocks under `/mod/{name}/…` can reuse the same
+// emitters as `/X`, `/obs`, `/var`, `/obsm/…`, `/uns/…`.
 
 pub(super) fn write_sparse_group_at(
     parent: &hdf5::Group,

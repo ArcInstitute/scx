@@ -1090,6 +1090,71 @@ fn test_h5mu_round_trip() {
     assert_eq!(csr_adt.shape, (12, 10));
 }
 
+/// Phase E: per-modality codec routing fires on the h5mu pipeline.
+/// The `rna` modality (small UMI-style integer counts) should use
+/// Scx1; the `adt` modality (Protein → Zstd override) should use
+/// Zstd, even though the underlying byte distribution is similar.
+#[test]
+fn test_h5mu_per_modality_codec_routing() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use scx_format::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 12, 50, 10);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let rna_id = reader.modality_id("rna").unwrap();
+    let adt_id = reader.modality_id("adt").unwrap();
+
+    let bytes = std::fs::read(&scx_path).unwrap();
+    let mut rna_codecs: Vec<u8> = Vec::new();
+    let mut adt_codecs: Vec<u8> = Vec::new();
+    for entry in &reader.catalog().entries {
+        if entry.section_type != SectionType::CsrShard {
+            continue;
+        }
+        let section = &bytes[entry.offset as usize..][..entry.length as usize];
+        let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+            &section[..scx_format::shard::SHARD_HEADER_SIZE],
+        ))
+        .unwrap();
+        if entry.modality_id == rna_id {
+            rna_codecs.push(sh.codec_id);
+        } else if entry.modality_id == adt_id {
+            adt_codecs.push(sh.codec_id);
+        }
+    }
+    assert!(!rna_codecs.is_empty(), "expected at least one RNA shard");
+    assert!(!adt_codecs.is_empty(), "expected at least one ADT shard");
+    for c in &rna_codecs {
+        assert_eq!(
+            *c,
+            CodecId::Scx1 as u8,
+            "RNA shard codec should be Scx1 (small UMI median, RNA modality)"
+        );
+    }
+    for c in &adt_codecs {
+        assert_eq!(
+            *c,
+            CodecId::Zstd as u8,
+            "ADT shard codec should be Zstd (Protein modality override)"
+        );
+    }
+
+    // Modality table should also remember the resolved per-modality
+    // default codecs, since the h5mu pipeline registers each modality
+    // with the resolved codec.
+    let rna_info = reader.modality_info(rna_id).unwrap();
+    let adt_info = reader.modality_info(adt_id).unwrap();
+    assert_eq!(rna_info.default_codec_id, CodecId::Scx1 as u8);
+    assert_eq!(adt_info.default_codec_id, CodecId::Zstd as u8);
+}
+
 /// `scx_to_h5mu` round-trip: convert h5mu → SCX → h5mu and verify
 /// the resulting h5mu reports two modalities with the right
 /// per-modality shapes and that the outer obs is preserved.
