@@ -11,6 +11,10 @@ mod h5ad_read;
 #[cfg(feature = "hdf5")]
 mod h5ad_write;
 #[cfg(feature = "hdf5")]
+mod mudata_pipeline;
+#[cfg(feature = "hdf5")]
+mod mudata_write;
+#[cfg(feature = "hdf5")]
 mod tenx_read;
 
 #[cfg(feature = "hdf5")]
@@ -544,6 +548,14 @@ mod pipeline {
 #[cfg(feature = "hdf5")]
 #[allow(unused_imports)]
 pub use pipeline::{h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions};
+
+#[cfg(feature = "hdf5")]
+#[allow(unused_imports)]
+pub use mudata_pipeline::{h5mu_to_scx, is_h5mu_file};
+
+#[cfg(feature = "hdf5")]
+#[allow(unused_imports)]
+pub use mudata_write::{scx_modality_to_h5ad, scx_to_h5mu};
 
 #[cfg(all(test, feature = "hdf5"))]
 mod tests;

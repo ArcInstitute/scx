@@ -944,3 +944,207 @@ fn test_format_detection() {
     let file = hdf5::File::open(&tenx_path).unwrap();
     assert_eq!(detect_input_format(&file).unwrap(), InputFormat::TenX);
 }
+
+// -----------------------------------------------------------------------
+// Phase D: h5mu / MuData round-trip tests
+// -----------------------------------------------------------------------
+
+/// Create a minimal h5mu file with `n_obs` cells across two
+/// modalities (rna with `rna_n_vars` features and adt with
+/// `adt_n_vars` features). Mirrors `create_test_h5ad` for the per-
+/// modality `/mod/{name}/X` and `/mod/{name}/var` blocks plus an
+/// outer `/obs`.
+fn create_test_h5mu(path: &Path, n_obs: usize, rna_n_vars: usize, adt_n_vars: usize) {
+    let file = hdf5::File::create(path).unwrap();
+
+    // Outer obs.
+    let obs = file.create_group("obs").unwrap();
+    let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+    obs.new_dataset::<VarLenUnicode>()
+        .shape([n_obs])
+        .create("_index")
+        .unwrap()
+        .write(&obs_index)
+        .unwrap();
+    obs.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+
+    // /mod group.
+    let mod_group = file.create_group("mod").unwrap();
+
+    let write_modality = |group: &hdf5::Group, n_vars: usize| {
+        // Build trivial CSR data: one nonzero per row at column (row % n_vars).
+        let mut indptr = vec![0i64];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for row in 0..n_obs {
+            indices.push((row % n_vars) as i32);
+            data.push((row + 1) as f32);
+            indptr.push(data.len() as i64);
+        }
+
+        let x = group.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+
+        // var
+        let var = group.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> =
+            (0..n_vars).map(|i| vlu(&format!("feat_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    };
+
+    let rna = mod_group.create_group("rna").unwrap();
+    write_modality(&rna, rna_n_vars);
+    let adt = mod_group.create_group("adt").unwrap();
+    write_modality(&adt, adt_n_vars);
+}
+
+/// Round-trip: create an h5mu fixture → h5mu_to_scx → ScxReader
+/// reports two modalities with the right names, var counts, and
+/// CSR shard counts. Per-modality reads return non-empty data.
+#[test]
+fn test_h5mu_round_trip() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 12, 50, 10);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(reader.is_multimodal());
+    assert_eq!(reader.n_modalities(), 2);
+    // HDF5 returns /mod members in alphabetical order, so the
+    // registered order is ["adt", "rna"] rather than the
+    // insertion order ["rna", "adt"]. Order-insensitive check.
+    let mut names: Vec<String> = reader
+        .modality_names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["adt".to_string(), "rna".to_string()]);
+    assert!(reader.header().has_modalities());
+
+    let rna_id = reader.modality_id("rna").unwrap();
+    let adt_id = reader.modality_id("adt").unwrap();
+    assert_eq!(reader.modality_info(rna_id).unwrap().n_vars, 50);
+    assert_eq!(reader.modality_info(adt_id).unwrap().n_vars, 10);
+
+    // Per-modality var read.
+    let var_rna = reader.read_var_for(rna_id).unwrap();
+    assert_eq!(var_rna.num_rows(), 50);
+    let var_adt = reader.read_var_for(adt_id).unwrap();
+    assert_eq!(var_adt.num_rows(), 10);
+
+    // Per-modality CSR read.
+    assert!(reader.csr_shard_count_for(rna_id) >= 1);
+    assert!(reader.csr_shard_count_for(adt_id) >= 1);
+    let csr_rna = reader.read_all_csr_shards_for(rna_id).unwrap();
+    assert_eq!(csr_rna.shape, (12, 50));
+    let csr_adt = reader.read_all_csr_shards_for(adt_id).unwrap();
+    assert_eq!(csr_adt.shape, (12, 10));
+}
+
+/// `scx_to_h5mu` round-trip: convert h5mu → SCX → h5mu and verify
+/// the resulting h5mu reports two modalities with the right
+/// per-modality shapes and that the outer obs is preserved.
+#[test]
+fn test_scx_to_h5mu_round_trip() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use super::mudata_write::scx_to_h5mu;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_path = dir.path().join("mid.scx");
+    let h5mu_out = dir.path().join("out.h5mu");
+    create_test_h5mu(&h5mu_in, 8, 30, 5);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_in, &scx_path, &opts).unwrap();
+    scx_to_h5mu(&scx_path, &h5mu_out).unwrap();
+
+    let file = hdf5::File::open(&h5mu_out).unwrap();
+    // /mod/rna/X and /mod/adt/X exist.
+    assert!(file.group("mod").is_ok());
+    assert!(file.group("mod/rna").is_ok());
+    assert!(file.group("mod/adt").is_ok());
+    assert!(file.group("mod/rna/X").is_ok());
+    assert!(file.group("mod/adt/X").is_ok());
+    // Outer obs preserved.
+    assert!(file.group("obs").is_ok());
+    // Per-modality var preserved.
+    let rna_var = file.group("mod/rna/var").unwrap();
+    assert!(rna_var.dataset("_index").is_ok());
+}
+
+/// Single-modality extract: --to h5ad with --modality NAME on a
+/// multi-modality file produces a valid h5ad of just that
+/// modality.
+#[test]
+fn test_modality_extract_to_h5ad() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use super::mudata_write::scx_modality_to_h5ad;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_path = dir.path().join("mid.scx");
+    let h5ad_out = dir.path().join("rna.h5ad");
+    create_test_h5mu(&h5mu_in, 6, 40, 7);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_in, &scx_path, &opts).unwrap();
+    scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna").unwrap();
+
+    let file = hdf5::File::open(&h5ad_out).unwrap();
+    assert!(file.group("X").is_ok());
+    assert!(file.group("obs").is_ok());
+    assert!(file.group("var").is_ok());
+    // var should have 40 entries (rna's count, not adt's 7).
+    let var_idx = file.dataset("var/_index").unwrap();
+    assert_eq!(var_idx.shape()[0], 40);
+}

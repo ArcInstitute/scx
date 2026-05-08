@@ -30,6 +30,12 @@ eval = [
 scvi = [
     "scvi-tools",
 ]
+# Multimodal h5mu / MuData round-trip via `pyscx.from_mudata` /
+# `PyExperiment.to_mudata`. Optional — the rest of pyscx works
+# without it; only the multimodal API requires `mudata`.
+mudata = [
+    "mudata>=0.2,<1.0",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

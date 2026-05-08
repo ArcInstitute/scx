@@ -452,6 +452,52 @@ impl ScxReader {
         self.read_csc_from_entry(shards[shard_idx])
     }
 
+    /// Read and assemble all CSR shards for the given modality into a
+    /// single `ScxCsr`. Mirrors `read_all_csr_shards()` (the global
+    /// path) but filters catalog entries by `modality_id` and overrides
+    /// the assembled `n_cols` with the modality's `n_vars` (since the
+    /// file-level `header.n_vars` is the max across modalities, not
+    /// each modality's own count).
+    pub fn read_all_csr_shards_for(&self, modality_id: u8) -> Result<ScxCsr> {
+        let shards = self.full_catalog.csr_shards_for_modality(modality_id);
+        #[cfg(feature = "parallel")]
+        let assembled = self.assemble_shards_parallel(&shards)?;
+        #[cfg(not(feature = "parallel"))]
+        let assembled = self.assemble_shards(&shards)?;
+
+        // Patch n_cols to the modality's actual n_vars when available.
+        // For modality_id == 0 / single-modality v2 files the global
+        // header.n_vars matches, so this is a no-op.
+        let n_cols = match self.modality_info(modality_id) {
+            Some(info) => info.n_vars as usize,
+            None => assembled.shape.1,
+        };
+        Ok(ScxCsr::new_unchecked(
+            (assembled.shape.0, n_cols),
+            assembled.indptr,
+            assembled.indices,
+            assembled.data,
+        ))
+    }
+
+    /// Read and assemble all CSC shards for the given modality into a
+    /// single `ScxCsc`. Mirrors the per-modality CSR reader; falls
+    /// back to a sequential per-shard concat (the parallel CSC
+    /// assembler can be added later if hot).
+    pub fn read_all_csc_shards_for(&self, modality_id: u8) -> Result<ScxCsc> {
+        let n_rows = self.header.n_obs as usize;
+        let shards = self.full_catalog.csc_shards_for_modality(modality_id);
+        if shards.is_empty() {
+            return Ok(ScxCsc::new_unchecked(
+                (n_rows, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        self.assemble_csc_shards(&shards)
+    }
+
     /// Read an obsm batch keyed by `(modality_id, key)`. Section
     /// names are `obsm/{modality_name}/{key}` for `modality_id >= 1`
     /// and `obsm/{key}` for `modality_id == 0` (global).

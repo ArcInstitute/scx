@@ -106,6 +106,73 @@ fn write_sparse_group(
     write_sparse_arrays(&group, indptr, indices, data, n_obs, n_vars)
 }
 
+/// Module-internal helpers for the h5mu writer (Phase D.2). All
+/// take a parent `hdf5::Group` instead of the root `hdf5::File` so
+/// per-modality blocks under `/mod/{name}/…` can reuse the same
+/// emitters as `/X`, `/obs`, `/var`, `/obsm/…`, `/uns/…`.
+
+pub(super) fn write_sparse_group_at(
+    parent: &hdf5::Group,
+    name: &str,
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+) -> Result<(), ConvertError> {
+    let group = parent.create_group(name)?;
+    write_sparse_arrays(&group, indptr, indices, data, n_obs, n_vars)
+}
+
+pub(super) fn write_dataframe_group_at(
+    parent: &hdf5::Group,
+    name: &str,
+    batch: &arrow::array::RecordBatch,
+) -> Result<(), ConvertError> {
+    let group = parent.group(name).or_else(|_| parent.create_group(name))?;
+    let schema = batch.schema();
+    group
+        .new_attr::<VarLenUnicode>()
+        .create("encoding-type")?
+        .write_scalar(&vlu("dataframe"))?;
+    group
+        .new_attr::<VarLenUnicode>()
+        .create("encoding-version")?
+        .write_scalar(&vlu("0.2.0"))?;
+
+    let mut col_order: Vec<VarLenUnicode> = Vec::with_capacity(batch.num_columns());
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(col_idx);
+        write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
+        col_order.push(vlu(field.name()));
+    }
+
+    if !col_order.is_empty() {
+        group
+            .new_attr::<VarLenUnicode>()
+            .shape(col_order.len())
+            .create("column-order")?
+            .write_raw(&col_order)?;
+    }
+
+    Ok(())
+}
+
+pub(super) fn write_obsm_entry_at(
+    obsm_group: &hdf5::Group,
+    name: &str,
+    batch: &arrow::array::RecordBatch,
+) -> Result<(), ConvertError> {
+    write_obsm_entry(obsm_group, name, batch)
+}
+
+pub(super) fn write_uns_entries_at(
+    group: &hdf5::Group,
+    value: &serde_json::Value,
+) -> Result<(), ConvertError> {
+    write_uns_entries(group, value)
+}
+
 fn write_sparse_arrays(
     group: &hdf5::Group,
     indptr: &[i64],

@@ -185,6 +185,43 @@ impl PyExperiment {
         self.reader.validate().map_err(to_pyerr)
     }
 
+    /// True if this file is multimodal (Phase B / v2 with
+    /// `n_modalities > 0`). Mirrors `header.has_modalities()`.
+    #[getter]
+    fn is_multimodal(&self) -> bool {
+        self.reader.is_multimodal()
+    }
+
+    /// Number of registered modalities (0 for v1 files and
+    /// single-modality v2 files).
+    #[getter]
+    fn n_modalities(&self) -> u32 {
+        self.reader.n_modalities()
+    }
+
+    /// Ordered list of modality names (empty for single-modality
+    /// files). The position in the list maps 1:1 to the 1-based
+    /// modality_id (`names[i] -> modality_id = i + 1`).
+    #[getter]
+    fn modality_names(&self) -> Vec<String> {
+        self.reader
+            .modality_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Materialise this file as a `mudata.MuData` object.
+    ///
+    /// Iterates the registered modalities, builds an AnnData per
+    /// modality via the existing zero-copy CSR path, and attaches
+    /// them to a `MuData(...)` with the shared global obs.
+    /// Single-modality files raise `RuntimeError` directing to
+    /// `to_anndata()`.
+    fn to_mudata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::mudata::to_mudata(py, &self.reader)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyExperiment(n_obs={}, n_vars={}, nnz={}, shards={}, codec={})",

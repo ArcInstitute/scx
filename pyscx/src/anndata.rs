@@ -153,7 +153,10 @@ pub(crate) fn csr_to_scipy<'py>(
 }
 
 /// Convert an Arrow RecordBatch (obsm) to a numpy 2D array.
-fn obsm_batch_to_numpy<'py>(py: Python<'py>, batch: &RecordBatch) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn obsm_batch_to_numpy<'py>(
+    py: Python<'py>,
+    batch: &RecordBatch,
+) -> PyResult<Bound<'py, PyAny>> {
     let table = record_batch_to_pyarrow(py, batch)?;
     let df = pyarrow_table_to_pandas(&table)?;
     df.getattr("values")
