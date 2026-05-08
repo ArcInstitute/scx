@@ -155,6 +155,12 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
 
     // 5. Copy sections in the specified order, recording new offsets/checksums
     let mut new_entries: Vec<FullCatalogEntry> = Vec::with_capacity(ordered_entries.len());
+    // Phase G.1a: track the modality table's new offset/length so the
+    // header can be updated to point at the post-cloud_optimize
+    // location. The struct-copy below preserves `n_modalities` and
+    // the has_modalities flag.
+    let mut modality_table_offset_new: u64 = 0;
+    let mut modality_table_length_new: u64 = 0;
 
     for &entry in &ordered_entries {
         // Pad to 8-byte alignment
@@ -187,6 +193,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         let section_data = &input_data[src_start..src_end];
         writer.write_all(section_data)?;
         write_offset += entry.length;
+
+        if entry.section_type == SectionType::ModalityTable {
+            modality_table_offset_new = new_offset;
+            modality_table_length_new = entry.length;
+        }
 
         // Recompute checksum (section bytes unchanged, so checksum matches)
         new_entries.push(FullCatalogEntry {
@@ -260,6 +271,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     new_header.front_catalog_offset = front_catalog_offset;
     new_header.front_catalog_length = front_catalog_size;
     new_header.set_front_catalog();
+    // Phase G.1a: cloud_optimize re-lays out sections, so the
+    // source's modality_table_offset is stale. Point at the new
+    // location (or 0 if the source had none).
+    new_header.modality_table_offset = modality_table_offset_new;
+    new_header.modality_table_length = modality_table_length_new;
     new_header.file_checksum = 0;
 
     writer.seek(SeekFrom::Start(0))?;

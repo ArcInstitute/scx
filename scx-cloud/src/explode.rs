@@ -114,24 +114,55 @@ pub(crate) fn section_name_to_path(
         SectionType::VarMetadata => Ok("var.arrow".to_string()),
         SectionType::VarIndex => Ok("var_index.arrow".to_string()),
         SectionType::CsrShard => {
-            // "X_shard_N" → "X/NNNNNN.shard"
+            // Phase G.2: per-modality CSR shards are named
+            // "X/{modality_name}/shard_{idx}" by the writer (see
+            // writer.rs::write_csr_shard_for). They map to
+            // "X/{modality_name}/{idx:06}.shard" on disk so each
+            // modality lives in its own directory.
+            if let Some(rest) = name.strip_prefix("X/") {
+                if let Some(slash_pos) = rest.rfind("/shard_") {
+                    let mname = &rest[..slash_pos];
+                    let idx_str = &rest[slash_pos + "/shard_".len()..];
+                    let idx: u32 = idx_str.parse().map_err(|_| {
+                        format!(
+                            "invalid per-modality CsrShard name: cannot parse index from '{name}'"
+                        )
+                    })?;
+                    return Ok(format!("X/{mname}/{idx:06}.shard"));
+                }
+            }
+            // Legacy / single-modality: "X_shard_N" → "X/NNNNNN.shard"
             let idx: u32 = name
                 .strip_prefix("X_shard_")
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
-                    format!("invalid CsrShard name: expected 'X_shard_N', got '{name}'")
+                    format!("invalid CsrShard name: expected 'X_shard_N' or 'X/{{modality}}/shard_N', got '{name}'")
                 })?;
             Ok(format!("X/{idx:06}.shard"))
         }
         SectionType::CscShard => {
-            // "X_csc_shard_N" → "Xc/NNNNNN.shard"
-            // Parallel naming to CsrShard's `X/` directory; the `c`
-            // suffix marks the column-major sidecar.
+            // Phase G.2: per-modality CSC shards are named
+            // "X_csc/{modality_name}/shard_{idx}" by the writer (see
+            // writer.rs::write_csc_shard_for). Map to
+            // "Xc/{modality_name}/{idx:06}.shard".
+            if let Some(rest) = name.strip_prefix("X_csc/") {
+                if let Some(slash_pos) = rest.rfind("/shard_") {
+                    let mname = &rest[..slash_pos];
+                    let idx_str = &rest[slash_pos + "/shard_".len()..];
+                    let idx: u32 = idx_str.parse().map_err(|_| {
+                        format!(
+                            "invalid per-modality CscShard name: cannot parse index from '{name}'"
+                        )
+                    })?;
+                    return Ok(format!("Xc/{mname}/{idx:06}.shard"));
+                }
+            }
+            // Legacy: "X_csc_shard_N" → "Xc/NNNNNN.shard"
             let idx: u32 = name
                 .strip_prefix("X_csc_shard_")
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
-                    format!("invalid CscShard name: expected 'X_csc_shard_N', got '{name}'")
+                    format!("invalid CscShard name: expected 'X_csc_shard_N' or 'X_csc/{{modality}}/shard_N', got '{name}'")
                 })?;
             Ok(format!("Xc/{idx:06}.shard"))
         }
@@ -170,6 +201,10 @@ pub(crate) fn section_name_to_path(
         SectionType::DeletionVectors => Ok("_deletion_vectors.bin".to_string()),
         SectionType::ObsPredicateIndex => Ok("_obs_predicate_index.bin".to_string()),
         SectionType::VarPredicateIndex => Ok("_var_predicate_index.bin".to_string()),
+        // Phase G.2: modality table is a single global section, written
+        // as a top-level file in the exploded layout. The pack reader
+        // reattaches it via `path_to_section_name`.
+        SectionType::ModalityTable => Ok("_modality_table.bin".to_string()),
         _ => Ok(format!("{name}.bin")),
     }
 }
@@ -195,23 +230,40 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
             "var_predicate_index".to_string(),
             SectionType::VarPredicateIndex,
         )),
+        "_modality_table.bin" => Some(("modality_table".to_string(), SectionType::ModalityTable)),
         _ if rel_path.starts_with("X/") && rel_path.ends_with(".shard") => {
-            let idx_str = rel_path
+            // Phase G.2: per-modality CSR shards live at
+            // "X/{modality_name}/{idx:06}.shard"; the legacy
+            // single-modality layout is "X/{idx:06}.shard".
+            let inner = rel_path
                 .strip_prefix("X/")
                 .unwrap()
                 .strip_suffix(".shard")
                 .unwrap();
-            let idx: u32 = idx_str.parse().ok()?;
+            let parts: Vec<&str> = inner.rsplitn(2, '/').collect();
+            if parts.len() == 2 {
+                // "rna/000042" → "X/rna/shard_42"
+                let idx: u32 = parts[0].parse().ok()?;
+                let mname = parts[1];
+                return Some((format!("X/{mname}/shard_{idx}"), SectionType::CsrShard));
+            }
+            let idx: u32 = inner.parse().ok()?;
             Some((format!("X_shard_{idx}"), SectionType::CsrShard))
         }
         // Reverse of "X_csc_shard_N" → "Xc/NNNNNN.shard".
         _ if rel_path.starts_with("Xc/") && rel_path.ends_with(".shard") => {
-            let idx_str = rel_path
+            let inner = rel_path
                 .strip_prefix("Xc/")
                 .unwrap()
                 .strip_suffix(".shard")
                 .unwrap();
-            let idx: u32 = idx_str.parse().ok()?;
+            let parts: Vec<&str> = inner.rsplitn(2, '/').collect();
+            if parts.len() == 2 {
+                let idx: u32 = parts[0].parse().ok()?;
+                let mname = parts[1];
+                return Some((format!("X_csc/{mname}/shard_{idx}"), SectionType::CscShard));
+            }
+            let idx: u32 = inner.parse().ok()?;
             Some((format!("X_csc_shard_{idx}"), SectionType::CscShard))
         }
         _ if rel_path.starts_with("obsm/") && rel_path.ends_with(".arrow") => {

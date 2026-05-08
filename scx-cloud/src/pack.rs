@@ -112,6 +112,10 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
 
     // 6. Read and write each section, recording new offsets
     let mut new_entries: Vec<FullCatalogEntry> = Vec::with_capacity(ordered_entries.len());
+    // Phase G.2: track the modality table's new offset/length so the
+    // header can be updated to point at the post-pack location.
+    let mut modality_table_offset_new: u64 = 0;
+    let mut modality_table_length_new: u64 = 0;
 
     for &entry in &ordered_entries {
         // Pad to 8-byte alignment
@@ -136,6 +140,11 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
         // Recompute checksum from actual section data (may differ from
         // original if section files were modified on disk)
         let checksum = scx_format::blake3_hash(&section_data);
+
+        if entry.section_type == SectionType::ModalityTable {
+            modality_table_offset_new = new_offset;
+            modality_table_length_new = section_data.len() as u64;
+        }
 
         new_entries.push(FullCatalogEntry {
             name: entry.name.clone(),
@@ -203,6 +212,13 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
     new_header.root_catalog_length = root_catalog_length;
     new_header.full_catalog_offset = full_catalog_offset_new;
     new_header.full_catalog_length = new_full_catalog_length;
+    // Phase G.2: pack re-lays out sections, so the source's
+    // modality_table_offset is stale. Update the header to point at
+    // the post-pack location (or zero if the source had no
+    // modality table). The struct-copy at line 201 preserves
+    // `n_modalities` and the has_modalities flag.
+    new_header.modality_table_offset = modality_table_offset_new;
+    new_header.modality_table_length = modality_table_length_new;
 
     if front_catalog_length <= estimated_front_catalog_size {
         new_header.front_catalog_offset = front_catalog_offset;
@@ -791,6 +807,147 @@ mod tests {
         assert_eq!(pre_csc.data, post_csc.data);
 
         // Validate per-section checksums on the packed file.
+        for (name, passed) in r.validate().unwrap() {
+            assert!(passed, "checksum failed for section: {name}");
+        }
+    }
+
+    /// Phase G.2: write a synthetic CITE-seq-style multimodal SCX
+    /// file for use by the modality-table round-trip tests below.
+    /// Two modalities: rna (n_vars = 12) + adt (n_vars = 4). Each
+    /// gets one CSR shard.
+    fn write_multimodal_test_file(dir: &tempfile::TempDir, n_obs: usize) -> std::path::PathBuf {
+        use scx_format::ModalityType;
+        let path = dir.path().join("multi.scx");
+        let mut header = sample_header(n_obs as u64, 12);
+        header.n_vars = 12; // global = max across modalities
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        writer.set_modality_n_vars(rna_id, 12).unwrap();
+        writer.write_var_for(rna_id, &sample_var(12)).unwrap();
+        let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, 12);
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &rna_indptr,
+                &rna_indices,
+                &rna_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::Zstd,
+                ValueEncoding::Uint8,
+            )
+            .unwrap();
+        writer.set_modality_n_vars(adt_id, 4).unwrap();
+        writer.write_var_for(adt_id, &sample_var(4)).unwrap();
+        let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, 4);
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &adt_indptr,
+                &adt_indices,
+                &adt_values,
+                CodecId::Zstd,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        writer.finish().unwrap();
+        path
+    }
+
+    /// Phase G.2: explode + pack on a CITE-seq SCX file preserves the
+    /// modality table and updates header offsets to the post-pack
+    /// location.
+    #[test]
+    fn test_explode_pack_multimodal_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, 16);
+        let exploded = dir.path().join("multi.scxd");
+        let repacked = dir.path().join("multi_repacked.scx");
+
+        crate::explode::explode(&input, &exploded).unwrap();
+        // The exploded directory should contain _modality_table.bin
+        // (Phase G.2 layout).
+        assert!(
+            exploded.join("_modality_table.bin").exists(),
+            "exploded layout should contain _modality_table.bin"
+        );
+        // Per-modality CSR shards live under X/{modality}/.
+        assert!(
+            exploded.join("X/rna").is_dir(),
+            "exploded layout should have X/rna/ subdirectory"
+        );
+        assert!(
+            exploded.join("X/adt").is_dir(),
+            "exploded layout should have X/adt/ subdirectory"
+        );
+
+        pack(&exploded, &repacked).unwrap();
+        let r = ScxReader::open(&repacked).unwrap();
+        assert!(r.is_multimodal(), "round-tripped file should be multimodal");
+        assert_eq!(r.n_modalities(), 2);
+        let mut names: Vec<String> = r.modality_names().iter().map(|s| s.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["adt".to_string(), "rna".to_string()]);
+        // Modality table offset/length point at the post-pack
+        // location, not the source.
+        assert!(r.header().modality_table_offset > 0);
+        assert!(r.header().modality_table_length > 0);
+        // Section bytes round-trip; per-modality CSR reads still work.
+        let rna_id = r.modality_id("rna").unwrap();
+        let adt_id = r.modality_id("adt").unwrap();
+        let rna_csr = r.read_all_csr_shards_for(rna_id).unwrap();
+        assert_eq!(rna_csr.shape, (16, 12));
+        let adt_csr = r.read_all_csr_shards_for(adt_id).unwrap();
+        assert_eq!(adt_csr.shape, (16, 4));
+        for (name, passed) in r.validate().unwrap() {
+            assert!(passed, "checksum failed for section: {name}");
+        }
+    }
+
+    /// Phase G.1a: cloud_optimize on a multimodal SCX file preserves
+    /// the modality table and updates the header's
+    /// modality_table_offset to the post-optimize location.
+    #[test]
+    fn test_cloud_optimize_multimodal_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, 12);
+        let output = dir.path().join("multi_opt.scx");
+
+        crate::cloud_optimize::cloud_optimize(&input, &output).unwrap();
+        let r = ScxReader::open(&output).unwrap();
+        assert!(r.is_multimodal());
+        assert_eq!(r.n_modalities(), 2);
+        let mut names: Vec<String> = r.modality_names().iter().map(|s| s.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["adt".to_string(), "rna".to_string()]);
+        assert!(r.header().modality_table_offset > 0);
+        assert!(r.header().modality_table_length > 0);
+        // Modality table content must round-trip exactly.
+        let table = r.modality_table().unwrap();
+        let rna = table.entries.iter().find(|e| e.name == "rna").unwrap();
+        let adt = table.entries.iter().find(|e| e.name == "adt").unwrap();
+        assert_eq!(rna.n_vars, 12);
+        assert_eq!(adt.n_vars, 4);
         for (name, passed) in r.validate().unwrap() {
             assert!(passed, "checksum failed for section: {name}");
         }

@@ -322,6 +322,11 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
 
     // Write each section sequentially
     let mut new_entries: Vec<FullCatalogEntry> = Vec::with_capacity(ordered_entries.len());
+    // Phase G.1a: track the modality table's new offset/length so the
+    // header can be updated. The struct-copy of `header` preserves
+    // `n_modalities` and the has_modalities flag.
+    let mut modality_table_offset_new: u64 = 0;
+    let mut modality_table_length_new: u64 = 0;
 
     for (i, (_, section_data)) in downloaded_sections.iter().enumerate() {
         let entry = ordered_entries[i];
@@ -337,6 +342,11 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         let new_offset = write_offset;
         writer.write_all(section_data)?;
         write_offset += section_data.len() as u64;
+
+        if entry.section_type == SectionType::ModalityTable {
+            modality_table_offset_new = new_offset;
+            modality_table_length_new = section_data.len() as u64;
+        }
 
         new_entries.push(FullCatalogEntry {
             name: entry.name.clone(),
@@ -407,6 +417,10 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     new_header.root_catalog_length = root_catalog_length;
     new_header.full_catalog_offset = full_catalog_offset_new;
     new_header.full_catalog_length = new_full_catalog_length;
+    // Phase G.1a: pull re-lays out sections, so the source's
+    // modality_table_offset is stale. Point at the new location.
+    new_header.modality_table_offset = modality_table_offset_new;
+    new_header.modality_table_length = modality_table_length_new;
     new_header.file_checksum = 0;
 
     writer.seek(SeekFrom::Start(0))?;
@@ -652,6 +666,11 @@ pub async fn pull_filtered(
             SectionType::VarMetadata | SectionType::VarIndex | SectionType::UnsBlob => {
                 entries_to_download.push(entry);
             }
+            // Phase G.1c: pull the modality table so we can re-emit
+            // it in the local file with rewritten per-modality counts.
+            SectionType::ModalityTable => {
+                entries_to_download.push(entry);
+            }
             _ => {} // skip obsm, layers, obsp, etc.
         }
     }
@@ -802,6 +821,82 @@ pub async fn pull_filtered(
         }
     }
 
+    // Phase G.1c: re-emit the ModalityTable section at EOF before
+    // the catalog. Per-modality `n_csr_shards` and `nnz` are
+    // recomputed from the filtered new_entries; modalities that
+    // were entirely filtered out keep their entry with
+    // n_csr_shards=0/nnz=0 so the modality table's structure
+    // (names, types, n_vars) survives the filter unchanged.
+    let (modality_table_offset_new, modality_table_length_new) = if header.n_modalities > 0 {
+        let mt_entry = entries_to_download
+            .iter()
+            .find(|e| e.section_type == SectionType::ModalityTable);
+        if let Some(mt_entry) = mt_entry {
+            if let Some(mt_bytes) = section_data_map.get(&mt_entry.name) {
+                let mut table = scx_format::ModalityTable::read_from(
+                    &mut Cursor::new(mt_bytes),
+                    mt_bytes.len(),
+                )?;
+                // Reset per-modality counts before recomputing from
+                // the filtered catalog. CSC sidecars are dropped
+                // file-wide on pull_filtered (matching the
+                // header.clear_csc() / n_csc_shards = 0 below); zero
+                // each modality's CSC marker too.
+                for info in table.entries.iter_mut() {
+                    info.n_csr_shards = 0;
+                    info.n_csc_shards = 0;
+                    info.nnz = 0;
+                    info.flags = scx_format::ModalityFlags::from_bits_truncate(
+                        info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
+                    );
+                }
+                for entry in &new_entries {
+                    if entry.modality_id == 0 {
+                        continue;
+                    }
+                    let idx = (entry.modality_id - 1) as usize;
+                    if let Some(info) = table.entries.get_mut(idx) {
+                        if entry.section_type == SectionType::CsrShard {
+                            info.n_csr_shards += 1;
+                            if let Some(stats) = &entry.stats {
+                                info.nnz += stats.nnz;
+                            }
+                        }
+                    }
+                }
+                let mt_aligned = align_to_8(write_offset);
+                let pad = (mt_aligned - write_offset) as usize;
+                if pad > 0 {
+                    writer.write_all(&vec![0u8; pad])?;
+                    write_offset = mt_aligned;
+                }
+                let mt_offset_new = write_offset;
+                let mut mt_buf = Vec::new();
+                table.write_to(&mut mt_buf)?;
+                let mt_checksum = blake3::hash(&mt_buf);
+                writer.write_all(&mt_buf)?;
+                let mt_len = mt_buf.len() as u64;
+                write_offset += mt_len;
+                new_entries.push(FullCatalogEntry {
+                    name: "modality_table".to_string(),
+                    offset: mt_offset_new,
+                    length: mt_len,
+                    section_type: SectionType::ModalityTable,
+                    checksum: *mt_checksum.as_bytes(),
+                    modality_id: 0,
+                    stats: None,
+                });
+                (mt_offset_new, mt_len)
+            } else {
+                (0u64, 0u64)
+            }
+        } else {
+            (0u64, 0u64)
+        }
+    } else {
+        (0u64, 0u64)
+    };
+
     // Write full catalog at EOF
     let catalog_aligned = align_to_8(write_offset);
     let pad = (catalog_aligned - write_offset) as usize;
@@ -841,6 +936,10 @@ pub async fn pull_filtered(
     // CscShard entries; clear the header count + flag to match.
     new_header.n_csc_shards = 0;
     new_header.clear_csc();
+    // Phase G.1c: point at the rewritten modality table (or zero if
+    // the source had no modality table).
+    new_header.modality_table_offset = modality_table_offset_new;
+    new_header.modality_table_length = modality_table_length_new;
     new_header.root_catalog_offset = HEADER_SIZE as u64;
     new_header.root_catalog_length = root_catalog_length;
     new_header.full_catalog_offset = full_catalog_offset_new;
