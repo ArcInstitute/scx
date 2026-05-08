@@ -498,6 +498,158 @@ impl ScxReader {
         self.assemble_csc_shards(&shards)
     }
 
+    /// Phase B.4: read a contiguous column range from a modality's
+    /// CSC shards. Same shape as `read_csc_columns(col_range)` but
+    /// scoped to one modality via the catalog's
+    /// `csc_shards_for_modality` filter. Shard intersection /
+    /// `col_slice` semantics match the single-modality version.
+    pub fn read_csc_columns_for(
+        &self,
+        modality_id: u8,
+        col_range: std::ops::Range<u32>,
+    ) -> Result<ScxCsc> {
+        let c_lo = col_range.start as u64;
+        let c_hi = col_range.end as u64;
+        let n_rows = self.header.n_obs as usize;
+
+        if c_lo >= c_hi {
+            return Ok(ScxCsc::new_unchecked(
+                (n_rows, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        // Filter to the modality's CSC shards, then intersect with
+        // the column range. We can't use the file-wide
+        // `csc_shards_for_col_range` helper because it doesn't filter
+        // by modality_id.
+        let modality_shards = self.full_catalog.csc_shards_for_modality(modality_id);
+        let shards: Vec<&FullCatalogEntry> = modality_shards
+            .into_iter()
+            .filter(|e| match e.stats.as_ref() {
+                Some(s) => {
+                    let shard_lo = s.major_start(e.section_type);
+                    let shard_hi = s.major_end(e.section_type);
+                    shard_lo < c_hi && c_lo < shard_hi
+                }
+                None => false,
+            })
+            .collect();
+
+        let mut decoded: Vec<ScxCsc> = Vec::with_capacity(shards.len());
+        for entry in &shards {
+            let csc = self.read_csc_from_entry(entry)?;
+            let stats = entry.stats.as_ref().ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("CSC shard '{}' missing stats block", entry.name))
+            })?;
+            let shard_lo = stats.major_start(entry.section_type);
+            let shard_hi = stats.major_end(entry.section_type);
+            let lo_in_shard = c_lo.saturating_sub(shard_lo) as usize;
+            let hi_in_shard = (c_hi.min(shard_hi).saturating_sub(shard_lo)) as usize;
+            let sliced = if lo_in_shard == 0 && hi_in_shard == csc.n_cols() {
+                csc
+            } else {
+                csc.col_slice(lo_in_shard, hi_in_shard).map_err(|e| {
+                    ScxError::InvalidCatalog(format!(
+                        "CSC col_slice failed for shard '{}': {e}",
+                        entry.name
+                    ))
+                })?
+            };
+            decoded.push(sliced);
+        }
+
+        concatenate_csc_along_cols(decoded, n_rows)
+    }
+
+    /// Phase B.4: read a sorted column subset from a modality's CSC
+    /// shards. Same shape as `read_csc_columns_subset(cols)` —
+    /// collapses contiguous runs and concatenates per-run
+    /// `read_csc_columns_for` results.
+    pub fn read_csc_columns_subset_for(&self, modality_id: u8, cols: &[u32]) -> Result<ScxCsc> {
+        let n_rows = self.header.n_obs as usize;
+        if cols.is_empty() {
+            return Ok(ScxCsc::new_unchecked(
+                (n_rows, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let mut runs: Vec<ScxCsc> = Vec::new();
+        let mut run_start = cols[0];
+        let mut run_end = cols[0] + 1;
+        for &c in &cols[1..] {
+            if c == run_end {
+                run_end = c + 1;
+            } else {
+                runs.push(self.read_csc_columns_for(modality_id, run_start..run_end)?);
+                run_start = c;
+                run_end = c + 1;
+            }
+        }
+        runs.push(self.read_csc_columns_for(modality_id, run_start..run_end)?);
+        if runs.len() == 1 {
+            return Ok(runs.pop().unwrap());
+        }
+        concatenate_csc_along_cols(runs, n_rows)
+    }
+
+    /// Phase B.4: read a per-modality named layer (CSR), assembling
+    /// all its shards into a single `ScxCsr`. Mirrors `read_layer`
+    /// but filters via `catalog.layer_csr_shards_for_modality(...)`.
+    /// Output `n_cols` is patched from `modality_info(id).n_vars`
+    /// (matching `read_all_csr_shards_for`).
+    pub fn read_layer_for(&self, modality_id: u8, layer_name: &str) -> Result<ScxCsr> {
+        let shards = self
+            .full_catalog
+            .layer_csr_shards_for_modality(modality_id, layer_name);
+        if shards.is_empty() {
+            return Err(ScxError::SectionNotFound(format!(
+                "layer '{layer_name}' for modality_id {modality_id}"
+            )));
+        }
+        let mut assembled = {
+            #[cfg(feature = "parallel")]
+            {
+                self.assemble_shards_parallel(&shards)?
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                self.assemble_shards(&shards)?
+            }
+        };
+        // Patch n_cols from the modality's per-modality n_vars (the
+        // assembler used header.n_vars which is the file-wide max).
+        if let Some(info) = self.modality_info(modality_id) {
+            assembled.shape.1 = info.n_vars as usize;
+        }
+        Ok(assembled)
+    }
+
+    /// Phase B.4: read a per-modality named layer's CSC shards,
+    /// concatenated along the column axis. Mirrors
+    /// `read_all_csc_shards_for` but filters by layer name via
+    /// `catalog.layer_csc_shards_for_modality(...)`.
+    pub fn read_layer_csc_for(&self, modality_id: u8, layer_name: &str) -> Result<ScxCsc> {
+        let n_rows = self.header.n_obs as usize;
+        let shards = self
+            .full_catalog
+            .layer_csc_shards_for_modality(modality_id, layer_name);
+        if shards.is_empty() {
+            return Err(ScxError::SectionNotFound(format!(
+                "layer-csc '{layer_name}' for modality_id {modality_id}"
+            )));
+        }
+        let decoded: Vec<ScxCsc> = shards
+            .iter()
+            .map(|e| self.read_csc_from_entry(e))
+            .collect::<Result<Vec<_>>>()?;
+        concatenate_csc_along_cols(decoded, n_rows)
+    }
+
     /// Read an obsm batch keyed by `(modality_id, key)`. Section
     /// names are `obsm/{modality_name}/{key}` for `modality_id >= 1`
     /// and `obsm/{key}` for `modality_id == 0` (global).

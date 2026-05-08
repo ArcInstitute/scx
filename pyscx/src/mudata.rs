@@ -399,6 +399,8 @@ pub fn from_mudata_impl(
                 payload.modality_type,
                 codec_id,
                 value_encoding,
+                false, // build_csc: per-modality CSC handled by from_mudata's
+                       // explicit csc='always' path, not the writer auto-emit.
             )
             .map_err(to_pyerr)?;
         writer

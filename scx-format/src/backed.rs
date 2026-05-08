@@ -70,6 +70,32 @@ impl BackedCsrIndex {
         Self::from_catalog_filtered(catalog, SectionType::LayerCsrShard, Some(&prefix))
     }
 
+    /// Phase B.5 / D.4: build from a [`FullCatalog`] for a specific
+    /// modality. Mirrors `BackedCscIndex::from_catalog_for_modality`
+    /// — filters CSR entries by `(SectionType::CsrShard, modality_id)`
+    /// and indexes the per-modality position-to-row mapping.
+    pub fn from_catalog_for_modality(catalog: &FullCatalog, modality_id: u8) -> Self {
+        let mut shard_entries: Vec<ShardRange> = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+            .filter_map(|e| {
+                e.stats.as_ref().map(|s| ShardRange {
+                    row_start: s.row_start,
+                    row_end: s.row_end,
+                    sorted_shard_idx: 0,
+                })
+            })
+            .collect();
+        shard_entries.sort_by_key(|r| r.row_start);
+        for (i, entry) in shard_entries.iter_mut().enumerate() {
+            entry.sorted_shard_idx = i;
+        }
+        BackedCsrIndex {
+            shard_ranges: shard_entries,
+        }
+    }
+
     /// Internal: build from catalog filtering by section type and optional name prefix.
     fn from_catalog_filtered(
         catalog: &FullCatalog,
@@ -474,6 +500,50 @@ impl BackedCsrReader {
         let x_sorted_entries = reader
             .catalog()
             .shards_sorted()
+            .into_iter()
+            .cloned()
+            .collect();
+        let prefetch_count = cache_shards.max(2);
+        BackedCsrReader {
+            reader,
+            index,
+            n_vars,
+            n_obs,
+            layer_name: None,
+            x_sorted_entries,
+            sorted_entries: Vec::new(),
+            cache,
+            in_flight,
+            metrics: None,
+            prefetch_count,
+            cache_shards,
+        }
+    }
+
+    /// Phase B.5 / D.4: create a backed CSR reader scoped to a
+    /// specific modality. Filters CSR shards by
+    /// `(SectionType::CsrShard, modality_id)` so each modality gets
+    /// its own LRU cache and shard range — matching the
+    /// `BackedCscReader::for_modality` shape. `n_vars` is taken from
+    /// the modality's table entry (per-modality `n_vars`), not the
+    /// file-wide `header.n_vars` (which is the max across modalities
+    /// on multimodal v2 files).
+    pub fn for_modality(reader: ScxReader, modality_id: u8, cache_shards: usize) -> Self {
+        let index = BackedCsrIndex::from_catalog_for_modality(reader.catalog(), modality_id);
+        let n_vars = match reader.modality_info(modality_id) {
+            Some(info) => info.n_vars as usize,
+            None => reader.n_vars() as usize,
+        };
+        let n_obs = reader.n_obs() as usize;
+        let cache = Self::make_cache(cache_shards, usize::MAX);
+        let in_flight = if cache.is_some() {
+            Some(Mutex::new(HashMap::new()))
+        } else {
+            None
+        };
+        let x_sorted_entries = reader
+            .catalog()
+            .csr_shards_for_modality(modality_id)
             .into_iter()
             .cloned()
             .collect();

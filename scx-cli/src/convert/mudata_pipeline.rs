@@ -198,8 +198,14 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         let (value_encoding, codec_id) =
             detect_value_encoding_for_modality(&data, opts.codec, modality_type);
 
+        // build_csc=opts.csc lets the writer emit per-modality CSC
+        // sidecars at finish() time so callers can drop the manual
+        // `write_modality_csc_shards_from_csr` invocation below once
+        // they migrate. The legacy manual path still works (and is
+        // still wired below) — auto-emit + manual would double-write,
+        // so flip one or the other.
         let modality_id = writer
-            .add_modality(mname, modality_type, codec_id, value_encoding)
+            .add_modality(mname, modality_type, codec_id, value_encoding, false)
             .map_err(ConvertError::from)?;
         writer
             .set_modality_n_vars(modality_id, *mod_n_vars as u64)

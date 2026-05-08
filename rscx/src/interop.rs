@@ -1219,6 +1219,8 @@ fn from_seurat_multi_assay(
                 payload.modality_type,
                 resolved_codec,
                 payload.value_encoding,
+                false, // build_csc: from_seurat / from_mae's csc=TRUE path
+                       // is rejected explicitly above, so no auto-emit.
             )
             .map_err(|e| Error::Other(format!("add_modality({}) failed: {}", payload.name, e)))?;
         writer
@@ -1603,6 +1605,8 @@ pub fn from_mae(
                 payload.modality_type,
                 resolved_codec,
                 payload.value_encoding,
+                false, // build_csc: from_seurat / from_mae's csc=TRUE path
+                       // is rejected explicitly above, so no auto-emit.
             )
             .map_err(|e| Error::Other(format!("add_modality({}) failed: {}", payload.name, e)))?;
         writer

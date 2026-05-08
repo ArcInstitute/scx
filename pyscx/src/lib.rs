@@ -289,6 +289,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::IndexPlanDataset>()?;
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
+    m.add_class::<backed::ScxBackedMuDataset>()?;
+    m.add_class::<backed::ScxBackedMuModality>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
     m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
 

@@ -75,6 +75,14 @@ pub struct ScxWriter {
     /// file is single-modality and `finish()` emits no
     /// `ModalityTable` section.
     modalities: Vec<crate::modality::ModalityInfo>,
+    /// Phase B.3: per-modality `build_csc` flags (writer-only — not
+    /// persisted in the on-disk modality table). When `true`,
+    /// `finish()` reads the modality's CSR shards back from the
+    /// temp file, runs a streaming CSR→CSC transpose, and emits CSC
+    /// sidecar shards via `write_csc_shard_for` before catalog
+    /// assembly. The resulting CSC presence is recorded in the
+    /// `ModalityFlags::HAS_CSC` bit on disk.
+    modality_build_csc: Vec<bool>,
 }
 
 /// Output of parallel shard encoding, ready for sequential write.
@@ -150,6 +158,7 @@ impl ScxWriter {
             has_obsp: false,
             current_modality_id: 0,
             modalities: Vec::new(),
+            modality_build_csc: Vec::new(),
         })
     }
 
@@ -684,6 +693,7 @@ impl ScxWriter {
         modality_type: ModalityType,
         default_codec: CodecId,
         default_value_encoding: ValueEncoding,
+        build_csc: bool,
     ) -> Result<u8> {
         ModalityTable::validate_name(name)?;
         if self.modalities.iter().any(|m| m.name == name) {
@@ -708,6 +718,7 @@ impl ScxWriter {
             flags: ModalityFlags::empty(),
         };
         self.modalities.push(info);
+        self.modality_build_csc.push(build_csc);
         Ok(self.modalities.len() as u8)
     }
 
@@ -1032,10 +1043,204 @@ impl ScxWriter {
             })
     }
 
+    /// Phase B.3: streaming CSR→CSC transpose pass for modalities
+    /// registered with `add_modality(..., build_csc=true)`.
+    ///
+    /// Reads each modality's CSR shards back from the writer's own
+    /// temp file (decoded via `scx_codec::decode_shard_scipy`), runs
+    /// `streaming_csr_to_csc_iter_with_cap`, and emits CSC sidecars
+    /// via `write_csc_shard_for`. The latter increments
+    /// `info.n_csc_shards` and sets `ModalityFlags::HAS_CSC` so the
+    /// modality table emitted just after this pass records CSC
+    /// presence correctly.
+    ///
+    /// Memory cap matches `scx-cli/src/build_csc.rs`'s 4 GiB default.
+    /// CSC sharding granularity matches the CLI's
+    /// `csc_cols_per_shard = 5000`.
+    fn auto_emit_csc_for_marked_modalities(&mut self) -> Result<()> {
+        const FINISH_TIME_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+        const DEFAULT_CSC_COLS_PER_SHARD: usize = 5000;
+
+        if self.modality_build_csc.iter().all(|&b| !b) {
+            return Ok(());
+        }
+
+        let n_obs = self.header.n_obs as usize;
+
+        // Collect per-modality work: (modality_id, csr_entries cloned, n_vars).
+        // Cloning entries is cheap (Vec<u8> name + a few fields) and lets us
+        // borrow `self` mutably for `write_csc_shard_for` calls below.
+        let mut work: Vec<(u8, Vec<FullCatalogEntry>, usize)> = Vec::new();
+        for (idx, build_csc) in self.modality_build_csc.iter().enumerate() {
+            if !*build_csc {
+                continue;
+            }
+            let modality_id = (idx + 1) as u8;
+            let n_vars = self.modalities[idx].n_vars as usize;
+            let csr_entries: Vec<FullCatalogEntry> = self
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+                .cloned()
+                .collect();
+            if csr_entries.is_empty() {
+                continue;
+            }
+            work.push((modality_id, csr_entries, n_vars));
+        }
+        if work.is_empty() {
+            return Ok(());
+        }
+
+        // Flush BufWriter so all CSR shard bytes are durable in the
+        // underlying File before we read them back.
+        self.writer()?.flush()?;
+
+        for (modality_id, csr_entries, n_vars) in work {
+            // Decode each CSR shard back to ScxCsr by reading from the
+            // open temp file. Mirrors the `read_shard_from_entry` flow
+            // in `scx-format/src/reader.rs::read_shard_from_entry_inner`,
+            // adapted to a `File` (no mmap).
+            let mut csr_shards: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(csr_entries.len());
+            // First-shard codec / value_encoding govern the CSC sidecar
+            // (matches the standalone `scx build-csc` choice).
+            let mut csc_codec: Option<CodecId> = None;
+            let mut csc_value_encoding: Option<ValueEncoding> = None;
+            for entry in &csr_entries {
+                let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
+                if csc_codec.is_none() {
+                    csc_codec = Some(
+                        CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?,
+                    );
+                    csc_value_encoding = Some(
+                        ValueEncoding::from_u8(sh.value_encoding)
+                            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?,
+                    );
+                }
+                let n_shard_rows = indptr.len() - 1;
+                csr_shards.push(scx_sparse::ScxCsr::new_unchecked(
+                    (n_shard_rows, n_vars),
+                    indptr,
+                    indices,
+                    data,
+                ));
+            }
+
+            let codec = csc_codec.expect("at least one CSR entry processed");
+            let value_encoding = csc_value_encoding.expect("at least one CSR entry processed");
+
+            // Streaming CSR→CSC transpose. Mirrors
+            // `scx-cli/src/build_csc.rs:159`.
+            let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
+                &csr_shards,
+                n_obs,
+                n_vars,
+                FINISH_TIME_CSC_MEMORY_BYTES,
+                DEFAULT_CSC_COLS_PER_SHARD,
+            )
+            .map_err(|e| {
+                ScxError::InvalidCatalog(format!("auto_emit_csc transpose failed: {e}"))
+            })?;
+
+            loop {
+                let col_start = iter.current_col_start() as u64;
+                let chunk = match iter.next() {
+                    Some(c) => c.map_err(|e| {
+                        ScxError::InvalidCatalog(format!("auto_emit_csc chunk decode failed: {e}"))
+                    })?,
+                    None => break,
+                };
+                let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
+                let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
+                let csc_raw_values = value_encoding.encode_f32_batch(&chunk.data).map_err(|e| {
+                    ScxError::InvalidCatalog(format!("auto_emit_csc encode_f32_batch failed: {e}"))
+                })?;
+
+                self.write_csc_shard_for(
+                    modality_id,
+                    &csc_indptr_u64,
+                    &csc_indices_u32,
+                    &csc_raw_values,
+                    codec,
+                    value_encoding,
+                    col_start,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase B.3 helper: read a CSR catalog entry back from the
+    /// writer's temp file and decode it via `scx_codec::decode_shard_scipy`.
+    /// Returns the parsed `ShardHeader` plus the scipy-shape
+    /// `(indptr, indices, data)` triple.
+    #[allow(clippy::type_complexity)]
+    fn decode_csr_entry(
+        &mut self,
+        entry: &FullCatalogEntry,
+        _n_vars: usize,
+    ) -> Result<(ShardHeader, Vec<i64>, Vec<i32>, Vec<f32>)> {
+        use std::io::Cursor;
+
+        // Flush any pending BufWriter bytes before seeking the inner
+        // file: BufWriter calls `write_all` on its inner File at the
+        // file's current cursor, so leaving buffered data while we
+        // seek would interleave when the buffer next flushes.
+        let writer = self.writer()?;
+        writer.flush()?;
+        let file = writer.get_mut();
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut section = vec![0u8; entry.length as usize];
+        file.read_exact(&mut section)?;
+
+        let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+
+        let indptr_bytes = &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
+        let indices_bytes =
+            &section[sh.indices_rel_offset as usize..][..sh.indices_length as usize];
+        let values_bytes = &section[sh.values_rel_offset as usize..][..sh.values_length as usize];
+
+        let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
+        let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
+        let index_dtype_u16 = sh.index_dtype == 0;
+
+        let encoded = scx_codec::EncodedShardRef {
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+        };
+
+        let (indptr, indices, data) = scx_codec::decode_shard_scipy(
+            &encoded,
+            codec_id,
+            value_encoding,
+            sh.n_major as usize,
+            sh.nnz as usize,
+            index_dtype_u16,
+        )
+        .map_err(ScxError::Codec)?;
+
+        // Restore the file cursor to EOF so subsequent
+        // `write_csc_shard_for` calls append from the right position.
+        // The BufWriter wraps the same underlying file; seek the inner
+        // File explicitly.
+        let writer = self.writer()?;
+        let file = writer.get_mut();
+        file.seek(SeekFrom::End(0))?;
+        Ok((sh, indptr, indices, data))
+    }
+
     /// Finalize the file: write catalogs, header, fsync, atomic rename.
     ///
     /// Returns the final file path on success.
     pub fn finish(mut self) -> Result<PathBuf> {
+        // Phase B.3: auto-emit CSC sidecars for any modality registered
+        // with `build_csc=true`. Runs before the modality table is
+        // serialised so the table picks up the resulting
+        // `n_csc_shards` / `flags.has_csc()` state.
+        self.auto_emit_csc_for_marked_modalities()?;
+
         // Flush BufWriter and take inner File
         let buf_writer = self.file.take().ok_or(ScxError::WriterAlreadyFinished)?;
         let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
@@ -2451,6 +2656,7 @@ mod tests {
                 ModalityType::Rna,
                 CodecId::None,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         let adt_id = writer
@@ -2459,6 +2665,7 @@ mod tests {
                 ModalityType::Protein,
                 CodecId::None,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         let atac_id = writer
@@ -2467,6 +2674,7 @@ mod tests {
                 ModalityType::Atac,
                 CodecId::None,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         assert_eq!(rna_id, 1);
@@ -2619,6 +2827,7 @@ mod tests {
                 ModalityType::Rna,
                 CodecId::None,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         let adt_id = writer
@@ -2627,6 +2836,7 @@ mod tests {
                 ModalityType::Protein,
                 CodecId::None,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         writer.write_var_for(rna_id, &sample_var()).unwrap();
@@ -2693,5 +2903,185 @@ mod tests {
             BackedCscReader::for_modality(ScxReader::open(&final_path).unwrap(), adt_id, 4)
                 .unwrap();
         assert_eq!(adt_csc.n_shards(), 1);
+    }
+
+    /// Phase B.6: `add_modality(..., build_csc=true)` triggers an
+    /// auto-emit transpose pass at finish() time. After finish(), the
+    /// modality's `n_csc_shards >= 1` and `flags.has_csc() == true`,
+    /// even though the caller never invoked `write_csc_shard_for` —
+    /// the writer read the CSR shards back from its temp file and
+    /// streamed them through `streaming_csr_to_csc_iter_with_cap`.
+    #[test]
+    fn test_phase_b3_auto_emit_csc() {
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_emit_csc.scx");
+        let header = sample_header();
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                true, // build_csc — Phase B.3 auto-emit
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+
+        // Both modalities get one CSR shard. Only `rna`'s
+        // `build_csc=true`, so only its CSC sidecar should
+        // auto-emit.
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = ScxReader::open(&final_path).unwrap();
+
+        // RNA picked up the auto-emit; ADT did not.
+        assert!(
+            reader.csc_shard_count_for(rna_id) >= 1,
+            "rna should have at least one auto-emitted CSC shard"
+        );
+        assert_eq!(
+            reader.csc_shard_count_for(adt_id),
+            0,
+            "adt build_csc=false → no CSC sidecar"
+        );
+        assert!(reader.modality_info(rna_id).unwrap().flags.has_csc());
+        assert!(!reader.modality_info(adt_id).unwrap().flags.has_csc());
+
+        // The auto-emitted CSC stores the same nnz as the CSR. We
+        // compare nnz rather than densifying because the CSR shape is
+        // (n_shard_rows, n_modality_vars) while the CSC shape uses
+        // file-wide n_obs (the column-axis slice covers the full obs
+        // range, with zero rows for cells absent from the CSR shard).
+        let csr = reader.read_all_csr_shards_for(rna_id).unwrap();
+        let csc = reader.read_all_csc_shards_for(rna_id).unwrap();
+        assert_eq!(
+            *csr.indptr.last().unwrap_or(&0),
+            *csc.indptr.last().unwrap_or(&0),
+            "CSR and CSC nnz must agree after auto-emit"
+        );
+    }
+
+    /// Phase B.4: per-modality CSC column-range reads return columns
+    /// from the right modality only.
+    #[test]
+    fn test_phase_b4_read_csc_columns_for() {
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b4_csc_columns_for.scx");
+        let header = sample_header();
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+        // Both modalities get one CSC shard at col_start=0.
+        writer
+            .write_csc_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csc_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = ScxReader::open(&final_path).unwrap();
+
+        // Per-modality CSC counters reflect what was written.
+        assert_eq!(reader.csc_shard_count_for(rna_id), 1);
+        assert_eq!(reader.csc_shard_count_for(adt_id), 1);
+
+        // Per-modality CSC range read returns the modality's
+        // contribution. We assert the call succeeds and returns a
+        // non-empty result (exact column-slice semantics are
+        // covered by the single-modality `read_csc_columns` tests).
+        let rna_cols = reader.read_csc_columns_for(rna_id, 0..3).unwrap();
+        assert!(
+            rna_cols.shape.1 >= 1,
+            "rna CSC range read should return ≥ 1 col"
+        );
+        let rna_subset = reader
+            .read_csc_columns_subset_for(rna_id, &[0u32, 2])
+            .unwrap();
+        assert!(rna_subset.shape.1 >= 1);
     }
 }

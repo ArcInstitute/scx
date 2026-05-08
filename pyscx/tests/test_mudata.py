@@ -113,3 +113,118 @@ def test_from_mudata_per_modality_codec_routing(cite_seq_mudata):
         assert adt_info["default_codec_id"] == ZSTD, (
             f"ADT default codec should be Zstd (id=2); got {adt_info['default_codec_id']}"
         )
+
+
+# --- Phase D.4: ScxBackedMuDataset ----------------------------------------
+
+
+def test_backed_mudata_lazy_mod_access(cite_seq_mudata):
+    """Phase D.4: `ScxBackedMuDataset.mod[name]` returns a lazy
+    `ScxBackedSparseDataset` pinned to the chosen modality. Per-modality
+    `n_vars` matches the modality table (not the file-wide max)."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(cite_seq_mudata, path)
+        mu = pyscx.ScxBackedMuDataset(path)
+
+        assert mu.is_multimodal is True
+        assert mu.n_modalities == 2
+        assert sorted(mu.modality_names) == ["adt", "rna"]
+        assert mu.modality_id("rna") is not None
+        assert mu.modality_id("unknown") is None
+
+        rna = mu.mod["rna"]
+        assert rna.modality_id == mu.modality_id("rna")
+        # Per-modality n_vars survives the wrapper (not the file-wide
+        # header.n_vars max).
+        rna_info = mu.modality_info(mu.modality_id("rna"))
+        assert rna_info is not None
+        assert rna.shape == (cite_seq_mudata.n_obs, rna_info["n_vars"])
+
+        adt = mu.mod["adt"]
+        adt_info = mu.modality_info(mu.modality_id("adt"))
+        assert adt is not None and adt_info is not None
+        assert adt.shape == (cite_seq_mudata.n_obs, adt_info["n_vars"])
+
+
+def test_backed_mudata_obs_caches(cite_seq_mudata):
+    """Phase D.4: `.obs` is materialised on first access and cached
+    thereafter — second access returns the same Python object."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(cite_seq_mudata, path)
+        mu = pyscx.ScxBackedMuDataset(path)
+
+        obs1 = mu.obs
+        obs2 = mu.obs
+        # Cache returns the same Python object on subsequent access.
+        assert obs1 is obs2
+        # The DataFrame's row count matches the global n_obs.
+        assert len(obs1) == cite_seq_mudata.n_obs
+
+
+def test_backed_mudata_mod_dict_surface(cite_seq_mudata):
+    """Phase D.4: `.mod` is dict-like — supports `name in mu.mod`,
+    `iter(mu.mod)`, `keys()`, `len(mu.mod)`, and raises KeyError on
+    unknown names."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(cite_seq_mudata, path)
+        mu = pyscx.ScxBackedMuDataset(path)
+
+        assert "rna" in mu.mod
+        assert "adt" in mu.mod
+        assert "unknown" not in mu.mod
+        assert len(mu.mod) == 2
+        assert sorted(mu.mod.keys()) == ["adt", "rna"]
+        assert sorted(list(mu.mod)) == ["adt", "rna"]
+
+        with pytest.raises(KeyError):
+            _ = mu.mod["unknown"]
+
+
+def test_backed_mudata_to_mudata_eager(cite_seq_mudata):
+    """Phase D.4: `to_mudata()` is the eager-materialisation escape
+    hatch — wraps the same `mudata::to_mudata` path used by
+    `pyscx.open(path).to_mudata()`."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(cite_seq_mudata, path)
+        mu = pyscx.ScxBackedMuDataset(path)
+        full = mu.to_mudata()
+        assert "rna" in full.mod
+        assert "adt" in full.mod
+
+
+def test_backed_mudata_rejects_single_modality(tmp_path):
+    """Phase D.4: opening a single-modality file via
+    `ScxBackedMuDataset` raises with a clear message directing the
+    user to `pyscx.open(path)`."""
+    pytest.importorskip("anndata")
+    import anndata
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.3, size=(20, 30)).astype(np.float32))
+    )
+    adata.var_names = [f"g{i}" for i in range(30)]
+    adata.obs_names = [f"c{i}" for i in range(20)]
+    path = str(tmp_path / "single.scx")
+    pyscx.from_anndata(adata, path)
+
+    with pytest.raises(RuntimeError, match="single-modality"):
+        pyscx.ScxBackedMuDataset(path)

@@ -830,6 +830,7 @@ mod tests {
                 ModalityType::Rna,
                 CodecId::None,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         writer.set_modality_n_vars(rna_id, 12).unwrap();
@@ -853,6 +854,7 @@ mod tests {
                 ModalityType::Protein,
                 CodecId::Zstd,
                 ValueEncoding::Uint8,
+                false,
             )
             .unwrap();
         writer.set_modality_n_vars(adt_id, 4).unwrap();
