@@ -478,6 +478,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
 
@@ -503,6 +505,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
 
@@ -528,6 +532,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
 
@@ -551,6 +557,8 @@ mod tests {
             true,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
         // Should succeed without writing any file
@@ -570,6 +578,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -590,6 +600,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -612,6 +624,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
 
@@ -635,6 +649,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -697,6 +713,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
 
@@ -732,6 +750,8 @@ mod tests {
             false,
             10000,
             "auto",
+            false,
+            5000,
         )
         .unwrap();
 
