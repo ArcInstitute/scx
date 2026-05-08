@@ -66,18 +66,33 @@ pub async fn io_stage(
     reader: Arc<ScxReader>,
     shard_groups: Vec<Vec<usize>>,
     deletion_vectors: Option<scx_format::deletion_vectors::DeletionVectors>,
+    modality_id: Option<u8>,
     tx: tokio::sync::mpsc::Sender<ShardGroup>,
 ) -> Result<()> {
     // Pre-compute the sorted shard catalog entries. The shard indices in
     // `shard_groups` refer to positions in this sorted list.
-    let sorted_entries = reader.catalog().shards_sorted();
+    //
+    // Phase H.1: when `modality_id` is set, the entries are filtered to
+    // that modality's CSR shards (matching the filter applied in
+    // `pipeline.rs::start_epoch`). Per-modality and global runs use the
+    // same code path; only the entry list differs.
+    let sorted_entries: Vec<&scx_format::FullCatalogEntry> = match modality_id {
+        Some(mid) => reader.catalog().csr_shards_for_modality(mid),
+        None => reader.catalog().shards_sorted(),
+    };
     let n_shards = sorted_entries.len();
 
     // Pre-compute per-shard deletion bitmaps for O(1) lookup.
     // Map: shard_index (position in sorted list) → RoaringBitmap of deleted local rows.
+    //
+    // Phase H.1: deletion vectors and per-modality filtering are
+    // mutually exclusive — the deletion_vectors `shards` map keys are
+    // global shard indices, which don't match the per-modality
+    // positions in `sorted_entries` after filtering. Skip applying
+    // deletion vectors when `modality_id` is set.
     let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> =
-        Arc::new(match &deletion_vectors {
-            Some(dv) => {
+        Arc::new(match (&deletion_vectors, modality_id) {
+            (Some(dv), None) => {
                 let mut map = std::collections::HashMap::new();
                 for (&shard_id, bitmap) in &dv.shards {
                     let shard_idx = shard_id as usize;
@@ -87,7 +102,7 @@ pub async fn io_stage(
                 }
                 map
             }
-            None => std::collections::HashMap::new(),
+            _ => std::collections::HashMap::new(),
         });
 
     // Pre-compute per-group byte ranges for coalesced MADV_WILLNEED prefetch.
@@ -142,9 +157,13 @@ pub async fn io_stage(
         group_count += 1;
 
         // Perform blocking shard reads inside spawn_blocking.
+        let group_modality_id = modality_id;
         let group = tokio::task::spawn_blocking(move || -> Result<ShardGroup> {
             let t0 = Instant::now();
-            let sorted = reader.catalog().shards_sorted();
+            let sorted: Vec<&scx_format::FullCatalogEntry> = match group_modality_id {
+                Some(mid) => reader.catalog().csr_shards_for_modality(mid),
+                None => reader.catalog().shards_sorted(),
+            };
             let mut shards = Vec::with_capacity(group_indices.len());
 
             // Issue a coalesced MADV_WILLNEED for this group's byte range.
@@ -404,7 +423,7 @@ mod tests {
             let shard_groups = vec![vec![0, 1], vec![2]];
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, None, tx));
 
             let mut received_groups = Vec::new();
             while let Some(group) = rx.recv().await {
@@ -439,7 +458,7 @@ mod tests {
             let shard_groups = vec![vec![0]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let r2 = Arc::clone(&reader);
-            let handle = tokio::spawn(io_stage(r2, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(r2, shard_groups, None, None, tx));
 
             let group = rx.recv().await.unwrap();
             handle.await.unwrap().unwrap();
@@ -472,7 +491,7 @@ mod tests {
             let shard_groups = vec![vec![0], vec![1], vec![2]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, None, tx));
 
             // Consume one at a time
             let mut count = 0;
@@ -495,7 +514,7 @@ mod tests {
 
             let shard_groups = vec![vec![0]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, None, tx));
 
             let group = rx.recv().await.unwrap();
             assert_eq!(group.shards.len(), 1);
@@ -526,7 +545,7 @@ mod tests {
 
             let shard_groups = vec![vec![0, 1]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), None, tx));
 
             let group = rx.recv().await.unwrap();
             handle.await.unwrap().unwrap();
@@ -556,7 +575,7 @@ mod tests {
 
             let shard_groups = vec![vec![0, 1]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, Some(dv), None, tx));
 
             let group = rx.recv().await.unwrap();
             handle.await.unwrap().unwrap();
@@ -625,7 +644,7 @@ mod tests {
             // Feed groups already sorted by offset: [0,1], [2,3]
             let shard_groups = vec![vec![0, 1], vec![2, 3]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, None, tx));
 
             let mut received = Vec::new();
             while let Some(group) = rx.recv().await {
@@ -662,7 +681,7 @@ mod tests {
 
             let shard_groups = vec![vec![0]];
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            let handle = tokio::spawn(io_stage(reader, shard_groups, None, tx));
+            let handle = tokio::spawn(io_stage(reader, shard_groups, None, None, tx));
 
             let group = rx.recv().await.unwrap();
             assert_eq!(group.shards.len(), 1);

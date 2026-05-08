@@ -57,6 +57,18 @@ pub struct LoaderConfig {
     /// Memory budget in MB (default: 512).
     /// Pipeline auto-tunes shard_group_size and prefetch_batches to fit.
     pub max_memory_mb: usize,
+    /// Phase H.1: optional modality filter.
+    ///
+    /// `None` = legacy global / single-modality behaviour: load every CSR
+    /// shard in the file (matches the v1 invariant).
+    ///
+    /// `Some(id)` (1-based) = restrict the I/O stage to shards stamped
+    /// with the given `modality_id`. Cells (obs) are global across
+    /// modalities, so `n_obs` is unchanged; only the X matrix is
+    /// per-modality. Deletion vectors are not supported in conjunction
+    /// with this filter (the per-shard bitmap keys reference the global
+    /// shard index, not the per-modality index).
+    pub modality_id: Option<u8>,
 }
 
 impl Default for LoaderConfig {
@@ -72,6 +84,7 @@ impl Default for LoaderConfig {
             target_sum: 1e4,
             seed: 42,
             max_memory_mb: 512,
+            modality_id: None,
         }
     }
 }
@@ -396,9 +409,35 @@ impl TrainingPipeline {
 
         // Read header metadata
         let header = reader.header();
-        let n_vars = header.n_vars;
         let shard_target_rows = header.shard_target_rows;
-        let n_csr_shards = reader.catalog().shards_sorted().len();
+
+        // Phase H.1: per-modality filtering. When `modality_id` is set,
+        // n_vars and the shard count come from the modality table /
+        // per-modality catalog filter, not the file-wide header.
+        let (n_vars, n_csr_shards, modality_nnz) = if let Some(mid) = config.modality_id {
+            if mid == 0 {
+                return Err(LoaderError::ConfigError {
+                    reason: "modality_id must be >= 1 (0 is reserved for global / legacy)"
+                        .to_string(),
+                });
+            }
+            let info = reader
+                .modality_info(mid)
+                .ok_or_else(|| LoaderError::ConfigError {
+                    reason: format!(
+                        "modality_id {mid} not found in file (n_modalities = {})",
+                        reader.n_modalities()
+                    ),
+                })?;
+            let n_shards = reader.catalog().csr_shards_for_modality(mid).len();
+            (info.n_vars, n_shards, info.nnz)
+        } else {
+            (
+                header.n_vars,
+                reader.catalog().shards_sorted().len(),
+                header.nnz,
+            )
+        };
 
         // Read obs metadata (full RecordBatch for column extraction)
         let t0 = Instant::now();
@@ -421,9 +460,11 @@ impl TrainingPipeline {
             );
         }
 
-        // Compute average nnz per cell for memory budget estimation
+        // Compute average nnz per cell for memory budget estimation.
+        // Phase H.1: per-modality runs use the modality's nnz, not the
+        // file-wide header.nnz which sums across modalities.
         let avg_nnz_per_cell = if header.n_obs > 0 {
-            header.nnz as f64 / header.n_obs as f64
+            modality_nnz as f64 / header.n_obs as f64
         } else {
             0.0
         };
@@ -561,13 +602,28 @@ impl TrainingPipeline {
         // sorted by file offset within and across groups for sequential I/O.
         // Collect into owned `Vec<u64>` first so the catalog borrow ends
         // before `ensure_decode_pool` (which needs `&mut self`).
-        let shard_offsets: Vec<u64> = self
-            .reader
-            .catalog()
-            .shards_sorted()
-            .iter()
-            .map(|e| e.offset)
-            .collect();
+        //
+        // Phase H.1: when `modality_id` is set, the shard list is
+        // filtered to that modality's CSR shards. The shuffler /
+        // io_stage operate on the filtered list (per-modality positions
+        // 0..N), which io_stage maps back to the original catalog
+        // entries via the same filter applied internally.
+        let shard_offsets: Vec<u64> = match self.config.modality_id {
+            Some(mid) => self
+                .reader
+                .catalog()
+                .csr_shards_for_modality(mid)
+                .iter()
+                .map(|e| e.offset)
+                .collect(),
+            None => self
+                .reader
+                .catalog()
+                .shards_sorted()
+                .iter()
+                .map(|e| e.offset)
+                .collect(),
+        };
 
         // Phase 3.3 mmap smoke-read. Touch one byte of the first CSR shard's
         // backing region before spawning the I/O / decode threads. If the
@@ -637,6 +693,7 @@ impl TrainingPipeline {
         let t_spawn_io = Instant::now();
         let io_reader = Arc::clone(&self.reader);
         let io_dv = self.deletion_vectors.clone();
+        let io_modality_id = self.config.modality_id;
         let io_handle = std::thread::Builder::new()
             .name("scx-io".to_string())
             .spawn(move || -> Result<()> {
@@ -649,7 +706,13 @@ impl TrainingPipeline {
                             "I/O thread: failed to build current-thread runtime: {e}"
                         ))
                     })?;
-                let res = rt.block_on(io_stage(io_reader, shard_groups, io_dv, io_tx));
+                let res = rt.block_on(io_stage(
+                    io_reader,
+                    shard_groups,
+                    io_dv,
+                    io_modality_id,
+                    io_tx,
+                ));
                 tracing::trace!(
                     pid = std::process::id(),
                     ok = res.is_ok(),
