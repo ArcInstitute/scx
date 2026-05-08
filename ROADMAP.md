@@ -290,26 +290,57 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] SingleCellExperiment interop
 - [x] Harmony batch correction in R (see `rscx/R/harmony.R`)
 
-### 3.4 Multimodal Support — IN PROGRESS (Phase A landed)
+### 3.4 Multimodal Support — SHIPPED (Phases A–I)
 - [x] **Phase A**: format v2 bump; carve `n_modalities` /
   `modality_table_offset` / `modality_table_length` out of the header
   reserved tail; add `has_modalities` flag (bit 7); add explicit
   `col_start` / `col_end` to `ShardStats` (catalog v2); v2-strict
   CSC `shard_type=1` validation with `ScxError::InvalidShardType`.
-- [ ] **Phase B**: `ModalityTable` section (id 15), `LayerCscShard`
+- [x] **Phase B**: `ModalityTable` section (id 15), `LayerCscShard`
   (id 16), per-modality reader / writer methods, `BackedCscReader`
-  per-modality scoping, auto-emit CSC sidecar.
-- [ ] CITE-seq (RNA + protein): multi-feature-space layout
-- [ ] Spatial transcriptomics: spatial coordinates + optional R-tree index — **DEFERRED**
-- [ ] `scx convert --from h5mu` (MuData format) — **DEFERRED**
-- [ ] Round-trip with MuData/MuOn objects — **DEFERRED**
+  per-modality scoping.
+- [x] **Phase C**: catalog `modality_id: u8` field, per-modality
+  filtering helpers (`csr_shards_for_modality`, etc.), bumped
+  `catalog_version = 2`.
+- [x] **Phase D**: CITE-seq / 10x Multiome / TEA-seq layout via
+  `pyscx.from_mudata` / `to_mudata` and `scx convert --from h5mu`.
+- [x] **Phase E**: per-modality auto-codec via
+  `select_codec_for_modality` (RNA→Scx1/Zstd, ADT→Zstd, ATAC→Zstd
+  or Lz4Shuffle).
+- [x] **Phase F**: `scx info` per-modality table, `scx validate`
+  modality cross-checks, `scx append --modality`, `scx subset
+  --modality NAME` extract.
+- [x] **Phase G**: cloud header preservation (`cloud_optimize` /
+  `pack` / `pull` rewrite the modality table at the new layout
+  offset; `pull_filtered` recomputes per-modality counts from the
+  filtered catalog), exploded `_modality_table.bin` + per-modality
+  `X/{name}/` directories.
+- [x] **Phase H**: `pyscx.MultimodalTrainingDataset` with
+  triple-buffered per-modality pipelines and aligned `cell_indices`
+  validation; `TrainingDataset(path)` backward-compat warning on
+  multimodal files.
+- [x] **Phase I**: rscx Seurat v5 multi-assay (`from_seurat` /
+  `scx_open(...)$to_seurat()`) and Bioconductor MAE
+  (`from_mae` / `$to_mae()`) interop.
+- [ ] Multimodal `scx merge` / `scx compact` — **DEFERRED** (current
+  ops reject multimodal inputs; extract via `scx subset --modality`
+  first).
+- [ ] Per-modality CSC sidecar preservation on `scx append` —
+  **DEFERRED** (file-wide CSC drop today; appending into RNA still
+  invalidates ADT's CSC).
+- [ ] Spatial transcriptomics R-tree index — **DEFERRED** (separate
+  spec; spatial coordinates already work via standard `obs`/`obsm`).
 
-**Status**: Phase A foundation work has shipped (v2 format, modality
-fields in header, `has_modalities` flag at bit 7, explicit `col_start` /
-`col_end` in `ShardStats`). Section ids 15 = `ModalityTable` and
-16 = `LayerCscShard` are reserved for Phase B; ids 17–31 are reserved
-for further multimodal/spatial extensions; ids 32–239 are reserved for
-future use; ids 240–255 are vendor / private.
+**Status**: shipped end-to-end via Phases A–I. CITE-seq /
+10x Multiome / TEA-seq round-trip through `pyscx.from_mudata` /
+`pyscx.MultimodalTrainingDataset` and Seurat v5 / MAE via rscx. See
+[docs/multimodal.md](docs/multimodal.md) for the user-facing guide
+and [docs/format.md § 13](docs/format.md#13-multimodal-extension) for
+the on-disk layout. Section ids 15 = `ModalityTable` and
+16 = `LayerCscShard` are now allocated; ids 17–31 are reserved for
+further multimodal/spatial extensions; ids 32–239 are reserved for
+future use; ids 240–255 are vendor / private. The `has_modalities`
+header flag (bit 7) is wired through writers and readers.
 
 ### 3.5 Quality + Polish — PARTIALLY COMPLETE
 - [ ] Full conformance test suite with reference .scx files — **PARTIAL**: round-trip and per-codec correctness tests run in CI; no frozen reference-file vectors yet.
@@ -457,7 +488,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] CELLxGENE Census 500K, 1M, 5M subsets (large)
 - [x] 10M-cell synthetic build for training loader (`build_census_*.py`)
 - [x] Smart-seq2 50K (non-UMI protocol — validates codec selection heuristic)
-- [ ] CITE-seq reference dataset — blocked on Phase 3.4 multimodal (tracked separately; out of Phase 5 scope)
+- [ ] CITE-seq reference dataset — Phase 3.4 multimodal landed (`pyscx.from_mudata` + `MultimodalTrainingDataset` ship), but the comprehensive benchmark suite has not been extended with multimodal compression / training rows yet. Tracked under MULTIMODAL-SUPPORT.md Phase K.3 / K.4.
 
 ### 5.4 Local HPC Benchmarking (Chimera SLURM) — COMPLETE
 - [x] Parallel SLURM submission via `benchmarks/scripts/submit_benchmarks.py`

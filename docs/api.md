@@ -2,7 +2,7 @@
 
 ## Section Types
 
-15 section types are defined in `scx-format/src/section.rs`:
+17 section types are defined in `scx-format/src/section.rs`:
 
 ```
 ObsMetadata (0)        — Arrow IPC metadata for observations
@@ -25,6 +25,10 @@ Provenance (11)        — Operation history
 DeletionVectors (12)   — Logical deletion tracking (Roaring Bitmap)
 ObsPredicateIndex (13) — Obs predicate index for query pushdown
 VarPredicateIndex (14) — Var predicate index for query pushdown
+ModalityTable (15)     — v2; ordered list of named modalities (CITE-seq,
+                         10x Multiome, …). See docs/format.md § 13.
+LayerCscShard (16)     — v2; per-modality CSC sidecar for a named layer
+                         (parallel to LayerCsrShard).
 ```
 
 ## ScxReader (`scx-format/src/reader.rs`)
@@ -79,6 +83,153 @@ VarPredicateIndex (14) — Var predicate index for query pushdown
 - `write_raw_shard(raw_bytes, section_type, name, stats, nnz)` — Pre-encoded shard passthrough
 - `set_shard_column_stats(column_stats)` — Per-column shard statistics for catalog
 - `finish()` — Atomic write: full catalog at EOF -> pwrite root catalog -> pwrite header -> fsync -> rename
+
+## Multimodal API
+
+v2 SCX files carry multiple modalities (RNA + ADT + ATAC + …) routed
+via a 1-byte `modality_id` stamped on each catalog entry. See
+[docs/format.md § 13](format.md#13-multimodal-extension) for the
+on-disk layout and [docs/multimodal.md](multimodal.md) for the
+end-to-end usage guide.
+
+### `ModalityType` enum (`scx-format/src/modality.rs`)
+
+```
+ModalityType::Rna           = 0
+ModalityType::Protein       = 1   // ADT
+ModalityType::Atac          = 2
+ModalityType::Spatial       = 3
+ModalityType::Methylation   = 4
+ModalityType::Custom        = 255
+```
+
+Drives per-modality codec selection (see
+[docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults)).
+
+### `ModalityInfo` struct
+
+Per-modality record carried on disk by the `ModalityTable` section:
+
+```rust
+pub struct ModalityInfo {
+    pub name: String,                  // UTF-8, ≤ 64 bytes, unique
+    pub modality_type: ModalityType,
+    pub default_codec_id: u8,          // CodecId u8 repr
+    pub default_value_encoding: u8,    // ValueEncoding u8 repr
+    pub n_vars: u64,                   // Per-modality variable count
+    pub nnz: u64,                      // Per-modality non-zeros
+    pub n_csr_shards: u32,
+    pub n_csc_shards: u32,
+    pub flags: ModalityFlags,          // HAS_CSC, HAS_OBSM, HAS_OBSP, HAS_LAYERS, HAS_UNS
+}
+```
+
+### `ScxReader` — multimodal accessors
+
+- `is_multimodal()` / `n_modalities()` / `has_modalities()` — capability checks.
+- `modality_table()` → `Option<&ModalityTable>` — full parsed table.
+- `modality_names()` → `Vec<&str>` — names in registration order.
+- `modality_id(name)` → `Option<u8>` — name → id resolution.
+- `modality_info(id)` → `Option<&ModalityInfo>` — per-modality record.
+- `read_var_for(modality_id)` — per-modality var as `RecordBatch`.
+- `read_csr_shard_for(modality_id, shard_idx)` — single shard from
+  the modality's CSR shard list.
+- `read_all_csr_shards_for(modality_id)` — concatenated CSR for the
+  modality. Patches `n_cols` from `modality_info(id).n_vars` so the
+  resulting `ScxCsr` has the modality's per-modality `n_vars` rather
+  than the file-wide `header.n_vars` (which is the max across modalities).
+- `csr_shard_count_for(modality_id)` — CSR shard count.
+- `read_all_csc_shards_for(modality_id)` / `csc_shard_count_for(modality_id)`
+  — same shape on the column-major axis.
+- `read_obsm_for(modality_id, key)` — per-modality embeddings.
+
+### `ScxWriter` — multimodal writers
+
+- `add_modality(name, modality_type, default_codec, default_value_encoding)` →
+  `Result<u8>` — register a modality (1-based id). Validates the name
+  (≤ 64 bytes, UTF-8, unique).
+- `set_modality_n_vars(modality_id, n_vars)` — record the per-modality
+  variable count (called once per modality, before the first per-modality
+  shard write).
+- `modality_id(name)` → `Option<u8>` / `modality_name_for(id)` — lookups.
+- `write_var_for(modality_id, batch)` — per-modality var.
+- `write_csr_shard_for(modality_id, indptr, indices, values, codec_id, encoding, row_start)`
+  — per-modality CSR shard. Uses the `X/{name}/shard_{i}` naming convention.
+  Updates the modality's `n_csr_shards` / `nnz` automatically.
+- `write_csc_shard_for(modality_id, indptr, indices, values, codec_id, encoding, col_start)`
+  — per-modality CSC shard (`X_csc/{name}/shard_{i}`). Section type is
+  `CscShard` (5).
+- `write_layer_for(modality_id, layer_name, ...)` /
+  `write_obsm_for(modality_id, key, batch)` /
+  `write_obsp_for(modality_id, key, ...)` /
+  `write_uns_for(modality_id, json)` — per-modality variants of the
+  legacy section writers. Stamp the catalog entry with the chosen
+  `modality_id`.
+- `finish()` — emits the `ModalityTable` section automatically when
+  any modality was registered. Updates header `n_modalities` /
+  `modality_table_offset` / `modality_table_length` and sets the
+  `has_modalities` flag bit.
+
+### Codec selection — `select_codec_for_modality`
+
+`select_codec_for_modality(raw_values, value_encoding, modality_type)`
+extends `select_codec` with per-modality routing (Phase E):
+RNA / Custom / Methylation / Spatial → delegate to `select_codec`;
+Protein/ADT → Zstd for integers, Pcodec for floats; ATAC → Zstd for
+binary peak presence (sample max ≤ 1) else Lz4Shuffle, Pcodec for
+floats. See [docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults).
+
+### Per-modality `BackedCscReader`
+
+`BackedCscReader::for_modality(reader, modality_id, cache_shards)` —
+builds a column-major reader scoped to one modality so multimodal
+training (e.g. totalVI) can hold separate caches per modality without
+LRU thrashing across modalities.
+
+### Python (`pyscx`)
+
+- `pyscx.from_mudata(mu, path, codec="auto", ...)` — write a MuData
+  object as a multimodal SCX file. Per-modality CSR shards stamped
+  with `modality_id` derived from the registration order; per-modality
+  codec resolved via `select_codec_for_modality`.
+- `pyscx.open(path)` returns `PyExperiment`. New attrs / methods:
+  - `is_multimodal: bool`, `n_modalities: int`, `modality_names: list[str]`.
+  - `modality_id(name) -> int | None`, `modality_info(id) -> dict | None`.
+  - `to_mudata() -> mudata.MuData` — round-trips back to MuData.
+- `pyscx.MultimodalTrainingDataset(path, modalities=[…], …)` — yields
+  per-batch dicts `{"X": {modality_name: ndarray}, "obs": {...},
+  "cell_indices": ndarray}` (or tuples in `return_dict=False` mode).
+- Backward compat: `pyscx.TrainingDataset(path)` on a multimodal file
+  emits `UserWarning` and falls back to the alphabetically-first
+  modality. Pass `modality="rna"` explicitly to suppress.
+
+### R (`rscx`)
+
+- `from_seurat(seu, path)` detects Seurat v5 multi-assay objects
+  (`length(seu@assays) > 1`) and routes to a multimodal write path
+  with one modality per assay. Single-assay objects keep the legacy
+  path.
+- `from_mae(mae, path)` writes a Bioconductor `MultiAssayExperiment`
+  as multimodal SCX. Cells must align across experiments
+  (`colnames(experiments[[i]])` identical); on misalignment, raises
+  with a clear error directing to `intersectColumns(mae)`.
+- `scx_open(path)$to_seurat()` builds a Seurat v5 multi-assay object
+  on multimodal files (one `Assay5` per modality, shared `meta.data`).
+- `scx_open(path)$to_mae()` builds a `MultiAssayExperiment` (one
+  `SingleCellExperiment` per modality, shared `colData`).
+- `scx_open(path)$is_multimodal()` / `$modality_names()` — capability
+  checks.
+
+### CLI surface
+
+```
+scx info path.scx               # Modalities (N): name, type, n_vars, nnz, csr/csc, codec
+scx validate path.scx           # ModalityTable checksum + n_modalities cross-check
+scx convert --from h5mu in.h5mu --to scx out.scx
+scx convert --to h5ad out.scx out.h5ad --modality rna
+scx append target.scx --input new.scx --modality rna
+scx subset in.scx --modality rna --output rna_only.scx
+```
 
 ## Codec Selection (`scx-format/src/codec_select.rs`)
 
