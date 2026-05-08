@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use extendr_api::prelude::*;
+use scx_engine::pipeline::QueryResult;
 use scx_format::ScxReader;
 
 mod harmony;
@@ -123,6 +124,64 @@ impl ScxExperiment {
     /// Re-opens the file (QueryPipeline::open creates its own ScxReader).
     fn query(&self) -> Result<RQueryPipeline> {
         RQueryPipeline::from_path(self.path.to_str().unwrap_or(""))
+    }
+
+    /// Phase I.1: True if this file has a registered modality table.
+    fn is_multimodal(&self) -> bool {
+        self.reader.is_multimodal()
+    }
+
+    /// Phase I.1: list modality names registered in the file (in
+    /// insertion order). Empty for single-modality / v1 files.
+    fn modality_names(&self) -> Vec<String> {
+        self.reader
+            .modality_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Phase I.1: build a Seurat v5 multi-assay object from this
+    /// SCX file. On a single-modality file, returns a one-assay
+    /// Seurat v5 object (matches the legacy
+    /// `RQueryResult$to_seurat()` shape). On a multi-modality file,
+    /// returns a Seurat v5 object with one assay per modality, all
+    /// sharing the global obs as their meta.data.
+    fn to_seurat(&self) -> Result<Robj> {
+        if self.reader.is_multimodal() {
+            interop::to_seurat_multimodal(&self.reader)
+        } else {
+            // Reuse the existing single-modality path by
+            // materialising a QueryResult-equivalent in-memory
+            // structure. Read X / obs / var directly.
+            let csr = self
+                .reader
+                .read_all_csr_shards()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let obs = self
+                .reader
+                .read_obs()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let var = self
+                .reader
+                .read_var()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let result = QueryResult {
+                x: csr,
+                obs,
+                var,
+                skipped_shards: 0,
+                total_shards: 0,
+            };
+            interop::to_seurat_v5(&result)
+        }
+    }
+
+    /// Phase I.2: build a Bioconductor `MultiAssayExperiment` from
+    /// this SCX file. Single-modality files raise — use
+    /// `RQueryResult$to_sce()` for those.
+    fn to_mae(&self) -> Result<Robj> {
+        interop::to_mae(&self.reader)
     }
 }
 

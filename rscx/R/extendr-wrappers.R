@@ -24,6 +24,13 @@ ScxExperiment$new <- function(path) {
     ptr <- .Call(wrap__ScxExperiment__query, self$.ptr)
     RQueryPipeline$.wrap(ptr)
   }
+  # Phase I.1 / I.2: multimodal accessors.
+  self$is_multimodal <- function()
+    .Call(wrap__ScxExperiment__is_multimodal, self$.ptr)
+  self$modality_names <- function()
+    .Call(wrap__ScxExperiment__modality_names, self$.ptr)
+  self$to_seurat <- function() .Call(wrap__ScxExperiment__to_seurat, self$.ptr)
+  self$to_mae <- function() .Call(wrap__ScxExperiment__to_mae, self$.ptr)
   class(self) <- "ScxExperiment"
   self
 }
@@ -133,6 +140,22 @@ from_sce <- function(sce_obj, output_path, codec = NULL,
   invisible(.Call(
     wrap__from_sce,
     sce_obj,
+    output_path,
+    if (is.null(codec)) NULL else as.character(codec),
+    as.logical(csc),
+    as.integer(csc_cols_per_shard)
+  ))
+}
+
+# Phase I.2: import a Bioconductor MultiAssayExperiment to a multimodal
+# SCX file. Requires aligned cell axes across experiments; raises with
+# a clear message on mismatch.
+#' @export
+from_mae <- function(mae_obj, output_path, codec = NULL,
+                     csc = FALSE, csc_cols_per_shard = 5000L) {
+  invisible(.Call(
+    wrap__from_mae,
+    mae_obj,
     output_path,
     if (is.null(codec)) NULL else as.character(codec),
     as.logical(csc),
