@@ -147,21 +147,32 @@ impl ScxReader {
 
     /// Read the Arrow IPC schema from a catalog entry without deserializing data.
     /// This reads only the IPC footer (~KB) to extract field names and types.
+    ///
+    /// Downcasts `LargeUtf8 → Utf8` / `LargeBinary → Binary` so the schema
+    /// stays in lockstep with [`Self::read_arrow_ipc`] regardless of the
+    /// on-disk encoding (see [`crate::arrow_compat`]).
     fn read_arrow_ipc_schema(&self, entry: &FullCatalogEntry) -> Result<arrow::datatypes::Schema> {
         let slice = self.section_bytes(entry)?;
         let cursor = Cursor::new(slice);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-        Ok(reader.schema().as_ref().clone())
+        let schema = reader.schema();
+        let empty = RecordBatch::new_empty(schema);
+        let normalized = crate::arrow_compat::downcast_large_types(&empty)?;
+        Ok(normalized.schema().as_ref().clone())
     }
 
     /// Read an Arrow IPC section from a catalog entry.
+    ///
+    /// Downcasts `LargeUtf8 → Utf8` / `LargeBinary → Binary` so callers
+    /// always see canonical narrow types regardless of the on-disk
+    /// encoding (see [`crate::arrow_compat`]).
     fn read_arrow_ipc(&self, entry: &FullCatalogEntry) -> Result<RecordBatch> {
         let slice = self.section_bytes(entry)?;
         let cursor = Cursor::new(slice);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
         // Read the first (and typically only) batch
         let mut batches = reader.into_iter();
-        batches
+        let batch = batches
             .next()
             .ok_or_else(|| {
                 ScxError::Io(std::io::Error::new(
@@ -169,7 +180,8 @@ impl ScxReader {
                     "Arrow IPC file contains no batches",
                 ))
             })?
-            .map_err(ScxError::Arrow)
+            .map_err(ScxError::Arrow)?;
+        crate::arrow_compat::downcast_large_types(&batch)
     }
 
     /// Read the obs schema without deserializing the full RecordBatch.

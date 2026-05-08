@@ -550,12 +550,13 @@ pub async fn pull_filtered(
     total_bytes_downloaded += obs_data.len() as u64;
     let obs_bytes = obs_data.to_vec();
 
-    // Parse obs as Arrow IPC
+    // Parse obs as Arrow IPC. Downcast `LargeUtf8 → Utf8` (and binary)
+    // so the predicate evaluator and downstream pyscx callers see the
+    // canonical narrow types regardless of the on-disk encoding.
     let obs_cursor = Cursor::new(&obs_bytes);
     let obs_reader = arrow::ipc::reader::FileReader::try_new(obs_cursor, None)
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let obs_schema = obs_reader.schema();
-    let obs_batch: arrow::array::RecordBatch = obs_reader
+    let raw_batch: arrow::array::RecordBatch = obs_reader
         .into_iter()
         .next()
         .ok_or_else(|| {
@@ -565,6 +566,8 @@ pub async fn pull_filtered(
             ))
         })?
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let obs_batch = scx_format::downcast_large_types(&raw_batch)?;
+    let obs_schema = obs_batch.schema();
 
     // Parse and evaluate predicate
     let predicate = scx_engine::parse_predicate(filter, &obs_schema).map_err(|e| {
@@ -914,13 +917,18 @@ fn filter_record_batch(
 }
 
 /// Serialize a RecordBatch to Arrow IPC bytes (File format).
+///
+/// Upcasts `Utf8 → LargeUtf8` so columns larger than 2 GB do not
+/// overflow Arrow IPC's 32-bit offset limit (see
+/// [`scx_format::arrow_compat`]).
 fn record_batch_to_arrow_ipc(batch: &arrow::array::RecordBatch) -> Result<Vec<u8>> {
+    let batch = scx_format::upcast_to_large_types(batch)?;
     let mut buf = Vec::new();
     {
         let mut ipc_writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &batch.schema())
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         ipc_writer
-            .write(batch)
+            .write(&batch)
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         ipc_writer
             .finish()

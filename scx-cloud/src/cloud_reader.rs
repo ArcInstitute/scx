@@ -109,6 +109,11 @@ impl CloudReader {
     }
 
     /// Read obs metadata as an Arrow RecordBatch.
+    ///
+    /// Bypasses `ScxReader::read_arrow_ipc`, so applies
+    /// `scx_format::downcast_large_types` explicitly to surface the
+    /// canonical narrow `Utf8` / `Binary` types regardless of the
+    /// on-disk encoding.
     pub async fn read_obs(&self) -> Result<RecordBatch> {
         let obs_data = self.read_section("obs").await?;
         let cursor = Cursor::new(&obs_data);
@@ -124,10 +129,15 @@ impl CloudReader {
                 ))
             })?
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        Ok(batch)
+        Ok(scx_format::downcast_large_types(&batch)?)
     }
 
     /// Read var metadata as an Arrow RecordBatch.
+    ///
+    /// Bypasses `ScxReader::read_arrow_ipc`, so applies
+    /// `scx_format::downcast_large_types` explicitly to surface the
+    /// canonical narrow `Utf8` / `Binary` types regardless of the
+    /// on-disk encoding.
     pub async fn read_var(&self) -> Result<RecordBatch> {
         let var_data = self.read_section("var").await?;
         let cursor = Cursor::new(&var_data);
@@ -143,7 +153,7 @@ impl CloudReader {
                 ))
             })?
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        Ok(batch)
+        Ok(scx_format::downcast_large_types(&batch)?)
     }
 
     /// Read multiple shard sections in parallel.

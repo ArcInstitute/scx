@@ -193,11 +193,16 @@ impl ScxWriter {
     }
 
     /// Serialize a RecordBatch to Arrow IPC file format bytes.
+    ///
+    /// Upcasts `Utf8 → LargeUtf8` and `Binary → LargeBinary` so columns
+    /// larger than 2 GB do not overflow Arrow IPC's 32-bit offset limit.
+    /// See [`crate::arrow_compat`] for details.
     fn write_arrow_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
+        let batch = crate::arrow_compat::upcast_to_large_types(batch)?;
         let mut buf = Vec::new();
         {
             let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, batch.schema_ref())?;
-            writer.write(batch)?;
+            writer.write(&batch)?;
             writer.finish()?;
         }
         Ok(buf)
