@@ -11,8 +11,12 @@ on GitHub and in the rendered site.
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import os
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 DOCS_DIR = Path(__file__).resolve().parent
@@ -30,13 +34,10 @@ copyright = "2025, Arc Institute"
 def _read_version() -> str:
     pyproject = REPO_ROOT / "pyscx" / "pyproject.toml"
     try:
-        for line in pyproject.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("version"):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return "0.0.0"
+        with pyproject.open("rb") as f:
+            return tomllib.load(f).get("project", {}).get("version", "0.0.0")
+    except (OSError, tomllib.TOMLDecodeError):
+        return "0.0.0"
 
 
 release = _read_version()
@@ -109,7 +110,6 @@ autodoc_mock_imports = [
 # autodoc's `automodule:: pyscx.accel` can't import it. Register it
 # manually so autodoc can find it.
 try:
-    import sys
     import pyscx as _pyscx_for_docs
 
     for _sub in ("accel",):
@@ -148,14 +148,12 @@ html_theme_options = {
     "navigation_with_keys": True,
 }
 
-# Some markdown docs cross-link to files outside docs/ (e.g.
-# `../benchmarks/README.md`). Those resolve fine on GitHub but not in the
-# built site — silence the warning rather than failing the build.
-suppress_warnings = [
-    "myst.xref_missing",
-    "myst.header",
-    "myst.iref_ambiguous",
-]
+# suppress_warnings is intentionally unset. A small number of cross-repo
+# links (e.g. `../benchmarks/README.md` in performance.md) reliably emit
+# `myst.xref_missing` at build time — those are known and harmless (the
+# build still succeeds; `fail_on_warning: false` in .readthedocs.yaml).
+# Leaving the warning live so a newly-introduced broken xref shows up
+# instead of being silently swallowed.
 
 # Keep build non-fatal on these RTD environments (Rust extension not built).
 nitpicky = False
@@ -167,11 +165,6 @@ nitpicky = False
 # function/class. Our resolver returns a GitHub blob URL for pure-Python
 # symbols (iter_chunks, ScxDataModule, …) and `None` for Rust-defined
 # (PyO3-compiled) symbols, since those have no traceable Python source.
-
-import importlib  # noqa: E402
-import inspect    # noqa: E402
-import os         # noqa: E402
-import subprocess  # noqa: E402
 
 GITHUB_USER = "ArcInstitute"
 GITHUB_REPO = "scx"
