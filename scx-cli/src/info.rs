@@ -4,6 +4,7 @@ use std::path::Path;
 
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::catalog::FullCatalog;
+use scx_format::modality::ModalityType;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
@@ -96,6 +97,40 @@ pub fn run_info(
     // Line 5: file size
     let file_size = std::fs::metadata(path)?.len();
     println!("File size: {}", human_size(file_size));
+
+    // Modality table (Phase F.1): when n_modalities > 0, print one
+    // row per modality. Single-modality files skip this block to
+    // keep their summary unchanged.
+    if let Some(table) = reader.modality_table() {
+        if !table.entries.is_empty() {
+            println!();
+            println!(
+                "Modalities ({}):  {:<14} {:<10} {:>10} {:>14} {:>6} {:>6} {:<10}",
+                table.entries.len(),
+                "name",
+                "type",
+                "n_vars",
+                "nnz",
+                "csr",
+                "csc",
+                "codec",
+            );
+            for info in &table.entries {
+                let type_name = modality_type_name(info.modality_type);
+                let codec_name = codec_id_name(info.default_codec_id);
+                println!(
+                    "                  {:<14} {:<10} {:>10} {:>14} {:>6} {:>6} {:<10}",
+                    info.name,
+                    type_name,
+                    fmt_num(info.n_vars),
+                    fmt_num(info.nnz),
+                    info.n_csr_shards,
+                    info.n_csc_shards,
+                    codec_name,
+                );
+            }
+        }
+    }
 
     // Sections table
     println!();
@@ -246,6 +281,29 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         "file_size_bytes": file_size,
         "sections": sections,
     });
+
+    // Phase F.1: per-modality table in JSON output.
+    if let Some(table) = reader.modality_table() {
+        if !table.entries.is_empty() {
+            let modalities: Vec<_> = table
+                .entries
+                .iter()
+                .map(|info| {
+                    serde_json::json!({
+                        "name": info.name,
+                        "modality_type": modality_type_name(info.modality_type),
+                        "n_vars": info.n_vars,
+                        "nnz": info.nnz,
+                        "n_csr_shards": info.n_csr_shards,
+                        "n_csc_shards": info.n_csc_shards,
+                        "default_codec": codec_id_name(info.default_codec_id),
+                        "flags": info.flags.bits(),
+                    })
+                })
+                .collect();
+            obj["modalities"] = serde_json::json!(modalities);
+        }
+    }
 
     // Per-CSC-shard layout for files with multiple CSC shards.
     if header.n_csc_shards > 1 {
@@ -487,6 +545,28 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
             }
             format!("layer-csc ({})", name)
         }
+    }
+}
+
+fn modality_type_name(t: ModalityType) -> &'static str {
+    match t {
+        ModalityType::Rna => "RNA",
+        ModalityType::Protein => "Protein",
+        ModalityType::Atac => "ATAC",
+        ModalityType::Spatial => "Spatial",
+        ModalityType::Methylation => "Methylation",
+        ModalityType::Custom => "Custom",
+    }
+}
+
+fn codec_id_name(id: u8) -> &'static str {
+    match CodecId::from_u8(id) {
+        Some(CodecId::None) => "none",
+        Some(CodecId::Scx1) => "scx1",
+        Some(CodecId::Zstd) => "zstd",
+        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
+        Some(CodecId::Pcodec) => "pcodec",
+        None => "unknown",
     }
 }
 

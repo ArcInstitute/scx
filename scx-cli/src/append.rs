@@ -10,6 +10,7 @@ use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 pub fn run_append(
     target: &Path,
     input: &Path,
+    modality: Option<&str>,
     codec: &str,
     shard_size: u32,
     rebuild_csc: bool,
@@ -17,31 +18,116 @@ pub fn run_append(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open input file
     let input_reader = ScxReader::open(input)?;
-    let input_header = input_reader.header();
 
     // Open target file to validate n_vars
     let target_reader = ScxReader::open(target)?;
     let target_header = target_reader.header();
 
-    if target_header.n_vars != input_header.n_vars {
+    // Phase F.3: resolve modality routing.
+    //
+    //   - On a multimodal target, `--modality NAME` is required so the
+    //     append is unambiguous (cells are global, but X is
+    //     per-modality).
+    //   - On a single-modality target, `--modality` is optional and
+    //     defaults to 0 (global / legacy).
+    let target_modality_id: u8 = if target_reader.is_multimodal() {
+        match modality {
+            Some(name) => target_reader.modality_id(name).ok_or_else(|| {
+                format!(
+                    "target file does not have a modality named '{name}'; \
+                     run `scx info {}` to list modalities",
+                    target.display()
+                )
+            })?,
+            None => {
+                return Err(format!(
+                    "target file is multimodal ({} modalities); pass `--modality NAME`. \
+                     Run `scx info {}` to list modalities.",
+                    target_reader.n_modalities(),
+                    target.display()
+                )
+                .into());
+            }
+        }
+    } else if let Some(name) = modality {
         return Err(format!(
-            "n_vars mismatch: target has {} vars, input has {} vars",
-            target_header.n_vars, input_header.n_vars
+            "target file is single-modality but `--modality {name}` was passed; \
+             remove the flag (or use a multimodal target)"
+        )
+        .into());
+    } else {
+        0
+    };
+
+    // n_vars cross-check: per-modality append uses the target modality's
+    // `n_vars`; legacy / single-modality append uses the file-wide
+    // `header.n_vars`.
+    let target_modality_n_vars: u64 = if target_modality_id == 0 {
+        target_header.n_vars
+    } else {
+        target_reader
+            .modality_info(target_modality_id)
+            .map(|info| info.n_vars)
+            .unwrap_or(target_header.n_vars)
+    };
+
+    // Resolve the matching input modality when both files are multimodal.
+    // For a multimodal input → multimodal target append, the input must
+    // expose the same modality name. For a single-modality input → any
+    // target, just use the input's global shards.
+    let input_modality_id: u8 = if input_reader.is_multimodal() {
+        if target_modality_id == 0 {
+            return Err("input file is multimodal but target is single-modality; \
+                 use `scx subset --modality NAME` on the input first"
+                .into());
+        }
+        let mname = modality.expect("multimodal target requires --modality");
+        input_reader.modality_id(mname).ok_or_else(|| {
+            format!(
+                "input file is multimodal but does not have a modality named '{mname}'; \
+                 the input must expose the same modality as the target"
+            )
+        })?
+    } else {
+        0
+    };
+
+    // n_vars equality between source and target on the matching axis.
+    let input_n_vars: u64 = if input_modality_id == 0 {
+        input_reader.header().n_vars
+    } else {
+        input_reader
+            .modality_info(input_modality_id)
+            .map(|info| info.n_vars)
+            .unwrap_or(input_reader.header().n_vars)
+    };
+    if target_modality_n_vars != input_n_vars {
+        return Err(format!(
+            "n_vars mismatch: target has {target_modality_n_vars} vars, \
+             input has {input_n_vars} vars"
         )
         .into());
     }
-    drop(target_reader);
 
-    // Read CSR data from input (in-memory scipy types: i64/i32/f32)
-    let csr = input_reader.read_all_csr_shards()?;
+    // Read CSR data from the matching modality of the input.
+    let csr = if input_modality_id == 0 {
+        input_reader.read_all_csr_shards()?
+    } else {
+        input_reader.read_all_csr_shards_for(input_modality_id)?
+    };
 
     if csr.n_rows() == 0 {
         println!("Input file has 0 cells, nothing to append.");
         return Ok(());
     }
 
-    // Detect ValueEncoding from the input file's first CSR shard header
-    let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
+    // Detect ValueEncoding from the matching modality's first CSR shard.
+    let csr_entries: Vec<&scx_format::FullCatalogEntry> = input_reader
+        .catalog()
+        .shards(SectionType::CsrShard)
+        .into_iter()
+        .filter(|e| e.modality_id == input_modality_id)
+        .collect();
     let value_encoding = if let Some(first_shard) = csr_entries.first() {
         let bytes = input_reader.section_bytes(first_shard)?;
         if bytes.len() >= SHARD_HEADER_SIZE {
@@ -53,7 +139,7 @@ pub fn run_append(
             return Err("input CSR shard too small to read header".into());
         }
     } else {
-        return Err("input file has no CSR shards".into());
+        return Err("input file has no CSR shards for the requested modality".into());
     };
 
     // Convert from scipy in-memory types back to on-disk types
@@ -64,16 +150,24 @@ pub fn run_append(
     // data: f32 → raw LE bytes matching ValueEncoding
     let new_values = f32_to_raw_values(&csr.data, value_encoding);
 
-    // Read obs metadata from input
+    // Read obs metadata from input (cells are global across modalities,
+    // so we always pull from the global obs table).
     let new_obs = input_reader.read_obs()?;
 
-    // Resolve codec
+    // Resolve codec. Per-modality append uses the target modality's
+    // biological type for auto-codec routing.
+    let target_modality_type = if target_modality_id == 0 {
+        scx_format::ModalityType::Rna
+    } else {
+        target_reader
+            .modality_info(target_modality_id)
+            .map(|info| info.modality_type)
+            .unwrap_or(scx_format::ModalityType::Rna)
+    };
     let codec_id = match codec {
-        "auto" => scx_format::select_codec_for_modality(
-            &new_values,
-            value_encoding,
-            scx_format::ModalityType::Rna,
-        ),
+        "auto" => {
+            scx_format::select_codec_for_modality(&new_values, value_encoding, target_modality_type)
+        }
         "none" => CodecId::None,
         "scx1" => CodecId::Scx1,
         "zstd" => CodecId::Zstd,
@@ -88,9 +182,12 @@ pub fn run_append(
         }
     };
 
-    // Call scx_ops::append
+    // Drop the target reader before scx_ops::append acquires the file lock.
+    drop(target_reader);
+
+    // Call scx_ops::append (per-modality variant).
     let n_cells = new_indptr.len() - 1;
-    scx_ops::append(
+    scx_ops::append_for_modality(
         target,
         &new_obs,
         &new_indptr,
@@ -99,6 +196,7 @@ pub fn run_append(
         value_encoding,
         codec_id,
         shard_size,
+        target_modality_id,
     )?;
 
     println!(

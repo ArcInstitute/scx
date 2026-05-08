@@ -103,6 +103,12 @@ enum Commands {
         /// Source SCX file containing cells to append
         #[arg(long)]
         input: PathBuf,
+        /// Modality name to append into. Required on multimodal target
+        /// files (`scx info` shows the modality table). Optional on
+        /// single-modality files — defaults to the global / primary
+        /// modality.
+        #[arg(long)]
+        modality: Option<String>,
         /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
@@ -307,6 +313,11 @@ enum Commands {
         /// File containing gene names or numeric indices (one per line) for column projection
         #[arg(long)]
         genes: Option<PathBuf>,
+        /// On a multimodal input, extract a single modality by name
+        /// to a new single-modality v2 file. When set with `--genes`,
+        /// scopes the gene filter to that modality's index space.
+        #[arg(long)]
+        modality: Option<String>,
         /// Show matching count without writing output
         #[arg(long)]
         dry_run: bool,
@@ -386,6 +397,7 @@ fn main() {
         Commands::Append {
             target,
             input,
+            modality,
             codec,
             shard_size,
             rebuild_csc,
@@ -393,6 +405,7 @@ fn main() {
         } => append::run_append(
             &target,
             &input,
+            modality.as_deref(),
             &codec,
             shard_size,
             rebuild_csc,
@@ -456,6 +469,7 @@ fn main() {
             output,
             filter,
             genes,
+            modality,
             dry_run,
             shard_size,
             codec,
@@ -466,6 +480,7 @@ fn main() {
             output.as_deref(),
             filter.as_deref(),
             genes.as_deref(),
+            modality.as_deref(),
             dry_run,
             shard_size,
             &codec,

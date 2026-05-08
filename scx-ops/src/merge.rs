@@ -50,6 +50,40 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         }
     }
 
+    // Phase F.4: validate modality structure consistency. Multimodal
+    // merge requires every input to expose the same set of
+    // modalities (name + type + n_vars). On mismatch, raise with a
+    // clear error directing to extract-then-merge.
+    let any_multimodal = readers.iter().any(|r| r.is_multimodal());
+    if any_multimodal {
+        let first = readers[0].modality_table();
+        for (i, reader) in readers.iter().enumerate().skip(1) {
+            let here = reader.modality_table();
+            if !modality_tables_match(first, here) {
+                return Err(OpsError::ModalityMismatch {
+                    detail: format!(
+                        "input 0 and input {i} have different modality structures \
+                         (name / modality_type / n_vars must match across all inputs); \
+                         use `scx subset --modality NAME` on each input to extract a \
+                         single modality first, then `scx merge` the single-modality files"
+                    ),
+                });
+            }
+        }
+        // All inputs have matching modality structure, but full
+        // multimodal merge (concatenating per-modality shards) is
+        // not yet implemented — the existing merge logic below
+        // assumes single-modality and would silently flatten the
+        // file. Refuse rather than corrupt.
+        return Err(OpsError::ModalityMismatch {
+            detail: "all inputs are multimodal with matching structures, but multimodal \
+                 merge (preserving the modality table) is not yet implemented; \
+                 use `scx subset --modality NAME` on each input to extract a \
+                 single modality first, then `scx merge` the single-modality files"
+                .to_string(),
+        });
+    }
+
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
 
     let first_header = readers[0].header();
@@ -352,4 +386,26 @@ fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) -> Resul
         }
     }
     Ok(())
+}
+
+/// Phase F.4 helper: two modality tables match iff they have the same
+/// length and every entry agrees on (name, modality_type, n_vars).
+/// Two `None`s also match (both inputs single-modality). Mixed
+/// `Some` / `None` does not match.
+fn modality_tables_match(
+    a: Option<&scx_format::ModalityTable>,
+    b: Option<&scx_format::ModalityTable>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+        (Some(x), Some(y)) => {
+            if x.len() != y.len() {
+                return false;
+            }
+            x.entries.iter().zip(y.entries.iter()).all(|(p, q)| {
+                p.name == q.name && p.modality_type == q.modality_type && p.n_vars == q.n_vars
+            })
+        }
+    }
 }

@@ -23,6 +23,22 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     let reader = ScxReader::open(input_path)?;
     let in_header = reader.header();
 
+    // Phase F.4: multimodal compact (per-modality row filtering with
+    // modality table preservation) is not yet implemented. The
+    // single-modality compact path below would silently drop the
+    // modality table and stamp every shard with `modality_id = 0`.
+    // Refuse rather than corrupt.
+    if reader.is_multimodal() {
+        return Err(crate::error::OpsError::Format(
+            scx_format::ScxError::InvalidCatalog(format!(
+                "compact does not yet support multimodal files ({} modalities). \
+                 Use `scx subset --modality NAME` to extract a single modality first, \
+                 then `scx compact` it.",
+                reader.n_modalities()
+            )),
+        ));
+    }
+
     // Load deletion vectors
     let dv = reader.read_deletion_vectors()?;
 

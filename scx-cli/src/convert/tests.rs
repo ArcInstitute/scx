@@ -1213,3 +1213,239 @@ fn test_modality_extract_to_h5ad() {
     let var_idx = file.dataset("var/_index").unwrap();
     assert_eq!(var_idx.shape()[0], 40);
 }
+
+// --- Phase F coverage ---------------------------------------------------
+
+/// Phase F.1: `scx info` exposes per-modality counts via the
+/// modality table accessor. We don't capture stdout here — instead
+/// we verify the underlying accessors (which `run_info` formats).
+#[test]
+fn test_info_modality_table_exposed() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 8, 30, 5);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let table = reader.modality_table().expect("modality table present");
+    assert_eq!(table.len(), 2);
+    let names: Vec<&str> = table.entries.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"rna"));
+    assert!(names.contains(&"adt"));
+    for info in &table.entries {
+        assert!(info.n_csr_shards >= 1);
+        // Default codec must not be 0/None — auto resolution always
+        // picks a concrete codec, even on empty data.
+        assert_ne!(info.default_codec_id, 0);
+    }
+}
+
+/// Phase F.4: `scx subset --modality NAME` extracts a single modality
+/// to a fresh single-modality SCX file. The extract preserves the
+/// modality's per-modality `n_vars` and the file's global obs.
+#[test]
+fn test_subset_extract_modality() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_in = dir.path().join("multi.scx");
+    let scx_out = dir.path().join("rna_only.scx");
+    create_test_h5mu(&h5mu_in, 10, 25, 6);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_in, &scx_in, &opts).unwrap();
+
+    crate::subset::run_subset(
+        &scx_in,
+        Some(&scx_out),
+        None,
+        None,
+        Some("rna"),
+        false,
+        10000,
+        "auto",
+        false,
+        5000,
+    )
+    .unwrap();
+
+    let out = ScxReader::open(&scx_out).unwrap();
+    assert!(
+        !out.is_multimodal(),
+        "extracted file should be single-modality"
+    );
+    assert_eq!(out.header().n_obs, 10);
+    assert_eq!(
+        out.header().n_vars,
+        25,
+        "rna's n_vars (not the file-wide max)"
+    );
+    let csr = out.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape, (10, 25));
+}
+
+/// Phase F.4: `scx merge` rejects two multimodal files with mismatched
+/// modality structures. The user-facing error directs to extract-then-
+/// merge.
+#[test]
+fn test_merge_multimodal_mismatch_raises() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_a = dir.path().join("a.h5mu");
+    let h5mu_b = dir.path().join("b.h5mu");
+    let scx_a = dir.path().join("a.scx");
+    let scx_b = dir.path().join("b.scx");
+    let merged = dir.path().join("merged.scx");
+
+    // Two multimodal files where modality b's RNA n_vars differs.
+    create_test_h5mu(&h5mu_a, 6, 30, 5);
+    create_test_h5mu(&h5mu_b, 6, 50, 5); // different rna n_vars
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_a, &scx_a, &opts).unwrap();
+    h5mu_to_scx(&h5mu_b, &scx_b, &opts).unwrap();
+
+    // The pre-existing n_vars mismatch trips first (header.n_vars
+    // is the per-file max). Either way the merge must fail with a
+    // clear error rather than producing a corrupt single-modality
+    // output.
+    let err = scx_ops::merge(&[&scx_a, &scx_b], &merged).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("incompatible n_vars") || msg.contains("modality"),
+        "merge error should mention n_vars or modality mismatch; got: {msg}"
+    );
+}
+
+/// Phase F.4: `scx merge` of two multimodal files that match in
+/// every modality is also explicitly rejected (multimodal merge is
+/// not yet implemented). Refusing is safer than silently producing
+/// a flattened output.
+#[test]
+fn test_merge_multimodal_match_still_unsupported() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_a = dir.path().join("a.h5mu");
+    let h5mu_b = dir.path().join("b.h5mu");
+    let scx_a = dir.path().join("a.scx");
+    let scx_b = dir.path().join("b.scx");
+    let merged = dir.path().join("merged.scx");
+
+    create_test_h5mu(&h5mu_a, 6, 30, 5);
+    create_test_h5mu(&h5mu_b, 6, 30, 5); // matching modality structure
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_a, &scx_a, &opts).unwrap();
+    h5mu_to_scx(&h5mu_b, &scx_b, &opts).unwrap();
+
+    let err = scx_ops::merge(&[&scx_a, &scx_b], &merged).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("multimodal") || msg.contains("modality"),
+        "merge error should mention multimodal limitation; got: {msg}"
+    );
+}
+
+/// Phase F.4: `scx compact` on a multimodal file is rejected with a
+/// clear error directing to subset-then-compact.
+#[test]
+fn test_compact_multimodal_unsupported() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_in = dir.path().join("multi.scx");
+    let scx_out = dir.path().join("compacted.scx");
+    create_test_h5mu(&h5mu_in, 6, 20, 5);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_in, &scx_in, &opts).unwrap();
+
+    let err = scx_ops::compact(&scx_in, &scx_out).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("multimodal"),
+        "compact error should mention multimodal limitation; got: {msg}"
+    );
+}
+
+/// Phase F.3: `scx_ops::append_for_modality` stamps shards with the
+/// chosen modality_id and updates the modality table's per-modality
+/// counts. We exercise the full path: build a multimodal file from
+/// h5mu, append to its rna modality, verify the rna modality's
+/// counts went up while the adt modality is untouched.
+#[test]
+fn test_append_for_modality_updates_table() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use scx_format::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 8, 20, 5);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+
+    // Capture pre-append per-modality state.
+    let pre = ScxReader::open(&scx_path).unwrap();
+    let rna_id = pre.modality_id("rna").unwrap();
+    let adt_id = pre.modality_id("adt").unwrap();
+    let pre_rna_csr = pre.modality_info(rna_id).unwrap().n_csr_shards;
+    let pre_adt_csr = pre.modality_info(adt_id).unwrap().n_csr_shards;
+    let pre_rna_nnz = pre.modality_info(rna_id).unwrap().nnz;
+    let pre_adt_nnz = pre.modality_info(adt_id).unwrap().nnz;
+    let pre_obs = pre.read_obs().unwrap();
+    drop(pre);
+
+    // Build a fresh batch of CSR data appropriate for rna's vars
+    // (n_vars = 20). One non-zero per row at column 0.
+    let n_new_rows = 4u64;
+    let new_indptr: Vec<u64> = (0..=n_new_rows).collect();
+    let new_indices: Vec<u32> = vec![0u32; n_new_rows as usize];
+    let new_values: Vec<u8> = vec![1u8; n_new_rows as usize]; // uint8
+
+    // Build a new obs batch by truncating the existing obs to 4 rows.
+    let new_obs_batch = pre_obs.slice(0, n_new_rows as usize);
+
+    scx_ops::append_for_modality(
+        &scx_path,
+        &new_obs_batch,
+        &new_indptr,
+        &new_indices,
+        &new_values,
+        scx_codec::ValueEncoding::Uint8,
+        scx_codec::CodecId::Scx1,
+        10000,
+        rna_id,
+    )
+    .unwrap();
+
+    // Re-open and verify post-append state.
+    let post = ScxReader::open(&scx_path).unwrap();
+    assert_eq!(post.header().n_obs, 8 + n_new_rows);
+    let rna_post = post.modality_info(rna_id).unwrap();
+    let adt_post = post.modality_info(adt_id).unwrap();
+    assert!(
+        rna_post.n_csr_shards > pre_rna_csr,
+        "rna n_csr_shards should grow"
+    );
+    assert!(rna_post.nnz > pre_rna_nnz, "rna nnz should grow");
+    assert_eq!(adt_post.n_csr_shards, pre_adt_csr, "adt untouched");
+    assert_eq!(adt_post.nnz, pre_adt_nnz, "adt untouched");
+
+    // The new shard's catalog entry must be stamped with rna_id.
+    let new_shards: Vec<_> = post
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == rna_id)
+        .collect();
+    assert!(new_shards.len() as u32 >= rna_post.n_csr_shards);
+}
