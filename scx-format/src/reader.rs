@@ -145,19 +145,56 @@ impl ScxReader {
     // Arrow IPC reading (11.5–11.8)
     // -----------------------------------------------------------------------
 
-    /// Read the Arrow IPC schema from a catalog entry without deserializing data.
-    /// This reads only the IPC footer (~KB) to extract field names and types.
+    /// Read the Arrow IPC schema from a catalog entry.
     ///
-    /// Downcasts `LargeUtf8 → Utf8` / `LargeBinary → Binary` so the schema
-    /// stays in lockstep with [`Self::read_arrow_ipc`] regardless of the
-    /// on-disk encoding (see [`crate::arrow_compat`]).
+    /// Stays in lockstep with [`Self::read_arrow_ipc`] under the
+    /// opportunistic downcast in [`crate::arrow_compat`]: the
+    /// canonical schema depends on whether columns' actual offsets fit
+    /// back in `i32`, which can only be determined by inspecting the
+    /// data. So:
+    ///
+    /// - **Fast path** (no `LargeUtf8` / `LargeBinary` /
+    ///   `Dictionary(_, Large*)` on disk): return the IPC footer
+    ///   schema directly. No data deserialization. ~KB of work.
+    /// - **Slow path** (any wide type on disk): re-read the first
+    ///   batch and run `downcast_large_types` so the returned schema
+    ///   matches what `read_arrow_ipc` would produce — narrow types
+    ///   when offsets fit, wide types when they overflow.
     fn read_arrow_ipc_schema(&self, entry: &FullCatalogEntry) -> Result<arrow::datatypes::Schema> {
         let slice = self.section_bytes(entry)?;
         let cursor = Cursor::new(slice);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-        let schema = reader.schema();
-        let empty = RecordBatch::new_empty(schema);
-        let normalized = crate::arrow_compat::downcast_large_types(&empty)?;
+        let on_disk = reader.schema();
+
+        let has_wide = on_disk.fields().iter().any(|f| {
+            use arrow::datatypes::DataType;
+            matches!(f.data_type(), DataType::LargeUtf8 | DataType::LargeBinary)
+                || matches!(
+                    f.data_type(),
+                    DataType::Dictionary(_, v)
+                        if matches!(v.as_ref(), DataType::LargeUtf8 | DataType::LargeBinary)
+                )
+        });
+        if !has_wide {
+            return Ok(on_disk.as_ref().clone());
+        }
+
+        // Wide types present — drive the slow path through the same
+        // logic the data path uses, so schema reflects whether offsets
+        // actually overflow per column.
+        let cursor = Cursor::new(self.section_bytes(entry)?);
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+        let mut batches = reader.into_iter();
+        let batch = batches
+            .next()
+            .ok_or_else(|| {
+                ScxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Arrow IPC file contains no batches",
+                ))
+            })?
+            .map_err(ScxError::Arrow)?;
+        let normalized = crate::arrow_compat::downcast_large_types(&batch)?;
         Ok(normalized.schema().as_ref().clone())
     }
 
