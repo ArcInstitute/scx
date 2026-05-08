@@ -4,12 +4,14 @@
 //! [`BackedCsrReader`] for on-demand shard decoding with optional LRU caching.
 //! Used by pyscx's backed mode to implement AnnData-compatible lazy access.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use lru::LruCache;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry};
@@ -431,6 +433,11 @@ pub struct BackedCsrReader {
     metrics: Option<Arc<CacheMetrics>>,
     /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
     prefetch_count: usize,
+    /// Configured count cap on the LRU (0 = no cache). Mirrored here so
+    /// [`Self::warm_shards`] can chunk parallel decodes without locking the
+    /// cache. Only read under `cfg(feature = "parallel")`.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    cache_shards: usize,
 }
 
 impl BackedCsrReader {
@@ -483,6 +490,7 @@ impl BackedCsrReader {
             in_flight,
             metrics: None,
             prefetch_count,
+            cache_shards,
         }
     }
 
@@ -543,6 +551,7 @@ impl BackedCsrReader {
             in_flight,
             metrics: None,
             prefetch_count,
+            cache_shards,
         }
     }
 
@@ -659,6 +668,10 @@ impl BackedCsrReader {
             ));
         }
 
+        // Pre-decode cold shards in parallel before the per-shard gather.
+        // No-op when every shard is already cached.
+        self.warm_shards(&shard_indices)?;
+
         let mut slices = Vec::with_capacity(shard_indices.len());
         for &shard_idx in &shard_indices {
             let shard_csr = self.read_shard_cached_arc(shard_idx)?;
@@ -707,6 +720,10 @@ impl BackedCsrReader {
         let shard_indices = self
             .index
             .shards_for_indices(&sorted_pairs.iter().map(|&(r, _)| r).collect::<Vec<_>>());
+
+        // Pre-decode cold shards in parallel before the per-shard gather.
+        // No-op when every shard is already cached.
+        self.warm_shards(&shard_indices)?;
 
         // For each shard, extract the needed rows
         let mut row_csrs: Vec<(usize, ScxCsr)> = Vec::new();
@@ -780,6 +797,15 @@ impl BackedCsrReader {
         let mut sorted_pairs: Vec<(u64, usize)> =
             rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         sorted_pairs.sort_by_key(|&(r, _)| r);
+
+        // Pre-decode cold shards in parallel before the per-shard gather.
+        // `shards_for_indices` silently drops out-of-range rows (vs. the
+        // in-loop `shard_for_row` below which raises) — that's the right
+        // behavior here: warm what's resolvable, defer the proper error
+        // to the gather loop so out-of-range error semantics are preserved.
+        let warm_rows: Vec<u64> = sorted_pairs.iter().map(|&(r, _)| r).collect();
+        let prewarm_shards = self.index.shards_for_indices(&warm_rows);
+        self.warm_shards(&prewarm_shards)?;
 
         // Walk by shard. partition_point finds each shard's request
         // sub-slice in O(log R) instead of the O(R) inner scan that
@@ -1029,6 +1055,109 @@ impl BackedCsrReader {
         }
 
         Ok(csr)
+    }
+
+    /// Decode the requested shards into the LRU cache, in parallel when the
+    /// `parallel` feature is on and the configured `cache_shards > 1`.
+    ///
+    /// Used by the multi-shard read paths (`read_rows`, `read_row_indices`,
+    /// `read_rows_with`) to overlap zstd decode of cold shards across rayon
+    /// threads before the per-shard gather loop runs. After this returns,
+    /// up to `cache_shards` of the requested shards have been decoded and
+    /// are either in the LRU or were just served to a peer leader via the
+    /// singleflight table. Any tail beyond `cache_shards` is left for the
+    /// per-shard gather loop to decode sequentially — warming further would
+    /// just thrash the LRU (also capped at `cache_shards`) and force the
+    /// gather loop to re-decode the evicted prefix.
+    ///
+    /// No-op for shards already cached or in flight via the singleflight
+    /// table — the up-front filter avoids paying the singleflight Condvar
+    /// wait twice for the same shard inside one call.
+    ///
+    /// Peak transient RAM during decode is bounded by
+    /// `cache_shards × decoded shard size` — matches the steady-state cap
+    /// the LRU already enforces.
+    fn warm_shards(&self, shard_indices: &[usize]) -> Result<()> {
+        // No cache configured → nothing to warm; the per-shard reader path
+        // will decode without caching.
+        let (Some(cache_mutex), Some(in_flight_mutex)) = (&self.cache, &self.in_flight) else {
+            return Ok(());
+        };
+
+        if shard_indices.is_empty() {
+            return Ok(());
+        }
+
+        // Build the unique miss list under one lock acquisition each. We
+        // snapshot membership; a peer thread can race in between, but the
+        // singleflight + cache fast path inside `read_shard_cached_arc`
+        // catches every late-arriving entry so correctness is preserved —
+        // we only over- or under-filter for parallelism.
+        //
+        // Lock order: `in_flight` → `cache`, matching the miss path of
+        // `read_shard_cached_arc` (which acquires `in_flight`, then
+        // re-checks `cache` while still holding it). Inverting here would
+        // deadlock concurrent readers: one thread in `warm_shards` holding
+        // `cache` and waiting for `in_flight`, another in
+        // `read_shard_cached_arc` holding `in_flight` and waiting for
+        // `cache`.
+        let mut seen: HashSet<usize> = HashSet::with_capacity(shard_indices.len());
+        let mut misses: Vec<usize> = Vec::with_capacity(shard_indices.len());
+        {
+            let in_flight = in_flight_mutex.lock().unwrap();
+            let cache = cache_mutex.lock().unwrap();
+            for &idx in shard_indices {
+                if !seen.insert(idx) {
+                    continue;
+                }
+                if cache.contains(&idx) || in_flight.contains_key(&idx) {
+                    continue;
+                }
+                misses.push(idx);
+            }
+        }
+
+        if misses.is_empty() {
+            return Ok(());
+        }
+
+        // Sequential body: parallel feature off, single-slot cache, or only
+        // one shard to decode. `read_shard_cached_arc` handles the
+        // singleflight + insert + metrics + MADV_WILLNEED prefetch.
+        #[cfg(not(feature = "parallel"))]
+        {
+            for &idx in &misses {
+                self.read_shard_cached_arc(idx)?;
+            }
+            return Ok(());
+        }
+
+        #[cfg(feature = "parallel")]
+        {
+            if self.cache_shards <= 1 || misses.len() == 1 {
+                for &idx in &misses {
+                    self.read_shard_cached_arc(idx)?;
+                }
+                return Ok(());
+            }
+
+            // Cap warm at `cache_shards`. Warming more would just thrash
+            // the LRU (the cache is also capped at `cache_shards`),
+            // forcing the gather loop to re-decode any prefix evicted by
+            // later warm work. Tail shards beyond the cap are decoded
+            // sequentially by the per-shard gather loop — same behavior
+            // as the pre-`warm_shards` code for those shards, so we
+            // gracefully degrade to the prior throughput on wide reads
+            // instead of doubling decode work.
+            if misses.len() > self.cache_shards {
+                misses.truncate(self.cache_shards);
+            }
+
+            misses
+                .par_iter()
+                .try_for_each(|&idx| self.read_shard_cached_arc(idx).map(|_| ()))?;
+            Ok(())
+        }
     }
 
     // --- Native shard-by-shard aggregation ---
@@ -2493,6 +2622,211 @@ mod tests {
         assert_eq!(result.indptr, expected.indptr);
         assert_eq!(result.indices, expected.indices);
         assert_eq!(result.data, expected.data);
+    }
+
+    // -----------------------------------------------------------------------
+    // warm_shards / parallel cold-shard decode tests
+    // -----------------------------------------------------------------------
+
+    /// Build a reader on the same on-disk file as `seq_backed` but with
+    /// `cache_shards = 1` (forces the sequential body inside `warm_shards`
+    /// even when the `parallel` feature is on). Used to verify that the
+    /// parallel decode path produces byte-identical output to the
+    /// sequential one.
+    fn open_with_cache_shards(dir: &TempDir, cache_shards: usize) -> BackedCsrReader {
+        let path = dir.path().join("test.scx");
+        let reader = ScxReader::open(&path).unwrap();
+        BackedCsrReader::new(reader, cache_shards)
+    }
+
+    #[test]
+    fn test_warm_shards_parity_parallel_vs_sequential() {
+        // 8 shards, scattered indices that touch ≥ 3 of them. Compare
+        // parallel-decode output against a sequential control.
+        let dir = tempfile::tempdir().unwrap();
+        let (par, _full) = write_test_file_and_open(&dir, 32, 10, 8, 8);
+        let seq = open_with_cache_shards(&dir, 1);
+
+        let indices: [u64; 7] = [0, 5, 11, 18, 24, 27, 31];
+        let par_out = par.read_row_indices(&indices).unwrap();
+        let seq_out = seq.read_row_indices(&indices).unwrap();
+
+        assert_eq!(par_out.indptr, seq_out.indptr);
+        assert_eq!(par_out.indices, seq_out.indices);
+        assert_eq!(par_out.data, seq_out.data);
+
+        // Same comparison for read_rows (range) and read_rows_with (gather).
+        let par_range = par.read_rows(2, 30).unwrap();
+        let seq_range = seq.read_rows(2, 30).unwrap();
+        assert_eq!(par_range.indptr, seq_range.indptr);
+        assert_eq!(par_range.indices, seq_range.indices);
+        assert_eq!(par_range.data, seq_range.data);
+
+        let par_gather = gather_with(&par, &indices);
+        let seq_gather = gather_with(&seq, &indices);
+        assert_eq!(par_gather, seq_gather);
+    }
+
+    #[test]
+    fn test_warm_shards_no_misses_is_noop() {
+        // Pre-warm every touched shard, then call read_row_indices on the
+        // same set. The metrics `misses` counter should stay at the
+        // pre-warm value because warm_shards filters cache hits up front.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut backed, _) = write_test_file_and_open(&dir, 32, 10, 8, 8);
+        let metrics = backed.enable_metrics();
+
+        // Pre-warm shards 0, 1, 3 directly.
+        for s in [0usize, 1, 3] {
+            backed.read_shard_cached_arc(s).unwrap();
+        }
+        let baseline_misses = metrics.misses.load(Ordering::Relaxed);
+        assert_eq!(baseline_misses, 3, "pre-warm should miss exactly 3 times");
+
+        // Indices 0, 5, 13 land on shards 0, 1, 3 respectively.
+        let _ = backed.read_row_indices(&[0u64, 5, 13]).unwrap();
+
+        let after_misses = metrics.misses.load(Ordering::Relaxed);
+        assert_eq!(
+            after_misses, baseline_misses,
+            "fully cached read should not register any new miss",
+        );
+    }
+
+    #[test]
+    fn test_warm_shards_concurrent_dedup_via_singleflight() {
+        // N threads each call read_row_indices for the same set of cold
+        // shards. The singleflight table must dedupe so total misses ==
+        // n_unique_shards regardless of N.
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut backed, _) = write_test_file_and_open(&dir, 64, 10, 8, 8);
+        let metrics = backed.enable_metrics();
+        let backed = Arc::new(backed);
+
+        // Indices touching 4 unique shards: 0, 1, 5, 7.
+        let indices: Vec<u64> = vec![0, 12, 41, 60];
+
+        let n_threads = 8;
+        let mut handles = Vec::with_capacity(n_threads);
+        for _ in 0..n_threads {
+            let b = Arc::clone(&backed);
+            let ix = indices.clone();
+            handles.push(thread::spawn(move || {
+                b.read_row_indices(&ix).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let n_unique_shards: u64 = 4;
+        let misses = metrics.misses.load(Ordering::Relaxed);
+        assert!(
+            misses <= n_unique_shards,
+            "expected ≤ {n_unique_shards} misses across {n_threads} concurrent readers, \
+             got {misses} — singleflight broke under parallel warm_shards",
+        );
+        // And at least one — every shard had to be decoded once.
+        assert!(misses >= 1, "expected ≥ 1 miss");
+
+        // Singleflight slots must be empty after all threads finish.
+        for s in [0usize, 1, 5, 7] {
+            assert!(
+                !backed.in_flight_contains(s),
+                "in_flight slot for shard {s} should be cleared after join",
+            );
+        }
+    }
+
+    #[test]
+    fn test_warm_shards_propagates_oor_error() {
+        // Calling warm_shards directly with an out-of-range shard_idx
+        // should surface a ShardIndexOutOfBounds error from the underlying
+        // read path, and must not strand the singleflight table.
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, _) = write_test_file_and_open(&dir, 32, 10, 4, 4);
+
+        // Shard 99 doesn't exist — file has 4 shards.
+        let result = backed.warm_shards(&[0usize, 1, 99]);
+        assert!(result.is_err(), "OOR shard idx must error");
+
+        // Singleflight cleanup: every leader's LeaderGuard::Drop must have
+        // removed its slot regardless of error.
+        for s in 0..4usize {
+            assert!(
+                !backed.in_flight_contains(s),
+                "in_flight slot for shard {s} should be cleared after error",
+            );
+        }
+        assert!(!backed.in_flight_contains(99));
+    }
+
+    #[test]
+    fn test_warm_shards_no_cache_is_noop() {
+        // cache_shards = 0 disables the cache entirely — warm_shards must
+        // be a no-op (the per-shard read path will decode without caching).
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+
+        backed.warm_shards(&[0usize, 1, 2, 3]).unwrap();
+        // And the multi-shard reader path still works.
+        let result = backed.read_rows(0, 12).unwrap();
+        assert_eq!(result.shape.0, 12);
+    }
+
+    #[test]
+    fn test_warm_shards_no_deadlock_with_concurrent_direct_decoders() {
+        // Regression for the AB/BA lock-order inversion between
+        // `warm_shards` and `read_shard_cached_arc`'s miss path. We spawn
+        // two pools against the same `BackedCsrReader`:
+        //   - "warmers": call `read_rows`, which funnels through `warm_shards`
+        //   - "direct":  call `read_shard_cached_arc` directly
+        // Both target overlapping cold shards, so the two lock-acquisition
+        // paths run concurrently. Pre-fix this deadlocks probabilistically;
+        // post-fix every thread joins. If the deadlock returns, the test
+        // hangs and CI's job timeout fails the run.
+        //
+        // `cache_shards = 8` < n_shards = 16 also exercises the P2 truncation
+        // branch (warm caps at cache_shards instead of decoding the full
+        // miss list and thrashing the LRU).
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, _) = write_test_file_and_open(&dir, 128, 10, 16, 8);
+        let backed = Arc::new(backed);
+
+        let n_iters = 64;
+        let n_warmers = 4;
+        let n_direct = 4;
+        let target_shards: Vec<usize> = (0..16).collect();
+
+        let mut handles = Vec::with_capacity(n_warmers + n_direct);
+        for _ in 0..n_warmers {
+            let b = Arc::clone(&backed);
+            handles.push(thread::spawn(move || {
+                for _ in 0..n_iters {
+                    let _ = b.read_rows(0, 128).unwrap();
+                }
+            }));
+        }
+        for _ in 0..n_direct {
+            let b = Arc::clone(&backed);
+            let shards = target_shards.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..n_iters {
+                    for &s in &shards {
+                        let _ = b.read_shard_cached_arc(s).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     // -----------------------------------------------------------------------
