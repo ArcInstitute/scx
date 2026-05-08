@@ -32,7 +32,7 @@ use scx_format::provenance::ProvenanceEntry;
 use scx_format::writer::ScxWriter;
 
 use super::detect::{detect_matrix_format_at, MatrixFormat};
-use super::dtype::{detect_value_encoding, values_to_raw_bytes};
+use super::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
 use super::h5ad_read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
 use super::pipeline::{ConvertError, ConvertOptions};
 
@@ -194,9 +194,10 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
 
         let (indptr, indices, data, _read_n_obs, _read_n_vars) =
             read_x_matrix_at(&file, &x_path, *fmt)?;
-        let (value_encoding, codec_id) = detect_value_encoding(&data, opts.codec);
-
         let modality_type = infer_modality_type(mname);
+        let (value_encoding, codec_id) =
+            detect_value_encoding_for_modality(&data, opts.codec, modality_type);
+
         let modality_id = writer
             .add_modality(mname, modality_type, codec_id, value_encoding)
             .map_err(ConvertError::from)?;
@@ -253,7 +254,8 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         // with this modality_id.
         if let Ok(layers) = read_layers_at(&file, &layers_path) {
             for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
-                let (l_enc, l_codec) = detect_value_encoding(l_data, opts.codec);
+                let (l_enc, l_codec) =
+                    detect_value_encoding_for_modality(l_data, opts.codec, modality_type);
                 write_modality_layer_shards(
                     &mut writer,
                     modality_id,

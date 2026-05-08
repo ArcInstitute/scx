@@ -392,7 +392,11 @@ fn write_subset_scx(
         let codec_id = if let Some(c) = explicit_codec {
             c
         } else {
-            scx_format::select_codec(shard_values, value_encoding)
+            scx_format::select_codec_for_modality(
+                shard_values,
+                value_encoding,
+                scx_format::ModalityType::Rna,
+            )
         };
 
         writer.write_csr_shard(

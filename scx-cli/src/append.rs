@@ -69,7 +69,11 @@ pub fn run_append(
 
     // Resolve codec
     let codec_id = match codec {
-        "auto" => scx_format::select_codec(&new_values, value_encoding),
+        "auto" => scx_format::select_codec_for_modality(
+            &new_values,
+            value_encoding,
+            scx_format::ModalityType::Rna,
+        ),
         "none" => CodecId::None,
         "scx1" => CodecId::Scx1,
         "zstd" => CodecId::Zstd,

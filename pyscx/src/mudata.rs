@@ -24,7 +24,7 @@ use scx_format::header::{FileHeader, MAGIC};
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
-use scx_format::select_codec;
+use scx_format::select_codec_for_modality;
 use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
@@ -378,7 +378,9 @@ pub fn from_mudata_impl(
         let raw_values_bytes = data_to_f32_bytes(&payload.data);
         let codec_id = match explicit_codec {
             Some(c) => c,
-            None => select_codec(&raw_values_bytes, value_encoding),
+            None => {
+                select_codec_for_modality(&raw_values_bytes, value_encoding, payload.modality_type)
+            }
         };
 
         let modality_id = writer

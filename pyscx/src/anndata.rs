@@ -15,8 +15,8 @@ use scx_format::header::MAGIC;
 use scx_format::section::SectionType;
 use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
 use scx_format::{
-    compute_shard_stats, select_codec, FileHeader, PreEncodedSection, ProvenanceEntry, ScxReader,
-    ScxWriter,
+    compute_shard_stats, select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection,
+    ProvenanceEntry, ScxReader, ScxWriter,
 };
 
 use crate::to_pyerr;
@@ -1334,7 +1334,11 @@ fn parallel_encode_csr_shards(
                             codec_id
                         }
                     }
-                    None => select_codec(&shard_values_bytes, shard_value_encoding),
+                    None => select_codec_for_modality(
+                        &shard_values_bytes,
+                        shard_value_encoding,
+                        ModalityType::Rna,
+                    ),
                 };
 
                 // 5. Encode shard
@@ -1587,7 +1591,7 @@ pub fn from_anndata_impl(
                 codec_id
             }
         }
-        None => select_codec(&first_values, first_encoding),
+        None => select_codec_for_modality(&first_values, first_encoding, ModalityType::Rna),
     };
 
     // Build FileHeader

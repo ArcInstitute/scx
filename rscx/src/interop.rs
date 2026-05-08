@@ -619,8 +619,8 @@ fn write_csr_to_scx(
 ) -> Result<()> {
     use scx_codec::CodecId;
     use scx_format::header::FileHeader;
-    use scx_format::select_codec;
     use scx_format::writer::ScxWriter;
+    use scx_format::{select_codec_for_modality, ModalityType};
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
     let shard_target_rows: usize = 16384;
@@ -693,7 +693,7 @@ fn write_csr_to_scx(
                     c
                 }
             }
-            None => select_codec(shard_values, value_encoding),
+            None => select_codec_for_modality(shard_values, value_encoding, ModalityType::Rna),
         };
         last_csr_codec = codec;
 

@@ -28,7 +28,9 @@ pub use catalog::{
     SHARD_STATS_BASE_SIZE_V1, SHARD_STATS_BASE_SIZE_V2,
 };
 pub use checksum::{blake3_hash, blake3_truncated_64};
-pub use codec_select::{select_codec, select_codec_with_profile, CodecProfile};
+pub use codec_select::{
+    select_codec, select_codec_for_modality, select_codec_with_profile, CodecProfile,
+};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use error::{Result, ScxError};

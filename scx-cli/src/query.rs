@@ -245,8 +245,12 @@ fn write_query_result(
         let val_end = idx_end * value_byte_size;
         let shard_values = &raw_values[val_start..val_end];
 
-        // Auto-codec selection
-        let codec_id = scx_format::select_codec(shard_values, value_encoding);
+        // Auto-codec selection (single-modality query → RNA default)
+        let codec_id = scx_format::select_codec_for_modality(
+            shard_values,
+            value_encoding,
+            scx_format::ModalityType::Rna,
+        );
 
         writer.write_csr_shard(
             &shard_indptr,

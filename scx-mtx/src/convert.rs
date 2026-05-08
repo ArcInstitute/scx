@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
-use scx_format::select_codec;
 use scx_format::writer::ScxWriter;
+use scx_format::{select_codec_for_modality, ModalityType};
 
 use crate::error::MtxError;
 
@@ -129,7 +129,7 @@ fn detect_value_encoding(
                 codec_id
             }
         }
-        None => select_codec(&raw_bytes, encoding),
+        None => select_codec_for_modality(&raw_bytes, encoding, ModalityType::Rna),
     };
 
     (encoding, codec)
