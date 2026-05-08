@@ -893,6 +893,17 @@ def estimate_memory_gb(
         # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
         # on 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.1)
+    elif benchmark == "multimodal_compression":
+        # Five-format sweep on a `.h5mu` source. Loads MuData once + writes
+        # multiple variants (h5mu raw/gzip, zarr, two SCX). Like
+        # single-modality `compression`, dominated by Python overhead;
+        # half of base is generous.
+        peak_mb = base_mb * 0.5
+    elif benchmark == "multimodal_training":
+        # Eager mudata baseline materialises every modality; SCX path
+        # streams. CITE-seq peaks at ~590 MB, Multiome at ~5 GB host RSS
+        # in the empirical SLURM run; size like ml_loader's sparse path.
+        peak_mb = max(base_mb * 2, dense_mb * 0.5)
     else:
         peak_mb = base_mb
 
@@ -969,6 +980,12 @@ def estimate_time_minutes(
         # cached per dataset so the per-variant work is bounded by the op
         # itself.
         "bench_csc_dispatch":     45,
+        # Phase K — multimodal benchmarks. Five-format compression sweep
+        # finishes in <1 min on real CITE-seq / Multiome fixtures; the
+        # training benchmark runs a 100-batch loop + TTFB warm-up, well
+        # within 30 minutes even at Multiome's 144K-feature ATAC width.
+        "multimodal_compression": 10,
+        "multimodal_training":    30,
     }
     base = base_minutes.get(benchmark, 15)
 

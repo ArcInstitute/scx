@@ -18,6 +18,7 @@ per-modality codec routing on a real multimodal dataset.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from pathlib import Path
 
@@ -39,6 +40,9 @@ def _estimate_per_modality_nnz(h5mu_path: Path) -> dict[str, int]:
     import mudata
     import scipy.sparse as sp
 
+    # Disable HDF5 file locking — multiple parallel SLURM jobs may read
+    # the same source `.h5mu` concurrently.
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     mu = mudata.read_h5mu(str(h5mu_path), backed="r")
     out: dict[str, int] = {}
     try:
@@ -155,9 +159,23 @@ def run(
         file_size_bytes=converted_bytes,
         metadata=metadata,
     )
-    if convert_result is not None:
-        result.add_run(
-            wall_s=convert_result.wall_s,
-            peak_rss_mb=convert_result.peak_rss_mb,
-        )
+    # Headline metrics flow into ``runs[].extra`` so the gate's
+    # ``check_absolute_floors`` (which reads ``runs[].extra`` per
+    # ``compare_against_baseline.py``) can see them. ``metadata``
+    # keeps the human-readable summary. We always emit at least one
+    # run carrying the metrics — even when ``converted_path`` is
+    # supplied by the orchestrator (so no in-benchmark conversion
+    # happened) — because otherwise the gate would treat the
+    # benchmark as "no observations" and fail every floor.
+    wall_s = convert_result.wall_s if convert_result is not None else 0.0
+    peak_rss_mb = (
+        convert_result.peak_rss_mb if convert_result is not None else 0.0
+    )
+    result.add_run(
+        wall_s=wall_s,
+        peak_rss_mb=peak_rss_mb,
+        output_size_bytes=converted_bytes,
+        compression_ratio_vs_h5mu=metadata["compression_ratio_vs_h5mu"],
+        bits_per_nnz=metadata["bits_per_nnz"],
+    )
     return result

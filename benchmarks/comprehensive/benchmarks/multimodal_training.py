@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,15 @@ def _peak_rss_mb() -> float:
     r = resource.getrusage(resource.RUSAGE_SELF)
     # Linux: ru_maxrss is in KB.
     return r.ru_maxrss / 1024.0
+
+
+def _disable_hdf5_locking() -> None:
+    """Multiple parallel SLURM jobs may read the same source `.h5mu`
+    concurrently; the default h5py file lock raises ``BlockingIOError:
+    errno 11`` on contended reads. Disable locking for read-only opens
+    (the source is never mutated during a benchmark).
+    """
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +158,7 @@ def _run_h5mu_epoch(
     import mudata
     import scipy.sparse as sp
 
+    _disable_hdf5_locking()
     mu = mudata.read_h5mu(str(h5mu_path))
     # Materialise per-modality X as scipy CSR and capture the global
     # n_obs from the outer obs.
@@ -261,6 +272,7 @@ def _measure_ttfb_h5mu(path: Path, modality_names: tuple[str, ...]) -> list[floa
     import mudata
     import scipy.sparse as sp
 
+    _disable_hdf5_locking()
     times: list[float] = []
     for _ in range(_N_TTFB_RUNS):
         gc.collect()
@@ -407,10 +419,21 @@ def run(
         metadata=metadata,
     )
     for e in epochs:
+        # Headline metrics flow into ``runs[].extra`` so the gate's
+        # ``check_absolute_floors`` can read them
+        # (``compare_against_baseline.py:_load_current_raw_metric``).
+        # ``time_to_first_batch_s`` is measured once outside the
+        # epoch loop and broadcast into every run so the
+        # median-across-runs reduction collapses to the right
+        # scalar without a special-case path. ``metadata`` keeps
+        # the human-readable summary.
         result.add_run(
             wall_s=e.wall_s,
             peak_rss_mb=e.peak_rss_mb,
             n_batches=e.n_batches,
             n_cells=e.n_cells,
+            batches_per_sec=(e.n_batches / e.wall_s) if e.wall_s > 0 else 0.0,
+            cells_per_sec=(e.n_cells / e.wall_s) if e.wall_s > 0 else 0.0,
+            time_to_first_batch_s=median_ttfb,
         )
     return result

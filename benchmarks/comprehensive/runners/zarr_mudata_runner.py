@@ -83,6 +83,8 @@ class ZarrMuDataRunner(FormatRunner):
         u0, s0 = self._get_cpu_times()
         t0 = time.perf_counter()
 
+        # Disable HDF5 file locking — see scx_runner.convert_from_h5mu.
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
         mu = mudata.read_h5mu(h5mu_path)
         # mudata 0.4 uses anndata's experimental zarr writer; the public
         # API is `mu.write_zarr(path)`. The compressor is configured at

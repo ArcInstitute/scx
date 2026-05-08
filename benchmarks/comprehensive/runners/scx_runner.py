@@ -171,6 +171,12 @@ class ScxRunner(FormatRunner):
         u0, s0 = self._get_cpu_times()
         t0 = time.perf_counter()
 
+        # Multiple parallel SLURM jobs read the same source `.h5mu`
+        # concurrently; the default h5py file lock raises
+        # ``BlockingIOError: errno 11`` on contended reads. Disable
+        # file locking for read-only opens (the source is never
+        # mutated during a benchmark).
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
         mu = mudata.read_h5mu(h5mu_path)
         pyscx.from_mudata(
             mu,

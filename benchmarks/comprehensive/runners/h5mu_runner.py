@@ -94,6 +94,8 @@ class H5muRunner(FormatRunner):
         u0, s0 = self._get_cpu_times()
         t0 = time.perf_counter()
 
+        # Disable HDF5 file locking — see scx_runner.convert_from_h5mu.
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
         mu = mudata.read_h5mu(h5mu_path)
         mu.write_h5mu(output_path, compression=self.compression)
 

@@ -733,8 +733,9 @@ performance currently under regression governance:
 | **Cell-eval / arc-bench parity perf** | `cell_eval_parity_perf` |
 | **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
 | **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
+| **Multimodal — h5mu compression and training-loader throughput** | `multimodal_compression`, `multimodal_training` |
 
-That is 27 benchmarks across 11 distinct domains, each expanded across the
+That is 29 benchmarks across 12 distinct domains, each expanded across the
 relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
 plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
 and the tier's dataset list (pbmc3k → census_10m). The canonical list
@@ -754,9 +755,11 @@ capture run picks it up automatically.
 >     print(sorted(keys))"
 > ```
 >
-> The current `LATEST` symlink points at `v0.6.0-gpu-phase1-7-multidataset`,
-> which is **accel-only** (60 rows: `accel_hvg / knn / leiden / pca /
-> preprocess / umap`). Format / cloud / `ml_loader` / `index_plan` /
+> The current `LATEST` symlink points at `v0.6.1-multimodal`, which
+> covers **format + accel + multimodal** rows captured at the small
+> tier (60 accel cells from the prior baseline plus the new
+> `multimodal_compression` / `multimodal_training` rows on
+> `cite_seq_pbmc` + `multiome_pbmc`). Format / cloud / `ml_loader` / `index_plan` /
 > `correctness` / `roundtrip` / `cell_eval_parity_perf` benchmarks
 > capture cleanly but produce no gate signal against this baseline. The
 > earlier `v0.6.0-gpu-phase1-7` baseline (577 rows) covers format +
