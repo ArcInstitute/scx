@@ -133,3 +133,29 @@ def test_pseudobulk_filtered_csc_dispatch_reaches_kernel(wide_adata, tmp_path):
         # Allow pydeseq2 / dependency errors; reject CSC gate failures.
         if "CSC" in msg or "gene_indices" in msg or "gene subset" in msg:
             raise
+
+
+def test_pseudobulk_filtered_csc_rejects_oob_gene_index(wide_adata, tmp_path):
+    """An out-of-range `gene_indices` entry must surface as a Python
+    `RuntimeError`, not a Rust panic.
+
+    Before the fix, `pyscx/src/accel/pseudobulk.rs` did
+    `gene_names[c as usize]` directly — any `c >= n_vars` aborted the
+    interpreter via `PanicException` instead of giving the caller a
+    catchable error.
+    """
+    import pyscx
+
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", wide_adata)
+    n_vars = a_csc.shape[1]
+    bogus = [0, 1, n_vars + 5]  # last entry is OOB
+
+    with pytest.raises(RuntimeError, match="out of range"):
+        pyscx.accel.pseudobulk_dex(
+            a_csc,
+            ["group"],
+            "group",
+            "A",
+            prefer_format="csc",
+            gene_indices=bogus,
+        )

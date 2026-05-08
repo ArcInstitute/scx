@@ -55,6 +55,11 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
     }
 
     let mut all_chunk_results = Vec::new();
+    // Allocate the row-major dense scatter buffer once and reuse across
+    // chunks. The trailing chunk may be smaller; we slice down and zero
+    // only the active sub-range, avoiding the per-chunk full allocation.
+    let max_chunk = gene_chunk_size.min(n_vars);
+    let mut dense = vec![0.0f32; n_obs.saturating_mul(max_chunk)];
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
         let chunk_end = (chunk_start + gene_chunk_size).min(n_vars);
@@ -66,24 +71,24 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
             .map_err(AccelError::Scx)?;
 
         // Scatter into row-major dense buffer [n_obs × chunk_size].
-        let mut dense = vec![0.0f32; n_obs * chunk_size];
+        let dense_view = &mut dense[..n_obs * chunk_size];
+        dense_view.fill(0.0);
         for local_col in 0..chunk_size {
             let s = csc.indptr[local_col] as usize;
             let e = csc.indptr[local_col + 1] as usize;
             for j in s..e {
                 let row = csc.indices[j] as usize;
                 if row < n_obs {
-                    dense[row * chunk_size + local_col] = csc.data[j];
+                    dense_view[row * chunk_size + local_col] = csc.data[j];
                 }
             }
         }
 
-        let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
         let chunk_result = wilcoxon_rank_sum(
-            &dense,
+            dense_view,
             n_obs,
             chunk_size,
-            &chunk_genes,
+            &gene_names[chunk_start..chunk_end],
             groups,
             group_names,
             reference,

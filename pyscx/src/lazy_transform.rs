@@ -1962,8 +1962,22 @@ impl scx_format::ColumnShardSource for LazyShardSource {
         })?;
         let mut csc = (*backed.read_shard_cached(shard_idx)?).clone();
         apply_transforms_to_csc(&self.transforms, &mut csc)?;
-        if let Some(ref cols) = self.col_projection {
-            csc = scx_engine::projection::project_csc(&csc, cols);
+        if let Some(ref proj) = self.col_projection {
+            // `proj` is sorted/dedup'd GLOBAL column IDs, but `csc` is a
+            // shard slab whose own column space is `0..shard_n_cols`.
+            // Filter `proj` to entries inside this shard's global range,
+            // remap to shard-local, then project.
+            let (g_lo, g_hi) =
+                scx_format::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)
+                    .ok_or_else(|| {
+                        scx_format::ScxError::Io(std::io::Error::other(
+                            "CSC unavailable: missing shard col range for projection remap",
+                        ))
+                    })?;
+            let p_lo = proj.partition_point(|&g| g < g_lo);
+            let p_hi = proj.partition_point(|&g| g < g_hi);
+            let local: Vec<u32> = proj[p_lo..p_hi].iter().map(|&g| g - g_lo).collect();
+            csc = scx_engine::projection::project_csc(&csc, &local);
         }
         Ok(csc)
     }
@@ -2010,7 +2024,19 @@ impl scx_format::ColumnShardSource for LazyShardSource {
 
     fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {
         let backed = self.backed_csc.as_ref()?;
-        scx_format::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)
+        let (g_lo, g_hi) =
+            scx_format::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)?;
+        match &self.col_projection {
+            Some(proj) => {
+                // Map the inner shard's global range [g_lo, g_hi) onto
+                // the projected axis. Consumers iterating shards see
+                // ranges in the same axis as `n_vars()` (projected).
+                let p_lo = proj.partition_point(|&g| g < g_lo) as u32;
+                let p_hi = proj.partition_point(|&g| g < g_hi) as u32;
+                Some((p_lo, p_hi))
+            }
+            None => Some((g_lo, g_hi)),
+        }
     }
 }
 

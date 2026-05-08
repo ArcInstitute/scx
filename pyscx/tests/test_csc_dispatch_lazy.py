@@ -125,3 +125,80 @@ def test_lazy_log1p_then_normalize_total_csc_raises(small_adata, tmp_path):
     pyscx.accel.normalize_total(a_csc)
     with pytest.raises(RuntimeError, match="CSC|column-local"):
         pyscx.accel.col_sums(a_csc.X, prefer_format="csc")
+
+
+# ---------------------------------------------------------------------------
+# Column projection × CSC: HVG must accumulate against the projected
+# axis. Regression for the bug where LazyShardSource::read_csc_shard
+# applied global col_projection IDs against shard-local column space.
+# ---------------------------------------------------------------------------
+
+
+def test_lazy_csc_with_col_projection_hvg_matches_csr(small_adata, tmp_path):
+    """HVG via prefer_format='csc' on a column-projected lazy dataset
+    must match the CSR equivalent.
+
+    The CSC HVG kernels (`streaming_mean_var_csc`,
+    `streaming_clip_square_sum_csc`) iterate per CSC shard via
+    `read_csc_shard`. Before the fix, `LazyShardSource::read_csc_shard`
+    fed `project_csc` global file column IDs against a shard-local
+    column space — out-of-shard projection entries were silently dropped
+    and survivors mapped to wrong shard-local positions, corrupting the
+    means/variances written to `adata.var`.
+
+    The fixture has 16 genes with `csc_cols_per_shard=4` → 4 CSC shards.
+    `filter_genes(min_cells=3)` yields a projection spanning multiple
+    shards. We compare HVG outputs against the CSR path on the same
+    chain.
+    """
+    import pyscx
+
+    a_csr = _open_with_csc(tmp_path / "with_csc_csr.scx", small_adata)
+    a_csc = _open_with_csc(tmp_path / "with_csc_csc.scx", small_adata)
+
+    pyscx.accel.log1p(a_csr)
+    pyscx.accel.log1p(a_csc)
+
+    pyscx.accel.filter_genes(a_csr, min_cells=3)
+    pyscx.accel.filter_genes(a_csc, min_cells=3)
+
+    n_proj = a_csc.X.shape[1]
+    # The bug only fires when the projection spans at least two CSC
+    # shards. csc_cols_per_shard=4, so we need projected indices that
+    # fall in different shards. With min_cells=3 on the seeded fixture,
+    # the projection covers multiple shards by construction; assert as
+    # a guard against fixture drift.
+    assert n_proj >= 4, (
+        f"projection too narrow ({n_proj}); test won't exercise multi-shard "
+        f"col_projection. Adjust min_cells or fixture seed."
+    )
+
+    n_top = max(2, min(5, n_proj - 1))
+    pyscx.accel.highly_variable_genes(
+        a_csr,
+        n_top_genes=n_top,
+        flavor="seurat_v3",
+        prefer_format="csr",
+    )
+    pyscx.accel.highly_variable_genes(
+        a_csc,
+        n_top_genes=n_top,
+        flavor="seurat_v3",
+        prefer_format="csc",
+    )
+
+    csr_means = np.asarray(a_csr.var["means"], dtype=np.float64)
+    csc_means = np.asarray(a_csc.var["means"], dtype=np.float64)
+    csr_var = np.asarray(a_csr.var["variances"], dtype=np.float64)
+    csc_var = np.asarray(a_csc.var["variances"], dtype=np.float64)
+
+    np.testing.assert_allclose(
+        csc_means, csr_means, atol=1e-5,
+        err_msg="CSC means diverge from CSR after col_projection — "
+                "LazyShardSource::read_csc_shard projection remap regression",
+    )
+    np.testing.assert_allclose(
+        csc_var, csr_var, atol=1e-5,
+        err_msg="CSC variances diverge from CSR after col_projection — "
+                "LazyShardSource::read_csc_shard projection remap regression",
+    )

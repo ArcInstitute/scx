@@ -205,8 +205,15 @@ pub fn pseudobulk_dex(
         let n_groups = group_labels.len();
         let projected_gene_names: Vec<String> = resolved_indices
             .iter()
-            .map(|&c| gene_names[c as usize].clone())
-            .collect();
+            .map(|&c| {
+                gene_names.get(c as usize).cloned().ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "gene index {c} out of range for n_vars = {}",
+                        gene_names.len()
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             let source = backed.as_column_source().ok_or_else(|| {
