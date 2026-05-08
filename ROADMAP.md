@@ -290,15 +290,26 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] SingleCellExperiment interop
 - [x] Harmony batch correction in R (see `rscx/R/harmony.R`)
 
-### 3.4 Multimodal Support — DEFERRED
-- [ ] CITE-seq (RNA + protein): multi-feature-space layout (docs/format.md §Multimodal Extension) — **DEFERRED**
+### 3.4 Multimodal Support — IN PROGRESS (Phase A landed)
+- [x] **Phase A**: format v2 bump; carve `n_modalities` /
+  `modality_table_offset` / `modality_table_length` out of the header
+  reserved tail; add `has_modalities` flag (bit 7); add explicit
+  `col_start` / `col_end` to `ShardStats` (catalog v2); v2-strict
+  CSC `shard_type=1` validation with `ScxError::InvalidShardType`.
+- [ ] **Phase B**: `ModalityTable` section (id 15), `LayerCscShard`
+  (id 16), per-modality reader / writer methods, `BackedCscReader`
+  per-modality scoping, auto-emit CSC sidecar.
+- [ ] CITE-seq (RNA + protein): multi-feature-space layout
 - [ ] Spatial transcriptomics: spatial coordinates + optional R-tree index — **DEFERRED**
 - [ ] `scx convert --from h5mu` (MuData format) — **DEFERRED**
 - [ ] Round-trip with MuData/MuOn objects — **DEFERRED**
 
-**Status**: Section types 13–239 are reserved for multimodal/spatial extensions
-and the `has_modalities` header flag is defined, but no implementation exists.
-Deferred until a concrete user requirement lands.
+**Status**: Phase A foundation work has shipped (v2 format, modality
+fields in header, `has_modalities` flag at bit 7, explicit `col_start` /
+`col_end` in `ShardStats`). Section ids 15 = `ModalityTable` and
+16 = `LayerCscShard` are reserved for Phase B; ids 17–31 are reserved
+for further multimodal/spatial extensions; ids 32–239 are reserved for
+future use; ids 240–255 are vendor / private.
 
 ### 3.5 Quality + Polish — PARTIALLY COMPLETE
 - [ ] Full conformance test suite with reference .scx files — **PARTIAL**: round-trip and per-codec correctness tests run in CI; no frozen reference-file vectors yet.

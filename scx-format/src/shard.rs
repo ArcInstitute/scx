@@ -178,6 +178,28 @@ impl ShardHeader {
         self.shard_type == 1 || catalog_section_type == SectionType::CscShard
     }
 
+    /// Strict v2 validation: when the catalog tags a shard as CSC,
+    /// require `shard_type == 1`. Used by v2 read paths only.
+    ///
+    /// The `is_csc()` catalog-wins fallback survives on the v1 read
+    /// path, where legacy files in the wild may carry the buggy
+    /// `shard_type = 0` byte for CSC shards.
+    ///
+    /// On v2 reads, the writer is correct from day one
+    /// (`derive_shard_type` returns `1` for `CscShard`), so any
+    /// disagreement is corruption: surface a clear error rather than
+    /// quietly accept it.
+    pub fn validate_csc_strict(&self, catalog_section_type: SectionType) -> Result<()> {
+        if catalog_section_type == SectionType::CscShard && self.shard_type != 1 {
+            return Err(ScxError::InvalidShardType {
+                expected: 1,
+                got: self.shard_type,
+                section_type: catalog_section_type as u8,
+            });
+        }
+        Ok(())
+    }
+
     /// Return the global major-axis start offset.
     ///
     /// This is `row_start` for CSR/LayerCsrShard/ObspCsrShard and
@@ -440,6 +462,43 @@ mod tests {
         assert_eq!(derive_shard_type(SectionType::CsrShard), 0);
         assert_eq!(derive_shard_type(SectionType::LayerCsrShard), 0);
         assert_eq!(derive_shard_type(SectionType::ObspCsrShard), 0);
+    }
+
+    /// `validate_csc_strict` (the v2 strict path) accepts a correct
+    /// CSC shard (byte == 1) and rejects shard_type != 1 with the
+    /// `InvalidShardType` error.
+    #[test]
+    fn validate_csc_strict_accepts_byte_1() {
+        let mut h = sample_shard_header();
+        h.shard_type = 1;
+        h.validate_csc_strict(SectionType::CscShard).unwrap();
+    }
+
+    #[test]
+    fn validate_csc_strict_rejects_byte_0_for_csc() {
+        let mut h = sample_shard_header();
+        h.shard_type = 0;
+        let err = h.validate_csc_strict(SectionType::CscShard).unwrap_err();
+        match err {
+            ScxError::InvalidShardType {
+                expected,
+                got,
+                section_type,
+            } => {
+                assert_eq!(expected, 1);
+                assert_eq!(got, 0);
+                assert_eq!(section_type, SectionType::CscShard as u8);
+            }
+            other => panic!("expected InvalidShardType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_csc_strict_noop_for_non_csc() {
+        let mut h = sample_shard_header();
+        h.shard_type = 0;
+        // CSR catalog → strict check is a no-op regardless of shard_type byte.
+        h.validate_csc_strict(SectionType::CsrShard).unwrap();
     }
 
     #[test]

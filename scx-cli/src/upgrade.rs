@@ -113,7 +113,10 @@ fn rewrite_with_current_version(
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     // Read metadata
@@ -164,7 +167,7 @@ fn rewrite_with_current_version(
         let col_start = csc_entry
             .stats
             .as_ref()
-            .map(|s| s.major_start())
+            .map(|s| s.major_start(csc_entry.section_type))
             .unwrap_or(0);
 
         let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
@@ -206,7 +209,7 @@ mod tests {
         let new_hdr = new_reader.header();
         assert_eq!(new_hdr.n_obs, orig_hdr.n_obs);
         assert_eq!(new_hdr.n_vars, orig_hdr.n_vars);
-        assert_eq!(new_hdr.format_version, 1);
+        assert_eq!(new_hdr.format_version, scx_format::CURRENT_FORMAT_VERSION);
 
         // Verify CSR data matches
         let orig_csr = orig_reader.read_all_csr_shards().unwrap();
@@ -263,7 +266,10 @@ mod tests {
         // Verify data preserved after in-place rewrite
         let reader = ScxReader::open(&input).unwrap();
         assert_eq!(reader.header().n_obs, orig_n_obs);
-        assert_eq!(reader.header().format_version, 1);
+        assert_eq!(
+            reader.header().format_version,
+            scx_format::CURRENT_FORMAT_VERSION
+        );
 
         let csr = reader.read_all_csr_shards().unwrap();
         assert_eq!(csr.shape, orig_csr.shape);

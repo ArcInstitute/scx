@@ -17,7 +17,7 @@ use scx_format::writer::ScxWriter;
 fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -39,7 +39,10 @@ fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     }
 }
 
@@ -174,7 +177,7 @@ fn test_info_runs_on_valid_file() {
     assert_eq!(header.n_obs, 6);
     assert_eq!(header.n_vars, 10);
     assert_eq!(header.nnz, 12);
-    assert_eq!(header.format_version, 1);
+    assert_eq!(header.format_version, scx_format::CURRENT_FORMAT_VERSION);
     assert_eq!(header.n_csr_shards, 2);
 
     let catalog = reader.catalog();
@@ -288,7 +291,7 @@ fn test_cli_info_subcommand() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("SCX v1"));
+    assert!(stdout.contains(&format!("SCX v{}", scx_format::CURRENT_FORMAT_VERSION)));
     assert!(stdout.contains("6 cells"));
     assert!(stdout.contains("10 genes"));
 }

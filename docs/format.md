@@ -89,9 +89,10 @@ pads the rest out to 256.
 | 1 | `has_bitmap` | Detection bitmap present |
 | 2 | `has_obsm` | Cell embeddings present |
 | 3 | `has_obsp` | Cell-cell graphs present |
-| 4 | `has_modalities` | Multimodal — section paths include `mod/{name}/…` |
+| 4 | reserved | Must be zero on write, ignored on read |
 | 5 | `has_deletion_vectors` | Deletion vectors section present |
 | 6 | `has_front_catalog` | Cloud-ready layout — front catalog duplicate valid |
+| 7 | `has_modalities` | v2 only; set when `n_modalities > 0` |
 
 ### Index dtype
 
@@ -164,12 +165,17 @@ catalog_checksum: [u8; 32]       (BLAKE3 of all preceding catalog bytes)
 | 10 | `uns_blob` |
 | 11 | `provenance` |
 | 12 | `deletion_vectors` |
-| 13–239 | Reserved for extensions (multimodal, spatial) |
-| 240–254 | Reserved for encrypted section types |
+| 13 | `obs_predicate_index` |
+| 14 | `var_predicate_index` |
+| 15 | `modality_table` (v2; reserved — emitted by future Phase B) |
+| 16 | `layer_csc_shard` (v2; reserved — emitted by future Phase B) |
+| 17–31 | Reserved for multimodal/spatial extensions |
+| 32–239 | Reserved for future use |
+| 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
 
-Unknown types (≥13 for v1) are skipped by readers with a warning, which
-allows the format to evolve without breaking old readers.
+Unknown types are skipped by readers with a warning, which allows the
+format to evolve without breaking old readers.
 
 ### Per-shard statistics
 

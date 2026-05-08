@@ -493,8 +493,27 @@ impl ScxWriter {
             + block_index_bytes.len()) as u64;
         self.current_offset += section_length;
 
-        // Compute shard stats from raw values
-        let stats = compute_shard_stats(values, value_encoding, row_start, n_major as u64, nnz);
+        // Compute shard stats from raw values. Dispatch on section
+        // type: CSC shards use the column-major axis (the file-wide
+        // `n_obs` is the unbound row range), all others use the
+        // row-major axis (the file-wide `n_vars` is the unbound column
+        // range). `row_start` here is interpreted on the major axis —
+        // for CSC paths it carries `col_start` (see `write_csc_shard`,
+        // which passes its `col_start` argument as the inner
+        // `row_start`).
+        let (major_kind, n_minor) = match section_type {
+            SectionType::CscShard => (MajorAxis::Col, self.header.n_obs),
+            _ => (MajorAxis::Row, self.header.n_vars),
+        };
+        let stats = compute_shard_stats(
+            values,
+            value_encoding,
+            major_kind,
+            row_start,
+            n_major as u64,
+            n_minor,
+            nnz,
+        );
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
@@ -644,7 +663,7 @@ impl ScxWriter {
         let full_catalog_offset = aligned_offset;
 
         let full_catalog = FullCatalog {
-            catalog_version: 1,
+            catalog_version: crate::catalog::CURRENT_CATALOG_VERSION,
             manifest_sequence: self.header.manifest_sequence,
             prev_catalog_offset: 0,
             n_obs: self.header.n_obs,
@@ -809,12 +828,36 @@ impl Drop for ScxWriter {
     }
 }
 
+/// Major axis of a shard: row-major (CSR/Layer/Obsp) or column-major
+/// (CSC). Tells `compute_shard_stats` which pair (`row_*` or `col_*`)
+/// carries the shard's primary index range; the other pair is filled
+/// with the full extent of the unbound axis (`n_minor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MajorAxis {
+    /// Row-major shard. The `row_start`/`row_end` pair carries the
+    /// primary range; `col_start`/`col_end` cover `[0, n_minor)`.
+    Row,
+    /// Column-major shard. The `col_start`/`col_end` pair carries the
+    /// primary range; `row_start`/`row_end` cover `[0, n_minor)`.
+    Col,
+}
+
 /// Compute shard statistics from raw value bytes.
+///
+/// `major_kind` distinguishes row-major (CSR/Layer/Obsp) and
+/// column-major (CSC) shards. `major_start` is the global index where
+/// this shard begins on its primary axis; `n_major` is the count of
+/// major-axis entries in the shard. `n_minor` is the count of entries
+/// on the OTHER axis (file-wide `n_vars` for row-major shards or
+/// file-wide `n_obs` for column-major shards) — used to populate the
+/// "full range" pair for v2 symmetry.
 pub fn compute_shard_stats(
     values: &[u8],
     value_encoding: ValueEncoding,
-    row_start: u64,
-    n_rows: u64,
+    major_kind: MajorAxis,
+    major_start: u64,
+    n_major: u64,
+    n_minor: u64,
     nnz: u64,
 ) -> ShardStats {
     let (value_min, value_max, value_sum) = match value_encoding {
@@ -873,9 +916,16 @@ pub fn compute_shard_stats(
         ValueEncoding::Float32 | ValueEncoding::Float16 => (0, 0, 0),
     };
 
+    let (row_start, row_end, col_start, col_end) = match major_kind {
+        MajorAxis::Row => (major_start, major_start + n_major, 0, n_minor),
+        MajorAxis::Col => (0, n_minor, major_start, major_start + n_major),
+    };
+
     ShardStats {
         row_start,
-        row_end: row_start + n_rows,
+        row_end,
+        col_start,
+        col_end,
         nnz,
         value_min,
         value_max,
@@ -895,7 +945,7 @@ mod tests {
     fn sample_header() -> FileHeader {
         FileHeader {
             magic: crate::header::MAGIC,
-            format_version: 1,
+            format_version: crate::header::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: 100,
@@ -917,7 +967,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 
@@ -981,7 +1034,7 @@ mod tests {
         let hdr = FileHeader::read_from(&mut cursor).unwrap();
 
         assert_eq!(hdr.magic, crate::header::MAGIC);
-        assert_eq!(hdr.format_version, 1);
+        assert_eq!(hdr.format_version, crate::header::CURRENT_FORMAT_VERSION);
         assert_eq!(hdr.n_csr_shards, 1);
         assert_eq!(hdr.root_catalog_offset, HEADER_SIZE as u64);
         assert!(hdr.full_catalog_offset >= SECTIONS_START_OFFSET);
@@ -1261,17 +1314,40 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// Test compute_shard_stats
+    /// Test compute_shard_stats (row-major branch)
     #[test]
     fn test_compute_shard_stats() {
         let values: Vec<u8> = vec![5, 10, 1, 3, 7, 2];
-        let stats = compute_shard_stats(&values, ValueEncoding::Uint8, 0, 3, 6);
+        // Row-major shard: rows [0, 3), col_end = n_minor (= n_vars).
+        let stats = compute_shard_stats(&values, ValueEncoding::Uint8, MajorAxis::Row, 0, 3, 50, 6);
         assert_eq!(stats.row_start, 0);
         assert_eq!(stats.row_end, 3);
+        assert_eq!(stats.col_start, 0);
+        assert_eq!(stats.col_end, 50);
         assert_eq!(stats.nnz, 6);
         assert_eq!(stats.value_min, 1);
         assert_eq!(stats.value_max, 10);
         assert_eq!(stats.value_sum, 28); // 5+10+1+3+7+2
+    }
+
+    /// Test compute_shard_stats column-major branch.
+    #[test]
+    fn test_compute_shard_stats_col_major() {
+        let values: Vec<u8> = vec![5, 10, 1];
+        // Column-major shard: cols [100, 102), row pair = full [0, n_obs).
+        let stats = compute_shard_stats(
+            &values,
+            ValueEncoding::Uint8,
+            MajorAxis::Col,
+            100,
+            2,
+            1000,
+            3,
+        );
+        assert_eq!(stats.col_start, 100);
+        assert_eq!(stats.col_end, 102);
+        assert_eq!(stats.row_start, 0);
+        assert_eq!(stats.row_end, 1000);
     }
 
     /// Test compute_shard_stats for Float32 returns zero stats
@@ -1282,7 +1358,8 @@ mod tests {
         values.extend_from_slice(&1.0f32.to_le_bytes());
         values.extend_from_slice(&2.5f32.to_le_bytes());
         values.extend_from_slice(&0.5f32.to_le_bytes());
-        let stats = compute_shard_stats(&values, ValueEncoding::Float32, 0, 2, 3);
+        let stats =
+            compute_shard_stats(&values, ValueEncoding::Float32, MajorAxis::Row, 0, 2, 50, 3);
         assert_eq!(stats.value_min, 0, "float32 value_min must be zero");
         assert_eq!(stats.value_max, 0, "float32 value_max must be zero");
         assert_eq!(stats.value_sum, 0, "float32 value_sum must be zero");
@@ -1295,7 +1372,15 @@ mod tests {
     #[test]
     fn test_compute_shard_stats_float16() {
         let values = vec![0u8; 6]; // 3 × 2-byte float16 values
-        let stats = compute_shard_stats(&values, ValueEncoding::Float16, 10, 5, 3);
+        let stats = compute_shard_stats(
+            &values,
+            ValueEncoding::Float16,
+            MajorAxis::Row,
+            10,
+            5,
+            50,
+            3,
+        );
         assert_eq!(stats.value_min, 0, "float16 value_min must be zero");
         assert_eq!(stats.value_max, 0, "float16 value_max must be zero");
         assert_eq!(stats.value_sum, 0, "float16 value_sum must be zero");
@@ -1407,6 +1492,84 @@ mod tests {
                 entry.name,
                 entry.offset
             );
+        }
+    }
+
+    /// v2 strict shard_type validation: a CSC shard whose
+    /// `shard_type` byte is corrupted to 0 must be rejected by the
+    /// reader. This is the new behavior on the v2 catalog read path
+    /// (catalog-wins tolerance survives only on v1 reads).
+    #[test]
+    fn test_strict_shard_type_v2_rejects_corrupted_csc() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_csc.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csc_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+
+        // Find the CSC shard's on-disk shard_type byte (offset 5 in
+        // the shard header) and corrupt it from 1 → 0.
+        let mut data = std::fs::read(&final_path).unwrap();
+        let hdr = FileHeader::read_from(&mut std::io::Cursor::new(&data)).unwrap();
+        let fc_start = hdr.full_catalog_offset as usize;
+        let fc_end = fc_start + hdr.full_catalog_length as usize;
+        let catalog = FullCatalog::read_from(
+            &mut std::io::Cursor::new(&data[fc_start..fc_end]),
+            hdr.full_catalog_length as usize,
+            true,
+        )
+        .unwrap();
+        let csc_entry = catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CscShard)
+            .unwrap();
+        // shard_type is the 6th byte of the shard header (after the
+        // 4-byte magic and 1-byte shard_format_version).
+        let shard_type_offset = csc_entry.offset as usize + 4 + 1;
+        assert_eq!(data[shard_type_offset], 1, "writer must emit shard_type=1");
+        data[shard_type_offset] = 0;
+
+        // Need to rewrite to a new path to preserve the original mmap
+        // semantics; the file_checksum will not match either, so open
+        // with verify_catalog/header disabled.
+        let corrupt_path = dir.path().join("strict_csc_corrupt.scx");
+        std::fs::write(&corrupt_path, &data).unwrap();
+
+        // Open and try to read the CSC shard. The strict v2 validator
+        // fires inside `read_shard_from_entry_inner` and returns
+        // `InvalidShardType`.
+        let reader = ScxReader::open_unchecked(&corrupt_path).unwrap();
+        let err = reader.read_csc_shard(0).unwrap_err();
+        match err {
+            ScxError::InvalidShardType {
+                expected,
+                got,
+                section_type,
+            } => {
+                assert_eq!(expected, 1);
+                assert_eq!(got, 0);
+                assert_eq!(section_type, SectionType::CscShard as u8);
+            }
+            other => panic!("expected InvalidShardType, got {other:?}"),
         }
     }
 
@@ -1552,7 +1715,7 @@ mod tests {
     fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: crate::header::MAGIC,
-            format_version: 1,
+            format_version: crate::header::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -1578,7 +1741,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 

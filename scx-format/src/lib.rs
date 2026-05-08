@@ -19,16 +19,19 @@ pub use backed::{
     concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
     BackedCsrReader, CacheMetrics,
 };
+#[allow(deprecated)]
+pub use catalog::SHARD_STATS_BASE_SIZE;
 pub use catalog::{
     column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry,
-    ShardStats, ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE,
+    ShardStats, CURRENT_CATALOG_VERSION, ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE,
+    SHARD_STATS_BASE_SIZE_V1, SHARD_STATS_BASE_SIZE_V2,
 };
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::{select_codec, select_codec_with_profile, CodecProfile};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use error::{Result, ScxError};
-pub use header::{FileHeader, HEADER_SIZE, MAGIC};
+pub use header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use provenance::{Provenance, ProvenanceEntry};
 pub use reader::ScxReader;
 pub use section::{align_to_8, SectionType};
@@ -37,4 +40,6 @@ pub use shard::{
     SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 pub use shard_source::{ColumnShardSource, ShardSource};
-pub use writer::{compute_shard_stats, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET};
+pub use writer::{
+    compute_shard_stats, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
+};

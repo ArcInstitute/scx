@@ -311,11 +311,14 @@ pub fn append(
         lock.write_all(&section_data)?;
         write_offset += section_length;
 
+        // append.rs always emits row-major CSR shards.
         let stats = compute_shard_stats(
             shard_values,
             value_encoding,
+            scx_format::MajorAxis::Row,
             global_row_start,
             shard_rows as u64,
+            file_n_vars,
             shard_nnz,
         );
 
@@ -467,7 +470,7 @@ pub fn append(
     let new_n_obs = old_n_obs + n_new_rows as u64;
     let new_manifest_sequence = header.manifest_sequence + 1;
     let new_catalog = FullCatalog {
-        catalog_version: 1,
+        catalog_version: scx_format::CURRENT_CATALOG_VERSION,
         manifest_sequence: new_manifest_sequence,
         prev_catalog_offset: old_catalog_offset,
         n_obs: new_n_obs,

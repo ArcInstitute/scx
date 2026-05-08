@@ -33,7 +33,7 @@ use scx_format::{FileHeader, ScxReader, ScxWriter};
 fn header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: HEADER_SIZE as u16,
         flags: 0,
         n_obs,
@@ -55,7 +55,10 @@ fn header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     }
 }
 

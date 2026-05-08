@@ -102,8 +102,14 @@ impl ScxReader {
             });
         }
         let fc_slice = &mmap[fc_offset..fc_end];
-        let full_catalog =
+        let mut full_catalog =
             FullCatalog::read_from(&mut Cursor::new(fc_slice), fc_length, verify_catalog)?;
+
+        // v1 → v2 reconciliation: populate `col_start`/`col_end` for
+        // row-major shard entries from `n_vars`. CSC entries are
+        // already reconciled inside `FullCatalog::read_from`. No-op on
+        // v2 catalogs.
+        full_catalog.reconcile_v1_csr_col_range(header.n_vars);
 
         Ok(ScxReader {
             mmap,
@@ -374,8 +380,8 @@ impl ScxReader {
             let stats = entry.stats.as_ref().ok_or_else(|| {
                 ScxError::InvalidCatalog(format!("CSC shard '{}' missing stats block", entry.name))
             })?;
-            let shard_lo = stats.major_start();
-            let shard_hi = stats.major_end();
+            let shard_lo = stats.major_start(entry.section_type);
+            let shard_hi = stats.major_end(entry.section_type);
             let lo_in_shard = c_lo.saturating_sub(shard_lo) as usize;
             let hi_in_shard = (c_hi.min(shard_hi).saturating_sub(shard_lo)) as usize;
             let sliced = if lo_in_shard == 0 && hi_in_shard == csc.n_cols() {
@@ -909,6 +915,14 @@ impl ScxReader {
         // Parse shard header
         let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
 
+        // v2 strict shard_type validation: a v2 catalog must not carry
+        // CSC entries with shard_type != 1. v1 catalogs preserve the
+        // legacy catalog-wins tolerance (the writer hardcoded
+        // shard_type = 0 for CSC pre-CSC-SUPPORT).
+        if self.full_catalog.catalog_version >= 2 {
+            sh.validate_csc_strict(entry.section_type)?;
+        }
+
         // Extract encoded byte slices
         let indptr_bytes = &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
         let indices_bytes =
@@ -1239,7 +1253,7 @@ fn values_to_f32(raw: &[u8], encoding: ValueEncoding) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::MAGIC;
+    use crate::header::{CURRENT_FORMAT_VERSION, MAGIC};
     use crate::provenance::ProvenanceEntry;
     use crate::writer::ScxWriter;
     use arrow::array::{Float32Array, StringArray};
@@ -1249,7 +1263,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -1271,7 +1285,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 
@@ -1411,7 +1428,7 @@ mod tests {
         assert_eq!(reader.n_obs(), 6);
         assert_eq!(reader.n_vars(), 10);
         assert_eq!(reader.nnz(), 12);
-        assert_eq!(reader.header().format_version, 1);
+        assert_eq!(reader.header().format_version, CURRENT_FORMAT_VERSION);
 
         // read_obs
         let obs = reader.read_obs().unwrap();

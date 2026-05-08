@@ -79,7 +79,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     // input flag state forward.
     let out_header = FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs: total_n_obs,
@@ -101,7 +101,10 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     let mut writer = ScxWriter::new(output_path, out_header)?;

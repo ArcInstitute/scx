@@ -1420,12 +1420,16 @@ fn parallel_encode_csr_shards(
                     + encoded.values_bytes.len()
                     + block_index_bytes.len()) as u64;
 
-                // 10. Compute shard stats
+                // 10. Compute shard stats. pyscx writes row-major CSR
+                // shards exclusively (CSC sidecars are emitted via a
+                // separate path, see scx-cli/src/build_csc.rs).
                 let stats = compute_shard_stats(
                     &shard_values_bytes,
                     shard_value_encoding,
+                    scx_format::MajorAxis::Row,
                     b.row_start as u64,
                     n_major as u64,
+                    n_vars as u64,
                     nnz,
                 );
 
@@ -1586,7 +1590,7 @@ pub fn from_anndata_impl(
     // Build FileHeader
     let header = FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -1608,7 +1612,10 @@ pub fn from_anndata_impl(
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     let mut writer = ScxWriter::new(path, header).map_err(to_pyerr)?;

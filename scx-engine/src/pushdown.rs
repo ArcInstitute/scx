@@ -579,6 +579,8 @@ mod tests {
                 stats: Some(ShardStats {
                     row_start,
                     row_end,
+                    col_start: 0,
+                    col_end: 0,
                     nnz: 1000,
                     value_min: 1,
                     value_max: 255,
@@ -590,7 +592,7 @@ mod tests {
         }
 
         FullCatalog {
-            catalog_version: 1,
+            catalog_version: scx_format::CURRENT_CATALOG_VERSION,
             manifest_sequence: 1,
             prev_catalog_offset: 0,
             n_obs: entries
