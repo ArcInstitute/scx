@@ -1,5 +1,5 @@
-use arrow::array::{Float64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{DictionaryArray, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -1340,4 +1340,195 @@ fn test_append_pure_csr_unaffected() {
     assert!(!r.header().has_csc());
     assert_eq!(r.header().n_csc_shards, 0);
     assert_eq!(r.n_obs(), 6);
+}
+
+// ---------------------------------------------------------------------------
+// LargeUtf8 round-trip tests (regression for Arrow IPC 2 GB offset overflow)
+//
+// On disk we now store string/binary obs columns as `LargeUtf8` /
+// `LargeBinary` (64-bit offsets) so files with > ~2.8 M cells do not
+// overflow Arrow IPC's 32-bit offset limit. Callers should still see
+// the canonical narrow types in memory after read.
+// ---------------------------------------------------------------------------
+
+/// Build an obs RecordBatch with both a plain `Utf8` `cell_id` and a
+/// `Dictionary(Int8, Utf8)` `cluster` column. Used to exercise both
+/// the upcast/downcast path and the dictionary handling.
+fn sample_obs_with_cluster(n: usize) -> arrow::array::RecordBatch {
+    let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+    let clusters: Vec<&str> = (0..n)
+        .map(|i| match i % 3 {
+            0 => "A",
+            1 => "B",
+            _ => "C",
+        })
+        .collect();
+
+    let cluster_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cluster", cluster_dt, true),
+    ]);
+
+    let cluster_arr: DictionaryArray<Int8Type> = clusters.into_iter().collect();
+
+    arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(cluster_arr),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("append_utf8.scx");
+
+    // Write baseline file with a richer obs (Utf8 cell_id + Dictionary cluster).
+    {
+        let header = sample_header(4, 10);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs_with_cluster(4)).unwrap();
+        writer.write_var(&sample_var(10)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(4, 10);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    // Append more rows.
+    let new_obs = sample_obs_with_cluster(3);
+    let (indptr, indices, values) = sample_shard_data(3, 10);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+    )
+    .unwrap();
+
+    // Reopen and verify schema reports the canonical narrow `Utf8` —
+    // not `LargeUtf8` — even though the data is stored as LargeUtf8 on
+    // disk after the append (which exercises the inline-IPC bypass
+    // path with explicit upcast/downcast).
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.n_obs(), 7);
+
+    let schema = reader.read_obs_schema().unwrap();
+    assert_eq!(schema.field(0).name(), "cell_id");
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 7);
+    assert_eq!(obs.schema().field(0).data_type(), &DataType::Utf8);
+    let cell_ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(cell_ids.value(0), "cell_0");
+    assert_eq!(cell_ids.value(3), "cell_3");
+    assert_eq!(cell_ids.value(4), "cell_0"); // start of appended batch
+    assert_eq!(cell_ids.value(6), "cell_2");
+
+    // The cluster column went through `unify_dict_columns` during
+    // append, so it lands as a flat `Utf8` column on the merged side.
+    // The key invariant for this test is that it is *not* `LargeUtf8`.
+    let cluster_dt = obs.schema().field(1).data_type().clone();
+    assert!(
+        matches!(cluster_dt, DataType::Utf8 | DataType::Dictionary(_, _)),
+        "cluster column dtype should be Utf8 or Dictionary, got {cluster_dt:?}",
+    );
+    assert!(
+        !matches!(cluster_dt, DataType::LargeUtf8),
+        "cluster column must not surface as LargeUtf8",
+    );
+}
+
+#[test]
+fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build two SCX inputs with rich obs.
+    let make_input = |name: &str, n: usize| -> PathBuf {
+        let path = dir.path().join(name);
+        let header = sample_header(n as u64, 10);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs_with_cluster(n)).unwrap();
+        writer.write_var(&sample_var(10)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(n, 10);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_provenance(vec![ProvenanceEntry {
+                timestamp: 1710000000,
+                action: "convert".to_string(),
+                tool: "test".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![],
+            }])
+            .unwrap();
+        writer.finish().unwrap();
+        path
+    };
+
+    let path1 = make_input("merge1.scx", 5);
+    let path2 = make_input("merge2.scx", 7);
+    let output = dir.path().join("merged_utf8.scx");
+
+    scx_ops::merge(&[path1.as_path(), path2.as_path()], &output).unwrap();
+
+    let reader = ScxReader::open(&output).unwrap();
+    assert_eq!(reader.n_obs(), 12);
+
+    // Schema-only path (read_obs_schema) and full read must both report
+    // the canonical narrow `Utf8` after the LargeUtf8 → Utf8 downcast.
+    let schema = reader.read_obs_schema().unwrap();
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 12);
+    assert_eq!(obs.schema().field(0).data_type(), &DataType::Utf8);
+    assert_eq!(obs.schema(), Arc::new(schema));
+
+    let cell_ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(cell_ids.value(0), "cell_0"); // file 1
+    assert_eq!(cell_ids.value(4), "cell_4");
+    assert_eq!(cell_ids.value(5), "cell_0"); // file 2
+    assert_eq!(cell_ids.value(11), "cell_6");
+
+    let cluster_dt = obs.schema().field(1).data_type().clone();
+    assert!(
+        !matches!(cluster_dt, DataType::LargeUtf8),
+        "cluster column must not surface as LargeUtf8 after merge",
+    );
 }

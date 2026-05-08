@@ -90,17 +90,25 @@ fn write_csc_shards_from_csr(
 // ---------------------------------------------------------------------------
 
 /// Convert an Arrow RecordBatch to a pyarrow Table via IPC bytes.
+///
+/// Upcasts `Utf8 → LargeUtf8` so the in-memory IPC buffer doesn't
+/// overflow Arrow's 32-bit offset limit on multi-million-cell obs
+/// (see [`scx_format::arrow_compat`]). pyarrow handles `LargeUtf8`
+/// natively and pandas conversion via `to_pandas()` produces the same
+/// `object` dtype either way.
 pub(crate) fn record_batch_to_pyarrow<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let batch = scx_format::upcast_to_large_types(batch)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     // Serialize to Arrow IPC file format
     let mut buf = Vec::new();
     {
         let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, batch.schema_ref())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         writer
-            .write(batch)
+            .write(&batch)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         writer
             .finish()
@@ -914,7 +922,9 @@ pub(crate) fn pandas_to_record_batch(
     let py_bytes = buf.call_method0("to_pybytes")?;
     let bytes: &[u8] = py_bytes.extract()?;
 
-    // Decode in Rust
+    // Decode in Rust. Downcast `LargeUtf8 → Utf8` so the rest of the
+    // Rust pipeline (and SCX writer) sees canonical narrow types
+    // regardless of what pyarrow chose on its side.
     let cursor = Cursor::new(bytes.to_vec());
     let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -923,7 +933,7 @@ pub(crate) fn pandas_to_record_batch(
         .next()
         .ok_or_else(|| PyRuntimeError::new_err("Arrow IPC contains no batches"))?
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    Ok(batch)
+    scx_format::downcast_large_types(&batch).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Ensure X is a CSR matrix; convert from dense or CSC if needed.

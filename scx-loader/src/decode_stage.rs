@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use arrow::array::{
-    Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
-    UInt64Array,
+    Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
+    StringArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -297,52 +297,69 @@ fn extract_single_column(
                 .collect();
             Ok(ObsColumn::Float64(values))
         }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| LoaderError::ConfigError {
-                    reason: format!("obs column '{col_name}': expected StringArray"),
-                })?;
-            // Treat string columns as categorical: build unique categories + codes.
-            let mut categories: Vec<String> = Vec::new();
-            let mut cat_map: HashMap<String, u32> = HashMap::new();
-            let mut codes: Vec<u32> = Vec::with_capacity(cell_indices.len());
-
-            for &idx in cell_indices {
-                let val = arr.value(idx as usize).to_string();
-                let code = if let Some(&existing) = cat_map.get(&val) {
-                    existing
-                } else {
-                    let code = categories.len() as u32;
-                    categories.push(val.clone());
-                    cat_map.insert(val, code);
-                    code
-                };
-                codes.push(code);
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            // String → categorical via unique-value indexing. The
+            // opportunistic downcast in `scx_format::arrow_compat` may
+            // surface obs as either `Utf8` (StringArray, i32 offsets)
+            // or `LargeUtf8` (LargeStringArray, i64 offsets) on >2 GB
+            // single-column metadata. Both array types share the same
+            // `.value(idx) -> &str` API.
+            macro_rules! decode_strings {
+                ($arr:expr) => {{
+                    let arr = $arr;
+                    let mut categories: Vec<String> = Vec::new();
+                    let mut cat_map: HashMap<String, u32> = HashMap::new();
+                    let mut codes: Vec<u32> = Vec::with_capacity(cell_indices.len());
+                    for &idx in cell_indices {
+                        let val = arr.value(idx as usize).to_string();
+                        let code = if let Some(&existing) = cat_map.get(&val) {
+                            existing
+                        } else {
+                            let code = categories.len() as u32;
+                            categories.push(val.clone());
+                            cat_map.insert(val, code);
+                            code
+                        };
+                        codes.push(code);
+                    }
+                    ObsColumn::Categorical(codes, categories)
+                }};
             }
-            Ok(ObsColumn::Categorical(codes, categories))
+            if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                Ok(decode_strings!(arr))
+            } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+                Ok(decode_strings!(arr))
+            } else {
+                Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "obs column '{col_name}': expected StringArray/LargeStringArray"
+                    ),
+                })
+            }
         }
         DataType::Dictionary(key_type, _value_type) => {
             // Arrow dictionary encoding → Categorical.
-            // Extract categories from the dictionary values (must be Utf8).
-            // Support common Arrow key types: Int8, Int16, Int32, UInt8, UInt16, UInt32.
+            // Values may be `Utf8` or `LargeUtf8` (`scx_format::arrow_compat`
+            // opportunistic downcast surfaces wide types when offsets
+            // overflow). Keys come in the usual signed/unsigned int spread.
+            fn dict_categories(values: &dyn Array, col_name: &str) -> Result<Vec<String>> {
+                if let Some(v) = values.as_any().downcast_ref::<StringArray>() {
+                    Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
+                } else if let Some(v) = values.as_any().downcast_ref::<LargeStringArray>() {
+                    Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
+                } else {
+                    Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "obs column '{col_name}': dictionary values are not Utf8/LargeUtf8"
+                        ),
+                    })
+                }
+            }
             macro_rules! decode_dict {
                 ($key_ty:ty) => {{
                     let dict_arr = array.as_dictionary::<$key_ty>();
                     let keys = dict_arr.keys();
-                    let values_arr = dict_arr
-                        .values()
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| LoaderError::ConfigError {
-                            reason: format!(
-                                "obs column '{col_name}': dictionary values are not Utf8"
-                            ),
-                        })?;
-                    let categories: Vec<String> = (0..values_arr.len())
-                        .map(|i| values_arr.value(i).to_string())
-                        .collect();
+                    let categories = dict_categories(dict_arr.values().as_ref(), col_name)?;
                     let codes: Vec<u32> = cell_indices
                         .iter()
                         .map(|&idx| keys.value(idx as usize) as u32)
@@ -507,7 +524,7 @@ pub fn decode_stage(
 mod tests {
     use super::*;
     use crate::io_stage::ShardData;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{DictionaryArray, Int64Array, LargeStringArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -844,6 +861,66 @@ mod tests {
             assert_eq!(&categories[codes[2] as usize], "cell_2");
         } else {
             panic!("expected Categorical variant");
+        }
+    }
+
+    #[test]
+    fn test_extract_large_utf8_column_decodes_as_categorical() {
+        // Mirrors `test_extract_categorical_column` but the obs column is
+        // `LargeUtf8` (i64 offsets) — the in-memory shape that
+        // `scx_format::arrow_compat::downcast_large_types` surfaces when
+        // a >2 GB obs column does not fit back in i32 offsets. Without
+        // the LargeUtf8 arm in `extract_single_column`, this would error
+        // out as "unsupported data type".
+        let n = 4;
+        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+        let schema = Schema::new(vec![Field::new("cell_id", DataType::LargeUtf8, false)]);
+        let obs = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(LargeStringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let cell_indices: Vec<u64> = vec![0, 2, 3];
+        let result = extract_obs_columns(&obs, &cell_indices, &["cell_id".to_string()]).unwrap();
+        let col = result.get("cell_id").unwrap();
+        if let ObsColumn::Categorical(codes, categories) = col {
+            assert_eq!(codes.len(), 3);
+            assert_eq!(&categories[codes[0] as usize], "cell_0");
+            assert_eq!(&categories[codes[1] as usize], "cell_2");
+            assert_eq!(&categories[codes[2] as usize], "cell_3");
+        } else {
+            panic!("expected Categorical variant from LargeUtf8 obs column");
+        }
+    }
+
+    #[test]
+    fn test_extract_dictionary_largeutf8_values_decodes_as_categorical() {
+        // `Dictionary(Int8, LargeUtf8)` is the post-opportunistic-downcast
+        // shape for a clustered/categorical obs column whose value
+        // dictionary's offsets overflow i32. Should decode into the same
+        // ObsColumn::Categorical as `Dictionary(Int8, Utf8)`.
+        use arrow::datatypes::Int8Type;
+        let values = LargeStringArray::from(vec!["A", "B", "C"]);
+        let keys = arrow::array::Int8Array::from(vec![0_i8, 1, 2, 1, 0]);
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::LargeUtf8));
+        let schema = Schema::new(vec![Field::new("cluster", dict_dt, false)]);
+        let obs =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict) as Arc<dyn Array>]).unwrap();
+
+        let cell_indices: Vec<u64> = vec![0, 1, 2, 3, 4];
+        let result = extract_obs_columns(&obs, &cell_indices, &["cluster".to_string()]).unwrap();
+        let col = result.get("cluster").unwrap();
+        if let ObsColumn::Categorical(codes, categories) = col {
+            assert_eq!(codes, &vec![0_u32, 1, 2, 1, 0]);
+            assert_eq!(
+                categories,
+                &vec!["A".to_string(), "B".to_string(), "C".to_string()]
+            );
+        } else {
+            panic!("expected Categorical variant from Dictionary(_, LargeUtf8) obs column");
         }
     }
 

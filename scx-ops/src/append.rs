@@ -121,7 +121,11 @@ pub fn append(
     let old_n_csr_shards = header.n_csr_shards;
     let old_catalog_offset = header.full_catalog_offset;
 
-    // Read existing obs section for concatenation
+    // Read existing obs section for concatenation. This bypasses
+    // `ScxReader::read_obs`, so apply `downcast_large_types` explicitly
+    // — files written after the LargeUtf8 fix store obs as LargeUtf8 on
+    // disk, but downstream code (and the schema check below) expects
+    // the canonical narrow `Utf8` type.
     let old_obs = {
         let obs_entry = old_catalog.get("obs").ok_or_else(|| {
             OpsError::Format(scx_format::ScxError::SectionNotFound("obs".to_string()))
@@ -132,12 +136,13 @@ pub fn append(
         let cursor = Cursor::new(buf);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
         let mut batches = reader.into_iter();
-        batches.next().ok_or_else(|| {
+        let batch = batches.next().ok_or_else(|| {
             OpsError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "obs section contains no batches",
             ))
-        })??
+        })??;
+        scx_format::downcast_large_types(&batch).map_err(OpsError::Format)?
     };
 
     // Validate obs schema equivalence between the target file's existing obs
@@ -335,6 +340,11 @@ pub fn append(
         let new_unified = unify_dict_columns(new_obs)?;
         concat_batches(&old_unified.schema(), &[old_unified, new_unified])?
     };
+    // Inline write bypasses `ScxWriter::write_arrow_ipc`, so upcast
+    // explicitly: obs columns may exceed Arrow IPC's 32-bit offset
+    // limit at multi-million-cell scale and need 64-bit `LargeUtf8` /
+    // `LargeBinary` offsets on disk.
+    let merged_obs = scx_format::upcast_to_large_types(&merged_obs).map_err(OpsError::Format)?;
     let obs_ipc_bytes = {
         let mut buf = Vec::new();
         let mut writer =
