@@ -37,6 +37,10 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+# Test scaffolding for CSC kernels — `csc/test_helpers.rs` builds tiny
+# SCX files via the lower-level writer API to exercise CSR/CSC parity.
+scx-codec = { path = "../scx-codec" }
+arrow = { workspace = true }
 
 [[bench]]
 name = "distances"

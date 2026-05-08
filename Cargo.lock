@@ -3354,6 +3354,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scx-accel"
 version = "0.2.0"
 dependencies = [
+ "arrow",
  "criterion",
  "faer",
  "faer-traits",
@@ -3366,6 +3367,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",
  "rayon",
+ "scx-codec",
  "scx-engine",
  "scx-format",
  "scx-gpu",
@@ -3566,6 +3568,7 @@ dependencies = [
  "byteorder",
  "fs4",
  "half",
+ "log",
  "memmap2",
  "roaring",
  "scx-codec",
@@ -3581,6 +3584,7 @@ name = "scx-sparse"
 version = "0.2.0"
 dependencies = [
  "log",
+ "proptest",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",

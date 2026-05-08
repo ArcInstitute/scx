@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -137,7 +137,13 @@ pub fn normalize_total(
                 target_sum,
             }],
             non_negative,
-        );
+        )
+        // Forward CSC sidecar so a later log1p() preserves the
+        // CSC-dispatch capability (NormalizeTotal itself is not
+        // column-local, but a NormalizeTotal+Log1p chain is — the
+        // gate at as_column_source() will reject it for now;
+        // carrying the handle costs nothing).
+        .with_csc_reader(backed_ref.backed_csc.clone());
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;
@@ -227,7 +233,10 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
             backed_ref.col_projection_arc(),
             vec![Transform::Log1p],
             non_negative,
-        );
+        )
+        // Forward CSC sidecar so the resulting log1p()-only chain
+        // remains CSC-dispatchable via as_column_source().
+        .with_csc_reader(backed_ref.backed_csc.clone());
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;
@@ -263,15 +272,27 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 ///     log1p: if True, also add log1p-transformed versions of count metrics
 ///     inplace: if True (default), write metrics to adata.obs/var;
 ///              if False, return (obs_df, var_df)
+///     prefer_format: "csr" (default) or "csc". When "csc", the gene-axis
+///         (`total_counts`, `n_cells_by_counts`) accumulators read the CSC
+///         sidecar instead of streaming CSR shards. The cell-axis stays
+///         on CSR — row aggregations have no CSC win. Capability gate
+///         applies (no row deletion vector, no non-column-local
+///         transforms; raises on missing CSC sidecar).
 #[pyfunction]
-#[pyo3(signature = (adata, qc_vars=None, log1p=true, inplace=true))]
+#[pyo3(signature = (adata, qc_vars=None, log1p=true, inplace=true, prefer_format="csr"))]
 pub fn calculate_qc_metrics<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     qc_vars: Option<Vec<String>>,
     log1p: bool,
     inplace: bool,
+    prefer_format: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+        )));
+    }
     let x = adata.getattr("X")?;
     let qc_vars = qc_vars.unwrap_or_default();
 
@@ -280,7 +301,15 @@ pub fn calculate_qc_metrics<'py>(
     let is_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
 
     if !is_backed && !is_lazy {
-        // Delegate to scanpy for regular scipy/dense
+        // Delegate to scanpy for regular scipy/dense. CSC on a non-SCX
+        // matrix has no meaningful interpretation — reject explicitly so
+        // the user doesn't think it had any effect.
+        if prefer_format == "csc" {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' requires adata.X to be ScxBackedSparseDataset \
+                 or ScxLazyTransformedDataset (got scipy/dense)",
+            ));
+        }
         let sc = py.import("scanpy")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("inplace", inplace)?;
@@ -298,7 +327,10 @@ pub fn calculate_qc_metrics<'py>(
     let np = py.import("numpy")?;
     let pd = py.import("pandas")?;
 
-    // Compute per-cell total_counts and n_genes_by_counts
+    // Compute per-cell total_counts and n_genes_by_counts. Row-axis
+    // aggregations stay CSR regardless of prefer_format — CSC offers
+    // no win for row sums (would require gathering per-shard column
+    // contributions back into a row index).
     let (total_counts, n_genes): (Vec<f64>, Vec<i64>) = if is_backed {
         let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
         let row_sums = backed
@@ -326,8 +358,11 @@ pub fn calculate_qc_metrics<'py>(
         )
     };
 
-    // Compute per-gene total_counts and n_cells_by_counts
-    let (gene_total_counts, n_cells): (Vec<f64>, Vec<i64>) = if is_backed {
+    // Compute per-gene total_counts and n_cells_by_counts.
+    let (gene_total_counts, n_cells): (Vec<f64>, Vec<i64>) = if prefer_format == "csc" {
+        // CSC dispatch: capability gate + projected_agg twins.
+        compute_gene_axis_csc(&x)?
+    } else if is_backed {
         let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
         let col_sums = match &backed.kept_to_global {
             Some(kept) => backed
@@ -772,4 +807,52 @@ fn gpu_log1p_dispatch(
     let sc = py.import("scanpy")?;
     sc.getattr("pp")?.call_method1("log1p", (adata,))?;
     Ok(())
+}
+
+/// Compute per-gene `(total_counts, n_cells_by_counts)` via the CSC
+/// path. Used by `calculate_qc_metrics(prefer_format="csc")`.
+///
+/// Capability gate (raised on missing CSC sidecar / non-column-local
+/// transforms / row deletion vector active) is delegated to
+/// `as_column_source()`. Honors `col_projection` if set on the
+/// dataset.
+fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<i64>)> {
+    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        let source = backed.as_column_source().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "CSC requested but unavailable: file has no CSC sidecar, \
+                 or a row deletion vector is active",
+            )
+        })?;
+        let cols_owned: Vec<u32> = match backed.col_projection() {
+            Some(c) => c.to_vec(),
+            None => (0..backed.shape_val.1 as u32).collect(),
+        };
+        let sums = projected_agg::col_sums_projected_csc(source, &cols_owned)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let nnz = projected_agg::col_nnz_projected_csc(source, &cols_owned)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        return Ok((sums, nnz));
+    }
+    if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        let lazy_src = lazy.as_column_source().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "CSC requested but unavailable: file has no CSC sidecar, \
+                 the transform chain contains a non-column-local op, or a \
+                 row deletion vector is active",
+            )
+        })?;
+        let cols_owned: Vec<u32> = match lazy.col_projection() {
+            Some(c) => c.to_vec(),
+            None => (0..lazy.shape_val.1 as u32).collect(),
+        };
+        let sums = projected_agg::col_sums_projected_csc(&lazy_src, &cols_owned)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let nnz = projected_agg::col_nnz_projected_csc(&lazy_src, &cols_owned)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        return Ok((sums, nnz));
+    }
+    Err(PyRuntimeError::new_err(
+        "prefer_format='csc' requires backed or lazy SCX dataset",
+    ))
 }

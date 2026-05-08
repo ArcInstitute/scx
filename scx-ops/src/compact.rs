@@ -46,12 +46,31 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
 
     let new_n_obs = filtered_obs.num_rows();
 
+    // CSC sidecars (column-major shards) are dropped by `compact`: the
+    // operation re-shards CSR rows on a different row layout, so any
+    // input CSC shards would silently reference stale row indices.
+    // Caller can opt back in via `--rebuild-csc` on the CLI to re-run
+    // `build-csc` against the compacted output. Phase H.2.
+    let had_csc = in_header.has_csc();
+    if had_csc {
+        log::warn!(
+            "compact dropped CSC shards from {input}: rerun \
+             `scx build-csc` (or pass --rebuild-csc) to restore the \
+             column-major sidecar",
+            input = input_path.display()
+        );
+    }
+    // Carry all input flags except `has_deletion_vectors` (bit 5) — the
+    // compacted output applies the deletion vector and drops it — and
+    // `has_csc` (bit 0) — the CSC sidecar is dropped explicitly above.
+    let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
+
     // Set up output header
     let out_header = FileHeader {
         magic: MAGIC,
         format_version: 1,
         header_length: 256,
-        flags: in_header.flags & !(1 << 5), // carry all flags except has_deletion_vectors
+        flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars,
         nnz: 0, // will be set by finish

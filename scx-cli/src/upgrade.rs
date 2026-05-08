@@ -8,7 +8,6 @@ use std::path::Path;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 
 use crate::rewrite_helpers;
@@ -87,7 +86,7 @@ fn rewrite_with_current_version(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let in_header = reader.header();
 
-    let csr_entries = reader.catalog().shards_sorted();
+    let csr_entries = reader.catalog().csr_shards_sorted();
 
     // Set up output header
     let out_header = FileHeader {
@@ -150,13 +149,10 @@ fn rewrite_with_current_version(
         )?;
     }
 
-    // Re-write CSC shards (if present, per-shard codec)
-    let csc_entries: Vec<&scx_format::FullCatalogEntry> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CscShard)
-        .collect();
+    // Re-write CSC shards (if present, per-shard codec). Sorted by
+    // major_start() (= col_start for CSC entries via the axis-overload
+    // in ShardStats; on-disk fields are unchanged).
+    let csc_entries = reader.catalog().csc_shards_sorted();
 
     for csc_entry in &csc_entries {
         let sh = reader.read_shard_header(csc_entry)?;
@@ -165,7 +161,11 @@ fn rewrite_with_current_version(
         let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
 
         let (indptr, indices, data) = reader.read_shard_from_entry(csc_entry)?;
-        let col_start = csc_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+        let col_start = csc_entry
+            .stats
+            .as_ref()
+            .map(|s| s.major_start())
+            .unwrap_or(0);
 
         let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
         let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
@@ -184,7 +184,7 @@ fn rewrite_with_current_version(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{sample_header, write_test_file};
+    use crate::test_utils::write_test_file;
     use scx_codec::{CodecId, ValueEncoding};
 
     #[test]
@@ -281,5 +281,129 @@ mod tests {
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("--in-place"));
+    }
+
+    /// write a file with CSR + multi-shard CSC, run
+    /// rewrite_with_current_version, and confirm the output preserves
+    /// has_csc, the CSC shard count, per-shard column ranges, and
+    /// densified contents.
+    #[test]
+    fn test_upgrade_preserves_csc_multi_shard() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("with_csc.scx");
+
+        // 4 rows × 6 cols dense reference (column-by-column nnz).
+        let n_rows = 4usize;
+        let n_cols = 6usize;
+        #[rustfmt::skip]
+        let dense: Vec<f32> = vec![
+            // col: 0    1    2    3    4    5
+                   1.0, 0.0, 0.0, 4.0, 0.0, 7.0,
+                   0.0, 2.0, 5.0, 0.0, 0.0, 8.0,
+                   0.0, 0.0, 0.0, 0.0, 6.0, 0.0,
+                   3.0, 0.0, 0.0, 0.0, 0.0, 9.0,
+        ];
+
+        // Build CSC arrays for a column range from the dense reference.
+        let csc_arrays = |col_start: usize, col_end: usize| -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+            let mut indptr: Vec<u64> = vec![0];
+            let mut indices: Vec<u32> = Vec::new();
+            let mut values: Vec<u8> = Vec::new();
+            for col in col_start..col_end {
+                for row in 0..n_rows {
+                    let v = dense[row * n_cols + col];
+                    if v != 0.0 {
+                        indices.push(row as u32);
+                        values.push(v as u8);
+                    }
+                }
+                indptr.push(indices.len() as u64);
+            }
+            (indptr, indices, values)
+        };
+
+        let header = sample_header(n_rows as u64, n_cols as u64);
+        let mut writer = ScxWriter::new(&input, header).unwrap();
+        writer.write_obs(&sample_obs(n_rows)).unwrap();
+        writer.write_var(&sample_var(n_cols)).unwrap();
+
+        // Empty CSR shard for file invariants.
+        let csr_indptr = vec![0u64; n_rows + 1];
+        writer
+            .write_csr_shard(
+                &csr_indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // 3 CSC shards: cols [0..2), [2..4), [4..6) — non-uniform on
+        // purpose so the col_range preservation is meaningful.
+        for (cs, ce) in [(0usize, 2usize), (2, 4), (4, 6)] {
+            let (ip, ix, vb) = csc_arrays(cs, ce);
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    cs as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        // Sanity: input has CSC.
+        let in_reader = ScxReader::open(&input).unwrap();
+        assert!(in_reader.header().has_csc());
+        assert_eq!(in_reader.header().n_csc_shards, 3);
+        let in_csc = in_reader.read_all_csc_shards().unwrap();
+        assert_eq!(in_csc.to_dense().unwrap(), dense);
+
+        // Rewrite through current writer.
+        let output = dir.path().join("upgraded.scx");
+        rewrite_with_current_version(&in_reader, &output).unwrap();
+        drop(in_reader);
+
+        // Output preserves CSC: flag, count, per-shard col ranges, contents.
+        let out_reader = ScxReader::open(&output).unwrap();
+        assert!(
+            out_reader.header().has_csc(),
+            "has_csc must survive upgrade"
+        );
+        assert_eq!(out_reader.header().n_csc_shards, 3);
+
+        let out_csc_entries = out_reader.catalog().csc_shards_sorted();
+        assert_eq!(out_csc_entries.len(), 3);
+        let ranges: Vec<std::ops::Range<u64>> = out_csc_entries
+            .iter()
+            .map(|e| e.stats.as_ref().unwrap().col_range())
+            .collect();
+        assert_eq!(ranges, vec![0..2, 2..4, 4..6]);
+
+        // On-disk shard_type byte must remain `1` for re-emitted CSC
+        // shards (invariant survives rewrite).
+        let out_data = std::fs::read(&output).unwrap();
+        for entry in &out_csc_entries {
+            let section = &out_data[entry.offset as usize..][..entry.length as usize];
+            let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format::shard::SHARD_HEADER_SIZE],
+            ))
+            .unwrap();
+            assert_eq!(sh.shard_type, 1, "CSC shard byte must be 1 after upgrade");
+            assert!(sh.is_csc(SectionType::CscShard));
+        }
+
+        // Densify and compare.
+        let out_csc = out_reader.read_all_csc_shards().unwrap();
+        assert_eq!(out_csc.shape, (n_rows, n_cols));
+        assert_eq!(out_csc.to_dense().unwrap(), dense);
     }
 }

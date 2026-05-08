@@ -810,6 +810,69 @@ All accelerators support a `device` parameter for GPU acceleration:
 - `device="gpu"` — force GPU (raises error if unavailable)
 - `device="gpu:1"` — select a specific GPU on multi-GPU systems
 
+### `prefer_format="csr"|"csc"`: explicit column-major dispatch
+
+A subset of accelerators take a `prefer_format` kwarg that selects
+between the row-major CSR path (default) and the column-major CSC
+sidecar path. Entries that accept it:
+
+| Function | CSC win |
+|----------|---------|
+| `pyscx.accel.highly_variable_genes` | Single-batch seurat_v3 only — single-pass per-column accumulators with no `O(n_vars)` row-wise scratch. Multi-batch and non-seurat_v3 raise. |
+| `pyscx.accel.rank_genes_groups` | Per gene chunk: read CSC slab + scatter into row-major dense buffer (vs decode every row + project for CSR). Clearest CSC win. |
+| `pyscx.accel.pseudobulk_dex` | Filtered-gene subsets only (`gene_indices=...` or column projection on `adata.X`). Full-gene pseudobulk has no CSC win and raises. |
+| `pyscx.accel.calculate_qc_metrics` | Gene-axis aggregations only (`total_counts`, `n_cells_by_counts`); cell-axis stays CSR. |
+| `pyscx.accel.col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | Per-column aggregations on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`. |
+| `pyscx.accel.pca` | **Rejects `prefer_format="csc"`** with `ValueError`. Covariance build and randomized SpMM are row-major; CSC offers no measurable speed-up. |
+
+**Default is `"csr"` everywhere.** No `"auto"` — the runtime can't
+guess whether CSC dispatch is safe (depends on the file having a
+sidecar AND the user's transform chain being column-local). No
+thread-local default. No env-var override. Each call sites the
+choice locally.
+
+`prefer_format="csc"` requires *all* of the following; otherwise it
+raises `RuntimeError` with a message naming the missing capability:
+
+1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always")`,
+   `scx convert --csc=always`, or `scx build-csc`).
+2. The transform chain on `adata.X` contains only column-local
+   operations. `Log1p` is column-local; `NormalizeTotal` and
+   `RowScale` are not (per-row state). The common `normalize_total →
+   log1p` chain is *not* column-local — use `prefer_format="csr"`.
+3. No active row deletion vector. After
+   `pyscx.accel.filter_cells()` or `pyscx.accel.subset_obs()`, the
+   dataset has `kept_to_global` set; CSC dispatch then raises until
+   you `materialize()` or rebuild the file.
+
+Invalid values (e.g. `"auto"`, `"CSC"`) raise `ValueError`.
+
+```python
+import pyscx
+
+# Open a CSC-equipped file
+exp = pyscx.open("atlas.scx")  # written via pyscx.from_anndata(csc="always")
+adata = exp.to_anndata(backed=True)
+
+# DE on a small target gene set — CSC slab read avoids decoding every row
+pyscx.accel.rank_genes_groups(
+    adata, "perturbation", reference="control",
+    prefer_format="csc",
+)
+
+# log1p preserves CSC capability (column-local)
+pyscx.accel.log1p(adata)
+pyscx.accel.col_sums(adata.X, prefer_format="csc")  # works
+
+# normalize_total breaks it (row-local)
+pyscx.accel.normalize_total(adata, target_sum=1e4)
+pyscx.accel.col_sums(adata.X, prefer_format="csc")  # raises RuntimeError
+```
+
+For the on-disk format and sharding granularity, see
+[docs/sharding.md § CSC sharding](sharding.md#csc-sharding) and
+[docs/format.md § 4.1 CSC Shard Internal Layout](format.md#41-csc-shard-internal-layout).
+
 ### PCA (`pyscx.accel.pca`)
 
 Two methods, auto-routed by the number of variables:

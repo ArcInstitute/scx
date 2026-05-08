@@ -4,6 +4,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
 use crate::error::{Result, ScxError};
+use crate::section::SectionType;
 
 /// Size of the shard header in bytes.
 pub const SHARD_HEADER_SIZE: usize = 76;
@@ -37,7 +38,17 @@ pub struct ShardHeader {
     pub n_minor: u32,
     /// Total non-zeros in this shard
     pub nnz: u64,
-    /// Global row index of the first row in this shard (not a byte offset)
+    /// Global major-axis index of the first major entry in this shard
+    /// (not a byte offset).
+    ///
+    /// Axis-dependent semantics:
+    /// - `CsrShard` / `LayerCsrShard` / `ObspCsrShard`: `row_start`
+    ///   (global row index where this shard begins).
+    /// - `CscShard`: `col_start` (global column index where this shard
+    ///   begins).
+    ///
+    /// Use `ShardHeader::major_axis_start()` to get this field by its
+    /// generic name.
     pub global_offset: u64,
     /// Relative offset to indptr data (from shard start)
     pub indptr_rel_offset: u32,
@@ -140,6 +151,40 @@ impl ShardHeader {
             block_index_length,
             checksum,
         })
+    }
+}
+
+/// Derive the on-disk `shard_type` byte from a `SectionType`.
+///
+/// Returns `1` for `CscShard` (column-major) and `0` for everything else
+/// (CSR, layer CSR, obsp CSR). Used by writer call sites to label shards
+/// correctly in their 76-byte headers.
+pub fn derive_shard_type(section_type: SectionType) -> u8 {
+    match section_type {
+        SectionType::CscShard => 1,
+        _ => 0,
+    }
+}
+
+impl ShardHeader {
+    /// Returns true if this shard is column-major (CSC).
+    ///
+    /// Honors both the on-disk `shard_type` byte (`1` = CSC) and the
+    /// catalog `section_type` for forward/backward compatibility:
+    /// pre-Phase-A files were written with `shard_type = 0` even for CSC
+    /// shards (the catalog `section_type == CscShard` is what made them
+    /// CSC). The catalog wins when the byte disagrees.
+    pub fn is_csc(&self, catalog_section_type: SectionType) -> bool {
+        self.shard_type == 1 || catalog_section_type == SectionType::CscShard
+    }
+
+    /// Return the global major-axis start offset.
+    ///
+    /// This is `row_start` for CSR/LayerCsrShard/ObspCsrShard and
+    /// `col_start` for CscShard. The on-disk field is named
+    /// `global_offset` for axis-agnostic encoding.
+    pub fn major_axis_start(&self) -> u64 {
+        self.global_offset
     }
 }
 
@@ -383,6 +428,46 @@ mod tests {
     fn block_index_entry_rejects_large_nnz() {
         let err = BlockIndexEntry::new(0, 128, 0, 0, 0, u32::MAX as u64 + 1).unwrap_err();
         assert!(matches!(err, ScxError::BlockNnzOverflow(_)));
+    }
+
+    #[test]
+    fn derive_shard_type_csc_is_one() {
+        assert_eq!(derive_shard_type(SectionType::CscShard), 1);
+    }
+
+    #[test]
+    fn derive_shard_type_csr_variants_are_zero() {
+        assert_eq!(derive_shard_type(SectionType::CsrShard), 0);
+        assert_eq!(derive_shard_type(SectionType::LayerCsrShard), 0);
+        assert_eq!(derive_shard_type(SectionType::ObspCsrShard), 0);
+    }
+
+    #[test]
+    fn shard_header_is_csc_byte_says_yes() {
+        let mut h = sample_shard_header();
+        h.shard_type = 1;
+        // Even with a CsrShard catalog entry, byte=1 still flags CSC
+        // (this branch is mostly defensive — the writer never produces
+        // such a mismatch).
+        assert!(h.is_csc(SectionType::CsrShard));
+        assert!(h.is_csc(SectionType::CscShard));
+    }
+
+    #[test]
+    fn shard_header_is_csc_catalog_says_yes_v1_legacy() {
+        // Legacy v1 file: writer hardcoded shard_type=0 for CSC; the
+        // catalog section_type is the source of truth.
+        let mut h = sample_shard_header();
+        h.shard_type = 0;
+        assert!(h.is_csc(SectionType::CscShard));
+        assert!(!h.is_csc(SectionType::CsrShard));
+    }
+
+    #[test]
+    fn shard_header_major_axis_start_returns_global_offset() {
+        let mut h = sample_shard_header();
+        h.global_offset = 1234;
+        assert_eq!(h.major_axis_start(), 1234);
     }
 
     #[test]

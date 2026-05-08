@@ -204,6 +204,19 @@ pub struct CscShardIterator<'a> {
     current_col: usize,
 }
 
+impl<'a> CscShardIterator<'a> {
+    /// Global column index where the *next* emitted chunk will start.
+    ///
+    /// Callers (e.g., `scx build-csc` writing one CSC shard per chunk)
+    /// use this to label each chunk with the correct `col_start`
+    /// before invoking `next()` — the iterator advances `current_col`
+    /// during `next()`, so reading after the call gives the *following*
+    /// chunk's start.
+    pub fn current_col_start(&self) -> usize {
+        self.current_col
+    }
+}
+
 impl<'a> Iterator for CscShardIterator<'a> {
     type Item = Result<CscArrays, TransposeError>;
 
@@ -220,6 +233,60 @@ impl<'a> Iterator for CscShardIterator<'a> {
 
         Some(Ok(chunk))
     }
+}
+
+/// Streaming CSR → CSC iterator with both a memory bound *and* a hard
+/// cap on columns per chunk.
+///
+/// Mirrors [`streaming_csr_to_csc_iter`] but the resulting chunk size is
+/// `min(memory_bound, max_cols)`. Used by `scx build-csc
+/// --csc-cols-per-shard <N>`: the user-facing knob is "at most N cols
+/// per shard" while still respecting the memory bound. Pass
+/// `usize::MAX` (or `u32::MAX as usize`) as `max_cols` to disable the
+/// cap and behave exactly like `streaming_csr_to_csc_iter`.
+pub fn streaming_csr_to_csc_iter_with_cap<'a>(
+    shards: &'a [ScxCsr],
+    n_rows_total: usize,
+    n_cols: usize,
+    max_memory_bytes: usize,
+    max_cols: usize,
+) -> Result<CscShardIterator<'a>, TransposeError> {
+    for shard in shards {
+        if shard.n_cols() != n_cols {
+            return Err(TransposeError::ShapeMismatch {
+                shard_cols: shard.n_cols(),
+                expected_cols: n_cols,
+            });
+        }
+    }
+
+    let chunk_cols = compute_chunk_cols_with_cap(n_rows_total, max_memory_bytes, max_cols)?;
+
+    Ok(CscShardIterator {
+        shards,
+        n_rows_total,
+        n_cols,
+        chunk_cols,
+        current_col: 0,
+    })
+}
+
+/// Compute chunk size as `min(compute_chunk_cols(...), max_cols)`.
+///
+/// `max_cols == 0` is treated as "no cap" (returns just the memory
+/// bound) for ergonomic API symmetry with `usize::MAX` — both indicate
+/// "don't constrain me on the column axis." Callers that genuinely
+/// want zero-column chunks should not call this function at all.
+pub fn compute_chunk_cols_with_cap(
+    n_rows_total: usize,
+    max_memory_bytes: usize,
+    max_cols: usize,
+) -> Result<usize, TransposeError> {
+    let mem_bound = compute_chunk_cols(n_rows_total, max_memory_bytes)?;
+    if max_cols == 0 {
+        return Ok(mem_bound);
+    }
+    Ok(mem_bound.min(max_cols))
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +544,99 @@ mod tests {
         let shard_b = dense_to_csr(&[1.0, 2.0, 3.0], 1, 3);
         let err = streaming_csr_to_csc(&[shard_a, shard_b], 2, 2, 1_000_000).unwrap_err();
         assert!(matches!(err, TransposeError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_compute_chunk_cols_with_cap_caps_when_smaller() {
+        // 100 rows × 12 = 1200 bytes/col. Budget 12_000 → 10 cols.
+        // Cap at 3 → expect 3.
+        let n = compute_chunk_cols_with_cap(100, 12_000, 3).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn test_compute_chunk_cols_with_cap_uses_memory_when_smaller() {
+        // 100 rows × 12 = 1200 bytes/col. Budget 12_000 → 10 cols.
+        // Cap at 50 → memory wins, expect 10.
+        let n = compute_chunk_cols_with_cap(100, 12_000, 50).unwrap();
+        assert_eq!(n, 10);
+    }
+
+    #[test]
+    fn test_compute_chunk_cols_with_cap_zero_means_no_cap() {
+        let n_no_cap = compute_chunk_cols_with_cap(100, 12_000, 0).unwrap();
+        let n_max_cap = compute_chunk_cols_with_cap(100, 12_000, usize::MAX).unwrap();
+        assert_eq!(n_no_cap, n_max_cap);
+    }
+
+    #[test]
+    fn test_streaming_iter_with_cap_emits_capped_chunks() {
+        // 4×6 matrix; cap at 3 cols/chunk → ceil(6 / 3) = 2 chunks.
+        #[rustfmt::skip]
+        let dense = vec![
+            1.0, 0.0, 2.0, 0.0, 0.0, 3.0,
+            0.0, 4.0, 0.0, 5.0, 0.0, 0.0,
+            6.0, 0.0, 0.0, 0.0, 7.0, 0.0,
+            0.0, 0.0, 8.0, 9.0, 0.0, 0.0,
+        ];
+        let csr = dense_to_csr(&dense, 4, 6);
+        let shards = [csr];
+
+        // Generous memory bound — cap should drive the chunking.
+        let mut iter = streaming_csr_to_csc_iter_with_cap(&shards, 4, 6, 1_000_000, 3).unwrap();
+
+        // Before next(): col_start == 0.
+        assert_eq!(iter.current_col_start(), 0);
+
+        let chunk0 = iter.next().unwrap().unwrap();
+        assert_eq!(chunk0.shape, (4, 3));
+        // After first chunk: col_start advanced to 3.
+        assert_eq!(iter.current_col_start(), 3);
+
+        let chunk1 = iter.next().unwrap().unwrap();
+        assert_eq!(chunk1.shape, (4, 3));
+        // After second chunk: col_start at 6 (== n_cols).
+        assert_eq!(iter.current_col_start(), 6);
+
+        assert!(iter.next().is_none());
+
+        // Reconstruct and verify.
+        let mut reconstructed = vec![0.0f32; 24]; // 4×6
+        for (chunk_idx, chunk) in [&chunk0, &chunk1].iter().enumerate() {
+            let col_offset = chunk_idx * 3;
+            for col in 0..chunk.shape.1 {
+                let s = chunk.indptr[col] as usize;
+                let e = chunk.indptr[col + 1] as usize;
+                for j in s..e {
+                    let row = chunk.indices[j] as usize;
+                    reconstructed[row * 6 + col + col_offset] = chunk.data[j];
+                }
+            }
+        }
+        assert_eq!(reconstructed, dense);
+    }
+
+    #[test]
+    fn test_streaming_iter_with_cap_uneven_last_chunk() {
+        // 2×7 with cap=3 → chunks [0..3), [3..6), [6..7) (last is 1 col)
+        let dense = vec![
+            1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0, 6.0, 0.0, 7.0, 0.0,
+        ];
+        let csr = dense_to_csr(&dense, 2, 7);
+        let shards = [csr];
+
+        let mut iter = streaming_csr_to_csc_iter_with_cap(&shards, 2, 7, 1_000_000, 3).unwrap();
+        let mut starts = Vec::new();
+        let mut sizes = Vec::new();
+        starts.push(iter.current_col_start());
+        while let Some(chunk) = iter.next() {
+            sizes.push(chunk.unwrap().shape.1);
+            starts.push(iter.current_col_start());
+        }
+        // Three chunks of sizes 3, 3, 1 starting at 0, 3, 6 (with final
+        // current_col_start == 7 reflecting EOF).
+        assert_eq!(sizes, vec![3, 3, 1]);
+        assert_eq!(starts, vec![0, 3, 6, 7]);
     }
 
     #[test]

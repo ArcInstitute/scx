@@ -12,3 +12,6 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 rand_distr = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -47,11 +47,19 @@ pub fn run_info(
         _ => "unknown",
     };
 
-    // Line 2: shards/codec/index
-    println!(
-        "Shards: {} CSR | Codec: {} | Index dtype: {}",
-        header.n_csr_shards, codec_name, index_dtype,
-    );
+    // Line 2: shards/codec/index. Suppress the CSC count when zero so
+    // the line stays clean for files that ship without a sidecar.
+    if header.n_csc_shards > 0 {
+        println!(
+            "Shards: {} CSR | {} CSC | Codec: {} | Index dtype: {}",
+            header.n_csr_shards, header.n_csc_shards, codec_name, index_dtype,
+        );
+    } else {
+        println!(
+            "Shards: {} CSR | Codec: {} | Index dtype: {}",
+            header.n_csr_shards, codec_name, index_dtype,
+        );
+    }
 
     // Value encoding: read from first CSR shard header
     let csr_shards = catalog.shards(SectionType::CsrShard);
@@ -134,6 +142,34 @@ pub fn run_info(
         println!("Flags: {}", flags.join(", "));
     }
 
+    // CSC sidecar layout: when more than one CSC shard is present,
+    // print the per-shard column range + nnz so users can see the
+    // sharding granularity. One-shard files leave it implicit — the
+    // count on the Shards line says it all.
+    if header.n_csc_shards > 1 {
+        println!();
+        println!(
+            "CSC layout ({} shards, {} cols/shard avg):",
+            header.n_csc_shards,
+            header.n_vars / header.n_csc_shards as u64,
+        );
+        for (i, entry) in catalog.csc_shards_sorted().iter().enumerate() {
+            let range = entry.stats.as_ref().map(|s| s.col_range());
+            let nnz = entry.stats.as_ref().map(|s| s.nnz).unwrap_or(0);
+            match range {
+                Some(r) => println!(
+                    "  shard {:>3}: cols {}..{} ({} cols), nnz {}",
+                    i,
+                    fmt_num(r.start),
+                    fmt_num(r.end),
+                    fmt_num(r.end - r.start),
+                    fmt_num(nnz),
+                ),
+                None => println!("  shard {:>3}: (no stats)", i),
+            }
+        }
+    }
+
     // Deletion vector detail
     if header.has_deletion_vectors() {
         if let Ok(Some(dv)) = reader.read_deletion_vectors() {
@@ -201,6 +237,8 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         "n_vars": header.n_vars,
         "nnz": header.nnz,
         "n_csr_shards": header.n_csr_shards,
+        "n_csc_shards": header.n_csc_shards,
+        "has_csc": header.has_csc(),
         "codec": codec_name,
         "index_dtype": if header.index_dtype == 0 { "u16" } else { "u32" },
         "shard_target_rows": header.shard_target_rows,
@@ -208,6 +246,25 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         "file_size_bytes": file_size,
         "sections": sections,
     });
+
+    // Per-CSC-shard layout for files with multiple CSC shards.
+    if header.n_csc_shards > 1 {
+        let csc_layout: Vec<_> = catalog
+            .csc_shards_sorted()
+            .iter()
+            .map(|entry| {
+                let range = entry.stats.as_ref().map(|s| s.col_range());
+                let nnz = entry.stats.as_ref().map(|s| s.nnz).unwrap_or(0);
+                serde_json::json!({
+                    "name": entry.name,
+                    "col_start": range.as_ref().map(|r| r.start),
+                    "col_end": range.as_ref().map(|r| r.end),
+                    "nnz": nnz,
+                })
+            })
+            .collect();
+        obj["csc_layout"] = serde_json::json!(csc_layout);
+    }
 
     // Deletion vectors
     if header.has_deletion_vectors() {

@@ -671,20 +671,21 @@ fn test_integer_dtype_detection() {
     // Empty
     assert!(is_integer_data(&[]));
 
-    // detect_value_encoding
-    let (enc, codec) = detect_value_encoding(&[1.0, 2.0, 255.0]);
+    // detect_value_encoding (auto-codec selection: pass `None` for the
+    // explicit-codec override).
+    let (enc, codec) = detect_value_encoding(&[1.0, 2.0, 255.0], None);
     assert_eq!(enc, ValueEncoding::Uint8);
     assert_eq!(codec, CodecId::Scx1);
 
-    let (enc, codec) = detect_value_encoding(&[1.0, 256.0]);
+    let (enc, codec) = detect_value_encoding(&[1.0, 256.0], None);
     assert_eq!(enc, ValueEncoding::Uint16);
     assert_eq!(codec, CodecId::Scx1);
 
-    let (enc, codec) = detect_value_encoding(&[1.0, 70000.0]);
+    let (enc, codec) = detect_value_encoding(&[1.0, 70000.0], None);
     assert_eq!(enc, ValueEncoding::Uint32);
     assert_eq!(codec, CodecId::Scx1);
 
-    let (enc, codec) = detect_value_encoding(&[0.5, 1.5]);
+    let (enc, codec) = detect_value_encoding(&[0.5, 1.5], None);
     assert_eq!(enc, ValueEncoding::Float32);
     assert_eq!(codec, CodecId::Zstd);
 }
@@ -725,6 +726,7 @@ fn test_multi_shard() {
 
     let opts = ConvertOptions {
         shard_target_rows: 10,
+        ..ConvertOptions::default()
     };
     h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
 
@@ -825,6 +827,104 @@ fn test_float_data_uses_zstd() {
     let reader = ScxReader::open(&scx_path).unwrap();
     // Should use Zstd for float data
     assert_eq!(reader.header().codec_id, CodecId::Zstd as u8);
+}
+
+/// convert h5ad → scx with `csc=always`, verify the output
+/// has `has_csc()`, the expected CSC shard count, contiguous column
+/// ranges, and densified contents matching the CSR data.
+#[test]
+fn test_h5ad_to_scx_csc_always() {
+    use scx_format::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("with_csc.scx");
+
+    let n_obs = 12;
+    let n_vars = 10;
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
+
+    let opts = ConvertOptions {
+        csc: true,
+        csc_cols_per_shard: 4, // → ceil(10/4) = 3 CSC shards
+        ..ConvertOptions::default()
+    };
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let hdr = reader.header();
+    assert!(hdr.has_csc(), "has_csc must be set after csc=always");
+    assert_eq!(hdr.n_csc_shards, 3, "expected ceil(10/4) = 3 CSC shards");
+
+    // Catalog: contiguous coverage of [0, n_vars).
+    let csc_entries = reader.catalog().csc_shards_sorted();
+    let ranges: Vec<std::ops::Range<u64>> = csc_entries
+        .iter()
+        .map(|e| e.stats.as_ref().unwrap().col_range())
+        .collect();
+    assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
+    for w in ranges.windows(2) {
+        assert_eq!(w[0].end, w[1].start);
+    }
+
+    // On-disk shard_type byte is 1 for every CSC shard.
+    let bytes = std::fs::read(&scx_path).unwrap();
+    for entry in &csc_entries {
+        assert_eq!(entry.section_type, SectionType::CscShard);
+        let section = &bytes[entry.offset as usize..][..entry.length as usize];
+        let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+            &section[..scx_format::shard::SHARD_HEADER_SIZE],
+        ))
+        .unwrap();
+        assert_eq!(sh.shard_type, 1);
+    }
+
+    // Densified CSC == densified CSR.
+    let dense_csr = reader.read_all_csr_shards().unwrap().to_dense().unwrap();
+    let dense_csc = reader.read_all_csc_shards().unwrap().to_dense().unwrap();
+    assert_eq!(dense_csc, dense_csr);
+}
+
+/// same shape of test for the 10x path.
+#[test]
+fn test_tenx_to_scx_csc_always() {
+    let dir = tempfile::tempdir().unwrap();
+    let tenx_path = dir.path().join("input.h5");
+    let scx_path = dir.path().join("with_csc.scx");
+
+    let n_cells = 8;
+    let n_genes = 12;
+    create_test_tenx_h5(&tenx_path, n_cells, n_genes);
+
+    let opts = ConvertOptions {
+        csc: true,
+        csc_cols_per_shard: 5, // → ceil(12/5) = 3 CSC shards
+        ..ConvertOptions::default()
+    };
+    tenx_to_scx(&tenx_path, &scx_path, &opts).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(reader.header().has_csc());
+    assert_eq!(reader.header().n_csc_shards, 3);
+    let dense_csr = reader.read_all_csr_shards().unwrap().to_dense().unwrap();
+    let dense_csc = reader.read_all_csc_shards().unwrap().to_dense().unwrap();
+    assert_eq!(dense_csc, dense_csr);
+}
+
+/// default `ConvertOptions` (csc=false) emits no CSC sidecar.
+#[test]
+fn test_h5ad_default_csc_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("csr_only.scx");
+    create_test_h5ad(&h5ad_path, 10, 8, "csr", true);
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(!reader.header().has_csc());
+    assert_eq!(reader.header().n_csc_shards, 0);
 }
 
 #[test]

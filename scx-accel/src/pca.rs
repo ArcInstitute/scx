@@ -194,6 +194,16 @@ fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
 /// Streams data shard-by-shard — peak memory is one decoded shard plus
 /// the working matrices (n_obs × k and n_vars × k where k = n_components + n_oversamples).
 ///
+/// # CSR-only by design
+///
+/// PCA stays on the CSR `ShardSource` trait — there is no
+/// `ColumnShardSource` overload. The randomized SpMM consumes one
+/// shard's rows at a time (row-major access pattern); CSC's column-
+/// major layout would force per-column gather scatter with no
+/// measurable speed-up. The covariance variant is similar.
+/// `pyscx.accel.pca` rejects `prefer_format="csc"` with a `ValueError`
+/// for the same reason.
+///
 /// # Arguments
 ///
 /// * `source` — Shard source (provides shard-by-shard access)
@@ -859,6 +869,13 @@ pub const COVARIANCE_PCA_THRESHOLD: usize = 5_000;
 /// 4. Stream again to compute embeddings: `E += (X_shard - mean) @ V[:, top_k]`
 ///
 /// Memory: O(n_vars²) for the covariance matrix. Only practical when n_vars ≤ ~5,000.
+///
+/// # CSR-only by design
+///
+/// Like [`randomized_pca`], the covariance build accumulates
+/// `X_shard^T @ X_shard` from row-major nonzeros and offers no win on
+/// CSC. CSC dispatch is rejected at the pyscx entry point —
+/// `pyscx.accel.pca(prefer_format="csc")` raises `ValueError`.
 pub fn covariance_pca<S: ShardSource>(
     source: &S,
     n_components: usize,

@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 
-use scx_format::BackedCsrReader;
+use scx_format::{BackedCscReader, BackedCsrReader};
 
 use crate::anndata::csr_to_scipy;
 use crate::lazy_transform::Transform;
@@ -29,6 +29,10 @@ use crate::projected_agg;
 #[pyclass(name = "ScxBackedSparseDataset")]
 pub struct ScxBackedSparseDataset {
     pub(crate) backed: Arc<BackedCsrReader>,
+    /// Optional CSC sidecar reader. Populated when the file has CSC
+    /// shards AND the open path requested CSC capability. `None` ⇒
+    /// `as_column_source()` always returns `None`.
+    pub(crate) backed_csc: Option<Arc<BackedCscReader>>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) n_shards: usize,
     pub(crate) cache_shards: usize,
@@ -54,6 +58,7 @@ impl ScxBackedSparseDataset {
         let n_shards = backed.index().n_shards();
         ScxBackedSparseDataset {
             backed,
+            backed_csc: None,
             shape_val,
             n_shards,
             cache_shards,
@@ -77,6 +82,7 @@ impl ScxBackedSparseDataset {
         let n_shards = backed.index().n_shards();
         ScxBackedSparseDataset {
             backed,
+            backed_csc: None,
             shape_val: (n_kept, n_vars),
             n_shards,
             cache_shards,
@@ -84,6 +90,44 @@ impl ScxBackedSparseDataset {
             col_projection: None,
             non_negative: true,
         }
+    }
+
+    /// Attach an optional CSC sidecar reader. After this call,
+    /// `as_column_source()` may return `Some` if the gate conditions
+    /// are also satisfied. Returns `&mut Self` for builder-style use.
+    pub fn with_csc_reader(&mut self, backed_csc: Option<Arc<BackedCscReader>>) -> &mut Self {
+        self.backed_csc = backed_csc;
+        self
+    }
+
+    /// Capability gate: returns `Some(&dyn ColumnShardSource)` iff this
+    /// dataset can serve CSC reads. **Single capability-detection point
+    /// in the codebase** for `prefer_format="csc"` dispatch.
+    ///
+    /// Returns `Some` iff:
+    /// - `backed_csc` is set (file has a CSC sidecar AND the open path
+    ///   requested CSC capability), AND
+    /// - `kept_to_global` is `None` (no row deletion vector active —
+    ///   CSC indices encode global rows; deletions would require a
+    ///   per-shard index remap that the CSC reader doesn't perform).
+    ///
+    /// Note: column projection is intentionally NOT a hard
+    /// disqualifier here. `BackedCscReader::read_csc_columns_subset`
+    /// supports gather-style column projection, so consumers that
+    /// honor `col_projection()` can still use the CSC path.
+    /// However, this base wrapper does not transparently apply
+    /// `col_projection` to CSC reads — that is the consumer's
+    /// responsibility (or, more typically, lives on
+    /// `ScxLazyTransformedDataset` which does apply it). Direct
+    /// callers of `as_column_source` on a projected
+    /// `ScxBackedSparseDataset` get the full-axis view; reach for
+    /// `col_projection()` if you need projected reads.
+    pub fn as_column_source(&self) -> Option<&dyn scx_format::ColumnShardSource> {
+        if self.kept_to_global.is_some() {
+            return None;
+        }
+        let backed_csc = self.backed_csc.as_ref()?;
+        Some(backed_csc.as_ref() as &dyn scx_format::ColumnShardSource)
     }
 
     /// Set column projection on this dataset.
@@ -365,7 +409,8 @@ impl ScxBackedSparseDataset {
                     factors: Arc::new(global_factors),
                 }],
                 self.non_negative,
-            );
+            )
+            .with_csc_reader(self.backed_csc.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -405,7 +450,8 @@ impl ScxBackedSparseDataset {
                     factors: Arc::new(global_inv),
                 }],
                 self.non_negative,
-            );
+            )
+            .with_csc_reader(self.backed_csc.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -1220,6 +1266,7 @@ impl ScxBackedSparseDataset {
                 let composed = self.compose_col_projection(&col_indices);
                 let new_ds = ScxBackedSparseDataset {
                     backed: Arc::clone(&self.backed),
+                    backed_csc: self.backed_csc.clone(),
                     shape_val: (self.shape_val.0, composed.len()),
                     n_shards: self.n_shards,
                     cache_shards: self.cache_shards,

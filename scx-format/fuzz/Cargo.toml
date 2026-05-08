@@ -30,3 +30,9 @@ name = "fuzz_catalog"
 path = "fuzz_targets/fuzz_catalog.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_csc_shard"
+path = "fuzz_targets/fuzz_csc_shard.rs"
+test = false
+doc = false

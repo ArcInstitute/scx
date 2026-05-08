@@ -61,6 +61,9 @@ ALL_BENCHMARKS: list[str] = [
     "accel_leiden",
     "accel_preprocess",
     "accel_hvg",
+    # CSC dispatch sweep (Phase L.3): qc_metrics / HVG / DE /
+    # pseudobulk × {csr, csc} on a CSC-equipped fixture.
+    "bench_csc_dispatch",
 ]
 
 

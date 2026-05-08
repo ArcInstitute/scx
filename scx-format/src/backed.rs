@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use lru::LruCache;
-use scx_sparse::ScxCsr;
+use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::error::{Result, ScxError};
@@ -1538,6 +1538,442 @@ pub fn total_variance_from_col_sq(col_sum_sq: &[f64], means: Option<&[f64]>, n_o
 }
 
 // ---------------------------------------------------------------------------
+// BackedCscIndex — column-major counterpart to BackedCsrIndex
+// ---------------------------------------------------------------------------
+
+/// Per-shard column range for a CSC sidecar.
+///
+/// Mirrors `ShardRange` (CSR) but the major axis is columns. The
+/// on-disk fields are still `row_start` / `row_end` in `ShardStats`
+/// (axis-overload — for `CscShard` entries those fields hold
+/// `col_start` / `col_end`); we read them via
+/// `ShardStats::major_start()` / `major_end()`.
+#[derive(Debug, Clone, Copy)]
+struct CscShardRange {
+    col_start: u64,
+    col_end: u64,
+    /// Position in the sorted-and-filtered CSC shard list. Equal to the
+    /// shard index used by `ScxReader::read_csc_shard`.
+    sorted_shard_idx: usize,
+}
+
+/// Precomputed column-shard index for O(log n) col-range lookups.
+///
+/// Built once from a [`FullCatalog`] at open time. Filters
+/// `SectionType::CscShard` only — `LayerCscShard` does not exist in
+/// the current format version (deferred until layer-level CSC
+/// support is needed).
+#[derive(Debug, Clone)]
+pub struct BackedCscIndex {
+    /// Sorted by `col_start`.
+    shard_ranges: Vec<CscShardRange>,
+}
+
+impl BackedCscIndex {
+    /// Build from a [`FullCatalog`].
+    ///
+    /// Extracts CSC shard entries, sorts by `col_start`, and records
+    /// each shard's position in sorted order (the index used by
+    /// `ScxReader::read_csc_shard` after `csc_shards_sorted()`).
+    pub fn from_catalog(catalog: &FullCatalog) -> Self {
+        let mut shard_entries: Vec<CscShardRange> = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .filter_map(|e| {
+                e.stats.as_ref().map(|s| CscShardRange {
+                    col_start: s.major_start(),
+                    col_end: s.major_end(),
+                    sorted_shard_idx: 0,
+                })
+            })
+            .collect();
+
+        shard_entries.sort_by_key(|r| r.col_start);
+        for (i, entry) in shard_entries.iter_mut().enumerate() {
+            entry.sorted_shard_idx = i;
+        }
+        BackedCscIndex {
+            shard_ranges: shard_entries,
+        }
+    }
+
+    /// Number of CSC shards.
+    pub fn n_shards(&self) -> usize {
+        self.shard_ranges.len()
+    }
+
+    /// Find the CSC shard containing `col`, or `None` if `col` falls
+    /// outside every shard's `[col_start, col_end)`.
+    pub fn shard_for_col(&self, col: u64) -> Option<usize> {
+        let pos = self.shard_ranges.partition_point(|r| r.col_start <= col);
+        if pos == 0 {
+            return None;
+        }
+        let r = &self.shard_ranges[pos - 1];
+        if col >= r.col_start && col < r.col_end {
+            Some(r.sorted_shard_idx)
+        } else {
+            None
+        }
+    }
+
+    /// All shard indices whose `[col_start, col_end)` intersects
+    /// `[c_lo, c_hi)`. Returned in ascending order.
+    pub fn shards_for_col_range(&self, c_lo: u64, c_hi: u64) -> Vec<usize> {
+        if c_lo >= c_hi || self.shard_ranges.is_empty() {
+            return Vec::new();
+        }
+        let first = self.shard_ranges.partition_point(|r| r.col_end <= c_lo);
+        let mut result = Vec::new();
+        for r in &self.shard_ranges[first..] {
+            if r.col_start >= c_hi {
+                break;
+            }
+            result.push(r.sorted_shard_idx);
+        }
+        result
+    }
+
+    /// Get the shard column range `(col_start, col_end)`.
+    pub fn shard_col_range(&self, shard_idx: usize) -> Option<(u64, u64)> {
+        self.shard_ranges
+            .get(shard_idx)
+            .map(|r| (r.col_start, r.col_end))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BackedCscReader — column-major counterpart to BackedCsrReader
+// ---------------------------------------------------------------------------
+
+/// On-demand CSC reader with optional decoded-shard caching.
+///
+/// Wraps an [`ScxReader`] with a [`BackedCscIndex`] for O(log n)
+/// column-range lookups and an optional count-only LRU cache for
+/// decoded `ScxCsc` shards. Implements [`crate::ColumnShardSource`].
+///
+/// The cache is intentionally simpler than `BackedCsrReader`'s:
+/// count-only LRU, no byte budget, no singleflight. CSC analytical
+/// kernels (Phase F: DE on gene chunks, projected `col_*`) tend to
+/// access shards in column-range order with limited reuse, so the CSR
+/// reader's heavier machinery isn't a fit yet. If benchmarks later show
+/// contention on the same shard from multiple threads, the singleflight
+/// pattern can be ported over.
+pub struct BackedCscReader {
+    reader: ScxReader,
+    index: BackedCscIndex,
+    n_obs: usize,
+    n_vars: usize,
+    /// Sorted CSC shard catalog entries (catalog index == sorted shard
+    /// index). Pre-cached at construction so we don't re-scan the
+    /// catalog on every read.
+    sorted_entries: Vec<FullCatalogEntry>,
+    /// Optional count-only LRU cache (`None` ⇒ no caching).
+    cache: Option<Mutex<CscCache>>,
+    /// Optional metrics handle.
+    metrics: Option<Arc<CacheMetrics>>,
+}
+
+/// Minimal count-only LRU cache for decoded CSC shards. Counterpart to
+/// `WeightedLruCache` for CSR; we don't yet need a byte budget here.
+struct CscCache {
+    inner: LruCache<usize, Arc<ScxCsc>>,
+    metrics: Option<Arc<CacheMetrics>>,
+}
+
+impl CscCache {
+    fn new(cap: usize) -> Self {
+        let cap = NonZeroUsize::new(cap).unwrap();
+        CscCache {
+            inner: LruCache::new(cap),
+            metrics: None,
+        }
+    }
+
+    fn get(&mut self, key: &usize) -> Option<Arc<ScxCsc>> {
+        self.inner.get(key).cloned()
+    }
+
+    fn put(&mut self, key: usize, value: Arc<ScxCsc>) {
+        let was_replace = self.inner.contains(&key);
+        if let Some(_displaced) = self.inner.put(key, value) {
+            if !was_replace {
+                if let Some(m) = &self.metrics {
+                    m.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // CSC cache is count-only (no byte budget); `bytes_inserted` /
+        // `peak_bytes_in_cache` on the shared `CacheMetrics` are
+        // intentionally left at zero here. Mirror their CSR-side
+        // semantics if a byte budget is added later.
+    }
+}
+
+impl BackedCscReader {
+    /// Create a new backed CSC reader from an [`ScxReader`].
+    ///
+    /// `cache_shards`: number of decoded CSC shards to cache (0 = no
+    /// cache). The underlying file must have CSC sidecar shards
+    /// (`reader.header().has_csc()`); otherwise `read_csc_shard` will
+    /// always return an out-of-bounds error.
+    pub fn new(reader: ScxReader, cache_shards: usize) -> Result<Self> {
+        let index = BackedCscIndex::from_catalog(reader.catalog());
+        let n_obs = reader.n_obs() as usize;
+        let n_vars = reader.n_vars() as usize;
+        let sorted_entries: Vec<FullCatalogEntry> = reader
+            .catalog()
+            .csc_shards_sorted()
+            .into_iter()
+            .cloned()
+            .collect();
+        let cache = if cache_shards > 0 {
+            Some(Mutex::new(CscCache::new(cache_shards)))
+        } else {
+            None
+        };
+        Ok(BackedCscReader {
+            reader,
+            index,
+            n_obs,
+            n_vars,
+            sorted_entries,
+            cache,
+            metrics: None,
+        })
+    }
+
+    /// Borrow the CSC shard index.
+    pub fn index(&self) -> &BackedCscIndex {
+        &self.index
+    }
+
+    /// Enable shard-cache metrics. Returns a cloneable
+    /// `Arc<CacheMetrics>` so callers can sample counters without going
+    /// through the cache lock. The returned handle's `hits` /
+    /// `misses` / `evictions` reflect CSC-side activity; CSR metrics
+    /// live on `BackedCsrReader::enable_metrics()` separately.
+    pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
+        let m = Arc::new(CacheMetrics::default());
+        self.metrics = Some(Arc::clone(&m));
+        if let Some(ref cache_mutex) = self.cache {
+            let mut c = cache_mutex.lock().unwrap();
+            c.metrics = Some(Arc::clone(&m));
+        }
+        m
+    }
+
+    /// Borrow the metrics handle, if enabled.
+    pub fn metrics(&self) -> Option<&Arc<CacheMetrics>> {
+        self.metrics.as_ref()
+    }
+
+    /// Number of CSC shards.
+    pub fn n_shards(&self) -> usize {
+        self.index.n_shards()
+    }
+
+    /// Total number of observations (rows). CSC shards span the full
+    /// row axis, so this equals the file's `n_obs`.
+    pub fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+
+    /// Number of variables (columns).
+    pub fn n_vars(&self) -> usize {
+        self.n_vars
+    }
+
+    /// Read and decode a CSC shard without consulting the cache.
+    /// Useful for one-shot streaming passes where caching would only
+    /// add overhead.
+    pub fn read_shard_uncached(&self, shard_idx: usize) -> Result<ScxCsc> {
+        let entry = self
+            .sorted_entries
+            .get(shard_idx)
+            .ok_or(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: self.sorted_entries.len(),
+            })?;
+        let (indptr, indices, data) = self.reader.read_shard_from_entry(entry)?;
+        let n_cols_in_shard = indptr.len().saturating_sub(1);
+        Ok(ScxCsc::new_unchecked(
+            (self.n_obs, n_cols_in_shard),
+            indptr,
+            indices,
+            data,
+        ))
+    }
+
+    /// Read and optionally cache a CSC shard, returning a shared
+    /// `Arc<ScxCsc>`. On cache hit increments `metrics.hits`; on miss
+    /// (or no cache) increments `metrics.misses` and decodes.
+    pub fn read_shard_cached(&self, shard_idx: usize) -> Result<Arc<ScxCsc>> {
+        if let Some(ref cache_mutex) = self.cache {
+            let mut cache = cache_mutex.lock().unwrap();
+            if let Some(cached) = cache.get(&shard_idx) {
+                if let Some(m) = &self.metrics {
+                    m.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(cached);
+            }
+        }
+        if let Some(m) = &self.metrics {
+            m.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        let csc = Arc::new(self.read_shard_uncached(shard_idx)?);
+        if let Some(ref cache_mutex) = self.cache {
+            let mut cache = cache_mutex.lock().unwrap();
+            cache.put(shard_idx, Arc::clone(&csc));
+        }
+        Ok(csc)
+    }
+
+    /// Read a contiguous column slice across CSC shards.
+    ///
+    /// Skips shards whose `[col_start, col_end)` does not intersect
+    /// `col_range`; `col_slice`s partial-overlap shards post-decode.
+    /// Cached: each overlapping shard is fetched via
+    /// [`Self::read_shard_cached`].
+    pub fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> Result<ScxCsc> {
+        let c_lo = col_range.start as u64;
+        let c_hi = col_range.end as u64;
+        if c_lo >= c_hi {
+            return Ok(ScxCsc::new_unchecked(
+                (self.n_obs, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let shard_indices = self.index.shards_for_col_range(c_lo, c_hi);
+
+        let mut decoded: Vec<ScxCsc> = Vec::with_capacity(shard_indices.len());
+        for shard_idx in shard_indices {
+            let csc = self.read_shard_cached(shard_idx)?;
+            let (shard_lo, shard_hi) = self.index.shard_col_range(shard_idx).ok_or_else(|| {
+                ScxError::InvalidCatalog(format!(
+                    "BackedCscIndex missing range for shard {shard_idx}"
+                ))
+            })?;
+            let lo_in_shard = c_lo.saturating_sub(shard_lo) as usize;
+            let hi_in_shard = (c_hi.min(shard_hi).saturating_sub(shard_lo)) as usize;
+            let sliced = if lo_in_shard == 0 && hi_in_shard == csc.n_cols() {
+                (*csc).clone()
+            } else {
+                csc.col_slice(lo_in_shard, hi_in_shard).map_err(|e| {
+                    ScxError::InvalidCatalog(format!(
+                        "BackedCscReader col_slice failed for shard {shard_idx}: {e}"
+                    ))
+                })?
+            };
+            decoded.push(sliced);
+        }
+        concatenate_csc_along_cols(decoded, self.n_obs)
+    }
+
+    /// Read an arbitrary sorted column subset by collapsing it to
+    /// contiguous runs and concatenating per-run `read_csc_columns`
+    /// results. Mirrors `ScxReader::read_csc_columns_subset` but uses
+    /// the cached shard reads.
+    pub fn read_csc_columns_subset(&self, cols: &[u32]) -> Result<ScxCsc> {
+        if cols.is_empty() {
+            return Ok(ScxCsc::new_unchecked(
+                (self.n_obs, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let mut runs: Vec<ScxCsc> = Vec::new();
+        let mut run_start = cols[0];
+        let mut run_end = cols[0] + 1;
+        for &c in &cols[1..] {
+            if c == run_end {
+                run_end = c + 1;
+            } else {
+                runs.push(self.read_csc_columns(run_start..run_end)?);
+                run_start = c;
+                run_end = c + 1;
+            }
+        }
+        runs.push(self.read_csc_columns(run_start..run_end)?);
+        if runs.len() == 1 {
+            return Ok(runs.pop().unwrap());
+        }
+        concatenate_csc_along_cols(runs, self.n_obs)
+    }
+}
+
+/// Concatenate a list of CSC parts along the column axis.
+/// Internal helper — the same logic also lives in `reader.rs` as a
+/// private free function. Local copy avoids cross-module visibility
+/// changes.
+fn concatenate_csc_along_cols(parts: Vec<ScxCsc>, n_rows: usize) -> Result<ScxCsc> {
+    if parts.is_empty() {
+        return Ok(ScxCsc::new_unchecked(
+            (n_rows, 0),
+            vec![0],
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    let total_cols: usize = parts.iter().map(|p| p.n_cols()).sum();
+    let total_nnz: usize = parts.iter().map(|p| p.nnz()).sum();
+    let mut indptr = Vec::with_capacity(total_cols + 1);
+    let mut indices = Vec::with_capacity(total_nnz);
+    let mut data = Vec::with_capacity(total_nnz);
+    indptr.push(0i64);
+    let mut cum_nnz: i64 = 0;
+    for part in parts {
+        let part_n_cols = part.n_cols();
+        for i in 1..=part_n_cols {
+            indptr.push(part.indptr[i] + cum_nnz);
+        }
+        cum_nnz += part.indptr[part_n_cols];
+        indices.extend_from_slice(&part.indices);
+        data.extend_from_slice(&part.data);
+    }
+    Ok(ScxCsc::new_unchecked(
+        (n_rows, total_cols),
+        indptr,
+        indices,
+        data,
+    ))
+}
+
+impl crate::shard_source::ColumnShardSource for BackedCscReader {
+    fn n_csc_shards(&self) -> usize {
+        BackedCscReader::n_shards(self)
+    }
+
+    fn n_obs(&self) -> usize {
+        BackedCscReader::n_obs(self)
+    }
+
+    fn n_vars(&self) -> usize {
+        BackedCscReader::n_vars(self)
+    }
+
+    fn read_csc_shard(&self, shard_idx: usize) -> Result<ScxCsc> {
+        // Owned clone — trait return type is `ScxCsc`, not `Arc<_>`.
+        Ok((*self.read_shard_cached(shard_idx)?).clone())
+    }
+
+    fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> Result<ScxCsc> {
+        BackedCscReader::read_csc_columns(self, col_range)
+    }
+
+    fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {
+        let (lo, hi) = self.index.shard_col_range(shard_idx)?;
+        let lo = u32::try_from(lo).ok()?;
+        let hi = u32::try_from(hi).ok()?;
+        Some((lo, hi))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CSR concatenation helper
 // ---------------------------------------------------------------------------
 
@@ -2112,5 +2548,242 @@ mod tests {
         assert_eq!(backed.shape(), (12, 10));
         assert_eq!(backed.n_obs(), 12);
         assert_eq!(backed.n_vars(), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // BackedCscReader tests
+    // -----------------------------------------------------------------------
+
+    /// Build a CSC arrays for a column range from a row-major dense
+    /// reference. Returns `(indptr_u64, indices_u32, values_u8)`.
+    fn csc_arrays_for_range(
+        dense: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+        col_start: usize,
+        col_end: usize,
+    ) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+        let mut indptr: Vec<u64> = vec![0];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for col in col_start..col_end {
+            for row in 0..n_rows {
+                let v = dense[row * n_cols + col];
+                if v != 0 {
+                    indices.push(row as u32);
+                    values.push(v);
+                }
+            }
+            indptr.push(indices.len() as u64);
+        }
+        (indptr, indices, values)
+    }
+
+    /// Write a CSR + 4-shard-CSC test file with `cols_per_csc_shard`
+    /// columns per CSC shard. Returns the path and the dense reference
+    /// matrix (row-major u8).
+    fn write_csc_test_file(
+        dir: &TempDir,
+        n_obs: usize,
+        n_vars: usize,
+        cols_per_csc_shard: usize,
+    ) -> (std::path::PathBuf, Vec<u8>) {
+        let path = dir.path().join("with_csc.scx");
+        let header = sample_header(n_obs as u64, n_vars as u64, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        // Build a deterministic row-major dense matrix; pick a nnz
+        // pattern that distributes values across all columns.
+        let mut dense = vec![0u8; n_obs * n_vars];
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                if (r + c) % 3 == 0 {
+                    dense[r * n_vars + c] = ((r * 7 + c * 11) % 200 + 1) as u8;
+                }
+            }
+        }
+
+        // CSR shard built from the dense matrix.
+        let mut indptr_csr = vec![0u64];
+        let mut indices_csr = Vec::new();
+        let mut values_csr = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = dense[r * n_vars + c];
+                if v != 0 {
+                    indices_csr.push(c as u32);
+                    values_csr.push(v);
+                }
+            }
+            indptr_csr.push(indices_csr.len() as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr_csr,
+                &indices_csr,
+                &values_csr,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // CSC sidecar split into shards by column.
+        let mut col_start = 0usize;
+        while col_start < n_vars {
+            let col_end = (col_start + cols_per_csc_shard).min(n_vars);
+            let (ip, ix, vb) = csc_arrays_for_range(&dense, n_obs, n_vars, col_start, col_end);
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    col_start as u64,
+                )
+                .unwrap();
+            col_start = col_end;
+        }
+        writer.finish().unwrap();
+        (path, dense)
+    }
+
+    #[test]
+    fn backed_csc_index_basic() {
+        // 12 rows × 10 cols, 3 cols per CSC shard → 4 shards: [0,3), [3,6), [6,9), [9,10).
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_csc_test_file(&dir, 12, 10, 3);
+        let reader = ScxReader::open(&path).unwrap();
+        let csc = BackedCscReader::new(reader, 0).unwrap();
+
+        assert_eq!(csc.n_shards(), 4);
+        assert_eq!(csc.n_obs(), 12);
+        assert_eq!(csc.n_vars(), 10);
+
+        // Per-shard ranges via the index.
+        let idx = csc.index();
+        assert_eq!(idx.shard_col_range(0), Some((0, 3)));
+        assert_eq!(idx.shard_col_range(1), Some((3, 6)));
+        assert_eq!(idx.shard_col_range(2), Some((6, 9)));
+        assert_eq!(idx.shard_col_range(3), Some((9, 10)));
+        assert_eq!(idx.shard_col_range(99), None);
+
+        // shards_for_col_range: cover shards 1+2 only.
+        assert_eq!(idx.shards_for_col_range(4, 8), vec![1, 2]);
+        assert_eq!(idx.shards_for_col_range(0, 10), vec![0, 1, 2, 3]);
+        // Half-open boundary exclusion.
+        assert_eq!(idx.shards_for_col_range(0, 3), vec![0]);
+        // Past the end / empty / inverted.
+        assert!(idx.shards_for_col_range(100, 200).is_empty());
+        assert!(idx.shards_for_col_range(5, 5).is_empty());
+
+        // shard_for_col single lookups.
+        assert_eq!(idx.shard_for_col(0), Some(0));
+        assert_eq!(idx.shard_for_col(2), Some(0));
+        assert_eq!(idx.shard_for_col(3), Some(1));
+        assert_eq!(idx.shard_for_col(9), Some(3));
+        assert_eq!(idx.shard_for_col(10), None);
+    }
+
+    #[test]
+    fn backed_csc_read_csc_columns_correctness() {
+        // 8 rows × 12 cols, 4 cols per CSC shard → 3 shards.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, dense) = write_csc_test_file(&dir, 8, 12, 4);
+        let reader = ScxReader::open(&path).unwrap();
+        let csc = BackedCscReader::new(reader, 4).unwrap();
+
+        // Helper: dense slice as f32 for column range [c_lo, c_hi).
+        let dense_slice = |c_lo: usize, c_hi: usize| -> Vec<f32> {
+            let cols = c_hi - c_lo;
+            let mut out = vec![0f32; 8 * cols];
+            for r in 0..8 {
+                for (oc, sc) in (c_lo..c_hi).enumerate() {
+                    out[r * cols + oc] = dense[r * 12 + sc] as f32;
+                }
+            }
+            out
+        };
+
+        for &(c_lo, c_hi) in &[(0u32, 12u32), (1, 5), (5, 11), (4, 8), (0, 0)] {
+            let got = csc.read_csc_columns(c_lo..c_hi).unwrap();
+            assert_eq!(got.shape, (8, (c_hi - c_lo) as usize));
+            assert_eq!(
+                got.to_dense().unwrap(),
+                dense_slice(c_lo as usize, c_hi as usize),
+                "mismatch on cols [{c_lo}..{c_hi})"
+            );
+        }
+    }
+
+    #[test]
+    fn backed_csc_read_csc_columns_skip_count_metric() {
+        // 8 rows × 12 cols, 4 cols per CSC shard → 3 shards.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_csc_test_file(&dir, 8, 12, 4);
+        let reader = ScxReader::open(&path).unwrap();
+        let mut csc = BackedCscReader::new(reader, 4).unwrap();
+        let metrics = csc.enable_metrics();
+
+        // Query that overlaps shards 0 and 1 (cols [2..6) crosses the
+        // 0..4 / 4..8 boundary). Shard 2 is skipped.
+        let _ = csc.read_csc_columns(2..6).unwrap();
+        let misses_after = metrics.misses.load(Ordering::Relaxed);
+        assert_eq!(misses_after, 2, "exactly 2 shard decodes expected");
+        assert_eq!(metrics.hits.load(Ordering::Relaxed), 0);
+
+        // Reissue same range — both shards now in cache → 0 new misses.
+        let _ = csc.read_csc_columns(2..6).unwrap();
+        assert_eq!(
+            metrics.misses.load(Ordering::Relaxed),
+            misses_after,
+            "no new decodes; both shards served from cache"
+        );
+        assert_eq!(metrics.hits.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn backed_csc_read_csc_columns_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, dense) = write_csc_test_file(&dir, 8, 12, 4);
+        let reader = ScxReader::open(&path).unwrap();
+        let csc = BackedCscReader::new(reader, 4).unwrap();
+
+        // Non-contiguous subset.
+        let cols = [0u32, 1, 5, 6, 11];
+        let got = csc.read_csc_columns_subset(&cols).unwrap();
+        assert_eq!(got.shape, (8, cols.len()));
+        let got_dense = got.to_dense().unwrap();
+        for (oc, &sc) in cols.iter().enumerate() {
+            for r in 0..8 {
+                assert_eq!(
+                    got_dense[r * cols.len() + oc],
+                    dense[r * 12 + sc as usize] as f32,
+                    "subset mismatch at row {r} col {sc}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backed_csc_column_shard_source_trait_dispatch() {
+        // Confirm the trait impl delegates correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_csc_test_file(&dir, 8, 12, 4);
+        let reader = ScxReader::open(&path).unwrap();
+        let csc = BackedCscReader::new(reader, 0).unwrap();
+        let trait_obj: &dyn crate::ColumnShardSource = &csc;
+        assert_eq!(trait_obj.n_csc_shards(), 3);
+        assert_eq!(trait_obj.n_obs(), 8);
+        assert_eq!(trait_obj.n_vars(), 12);
+        assert_eq!(trait_obj.shape(), (8, 12));
+        assert_eq!(trait_obj.csc_shard_col_range(0), Some((0, 4)));
+        assert_eq!(trait_obj.csc_shard_col_range(2), Some((8, 12)));
+        assert_eq!(trait_obj.csc_shard_col_range(99), None);
+        let s0 = trait_obj.read_csc_shard(0).unwrap();
+        assert_eq!(s0.n_cols(), 4);
     }
 }

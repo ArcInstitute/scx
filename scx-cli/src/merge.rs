@@ -5,7 +5,12 @@ use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_format::reader::ScxReader;
 
-pub fn run_merge(inputs: &[PathBuf], output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_merge(
+    inputs: &[PathBuf],
+    output: &Path,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Validate at least 2 inputs
     if inputs.len() < 2 {
         return Err("at least 2 files required for merge".into());
@@ -68,6 +73,13 @@ pub fn run_merge(inputs: &[PathBuf], output: &Path) -> Result<(), Box<dyn std::e
         total_obs,
         total_shards,
     );
+    drop(out_reader);
+
+    // Re-emit the CSC sidecar against the merged output.
+    if rebuild_csc {
+        crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        println!("Rebuilt CSC sidecar on {}", output.display());
+    }
 
     Ok(())
 }

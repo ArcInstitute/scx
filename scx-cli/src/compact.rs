@@ -8,6 +8,8 @@ pub fn run_compact(
     input: &Path,
     output: &Path,
     force: bool,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate input exists
     if !input.exists() {
@@ -56,6 +58,12 @@ pub fn run_compact(
         human_size(after_size),
         reduction,
     );
+
+    // Re-emit the CSC sidecar against the compacted output.
+    if rebuild_csc {
+        crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        println!("Rebuilt CSC sidecar on {}", output.display());
+    }
 
     Ok(())
 }

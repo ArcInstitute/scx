@@ -61,6 +61,14 @@ mod pipeline {
         pub shard_target_rows: u32,
         /// Explicit codec override. None = auto-select based on value distribution.
         pub codec: Option<CodecId>,
+        /// When `true`, also emit a CSC sidecar at write time (multi-shard
+        /// column-major layout). The CSR shards are still written first;
+        /// CSC chunks are produced via streaming transpose over the
+        /// in-memory CSR data.
+        pub csc: bool,
+        /// Columns per CSC shard when `csc == true`. `0` disables the
+        /// cap (single CSC shard, memory permitting).
+        pub csc_cols_per_shard: usize,
     }
 
     impl Default for ConvertOptions {
@@ -68,6 +76,8 @@ mod pipeline {
             ConvertOptions {
                 shard_target_rows: 16384,
                 codec: None,
+                csc: false,
+                csc_cols_per_shard: 5000,
             }
         }
     }
@@ -146,6 +156,22 @@ mod pipeline {
             codec_id,
             index_dtype,
         )?;
+
+        // Optional CSC sidecar — streaming transpose over the in-memory
+        // CSR data, one shard per chunk.
+        if opts.csc {
+            write_csc_shards_from_csr(
+                &mut writer,
+                &indptr,
+                &indices,
+                &data,
+                n_obs,
+                n_vars,
+                value_encoding,
+                codec_id,
+                opts.csc_cols_per_shard,
+            )?;
+        }
 
         // Write optional sections
         if let Ok(obsm_map) = read_obsm(&file) {
@@ -259,6 +285,21 @@ mod pipeline {
             index_dtype,
         )?;
 
+        // Optional CSC sidecar — same streaming transpose as h5ad.
+        if opts.csc {
+            write_csc_shards_from_csr(
+                &mut writer,
+                &tenx.indptr,
+                &tenx.indices,
+                &tenx.data,
+                tenx.n_cells,
+                tenx.n_genes,
+                value_encoding,
+                codec_id,
+                opts.csc_cols_per_shard,
+            )?;
+        }
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -277,6 +318,78 @@ mod pipeline {
 
     pub fn scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), ConvertError> {
         write_scx_to_h5ad(scx_path, h5ad_path)
+    }
+
+    /// Memory budget for the streaming CSR→CSC transpose at convert time.
+    ///
+    /// 4 GiB matches the `scx build-csc` default. The convert pipeline
+    /// already holds the full CSR matrix in RAM, so this only bounds
+    /// the per-chunk transpose working set. Large enough for typical
+    /// inputs; the user-facing knob is `csc_cols_per_shard`.
+    const CONVERT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+    /// Streaming CSR → CSC transpose over the in-memory matrix, with
+    /// the result written shard-by-shard via `writer.write_csc_shard`.
+    ///
+    /// Each emitted shard's column count is bounded by
+    /// `csc_cols_per_shard` (or the memory budget, whichever is
+    /// smaller). The CSR data already lives in `(indptr, indices, data)`
+    /// at this point in the pipeline — passed straight to the streaming
+    /// iterator without re-reading from disk.
+    #[allow(clippy::too_many_arguments)]
+    fn write_csc_shards_from_csr(
+        writer: &mut ScxWriter,
+        indptr: &[i64],
+        indices: &[i32],
+        data: &[f32],
+        n_obs: usize,
+        n_vars: usize,
+        value_encoding: ValueEncoding,
+        codec_id: CodecId,
+        csc_cols_per_shard: usize,
+    ) -> Result<(), ConvertError> {
+        // Wrap the in-memory CSR as a single ScxCsr "shard" for the
+        // transpose iterator. Use the unchecked constructor — these
+        // arrays were just produced by validated readers, no need to
+        // re-validate.
+        let csr = scx_sparse::ScxCsr::new_unchecked(
+            (n_obs, n_vars),
+            indptr.to_vec(),
+            indices.to_vec(),
+            data.to_vec(),
+        );
+        let shards = std::slice::from_ref(&csr);
+
+        let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
+            shards,
+            n_obs,
+            n_vars,
+            CONVERT_CSC_MEMORY_BYTES,
+            csc_cols_per_shard,
+        )
+        .map_err(|e| ConvertError::Other(format!("CSC transpose failed: {e}")))?;
+
+        loop {
+            let col_start = iter.current_col_start() as u64;
+            let chunk = match iter.next() {
+                Some(c) => c.map_err(|e| ConvertError::Other(format!("CSC chunk failed: {e}")))?,
+                None => break,
+            };
+
+            let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
+            let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
+            let raw_values = values_to_raw_bytes(&chunk.data, value_encoding);
+
+            writer.write_csc_shard(
+                &csc_indptr_u64,
+                &csc_indices_u32,
+                &raw_values,
+                codec_id,
+                value_encoding,
+                col_start,
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

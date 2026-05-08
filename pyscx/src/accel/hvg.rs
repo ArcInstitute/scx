@@ -34,8 +34,14 @@ use super::filtering::update_layers_col_projection;
 ///     n_bins: Number of bins for seurat flavor (default: 20)
 ///     device: Device selection — "auto" (default), "cpu", "gpu", or
 ///         "gpu:N" to target CUDA device N on multi-GPU systems.
+///     prefer_format: "csr" (default) or "csc". When "csc", the streaming
+///         mean/var and clipped-sum passes use the column-major sidecar
+///         instead of the row-major shards. Requires the file to have a
+///         CSC sidecar (`from_anndata(csc="always")`). Single-batch
+///         seurat_v3 only — multi-batch and seurat flavor raise on
+///         CSC. Mutually exclusive with `device != "cpu"`.
 #[pyfunction]
-#[pyo3(signature = (adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=false, n_bins=20, device="auto"))]
+#[pyo3(signature = (adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=false, n_bins=20, device="auto", prefer_format="csr"))]
 #[allow(clippy::too_many_arguments)]
 pub fn highly_variable_genes<'py>(
     py: Python<'py>,
@@ -47,7 +53,39 @@ pub fn highly_variable_genes<'py>(
     subset: bool,
     n_bins: usize,
     device: &str,
+    prefer_format: &str,
 ) -> PyResult<()> {
+    // Validate prefer_format up front (matches the constraint applied
+    // across all `pyscx.accel.*` entry points).
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+        )));
+    }
+    if prefer_format == "csc" {
+        // CSC HVG only handles single-batch seurat_v3 on CPU. Reject
+        // mismatched configurations with a clear message rather than
+        // silently falling back, since the user has explicitly opted in.
+        if batch_key.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' for HVG only supports single-batch mode; \
+                 pass batch_key=None or use prefer_format='csr'",
+            ));
+        }
+        if !matches!(flavor, "seurat_v3" | "seurat_v3_paper") {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' for HVG only supports flavor='seurat_v3' \
+                 (or 'seurat_v3_paper'); use prefer_format='csr' for 'seurat'",
+            ));
+        }
+        if device != "cpu" && device != "auto" {
+            return Err(PyRuntimeError::new_err(format!(
+                "prefer_format='csc' for HVG is mutually exclusive with device={device:?}; \
+                 set device='cpu' (or 'auto') or use prefer_format='csr'"
+            )));
+        }
+        return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor);
+    }
     let resolved = super::gpu::resolve_device(device)?;
     // GPU path is only supported for single-batch seurat_v3; emit a warning
     // and fall back to CPU otherwise so the call succeeds with correct results.
@@ -783,4 +821,173 @@ fn apply_hvg_subset(
     }
 
     Ok(())
+}
+
+/// Single-batch seurat_v3 HVG via the CSC dispatch.
+///
+/// Same numerics as `hvg_seurat_v3` for the single-batch case, but
+/// pulls per-column mean/var and clipped sums from `ColumnShardSource`
+/// instead of the CSR-side `streaming_mean_var_batched`. The loess fit
+/// (Python `skmisc.loess`), ranking, and result-writing logic are
+/// identical to the CSR path — duplicated rather than abstracted to
+/// keep the CSR side untouched.
+fn hvg_seurat_v3_csc(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    n_top_genes: usize,
+    span: f64,
+    subset: bool,
+    flavor: &str,
+) -> PyResult<()> {
+    use scx_format::ColumnShardSource;
+
+    let x = adata.getattr("X")?;
+
+    // Helper closure that runs the entire CSC seurat_v3 pipeline against
+    // a `&dyn ColumnShardSource`. Used by both the backed and lazy
+    // branches below to share the kernel invocations and the post-
+    // processing (loess, ranking, var-writing).
+    let run_pipeline = |source: &dyn ColumnShardSource, x_obj: &Bound<'_, PyAny>| -> PyResult<()> {
+        let n_obs = source.n_obs();
+        let n_vars = source.n_vars();
+
+        // ── 1. Single-pass per-column mean / var ────────────────────
+        let stats = scx_accel::streaming_mean_var_csc(source)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?;
+
+        // ── 2. Loess fit on (log10 mean, log10 var) for non-constant
+        //       genes — identical to the CSR seurat_v3 fit.
+        let mut estimat_var = vec![0.0f64; n_vars];
+        let not_const: Vec<bool> = stats.variances.iter().map(|&v| v > 0.0).collect();
+        let x_vals: Vec<f64> = stats
+            .means
+            .iter()
+            .zip(not_const.iter())
+            .filter(|(_, &nc)| nc)
+            .map(|(&m, _)| m.max(1e-300).log10())
+            .collect();
+        let y_vals: Vec<f64> = stats
+            .variances
+            .iter()
+            .zip(not_const.iter())
+            .filter(|(_, &nc)| nc)
+            .map(|(&v, _)| v.max(1e-300).log10())
+            .collect();
+
+        if x_vals.len() >= 3 {
+            let x_arr = numpy::PyArray::from_vec(py, x_vals);
+            let y_arr = numpy::PyArray::from_vec(py, y_vals);
+            let loess_mod = py.import("skmisc.loess")?;
+            let loess_cls = loess_mod.getattr("loess")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("span", span)?;
+            kwargs.set_item("degree", 2)?;
+            let model = loess_cls.call((x_arr, y_arr), Some(&kwargs))?;
+            model.call_method0("fit")?;
+            let fitted: Vec<f64> = model
+                .getattr("outputs")?
+                .getattr("fitted_values")?
+                .extract()?;
+            let mut fi = 0;
+            for (j, &nc) in not_const.iter().enumerate() {
+                if nc {
+                    estimat_var[j] = fitted[fi];
+                    fi += 1;
+                }
+            }
+        }
+
+        // ── 3. clip_val per gene — `reg_std * sqrt(n) + mean`.
+        let mut clip_val = vec![0.0f64; n_vars];
+        let n_f = n_obs as f64;
+        let sqrt_n = n_f.sqrt();
+        for j in 0..n_vars {
+            let reg_std = 10.0f64.powf(estimat_var[j]).sqrt();
+            clip_val[j] = reg_std * sqrt_n + stats.means[j];
+        }
+
+        // ── 4. Single-pass per-column clipped sum / sum_sq.
+        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(source, &clip_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
+
+        // ── 5. Compute normalized variance per gene.
+        let denom_n = (n_f - 1.0).max(1.0);
+        let mut norm_gene_var = vec![0.0f64; n_vars];
+        for j in 0..n_vars {
+            let reg_std_sq = 10.0f64.powf(estimat_var[j]);
+            if reg_std_sq > 0.0 {
+                norm_gene_var[j] = (1.0 / (denom_n * reg_std_sq))
+                    * (n_f * stats.means[j] * stats.means[j] + sbcs[j]
+                        - 2.0 * bcs[j] * stats.means[j]);
+            }
+        }
+
+        // ── 6. Single-batch ranking: sort by normalized variance desc.
+        //       (Multi-batch logic is unreachable here — gated upstream.)
+        let mut indices: Vec<usize> = (0..n_vars).collect();
+        indices.sort_by(|&a, &b| {
+            norm_gene_var[b]
+                .partial_cmp(&norm_gene_var[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut hvg_mask = vec![false; n_vars];
+        let mut ranks = vec![f64::NAN; n_vars];
+        for (r, &g) in indices.iter().enumerate().take(n_top_genes.min(n_vars)) {
+            hvg_mask[g] = true;
+            ranks[g] = r as f64;
+        }
+        let _ = flavor; // single-batch path: seurat_v3 / seurat_v3_paper share ordering.
+
+        // ── 7. Write to adata.var (matches CSR seurat_v3 schema).
+        let var = adata.getattr("var")?;
+        var.set_item(
+            "highly_variable",
+            numpy::PyArray::from_vec(py, hvg_mask.clone()),
+        )?;
+        var.set_item("means", numpy::PyArray::from_vec(py, stats.means))?;
+        var.set_item("variances", numpy::PyArray::from_vec(py, stats.variances))?;
+        var.set_item(
+            "variances_norm",
+            numpy::PyArray::from_vec(py, norm_gene_var),
+        )?;
+        var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
+
+        // ── 8. Optionally subset adata to HVG.
+        if subset {
+            apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+        }
+        Ok(())
+    };
+
+    // Dispatch: backed yields a borrowed `&dyn`, lazy yields an owned
+    // `LazyShardSource` (we then borrow from it).
+    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+        let backed_ref = backed.borrow();
+        let source = backed_ref.as_column_source().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "CSC requested but unavailable: file has no CSC sidecar, \
+                 or a row deletion vector is active. Re-import with \
+                 `csc=\"always\"` or pass `prefer_format='csr'`.",
+            )
+        })?;
+        return run_pipeline(source, &x);
+    }
+
+    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+        let lazy_ref = lazy.borrow();
+        let lazy_src = lazy_ref.as_column_source().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "CSC requested but unavailable: file has no CSC sidecar, \
+                 the transform chain contains a non-column-local op \
+                 (NormalizeTotal or RowScale), or a row deletion vector \
+                 is active. Pass `prefer_format='csr'` to use the CSR path.",
+            )
+        })?;
+        return run_pipeline(&lazy_src, &x);
+    }
+
+    Err(PyRuntimeError::new_err(
+        "prefer_format='csc' requires adata.X to be ScxBackedSparseDataset \
+         or ScxLazyTransformedDataset (got a regular scipy/dense matrix)",
+    ))
 }

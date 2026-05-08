@@ -167,6 +167,11 @@ fn write_query_result(
 
     let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
 
+    // `flags: 0` and `n_csc_shards: 0` are intentional: query-result
+    // materialization writes a freshly-projected CSR matrix; the
+    // input file's CSC sidecar (if any) does not match the projected
+    // row/column space, so we don't carry it forward. Re-run
+    // `scx build-csc` against the output if a CSC sidecar is needed.
     let header = FileHeader {
         magic: scx_format::MAGIC,
         format_version: 1,

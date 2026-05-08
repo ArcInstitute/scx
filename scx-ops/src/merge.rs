@@ -54,8 +54,29 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 
     let first_header = readers[0].header();
 
+    // CSC sidecars are dropped on merge: row layout is
+    // re-concatenated across inputs, so any per-input CSC `indices`
+    // arrays would reference stale row indices in the merged output.
+    // Caller can opt back in via `--rebuild-csc` on the CLI.
+    // Phase H.3.
+    let any_input_had_csc = readers.iter().any(|r| r.header().has_csc());
+    if any_input_had_csc {
+        let inputs_str = input_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!(
+            "merge dropped CSC shards from at least one input ({inputs_str}): \
+             rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
+             column-major sidecar on the merged output"
+        );
+    }
+
     // Build output header. codec_id is 0 (None) because actual codec is
-    // selected per-shard via select_codec().
+    // selected per-shard via select_codec(). `flags` stays 0 — merge
+    // intentionally produces a clean output header rather than carrying
+    // input flag state forward.
     let out_header = FileHeader {
         magic: MAGIC,
         format_version: 1,

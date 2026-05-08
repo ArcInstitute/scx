@@ -12,7 +12,9 @@ use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
-use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
+use scx_format::shard::{
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
+};
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
@@ -271,7 +273,7 @@ pub fn append(
         let sh = ShardHeader {
             magic: SHARD_MAGIC,
             shard_format_version: 1,
-            shard_type: 0,
+            shard_type: derive_shard_type(SectionType::CsrShard),
             codec_id: shard_codec as u8,
             value_encoding: value_encoding as u8,
             index_dtype: header.index_dtype,
@@ -403,14 +405,36 @@ pub fn append(
     let prov_checksum = blake3_hash(&prov_bytes);
     write_offset += prov_length;
 
-    // Build new catalog: old entries (minus old obs, minus old provenance) + new shards + new obs + new provenance
+    // Build new catalog: old entries (minus old obs, minus old provenance,
+    // minus stale CSC shards) + new shards + new obs + new provenance.
+    //
+    // CSC sidecars index global rows: appending rows shifts the row space
+    // but the on-disk CSC `indices` arrays still reference the old row
+    // count, so they must be dropped. Caller can opt back in via
+    // `--rebuild-csc` in the CLI.
+    let had_csc = header.has_csc();
+    let n_dropped_csc = old_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard)
+        .count();
     let mut new_entries: Vec<FullCatalogEntry> = old_catalog
         .entries
         .into_iter()
         .filter(|e| {
-            e.section_type != SectionType::ObsMetadata && e.section_type != SectionType::Provenance
+            e.section_type != SectionType::ObsMetadata
+                && e.section_type != SectionType::Provenance
+                && e.section_type != SectionType::CscShard
         })
         .collect();
+    if had_csc {
+        log::warn!(
+            "append dropped {n_dropped_csc} CSC shards from {target}: \
+             rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
+             column-major sidecar",
+            target = target_path.display()
+        );
+    }
 
     new_entries.extend(new_shard_entries);
     new_entries.push(FullCatalogEntry {
@@ -488,6 +512,11 @@ pub fn append(
         .iter()
         .filter(|e| e.section_type == SectionType::CsrShard)
         .count() as u32;
+    // CSC sidecars were filtered out of `new_entries` above; reflect
+    // that in the header's count + flag bit so readers don't try to
+    // load shards that are no longer in the catalog.
+    header.n_csc_shards = 0;
+    header.clear_csc();
     header.full_catalog_offset = new_catalog_offset;
     header.full_catalog_length = new_catalog_length;
     header.manifest_sequence = new_manifest_sequence;

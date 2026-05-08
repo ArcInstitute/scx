@@ -8,7 +8,7 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use memmap2::Mmap;
 use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
-use scx_sparse::ScxCsr;
+use scx_sparse::{ScxCsc, ScxCsr};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -266,6 +266,222 @@ impl ScxReader {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // CSC shard reading (Phase A.3)
+    // -----------------------------------------------------------------------
+
+    /// Number of CSC shards in the file (from the file header).
+    pub fn csc_shard_count(&self) -> u32 {
+        self.header.n_csc_shards
+    }
+
+    /// Read a single CSC shard by index in catalog order, returning a
+    /// fully-validated `ScxCsc`.
+    ///
+    /// The shard's `[col_start, col_end)` is taken from the catalog
+    /// `ShardStats` (axis-overloaded `row_start`/`row_end`); within the
+    /// shard, `indices` are global row indices.
+    pub fn read_csc_shard(&self, shard_idx: usize) -> Result<ScxCsc> {
+        let shards = self.full_catalog.csc_shards_sorted();
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_csc_from_entry(shards[shard_idx])
+    }
+
+    /// Read all CSC shards and concatenate them along the column axis.
+    pub fn read_all_csc_shards(&self) -> Result<ScxCsc> {
+        let shards = self.full_catalog.csc_shards_sorted();
+        self.assemble_csc_shards(&shards)
+    }
+
+    /// Read a contiguous range of columns. Skips CSC shards whose
+    /// `[col_start, col_end)` does not intersect `col_range`. Partially
+    /// overlapping shards are decoded and `col_slice`d post-decode.
+    pub fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> Result<ScxCsc> {
+        let c_lo = col_range.start as u64;
+        let c_hi = col_range.end as u64;
+        let n_rows = self.header.n_obs as usize;
+
+        if c_lo >= c_hi {
+            return Ok(ScxCsc::new_unchecked(
+                (n_rows, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let shards = self.full_catalog.csc_shards_for_col_range(c_lo, c_hi);
+
+        // Decode each shard, then column-slice partial overlaps to the
+        // intersection with [c_lo, c_hi).
+        let mut decoded: Vec<ScxCsc> = Vec::with_capacity(shards.len());
+        for entry in &shards {
+            let csc = self.read_csc_from_entry(entry)?;
+            let stats = entry.stats.as_ref().ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("CSC shard '{}' missing stats block", entry.name))
+            })?;
+            let shard_lo = stats.major_start();
+            let shard_hi = stats.major_end();
+            let lo_in_shard = c_lo.saturating_sub(shard_lo) as usize;
+            let hi_in_shard = (c_hi.min(shard_hi).saturating_sub(shard_lo)) as usize;
+            let sliced = if lo_in_shard == 0 && hi_in_shard == csc.n_cols() {
+                csc
+            } else {
+                csc.col_slice(lo_in_shard, hi_in_shard).map_err(|e| {
+                    ScxError::InvalidCatalog(format!(
+                        "CSC col_slice failed for shard '{}': {e}",
+                        entry.name
+                    ))
+                })?
+            };
+            decoded.push(sliced);
+        }
+
+        concatenate_csc_along_cols(decoded, n_rows)
+    }
+
+    /// Read an arbitrary sorted column subset by collapsing it to
+    /// contiguous runs and concatenating per-run `read_csc_columns`
+    /// results. The caller is responsible for sorting `cols`; duplicates
+    /// are not deduplicated.
+    pub fn read_csc_columns_subset(&self, cols: &[u32]) -> Result<ScxCsc> {
+        let n_rows = self.header.n_obs as usize;
+        if cols.is_empty() {
+            return Ok(ScxCsc::new_unchecked(
+                (n_rows, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        // Detect contiguous runs and read each as one column slice.
+        let mut runs: Vec<ScxCsc> = Vec::new();
+        let mut run_start = cols[0];
+        let mut run_end = cols[0] + 1;
+        for &c in &cols[1..] {
+            if c == run_end {
+                run_end = c + 1;
+            } else if c < run_end {
+                // Non-monotonic input — fall through to a single-column
+                // slice rather than silently re-using the run buffer.
+                runs.push(self.read_csc_columns(run_start..run_end)?);
+                run_start = c;
+                run_end = c + 1;
+            } else {
+                runs.push(self.read_csc_columns(run_start..run_end)?);
+                run_start = c;
+                run_end = c + 1;
+            }
+        }
+        runs.push(self.read_csc_columns(run_start..run_end)?);
+
+        if runs.len() == 1 {
+            return Ok(runs.pop().unwrap());
+        }
+        concatenate_csc_along_cols(runs, n_rows)
+    }
+
+    /// Decode a single CSC shard from a catalog entry. The decoded
+    /// arrays are validated and wrapped in `ScxCsc::new_unchecked` (the
+    /// shard payload was BLAKE3-checksummed when the catalog was
+    /// verified at `open()`).
+    fn read_csc_from_entry(&self, entry: &FullCatalogEntry) -> Result<ScxCsc> {
+        let (indptr, indices, data) = self.read_shard_from_entry(entry)?;
+        // For CSC: n_major == n_cols_in_shard, indices are global row
+        // indices in [0, n_obs). The shard header's n_minor is set to
+        // n_vars by the writer (since n_minor reuses the file's n_vars
+        // slot); the actual column count is len(indptr) - 1.
+        let n_cols_in_shard = indptr.len().saturating_sub(1);
+        let n_rows = self.header.n_obs as usize;
+        Ok(ScxCsc::new_unchecked(
+            (n_rows, n_cols_in_shard),
+            indptr,
+            indices,
+            data,
+        ))
+    }
+
+    /// Concatenate a sorted list of CSC shards along the column axis.
+    /// Each shard contributes its columns in order; indptr offsets are
+    /// rebased via cumulative-nnz prefix accumulation. CSC `indices` are
+    /// already global row IDs and need no offsetting.
+    fn assemble_csc_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsc> {
+        let n_rows = self.header.n_obs as usize;
+        if shards.is_empty() {
+            return Ok(ScxCsc::new_unchecked(
+                (n_rows, 0),
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let decoded: Vec<ScxCsc> = shards
+            .iter()
+            .map(|entry| self.read_csc_from_entry(entry))
+            .collect::<Result<_>>()?;
+
+        concatenate_csc_along_cols(decoded, n_rows)
+    }
+}
+
+/// Concatenate a list of CSC shards along the column axis.
+///
+/// Each shard contributes its columns in order; the result's indptr is
+/// length `1 + Σ n_cols_in_shard` with cumulative-nnz prefix sums.
+/// Indices and data are concatenated verbatim (CSC indices are global
+/// row IDs).
+///
+/// `n_rows` is the global row count (every shard must share this; the
+/// caller is responsible for the invariant).
+fn concatenate_csc_along_cols(parts: Vec<ScxCsc>, n_rows: usize) -> Result<ScxCsc> {
+    if parts.is_empty() {
+        return Ok(ScxCsc::new_unchecked(
+            (n_rows, 0),
+            vec![0],
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let total_cols: usize = parts.iter().map(|p| p.n_cols()).sum();
+    let total_nnz: usize = parts.iter().map(|p| p.nnz()).sum();
+
+    let mut indptr = Vec::with_capacity(total_cols + 1);
+    let mut indices = Vec::with_capacity(total_nnz);
+    let mut data = Vec::with_capacity(total_nnz);
+
+    indptr.push(0i64);
+    let mut cum_nnz: i64 = 0;
+
+    for part in parts {
+        let part_n_cols = part.n_cols();
+        // Append indptr[1..] with cumulative offset; the leading 0 is
+        // already in `indptr` (or is replaced by the previous part's
+        // last entry).
+        for i in 1..=part_n_cols {
+            indptr.push(part.indptr[i] + cum_nnz);
+        }
+        cum_nnz += part.indptr[part_n_cols];
+        indices.extend_from_slice(&part.indices);
+        data.extend_from_slice(&part.data);
+    }
+
+    Ok(ScxCsc::new_unchecked(
+        (n_rows, total_cols),
+        indptr,
+        indices,
+        data,
+    ))
+}
+
+impl ScxReader {
     // -----------------------------------------------------------------------
     // Layer reading (11.9–11.10)
     // -----------------------------------------------------------------------
@@ -1575,6 +1791,158 @@ mod tests {
         for (name, passed) in &results {
             assert!(passed, "section '{}' failed checksum", name);
         }
+    }
+
+    /// Phase J.2: validate() re-checks BLAKE3 for CSC shards via the
+    /// generic catalog walk. Build a CSR + CSC test file, verify all
+    /// CSC sections appear in the results and pass.
+    #[test]
+    fn test_validate_csc_shards_pass_on_clean_file() {
+        use crate::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc_clean.scx");
+
+        // Build a small CSR + CSC file directly.
+        let n_obs = 8usize;
+        let n_vars = 6usize;
+        let header = sample_header(n_obs as u64, n_vars as u64, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        // CSR (single shard)
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // CSC: two shards of 3 cols each.
+        for chunk_start in (0..n_vars).step_by(3) {
+            let chunk_end = (chunk_start + 3).min(n_vars);
+            let mut ip = vec![0u64];
+            let mut ix: Vec<u32> = Vec::new();
+            let mut vb: Vec<u8> = Vec::new();
+            for c in chunk_start..chunk_end {
+                ix.push((c % n_obs) as u32);
+                vb.push((c as u8) + 1);
+                ip.push(ix.len() as u64);
+            }
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    chunk_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let results = reader.validate().unwrap();
+
+        // Confirm the CSC shards are in the results AND all pass.
+        let csc_results: Vec<_> = results
+            .iter()
+            .filter(|(name, _)| name.starts_with("X_csc_shard_"))
+            .collect();
+        assert_eq!(csc_results.len(), 2, "expected 2 CSC shards in validate()");
+        for (name, passed) in &csc_results {
+            assert!(*passed, "CSC section '{}' failed checksum", name);
+        }
+
+        // Also confirm `validate()` walks every catalog entry: total
+        // results count >= number of catalog entries with CscShard
+        // type, so no CSC entry was silently skipped.
+        let n_csc_entries = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .count();
+        let n_csc_in_results = results
+            .iter()
+            .filter(|(name, _)| name.starts_with("X_csc_shard_"))
+            .count();
+        assert_eq!(n_csc_entries, n_csc_in_results);
+    }
+
+    /// Phase J.2: validate() flags corruption inside a CSC shard.
+    /// CSC is not in the "essential" set (corrupting only CSC
+    /// shouldn't fail the full file), so we expect Ok with a
+    /// `passed=false` row for the corrupted CSC section.
+    #[test]
+    fn test_validate_detects_csc_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc_corrupt.scx");
+
+        let n_obs = 6usize;
+        let n_vars = 4usize;
+        let header = sample_header(n_obs as u64, n_vars as u64, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        // One CSC shard.
+        let ip = vec![0u64, 1, 2, 3, 4];
+        let ix: Vec<u32> = vec![0, 1, 2, 3];
+        let vb: Vec<u8> = vec![10, 20, 30, 40];
+        writer
+            .write_csc_shard(&ip, &ix, &vb, CodecId::None, ValueEncoding::Uint8, 0)
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Find the CSC shard offset in the catalog.
+        let reader = ScxReader::open(&path).unwrap();
+        let csc_entry = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == crate::section::SectionType::CscShard)
+            .unwrap()
+            .clone();
+        let csc_offset = csc_entry.offset as usize;
+        drop(reader);
+
+        // Flip a byte in the CSC payload (after the 76-byte header).
+        let mut data = std::fs::read(&path).unwrap();
+        let corrupt_pos = csc_offset + SHARD_HEADER_SIZE + 1;
+        data[corrupt_pos] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        // validate() should NOT return Err (CSC is not "essential"),
+        // but should report the CSC section as failed.
+        let reader = ScxReader::open(&path).unwrap();
+        let results = reader.validate().expect(
+            "validate() should not error on CSC corruption since CSC is not \
+             in the essential-section set",
+        );
+        let csc_passed: bool = results
+            .iter()
+            .find(|(name, _)| name == &csc_entry.name)
+            .map(|(_, p)| *p)
+            .expect("CSC entry should appear in validate() results");
+        assert!(!csc_passed, "validate() should flag corrupted CSC section");
     }
 
     // -----------------------------------------------------------------------

@@ -11,6 +11,7 @@ mod delete;
 mod info;
 mod merge;
 mod query;
+mod rebuild_csc;
 mod rewrite_helpers;
 mod rollback;
 mod subset;
@@ -58,6 +59,18 @@ enum Commands {
         /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
+        /// Whether to also emit a CSC sidecar at write time.
+        ///
+        /// `off` (default): CSR-only output, matches existing behavior.
+        /// `always`: also emits a CSC sidecar (column-major shards).
+        /// No `auto` mode — by design, users opt in explicitly.
+        #[arg(long, default_value = "off", value_parser = ["off", "always"])]
+        csc: String,
+        /// Columns per CSC shard when `--csc always` (default 5000).
+        ///
+        /// Pass `0` to disable the cap (single CSC shard, memory permitting).
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Display SCX file information
     Info {
@@ -91,6 +104,15 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value = "10000")]
         shard_size: u32,
+        /// Rebuild the CSC sidecar after appending (drops + re-emits via
+        /// `scx build-csc`). Without this flag, append drops the CSC
+        /// sidecar with a warning — the row layout no longer matches.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc` is
+        /// set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Logically delete cells matching a predicate
     Delete {
@@ -113,6 +135,16 @@ enum Commands {
         /// Overwrite output if it exists
         #[arg(long)]
         force: bool,
+        /// Rebuild the CSC sidecar on the compacted output (drops +
+        /// re-emits via `scx build-csc`). Without this flag, compact
+        /// drops the CSC sidecar with a warning — the row layout no
+        /// longer matches after deletion-vector application.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
+        /// is set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -129,6 +161,15 @@ enum Commands {
         /// Output path for merged file
         #[arg(long)]
         output: PathBuf,
+        /// Rebuild the CSC sidecar on the merged output (drops +
+        /// re-emits via `scx build-csc`). Without this flag, merge
+        /// drops any input CSC sidecars with a warning.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
+        /// is set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Query cells by predicate
     Query {
@@ -238,6 +279,15 @@ enum Commands {
         /// Overwrite output if it exists
         #[arg(long)]
         force: bool,
+        /// Maximum columns per emitted CSC shard (default: 5000).
+        ///
+        /// Drives multi-shard CSC layouts: the writer emits ceil(n_vars
+        /// / N) CSC shards, each covering a contiguous column range.
+        /// Smaller values enable finer-grained column-range pushdown at
+        /// read time but produce more shards. Pass 0 for no cap (single
+        /// shard, memory permitting).
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Extract a subset of cells and/or genes into a new SCX file
     Subset {
@@ -261,6 +311,16 @@ enum Commands {
         /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
+        /// Rebuild the CSC sidecar on the subset output (drops +
+        /// re-emits via `scx build-csc` against the projected CSR).
+        /// Without this flag, subset drops any input CSC sidecar
+        /// with a warning — the row/column index space changes.
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
+        /// is set (default: 5000). Ignored without `--rebuild-csc`.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
     },
     /// Upgrade an SCX file to the latest format version
     Upgrade {
@@ -289,6 +349,8 @@ fn main() {
             to,
             shard_size,
             codec,
+            csc,
+            csc_cols_per_shard,
         } => run_convert(
             &input,
             &output,
@@ -296,6 +358,8 @@ fn main() {
             to.as_deref(),
             shard_size,
             &codec,
+            &csc,
+            csc_cols_per_shard,
         ),
         Commands::Info {
             file,
@@ -317,7 +381,16 @@ fn main() {
             input,
             codec,
             shard_size,
-        } => append::run_append(&target, &input, &codec, shard_size),
+            rebuild_csc,
+            csc_cols_per_shard,
+        } => append::run_append(
+            &target,
+            &input,
+            &codec,
+            shard_size,
+            rebuild_csc,
+            csc_cols_per_shard,
+        ),
         Commands::Delete {
             file,
             filter,
@@ -327,9 +400,16 @@ fn main() {
             input,
             output,
             force,
-        } => compact::run_compact(&input, &output, force),
+            rebuild_csc,
+            csc_cols_per_shard,
+        } => compact::run_compact(&input, &output, force, rebuild_csc, csc_cols_per_shard),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
-        Commands::Merge { inputs, output } => merge::run_merge(&inputs, &output),
+        Commands::Merge {
+            inputs,
+            output,
+            rebuild_csc,
+            csc_cols_per_shard,
+        } => merge::run_merge(&inputs, &output, rebuild_csc, csc_cols_per_shard),
         Commands::Query {
             file,
             filter,
@@ -362,7 +442,8 @@ fn main() {
             output,
             memory_limit,
             force,
-        } => build_csc::run_build_csc(&input, &output, &memory_limit, force),
+            csc_cols_per_shard,
+        } => build_csc::run_build_csc(&input, &output, &memory_limit, force, csc_cols_per_shard),
         Commands::Subset {
             input,
             output,
@@ -371,6 +452,8 @@ fn main() {
             dry_run,
             shard_size,
             codec,
+            rebuild_csc,
+            csc_cols_per_shard,
         } => subset::run_subset(
             &input,
             output.as_deref(),
@@ -379,6 +462,8 @@ fn main() {
             dry_run,
             shard_size,
             &codec,
+            rebuild_csc,
+            csc_cols_per_shard,
         ),
         Commands::Upgrade {
             input,
@@ -421,6 +506,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_convert(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -428,6 +514,8 @@ fn run_convert(
     to: Option<&str>,
     shard_size: u32,
     codec: &str,
+    csc: &str,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine conversion direction from explicit flags or file extensions
     let direction = match (from, to) {
@@ -451,23 +539,54 @@ fn run_convert(
         }
     };
 
+    // CSC mode is meaningful only on input → SCX paths. Reject silently
+    // for output paths (h5ad / mtx) where the destination has no CSC
+    // concept.
+    let csc_always = match csc {
+        "off" => false,
+        "always" => true,
+        // clap value_parser already restricts to {off, always}; this
+        // arm is defensive.
+        other => return Err(format!("invalid --csc value: {other}").into()),
+    };
+
     // MTX conversions are always available (no hdf5 feature needed)
     match direction {
-        "mtx_to_scx" => return dispatch_mtx_to_scx(input, output, shard_size, codec),
+        "mtx_to_scx" => {
+            return dispatch_mtx_to_scx(
+                input,
+                output,
+                shard_size,
+                codec,
+                csc_always,
+                csc_cols_per_shard,
+            );
+        }
         "scx_to_mtx" => return dispatch_scx_to_mtx(input, output),
         _ => {}
     }
 
-    dispatch_convert(direction, input, output, shard_size, codec)
+    dispatch_convert(
+        direction,
+        input,
+        output,
+        shard_size,
+        codec,
+        csc_always,
+        csc_cols_per_shard,
+    )
 }
 
 #[cfg(feature = "hdf5")]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_convert(
     direction: &str,
     input: &std::path::Path,
     output: &std::path::Path,
     shard_size: u32,
     codec: &str,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -492,6 +611,8 @@ fn dispatch_convert(
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
         codec: explicit_codec,
+        csc: csc_always,
+        csc_cols_per_shard,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -521,12 +642,15 @@ fn dispatch_convert(
 }
 
 #[cfg(not(feature = "hdf5"))]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_convert(
     _direction: &str,
     _input: &std::path::Path,
     _output: &std::path::Path,
     _shard_size: u32,
     _codec: &str,
+    _csc_always: bool,
+    _csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
@@ -541,6 +665,8 @@ fn dispatch_mtx_to_scx(
     output: &std::path::Path,
     shard_size: u32,
     codec: &str,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::mtx_pipeline;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -554,8 +680,21 @@ fn dispatch_mtx_to_scx(
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
     mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
-
     pb.finish_and_clear();
+
+    // MTX conversion is delegated to the standalone `scx-mtx` crate,
+    // which doesn't know about CSC. When the user opts in via
+    // `--csc always`, post-process the just-written file with the
+    // existing build-csc machinery: write to `<output>.csc.tmp`, then
+    // atomically rename onto the final path. Costs an extra read pass
+    // but adds the CSC sidecar without modifying scx-mtx.
+    if csc_always {
+        let tmp = output.with_extension("scx.csc.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        build_csc::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard)?;
+        std::fs::rename(&tmp, output)?;
+    }
+
     println!("Converted {} -> {}", input.display(), output.display());
     Ok(())
 }

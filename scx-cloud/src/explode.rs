@@ -123,6 +123,18 @@ pub(crate) fn section_name_to_path(
                 })?;
             Ok(format!("X/{idx:06}.shard"))
         }
+        SectionType::CscShard => {
+            // "X_csc_shard_N" → "Xc/NNNNNN.shard"
+            // Parallel naming to CsrShard's `X/` directory; the `c`
+            // suffix marks the column-major sidecar.
+            let idx: u32 = name
+                .strip_prefix("X_csc_shard_")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    format!("invalid CscShard name: expected 'X_csc_shard_N', got '{name}'")
+                })?;
+            Ok(format!("Xc/{idx:06}.shard"))
+        }
         SectionType::ObsmEmbedding => {
             // "obsm/{name}" → "obsm/{name}.arrow"
             let obsm_name = name.strip_prefix("obsm/").unwrap_or(name);
@@ -191,6 +203,16 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
                 .unwrap();
             let idx: u32 = idx_str.parse().ok()?;
             Some((format!("X_shard_{idx}"), SectionType::CsrShard))
+        }
+        // Reverse of "X_csc_shard_N" → "Xc/NNNNNN.shard".
+        _ if rel_path.starts_with("Xc/") && rel_path.ends_with(".shard") => {
+            let idx_str = rel_path
+                .strip_prefix("Xc/")
+                .unwrap()
+                .strip_suffix(".shard")
+                .unwrap();
+            let idx: u32 = idx_str.parse().ok()?;
+            Some((format!("X_csc_shard_{idx}"), SectionType::CscShard))
         }
         _ if rel_path.starts_with("obsm/") && rel_path.ends_with(".arrow") => {
             let name = rel_path
@@ -295,6 +317,21 @@ mod tests {
         assert!(section_name_to_path("bad_name", SectionType::CsrShard).is_err());
         assert!(section_name_to_path("raw_counts_shard_xyz", SectionType::LayerCsrShard).is_err());
         assert!(section_name_to_path("obsp/dist_shard_xyz", SectionType::ObspCsrShard).is_err());
+        // CSC shard names must follow X_csc_shard_N pattern.
+        assert!(section_name_to_path("X_csc_shard_abc", SectionType::CscShard).is_err());
+        assert!(section_name_to_path("X_shard_0", SectionType::CscShard).is_err());
+    }
+
+    #[test]
+    fn test_csc_shard_path_mapping() {
+        assert_eq!(
+            section_name_to_path("X_csc_shard_0", SectionType::CscShard).unwrap(),
+            "Xc/000000.shard"
+        );
+        assert_eq!(
+            section_name_to_path("X_csc_shard_5", SectionType::CscShard).unwrap(),
+            "Xc/000005.shard"
+        );
     }
 
     #[test]
@@ -304,6 +341,8 @@ mod tests {
             ("var", SectionType::VarMetadata),
             ("X_shard_0", SectionType::CsrShard),
             ("X_shard_42", SectionType::CsrShard),
+            ("X_csc_shard_0", SectionType::CscShard),
+            ("X_csc_shard_5", SectionType::CscShard),
             ("obsm/X_pca", SectionType::ObsmEmbedding),
             ("uns", SectionType::UnsBlob),
             ("provenance", SectionType::Provenance),

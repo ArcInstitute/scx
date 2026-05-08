@@ -18,6 +18,7 @@
 //!   energy distance, discrimination score, knockdown, clustering agreement)
 //! - `util` — Shared CSR extraction helpers
 
+pub mod col_aggs;
 pub mod de;
 pub mod eval_metrics;
 pub mod filtering;

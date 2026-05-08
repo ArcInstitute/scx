@@ -131,6 +131,111 @@ fn write_test_file(
     path
 }
 
+/// Build CSC arrays for a single column range over a u8 dense matrix.
+fn dense_to_csc_range(
+    dense: &[u8],
+    n_obs: usize,
+    n_vars: usize,
+    col_start: usize,
+    col_end: usize,
+) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+    let mut indptr: Vec<u64> = vec![0];
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for c in col_start..col_end {
+        for r in 0..n_obs {
+            let v = dense[r * n_vars + c];
+            if v != 0 {
+                indices.push(r as u32);
+                values.push(v);
+            }
+        }
+        indptr.push(indices.len() as u64);
+    }
+    (indptr, indices, values)
+}
+
+/// Write an SCX test file equipped with both CSR and a CSC sidecar.
+/// Returns the file path. Phase H mutating-op tests use this to
+/// verify that CSC drop + clear flag fires on the output.
+fn write_csc_test_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    cols_per_csc_shard: usize,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // CSR shard built from a deterministic dense pattern.
+    let mut dense = vec![0u8; n_obs * n_vars];
+    for r in 0..n_obs {
+        for c in 0..n_vars {
+            if (r + c) % 3 == 0 {
+                dense[r * n_vars + c] = ((r * 7 + c * 11) % 200 + 1) as u8;
+            }
+        }
+    }
+    let mut indptr_csr = vec![0u64];
+    let mut indices_csr = Vec::new();
+    let mut values_csr = Vec::new();
+    for r in 0..n_obs {
+        for c in 0..n_vars {
+            let v = dense[r * n_vars + c];
+            if v != 0 {
+                indices_csr.push(c as u32);
+                values_csr.push(v);
+            }
+        }
+        indptr_csr.push(indices_csr.len() as u64);
+    }
+    writer
+        .write_csr_shard(
+            &indptr_csr,
+            &indices_csr,
+            &values_csr,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // CSC sidecar split into shards by column.
+    let mut col_start = 0usize;
+    while col_start < n_vars {
+        let col_end = (col_start + cols_per_csc_shard).min(n_vars);
+        let (ip, ix, vb) = dense_to_csc_range(&dense, n_obs, n_vars, col_start, col_end);
+        writer
+            .write_csc_shard(
+                &ip,
+                &ix,
+                &vb,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                col_start as u64,
+            )
+            .unwrap();
+        col_start = col_end;
+    }
+
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
 // ---------------------------------------------------------------------------
 // Append tests
 // ---------------------------------------------------------------------------
@@ -1102,4 +1207,137 @@ fn test_append_rejects_oob_indices() {
     // File should be unchanged (error before any writes)
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// CSC drop on mutating ops (`append`, `compact`, `merge`)
+// ---------------------------------------------------------------------------
+
+/// Append on a CSC-equipped file drops the CSC sidecar:
+///   - `header.has_csc()` returns false on the post-append file
+///   - `header.n_csc_shards == 0`
+///   - The full catalog contains zero CscShard entries
+///   - CSR readback works as expected
+#[test]
+fn test_append_drops_csc_from_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_csc_test_file(&dir, "csc_input.scx", 6, 8, 4);
+
+    // Sanity: pre-append, the file has CSC shards.
+    {
+        let r = ScxReader::open(&path).unwrap();
+        assert!(r.header().has_csc());
+        assert!(r.header().n_csc_shards >= 1);
+    }
+
+    let new_obs = sample_obs(4);
+    let (indptr, indices, values) = sample_shard_data(4, 8);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    assert_eq!(r.n_obs(), 10);
+    assert!(
+        !r.header().has_csc(),
+        "has_csc flag should be cleared after append"
+    );
+    assert_eq!(r.header().n_csc_shards, 0);
+
+    // Catalog should contain no CscShard entries.
+    let csc_count = r
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .count();
+    assert_eq!(csc_count, 0);
+
+    // CSR readback unchanged.
+    let csr = r.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 10);
+}
+
+#[test]
+fn test_compact_drops_csc_from_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_csc_test_file(&dir, "csc_compact_in.scx", 6, 8, 4);
+    let output = dir.path().join("csc_compact_out.scx");
+
+    scx_ops::compact(&input, &output).unwrap();
+
+    let r = ScxReader::open(&output).unwrap();
+    assert!(
+        !r.header().has_csc(),
+        "compact output should not advertise CSC"
+    );
+    assert_eq!(r.header().n_csc_shards, 0);
+    let csc_count = r
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .count();
+    assert_eq!(csc_count, 0);
+}
+
+#[test]
+fn test_merge_drops_csc_from_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let p1 = write_csc_test_file(&dir, "csc_m1.scx", 4, 6, 3);
+    let p2 = write_csc_test_file(&dir, "csc_m2.scx", 5, 6, 3);
+    let output = dir.path().join("csc_merged.scx");
+
+    scx_ops::merge(&[p1.as_path(), p2.as_path()], &output).unwrap();
+
+    let r = ScxReader::open(&output).unwrap();
+    assert!(
+        !r.header().has_csc(),
+        "merge output should not advertise CSC"
+    );
+    assert_eq!(r.header().n_csc_shards, 0);
+    assert_eq!(r.n_obs(), 9);
+    let csc_count = r
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .count();
+    assert_eq!(csc_count, 0);
+}
+
+/// Pure-CSR file is untouched by the new CSC-drop logic — `has_csc`
+/// stays false and the file remains structurally identical to the
+/// pre-Phase-H behavior.
+#[test]
+fn test_append_pure_csr_unaffected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "pure_csr.scx", 4, 6, 1);
+
+    let new_obs = sample_obs(2);
+    let (indptr, indices, values) = sample_shard_data(2, 6);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    assert!(!r.header().has_csc());
+    assert_eq!(r.header().n_csc_shards, 0);
+    assert_eq!(r.n_obs(), 6);
 }

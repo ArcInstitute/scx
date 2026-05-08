@@ -345,6 +345,11 @@ def main() -> None:
         args.include_accel
         or any((fk or "").startswith("accel_") for fk in (args.formats or []))
         or any((b or "").startswith("accel_") for b in (args.benchmarks or []))
+        # `bench_csc_dispatch` exposes its variants through
+        # `accel_formats()` even though the benchmark name doesn't carry
+        # the `accel_` prefix. Treat its presence the same way.
+        or any(b == "bench_csc_dispatch" for b in (args.benchmarks or []))
+        or any((fk or "").startswith("bench_csc__") for fk in (args.formats or []))
     )
     pool = list(ALL_FORMATS)
     if need_accel:
@@ -389,7 +394,14 @@ def main() -> None:
     # touch the `runners/*_runner.py` contract surface — they go through
     # `accel_*.py` modules in `comprehensive/benchmarks/`, which the smoke
     # gate doesn't validate).
-    non_accel_benchmarks = [b for b in benchmarks if not b.startswith("accel_")]
+    # `bench_csc_dispatch` is structurally an accel benchmark (self-
+    # contained, doesn't go through the runner contract surface) even
+    # though its name doesn't carry the `accel_` prefix. Treat it the
+    # same way for smoke-test gating.
+    non_accel_benchmarks = [
+        b for b in benchmarks
+        if not b.startswith("accel_") and b != "bench_csc_dispatch"
+    ]
     needs_smoke = (
         not getattr(args, "skip_smoke", False)
         and len(non_accel_benchmarks) > 0
@@ -514,9 +526,15 @@ def main() -> None:
                 if bench_name.startswith("accel_"):
                     if not fmt.key.startswith(f"{bench_name}__"):
                         continue
-                elif fmt.key.startswith("accel_"):
+                elif bench_name == "bench_csc_dispatch":
+                    # `bench_csc_dispatch` exposes its variants as
+                    # `bench_csc__<op>_<csr|csc>` (Phase L.3); same
+                    # self-contained-pairing rule applies.
+                    if not fmt.key.startswith("bench_csc__"):
+                        continue
+                elif fmt.key.startswith("accel_") or fmt.key.startswith("bench_csc__"):
                     # Non-accel benchmarks (read_full, etc.) don't pair
-                    # with accel variants either.
+                    # with accel / CSC dispatch variants either.
                     continue
 
                 key = (ds_name, fmt.key)
@@ -603,7 +621,9 @@ def main() -> None:
         def _pairs_ok(b: str, fk: str) -> bool:
             if b.startswith("accel_"):
                 return fk.startswith(f"{b}__")
-            return not fk.startswith("accel_")
+            if b == "bench_csc_dispatch":
+                return fk.startswith("bench_csc__")
+            return not (fk.startswith("accel_") or fk.startswith("bench_csc__"))
 
         n_conv = sum(
             1 for ds in datasets for fmt in formats

@@ -34,13 +34,17 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
     let header_bytes = std::fs::read(input_dir.join("_header.bin"))?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_bytes))?;
 
-    // 3. Define section ordering for cloud-optimized layout
+    // 3. Define section ordering for cloud-optimized layout.
+    //    `CscShard` placed adjacent to `CsrShard` so column-major
+    //    reads stay in the contiguous prefix region of the packed
+    //    file.
     let section_order: &[SectionType] = &[
         SectionType::ObsMetadata,
         SectionType::ObsIndex,
         SectionType::VarMetadata,
         SectionType::VarIndex,
         SectionType::CsrShard,
+        SectionType::CscShard,
         SectionType::LayerCsrShard,
         SectionType::ObsmEmbedding,
         SectionType::ObspCsrShard,
@@ -673,5 +677,118 @@ mod tests {
         let dv_read = reader.read_deletion_vectors().unwrap().unwrap();
         assert_eq!(dv_read.shards.len(), 1);
         assert_eq!(dv_read.total_deleted(), 2);
+    }
+
+    /// explode + pack roundtrip on a CSC-equipped file.
+    /// Verifies that the new `Xc/NNNNNN.shard` paths flow through the
+    /// exploded directory and that the writer's `write_raw_shard`
+    /// (after the I.1 counter fix) repopulates `n_csc_shards` and
+    /// `has_csc` correctly on the packed output.
+    #[test]
+    fn test_explode_pack_roundtrip_preserves_csc() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("with_csc.scx");
+
+        // Build CSR + 2-shard CSC test file directly.
+        let n_obs = 12usize;
+        let n_vars = 8usize;
+        let header = sample_header(n_obs as u64, n_vars as u64);
+        let mut writer = ScxWriter::new(&input, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        let mut dense = vec![0u8; n_obs * n_vars];
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                if (r + c) % 3 == 0 {
+                    dense[r * n_vars + c] = ((r * 7 + c * 11) % 200 + 1) as u8;
+                }
+            }
+        }
+
+        // CSR
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = dense[r * n_vars + c];
+                if v != 0 {
+                    indices.push(c as u32);
+                    values.push(v);
+                }
+            }
+            indptr.push(indices.len() as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // CSC (2 shards × 4 cols)
+        for chunk_start in (0..n_vars).step_by(4) {
+            let chunk_end = (chunk_start + 4).min(n_vars);
+            let mut ip = vec![0u64];
+            let mut ix = Vec::new();
+            let mut vb = Vec::new();
+            for c in chunk_start..chunk_end {
+                for r in 0..n_obs {
+                    let v = dense[r * n_vars + c];
+                    if v != 0 {
+                        ix.push(r as u32);
+                        vb.push(v);
+                    }
+                }
+                ip.push(ix.len() as u64);
+            }
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    chunk_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        // Read pre-roundtrip CSC state.
+        let r = ScxReader::open(&input).unwrap();
+        let pre_csc = r.read_all_csc_shards().unwrap();
+        drop(r);
+
+        // Explode → directory should contain Xc/000000.shard and Xc/000001.shard.
+        let exploded_dir = dir.path().join("exploded.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+        assert!(exploded_dir.join("Xc/000000.shard").exists());
+        assert!(exploded_dir.join("Xc/000001.shard").exists());
+
+        // Pack → reassembled file preserves CSC.
+        let packed = dir.path().join("packed.scx");
+        pack(&exploded_dir, &packed).unwrap();
+
+        let r = ScxReader::open(&packed).unwrap();
+        assert!(r.header().has_csc(), "packed output should advertise CSC");
+        assert_eq!(r.header().n_csc_shards, 2);
+
+        // CSC contents round-trip equal.
+        let post_csc = r.read_all_csc_shards().unwrap();
+        assert_eq!(pre_csc.shape, post_csc.shape);
+        assert_eq!(pre_csc.indptr, post_csc.indptr);
+        assert_eq!(pre_csc.indices, post_csc.indices);
+        assert_eq!(pre_csc.data, post_csc.data);
+
+        // Validate per-section checksums on the packed file.
+        for (name, passed) in r.validate().unwrap() {
+            assert!(passed, "checksum failed for section: {name}");
+        }
     }
 }

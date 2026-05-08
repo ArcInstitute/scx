@@ -14,7 +14,8 @@ pub mod shard_source;
 pub mod writer;
 
 pub use backed::{
-    concatenate_csr, total_variance_from_col_sq, BackedCsrIndex, BackedCsrReader, CacheMetrics,
+    concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
+    BackedCsrReader, CacheMetrics,
 };
 pub use catalog::{
     column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry,
@@ -30,8 +31,8 @@ pub use provenance::{Provenance, ProvenanceEntry};
 pub use reader::ScxReader;
 pub use section::{align_to_8, SectionType};
 pub use shard::{
-    BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE, SHARD_HEADER_SIZE,
-    SHARD_MAGIC,
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE,
+    SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
-pub use shard_source::ShardSource;
+pub use shard_source::{ColumnShardSource, ShardSource};
 pub use writer::{compute_shard_stats, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET};

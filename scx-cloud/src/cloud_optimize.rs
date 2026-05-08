@@ -75,14 +75,20 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     let front_catalog_reserved_size = orig_catalog_bytes.len() as u64;
 
     // 2. Determine section ordering for the output file
-    //    Order: obs → var → CsrShard → LayerCsrShard → ObsmEmbedding → ObspCsrShard
-    //         → UnsBlob → ObsPredicateIndex → VarPredicateIndex → Provenance → DeletionVectors
+    //    Order: obs → var → CsrShard → CscShard → LayerCsrShard
+    //         → ObsmEmbedding → ObspCsrShard → UnsBlob
+    //         → ObsPredicateIndex → VarPredicateIndex → Provenance
+    //         → DeletionVectors
+    //
+    // CscShard placed adjacent to CsrShard so column-major reads stay
+    // in a contiguous prefix region of the cloud-optimized file.
     let section_order: &[SectionType] = &[
         SectionType::ObsMetadata,
         SectionType::ObsIndex,
         SectionType::VarMetadata,
         SectionType::VarIndex,
         SectionType::CsrShard,
+        SectionType::CscShard,
         SectionType::LayerCsrShard,
         SectionType::ObsmEmbedding,
         SectionType::ObspCsrShard,
@@ -646,5 +652,123 @@ mod tests {
         hdr.clear_front_catalog();
         assert!(!hdr.has_front_catalog());
         assert!(hdr.has_deletion_vectors());
+    }
+
+    /// cloud_optimize on a CSC-equipped file preserves the
+    /// `n_csc_shards` count and `has_csc` flag bit, and the CscShard
+    /// catalog entries survive the section-copy reorder.
+    #[test]
+    fn test_cloud_optimize_preserves_csc() {
+        let dir = tempfile::tempdir().unwrap();
+        let n_obs = 12usize;
+        let n_vars = 8usize;
+        let input = dir.path().join("with_csc.scx");
+
+        // Build a CSR + CSC test file directly.
+        let header = sample_header(n_obs as u64, n_vars as u64);
+        let mut writer = ScxWriter::new(&input, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        // Build the same dense matrix that the read assertions expect.
+        let mut dense = vec![0u8; n_obs * n_vars];
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                if (r + c) % 3 == 0 {
+                    dense[r * n_vars + c] = ((r * 7 + c * 11) % 200 + 1) as u8;
+                }
+            }
+        }
+
+        // CSR
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = dense[r * n_vars + c];
+                if v != 0 {
+                    indices.push(c as u32);
+                    values.push(v);
+                }
+            }
+            indptr.push(indices.len() as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // CSC: two shards of 4 columns each
+        for chunk_start in (0..n_vars).step_by(4) {
+            let chunk_end = (chunk_start + 4).min(n_vars);
+            let mut ip = vec![0u64];
+            let mut ix = Vec::new();
+            let mut vb = Vec::new();
+            for c in chunk_start..chunk_end {
+                for r in 0..n_obs {
+                    let v = dense[r * n_vars + c];
+                    if v != 0 {
+                        ix.push(r as u32);
+                        vb.push(v);
+                    }
+                }
+                ip.push(ix.len() as u64);
+            }
+            writer
+                .write_csc_shard(
+                    &ip,
+                    &ix,
+                    &vb,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    chunk_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        // Sanity: pre-cloud-optimize file has CSC.
+        let r = ScxReader::open(&input).unwrap();
+        assert!(r.header().has_csc());
+        assert_eq!(r.header().n_csc_shards, 2);
+        let pre_csc = r.read_all_csc_shards().unwrap();
+        drop(r);
+
+        // Run cloud_optimize.
+        let output = dir.path().join("optimized.scx");
+        cloud_optimize(&input, &output).unwrap();
+
+        // Post-cloud-optimize: CSC count + flag preserved.
+        let r = ScxReader::open(&output).unwrap();
+        assert!(r.header().has_front_catalog());
+        assert!(
+            r.header().has_csc(),
+            "has_csc flag should be preserved through cloud_optimize"
+        );
+        assert_eq!(r.header().n_csc_shards, 2);
+
+        // CSC catalog entries survive the reorder.
+        let csc_entries: Vec<_> = r
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .collect();
+        assert_eq!(csc_entries.len(), 2);
+
+        // CSC contents round-trip equal: sorted (col, row, value)
+        // triples match the pre-optimize file.
+        let post_csc = r.read_all_csc_shards().unwrap();
+        assert_eq!(pre_csc.shape, post_csc.shape);
+        assert_eq!(pre_csc.indptr, post_csc.indptr);
+        assert_eq!(pre_csc.indices, post_csc.indices);
+        assert_eq!(pre_csc.data, post_csc.data);
     }
 }
