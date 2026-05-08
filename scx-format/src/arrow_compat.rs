@@ -59,20 +59,28 @@ fn convert(batch: &RecordBatch, widen: bool) -> Result<RecordBatch> {
         return Ok(batch.clone());
     }
 
+    // Preserve schema-level metadata (notably the `b"pandas"` key, which
+    // tells pyarrow's `to_pandas()` which column is the index) and
+    // field-level metadata. Building the new Schema via `Schema::new`
+    // alone would silently drop both and break the AnnData round-trip.
     let mut new_fields = Vec::with_capacity(schema.fields().len());
     let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
         if let Some(target_dt) = target_for(field.data_type()) {
             new_columns.push(arrow::compute::cast(col, &target_dt)?);
-            new_fields.push(Field::new(field.name(), target_dt, field.is_nullable()));
+            new_fields.push(
+                Field::new(field.name(), target_dt, field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            );
         } else {
             new_columns.push(col.clone());
             new_fields.push(field.as_ref().clone());
         }
     }
+    let new_schema = Schema::new(new_fields).with_metadata(schema.metadata().clone());
     Ok(RecordBatch::try_new(
-        std::sync::Arc::new(Schema::new(new_fields)),
+        std::sync::Arc::new(new_schema),
         new_columns,
     )?)
 }
@@ -244,6 +252,40 @@ mod tests {
             .unwrap();
         assert_eq!(got.value(0), "foo");
         assert_eq!(got.value(1), "bar");
+    }
+
+    #[test]
+    fn schema_and_field_metadata_are_preserved() {
+        use std::collections::HashMap;
+
+        // Schema metadata: pandas integration relies on the `b"pandas"`
+        // key (which encodes index column hints). Field metadata is
+        // sometimes set for var_names symbol mapping, etc. Both must
+        // survive a round-trip or the AnnData / pandas pipeline breaks.
+        let mut schema_md = HashMap::new();
+        schema_md.insert(
+            "pandas".to_string(),
+            r#"{"index_columns":["cell_id"]}"#.to_string(),
+        );
+        schema_md.insert("custom_top".to_string(), "value_top".to_string());
+
+        let mut field_md = HashMap::new();
+        field_md.insert("symbol_column".to_string(), "ENSG".to_string());
+
+        let field = Field::new("cell_id", DataType::Utf8, false).with_metadata(field_md.clone());
+        let schema = Arc::new(Schema::new(vec![field]).with_metadata(schema_md.clone()));
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+
+        let upcast = upcast_to_large_types(&batch).unwrap();
+        assert_eq!(upcast.schema().metadata(), &schema_md);
+        assert_eq!(upcast.schema().field(0).metadata(), &field_md);
+        assert_eq!(upcast.schema().field(0).data_type(), &DataType::LargeUtf8);
+
+        let downcast = downcast_large_types(&upcast).unwrap();
+        assert_eq!(downcast.schema().metadata(), &schema_md);
+        assert_eq!(downcast.schema().field(0).metadata(), &field_md);
+        assert_eq!(downcast.schema().field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]
