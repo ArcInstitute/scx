@@ -191,7 +191,7 @@ fn from_10x(
 ///     mu = md.MuData({"rna": rna_adata, "adt": adt_adata})
 ///     pyscx.from_mudata(mu, "cite_seq.scx")
 #[pyfunction]
-#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000))]
+#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, codec_per_modality=true))]
 #[allow(clippy::too_many_arguments)]
 fn from_mudata(
     py: Python<'_>,
@@ -201,8 +201,18 @@ fn from_mudata(
     shard_size: Option<u32>,
     csc: &str,
     csc_cols_per_shard: usize,
+    codec_per_modality: bool,
 ) -> PyResult<()> {
-    mudata::from_mudata_impl(py, mu, path, codec, shard_size, csc, csc_cols_per_shard)
+    mudata::from_mudata_impl(
+        py,
+        mu,
+        path,
+        codec,
+        shard_size,
+        csc,
+        csc_cols_per_shard,
+        codec_per_modality,
+    )
 }
 
 /// Convert a Cell Ranger MTX directory to SCX.

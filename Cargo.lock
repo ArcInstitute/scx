@@ -3471,6 +3471,7 @@ dependencies = [
  "half",
  "lru",
  "memmap2",
+ "proptest",
  "rayon",
  "roaring",
  "scx-codec",

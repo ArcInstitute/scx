@@ -123,6 +123,21 @@ class FormatRunner(ABC):
         ConvertResult with timing, size, and throughput.
         """
 
+    def convert_from_h5mu(
+        self, h5mu_path: str | Path, output_path: str | Path
+    ) -> ConvertResult:
+        """Convert a multimodal `.h5mu` file to this format (Phase K).
+
+        Default implementation raises ``NotImplementedError`` so existing
+        single-modality runners stay unaffected. The multimodal-aware
+        runners (``ScxRunner``, ``H5muRunner``, ``ZarrMuDataRunner``)
+        override this. The multimodal_compression benchmark dispatches
+        to this method when ``dataset.multimodal`` is true.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support convert_from_h5mu"
+        )
+
     @abstractmethod
     def read_full(self, path: str | Path) -> TimingResult:
         """Read the entire expression matrix into an in-memory CSR.

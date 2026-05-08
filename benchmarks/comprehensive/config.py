@@ -76,6 +76,12 @@ class DatasetConfig:
     available: bool = True  # Whether the dataset is expected to already exist
     synthetic: bool = False  # If True, materialized on demand by the benchmark
     synth_params: dict[str, Any] = field(default_factory=dict)
+    # Phase K: multimodal flag + modality names (Phase B vocabulary).
+    # Multimodal datasets carry a `.h5mu` source instead of `.h5ad`; the
+    # multimodal_compression / multimodal_training benchmarks branch on
+    # this flag.
+    multimodal: bool = False
+    modality_names: tuple[str, ...] = ()
 
     @property
     def h5ad_path(self) -> Path:
@@ -149,6 +155,30 @@ class DatasetConfig:
     def anndata_zarr_backed_path(self) -> Path:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
+    # Phase K: multimodal source + per-format paths.
+    @property
+    def h5mu_path(self) -> Path:
+        return DATA_DIR / f"{self.name}.h5mu"
+
+    @property
+    def h5mu_gzip_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_gzip.h5mu"
+
+    @property
+    def scx_multimodal_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_multimodal.scx"
+
+    @property
+    def scx_multimodal_uniform_path(self) -> Path:
+        """SCX multimodal written with `codec_per_modality=False`
+        (Phase K.3.4 sweep variant — every modality routed through
+        single-modality `select_codec`)."""
+        return DATA_DIR / f"{self.name}_multimodal_uniform.scx"
+
+    @property
+    def zarr_mudata_path(self) -> Path:
+        return DATA_DIR / f"{self.name}.zarr.mudata"
+
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key.
 
@@ -208,6 +238,12 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
     "anndata_zarr_backed": "anndata_zarr_backed_path",
+    # Phase K — multimodal format keys.
+    "h5mu_uncompressed": "h5mu_path",
+    "h5mu_gzip": "h5mu_gzip_path",
+    "zarr_mudata_zstd": "zarr_mudata_path",
+    "scx_multimodal_per_modality_auto": "scx_multimodal_path",
+    "scx_multimodal_uniform_auto": "scx_multimodal_uniform_path",
 }
 
 
@@ -437,7 +473,37 @@ DATASETS: dict[str, DatasetConfig] = {
         approx_h5ad_mb=4_000, available=True, synthetic=True,
         synth_params={"n_obs": 1_000_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
     ),
+    # Phase K — multimodal datasets sourced from 10x Genomics public
+    # CITE-seq + Multiome libraries. Staged via
+    # benchmarks/scripts/download_citeseq_pbmc.py and
+    # download_multiome_pbmc.py. n_vars is the *sum* across modalities
+    # (no single global var index; each modality has its own).
+    "cite_seq_pbmc": DatasetConfig(
+        id="K1", name="cite_seq_pbmc_5k",
+        n_obs=5_247, n_vars=33_538 + 32,
+        protocol="10x v3 (UMI) + Antibody Capture",
+        source="10x Genomics — 5k_pbmc_protein_v3",
+        approx_h5ad_mb=85, available=True,
+        multimodal=True, modality_names=("rna", "adt"),
+    ),
+    "multiome_pbmc": DatasetConfig(
+        id="K2", name="multiome_pbmc_10k",
+        n_obs=11_898, n_vars=36_601 + 143_887,
+        protocol="10x Multiome ARC v1 (RNA + ATAC)",
+        source="10x Genomics — pbmc_granulocyte_sorted_10k",
+        approx_h5ad_mb=1_086, available=True,
+        multimodal=True, modality_names=("rna", "atac"),
+    ),
 }
+
+
+# Phase K — convenience export of multimodal-only dataset names so the
+# orchestrator can resolve `--datasets multimodal` shorthand and the
+# multimodal benchmarks can iterate over the right subset without
+# leaking single-modality entries.
+MULTIMODAL_DATASETS: list[str] = [
+    name for name, ds in DATASETS.items() if ds.multimodal
+]
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +555,36 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
                   "zarr_runner", {"backed": True}),
 ]
 
-ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS
+
+# Phase K — multimodal format variants. These consume `.h5mu` rather
+# than `.h5ad`, so the multimodal_compression benchmark routes via
+# `runner.convert_from_h5mu` instead of `convert_from_h5ad`.
+MULTIMODAL_FORMATS: list[FormatVariant] = [
+    FormatVariant(
+        "h5mu (uncompressed)", "h5mu_uncompressed", "multimodal", "h5mu_runner",
+        {"compression": None},
+    ),
+    FormatVariant(
+        "h5mu (gzip)", "h5mu_gzip", "multimodal", "h5mu_runner",
+        {"compression": "gzip"},
+    ),
+    FormatVariant(
+        "Zarr-MuData (zstd)", "zarr_mudata_zstd", "multimodal", "zarr_mudata_runner",
+        {"compressor": "zstd", "level": 3},
+    ),
+    FormatVariant(
+        "SCX multimodal (per-modality auto)",
+        "scx_multimodal_per_modality_auto", "multimodal", "scx_runner",
+        {"codec": "auto", "codec_per_modality": True},
+    ),
+    FormatVariant(
+        "SCX multimodal (uniform auto)",
+        "scx_multimodal_uniform_auto", "multimodal", "scx_runner",
+        {"codec": "auto", "codec_per_modality": False},
+    ),
+]
+
+ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS + MULTIMODAL_FORMATS
 
 
 # ---------------------------------------------------------------------------

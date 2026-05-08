@@ -207,6 +207,36 @@ with cellxgene_census.open_soma() as census:
 fi
 
 # --------------------------------------------------------------------------
+# 5b. CITE-seq + Multiome multimodal datasets (Phase K)
+# --------------------------------------------------------------------------
+echo ""
+echo "=== Multimodal datasets ==="
+
+CITE_H5MU="$DATA_DIR/cite_seq_pbmc_5k.h5mu"
+if [ -f "$CITE_H5MU" ]; then
+    echo "[SKIP] CITE-seq PBMC 5k already exists: $CITE_H5MU"
+else
+    SCX_DATA_DIR="$DATA_DIR" "$PYTHON" \
+        "$REPO_ROOT/benchmarks/scripts/download_citeseq_pbmc.py" \
+        || echo "[WARN] CITE-seq PBMC 5k download failed (requires mudata + scanpy). Skipping."
+    if [ -f "$CITE_H5MU" ]; then
+        echo "[DONE] CITE-seq PBMC 5k: $CITE_H5MU"
+    fi
+fi
+
+MULTIOME_H5MU="$DATA_DIR/multiome_pbmc_10k.h5mu"
+if [ -f "$MULTIOME_H5MU" ]; then
+    echo "[SKIP] Multiome PBMC 10k already exists: $MULTIOME_H5MU"
+else
+    SCX_DATA_DIR="$DATA_DIR" "$PYTHON" \
+        "$REPO_ROOT/benchmarks/scripts/download_multiome_pbmc.py" \
+        || echo "[WARN] Multiome PBMC 10k download failed (requires mudata + scanpy). Skipping."
+    if [ -f "$MULTIOME_H5MU" ]; then
+        echo "[DONE] Multiome PBMC 10k: $MULTIOME_H5MU"
+    fi
+fi
+
+# --------------------------------------------------------------------------
 # 6. Convert all h5ad datasets to .scx format
 # --------------------------------------------------------------------------
 echo ""

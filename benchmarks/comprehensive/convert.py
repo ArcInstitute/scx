@@ -43,7 +43,15 @@ def convert_dataset_format(
     )
 
     runner = make_runner(format_variant)
-    runner.convert_from_h5ad(dataset.h5ad_path, output_path)
+    if dataset.multimodal:
+        # Phase K: multimodal datasets ship as `.h5mu`; route through
+        # the multimodal-aware converter on the runner. Single-modality
+        # runners raise NotImplementedError on this path, so an
+        # accidental pass against a non-multimodal runner surfaces a
+        # clear error instead of silently emitting a malformed file.
+        runner.convert_from_h5mu(dataset.h5mu_path, output_path)
+    else:
+        runner.convert_from_h5ad(dataset.h5ad_path, output_path)
 
     logger.info("  Done: %s (%.1f MB)", output_path, output_path.stat().st_size / 1e6
                 if output_path.is_file() else 0)

@@ -164,6 +164,13 @@ pub fn to_mudata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py
 /// Implementation of `pyscx.from_mudata(mu, path, ...)`. Mirrors
 /// `from_anndata_impl` but iterates `mu.mod` and emits one modality
 /// per AnnData.
+///
+/// `codec_per_modality` (default `true`) routes each modality through
+/// `select_codec_for_modality` so RNA / Protein / ATAC each pick the
+/// codec that best suits their value distribution. When `false`,
+/// every modality is routed through the single-modality `select_codec`
+/// helper instead — used by the multimodal compression benchmark to
+/// quantify the gain from per-modality routing (Phase K.3.4).
 #[allow(clippy::too_many_arguments)]
 pub fn from_mudata_impl(
     py: Python<'_>,
@@ -173,6 +180,7 @@ pub fn from_mudata_impl(
     shard_size: Option<u32>,
     csc: &str,
     csc_cols_per_shard: usize,
+    codec_per_modality: bool,
 ) -> PyResult<()> {
     let _ = csc_cols_per_shard; // CSC for h5mu input is a Phase D follow-on
     let csc_always = match csc {
@@ -389,7 +397,21 @@ pub fn from_mudata_impl(
                 }
             }
             None => {
-                select_codec_for_modality(&raw_values_bytes, value_encoding, payload.modality_type)
+                if codec_per_modality {
+                    select_codec_for_modality(
+                        &raw_values_bytes,
+                        value_encoding,
+                        payload.modality_type,
+                    )
+                } else {
+                    // Phase K.3.4: skip the per-modality routing and
+                    // run every modality through the same
+                    // single-modality `select_codec`. Used by the
+                    // multimodal compression benchmark to compare the
+                    // uniform-auto baseline against per-modality
+                    // routing.
+                    scx_format::select_codec(&raw_values_bytes, value_encoding)
+                }
             }
         };
 
