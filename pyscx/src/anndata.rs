@@ -1529,8 +1529,27 @@ pub fn from_anndata_impl(
         validate_csr_arrays(indptr_slice, indices_slice, n_vars)?;
     }
 
-    // Determine index dtype
-    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
+    // Determine index dtype.
+    //
+    // CSR shards encode column indices (bounded by `n_vars`); CSC
+    // sidecars encode global row indices (bounded by `n_obs`). The
+    // file header carries one shared `index_dtype` that drives the
+    // u16/u32 encoding choice in `write_shard_inner`. When CSC is
+    // requested, fall back to u32 if EITHER axis exceeds u16. This
+    // costs CSR a few bytes per index when n_obs > 65535 but
+    // unblocks CSC writes on large-cell datasets (`census_1m`+).
+    let index_dtype: u8 = {
+        let max_axis = if csc_always {
+            n_obs.max(n_vars)
+        } else {
+            n_vars
+        };
+        if max_axis <= 65535 {
+            0
+        } else {
+            1
+        }
+    };
 
     // Peek at first shard's data to set file header codec_id (informational only;
     // readers use the per-shard header). Per-shard encoding/codec selection

@@ -158,7 +158,10 @@ class DatasetConfig:
         source h5ad path itself, which is what the `accel_*.py`
         benchmark modules already use through `dataset.h5ad_path`.
         """
-        if format_key.startswith("accel_"):
+        if format_key.startswith("accel_") or format_key.startswith("bench_csc__"):
+            # `bench_csc_dispatch` variants run on the source h5ad
+            # directly; the bench module converts to a CSC-equipped
+            # SCX file once per dataset and caches it.
             return self.h5ad_path
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
         if prop is None:
