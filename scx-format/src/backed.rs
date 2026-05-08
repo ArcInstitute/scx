@@ -1063,17 +1063,20 @@ impl BackedCsrReader {
     /// Used by the multi-shard read paths (`read_rows`, `read_row_indices`,
     /// `read_rows_with`) to overlap zstd decode of cold shards across rayon
     /// threads before the per-shard gather loop runs. After this returns,
-    /// every requested shard has been decoded once and is either in the LRU
-    /// or has just been served to a peer leader via the singleflight table.
+    /// up to `cache_shards` of the requested shards have been decoded and
+    /// are either in the LRU or were just served to a peer leader via the
+    /// singleflight table. Any tail beyond `cache_shards` is left for the
+    /// per-shard gather loop to decode sequentially — warming further would
+    /// just thrash the LRU (also capped at `cache_shards`) and force the
+    /// gather loop to re-decode the evicted prefix.
     ///
     /// No-op for shards already cached or in flight via the singleflight
     /// table — the up-front filter avoids paying the singleflight Condvar
     /// wait twice for the same shard inside one call.
     ///
     /// Peak transient RAM during decode is bounded by
-    /// `min(unique misses, cache_shards) × decoded shard size` because we
-    /// process the miss list in `cache_shards`-sized chunks; this matches
-    /// the steady-state cap the LRU already enforces.
+    /// `cache_shards × decoded shard size` — matches the steady-state cap
+    /// the LRU already enforces.
     fn warm_shards(&self, shard_indices: &[usize]) -> Result<()> {
         // No cache configured → nothing to warm; the per-shard reader path
         // will decode without caching.
@@ -1090,11 +1093,19 @@ impl BackedCsrReader {
         // singleflight + cache fast path inside `read_shard_cached_arc`
         // catches every late-arriving entry so correctness is preserved —
         // we only over- or under-filter for parallelism.
+        //
+        // Lock order: `in_flight` → `cache`, matching the miss path of
+        // `read_shard_cached_arc` (which acquires `in_flight`, then
+        // re-checks `cache` while still holding it). Inverting here would
+        // deadlock concurrent readers: one thread in `warm_shards` holding
+        // `cache` and waiting for `in_flight`, another in
+        // `read_shard_cached_arc` holding `in_flight` and waiting for
+        // `cache`.
         let mut seen: HashSet<usize> = HashSet::with_capacity(shard_indices.len());
         let mut misses: Vec<usize> = Vec::with_capacity(shard_indices.len());
         {
-            let cache = cache_mutex.lock().unwrap();
             let in_flight = in_flight_mutex.lock().unwrap();
+            let cache = cache_mutex.lock().unwrap();
             for &idx in shard_indices {
                 if !seen.insert(idx) {
                     continue;
@@ -1130,15 +1141,21 @@ impl BackedCsrReader {
                 return Ok(());
             }
 
-            // Cap in-flight decodes at cache_shards by walking the miss list
-            // in chunks. par_iter inside each chunk lets rayon overlap the
-            // zstd decodes; chunks run sequentially so peak transient RAM
-            // is bounded by `cache_shards × decoded shard size`.
-            for chunk in misses.chunks(self.cache_shards) {
-                chunk
-                    .par_iter()
-                    .try_for_each(|&idx| self.read_shard_cached_arc(idx).map(|_| ()))?;
+            // Cap warm at `cache_shards`. Warming more would just thrash
+            // the LRU (the cache is also capped at `cache_shards`),
+            // forcing the gather loop to re-decode any prefix evicted by
+            // later warm work. Tail shards beyond the cap are decoded
+            // sequentially by the per-shard gather loop — same behavior
+            // as the pre-`warm_shards` code for those shards, so we
+            // gracefully degrade to the prior throughput on wide reads
+            // instead of doubling decode work.
+            if misses.len() > self.cache_shards {
+                misses.truncate(self.cache_shards);
             }
+
+            misses
+                .par_iter()
+                .try_for_each(|&idx| self.read_shard_cached_arc(idx).map(|_| ()))?;
             Ok(())
         }
     }
@@ -2758,6 +2775,58 @@ mod tests {
         // And the multi-shard reader path still works.
         let result = backed.read_rows(0, 12).unwrap();
         assert_eq!(result.shape.0, 12);
+    }
+
+    #[test]
+    fn test_warm_shards_no_deadlock_with_concurrent_direct_decoders() {
+        // Regression for the AB/BA lock-order inversion between
+        // `warm_shards` and `read_shard_cached_arc`'s miss path. We spawn
+        // two pools against the same `BackedCsrReader`:
+        //   - "warmers": call `read_rows`, which funnels through `warm_shards`
+        //   - "direct":  call `read_shard_cached_arc` directly
+        // Both target overlapping cold shards, so the two lock-acquisition
+        // paths run concurrently. Pre-fix this deadlocks probabilistically;
+        // post-fix every thread joins. If the deadlock returns, the test
+        // hangs and CI's job timeout fails the run.
+        //
+        // `cache_shards = 8` < n_shards = 16 also exercises the P2 truncation
+        // branch (warm caps at cache_shards instead of decoding the full
+        // miss list and thrashing the LRU).
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (backed, _) = write_test_file_and_open(&dir, 128, 10, 16, 8);
+        let backed = Arc::new(backed);
+
+        let n_iters = 64;
+        let n_warmers = 4;
+        let n_direct = 4;
+        let target_shards: Vec<usize> = (0..16).collect();
+
+        let mut handles = Vec::with_capacity(n_warmers + n_direct);
+        for _ in 0..n_warmers {
+            let b = Arc::clone(&backed);
+            handles.push(thread::spawn(move || {
+                for _ in 0..n_iters {
+                    let _ = b.read_rows(0, 128).unwrap();
+                }
+            }));
+        }
+        for _ in 0..n_direct {
+            let b = Arc::clone(&backed);
+            let shards = target_shards.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..n_iters {
+                    for &s in &shards {
+                        let _ = b.read_shard_cached_arc(s).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     // -----------------------------------------------------------------------
