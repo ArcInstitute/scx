@@ -168,8 +168,14 @@ def _cancel_dep_never_satisfied() -> int:
 # each emit their own "Throttling…/Resumed…" pair. The submit loops
 # fire ``_wait_under_pending_cap`` once per job — without dedup, every
 # near-cap step repeats the message, flooding the log when 1000+ jobs
-# cycle through the cap.
-_THROTTLE_STATE: dict[str, bool] = {"in_throttle": False}
+# cycle through the cap. A short cooldown after "Resumed" suppresses
+# spurious re-throttle emission when the queue oscillates around the
+# cap (sub-second; see _THROTTLE_RESUME_COOLDOWN_S below).
+_THROTTLE_STATE: dict[str, float] = {
+    "in_throttle": 0.0,        # 0.0 = not in throttle, else timestamp of throttle entry
+    "last_resumed_at": 0.0,    # monotonic timestamp of most recent "Resumed" log
+}
+_THROTTLE_RESUME_COOLDOWN_S = 60.0  # don't re-log "Throttling" within 60s of resume
 
 
 def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
@@ -194,8 +200,13 @@ def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
     if cap <= 0:
         return
 
-    # Fast path: queue is below cap; emit "Resumed" only if we were in
-    # a throttling episode last call.
+    now = _time.monotonic()
+
+    # Fast path: queue is below cap. Emit "Resumed" once when we exit
+    # a logged throttling episode; subsequent calls stay silent. The
+    # ``in_throttle`` slot is a timestamp (0.0 when not throttling) so
+    # a future log-line could surface elapsed-throttle duration; the
+    # boolean check is value-truthiness on the timestamp.
     initial_active = _count_active_user_jobs()
     if initial_active < cap:
         if _THROTTLE_STATE["in_throttle"]:
@@ -203,17 +214,30 @@ def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
                 "  Resumed %s submission (active=%d < cap=%d)",
                 kind, initial_active, cap,
             )
-            _THROTTLE_STATE["in_throttle"] = False
+            _THROTTLE_STATE["in_throttle"] = 0.0
+            _THROTTLE_STATE["last_resumed_at"] = now
         return
 
-    # At-cap: enter throttle loop. Log the entry once.
-    if not _THROTTLE_STATE["in_throttle"]:
+    # At-cap. Decide whether this is a fresh throttle episode worth
+    # announcing or a near-immediate re-hit after a resume (queue
+    # oscillating around the cap during a submission burst). Re-hits
+    # within `_THROTTLE_RESUME_COOLDOWN_S` of the last resume are
+    # rolled into the same logical episode and stay silent.
+    is_fresh_episode = (
+        not _THROTTLE_STATE["in_throttle"]
+        and (now - _THROTTLE_STATE["last_resumed_at"]) > _THROTTLE_RESUME_COOLDOWN_S
+    )
+    if is_fresh_episode:
         logger.info(
             "  Throttling %s submission: active=%d >= cap=%d; "
             "polling squeue every 30s until queue drops below cap.",
             kind, initial_active, cap,
         )
-        _THROTTLE_STATE["in_throttle"] = True
+        _THROTTLE_STATE["in_throttle"] = now
+    elif not _THROTTLE_STATE["in_throttle"]:
+        # Recent resume — suppress the log but still mark in-throttle
+        # so the matching "Resumed" line emits when we drain.
+        _THROTTLE_STATE["in_throttle"] = now
 
     while True:
         active = _count_active_user_jobs()
@@ -792,12 +816,20 @@ def main() -> None:
                     # terminal failure.
                     conv_state = ""
                     try:
-                        conv_state = (conv_jobs[key].state or "").upper()
+                        conv_state = conv_jobs[key].state or ""
                     except Exception:
                         # Best-effort lookup; on transient squeue
                         # failures fall through to normal submission.
                         conv_state = ""
-                    if conv_state in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL"}:
+                    # See the result-loop fast-fail for the rationale —
+                    # match the FIRST whitespace-/+-delimited token so
+                    # rich slurm states like "CANCELLED by 10024" or
+                    # "CANCELLED+0:0" land correctly.
+                    conv_head = (
+                        conv_state.replace("+", " ").split()[0].upper()
+                        if conv_state else ""
+                    )
+                    if conv_head in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}:
                         logger.warning(
                             "  SKIP %s: upstream convert %s already %s",
                             label, conv_jobs[key].job_id, conv_state,
@@ -938,21 +970,41 @@ def main() -> None:
             # spins for ~15s per call (it polls slurm's pickle output
             # with backoff before declaring failure). Across thousands
             # of cancelled jobs that's hours of wall-time. Short-
-            # circuit by checking ``job.state`` first — when CANCELLED
-            # / NODE_FAIL / TIMEOUT, raise immediately so the existing
+            # circuit by checking ``job.state`` first — when in a
+            # terminal failure state, raise immediately so the existing
             # try/except classifies it and we move on.
+            #
+            # SLURM (via sacct) returns rich state strings, not bare
+            # codes:
+            #   "CANCELLED by 10024"        — user-cancelled
+            #   "CANCELLED+0:0"             — cancelled with exit
+            #   "FAILED"                    — runtime error
+            #   "TIMEOUT"                   — wallclock exceeded
+            #   "NODE_FAIL"                 — node died
+            #   "OUT_OF_MEMORY"             — OOM
+            #   "PREEMPTED"                 — preempted (cpu_preemptible)
+            # Match on the FIRST whitespace-/+-delimited token so all
+            # variants land correctly (the previous exact-set match
+            # silently fell through on "CANCELLED by 10024", causing
+            # ~15 s/job slow drains across thousands of cancelled
+            # jobs in earlier rounds).
             try:
-                state = (job.state or "").upper()
+                raw_state = job.state or ""
             except Exception:
-                state = ""
-            if state in {"CANCELLED", "TIMEOUT", "NODE_FAIL"}:
-                logger.warning("  FAST_FAIL: %s -> state=%s", label, state)
+                raw_state = ""
+            head = raw_state.replace("+", " ").split()[0].upper() if raw_state else ""
+            if head in {"CANCELLED", "TIMEOUT", "NODE_FAIL", "FAILED", "OUT_OF_MEMORY", "PREEMPTED"}:
+                logger.warning("  FAST_FAIL: %s -> state=%s", label, raw_state)
                 if conv_key is not None and conv_key in conv_jobs:
                     try:
-                        conv_state = (conv_jobs[conv_key].state or "").upper()
+                        conv_raw = conv_jobs[conv_key].state or ""
                     except Exception:
-                        conv_state = ""
-                    if conv_state in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL"}:
+                        conv_raw = ""
+                    conv_head = (
+                        conv_raw.replace("+", " ").split()[0].upper()
+                        if conv_raw else ""
+                    )
+                    if conv_head in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}:
                         dep_failed += 1
                         continue
                 failed += 1

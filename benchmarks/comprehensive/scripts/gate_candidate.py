@@ -473,26 +473,37 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
     # the SLURM worker would source is checkable here), don't submit the
     # probe — it would otherwise fail with a cupy ImportError on the
     # worker and surface as a confusing pre-flight FAIL. Operators get a
-    # one-line warning + clear remediation instead. This is the
-    # difference between "GPU coverage requested but env missing" → skip
-    # and "GPU coverage requested and env present" → probe.
+    # one-line warning + clear remediation instead.
+    #
+    # When we skip the cluster probe because the env is missing, we
+    # ALSO disable the local-host GPU fallback (nvidia-smi / cupy on
+    # the submission host) — there's no point checking for a GPU on a
+    # CPU-only orchestrator host (login node / sh_dev) when we already
+    # know we can't run GPU benchmarks anyway. Treat env-missing as a
+    # soft `--no-gpu` for the rest of the pre-flight: log the skip and
+    # propagate it through `args.no_gpu` so downstream coverage banners
+    # / capture invocation see the same disabled state.
+    skip_gpu_due_to_missing_env = False
     if want_cluster_probe and args.probe_conda_env:
         env_path = Path.home() / "miniforge3" / "envs" / args.probe_conda_env
         if not env_path.is_dir():
             log.warning(
                 "  gpu_probe : SKIP — conda env %r not found at %s; pass "
-                "--no-gpu to skip GPU coverage entirely, or "
+                "--no-gpu explicitly to silence this warning, or "
                 "`conda env create -f benchmarks/comprehensive/envs/scx-bench-gpu.yml` "
-                "to install it.",
+                "to enable GPU coverage. Continuing with GPU coverage "
+                "disabled (CPU-only mode).",
                 args.probe_conda_env, env_path,
             )
             want_cluster_probe = False
+            skip_gpu_due_to_missing_env = True
+            args.no_gpu = True  # propagate to capture / banner / coverage
             probe_info["outcome"] = "skipped_env_missing"
 
     if want_cluster_probe:
         gpu_checks, probe_info = _run_cluster_gpu_probe(args)
         checks.extend(gpu_checks)
-    elif not args.no_gpu:
+    elif not args.no_gpu and not skip_gpu_due_to_missing_env:
         # Local fallback: today's checks, run on the submission host.
         nvidia = _check_nvidia_smi()
         checks.append(nvidia)
