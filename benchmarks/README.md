@@ -252,12 +252,45 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 
 ### Which environment to use
 
+> [!CAUTION]
+> **The comprehensive benchmark orchestrators (`run_parallel.py`,
+> `capture_baseline.py`, `gate_candidate.py`) MUST be launched from
+> within the `scx-bench` conda env, not the dev `.venv/`.** This
+> isn't a soft preference — it's load-bearing. `run_parallel.py`'s
+> `_slurm_setup_cmds()` only activates a conda env on each SLURM
+> worker when the orchestrator's own `CONDA_PREFIX` contains
+> `"scx-bench"`. Launched from `.venv/`, every SLURM job's PATH
+> falls back to `.venv/bin` — which does **not** include `mudata`,
+> `slafdb`, `BPCells`, or other format-runner deps. The cascade
+> failure mode is recurring + expensive:
+>
+> 1. Phase A: many `convert_from_h5ad` jobs ImportError at runtime
+>    because the dependency isn't on `.venv/bin/python`.
+> 2. Phase B: hundreds of dependent bench jobs queue as
+>    `DependencyNeverSatisfied`, pinning the QOS-cap throttle.
+> 3. Phase B post-submit: orchestrator's `job.result()` loop spends
+>    ~15 s per cancelled job, multiplying into hour-long drains.
+>
+> **Always:**
+>
+> ```bash
+> conda activate scx-bench
+> python benchmarks/comprehensive/scripts/gate_candidate.py --tier small
+> ```
+>
+> The orchestrator now also emits a loud runtime warning when
+> launched from a non-scx-bench env, but it does not refuse — narrow
+> manual runs (e.g. `--accel-only` on a CPU laptop) sometimes work
+> from `.venv/` if the relevant runners' deps happen to be present.
+
 **Comprehensive benchmark suite** (`comprehensive/`):
 
 | Script | Environment | Activation |
 |--------|-------------|------------|
+| `comprehensive/scripts/gate_candidate.py` | **`scx-bench`** | `conda activate scx-bench` |
+| `comprehensive/scripts/capture_baseline.py` | **`scx-bench`** | `conda activate scx-bench` |
+| `comprehensive/scripts/run_parallel.py` | **`scx-bench`** | `conda activate scx-bench` |
 | `comprehensive/scripts/run_all.py` | `scx-bench` | `conda activate scx-bench` |
-| `comprehensive/scripts/run_parallel.py` | `scx-bench` | `conda activate scx-bench` |
 | `comprehensive/scripts/validate_*.py` | `scx-bench` | `conda activate scx-bench` |
 | GPU benchmarks | `scx-bench-gpu` | `conda activate scx-bench-gpu` |
 | BPCells benchmarks | `scx-bench-r` | `conda activate scx-bench-r` |
@@ -274,6 +307,20 @@ bash benchmarks/comprehensive/scripts/run_slurm.sh --conda-env scx-bench-gpu
 ---
 
 ## Parallel Benchmark Execution (run_parallel.py)
+
+> [!IMPORTANT]
+> **Orchestrator vs. workers.** `run_parallel.py` and `gate_candidate.py`
+> are *job submitters* — they run on the host you invoke them from
+> (login node, `sh_dev`, or any CPU-only machine that can reach SLURM)
+> and submit SLURM jobs that execute on the actual compute nodes.
+> **You do not need a GPU on the host running the orchestrator** —
+> GPU-bearing benchmarks request GPUs from SLURM (`partition=preemptible
+> slurm_gres=gpu:1`) and run on H100 worker nodes. This is the standard
+> Chimera workflow: orchestrate from `sh_dev` (or login), benchmarks
+> execute under `sbatch` on GPU nodes. The orchestrator script just
+> needs to stay alive long enough to submit; it can exit immediately
+> after submission (jobs continue independently) or follow the
+> submitted jobs through completion (default).
 
 The serial orchestrator (`run_all.py`) processes benchmarks sequentially within a single SLURM job. For faster execution, `run_parallel.py` uses two-phase parallel execution via `submitit`:
 

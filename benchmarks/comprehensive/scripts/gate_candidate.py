@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Ad-hoc regression gate (local controller, SLURM workers).
 
+This is a **job submitter**, not a benchmark runner. The controller
+process (which can run on any CPU-only host: a login node, ``sh_dev``,
+a laptop with cluster access — wherever you can reach ``sbatch``)
+submits SLURM jobs that execute the benchmarks on real compute nodes.
+**You do not need a GPU on the host running this script** — GPU
+benchmarks request GPUs from SLURM and run on H100 worker nodes via
+``sbatch``. This is the standard Chimera workflow: orchestrate from
+``sh_dev``, benchmarks execute under ``sbatch`` on GPU partitions.
+
 Captures a **candidate snapshot** under ``benchmarks/comprehensive/results/<name>/``
 via ``capture_baseline.py`` (default name ``candidate_<sha>_<YYYYMMDD>``),
 then runs ``compare_against_baseline.py --gate`` to diff that snapshot
@@ -18,9 +27,11 @@ benchmark axes (format, accel CPU, accel GPU) actually ran.
 
 GPU pre-flight runs on a SLURM compute node when SLURM is detected (the
 controller submits a small ``gpu_probe`` job that validates nvidia-smi /
-cupy / pyscx.accel on a real GPU instead of the submission host). Pass
-``--probe-partition -`` to force local GPU checks, or ``--no-gpu`` to skip
-GPU coverage entirely.
+cupy / pyscx.accel on a real GPU instead of the submission host) — so
+GPU pre-flight passes from any submission host, GPU or not. Pass
+``--probe-partition -`` to force local GPU checks (only use this when
+the submission host *is* a GPU node), or ``--no-gpu`` to skip GPU
+coverage entirely.
 
 Usage::
 
@@ -457,6 +468,27 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
         and args.probe_partition != "-"
     )
 
+    # Graceful skip: if the requested probe conda env doesn't exist on
+    # the local filesystem (Weka is shared on Chimera, so the same path
+    # the SLURM worker would source is checkable here), don't submit the
+    # probe — it would otherwise fail with a cupy ImportError on the
+    # worker and surface as a confusing pre-flight FAIL. Operators get a
+    # one-line warning + clear remediation instead. This is the
+    # difference between "GPU coverage requested but env missing" → skip
+    # and "GPU coverage requested and env present" → probe.
+    if want_cluster_probe and args.probe_conda_env:
+        env_path = Path.home() / "miniforge3" / "envs" / args.probe_conda_env
+        if not env_path.is_dir():
+            log.warning(
+                "  gpu_probe : SKIP — conda env %r not found at %s; pass "
+                "--no-gpu to skip GPU coverage entirely, or "
+                "`conda env create -f benchmarks/comprehensive/envs/scx-bench-gpu.yml` "
+                "to install it.",
+                args.probe_conda_env, env_path,
+            )
+            want_cluster_probe = False
+            probe_info["outcome"] = "skipped_env_missing"
+
     if want_cluster_probe:
         gpu_checks, probe_info = _run_cluster_gpu_probe(args)
         checks.extend(gpu_checks)
@@ -702,6 +734,8 @@ def _capture_argv(args: argparse.Namespace, candidate_dir: Path, *, dry_run: boo
         cmd.extend(["--benchmarks", *args.benchmarks])
     if args.datasets:
         cmd.extend(["--datasets", *args.datasets])
+    if args.formats:
+        cmd.extend(["--formats", *args.formats])
     if args.skip_smoke:
         cmd.append("--skip-smoke")
     if args.partition is not None:
@@ -835,6 +869,14 @@ def parse_args() -> argparse.Namespace:
                         help="Override the tier's dataset list (forwarded to "
                              "capture_baseline.py). Useful with --benchmarks "
                              "for narrow spot-checks.")
+    parser.add_argument("--formats", nargs="+", default=None,
+                        help="Restrict to a subset of format keys (forwarded "
+                             "to capture_baseline.py → run_parallel.py). "
+                             "Default: tier-implicit. Use to scope away "
+                             "from format runners whose deps aren't in the "
+                             "current conda env (e.g. drop `slaf` when not "
+                             "running from `scx-bench-slaf`, drop `bpcells` "
+                             "when not running from `scx-bench-r`).")
     parser.add_argument("--skip-smoke", action="store_true",
                         help="Skip the pre-submit format-runner contract "
                              "check inside run_parallel.py. Useful for narrow "
@@ -866,9 +908,16 @@ def parse_args() -> argparse.Namespace:
                        help="SLURM partition for the GPU probe job. "
                             "Use '-' to disable cluster probing and force "
                             "local GPU checks (default: preemptible).")
-    probe.add_argument("--probe-conda-env", default="scx-gpu",
+    probe.add_argument("--probe-conda-env", default="scx-bench-gpu",
                        help="Conda env to activate inside the probe job "
-                            "(default: scx-gpu). Empty string skips activation.")
+                            "(default: scx-bench-gpu — the canonical GPU "
+                            "benchmark env per `benchmarks/README.md`). "
+                            "Empty string skips activation. The pre-flight "
+                            "auto-skips the cluster probe (printing a clear "
+                            "warning) when the env doesn't exist on the "
+                            "Weka shared filesystem, so a CPU-only host or "
+                            "a host that just doesn't have the GPU env "
+                            "doesn't get blocked at pre-flight.")
     probe.add_argument("--probe-cpus", type=int, default=2,
                        help="CPUs requested for the probe (default: 2).")
     probe.add_argument("--probe-mem-gb", type=int, default=8,
@@ -889,10 +938,52 @@ def _git_sha() -> str:
     return out.strip() if rc == 0 else "unknown"
 
 
+def _check_conda_env() -> None:
+    """Loudly warn if the script is being launched from outside the
+    canonical ``scx-bench`` (or sibling) conda env.
+
+    The comprehensive benchmark suite is designed around isolated
+    conda envs (``scx-bench``, ``scx-bench-gpu``, ``scx-bench-r``,
+    ``scx-bench-slaf``, see ``benchmarks/comprehensive/envs/``).
+    ``run_parallel.py``'s ``_slurm_setup_cmds`` only activates a
+    conda env on the SLURM workers when the orchestrator's own
+    ``CONDA_PREFIX`` contains ``"scx-bench"`` — otherwise every job
+    falls back to the dev ``.venv/`` PATH, which lacks
+    ``mudata`` / ``slafdb`` / ``BPCells`` / etc., cascading hundreds
+    of convert+bench jobs into ``DependencyNeverSatisfied``. The
+    warning is non-fatal so operators can still iterate from
+    ``.venv/`` for narrow runs (e.g. accel-only on a CPU laptop)
+    but the loud reminder prevents accidental hour-long stalls.
+    """
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    if "scx-bench" not in conda_prefix:
+        msg = (
+            "WARNING: gate_candidate.py was launched from a non-scx-bench "
+            "environment (CONDA_PREFIX=%r). The orchestrator's per-SLURM-job "
+            "setup will fall back to the dev .venv/ PATH, which is missing "
+            "format-runner deps (mudata, slafdb, BPCells, etc.). Most "
+            "convert jobs will fail with ImportError, cascading into "
+            "DependencyNeverSatisfied chains that stall the gate.\n\n"
+            "    To run end-to-end:\n"
+            "        conda activate scx-bench\n"
+            "        python benchmarks/comprehensive/scripts/gate_candidate.py ...\n\n"
+            "    Or scope formats to ones that work in the dev venv:\n"
+            "        --formats h5ad_none h5ad_gzip h5ad_lzf zarr_zstd zarr_lz4 \\\n"
+            "                  tiledb_soma scx_auto scx_none scx_scx1 scx_zstd \\\n"
+            "                  scx_lz4 scx_pcodec h5mu_uncompressed h5mu_gzip \\\n"
+            "                  zarr_mudata_zstd scx_multimodal_per_modality_auto \\\n"
+            "                  scx_multimodal_uniform_auto"
+        ) % (conda_prefix or "(unset)",)
+        print("\n" + "=" * 70, file=sys.stderr)
+        print(msg, file=sys.stderr)
+        print("=" * 70 + "\n", file=sys.stderr)
+
+
 def main() -> int:
     args = parse_args()
     if args.extra_gate_args and args.extra_gate_args[0] == "--":
         args.extra_gate_args = args.extra_gate_args[1:]
+    _check_conda_env()
 
     # Import submitit eagerly (before setup_logging) so its import-time
     # logging.config.dictConfig() side-effect can't close our FileHandler's

@@ -192,6 +192,7 @@ def submit_benchmarks(
     no_gpu: bool = False,
     benchmarks: list[str] | None = None,
     datasets: list[str] | None = None,
+    formats: list[str] | None = None,
     skip_smoke: bool = False,
 ) -> int:
     """Invoke run_parallel.py with the selected tier's settings.
@@ -258,6 +259,8 @@ def submit_benchmarks(
         cmd.append("--include-accel")
     if no_gpu:
         cmd.append("--no-gpu")
+    if formats:
+        cmd.extend(["--formats", *formats])
 
     print("[baseline] submitting benchmarks:")
     print("           " + " ".join(cmd))
@@ -497,6 +500,14 @@ def main() -> int:
              "`--datasets pbmc3k tabula_sapiens_100k`).",
     )
     parser.add_argument(
+        "--formats", nargs="+", default=None,
+        help="Restrict to a subset of format keys, forwarded to "
+             "run_parallel.py. Use to scope away from format runners "
+             "whose deps aren't in the current conda env (e.g. drop "
+             "`slaf` when not running from `scx-bench-slaf`, drop "
+             "`bpcells` when not running from `scx-bench-r`).",
+    )
+    parser.add_argument(
         "--skip-smoke", action="store_true",
         help="Skip the pre-submit format-runner contract check. Useful for "
              "narrow accel-only runs or when known-broken format runners "
@@ -558,6 +569,7 @@ def main() -> int:
             no_gpu=args.no_gpu,
             benchmarks=args.benchmarks,
             datasets=args.datasets,
+            formats=args.formats,
             skip_smoke=args.skip_smoke,
         )
         if rc != 0:
@@ -577,6 +589,7 @@ def main() -> int:
             no_gpu=args.no_gpu,
             benchmarks=args.benchmarks,
             datasets=args.datasets,
+            formats=args.formats,
             skip_smoke=args.skip_smoke,
         )
         return 0
