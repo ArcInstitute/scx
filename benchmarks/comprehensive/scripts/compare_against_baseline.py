@@ -552,12 +552,29 @@ def _load_current_raw_metric(
     return statistics.median(values)
 
 
+def _triple_was_run(
+    current_dir: Path, benchmark: str, fmt: str, dataset: str,
+) -> bool:
+    """True iff the raw result JSON for this triple exists in the
+    candidate snapshot. Distinguishes "operator scoped this triple out
+    via --formats / --benchmarks / --datasets" from "triple ran but
+    the metric is missing in runs[].extra"."""
+    return (current_dir / "raw" / f"{benchmark}__{fmt}__{dataset}.json").exists()
+
+
 def check_absolute_floors(
     current_dir: Path,
     floors: list[dict[str, Any]],
 ) -> list[FloorViolation]:
     """Return one FloorViolation per (benchmark, format, dataset) whose
     named metric is missing, NaN, or violates the configured threshold.
+
+    Floors for triples the candidate didn't run (e.g. operator passed
+    ``--formats h5ad_*`` and the floor is on ``slaf``) are silently
+    skipped — the operator explicitly scoped them out, so flagging them
+    as "missing" is informational noise that drowns the signal. Real
+    "missing-metric" violations (the triple ran but ``runs[].extra``
+    doesn't carry the metric) still surface.
 
     Each spec carries a ``direction`` ("min" or "max") — for ``direction="min"``
     the observed value must be >= threshold (e.g. throughput floors); for
@@ -571,6 +588,11 @@ def check_absolute_floors(
         metric = spec["metric"]
         threshold = spec["threshold"]
         direction = spec["direction"]
+        # Scoped-out triples: skip silently. Without this, narrowing
+        # the run via --formats / --benchmarks turns into ~50 spurious
+        # "missing" violations per gate report.
+        if not _triple_was_run(current_dir, benchmark, fmt, dataset):
+            continue
         observed = _load_current_raw_metric(
             current_dir, benchmark, fmt, dataset, metric,
         )

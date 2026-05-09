@@ -378,6 +378,43 @@ def _slurm_setup_cmds() -> list[str]:
     # use MPI; tell srun so.
     mpi_none = "export SLURM_MPI_TYPE=none"
 
+    # Forward GCP credentials to the worker. ``cloud_*`` benchmarks
+    # (cloud_push / cloud_pull / cloud_read / cloud_metadata /
+    # cloud_filtered / cloud_reader_vs_pull / cost_model /
+    # cloud_large_atlas) need ``GOOGLE_APPLICATION_CREDENTIALS`` to
+    # auth against GCS — without it ~64 cloud cells per tier-small
+    # run fail with "anonymous gcsfs" / 401 errors. The orchestrator
+    # already loads it from `.env` (via bench_env.py + python-dotenv),
+    # but submitit doesn't propagate process-environment vars to
+    # SLURM workers, so we inject an explicit export here. Also
+    # tilde-expand the path because gcsfs / google-auth don't.
+    cloud_setup: list[str] = []
+    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if gac:
+        gac = os.path.expanduser(gac)
+        # Single-quote so spaces / special chars in the path don't
+        # explode the shell. Skip when the file isn't readable on
+        # the orchestrator side — the worker will inherit the same
+        # Weka filesystem, so unreadable here means unreadable there.
+        if os.path.isfile(gac):
+            cloud_setup.append(
+                f"export GOOGLE_APPLICATION_CREDENTIALS='{gac}'"
+            )
+        else:
+            logger.warning(
+                "GOOGLE_APPLICATION_CREDENTIALS=%s does not exist; "
+                "cloud_* benchmark jobs will run unauthenticated.",
+                gac,
+            )
+    # Forward GCS bucket / project / region knobs from cloud_fixtures /
+    # config so the worker doesn't have to re-read `.env`.
+    for var in ("GCS_TEST_BUCKET", "GCP_PROJECT", "GCP_BUCKET_REGION",
+                "SCX_DATA_DIR", "SCX_WORK_DIR"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            val = os.path.expanduser(val) if "DIR" in var else val
+            cloud_setup.append(f"export {var}='{val}'")
+
     if "scx-bench" in conda_prefix:
         conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
         if not conda_base:
@@ -386,12 +423,14 @@ def _slurm_setup_cmds() -> list[str]:
         return [
             env_cleanup,
             mpi_none,
+            *cloud_setup,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
     return [
         env_cleanup,
         mpi_none,
+        *cloud_setup,
         f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
     ]
 
