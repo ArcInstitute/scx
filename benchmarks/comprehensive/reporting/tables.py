@@ -872,6 +872,119 @@ def ml_loader_table(datasets: list[str] | None = None) -> str:
     return _pivot_to_table(pivot, datasets, fmt_bps, bold_best="max", title="Loader")
 
 
+def multimodal_compression_table(datasets: list[str] | None = None) -> str:
+    """File-size + compression ratio for multimodal_compression rows.
+
+    Compares SCX v2 multimodal (per-modality auto + uniform auto) vs
+    h5mu (uncompressed + gzip) and zarr-mudata (zstd) on the registered
+    multimodal datasets. Value: ``file_size_bytes`` rendered as a
+    human-readable size.
+    """
+    if datasets is None:
+        datasets = ["cite_seq_pbmc_5k", "multiome_pbmc_10k"]
+    results = load_all_results(benchmark="multimodal_compression")
+    pivot = _build_pivot(results, "file_size_bytes", datasets)
+    return _pivot_to_table(pivot, datasets, _fmt_size, bold_best="min", title="Format")
+
+
+def multimodal_compression_ratio_table(datasets: list[str] | None = None) -> str:
+    """Compression ratio relative to h5mu uncompressed for the same dataset.
+
+    Higher is better. Pulled from each row's
+    ``metadata.compression_ratio_vs_h5mu``.
+    """
+    if datasets is None:
+        datasets = ["cite_seq_pbmc_5k", "multiome_pbmc_10k"]
+    results = load_all_results(benchmark="multimodal_compression")
+    pivot: dict[str, dict[str, float | None]] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        fmt = r.get("format", "")
+        ratio = (r.get("metadata") or {}).get("compression_ratio_vs_h5mu")
+        if ratio is not None:
+            pivot.setdefault(fmt, {})[ds] = float(ratio)
+
+    def fmt_ratio(v):
+        return "—" if v is None else f"{v:.2f}x"
+
+    return _pivot_to_table(pivot, datasets, fmt_ratio, bold_best="max", title="Format")
+
+
+def multimodal_training_table(datasets: list[str] | None = None) -> str:
+    """Multimodal training-loader throughput (batches/sec) — median across runs.
+
+    Pulls ``batches_per_sec`` from each row's ``runs[].extra``. Higher is
+    better. Mirrors the ``ml_loader_table`` shape.
+    """
+    if datasets is None:
+        datasets = ["cite_seq_pbmc_5k", "multiome_pbmc_10k"]
+    results = load_all_results(benchmark="multimodal_training")
+    pivot: dict[str, dict[str, float | None]] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        fmt = r.get("format", "")
+        bps_vals: list[float] = []
+        for run in r.get("runs", []) or []:
+            extra = run.get("extra") or {}
+            v = extra.get("batches_per_sec")
+            if v is not None:
+                try:
+                    bps_vals.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+        if bps_vals:
+            pivot.setdefault(fmt, {})[ds] = statistics.median(bps_vals)
+
+    def fmt_bps(v):
+        return "—" if v is None else f"{v:,.1f}"
+
+    return _pivot_to_table(pivot, datasets, fmt_bps, bold_best="max", title="Format")
+
+
+def multimodal_training_ttfb_table(datasets: list[str] | None = None) -> str:
+    """Time-to-first-batch (seconds) for multimodal_training. Lower is better."""
+    if datasets is None:
+        datasets = ["cite_seq_pbmc_5k", "multiome_pbmc_10k"]
+    results = load_all_results(benchmark="multimodal_training")
+    pivot: dict[str, dict[str, float | None]] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        fmt = r.get("format", "")
+        ttfbs: list[float] = []
+        for run in r.get("runs", []) or []:
+            extra = run.get("extra") or {}
+            v = extra.get("time_to_first_batch_s")
+            if v is not None:
+                try:
+                    ttfbs.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+        if ttfbs:
+            pivot.setdefault(fmt, {})[ds] = statistics.median(ttfbs)
+
+    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min", title="Format")
+
+
+def bench_csc_dispatch_table(datasets: list[str] | None = None) -> str:
+    """CSC vs CSR dispatch perf for qc_metrics / hvg / de / pseudobulk.
+
+    Format keys are ``bench_csc__<op>_<axis>``; we surface the median
+    wall-time per (format, dataset). Aimed at making the Phase L.3
+    sweep visible in the report.
+    """
+    if datasets is None:
+        datasets = MAIN_DATASETS
+    results = load_all_results(benchmark="bench_csc_dispatch")
+    pivot = _build_pivot(results, "median_wall_s", datasets)
+    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min", title="Variant")
+
+
 def correctness_table() -> str:
     """Generate correctness validation summary table."""
     results = load_all_results()  # Load all, filter correctness
