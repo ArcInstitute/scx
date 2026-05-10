@@ -290,10 +290,18 @@ if $CREATE_CPU; then
     fi
     echo ""
 
-    # Build pyscx
-    echo "--- Building pyscx in scx-bench ---"
+    # Build pyscx WITH the cloud feature so cloud_* benchmarks
+    # (cloud_push / cloud_pull / cloud_read / cloud_metadata /
+    # cloud_filtered / cloud_reader_vs_pull / cost_model /
+    # cloud_large_atlas) can resolve `pyscx.push`, `pyscx.pull`, and
+    # `pyscx.open_cloud`. These are gated behind `#[cfg(feature =
+    # "cloud")]` in pyscx/src/lib.rs and would otherwise raise
+    # `AttributeError` on every cloud benchmark cell. The cloud
+    # feature pulls in scx-cloud + tokio (pyscx/Cargo.toml), no GPU
+    # dependency.
+    echo "--- Building pyscx (with cloud feature) in scx-bench ---"
     activate_env "scx-bench"
-    build_pyscx
+    build_pyscx "cloud"
     echo ""
 fi
 

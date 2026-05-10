@@ -400,6 +400,17 @@ def _slurm_setup_cmds() -> list[str]:
             cloud_setup.append(
                 f"export GOOGLE_APPLICATION_CREDENTIALS='{gac}'"
             )
+            # pyscx.push / pull / open_cloud go through object_store's
+            # GoogleCloudStorageBuilder::from_env(), which recognises
+            # GOOGLE_SERVICE_ACCOUNT_PATH but does not auto-fall-back to
+            # GOOGLE_APPLICATION_CREDENTIALS. Off-GCE hosts otherwise pay a
+            # ~14 s IMDS retry timeout per push call before failing. Mirror
+            # GAC into GOOGLE_SERVICE_ACCOUNT_PATH unless the operator set
+            # one explicitly.
+            if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_PATH", "").strip():
+                cloud_setup.append(
+                    f"export GOOGLE_SERVICE_ACCOUNT_PATH='{gac}'"
+                )
         else:
             logger.warning(
                 "GOOGLE_APPLICATION_CREDENTIALS=%s does not exist; "

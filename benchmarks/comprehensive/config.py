@@ -849,8 +849,13 @@ def estimate_memory_gb(
         # 14+ scanpy-equivalence checks (PCA, kNN, UMAP, leiden, DE).
         # slurm_validation_suite.sh allocates 80 GB for pbmc3k and 250 GB
         # for the pbmc3k+tabula_sapiens_100k combined run; size like
-        # read_full but with a 1.5x safety multiplier on top.
-        peak_mb = max(base_mb * 2, dense_mb * 1.5)
+        # read_full but with a denser safety multiplier on top.
+        # Bumped from `(base_mb*2, dense_mb*1.5)` after the 2026-05-09
+        # tier-full gate run OOM-killed pbmc10k + smartseq2 / scx_auto.
+        # Stacked-fixture footprint runs ~2x on those two datasets
+        # because the scanpy reference materialises a dense X for the
+        # equivalence assertions before the SCX + SLAF readers join in.
+        peak_mb = max(base_mb * 3, dense_mb * 2.0)
     elif benchmark == "roundtrip":
         # Holds source AnnData + SCX-materialised AnnData resident at the
         # same time, plus the (a - b) CSR diff scratch and a second copy
@@ -947,7 +952,14 @@ def estimate_time_minutes(
         "read_full":              8,
         "read_selective":         10,
         "parallel_scaling":       20,
-        "parallel_write_scaling": 25,
+        # Bumped from 25 → 40 after the 2026-05-09 tier-full gate run
+        # timed out 3 `parallel_write_scaling/{smartseq2,census_500k,census_1m}/
+        # tiledb_soma` cells at the 25-min SLURM budget. The benchmark loops
+        # 6 thread counts × (1 warmup + N timed runs); tiledb_soma writes
+        # are ~25 s on smartseq2 and >4 min on census_1m, so the per-cell
+        # wallclock fanout dwarfs the prior 25-min floor. tiledb_soma also
+        # picks up the 2× format multiplier at 500K+ cells below.
+        "parallel_write_scaling": 40,
         "memory":                 15,
         "fragment_ops":           15,
         "cloud_push":             20,
@@ -958,7 +970,12 @@ def estimate_time_minutes(
         "cloud_reader_vs_pull":   25,
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
-        "ml_loader":              45,
+        # Bumped from 45 → 60 after the 2026-05-09 tier-full gate run
+        # timed out `ml_loader/h5ad_gzip/census_1m` at 85 min wallclock.
+        # The full 1M-cell h5ad-gzip read is the slowest combination
+        # in the suite; 60-min base + 12-min/M slope + 1.5× density
+        # multiplier yields ~108 min, comfortable headroom.
+        "ml_loader":              60,
         "correctness":            60,
         "roundtrip":              10,
         "cell_eval_parity_perf":  60,
@@ -1032,6 +1049,16 @@ def estimate_time_minutes(
     # Dense-path formats (h5ad / zarr) take longer at census scale.
     if format_key.startswith(("h5ad", "zarr")) and n_obs >= 1_000_000:
         total = int(total * 1.5)
+    # tiledb_soma writes are I/O-bound and scale faster than the default
+    # 8 min/M slope: empirical 41 min on 500K, 82 min on 1M (vs ~25 s on
+    # 75K). Without the multiplier, 500K and 1M cells exhaust the
+    # SLURM budget before the 6× thread sweep finishes.
+    if (
+        benchmark == "parallel_write_scaling"
+        and format_key == "tiledb_soma"
+        and n_obs >= 500_000
+    ):
+        total = int(total * 2.5)
 
     # Round up to 5-min increments.
     return max(5, math.ceil(total / 5) * 5)
