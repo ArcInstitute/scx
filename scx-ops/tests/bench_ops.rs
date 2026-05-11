@@ -7,11 +7,12 @@
 /// script (`benchmarks/scripts/benchmark_ops.py`) parses into a report.
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -163,8 +164,8 @@ fn bench_ops_append_10k() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
     let elapsed = start.elapsed();
@@ -216,8 +217,8 @@ fn bench_ops_compact_after_3_appends() {
             &indices,
             &values,
             ValueEncoding::Uint8,
-            CodecId::None,
-            16384,
+            CodecSelection::Auto,
+            NonZeroU32::new(16384).unwrap(),
         )
         .unwrap();
     }

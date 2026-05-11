@@ -3,13 +3,14 @@
 // Wraps scx-ops (append, mark_deleted, compact, rollback, merge) for Python.
 
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 use scx_format::ScxReader;
@@ -17,6 +18,47 @@ use scx_format::ScxReader;
 use scx_ops::OpsError;
 
 use crate::anndata;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SHARD_SIZE: i64 = 16384;
+
+/// Validate the Python-side `shard_size` kwarg and convert to NonZeroU32.
+///
+/// Accepts a signed i64 (rather than u32) so that negative values from
+/// Python raise `ValueError` here instead of `OverflowError` during
+/// pyo3 argument extraction. Per review P0 #9, all `shard_size <= 0`
+/// inputs are rejected with `ValueError` before crossing into Rust.
+fn validate_shard_size(shard_size: Option<i64>) -> PyResult<NonZeroU32> {
+    let v = shard_size.unwrap_or(DEFAULT_SHARD_SIZE);
+    if v <= 0 {
+        return Err(PyValueError::new_err(format!(
+            "shard_size must be > 0 (got {v})"
+        )));
+    }
+    let v_u32: u32 = v.try_into().map_err(|_| {
+        PyValueError::new_err(format!("shard_size {v} exceeds u32::MAX ({})", u32::MAX))
+    })?;
+    NonZeroU32::new(v_u32).ok_or_else(|| PyValueError::new_err("shard_size must be > 0"))
+}
+
+/// Map an Option<CodecId> (from anndata::parse_codec) plus the detected
+/// value encoding into a CodecSelection. Preserves the legacy
+/// Scx1+float silent fixup at the binding boundary.
+fn resolve_codec_selection(
+    explicit_codec: Option<CodecId>,
+    value_encoding: ValueEncoding,
+) -> CodecSelection {
+    match explicit_codec {
+        None => CodecSelection::Auto,
+        Some(CodecId::Scx1) if !value_encoding.is_integer() => {
+            CodecSelection::Explicit(CodecId::Zstd)
+        }
+        Some(c) => CodecSelection::Explicit(c),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error conversion
@@ -51,10 +93,10 @@ pub fn append(
     target: &str,
     input: &str,
     codec: Option<&str>,
-    shard_size: Option<u32>,
+    shard_size: Option<i64>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
-    let shard_target_rows = shard_size.unwrap_or(16384);
+    let shard_target_rows = validate_shard_size(shard_size)?;
 
     // Open input file
     let input_reader =
@@ -128,17 +170,10 @@ pub fn append(
         .read_obs()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    // Resolve codec
-    let effective_codec = match explicit_codec {
-        Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !value_encoding.is_integer() {
-                CodecId::Zstd
-            } else {
-                codec_id
-            }
-        }
-        None => CodecId::None, // auto-select per shard inside append
-    };
+    // Resolve codec selection. None / "auto" → CodecSelection::Auto.
+    // Explicit Scx1 with non-integer encoding falls back to Zstd
+    // (Scx1 only encodes integers).
+    let codec_selection = resolve_codec_selection(explicit_codec, value_encoding);
 
     let target_path = PathBuf::from(target);
     py.allow_threads(|| {
@@ -149,7 +184,7 @@ pub fn append(
             &indices,
             &values_bytes,
             value_encoding,
-            effective_codec,
+            codec_selection,
             shard_target_rows,
         )
     })
@@ -178,11 +213,11 @@ pub fn append_from_anndata(
     target: &str,
     adata: &Bound<'_, PyAny>,
     codec: Option<&str>,
-    shard_size: Option<u32>,
+    shard_size: Option<i64>,
     in_place: bool,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
-    let shard_target_rows = shard_size.unwrap_or(16384);
+    let shard_target_rows = validate_shard_size(shard_size)?;
 
     // Extract CSR from adata.X
     let x = adata.getattr("X")?;
@@ -259,17 +294,10 @@ pub fn append_from_anndata(
     let obs_df = adata.getattr("obs")?;
     let obs = anndata::pandas_to_record_batch(py, &obs_df)?;
 
-    // Resolve codec
-    let effective_codec = match explicit_codec {
-        Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !value_encoding.is_integer() {
-                CodecId::Zstd
-            } else {
-                codec_id
-            }
-        }
-        None => CodecId::None, // auto-select per shard inside append
-    };
+    // Resolve codec selection. None / "auto" → CodecSelection::Auto.
+    // Explicit Scx1 with non-integer encoding falls back to Zstd
+    // (Scx1 only encodes integers).
+    let codec_selection = resolve_codec_selection(explicit_codec, value_encoding);
 
     let target_path = PathBuf::from(target);
     py.allow_threads(|| {
@@ -280,7 +308,7 @@ pub fn append_from_anndata(
             &indices,
             &values_bytes,
             value_encoding,
-            effective_codec,
+            codec_selection,
             shard_target_rows,
         )
     })

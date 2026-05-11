@@ -10,7 +10,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
+use scx_format::section::SectionType;
+use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 use scx_format::writer::ScxWriter;
+use scx_format::ScxReader;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -453,6 +456,77 @@ fn test_append_mismatched_nvars() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("n_vars mismatch"));
+}
+
+#[test]
+fn test_cli_append_honors_codec_zstd() {
+    // P0 #2: `scx append --codec zstd` must produce an appended shard
+    // whose on-disk codec_id is Zstd. Before the fix, the codec arg
+    // was silently ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "tgt_codec.scx", 8, 10);
+    let source = write_test_file(&dir, "src_codec.scx", 4, 10);
+
+    let output = scx_cli()
+        .args([
+            "append",
+            target.to_str().unwrap(),
+            "--input",
+            source.to_str().unwrap(),
+            "--codec",
+            "zstd",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "append --codec zstd failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reader = ScxReader::open(&target).unwrap();
+    let shards = reader.catalog().shards(SectionType::CsrShard);
+    let last = shards.last().expect("at least one CSR shard");
+    let bytes = reader.section_bytes(last).unwrap();
+    let sh =
+        ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+    assert_eq!(
+        sh.codec_id,
+        CodecId::Zstd as u8,
+        "appended shard codec must be Zstd"
+    );
+}
+
+#[test]
+fn test_append_rejects_zero_shard_size() {
+    // P0 #1: `--shard-size 0` must fail fast at the CLI boundary.
+    // The Append clap field is typed `NonZeroU32`, so clap rejects "0"
+    // during arg parsing without ever invoking run_append.
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "target_zero.scx", 8, 10);
+    let source = write_test_file(&dir, "source_zero.scx", 4, 10);
+
+    let output = scx_cli()
+        .args([
+            "append",
+            target.to_str().unwrap(),
+            "--input",
+            source.to_str().unwrap(),
+            "--shard-size",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "expected failure for --shard-size 0"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap's NonZeroU32 parse error mentions "shard-size" and rejects the value.
+    assert!(
+        stderr.contains("shard-size") || stderr.contains("shard_size"),
+        "stderr did not mention shard-size: {stderr}"
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process;
 
@@ -112,9 +113,9 @@ enum Commands {
         /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
-        /// Target rows per shard
-        #[arg(long, default_value = "10000")]
-        shard_size: u32,
+        /// Target rows per shard (must be > 0)
+        #[arg(long, default_value_t = NonZeroU32::new(10000).unwrap())]
+        shard_size: NonZeroU32,
         /// Rebuild the CSC sidecar after appending (drops + re-emits via
         /// `scx build-csc`). Without this flag, append drops the CSC
         /// sidecar with a warning — the row layout no longer matches.

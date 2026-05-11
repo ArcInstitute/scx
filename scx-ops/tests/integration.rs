@@ -1,10 +1,11 @@
 use arrow::array::{DictionaryArray, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Int8Type, Schema};
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::writer::ScxWriter;
 use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -259,8 +260,8 @@ fn test_append_read_back_all_cells() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -294,8 +295,8 @@ fn test_append_manifest_sequence_increments() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -374,8 +375,8 @@ fn test_compact_after_appends() {
             &indices,
             &values,
             ValueEncoding::Uint8,
-            CodecId::None,
-            16384,
+            CodecSelection::Auto,
+            NonZeroU32::new(16384).unwrap(),
         )
         .unwrap();
     }
@@ -427,8 +428,8 @@ fn test_rollback_after_append() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -514,8 +515,8 @@ fn test_flock_serializes_appends() {
                     &indices,
                     &values,
                     ValueEncoding::Uint8,
-                    CodecId::None,
-                    16384,
+                    CodecSelection::Auto,
+                    NonZeroU32::new(16384).unwrap(),
                 )
                 .unwrap();
             })
@@ -549,8 +550,8 @@ fn test_append_provenance() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -609,8 +610,8 @@ fn test_rollback_to_specific_sequence() {
             &indices,
             &values,
             ValueEncoding::Uint8,
-            CodecId::None,
-            16384,
+            CodecSelection::Auto,
+            NonZeroU32::new(16384).unwrap(),
         )
         .unwrap();
     }
@@ -661,8 +662,8 @@ fn test_append_multi_shard() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        3, // very small target
+        CodecSelection::Auto,
+        NonZeroU32::new(3).unwrap(), // very small target
     )
     .unwrap();
 
@@ -714,8 +715,8 @@ fn test_compact_correct_nnz() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -843,8 +844,8 @@ fn test_shard_header_global_offset_is_row_index() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -999,14 +1000,148 @@ fn test_compact_preserves_layers_obsm_uns() {
     assert_eq!(uns["method"], "test");
 }
 
-/// Task 7: append with Scx1 codec
-#[test]
-fn test_append_with_codec_scx1() {
+/// Read the codec_id from the most recently appended CSR shard.
+fn last_appended_shard_codec(path: &std::path::Path) -> CodecId {
+    use scx_format::section::SectionType;
+    let reader = ScxReader::open(path).unwrap();
+    let shards = reader.catalog().shards(SectionType::CsrShard);
+    let last = shards
+        .last()
+        .expect("file must have at least one CSR shard");
+    let bytes = reader.section_bytes(last).unwrap();
+    let sh =
+        ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+    CodecId::from_u8(sh.codec_id).expect("shard codec_id should be a valid CodecId")
+}
+
+/// P0 #2: append must honour `CodecSelection::Explicit(c)` — every legal
+/// codec, when forced, must end up on disk in the appended shard's
+/// ShardHeader. The previous test only checked shape/nnz, which is why
+/// the `_codec_id` parameter-ignored bug was undetectable.
+fn append_with_explicit_codec(
+    fixture_name: &str,
+    codec: CodecId,
+    value_encoding: ValueEncoding,
+    raw_values: Vec<u8>,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_test_file(&dir, "scx1app.scx", 6, 10, 1);
+    let path = write_test_file(&dir, fixture_name, 6, 10, 1);
+
+    let new_obs = sample_obs(4);
+    // 4 rows × 2 nnz each, indices in [0, 10).
+    let indptr: Vec<u64> = vec![0, 2, 4, 6, 8];
+    let indices: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+    assert_eq!(
+        raw_values.len(),
+        8 * value_encoding.byte_width(),
+        "raw_values length must match 8 nnz × byte_width"
+    );
+
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &raw_values,
+        value_encoding,
+        CodecSelection::Explicit(codec),
+        NonZeroU32::new(16384).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        last_appended_shard_codec(&path),
+        codec,
+        "appended shard codec_id must equal the explicitly requested codec"
+    );
+
+    // Sanity round-trip: decoded CSR must still have the expected shape.
+    let reader = ScxReader::open(&path).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 10);
+    assert_eq!(csr.nnz(), 20);
+}
+
+fn u8_values(vs: &[u8]) -> Vec<u8> {
+    vs.to_vec()
+}
+
+fn f32_values(vs: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vs.len() * 4);
+    for v in vs {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn test_append_with_explicit_codec_none() {
+    append_with_explicit_codec(
+        "explicit_none.scx",
+        CodecId::None,
+        ValueEncoding::Uint8,
+        u8_values(&[1, 2, 3, 4, 5, 6, 7, 8]),
+    );
+}
+
+#[test]
+fn test_append_with_explicit_codec_scx1() {
+    // Scx1 requires integer encoding; uint8 with small UMI values.
+    append_with_explicit_codec(
+        "explicit_scx1.scx",
+        CodecId::Scx1,
+        ValueEncoding::Uint8,
+        u8_values(&[1, 2, 3, 4, 5, 6, 7, 8]),
+    );
+}
+
+#[test]
+fn test_append_with_explicit_codec_zstd() {
+    append_with_explicit_codec(
+        "explicit_zstd.scx",
+        CodecId::Zstd,
+        ValueEncoding::Uint8,
+        u8_values(&[10, 20, 30, 40, 50, 60, 70, 80]),
+    );
+}
+
+#[test]
+fn test_append_with_explicit_codec_lz4() {
+    append_with_explicit_codec(
+        "explicit_lz4.scx",
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint8,
+        u8_values(&[1, 2, 3, 4, 5, 6, 7, 8]),
+    );
+}
+
+#[test]
+fn test_append_with_explicit_codec_pcodec() {
+    // Pcodec's natural input is float data.
+    append_with_explicit_codec(
+        "explicit_pcodec.scx",
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        f32_values(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    );
+}
+
+#[test]
+fn test_append_with_codec_auto_matches_select_codec_for_modality() {
+    // CodecSelection::Auto should call select_codec_for_modality per
+    // shard. With modality_id == 0 the resolved modality_type is RNA,
+    // which delegates to select_codec — so the on-disk codec must match
+    // what select_codec would have chosen for the shard data.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "auto_codec.scx", 6, 10, 1);
 
     let new_obs = sample_obs(4);
     let (indptr, indices, values) = sample_shard_data(4, 10);
+    let expected = scx_format::select_codec_for_modality(
+        &values,
+        ValueEncoding::Uint8,
+        scx_format::ModalityType::Rna,
+    );
     scx_ops::append(
         &path,
         &new_obs,
@@ -1014,16 +1149,16 @@ fn test_append_with_codec_scx1() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::Scx1,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
-    let reader = ScxReader::open(&path).unwrap();
-    assert_eq!(reader.n_obs(), 10);
-    let csr = reader.read_all_csr_shards().unwrap();
-    assert_eq!(csr.shape.0, 10);
-    assert_eq!(csr.nnz(), 20);
+    assert_eq!(
+        last_appended_shard_codec(&path),
+        expected,
+        "Auto must defer to select_codec_for_modality"
+    );
 }
 
 /// Task 7: compact round-trip preserves Zstd-encoded data
@@ -1165,8 +1300,8 @@ fn test_append_empty_rows() {
         &[],
         &[],
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -1196,8 +1331,8 @@ fn test_append_rejects_oob_indices() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     );
 
     assert!(result.is_err(), "append should reject OOB indices");
@@ -1210,6 +1345,71 @@ fn test_append_rejects_oob_indices() {
     // File should be unchanged (error before any writes)
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 4);
+}
+
+/// P1 #11: append must reject `target_n_vars > u32::MAX` early, mirroring
+/// the writer-side `NVarsOverflow` guard at scx-format::writer:496. Build
+/// a synthetic target with `header.n_vars = u32::MAX + 1` (no CSR shards
+/// — the writer-side check would otherwise reject the file at creation
+/// time) and assert that append fails *before* writing anything.
+#[test]
+fn test_append_rejects_n_vars_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nvars_overflow.scx");
+    let n_obs: u64 = 4;
+    let n_vars_overflow: u64 = u32::MAX as u64 + 1;
+
+    // Hand-rolled fixture: valid SCX file with no CSR shards but
+    // header.n_vars > u32::MAX. ScxWriter::new doesn't validate the
+    // header; we just skip write_csr_shard to bypass the writer-side
+    // NVarsOverflow guard.
+    let mut header = sample_header(n_obs, n_vars_overflow);
+    header.index_dtype = 1; // u32, since n_vars > u16::MAX
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+    // Skip write_var with the absurdly large n_vars — var is optional.
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    let pre_append_size = std::fs::metadata(&path).unwrap().len();
+
+    let new_obs = sample_obs(2);
+    let indptr = vec![0u64, 1, 2];
+    let indices = vec![0u32, 1];
+    let values = vec![1u8, 2];
+
+    let result = scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+    );
+
+    assert!(result.is_err(), "append should reject n_vars > u32::MAX");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("exceeds u32::MAX"),
+        "expected NVarsOverflow error, got: {err}"
+    );
+
+    // File must be byte-identical post-failure — the guard fires before
+    // any disk mutation.
+    let post_append_size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        post_append_size, pre_append_size,
+        "append must not touch the file on n_vars overflow"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,8 +1442,8 @@ fn test_append_drops_csc_from_input() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -1334,8 +1534,8 @@ fn test_append_pure_csr_unaffected() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -1422,8 +1622,8 @@ fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
     )
     .unwrap();
 
@@ -1631,8 +1831,8 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
         &new_indices,
         &new_values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        16384,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
         2, // adt
     )
     .unwrap();

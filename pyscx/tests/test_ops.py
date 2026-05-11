@@ -24,6 +24,66 @@ def test_append_scx_to_scx(query_adata, scx_from_adata, tmp_dir):
     assert new_n == original_n * 2
 
 
+def test_append_honors_codec(query_adata, scx_from_adata):
+    """P0 #2: pyscx.append plumbs the explicit codec string through to scx_ops::append.
+
+    The Rust-level test (test_append_with_explicit_codec_zstd in
+    scx-ops/tests/integration.rs) asserts the on-disk shard codec_id;
+    this test just confirms the Python string parser reaches Rust
+    without panicking and the appended cells round-trip.
+    """
+    import pyscx
+
+    path1 = scx_from_adata(query_adata, "codec1.scx")
+    path2 = scx_from_adata(query_adata, "codec2.scx")
+    original_n = pyscx.open(path1).n_obs
+
+    pyscx.append(path1, path2, codec="zstd")
+    assert pyscx.open(path1).n_obs == original_n * 2
+
+
+def test_append_rejects_nonpositive_shard_size(query_adata, scx_from_adata):
+    """P0 #1 + P0 #9: pyscx.append / append_from_anndata reject shard_size <= 0
+    with ValueError before crossing into Rust. Covers both shard_size=0 and
+    negative integers (which previously would have surfaced as OverflowError
+    from pyo3 u32 extraction).
+    """
+    import anndata
+    import pandas as pd
+    import pyscx
+
+    path1 = scx_from_adata(query_adata, "z1.scx")
+    path2 = scx_from_adata(query_adata, "z2.scx")
+
+    # Zero case (P0 #1)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append(path1, path2, shard_size=0)
+
+    # Negative case (P0 #9 — must be ValueError, not OverflowError)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append(path1, path2, shard_size=-1)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append(path1, path2, shard_size=-100)
+
+    # Same checks for append_from_anndata.
+    n_new = 4
+    n_vars = query_adata.n_vars
+    dense = np.zeros((n_new, n_vars), dtype=np.float32)
+    dense[0, 0] = 1
+    x = sp.csr_matrix(dense)
+    obs = pd.DataFrame(
+        {"cell_type": pd.Categorical(["T cell"] * n_new)},
+        index=[f"z_{i}" for i in range(n_new)],
+    )
+    var = query_adata.var.copy()
+    new_adata = anndata.AnnData(X=x, obs=obs, var=var)
+
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append_from_anndata(path1, new_adata, shard_size=0)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append_from_anndata(path1, new_adata, shard_size=-1)
+
+
 def test_append_from_anndata(query_adata, scx_from_adata):
     """append_from_anndata() — append AnnData, verify all cells present."""
     import anndata

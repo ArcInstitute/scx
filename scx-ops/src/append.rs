@@ -1,16 +1,17 @@
 // Append operation: add new rows to an existing SCX file.
 
 use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecSelection, ValueEncoding};
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::modality::ModalityTable;
+use scx_format::modality::{ModalityTable, ModalityType};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::shard::{
@@ -34,8 +35,8 @@ pub fn append(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
-    codec_id: CodecId,
-    shard_target_rows: u32,
+    codec_selection: CodecSelection,
+    shard_target_rows: NonZeroU32,
 ) -> Result<()> {
     append_for_modality(
         target_path,
@@ -44,7 +45,7 @@ pub fn append(
         new_indices,
         new_values,
         value_encoding,
-        codec_id,
+        codec_selection,
         shard_target_rows,
         0,
     )
@@ -70,8 +71,8 @@ pub fn append_for_modality(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
-    _codec_id: CodecId,
-    shard_target_rows: u32,
+    codec_selection: CodecSelection,
+    shard_target_rows: NonZeroU32,
     modality_id: u8,
 ) -> Result<()> {
     let mut lock = FileLock::acquire_exclusive(target_path)?;
@@ -187,14 +188,21 @@ pub fn append_for_modality(
             )));
         }
     }
-    let modality_name: Option<String> = if modality_id == 0 {
-        None
-    } else {
-        modality_table
-            .as_ref()
-            .and_then(|t| t.entries.get((modality_id - 1) as usize))
-            .map(|info| info.name.clone())
-    };
+    // Resolve the target modality's info once. `info_of(0)` returns None
+    // (global / legacy files), so callers naturally fall back to defaults
+    // derived from the file header. For modality_id != 0 the entry is
+    // guaranteed to exist (out-of-range ids are rejected above); the
+    // `unwrap_or` fallbacks below are defensive.
+    let modality_info = modality_table.as_ref().and_then(|t| t.info_of(modality_id));
+    let modality_name: Option<String> = modality_info.map(|info| info.name.clone());
+    let modality_type: ModalityType = modality_info
+        .map(|info| info.modality_type)
+        .unwrap_or(ModalityType::Rna);
+    // Per-modality `n_vars` (used for codec auto-selection and index
+    // bounds checks) may differ from the file-wide max across modalities.
+    let target_n_vars: u64 = modality_info
+        .map(|info| info.n_vars)
+        .unwrap_or(header.n_vars);
 
     // Per-modality CSR shard count for naming. Global (modality_id == 0)
     // continues to use the file-wide `header.n_csr_shards`; per-modality
@@ -208,19 +216,15 @@ pub fn append_for_modality(
             .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
             .count() as u32
     };
-
-    // Validate indices are within [0, n_vars). For per-modality
-    // append, `n_vars` is the chosen modality's `n_vars`, not the
-    // header's (which may be the file-wide max across modalities).
-    let target_n_vars: u64 = if modality_id == 0 {
-        header.n_vars
-    } else {
-        modality_table
-            .as_ref()
-            .and_then(|t| t.entries.get((modality_id - 1) as usize))
-            .map(|info| info.n_vars)
-            .unwrap_or(header.n_vars)
-    };
+    // P1 #11: mirror the writer-side `NVarsOverflow` guard
+    // (scx-format/src/writer.rs:496) so an oversized n_vars fires
+    // *before* the file is touched, instead of later when the shard
+    // header's u32 n_minor field would silently truncate.
+    if target_n_vars > u32::MAX as u64 {
+        return Err(OpsError::Format(scx_format::ScxError::NVarsOverflow(
+            target_n_vars,
+        )));
+    }
     if let Some(&max_idx) = new_indices.iter().max() {
         if max_idx as u64 >= target_n_vars {
             return Err(OpsError::IndexOutOfBounds {
@@ -299,7 +303,7 @@ pub fn append_for_modality(
     let mut row_offset = 0usize;
 
     while row_offset < n_new_rows {
-        let shard_rows = std::cmp::min(shard_target_rows as usize, n_new_rows - row_offset);
+        let shard_rows = std::cmp::min(shard_target_rows.get() as usize, n_new_rows - row_offset);
         let shard_indptr_start = new_indptr[row_offset];
         let shard_indptr_end = new_indptr[row_offset + shard_rows];
         let shard_nnz = shard_indptr_end - shard_indptr_start;
@@ -325,8 +329,15 @@ pub fn append_for_modality(
         let val_end = idx_end * value_byte_size;
         let shard_values = &new_values[val_start..val_end];
 
-        // Per-shard codec selection (auto-select optimal codec for this shard's data)
-        let shard_codec = scx_format::select_codec(shard_values, value_encoding);
+        // Per-shard codec selection. `Auto` picks data- and modality-
+        // driven codecs per shard; `Explicit(c)` forces `c` for every
+        // appended shard.
+        let shard_codec = match codec_selection {
+            CodecSelection::Auto => {
+                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
+            }
+            CodecSelection::Explicit(c) => c,
+        };
 
         let shard_idx = old_per_modality_csr + new_shard_entries.len() as u32;
         // Per-modality shards follow the writer's `X/{name}/shard_{i}`
