@@ -436,6 +436,110 @@ def _check_slurm() -> CheckResult:
     return CheckResult("slurm", "ok", "SLURM detected")
 
 
+def _check_cloud_probe(python: str, bucket: str | None = None) -> list[CheckResult]:
+    """Probe cloud connectivity before submitting jobs.
+
+    Catches two recurring pre-run failure modes that otherwise surface
+    only after hundreds of FAST_FAILs land in the gate report:
+
+      1. **gcsfs not registered with fsspec** — the env has fsspec but
+         not gcsfs (or version-mismatched), so the `gs://` protocol fails
+         at first use. Surfaces as `Please install gcsfs` from each cloud
+         cell. Tier-full gate ran into this on 2026-05-10 worker env →
+         24 zarr cloud FAST_FAILs.
+      2. **catalog symmetry bug class** — a known-bad cloud `.scxd`
+         catalog round-trips at push but fails at pull with
+         `failed to fill whole buffer`. Surfaces as 158 cloud FAST_FAILs
+         on the second 2026-05-10 gate run.
+
+    Each probe runs in < 30 s; the combined cost is far cheaper than a
+    2 h gate that fails late. Returns one CheckResult per probe.
+    Skipped silently when ``--probe-cloud`` is not passed.
+    """
+    # Imported here so the controller doesn't carry these symbols
+    # unconditionally; the bucket default lives in config.py.
+    if bucket is None:
+        rc, out = _run_silent(
+            [python, "-c", "from benchmarks.comprehensive.config import GCS_TEST_BUCKET; print(GCS_TEST_BUCKET)"],
+            timeout=10,
+        )
+        if rc != 0:
+            return [CheckResult(
+                "cloud_probe", "fail",
+                f"could not resolve GCS_TEST_BUCKET via {python!r}: {out.strip()[:120]}",
+            )]
+        bucket = out.strip().splitlines()[-1] if out.strip() else "gs://arc-ctc-nextflow/scx-test"
+
+    checks: list[CheckResult] = []
+
+    # 1. fsspec gs protocol resolution + bucket reachability.
+    # `ls` confirms credentials too — IMDS / GOOGLE_APPLICATION_CREDENTIALS
+    # must be wired before this returns.
+    rc, out = _run_silent(
+        [python, "-c", (
+            "import fsspec; "
+            f"fs = fsspec.filesystem('gs'); "
+            f"list(fs.ls({bucket!r}))[:1]"
+        )],
+        timeout=25,
+    )
+    if rc != 0:
+        msg = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+        checks.append(CheckResult(
+            "cloud_gcsfs", "fail",
+            f"fsspec gs filesystem failed on {bucket} — gcsfs missing/mismatched "
+            f"or GCP credentials not configured: {msg[:160]}",
+        ))
+        # If gcsfs is broken, the open_cloud probe will likely fail for
+        # the same reason — skip it to keep the operator's attention on
+        # the root cause.
+        return checks
+    checks.append(CheckResult("cloud_gcsfs", "ok", f"fsspec ls {bucket} ok"))
+
+    # 2. pyscx.open_cloud round-trip on a known small fixture (catches
+    # catalog-symmetry / cloud-layout bugs class). pbmc3k is the
+    # cheapest possible probe (1 GET on _catalog.bin + a metadata
+    # touch); skip with WARN rather than FAIL if it isn't staged.
+    probe_url = f"{bucket.rstrip('/')}/pbmc3k.scxd"
+    rc, out = _run_silent(
+        [python, "-c", (
+            f"import pyscx; "
+            f"h = pyscx.open_cloud({probe_url!r}); "
+            f"_ = (h.n_obs, h.n_vars, h.nnz)"
+        )],
+        timeout=30,
+    )
+    if rc != 0:
+        msg = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+        # Heuristic: distinguish "fixture not staged" (warn — operator
+        # forgot setup_cloud_test_data.sh) from "open failed despite
+        # fixture existing" (fail — actual catalog/format problem).
+        not_staged = (
+            "no such" in msg.lower()
+            or "not found" in msg.lower()
+            or "404" in msg
+        )
+        if not_staged:
+            checks.append(CheckResult(
+                "cloud_open", "warn",
+                f"probe fixture {probe_url} not staged — open_cloud "
+                f"symmetry check skipped. Run setup_cloud_test_data.sh "
+                f"to enable.",
+            ))
+        else:
+            checks.append(CheckResult(
+                "cloud_open", "fail",
+                f"pyscx.open_cloud failed on {probe_url} — likely "
+                f"catalog-format bug; re-push fixtures with current pyscx: "
+                f"{msg[:160]}",
+            ))
+        return checks
+    checks.append(CheckResult(
+        "cloud_open", "ok", f"pyscx.open_cloud {probe_url} ok",
+    ))
+    return checks
+
+
 def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
     """Run pre-flight checks and return ``(checks, probe_info)``.
 
@@ -515,6 +619,15 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
     # compute node, where the GPU-built wheel actually lives).
     if not args.no_accel and not want_cluster_probe:
         checks.append(_check_pyscx_accel(args.python))
+
+    # Cloud probe — opt-in. When the gate's matrix includes cloud cells,
+    # this catches the two recurring pre-run failure modes (missing
+    # gcsfs registration, catalog symmetry bug) in < 30 s instead of
+    # after 158 FAST_FAILs land in the gate report. Disabled by default
+    # because not every gate run exercises cloud (--accel-only,
+    # --no-accel, narrow --formats lists).
+    if args.probe_cloud:
+        checks.extend(_check_cloud_probe(args.python))
 
     width = max(len(c.name) for c in checks)
     marker = {"ok": "OK   ", "warn": "WARN ", "fail": "FAIL "}
@@ -872,6 +985,16 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--no-gpu", action="store_true",
                         help="Drop GPU accel format variants (accel_*__*_gpu*).")
+    parser.add_argument("--probe-cloud", action="store_true",
+                        help="Run a cloud connectivity probe in pre-flight: "
+                             "fsspec gs ls (catches missing/mismatched gcsfs) "
+                             "and pyscx.open_cloud against a small staged "
+                             "fixture (catches the catalog-symmetry bug "
+                             "class). Adds ~10-30s to pre-flight but surfaces "
+                             "two recurring failure modes in seconds rather "
+                             "than after the full matrix lands as FAST_FAILs. "
+                             "Opt-in because --accel-only / --no-accel / "
+                             "narrow --formats runs may not exercise cloud.")
     parser.add_argument("--benchmarks", nargs="+", default=None,
                         help="Restrict to a subset of the canonical benchmark "
                              "list (e.g. `--benchmarks accel_pca`). Forwarded "

@@ -692,6 +692,35 @@ dataset-prep, ML-loader, and standalone GPU/Harmony scripts remain
 > require one-time fixture staging via
 > `benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`.
 
+### Refreshing derived fixtures after an h5ad change
+
+When the source h5ad fixtures change (e.g. an obs-column augmentation),
+the derived `scx_auto`, `tiledb_soma`, and `zarr_zstd` local files —
+and their cloud-pushed copies — go stale. Use `reconvert_fixtures.py`
+to drive the full re-conversion + push pipeline:
+
+```bash
+# Default matrix: all datasets × {scx_auto, tiledb_soma, zarr_zstd}, local only
+python benchmarks/scripts/reconvert_fixtures.py
+
+# Cherry-pick datasets + formats and re-push to GCS
+python benchmarks/scripts/reconvert_fixtures.py \
+    --datasets pbmc3k pbmc10k tabula_sapiens_100k \
+    --formats scx_auto tiledb_soma \
+    --cloud-push
+
+# Dry-run to see the plan without converting or uploading
+python benchmarks/scripts/reconvert_fixtures.py --dry-run --cloud-push
+
+# List known datasets / format keys
+python benchmarks/scripts/reconvert_fixtures.py --list
+```
+
+`--cloud-push` invalidates the existing GCS copy (main directory +
+`.blake3` sidecar) before uploading so `ensure_cloud_fixture`'s
+completion short-circuit doesn't skip the fresh data. Requires
+`GOOGLE_APPLICATION_CREDENTIALS` (or ADC) and `gsutil` on PATH.
+
 ---
 
 ## Monitoring Jobs
