@@ -13,6 +13,7 @@ powers the ``anndata_zarr_backed`` FormatVariant.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from benchmarks.comprehensive.runners.base import (
     FormatRunner,
     TimingResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ZarrRunner(FormatRunner):
@@ -289,6 +292,26 @@ class ZarrRunner(FormatRunner):
             return store, True
         except (FileNotFoundError, KeyError, ValueError):
             return zarr.open(cloud_url, mode="r"), False
+
+    def cloud_obs_columns(self, cloud_url: str) -> set[str]:
+        """Return the obs column set on a cloud-staged ``.zarr`` fixture.
+
+        Opens the AnnData-on-Zarr store and reads the obs group's keys.
+        Returns an empty set on any error so the caller treats it as
+        unknown-schema and skips column-typed predicates.
+        """
+        try:
+            import anndata
+
+            adata = anndata.read_zarr(cloud_url)
+            return set(adata.obs.columns)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cloud_obs_columns failed for %s: %s — predicates against named "
+                "obs columns will be skipped for this fixture.",
+                cloud_url, exc,
+            )
+            return set()
 
     def read_cloud(self, cloud_url: str) -> TimingResult:
         if self.backed:

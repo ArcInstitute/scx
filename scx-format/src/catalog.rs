@@ -404,21 +404,32 @@ pub struct FullCatalog {
 
 impl FullCatalog {
     /// Serialize the full catalog. Appends a trailing 32-byte BLAKE3 checksum.
+    ///
+    /// `ShardStats::write_to` always emits the v2 stats layout (with the
+    /// explicit `col_start` / `col_end` pair). To keep the declared
+    /// `catalog_version` consistent with what we actually write — readers
+    /// branch on this field — we transparently upgrade `catalog_version` to
+    /// at least 2 here. v2 is a strict superset of v1, so v1 consumers
+    /// reading round-tripped catalogs still parse cleanly via the v2 path.
+    /// This closes the symmetry break that broke `pyscx.pull` of any cloud
+    /// `.scxd` directory whose source `.scx` was written before the v2 stats
+    /// layout shipped (2026-05-10 tier-full gate run #2).
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
+        let catalog_version = std::cmp::max(self.catalog_version, 2);
+
         let mut buf = Vec::new();
 
         // Header fields
-        buf.write_u16::<LittleEndian>(self.catalog_version)?;
+        buf.write_u16::<LittleEndian>(catalog_version)?;
         buf.write_u64::<LittleEndian>(self.manifest_sequence)?;
         buf.write_u64::<LittleEndian>(self.prev_catalog_offset)?;
         buf.write_u64::<LittleEndian>(self.n_obs)?;
         buf.write_u32::<LittleEndian>(self.entries.len() as u32)?;
 
         // Entries. v2 layout adds a single `modality_id: u8` between
-        // the per-entry checksum and the stats length prefix. v1
-        // layout omits that byte. Writers emit whichever layout
-        // matches `self.catalog_version`.
-        let v2 = self.catalog_version >= 2;
+        // the per-entry checksum and the stats length prefix. Since we
+        // always write the v2 catalog header now, every entry carries
+        // its modality_id (zero for single-modality files).
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
             buf.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
@@ -427,10 +438,7 @@ impl FullCatalog {
             buf.write_u64::<LittleEndian>(entry.length)?;
             buf.write_u8(entry.section_type as u8)?;
             buf.write_all(&entry.checksum)?;
-
-            if v2 {
-                buf.write_u8(entry.modality_id)?;
-            }
+            buf.write_u8(entry.modality_id)?;
 
             // Stats: write length prefix then optional stats bytes
             match &entry.stats {
@@ -1344,5 +1352,55 @@ mod tests {
         // Empty range (lo == hi or lo > hi): empty.
         assert!(catalog.csc_shards_for_col_range(50, 50).is_empty());
         assert!(catalog.csc_shards_for_col_range(200, 100).is_empty());
+    }
+
+    /// Regression: 2026-05-10 tier-full gate run #2.
+    ///
+    /// Before the fix, `FullCatalog::write_to` preserved `catalog_version`
+    /// from `self` while `ShardStats::write_to` always emitted the v2 stats
+    /// layout (with explicit `col_start` / `col_end`). When a v1 catalog
+    /// (e.g. one parsed from an older `.scx` file by `scx-cloud::push`) was
+    /// re-serialised, the on-disk header claimed v1 but the per-entry stats
+    /// were v2-shaped. Readers branched on the header, parsed v1-sized
+    /// stats, and walked off the end of the buffer — surfacing as
+    /// `failed to fill whole buffer` on every `pyscx.pull`.
+    ///
+    /// Fix: `write_to` upgrades `catalog_version` to at least 2 before
+    /// serialising. v1 catalogs round-trip into v2 catalogs that any
+    /// reader can parse cleanly.
+    #[test]
+    fn write_upgrades_v1_catalog_to_v2() {
+        let v1 = FullCatalog {
+            catalog_version: 1,
+            manifest_sequence: 0,
+            prev_catalog_offset: 0,
+            n_obs: 1_000,
+            entries: vec![
+                sample_full_entry("obs", SectionType::ObsMetadata, false),
+                sample_full_entry("X_shard_0", SectionType::CsrShard, true),
+            ],
+        };
+
+        let mut buf = Vec::new();
+        v1.write_to(&mut buf).unwrap();
+
+        // The first 2 bytes of the catalog payload are the catalog_version
+        // (u16 LE). Auto-upgrade should land 2 on disk even though the
+        // source struct said 1.
+        let on_disk_version = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(
+            on_disk_version, 2,
+            "expected catalog_version=2 on disk (v1 should auto-upgrade)"
+        );
+
+        // Round-trip parses cleanly — pre-fix, this raised
+        // `failed to fill whole buffer` because v1 stats parsing
+        // misaligned against the v2-shaped bytes.
+        let total_len = buf.len();
+        let parsed =
+            FullCatalog::read_from(&mut std::io::Cursor::new(&buf), total_len, true).unwrap();
+        assert_eq!(parsed.catalog_version, 2);
+        assert_eq!(parsed.n_obs, v1.n_obs);
+        assert_eq!(parsed.entries.len(), v1.entries.len());
     }
 }

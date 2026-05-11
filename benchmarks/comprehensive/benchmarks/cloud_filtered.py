@@ -70,21 +70,41 @@ def _obs_columns(dataset: DatasetConfig) -> set[str]:
         adata.file.close()
 
 
-def _applicable_predicates(dataset: DatasetConfig):
-    """Filter ``default_predicates`` to those whose columns exist on *dataset*."""
-    cols = _obs_columns(dataset)
+def _applicable_predicates(
+    dataset: DatasetConfig,
+    cloud_cols: set[str] | None = None,
+):
+    """Filter ``default_predicates`` to those whose columns exist.
+
+    Always passes ``RandomSamplePredicate`` (column-free). For column-typed
+    predicates, the local h5ad obs columns are the first-pass filter (cheap,
+    no cloud round-trip). When ``cloud_cols`` is provided, it's the
+    authoritative second-pass gate — a column present in the local h5ad but
+    missing from the cloud fixture (e.g. pbmc10k.soma materialised before
+    the ``obs.n_counts`` augmentation) is skipped before the runner is
+    invoked, avoiding a mid-benchmark schema-error explosion.
+    """
+    local_cols = _obs_columns(dataset)
     out = []
     for pred in default_predicates():
         if isinstance(pred, RandomSamplePredicate):
             out.append(pred)
         elif isinstance(pred, (EqPredicate, GtPredicate)):
-            if pred.column in cols:
-                out.append(pred)
-            else:
+            if pred.column not in local_cols:
                 logger.info(
-                    "Skipping predicate %s — obs column %r absent in %s",
+                    "Skipping predicate %s — obs column %r absent in local h5ad %s",
                     pred.name, pred.column, dataset.name,
                 )
+                continue
+            if cloud_cols is not None and pred.column not in cloud_cols:
+                logger.info(
+                    "Skipping predicate %s — obs column %r absent in cloud "
+                    "fixture for %s (local h5ad has it, but the cloud-staged "
+                    "copy was materialised before that column was added)",
+                    pred.name, pred.column, dataset.name,
+                )
+                continue
+            out.append(pred)
     return out
 
 
@@ -115,18 +135,24 @@ def run(
             f"Run conversion first (--formats {format_variant.key})."
         )
 
-    predicates = _applicable_predicates(dataset)
+    require_gcp_credentials()
+    cloud_url = ensure_cloud_fixture(
+        dataset, format_variant, Path(converted_path), provider=provider,
+    )
+
+    # The local h5ad obs may have columns (e.g. n_counts after the augmentation
+    # script) that the cloud-staged fixture lacks — those fixtures pre-date
+    # the augmentation and weren't re-pushed. Probe the cloud schema once and
+    # use it as the authoritative gate on column-typed predicates.
+    cloud_cols = runner.cloud_obs_columns(cloud_url)
+
+    predicates = _applicable_predicates(dataset, cloud_cols=cloud_cols or None)
     if not predicates:
         logger.info(
             "Skipping cloud_filtered for %s / %s — no predicates apply to this dataset",
             format_variant.key, dataset.name,
         )
         return None
-
-    require_gcp_credentials()
-    cloud_url = ensure_cloud_fixture(
-        dataset, format_variant, Path(converted_path), provider=provider,
-    )
 
     result = BenchmarkResult(
         benchmark="cloud_filtered",

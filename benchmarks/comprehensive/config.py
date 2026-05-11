@@ -735,8 +735,10 @@ MEM_HIGH_MEM_THRESHOLD_GB = 200
 # Hard ceiling — the largest single-task allocation cpu_high_mem can serve.
 # Estimates above this are clamped (with a warning at submit time); jobs that
 # legitimately need more would have OOMed under the previous uniform 500 GB
-# scheme too.
-MEM_CEILING_GB = 500
+# scheme too. Bumped 500 → 1000 GB after the 2026-05-10 tier-full gate ran
+# correctness/scx_auto into the prior ceiling on census_500k / census_1m;
+# Chimera's high-mem nodes carry ~1–2 TB so 1 TB single-task is reachable.
+MEM_CEILING_GB = 1000
 
 # Floor for any job (Python + scanpy + pyo3 baseline + scratch).
 MEM_FLOOR_GB = 8
@@ -787,6 +789,14 @@ def estimate_memory_gb(
     elif benchmark == "read_selective":
         # Column-projected reads — small in absolute terms.
         peak_mb = base_mb * 0.5
+        # tiledb_soma materialises the full obs DataFrame before
+        # applying the predicate's value_filter — on census_1m that's
+        # ~1.5 GB of obs plus per-thread working buffers — and OOM-killed
+        # both census tier cells on the 2026-05-10 tier-full run. Bump for
+        # >=500K cells via the dense-mb proxy (scales with n_obs * n_vars
+        # but in practice the obs side dominates).
+        if format_key == "tiledb_soma" and n_obs >= 500_000:
+            peak_mb = max(peak_mb, dense_mb * 0.6)
     elif benchmark == "compression":
         # Just measures file sizes — Python overhead only.
         peak_mb = base_mb * 0.25
@@ -851,11 +861,26 @@ def estimate_memory_gb(
         # for the pbmc3k+tabula_sapiens_100k combined run; size like
         # read_full but with a denser safety multiplier on top.
         # Bumped from `(base_mb*2, dense_mb*1.5)` after the 2026-05-09
-        # tier-full gate run OOM-killed pbmc10k + smartseq2 / scx_auto.
-        # Stacked-fixture footprint runs ~2x on those two datasets
-        # because the scanpy reference materialises a dense X for the
-        # equivalence assertions before the SCX + SLAF readers join in.
-        peak_mb = max(base_mb * 3, dense_mb * 2.0)
+        # tier-full gate run, then bumped again from `(base_mb*3, dense_mb*2.0)`
+        # after the 2026-05-10 run OOM-killed 5 datasets (pbmc10k, smartseq2,
+        # tabula_sapiens_100k, census_500k, census_1m) on scx_auto.
+        # Stacked-fixture footprint runs ~2.5x dense on the larger datasets:
+        # scanpy reference materialises a dense X for the equivalence
+        # assertions, SCX backed reader holds its own working buffers, and
+        # SLAF round-trip transiently doubles the in-flight cell count.
+        # The 12-GB peak floor handles small datasets like pbmc10k (1.5 GB
+        # dense) where the multipliers under-shoot — pbmc10k OOM-killed at
+        # the 16 GB allocation that the formula otherwise yielded.
+        # Run #4 of the 2026-05-10 gate still OOM'd 4 datasets (smartseq2,
+        # tabula_sapiens_100k, census_500k, census_1m) at the 2.5x dense
+        # multiplier; run #5 OOM'd the same 4 at the 3.5x multiplier.
+        # smartseq2 OOM-killed at the 64 GB allocation after only 96s,
+        # suggesting peak is well above 5x dense. Bumped to 5x dense to
+        # cover (scanpy reference + SCX backed + SLAF round-trip) all
+        # materialising simultaneously + PCA/DE working buffers.
+        # census_500k / census_1m hit MEM_CEILING_GB at this multiplier;
+        # those triples should ride a justification, not a higher cap.
+        peak_mb = max(base_mb * 4, dense_mb * 5.0, 12 * 1024)
     elif benchmark == "roundtrip":
         # Holds source AnnData + SCX-materialised AnnData resident at the
         # same time, plus the (a - b) CSR diff scratch and a second copy
@@ -979,6 +1004,20 @@ def estimate_time_minutes(
         "correctness":            60,
         "roundtrip":              10,
         "cell_eval_parity_perf":  60,
+        # Default 15-min fall-through clipped all 6 index_plan/scx_auto cells
+        # on the 2026-05-10 tier-full run. The workers2 path is ~50% slower
+        # after the v2-catalog regression (see
+        # results/justifications/index_plan_workers2_v2_catalog.md), and the
+        # cell runs workers0 + workers2 + the streaming dataset training path
+        # back-to-back. Bumped 15→40 then 40→75 after run #4 still hit the
+        # 40-min timeout on smartseq2/tabula_100k/census_500k/census_1m —
+        # smartseq2's high n_vars (61497) drives the loader to fall back to
+        # per-batch sizes well under the 512 MB internal budget, slowing
+        # iteration substantially. Run #5 caught tabula_sapiens_100k (75:11
+        # elapsed on a 75-min cap) and census_500k (80:05 on 80-min) just
+        # over budget — bump base 75→120 to give the larger datasets clear
+        # headroom on top of the 8 min/M slope.
+        "index_plan":            120,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
         # cluster, (b) over-budgeting once beats serial retries on timeout

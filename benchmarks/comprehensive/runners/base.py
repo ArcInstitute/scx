@@ -307,6 +307,21 @@ class FormatRunner(ABC):
             f"{self.name} does not support read_cloud_filtered_query"
         )
 
+    def cloud_obs_columns(self, cloud_url: str) -> set[str]:
+        """Return the obs column set visible at a cloud fixture URL.
+
+        Default implementation returns the empty set, signalling "I don't
+        know what's in the cloud fixture's obs". ``cloud_filtered.py`` uses
+        this set as the authoritative gate for predicates that reference
+        named obs columns — a local h5ad fixture may have ``n_counts``
+        attached after augmentation, while the cloud-staged copy was
+        materialised before that augmentation and lacks the column. The
+        runner can override this with a cheap header-only read of the cloud
+        schema; an empty result instructs the benchmark to skip any
+        column-typed predicate rather than fail mid-run.
+        """
+        return set()
+
     def read_filtered_query(
         self,
         path: str | Path,

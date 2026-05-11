@@ -40,9 +40,15 @@ dependencies:
   - pyarrow=23.0.1
   - tiledbsoma=2.3.0
 
-  # Cloud object-store (zarr + anndata async store routing for gs:// URIs)
-  - fsspec=2025.9.0
-  - gcsfs=2025.9.0
+  # Cloud object-store (zarr + anndata async store routing for gs:// URIs).
+  # Both packages must land via the same channel (conda-forge here) so that
+  # gcsfs's protocol registration is visible to fsspec at import time. The
+  # 2026-05-10 tier-full gate caught a worker env where conda's solver
+  # silently dropped gcsfs but left fsspec, breaking 24 zarr cloud_*/zarr_*
+  # cells with "Please install gcsfs to access Google Storage". Pin to a
+  # matched-version pair so future env rebuilds preserve the registration.
+  - fsspec=2026.2.0
+  - gcsfs=2026.2.0
 
   # Analysis (for accelerator comparisons against scanpy)
   - scikit-learn=1.8.0
