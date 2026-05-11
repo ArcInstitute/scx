@@ -432,7 +432,7 @@ impl MultimodalTrainingDataset {
         drop(reader);
         let mut pipelines = Vec::with_capacity(resolved.len());
         let mut names = Vec::with_capacity(resolved.len());
-        for ((name, mid, _), modality_mb) in resolved.into_iter().zip(per_modality_mb.into_iter()) {
+        for ((name, mid, _), modality_mb) in resolved.into_iter().zip(per_modality_mb) {
             let config = LoaderConfig {
                 batch_size: batch_size.unwrap_or(defaults.batch_size),
                 shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
