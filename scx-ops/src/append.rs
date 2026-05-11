@@ -236,6 +236,15 @@ pub fn append_for_modality(
             .map(|info| info.n_vars)
             .unwrap_or(header.n_vars)
     };
+    // P1 #11: mirror the writer-side `NVarsOverflow` guard
+    // (scx-format/src/writer.rs:496) so an oversized n_vars fires
+    // *before* the file is touched, instead of later when the shard
+    // header's u32 n_minor field would silently truncate.
+    if target_n_vars > u32::MAX as u64 {
+        return Err(OpsError::Format(scx_format::ScxError::NVarsOverflow(
+            target_n_vars,
+        )));
+    }
     if let Some(&max_idx) = new_indices.iter().max() {
         if max_idx as u64 >= target_n_vars {
             return Err(OpsError::IndexOutOfBounds {

@@ -1347,6 +1347,71 @@ fn test_append_rejects_oob_indices() {
     assert_eq!(reader.n_obs(), 4);
 }
 
+/// P1 #11: append must reject `target_n_vars > u32::MAX` early, mirroring
+/// the writer-side `NVarsOverflow` guard at scx-format::writer:496. Build
+/// a synthetic target with `header.n_vars = u32::MAX + 1` (no CSR shards
+/// — the writer-side check would otherwise reject the file at creation
+/// time) and assert that append fails *before* writing anything.
+#[test]
+fn test_append_rejects_n_vars_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nvars_overflow.scx");
+    let n_obs: u64 = 4;
+    let n_vars_overflow: u64 = u32::MAX as u64 + 1;
+
+    // Hand-rolled fixture: valid SCX file with no CSR shards but
+    // header.n_vars > u32::MAX. ScxWriter::new doesn't validate the
+    // header; we just skip write_csr_shard to bypass the writer-side
+    // NVarsOverflow guard.
+    let mut header = sample_header(n_obs, n_vars_overflow);
+    header.index_dtype = 1; // u32, since n_vars > u16::MAX
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+    // Skip write_var with the absurdly large n_vars — var is optional.
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    let pre_append_size = std::fs::metadata(&path).unwrap().len();
+
+    let new_obs = sample_obs(2);
+    let indptr = vec![0u64, 1, 2];
+    let indices = vec![0u32, 1];
+    let values = vec![1u8, 2];
+
+    let result = scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+    );
+
+    assert!(result.is_err(), "append should reject n_vars > u32::MAX");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("exceeds u32::MAX"),
+        "expected NVarsOverflow error, got: {err}"
+    );
+
+    // File must be byte-identical post-failure — the guard fires before
+    // any disk mutation.
+    let post_append_size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        post_append_size, pre_append_size,
+        "append must not touch the file on n_vars overflow"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CSC drop on mutating ops (`append`, `compact`, `merge`)
 // ---------------------------------------------------------------------------
