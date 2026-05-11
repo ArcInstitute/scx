@@ -25,4 +25,4 @@ pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
 
 #[cfg(feature = "python")]
-pub use python::{IndexPlanDataset, TrainingDataset};
+pub use python::{IndexPlanDataset, MultimodalTrainingDataset, TrainingDataset};

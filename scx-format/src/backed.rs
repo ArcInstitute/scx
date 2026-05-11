@@ -70,6 +70,32 @@ impl BackedCsrIndex {
         Self::from_catalog_filtered(catalog, SectionType::LayerCsrShard, Some(&prefix))
     }
 
+    /// Phase B.5 / D.4: build from a [`FullCatalog`] for a specific
+    /// modality. Mirrors `BackedCscIndex::from_catalog_for_modality`
+    /// — filters CSR entries by `(SectionType::CsrShard, modality_id)`
+    /// and indexes the per-modality position-to-row mapping.
+    pub fn from_catalog_for_modality(catalog: &FullCatalog, modality_id: u8) -> Self {
+        let mut shard_entries: Vec<ShardRange> = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+            .filter_map(|e| {
+                e.stats.as_ref().map(|s| ShardRange {
+                    row_start: s.row_start,
+                    row_end: s.row_end,
+                    sorted_shard_idx: 0,
+                })
+            })
+            .collect();
+        shard_entries.sort_by_key(|r| r.row_start);
+        for (i, entry) in shard_entries.iter_mut().enumerate() {
+            entry.sorted_shard_idx = i;
+        }
+        BackedCsrIndex {
+            shard_ranges: shard_entries,
+        }
+    }
+
     /// Internal: build from catalog filtering by section type and optional name prefix.
     fn from_catalog_filtered(
         catalog: &FullCatalog,
@@ -474,6 +500,50 @@ impl BackedCsrReader {
         let x_sorted_entries = reader
             .catalog()
             .shards_sorted()
+            .into_iter()
+            .cloned()
+            .collect();
+        let prefetch_count = cache_shards.max(2);
+        BackedCsrReader {
+            reader,
+            index,
+            n_vars,
+            n_obs,
+            layer_name: None,
+            x_sorted_entries,
+            sorted_entries: Vec::new(),
+            cache,
+            in_flight,
+            metrics: None,
+            prefetch_count,
+            cache_shards,
+        }
+    }
+
+    /// Phase B.5 / D.4: create a backed CSR reader scoped to a
+    /// specific modality. Filters CSR shards by
+    /// `(SectionType::CsrShard, modality_id)` so each modality gets
+    /// its own LRU cache and shard range — matching the
+    /// `BackedCscReader::for_modality` shape. `n_vars` is taken from
+    /// the modality's table entry (per-modality `n_vars`), not the
+    /// file-wide `header.n_vars` (which is the max across modalities
+    /// on multimodal v2 files).
+    pub fn for_modality(reader: ScxReader, modality_id: u8, cache_shards: usize) -> Self {
+        let index = BackedCsrIndex::from_catalog_for_modality(reader.catalog(), modality_id);
+        let n_vars = match reader.modality_info(modality_id) {
+            Some(info) => info.n_vars as usize,
+            None => reader.n_vars() as usize,
+        };
+        let n_obs = reader.n_obs() as usize;
+        let cache = Self::make_cache(cache_shards, usize::MAX);
+        let in_flight = if cache.is_some() {
+            Some(Mutex::new(HashMap::new()))
+        } else {
+            None
+        };
+        let x_sorted_entries = reader
+            .catalog()
+            .csr_shards_for_modality(modality_id)
             .into_iter()
             .cloned()
             .collect();
@@ -1699,25 +1769,68 @@ pub struct BackedCscIndex {
 }
 
 impl BackedCscIndex {
-    /// Build from a [`FullCatalog`].
-    ///
-    /// Extracts CSC shard entries, sorts by `col_start`, and records
-    /// each shard's position in sorted order (the index used by
-    /// `ScxReader::read_csc_shard` after `csc_shards_sorted()`).
+    /// Build from a [`FullCatalog`], scoped to global / single-modality
+    /// CSC shards (`modality_id == 0`). Backwards-compatible entry
+    /// point for v1 files and single-modality v2 files.
     pub fn from_catalog(catalog: &FullCatalog) -> Self {
+        Self::from_catalog_for_modality(catalog, 0)
+    }
+
+    /// Build from a [`FullCatalog`], scoped to a specific modality.
+    /// Filters CSC shards by `(SectionType::CscShard, modality_id)`,
+    /// sorts by `col_start`, and records each shard's position in
+    /// sorted order. v2 multimodal files use this constructor with
+    /// `modality_id >= 1`.
+    pub fn from_catalog_for_modality(catalog: &FullCatalog, modality_id: u8) -> Self {
         let mut shard_entries: Vec<CscShardRange> = catalog
             .entries
             .iter()
-            .filter(|e| e.section_type == SectionType::CscShard)
+            .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == modality_id)
             .filter_map(|e| {
                 e.stats.as_ref().map(|s| CscShardRange {
-                    col_start: s.major_start(),
-                    col_end: s.major_end(),
+                    col_start: s.major_start(SectionType::CscShard),
+                    col_end: s.major_end(SectionType::CscShard),
                     sorted_shard_idx: 0,
                 })
             })
             .collect();
 
+        shard_entries.sort_by_key(|r| r.col_start);
+        for (i, entry) in shard_entries.iter_mut().enumerate() {
+            entry.sorted_shard_idx = i;
+        }
+        BackedCscIndex {
+            shard_ranges: shard_entries,
+        }
+    }
+
+    /// Build from a [`FullCatalog`], scoped to a layer's CSC shards
+    /// for a given modality. Filters by
+    /// `(SectionType::LayerCscShard, modality_id, layer_name)`. The
+    /// `layer_name` matches by substring `/{layer_name}/` in the
+    /// section name (mirrors `FullCatalog::layer_csc_shards_for_modality`).
+    pub fn from_catalog_for_layer(
+        catalog: &FullCatalog,
+        modality_id: u8,
+        layer_name: &str,
+    ) -> Self {
+        let needle = format!("/{layer_name}/");
+        let mut shard_entries: Vec<CscShardRange> = catalog
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::LayerCscShard
+                    && e.modality_id == modality_id
+                    && e.name.contains(&needle)
+            })
+            .filter_map(|e| {
+                e.stats.as_ref().map(|s| CscShardRange {
+                    col_start: s.major_start(SectionType::CscShard),
+                    col_end: s.major_end(SectionType::CscShard),
+                    sorted_shard_idx: 0,
+                })
+            })
+            .collect();
         shard_entries.sort_by_key(|r| r.col_start);
         for (i, entry) in shard_entries.iter_mut().enumerate() {
             entry.sorted_shard_idx = i;
@@ -1841,19 +1954,77 @@ impl CscCache {
 }
 
 impl BackedCscReader {
-    /// Create a new backed CSC reader from an [`ScxReader`].
+    /// Create a new backed CSC reader from an [`ScxReader`], scoped
+    /// to the global / single-modality CSC shards
+    /// (`modality_id == 0`). Convenience wrapper around
+    /// [`Self::for_modality`] kept for backward compatibility with
+    /// v1 / single-modality v2 callers.
     ///
     /// `cache_shards`: number of decoded CSC shards to cache (0 = no
     /// cache). The underlying file must have CSC sidecar shards
     /// (`reader.header().has_csc()`); otherwise `read_csc_shard` will
     /// always return an out-of-bounds error.
     pub fn new(reader: ScxReader, cache_shards: usize) -> Result<Self> {
-        let index = BackedCscIndex::from_catalog(reader.catalog());
+        Self::for_modality(reader, 0, cache_shards)
+    }
+
+    /// Create a backed CSC reader scoped to a specific modality.
+    /// Filters CSC shards by `(SectionType::CscShard, modality_id)`
+    /// so each modality gets its own LRU cache and shard range —
+    /// avoids cache thrashing under interleaved access patterns
+    /// (e.g. totalVI training touching RNA + ADT in the same step).
+    pub fn for_modality(reader: ScxReader, modality_id: u8, cache_shards: usize) -> Result<Self> {
+        let index = BackedCscIndex::from_catalog_for_modality(reader.catalog(), modality_id);
         let n_obs = reader.n_obs() as usize;
-        let n_vars = reader.n_vars() as usize;
+        // For multimodal files the per-modality `n_vars` lives on
+        // the modality table; the file-level `header.n_vars` is the
+        // primary modality's count or aggregate. Prefer the modality
+        // info when available.
+        let n_vars = match reader.modality_info(modality_id) {
+            Some(info) => info.n_vars as usize,
+            None => reader.n_vars() as usize,
+        };
         let sorted_entries: Vec<FullCatalogEntry> = reader
             .catalog()
-            .csc_shards_sorted()
+            .csc_shards_for_modality(modality_id)
+            .into_iter()
+            .cloned()
+            .collect();
+        let cache = if cache_shards > 0 {
+            Some(Mutex::new(CscCache::new(cache_shards)))
+        } else {
+            None
+        };
+        Ok(BackedCscReader {
+            reader,
+            index,
+            n_obs,
+            n_vars,
+            sorted_entries,
+            cache,
+            metrics: None,
+        })
+    }
+
+    /// Create a backed CSC reader scoped to a layer's CSC sidecar
+    /// for a given modality. Filters by
+    /// `(SectionType::LayerCscShard, modality_id, layer_name)`.
+    pub fn for_layer(
+        reader: ScxReader,
+        modality_id: u8,
+        layer_name: &str,
+        cache_shards: usize,
+    ) -> Result<Self> {
+        let index =
+            BackedCscIndex::from_catalog_for_layer(reader.catalog(), modality_id, layer_name);
+        let n_obs = reader.n_obs() as usize;
+        let n_vars = match reader.modality_info(modality_id) {
+            Some(info) => info.n_vars as usize,
+            None => reader.n_vars() as usize,
+        };
+        let sorted_entries: Vec<FullCatalogEntry> = reader
+            .catalog()
+            .layer_csc_shards_for_modality(modality_id, layer_name)
             .into_iter()
             .cloned()
             .collect();
@@ -2169,7 +2340,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: crate::header::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -2191,7 +2362,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 
@@ -2844,7 +3018,7 @@ mod tests {
     #[test]
     fn test_concatenate_single() {
         let csr = ScxCsr::new_unchecked((2, 5), vec![0, 2, 3], vec![1, 3, 2], vec![5.0, 10.0, 2.0]);
-        let result = concatenate_csr(&[csr.clone()], 5).unwrap();
+        let result = concatenate_csr(std::slice::from_ref(&csr), 5).unwrap();
         assert_eq!(result.indptr, csr.indptr);
         assert_eq!(result.indices, csr.indices);
         assert_eq!(result.data, csr.data);

@@ -174,7 +174,7 @@ fn write_query_result(
     // `scx build-csc` against the output if a CSC sidecar is needed.
     let header = FileHeader {
         magic: scx_format::MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -196,7 +196,10 @@ fn write_query_result(
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     let mut writer = ScxWriter::new(output, header)?;
@@ -242,8 +245,12 @@ fn write_query_result(
         let val_end = idx_end * value_byte_size;
         let shard_values = &raw_values[val_start..val_end];
 
-        // Auto-codec selection
-        let codec_id = scx_format::select_codec(shard_values, value_encoding);
+        // Auto-codec selection (single-modality query → RNA default)
+        let codec_id = scx_format::select_codec_for_modality(
+            shard_values,
+            value_encoding,
+            scx_format::ModalityType::Rna,
+        );
 
         writer.write_csr_shard(
             &shard_indptr,

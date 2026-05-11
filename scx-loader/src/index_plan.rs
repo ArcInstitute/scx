@@ -989,7 +989,7 @@ mod tests {
 
         let header = FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: n_obs as u64,
@@ -1011,7 +1011,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         };
         let mut writer = ScxWriter::new(path, header).unwrap();
 
@@ -1486,7 +1489,7 @@ mod tests {
 
         let header = FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: n_obs as u64,
@@ -1508,7 +1511,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         };
         let mut writer = ScxWriter::new(path, header).unwrap();
 

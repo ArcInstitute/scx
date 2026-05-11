@@ -64,6 +64,12 @@ ALL_BENCHMARKS: list[str] = [
     # CSC dispatch sweep (Phase L.3): qc_metrics / HVG / DE /
     # pseudobulk × {csr, csc} on a CSC-equipped fixture.
     "bench_csc_dispatch",
+    # Phase K — multimodal benchmarks. Both gated on
+    # `dataset.multimodal == True` inside the modules; non-multimodal
+    # datasets surface a clear "use compression / ml_loader instead"
+    # error so the orchestrator never silently skips them.
+    "multimodal_compression",
+    "multimodal_training",
 ]
 
 

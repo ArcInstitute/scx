@@ -1,0 +1,184 @@
+"""Phase H — multimodal training loader tests.
+
+Covers:
+- `pyscx.MultimodalTrainingDataset` round-trip on a CITE-seq fixture:
+  tuple/dict batches whose row indices align across modalities.
+- `pyscx.TrainingDataset(path)` on a multimodal file falls back to
+  the alphabetically-first modality and emits a UserWarning (Phase H.3
+  backward-compat path).
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import warnings
+
+import numpy as np
+import pytest
+
+
+@pytest.fixture
+def cite_seq_path():
+    """Tiny CITE-seq SCX fixture written via pyscx.from_mudata."""
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, rna_n_vars, adt_n_vars = 64, 50, 8
+
+    rna_dense = rng.poisson(lam=0.4, size=(n_obs, rna_n_vars)).astype(np.float32)
+    adt_dense = rng.poisson(lam=0.4, size=(n_obs, adt_n_vars)).astype(np.float32)
+    rna_ad = anndata.AnnData(X=sp.csr_matrix(rna_dense))
+    rna_ad.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    adt_ad = anndata.AnnData(X=sp.csr_matrix(adt_dense))
+    adt_ad.var_names = [f"a{i}" for i in range(adt_n_vars)]
+    mu = mudata.MuData({"rna": rna_ad, "adt": adt_ad})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(mu, path)
+        yield path, n_obs, rna_n_vars, adt_n_vars
+
+
+def test_multimodal_dataset_dict_batches(cite_seq_path):
+    """Phase H.1 / H.2: dict-mode batches expose per-modality X arrays
+    and a shared `cell_indices` row ordering."""
+    import pyscx
+
+    path, n_obs, rna_n_vars, adt_n_vars = cite_seq_path
+    ds = pyscx.MultimodalTrainingDataset(
+        path,
+        modalities=["rna", "adt"],
+        batch_size=16,
+        normalize=False,
+        log1p=False,
+        seed=42,
+    )
+    assert ds.n_obs == n_obs
+    assert ds.modality_names == ["rna", "adt"]
+    nv = ds.n_vars
+    assert nv["rna"] == rna_n_vars
+    assert nv["adt"] == adt_n_vars
+
+    seen_rows = 0
+    for batch in ds:
+        assert "X" in batch
+        assert "cell_indices" in batch
+        x_dict = batch["X"]
+        assert "rna" in x_dict
+        assert "adt" in x_dict
+        n_rna = x_dict["rna"].shape[0]
+        n_adt = x_dict["adt"].shape[0]
+        # Per-modality batches share the same row count.
+        assert n_rna == n_adt
+        # Per-modality n_vars differs.
+        assert x_dict["rna"].shape[1] == rna_n_vars
+        assert x_dict["adt"].shape[1] == adt_n_vars
+        # cell_indices rank matches the batch row count.
+        assert batch["cell_indices"].shape[0] == n_rna
+        seen_rows += n_rna
+    # Total cells iterated equals n_obs (one full epoch).
+    assert seen_rows == n_obs
+    ds.close()
+
+
+def test_multimodal_dataset_tuple_batches(cite_seq_path):
+    """Phase H.2: `return_dict=False` yields tuples of X arrays."""
+    import pyscx
+
+    path, _, rna_n_vars, adt_n_vars = cite_seq_path
+    ds = pyscx.MultimodalTrainingDataset(
+        path,
+        modalities=["rna", "adt"],
+        batch_size=8,
+        normalize=False,
+        log1p=False,
+        return_dict=False,
+        seed=42,
+    )
+    for batch in ds:
+        # Tuple mode: (X_rna, X_adt) in the order of `modalities`.
+        assert isinstance(batch, tuple)
+        assert len(batch) == 2
+        rna_x, adt_x = batch
+        assert rna_x.shape[0] == adt_x.shape[0]
+        assert rna_x.shape[1] == rna_n_vars
+        assert adt_x.shape[1] == adt_n_vars
+    ds.close()
+
+
+def test_multimodal_dataset_unknown_modality_raises(cite_seq_path):
+    """Constructor raises a clear error when an unknown modality is requested."""
+    import pyscx
+
+    path, *_ = cite_seq_path
+    with pytest.raises(RuntimeError, match="modality named 'spatial'"):
+        pyscx.MultimodalTrainingDataset(path, modalities=["rna", "spatial"])
+
+
+def test_multimodal_dataset_rejects_single_modality_file(tmp_path):
+    """On a single-modality file, MultimodalTrainingDataset directs the user back to TrainingDataset."""
+    pytest.importorskip("anndata")
+    import anndata
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.3, size=(20, 30)).astype(np.float32))
+    )
+    adata.var_names = [f"g{i}" for i in range(30)]
+    adata.obs_names = [f"c{i}" for i in range(20)]
+    path = str(tmp_path / "single.scx")
+    pyscx.from_anndata(adata, path)
+
+    with pytest.raises(RuntimeError, match="single-modality"):
+        pyscx.MultimodalTrainingDataset(path, modalities=["rna"])
+
+
+def test_training_dataset_multimodal_warns(cite_seq_path):
+    """Phase H.3: TrainingDataset on a multimodal file emits UserWarning
+    and falls back to the alphabetically-first modality."""
+    import pyscx
+
+    path, n_obs, _, adt_n_vars = cite_seq_path
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ds = pyscx.TrainingDataset(path, batch_size=16, normalize=False, log1p=False)
+        # The warning should fire during construction.
+        msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+        assert any("multimodal" in m and "MultimodalTrainingDataset" in m for m in msgs), (
+            f"expected multimodal-fallback UserWarning, got: {msgs}"
+        )
+    # Alphabetically-first modality is "adt"; verify the dataset
+    # resolved to the ADT n_vars (8), not the RNA n_vars.
+    assert ds.n_vars == adt_n_vars
+    assert ds.n_obs == n_obs
+    ds.close()
+
+
+def test_training_dataset_explicit_modality_kwarg(cite_seq_path):
+    """Phase H.1: explicit `modality=` selects without warning."""
+    import pyscx
+
+    path, n_obs, rna_n_vars, _ = cite_seq_path
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ds = pyscx.TrainingDataset(
+            path, modality="rna", batch_size=16, normalize=False, log1p=False
+        )
+        # No multimodal-fallback warning when modality is explicit.
+        multimodal_warnings = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, UserWarning)
+            and "MultimodalTrainingDataset" in str(w.message)
+        ]
+        assert not multimodal_warnings, multimodal_warnings
+    assert ds.n_vars == rna_n_vars
+    assert ds.n_obs == n_obs
+    ds.close()

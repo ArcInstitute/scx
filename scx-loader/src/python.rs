@@ -92,6 +92,12 @@ impl TrainingDataset {
     ///     prefetch_batches: Ring buffer depth (default: 4).
     ///     seed: RNG seed for reproducibility (default: 42).
     ///     max_memory_mb: Memory budget in MB (default: 512).
+    ///     modality: Phase H.1 — name of the modality to load on a
+    ///         multimodal v2 file. On a single-modality file this is
+    ///         ignored. On a multimodal file with no `modality`
+    ///         argument, the dataset emits a UserWarning and loads
+    ///         the alphabetically-first modality only — use
+    ///         `MultimodalTrainingDataset` for full coverage.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -106,8 +112,10 @@ impl TrainingDataset {
         prefetch_batches=None,
         seed=None,
         max_memory_mb=None,
+        modality=None,
     ))]
     fn new(
+        py: Python<'_>,
         path: &str,
         batch_size: Option<usize>,
         hvg_indices: Option<Vec<u32>>,
@@ -119,7 +127,15 @@ impl TrainingDataset {
         prefetch_batches: Option<usize>,
         seed: Option<u64>,
         max_memory_mb: Option<usize>,
+        modality: Option<String>,
     ) -> PyResult<Self> {
+        // Phase H.1: resolve modality_id. Single-modality files keep
+        // the legacy global path. Multimodal files need either an
+        // explicit `modality=` kwarg or fall back to the alphabetical
+        // first modality (with a UserWarning telling the user to use
+        // MultimodalTrainingDataset).
+        let modality_id = resolve_modality_id_with_warning(py, path, modality.as_deref())?;
+
         let defaults = LoaderConfig::default();
         let config = LoaderConfig {
             batch_size: batch_size.unwrap_or(defaults.batch_size),
@@ -132,6 +148,7 @@ impl TrainingDataset {
             target_sum: target_sum.unwrap_or(defaults.target_sum),
             seed: seed.unwrap_or(defaults.seed),
             max_memory_mb: max_memory_mb.unwrap_or(defaults.max_memory_mb),
+            modality_id,
         };
 
         let pipeline = TrainingPipeline::new(path, config)
@@ -266,6 +283,365 @@ impl TrainingDataset {
             self.pipeline.n_output_genes(),
         )
     }
+}
+
+/// Multimodal training dataset (Phase H.1 of MULTIMODAL-SUPPORT.md).
+///
+/// Wraps N independent `TrainingPipeline` instances — one per requested
+/// modality — and yields per-batch dicts whose cell axes align across
+/// modalities. Cells (obs) are global across modalities, so all
+/// pipelines see the same `n_obs` and the same shuffler seed produces
+/// the same row ordering when their per-modality shard layouts agree
+/// (the standard CITE-seq / multiome writer guarantees this).
+///
+/// On `__next__`, returns
+/// `{"X": {modality_name: ndarray, ...}, "obs": {...}, "cell_indices": ndarray}`
+/// when constructed with `return_dict=True` (default), or a tuple
+/// `(X_modality_0, X_modality_1, ...)` when `return_dict=False`. The
+/// per-modality X arrays share the same `cell_indices` row ordering;
+/// the wrapper validates this on each batch and raises
+/// `RuntimeError` if the per-modality shufflers diverge (e.g. because
+/// the modalities have different shard layouts on disk — typically a
+/// writer / file-construction bug).
+#[pyclass]
+pub struct MultimodalTrainingDataset {
+    /// One pipeline per requested modality, in the order the user
+    /// supplied them.
+    pipelines: Vec<TrainingPipeline>,
+    /// Modality names parallel to `pipelines`.
+    modality_names: Vec<String>,
+    /// True → batches are dicts. False → batches are tuples of X arrays.
+    return_dict: bool,
+    epoch_started: bool,
+    creation_pid: u32,
+}
+
+#[pymethods]
+impl MultimodalTrainingDataset {
+    /// Create a new `MultimodalTrainingDataset` from a multimodal SCX file.
+    ///
+    /// Args:
+    ///     path: Path to the .scx file.
+    ///     modalities: List of modality names to load (e.g.
+    ///         `["rna", "adt"]`). All listed modalities must exist
+    ///         in the file's modality table.
+    ///     batch_size: Mini-batch size shared across modalities.
+    ///     hvg_indices: Optional HVG projection. Currently applied
+    ///         to every modality identically; for per-modality
+    ///         projections, instantiate separate
+    ///         `TrainingDataset(modality=…, hvg_indices=…)` instances
+    ///         and zip in Python.
+    ///     obs_columns: Obs columns to include in each batch (read
+    ///         once from the global obs table).
+    ///     return_dict: If True (default), yield
+    ///         `{"X": {name: ndarray}, "obs": {...}, "cell_indices": ...}`.
+    ///         If False, yield a tuple `(X_0, X_1, …)` aligned with
+    ///         `modalities` order.
+    ///     normalize, log1p, target_sum, shard_group_size,
+    ///     prefetch_batches, seed, max_memory_mb: see
+    ///     `TrainingDataset` for semantics. `max_memory_mb` is
+    ///     divided across modalities proportionally to per-modality
+    ///     nnz (modalities with denser X get a larger share of the
+    ///     memory budget).
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        path,
+        modalities,
+        batch_size=None,
+        hvg_indices=None,
+        obs_columns=None,
+        return_dict=None,
+        normalize=None,
+        log1p=None,
+        target_sum=None,
+        shard_group_size=None,
+        prefetch_batches=None,
+        seed=None,
+        max_memory_mb=None,
+    ))]
+    fn new(
+        path: &str,
+        modalities: Vec<String>,
+        batch_size: Option<usize>,
+        hvg_indices: Option<Vec<u32>>,
+        obs_columns: Option<Vec<String>>,
+        return_dict: Option<bool>,
+        normalize: Option<bool>,
+        log1p: Option<bool>,
+        target_sum: Option<f64>,
+        shard_group_size: Option<usize>,
+        prefetch_batches: Option<usize>,
+        seed: Option<u64>,
+        max_memory_mb: Option<usize>,
+    ) -> PyResult<Self> {
+        use scx_format::ScxReader;
+        if modalities.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "MultimodalTrainingDataset: `modalities` must contain at least one name",
+            ));
+        }
+
+        // Open the file once to resolve modality_id + per-modality nnz
+        // for the memory-budget split. The inner `TrainingPipeline::new`
+        // re-opens the file per modality.
+        let reader = ScxReader::open(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        if !reader.is_multimodal() {
+            return Err(PyRuntimeError::new_err(format!(
+                "MultimodalTrainingDataset: file '{path}' is single-modality. \
+                 Use TrainingDataset(path) instead."
+            )));
+        }
+        let mut resolved: Vec<(String, u8, u64)> = Vec::with_capacity(modalities.len());
+        for name in &modalities {
+            let mid = reader.modality_id(name).ok_or_else(|| {
+                let registered: Vec<&str> = reader.modality_names();
+                PyRuntimeError::new_err(format!(
+                    "MultimodalTrainingDataset: file '{path}' does not have a \
+                     modality named '{name}'. Registered modalities: {registered:?}"
+                ))
+            })?;
+            let info = reader.modality_info(mid).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "MultimodalTrainingDataset: failed to resolve modality_info for '{name}'"
+                ))
+            })?;
+            resolved.push((name.clone(), mid, info.nnz));
+        }
+
+        // Memory budget split. The user-supplied `max_memory_mb` is
+        // total across all modalities; allocate proportionally to
+        // per-modality nnz. Each modality gets at least 64 MB so the
+        // budget tuner has room to settle on viable shard_group_size /
+        // prefetch_batches values.
+        let defaults = LoaderConfig::default();
+        let total_mb = max_memory_mb.unwrap_or(defaults.max_memory_mb);
+        let total_nnz: u64 = resolved.iter().map(|(_, _, n)| *n).sum::<u64>().max(1);
+        let per_modality_mb: Vec<usize> = resolved
+            .iter()
+            .map(|(_, _, nnz)| {
+                let share = (total_mb as f64) * (*nnz as f64) / (total_nnz as f64);
+                (share as usize).max(64)
+            })
+            .collect();
+
+        // Build one pipeline per modality. All pipelines share the
+        // same seed so the per-modality shufflers agree on row
+        // ordering as long as the per-modality shard layouts align
+        // (which the standard multimodal writer guarantees).
+        drop(reader);
+        let mut pipelines = Vec::with_capacity(resolved.len());
+        let mut names = Vec::with_capacity(resolved.len());
+        for ((name, mid, _), modality_mb) in resolved.into_iter().zip(per_modality_mb) {
+            let config = LoaderConfig {
+                batch_size: batch_size.unwrap_or(defaults.batch_size),
+                shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
+                prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
+                hvg_indices: hvg_indices.clone(),
+                obs_columns: obs_columns.clone().unwrap_or_default(),
+                normalize: normalize.unwrap_or(defaults.normalize),
+                log1p: log1p.unwrap_or(defaults.log1p),
+                target_sum: target_sum.unwrap_or(defaults.target_sum),
+                seed: seed.unwrap_or(defaults.seed),
+                max_memory_mb: modality_mb,
+                modality_id: Some(mid),
+            };
+            let pipeline = TrainingPipeline::new(path, config)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            pipelines.push(pipeline);
+            names.push(name);
+        }
+
+        Ok(MultimodalTrainingDataset {
+            pipelines,
+            modality_names: names,
+            return_dict: return_dict.unwrap_or(true),
+            epoch_started: false,
+            creation_pid: std::process::id(),
+        })
+    }
+
+    fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        for p in slf.pipelines.iter_mut() {
+            p.start_epoch()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        slf.epoch_started = true;
+        Ok(slf)
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.MultimodalTrainingDataset requires num_workers=0. The Rust pipeline manages its \
+                 own threads.",
+            ));
+        }
+        if !self.epoch_started {
+            return Err(PyRuntimeError::new_err(
+                "Must call __iter__ before __next__",
+            ));
+        }
+
+        // Pull one batch from each modality in lockstep. Releasing the
+        // GIL once around all pulls is the simplest correct
+        // implementation; with the same seed the pipelines should
+        // produce in roughly aligned cadence.
+        let batches_opt: Option<Vec<Batch>> = py.allow_threads(|| {
+            let mut out = Vec::with_capacity(self.pipelines.len());
+            for p in self.pipelines.iter_mut() {
+                match p.next_batch() {
+                    Some(b) => out.push(b),
+                    None => return None,
+                }
+            }
+            Some(out)
+        });
+
+        let batches = match batches_opt {
+            Some(b) => b,
+            None => {
+                self.epoch_started = false;
+                return Ok(None);
+            }
+        };
+
+        // Cross-modality cell-axis alignment check. The per-modality
+        // shufflers should produce identical row orderings when their
+        // shard layouts match; if they don't, surface a clear error
+        // rather than silently emit mis-aligned batches.
+        let first_indices = &batches[0].cell_indices;
+        for (i, b) in batches.iter().enumerate().skip(1) {
+            if b.cell_indices != *first_indices {
+                return Err(PyRuntimeError::new_err(format!(
+                    "MultimodalTrainingDataset: modalities '{}' and '{}' produced \
+                     different cell_indices on the same batch — this typically means \
+                     the per-modality shard layouts disagree (different shard counts \
+                     or row ranges). Reshard the file with a uniform shard_target_rows \
+                     before training.",
+                    self.modality_names[0], self.modality_names[i],
+                )));
+            }
+        }
+
+        // Build the output. Both the dict and tuple paths share the
+        // first batch's obs / cell_indices (cells are global, so the
+        // obs record is identical across modalities).
+        let dict = build_multimodal_batch_dict(py, &batches, &self.modality_names)?;
+        if self.return_dict {
+            Ok(Some(dict.into_any()))
+        } else {
+            // Tuple of X arrays in modality order.
+            let x_dict = dict.get_item("X")?.expect("X key always present");
+            let x_dict = x_dict.downcast::<PyDict>()?;
+            let mut tuple_items: Vec<Bound<'_, PyAny>> =
+                Vec::with_capacity(self.modality_names.len());
+            for name in &self.modality_names {
+                let v = x_dict
+                    .get_item(name)?
+                    .expect("modality entry always present");
+                tuple_items.push(v);
+            }
+            Ok(Some(PyTuple::new(py, &tuple_items)?.into_any()))
+        }
+    }
+
+    /// Total observations (cells), shared across modalities (global obs axis).
+    #[getter]
+    fn n_obs(&self) -> u64 {
+        self.pipelines.first().map(|p| p.n_obs()).unwrap_or(0)
+    }
+
+    /// List of modality names, in the same order as the constructor's
+    /// `modalities` argument.
+    #[getter]
+    fn modality_names(&self) -> Vec<String> {
+        self.modality_names.clone()
+    }
+
+    /// Per-modality `n_vars` as a dict.
+    #[getter]
+    fn n_vars(&self) -> HashMap<String, u64> {
+        self.modality_names
+            .iter()
+            .zip(self.pipelines.iter())
+            .map(|(n, p)| (n.clone(), p.n_vars()))
+            .collect()
+    }
+
+    fn close(&mut self, py: Python<'_>) {
+        py.allow_threads(|| {
+            for p in self.pipelines.iter_mut() {
+                p.shutdown();
+            }
+        });
+    }
+
+    fn __repr__(&self) -> String {
+        let names: Vec<&str> = self.modality_names.iter().map(|s| s.as_str()).collect();
+        format!(
+            "MultimodalTrainingDataset(n_obs={}, modalities={names:?})",
+            self.n_obs(),
+        )
+    }
+}
+
+/// Phase H.2 helper: build a `{"X": {name: ndarray}, "obs": {...},
+/// "cell_indices": ndarray}` dict from a slice of per-modality
+/// `Batch`es. Uses the first batch's `obs` and `cell_indices` (cells
+/// are global across modalities).
+fn build_multimodal_batch_dict<'py>(
+    py: Python<'py>,
+    batches: &[Batch],
+    modality_names: &[String],
+) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::IntoPyArray;
+    let dict = PyDict::new(py);
+
+    let x_dict = PyDict::new(py);
+    for (name, batch) in modality_names.iter().zip(batches.iter()) {
+        let n_genes = if batch.x_shape.0 > 0 {
+            batch.x_shape.1
+        } else {
+            0
+        };
+        let x_owned: Vec<f32> = batch.x.clone();
+        let x_arr = x_owned.into_pyarray(py);
+        let x_2d = x_arr
+            .reshape([batch.x_shape.0, n_genes])
+            .map_err(|e| PyRuntimeError::new_err(format!("X reshape failed: {e}")))?;
+        x_dict.set_item(name, x_2d)?;
+    }
+    dict.set_item("X", x_dict)?;
+
+    // obs and cell_indices come from the first modality's batch
+    // (all batches share the global obs table). Skip if obs_columns
+    // were not requested — empty dict.
+    let obs_dict = PyDict::new(py);
+    for (col_name, col) in &batches[0].obs {
+        let arr_obj = match col {
+            ObsColumn::Float64(v) => v.clone().into_pyarray(py).into_any(),
+            ObsColumn::Int64(v) => v.clone().into_pyarray(py).into_any(),
+            ObsColumn::Categorical(codes, cats) => {
+                // Decode codes to category strings; emit as a Python
+                // list (numpy lacks a native variable-width string
+                // dtype). Consumer can wrap in pandas.Categorical.
+                let decoded: Vec<&str> = codes
+                    .iter()
+                    .map(|&c| cats.get(c as usize).map(|s| s.as_str()).unwrap_or(""))
+                    .collect();
+                let list = pyo3::types::PyList::new(py, decoded)?;
+                list.into_any()
+            }
+        };
+        obs_dict.set_item(col_name, arr_obj)?;
+    }
+    dict.set_item("obs", obs_dict)?;
+    dict.set_item(
+        "cell_indices",
+        batches[0].cell_indices.clone().into_pyarray(py),
+    )?;
+    Ok(dict)
 }
 
 /// Plan-driven paired-batch reader for `(perturbed, control)` ML training.
@@ -765,6 +1141,88 @@ fn obs_to_pydict<'py>(
         }
     }
     Ok(obs_dict)
+}
+
+/// Phase H.1 / H.3: resolve the optional `modality` kwarg to a
+/// `modality_id: Option<u8>` for the loader pipeline.
+///
+/// Behaviour:
+/// - Single-modality file + no `modality` arg → returns `None` (legacy
+///   global path).
+/// - Single-modality file + `modality` arg → error (the file has no
+///   such modality).
+/// - Multimodal file + explicit `modality` name → resolves the name;
+///   error if not found.
+/// - Multimodal file + no `modality` arg → emits `UserWarning` and
+///   falls back to the alphabetically-first modality name.
+///
+/// Opens the SCX file briefly to inspect the modality table; the
+/// inner `TrainingPipeline::new` re-opens it so this transient open
+/// is cheap and serves only the modality resolution.
+fn resolve_modality_id_with_warning(
+    py: Python<'_>,
+    path: &str,
+    modality: Option<&str>,
+) -> PyResult<Option<u8>> {
+    use scx_format::ScxReader;
+    let reader = ScxReader::open(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    if !reader.is_multimodal() {
+        if let Some(name) = modality {
+            return Err(PyRuntimeError::new_err(format!(
+                "TrainingDataset: file '{path}' is single-modality but \
+                 `modality='{name}'` was passed; remove the kwarg, or \
+                 use a multimodal source."
+            )));
+        }
+        return Ok(None);
+    }
+
+    if let Some(name) = modality {
+        return match reader.modality_id(name) {
+            Some(mid) => Ok(Some(mid)),
+            None => {
+                let names: Vec<&str> = reader.modality_names();
+                Err(PyRuntimeError::new_err(format!(
+                    "TrainingDataset: file '{path}' does not have a \
+                     modality named '{name}'. Registered modalities: {names:?}"
+                )))
+            }
+        };
+    }
+
+    // No modality arg on a multimodal file: fall back to the
+    // alphabetically-first modality and emit a UserWarning telling
+    // the user to use MultimodalTrainingDataset for full coverage.
+    let mut names: Vec<String> = reader
+        .modality_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.sort();
+    let chosen = names
+        .first()
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "TrainingDataset: file '{path}' is flagged multimodal but \
+                 the modality table is empty"
+            ))
+        })?
+        .clone();
+    let mid = reader.modality_id(&chosen).ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "TrainingDataset: failed to resolve modality_id for '{chosen}'"
+        ))
+    })?;
+
+    let warnings = py.import("warnings")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let msg = format!(
+        "file is multimodal; loading modality '{chosen}' only — use \
+         MultimodalTrainingDataset for full coverage"
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(Some(mid))
 }
 
 /// Convert an `IndexPlanBatch` into the Python dict shape:

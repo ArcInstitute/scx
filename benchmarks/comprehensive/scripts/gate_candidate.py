@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Ad-hoc regression gate (local controller, SLURM workers).
 
+This is a **job submitter**, not a benchmark runner. The controller
+process (which can run on any CPU-only host: a login node, ``sh_dev``,
+a laptop with cluster access — wherever you can reach ``sbatch``)
+submits SLURM jobs that execute the benchmarks on real compute nodes.
+**You do not need a GPU on the host running this script** — GPU
+benchmarks request GPUs from SLURM and run on H100 worker nodes via
+``sbatch``. This is the standard Chimera workflow: orchestrate from
+``sh_dev``, benchmarks execute under ``sbatch`` on GPU partitions.
+
 Captures a **candidate snapshot** under ``benchmarks/comprehensive/results/<name>/``
 via ``capture_baseline.py`` (default name ``candidate_<sha>_<YYYYMMDD>``),
 then runs ``compare_against_baseline.py --gate`` to diff that snapshot
@@ -18,9 +27,11 @@ benchmark axes (format, accel CPU, accel GPU) actually ran.
 
 GPU pre-flight runs on a SLURM compute node when SLURM is detected (the
 controller submits a small ``gpu_probe`` job that validates nvidia-smi /
-cupy / pyscx.accel on a real GPU instead of the submission host). Pass
-``--probe-partition -`` to force local GPU checks, or ``--no-gpu`` to skip
-GPU coverage entirely.
+cupy / pyscx.accel on a real GPU instead of the submission host) — so
+GPU pre-flight passes from any submission host, GPU or not. Pass
+``--probe-partition -`` to force local GPU checks (only use this when
+the submission host *is* a GPU node), or ``--no-gpu`` to skip GPU
+coverage entirely.
 
 Usage::
 
@@ -425,6 +436,110 @@ def _check_slurm() -> CheckResult:
     return CheckResult("slurm", "ok", "SLURM detected")
 
 
+def _check_cloud_probe(python: str, bucket: str | None = None) -> list[CheckResult]:
+    """Probe cloud connectivity before submitting jobs.
+
+    Catches two recurring pre-run failure modes that otherwise surface
+    only after hundreds of FAST_FAILs land in the gate report:
+
+      1. **gcsfs not registered with fsspec** — the env has fsspec but
+         not gcsfs (or version-mismatched), so the `gs://` protocol fails
+         at first use. Surfaces as `Please install gcsfs` from each cloud
+         cell. Tier-full gate ran into this on 2026-05-10 worker env →
+         24 zarr cloud FAST_FAILs.
+      2. **catalog symmetry bug class** — a known-bad cloud `.scxd`
+         catalog round-trips at push but fails at pull with
+         `failed to fill whole buffer`. Surfaces as 158 cloud FAST_FAILs
+         on the second 2026-05-10 gate run.
+
+    Each probe runs in < 30 s; the combined cost is far cheaper than a
+    2 h gate that fails late. Returns one CheckResult per probe.
+    Skipped silently when ``--probe-cloud`` is not passed.
+    """
+    # Imported here so the controller doesn't carry these symbols
+    # unconditionally; the bucket default lives in config.py.
+    if bucket is None:
+        rc, out = _run_silent(
+            [python, "-c", "from benchmarks.comprehensive.config import GCS_TEST_BUCKET; print(GCS_TEST_BUCKET)"],
+            timeout=10,
+        )
+        if rc != 0:
+            return [CheckResult(
+                "cloud_probe", "fail",
+                f"could not resolve GCS_TEST_BUCKET via {python!r}: {out.strip()[:120]}",
+            )]
+        bucket = out.strip().splitlines()[-1] if out.strip() else "gs://arc-ctc-nextflow/scx-test"
+
+    checks: list[CheckResult] = []
+
+    # 1. fsspec gs protocol resolution + bucket reachability.
+    # `ls` confirms credentials too — IMDS / GOOGLE_APPLICATION_CREDENTIALS
+    # must be wired before this returns.
+    rc, out = _run_silent(
+        [python, "-c", (
+            "import fsspec; "
+            f"fs = fsspec.filesystem('gs'); "
+            f"list(fs.ls({bucket!r}))[:1]"
+        )],
+        timeout=25,
+    )
+    if rc != 0:
+        msg = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+        checks.append(CheckResult(
+            "cloud_gcsfs", "fail",
+            f"fsspec gs filesystem failed on {bucket} — gcsfs missing/mismatched "
+            f"or GCP credentials not configured: {msg[:160]}",
+        ))
+        # If gcsfs is broken, the open_cloud probe will likely fail for
+        # the same reason — skip it to keep the operator's attention on
+        # the root cause.
+        return checks
+    checks.append(CheckResult("cloud_gcsfs", "ok", f"fsspec ls {bucket} ok"))
+
+    # 2. pyscx.open_cloud round-trip on a known small fixture (catches
+    # catalog-symmetry / cloud-layout bugs class). pbmc3k is the
+    # cheapest possible probe (1 GET on _catalog.bin + a metadata
+    # touch); skip with WARN rather than FAIL if it isn't staged.
+    probe_url = f"{bucket.rstrip('/')}/pbmc3k.scxd"
+    rc, out = _run_silent(
+        [python, "-c", (
+            f"import pyscx; "
+            f"h = pyscx.open_cloud({probe_url!r}); "
+            f"_ = (h.n_obs, h.n_vars, h.nnz)"
+        )],
+        timeout=30,
+    )
+    if rc != 0:
+        msg = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+        # Heuristic: distinguish "fixture not staged" (warn — operator
+        # forgot setup_cloud_test_data.sh) from "open failed despite
+        # fixture existing" (fail — actual catalog/format problem).
+        not_staged = (
+            "no such" in msg.lower()
+            or "not found" in msg.lower()
+            or "404" in msg
+        )
+        if not_staged:
+            checks.append(CheckResult(
+                "cloud_open", "warn",
+                f"probe fixture {probe_url} not staged — open_cloud "
+                f"symmetry check skipped. Run setup_cloud_test_data.sh "
+                f"to enable.",
+            ))
+        else:
+            checks.append(CheckResult(
+                "cloud_open", "fail",
+                f"pyscx.open_cloud failed on {probe_url} — likely "
+                f"catalog-format bug; re-push fixtures with current pyscx: "
+                f"{msg[:160]}",
+            ))
+        return checks
+    checks.append(CheckResult(
+        "cloud_open", "ok", f"pyscx.open_cloud {probe_url} ok",
+    ))
+    return checks
+
+
 def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
     """Run pre-flight checks and return ``(checks, probe_info)``.
 
@@ -457,10 +572,42 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
         and args.probe_partition != "-"
     )
 
+    # Graceful skip: if the requested probe conda env doesn't exist on
+    # the local filesystem (Weka is shared on Chimera, so the same path
+    # the SLURM worker would source is checkable here), don't submit the
+    # probe — it would otherwise fail with a cupy ImportError on the
+    # worker and surface as a confusing pre-flight FAIL. Operators get a
+    # one-line warning + clear remediation instead.
+    #
+    # When we skip the cluster probe because the env is missing, we
+    # ALSO disable the local-host GPU fallback (nvidia-smi / cupy on
+    # the submission host) — there's no point checking for a GPU on a
+    # CPU-only orchestrator host (login node / sh_dev) when we already
+    # know we can't run GPU benchmarks anyway. Treat env-missing as a
+    # soft `--no-gpu` for the rest of the pre-flight: log the skip and
+    # propagate it through `args.no_gpu` so downstream coverage banners
+    # / capture invocation see the same disabled state.
+    skip_gpu_due_to_missing_env = False
+    if want_cluster_probe and args.probe_conda_env:
+        env_path = Path.home() / "miniforge3" / "envs" / args.probe_conda_env
+        if not env_path.is_dir():
+            log.warning(
+                "  gpu_probe : SKIP — conda env %r not found at %s; pass "
+                "--no-gpu explicitly to silence this warning, or "
+                "`conda env create -f benchmarks/comprehensive/envs/scx-bench-gpu.yml` "
+                "to enable GPU coverage. Continuing with GPU coverage "
+                "disabled (CPU-only mode).",
+                args.probe_conda_env, env_path,
+            )
+            want_cluster_probe = False
+            skip_gpu_due_to_missing_env = True
+            args.no_gpu = True  # propagate to capture / banner / coverage
+            probe_info["outcome"] = "skipped_env_missing"
+
     if want_cluster_probe:
         gpu_checks, probe_info = _run_cluster_gpu_probe(args)
         checks.extend(gpu_checks)
-    elif not args.no_gpu:
+    elif not args.no_gpu and not skip_gpu_due_to_missing_env:
         # Local fallback: today's checks, run on the submission host.
         nvidia = _check_nvidia_smi()
         checks.append(nvidia)
@@ -472,6 +619,15 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
     # compute node, where the GPU-built wheel actually lives).
     if not args.no_accel and not want_cluster_probe:
         checks.append(_check_pyscx_accel(args.python))
+
+    # Cloud probe — opt-in. When the gate's matrix includes cloud cells,
+    # this catches the two recurring pre-run failure modes (missing
+    # gcsfs registration, catalog symmetry bug) in < 30 s instead of
+    # after 158 FAST_FAILs land in the gate report. Disabled by default
+    # because not every gate run exercises cloud (--accel-only,
+    # --no-accel, narrow --formats lists).
+    if args.probe_cloud:
+        checks.extend(_check_cloud_probe(args.python))
 
     width = max(len(c.name) for c in checks)
     marker = {"ok": "OK   ", "warn": "WARN ", "fail": "FAIL "}
@@ -702,6 +858,8 @@ def _capture_argv(args: argparse.Namespace, candidate_dir: Path, *, dry_run: boo
         cmd.extend(["--benchmarks", *args.benchmarks])
     if args.datasets:
         cmd.extend(["--datasets", *args.datasets])
+    if args.formats:
+        cmd.extend(["--formats", *args.formats])
     if args.skip_smoke:
         cmd.append("--skip-smoke")
     if args.partition is not None:
@@ -827,6 +985,16 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--no-gpu", action="store_true",
                         help="Drop GPU accel format variants (accel_*__*_gpu*).")
+    parser.add_argument("--probe-cloud", action="store_true",
+                        help="Run a cloud connectivity probe in pre-flight: "
+                             "fsspec gs ls (catches missing/mismatched gcsfs) "
+                             "and pyscx.open_cloud against a small staged "
+                             "fixture (catches the catalog-symmetry bug "
+                             "class). Adds ~10-30s to pre-flight but surfaces "
+                             "two recurring failure modes in seconds rather "
+                             "than after the full matrix lands as FAST_FAILs. "
+                             "Opt-in because --accel-only / --no-accel / "
+                             "narrow --formats runs may not exercise cloud.")
     parser.add_argument("--benchmarks", nargs="+", default=None,
                         help="Restrict to a subset of the canonical benchmark "
                              "list (e.g. `--benchmarks accel_pca`). Forwarded "
@@ -835,6 +1003,14 @@ def parse_args() -> argparse.Namespace:
                         help="Override the tier's dataset list (forwarded to "
                              "capture_baseline.py). Useful with --benchmarks "
                              "for narrow spot-checks.")
+    parser.add_argument("--formats", nargs="+", default=None,
+                        help="Restrict to a subset of format keys (forwarded "
+                             "to capture_baseline.py → run_parallel.py). "
+                             "Default: tier-implicit. Use to scope away "
+                             "from format runners whose deps aren't in the "
+                             "current conda env (e.g. drop `slaf` when not "
+                             "running from `scx-bench-slaf`, drop `bpcells` "
+                             "when not running from `scx-bench-r`).")
     parser.add_argument("--skip-smoke", action="store_true",
                         help="Skip the pre-submit format-runner contract "
                              "check inside run_parallel.py. Useful for narrow "
@@ -866,9 +1042,16 @@ def parse_args() -> argparse.Namespace:
                        help="SLURM partition for the GPU probe job. "
                             "Use '-' to disable cluster probing and force "
                             "local GPU checks (default: preemptible).")
-    probe.add_argument("--probe-conda-env", default="scx-gpu",
+    probe.add_argument("--probe-conda-env", default="scx-bench-gpu",
                        help="Conda env to activate inside the probe job "
-                            "(default: scx-gpu). Empty string skips activation.")
+                            "(default: scx-bench-gpu — the canonical GPU "
+                            "benchmark env per `benchmarks/README.md`). "
+                            "Empty string skips activation. The pre-flight "
+                            "auto-skips the cluster probe (printing a clear "
+                            "warning) when the env doesn't exist on the "
+                            "Weka shared filesystem, so a CPU-only host or "
+                            "a host that just doesn't have the GPU env "
+                            "doesn't get blocked at pre-flight.")
     probe.add_argument("--probe-cpus", type=int, default=2,
                        help="CPUs requested for the probe (default: 2).")
     probe.add_argument("--probe-mem-gb", type=int, default=8,
@@ -889,10 +1072,52 @@ def _git_sha() -> str:
     return out.strip() if rc == 0 else "unknown"
 
 
+def _check_conda_env() -> None:
+    """Loudly warn if the script is being launched from outside the
+    canonical ``scx-bench`` (or sibling) conda env.
+
+    The comprehensive benchmark suite is designed around isolated
+    conda envs (``scx-bench``, ``scx-bench-gpu``, ``scx-bench-r``,
+    ``scx-bench-slaf``, see ``benchmarks/comprehensive/envs/``).
+    ``run_parallel.py``'s ``_slurm_setup_cmds`` only activates a
+    conda env on the SLURM workers when the orchestrator's own
+    ``CONDA_PREFIX`` contains ``"scx-bench"`` — otherwise every job
+    falls back to the dev ``.venv/`` PATH, which lacks
+    ``mudata`` / ``slafdb`` / ``BPCells`` / etc., cascading hundreds
+    of convert+bench jobs into ``DependencyNeverSatisfied``. The
+    warning is non-fatal so operators can still iterate from
+    ``.venv/`` for narrow runs (e.g. accel-only on a CPU laptop)
+    but the loud reminder prevents accidental hour-long stalls.
+    """
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    if "scx-bench" not in conda_prefix:
+        msg = (
+            "WARNING: gate_candidate.py was launched from a non-scx-bench "
+            "environment (CONDA_PREFIX=%r). The orchestrator's per-SLURM-job "
+            "setup will fall back to the dev .venv/ PATH, which is missing "
+            "format-runner deps (mudata, slafdb, BPCells, etc.). Most "
+            "convert jobs will fail with ImportError, cascading into "
+            "DependencyNeverSatisfied chains that stall the gate.\n\n"
+            "    To run end-to-end:\n"
+            "        conda activate scx-bench\n"
+            "        python benchmarks/comprehensive/scripts/gate_candidate.py ...\n\n"
+            "    Or scope formats to ones that work in the dev venv:\n"
+            "        --formats h5ad_none h5ad_gzip h5ad_lzf zarr_zstd zarr_lz4 \\\n"
+            "                  tiledb_soma scx_auto scx_none scx_scx1 scx_zstd \\\n"
+            "                  scx_lz4 scx_pcodec h5mu_uncompressed h5mu_gzip \\\n"
+            "                  zarr_mudata_zstd scx_multimodal_per_modality_auto \\\n"
+            "                  scx_multimodal_uniform_auto"
+        ) % (conda_prefix or "(unset)",)
+        print("\n" + "=" * 70, file=sys.stderr)
+        print(msg, file=sys.stderr)
+        print("=" * 70 + "\n", file=sys.stderr)
+
+
 def main() -> int:
     args = parse_args()
     if args.extra_gate_args and args.extra_gate_args[0] == "--":
         args.extra_gate_args = args.extra_gate_args[1:]
+    _check_conda_env()
 
     # Import submitit eagerly (before setup_logging) so its import-time
     # logging.config.dictConfig() side-effect can't close our FileHandler's

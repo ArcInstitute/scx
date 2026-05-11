@@ -10,6 +10,7 @@ use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
+use scx_format::modality::ModalityTable;
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::shard::{
@@ -22,6 +23,9 @@ use crate::flock::FileLock;
 use crate::rollback::build_root_catalog_from_full;
 
 /// Append new rows to an existing SCX file.
+///
+/// Single-modality / global-axis convenience. Equivalent to
+/// [`append_for_modality`] with `modality_id = 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn append(
     target_path: &Path,
@@ -30,8 +34,45 @@ pub fn append(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
+    codec_id: CodecId,
+    shard_target_rows: u32,
+) -> Result<()> {
+    append_for_modality(
+        target_path,
+        new_obs,
+        new_indptr,
+        new_indices,
+        new_values,
+        value_encoding,
+        codec_id,
+        shard_target_rows,
+        0,
+    )
+}
+
+/// Append new rows to an existing SCX file, stamping new shards with
+/// the given `modality_id` (Phase F.3 of MULTIMODAL-SUPPORT.md).
+///
+/// `modality_id = 0` matches the legacy single-modality / global
+/// behaviour. On multimodal files, the caller MUST pass a registered
+/// modality id (1..=n_modalities) — the modality table is updated
+/// in-place to reflect the new shards' nnz / shard count.
+///
+/// Note: cells (obs) are global across modalities, so even a
+/// per-modality append still updates the file's `n_obs`. The append
+/// callers are expected to feed in CSR data indexed against the
+/// chosen modality's `n_vars`, not the global `header.n_vars`.
+#[allow(clippy::too_many_arguments)]
+pub fn append_for_modality(
+    target_path: &Path,
+    new_obs: &RecordBatch,
+    new_indptr: &[u64],
+    new_indices: &[u32],
+    new_values: &[u8],
+    value_encoding: ValueEncoding,
     _codec_id: CodecId,
     shard_target_rows: u32,
+    modality_id: u8,
 ) -> Result<()> {
     let mut lock = FileLock::acquire_exclusive(target_path)?;
 
@@ -106,20 +147,88 @@ pub fn append(
         });
     }
 
-    // Validate indices are within [0, n_vars)
-    let file_n_vars = header.n_vars;
-    if let Some(&max_idx) = new_indices.iter().max() {
-        if max_idx as u64 >= file_n_vars {
-            return Err(OpsError::IndexOutOfBounds {
-                index: max_idx,
-                n_vars: file_n_vars,
-            });
-        }
-    }
-
     let old_n_obs = header.n_obs;
     let old_n_csr_shards = header.n_csr_shards;
     let old_catalog_offset = header.full_catalog_offset;
+
+    // Phase F.3: load the modality table on disk (if any) so we can
+    // (a) resolve the target modality's name for shard naming, and
+    // (b) update its per-modality counts before re-emitting it.
+    let mut modality_table = if header.n_modalities > 0
+        && header.modality_table_offset != 0
+        && header.modality_table_length != 0
+    {
+        let mt_off = header.modality_table_offset;
+        let mt_len = header.modality_table_length as usize;
+        lock.seek(SeekFrom::Start(mt_off))?;
+        let mut buf = vec![0u8; mt_len];
+        std::io::Read::read_exact(&mut lock, &mut buf)?;
+        Some(ModalityTable::read_from(&mut Cursor::new(&buf), mt_len)?)
+    } else {
+        None
+    };
+
+    // Resolve the target modality. modality_id == 0 means "global" /
+    // legacy single-modality behaviour. > 0 must reference an entry
+    // in the modality table.
+    if modality_id != 0 {
+        let table = modality_table.as_ref().ok_or_else(|| {
+            OpsError::Format(scx_format::ScxError::InvalidCatalog(format!(
+                "append: target file has no modality table but modality_id={modality_id} \
+                 was requested"
+            )))
+        })?;
+        if (modality_id as usize) > table.len() {
+            return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+                format!(
+                    "append: modality_id={modality_id} out of range (file has {} modalities)",
+                    table.len()
+                ),
+            )));
+        }
+    }
+    let modality_name: Option<String> = if modality_id == 0 {
+        None
+    } else {
+        modality_table
+            .as_ref()
+            .and_then(|t| t.entries.get((modality_id - 1) as usize))
+            .map(|info| info.name.clone())
+    };
+
+    // Per-modality CSR shard count for naming. Global (modality_id == 0)
+    // continues to use the file-wide `header.n_csr_shards`; per-modality
+    // appends count only existing shards with that modality_id.
+    let old_per_modality_csr = if modality_id == 0 {
+        old_n_csr_shards
+    } else {
+        old_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+            .count() as u32
+    };
+
+    // Validate indices are within [0, n_vars). For per-modality
+    // append, `n_vars` is the chosen modality's `n_vars`, not the
+    // header's (which may be the file-wide max across modalities).
+    let target_n_vars: u64 = if modality_id == 0 {
+        header.n_vars
+    } else {
+        modality_table
+            .as_ref()
+            .and_then(|t| t.entries.get((modality_id - 1) as usize))
+            .map(|info| info.n_vars)
+            .unwrap_or(header.n_vars)
+    };
+    if let Some(&max_idx) = new_indices.iter().max() {
+        if max_idx as u64 >= target_n_vars {
+            return Err(OpsError::IndexOutOfBounds {
+                index: max_idx,
+                n_vars: target_n_vars,
+            });
+        }
+    }
 
     // Read existing obs section for concatenation. This bypasses
     // `ScxReader::read_obs`, so apply `downcast_large_types` explicitly
@@ -219,8 +328,14 @@ pub fn append(
         // Per-shard codec selection (auto-select optimal codec for this shard's data)
         let shard_codec = scx_format::select_codec(shard_values, value_encoding);
 
-        let shard_idx = old_n_csr_shards + new_shard_entries.len() as u32;
-        let shard_name = format!("X_shard_{shard_idx}");
+        let shard_idx = old_per_modality_csr + new_shard_entries.len() as u32;
+        // Per-modality shards follow the writer's `X/{name}/shard_{i}`
+        // convention (writer.rs::write_csr_shard_for); global / legacy
+        // entries keep the flat `X_shard_{i}` naming.
+        let shard_name = match modality_name.as_deref() {
+            Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
+            None => format!("X_shard_{shard_idx}"),
+        };
         let global_row_start = old_n_obs + row_offset as u64;
 
         // Pad to 8-byte alignment
@@ -284,7 +399,12 @@ pub fn append(
             index_dtype: header.index_dtype,
             reserved_flags: [0; 3],
             n_major: shard_rows as u32,
-            n_minor: file_n_vars as u32,
+            // PR #68: use the target modality's n_vars (resolved
+            // above) rather than `header.n_vars` (which is the
+            // file-wide max across modalities). Required for v2
+            // multimodal files; identical to the legacy single-
+            // modality path where `target_n_vars == header.n_vars`.
+            n_minor: target_n_vars as u32,
             nnz: shard_nnz,
             global_offset: global_row_start,
             indptr_rel_offset,
@@ -311,11 +431,16 @@ pub fn append(
         lock.write_all(&section_data)?;
         write_offset += section_length;
 
+        // append.rs always emits row-major CSR shards. Use the
+        // target modality's n_vars (PR #68) — see ShardHeader.n_minor
+        // above for rationale.
         let stats = compute_shard_stats(
             shard_values,
             value_encoding,
+            scx_format::MajorAxis::Row,
             global_row_start,
             shard_rows as u64,
+            target_n_vars,
             shard_nnz,
         );
 
@@ -325,6 +450,9 @@ pub fn append(
             length: section_length,
             section_type: SectionType::CsrShard,
             checksum: section_checksum,
+            // Phase F.3: stamp shards with the chosen modality id (0 =
+            // global / legacy single-modality).
+            modality_id,
             stats: Some(stats),
         });
 
@@ -446,6 +574,7 @@ pub fn append(
         );
     }
 
+    let n_new_csr_shards = new_shard_entries.len() as u32;
     new_entries.extend(new_shard_entries);
     new_entries.push(FullCatalogEntry {
         name: "obs".to_string(),
@@ -453,6 +582,7 @@ pub fn append(
         length: new_obs_length,
         section_type: SectionType::ObsMetadata,
         checksum: new_obs_checksum,
+        modality_id: 0, // obs is shared across modalities (global)
         stats: None,
     });
     new_entries.push(FullCatalogEntry {
@@ -461,18 +591,65 @@ pub fn append(
         length: prov_length,
         section_type: SectionType::Provenance,
         checksum: prov_checksum,
+        modality_id: 0, // provenance is global
         stats: None,
     });
 
     let new_n_obs = old_n_obs + n_new_rows as u64;
     let new_manifest_sequence = header.manifest_sequence + 1;
     let new_catalog = FullCatalog {
-        catalog_version: 1,
+        catalog_version: scx_format::CURRENT_CATALOG_VERSION,
         manifest_sequence: new_manifest_sequence,
         prev_catalog_offset: old_catalog_offset,
         n_obs: new_n_obs,
         entries: new_entries,
     };
+
+    // Phase F.3: re-emit the modality table at a fresh EOF location
+    // (alongside the catalog) before the catalog so the header can
+    // be updated atomically. Per-modality counts:
+    //   - the target modality gets `n_csr_shards += new shards` and
+    //     `nnz += total_new_nnz`
+    //   - every modality drops its CSC sidecar count + HAS_CSC flag
+    //     because the file-wide CSC drop applies uniformly (Phase
+    //     F.3 todo: per-modality CSC preservation when only one
+    //     modality is being appended into requires per-modality
+    //     row-axis decoupling — the writer already writes shared
+    //     obs, so for now match the file-wide drop).
+    let (modality_table_offset, modality_table_length) =
+        if let Some(mut table) = modality_table.take() {
+            if modality_id != 0 {
+                if let Some(info) = table.entries.get_mut((modality_id - 1) as usize) {
+                    info.n_csr_shards += n_new_csr_shards;
+                    info.nnz += total_new_nnz;
+                }
+            }
+            // CSC sidecars are dropped file-wide on append (matches the
+            // global header.clear_csc() / n_csc_shards = 0 below). Clear
+            // every modality's CSC marker to keep the modality table in
+            // sync with reality.
+            for info in table.entries.iter_mut() {
+                info.n_csc_shards = 0;
+                info.flags = scx_format::ModalityFlags::from_bits_truncate(
+                    info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
+                );
+            }
+
+            let mt_aligned = align_to_8(write_offset);
+            let pad = (mt_aligned - write_offset) as usize;
+            if pad > 0 {
+                lock.write_all(&vec![0u8; pad])?;
+                write_offset = mt_aligned;
+            }
+            let mut mt_buf = Vec::new();
+            table.write_to(&mut mt_buf)?;
+            lock.write_all(&mt_buf)?;
+            let mt_len = mt_buf.len() as u64;
+            write_offset += mt_len;
+            (mt_aligned, mt_len)
+        } else {
+            (header.modality_table_offset, header.modality_table_length)
+        };
 
     // Write new catalog
     let catalog_aligned = align_to_8(write_offset);
@@ -529,6 +706,8 @@ pub fn append(
     header.clear_csc();
     header.full_catalog_offset = new_catalog_offset;
     header.full_catalog_length = new_catalog_length;
+    header.modality_table_offset = modality_table_offset;
+    header.modality_table_length = modality_table_length;
     header.manifest_sequence = new_manifest_sequence;
     header.prev_catalog_offset = old_catalog_offset;
     header.root_catalog_offset = HEADER_SIZE as u64;

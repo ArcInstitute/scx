@@ -58,6 +58,9 @@ pub enum OpsError {
     #[error("codec error: {0}")]
     Codec(#[from] scx_codec::CodecError),
 
+    #[error("modality mismatch on merge: {detail}")]
+    ModalityMismatch { detail: String },
+
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }

@@ -290,15 +290,63 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] SingleCellExperiment interop
 - [x] Harmony batch correction in R (see `rscx/R/harmony.R`)
 
-### 3.4 Multimodal Support — DEFERRED
-- [ ] CITE-seq (RNA + protein): multi-feature-space layout (docs/format.md §Multimodal Extension) — **DEFERRED**
-- [ ] Spatial transcriptomics: spatial coordinates + optional R-tree index — **DEFERRED**
-- [ ] `scx convert --from h5mu` (MuData format) — **DEFERRED**
-- [ ] Round-trip with MuData/MuOn objects — **DEFERRED**
+### 3.4 Multimodal Support — SHIPPED (Phases A–I)
+- [x] **Phase A**: format v2 bump; carve `n_modalities` /
+  `modality_table_offset` / `modality_table_length` out of the header
+  reserved tail; add `has_modalities` flag (bit 7); add explicit
+  `col_start` / `col_end` to `ShardStats` (catalog v2); v2-strict
+  CSC `shard_type=1` validation with `ScxError::InvalidShardType`.
+- [x] **Phase B**: `ModalityTable` section (id 15), `LayerCscShard`
+  (id 16), per-modality reader / writer methods, `BackedCscReader`
+  per-modality scoping.
+- [x] **Phase C**: catalog `modality_id: u8` field, per-modality
+  filtering helpers (`csr_shards_for_modality`, etc.), bumped
+  `catalog_version = 2`. `FullCatalog::write_to` auto-upgrades
+  `catalog_version` to ≥2 on serialise so the on-disk header matches
+  the v2 stats layout that `ShardStats::write_to` always emits —
+  closes the 2026-05-10 symmetry bug where push-side re-serialisation
+  of a v1 catalog produced "v1 header / v2 stats" hybrids unreadable
+  by any code path (regression test
+  `catalog::tests::write_upgrades_v1_catalog_to_v2`).
+- [x] **Phase D**: CITE-seq / 10x Multiome / TEA-seq layout via
+  `pyscx.from_mudata` / `to_mudata` and `scx convert --from h5mu`.
+- [x] **Phase E**: per-modality auto-codec via
+  `select_codec_for_modality` (RNA→Scx1/Zstd, ADT→Zstd, ATAC→Zstd
+  or Lz4Shuffle).
+- [x] **Phase F**: `scx info` per-modality table, `scx validate`
+  modality cross-checks, `scx append --modality`, `scx subset
+  --modality NAME` extract.
+- [x] **Phase G**: cloud header preservation (`cloud_optimize` /
+  `pack` / `pull` rewrite the modality table at the new layout
+  offset; `pull_filtered` recomputes per-modality counts from the
+  filtered catalog), exploded `_modality_table.bin` + per-modality
+  `X/{name}/` directories.
+- [x] **Phase H**: `pyscx.MultimodalTrainingDataset` with
+  triple-buffered per-modality pipelines and aligned `cell_indices`
+  validation; `TrainingDataset(path)` backward-compat warning on
+  multimodal files.
+- [x] **Phase I**: rscx Seurat v5 multi-assay (`from_seurat` /
+  `scx_open(...)$to_seurat()`) and Bioconductor MAE
+  (`from_mae` / `$to_mae()`) interop.
+- [ ] Multimodal `scx merge` / `scx compact` — **DEFERRED** (current
+  ops reject multimodal inputs; extract via `scx subset --modality`
+  first).
+- [ ] Per-modality CSC sidecar preservation on `scx append` —
+  **DEFERRED** (file-wide CSC drop today; appending into RNA still
+  invalidates ADT's CSC).
+- [ ] Spatial transcriptomics R-tree index — **DEFERRED** (separate
+  spec; spatial coordinates already work via standard `obs`/`obsm`).
 
-**Status**: Section types 13–239 are reserved for multimodal/spatial extensions
-and the `has_modalities` header flag is defined, but no implementation exists.
-Deferred until a concrete user requirement lands.
+**Status**: shipped end-to-end via Phases A–I. CITE-seq /
+10x Multiome / TEA-seq round-trip through `pyscx.from_mudata` /
+`pyscx.MultimodalTrainingDataset` and Seurat v5 / MAE via rscx. See
+[docs/multimodal.md](docs/multimodal.md) for the user-facing guide
+and [docs/format.md § 13](docs/format.md#13-multimodal-extension) for
+the on-disk layout. Section ids 15 = `ModalityTable` and
+16 = `LayerCscShard` are now allocated; ids 17–31 are reserved for
+further multimodal/spatial extensions; ids 32–239 are reserved for
+future use; ids 240–255 are vendor / private. The `has_modalities`
+header flag (bit 7) is wired through writers and readers.
 
 ### 3.5 Quality + Polish — PARTIALLY COMPLETE
 - [ ] Full conformance test suite with reference .scx files — **PARTIAL**: round-trip and per-codec correctness tests run in CI; no frozen reference-file vectors yet.
@@ -446,7 +494,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] CELLxGENE Census 500K, 1M, 5M subsets (large)
 - [x] 10M-cell synthetic build for training loader (`build_census_*.py`)
 - [x] Smart-seq2 50K (non-UMI protocol — validates codec selection heuristic)
-- [ ] CITE-seq reference dataset — blocked on Phase 3.4 multimodal (tracked separately; out of Phase 5 scope)
+- [ ] CITE-seq reference dataset — Phase 3.4 multimodal landed (`pyscx.from_mudata` + `MultimodalTrainingDataset` ship), but the comprehensive benchmark suite has not been extended with multimodal compression / training rows yet. Tracked under MULTIMODAL-SUPPORT.md Phase K.3 / K.4.
 
 ### 5.4 Local HPC Benchmarking (Chimera SLURM) — COMPLETE
 - [x] Parallel SLURM submission via `benchmarks/scripts/submit_benchmarks.py`
@@ -488,6 +536,11 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 - [x] On-demand gate runs: `scripts/gate_candidate.py` one-shot captures a candidate snapshot and runs the gate against `results/baselines/LATEST`. Recommended trigger points (pre-PR / pre-merge / pre-release / on-suspicion) documented in `benchmarks/README.md`. Cron-based scheduling was explicitly deferred — no wasted compute when nothing changed, every gate result ties to a specific commit.
 - [x] JSON result diff against the canonical baseline via `compare_against_baseline.py --gate` (3% wall / 10% RSS / 1% size tolerances; absolute floors from `thresholds.yaml`; disappearing-benchmark detection; justification-markdown suppression with expiry dates).
 - [x] Rolling performance dashboard: `reporting/dashboard.py` emits `BENCHMARK_REPORT.html` alongside the markdown; `dashboard_history.json` threads "← previous snapshot" navigation. `publish_dashboard.py` rsyncs to a configurable static-hosting target (no-op when unset).
+- [x] **Variance-aware per-row timing tolerance** — when the baseline's `summary.json` carries `wall_s_iqr` per row, the gate widens the row's effective tolerance to `max(--timing-tolerance, --iqr-k * baseline_iqr / baseline_median)`. Replaces the prior flat 3% floor on rows whose intrinsic CV is higher than the floor (avoids false positives). Coverage and fallback counts surface in the markdown report header (`Timing IQR coverage: X/Y rows have wall_s_iqr; Z fall back to fixed P% tolerance`). Captured automatically when `capture_baseline.py` sees `n_runs >= 3`; `n_runs < 3` rows fall back to the fixed tolerance by design (IQR is unreliable on 2 samples).
+- [x] **Justification suppression covers floors** — `(benchmark, format, dataset)` entries in `results/justifications/*.md` suppress both `is_regression` deltas and `absolute_floor` violations on the same triple (previously only filtered regressions; floors silently failed the gate even when the triple was justified). Floors marked `| suppressed |` in the markdown report rather than dropped, so operators see what was waived. Deferred floors documented in `thresholds.yaml` § "Deferred floors".
+- [x] **TIMEOUT-handling robustness** — `run_parallel.py`'s wait loop falls back to `sacct -X -j <id>` when `submitit.Job.state` returns empty (post-squeue-reap), so a job that timed out before writing its result pickle no longer hangs `.result()` indefinitely. 12 hermetic tests in `test_run_parallel_timeout.py` cover the head-state normalisation + reap-sequence handling.
+- [x] **Cloud preflight** — `gate_candidate.py --probe-cloud` (opt-in) does one `fsspec.filesystem('gs').ls(<bucket>)` + one `pyscx.open_cloud(<probe_url>)` in <30 s before any sbatch. Catches missing/mismatched `gcsfs` and catalog-format bugs (the two recurring pre-run failure modes from the 2026-05 firefight: 24 zarr cloud FAST_FAILs and 158 SCX cloud FAST_FAILs respectively) before they cascade into the live gate.
+- [x] **Fixture re-conversion workflow** — `benchmarks/scripts/reconvert_fixtures.py` is the canonical entry point for rebuilding derived SCX / Zarr / TileDB local files (and their cloud-pushed copies) after a source h5ad fixture change. Default matrix: all datasets × `{scx_auto, tiledb_soma, zarr_zstd}`. `--cloud-push` invalidates the prior `.blake3` completion sidecar before re-uploading so `ensure_cloud_fixture`'s short-circuit doesn't skip fresh data. Replaces the ad-hoc `/tmp/reconvert_stale.py` from the 2026-05 campaign.
 
 ### Go/No-Go Gate — Phase 5
 - [x] Comprehensive cloud benchmark suite runs to completion on GCS via the unified launcher (`run_parallel.py --benchmarks cloud_*`).

@@ -96,7 +96,13 @@ DEFAULT_PARTITION = os.environ.get("SCX_BENCH_PARTITION", "cpu_preemptible")
 
 TIERS = {
     "small": {
-        "datasets": ["pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k"],
+        "datasets": [
+            "pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k",
+            # Phase K — multimodal datasets in the small tier so the
+            # default `gate_candidate.py` run sees `multimodal_*`
+            # benchmarks against real CITE-seq + Multiome fixtures.
+            "cite_seq_pbmc", "multiome_pbmc",
+        ],
         "partition": DEFAULT_PARTITION,
         "mem_gb": 8,
         "timeout": 240,
@@ -105,6 +111,7 @@ TIERS = {
         "datasets": [
             "pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k",
             "census_500k", "census_1m",
+            "cite_seq_pbmc", "multiome_pbmc",
         ],
         "partition": DEFAULT_PARTITION,
         "mem_gb": 8,
@@ -185,6 +192,7 @@ def submit_benchmarks(
     no_gpu: bool = False,
     benchmarks: list[str] | None = None,
     datasets: list[str] | None = None,
+    formats: list[str] | None = None,
     skip_smoke: bool = False,
 ) -> int:
     """Invoke run_parallel.py with the selected tier's settings.
@@ -251,6 +259,8 @@ def submit_benchmarks(
         cmd.append("--include-accel")
     if no_gpu:
         cmd.append("--no-gpu")
+    if formats:
+        cmd.extend(["--formats", *formats])
 
     print("[baseline] submitting benchmarks:")
     print("           " + " ".join(cmd))
@@ -264,13 +274,29 @@ def submit_benchmarks(
 
 
 def _tier_matches(filename: str, tier_cfg: dict[str, Any]) -> bool:
-    """Does this results/raw/<name>.json belong to the current tier?"""
+    """Does this results/raw/<name>.json belong to the current tier?
+
+    ``tier_cfg["datasets"]`` lists registry *keys* (e.g.
+    ``"cite_seq_pbmc"``); the filename embeds the dataset's
+    ``.name`` field (e.g. ``"cite_seq_pbmc_5k"``). For most
+    single-modality datasets key == name, so the direct membership
+    test catches them. For multimodal datasets the name is
+    versioned (``..._5k``, ``..._10k``) so we additionally resolve
+    each tier key through ``DATASETS`` and accept a name match.
+    """
     # Convention: filenames are "<bench>__<format>__<dataset>.json".
     parts = filename.rsplit("__", 2)
     if len(parts) != 3 or not parts[-1].endswith(".json"):
         return False
     dataset = parts[-1][:-len(".json")]
-    return dataset in tier_cfg["datasets"]
+    if dataset in tier_cfg["datasets"]:
+        return True
+    # Fallback: translate tier keys to .name fields and check there.
+    from benchmarks.comprehensive.config import DATASETS
+    tier_names = {
+        DATASETS[k].name for k in tier_cfg["datasets"] if k in DATASETS
+    }
+    return dataset in tier_names
 
 
 def archive_raw_results(
@@ -474,6 +500,14 @@ def main() -> int:
              "`--datasets pbmc3k tabula_sapiens_100k`).",
     )
     parser.add_argument(
+        "--formats", nargs="+", default=None,
+        help="Restrict to a subset of format keys, forwarded to "
+             "run_parallel.py. Use to scope away from format runners "
+             "whose deps aren't in the current conda env (e.g. drop "
+             "`slaf` when not running from `scx-bench-slaf`, drop "
+             "`bpcells` when not running from `scx-bench-r`).",
+    )
+    parser.add_argument(
         "--skip-smoke", action="store_true",
         help="Skip the pre-submit format-runner contract check. Useful for "
              "narrow accel-only runs or when known-broken format runners "
@@ -535,6 +569,7 @@ def main() -> int:
             no_gpu=args.no_gpu,
             benchmarks=args.benchmarks,
             datasets=args.datasets,
+            formats=args.formats,
             skip_smoke=args.skip_smoke,
         )
         if rc != 0:
@@ -554,6 +589,7 @@ def main() -> int:
             no_gpu=args.no_gpu,
             benchmarks=args.benchmarks,
             datasets=args.datasets,
+            formats=args.formats,
             skip_smoke=args.skip_smoke,
         )
         return 0

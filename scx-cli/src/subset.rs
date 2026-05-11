@@ -17,12 +17,35 @@ pub fn run_subset(
     output: Option<&Path>,
     filter: Option<&str>,
     gene_file: Option<&Path>,
+    modality: Option<&str>,
     dry_run: bool,
     shard_size: u32,
     codec: &str,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Phase F.4: pure modality extraction (no filter / no genes).
+    // The output is a single-modality v2 file containing just the
+    // chosen modality's CSR + var, with the file's global obs.
+    if let Some(name) = modality {
+        if filter.is_none() && gene_file.is_none() {
+            if dry_run {
+                return Err("--dry-run is not supported for `--modality NAME` extraction".into());
+            }
+            let out_path = output.ok_or("--output is required for `--modality NAME` extraction")?;
+            return extract_modality(input, out_path, name, shard_size, codec);
+        }
+        // Filter/genes scoping for a specific modality is a Phase F+
+        // follow-on: the QueryPipeline below is single-modality and
+        // would need per-modality plumbing to honour `--modality`.
+        return Err(
+            "`--modality NAME` combined with `--filter` / `--genes` is not yet supported; \
+             extract the modality first via `scx subset --modality NAME --output …`, then \
+             rerun the filter on the extracted single-modality file"
+                .into(),
+        );
+    }
+
     // 1. Validate: at least one of --filter or --genes must be specified
     if filter.is_none() && gene_file.is_none() {
         return Err("At least one of --filter or --genes is required".into());
@@ -302,6 +325,201 @@ fn detect_value_encoding_from_reader(
     }
 }
 
+/// Phase F.4: extract a single modality from a multimodal SCX file
+/// to a new single-modality v2 file. Cells (obs) are global across
+/// modalities, so the output's obs matches the input's obs.
+fn extract_modality(
+    input: &Path,
+    output: &Path,
+    modality_name: &str,
+    shard_size: u32,
+    codec: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reader = ScxReader::open(input)?;
+    if !reader.is_multimodal() {
+        return Err(format!(
+            "input file is single-modality; `--modality {modality_name}` is not applicable"
+        )
+        .into());
+    }
+    let modality_id = reader.modality_id(modality_name).ok_or_else(|| {
+        format!(
+            "input file does not have a modality named '{modality_name}'; \
+             run `scx info {}` to list modalities",
+            input.display()
+        )
+    })?;
+    let info = reader
+        .modality_info(modality_id)
+        .expect("modality_id resolved above");
+
+    let n_obs = reader.header().n_obs;
+    let n_vars = info.n_vars;
+
+    // Detect value encoding from the chosen modality's first CSR shard.
+    let value_encoding = {
+        let csr_entries: Vec<&scx_format::FullCatalogEntry> = reader
+            .catalog()
+            .shards(SectionType::CsrShard)
+            .into_iter()
+            .filter(|e| e.modality_id == modality_id)
+            .collect();
+        if let Some(first_shard) = csr_entries.first() {
+            let bytes = reader.section_bytes(first_shard)?;
+            if bytes.len() >= SHARD_HEADER_SIZE {
+                let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+                    &bytes[..SHARD_HEADER_SIZE],
+                ))?;
+                ValueEncoding::from_u8(sh.value_encoding).ok_or_else(|| {
+                    format!(
+                        "unknown value encoding {} on modality '{modality_name}'",
+                        sh.value_encoding
+                    )
+                })?
+            } else {
+                return Err("input CSR shard too small to read header".into());
+            }
+        } else {
+            return Err(format!(
+                "modality '{modality_name}' has no CSR shards in {}",
+                input.display()
+            )
+            .into());
+        }
+    };
+
+    let explicit_codec = match codec {
+        "auto" => None,
+        "none" => Some(scx_codec::CodecId::None),
+        "scx1" => Some(scx_codec::CodecId::Scx1),
+        "zstd" => Some(scx_codec::CodecId::Zstd),
+        "lz4" => Some(scx_codec::CodecId::Lz4Shuffle),
+        "pcodec" => Some(scx_codec::CodecId::Pcodec),
+        other => {
+            return Err(format!(
+                "unknown codec: '{other}'. Use auto, none, scx1, zstd, lz4, or pcodec."
+            )
+            .into());
+        }
+    };
+    let modality_type = info.modality_type;
+
+    let csr = reader.read_all_csr_shards_for(modality_id)?;
+    let var = reader.read_var_for(modality_id)?;
+    let obs = reader.read_obs()?;
+    // PR #68: preserve metadata when extracting a single modality.
+    // Per-modality `uns/{name}` wins; fall back to the file-wide
+    // `uns` so a multimodal file with only one of the two still
+    // round-trips its annotations through `extract`.
+    let uns = reader
+        .read_uns_for(modality_id)
+        .ok()
+        .or_else(|| reader.read_uns().ok());
+
+    let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs,
+        n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: shard_size,
+        codec_id: 0,
+        index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    };
+
+    let mut writer = ScxWriter::new(output, header)?;
+    writer.write_obs(&obs)?;
+    writer.write_var(&var)?;
+
+    let indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
+    let indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
+    let raw_values = value_encoding.encode_f32_batch(&csr.data)?;
+
+    let shard_target = shard_size as usize;
+    // `indptr.len() - 1` would underflow on an empty indptr;
+    // `saturating_sub` matches the row-sharding template in
+    // pyscx::from_mudata and is also rust-1.95 clippy-clean
+    // (`unnecessary_min_or_max` flags the prior `.max(0)`).
+    let total_rows = indptr.len().saturating_sub(1);
+    let mut row_offset = 0usize;
+    while row_offset < total_rows {
+        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
+        let shard_indptr_start = indptr[row_offset];
+        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
+            .iter()
+            .map(|&v| v - shard_indptr_start)
+            .collect();
+        let shard_nnz = *shard_indptr.last().unwrap();
+        let idx_start = shard_indptr_start as usize;
+        let idx_end = (shard_indptr_start + shard_nnz) as usize;
+        let shard_indices = &indices[idx_start..idx_end];
+        let value_byte_size = value_encoding.byte_width();
+        let val_start = idx_start * value_byte_size;
+        let val_end = idx_end * value_byte_size;
+        let shard_values = &raw_values[val_start..val_end];
+        let codec_id = match explicit_codec {
+            Some(c) => c,
+            None => {
+                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
+            }
+        };
+        writer.write_csr_shard(
+            &shard_indptr,
+            shard_indices,
+            shard_values,
+            codec_id,
+            value_encoding,
+            row_offset as u64,
+        )?;
+        row_offset += shard_rows;
+    }
+
+    // PR #68: preserve uns + provenance — `write_subset_scx` does this
+    // for filter/gene-index subsets; the modality-extraction path was
+    // dropping them silently.
+    if let Some(uns_data) = &uns {
+        writer.write_uns(uns_data)?;
+    }
+    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: "modality_extract".to_string(),
+        tool: format!("scx-cli {}", env!("CARGO_PKG_VERSION")),
+        params_json: serde_json::json!({ "modality": modality_name }).to_string(),
+        input_checksums: vec![],
+    }])?;
+
+    writer.finish()?;
+    println!(
+        "Extracted modality '{modality_name}' ({n_vars} vars) from {} to {}",
+        input.display(),
+        output.display()
+    );
+    Ok(())
+}
+
 /// Write a subset QueryResult to a new SCX file.
 #[allow(clippy::too_many_arguments)]
 fn write_subset_scx(
@@ -343,7 +561,10 @@ fn write_subset_scx(
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     let mut writer = ScxWriter::new(output, header)?;
@@ -389,7 +610,11 @@ fn write_subset_scx(
         let codec_id = if let Some(c) = explicit_codec {
             c
         } else {
-            scx_format::select_codec(shard_values, value_encoding)
+            scx_format::select_codec_for_modality(
+                shard_values,
+                value_encoding,
+                scx_format::ModalityType::Rna,
+            )
         };
 
         writer.write_csr_shard(
@@ -475,6 +700,7 @@ mod tests {
             Some(output.as_path()),
             Some("cell_type == 'T cell'"),
             None,
+            None,
             false,
             10000,
             "auto",
@@ -502,6 +728,7 @@ mod tests {
             Some(output.as_path()),
             None,
             Some(gene_file.as_path()),
+            None,
             false,
             10000,
             "auto",
@@ -529,6 +756,7 @@ mod tests {
             Some(output.as_path()),
             Some("cell_type == 'T cell'"),
             Some(gene_file.as_path()),
+            None,
             false,
             10000,
             "auto",
@@ -554,6 +782,7 @@ mod tests {
             None,
             Some("cell_type == 'T cell'"),
             None,
+            None,
             true,
             10000,
             "auto",
@@ -573,6 +802,7 @@ mod tests {
         let err = run_subset(
             &input,
             Some(output.as_path()),
+            None,
             None,
             None,
             false,
@@ -596,6 +826,7 @@ mod tests {
             &input,
             None,
             Some("cell_type == 'T cell'"),
+            None,
             None,
             false,
             10000,
@@ -621,6 +852,7 @@ mod tests {
             Some(output.as_path()),
             None,
             Some(gene_file.as_path()),
+            None,
             false,
             10000,
             "auto",
@@ -646,6 +878,7 @@ mod tests {
             Some(dir.path().join("out.scx").as_path()),
             None,
             Some(gene_file.as_path()),
+            None,
             false,
             10000,
             "auto",
@@ -710,6 +943,7 @@ mod tests {
             Some(output.as_path()),
             Some("cell_type == 'T cell'"),
             None,
+            None,
             false,
             10000,
             "auto",
@@ -726,6 +960,142 @@ mod tests {
             "uns should be preserved"
         );
         assert_eq!(roundtrip_uns["version"], 42, "uns values should round-trip");
+    }
+
+    /// Helper: build a 2-modality SCX file for the extract_modality
+    /// tests. `with_global_uns` / `with_rna_uns` control which uns
+    /// sections are written. Returns the input path and a clone of
+    /// whichever uns blob the caller asked to be written, for asserts.
+    #[allow(clippy::type_complexity)]
+    fn write_multimodal_test_file(
+        dir: &tempfile::TempDir,
+        global_uns: Option<serde_json::Value>,
+        rna_uns: Option<serde_json::Value>,
+    ) -> std::path::PathBuf {
+        use crate::test_utils::{sample_obs, sample_var};
+        use scx_format::modality::ModalityType;
+
+        let path = dir.path().join("multimodal_uns.scx");
+        // header.n_vars = max across modalities = 5.
+        let mut header = crate::test_utils::sample_header(3, 5);
+        header.n_vars = 5;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(3)).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(5)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(3)).unwrap();
+        writer.set_modality_n_vars(rna_id, 5).unwrap();
+        writer.set_modality_n_vars(adt_id, 3).unwrap();
+
+        // One small CSR shard per modality so the file is well-formed.
+        let indptr = vec![0u64, 1, 2, 3];
+        let indices = vec![0u32, 1, 2];
+        let values = vec![1u8, 2, 3];
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        if let Some(u) = &global_uns {
+            writer.write_uns(u).unwrap();
+        }
+        if let Some(u) = &rna_uns {
+            writer.write_uns_for(rna_id, u).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// PR #68: `scx subset --modality NAME` (the `extract_modality`
+    /// path) must preserve `uns`, preferring the per-modality
+    /// `uns/{name}` over the file-wide `uns`, and must record a
+    /// `modality_extract` provenance entry. The pre-fix path silently
+    /// dropped both.
+    #[test]
+    fn test_extract_modality_prefers_modality_uns() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = serde_json::json!({"source": "global", "version": 1});
+        let rna = serde_json::json!({"source": "rna", "version": 42});
+        let input = write_multimodal_test_file(&dir, Some(global), Some(rna));
+
+        let output = dir.path().join("extracted_rna.scx");
+        extract_modality(&input, &output, "rna", 10000, "none").unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+
+        // Per-modality uns wins.
+        let roundtrip = reader.read_uns().unwrap();
+        assert_eq!(
+            roundtrip["source"], "rna",
+            "per-modality uns must win over global"
+        );
+        assert_eq!(roundtrip["version"], 42);
+
+        // Provenance entry recorded.
+        let prov = reader
+            .read_provenance()
+            .expect("extract_modality must write a provenance entry");
+        let extract = prov
+            .operations
+            .iter()
+            .find(|e| e.action == "modality_extract")
+            .expect("provenance must include a modality_extract action");
+        assert!(extract.params_json.contains("\"modality\""));
+        assert!(extract.params_json.contains("\"rna\""));
+    }
+
+    /// Fallback: only the global `uns` is set on the input → output
+    /// inherits that global uns (per-modality is absent for rna).
+    #[test]
+    fn test_extract_modality_falls_back_to_global_uns() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = serde_json::json!({"source": "global", "version": 7});
+        let input = write_multimodal_test_file(&dir, Some(global), None);
+
+        let output = dir.path().join("extracted_rna_global.scx");
+        extract_modality(&input, &output, "rna", 10000, "none").unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        let roundtrip = reader.read_uns().unwrap();
+        assert_eq!(roundtrip["source"], "global");
+        assert_eq!(roundtrip["version"], 7);
     }
 
     #[test]
@@ -747,6 +1117,7 @@ mod tests {
             Some(output.as_path()),
             None,
             Some(gene_path.as_path()),
+            None,
             false,
             10000,
             "auto",

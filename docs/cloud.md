@@ -176,11 +176,17 @@ distribution of a single file.
 s3://bucket/atlas.scxd/
 ├── _header.bin               # 256-byte file header
 ├── _catalog.bin              # Full catalog (uploaded LAST)
+├── _modality_table.bin       # Optional — present on multimodal v2 files
 ├── obs.arrow                 # Cell metadata
 ├── var.arrow                 # Gene metadata
 ├── X/
-│   ├── 000000.shard          # CSR shards — byte-identical to the packed form
+│   ├── 000000.shard          # Single-modality CSR shards — byte-identical to packed
 │   ├── 000001.shard
+│   ├── rna/                  # Multimodal: per-modality directory
+│   │   ├── 000000.shard
+│   │   └── ...
+│   ├── adt/
+│   │   └── 000000.shard
 │   └── ...
 ├── obsm/                     # Optional embeddings
 ├── layers/                   # Optional layers

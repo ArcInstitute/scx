@@ -19,6 +19,12 @@ pub enum SectionType {
     DeletionVectors = 12,
     ObsPredicateIndex = 13,
     VarPredicateIndex = 14,
+    /// v2: named, ordered list of modalities (CITE-seq, multiome, …).
+    /// One per file. See `crate::modality::ModalityTable`.
+    ModalityTable = 15,
+    /// v2: per-modality CSC sidecar for a layer (the column-major
+    /// counterpart of `LayerCsrShard = 7`).
+    LayerCscShard = 16,
 }
 
 impl SectionType {
@@ -40,13 +46,15 @@ impl SectionType {
             12 => Some(Self::DeletionVectors),
             13 => Some(Self::ObsPredicateIndex),
             14 => Some(Self::VarPredicateIndex),
+            15 => Some(Self::ModalityTable),
+            16 => Some(Self::LayerCscShard),
             _ => None,
         }
     }
 
-    /// Returns true if `v` is a known section type ID (0..=14).
+    /// Returns true if `v` is a known section type ID (0..=16).
     pub fn is_known(v: u8) -> bool {
-        v <= 14
+        v <= 16
     }
 }
 
@@ -72,20 +80,22 @@ mod tests {
             SectionType::from_u8(14),
             Some(SectionType::VarPredicateIndex)
         );
+        assert_eq!(SectionType::from_u8(15), Some(SectionType::ModalityTable));
+        assert_eq!(SectionType::from_u8(16), Some(SectionType::LayerCscShard));
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(15), None);
+        assert_eq!(SectionType::from_u8(17), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 
     #[test]
     fn section_type_is_known() {
-        for v in 0..=14 {
+        for v in 0..=16 {
             assert!(SectionType::is_known(v));
         }
-        assert!(!SectionType::is_known(15));
+        assert!(!SectionType::is_known(17));
         assert!(!SectionType::is_known(255));
     }
 

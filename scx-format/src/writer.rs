@@ -13,6 +13,7 @@ use crate::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntr
 use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
+use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
 use crate::section::{align_to_8, SectionType};
 use crate::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE,
@@ -64,6 +65,24 @@ pub struct ScxWriter {
     total_nnz: u64,
     has_obsm: bool,
     has_obsp: bool,
+    /// The `modality_id` stamped on every catalog entry created by
+    /// the next write call. Defaults to `0` (global / single-modality
+    /// shape). Public `*_for` methods set this for the duration of
+    /// the call and reset it to `0` afterwards via the
+    /// `ModalityScope` RAII guard.
+    current_modality_id: u8,
+    /// Modalities registered via `add_modality()`. When empty, the
+    /// file is single-modality and `finish()` emits no
+    /// `ModalityTable` section.
+    modalities: Vec<crate::modality::ModalityInfo>,
+    /// Phase B.3: per-modality `build_csc` flags (writer-only — not
+    /// persisted in the on-disk modality table). When `true`,
+    /// `finish()` reads the modality's CSR shards back from the
+    /// temp file, runs a streaming CSR→CSC transpose, and emits CSC
+    /// sidecar shards via `write_csc_shard_for` before catalog
+    /// assembly. The resulting CSC presence is recorded in the
+    /// `ModalityFlags::HAS_CSC` bit on disk.
+    modality_build_csc: Vec<bool>,
 }
 
 /// Output of parallel shard encoding, ready for sequential write.
@@ -137,6 +156,9 @@ impl ScxWriter {
             total_nnz: 0,
             has_obsm: false,
             has_obsp: false,
+            current_modality_id: 0,
+            modalities: Vec::new(),
+            modality_build_csc: Vec::new(),
         })
     }
 
@@ -186,6 +208,7 @@ impl ScxWriter {
             length,
             section_type,
             checksum,
+            modality_id: self.current_modality_id,
             stats,
         });
 
@@ -398,6 +421,23 @@ impl ScxWriter {
         let nnz = *indptr.last().unwrap_or(&0);
         let index_dtype_u16 = self.header.index_dtype == 0;
 
+        // Resolve the unbound-minor extent for this shard. For CSC shards
+        // the minor axis is rows (file-wide `n_obs`, shared across
+        // modalities). For row-major shards (CSR / LayerCsr / ObspCsr)
+        // the minor axis is columns, which is per-modality: when
+        // `current_modality_id > 0` we MUST use that modality's `n_vars`
+        // rather than the file-wide max (`self.header.n_vars`), otherwise
+        // every shard in a multi-modality file gets stamped with the max
+        // and column-range pruning / bounds checks break.
+        let row_major_n_minor: u64 = if self.current_modality_id > 0 {
+            self.modalities
+                .get((self.current_modality_id - 1) as usize)
+                .map(|m| m.n_vars)
+                .unwrap_or(self.header.n_vars)
+        } else {
+            self.header.n_vars
+        };
+
         // Encode the shard data
         let encoded = scx_codec::encode_shard(
             indptr,
@@ -445,10 +485,18 @@ impl ScxWriter {
             reserved_flags: [0; 3],
             n_major,
             n_minor: {
-                if self.header.n_vars > u32::MAX as u64 {
-                    return Err(ScxError::NVarsOverflow(self.header.n_vars));
+                // CSC shards have n_obs as their minor axis (and
+                // `row_major_n_minor` is unused for those); row-major
+                // shards use the per-modality column count resolved
+                // above so multimodal files stamp the correct extent.
+                let header_n_minor = match section_type {
+                    SectionType::CscShard => self.header.n_obs,
+                    _ => row_major_n_minor,
+                };
+                if header_n_minor > u32::MAX as u64 {
+                    return Err(ScxError::NVarsOverflow(header_n_minor));
                 }
-                self.header.n_vars as u32
+                header_n_minor as u32
             },
             nnz,
             global_offset: row_start,
@@ -493,8 +541,27 @@ impl ScxWriter {
             + block_index_bytes.len()) as u64;
         self.current_offset += section_length;
 
-        // Compute shard stats from raw values
-        let stats = compute_shard_stats(values, value_encoding, row_start, n_major as u64, nnz);
+        // Compute shard stats from raw values. Dispatch on section
+        // type: CSC shards use the column-major axis (the file-wide
+        // `n_obs` is the unbound row range, shared across modalities),
+        // all others use the row-major axis with the per-modality
+        // column extent resolved at the top of this function.
+        // `row_start` here is interpreted on the major axis — for CSC
+        // paths it carries `col_start` (see `write_csc_shard`, which
+        // passes its `col_start` argument as the inner `row_start`).
+        let (major_kind, n_minor) = match section_type {
+            SectionType::CscShard => (MajorAxis::Col, self.header.n_obs),
+            _ => (MajorAxis::Row, row_major_n_minor),
+        };
+        let stats = compute_shard_stats(
+            values,
+            value_encoding,
+            major_kind,
+            row_start,
+            n_major as u64,
+            n_minor,
+            nnz,
+        );
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
@@ -502,6 +569,7 @@ impl ScxWriter {
             length: section_length,
             section_type,
             checksum: section_checksum,
+            modality_id: self.current_modality_id,
             stats: Some(stats),
         });
 
@@ -541,6 +609,7 @@ impl ScxWriter {
             length: section_length,
             section_type,
             checksum: section_checksum,
+            modality_id: self.current_modality_id,
             stats: Some(stats),
         });
 
@@ -592,6 +661,7 @@ impl ScxWriter {
             length: section.section_length,
             section_type: section.section_type,
             checksum: section.section_checksum,
+            modality_id: self.current_modality_id,
             stats: Some(section.stats),
         });
 
@@ -626,13 +696,623 @@ impl ScxWriter {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Phase B: per-modality writer API
+    // -----------------------------------------------------------------------
+
+    /// Register a modality and return its 1-based `modality_id`.
+    ///
+    /// Modalities must be registered up-front (before any per-modality
+    /// section writes) so that subsequent `*_for(modality_id, …)`
+    /// calls have a valid id to stamp on catalog entries. The order
+    /// of registration is significant — the on-disk `ModalityTable`
+    /// preserves insertion order, and the assigned `modality_id`
+    /// equals position-in-table + 1.
+    ///
+    /// `modality_id = 0` is reserved for "global" entries (obs,
+    /// obs_index, provenance, …) and cannot be allocated by this
+    /// method.
+    pub fn add_modality(
+        &mut self,
+        name: &str,
+        modality_type: ModalityType,
+        default_codec: CodecId,
+        default_value_encoding: ValueEncoding,
+        build_csc: bool,
+    ) -> Result<u8> {
+        ModalityTable::validate_name(name)?;
+        if self.modalities.iter().any(|m| m.name == name) {
+            return Err(ScxError::InvalidCatalog(format!(
+                "modality name '{name}' already registered"
+            )));
+        }
+        if self.modalities.len() >= MAX_MODALITIES as usize {
+            return Err(ScxError::InvalidCatalog(format!(
+                "cannot register more than {MAX_MODALITIES} modalities"
+            )));
+        }
+        let info = ModalityInfo {
+            name: name.to_string(),
+            modality_type,
+            default_codec_id: default_codec as u8,
+            default_value_encoding: default_value_encoding as u8,
+            n_vars: 0,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            flags: ModalityFlags::empty(),
+        };
+        self.modalities.push(info);
+        self.modality_build_csc.push(build_csc);
+        Ok(self.modalities.len() as u8)
+    }
+
+    /// Resolve a registered modality name to its `modality_id`.
+    /// Returns `None` for unknown names.
+    pub fn modality_id(&self, name: &str) -> Option<u8> {
+        self.modalities
+            .iter()
+            .position(|m| m.name == name)
+            .map(|idx| (idx + 1) as u8)
+    }
+
+    /// Number of modalities registered so far.
+    pub fn n_modalities(&self) -> usize {
+        self.modalities.len()
+    }
+
+    /// Run `body` with `current_modality_id` temporarily set to `id`.
+    /// Used internally by every `*_for` method to stamp the right
+    /// modality id on catalog entries created by `body`.
+    fn with_modality<F, R>(&mut self, id: u8, body: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> Result<R>,
+    {
+        if id == 0 {
+            return Err(ScxError::InvalidCatalog(
+                "modality_id 0 is reserved for global entries".to_string(),
+            ));
+        }
+        if id as usize > self.modalities.len() {
+            return Err(ScxError::InvalidCatalog(format!(
+                "modality_id {id} out of range (registered: {})",
+                self.modalities.len()
+            )));
+        }
+        let prev = self.current_modality_id;
+        self.current_modality_id = id;
+        let result = body(self);
+        self.current_modality_id = prev;
+        result
+    }
+
+    /// Per-modality `write_var`. Catalog entry stamped with
+    /// `modality_id`. The section name is `var/{modality_name}` to
+    /// avoid colliding with the global "var" section (used for
+    /// modality_id == 0 / single-modality files).
+    pub fn write_var_for(&mut self, modality_id: u8, var: &RecordBatch) -> Result<()> {
+        let name = self.var_section_name(modality_id)?;
+        let data = Self::write_arrow_ipc(var)?;
+        self.with_modality(modality_id, |this| {
+            this.write_section_bytes(name, SectionType::VarMetadata, &data, None)
+        })
+    }
+
+    fn var_section_name(&self, modality_id: u8) -> Result<String> {
+        if modality_id == 0 {
+            return Ok("var".to_string());
+        }
+        let idx = (modality_id - 1) as usize;
+        let mname = self
+            .modalities
+            .get(idx)
+            .map(|m| m.name.clone())
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
+            })?;
+        Ok(format!("var/{mname}"))
+    }
+
+    /// Per-modality `write_csr_shard`. Section names are
+    /// `X/{modality_name}/shard_{idx}` to avoid the global "X_shard_*"
+    /// namespace. Shard counts accumulate on the registered
+    /// `ModalityInfo` and are flushed to the modality table at
+    /// `finish()` time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_csr_shard_for(
+        &mut self,
+        modality_id: u8,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let shard_idx = self
+            .modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.n_csr_shards)
+            .unwrap_or(0);
+        let name = format!("X/{mname}/shard_{shard_idx}");
+        let nnz = *indptr.last().unwrap_or(&0);
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                row_start,
+                &name,
+                SectionType::CsrShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.n_csr_shards += 1;
+            info.nnz += nnz;
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_csc_shard`. Section names are
+    /// `X_csc/{modality_name}/shard_{idx}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_csc_shard_for(
+        &mut self,
+        modality_id: u8,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        col_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let shard_idx = self
+            .modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.n_csc_shards)
+            .unwrap_or(0);
+        let name = format!("X_csc/{mname}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                col_start,
+                &name,
+                SectionType::CscShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.n_csc_shards += 1;
+            info.flags.set_csc();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_layer_csr_shard`. Section name is
+    /// `layer/{modality_name}/{layer_name}/shard_{idx}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_layer_csr_shard_for(
+        &mut self,
+        modality_id: u8,
+        layer_name: &str,
+        shard_idx: u32,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("layer/{mname}/{layer_name}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                row_start,
+                &name,
+                SectionType::LayerCsrShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_layers();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_layer_csc_shard`. Section name is
+    /// `layer_csc/{modality_name}/{layer_name}/shard_{idx}`.
+    /// Emits `SectionType::LayerCscShard` (id 16, new in v2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_layer_csc_shard_for(
+        &mut self,
+        modality_id: u8,
+        layer_name: &str,
+        shard_idx: u32,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        col_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("layer_csc/{mname}/{layer_name}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                col_start,
+                &name,
+                SectionType::LayerCscShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_layers();
+            info.flags.set_csc();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_obsm`. Section name is
+    /// `obsm/{modality_name}/{key}`.
+    pub fn write_obsm_for(
+        &mut self,
+        modality_id: u8,
+        key: &str,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("obsm/{mname}/{key}");
+        let data = Self::write_arrow_ipc(batch)?;
+        self.with_modality(modality_id, |this| {
+            this.has_obsm = true;
+            this.write_section_bytes(name, SectionType::ObsmEmbedding, &data, None)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_obsm();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_obsp_shard`. Section name is
+    /// `obsp/{modality_name}/{name}/shard_{shard_idx}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_obsp_shard_for(
+        &mut self,
+        modality_id: u8,
+        obsp_name: &str,
+        shard_idx: u32,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("obsp/{mname}/{obsp_name}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.has_obsp = true;
+            this.write_shard_inner(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                row_start,
+                &name,
+                SectionType::ObspCsrShard,
+            )
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_obsp();
+        }
+        Ok(())
+    }
+
+    /// Per-modality `write_uns`. Section name is
+    /// `uns/{modality_name}`.
+    pub fn write_uns_for(&mut self, modality_id: u8, json: &serde_json::Value) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let name = format!("uns/{mname}");
+        let data = serde_json::to_vec(json)?;
+        self.with_modality(modality_id, |this| {
+            this.write_section_bytes(name, SectionType::UnsBlob, &data, None)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_uns();
+        }
+        Ok(())
+    }
+
+    /// Set the `n_vars` count for an already-registered modality.
+    /// Required before `finish()` so the on-disk `ModalityTable`
+    /// records the correct per-modality variable count.
+    pub fn set_modality_n_vars(&mut self, modality_id: u8, n_vars: u64) -> Result<()> {
+        let idx = (modality_id
+            .checked_sub(1)
+            .ok_or_else(|| ScxError::InvalidCatalog("modality_id must be >= 1".to_string()))?)
+            as usize;
+        let info = self.modalities.get_mut(idx).ok_or_else(|| {
+            ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
+        })?;
+        info.n_vars = n_vars;
+        Ok(())
+    }
+
+    fn modality_name_for(&self, modality_id: u8) -> Result<String> {
+        if modality_id == 0 {
+            return Err(ScxError::InvalidCatalog(
+                "modality_id 0 is reserved for global entries".to_string(),
+            ));
+        }
+        self.modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.name.clone())
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
+            })
+    }
+
+    /// Phase B.3: streaming CSR→CSC transpose pass for modalities
+    /// registered with `add_modality(..., build_csc=true)`.
+    ///
+    /// Reads each modality's CSR shards back from the writer's own
+    /// temp file (decoded via `scx_codec::decode_shard_scipy`), runs
+    /// `streaming_csr_to_csc_iter_with_cap`, and emits CSC sidecars
+    /// via `write_csc_shard_for`. The latter increments
+    /// `info.n_csc_shards` and sets `ModalityFlags::HAS_CSC` so the
+    /// modality table emitted just after this pass records CSC
+    /// presence correctly.
+    ///
+    /// Memory cap matches `scx-cli/src/build_csc.rs`'s 4 GiB default.
+    /// CSC sharding granularity matches the CLI's
+    /// `csc_cols_per_shard = 5000`.
+    fn auto_emit_csc_for_marked_modalities(&mut self) -> Result<()> {
+        const FINISH_TIME_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+        const DEFAULT_CSC_COLS_PER_SHARD: usize = 5000;
+
+        if self.modality_build_csc.iter().all(|&b| !b) {
+            return Ok(());
+        }
+
+        let n_obs = self.header.n_obs as usize;
+
+        // Collect per-modality work: (modality_id, csr_entries cloned, n_vars).
+        // Cloning entries is cheap (Vec<u8> name + a few fields) and lets us
+        // borrow `self` mutably for `write_csc_shard_for` calls below.
+        let mut work: Vec<(u8, Vec<FullCatalogEntry>, usize)> = Vec::new();
+        for (idx, build_csc) in self.modality_build_csc.iter().enumerate() {
+            if !*build_csc {
+                continue;
+            }
+            let modality_id = (idx + 1) as u8;
+            let n_vars = self.modalities[idx].n_vars as usize;
+            let csr_entries: Vec<FullCatalogEntry> = self
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+                .cloned()
+                .collect();
+            if csr_entries.is_empty() {
+                continue;
+            }
+            work.push((modality_id, csr_entries, n_vars));
+        }
+        if work.is_empty() {
+            return Ok(());
+        }
+
+        // Flush BufWriter so all CSR shard bytes are durable in the
+        // underlying File before we read them back.
+        self.writer()?.flush()?;
+
+        for (modality_id, csr_entries, n_vars) in work {
+            // Decode each CSR shard back to ScxCsr by reading from the
+            // open temp file. Mirrors the `read_shard_from_entry` flow
+            // in `scx-format/src/reader.rs::read_shard_from_entry_inner`,
+            // adapted to a `File` (no mmap).
+            let mut csr_shards: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(csr_entries.len());
+            // First-shard codec / value_encoding govern the CSC sidecar
+            // (matches the standalone `scx build-csc` choice).
+            let mut csc_codec: Option<CodecId> = None;
+            let mut csc_value_encoding: Option<ValueEncoding> = None;
+            for entry in &csr_entries {
+                let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
+                if csc_codec.is_none() {
+                    csc_codec = Some(
+                        CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?,
+                    );
+                    csc_value_encoding = Some(
+                        ValueEncoding::from_u8(sh.value_encoding)
+                            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?,
+                    );
+                }
+                let n_shard_rows = indptr.len() - 1;
+                csr_shards.push(scx_sparse::ScxCsr::new_unchecked(
+                    (n_shard_rows, n_vars),
+                    indptr,
+                    indices,
+                    data,
+                ));
+            }
+
+            let codec = csc_codec.expect("at least one CSR entry processed");
+            let value_encoding = csc_value_encoding.expect("at least one CSR entry processed");
+
+            // Streaming CSR→CSC transpose. Mirrors
+            // `scx-cli/src/build_csc.rs:159`.
+            let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
+                &csr_shards,
+                n_obs,
+                n_vars,
+                FINISH_TIME_CSC_MEMORY_BYTES,
+                DEFAULT_CSC_COLS_PER_SHARD,
+            )
+            .map_err(|e| {
+                ScxError::InvalidCatalog(format!("auto_emit_csc transpose failed: {e}"))
+            })?;
+
+            loop {
+                let col_start = iter.current_col_start() as u64;
+                let chunk = match iter.next() {
+                    Some(c) => c.map_err(|e| {
+                        ScxError::InvalidCatalog(format!("auto_emit_csc chunk decode failed: {e}"))
+                    })?,
+                    None => break,
+                };
+                let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
+                let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
+                let csc_raw_values = value_encoding.encode_f32_batch(&chunk.data).map_err(|e| {
+                    ScxError::InvalidCatalog(format!("auto_emit_csc encode_f32_batch failed: {e}"))
+                })?;
+
+                self.write_csc_shard_for(
+                    modality_id,
+                    &csc_indptr_u64,
+                    &csc_indices_u32,
+                    &csc_raw_values,
+                    codec,
+                    value_encoding,
+                    col_start,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase B.3 helper: read a CSR catalog entry back from the
+    /// writer's temp file and decode it via `scx_codec::decode_shard_scipy`.
+    /// Returns the parsed `ShardHeader` plus the scipy-shape
+    /// `(indptr, indices, data)` triple.
+    #[allow(clippy::type_complexity)]
+    fn decode_csr_entry(
+        &mut self,
+        entry: &FullCatalogEntry,
+        _n_vars: usize,
+    ) -> Result<(ShardHeader, Vec<i64>, Vec<i32>, Vec<f32>)> {
+        use std::io::Cursor;
+
+        // Flush any pending BufWriter bytes before seeking the inner
+        // file: BufWriter calls `write_all` on its inner File at the
+        // file's current cursor, so leaving buffered data while we
+        // seek would interleave when the buffer next flushes.
+        let writer = self.writer()?;
+        writer.flush()?;
+        let file = writer.get_mut();
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut section = vec![0u8; entry.length as usize];
+        file.read_exact(&mut section)?;
+
+        let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+
+        let indptr_bytes = &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
+        let indices_bytes =
+            &section[sh.indices_rel_offset as usize..][..sh.indices_length as usize];
+        let values_bytes = &section[sh.values_rel_offset as usize..][..sh.values_length as usize];
+
+        let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
+        let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
+        let index_dtype_u16 = sh.index_dtype == 0;
+
+        let encoded = scx_codec::EncodedShardRef {
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+        };
+
+        let (indptr, indices, data) = scx_codec::decode_shard_scipy(
+            &encoded,
+            codec_id,
+            value_encoding,
+            sh.n_major as usize,
+            sh.nnz as usize,
+            index_dtype_u16,
+        )
+        .map_err(ScxError::Codec)?;
+
+        // Restore the file cursor to EOF so subsequent
+        // `write_csc_shard_for` calls append from the right position.
+        // The BufWriter wraps the same underlying file; seek the inner
+        // File explicitly.
+        let writer = self.writer()?;
+        let file = writer.get_mut();
+        file.seek(SeekFrom::End(0))?;
+        Ok((sh, indptr, indices, data))
+    }
+
     /// Finalize the file: write catalogs, header, fsync, atomic rename.
     ///
     /// Returns the final file path on success.
     pub fn finish(mut self) -> Result<PathBuf> {
+        // Phase B.3: auto-emit CSC sidecars for any modality registered
+        // with `build_csc=true`. Runs before the modality table is
+        // serialised so the table picks up the resulting
+        // `n_csc_shards` / `flags.has_csc()` state.
+        self.auto_emit_csc_for_marked_modalities()?;
+
         // Flush BufWriter and take inner File
         let buf_writer = self.file.take().ok_or(ScxError::WriterAlreadyFinished)?;
         let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
+
+        // 1a. Emit the ModalityTable section (Phase B) if any
+        // modalities were registered. The table is just a normal
+        // section: it has a catalog entry, lives between the last
+        // regular section and the full catalog, and gets covered by
+        // the file checksum like everything else. The header records
+        // its offset/length and bit-7 capability flag.
+        let (modality_table_offset, modality_table_length) = if self.modalities.is_empty() {
+            (0u64, 0u64)
+        } else {
+            let aligned = align_to_8(self.current_offset);
+            let pad = (aligned - self.current_offset) as usize;
+            if pad > 0 {
+                file.write_all(&vec![0u8; pad])?;
+            }
+            self.current_offset = aligned;
+
+            let table = ModalityTable::new(self.modalities.clone());
+            let mut table_buf = Vec::new();
+            table.write_to(&mut table_buf)?;
+            let mt_offset = self.current_offset;
+            let mt_length = table_buf.len() as u64;
+            let mt_checksum = blake3_hash(&table_buf);
+            file.write_all(&table_buf)?;
+            self.current_offset += mt_length;
+
+            self.entries.push(FullCatalogEntry {
+                name: "modality_table".to_string(),
+                offset: mt_offset,
+                length: mt_length,
+                section_type: SectionType::ModalityTable,
+                checksum: mt_checksum,
+                modality_id: 0, // global section
+                stats: None,
+            });
+
+            self.header.n_modalities = self.modalities.len() as u32;
+            self.header.modality_table_offset = mt_offset;
+            self.header.modality_table_length = mt_length;
+            self.header.set_modalities();
+
+            (mt_offset, mt_length)
+        };
+        let _ = (modality_table_offset, modality_table_length); // header already set
 
         // 1. Write full catalog at EOF
         let aligned_offset = align_to_8(self.current_offset);
@@ -644,7 +1324,7 @@ impl ScxWriter {
         let full_catalog_offset = aligned_offset;
 
         let full_catalog = FullCatalog {
-            catalog_version: 1,
+            catalog_version: crate::catalog::CURRENT_CATALOG_VERSION,
             manifest_sequence: self.header.manifest_sequence,
             prev_catalog_offset: 0,
             n_obs: self.header.n_obs,
@@ -809,12 +1489,36 @@ impl Drop for ScxWriter {
     }
 }
 
+/// Major axis of a shard: row-major (CSR/Layer/Obsp) or column-major
+/// (CSC). Tells `compute_shard_stats` which pair (`row_*` or `col_*`)
+/// carries the shard's primary index range; the other pair is filled
+/// with the full extent of the unbound axis (`n_minor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MajorAxis {
+    /// Row-major shard. The `row_start`/`row_end` pair carries the
+    /// primary range; `col_start`/`col_end` cover `[0, n_minor)`.
+    Row,
+    /// Column-major shard. The `col_start`/`col_end` pair carries the
+    /// primary range; `row_start`/`row_end` cover `[0, n_minor)`.
+    Col,
+}
+
 /// Compute shard statistics from raw value bytes.
+///
+/// `major_kind` distinguishes row-major (CSR/Layer/Obsp) and
+/// column-major (CSC) shards. `major_start` is the global index where
+/// this shard begins on its primary axis; `n_major` is the count of
+/// major-axis entries in the shard. `n_minor` is the count of entries
+/// on the OTHER axis (file-wide `n_vars` for row-major shards or
+/// file-wide `n_obs` for column-major shards) — used to populate the
+/// "full range" pair for v2 symmetry.
 pub fn compute_shard_stats(
     values: &[u8],
     value_encoding: ValueEncoding,
-    row_start: u64,
-    n_rows: u64,
+    major_kind: MajorAxis,
+    major_start: u64,
+    n_major: u64,
+    n_minor: u64,
     nnz: u64,
 ) -> ShardStats {
     let (value_min, value_max, value_sum) = match value_encoding {
@@ -873,9 +1577,16 @@ pub fn compute_shard_stats(
         ValueEncoding::Float32 | ValueEncoding::Float16 => (0, 0, 0),
     };
 
+    let (row_start, row_end, col_start, col_end) = match major_kind {
+        MajorAxis::Row => (major_start, major_start + n_major, 0, n_minor),
+        MajorAxis::Col => (0, n_minor, major_start, major_start + n_major),
+    };
+
     ShardStats {
         row_start,
-        row_end: row_start + n_rows,
+        row_end,
+        col_start,
+        col_end,
         nnz,
         value_min,
         value_max,
@@ -895,7 +1606,7 @@ mod tests {
     fn sample_header() -> FileHeader {
         FileHeader {
             magic: crate::header::MAGIC,
-            format_version: 1,
+            format_version: crate::header::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: 100,
@@ -917,7 +1628,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 
@@ -981,7 +1695,7 @@ mod tests {
         let hdr = FileHeader::read_from(&mut cursor).unwrap();
 
         assert_eq!(hdr.magic, crate::header::MAGIC);
-        assert_eq!(hdr.format_version, 1);
+        assert_eq!(hdr.format_version, crate::header::CURRENT_FORMAT_VERSION);
         assert_eq!(hdr.n_csr_shards, 1);
         assert_eq!(hdr.root_catalog_offset, HEADER_SIZE as u64);
         assert!(hdr.full_catalog_offset >= SECTIONS_START_OFFSET);
@@ -1261,17 +1975,40 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// Test compute_shard_stats
+    /// Test compute_shard_stats (row-major branch)
     #[test]
     fn test_compute_shard_stats() {
         let values: Vec<u8> = vec![5, 10, 1, 3, 7, 2];
-        let stats = compute_shard_stats(&values, ValueEncoding::Uint8, 0, 3, 6);
+        // Row-major shard: rows [0, 3), col_end = n_minor (= n_vars).
+        let stats = compute_shard_stats(&values, ValueEncoding::Uint8, MajorAxis::Row, 0, 3, 50, 6);
         assert_eq!(stats.row_start, 0);
         assert_eq!(stats.row_end, 3);
+        assert_eq!(stats.col_start, 0);
+        assert_eq!(stats.col_end, 50);
         assert_eq!(stats.nnz, 6);
         assert_eq!(stats.value_min, 1);
         assert_eq!(stats.value_max, 10);
         assert_eq!(stats.value_sum, 28); // 5+10+1+3+7+2
+    }
+
+    /// Test compute_shard_stats column-major branch.
+    #[test]
+    fn test_compute_shard_stats_col_major() {
+        let values: Vec<u8> = vec![5, 10, 1];
+        // Column-major shard: cols [100, 102), row pair = full [0, n_obs).
+        let stats = compute_shard_stats(
+            &values,
+            ValueEncoding::Uint8,
+            MajorAxis::Col,
+            100,
+            2,
+            1000,
+            3,
+        );
+        assert_eq!(stats.col_start, 100);
+        assert_eq!(stats.col_end, 102);
+        assert_eq!(stats.row_start, 0);
+        assert_eq!(stats.row_end, 1000);
     }
 
     /// Test compute_shard_stats for Float32 returns zero stats
@@ -1282,7 +2019,8 @@ mod tests {
         values.extend_from_slice(&1.0f32.to_le_bytes());
         values.extend_from_slice(&2.5f32.to_le_bytes());
         values.extend_from_slice(&0.5f32.to_le_bytes());
-        let stats = compute_shard_stats(&values, ValueEncoding::Float32, 0, 2, 3);
+        let stats =
+            compute_shard_stats(&values, ValueEncoding::Float32, MajorAxis::Row, 0, 2, 50, 3);
         assert_eq!(stats.value_min, 0, "float32 value_min must be zero");
         assert_eq!(stats.value_max, 0, "float32 value_max must be zero");
         assert_eq!(stats.value_sum, 0, "float32 value_sum must be zero");
@@ -1295,7 +2033,15 @@ mod tests {
     #[test]
     fn test_compute_shard_stats_float16() {
         let values = vec![0u8; 6]; // 3 × 2-byte float16 values
-        let stats = compute_shard_stats(&values, ValueEncoding::Float16, 10, 5, 3);
+        let stats = compute_shard_stats(
+            &values,
+            ValueEncoding::Float16,
+            MajorAxis::Row,
+            10,
+            5,
+            50,
+            3,
+        );
         assert_eq!(stats.value_min, 0, "float16 value_min must be zero");
         assert_eq!(stats.value_max, 0, "float16 value_max must be zero");
         assert_eq!(stats.value_sum, 0, "float16 value_sum must be zero");
@@ -1407,6 +2153,84 @@ mod tests {
                 entry.name,
                 entry.offset
             );
+        }
+    }
+
+    /// v2 strict shard_type validation: a CSC shard whose
+    /// `shard_type` byte is corrupted to 0 must be rejected by the
+    /// reader. This is the new behavior on the v2 catalog read path
+    /// (catalog-wins tolerance survives only on v1 reads).
+    #[test]
+    fn test_strict_shard_type_v2_rejects_corrupted_csc() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_csc.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csc_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+
+        // Find the CSC shard's on-disk shard_type byte (offset 5 in
+        // the shard header) and corrupt it from 1 → 0.
+        let mut data = std::fs::read(&final_path).unwrap();
+        let hdr = FileHeader::read_from(&mut std::io::Cursor::new(&data)).unwrap();
+        let fc_start = hdr.full_catalog_offset as usize;
+        let fc_end = fc_start + hdr.full_catalog_length as usize;
+        let catalog = FullCatalog::read_from(
+            &mut std::io::Cursor::new(&data[fc_start..fc_end]),
+            hdr.full_catalog_length as usize,
+            true,
+        )
+        .unwrap();
+        let csc_entry = catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CscShard)
+            .unwrap();
+        // shard_type is the 6th byte of the shard header (after the
+        // 4-byte magic and 1-byte shard_format_version).
+        let shard_type_offset = csc_entry.offset as usize + 4 + 1;
+        assert_eq!(data[shard_type_offset], 1, "writer must emit shard_type=1");
+        data[shard_type_offset] = 0;
+
+        // Need to rewrite to a new path to preserve the original mmap
+        // semantics; the file_checksum will not match either, so open
+        // with verify_catalog/header disabled.
+        let corrupt_path = dir.path().join("strict_csc_corrupt.scx");
+        std::fs::write(&corrupt_path, &data).unwrap();
+
+        // Open and try to read the CSC shard. The strict v2 validator
+        // fires inside `read_shard_from_entry_inner` and returns
+        // `InvalidShardType`.
+        let reader = ScxReader::open_unchecked(&corrupt_path).unwrap();
+        let err = reader.read_csc_shard(0).unwrap_err();
+        match err {
+            ScxError::InvalidShardType {
+                expected,
+                got,
+                section_type,
+            } => {
+                assert_eq!(expected, 1);
+                assert_eq!(got, 0);
+                assert_eq!(section_type, SectionType::CscShard as u8);
+            }
+            other => panic!("expected InvalidShardType, got {other:?}"),
         }
     }
 
@@ -1552,7 +2376,7 @@ mod tests {
     fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: crate::header::MAGIC,
-            format_version: 1,
+            format_version: crate::header::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -1578,7 +2402,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 
@@ -1825,5 +2652,585 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B integration tests
+    // -----------------------------------------------------------------------
+
+    /// Full multimodal round-trip: register 3 modalities, write
+    /// distinct var batches per modality, then read everything back
+    /// through the per-modality reader API.
+    #[test]
+    fn test_phase_b_three_modality_round_trip() {
+        use crate::modality::{ModalityFlags, ModalityType};
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multimodal.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        // Register three modalities. Order matters — modality_id is
+        // 1-based and equals position+1.
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rna_id, 1);
+        assert_eq!(adt_id, 2);
+        assert_eq!(atac_id, 3);
+
+        // Distinct per-modality var batches. The writer doesn't
+        // enforce a relationship between var.num_rows and the
+        // modality's n_vars; we set that explicitly.
+        let var_rna = sample_var();
+        writer.write_var_for(rna_id, &var_rna).unwrap();
+        writer.write_var_for(adt_id, &var_rna).unwrap();
+        writer.write_var_for(atac_id, &var_rna).unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+        writer.set_modality_n_vars(atac_id, 50).unwrap();
+
+        // One CSR shard per modality.
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                atac_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+
+        // Read back through ScxReader.
+        let reader = ScxReader::open(&final_path).unwrap();
+        assert!(reader.is_multimodal());
+        assert_eq!(reader.n_modalities(), 3);
+        assert_eq!(reader.modality_names(), vec!["rna", "adt", "atac"]);
+
+        assert_eq!(reader.modality_id("rna"), Some(1));
+        assert_eq!(reader.modality_id("adt"), Some(2));
+        assert_eq!(reader.modality_id("atac"), Some(3));
+        assert_eq!(reader.modality_id("missing"), None);
+
+        let info = reader.modality_info(2).unwrap();
+        assert_eq!(info.name, "adt");
+        assert_eq!(info.modality_type, ModalityType::Protein);
+        assert_eq!(info.n_vars, 50);
+        assert_eq!(info.n_csr_shards, 1);
+        assert_eq!(info.n_csc_shards, 0);
+        assert_eq!(info.flags, ModalityFlags::empty());
+
+        // header.has_modalities flag is set.
+        assert!(reader.header().has_modalities());
+
+        // Per-modality var read.
+        let var_back = reader.read_var_for(rna_id).unwrap();
+        assert_eq!(var_back.num_rows(), var_rna.num_rows());
+
+        // Per-modality CSR shard count + read.
+        for id in [rna_id, adt_id, atac_id] {
+            assert_eq!(reader.csr_shard_count_for(id), 1);
+            let (ip, ix, dv) = reader.read_csr_shard_for(id, 0).unwrap();
+            assert_eq!(ip.len(), indptr.len());
+            assert_eq!(ix.len(), indices.len());
+            assert_eq!(dv.len(), values.len());
+        }
+    }
+
+    /// Regression test for PR #68: every CSR shard written via
+    /// `write_csr_shard_for` must stamp `ShardHeader.n_minor` and
+    /// `ShardStats.col_end` with the modality's own `n_vars` rather
+    /// than the file-wide `header.n_vars` (which is the max across
+    /// modalities). The existing 3-modality test uses uniform n_vars
+    /// so it can't catch the bug.
+    #[test]
+    fn test_multimodal_shard_stats_use_per_modality_n_vars() {
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+        use crate::section::SectionType;
+        use crate::shard::ShardHeader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("per_modality_nvars.scx");
+
+        // header.n_vars is the file-wide max across modalities.
+        let mut header = sample_header();
+        header.n_vars = 200;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        // Three modalities with DISTINCT n_vars; "atac" matches the
+        // header max, "rna" / "adt" do not. This ensures any path that
+        // accidentally falls back to header.n_vars (= 200) gets caught
+        // for the latter two.
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+
+        let expected: [(u8, u64); 3] = [(rna_id, 30), (adt_id, 12), (atac_id, 200)];
+
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+        writer.write_var_for(atac_id, &sample_var()).unwrap();
+        for (id, n_vars) in expected {
+            writer.set_modality_n_vars(id, n_vars).unwrap();
+        }
+
+        let (indptr, indices, values) = sample_shard_data();
+        for (id, _) in expected {
+            writer
+                .write_csr_shard_for(
+                    id,
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+        }
+
+        let final_path = writer.finish().unwrap();
+
+        let reader = ScxReader::open(&final_path).unwrap();
+        for (id, n_vars) in expected {
+            let shards: Vec<&FullCatalogEntry> = reader
+                .catalog()
+                .shards(SectionType::CsrShard)
+                .into_iter()
+                .filter(|e| e.modality_id == id)
+                .collect();
+            assert_eq!(
+                shards.len(),
+                1,
+                "modality_id {id} should have exactly 1 CSR shard"
+            );
+            let entry = shards[0];
+
+            // Catalog stats: row-major shards stamp col_end = n_minor.
+            let stats = entry
+                .stats
+                .as_ref()
+                .expect("v2 catalog must carry shard stats");
+            assert_eq!(
+                stats.col_end, n_vars,
+                "ShardStats.col_end for modality {id} should equal that \
+                 modality's n_vars ({n_vars}), got {} (header.n_vars=200)",
+                stats.col_end
+            );
+            assert_eq!(stats.col_start, 0);
+
+            // On-disk shard header: n_minor field must also match.
+            let bytes = reader.section_bytes(entry).unwrap();
+            let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
+                &bytes[..crate::shard::SHARD_HEADER_SIZE],
+            ))
+            .unwrap();
+            assert_eq!(
+                sh.n_minor as u64, n_vars,
+                "ShardHeader.n_minor for modality {id} should equal {n_vars}, \
+                 got {}",
+                sh.n_minor
+            );
+        }
+    }
+
+    /// Single-modality v2 file: no `add_modality` calls means no
+    /// `ModalityTable` section is emitted. The on-disk shape and the
+    /// reader-visible accessors match a v1 file.
+    #[test]
+    fn test_phase_b_single_modality_no_modality_table() {
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single_modality.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        let final_path = writer.finish().unwrap();
+
+        let reader = ScxReader::open(&final_path).unwrap();
+        assert!(!reader.is_multimodal());
+        assert_eq!(reader.n_modalities(), 0);
+        assert!(reader.modality_names().is_empty());
+        assert!(!reader.header().has_modalities());
+        assert_eq!(reader.header().modality_table_offset, 0);
+        assert_eq!(reader.header().modality_table_length, 0);
+        assert_eq!(reader.modality_info(0), None);
+        assert_eq!(reader.modality_info(1), None);
+        // Global accessors continue to work.
+        assert_eq!(reader.read_var_for(0).unwrap().num_rows(), 2);
+    }
+
+    /// Per-modality CSC sidecars produce shard counts on the right
+    /// modality's `ModalityInfo`, and the `BackedCscReader::for_modality`
+    /// constructor scopes shard reads to that modality.
+    #[test]
+    fn test_phase_b_per_modality_csc() {
+        use crate::backed::BackedCscReader;
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multimodal_csc.scx");
+        let header = sample_header();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+        // RNA gets a CSR shard only.
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        // ADT gets BOTH CSR and CSC.
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csc_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = ScxReader::open(&final_path).unwrap();
+
+        // Per-modality counts reflect the writes.
+        assert_eq!(reader.csc_shard_count_for(rna_id), 0);
+        assert_eq!(reader.csc_shard_count_for(adt_id), 1);
+        let adt_info = reader.modality_info(adt_id).unwrap();
+        assert!(adt_info.flags.has_csc());
+        let rna_info = reader.modality_info(rna_id).unwrap();
+        assert!(!rna_info.flags.has_csc());
+
+        // BackedCscReader scoped to RNA sees zero shards; scoped to
+        // ADT sees the one shard. This is the cache-isolation
+        // guarantee from B.5.
+        let rna_csc =
+            BackedCscReader::for_modality(ScxReader::open(&final_path).unwrap(), rna_id, 4)
+                .unwrap();
+        assert_eq!(rna_csc.n_shards(), 0);
+        let adt_csc =
+            BackedCscReader::for_modality(ScxReader::open(&final_path).unwrap(), adt_id, 4)
+                .unwrap();
+        assert_eq!(adt_csc.n_shards(), 1);
+    }
+
+    /// Phase B.6: `add_modality(..., build_csc=true)` triggers an
+    /// auto-emit transpose pass at finish() time. After finish(), the
+    /// modality's `n_csc_shards >= 1` and `flags.has_csc() == true`,
+    /// even though the caller never invoked `write_csc_shard_for` —
+    /// the writer read the CSR shards back from its temp file and
+    /// streamed them through `streaming_csr_to_csc_iter_with_cap`.
+    #[test]
+    fn test_phase_b3_auto_emit_csc() {
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_emit_csc.scx");
+        let header = sample_header();
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                true, // build_csc — Phase B.3 auto-emit
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+
+        // Both modalities get one CSR shard. Only `rna`'s
+        // `build_csc=true`, so only its CSC sidecar should
+        // auto-emit.
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = ScxReader::open(&final_path).unwrap();
+
+        // RNA picked up the auto-emit; ADT did not.
+        assert!(
+            reader.csc_shard_count_for(rna_id) >= 1,
+            "rna should have at least one auto-emitted CSC shard"
+        );
+        assert_eq!(
+            reader.csc_shard_count_for(adt_id),
+            0,
+            "adt build_csc=false → no CSC sidecar"
+        );
+        assert!(reader.modality_info(rna_id).unwrap().flags.has_csc());
+        assert!(!reader.modality_info(adt_id).unwrap().flags.has_csc());
+
+        // The auto-emitted CSC stores the same nnz as the CSR. We
+        // compare nnz rather than densifying because the CSR shape is
+        // (n_shard_rows, n_modality_vars) while the CSC shape uses
+        // file-wide n_obs (the column-axis slice covers the full obs
+        // range, with zero rows for cells absent from the CSR shard).
+        let csr = reader.read_all_csr_shards_for(rna_id).unwrap();
+        let csc = reader.read_all_csc_shards_for(rna_id).unwrap();
+        assert_eq!(
+            *csr.indptr.last().unwrap_or(&0),
+            *csc.indptr.last().unwrap_or(&0),
+            "CSR and CSC nnz must agree after auto-emit"
+        );
+    }
+
+    /// Phase B.4: per-modality CSC column-range reads return columns
+    /// from the right modality only.
+    #[test]
+    fn test_phase_b4_read_csc_columns_for() {
+        use crate::modality::ModalityType;
+        use crate::reader::ScxReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b4_csc_columns_for.scx");
+        let header = sample_header();
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+        writer.write_var_for(rna_id, &sample_var()).unwrap();
+        writer.write_var_for(adt_id, &sample_var()).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data();
+        // Both modalities get one CSC shard at col_start=0.
+        writer
+            .write_csc_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csc_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = ScxReader::open(&final_path).unwrap();
+
+        // Per-modality CSC counters reflect what was written.
+        assert_eq!(reader.csc_shard_count_for(rna_id), 1);
+        assert_eq!(reader.csc_shard_count_for(adt_id), 1);
+
+        // Per-modality CSC range read returns the modality's
+        // contribution. We assert the call succeeds and returns a
+        // non-empty result (exact column-slice semantics are
+        // covered by the single-modality `read_csc_columns` tests).
+        let rna_cols = reader.read_csc_columns_for(rna_id, 0..3).unwrap();
+        assert!(
+            rna_cols.shape.1 >= 1,
+            "rna CSC range read should return ≥ 1 col"
+        );
+        let rna_subset = reader
+            .read_csc_columns_subset_for(rna_id, &[0u32, 2])
+            .unwrap();
+        assert!(rna_subset.shape.1 >= 1);
     }
 }

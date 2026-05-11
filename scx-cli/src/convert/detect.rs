@@ -35,10 +35,21 @@ pub fn detect_input_format(file: &hdf5::File) -> Result<InputFormat, ConvertErro
     ))
 }
 
-/// Detect the matrix storage format in an h5ad file.
+/// Detect the matrix storage format in an h5ad file (X at root).
 pub fn detect_matrix_format(file: &hdf5::File) -> Result<MatrixFormat, ConvertError> {
-    // Check if X is a group (sparse) or dataset (dense)
-    if let Ok(group) = file.group("X") {
+    detect_matrix_format_at(file, "X")
+}
+
+/// Detect matrix storage format for a matrix at an arbitrary path inside
+/// an HDF5 file (e.g. `mod/rna/X` for a per-modality matrix in an h5mu
+/// file). Returns the same `MatrixFormat` semantics as the X-at-root
+/// detector — Csr / Csc for sparse groups, Dense for plain datasets.
+pub fn detect_matrix_format_at(
+    file: &hdf5::File,
+    path: &str,
+) -> Result<MatrixFormat, ConvertError> {
+    // Check if path is a group (sparse) or dataset (dense)
+    if let Ok(group) = file.group(path) {
         // Check encoding-type attribute
         if let Ok(attr) = group.attr("encoding-type") {
             let encoding_type: VarLenUnicode = attr.read_scalar()?;
@@ -48,7 +59,7 @@ pub fn detect_matrix_format(file: &hdf5::File) -> Result<MatrixFormat, ConvertEr
                 "csc_matrix" => Ok(MatrixFormat::Csc),
                 "array" => Ok(MatrixFormat::Dense),
                 other => Err(ConvertError::UnsupportedDtype(format!(
-                    "unknown encoding-type: {other}"
+                    "unknown encoding-type at '{path}': {other}"
                 ))),
             };
         }
@@ -62,11 +73,11 @@ pub fn detect_matrix_format(file: &hdf5::File) -> Result<MatrixFormat, ConvertEr
             return Ok(MatrixFormat::Csr);
         }
     }
-    // X is a dataset → dense
-    if file.dataset("X").is_ok() {
+    // path is a dataset → dense
+    if file.dataset(path).is_ok() {
         return Ok(MatrixFormat::Dense);
     }
-    Err(ConvertError::Other(
-        "cannot find X matrix in h5ad file".to_string(),
-    ))
+    Err(ConvertError::Other(format!(
+        "cannot find matrix at '{path}'"
+    )))
 }

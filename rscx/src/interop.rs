@@ -7,6 +7,7 @@ use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::DataType;
 use extendr_api::prelude::*;
 use scx_codec::ValueEncoding;
+use scx_format::ScxReader;
 use scx_sparse::ScxCsr;
 
 // ─── Arrow RecordBatch → R data.frame ────────────────────────────────────────
@@ -619,8 +620,8 @@ fn write_csr_to_scx(
 ) -> Result<()> {
     use scx_codec::CodecId;
     use scx_format::header::FileHeader;
-    use scx_format::select_codec;
     use scx_format::writer::ScxWriter;
+    use scx_format::{select_codec_for_modality, ModalityType};
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
     let shard_target_rows: usize = 16384;
@@ -628,7 +629,7 @@ fn write_csr_to_scx(
 
     let header = FileHeader {
         magic: scx_format::MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs: n_obs as u64,
@@ -650,7 +651,10 @@ fn write_csr_to_scx(
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     let mut writer = ScxWriter::new(output_path, header)
@@ -690,7 +694,7 @@ fn write_csr_to_scx(
                     c
                 }
             }
-            None => select_codec(shard_values, value_encoding),
+            None => select_codec_for_modality(shard_values, value_encoding, ModalityType::Rna),
         };
         last_csr_codec = codec;
 
@@ -890,6 +894,39 @@ pub fn from_seurat(
         })
         .transpose()?
         .unwrap_or(5000);
+
+    // Phase I.1: detect Seurat v5 multi-assay objects. If the object
+    // has more than one non-empty assay, route to the multimodal
+    // write path so each assay lands as its own modality in the SCX
+    // file. Single-assay objects keep the legacy single-modality
+    // path below.
+    let assay_names_vec: Vec<String> = {
+        let assay_names = R!("
+            if (!requireNamespace('SeuratObject', quietly = TRUE) &&
+                !requireNamespace('Seurat', quietly = TRUE))
+                stop('Seurat >= 5.0.0 is required for from_seurat()')
+            seu <- {{&seurat_obj}}
+            names(seu@assays)
+        ")
+        .map_err(|e| Error::Other(format!("failed to read Seurat assay names: {}", e)))?;
+        assay_names
+            .as_str_vector()
+            .ok_or_else(|| Error::Other("assay names not a character vector".into()))?
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    if assay_names_vec.len() > 1 {
+        return from_seurat_multi_assay(
+            seurat_obj,
+            &assay_names_vec,
+            output_path,
+            explicit_codec,
+            csc_always,
+            csc_cols_per_shard,
+        );
+    }
+
     // Single R!() call — moves seurat_obj once, returns a lightweight list
     let parts = R!("
         if (!requireNamespace('Seurat', quietly = TRUE))
@@ -1015,10 +1052,689 @@ pub fn from_sce(
     )
 }
 
+// ─── Phase I.1: Seurat v5 multi-assay path ──────────────────────────────────
+
+/// Phase I.1: write a Seurat v5 multi-assay object as a multimodal
+/// SCX file. Cells must align across assays (Seurat v5's invariant);
+/// per-assay counts are stamped with their own `modality_id`.
+fn from_seurat_multi_assay(
+    seurat_obj: Robj,
+    assay_names: &[String],
+    output_path: &str,
+    explicit_codec: Option<scx_codec::CodecId>,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
+) -> Result<()> {
+    use scx_codec::CodecId;
+    use scx_format::header::FileHeader;
+    use scx_format::writer::ScxWriter;
+    use scx_format::{select_codec_for_modality, ModalityType};
+
+    if csc_always {
+        return Err(Error::Other(
+            "from_seurat(csc=TRUE) on a multi-assay object is not yet supported; \
+             write per-modality CSC sidecars via `scx build-csc` after import"
+                .into(),
+        ));
+    }
+    let _ = csc_cols_per_shard; // unused on the no-CSC path
+
+    // Pull the global obs (meta.data) once. Seurat shares meta.data
+    // across assays, so it lives at modality_id = 0 (global) in SCX.
+    let obs_robj = R!("{{&seurat_obj}}@meta.data")
+        .map_err(|e| Error::Other(format!("failed to read meta.data: {}", e)))?;
+    let obs_batch = dataframe_to_record_batch(&obs_robj)?;
+
+    // Per-assay extraction: counts (dgCMatrix, genes × cells) + var
+    // (feature metadata data.frame). We pull these in one R!() per
+    // assay to minimise marshalling overhead.
+    struct AssayPayload {
+        name: String,
+        n_obs: usize,
+        n_vars: usize,
+        csr_indptr: Vec<u64>,
+        csr_indices: Vec<u32>,
+        values_bytes: Vec<u8>,
+        value_encoding: ValueEncoding,
+        var_batch: RecordBatch,
+        modality_type: ModalityType,
+    }
+    let mut payloads: Vec<AssayPayload> = Vec::with_capacity(assay_names.len());
+    let mut shared_n_obs: Option<usize> = None;
+    for name in assay_names {
+        let parts = R!("
+            seu <- {{&seurat_obj}}
+            assay_name <- {{name.as_str()}}
+            counts <- Seurat::GetAssayData(seu, assay = assay_name, layer = 'counts')
+            var_df <- tryCatch(seu[[assay_name]]@meta.data,
+                error = function(e) data.frame(feature_id = rownames(counts)))
+            list(counts = counts, var = var_df)
+        ")
+        .map_err(|e| Error::Other(format!("failed to extract assay '{name}': {e}")))?;
+        let counts = parts
+            .dollar("counts")
+            .map_err(|e| Error::Other(format!("failed to get counts for '{name}': {e}")))?;
+        let var_df = parts
+            .dollar("var")
+            .map_err(|e| Error::Other(format!("failed to get var for '{name}': {e}")))?;
+
+        let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
+            dgcmatrix_to_csr(&counts)?;
+        let var_batch = dataframe_to_record_batch(&var_df)?;
+        let modality_type = infer_modality_type_from_name(name);
+
+        // Cell-axis alignment check across assays.
+        match shared_n_obs {
+            None => shared_n_obs = Some(n_obs),
+            Some(expected) if expected == n_obs => {}
+            Some(expected) => {
+                return Err(Error::Other(format!(
+                    "from_seurat: assay '{name}' has n_obs = {n_obs} but the \
+                     first assay had n_obs = {expected}. Seurat v5 multi-assay \
+                     objects require identical cell axes across all assays."
+                )));
+            }
+        }
+
+        payloads.push(AssayPayload {
+            name: name.clone(),
+            n_obs,
+            n_vars,
+            csr_indptr,
+            csr_indices,
+            values_bytes,
+            value_encoding,
+            var_batch,
+            modality_type,
+        });
+    }
+
+    let n_obs = shared_n_obs.unwrap_or(0);
+    let max_n_vars = payloads.iter().map(|p| p.n_vars).max().unwrap_or(0) as u64;
+
+    // Build the multimodal v2 header. n_csr_shards / n_csc_shards /
+    // modality_table_offset are filled in by ScxWriter::finish based
+    // on the registered modalities + write_csr_shard_for calls.
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs as u64,
+        n_vars: max_n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: 16384,
+        codec_id: CodecId::None as u8,
+        index_dtype: if max_n_vars <= 65535 { 0 } else { 1 },
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    };
+    let mut writer = ScxWriter::new(output_path, header)
+        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
+
+    writer
+        .write_obs(&obs_batch)
+        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
+
+    // Per-modality writes: register modality, write var, write CSR
+    // shards in shard_target_rows row chunks.
+    let shard_target_rows: usize = 16384;
+    for payload in &payloads {
+        // Resolve the per-modality auto-codec by feeding the first
+        // shard's bytes through `select_codec_for_modality`. The
+        // modality table records this codec as the default.
+        let resolved_codec = match explicit_codec {
+            Some(c) => {
+                if c == CodecId::Scx1 && !payload.value_encoding.is_integer() {
+                    CodecId::Zstd
+                } else {
+                    c
+                }
+            }
+            None => select_codec_for_modality(
+                &payload.values_bytes,
+                payload.value_encoding,
+                payload.modality_type,
+            ),
+        };
+
+        let modality_id = writer
+            .add_modality(
+                &payload.name,
+                payload.modality_type,
+                resolved_codec,
+                payload.value_encoding,
+                false, // build_csc: from_seurat / from_mae's csc=TRUE path
+                       // is rejected explicitly above, so no auto-emit.
+            )
+            .map_err(|e| Error::Other(format!("add_modality({}) failed: {}", payload.name, e)))?;
+        writer
+            .set_modality_n_vars(modality_id, payload.n_vars as u64)
+            .map_err(|e| Error::Other(format!("set_modality_n_vars failed: {}", e)))?;
+        writer
+            .write_var_for(modality_id, &payload.var_batch)
+            .map_err(|e| Error::Other(format!("write_var_for failed: {}", e)))?;
+
+        let bw = payload.value_encoding.byte_width();
+        let mut row_start: usize = 0;
+        while row_start < payload.n_obs {
+            let row_end = (row_start + shard_target_rows).min(payload.n_obs);
+            let base = payload.csr_indptr[row_start];
+            let shard_indptr: Vec<u64> = payload.csr_indptr[row_start..=row_end]
+                .iter()
+                .map(|&v| v - base)
+                .collect();
+            let nnz_start = base as usize;
+            let nnz_end = payload.csr_indptr[row_end] as usize;
+            let shard_indices: Vec<u32> = payload.csr_indices[nnz_start..nnz_end].to_vec();
+            let shard_values = &payload.values_bytes[nnz_start * bw..nnz_end * bw];
+            writer
+                .write_csr_shard_for(
+                    modality_id,
+                    &shard_indptr,
+                    &shard_indices,
+                    shard_values,
+                    resolved_codec,
+                    payload.value_encoding,
+                    row_start as u64,
+                )
+                .map_err(|e| Error::Other(format!("write_csr_shard_for failed: {}", e)))?;
+            row_start = row_end;
+        }
+    }
+
+    writer
+        .finish()
+        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
+    Ok(())
+}
+
+/// Phase I.1 / I.2: best-effort modality-type inference from an assay
+/// name. Mirrors the heuristic in `pyscx::mudata::infer_modality_type`
+/// so multimodal SCX files written from Seurat / MAE / MuData carry
+/// consistent `ModalityType` tags.
+fn infer_modality_type_from_name(name: &str) -> scx_format::ModalityType {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("atac") || lower.contains("peak") {
+        scx_format::ModalityType::Atac
+    } else if lower.contains("adt") || lower.contains("protein") || lower.contains("antibody") {
+        scx_format::ModalityType::Protein
+    } else if lower.contains("spatial") {
+        scx_format::ModalityType::Spatial
+    } else if lower.contains("methyl") {
+        scx_format::ModalityType::Methylation
+    } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
+        scx_format::ModalityType::Rna
+    } else {
+        scx_format::ModalityType::Custom
+    }
+}
+
+// ─── Phase I.1: multimodal to_seurat / Phase I.2: MAE bindings ──────────────
+
+/// Phase I.1: build a Seurat v5 multi-assay object from a multimodal
+/// SCX reader. One `Assay5` per registered modality; meta.data and
+/// cell names come from the global obs.
+pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
+    if !reader.is_multimodal() {
+        return Err(Error::Other(
+            "to_seurat: source file is single-modality; use the per-result \
+             to_seurat() method instead"
+                .into(),
+        ));
+    }
+    let modality_names: Vec<String> = reader
+        .modality_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let obs_batch = reader
+        .read_obs()
+        .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
+    let obs_df = record_batch_to_dataframe(&obs_batch)?;
+
+    // Build the v5 object incrementally. We seed it with the first
+    // modality (Seurat v5 requires at least one assay at construction
+    // time), then attach the rest via seu[[name]] <- assay.
+    let n_modalities = modality_names.len();
+    if n_modalities == 0 {
+        return Err(Error::Other(
+            "to_seurat: file is multimodal but the modality table is empty".into(),
+        ));
+    }
+
+    // Helper closure: turn a (modality_name, modality_id) pair into
+    // a Seurat Assay5 robj on the R side.
+    let mut assay_robjs: Vec<(String, Robj)> = Vec::with_capacity(n_modalities);
+    for name in &modality_names {
+        let mid = reader.modality_id(name).ok_or_else(|| {
+            Error::Other(format!("modality '{name}' missing from modality table"))
+        })?;
+        let csr = reader
+            .read_all_csr_shards_for(mid)
+            .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {}", e)))?;
+        let dgc = csr_to_dgcmatrix(&csr)?;
+        let var_batch = reader
+            .read_var_for(mid)
+            .map_err(|e| Error::Other(format!("read_var_for({name}): {}", e)))?;
+        let var_df = record_batch_to_dataframe(&var_batch)?;
+        // Build an Assay5 from the per-modality counts + features.
+        let assay = R!("
+            if (!requireNamespace('Seurat', quietly = TRUE))
+                stop('Seurat >= 5.0.0 is required for to_seurat()')
+            counts_t <- Matrix::t({{dgc}})
+            a <- Seurat::CreateAssay5Object(counts = counts_t)
+            features_df <- {{var_df}}
+            if (nrow(features_df) == nrow(a)) {
+                # Attach feature metadata to the assay's @meta.data slot.
+                a@meta.data <- features_df
+            }
+            a
+        ")
+        .map_err(|e| Error::Other(format!("CreateAssay5Object({name}): {e}")))?;
+        assay_robjs.push((name.clone(), assay));
+    }
+
+    // Assemble the Seurat v5 object: seed with the first modality,
+    // then add the rest via `seu[[name]] <- assay`. The first
+    // modality's name is used as the default assay (matches Seurat's
+    // single-assay convention).
+    let (first_name, first_assay) = &assay_robjs[0];
+    let seu = R!("
+        seu <- Seurat::CreateSeuratObject(counts = {{first_assay}}, assay = {{first_name.as_str()}})
+        seu@meta.data <- {{obs_df}}
+        seu
+    ")
+    .map_err(|e| Error::Other(format!("CreateSeuratObject: {e}")))?;
+
+    let final_seu = if assay_robjs.len() > 1 {
+        let mut current = seu;
+        for (name, assay) in assay_robjs.iter().skip(1) {
+            current = R!("
+                seu <- {{current}}
+                seu[[{{name.as_str()}}]] <- {{assay}}
+                seu
+            ")
+            .map_err(|e| Error::Other(format!("attach assay '{name}': {e}")))?;
+        }
+        current
+    } else {
+        seu
+    };
+    Ok(final_seu)
+}
+
+/// Phase I.2: import a Bioconductor MultiAssayExperiment to a
+/// multimodal SCX file. Requires that all experiments share the same
+/// cell axis (`colnames` aligned across experiments). On
+/// misalignment, raises a clear error directing the user to align
+/// upfront via `intersectColumns()` or similar.
+#[extendr]
+pub fn from_mae(
+    mae_obj: Robj,
+    output_path: &str,
+    codec: Option<&str>,
+    csc: Option<bool>,
+    csc_cols_per_shard: Option<i32>,
+) -> Result<()> {
+    let explicit_codec = parse_codec_r(codec)?;
+    let csc_always = csc.unwrap_or(false);
+    let csc_cols_per_shard = csc_cols_per_shard
+        .map(|v| {
+            if v < 0 {
+                Err(Error::Other(format!(
+                    "csc_cols_per_shard must be >= 0, got {}",
+                    v
+                )))
+            } else {
+                Ok(v as usize)
+            }
+        })
+        .transpose()?
+        .unwrap_or(5000);
+
+    // Pull experiment names + per-experiment cell-axis fingerprints
+    // in a single R!() so we can validate alignment before any
+    // SCX-side allocation.
+    let info = R!("
+        if (!requireNamespace('MultiAssayExperiment', quietly = TRUE))
+            stop('MultiAssayExperiment is required for from_mae()')
+        mae <- {{&mae_obj}}
+        exps <- MultiAssayExperiment::experiments(mae)
+        nm <- names(exps)
+        # Collect colnames per experiment for alignment check.
+        col_lists <- lapply(seq_along(exps), function(i) colnames(exps[[i]]))
+        # Reference: union of cells from sampleMap (canonical for MAE).
+        ref_cells <- colnames(MultiAssayExperiment::colData(mae))
+        if (is.null(ref_cells)) ref_cells <- rownames(MultiAssayExperiment::colData(mae))
+        list(names = nm, col_lists = col_lists, ref_cells = ref_cells)
+    ")
+    .map_err(|e| Error::Other(format!("failed to inspect MAE: {}", e)))?;
+
+    let names_robj = info
+        .dollar("names")
+        .map_err(|e| Error::Other(format!("MAE names: {e}")))?;
+    let assay_names: Vec<String> = names_robj
+        .as_str_vector()
+        .ok_or_else(|| Error::Other("MAE experiment names missing".into()))?
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if assay_names.is_empty() {
+        return Err(Error::Other("from_mae: MAE has no experiments".into()));
+    }
+
+    // Per-experiment cell-alignment check. We compare each
+    // experiment's colnames against the first experiment's; on
+    // mismatch, raise.
+    let aligned = R!("
+        col_lists <- {{info.dollar(\"col_lists\").map_err(|e| Error::Other(format!(\"{e}\")))?}}
+        if (length(col_lists) <= 1) return(TRUE)
+        ref <- col_lists[[1]]
+        for (i in seq_along(col_lists)[-1]) {
+            if (!identical(col_lists[[i]], ref)) return(FALSE)
+        }
+        TRUE
+    ")
+    .map_err(|e| Error::Other(format!("MAE alignment check: {e}")))?;
+    let aligned_b: bool = aligned.as_logical().map(|b| b.is_true()).unwrap_or(false);
+    if !aligned_b {
+        return Err(Error::Other(
+            "from_mae: MAE experiments have non-aligned cell axes (different \
+             colnames across experiments). SCX requires a shared obs axis. \
+             Use MultiAssayExperiment::intersectColumns(mae) to keep only the \
+             cells present in every experiment, or NA-pad upfront, before \
+             calling from_mae()."
+                .into(),
+        ));
+    }
+
+    // Now extract per-experiment counts as dgCMatrix and per-experiment
+    // feature metadata. We reuse from_seurat_multi_assay's per-payload
+    // structure by routing through a shared multi-modality writer.
+    if csc_always {
+        return Err(Error::Other(
+            "from_mae(csc=TRUE) on a multi-experiment MAE is not yet supported; \
+             use `scx build-csc` after import"
+                .into(),
+        ));
+    }
+    let _ = csc_cols_per_shard;
+
+    use scx_codec::CodecId;
+    use scx_format::header::FileHeader;
+    use scx_format::writer::ScxWriter;
+    use scx_format::{select_codec_for_modality, ModalityType};
+
+    // colData becomes the global obs; rowData(experiments[[i]])
+    // becomes per-modality var.
+    let obs_df = R!("
+        as.data.frame(MultiAssayExperiment::colData({{&mae_obj}}))
+    ")
+    .map_err(|e| Error::Other(format!("MAE colData: {e}")))?;
+    let obs_batch = dataframe_to_record_batch(&obs_df)?;
+
+    struct AssayPayload {
+        name: String,
+        n_obs: usize,
+        n_vars: usize,
+        csr_indptr: Vec<u64>,
+        csr_indices: Vec<u32>,
+        values_bytes: Vec<u8>,
+        value_encoding: ValueEncoding,
+        var_batch: RecordBatch,
+        modality_type: ModalityType,
+    }
+    let mut payloads: Vec<AssayPayload> = Vec::with_capacity(assay_names.len());
+    let mut shared_n_obs: Option<usize> = None;
+    for name in &assay_names {
+        let parts = R!("
+            mae <- {{&mae_obj}}
+            ename <- {{name.as_str()}}
+            exp <- MultiAssayExperiment::experiments(mae)[[ename]]
+            counts <- as(SummarizedExperiment::assay(exp), 'dgCMatrix')
+            var_df <- as.data.frame(SummarizedExperiment::rowData(exp))
+            list(counts = counts, var = var_df)
+        ")
+        .map_err(|e| Error::Other(format!("extract MAE experiment '{name}': {e}")))?;
+        let counts = parts
+            .dollar("counts")
+            .map_err(|e| Error::Other(format!("MAE counts for '{name}': {e}")))?;
+        let var_df = parts
+            .dollar("var")
+            .map_err(|e| Error::Other(format!("MAE var for '{name}': {e}")))?;
+        let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
+            dgcmatrix_to_csr(&counts)?;
+        let var_batch = dataframe_to_record_batch(&var_df)?;
+        let modality_type = infer_modality_type_from_name(name);
+        match shared_n_obs {
+            None => shared_n_obs = Some(n_obs),
+            Some(expected) if expected == n_obs => {}
+            Some(expected) => {
+                return Err(Error::Other(format!(
+                    "from_mae: experiment '{name}' has n_obs = {n_obs} but \
+                     the first experiment had n_obs = {expected} after \
+                     alignment. This indicates a corrupted MAE."
+                )));
+            }
+        }
+        payloads.push(AssayPayload {
+            name: name.clone(),
+            n_obs,
+            n_vars,
+            csr_indptr,
+            csr_indices,
+            values_bytes,
+            value_encoding,
+            var_batch,
+            modality_type,
+        });
+    }
+
+    let n_obs = shared_n_obs.unwrap_or(0);
+    let max_n_vars = payloads.iter().map(|p| p.n_vars).max().unwrap_or(0) as u64;
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs as u64,
+        n_vars: max_n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: 16384,
+        codec_id: CodecId::None as u8,
+        index_dtype: if max_n_vars <= 65535 { 0 } else { 1 },
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    };
+    let mut writer = ScxWriter::new(output_path, header)
+        .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
+    writer
+        .write_obs(&obs_batch)
+        .map_err(|e| Error::Other(format!("write_obs failed: {}", e)))?;
+
+    let shard_target_rows: usize = 16384;
+    for payload in &payloads {
+        let resolved_codec = match explicit_codec {
+            Some(c) => {
+                if c == CodecId::Scx1 && !payload.value_encoding.is_integer() {
+                    CodecId::Zstd
+                } else {
+                    c
+                }
+            }
+            None => select_codec_for_modality(
+                &payload.values_bytes,
+                payload.value_encoding,
+                payload.modality_type,
+            ),
+        };
+        let modality_id = writer
+            .add_modality(
+                &payload.name,
+                payload.modality_type,
+                resolved_codec,
+                payload.value_encoding,
+                false, // build_csc: from_seurat / from_mae's csc=TRUE path
+                       // is rejected explicitly above, so no auto-emit.
+            )
+            .map_err(|e| Error::Other(format!("add_modality({}) failed: {}", payload.name, e)))?;
+        writer
+            .set_modality_n_vars(modality_id, payload.n_vars as u64)
+            .map_err(|e| Error::Other(format!("set_modality_n_vars failed: {}", e)))?;
+        writer
+            .write_var_for(modality_id, &payload.var_batch)
+            .map_err(|e| Error::Other(format!("write_var_for failed: {}", e)))?;
+
+        let bw = payload.value_encoding.byte_width();
+        let mut row_start: usize = 0;
+        while row_start < payload.n_obs {
+            let row_end = (row_start + shard_target_rows).min(payload.n_obs);
+            let base = payload.csr_indptr[row_start];
+            let shard_indptr: Vec<u64> = payload.csr_indptr[row_start..=row_end]
+                .iter()
+                .map(|&v| v - base)
+                .collect();
+            let nnz_start = base as usize;
+            let nnz_end = payload.csr_indptr[row_end] as usize;
+            let shard_indices: Vec<u32> = payload.csr_indices[nnz_start..nnz_end].to_vec();
+            let shard_values = &payload.values_bytes[nnz_start * bw..nnz_end * bw];
+            writer
+                .write_csr_shard_for(
+                    modality_id,
+                    &shard_indptr,
+                    &shard_indices,
+                    shard_values,
+                    resolved_codec,
+                    payload.value_encoding,
+                    row_start as u64,
+                )
+                .map_err(|e| Error::Other(format!("write_csr_shard_for failed: {}", e)))?;
+            row_start = row_end;
+        }
+    }
+
+    writer
+        .finish()
+        .map_err(|e| Error::Other(format!("finish failed: {}", e)))?;
+    Ok(())
+}
+
+/// Phase I.2: build a Bioconductor `MultiAssayExperiment` from a
+/// multimodal SCX reader. Each modality becomes a
+/// `SingleCellExperiment` in `experiments`; the global obs becomes
+/// `colData`. Cell names are taken from the obs row index (or
+/// auto-generated as `cell_0..n`).
+pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
+    if !reader.is_multimodal() {
+        return Err(Error::Other(
+            "to_mae: source file is single-modality; use to_sce() instead".into(),
+        ));
+    }
+    let modality_names: Vec<String> = reader
+        .modality_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if modality_names.is_empty() {
+        return Err(Error::Other(
+            "to_mae: file is multimodal but the modality table is empty".into(),
+        ));
+    }
+    let obs_batch = reader
+        .read_obs()
+        .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
+    let obs_df = record_batch_to_dataframe(&obs_batch)?;
+
+    // Build a list of SingleCellExperiments (one per modality) on
+    // the R side, then assemble a MAE.
+    let mut sce_pairs: Vec<(String, Robj)> = Vec::with_capacity(modality_names.len());
+    for name in &modality_names {
+        let mid = reader.modality_id(name).ok_or_else(|| {
+            Error::Other(format!("modality '{name}' missing from modality table"))
+        })?;
+        let csr = reader
+            .read_all_csr_shards_for(mid)
+            .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {e}")))?;
+        let dgc = csr_to_dgcmatrix(&csr)?;
+        let var_batch = reader
+            .read_var_for(mid)
+            .map_err(|e| Error::Other(format!("read_var_for({name}): {e}")))?;
+        let var_df = record_batch_to_dataframe(&var_batch)?;
+        let sce = R!("
+            if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
+                stop('SingleCellExperiment is required for to_mae()')
+            counts_t <- Matrix::t({{dgc}})
+            SingleCellExperiment::SingleCellExperiment(
+                assays = list(counts = counts_t),
+                rowData = S4Vectors::DataFrame({{var_df}})
+            )
+        ")
+        .map_err(|e| Error::Other(format!("SCE for modality '{name}': {e}")))?;
+        sce_pairs.push((name.clone(), sce));
+    }
+
+    // Assemble experiments(list) on the R side and wrap in a MAE.
+    // We feed the SCEs in one at a time via R variable bindings to
+    // avoid an arbitrarily-long single R!() call.
+    let r_list_init = R!("list()").map_err(|e| Error::Other(format!("init list: {e}")))?;
+    let mut exp_list = r_list_init;
+    for (name, sce) in &sce_pairs {
+        exp_list = R!("
+            l <- {{exp_list}}
+            l[[{{name.as_str()}}]] <- {{sce}}
+            l
+        ")
+        .map_err(|e| Error::Other(format!("append experiment '{name}': {e}")))?;
+    }
+
+    let mae = R!("
+        if (!requireNamespace('MultiAssayExperiment', quietly = TRUE))
+            stop('MultiAssayExperiment is required for to_mae()')
+        MultiAssayExperiment::MultiAssayExperiment(
+            experiments = {{exp_list}},
+            colData = S4Vectors::DataFrame({{obs_df}})
+        )
+    ")
+    .map_err(|e| Error::Other(format!("MAE construction failed: {}", e)))?;
+    Ok(mae)
+}
+
 // ─── Module Registration ─────────────────────────────────────────────────────
 
 extendr_module! {
     mod interop;
     fn from_seurat;
     fn from_sce;
+    fn from_mae;
 }

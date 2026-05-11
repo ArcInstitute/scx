@@ -15,8 +15,8 @@ use scx_format::header::MAGIC;
 use scx_format::section::SectionType;
 use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
 use scx_format::{
-    compute_shard_stats, select_codec, FileHeader, PreEncodedSection, ProvenanceEntry, ScxReader,
-    ScxWriter,
+    compute_shard_stats, select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection,
+    ProvenanceEntry, ScxReader, ScxWriter,
 };
 
 use crate::to_pyerr;
@@ -153,7 +153,10 @@ pub(crate) fn csr_to_scipy<'py>(
 }
 
 /// Convert an Arrow RecordBatch (obsm) to a numpy 2D array.
-fn obsm_batch_to_numpy<'py>(py: Python<'py>, batch: &RecordBatch) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn obsm_batch_to_numpy<'py>(
+    py: Python<'py>,
+    batch: &RecordBatch,
+) -> PyResult<Bound<'py, PyAny>> {
     let table = record_batch_to_pyarrow(py, batch)?;
     let df = pyarrow_table_to_pandas(&table)?;
     df.getattr("values")
@@ -1331,7 +1334,11 @@ fn parallel_encode_csr_shards(
                             codec_id
                         }
                     }
-                    None => select_codec(&shard_values_bytes, shard_value_encoding),
+                    None => select_codec_for_modality(
+                        &shard_values_bytes,
+                        shard_value_encoding,
+                        ModalityType::Rna,
+                    ),
                 };
 
                 // 5. Encode shard
@@ -1420,12 +1427,16 @@ fn parallel_encode_csr_shards(
                     + encoded.values_bytes.len()
                     + block_index_bytes.len()) as u64;
 
-                // 10. Compute shard stats
+                // 10. Compute shard stats. pyscx writes row-major CSR
+                // shards exclusively (CSC sidecars are emitted via a
+                // separate path, see scx-cli/src/build_csc.rs).
                 let stats = compute_shard_stats(
                     &shard_values_bytes,
                     shard_value_encoding,
+                    scx_format::MajorAxis::Row,
                     b.row_start as u64,
                     n_major as u64,
+                    n_vars as u64,
                     nnz,
                 );
 
@@ -1580,13 +1591,13 @@ pub fn from_anndata_impl(
                 codec_id
             }
         }
-        None => select_codec(&first_values, first_encoding),
+        None => select_codec_for_modality(&first_values, first_encoding, ModalityType::Rna),
     };
 
     // Build FileHeader
     let header = FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -1608,7 +1619,10 @@ pub fn from_anndata_impl(
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     };
 
     let mut writer = ScxWriter::new(path, header).map_err(to_pyerr)?;

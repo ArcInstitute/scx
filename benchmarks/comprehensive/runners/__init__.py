@@ -2,7 +2,9 @@
 
 from benchmarks.comprehensive.runners.base import ConvertResult, FormatRunner, TimingResult
 from benchmarks.comprehensive.runners.h5ad_runner import H5adRunner
+from benchmarks.comprehensive.runners.h5mu_runner import H5muRunner
 from benchmarks.comprehensive.runners.zarr_runner import ZarrRunner
+from benchmarks.comprehensive.runners.zarr_mudata_runner import ZarrMuDataRunner
 from benchmarks.comprehensive.runners.tiledb_runner import TileDBRunner
 from benchmarks.comprehensive.runners.scx_runner import ScxRunner
 from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
@@ -14,7 +16,9 @@ __all__ = [
     "TimingResult",
     "ConvertResult",
     "H5adRunner",
+    "H5muRunner",
     "ZarrRunner",
+    "ZarrMuDataRunner",
     "TileDBRunner",
     "ScxRunner",
     "BPCellsRunner",
@@ -26,7 +30,9 @@ __all__ = [
 
 _RUNNER_MAP = {
     "h5ad_runner": H5adRunner,
+    "h5mu_runner": H5muRunner,
     "zarr_runner": ZarrRunner,
+    "zarr_mudata_runner": ZarrMuDataRunner,
     "tiledb_runner": TileDBRunner,
     "scx_runner": ScxRunner,
     "bpcells_runner": BPCellsRunner,

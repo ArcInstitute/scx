@@ -252,12 +252,45 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 
 ### Which environment to use
 
+> [!CAUTION]
+> **The comprehensive benchmark orchestrators (`run_parallel.py`,
+> `capture_baseline.py`, `gate_candidate.py`) MUST be launched from
+> within the `scx-bench` conda env, not the dev `.venv/`.** This
+> isn't a soft preference — it's load-bearing. `run_parallel.py`'s
+> `_slurm_setup_cmds()` only activates a conda env on each SLURM
+> worker when the orchestrator's own `CONDA_PREFIX` contains
+> `"scx-bench"`. Launched from `.venv/`, every SLURM job's PATH
+> falls back to `.venv/bin` — which does **not** include `mudata`,
+> `slafdb`, `BPCells`, or other format-runner deps. The cascade
+> failure mode is recurring + expensive:
+>
+> 1. Phase A: many `convert_from_h5ad` jobs ImportError at runtime
+>    because the dependency isn't on `.venv/bin/python`.
+> 2. Phase B: hundreds of dependent bench jobs queue as
+>    `DependencyNeverSatisfied`, pinning the QOS-cap throttle.
+> 3. Phase B post-submit: orchestrator's `job.result()` loop spends
+>    ~15 s per cancelled job, multiplying into hour-long drains.
+>
+> **Always:**
+>
+> ```bash
+> conda activate scx-bench
+> python benchmarks/comprehensive/scripts/gate_candidate.py --tier small
+> ```
+>
+> The orchestrator now also emits a loud runtime warning when
+> launched from a non-scx-bench env, but it does not refuse — narrow
+> manual runs (e.g. `--accel-only` on a CPU laptop) sometimes work
+> from `.venv/` if the relevant runners' deps happen to be present.
+
 **Comprehensive benchmark suite** (`comprehensive/`):
 
 | Script | Environment | Activation |
 |--------|-------------|------------|
+| `comprehensive/scripts/gate_candidate.py` | **`scx-bench`** | `conda activate scx-bench` |
+| `comprehensive/scripts/capture_baseline.py` | **`scx-bench`** | `conda activate scx-bench` |
+| `comprehensive/scripts/run_parallel.py` | **`scx-bench`** | `conda activate scx-bench` |
 | `comprehensive/scripts/run_all.py` | `scx-bench` | `conda activate scx-bench` |
-| `comprehensive/scripts/run_parallel.py` | `scx-bench` | `conda activate scx-bench` |
 | `comprehensive/scripts/validate_*.py` | `scx-bench` | `conda activate scx-bench` |
 | GPU benchmarks | `scx-bench-gpu` | `conda activate scx-bench-gpu` |
 | BPCells benchmarks | `scx-bench-r` | `conda activate scx-bench-r` |
@@ -274,6 +307,20 @@ bash benchmarks/comprehensive/scripts/run_slurm.sh --conda-env scx-bench-gpu
 ---
 
 ## Parallel Benchmark Execution (run_parallel.py)
+
+> [!IMPORTANT]
+> **Orchestrator vs. workers.** `run_parallel.py` and `gate_candidate.py`
+> are *job submitters* — they run on the host you invoke them from
+> (login node, `sh_dev`, or any CPU-only machine that can reach SLURM)
+> and submit SLURM jobs that execute on the actual compute nodes.
+> **You do not need a GPU on the host running the orchestrator** —
+> GPU-bearing benchmarks request GPUs from SLURM (`partition=preemptible
+> slurm_gres=gpu:1`) and run on H100 worker nodes. This is the standard
+> Chimera workflow: orchestrate from `sh_dev` (or login), benchmarks
+> execute under `sbatch` on GPU nodes. The orchestrator script just
+> needs to stay alive long enough to submit; it can exit immediately
+> after submission (jobs continue independently) or follow the
+> submitted jobs through completion (default).
 
 The serial orchestrator (`run_all.py`) processes benchmarks sequentially within a single SLURM job. For faster execution, `run_parallel.py` uses two-phase parallel execution via `submitit`:
 
@@ -645,6 +692,35 @@ dataset-prep, ML-loader, and standalone GPU/Harmony scripts remain
 > require one-time fixture staging via
 > `benchmarks/comprehensive/scripts/setup_cloud_test_data.sh`.
 
+### Refreshing derived fixtures after an h5ad change
+
+When the source h5ad fixtures change (e.g. an obs-column augmentation),
+the derived `scx_auto`, `tiledb_soma`, and `zarr_zstd` local files —
+and their cloud-pushed copies — go stale. Use `reconvert_fixtures.py`
+to drive the full re-conversion + push pipeline:
+
+```bash
+# Default matrix: all datasets × {scx_auto, tiledb_soma, zarr_zstd}, local only
+python benchmarks/scripts/reconvert_fixtures.py
+
+# Cherry-pick datasets + formats and re-push to GCS
+python benchmarks/scripts/reconvert_fixtures.py \
+    --datasets pbmc3k pbmc10k tabula_sapiens_100k \
+    --formats scx_auto tiledb_soma \
+    --cloud-push
+
+# Dry-run to see the plan without converting or uploading
+python benchmarks/scripts/reconvert_fixtures.py --dry-run --cloud-push
+
+# List known datasets / format keys
+python benchmarks/scripts/reconvert_fixtures.py --list
+```
+
+`--cloud-push` invalidates the existing GCS copy (main directory +
+`.blake3` sidecar) before uploading so `ensure_cloud_fixture`'s
+completion short-circuit doesn't skip the fresh data. Requires
+`GOOGLE_APPLICATION_CREDENTIALS` (or ADC) and `gsutil` on PATH.
+
 ---
 
 ## Monitoring Jobs
@@ -733,8 +809,9 @@ performance currently under regression governance:
 | **Cell-eval / arc-bench parity perf** | `cell_eval_parity_perf` |
 | **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
 | **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
+| **Multimodal — h5mu compression and training-loader throughput** | `multimodal_compression`, `multimodal_training` |
 
-That is 27 benchmarks across 11 distinct domains, each expanded across the
+That is 29 benchmarks across 12 distinct domains, each expanded across the
 relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
 plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
 and the tier's dataset list (pbmc3k → census_10m). The canonical list
@@ -754,9 +831,11 @@ capture run picks it up automatically.
 >     print(sorted(keys))"
 > ```
 >
-> The current `LATEST` symlink points at `v0.6.0-gpu-phase1-7-multidataset`,
-> which is **accel-only** (60 rows: `accel_hvg / knn / leiden / pca /
-> preprocess / umap`). Format / cloud / `ml_loader` / `index_plan` /
+> The current `LATEST` symlink points at `v0.6.1-multimodal`, which
+> covers **format + accel + multimodal** rows captured at the small
+> tier (60 accel cells from the prior baseline plus the new
+> `multimodal_compression` / `multimodal_training` rows on
+> `cite_seq_pbmc` + `multiome_pbmc`). Format / cloud / `ml_loader` / `index_plan` /
 > `correctness` / `roundtrip` / `cell_eval_parity_perf` benchmarks
 > capture cleanly but produce no gate signal against this baseline. The
 > earlier `v0.6.0-gpu-phase1-7` baseline (577 rows) covers format +

@@ -185,6 +185,78 @@ impl PyExperiment {
         self.reader.validate().map_err(to_pyerr)
     }
 
+    /// True if this file is multimodal (Phase B / v2 with
+    /// `n_modalities > 0`). Mirrors `header.has_modalities()`.
+    #[getter]
+    fn is_multimodal(&self) -> bool {
+        self.reader.is_multimodal()
+    }
+
+    /// Number of registered modalities (0 for v1 files and
+    /// single-modality v2 files).
+    #[getter]
+    fn n_modalities(&self) -> u32 {
+        self.reader.n_modalities()
+    }
+
+    /// Ordered list of modality names (empty for single-modality
+    /// files). The position in the list maps 1:1 to the 1-based
+    /// modality_id (`names[i] -> modality_id = i + 1`).
+    #[getter]
+    fn modality_names(&self) -> Vec<String> {
+        self.reader
+            .modality_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Resolve a modality name to its 1-based `modality_id`.
+    /// Returns `None` for unknown names or single-modality files.
+    fn modality_id(&self, name: &str) -> Option<u8> {
+        self.reader.modality_id(name)
+    }
+
+    /// Per-modality information block for the given 1-based
+    /// `modality_id`. Returns a dict with the on-disk fields of
+    /// `ModalityInfo` (name, modality_type, default_codec_id,
+    /// default_value_encoding, n_vars, nnz, n_csr_shards,
+    /// n_csc_shards, flags). Useful for introspection (e.g. asserting
+    /// per-modality codec routing in tests).
+    fn modality_info<'py>(
+        &self,
+        py: Python<'py>,
+        modality_id: u8,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        use pyo3::types::PyDict;
+        let info = match self.reader.modality_info(modality_id) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let d = PyDict::new(py);
+        d.set_item("name", &info.name)?;
+        d.set_item("modality_type", info.modality_type as u8)?;
+        d.set_item("default_codec_id", info.default_codec_id)?;
+        d.set_item("default_value_encoding", info.default_value_encoding)?;
+        d.set_item("n_vars", info.n_vars)?;
+        d.set_item("nnz", info.nnz)?;
+        d.set_item("n_csr_shards", info.n_csr_shards)?;
+        d.set_item("n_csc_shards", info.n_csc_shards)?;
+        d.set_item("flags", info.flags.bits())?;
+        Ok(Some(d))
+    }
+
+    /// Materialise this file as a `mudata.MuData` object.
+    ///
+    /// Iterates the registered modalities, builds an AnnData per
+    /// modality via the existing zero-copy CSR path, and attaches
+    /// them to a `MuData(...)` with the shared global obs.
+    /// Single-modality files raise `RuntimeError` directing to
+    /// `to_anndata()`.
+    fn to_mudata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::mudata::to_mudata(py, &self.reader)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyExperiment(n_obs={}, n_vars={}, nnz={}, shards={}, codec={})",

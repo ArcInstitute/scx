@@ -51,18 +51,18 @@ experiment.scx (single binary file)
 
 ## 2. File Header (256 bytes)
 
-Written LE, at offset 0. Sections up to `reserved` total 124 bytes; `reserved`
-pads the rest out to 256.
+Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
+`reserved` pads the rest out to 256.
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `magic` | `[u8; 4]` | `b"SCX\x01"` |
-| `format_version` | `u16` | Current: 1 |
+| `format_version` | `u16` | 1 (legacy) or 2 (multimodal-capable). v2 readers accept both; v1 readers reject v2. |
 | `header_length` | `u16` | 256; reserves space for future header growth |
 | `flags` | `u32` | See flag table below |
 | `n_obs` | `u64` | Total cells (after deletions) |
-| `n_vars` | `u64` | Total genes |
-| `nnz` | `u64` | Total non-zeros |
+| `n_vars` | `u64` | Total genes (file-wide max across modalities on v2) |
+| `nnz` | `u64` | Total non-zeros (sums per-modality nnz on v2) |
 | `n_csr_shards` | `u32` | |
 | `n_csc_shards` | `u32` | 0 if CSC not present |
 | `shard_target_rows` | `u32` | Cells per CSR shard; default 10,000 |
@@ -79,7 +79,15 @@ pads the rest out to 256.
 | `file_checksum` | `u64` | BLAKE3 truncated to 64 bits |
 | `front_catalog_offset` | `u64` | 0 if `has_front_catalog` unset |
 | `front_catalog_length` | `u64` | 0 if not present |
-| `reserved` | `[u8; 132]` | Zeroed |
+| `n_modalities` | `u32` | v2 only; number of named modalities (0 = single-modality / v1-shape). Capped at 255. |
+| `modality_table_offset` | `u64` | v2 only; offset of the `ModalityTable` section. 0 when `n_modalities == 0`. |
+| `modality_table_length` | `u64` | v2 only; section byte length. 0 when `n_modalities == 0`. |
+| `reserved` | `[u8; 112]` | Zeroed. Shrunk from `[u8; 132]` in v2 to make room for the three modality fields. |
+
+v1 files have the older 132-byte `reserved` field; the v2 reader maps
+the leading 20 bytes of that block to the three new modality fields
+when reading a `format_version = 1` header (validating that those
+bytes are zero — v1 writers always zeroed the full reserved block).
 
 ### Flags
 
@@ -89,9 +97,10 @@ pads the rest out to 256.
 | 1 | `has_bitmap` | Detection bitmap present |
 | 2 | `has_obsm` | Cell embeddings present |
 | 3 | `has_obsp` | Cell-cell graphs present |
-| 4 | `has_modalities` | Multimodal — section paths include `mod/{name}/…` |
+| 4 | reserved | Must be zero on write, ignored on read |
 | 5 | `has_deletion_vectors` | Deletion vectors section present |
 | 6 | `has_front_catalog` | Cloud-ready layout — front catalog duplicate valid |
+| 7 | `has_modalities` | v2 only; set when `n_modalities > 0`. Fast capability check without reading the modality table. |
 
 ### Index dtype
 
@@ -130,22 +139,30 @@ rollback (a new catalog is appended per mutation; older catalogs remain in
 the file until `scx compact`).
 
 ```
-catalog_version: u16             (1)
+catalog_version: u16             (1 = legacy single-modality, 2 = multimodal)
 manifest_sequence: u64           (matches header)
 prev_catalog_offset: u64         (0 if first)
 n_obs: u64                       (observable cells after deletions)
 n_entries: u32
 For each entry:
   name_length: u16
-  name_bytes: [u8; name_length]  (UTF-8 path, e.g. "X/csr/000042")
+  name_bytes: [u8; name_length]  (UTF-8 path, e.g. "X/csr/000042"
+                                  or per-modality "X/{mname}/shard_42")
   offset: u64
   length: u64
   section_type: u8               (enum below)
   checksum: [u8; 32]             (full BLAKE3 of section content)
+  modality_id: u8                (v2 only; 0 = global, ≥ 1 = named modality)
   stats_length: u16
   stats: [u8; stats_length]      (per-section stats, format below)
 catalog_checksum: [u8; 32]       (BLAKE3 of all preceding catalog bytes)
 ```
+
+The `modality_id` field is added between the per-entry checksum and
+`stats_length` on v2 catalogs (1 byte / entry; 1 KB extra for a
+1000-shard file). v1 catalogs do not carry the field; the v2 reader
+materialises every v1 entry with `modality_id = 0` (global) when
+opening a v1 file.
 
 ### `section_type` enum
 
@@ -164,12 +181,17 @@ catalog_checksum: [u8; 32]       (BLAKE3 of all preceding catalog bytes)
 | 10 | `uns_blob` |
 | 11 | `provenance` |
 | 12 | `deletion_vectors` |
-| 13–239 | Reserved for extensions (multimodal, spatial) |
-| 240–254 | Reserved for encrypted section types |
+| 13 | `obs_predicate_index` |
+| 14 | `var_predicate_index` |
+| 15 | `modality_table` (v2; ordered list of modality records — see § 13) |
+| 16 | `layer_csc_shard` (v2; per-modality CSC sidecar for a named layer) |
+| 17–31 | Reserved for multimodal/spatial extensions |
+| 32–239 | Reserved for future use |
+| 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
 
-Unknown types (≥13 for v1) are skipped by readers with a warning, which
-allows the format to evolve without breaking old readers.
+Unknown types are skipped by readers with a warning, which allows the
+format to evolve without breaking old readers.
 
 ### Per-shard statistics
 
@@ -606,26 +628,112 @@ replace counts.
 
 ## 13. Multimodal Extension (Optional)
 
-Set `has_modalities` (bit 4) when the file contains multiple feature spaces
-(CITE-seq RNA + protein, etc.). Section paths gain a modality prefix:
+v2 files can carry multiple feature spaces (CITE-seq RNA + protein, 10x
+Multiome RNA + ATAC, …) in a single SCX. Cells are global; modalities
+are routed via a 1-byte `modality_id` stamped on each catalog entry,
+plus a `ModalityTable` section that names every registered modality.
+
+### 13.1 Header signal
+
+A multimodal file has:
+
+- `format_version = 2`,
+- `has_modalities` flag set (bit 7),
+- `n_modalities ≥ 1`,
+- `modality_table_offset` / `modality_table_length` pointing at the
+  `ModalityTable` section.
+
+A v2 file with `n_modalities = 0` (and the offset/length fields zero)
+is **single-modality** and decodes identically to a v1 file via the v2
+reader. Adopting v2 does not force users into multimodal.
+
+### 13.2 ModalityTable section (id 15)
+
+Variable-length section, typically a few hundred bytes for CITE-seq /
+multiome files. All values little-endian.
 
 ```
-experiment.scx
-├── obs metadata                   (shared across modalities)
-├── mod/rna/var metadata
-├── mod/rna/X/csr/…                (RNA counts)
-├── mod/protein/var metadata
-├── mod/protein/X/csr/…            (ADT counts)
-└── catalog
+u32 magic = b"MTBL"
+u16 version = 1
+u16 n_modalities                   (mirrors header.n_modalities; reader cross-checks)
+For each modality (1-based id, in registration order):
+  u8  name_length                  (≤ 64)
+  bytes name[name_length]          (UTF-8; unique within file)
+  u8  modality_type                (0=RNA, 1=Protein, 2=ATAC, 3=Spatial,
+                                    4=Methylation, 255=Custom)
+  u8  default_codec_id             (CodecId for this modality's X)
+  u8  default_value_encoding       (ValueEncoding for X)
+  u8  reserved_flags = 0
+  u64 n_vars
+  u64 nnz                          (sum across CSR shards)
+  u32 n_csr_shards
+  u32 n_csc_shards
+  u8  flags                        (bit 0: has_csc, 1: has_obsm, 2: has_obsp,
+                                    3: has_layers, 4: has_uns)
+  u8  reserved[7] = 0
+u32 blake3_truncated_checksum      (BLAKE3 of preceding bytes, truncated to 4 bytes)
 ```
 
-`obs` is shared (all modalities measure the same cells). Each modality has
-its own `var`, `X`, layers, and embeddings. This round-trips with MuData/MuOn.
+The `modality_id` of an entry is its 1-based position in this table.
+`modality_id = 0` is reserved for global / shared sections (`obs`,
+`obs_index`, `provenance`, `obs_predicate_index`, `deletion_vectors`,
+the `modality_table` section itself, and any v1 catalog entry parsed
+by the v2 reader).
 
-Spatial data reuses standard numeric `obs` columns (`x_spatial`, `y_spatial`,
-`z_spatial`); images may live in `uns` blobs (`uns/spatial/images/hires`, …)
-following SpatialData conventions. An R-tree spatial index is reserved as a
-future section type.
+### 13.3 Catalog routing
+
+Every catalog entry carries `modality_id: u8` (see §3 above). All
+section types are reused — there is no per-modality section-type
+explosion. Naming conventions for per-modality entries:
+
+| Section | Single-modality / global name | Per-modality name (`modality_id ≥ 1`) |
+|--------|-------------------------------|----------------------------------------|
+| CSR shard | `X_shard_{i}` | `X/{name}/shard_{i}` |
+| CSC shard | `X_csc_shard_{i}` | `X_csc/{name}/shard_{i}` |
+| Layer CSR | `{layer}_shard_{i}` | `layer/{name}/{layer}/shard_{i}` |
+| Layer CSC | (n/a in v1) | `layer_csc/{name}/{layer}/shard_{i}` (section type 16) |
+| var metadata | `var` | `var/{name}` |
+| obsm | `obsm/{key}` | `obsm/{name}/{key}` |
+| obsp | `obsp/{key}_shard_{i}` | `obsp/{name}/{key}/shard_{i}` |
+| uns | `uns` | `uns/{name}` |
+
+Cells are global, so the obs / obs_index / provenance sections are
+written exactly once at `modality_id = 0` regardless of how many
+modalities are registered. Per-modality "this cell has no measurement
+here" is expressed by an empty CSR row in that modality's shard.
+
+### 13.4 Per-modality `n_vars` vs the file-wide header
+
+Each modality has its own `n_vars` recorded in the modality table. The
+file-wide `header.n_vars` is the **maximum** across modalities (used
+to size shard headers' `n_minor` field uniformly across the file). To
+get the canonical per-modality variable count, read it from the
+modality table — never compute it from `header.n_vars`.
+
+### 13.5 Compatibility
+
+v1 readers reject v2 files at open time
+(`format_version > CURRENT_FORMAT_VERSION` → `UnsupportedVersion`).
+v2 readers accept v1 files (every entry materialises with
+`modality_id = 0`; `n_modalities` stays 0). This is one-way: adopting
+v2 means re-pinning consumer wheels (`pyscx`, `cell-load-scx`,
+`state-scx`, `rscx`) against a v2-aware reader.
+
+### 13.6 Spatial data
+
+Spatial transcriptomics files can be modeled as either:
+
+- An RNA modality + standard numeric `obs` columns
+  (`x_spatial`, `y_spatial`, `z_spatial`) and image blobs under
+  `uns/spatial/images/...`, matching SpatialData conventions. No
+  modality table needed in this shape.
+- A two-modality file: an RNA modality (`modality_type = 0`) plus a
+  Spatial modality (`modality_type = 3`) carrying coordinates as an
+  obsm entry tagged with that modality. This makes the spatial axis
+  explicit in the modality table.
+
+An R-tree spatial index is reserved as a future section type (out of
+scope for v2).
 
 ## 14. Cloud Layouts
 

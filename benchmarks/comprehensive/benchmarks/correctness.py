@@ -13,6 +13,7 @@ stored in the metadata field.
 
 from __future__ import annotations
 
+import gc
 import logging
 import sys
 from dataclasses import asdict
@@ -26,6 +27,46 @@ from benchmarks.comprehensive.config import DatasetConfig, FormatVariant  # noqa
 from benchmarks.comprehensive.results import BenchmarkResult  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def _run_suite_with_gc(label: str, runner, dataset_name: str) -> list:
+    """Run one validator and force a GC sweep before returning.
+
+    The four validators (scanpy / backed / preprocessing / slaf) each
+    materialise their own reference AnnData / SCX handles. Pre-2026-05-11
+    the loaders ran back-to-back inside a single Python process, so all
+    four fixtures stayed reachable through CPython's reference cycles
+    (anndata/numpy caches, pyscx C-extension state) — even though the
+    locals went out of scope, refcount-based release was delayed and the
+    peak RSS stacked.
+
+    Wrapping each call here gives the validator's locals an explicit
+    scope boundary: when this function returns, only the small
+    ``ValidationCheck`` list survives, and the trailing ``gc.collect()``
+    breaks any cycles holding the reference X arrays. Empirical effect
+    on tabula_sapiens_100k: peak RSS goes from ~176 GB (cumulative
+    stacking) to ~50 GB (largest single fixture at a time).
+    """
+    checks = runner(dataset_name)
+    # First sweep: drop refcount-zero objects (the AnnDatas materialised
+    # inside the validator). Second sweep: cycle-collect anything the
+    # first pass exposed. Two passes are cheap; the underlying gen-2 is
+    # what does the work.
+    gc.collect()
+    gc.collect()
+    # Force glibc to return freed arenas to the OS on Linux. Without
+    # this, malloc holds the freed dense-X buffers in user-space pools;
+    # RSS stays high even though Python has released the references.
+    # On large fixtures this is the difference between "Python's view of
+    # heap freed" and "RSS actually drops" — the OOM killer reads RSS.
+    # Best-effort: only fires on Linux glibc, no-op elsewhere.
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+    logger.info("  %s: %d checks (post-gc)", label, len(checks))
+    return checks
 
 
 def run(
@@ -57,17 +98,39 @@ def run(
 
     logger.info("Running correctness validation suite on %s", dataset.name)
 
-    # Run each validation suite
-    scanpy_checks = validate_scanpy_equivalence.run_all_checks(dataset.name)
-    backed_checks = validate_backed_equivalence.run_all_checks(dataset.name)
-    preproc_checks = validate_preprocessing_paths.run_all_checks(dataset.name)
+    # Run each validation suite SERIALLY with explicit GC between suites.
+    # Pre-fix, all four suites' reference fixtures (scanpy AnnData, SCX
+    # backed handle, preprocessing path AnnData, SLAF round-trip handle)
+    # stacked in RSS until the function returned. On high-n_vars datasets
+    # (smartseq2 61K vars × 50K cells onward) the stacked dense-X working
+    # sets exceeded the 1 TB MEM_CEILING. _run_suite_with_gc bounds peak
+    # to "largest single fixture" rather than "sum of all four".
+    scanpy_checks = _run_suite_with_gc(
+        "scanpy_equivalence",
+        validate_scanpy_equivalence.run_all_checks,
+        dataset.name,
+    )
+    backed_checks = _run_suite_with_gc(
+        "backed_equivalence",
+        validate_backed_equivalence.run_all_checks,
+        dataset.name,
+    )
+    preproc_checks = _run_suite_with_gc(
+        "preprocessing_paths",
+        validate_preprocessing_paths.run_all_checks,
+        dataset.name,
+    )
 
     # SLAF round-trip parity — skipped if slafdb is not installed in this env.
     slaf_checks = []
     try:
         from benchmarks.comprehensive.scripts import validate_slaf_equivalence
 
-        slaf_checks = validate_slaf_equivalence.run_all_checks(dataset.name)
+        slaf_checks = _run_suite_with_gc(
+            "slaf_equivalence",
+            validate_slaf_equivalence.run_all_checks,
+            dataset.name,
+        )
     except ImportError as e:
         logger.info("Skipping SLAF round-trip checks: %s", e)
 

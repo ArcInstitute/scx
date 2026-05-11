@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import time
@@ -11,6 +12,8 @@ from typing import Any
 import numpy as np
 
 from benchmarks.comprehensive.runners.base import ConvertResult, FormatRunner, TimingResult
+
+logger = logging.getLogger(__name__)
 
 try:
     import pyscx
@@ -26,6 +29,13 @@ try:
 except ImportError:
     _HAS_ANNDATA = False
 
+try:
+    import mudata  # noqa: F401
+
+    _HAS_MUDATA = True
+except ImportError:
+    _HAS_MUDATA = False
+
 
 _CODEC_NAMES = {
     "auto": ("SCX (auto)", "scx_auto"),
@@ -34,6 +44,16 @@ _CODEC_NAMES = {
     "zstd": ("SCX (zstd)", "scx_zstd"),
     "lz4": ("SCX (lz4)", "scx_lz4"),
     "pcodec": ("SCX (pcodec)", "scx_pcodec"),
+    # Phase K multimodal variants — name + key tags for the
+    # comprehensive results pipeline.
+    "_multimodal_per_modality_auto": (
+        "SCX multimodal (per-modality auto)",
+        "scx_multimodal_per_modality_auto",
+    ),
+    "_multimodal_uniform_auto": (
+        "SCX multimodal (uniform auto)",
+        "scx_multimodal_uniform_auto",
+    ),
 }
 
 
@@ -50,20 +70,33 @@ class ScxRunner(FormatRunner):
         "cloud_filtered",
     })
 
-    def __init__(self, codec: str = "auto") -> None:
+    def __init__(self, codec: str = "auto", codec_per_modality: bool = True) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
                 f"Unsupported codec {codec!r}; "
                 f"expected one of {list(_CODEC_NAMES)}"
             )
         self.codec = codec
+        # Phase K.3.4: when False, route every modality through the
+        # single-modality `select_codec` helper instead of
+        # `select_codec_for_modality`. Only meaningful for the
+        # multimodal compression sweep; ignored on single-modality
+        # convert paths.
+        self.codec_per_modality = codec_per_modality
 
     @property
     def name(self) -> str:
+        # Phase K: multimodal variants use a synthetic codec key so the
+        # name reflects "per-modality auto" vs "uniform auto" instead
+        # of just "SCX (auto)".
+        if self.codec == "auto" and not self.codec_per_modality:
+            return _CODEC_NAMES["_multimodal_uniform_auto"][0]
         return _CODEC_NAMES[self.codec][0]
 
     @property
     def key(self) -> str:
+        if self.codec == "auto" and not self.codec_per_modality:
+            return _CODEC_NAMES["_multimodal_uniform_auto"][1]
         return _CODEC_NAMES[self.codec][1]
 
     # ------------------------------------------------------------------
@@ -117,6 +150,76 @@ class ScxRunner(FormatRunner):
             output_size_bytes=output_size,
             write_throughput_mb_s=throughput,
             extra={"codec": self.codec},
+        )
+
+    def convert_from_h5mu(
+        self, h5mu_path: str | Path, output_path: str | Path
+    ) -> ConvertResult:
+        """Phase K: read a `.h5mu` and write a multimodal SCX file via
+        ``pyscx.from_mudata``. The ``codec_per_modality`` flag set in
+        ``__init__`` flows through to the writer — when False, every
+        modality routes through single-modality ``select_codec``
+        (uniform-auto sweep variant); when True (default), per-modality
+        codec routing applies (``select_codec_for_modality``)."""
+        self._check_pyscx()
+        if not _HAS_MUDATA:
+            raise RuntimeError(
+                "mudata is not installed. Install with: pip install mudata"
+            )
+
+        h5mu_path = str(h5mu_path)
+        output_path = str(output_path)
+
+        self._gc_collect()
+        u0, s0 = self._get_cpu_times()
+        t0 = time.perf_counter()
+
+        # Multiple parallel SLURM jobs read the same source `.h5mu`
+        # concurrently; the default h5py file lock raises
+        # ``BlockingIOError: errno 11`` on contended reads. Disable
+        # file locking for read-only opens (the source is never
+        # mutated during a benchmark).
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+        mu = mudata.read_h5mu(h5mu_path)
+        pyscx.from_mudata(
+            mu,
+            output_path,
+            codec=self.codec,
+            codec_per_modality=self.codec_per_modality,
+        )
+
+        wall = time.perf_counter() - t0
+        u1, s1 = self._get_cpu_times()
+        rss = self._get_rss_mb()
+
+        output_size = os.path.getsize(output_path)
+        throughput = (output_size / (1024 * 1024)) / wall if wall > 0 else 0.0
+
+        # Per-modality codec assignment from the on-disk modality table
+        # — useful for the per-modality codec sweep results.
+        per_modality_codec_id: dict[str, int] = {}
+        try:
+            reader = pyscx.open(output_path)
+            for name in reader.modality_names:
+                mid = reader.modality_id(name)
+                info = reader.modality_info(mid)
+                if info is not None:
+                    per_modality_codec_id[name] = int(info["default_codec_id"])
+        except Exception:
+            # Best-effort metadata; do not fail the convert if the
+            # post-write read-back fails.
+            pass
+
+        return ConvertResult(
+            wall_s=wall,
+            peak_rss_mb=rss,
+            output_size_bytes=output_size,
+            write_throughput_mb_s=throughput,
+            extra={
+                "codec": self.codec,
+                "codec_per_modality": self.codec_per_modality,
+                "per_modality_codec_id": per_modality_codec_id,
+            },
         )
 
     def read_full(self, path: str | Path) -> TimingResult:
@@ -379,6 +482,22 @@ class ScxRunner(FormatRunner):
             "telemetry": "phase_f_deferred",
         }
         return timing
+
+    def cloud_obs_columns(self, cloud_url: str) -> set[str]:
+        """Return the obs column set on a cloud-staged ``.scxd`` fixture.
+
+        ``PyCloudExperiment`` (the result of ``pyscx.open_cloud``) does not
+        expose obs schema introspection — only metadata counters
+        (n_obs, n_vars, nnz, shard_count). Fully reading obs would require
+        a full ``pyscx.pull``, which defeats the purpose of a cheap schema
+        probe. Returning the empty set signals "unknown schema" to
+        ``cloud_filtered.py``, falling back to the local-h5ad column gate.
+        This is safe for the SCX cloud fixtures because they're pushed
+        directly from the local ``.scx`` files in this repo's setup
+        pipeline (``setup_cloud_test_data.sh``), so the cloud schema
+        tracks the local schema by construction.
+        """
+        return set()
 
     def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
         """Metadata-only open via ``pyscx.open_cloud`` (no full pull).

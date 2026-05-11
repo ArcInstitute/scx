@@ -3,6 +3,7 @@ mod anndata;
 pub(crate) mod backed;
 mod experiment;
 pub(crate) mod lazy_transform;
+pub(crate) mod mudata;
 mod ops;
 mod preprocess;
 pub(crate) mod projected_agg;
@@ -172,6 +173,48 @@ fn from_10x(
     )
 }
 
+/// Convert a `mudata.MuData` object to a multimodal SCX v2 file.
+///
+/// Mirrors `from_anndata` for multi-modality inputs. The MuData's
+/// outer `obs` is written as the global obs section
+/// (`modality_id = 0`); each modality under `mu.mod` is registered
+/// via `ScxWriter::add_modality` and gets its own `var`,
+/// `CsrShard`, and `obsm` entries stamped with that modality's
+/// `modality_id`.
+///
+/// Phase D MVP: emits a single CSR shard per modality. Use
+/// `scx build-csc` afterwards to add CSC sidecars (the
+/// `csc='always'` shortcut is a Phase D follow-on).
+///
+/// Example:
+///     import mudata as md
+///     mu = md.MuData({"rna": rna_adata, "adt": adt_adata})
+///     pyscx.from_mudata(mu, "cite_seq.scx")
+#[pyfunction]
+#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, codec_per_modality=true))]
+#[allow(clippy::too_many_arguments)]
+fn from_mudata(
+    py: Python<'_>,
+    mu: &Bound<'_, PyAny>,
+    path: &str,
+    codec: Option<&str>,
+    shard_size: Option<u32>,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    codec_per_modality: bool,
+) -> PyResult<()> {
+    mudata::from_mudata_impl(
+        py,
+        mu,
+        path,
+        codec,
+        shard_size,
+        csc,
+        csc_cols_per_shard,
+        codec_per_modality,
+    )
+}
+
 /// Convert a Cell Ranger MTX directory to SCX.
 ///
 /// Reads the MTX directory (matrix.mtx[.gz], barcodes.tsv[.gz], features.tsv[.gz])
@@ -221,6 +264,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
     m.add_function(wrap_pyfunction!(to_mtx, m)?)?;
+    m.add_function(wrap_pyfunction!(from_mudata, m)?)?;
 
     // Preprocessing pipeline
     m.add_function(wrap_pyfunction!(preprocess::preprocess, m)?)?;
@@ -251,9 +295,12 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQueryPipeline>()?;
     m.add_class::<PyQueryResult>()?;
     m.add_class::<scx_loader::TrainingDataset>()?;
+    m.add_class::<scx_loader::MultimodalTrainingDataset>()?;
     m.add_class::<scx_loader::IndexPlanDataset>()?;
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
+    m.add_class::<backed::ScxBackedMuDataset>()?;
+    m.add_class::<backed::ScxBackedMuModality>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
     m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
 

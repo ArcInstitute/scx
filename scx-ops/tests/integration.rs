@@ -16,7 +16,7 @@ use tempfile::TempDir;
 fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: 1,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -38,7 +38,10 @@ fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     }
 }
 
@@ -1531,4 +1534,143 @@ fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
         !matches!(cluster_dt, DataType::LargeUtf8),
         "cluster column must not surface as LargeUtf8 after merge",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Multimodal append tests (PR #68 regression)
+// ---------------------------------------------------------------------------
+
+/// `append_for_modality` must stamp the appended CSR shard's
+/// `ShardHeader.n_minor` and `ShardStats.col_end` with the TARGET
+/// modality's `n_vars`, not the file-wide max. Regression for the bug
+/// where `header.n_vars` (the max across modalities) was used at both
+/// sites in `scx-ops::append::append_for_modality`.
+#[test]
+fn test_append_for_modality_uses_per_modality_n_vars() {
+    use scx_format::modality::ModalityType;
+    use scx_format::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multimodal_append.scx");
+
+    // Two modalities with DISTINCT n_vars; "rna" is the max so the
+    // file-wide header.n_vars = 30 == rna.n_vars. We then append into
+    // "adt" (n_vars = 10) — if the fix is missing, the appended shard
+    // would stamp n_minor = 30 instead of 10.
+    let rna_n_vars: u64 = 30;
+    let adt_n_vars: u64 = 10;
+    let header = sample_header(4, rna_n_vars);
+
+    {
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rna_id, 1);
+        assert_eq!(adt_id, 2);
+
+        writer.write_var_for(rna_id, &sample_var(2)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(2)).unwrap();
+        writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+        writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+        // Seed each modality with one CSR shard so the file is well-
+        // formed before the append.
+        let (rna_indptr, rna_indices, rna_values) = sample_shard_data(4, rna_n_vars as usize);
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &rna_indptr,
+                &rna_indices,
+                &rna_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        let (adt_indptr, adt_indices, adt_values) = sample_shard_data(4, adt_n_vars as usize);
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &adt_indptr,
+                &adt_indices,
+                &adt_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        writer.finish().unwrap();
+    }
+
+    // Append two new rows into the "adt" modality.
+    let new_obs = sample_obs(2);
+    let (new_indptr, new_indices, new_values) = sample_shard_data(2, adt_n_vars as usize);
+    scx_ops::append_for_modality(
+        &path,
+        &new_obs,
+        &new_indptr,
+        &new_indices,
+        &new_values,
+        ValueEncoding::Uint8,
+        CodecId::None,
+        16384,
+        2, // adt
+    )
+    .unwrap();
+
+    // The appended shard should carry adt.n_vars in both stats and
+    // on-disk header — not rna.n_vars (which is the file-wide max).
+    let reader = ScxReader::open(&path).unwrap();
+    let adt_shards: Vec<&scx_format::FullCatalogEntry> = reader
+        .catalog()
+        .shards(SectionType::CsrShard)
+        .into_iter()
+        .filter(|e| e.modality_id == 2)
+        .collect();
+    assert_eq!(
+        adt_shards.len(),
+        2,
+        "adt should have 2 CSR shards after append (1 seed + 1 appended)"
+    );
+
+    for entry in &adt_shards {
+        let stats = entry
+            .stats
+            .as_ref()
+            .expect("v2 catalog must carry shard stats");
+        assert_eq!(
+            stats.col_end, adt_n_vars,
+            "appended shard col_end should be adt.n_vars ({adt_n_vars}), got {}",
+            stats.col_end
+        );
+        assert_eq!(stats.col_start, 0);
+
+        let bytes = reader.section_bytes(entry).unwrap();
+        let sh =
+            ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+        assert_eq!(
+            sh.n_minor as u64, adt_n_vars,
+            "appended shard ShardHeader.n_minor should be adt.n_vars ({adt_n_vars}), got {}",
+            sh.n_minor
+        );
+    }
 }

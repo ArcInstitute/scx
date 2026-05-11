@@ -1,5 +1,6 @@
 // Auto-codec selection based on value distribution
 
+use crate::modality::ModalityType;
 use scx_codec::{CodecId, ValueEncoding};
 
 /// Codec selection profile for user-facing codec choice.
@@ -100,6 +101,51 @@ pub fn select_codec(raw_values: &[u8], value_encoding: ValueEncoding) -> CodecId
     }
 }
 
+/// Select codec using the modality's biological type as a hint.
+///
+/// Same shape as [`select_codec`] but routes per-modality:
+///
+/// - RNA / Custom / Methylation / Spatial → delegate to [`select_codec`]
+///   (Scx1 for small UMI integer medians, Zstd otherwise; Pcodec for
+///   floats — already correct for spatial float coordinates and
+///   methylation per-CpG counts).
+/// - Protein/ADT → Zstd for integers (Rice's UMI-distribution
+///   assumption breaks for ADT counts), Pcodec for float CLR layers.
+/// - ATAC → Zstd for binary peak presence (sample max ≤ 1, uint8 by
+///   convention), Lz4Shuffle for integer peak counts, Pcodec for floats.
+pub fn select_codec_for_modality(
+    raw_values: &[u8],
+    value_encoding: ValueEncoding,
+    modality_type: ModalityType,
+) -> CodecId {
+    match modality_type {
+        ModalityType::Rna
+        | ModalityType::Custom
+        | ModalityType::Spatial
+        | ModalityType::Methylation => select_codec(raw_values, value_encoding),
+        ModalityType::Protein => match value_encoding {
+            ValueEncoding::Float32 | ValueEncoding::Float16 => CodecId::Pcodec,
+            _ => CodecId::Zstd,
+        },
+        ModalityType::Atac => match value_encoding {
+            ValueEncoding::Float32 | ValueEncoding::Float16 => CodecId::Pcodec,
+            ValueEncoding::Uint8 if atac_sample_is_binary(raw_values) => CodecId::Zstd,
+            _ => CodecId::Lz4Shuffle,
+        },
+    }
+}
+
+/// Heuristic: a uint8 ATAC payload is treated as binary peak-presence
+/// when every sampled byte is in {0, 1}. Reuses the 10K-byte sampling
+/// pattern from [`select_codec`].
+fn atac_sample_is_binary(raw: &[u8]) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let n = raw.len().min(10_000);
+    raw[..n].iter().all(|&b| b <= 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +217,116 @@ mod tests {
             raw.extend_from_slice(&i.to_le_bytes());
         }
         assert_eq!(select_codec(&raw, ValueEncoding::Uint32), CodecId::Zstd);
+    }
+
+    // --- select_codec_for_modality coverage --------------------------------
+
+    #[test]
+    fn protein_uint8_small_median_uses_zstd() {
+        // Same fixture that picks Scx1 for RNA — Protein should override to Zstd.
+        let values: Vec<u8> = vec![1, 2, 1, 3, 2, 1, 1, 2, 4, 1];
+        assert_eq!(
+            select_codec_for_modality(&values, ValueEncoding::Uint8, ModalityType::Protein),
+            CodecId::Zstd
+        );
+    }
+
+    #[test]
+    fn protein_float_uses_pcodec() {
+        let raw = vec![0u8; 40]; // 10 float32 values
+        assert_eq!(
+            select_codec_for_modality(&raw, ValueEncoding::Float32, ModalityType::Protein),
+            CodecId::Pcodec
+        );
+    }
+
+    #[test]
+    fn atac_binary_uint8_uses_zstd() {
+        let values: Vec<u8> = vec![0, 1, 0, 1, 1, 0, 1, 0, 0, 1];
+        assert_eq!(
+            select_codec_for_modality(&values, ValueEncoding::Uint8, ModalityType::Atac),
+            CodecId::Zstd
+        );
+    }
+
+    #[test]
+    fn atac_count_uint8_uses_lz4shuffle() {
+        let values: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3];
+        assert_eq!(
+            select_codec_for_modality(&values, ValueEncoding::Uint8, ModalityType::Atac),
+            CodecId::Lz4Shuffle
+        );
+    }
+
+    #[test]
+    fn atac_uint16_counts_use_lz4shuffle() {
+        let mut raw = Vec::new();
+        for i in 0u16..20 {
+            raw.extend_from_slice(&i.to_le_bytes());
+        }
+        assert_eq!(
+            select_codec_for_modality(&raw, ValueEncoding::Uint16, ModalityType::Atac),
+            CodecId::Lz4Shuffle
+        );
+    }
+
+    #[test]
+    fn atac_float_uses_pcodec() {
+        let raw = vec![0u8; 40]; // 10 float32 values
+        assert_eq!(
+            select_codec_for_modality(&raw, ValueEncoding::Float32, ModalityType::Atac),
+            CodecId::Pcodec
+        );
+    }
+
+    #[test]
+    fn rna_falls_through_to_select_codec() {
+        let small: Vec<u8> = vec![1, 2, 1, 3, 2, 1, 1, 2, 4, 1];
+        assert_eq!(
+            select_codec_for_modality(&small, ValueEncoding::Uint8, ModalityType::Rna),
+            CodecId::Scx1
+        );
+        let mut large = Vec::new();
+        for i in 0u16..1000 {
+            large.extend_from_slice(&i.to_le_bytes());
+        }
+        assert_eq!(
+            select_codec_for_modality(&large, ValueEncoding::Uint16, ModalityType::Rna),
+            CodecId::Zstd
+        );
+    }
+
+    #[test]
+    fn custom_falls_through_to_select_codec() {
+        let small: Vec<u8> = vec![1, 2, 1, 3, 2, 1, 1, 2, 4, 1];
+        assert_eq!(
+            select_codec_for_modality(&small, ValueEncoding::Uint8, ModalityType::Custom),
+            CodecId::Scx1
+        );
+    }
+
+    #[test]
+    fn spatial_float_uses_pcodec() {
+        let raw = vec![0u8; 40];
+        assert_eq!(
+            select_codec_for_modality(&raw, ValueEncoding::Float32, ModalityType::Spatial),
+            CodecId::Pcodec
+        );
+    }
+
+    #[test]
+    fn methylation_falls_through_to_select_codec() {
+        let small: Vec<u8> = vec![1, 2, 1, 3, 2, 1, 1, 2, 4, 1];
+        assert_eq!(
+            select_codec_for_modality(&small, ValueEncoding::Uint8, ModalityType::Methylation),
+            CodecId::Scx1
+        );
+    }
+
+    #[test]
+    fn atac_sample_is_binary_helper() {
+        assert!(atac_sample_is_binary(&[0, 1, 0, 1, 1]));
+        assert!(!atac_sample_is_binary(&[0, 1, 2]));
+        assert!(!atac_sample_is_binary(&[]));
     }
 }

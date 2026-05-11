@@ -26,14 +26,29 @@ dependencies:
   - pandas=2.3.3
   - h5py=3.16.0
 
+  # Multimodal (Phase K): h5mu / MuData round-trip + benchmarks.
+  # Required by `multimodal_compression`, `multimodal_training`,
+  # the h5mu_runner / zarr_mudata_runner format runners, and
+  # pyscx.from_mudata / to_mudata. Without this, every multimodal
+  # convert/bench job ImportError's at runtime. mudata 0.3.x is the
+  # current PyPI cap (0.4.x not yet released as of 2026-05); upgrade
+  # the pin once 0.4 ships.
+  - mudata=0.3.8
+
   # Format-specific
   - zarr=3.1.5
   - pyarrow=23.0.1
   - tiledbsoma=2.3.0
 
-  # Cloud object-store (zarr + anndata async store routing for gs:// URIs)
-  - fsspec=2025.9.0
-  - gcsfs=2025.9.0
+  # Cloud object-store (zarr + anndata async store routing for gs:// URIs).
+  # Both packages must land via the same channel (conda-forge here) so that
+  # gcsfs's protocol registration is visible to fsspec at import time. The
+  # 2026-05-10 tier-full gate caught a worker env where conda's solver
+  # silently dropped gcsfs but left fsspec, breaking 24 zarr cloud_*/zarr_*
+  # cells with "Please install gcsfs to access Google Storage". Pin to a
+  # matched-version pair so future env rebuilds preserve the registration.
+  - fsspec=2026.2.0
+  - gcsfs=2026.2.0
 
   # Analysis (for accelerator comparisons against scanpy)
   - scikit-learn=1.8.0

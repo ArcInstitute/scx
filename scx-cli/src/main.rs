@@ -41,16 +41,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Convert between h5ad/10x/mtx and SCX formats
+    /// Convert between h5ad/h5mu/10x/mtx and SCX formats
     Convert {
         /// Input file path
         input: PathBuf,
         /// Output file path
         output: PathBuf,
-        /// Input format: h5ad, 10x, mtx
+        /// Input format: h5ad, h5mu, 10x, mtx
         #[arg(long)]
         from: Option<String>,
-        /// Output format: h5ad, mtx
+        /// Output format: h5ad, h5mu, mtx
         #[arg(long)]
         to: Option<String>,
         /// Target rows per shard
@@ -71,6 +71,11 @@ enum Commands {
         /// Pass `0` to disable the cap (single CSC shard, memory permitting).
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
+        /// Extract a single modality from a multi-modality SCX file
+        /// when writing to h5ad. Required when `--to h5ad` is used on
+        /// a multimodal SCX input; ignored otherwise.
+        #[arg(long)]
+        modality: Option<String>,
     },
     /// Display SCX file information
     Info {
@@ -98,6 +103,12 @@ enum Commands {
         /// Source SCX file containing cells to append
         #[arg(long)]
         input: PathBuf,
+        /// Modality name to append into. Required on multimodal target
+        /// files (`scx info` shows the modality table). Optional on
+        /// single-modality files — defaults to the global / primary
+        /// modality.
+        #[arg(long)]
+        modality: Option<String>,
         /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
         codec: String,
@@ -302,6 +313,11 @@ enum Commands {
         /// File containing gene names or numeric indices (one per line) for column projection
         #[arg(long)]
         genes: Option<PathBuf>,
+        /// On a multimodal input, extract a single modality by name
+        /// to a new single-modality v2 file. When set with `--genes`,
+        /// scopes the gene filter to that modality's index space.
+        #[arg(long)]
+        modality: Option<String>,
         /// Show matching count without writing output
         #[arg(long)]
         dry_run: bool,
@@ -351,6 +367,7 @@ fn main() {
             codec,
             csc,
             csc_cols_per_shard,
+            modality,
         } => run_convert(
             &input,
             &output,
@@ -360,6 +377,7 @@ fn main() {
             &codec,
             &csc,
             csc_cols_per_shard,
+            modality.as_deref(),
         ),
         Commands::Info {
             file,
@@ -379,6 +397,7 @@ fn main() {
         Commands::Append {
             target,
             input,
+            modality,
             codec,
             shard_size,
             rebuild_csc,
@@ -386,6 +405,7 @@ fn main() {
         } => append::run_append(
             &target,
             &input,
+            modality.as_deref(),
             &codec,
             shard_size,
             rebuild_csc,
@@ -449,6 +469,7 @@ fn main() {
             output,
             filter,
             genes,
+            modality,
             dry_run,
             shard_size,
             codec,
@@ -459,6 +480,7 @@ fn main() {
             output.as_deref(),
             filter.as_deref(),
             genes.as_deref(),
+            modality.as_deref(),
             dry_run,
             shard_size,
             &codec,
@@ -516,6 +538,7 @@ fn run_convert(
     codec: &str,
     csc: &str,
     csc_cols_per_shard: usize,
+    modality: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine conversion direction from explicit flags or file extensions
     let direction = match (from, to) {
@@ -525,9 +548,12 @@ fn run_convert(
         // Auto-detect: input is a directory → MTX
         (None, None) if input.is_dir() => "mtx_to_scx",
         // HDF5-based conversions
+        (Some("h5mu"), _) => "h5mu_to_scx",
+        (_, Some("h5mu")) => "scx_to_h5mu",
         (Some("h5ad"), _) | (None, None) if input.extension().is_some_and(|e| e == "h5ad") => {
             "h5ad_to_scx"
         }
+        (None, None) if input.extension().is_some_and(|e| e == "h5mu") => "h5mu_to_scx",
         (Some("10x"), _) | (None, None) if input.extension().is_some_and(|e| e == "h5") => {
             "tenx_to_scx"
         }
@@ -574,6 +600,7 @@ fn run_convert(
         codec,
         csc_always,
         csc_cols_per_shard,
+        modality,
     )
 }
 
@@ -587,6 +614,7 @@ fn dispatch_convert(
     codec: &str,
     csc_always: bool,
     csc_cols_per_shard: usize,
+    modality: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -623,10 +651,40 @@ fn dispatch_convert(
     );
     pb.set_message(format!("Converting {}...", input.display()));
 
+    // Special-case scx_to_h5ad on multimodal input: gate on the
+    // `--modality` flag and route through `scx_modality_to_h5ad` when
+    // present. The plain single-modality path stays untouched.
     let result: Result<(), ConvertError> = match direction {
         "h5ad_to_scx" => convert::h5ad_to_scx(input, output, &opts),
+        "h5mu_to_scx" => convert::h5mu_to_scx(input, output, &opts),
         "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts),
-        "scx_to_h5ad" => convert::scx_to_h5ad(input, output),
+        "scx_to_h5ad" => match modality {
+            Some(name) => convert::scx_modality_to_h5ad(input, output, name),
+            None => {
+                // If the file is multimodal, raise with a clear
+                // message; if single-modality, fall through to the
+                // legacy h5ad writer.
+                let reader = scx_format::reader::ScxReader::open(input)?;
+                if reader.is_multimodal() {
+                    drop(reader);
+                    return Err(format!(
+                        "SCX file '{}' has {} modalities; use --to h5mu, or use \
+                         --modality NAME to extract a single modality as h5ad",
+                        input.display(),
+                        {
+                            let r = scx_format::reader::ScxReader::open(input)?;
+                            let n = r.n_modalities();
+                            drop(r);
+                            n
+                        }
+                    )
+                    .into());
+                }
+                drop(reader);
+                convert::scx_to_h5ad(input, output)
+            }
+        },
+        "scx_to_h5mu" => convert::scx_to_h5mu(input, output),
         _ => unreachable!(),
     };
 
@@ -651,9 +709,10 @@ fn dispatch_convert(
     _codec: &str,
     _csc_always: bool,
     _csc_cols_per_shard: usize,
+    _modality: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
-        "h5ad/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
+        "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
          Note: MTX conversion is always available (use --from mtx or --to mtx)."
             .into(),
     )

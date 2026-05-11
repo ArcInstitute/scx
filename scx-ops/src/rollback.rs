@@ -98,16 +98,19 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
     file.read_exact(&mut header_buf)?;
 
     let mut cursor = Cursor::new(&header_buf[..]);
-    let _catalog_version = cursor.read_u16::<LittleEndian>()?;
+    let catalog_version = cursor.read_u16::<LittleEndian>()?;
     let _manifest_sequence = cursor.read_u64::<LittleEndian>()?;
     let _prev_catalog_offset = cursor.read_u64::<LittleEndian>()?;
     let _n_obs = cursor.read_u64::<LittleEndian>()?;
     let n_entries = cursor.read_u32::<LittleEndian>()? as usize;
 
     // Step 2: Scan entry headers to compute total catalog size.
-    // Each entry: name_len(2) + name(variable) + offset(8) + length(8)
-    //             + type(1) + checksum(32) + stats_len(2) + stats(variable)
+    // v1 entry: name_len(2) + name + offset(8) + length(8) + type(1)
+    //           + checksum(32) + stats_len(2) + stats
+    // v2 entry: same as v1 plus a modality_id(1) byte between
+    //           checksum and stats_len.
     // We read entries incrementally, one at a time, to avoid loading to EOF.
+    let modality_id_bytes: usize = if catalog_version >= 2 { 1 } else { 0 };
     let mut entries_size: usize = 0;
     for i in 0..n_entries {
         let entry_start = offset + CATALOG_HEADER_SIZE as u64 + entries_size as u64;
@@ -124,8 +127,10 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
         file.read_exact(&mut name_len_buf)?;
         let name_len = u16::from_le_bytes(name_len_buf) as usize;
 
-        // Fixed fields after name: offset(8) + length(8) + type(1) + checksum(32) = 49
-        let fixed_after_name = 8 + 8 + 1 + 32;
+        // Fixed fields after name:
+        //   v1: offset(8) + length(8) + type(1) + checksum(32) = 49
+        //   v2: same + modality_id(1)               = 50
+        let fixed_after_name = 8 + 8 + 1 + 32 + modality_id_bytes;
         let stats_len_pos = entry_start + 2 + name_len as u64 + fixed_after_name as u64;
 
         if stats_len_pos + 2 > file_len {

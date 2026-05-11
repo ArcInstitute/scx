@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 import numpy as np
 
 from benchmarks.comprehensive.runners.base import ConvertResult, FormatRunner, TimingResult
+
+logger = logging.getLogger(__name__)
 
 try:
     import tiledbsoma
@@ -265,6 +268,27 @@ class TileDBRunner(FormatRunner):
             "telemetry": "phase_f_deferred",
         }
         return timing
+
+    def cloud_obs_columns(self, cloud_url: str) -> set[str]:
+        """Return the obs column set on a cloud-staged ``.soma`` fixture.
+
+        The pbmc10k.soma / smartseq2.soma fixtures were materialised before
+        the local h5ad fixtures were augmented with ``obs.n_counts``, so
+        the cloud schema lacks columns that the local schema has. Reading
+        the obs columns here lets ``cloud_filtered.py`` skip predicates that
+        would otherwise raise ``schema error on column 'n_counts'`` mid-run.
+        """
+        _require_tiledbsoma()
+        try:
+            with tiledbsoma.Experiment.open(cloud_url) as exp:
+                return set(exp.obs.schema.names)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cloud_obs_columns failed for %s: %s — predicates against named "
+                "obs columns will be skipped for this fixture.",
+                cloud_url, exc,
+            )
+            return set()
 
     def read_cloud_metadata(self, cloud_url: str) -> TimingResult:
         """Open the experiment and touch its obs/var counts only."""

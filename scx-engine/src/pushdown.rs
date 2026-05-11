@@ -558,6 +558,7 @@ mod tests {
             length: 1000,
             section_type: SectionType::ObsMetadata,
             checksum: [0; 32],
+            modality_id: 0,
             stats: None,
         });
         entries.push(FullCatalogEntry {
@@ -566,6 +567,7 @@ mod tests {
             length: 500,
             section_type: SectionType::VarMetadata,
             checksum: [0; 32],
+            modality_id: 0,
             stats: None,
         });
 
@@ -576,9 +578,12 @@ mod tests {
                 length: 5000,
                 section_type: SectionType::CsrShard,
                 checksum: [0; 32],
+                modality_id: 0,
                 stats: Some(ShardStats {
                     row_start,
                     row_end,
+                    col_start: 0,
+                    col_end: 0,
                     nnz: 1000,
                     value_min: 1,
                     value_max: 255,
@@ -590,7 +595,7 @@ mod tests {
         }
 
         FullCatalog {
-            catalog_version: 1,
+            catalog_version: scx_format::CURRENT_CATALOG_VERSION,
             manifest_sequence: 1,
             prev_catalog_offset: 0,
             n_obs: entries

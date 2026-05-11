@@ -42,7 +42,10 @@ fn make_header(n_obs: u64, n_vars: u64) -> FileHeader {
         file_checksum: 0,
         front_catalog_offset: 0,
         front_catalog_length: 0,
-        reserved: [0u8; 132],
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
     }
 }
 

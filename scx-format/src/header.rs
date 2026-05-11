@@ -15,7 +15,14 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 ///
 /// Readers accept versions 1..=CURRENT_FORMAT_VERSION.
 /// The writer stamps this value in `finish()`.
-pub const CURRENT_FORMAT_VERSION: u16 = 1;
+///
+/// v2 (current) carries three new fields between `front_catalog_length`
+/// and the trailing `reserved` block: `n_modalities`,
+/// `modality_table_offset`, `modality_table_length`. v1 readers reject
+/// v2 files via the `format_version > CURRENT_FORMAT_VERSION` check;
+/// v2 readers accept both versions and stamp the new fields as zero
+/// when reading a v1 file (single-modality semantic equivalence).
+pub const CURRENT_FORMAT_VERSION: u16 = 2;
 
 /// The 256-byte file header that starts every SCX file.
 #[derive(Debug, Clone)]
@@ -37,7 +44,8 @@ pub struct FileHeader {
     /// |   4 | **reserved** — must be zero on write, ignored on read |
     /// |   5 | `has_deletion_vectors`                               |
     /// |   6 | `has_front_catalog`                                  |
-    /// | 7–31 | reserved for future use                              |
+    /// |   7 | `has_modalities` (v2; set when `n_modalities > 0`)    |
+    /// | 8–31 | reserved for future use                              |
     pub flags: u32,
     /// Number of observations (rows)
     pub n_obs: u64,
@@ -77,12 +85,33 @@ pub struct FileHeader {
     pub front_catalog_offset: u64,
     /// Length of the front catalog
     pub front_catalog_length: u64,
-    /// Reserved bytes (must be zero)
-    pub reserved: [u8; 132],
+    /// Number of named modalities (v2). `0` for single-modality files
+    /// (semantic equivalent of v1). Capped at 255 in practice; stored
+    /// as u32 for 8-byte alignment of the next field.
+    pub n_modalities: u32,
+    /// Byte offset of the `ModalityTable` section, or `0` when
+    /// `n_modalities == 0`.
+    pub modality_table_offset: u64,
+    /// Length of the `ModalityTable` section in bytes, or `0` when
+    /// `n_modalities == 0`.
+    pub modality_table_length: u64,
+    /// Reserved bytes (must be zero). Shrunk from 132 → 112 in v2 to
+    /// make room for the three modality-routing fields above
+    /// (132 − 4 − 8 − 8 = 112).
+    pub reserved: [u8; 112],
 }
 
 impl FileHeader {
     /// Write the header to a writer in little-endian byte order.
+    ///
+    /// The on-disk layout depends on `format_version`:
+    /// - v1: ... `front_catalog_length`, then a 132-byte `reserved` tail.
+    /// - v2: ... `front_catalog_length`, `n_modalities` (u32),
+    ///   `modality_table_offset` (u64), `modality_table_length` (u64),
+    ///   then a 112-byte `reserved` tail.
+    ///
+    /// Writers should always emit v2 going forward
+    /// (`format_version = CURRENT_FORMAT_VERSION`).
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_all(&self.magic)?;
         w.write_u16::<LittleEndian>(self.format_version)?;
@@ -107,11 +136,44 @@ impl FileHeader {
         w.write_u64::<LittleEndian>(self.file_checksum)?;
         w.write_u64::<LittleEndian>(self.front_catalog_offset)?;
         w.write_u64::<LittleEndian>(self.front_catalog_length)?;
-        w.write_all(&self.reserved)?;
+        if self.format_version >= 2 {
+            // v2 layout: three modality-routing fields before reserved.
+            w.write_u32::<LittleEndian>(self.n_modalities)?;
+            w.write_u64::<LittleEndian>(self.modality_table_offset)?;
+            w.write_u64::<LittleEndian>(self.modality_table_length)?;
+            w.write_all(&self.reserved)?;
+        } else {
+            // v1 layout: reserved is 132 bytes. Writers should not emit
+            // v1 going forward (CURRENT_FORMAT_VERSION = 2), but the
+            // 132-byte tail is preserved here for symmetry with the
+            // legacy on-disk shape: 20 leading zero bytes (where v2
+            // placed the new fields) followed by `self.reserved` (112
+            // bytes). The struct invariant for a v1 header must have
+            // n_modalities/modality_table_offset/length = 0 — the
+            // padding is a strict zero region.
+            let zero_pad = [0u8; 20];
+            w.write_all(&zero_pad)?;
+            w.write_all(&self.reserved)?;
+        }
         Ok(())
     }
 
     /// Read and validate a header from a reader.
+    ///
+    /// Branches on `format_version` after the version check:
+    /// - v1: the 20 bytes after `front_catalog_length` are part of the
+    ///   legacy 132-byte `reserved` block. They are strictly required
+    ///   to be zero (v1 writers always wrote them as zero, so any
+    ///   non-zero value here indicates corruption). The new modality
+    ///   fields are stamped as zero in the returned struct.
+    /// - v2: the three modality-routing fields (`n_modalities`,
+    ///   `modality_table_offset`, `modality_table_length`) are parsed
+    ///   from those 20 bytes, followed by 112 bytes of `reserved`.
+    ///
+    /// In either case, the cross-check
+    /// `(n_modalities == 0) == (modality_table_offset == 0) ==
+    /// (modality_table_length == 0)` must hold; disagreement raises
+    /// `ScxError::InvalidCatalog`.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
@@ -149,8 +211,36 @@ impl FileHeader {
         let front_catalog_offset = r.read_u64::<LittleEndian>()?;
         let front_catalog_length = r.read_u64::<LittleEndian>()?;
 
-        let mut reserved = [0u8; 132];
+        let (n_modalities, modality_table_offset, modality_table_length) = if format_version >= 2 {
+            let n_modalities = r.read_u32::<LittleEndian>()?;
+            let modality_table_offset = r.read_u64::<LittleEndian>()?;
+            let modality_table_length = r.read_u64::<LittleEndian>()?;
+            (n_modalities, modality_table_offset, modality_table_length)
+        } else {
+            // v1: the next 20 bytes were part of the legacy 132-byte
+            // reserved tail. They must be zero (defensive — v1 writers
+            // always wrote them as zero).
+            let mut leading_zero_pad = [0u8; 20];
+            r.read_exact(&mut leading_zero_pad)?;
+            if leading_zero_pad.iter().any(|&b| b != 0) {
+                return Err(ScxError::InvalidCatalog(
+                    "v1 header reserved bytes 0..20 must be zero".to_string(),
+                ));
+            }
+            (0u32, 0u64, 0u64)
+        };
+
+        let mut reserved = [0u8; 112];
         r.read_exact(&mut reserved)?;
+
+        // Cross-check: modality fields are all-zero or all-set.
+        let any_set = n_modalities != 0 || modality_table_offset != 0 || modality_table_length != 0;
+        let all_set = n_modalities != 0 && modality_table_offset != 0 && modality_table_length != 0;
+        if any_set && !all_set {
+            return Err(ScxError::InvalidCatalog(
+                "modality fields must be all-zero or all-non-zero".to_string(),
+            ));
+        }
 
         Ok(FileHeader {
             magic,
@@ -176,6 +266,9 @@ impl FileHeader {
             file_checksum,
             front_catalog_offset,
             front_catalog_length,
+            n_modalities,
+            modality_table_offset,
+            modality_table_length,
             reserved,
         })
     }
@@ -252,6 +345,23 @@ impl FileHeader {
     pub fn clear_front_catalog(&mut self) {
         self.flags &= !(1 << 6);
     }
+
+    /// Returns true if the has_modalities flag (bit 7) is set. v2-only.
+    /// Set when `n_modalities > 0`; provides a fast capability check
+    /// without reading the modality table.
+    pub fn has_modalities(&self) -> bool {
+        self.flags & (1 << 7) != 0
+    }
+
+    /// Set the has_modalities flag (bit 7). v2-only.
+    pub fn set_modalities(&mut self) {
+        self.flags |= 1 << 7;
+    }
+
+    /// Clear the has_modalities flag (bit 7). v2-only.
+    pub fn clear_modalities(&mut self) {
+        self.flags &= !(1 << 7);
+    }
 }
 
 #[cfg(test)]
@@ -262,7 +372,7 @@ mod tests {
     fn sample_header() -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: 50_000,
@@ -284,7 +394,10 @@ mod tests {
             file_checksum: 0xDEAD_BEEF_CAFE_BABE,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 
@@ -337,7 +450,7 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let decoded = FileHeader::read_from(&mut cursor).unwrap();
-        assert_eq!(decoded.reserved, [0u8; 132]);
+        assert_eq!(decoded.reserved, [0u8; 112]);
     }
 
     #[test]
@@ -366,14 +479,92 @@ mod tests {
 
     #[test]
     fn reject_bad_version() {
+        // Anything beyond CURRENT_FORMAT_VERSION (currently 2) must be
+        // rejected. Version 0 is also invalid.
         let mut header = sample_header();
-        header.format_version = 2;
+        header.format_version = CURRENT_FORMAT_VERSION + 1;
         let mut buf = Vec::new();
         header.write_to(&mut buf).unwrap();
 
         let mut cursor = Cursor::new(&buf);
         let err = FileHeader::read_from(&mut cursor).unwrap_err();
         assert!(matches!(err, ScxError::UnsupportedVersion));
+    }
+
+    /// v2 reader on a v1 header buffer: parses cleanly with
+    /// `n_modalities == 0` and zero modality-table offsets.
+    #[test]
+    fn v1_file_via_v2_reader() {
+        // Hand-build a v1-shaped 256-byte header on disk:
+        // identical prefix through `front_catalog_length`, then 132
+        // bytes of zero-valued reserved tail.
+        let mut header = sample_header();
+        header.format_version = 1;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), HEADER_SIZE);
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = FileHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.format_version, 1);
+        assert_eq!(decoded.n_modalities, 0);
+        assert_eq!(decoded.modality_table_offset, 0);
+        assert_eq!(decoded.modality_table_length, 0);
+        assert_eq!(decoded.reserved, [0u8; 112]);
+    }
+
+    /// v2 round-trip: write a header with non-zero modality fields,
+    /// read back, and assert all four new fields preserved.
+    #[test]
+    fn v2_round_trip_modality_fields() {
+        let mut header = sample_header();
+        header.n_modalities = 3;
+        header.modality_table_offset = 0x4000;
+        header.modality_table_length = 0x200;
+        header.set_modalities();
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), HEADER_SIZE);
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = FileHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.format_version, 2);
+        assert_eq!(decoded.n_modalities, 3);
+        assert_eq!(decoded.modality_table_offset, 0x4000);
+        assert_eq!(decoded.modality_table_length, 0x200);
+        assert!(decoded.has_modalities());
+    }
+
+    /// Cross-check: modality fields must be all-zero or all-non-zero.
+    /// Disagreement raises `InvalidCatalog`.
+    #[test]
+    fn v2_partial_modality_fields_rejected() {
+        let mut header = sample_header();
+        header.n_modalities = 3;
+        header.modality_table_offset = 0; // partial — should be rejected
+        header.modality_table_length = 0x200;
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let err = FileHeader::read_from(&mut cursor).unwrap_err();
+        assert!(matches!(err, ScxError::InvalidCatalog(_)));
+    }
+
+    /// has_modalities flag round-trip via setters.
+    #[test]
+    fn has_modalities_flag_accessors() {
+        let mut header = sample_header();
+        assert!(!header.has_modalities());
+        header.set_modalities();
+        assert!(header.has_modalities());
+        // Other flag accessors unaffected.
+        assert!(!header.has_csc());
+        assert!(!header.has_obsm());
+        header.clear_modalities();
+        assert!(!header.has_modalities());
     }
 
     #[test]

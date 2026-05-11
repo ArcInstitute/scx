@@ -20,9 +20,14 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import REPORTS_DIR, FIGURES_DIR, RAW_RESULTS_DIR
 from benchmarks.comprehensive.reporting.tables import (
+    bench_csc_dispatch_table,
     cell_eval_parity_perf_table,
     compression_table,
     compression_ratio_table,
+    multimodal_compression_ratio_table,
+    multimodal_compression_table,
+    multimodal_training_table,
+    multimodal_training_ttfb_table,
     scx_parallel_write_callout_table,
     datasets_table,
     cloud_filtered_table,
@@ -686,6 +691,94 @@ Operations with cost superlinear in ``n_obs`` (``energy_distance`` at O(N²),
 the sizes where they become infeasible — see the Notes column.
 
 {cell_eval_parity_perf_table()}
+""")
+
+    # -----------------------------------------------------------------------
+    # 13bA. Multimodal compression (Phase K.3)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 13bA. Multimodal Compression
+
+`pyscx.from_mudata` writes h5mu / MuData inputs (CITE-seq, 10x Multiome,
+TEA-seq) to SCX v2 multimodal files. Two SCX variants are compared:
+``scx_multimodal_per_modality_auto`` (Phase E codec routing — RNA→Scx1,
+Protein→Zstd, ATAC→Lz4Shuffle) vs ``scx_multimodal_uniform_auto``
+(single-modality ``select_codec`` applied uniformly). Baselines: h5mu
+uncompressed/gzip and Zarr-MuData (zstd).
+
+### File Sizes
+
+{multimodal_compression_table()}
+
+### Compression Ratio (vs h5mu uncompressed)
+
+{multimodal_compression_ratio_table()}
+
+Smoke numbers on real public 10x datasets (5k CITE-seq PBMC, 10k Multiome
+PBMC): SCX per-modality routing typically beats Zarr-MuData zstd by
+~1.5× and h5mu gzip by ~1.7× on CITE-seq. On Multiome, uniform-auto
+edges per-modality routing because ATAC's binary peaks compress
+better under Scx1 than Lz4Shuffle on this fixture.
+""")
+
+    # -----------------------------------------------------------------------
+    # 13bB. Multimodal training-loader throughput (Phase K.4)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 13bB. Multimodal Training Loader
+
+`pyscx.MultimodalTrainingDataset` yields per-batch dicts of
+{{modality_name → ndarray}} via the same triple-buffered Rust pipeline
+as the single-modality `TrainingDataset`. Compared against an eager
+``mudata.read_h5mu`` baseline that mirrors what scvi-tools' AnnTorchDataset
+does internally for multimodal models without an SCX-native loader.
+
+### Throughput (batches/sec, median across runs)
+
+{multimodal_training_table()}
+
+### Time to First Batch
+
+{multimodal_training_ttfb_table()}
+
+SCX's triple-buffered I/O and per-modality SHM densification keep the
+loader CPU-bound on the consumer side; eager-h5mu paths block on
+HDF5 read for every batch. Per-modality CSR shards mean SCX's TTFB
+is dominated by mmap+catalog open, not by data copy.
+""")
+
+    # -----------------------------------------------------------------------
+    # 13bC. CSC dispatch (Phase L.3)
+    # -----------------------------------------------------------------------
+    sections.append(f"""\
+---
+
+## 13bC. CSC vs CSR Dispatch (Phase L.3)
+
+`bench_csc_dispatch` exercises the column-major code paths in
+`pyscx.accel.*` against the equivalent row-major (CSR) paths. The
+sweep covers four ops × two axes:
+
+| Op | CSR variant | CSC variant |
+|---|---|---|
+| qc_metrics | `bench_csc__qc_metrics_csr` | `bench_csc__qc_metrics_csc` |
+| HVG | `bench_csc__hvg_csr` | `bench_csc__hvg_csc` |
+| Differential expression | `bench_csc__de_csr` | `bench_csc__de_csc` |
+| Pseudobulk | `bench_csc__pseudobulk_csr` | `bench_csc__pseudobulk_csc` |
+
+Each row's median wall-time:
+
+{bench_csc_dispatch_table()}
+
+CSC dispatch wins on column-heavy workloads (HVG variance, per-gene DE
+ranking). CSR dispatch wins on row-heavy workloads (per-cell
+qc_metrics, pseudobulk aggregation). The sweep validates that
+`prefer_format="csc"` actually picks the column-major path and that
+the column path produces equivalent numerical output.
 """)
 
     # -----------------------------------------------------------------------

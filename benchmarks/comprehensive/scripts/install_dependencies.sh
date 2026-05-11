@@ -198,6 +198,14 @@ packages = [
     'anndata', 'scanpy', 'zarr', 'h5py', 'scipy', 'numpy', 'pandas',
     'pyarrow', 'tiledbsoma', 'matplotlib', 'seaborn', 'scikit-learn',
     'umap-learn', 'leidenalg', 'psutil', 'maturin',
+    # Cloud object-store stack — gcsfs registers the 'gs' protocol with
+    # fsspec at import time. The 2026-05-10 tier-full gate caught a
+    # worker env where conda's solver had silently dropped gcsfs but
+    # left fsspec, surfacing as 24 confusing 'Please install gcsfs'
+    # errors across the zarr cloud_* and zarr_* cells. Listing both
+    # here in --check makes the gap surface in < 30s rather than
+    # after a 2 h benchmark run.
+    'fsspec', 'gcsfs',
 ]
 for pkg in packages:
     try:
@@ -220,6 +228,16 @@ try:
     print(f'  ✅ {\"torch\":20s} {torch.__version__}{gpu_str}')
 except ImportError:
     print(f'  ❌ {\"torch\":20s} NOT INSTALLED')
+
+# fsspec gs protocol registration — the real failure mode the gate
+# saw was 'gcsfs installed but not registered' (mismatched fsspec /
+# gcsfs versions). Verify the gs filesystem actually resolves.
+try:
+    import fsspec
+    fs = fsspec.filesystem('gs')
+    print(f'  ✅ {\"fsspec gs proto\":20s} {fs.__class__.__name__}')
+except Exception as exc:
+    print(f'  ❌ {\"fsspec gs proto\":20s} {type(exc).__name__}: {str(exc)[:80]}')
 " 2>/dev/null || echo "  (failed to query packages)"
 
             if [[ "$env_name" == "scx-bench-gpu" ]]; then
@@ -290,10 +308,18 @@ if $CREATE_CPU; then
     fi
     echo ""
 
-    # Build pyscx
-    echo "--- Building pyscx in scx-bench ---"
+    # Build pyscx WITH the cloud feature so cloud_* benchmarks
+    # (cloud_push / cloud_pull / cloud_read / cloud_metadata /
+    # cloud_filtered / cloud_reader_vs_pull / cost_model /
+    # cloud_large_atlas) can resolve `pyscx.push`, `pyscx.pull`, and
+    # `pyscx.open_cloud`. These are gated behind `#[cfg(feature =
+    # "cloud")]` in pyscx/src/lib.rs and would otherwise raise
+    # `AttributeError` on every cloud benchmark cell. The cloud
+    # feature pulls in scx-cloud + tokio (pyscx/Cargo.toml), no GPU
+    # dependency.
+    echo "--- Building pyscx (with cloud feature) in scx-bench ---"
     activate_env "scx-bench"
-    build_pyscx
+    build_pyscx "cloud"
     echo ""
 fi
 

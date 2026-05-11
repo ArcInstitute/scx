@@ -76,6 +76,12 @@ class DatasetConfig:
     available: bool = True  # Whether the dataset is expected to already exist
     synthetic: bool = False  # If True, materialized on demand by the benchmark
     synth_params: dict[str, Any] = field(default_factory=dict)
+    # Phase K: multimodal flag + modality names (Phase B vocabulary).
+    # Multimodal datasets carry a `.h5mu` source instead of `.h5ad`; the
+    # multimodal_compression / multimodal_training benchmarks branch on
+    # this flag.
+    multimodal: bool = False
+    modality_names: tuple[str, ...] = ()
 
     @property
     def h5ad_path(self) -> Path:
@@ -149,6 +155,30 @@ class DatasetConfig:
     def anndata_zarr_backed_path(self) -> Path:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
+    # Phase K: multimodal source + per-format paths.
+    @property
+    def h5mu_path(self) -> Path:
+        return DATA_DIR / f"{self.name}.h5mu"
+
+    @property
+    def h5mu_gzip_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_gzip.h5mu"
+
+    @property
+    def scx_multimodal_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_multimodal.scx"
+
+    @property
+    def scx_multimodal_uniform_path(self) -> Path:
+        """SCX multimodal written with `codec_per_modality=False`
+        (Phase K.3.4 sweep variant — every modality routed through
+        single-modality `select_codec`)."""
+        return DATA_DIR / f"{self.name}_multimodal_uniform.scx"
+
+    @property
+    def zarr_mudata_path(self) -> Path:
+        return DATA_DIR / f"{self.name}.zarr.mudata"
+
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key.
 
@@ -208,6 +238,12 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
     "anndata_zarr_backed": "anndata_zarr_backed_path",
+    # Phase K — multimodal format keys.
+    "h5mu_uncompressed": "h5mu_path",
+    "h5mu_gzip": "h5mu_gzip_path",
+    "zarr_mudata_zstd": "zarr_mudata_path",
+    "scx_multimodal_per_modality_auto": "scx_multimodal_path",
+    "scx_multimodal_uniform_auto": "scx_multimodal_uniform_path",
 }
 
 
@@ -437,7 +473,37 @@ DATASETS: dict[str, DatasetConfig] = {
         approx_h5ad_mb=4_000, available=True, synthetic=True,
         synth_params={"n_obs": 1_000_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
     ),
+    # Phase K — multimodal datasets sourced from 10x Genomics public
+    # CITE-seq + Multiome libraries. Staged via
+    # benchmarks/scripts/download_citeseq_pbmc.py and
+    # download_multiome_pbmc.py. n_vars is the *sum* across modalities
+    # (no single global var index; each modality has its own).
+    "cite_seq_pbmc": DatasetConfig(
+        id="K1", name="cite_seq_pbmc_5k",
+        n_obs=5_247, n_vars=33_538 + 32,
+        protocol="10x v3 (UMI) + Antibody Capture",
+        source="10x Genomics — 5k_pbmc_protein_v3",
+        approx_h5ad_mb=85, available=True,
+        multimodal=True, modality_names=("rna", "adt"),
+    ),
+    "multiome_pbmc": DatasetConfig(
+        id="K2", name="multiome_pbmc_10k",
+        n_obs=11_898, n_vars=36_601 + 143_887,
+        protocol="10x Multiome ARC v1 (RNA + ATAC)",
+        source="10x Genomics — pbmc_granulocyte_sorted_10k",
+        approx_h5ad_mb=1_086, available=True,
+        multimodal=True, modality_names=("rna", "atac"),
+    ),
 }
+
+
+# Phase K — convenience export of multimodal-only dataset names so the
+# orchestrator can resolve `--datasets multimodal` shorthand and the
+# multimodal benchmarks can iterate over the right subset without
+# leaking single-modality entries.
+MULTIMODAL_DATASETS: list[str] = [
+    name for name, ds in DATASETS.items() if ds.multimodal
+]
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +555,36 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
                   "zarr_runner", {"backed": True}),
 ]
 
-ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS
+
+# Phase K — multimodal format variants. These consume `.h5mu` rather
+# than `.h5ad`, so the multimodal_compression benchmark routes via
+# `runner.convert_from_h5mu` instead of `convert_from_h5ad`.
+MULTIMODAL_FORMATS: list[FormatVariant] = [
+    FormatVariant(
+        "h5mu (uncompressed)", "h5mu_uncompressed", "multimodal", "h5mu_runner",
+        {"compression": None},
+    ),
+    FormatVariant(
+        "h5mu (gzip)", "h5mu_gzip", "multimodal", "h5mu_runner",
+        {"compression": "gzip"},
+    ),
+    FormatVariant(
+        "Zarr-MuData (zstd)", "zarr_mudata_zstd", "multimodal", "zarr_mudata_runner",
+        {"compressor": "zstd", "level": 3},
+    ),
+    FormatVariant(
+        "SCX multimodal (per-modality auto)",
+        "scx_multimodal_per_modality_auto", "multimodal", "scx_runner",
+        {"codec": "auto", "codec_per_modality": True},
+    ),
+    FormatVariant(
+        "SCX multimodal (uniform auto)",
+        "scx_multimodal_uniform_auto", "multimodal", "scx_runner",
+        {"codec": "auto", "codec_per_modality": False},
+    ),
+]
+
+ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS + MULTIMODAL_FORMATS
 
 
 # ---------------------------------------------------------------------------
@@ -640,8 +735,10 @@ MEM_HIGH_MEM_THRESHOLD_GB = 200
 # Hard ceiling — the largest single-task allocation cpu_high_mem can serve.
 # Estimates above this are clamped (with a warning at submit time); jobs that
 # legitimately need more would have OOMed under the previous uniform 500 GB
-# scheme too.
-MEM_CEILING_GB = 500
+# scheme too. Bumped 500 → 1000 GB after the 2026-05-10 tier-full gate ran
+# correctness/scx_auto into the prior ceiling on census_500k / census_1m;
+# Chimera's high-mem nodes carry ~1–2 TB so 1 TB single-task is reachable.
+MEM_CEILING_GB = 1000
 
 # Floor for any job (Python + scanpy + pyo3 baseline + scratch).
 MEM_FLOOR_GB = 8
@@ -692,6 +789,14 @@ def estimate_memory_gb(
     elif benchmark == "read_selective":
         # Column-projected reads — small in absolute terms.
         peak_mb = base_mb * 0.5
+        # tiledb_soma materialises the full obs DataFrame before
+        # applying the predicate's value_filter — on census_1m that's
+        # ~1.5 GB of obs plus per-thread working buffers — and OOM-killed
+        # both census tier cells on the 2026-05-10 tier-full run. Bump for
+        # >=500K cells via the dense-mb proxy (scales with n_obs * n_vars
+        # but in practice the obs side dominates).
+        if format_key == "tiledb_soma" and n_obs >= 500_000:
+            peak_mb = max(peak_mb, dense_mb * 0.6)
     elif benchmark == "compression":
         # Just measures file sizes — Python overhead only.
         peak_mb = base_mb * 0.25
@@ -754,8 +859,28 @@ def estimate_memory_gb(
         # 14+ scanpy-equivalence checks (PCA, kNN, UMAP, leiden, DE).
         # slurm_validation_suite.sh allocates 80 GB for pbmc3k and 250 GB
         # for the pbmc3k+tabula_sapiens_100k combined run; size like
-        # read_full but with a 1.5x safety multiplier on top.
-        peak_mb = max(base_mb * 2, dense_mb * 1.5)
+        # read_full but with a denser safety multiplier on top.
+        # Bumped from `(base_mb*2, dense_mb*1.5)` after the 2026-05-09
+        # tier-full gate run, then bumped again from `(base_mb*3, dense_mb*2.0)`
+        # after the 2026-05-10 run OOM-killed 5 datasets (pbmc10k, smartseq2,
+        # tabula_sapiens_100k, census_500k, census_1m) on scx_auto.
+        # Stacked-fixture footprint runs ~2.5x dense on the larger datasets:
+        # scanpy reference materialises a dense X for the equivalence
+        # assertions, SCX backed reader holds its own working buffers, and
+        # SLAF round-trip transiently doubles the in-flight cell count.
+        # The 12-GB peak floor handles small datasets like pbmc10k (1.5 GB
+        # dense) where the multipliers under-shoot — pbmc10k OOM-killed at
+        # the 16 GB allocation that the formula otherwise yielded.
+        # Run #4 of the 2026-05-10 gate still OOM'd 4 datasets (smartseq2,
+        # tabula_sapiens_100k, census_500k, census_1m) at the 2.5x dense
+        # multiplier; run #5 OOM'd the same 4 at the 3.5x multiplier.
+        # smartseq2 OOM-killed at the 64 GB allocation after only 96s,
+        # suggesting peak is well above 5x dense. Bumped to 5x dense to
+        # cover (scanpy reference + SCX backed + SLAF round-trip) all
+        # materialising simultaneously + PCA/DE working buffers.
+        # census_500k / census_1m hit MEM_CEILING_GB at this multiplier;
+        # those triples should ride a justification, not a higher cap.
+        peak_mb = max(base_mb * 4, dense_mb * 5.0, 12 * 1024)
     elif benchmark == "roundtrip":
         # Holds source AnnData + SCX-materialised AnnData resident at the
         # same time, plus the (a - b) CSR diff scratch and a second copy
@@ -798,6 +923,17 @@ def estimate_memory_gb(
         # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
         # on 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.1)
+    elif benchmark == "multimodal_compression":
+        # Five-format sweep on a `.h5mu` source. Loads MuData once + writes
+        # multiple variants (h5mu raw/gzip, zarr, two SCX). Like
+        # single-modality `compression`, dominated by Python overhead;
+        # half of base is generous.
+        peak_mb = base_mb * 0.5
+    elif benchmark == "multimodal_training":
+        # Eager mudata baseline materialises every modality; SCX path
+        # streams. CITE-seq peaks at ~590 MB, Multiome at ~5 GB host RSS
+        # in the empirical SLURM run; size like ml_loader's sparse path.
+        peak_mb = max(base_mb * 2, dense_mb * 0.5)
     else:
         peak_mb = base_mb
 
@@ -841,7 +977,14 @@ def estimate_time_minutes(
         "read_full":              8,
         "read_selective":         10,
         "parallel_scaling":       20,
-        "parallel_write_scaling": 25,
+        # Bumped from 25 → 40 after the 2026-05-09 tier-full gate run
+        # timed out 3 `parallel_write_scaling/{smartseq2,census_500k,census_1m}/
+        # tiledb_soma` cells at the 25-min SLURM budget. The benchmark loops
+        # 6 thread counts × (1 warmup + N timed runs); tiledb_soma writes
+        # are ~25 s on smartseq2 and >4 min on census_1m, so the per-cell
+        # wallclock fanout dwarfs the prior 25-min floor. tiledb_soma also
+        # picks up the 2× format multiplier at 500K+ cells below.
+        "parallel_write_scaling": 40,
         "memory":                 15,
         "fragment_ops":           15,
         "cloud_push":             20,
@@ -852,10 +995,29 @@ def estimate_time_minutes(
         "cloud_reader_vs_pull":   25,
         "cost_model":             20,
         "cloud_large_atlas":      60,   # 50GB+ pull is not quick
-        "ml_loader":              45,
+        # Bumped from 45 → 60 after the 2026-05-09 tier-full gate run
+        # timed out `ml_loader/h5ad_gzip/census_1m` at 85 min wallclock.
+        # The full 1M-cell h5ad-gzip read is the slowest combination
+        # in the suite; 60-min base + 12-min/M slope + 1.5× density
+        # multiplier yields ~108 min, comfortable headroom.
+        "ml_loader":              60,
         "correctness":            60,
         "roundtrip":              10,
         "cell_eval_parity_perf":  60,
+        # Default 15-min fall-through clipped all 6 index_plan/scx_auto cells
+        # on the 2026-05-10 tier-full run. The workers2 path is ~50% slower
+        # after the v2-catalog regression (see
+        # results/justifications/index_plan_workers2_v2_catalog.md), and the
+        # cell runs workers0 + workers2 + the streaming dataset training path
+        # back-to-back. Bumped 15→40 then 40→75 after run #4 still hit the
+        # 40-min timeout on smartseq2/tabula_100k/census_500k/census_1m —
+        # smartseq2's high n_vars (61497) drives the loader to fall back to
+        # per-batch sizes well under the 512 MB internal budget, slowing
+        # iteration substantially. Run #5 caught tabula_sapiens_100k (75:11
+        # elapsed on a 75-min cap) and census_500k (80:05 on 80-min) just
+        # over budget — bump base 75→120 to give the larger datasets clear
+        # headroom on top of the 8 min/M slope.
+        "index_plan":            120,
         # Phase 9.3 (post-Tier-3 findings 3 + follow-up). Generous bases
         # because (a) longer timeouts don't hurt queue priority on this
         # cluster, (b) over-budgeting once beats serial retries on timeout
@@ -874,6 +1036,12 @@ def estimate_time_minutes(
         # cached per dataset so the per-variant work is bounded by the op
         # itself.
         "bench_csc_dispatch":     45,
+        # Phase K — multimodal benchmarks. Five-format compression sweep
+        # finishes in <1 min on real CITE-seq / Multiome fixtures; the
+        # training benchmark runs a 100-batch loop + TTFB warm-up, well
+        # within 30 minutes even at Multiome's 144K-feature ATAC width.
+        "multimodal_compression": 10,
+        "multimodal_training":    30,
     }
     base = base_minutes.get(benchmark, 15)
 
@@ -920,6 +1088,16 @@ def estimate_time_minutes(
     # Dense-path formats (h5ad / zarr) take longer at census scale.
     if format_key.startswith(("h5ad", "zarr")) and n_obs >= 1_000_000:
         total = int(total * 1.5)
+    # tiledb_soma writes are I/O-bound and scale faster than the default
+    # 8 min/M slope: empirical 41 min on 500K, 82 min on 1M (vs ~25 s on
+    # 75K). Without the multiplier, 500K and 1M cells exhaust the
+    # SLURM budget before the 6× thread sweep finishes.
+    if (
+        benchmark == "parallel_write_scaling"
+        and format_key == "tiledb_soma"
+        and n_obs >= 500_000
+    ):
+        total = int(total * 2.5)
 
     # Round up to 5-min increments.
     return max(5, math.ceil(total / 5) * 5)

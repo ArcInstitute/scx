@@ -11,6 +11,10 @@ mod h5ad_read;
 #[cfg(feature = "hdf5")]
 mod h5ad_write;
 #[cfg(feature = "hdf5")]
+mod mudata_pipeline;
+#[cfg(feature = "hdf5")]
+mod mudata_write;
+#[cfg(feature = "hdf5")]
 mod tenx_read;
 
 #[cfg(feature = "hdf5")]
@@ -110,7 +114,7 @@ mod pipeline {
         // Build header
         let header = FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: n_obs as u64,
@@ -132,7 +136,10 @@ mod pipeline {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         };
 
         let mut writer = ScxWriter::new(output, header)?;
@@ -243,7 +250,7 @@ mod pipeline {
 
         let header = FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: tenx.n_cells as u64,
@@ -265,7 +272,10 @@ mod pipeline {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         };
 
         let mut writer = ScxWriter::new(output, header)?;
@@ -538,6 +548,14 @@ mod pipeline {
 #[cfg(feature = "hdf5")]
 #[allow(unused_imports)]
 pub use pipeline::{h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions};
+
+#[cfg(feature = "hdf5")]
+#[allow(unused_imports)]
+pub use mudata_pipeline::{h5mu_to_scx, is_h5mu_file};
+
+#[cfg(feature = "hdf5")]
+#[allow(unused_imports)]
+pub use mudata_write::{scx_modality_to_h5ad, scx_to_h5mu};
 
 #[cfg(all(test, feature = "hdf5"))]
 mod tests;

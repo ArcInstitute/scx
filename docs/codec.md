@@ -231,6 +231,45 @@ Median is computed from a sample of up to 10,000 non-zero values from the
 shard — the same calculation used for Rice parameter selection (§4). The
 actual codec used is recorded in each shard header's `codec_id`.
 
+## 8a. Per-modality Codec Defaults
+
+Multimodal writers (CITE-seq, 10x Multiome, TEA-seq, MuData round-trips
+via `pyscx.from_mudata` / `scx convert --from h5mu`) carry a
+`ModalityType` tag per modality. The `codec="auto"` resolver routes
+through `select_codec_for_modality(raw_values, value_encoding,
+modality_type)` (canonical implementation at
+`scx-format/src/codec_select.rs::select_codec_for_modality()`), which
+specialises by biological modality:
+
+| Modality                    | Integer (uint8/16/32)                            | Float (32/16) |
+|-----------------------------|--------------------------------------------------|---------------|
+| RNA / Custom / Methylation  | Scx1 (median ≤ 8) else Zstd (delegates to §8)    | Pcodec        |
+| Protein (ADT)               | Zstd                                             | Pcodec        |
+| ATAC                        | Zstd if sample max ≤ 1 (binary peak) else Lz4Shuffle | Pcodec        |
+| Spatial                     | Scx1 (median ≤ 8) else Zstd (delegates to §8)    | Pcodec        |
+
+Rationale:
+
+- **Protein/ADT** counts violate Rice's near-geometric assumption (wider
+  dynamic range, lower zero-fraction); Zstd's LZ77 dictionary is the
+  better fit even when median is small. Float CLR layers stay on Pcodec.
+- **ATAC** uint8 payloads are effectively binary peak-presence in the
+  common pipelines; Zstd compresses them an order of magnitude better
+  than Lz4Shuffle. Integer peak counts (uint16+, or uint8 with values
+  > 1 in the sample) prefer Lz4Shuffle's faster decode at competitive
+  ratio. Floats (e.g. TF-IDF normalized peaks) take Pcodec.
+- **RNA / Custom / Methylation / Spatial-int** fall through to the
+  modality-blind §8 heuristic — their distributions match the Scx1 vs
+  Zstd split designed for UMI counts.
+
+Single-modality writers (`pyscx.from_anndata`, `scx convert --from h5ad`,
+`scx-mtx`, `rscx`) implicitly default to `ModalityType::Rna`, which
+delegates to the §8 heuristic — output is bit-identical to v1 / pre-Phase-E
+files. Multimodal-aware ops in `scx-ops` (`scx append`, `compact`,
+`merge` working on already-written SCX files) currently still use the
+modality-blind `select_codec`; modality-aware routing through ops is
+tracked under MULTIMODAL-SUPPORT Phase F.
+
 ## 9. Limitations & Pitfalls
 
 ### Rice assumes near-geometric distributions

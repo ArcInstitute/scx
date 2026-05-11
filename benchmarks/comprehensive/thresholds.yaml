@@ -722,3 +722,105 @@ absolute_floors:
     dataset: census_1m
     metric: batches_per_sec__pyscx_training_dataset
     min: 18.3
+
+  # ----- multimodal_compression (Phase K) -------------------------
+  # Absolute floors on the SCX multimodal output, derived from the
+  # 2026-05-08 SLURM run on real 10x public CITE-seq + Multiome
+  # fixtures. ``output_size_bytes`` is gated as a 1.4× ceiling
+  # (a 40% on-disk inflation is a codec or modality-routing
+  # regression); ``compression_ratio_vs_h5mu`` floors keep SCX
+  # from drifting below ~70% of the measured advantage over
+  # uncompressed h5mu.
+  #
+  # Measured CITE-seq (5247 cells, 33538 RNA + 32 ADT):
+  #   SCX per-modality: 15.8 MB, 5.25× vs h5mu raw.
+  # Measured Multiome (11898 cells, 36601 RNA + 143887 ATAC):
+  #   SCX per-modality: 238.3 MB, 4.56× vs h5mu raw.
+  - benchmark: multimodal_compression
+    format: scx_multimodal_per_modality_auto
+    dataset: cite_seq_pbmc_5k
+    metric: output_size_bytes
+    max: 22000000   # 22 MB ≈ 1.4× measured 15.8 MB
+  - benchmark: multimodal_compression
+    format: scx_multimodal_per_modality_auto
+    dataset: multiome_pbmc_10k
+    metric: output_size_bytes
+    max: 335000000  # 335 MB ≈ 1.4× measured 238 MB
+  - benchmark: multimodal_compression
+    format: scx_multimodal_per_modality_auto
+    dataset: cite_seq_pbmc_5k
+    metric: compression_ratio_vs_h5mu
+    min: 3.5         # ~70% of measured 5.25×
+  - benchmark: multimodal_compression
+    format: scx_multimodal_per_modality_auto
+    dataset: multiome_pbmc_10k
+    metric: compression_ratio_vs_h5mu
+    min: 3.0         # ~70% of measured 4.56×
+
+  # ----- multimodal_training (Phase K) ----------------------------
+  # MultimodalTrainingDataset throughput + time-to-first-batch
+  # floors. SCX should hit at least ~50% of measured batches/s and
+  # TTFB no worse than ~2× measured. 50% / 2× is wider than the
+  # ml_loader floors because the multimodal loader handles two
+  # streams in parallel and is more sensitive to per-modality codec
+  # choice than the single-stream `ml_loader`.
+  #
+  # Measured CITE-seq SCX per-modality: 570 batches/s, 0.079 s TTFB.
+  # Measured Multiome SCX per-modality: 24 batches/s, 1.84 s TTFB.
+  - benchmark: multimodal_training
+    format: scx_multimodal_per_modality_auto
+    dataset: cite_seq_pbmc_5k
+    metric: batches_per_sec
+    min: 285         # 0.5× measured 570
+  - benchmark: multimodal_training
+    format: scx_multimodal_per_modality_auto
+    dataset: cite_seq_pbmc_5k
+    metric: time_to_first_batch_s
+    max: 0.2         # ~2.5× measured 0.079s; absorbs cold-cache jitter
+  - benchmark: multimodal_training
+    format: scx_multimodal_per_modality_auto
+    dataset: multiome_pbmc_10k
+    metric: batches_per_sec
+    min: 12          # 0.5× measured 24
+  - benchmark: multimodal_training
+    format: scx_multimodal_per_modality_auto
+    dataset: multiome_pbmc_10k
+    metric: time_to_first_batch_s
+    max: 4.0         # ~2.2× measured 1.84s
+
+# ---------------------------------------------------------------------------
+# Deferred floors — known gaps tracked here so operators can see what's
+# missing and why. Add entries above this block once the blockers below
+# resolve; do NOT add them under `absolute_floors` until then, as the
+# gate would synthesise "missing metric" violations on every run.
+# ---------------------------------------------------------------------------
+#
+# 1. ml_loader / slaf throughput + TTFB floors
+#    Blocker: slafpy lives in a separate `scx-bench-slaf` conda env;
+#    the orchestrator activates exactly one env per gate run, so a
+#    single-env capture never produces slaf rows in the same snapshot
+#    as the rest. A floor here would synthesise a "missing metric"
+#    violation on every run from `scx-bench`. Revisit once the
+#    orchestrator supports per-runner env activation (or once slafpy
+#    is reachable from `scx-bench` without a transitive breakage).
+#
+# 2. accel_gpu_train / avg_gpu_util_pct__gpu_train floors
+#    Blocker: the current sampler runs `nvidia-smi dmon` at 1 Hz, which
+#    misses sub-second epoch boundaries on small fixtures (pbmc10k:
+#    ~30–60 ms per batch). The reported avg_util_pct under-counts the
+#    real utilisation by 20–50%, depending on epoch geometry. A floor
+#    on the under-counted value would either tolerate genuine
+#    underutilisation (set high) or false-positive on healthy runs
+#    (set low). Need an in-process CUDA event sampler that ticks at
+#    >= the kernel launch rate before a floor is safe.
+#
+# 3. cell_eval_parity_perf / census_1m floors
+#    Blocker: the cell-eval reference's energy_distance variants are
+#    O(N²) in n_obs and infeasible at >= 500K cells (would take days
+#    on the reference path even though SCX completes in minutes). The
+#    parity benchmark skips these variants at `n_obs >= 500K` —
+#    floors there would surface as missing-metric violations. Revisit
+#    if cell-eval upstream lands a streaming energy_distance, or if
+#    we accept "no reference comparison at census scale" and gate
+#    only on the SCX side wall-time / RSS (a different metric than
+#    cell_eval_parity_perf measures today).

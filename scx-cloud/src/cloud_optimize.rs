@@ -155,6 +155,12 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
 
     // 5. Copy sections in the specified order, recording new offsets/checksums
     let mut new_entries: Vec<FullCatalogEntry> = Vec::with_capacity(ordered_entries.len());
+    // Phase G.1a: track the modality table's new offset/length so the
+    // header can be updated to point at the post-cloud_optimize
+    // location. The struct-copy below preserves `n_modalities` and
+    // the has_modalities flag.
+    let mut modality_table_offset_new: u64 = 0;
+    let mut modality_table_length_new: u64 = 0;
 
     for &entry in &ordered_entries {
         // Pad to 8-byte alignment
@@ -188,6 +194,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         writer.write_all(section_data)?;
         write_offset += entry.length;
 
+        if entry.section_type == SectionType::ModalityTable {
+            modality_table_offset_new = new_offset;
+            modality_table_length_new = entry.length;
+        }
+
         // Recompute checksum (section bytes unchanged, so checksum matches)
         new_entries.push(FullCatalogEntry {
             name: entry.name.clone(),
@@ -195,6 +206,7 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
             length: entry.length,
             section_type: entry.section_type,
             checksum: entry.checksum,
+            modality_id: entry.modality_id,
             stats: entry.stats.clone(),
         });
     }
@@ -259,6 +271,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     new_header.front_catalog_offset = front_catalog_offset;
     new_header.front_catalog_length = front_catalog_size;
     new_header.set_front_catalog();
+    // Phase G.1a: cloud_optimize re-lays out sections, so the
+    // source's modality_table_offset is stale. Point at the new
+    // location (or 0 if the source had none).
+    new_header.modality_table_offset = modality_table_offset_new;
+    new_header.modality_table_length = modality_table_length_new;
     new_header.file_checksum = 0;
 
     writer.seek(SeekFrom::Start(0))?;
@@ -342,7 +359,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: 1,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -364,7 +381,10 @@ mod tests {
             file_checksum: 0,
             front_catalog_offset: 0,
             front_catalog_length: 0,
-            reserved: [0u8; 132],
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
         }
     }
 

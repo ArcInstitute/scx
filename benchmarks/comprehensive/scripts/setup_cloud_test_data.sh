@@ -32,15 +32,52 @@
 
 set -euo pipefail
 
+# Auto-load .env when invoked without `set -a; source .env` first. Plain
+# `source .env` doesn't export the unprefixed assignments, so a fresh
+# `bash setup_cloud_test_data.sh` subshell inherits nothing — that hits a
+# 14 s IMDS retry timeout per push call and exits 1 on the first fixture.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}${SCX_WORK_DIR:-}" && -f "$REPO_ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/.env"
+    set +a
+fi
+
 BUCKET="${GCS_TEST_BUCKET:-gs://arc-ctc-nextflow/scx-test}"
-DATA_DIR="${SCX_WORK_DIR:-/large_storage/arcinfra/projects/scx/benchmarks/datasets}"
+# `.env` sets SCX_WORK_DIR to the project root (`…/scx`). The actual
+# fixture directory is `…/scx/benchmarks/datasets`. Honour SCX_DATA_DIR
+# when explicitly set (matches config.py's resolution order); otherwise
+# derive from SCX_WORK_DIR with the standard `benchmarks/datasets` suffix
+# so a fresh `.env` works without further configuration.
+if [[ -n "${SCX_DATA_DIR:-}" ]]; then
+    DATA_DIR="$SCX_DATA_DIR"
+elif [[ -n "${SCX_WORK_DIR:-}" ]]; then
+    DATA_DIR="$SCX_WORK_DIR/benchmarks/datasets"
+else
+    DATA_DIR="/large_storage/arcinfra/projects/scx/benchmarks/datasets"
+fi
 DRY_RUN="${DRY_RUN:-0}"
+
+# pyscx.push uses object_store's GoogleCloudStorageBuilder::from_env(), which
+# recognizes GOOGLE_SERVICE_ACCOUNT_PATH but not GOOGLE_APPLICATION_CREDENTIALS
+# directly — without IMDS reachability (off-GCE hosts), missing the explicit
+# var causes a 14s timeout retrying the metadata server before failing. Bridge
+# the two when only GAC is set.
+if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -z "${GOOGLE_SERVICE_ACCOUNT_PATH:-}" ]]; then
+    export GOOGLE_SERVICE_ACCOUNT_PATH="$GOOGLE_APPLICATION_CREDENTIALS"
+fi
 
 # (dataset_name, local_dir_or_file, cloud_suffix) — cloud_suffix matches
 # the ``_FORMAT_KEY_TO_CLOUD_SUFFIX`` map in config.py.
 SMALL_FIXTURES=(
     "pbmc3k:pbmc3k_auto.scx:.scxd"
+    "pbmc10k:pbmc10k_auto.scx:.scxd"
+    "smartseq2:smartseq2_auto.scx:.scxd"
     "tabula_sapiens_100k:tabula_sapiens_100k_auto.scx:.scxd"
+    "census_500k:census_500k_auto.scx:.scxd"
+    "census_1m:census_1m_auto.scx:.scxd"
 )
 
 # Large atlas fixture for F.5. Adjust the local path once the atlas is

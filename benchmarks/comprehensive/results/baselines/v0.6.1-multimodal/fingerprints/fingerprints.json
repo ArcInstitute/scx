@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "note": "multimodal baseline; accelerator fingerprints inherited from prior baseline (skipped on capture)"
+  },
+  "timings_seconds": {},
+  "fingerprints": {}
+}

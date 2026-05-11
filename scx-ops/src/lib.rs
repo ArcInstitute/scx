@@ -7,7 +7,7 @@ pub mod flock;
 pub mod merge;
 pub mod rollback;
 
-pub use append::append;
+pub use append::{append, append_for_modality};
 pub use compact::compact;
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};

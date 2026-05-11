@@ -82,6 +82,271 @@ BENCHMARK_NAMES = list(ALL_BENCHMARKS)
 # .h5ad on disk for pert_synth_*), so Phase A would fail — skip it.
 _NO_CONVERSION = {"write", "parallel_write_scaling", "cell_eval_parity_perf"}
 
+# Benchmarks that operate on multimodal h5mu sources. They expect
+# `dataset.multimodal=True` and a multimodal-aware format runner; pairing
+# them with single-modality datasets / formats is wasted scheduling.
+_MULTIMODAL_BENCHMARKS = {"multimodal_compression", "multimodal_training"}
+
+# Format keys that consume `.h5mu` (or write the multimodal SCX layout).
+# Non-multimodal benchmarks can't read these; multimodal benchmarks can't
+# read non-multimodal formats. Defined inline (not imported from config)
+# so this list stays a single source of truth for the orchestrator.
+_MULTIMODAL_FORMAT_PREFIXES = ("h5mu_", "zarr_mudata_", "scx_multimodal_")
+
+
+def _is_multimodal_format(format_key: str) -> bool:
+    return any(format_key.startswith(p) for p in _MULTIMODAL_FORMAT_PREFIXES)
+
+
+def _count_active_user_jobs() -> int:
+    """Return total PD+R jobs currently queued for the invoking user.
+
+    Used by ``_wait_under_pending_cap`` to throttle submissions when
+    Chimera's ``QOSMaxSubmitJobPerUserLimit`` (~500 per user) is
+    approaching. Falls back to 0 when ``squeue`` is unreachable
+    (running outside SLURM, or a misconfigured PATH) — disabling the
+    throttle is safer than blocking the orchestrator.
+    """
+    import os
+    import subprocess
+    user = os.environ.get("USER", "")
+    if not user:
+        return 0
+    try:
+        out = subprocess.check_output(
+            ["squeue", "-u", user, "-h", "-t", "PD,R", "--format=%i"],
+            text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return 0
+    return sum(1 for line in out.splitlines() if line.strip())
+
+
+# Cache for sacct state lookups in the wait loop. Populated on first
+# fallback to sacct; subsequent reads of the same job_id are free.
+_SACCT_STATE_CACHE: dict[str, str] = {}
+
+
+def _sacct_head_state(job_id: str) -> str:
+    """Return the normalised head-state token for a SLURM job_id via sacct.
+
+    Used as a fallback when ``submitit.Job.state`` returns empty —
+    that happens after a job has been reaped from squeue but before
+    ``.result()`` has been called. Without this fallback, the wait
+    loop falls through to ``.result()`` on a job whose result pickle
+    was never written (e.g. a TIMEOUT before the worker flushed
+    output), and submitit blocks indefinitely.
+
+    Caches the first non-empty result so a re-poll of the same id
+    is free. Empty return = no sacct row or unreachable slurm.
+    """
+    cached = _SACCT_STATE_CACHE.get(job_id)
+    if cached is not None:
+        return cached
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["sacct", "-X", "-j", job_id, "-P", "--noheader", "--format=State"],
+            text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return ""
+    line = next((l.strip() for l in out.splitlines() if l.strip()), "")
+    head = line.replace("+", " ").split()[0].upper() if line else ""
+    if head:
+        _SACCT_STATE_CACHE[job_id] = head
+    return head
+
+
+def _job_terminal_head(job: Any) -> str:
+    """Return the head-state token for a submitit job, with sacct fallback.
+
+    ``job.state`` returns the live SLURM state from squeue when the
+    job is still tracked; once reaped (a few minutes after a terminal
+    transition), it returns empty. Calling ``.result()`` on a
+    reaped-but-incomplete job hangs because submitit cannot determine
+    whether the missing result pickle means "not yet" or "never".
+    Falling back to ``sacct`` resolves the historical state.
+
+    Returns the first whitespace-/+-delimited token uppercased, e.g.
+    "TIMEOUT", "FAILED", "COMPLETED", or "" when slurm has no record.
+    """
+    try:
+        raw_state = job.state or ""
+    except Exception:
+        raw_state = ""
+    head = raw_state.replace("+", " ").split()[0].upper() if raw_state else ""
+    if not head:
+        job_id = getattr(job, "job_id", None)
+        if job_id:
+            head = _sacct_head_state(str(job_id))
+    return head
+
+
+def _cancel_dep_never_satisfied() -> int:
+    """Scancel jobs stuck in ``DependencyNeverSatisfied`` and return
+    the count cancelled.
+
+    Required for the throttle to make progress when an upstream
+    convert fails AFTER its dependent bench was already submitted —
+    those bench jobs sit in the queue forever (counting toward the
+    QOS cap) and would otherwise pin the throttle indefinitely.
+    Best-effort: silently ignores ``squeue`` / ``scancel`` errors so
+    a transient slurm hiccup doesn't crash the orchestrator.
+    """
+    import os
+    import subprocess
+    user = os.environ.get("USER", "")
+    if not user:
+        return 0
+    try:
+        out = subprocess.check_output(
+            ["squeue", "-u", user, "-h", "-t", "PD", "--format=%i %r"],
+            text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return 0
+    ids = [
+        line.split()[0]
+        for line in out.splitlines()
+        if "DependencyNeverSatisfied" in line
+    ]
+    if not ids:
+        return 0
+    try:
+        subprocess.run(
+            ["scancel", *ids],
+            timeout=30, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return 0
+    return len(ids)
+
+
+# Module-level state for `_wait_under_pending_cap`: tracks whether we
+# logged an active throttling episode so the per-submit calls don't
+# each emit their own "Throttling…/Resumed…" pair. The submit loops
+# fire ``_wait_under_pending_cap`` once per job — without dedup, every
+# near-cap step repeats the message, flooding the log when 1000+ jobs
+# cycle through the cap. A short cooldown after "Resumed" suppresses
+# spurious re-throttle emission when the queue oscillates around the
+# cap (sub-second; see _THROTTLE_RESUME_COOLDOWN_S below).
+_THROTTLE_STATE: dict[str, float] = {
+    "in_throttle": 0.0,        # 0.0 = not in throttle, else timestamp of throttle entry
+    "last_resumed_at": 0.0,    # monotonic timestamp of most recent "Resumed" log
+}
+_THROTTLE_RESUME_COOLDOWN_S = 60.0  # don't re-log "Throttling" within 60s of resume
+
+
+def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
+    """Block until ``squeue`` reports fewer than ``cap`` PD+R jobs.
+
+    No-op when ``cap <= 0`` (throttle disabled). Polls every 30s.
+    Auto-cancels jobs stuck in ``DependencyNeverSatisfied`` (zombies
+    from upstream-convert failures that landed AFTER the bench
+    submitted) so the queue can drain — without this, a single failed
+    slaf / parquet / bpcells convert can pin hundreds of dependents
+    and stall the orchestrator for hours. ``kind`` is a label
+    ("convert" or "bench") embedded in the wait message.
+
+    Logging contract: at most one "Throttling…" line per *episode*
+    (consecutive calls returning before submitting a new job do not
+    re-log), and one "Resumed…" line when the episode actually ends.
+    Steady-state cycles (queue oscillates around cap as jobs land)
+    therefore produce a single throttle entry per logical pause, not
+    one per submit.
+    """
+    import time as _time
+    if cap <= 0:
+        return
+
+    now = _time.monotonic()
+
+    # Fast path: queue is below cap. Emit "Resumed" once when we exit
+    # a logged throttling episode; subsequent calls stay silent. The
+    # ``in_throttle`` slot is a timestamp (0.0 when not throttling) so
+    # a future log-line could surface elapsed-throttle duration; the
+    # boolean check is value-truthiness on the timestamp.
+    initial_active = _count_active_user_jobs()
+    if initial_active < cap:
+        if _THROTTLE_STATE["in_throttle"]:
+            logger.info(
+                "  Resumed %s submission (active=%d < cap=%d)",
+                kind, initial_active, cap,
+            )
+            _THROTTLE_STATE["in_throttle"] = 0.0
+            _THROTTLE_STATE["last_resumed_at"] = now
+        return
+
+    # At-cap. Decide whether this is a fresh throttle episode worth
+    # announcing or a near-immediate re-hit after a resume (queue
+    # oscillating around the cap during a submission burst). Re-hits
+    # within `_THROTTLE_RESUME_COOLDOWN_S` of the last resume are
+    # rolled into the same logical episode and stay silent.
+    is_fresh_episode = (
+        not _THROTTLE_STATE["in_throttle"]
+        and (now - _THROTTLE_STATE["last_resumed_at"]) > _THROTTLE_RESUME_COOLDOWN_S
+    )
+    if is_fresh_episode:
+        logger.info(
+            "  Throttling %s submission: active=%d >= cap=%d; "
+            "polling squeue every 30s until queue drops below cap.",
+            kind, initial_active, cap,
+        )
+        _THROTTLE_STATE["in_throttle"] = now
+    elif not _THROTTLE_STATE["in_throttle"]:
+        # Recent resume — suppress the log but still mark in-throttle
+        # so the matching "Resumed" line emits when we drain.
+        _THROTTLE_STATE["in_throttle"] = now
+
+    while True:
+        active = _count_active_user_jobs()
+        if active < cap:
+            # Don't log "Resumed" here — the next call into
+            # `_wait_under_pending_cap` will emit it via the fast
+            # path above. This keeps the resume message attached to
+            # the log line just before the next submission resumes,
+            # rather than appearing 30 s before any visible activity.
+            return
+        # At-cap: try to drain zombie deps before sleeping.
+        cancelled = _cancel_dep_never_satisfied()
+        if cancelled:
+            logger.info(
+                "  Cancelled %d DependencyNeverSatisfied job(s) to free "
+                "throttle slots; recheck immediately.",
+                cancelled,
+            )
+            continue
+        _time.sleep(30)
+
+
+def _triple_compatible(bench_name: str, ds_name: str, format_key: str) -> bool:
+    """True iff the (benchmark, dataset, format) triple is meaningful.
+
+    Filters at the launcher level so submitit doesn't spawn Phase A
+    convert jobs for incompatible pairings (e.g. accel_pca on a
+    multimodal dataset, or compression on the multimodal SCX layout).
+    Mirrors the inline accel / bench_csc rules in the Phase B loop;
+    factored out here because both Phase A (convert) and Phase B
+    (benchmark) need the same compatibility view.
+    """
+    ds = DATASETS.get(ds_name)
+    ds_is_multimodal = bool(ds and ds.multimodal)
+    fmt_is_multimodal = _is_multimodal_format(format_key)
+    bench_is_multimodal = bench_name in _MULTIMODAL_BENCHMARKS
+
+    # Multimodal datasets only pair with multimodal benchmarks +
+    # multimodal formats. Non-multimodal datasets never see multimodal
+    # benchmarks or formats.
+    if ds_is_multimodal != bench_is_multimodal:
+        return False
+    if ds_is_multimodal != fmt_is_multimodal:
+        return False
+    if bench_is_multimodal != fmt_is_multimodal:
+        return False
+    return True
+
 LOGS_DIR = PROJECT_ROOT / "benchmarks" / "comprehensive" / "logs" / "submitit"
 
 
@@ -174,6 +439,54 @@ def _slurm_setup_cmds() -> list[str]:
     # use MPI; tell srun so.
     mpi_none = "export SLURM_MPI_TYPE=none"
 
+    # Forward GCP credentials to the worker. ``cloud_*`` benchmarks
+    # (cloud_push / cloud_pull / cloud_read / cloud_metadata /
+    # cloud_filtered / cloud_reader_vs_pull / cost_model /
+    # cloud_large_atlas) need ``GOOGLE_APPLICATION_CREDENTIALS`` to
+    # auth against GCS — without it ~64 cloud cells per tier-small
+    # run fail with "anonymous gcsfs" / 401 errors. The orchestrator
+    # already loads it from `.env` (via bench_env.py + python-dotenv),
+    # but submitit doesn't propagate process-environment vars to
+    # SLURM workers, so we inject an explicit export here. Also
+    # tilde-expand the path because gcsfs / google-auth don't.
+    cloud_setup: list[str] = []
+    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if gac:
+        gac = os.path.expanduser(gac)
+        # Single-quote so spaces / special chars in the path don't
+        # explode the shell. Skip when the file isn't readable on
+        # the orchestrator side — the worker will inherit the same
+        # Weka filesystem, so unreadable here means unreadable there.
+        if os.path.isfile(gac):
+            cloud_setup.append(
+                f"export GOOGLE_APPLICATION_CREDENTIALS='{gac}'"
+            )
+            # pyscx.push / pull / open_cloud go through object_store's
+            # GoogleCloudStorageBuilder::from_env(), which recognises
+            # GOOGLE_SERVICE_ACCOUNT_PATH but does not auto-fall-back to
+            # GOOGLE_APPLICATION_CREDENTIALS. Off-GCE hosts otherwise pay a
+            # ~14 s IMDS retry timeout per push call before failing. Mirror
+            # GAC into GOOGLE_SERVICE_ACCOUNT_PATH unless the operator set
+            # one explicitly.
+            if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_PATH", "").strip():
+                cloud_setup.append(
+                    f"export GOOGLE_SERVICE_ACCOUNT_PATH='{gac}'"
+                )
+        else:
+            logger.warning(
+                "GOOGLE_APPLICATION_CREDENTIALS=%s does not exist; "
+                "cloud_* benchmark jobs will run unauthenticated.",
+                gac,
+            )
+    # Forward GCS bucket / project / region knobs from cloud_fixtures /
+    # config so the worker doesn't have to re-read `.env`.
+    for var in ("GCS_TEST_BUCKET", "GCP_PROJECT", "GCP_BUCKET_REGION",
+                "SCX_DATA_DIR", "SCX_WORK_DIR"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            val = os.path.expanduser(val) if "DIR" in var else val
+            cloud_setup.append(f"export {var}='{val}'")
+
     if "scx-bench" in conda_prefix:
         conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
         if not conda_base:
@@ -182,12 +495,14 @@ def _slurm_setup_cmds() -> list[str]:
         return [
             env_cleanup,
             mpi_none,
+            *cloud_setup,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
     return [
         env_cleanup,
         mpi_none,
+        *cloud_setup,
         f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
     ]
 
@@ -313,6 +628,18 @@ def _per_job_slurm_params(
         "mem_gb": mem,
         "timeout_min": timeout_min,
         "slurm_setup": _slurm_setup_cmds(),
+        # Submitit's ``executor.update_parameters`` mutates the
+        # executor's persistent state; values from a previous submit
+        # carry over to the next one unless explicitly cleared. This
+        # is a real bug in the wild — an SCX/ml_loader cell sets
+        # ``slurm_gres="gpu:1"`` and the very next CPU-only cell
+        # (e.g. ``ml_loader/h5ad_none/census_500k`` on
+        # ``cpu_high_mem``) inherits the gres request, fails sbatch
+        # with ``QOSMaxGRESPerJob`` (cpu_high_mem has no GPUs).
+        # Always emit an explicit ``slurm_gres`` (empty string when
+        # not needed) so each call fully overrides the executor's
+        # cached state.
+        "slurm_gres": "",
     }
     params.update(extra_slurm)
     return params
@@ -351,6 +678,18 @@ def main() -> None:
         or any(b == "bench_csc_dispatch" for b in (args.benchmarks or []))
         or any((fk or "").startswith("bench_csc__") for fk in (args.formats or []))
     )
+    # Multimodal benchmarks (Phase K) live outside PRIMARY_FORMATS —
+    # auto-include the multimodal format set whenever a multimodal
+    # benchmark is requested, mirroring `need_accel`. Without this,
+    # `--benchmarks multimodal_*` from `capture_baseline.py` (which
+    # never passes `--formats`) yields zero submissions because no
+    # h5mu / zarr_mudata / scx_multimodal_* format is in the default
+    # format pool.
+    from benchmarks.comprehensive.config import MULTIMODAL_FORMATS
+    need_multimodal = (
+        any(b in _MULTIMODAL_BENCHMARKS for b in (args.benchmarks or []))
+        or any(_is_multimodal_format(fk or "") for fk in (args.formats or []))
+    )
     pool = list(ALL_FORMATS)
     if need_accel:
         pool.extend(accel_formats())
@@ -361,8 +700,12 @@ def main() -> None:
         formats = pool
     elif args.include_additional:
         formats = list(ALL_FORMATS)
+    elif need_accel and need_multimodal:
+        formats = list(PRIMARY_FORMATS) + accel_formats() + list(MULTIMODAL_FORMATS)
     elif need_accel:
         formats = list(PRIMARY_FORMATS) + accel_formats()
+    elif need_multimodal:
+        formats = list(PRIMARY_FORMATS) + list(MULTIMODAL_FORMATS)
     else:
         formats = list(PRIMARY_FORMATS)
 
@@ -453,6 +796,14 @@ def main() -> None:
         for ds_name in datasets:
             cfg = DATASETS[ds_name]
             for fmt in formats:
+                # Skip incompatible pairings (multimodal dataset ↔
+                # single-modality format and vice versa). Sample any
+                # benchmark we plan to schedule on this dataset to
+                # decide compatibility — the convert phase only cares
+                # whether *some* benchmark in the run will use this
+                # (dataset, format) pair, which is the per-axis OR.
+                if cfg.multimodal != _is_multimodal_format(fmt.key):
+                    continue
                 key = (ds_name, fmt.key)
                 output_path = cfg.path_for_format(fmt.key)
 
@@ -475,6 +826,11 @@ def main() -> None:
                 params = _per_job_slurm_params(
                     args, ds_name, fmt.key, benchmark=None, is_conversion=True,
                 )
+                # Throttle: don't submit if the user's queue is at /
+                # near Chimera's QOSMaxSubmitJobPerUserLimit. Polls
+                # squeue and blocks until the queue drops below the
+                # cap. No-op when --max-pending-jobs <= 0.
+                _wait_under_pending_cap(args.max_pending_jobs, kind="convert")
                 executor.update_parameters(**params)
                 job = executor.submit(
                     _run_conversion,
@@ -496,6 +852,8 @@ def main() -> None:
         for ds_name in datasets:
             cfg = DATASETS[ds_name]
             for fmt in formats:
+                if cfg.multimodal != _is_multimodal_format(fmt.key):
+                    continue
                 path = cfg.path_for_format(fmt.key)
                 if path.exists():
                     conversion_paths[(ds_name, fmt.key)] = str(path)
@@ -537,6 +895,12 @@ def main() -> None:
                     # with accel / CSC dispatch variants either.
                     continue
 
+                # Multimodal pairings: multimodal benchmarks only run
+                # on multimodal datasets + multimodal formats; the
+                # inverse holds for single-modality benchmarks.
+                if not _triple_compatible(bench_name, ds_name, fmt.key):
+                    continue
+
                 key = (ds_name, fmt.key)
                 label = f"{bench_name}/{ds_name}/{fmt.key}"
 
@@ -550,6 +914,38 @@ def main() -> None:
                 if bench_name in _NO_CONVERSION:
                     conv_path = None
                 elif key in conv_jobs:
+                    # Short-circuit: if the convert job is already in
+                    # a terminal failure state, don't submit dependent
+                    # bench jobs. They'd just queue as
+                    # `DependencyNeverSatisfied`, eat throttle slots
+                    # for hours (each one counts toward Chimera's
+                    # QOSMaxSubmitJobPerUserLimit), and ultimately
+                    # cancel — wasted scheduler churn for zero
+                    # signal. ``state()`` is a lightweight squeue
+                    # query; submitit caches it. Treat anything in
+                    # FAILED / CANCELLED / TIMEOUT / NODE_FAIL as a
+                    # terminal failure.
+                    conv_state = ""
+                    try:
+                        conv_state = conv_jobs[key].state or ""
+                    except Exception:
+                        # Best-effort lookup; on transient squeue
+                        # failures fall through to normal submission.
+                        conv_state = ""
+                    # See the result-loop fast-fail for the rationale —
+                    # match the FIRST whitespace-/+-delimited token so
+                    # rich slurm states like "CANCELLED by 10024" or
+                    # "CANCELLED+0:0" land correctly.
+                    conv_head = (
+                        conv_state.replace("+", " ").split()[0].upper()
+                        if conv_state else ""
+                    )
+                    if conv_head in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}:
+                        logger.warning(
+                            "  SKIP %s: upstream convert %s already %s",
+                            label, conv_jobs[key].job_id, conv_state,
+                        )
+                        continue
                     dep_jobid = conv_jobs[key].job_id
                     conv_path = str(DATASETS[ds_name].path_for_format(fmt.key))
                 elif args.dry_run and key in dry_run_conv_keys:
@@ -579,6 +975,8 @@ def main() -> None:
                     extra = update_kwargs.get("slurm_additional_parameters", {}) or {}
                     extra = {**extra, "dependency": f"afterok:{dep_jobid}"}
                     update_kwargs["slurm_additional_parameters"] = extra
+                # Throttle: same QOS-cap respect as the convert loop.
+                _wait_under_pending_cap(args.max_pending_jobs, kind="bench")
                 executor.update_parameters(**update_kwargs)
                 job = executor.submit(
                     _run_benchmark,
@@ -658,7 +1056,67 @@ def main() -> None:
         logger.info("Waiting for %d benchmark jobs...", len(bench_jobs))
         t0 = time.perf_counter()
         done, failed, dep_failed = 0, 0, 0
-        for label, job, conv_key in bench_jobs:
+        # Periodically scancel jobs stuck in
+        # `DependencyNeverSatisfied` while we wait. Without this, a
+        # convert that fails AFTER its dependents were submitted
+        # leaves them queued forever — `job.result()` blocks
+        # indefinitely on a still-PD slurm job, so the orchestrator
+        # would hang here for hours. Cleaning periodically lets
+        # `.result()` advance (cancelled → FailedJobError → counted
+        # as dep_failed). We sweep every N completed jobs to amortise
+        # the squeue cost; ``check_freq`` mirrors the throttle's 30s
+        # cadence at typical 1-job-per-second drain rates.
+        check_freq = max(1, min(len(bench_jobs) // 20, 25))
+        for idx, (label, job, conv_key) in enumerate(bench_jobs):
+            if args.max_pending_jobs > 0 and idx % check_freq == 0:
+                cancelled = _cancel_dep_never_satisfied()
+                if cancelled:
+                    logger.info(
+                        "  [result-wait] cancelled %d zombie "
+                        "DependencyNeverSatisfied job(s); .result() "
+                        "calls on those will surface as dep_failed.",
+                        cancelled,
+                    )
+            # Fast-path: submitit's `.result()` on a CANCELLED job
+            # spins for ~15s per call (it polls slurm's pickle output
+            # with backoff before declaring failure). Across thousands
+            # of cancelled jobs that's hours of wall-time. Short-
+            # circuit by checking ``job.state`` first — when in a
+            # terminal failure state, raise immediately so the existing
+            # try/except classifies it and we move on.
+            #
+            # SLURM (via sacct) returns rich state strings, not bare
+            # codes:
+            #   "CANCELLED by 10024"        — user-cancelled
+            #   "CANCELLED+0:0"             — cancelled with exit
+            #   "FAILED"                    — runtime error
+            #   "TIMEOUT"                   — wallclock exceeded
+            #   "NODE_FAIL"                 — node died
+            #   "OUT_OF_MEMORY"             — OOM
+            #   "PREEMPTED"                 — preempted (cpu_preemptible)
+            # Match on the FIRST whitespace-/+-delimited token so all
+            # variants land correctly (the previous exact-set match
+            # silently fell through on "CANCELLED by 10024", causing
+            # ~15 s/job slow drains across thousands of cancelled
+            # jobs in earlier rounds).
+            #
+            # ``_job_terminal_head`` falls back to ``sacct`` when
+            # ``job.state`` returns empty — that arises when the job
+            # has been reaped from squeue and a bare ``.result()``
+            # would hang because submitit can't find a result pickle
+            # (typical after TIMEOUT, where the worker is killed
+            # mid-flush). Sacct yields the recorded historical state
+            # so the fast-fail predicate still fires.
+            head = _job_terminal_head(job)
+            if head in {"CANCELLED", "TIMEOUT", "NODE_FAIL", "FAILED", "OUT_OF_MEMORY", "PREEMPTED"}:
+                logger.warning("  FAST_FAIL: %s -> state=%s", label, head)
+                if conv_key is not None and conv_key in conv_jobs:
+                    conv_head = _job_terminal_head(conv_jobs[conv_key])
+                    if conv_head in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}:
+                        dep_failed += 1
+                        continue
+                failed += 1
+                continue
             try:
                 job.result()
                 done += 1
@@ -806,6 +1264,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-smoke", action="store_true",
         help="Skip the pre-submit runner contract check (Phase I.8).",
+    )
+    parser.add_argument(
+        "--max-pending-jobs", type=int, default=400,
+        help="Throttle SLURM submission to keep total queued (PD+R) "
+             "jobs at or below this cap. Required on Chimera, where "
+             "QOSMaxSubmitJobPerUserLimit aborts sbatch around ~500 "
+             "active jobs per user. The launcher polls `squeue -u "
+             "$USER` between submissions and sleeps when the cap is "
+             "reached, resuming as jobs land or fail. Set to 0 to "
+             "disable throttling (legacy behaviour). Default: 400.",
     )
 
     return parser.parse_args()

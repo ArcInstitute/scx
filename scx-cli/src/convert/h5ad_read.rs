@@ -19,10 +19,20 @@ type CsrArrays = (Vec<i64>, Vec<i32>, Vec<f32>, usize, usize);
 
 /// Read the X matrix from an h5ad file, returning CSR arrays and shape.
 pub fn read_x_matrix(file: &hdf5::File, format: MatrixFormat) -> Result<CsrArrays, ConvertError> {
+    read_x_matrix_at(file, "X", format)
+}
+
+/// Read a sparse / dense matrix at an arbitrary group path (used by
+/// the h5mu pipeline for per-modality X at `mod/{name}/X`).
+pub fn read_x_matrix_at(
+    file: &hdf5::File,
+    path: &str,
+    format: MatrixFormat,
+) -> Result<CsrArrays, ConvertError> {
     match format {
-        MatrixFormat::Csr => read_sparse_matrix(file, "X", false),
-        MatrixFormat::Csc => read_sparse_matrix(file, "X", true),
-        MatrixFormat::Dense => read_dense_matrix(file, "X"),
+        MatrixFormat::Csr => read_sparse_matrix(file, path, false),
+        MatrixFormat::Csc => read_sparse_matrix(file, path, true),
+        MatrixFormat::Dense => read_dense_matrix(file, path),
     }
 }
 
@@ -473,24 +483,36 @@ fn drop_explicit_zeros(
     (new_indptr, new_indices, new_data, n_obs, n_vars)
 }
 
-/// Read obsm embeddings from h5ad file.
+/// Read obsm embeddings from h5ad file (root `/obsm`).
 pub fn read_obsm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, ConvertError> {
+    read_obsm_at(file, "obsm")
+}
+
+/// Read an obsm group at an arbitrary path (e.g. `mod/rna/obsm` for an
+/// h5mu file's per-modality embeddings). Returns the same
+/// `name -> RecordBatch` map as `read_obsm`. Missing groups return an
+/// empty map rather than an error so callers don't need to special-case
+/// modalities without obsm.
+pub fn read_obsm_at(
+    file: &hdf5::File,
+    path: &str,
+) -> Result<HashMap<String, RecordBatch>, ConvertError> {
     let mut result = HashMap::new();
-
-    let obsm_group = file.group("obsm")?;
+    let obsm_group = match file.group(path) {
+        Ok(g) => g,
+        Err(_) => return Ok(result),
+    };
     let member_names = obsm_group.member_names()?;
-
     for name in &member_names {
         match read_obsm_entry(&obsm_group, name) {
             Ok(batch) => {
                 result.insert(name.clone(), batch);
             }
             Err(e) => {
-                eprintln!("warning: skipping obsm/{name}: {e}");
+                eprintln!("warning: skipping {path}/{name}: {e}");
             }
         }
     }
-
     Ok(result)
 }
 
@@ -633,24 +655,35 @@ fn read_uns_entry(group: &hdf5::Group, name: &str) -> Result<serde_json::Value, 
     )))
 }
 
-/// Read layers from h5ad file.
+/// Read layers from h5ad file (root `/layers`).
 /// Returns a map of layer_name → (indptr, indices, data, n_obs, n_vars).
 pub fn read_layers(file: &hdf5::File) -> Result<HashMap<String, CsrArrays>, ConvertError> {
-    let mut result = HashMap::new();
-    let layers_group = file.group("layers")?;
-    let member_names = layers_group.member_names()?;
+    read_layers_at(file, "layers")
+}
 
+/// Read layers from a layer group at an arbitrary path (e.g.
+/// `mod/rna/layers` for an h5mu file's per-modality layers). Missing
+/// groups return an empty map.
+pub fn read_layers_at(
+    file: &hdf5::File,
+    path: &str,
+) -> Result<HashMap<String, CsrArrays>, ConvertError> {
+    let mut result = HashMap::new();
+    let layers_group = match file.group(path) {
+        Ok(g) => g,
+        Err(_) => return Ok(result),
+    };
+    let member_names = layers_group.member_names()?;
     for name in &member_names {
         match read_layer_entry(file, &layers_group, name) {
             Ok(data) => {
                 result.insert(name.clone(), data);
             }
             Err(e) => {
-                eprintln!("warning: skipping layer '{name}': {e}");
+                eprintln!("warning: skipping layer '{path}/{name}': {e}");
             }
         }
     }
-
     Ok(result)
 }
 
