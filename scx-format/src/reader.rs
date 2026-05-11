@@ -454,10 +454,9 @@ impl ScxReader {
 
     /// Read and assemble all CSR shards for the given modality into a
     /// single `ScxCsr`. Mirrors `read_all_csr_shards()` (the global
-    /// path) but filters catalog entries by `modality_id` and overrides
-    /// the assembled `n_cols` with the modality's `n_vars` (since the
-    /// file-level `header.n_vars` is the max across modalities, not
-    /// each modality's own count).
+    /// path) but filters catalog entries by `modality_id` and prefers
+    /// the modality table's `n_vars` over the assembled shard extent
+    /// for the returned `n_cols`.
     pub fn read_all_csr_shards_for(&self, modality_id: u8) -> Result<ScxCsr> {
         let shards = self.full_catalog.csr_shards_for_modality(modality_id);
         #[cfg(feature = "parallel")]
@@ -465,9 +464,12 @@ impl ScxReader {
         #[cfg(not(feature = "parallel"))]
         let assembled = self.assemble_shards(&shards)?;
 
-        // Patch n_cols to the modality's actual n_vars when available.
-        // For modality_id == 0 / single-modality v2 files the global
-        // header.n_vars matches, so this is a no-op.
+        // Writers now stamp `ShardHeader.n_minor` with the per-modality
+        // `n_vars` (see `ScxWriter::write_shard_inner`), so the
+        // assembled extent should already match `modality_info.n_vars`.
+        // The modality_info preference here is defensive — it lets us
+        // recover the correct shape from older multimodal files that
+        // pre-date that fix and stamped the file-wide max.
         let n_cols = match self.modality_info(modality_id) {
             Some(info) => info.n_vars as usize,
             None => assembled.shape.1,
@@ -851,9 +853,9 @@ impl ScxReader {
     fn read_csc_from_entry(&self, entry: &FullCatalogEntry) -> Result<ScxCsc> {
         let (indptr, indices, data) = self.read_shard_from_entry(entry)?;
         // For CSC: n_major == n_cols_in_shard, indices are global row
-        // indices in [0, n_obs). The shard header's n_minor is set to
-        // n_vars by the writer (since n_minor reuses the file's n_vars
-        // slot); the actual column count is len(indptr) - 1.
+        // indices in [0, n_obs). The shard header's n_minor field
+        // carries the file-wide `n_obs` (the unbound minor axis for
+        // CSC); the actual column count is `len(indptr) - 1`.
         let n_cols_in_shard = indptr.len().saturating_sub(1);
         let n_rows = self.header.n_obs as usize;
         Ok(ScxCsc::new_unchecked(

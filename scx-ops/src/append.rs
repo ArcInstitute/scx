@@ -399,7 +399,12 @@ pub fn append_for_modality(
             index_dtype: header.index_dtype,
             reserved_flags: [0; 3],
             n_major: shard_rows as u32,
-            n_minor: header.n_vars as u32,
+            // PR #68: use the target modality's n_vars (resolved
+            // above) rather than `header.n_vars` (which is the
+            // file-wide max across modalities). Required for v2
+            // multimodal files; identical to the legacy single-
+            // modality path where `target_n_vars == header.n_vars`.
+            n_minor: target_n_vars as u32,
             nnz: shard_nnz,
             global_offset: global_row_start,
             indptr_rel_offset,
@@ -426,14 +431,16 @@ pub fn append_for_modality(
         lock.write_all(&section_data)?;
         write_offset += section_length;
 
-        // append.rs always emits row-major CSR shards.
+        // append.rs always emits row-major CSR shards. Use the
+        // target modality's n_vars (PR #68) — see ShardHeader.n_minor
+        // above for rationale.
         let stats = compute_shard_stats(
             shard_values,
             value_encoding,
             scx_format::MajorAxis::Row,
             global_row_start,
             shard_rows as u64,
-            header.n_vars,
+            target_n_vars,
             shard_nnz,
         );
 

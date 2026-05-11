@@ -407,6 +407,14 @@ fn extract_modality(
     let csr = reader.read_all_csr_shards_for(modality_id)?;
     let var = reader.read_var_for(modality_id)?;
     let obs = reader.read_obs()?;
+    // PR #68: preserve metadata when extracting a single modality.
+    // Per-modality `uns/{name}` wins; fall back to the file-wide
+    // `uns` so a multimodal file with only one of the two still
+    // round-trips its annotations through `extract`.
+    let uns = reader
+        .read_uns_for(modality_id)
+        .ok()
+        .or_else(|| reader.read_uns().ok());
 
     let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
     let header = FileHeader {
@@ -481,6 +489,23 @@ fn extract_modality(
         )?;
         row_offset += shard_rows;
     }
+
+    // PR #68: preserve uns + provenance — `write_subset_scx` does this
+    // for filter/gene-index subsets; the modality-extraction path was
+    // dropping them silently.
+    if let Some(uns_data) = &uns {
+        writer.write_uns(uns_data)?;
+    }
+    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: "modality_extract".to_string(),
+        tool: format!("scx-cli {}", env!("CARGO_PKG_VERSION")),
+        params_json: serde_json::json!({ "modality": modality_name }).to_string(),
+        input_checksums: vec![],
+    }])?;
 
     writer.finish()?;
     println!(
@@ -931,6 +956,142 @@ mod tests {
             "uns should be preserved"
         );
         assert_eq!(roundtrip_uns["version"], 42, "uns values should round-trip");
+    }
+
+    /// Helper: build a 2-modality SCX file for the extract_modality
+    /// tests. `with_global_uns` / `with_rna_uns` control which uns
+    /// sections are written. Returns the input path and a clone of
+    /// whichever uns blob the caller asked to be written, for asserts.
+    #[allow(clippy::type_complexity)]
+    fn write_multimodal_test_file(
+        dir: &tempfile::TempDir,
+        global_uns: Option<serde_json::Value>,
+        rna_uns: Option<serde_json::Value>,
+    ) -> std::path::PathBuf {
+        use crate::test_utils::{sample_obs, sample_var};
+        use scx_format::modality::ModalityType;
+
+        let path = dir.path().join("multimodal_uns.scx");
+        // header.n_vars = max across modalities = 5.
+        let mut header = crate::test_utils::sample_header(3, 5);
+        header.n_vars = 5;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(3)).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(5)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(3)).unwrap();
+        writer.set_modality_n_vars(rna_id, 5).unwrap();
+        writer.set_modality_n_vars(adt_id, 3).unwrap();
+
+        // One small CSR shard per modality so the file is well-formed.
+        let indptr = vec![0u64, 1, 2, 3];
+        let indices = vec![0u32, 1, 2];
+        let values = vec![1u8, 2, 3];
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                scx_codec::ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        if let Some(u) = &global_uns {
+            writer.write_uns(u).unwrap();
+        }
+        if let Some(u) = &rna_uns {
+            writer.write_uns_for(rna_id, u).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// PR #68: `scx subset --modality NAME` (the `extract_modality`
+    /// path) must preserve `uns`, preferring the per-modality
+    /// `uns/{name}` over the file-wide `uns`, and must record a
+    /// `modality_extract` provenance entry. The pre-fix path silently
+    /// dropped both.
+    #[test]
+    fn test_extract_modality_prefers_modality_uns() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = serde_json::json!({"source": "global", "version": 1});
+        let rna = serde_json::json!({"source": "rna", "version": 42});
+        let input = write_multimodal_test_file(&dir, Some(global), Some(rna));
+
+        let output = dir.path().join("extracted_rna.scx");
+        extract_modality(&input, &output, "rna", 10000, "none").unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+
+        // Per-modality uns wins.
+        let roundtrip = reader.read_uns().unwrap();
+        assert_eq!(
+            roundtrip["source"], "rna",
+            "per-modality uns must win over global"
+        );
+        assert_eq!(roundtrip["version"], 42);
+
+        // Provenance entry recorded.
+        let prov = reader
+            .read_provenance()
+            .expect("extract_modality must write a provenance entry");
+        let extract = prov
+            .operations
+            .iter()
+            .find(|e| e.action == "modality_extract")
+            .expect("provenance must include a modality_extract action");
+        assert!(extract.params_json.contains("\"modality\""));
+        assert!(extract.params_json.contains("\"rna\""));
+    }
+
+    /// Fallback: only the global `uns` is set on the input → output
+    /// inherits that global uns (per-modality is absent for rna).
+    #[test]
+    fn test_extract_modality_falls_back_to_global_uns() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = serde_json::json!({"source": "global", "version": 7});
+        let input = write_multimodal_test_file(&dir, Some(global), None);
+
+        let output = dir.path().join("extracted_rna_global.scx");
+        extract_modality(&input, &output, "rna", 10000, "none").unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        let roundtrip = reader.read_uns().unwrap();
+        assert_eq!(roundtrip["source"], "global");
+        assert_eq!(roundtrip["version"], 7);
     }
 
     #[test]

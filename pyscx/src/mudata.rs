@@ -432,32 +432,55 @@ pub fn from_mudata_impl(
             .write_var_for(modality_id, &payload.var_batch)
             .map_err(to_pyerr)?;
 
-        // Single CSR shard per modality for now (Phase D MVP). The
-        // h5mu CLI pipeline shards by `shard_target_rows`; we should
-        // do the same here in a follow-on, but a single shard is a
-        // valid SCX layout and round-trips correctly.
-        let _ = shard_target_rows; // currently single-shard
-        let shard_indptr: Vec<u64> = payload.indptr.iter().map(|&v| v as u64).collect();
-        let shard_indices: Vec<u32> = payload
-            .indices
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| PyRuntimeError::new_err(format!("negative column index {v}")))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        // Shard each modality's CSR by `shard_target_rows` so the
+        // emitted file streams well at census scale. The single-modality
+        // `from_anndata` writer already shards; mirroring that here
+        // keeps multimodal training I/O on the same footing. Codec /
+        // value_encoding are detected once per modality (see comment
+        // above) and shared across all of that modality's shards —
+        // mixing codecs within one modality would defeat the
+        // biological routing rationale.
+        let total_rows = payload.indptr.len().saturating_sub(1);
+        let shard_target = shard_target_rows as usize;
+        let value_byte_size = value_encoding.byte_width();
+        let mut row_offset = 0usize;
+        while row_offset < total_rows {
+            let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
+            let shard_indptr_base = payload.indptr[row_offset] as u64;
+            let shard_indptr: Vec<u64> = payload.indptr[row_offset..=row_offset + shard_rows]
+                .iter()
+                .map(|&v| (v as u64) - shard_indptr_base)
+                .collect();
+            let shard_nnz = *shard_indptr.last().unwrap_or(&0);
+            let idx_start = shard_indptr_base as usize;
+            let idx_end = idx_start + shard_nnz as usize;
 
-        writer
-            .write_csr_shard_for(
-                modality_id,
-                &shard_indptr,
-                &shard_indices,
-                &raw_values_bytes,
-                codec_id,
-                value_encoding,
-                0,
-            )
-            .map_err(to_pyerr)?;
+            let shard_indices: Vec<u32> = payload.indices[idx_start..idx_end]
+                .iter()
+                .map(|&v| {
+                    u32::try_from(v)
+                        .map_err(|_| PyRuntimeError::new_err(format!("negative column index {v}")))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+
+            let val_start = idx_start * value_byte_size;
+            let val_end = idx_end * value_byte_size;
+            let shard_values = &raw_values_bytes[val_start..val_end];
+
+            writer
+                .write_csr_shard_for(
+                    modality_id,
+                    &shard_indptr,
+                    &shard_indices,
+                    shard_values,
+                    codec_id,
+                    value_encoding,
+                    row_offset as u64,
+                )
+                .map_err(to_pyerr)?;
+
+            row_offset += shard_rows;
+        }
 
         for (key, batch) in &payload.obsm {
             writer

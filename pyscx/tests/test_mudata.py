@@ -172,6 +172,55 @@ def test_from_mudata_per_modality_codec_routing(cite_seq_mudata):
         )
 
 
+def test_from_mudata_honors_shard_size():
+    """PR #68: `pyscx.from_mudata(..., shard_size=N)` must shard each
+    modality's CSR by N rows. The pre-fix code accepted the parameter
+    but emitted a single CSR shard per modality regardless.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs = 100
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(lam=0.5, size=(n_obs, 8)).astype(np.float32))
+    )
+    rna.var_names = [f"g{i}" for i in range(8)]
+    adt = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(lam=0.5, size=(n_obs, 4)).astype(np.float32))
+    )
+    adt.var_names = [f"a{i}" for i in range(4)]
+    mu = mudata.MuData({"rna": rna, "adt": adt})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sharded.scx")
+        pyscx.from_mudata(mu, path, shard_size=30)
+
+        reader = pyscx.open(path)
+        for name in ("rna", "adt"):
+            mid = reader.modality_id(name)
+            assert mid is not None
+            info = reader.modality_info(mid)
+            assert info is not None
+            # 100 rows / 30 per shard = ceil(100/30) = 4 shards.
+            assert info["n_csr_shards"] == 4, (
+                f"modality {name!r} should have 4 CSR shards at shard_size=30, "
+                f"got {info['n_csr_shards']}"
+            )
+
+        # Round-trip still produces bit-equal matrices.
+        mu_back = reader.to_mudata()
+        for name in ("rna", "adt"):
+            np.testing.assert_array_equal(
+                mu.mod[name].X.toarray(),
+                mu_back.mod[name].X.toarray(),
+                err_msg=f"{name!r} round-trip mismatch after sharded write",
+            )
+
+
 # --- Phase D.4: ScxBackedMuDataset ----------------------------------------
 
 
