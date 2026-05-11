@@ -456,7 +456,11 @@ fn extract_modality(
     let raw_values = value_encoding.encode_f32_batch(&csr.data)?;
 
     let shard_target = shard_size as usize;
-    let total_rows = (indptr.len() - 1).max(0);
+    // `indptr.len() - 1` would underflow on an empty indptr;
+    // `saturating_sub` matches the row-sharding template in
+    // pyscx::from_mudata and is also rust-1.95 clippy-clean
+    // (`unnecessary_min_or_max` flags the prior `.max(0)`).
+    let total_rows = indptr.len().saturating_sub(1);
     let mut row_offset = 0usize;
     while row_offset < total_rows {
         let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
