@@ -42,8 +42,12 @@ def test_append_honors_codec(query_adata, scx_from_adata):
     assert pyscx.open(path1).n_obs == original_n * 2
 
 
-def test_append_rejects_zero_shard_size(query_adata, scx_from_adata):
-    """P0 #1: pyscx.append / append_from_anndata reject shard_size=0 with ValueError."""
+def test_append_rejects_nonpositive_shard_size(query_adata, scx_from_adata):
+    """P0 #1 + P0 #9: pyscx.append / append_from_anndata reject shard_size <= 0
+    with ValueError before crossing into Rust. Covers both shard_size=0 and
+    negative integers (which previously would have surfaced as OverflowError
+    from pyo3 u32 extraction).
+    """
     import anndata
     import pandas as pd
     import pyscx
@@ -51,10 +55,17 @@ def test_append_rejects_zero_shard_size(query_adata, scx_from_adata):
     path1 = scx_from_adata(query_adata, "z1.scx")
     path2 = scx_from_adata(query_adata, "z2.scx")
 
+    # Zero case (P0 #1)
     with pytest.raises(ValueError, match="shard_size must be > 0"):
         pyscx.append(path1, path2, shard_size=0)
 
-    # Same check for append_from_anndata: must reject before any I/O.
+    # Negative case (P0 #9 — must be ValueError, not OverflowError)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append(path1, path2, shard_size=-1)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append(path1, path2, shard_size=-100)
+
+    # Same checks for append_from_anndata.
     n_new = 4
     n_vars = query_adata.n_vars
     dense = np.zeros((n_new, n_vars), dtype=np.float32)
@@ -69,6 +80,8 @@ def test_append_rejects_zero_shard_size(query_adata, scx_from_adata):
 
     with pytest.raises(ValueError, match="shard_size must be > 0"):
         pyscx.append_from_anndata(path1, new_adata, shard_size=0)
+    with pytest.raises(ValueError, match="shard_size must be > 0"):
+        pyscx.append_from_anndata(path1, new_adata, shard_size=-1)
 
 
 def test_append_from_anndata(query_adata, scx_from_adata):
