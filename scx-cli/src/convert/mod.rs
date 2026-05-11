@@ -1,5 +1,8 @@
 // h5ad/10x -> scx, scx -> h5ad conversion
 
+mod direction;
+pub(crate) use direction::determine_convert_direction;
+
 #[cfg(feature = "hdf5")]
 mod csc_transpose;
 #[cfg(feature = "hdf5")]

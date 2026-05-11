@@ -541,30 +541,7 @@ fn run_convert(
     csc_cols_per_shard: usize,
     modality: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Determine conversion direction from explicit flags or file extensions
-    let direction = match (from, to) {
-        // MTX conversions (always available, no hdf5 feature needed)
-        (Some("mtx"), _) => "mtx_to_scx",
-        (_, Some("mtx")) => "scx_to_mtx",
-        // Auto-detect: input is a directory → MTX
-        (None, None) if input.is_dir() => "mtx_to_scx",
-        // HDF5-based conversions
-        (Some("h5mu"), _) => "h5mu_to_scx",
-        (_, Some("h5mu")) => "scx_to_h5mu",
-        (Some("h5ad"), _) | (None, None) if input.extension().is_some_and(|e| e == "h5ad") => {
-            "h5ad_to_scx"
-        }
-        (None, None) if input.extension().is_some_and(|e| e == "h5mu") => "h5mu_to_scx",
-        (Some("10x"), _) | (None, None) if input.extension().is_some_and(|e| e == "h5") => {
-            "tenx_to_scx"
-        }
-        (_, Some("h5ad")) | (None, None) if input.extension().is_some_and(|e| e == "scx") => {
-            "scx_to_h5ad"
-        }
-        _ => {
-            return Err("Cannot determine conversion direction. Use --from/--to flags.".into());
-        }
-    };
+    let direction = convert::determine_convert_direction(from, to, input)?;
 
     // CSC mode is meaningful only on input → SCX paths. Reject silently
     // for output paths (h5ad / mtx) where the destination has no CSC
