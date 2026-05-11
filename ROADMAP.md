@@ -301,7 +301,13 @@ scGPT train end-to-end on atlas-scale SCX data.
   per-modality scoping.
 - [x] **Phase C**: catalog `modality_id: u8` field, per-modality
   filtering helpers (`csr_shards_for_modality`, etc.), bumped
-  `catalog_version = 2`.
+  `catalog_version = 2`. `FullCatalog::write_to` auto-upgrades
+  `catalog_version` to ≥2 on serialise so the on-disk header matches
+  the v2 stats layout that `ShardStats::write_to` always emits —
+  closes the 2026-05-10 symmetry bug where push-side re-serialisation
+  of a v1 catalog produced "v1 header / v2 stats" hybrids unreadable
+  by any code path (regression test
+  `catalog::tests::write_upgrades_v1_catalog_to_v2`).
 - [x] **Phase D**: CITE-seq / 10x Multiome / TEA-seq layout via
   `pyscx.from_mudata` / `to_mudata` and `scx convert --from h5mu`.
 - [x] **Phase E**: per-modality auto-codec via
@@ -530,6 +536,11 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 - [x] On-demand gate runs: `scripts/gate_candidate.py` one-shot captures a candidate snapshot and runs the gate against `results/baselines/LATEST`. Recommended trigger points (pre-PR / pre-merge / pre-release / on-suspicion) documented in `benchmarks/README.md`. Cron-based scheduling was explicitly deferred — no wasted compute when nothing changed, every gate result ties to a specific commit.
 - [x] JSON result diff against the canonical baseline via `compare_against_baseline.py --gate` (3% wall / 10% RSS / 1% size tolerances; absolute floors from `thresholds.yaml`; disappearing-benchmark detection; justification-markdown suppression with expiry dates).
 - [x] Rolling performance dashboard: `reporting/dashboard.py` emits `BENCHMARK_REPORT.html` alongside the markdown; `dashboard_history.json` threads "← previous snapshot" navigation. `publish_dashboard.py` rsyncs to a configurable static-hosting target (no-op when unset).
+- [x] **Variance-aware per-row timing tolerance** — when the baseline's `summary.json` carries `wall_s_iqr` per row, the gate widens the row's effective tolerance to `max(--timing-tolerance, --iqr-k * baseline_iqr / baseline_median)`. Replaces the prior flat 3% floor on rows whose intrinsic CV is higher than the floor (avoids false positives). Coverage and fallback counts surface in the markdown report header (`Timing IQR coverage: X/Y rows have wall_s_iqr; Z fall back to fixed P% tolerance`). Captured automatically when `capture_baseline.py` sees `n_runs >= 3`; `n_runs < 3` rows fall back to the fixed tolerance by design (IQR is unreliable on 2 samples).
+- [x] **Justification suppression covers floors** — `(benchmark, format, dataset)` entries in `results/justifications/*.md` suppress both `is_regression` deltas and `absolute_floor` violations on the same triple (previously only filtered regressions; floors silently failed the gate even when the triple was justified). Floors marked `| suppressed |` in the markdown report rather than dropped, so operators see what was waived. Deferred floors documented in `thresholds.yaml` § "Deferred floors".
+- [x] **TIMEOUT-handling robustness** — `run_parallel.py`'s wait loop falls back to `sacct -X -j <id>` when `submitit.Job.state` returns empty (post-squeue-reap), so a job that timed out before writing its result pickle no longer hangs `.result()` indefinitely. 12 hermetic tests in `test_run_parallel_timeout.py` cover the head-state normalisation + reap-sequence handling.
+- [x] **Cloud preflight** — `gate_candidate.py --probe-cloud` (opt-in) does one `fsspec.filesystem('gs').ls(<bucket>)` + one `pyscx.open_cloud(<probe_url>)` in <30 s before any sbatch. Catches missing/mismatched `gcsfs` and catalog-format bugs (the two recurring pre-run failure modes from the 2026-05 firefight: 24 zarr cloud FAST_FAILs and 158 SCX cloud FAST_FAILs respectively) before they cascade into the live gate.
+- [x] **Fixture re-conversion workflow** — `benchmarks/scripts/reconvert_fixtures.py` is the canonical entry point for rebuilding derived SCX / Zarr / TileDB local files (and their cloud-pushed copies) after a source h5ad fixture change. Default matrix: all datasets × `{scx_auto, tiledb_soma, zarr_zstd}`. `--cloud-push` invalidates the prior `.blake3` completion sidecar before re-uploading so `ensure_cloud_fixture`'s short-circuit doesn't skip fresh data. Replaces the ad-hoc `/tmp/reconvert_stale.py` from the 2026-05 campaign.
 
 ### Go/No-Go Gate — Phase 5
 - [x] Comprehensive cloud benchmark suite runs to completion on GCS via the unified launcher (`run_parallel.py --benchmarks cloud_*`).
