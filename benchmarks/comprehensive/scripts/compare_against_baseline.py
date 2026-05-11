@@ -238,11 +238,6 @@ def diff_summaries(
     cur_rows = current_summary.get("rows", {})
     all_keys = sorted(set(base_rows) | set(cur_rows))
 
-    # Surface "baseline lacks variance metadata" exactly once, even if
-    # hundreds of rows are missing the field. Spamming per row just makes
-    # the gate output unreadable.
-    iqr_missing_warned = False
-
     for key in all_keys:
         try:
             bench, fmt, dataset = key.split("__", 2)
@@ -271,17 +266,7 @@ def diff_summaries(
             row_default_tol = default_tol
             if metric == "median_wall_s" and b is not None and b > 0:
                 b_iqr = base.get("wall_s_iqr")
-                if b_iqr is None:
-                    if not iqr_missing_warned:
-                        logger.warning(
-                            "baseline summary.json has no wall_s_iqr — "
-                            "falling back to fixed --timing-tolerance for "
-                            "all median_wall_s rows. Re-capture the baseline "
-                            "with a capture_baseline.py that records "
-                            "wall_s_iqr to enable variance-aware gating."
-                        )
-                        iqr_missing_warned = True
-                else:
+                if b_iqr is not None:
                     iqr_ratio = float(b_iqr) / float(b)
                     iqr_widened_tol = iqr_k * iqr_ratio
                     if iqr_widened_tol > row_default_tol:
@@ -672,15 +657,52 @@ def render_markdown(
     new_benchmarks = new_benchmarks or []
     floor_violations = floor_violations or []
 
-    noise_widened_count = sum(
-        1 for d in deltas
-        if d.metric == "median_wall_s" and d.noise_widened
-    )
+    # Per-row IQR coverage across all median_wall_s rows where the
+    # baseline carries a positive value. ``iqr_ratio`` is set in
+    # ``diff_summaries`` only when the baseline row has wall_s_iqr;
+    # absent rows fall back to the global ``--timing-tolerance``.
+    timing_eligible = [
+        d for d in deltas
+        if d.metric == "median_wall_s" and d.baseline is not None and d.baseline > 0
+    ]
+    iqr_covered = sum(1 for d in timing_eligible if d.iqr_ratio is not None)
+    iqr_missing = sum(1 for d in timing_eligible if d.iqr_ratio is None)
+    noise_widened_count = sum(1 for d in timing_eligible if d.noise_widened)
+
+    # Surface a single log warning when the baseline has rows missing
+    # wall_s_iqr, so operators know variance-aware gating isn't fully
+    # active. (The per-row breakdown lives in the markdown report
+    # above.) Total miss is suspicious — likely a baseline captured
+    # before SCHEMA_VERSION=2 — and surfaces a clear recapture hint.
+    if iqr_missing:
+        if iqr_covered == 0:
+            logger.warning(
+                "baseline summary.json has no wall_s_iqr on any of "
+                "%d eligible median_wall_s rows — using fixed "
+                "--timing-tolerance for all of them. Re-capture the "
+                "baseline with a capture_baseline.py that records "
+                "wall_s_iqr to enable variance-aware gating.",
+                iqr_missing,
+            )
+        else:
+            logger.info(
+                "baseline summary.json: %d/%d median_wall_s rows have "
+                "wall_s_iqr (variance-aware); %d fall back to fixed "
+                "--timing-tolerance (likely n_runs<3 by design — IQR "
+                "is undefined on 2 samples).",
+                iqr_covered, len(timing_eligible), iqr_missing,
+            )
 
     lines: list[str] = []
     lines.append("# Baseline Regression Report")
     lines.append("")
     lines.append(f"- Timing tolerance: {timing_tol * 100:.1f}%")
+    if timing_eligible:
+        lines.append(
+            f"- Timing IQR coverage: {iqr_covered}/{len(timing_eligible)} rows "
+            f"have wall_s_iqr (variance-aware); {iqr_missing} fall back to "
+            f"fixed {timing_tol * 100:.1f}% tolerance"
+        )
     if noise_widened_count:
         lines.append(
             f"- Timing rows widened by IQR (~): {noise_widened_count} "
@@ -697,7 +719,18 @@ def render_markdown(
     if flakiness_overrides_loaded:
         lines.append(f"- Flakiness overrides loaded: {flakiness_overrides_loaded}")
     if floor_violations:
-        lines.append(f"- Absolute-floor violations: {len(floor_violations)}")
+        suppressed_floor_count = sum(
+            1 for v in floor_violations
+            if (v.benchmark, v.fmt, v.dataset) in suppressed_triples
+        )
+        active_floor_count = len(floor_violations) - suppressed_floor_count
+        if suppressed_floor_count:
+            lines.append(
+                f"- Absolute-floor violations: {active_floor_count} "
+                f"({suppressed_floor_count} justification-suppressed)"
+            )
+        else:
+            lines.append(f"- Absolute-floor violations: {active_floor_count}")
     if new_benchmarks:
         lines.append(f"- New benchmarks (informational): {len(new_benchmarks)}")
     lines.append("")
@@ -778,14 +811,16 @@ def render_markdown(
     if floor_violations:
         lines.append("## Absolute-floor violations")
         lines.append("")
-        lines.append("| Benchmark | Format | Dataset | Metric | Threshold | Observed |")
-        lines.append("|---|---|---|---|---:|---:|")
+        lines.append("| Benchmark | Format | Dataset | Metric | Threshold | Observed | Status |")
+        lines.append("|---|---|---|---|---:|---:|---|")
         for v in floor_violations:
             obs = "missing" if v.observed is None else f"{v.observed:.3f}"
             op = ">=" if v.direction == "min" else "<="
+            suppressed_here = (v.benchmark, v.fmt, v.dataset) in suppressed_triples
+            status = "suppressed" if suppressed_here else "violated"
             lines.append(
                 f"| {v.benchmark} | {v.fmt} | {v.dataset} | {v.metric} | "
-                f"{op} {v.threshold:.3f} | {obs} |"
+                f"{op} {v.threshold:.3f} | {obs} | {status} |"
             )
         lines.append("")
 
@@ -1084,15 +1119,25 @@ def main() -> int:
         ))
 
     # Drop suppressed rows from the regression tally (only matters under
-    # --gate, since suppression set is empty otherwise).
+    # --gate, since suppression set is empty otherwise). The same
+    # suppression set also drops absolute-floor violations on the same
+    # (benchmark, format, dataset) — justifications cover both
+    # surfaces, since the floor metric and the regression metric on a
+    # triple share the same root cause when the triple itself is
+    # known-bad (e.g. v2 catalog workers2 path collapses both
+    # throughput floor AND timing regression).
     active_regressions = [
         d for d in deltas
         if d.is_regression
         and (d.benchmark, d.fmt, d.dataset) not in suppressed
     ]
+    active_floor_violations = [
+        v for v in floor_violations
+        if (v.benchmark, v.fmt, v.dataset) not in suppressed
+    ]
     if active_regressions:
         return 1
-    if floor_violations:
+    if active_floor_violations:
         return 1
     if fp_mismatches and not args.allow_fingerprint_drift:
         return 1

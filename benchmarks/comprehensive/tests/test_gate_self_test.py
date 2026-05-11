@@ -220,6 +220,74 @@ def test_absolute_floor_violation_fails_gate(tmp_path: Path) -> None:
     assert "Absolute-floor" in result.stdout or "floor" in result.stdout.lower()
 
 
+def test_absolute_floor_suppressed_by_justification(tmp_path: Path) -> None:
+    """A justification on (benchmark, format, dataset) suppresses both
+    regression and absolute-floor violations on that triple.
+
+    Without this, the existing ``index_plan_workers2_v2_catalog.md``
+    justification's metric-specific entries silently fail to suppress
+    the floor violations they were intended to cover (Triple parser
+    drops the ``metric`` field; the gate filters regressions by
+    (benchmark, format, dataset) but used to leave floors alone).
+    The fix: filter both surfaces by the same suppression set; mark
+    suppressed floors in the markdown report rather than dropping them
+    silently.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    thresh = tmp_path / "thresholds.yaml"
+    just = tmp_path / "justifications"
+    rows = {"cloud_push__scx_auto__pbmc3k": _row(1.0)}
+    _write_summary(base, rows)
+    _write_summary(cur, rows)
+    raw_dir = cur / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "cloud_push__scx_auto__pbmc3k.json").write_text(json.dumps({
+        "benchmark": "cloud_push",
+        "format": "scx_auto",
+        "dataset": "pbmc3k",
+        "runs": [
+            {"wall_s": 1.0, "extra": {"throughput_mbps": 12.3}},
+        ],
+    }))
+    thresh.write_text(
+        "absolute_floors:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    metric: throughput_mbps\n"
+        "    min: 50.0\n"
+    )
+    just.mkdir()
+    (just / "issue.md").write_text(
+        "---\n"
+        "triples:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "reason: Throughput regression accepted while upstream HTTP/2 bump lands.\n"
+        "---\n"
+    )
+
+    result = _run_gate(
+        "--thresholds", str(thresh),
+        "--justifications", str(just),
+        baseline=base, current=cur,
+    )
+    assert result.returncode == 0, (
+        f"justified floor violation must NOT fail the gate; "
+        f"stdout={result.stdout!r}"
+    )
+    # The violation is still surfaced in the report, marked suppressed.
+    assert "Absolute-floor violations: 0 (1 justification-suppressed)" in result.stdout, (
+        f"summary must distinguish active from suppressed floor violations; "
+        f"stdout={result.stdout!r}"
+    )
+    assert "| suppressed |" in result.stdout, (
+        f"per-row table must mark suppressed floors; stdout={result.stdout!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Loader / median / direction unit tests (hermetic, no subprocess).
 # ---------------------------------------------------------------------------
@@ -659,6 +727,42 @@ def test_missing_wall_iqr_falls_back_to_fixed_tolerance(tmp_path: Path) -> None:
     # WARN must fire exactly once across both rows.
     assert result.stderr.count("no wall_s_iqr") == 1, (
         f"missing-IQR WARN must fire once per gate run, not per row; "
+        f"stderr={result.stderr!r}"
+    )
+
+
+def test_partial_wall_iqr_coverage_reports_breakdown(tmp_path: Path) -> None:
+    """When SOME baseline rows have ``wall_s_iqr`` and others don't, the
+    report surfaces a coverage breakdown (X/Y rows variance-aware; Z fall
+    back). This distinguishes "baseline needs recapture" (0/Y covered)
+    from "some benchmarks only run n<3 times by design" (M/Y covered,
+    where M+Z=Y) — previously conflated under one alarming warning.
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    # Two rows: one with wall_s_iqr (variance-aware), one without
+    # (intrinsic fallback — n_runs<3).
+    _write_summary(base, {
+        "read_full__scx_auto__pbmc3k": _row(1.00, wall_iqr=0.05, n_runs=5),
+        "read_full__h5ad_none__pbmc3k": _row(2.00),
+    })
+    _write_summary(cur, {
+        "read_full__scx_auto__pbmc3k": _row(1.01),
+        "read_full__h5ad_none__pbmc3k": _row(2.01),
+    })
+
+    result = _run_gate(baseline=base, current=cur)
+    # Partial coverage surfaces in the markdown report (stdout). Stderr
+    # carries only WARNs by default; a partial-coverage INFO would only
+    # show with explicit log-level config, which most operators don't
+    # enable for the gate. The markdown is the durable artifact.
+    assert "Timing IQR coverage: 1/2 rows have wall_s_iqr" in result.stdout, (
+        f"markdown report must surface IQR coverage breakdown; "
+        f"stdout={result.stdout!r}"
+    )
+    # The all-rows-missing WARN must NOT fire on partial coverage.
+    assert "no wall_s_iqr on any of" not in result.stderr, (
+        f"partial coverage must not trigger the all-missing WARN; "
         f"stderr={result.stderr!r}"
     )
 

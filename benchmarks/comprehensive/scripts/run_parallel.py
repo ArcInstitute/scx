@@ -122,6 +122,67 @@ def _count_active_user_jobs() -> int:
     return sum(1 for line in out.splitlines() if line.strip())
 
 
+# Cache for sacct state lookups in the wait loop. Populated on first
+# fallback to sacct; subsequent reads of the same job_id are free.
+_SACCT_STATE_CACHE: dict[str, str] = {}
+
+
+def _sacct_head_state(job_id: str) -> str:
+    """Return the normalised head-state token for a SLURM job_id via sacct.
+
+    Used as a fallback when ``submitit.Job.state`` returns empty —
+    that happens after a job has been reaped from squeue but before
+    ``.result()`` has been called. Without this fallback, the wait
+    loop falls through to ``.result()`` on a job whose result pickle
+    was never written (e.g. a TIMEOUT before the worker flushed
+    output), and submitit blocks indefinitely.
+
+    Caches the first non-empty result so a re-poll of the same id
+    is free. Empty return = no sacct row or unreachable slurm.
+    """
+    cached = _SACCT_STATE_CACHE.get(job_id)
+    if cached is not None:
+        return cached
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["sacct", "-X", "-j", job_id, "-P", "--noheader", "--format=State"],
+            text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return ""
+    line = next((l.strip() for l in out.splitlines() if l.strip()), "")
+    head = line.replace("+", " ").split()[0].upper() if line else ""
+    if head:
+        _SACCT_STATE_CACHE[job_id] = head
+    return head
+
+
+def _job_terminal_head(job: Any) -> str:
+    """Return the head-state token for a submitit job, with sacct fallback.
+
+    ``job.state`` returns the live SLURM state from squeue when the
+    job is still tracked; once reaped (a few minutes after a terminal
+    transition), it returns empty. Calling ``.result()`` on a
+    reaped-but-incomplete job hangs because submitit cannot determine
+    whether the missing result pickle means "not yet" or "never".
+    Falling back to ``sacct`` resolves the historical state.
+
+    Returns the first whitespace-/+-delimited token uppercased, e.g.
+    "TIMEOUT", "FAILED", "COMPLETED", or "" when slurm has no record.
+    """
+    try:
+        raw_state = job.state or ""
+    except Exception:
+        raw_state = ""
+    head = raw_state.replace("+", " ").split()[0].upper() if raw_state else ""
+    if not head:
+        job_id = getattr(job, "job_id", None)
+        if job_id:
+            head = _sacct_head_state(str(job_id))
+    return head
+
+
 def _cancel_dep_never_satisfied() -> int:
     """Scancel jobs stuck in ``DependencyNeverSatisfied`` and return
     the count cancelled.
@@ -1038,22 +1099,19 @@ def main() -> None:
             # silently fell through on "CANCELLED by 10024", causing
             # ~15 s/job slow drains across thousands of cancelled
             # jobs in earlier rounds).
-            try:
-                raw_state = job.state or ""
-            except Exception:
-                raw_state = ""
-            head = raw_state.replace("+", " ").split()[0].upper() if raw_state else ""
+            #
+            # ``_job_terminal_head`` falls back to ``sacct`` when
+            # ``job.state`` returns empty — that arises when the job
+            # has been reaped from squeue and a bare ``.result()``
+            # would hang because submitit can't find a result pickle
+            # (typical after TIMEOUT, where the worker is killed
+            # mid-flush). Sacct yields the recorded historical state
+            # so the fast-fail predicate still fires.
+            head = _job_terminal_head(job)
             if head in {"CANCELLED", "TIMEOUT", "NODE_FAIL", "FAILED", "OUT_OF_MEMORY", "PREEMPTED"}:
-                logger.warning("  FAST_FAIL: %s -> state=%s", label, raw_state)
+                logger.warning("  FAST_FAIL: %s -> state=%s", label, head)
                 if conv_key is not None and conv_key in conv_jobs:
-                    try:
-                        conv_raw = conv_jobs[conv_key].state or ""
-                    except Exception:
-                        conv_raw = ""
-                    conv_head = (
-                        conv_raw.replace("+", " ").split()[0].upper()
-                        if conv_raw else ""
-                    )
+                    conv_head = _job_terminal_head(conv_jobs[conv_key])
                     if conv_head in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}:
                         dep_failed += 1
                         continue

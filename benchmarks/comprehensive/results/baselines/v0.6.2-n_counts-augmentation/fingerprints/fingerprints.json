@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "hostname": "GPU0F98",
+    "os": "Linux 5.15.0-176-generic",
+    "python_version": "3.13.13",
+    "numpy_version": "2.4.3",
+    "git_sha": "b1629eaf2974f517e0194ab1bcc1e7387393151a",
+    "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "rayon_num_threads": "1",
+    "pinned_seed": 42,
+    "pinned_threads": 1,
+    "blake3_available": true,
+    "pyscx_version": "unknown",
+    "scanpy_version": "1.12",
+    "anndata_version": "0.12.10",
+    "scipy_version": "1.17.1",
+    "dataset_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc3k.h5ad"
+  },
+  "timings_seconds": {
+    "pca": 0.5623795039718971,
+    "neighbors": 0.8104024139465764,
+    "umap": 1.1804439190309495,
+    "leiden": 0.07251551793888211,
+    "harmony": 0.3155100530711934,
+    "lisi": 0.2444397120270878
+  },
+  "fingerprints": {
+    "pca": {
+      "hash": "ca9946736c7918a663dded6a58156653279eb56a4ced30976c1321839d47e8b8",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "pca_variance_ratio": {
+      "hash": "0f32b4df7f24de04acb5b20a0d683f3075fca603ab4a7674fbe0cad19518b022",
+      "shape": [
+        20
+      ],
+      "dtype": "float64",
+      "nbytes": 160
+    },
+    "neighbors_distances": {
+      "hash": "df80cd0472ef503916b146e6e02d99b190549cda68b4dbb9f6ffe8c48a621af0",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "neighbors_connectivities": {
+      "hash": "c02b3ab26f9c96f1d559936a7e4d19dd99b790e3ed0e7fdb6dde14c12c50aa6e",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "umap": {
+      "hash": "46e0579c57d08f5bbef916f8c7285734315515611979f88c3c52982965c236f6",
+      "shape": [
+        2700,
+        2
+      ],
+      "dtype": "float32",
+      "nbytes": 21600
+    },
+    "leiden": {
+      "hash": "9773b46ff83e0dee6339c2dbf39fd090f7082fccec0081aa5867ae7991a869c8",
+      "shape": [
+        2700
+      ],
+      "dtype": "int32",
+      "nbytes": 10800
+    },
+    "harmony": {
+      "hash": "c96ac5d5173aab6d74cca14a5561d57df298b67a18a20d8a662858c973d1b4e7",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "lisi": {
+      "hash": "13ada82226901dd920fef38e6c1235be966c502f2739d14f254a6af5b7d3ec64",
+      "shape": [
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 21600
+    }
+  }
+}
