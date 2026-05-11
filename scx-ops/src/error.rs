@@ -61,9 +61,6 @@ pub enum OpsError {
     #[error("modality mismatch on merge: {detail}")]
     ModalityMismatch { detail: String },
 
-    #[error("invalid argument: {0}")]
-    InvalidArgument(String),
-
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }

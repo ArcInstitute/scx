@@ -66,13 +66,11 @@ fn resolve_codec_selection(
 
 /// Convert an OpsError to a Python exception.
 ///
-/// IncompatibleVars / InvalidArgument → ValueError (validation error).
+/// IncompatibleVars → ValueError (validation error).
 /// All other variants → RuntimeError.
 fn ops_to_pyerr(e: OpsError) -> PyErr {
     match &e {
-        OpsError::IncompatibleVars { .. } | OpsError::InvalidArgument(_) => {
-            PyValueError::new_err(e.to_string())
-        }
+        OpsError::IncompatibleVars { .. } => PyValueError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(e.to_string()),
     }
 }

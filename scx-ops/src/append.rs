@@ -188,28 +188,21 @@ pub fn append_for_modality(
             )));
         }
     }
-    let modality_name: Option<String> = if modality_id == 0 {
-        None
-    } else {
-        modality_table
-            .as_ref()
-            .and_then(|t| t.entries.get((modality_id - 1) as usize))
-            .map(|info| info.name.clone())
-    };
-
-    // Resolve the biological modality_type for codec auto-selection. For
-    // single-modality / legacy files (modality_id == 0), default to RNA.
-    // For per-modality append, look up the table entry; absence here is
-    // already rejected above, so the unwrap_or fallback is defensive.
-    let modality_type: ModalityType = if modality_id == 0 {
-        ModalityType::Rna
-    } else {
-        modality_table
-            .as_ref()
-            .and_then(|t| t.entries.get((modality_id - 1) as usize))
-            .map(|info| info.modality_type)
-            .unwrap_or(ModalityType::Rna)
-    };
+    // Resolve the target modality's info once. `info_of(0)` returns None
+    // (global / legacy files), so callers naturally fall back to defaults
+    // derived from the file header. For modality_id != 0 the entry is
+    // guaranteed to exist (out-of-range ids are rejected above); the
+    // `unwrap_or` fallbacks below are defensive.
+    let modality_info = modality_table.as_ref().and_then(|t| t.info_of(modality_id));
+    let modality_name: Option<String> = modality_info.map(|info| info.name.clone());
+    let modality_type: ModalityType = modality_info
+        .map(|info| info.modality_type)
+        .unwrap_or(ModalityType::Rna);
+    // Per-modality `n_vars` (used for codec auto-selection and index
+    // bounds checks) may differ from the file-wide max across modalities.
+    let target_n_vars: u64 = modality_info
+        .map(|info| info.n_vars)
+        .unwrap_or(header.n_vars);
 
     // Per-modality CSR shard count for naming. Global (modality_id == 0)
     // continues to use the file-wide `header.n_csr_shards`; per-modality
@@ -222,19 +215,6 @@ pub fn append_for_modality(
             .iter()
             .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
             .count() as u32
-    };
-
-    // Validate indices are within [0, n_vars). For per-modality
-    // append, `n_vars` is the chosen modality's `n_vars`, not the
-    // header's (which may be the file-wide max across modalities).
-    let target_n_vars: u64 = if modality_id == 0 {
-        header.n_vars
-    } else {
-        modality_table
-            .as_ref()
-            .and_then(|t| t.entries.get((modality_id - 1) as usize))
-            .map(|info| info.n_vars)
-            .unwrap_or(header.n_vars)
     };
     // P1 #11: mirror the writer-side `NVarsOverflow` guard
     // (scx-format/src/writer.rs:496) so an oversized n_vars fires
