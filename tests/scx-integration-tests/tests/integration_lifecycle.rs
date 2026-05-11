@@ -3,12 +3,13 @@
 //! Exercises the full contract across crate boundaries:
 //!   scx-format (write/read) → scx-ops (append/delete/compact/merge) → scx-engine (query)
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{AsArray, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
 use scx_format::reader::ScxReader;
 use scx_format::writer::ScxWriter;
@@ -162,8 +163,8 @@ fn test_full_lifecycle() {
             &indices,
             &values,
             ValueEncoding::Uint8,
-            CodecId::None,
-            10_000,
+            CodecSelection::Auto,
+            NonZeroU32::new(10_000).unwrap(),
         )
         .unwrap();
 
@@ -297,8 +298,8 @@ fn test_append_preserves_readability() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecId::None,
-        10_000,
+        CodecSelection::Auto,
+        NonZeroU32::new(10_000).unwrap(),
     )
     .unwrap();
 

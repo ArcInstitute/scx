@@ -1,16 +1,17 @@
 // Append operation: add new rows to an existing SCX file.
 
 use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecSelection, ValueEncoding};
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::modality::ModalityTable;
+use scx_format::modality::{ModalityTable, ModalityType};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::shard::{
@@ -34,8 +35,8 @@ pub fn append(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
-    codec_id: CodecId,
-    shard_target_rows: u32,
+    codec_selection: CodecSelection,
+    shard_target_rows: NonZeroU32,
 ) -> Result<()> {
     append_for_modality(
         target_path,
@@ -44,7 +45,7 @@ pub fn append(
         new_indices,
         new_values,
         value_encoding,
-        codec_id,
+        codec_selection,
         shard_target_rows,
         0,
     )
@@ -70,8 +71,8 @@ pub fn append_for_modality(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
-    _codec_id: CodecId,
-    shard_target_rows: u32,
+    codec_selection: CodecSelection,
+    shard_target_rows: NonZeroU32,
     modality_id: u8,
 ) -> Result<()> {
     let mut lock = FileLock::acquire_exclusive(target_path)?;
@@ -196,6 +197,20 @@ pub fn append_for_modality(
             .map(|info| info.name.clone())
     };
 
+    // Resolve the biological modality_type for codec auto-selection. For
+    // single-modality / legacy files (modality_id == 0), default to RNA.
+    // For per-modality append, look up the table entry; absence here is
+    // already rejected above, so the unwrap_or fallback is defensive.
+    let modality_type: ModalityType = if modality_id == 0 {
+        ModalityType::Rna
+    } else {
+        modality_table
+            .as_ref()
+            .and_then(|t| t.entries.get((modality_id - 1) as usize))
+            .map(|info| info.modality_type)
+            .unwrap_or(ModalityType::Rna)
+    };
+
     // Per-modality CSR shard count for naming. Global (modality_id == 0)
     // continues to use the file-wide `header.n_csr_shards`; per-modality
     // appends count only existing shards with that modality_id.
@@ -299,7 +314,7 @@ pub fn append_for_modality(
     let mut row_offset = 0usize;
 
     while row_offset < n_new_rows {
-        let shard_rows = std::cmp::min(shard_target_rows as usize, n_new_rows - row_offset);
+        let shard_rows = std::cmp::min(shard_target_rows.get() as usize, n_new_rows - row_offset);
         let shard_indptr_start = new_indptr[row_offset];
         let shard_indptr_end = new_indptr[row_offset + shard_rows];
         let shard_nnz = shard_indptr_end - shard_indptr_start;
@@ -325,8 +340,15 @@ pub fn append_for_modality(
         let val_end = idx_end * value_byte_size;
         let shard_values = &new_values[val_start..val_end];
 
-        // Per-shard codec selection (auto-select optimal codec for this shard's data)
-        let shard_codec = scx_format::select_codec(shard_values, value_encoding);
+        // Per-shard codec selection. `Auto` picks data- and modality-
+        // driven codecs per shard; `Explicit(c)` forces `c` for every
+        // appended shard.
+        let shard_codec = match codec_selection {
+            CodecSelection::Auto => {
+                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
+            }
+            CodecSelection::Explicit(c) => c,
+        };
 
         let shard_idx = old_per_modality_csr + new_shard_entries.len() as u32;
         // Per-modality shards follow the writer's `X/{name}/shard_{i}`

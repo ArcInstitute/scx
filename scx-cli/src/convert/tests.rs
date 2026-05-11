@@ -1,6 +1,7 @@
 // Integration tests for h5ad/10x conversion
 // All tests gated behind #[cfg(feature = "hdf5")] (in mod.rs)
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use arrow::array::Array;
@@ -1421,8 +1422,8 @@ fn test_append_for_modality_updates_table() {
         &new_indices,
         &new_values,
         scx_codec::ValueEncoding::Uint8,
-        scx_codec::CodecId::Scx1,
-        10000,
+        scx_codec::CodecSelection::Explicit(scx_codec::CodecId::Scx1),
+        NonZeroU32::new(10000).unwrap(),
         rna_id,
     )
     .unwrap();

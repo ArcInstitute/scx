@@ -44,6 +44,19 @@ impl CodecId {
     }
 }
 
+/// Caller-supplied codec choice for write operations that emit shards.
+///
+/// `Auto` defers per-shard codec selection to the writer (data- and
+/// modality-driven). `Explicit(c)` forces every emitted shard to use
+/// codec `c`. Distinguishing these avoids overloading `CodecId::None`
+/// as a sentinel for "auto-select" (`None` is a real codec: no
+/// compression).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecSelection {
+    Auto,
+    Explicit(CodecId),
+}
+
 /// Value encoding for the data array in a CSR shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueEncoding {

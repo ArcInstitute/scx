@@ -1,8 +1,9 @@
 // scx append — Append cells from another SCX file.
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
@@ -12,7 +13,7 @@ pub fn run_append(
     input: &Path,
     modality: Option<&str>,
     codec: &str,
-    shard_size: u32,
+    shard_size: NonZeroU32,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,25 +155,16 @@ pub fn run_append(
     // so we always pull from the global obs table).
     let new_obs = input_reader.read_obs()?;
 
-    // Resolve codec. Per-modality append uses the target modality's
-    // biological type for auto-codec routing.
-    let target_modality_type = if target_modality_id == 0 {
-        scx_format::ModalityType::Rna
-    } else {
-        target_reader
-            .modality_info(target_modality_id)
-            .map(|info| info.modality_type)
-            .unwrap_or(scx_format::ModalityType::Rna)
-    };
-    let codec_id = match codec {
-        "auto" => {
-            scx_format::select_codec_for_modality(&new_values, value_encoding, target_modality_type)
-        }
-        "none" => CodecId::None,
-        "scx1" => CodecId::Scx1,
-        "zstd" => CodecId::Zstd,
-        "lz4" => CodecId::Lz4Shuffle,
-        "pcodec" => CodecId::Pcodec,
+    // Resolve codec. `auto` defers per-shard modality-aware selection
+    // to append_for_modality; explicit names force that codec for every
+    // appended shard.
+    let codec_selection = match codec {
+        "auto" => CodecSelection::Auto,
+        "none" => CodecSelection::Explicit(CodecId::None),
+        "scx1" => CodecSelection::Explicit(CodecId::Scx1),
+        "zstd" => CodecSelection::Explicit(CodecId::Zstd),
+        "lz4" => CodecSelection::Explicit(CodecId::Lz4Shuffle),
+        "pcodec" => CodecSelection::Explicit(CodecId::Pcodec),
         other => {
             return Err(format!(
                 "unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
@@ -194,7 +186,7 @@ pub fn run_append(
         &new_indices,
         &new_values,
         value_encoding,
-        codec_id,
+        codec_selection,
         shard_size,
         target_modality_id,
     )?;
