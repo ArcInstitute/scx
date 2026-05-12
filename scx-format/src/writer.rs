@@ -696,9 +696,24 @@ impl ScxWriter {
             stats: Some(section.stats),
         });
 
-        if section.section_type == SectionType::CsrShard {
-            self.csr_shard_count += 1;
-            self.total_nnz += section.nnz;
+        match section.section_type {
+            SectionType::CsrShard => {
+                self.csr_shard_count += 1;
+                self.total_nnz += section.nnz;
+            }
+            SectionType::CscShard => {
+                // CSC shards count toward `n_csc_shards` so that
+                // `finish()` populates the header's `n_csc_shards` and
+                // `has_csc` flag bit. Without this, cloud
+                // pass-through paths (`cloud_optimize`, `pack`,
+                // `push`, `pull`) silently dropped CSC sidecars on
+                // copy.
+                self.csc_shard_count += 1;
+                // Don't add to total_nnz: CSC shards mirror the same
+                // values as CSR shards (different layout, same
+                // entries). Adding here would double-count nnz.
+            }
+            _ => {}
         }
 
         Ok(())
@@ -3560,5 +3575,159 @@ mod tests {
             .read_csc_columns_subset_for(rna_id, &[0u32, 2])
             .unwrap();
         assert!(rna_subset.shape.1 >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive tests (Patch 9): write_preencoded_shard CSC counting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preencoded_csc_shard_increments_csc_count() {
+        use crate::shard::{
+            BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
+        };
+        use scx_codec::{CodecId, EncodedShard, ValueEncoding};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc_preencoded.scx");
+
+        let mut header = sample_header();
+        header.n_obs = 3;
+        header.n_vars = 2;
+        header.nnz = 0;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        // First, write a normal CSR shard
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // Now craft a PreEncodedSection with section_type = CscShard
+        let csc_indptr = vec![0u64, 1, 3]; // 2 columns
+        let csc_indices = vec![0u32, 1, 2]; // 3 entries
+        let csc_values: Vec<u8> = vec![10, 20, 30];
+
+        let encoded = scx_codec::encode_shard(
+            &csc_indptr,
+            &csc_indices,
+            &csc_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            true,
+        )
+        .unwrap();
+
+        let block_index = BlockIndex {
+            entries: vec![BlockIndexEntry::new(0, 2, 0, 0, 0, 3).unwrap()],
+        };
+        let mut bi_buf = Vec::new();
+        block_index.write_to(&mut bi_buf).unwrap();
+
+        let sh = ShardHeader {
+            magic: SHARD_MAGIC,
+            shard_format_version: 1,
+            shard_type: 1, // CSC
+            codec_id: CodecId::None as u8,
+            value_encoding: ValueEncoding::Uint8 as u8,
+            index_dtype: 0,
+            reserved_flags: [0; 3],
+            n_major: 2,
+            n_minor: 3,
+            nnz: 3,
+            global_offset: 0,
+            indptr_rel_offset: SHARD_HEADER_SIZE as u32,
+            indptr_length: encoded.indptr_bytes.len() as u32,
+            indices_rel_offset: SHARD_HEADER_SIZE as u32 + encoded.indptr_bytes.len() as u32,
+            indices_length: encoded.indices_bytes.len() as u32,
+            values_rel_offset: SHARD_HEADER_SIZE as u32
+                + encoded.indptr_bytes.len() as u32
+                + encoded.indices_bytes.len() as u32,
+            values_length: encoded.values_bytes.len() as u32,
+            block_index_rel_offset: SHARD_HEADER_SIZE as u32
+                + encoded.indptr_bytes.len() as u32
+                + encoded.indices_bytes.len() as u32
+                + encoded.values_bytes.len() as u32,
+            block_index_length: bi_buf.len() as u32,
+            checksum: [0; 8], // dummy, we'll compute the real one
+        };
+        let mut hdr_buf = Vec::new();
+        sh.write_to(&mut hdr_buf).unwrap();
+
+        // Compute checksum from payload
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encoded.indptr_bytes);
+        payload.extend_from_slice(&encoded.indices_bytes);
+        payload.extend_from_slice(&encoded.values_bytes);
+        payload.extend_from_slice(&bi_buf);
+        let shard_checksum = crate::checksum::blake3_truncated_64(&payload);
+
+        // Rewrite header with correct checksum
+        let sh_corrected = ShardHeader {
+            checksum: shard_checksum,
+            ..sh
+        };
+        hdr_buf.clear();
+        sh_corrected.write_to(&mut hdr_buf).unwrap();
+
+        // Build full section for checksum
+        let mut full_section = Vec::new();
+        full_section.extend_from_slice(&hdr_buf);
+        full_section.extend_from_slice(&payload);
+        let section_checksum = crate::checksum::blake3_hash(&full_section);
+        let section_length = full_section.len() as u64;
+
+        let stats = compute_shard_stats(
+            &csc_values,
+            ValueEncoding::Uint8,
+            MajorAxis::Col,
+            0,
+            2,
+            3,
+            3,
+        );
+
+        let pre = PreEncodedSection {
+            encoded,
+            block_index_bytes: bi_buf,
+            header_buf: hdr_buf,
+            section_checksum,
+            section_length,
+            stats,
+            name: "X_csc_shard_0".to_string(),
+            section_type: SectionType::CscShard,
+            nnz: 3,
+        };
+
+        writer.write_preencoded_shard(pre).unwrap();
+        let final_path = writer.finish().unwrap();
+
+        // Verify the header now reports 1 CSC shard
+        let reader = crate::reader::ScxReader::open(&final_path).unwrap();
+        assert_eq!(
+            reader.csc_shard_count(),
+            1,
+            "write_preencoded_shard should count CSC shards"
+        );
+        assert_eq!(reader.header().n_csr_shards, 1);
+        assert_eq!(
+            reader.header().n_csc_shards,
+            1,
+            "header n_csc_shards should reflect the preencoded CSC shard"
+        );
+        assert!(
+            reader.header().has_csc(),
+            "header has_csc flag should be set after writing a CSC shard"
+        );
     }
 }

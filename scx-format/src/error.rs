@@ -88,8 +88,28 @@ pub enum ScxError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[error("allocation too large: requested {requested} bytes but only {available} bytes remain in section")]
+    AllocationTooLarge { requested: usize, available: usize },
+
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }
 
 pub type Result<T> = std::result::Result<T, ScxError>;
+
+/// Validate that a requested allocation does not exceed the remaining
+/// bytes in the enclosing section. Returns `ScxError::AllocationTooLarge`
+/// if `requested > section_remaining`.
+///
+/// Use this before every `Vec::with_capacity(n)` or `vec![0u8; n]` where
+/// `n` derives from an on-disk field to prevent a single malformed `u32`
+/// from requesting a multi-GB allocation.
+pub fn validate_allocation(requested: usize, section_remaining: usize) -> Result<()> {
+    if requested > section_remaining {
+        return Err(ScxError::AllocationTooLarge {
+            requested,
+            available: section_remaining,
+        });
+    }
+    Ok(())
+}

@@ -33,7 +33,7 @@ pub use codec_select::{
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
-pub use error::{Result, ScxError};
+pub use error::{validate_allocation, Result, ScxError};
 pub use header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,

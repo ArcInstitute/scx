@@ -495,6 +495,14 @@ impl FullCatalog {
         let n_obs = cur.read_u64::<LittleEndian>()?;
         let n_entries = cur.read_u32::<LittleEndian>()? as usize;
 
+        // Minimum serialized size of a single v2 catalog entry:
+        // 2 (name_len) + 0 (empty name) + 8 (offset) + 8 (length) +
+        // 1 (section_type) + 32 (checksum) + 1 (modality_id) +
+        // 2 (stats_len) = 54 bytes.
+        // v1 entries lack modality_id: 53 bytes. Use the smaller bound.
+        const MIN_ENTRY_BYTES: usize = 53;
+        crate::error::validate_allocation(n_entries.saturating_mul(MIN_ENTRY_BYTES), payload_len)?;
+
         let mut entries = Vec::with_capacity(n_entries);
         for _ in 0..n_entries {
             let name_len = cur.read_u16::<LittleEndian>()? as usize;
@@ -1402,5 +1410,37 @@ mod tests {
         assert_eq!(parsed.catalog_version, 2);
         assert_eq!(parsed.n_obs, v1.n_obs);
         assert_eq!(parsed.entries.len(), v1.entries.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive allocation cap tests (Patch 9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn catalog_rejects_oversized_n_entries() {
+        // Craft a minimal catalog payload with n_entries = u32::MAX.
+        // The catalog preamble is:
+        //   version(u16) + manifest_seq(u64) + prev_offset(u64) +
+        //   n_obs(u64) + n_entries(u32) = 30 bytes
+        // Plus 32 bytes trailing checksum = 62 bytes minimum.
+        let mut payload = Vec::new();
+        use byteorder::WriteBytesExt;
+        payload.write_u16::<LittleEndian>(2).unwrap(); // catalog_version
+        payload.write_u64::<LittleEndian>(1).unwrap(); // manifest_sequence
+        payload.write_u64::<LittleEndian>(0).unwrap(); // prev_catalog_offset
+        payload.write_u64::<LittleEndian>(100).unwrap(); // n_obs
+        payload.write_u32::<LittleEndian>(u32::MAX).unwrap(); // n_entries = absurd
+
+        // Append a dummy 32-byte checksum (verify_checksum = false).
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let total_len = payload.len();
+        let result = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false);
+        assert!(result.is_err(), "should reject oversized n_entries");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("allocation too large"),
+            "error should mention allocation: {err_msg}"
+        );
     }
 }
