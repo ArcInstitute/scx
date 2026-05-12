@@ -131,12 +131,8 @@ pub fn append(
     }
     drop(target_reader);
 
-    // Read CSR data
-    let csr = input_reader
-        .read_all_csr_shards()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    // Detect value encoding from first shard header
+    // Detect value encoding from the first source CSR shard header so we
+    // can resolve Scx1+float fallback before crossing into Rust.
     let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
     let value_encoding = if let Some(first_entry) = csr_entries.first() {
         let bytes = input_reader
@@ -151,43 +147,6 @@ pub fn append(
         return Err(PyRuntimeError::new_err("input file has no CSR shards"));
     };
 
-    // Convert i64 → u64 indptr (finding 9.2: validate non-negative).
-    let indptr: Vec<u64> = csr
-        .indptr
-        .iter()
-        .map(|&v| {
-            if v < 0 {
-                Err(PyRuntimeError::new_err(format!(
-                    "negative indptr value {v}"
-                )))
-            } else {
-                Ok(v as u64)
-            }
-        })
-        .collect::<PyResult<Vec<u64>>>()?;
-
-    // Convert i32 → u32 indices (finding 9.2: validate non-negative).
-    let indices: Vec<u32> = csr
-        .indices
-        .iter()
-        .map(|&v| {
-            if v < 0 {
-                Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
-            } else {
-                Ok(v as u32)
-            }
-        })
-        .collect::<PyResult<Vec<u32>>>()?;
-
-    // Encode f32 → raw LE bytes
-    let values_bytes = anndata::encode_values(&csr.data, value_encoding)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    // Read obs metadata
-    let obs = input_reader
-        .read_obs()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
     // Resolve codec selection. None / "auto" → CodecSelection::Auto.
     // Explicit Scx1 with non-integer encoding falls back to Zstd
     // (Scx1 only encodes integers).
@@ -195,15 +154,13 @@ pub fn append(
 
     let target_path = PathBuf::from(target);
     py.allow_threads(|| {
-        scx_ops::append(
+        scx_ops::append_from_reader(
             &target_path,
-            &obs,
-            &indptr,
-            &indices,
-            &values_bytes,
-            value_encoding,
+            &input_reader,
             codec_selection,
             shard_target_rows,
+            0,
+            0,
         )
     })
     .map_err(ops_to_pyerr)?;

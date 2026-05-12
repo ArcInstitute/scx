@@ -1874,3 +1874,359 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming append (append_from_reader) tests — P1 #15 (review §8.3)
+// ---------------------------------------------------------------------------
+
+/// Streaming append must produce a result indistinguishable from the
+/// bulk `append` path: same n_obs, same CSR contents, same obs.
+#[test]
+fn test_streaming_append_matches_bulk_append() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Two identical targets; two identical sources (single-shard).
+    let target_a = write_test_file(&dir, "stream_a_target.scx", 6, 10, 1);
+    let target_b = write_test_file(&dir, "stream_b_target.scx", 6, 10, 1);
+    let source = write_test_file(&dir, "stream_source.scx", 4, 10, 1);
+
+    // Bulk path: read source via read_all_csr_shards and call legacy append.
+    let src_reader = ScxReader::open(&source).unwrap();
+    let csr = src_reader.read_all_csr_shards().unwrap();
+    let bulk_indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
+    let bulk_indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
+    let bulk_values: Vec<u8> = csr.data.iter().map(|&v| v as u8).collect();
+    let src_obs = src_reader.read_obs().unwrap();
+    drop(src_reader);
+
+    scx_ops::append(
+        &target_a,
+        &src_obs,
+        &bulk_indptr,
+        &bulk_indices,
+        &bulk_values,
+        ValueEncoding::Uint8,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+    )
+    .unwrap();
+
+    // Streaming path: pass the source reader directly.
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target_b,
+        &src_reader,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let ra = ScxReader::open(&target_a).unwrap();
+    let rb = ScxReader::open(&target_b).unwrap();
+    assert_eq!(ra.n_obs(), 10);
+    assert_eq!(rb.n_obs(), 10);
+    let csr_a = ra.read_all_csr_shards().unwrap();
+    let csr_b = rb.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.shape, csr_b.shape);
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+    let obs_a = ra.read_obs().unwrap();
+    let obs_b = rb.read_obs().unwrap();
+    assert_eq!(obs_a.num_rows(), obs_b.num_rows());
+}
+
+/// Multi-shard source must round-trip into the target with correct global
+/// row offsets and shard count.
+#[test]
+fn test_streaming_append_multi_shard_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "stream_multi_target.scx", 4, 10, 1);
+    // Source has 4 shards of 25 rows each (100 total).
+    let source = write_test_file(&dir, "stream_multi_source.scx", 100, 10, 4);
+
+    let target_pre_shards = {
+        let r = ScxReader::open(&target).unwrap();
+        r.header().n_csr_shards
+    };
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let reader = ScxReader::open(&target).unwrap();
+    assert_eq!(reader.n_obs(), 104);
+    // Each source shard becomes one target shard (source rows ≤
+    // shard_target_rows), so we add 4 shards on top of the pre-existing.
+    assert_eq!(reader.header().n_csr_shards, target_pre_shards + 4);
+
+    // CSR readback over the whole file must reconstruct the appended rows
+    // in source order (global_offset monotonic).
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 104);
+}
+
+/// Streaming append must honour an explicit codec selection on every
+/// re-encoded shard, mirroring the bulk path's codec-respect test.
+#[test]
+fn test_streaming_append_respects_explicit_codec() {
+    let dir = tempfile::tempdir().unwrap();
+    // Target written with codec None; source likewise.
+    let target = write_test_file(&dir, "stream_codec_target.scx", 4, 10, 1);
+    let source = write_test_file(&dir, "stream_codec_source.scx", 8, 10, 2);
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        CodecSelection::Explicit(CodecId::Zstd),
+        NonZeroU32::new(16384).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    // Every appended shard (source had 2) must carry codec_id == Zstd.
+    let reader = ScxReader::open(&target).unwrap();
+    let appended: Vec<&scx_format::FullCatalogEntry> = reader
+        .catalog()
+        .shards(scx_format::section::SectionType::CsrShard)
+        .into_iter()
+        .filter(|e| e.stats.as_ref().map(|s| s.row_start >= 4).unwrap_or(false))
+        .collect();
+    assert!(!appended.is_empty(), "expected appended shards in catalog");
+    for entry in appended {
+        let bytes = reader.section_bytes(entry).unwrap();
+        let sh =
+            ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+        assert_eq!(
+            sh.codec_id,
+            CodecId::Zstd as u8,
+            "appended shard '{}' should be Zstd-encoded",
+            entry.name
+        );
+    }
+}
+
+/// Raw-copy fast path: when codec selection is Auto and source and
+/// target both use codec None / matching encoding / matching index dtype,
+/// the appended shard's payload bytes must equal the source payload
+/// (header diff only).
+#[test]
+fn test_streaming_append_raw_copy_fast_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "stream_raw_target.scx", 4, 10, 1);
+    let source = write_test_file(&dir, "stream_raw_source.scx", 8, 10, 1);
+
+    // Snapshot source payload bytes (header-stripped) before the append.
+    let source_payload: Vec<u8> = {
+        let r = ScxReader::open(&source).unwrap();
+        let shards = r
+            .catalog()
+            .shards(scx_format::section::SectionType::CsrShard);
+        assert_eq!(shards.len(), 1);
+        let bytes = r.section_bytes(shards[0]).unwrap();
+        bytes[SHARD_HEADER_SIZE..].to_vec()
+    };
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let reader = ScxReader::open(&target).unwrap();
+    // Locate the appended shard (row_start == 4).
+    let appended = reader
+        .catalog()
+        .shards(scx_format::section::SectionType::CsrShard)
+        .into_iter()
+        .find(|e| e.stats.as_ref().map(|s| s.row_start == 4).unwrap_or(false))
+        .expect("appended shard not found");
+    let bytes = reader.section_bytes(appended).unwrap();
+    assert_eq!(
+        &bytes[SHARD_HEADER_SIZE..],
+        source_payload.as_slice(),
+        "raw-copy fast path must leave payload bytes verbatim"
+    );
+
+    // Header must be patched: global_offset bumped, codec_id matches source's None.
+    let sh =
+        ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+    assert_eq!(sh.global_offset, 4);
+    assert_eq!(sh.codec_id, CodecId::None as u8);
+}
+
+/// Streaming append must drop CSC sidecars from the target, same as the
+/// bulk path.
+#[test]
+fn test_streaming_append_drops_csc_from_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_csc_test_file(&dir, "stream_csc_target.scx", 6, 8, 4);
+    let source = write_test_file(&dir, "stream_csc_source.scx", 4, 8, 1);
+
+    {
+        let r = ScxReader::open(&target).unwrap();
+        assert!(r.header().has_csc());
+    }
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let r = ScxReader::open(&target).unwrap();
+    assert_eq!(r.n_obs(), 10);
+    assert!(
+        !r.header().has_csc(),
+        "has_csc flag should be cleared after streaming append"
+    );
+    assert_eq!(r.header().n_csc_shards, 0);
+    let csc_count = r
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .count();
+    assert_eq!(csc_count, 0);
+}
+
+/// Streaming append into a per-modality target stamps the appended
+/// shard's `ShardHeader.n_minor` with the target modality's `n_vars`.
+#[test]
+fn test_streaming_append_multimodal() {
+    use scx_format::modality::ModalityType;
+    use scx_format::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_multimodal.scx");
+
+    let rna_n_vars: u64 = 30;
+    let adt_n_vars: u64 = 10;
+    let header = sample_header(4, rna_n_vars);
+
+    {
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(2)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(2)).unwrap();
+        writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+        writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+        let (rna_indptr, rna_indices, rna_values) = sample_shard_data(4, rna_n_vars as usize);
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &rna_indptr,
+                &rna_indices,
+                &rna_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        let (adt_indptr, adt_indices, adt_values) = sample_shard_data(4, adt_n_vars as usize);
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &adt_indptr,
+                &adt_indices,
+                &adt_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        writer.finish().unwrap();
+    }
+
+    // Source: a single-modality file with adt-compatible n_vars = 10.
+    let source = write_test_file(
+        &dir,
+        "stream_multimodal_source.scx",
+        2,
+        adt_n_vars as usize,
+        1,
+    );
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &path,
+        &src_reader,
+        CodecSelection::Auto,
+        NonZeroU32::new(16384).unwrap(),
+        2, // adt
+        0, // source is single-modality
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let adt_shards: Vec<&scx_format::FullCatalogEntry> = reader
+        .catalog()
+        .shards(SectionType::CsrShard)
+        .into_iter()
+        .filter(|e| e.modality_id == 2)
+        .collect();
+    assert_eq!(
+        adt_shards.len(),
+        2,
+        "adt should have 2 CSR shards after streaming append"
+    );
+    // The newly appended shard should have n_minor == adt_n_vars.
+    let appended = adt_shards
+        .iter()
+        .find(|e| e.stats.as_ref().map(|s| s.row_start == 4).unwrap_or(false))
+        .expect("appended adt shard not found");
+    let bytes = reader.section_bytes(appended).unwrap();
+    let sh =
+        ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+    assert_eq!(
+        sh.n_minor as u64, adt_n_vars,
+        "streaming-appended shard ShardHeader.n_minor should equal adt.n_vars"
+    );
+}

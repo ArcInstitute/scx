@@ -6,13 +6,14 @@ use std::path::Path;
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
-use scx_codec::{CodecSelection, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
 use scx_format::header::{FileHeader, HEADER_SIZE};
 use scx_format::modality::{ModalityTable, ModalityType};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
+use scx_format::reader::ScxReader;
 use scx_format::section::{align_to_8, SectionType};
 use scx_format::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
@@ -75,25 +76,7 @@ pub fn append_for_modality(
     shard_target_rows: NonZeroU32,
     modality_id: u8,
 ) -> Result<()> {
-    let mut lock = FileLock::acquire_exclusive(target_path)?;
-
-    // Read header
-    let mut header = {
-        lock.seek(SeekFrom::Start(0))?;
-        let mut buf = [0u8; HEADER_SIZE];
-        std::io::Read::read_exact(&mut lock, &mut buf)?;
-        FileHeader::read_from(&mut Cursor::new(&buf))?
-    };
-
-    // Read current full catalog
-    let old_catalog = {
-        let fc_offset = header.full_catalog_offset;
-        let fc_length = header.full_catalog_length;
-        lock.seek(SeekFrom::Start(fc_offset))?;
-        let mut buf = vec![0u8; fc_length as usize];
-        std::io::Read::read_exact(&mut lock, &mut buf)?;
-        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize, true)?
-    };
+    let (mut lock, prep) = prepare_append(target_path, modality_id)?;
 
     if new_indptr.is_empty() {
         return Ok(());
@@ -104,8 +87,6 @@ pub fn append_for_modality(
     }
 
     // Validate CSR shape invariants before touching any on-disk state.
-    // (These fire before the file has been modified, so the target file is
-    // untouched if any validation fails.)
     let expected_nnz = *new_indptr.last().expect("indptr is non-empty") as usize;
     if new_indices.len() != expected_nnz {
         return Err(OpsError::ShapeMismatch {
@@ -116,11 +97,7 @@ pub fn append_for_modality(
             ),
         });
     }
-    let value_byte_size = match value_encoding {
-        ValueEncoding::Uint8 => 1,
-        ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
-        ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
-    };
+    let value_byte_size = value_encoding_byte_width(value_encoding);
     if new_values.len() != expected_nnz * value_byte_size {
         return Err(OpsError::ShapeMismatch {
             detail: format!(
@@ -140,7 +117,6 @@ pub fn append_for_modality(
         }
     }
 
-    // obs schema / length must match the existing obs on disk.
     if new_obs.num_rows() != n_new_rows {
         return Err(OpsError::VarLengthMismatch {
             expected: n_new_rows,
@@ -148,13 +124,334 @@ pub fn append_for_modality(
         });
     }
 
-    let old_n_obs = header.n_obs;
-    let old_n_csr_shards = header.n_csr_shards;
-    let old_catalog_offset = header.full_catalog_offset;
+    if let Some(&max_idx) = new_indices.iter().max() {
+        if max_idx as u64 >= prep.target_n_vars {
+            return Err(OpsError::IndexOutOfBounds {
+                index: max_idx,
+                n_vars: prep.target_n_vars,
+            });
+        }
+    }
 
-    // Phase F.3: load the modality table on disk (if any) so we can
-    // (a) resolve the target modality's name for shard naming, and
-    // (b) update its per-modality counts before re-emitting it.
+    // Read existing obs and validate schema equivalence.
+    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
+    validate_obs_schema(&old_obs, new_obs)?;
+
+    // Seek to EOF for appending and run the per-chunk write loop.
+    let mut write_offset = lock.seek(SeekFrom::End(0))?;
+    let mut new_shard_entries: Vec<FullCatalogEntry> = Vec::new();
+    let mut total_new_nnz: u64 = 0;
+    let mut row_offset = 0usize;
+
+    while row_offset < n_new_rows {
+        let shard_rows = std::cmp::min(shard_target_rows.get() as usize, n_new_rows - row_offset);
+        let shard_indptr_start = new_indptr[row_offset];
+        let shard_indptr_end = new_indptr[row_offset + shard_rows];
+
+        // Extract shard-local indptr (rebased to 0)
+        let shard_indptr: Vec<u64> = new_indptr[row_offset..=row_offset + shard_rows]
+            .iter()
+            .map(|&v| v - shard_indptr_start)
+            .collect();
+
+        let idx_start = shard_indptr_start as usize;
+        let idx_end = shard_indptr_end as usize;
+        let shard_indices = &new_indices[idx_start..idx_end];
+        let val_start = idx_start * value_byte_size;
+        let val_end = idx_end * value_byte_size;
+        let shard_values = &new_values[val_start..val_end];
+
+        let shard_idx = prep.old_per_modality_csr + new_shard_entries.len() as u32;
+        let global_row_start = prep.old_n_obs + row_offset as u64;
+
+        let entry = write_csr_chunk(
+            &mut lock,
+            &mut write_offset,
+            &prep,
+            &shard_indptr,
+            shard_indices,
+            shard_values,
+            value_encoding,
+            codec_selection,
+            shard_idx,
+            global_row_start,
+        )?;
+        total_new_nnz += entry_nnz(&entry);
+        new_shard_entries.push(entry);
+
+        row_offset += shard_rows;
+    }
+
+    finalize_append(
+        target_path,
+        &mut lock,
+        prep,
+        &old_obs,
+        new_obs,
+        new_shard_entries,
+        total_new_nnz,
+        n_new_rows as u64,
+        write_offset,
+    )
+}
+
+/// Streaming SCX → SCX append.
+///
+/// Decodes one source CSR shard at a time (or copies its raw bytes verbatim
+/// when the codec / value encoding / index dtype / per-modality `n_vars`
+/// all match the target's expectations) instead of materialising the entire
+/// source matrix in host memory.
+///
+/// `target_modality_id = 0` and `source_modality_id = 0` match the legacy
+/// single-modality / global path. For multimodal targets, pass the
+/// registered modality id of the destination; for multimodal sources, pass
+/// the matching source modality.
+///
+/// Semantics: obs is global on both files (rows are global across
+/// modalities), so the source's obs is concatenated to the target's obs
+/// regardless of the modality_id arguments. CSC sidecars are dropped from
+/// the target on append (same as [`append_for_modality`]).
+pub fn append_from_reader(
+    target_path: &Path,
+    source: &ScxReader,
+    codec_selection: CodecSelection,
+    shard_target_rows: NonZeroU32,
+    target_modality_id: u8,
+    source_modality_id: u8,
+) -> Result<()> {
+    let (mut lock, prep) = prepare_append(target_path, target_modality_id)?;
+
+    // Enumerate the source's CSR shard catalog entries (already sorted by
+    // row_start by `csr_shards_for_modality`).
+    let source_csr_entries: Vec<FullCatalogEntry> = source
+        .catalog()
+        .csr_shards_for_modality(source_modality_id)
+        .into_iter()
+        .cloned()
+        .collect();
+
+    if source_csr_entries.is_empty() {
+        // Nothing to append — match `append_for_modality`'s empty-input behaviour.
+        return Ok(());
+    }
+
+    // Detect global per-append invariants from the first source shard header.
+    let first_sh = source.read_shard_header(&source_csr_entries[0])?;
+    let value_encoding = ValueEncoding::from_u8(first_sh.value_encoding)
+        .ok_or(OpsError::UnknownValueEncoding(first_sh.value_encoding))?;
+    let target_index_dtype = prep.header_index_dtype;
+
+    // Validate that every source shard agrees on value_encoding and that
+    // n_minor matches target_n_vars (otherwise re-encoding may still work,
+    // but the raw-copy fast path is unsafe — handled inline below).
+    let mut total_source_rows: u64 = 0;
+    for entry in &source_csr_entries {
+        let sh = source.read_shard_header(entry)?;
+        if sh.value_encoding != first_sh.value_encoding {
+            return Err(OpsError::ShapeMismatch {
+                detail: format!(
+                    "source shard '{}' value_encoding {} differs from first shard's {}",
+                    entry.name, sh.value_encoding, first_sh.value_encoding
+                ),
+            });
+        }
+        if (sh.n_minor as u64) > prep.target_n_vars {
+            return Err(OpsError::IndexOutOfBounds {
+                index: sh.n_minor.saturating_sub(1),
+                n_vars: prep.target_n_vars,
+            });
+        }
+        total_source_rows += sh.n_major as u64;
+    }
+
+    // Read obs from the source (cells are global across modalities).
+    let new_obs = source.read_obs().map_err(OpsError::Format)?;
+    if new_obs.num_rows() as u64 != total_source_rows {
+        return Err(OpsError::VarLengthMismatch {
+            expected: total_source_rows as usize,
+            found: new_obs.num_rows(),
+        });
+    }
+
+    // Read existing obs and validate schema equivalence (before writing).
+    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
+    validate_obs_schema(&old_obs, &new_obs)?;
+
+    // Per-source-shard streaming loop.
+    let mut write_offset = lock.seek(SeekFrom::End(0))?;
+    let mut new_shard_entries: Vec<FullCatalogEntry> = Vec::new();
+    let mut total_new_nnz: u64 = 0;
+    let mut cumulative_row_offset: u64 = 0;
+
+    for entry in &source_csr_entries {
+        let sh = source.read_shard_header(entry)?;
+        let shard_rows = sh.n_major as usize;
+        if shard_rows == 0 {
+            continue;
+        }
+        let global_row_start = prep.old_n_obs + cumulative_row_offset;
+
+        // Raw-copy fast path eligibility.
+        let raw_copy_ok = sh.index_dtype == target_index_dtype
+            && (sh.n_minor as u64) == prep.target_n_vars
+            && sh.n_major <= shard_target_rows.get()
+            && match codec_selection {
+                CodecSelection::Auto => true,
+                CodecSelection::Explicit(c) => sh.codec_id == c as u8,
+            };
+
+        if raw_copy_ok {
+            let shard_idx = prep.old_per_modality_csr + new_shard_entries.len() as u32;
+            let new_entry = raw_copy_csr_shard(
+                &mut lock,
+                &mut write_offset,
+                &prep,
+                source,
+                entry,
+                &sh,
+                value_encoding,
+                shard_idx,
+                global_row_start,
+            )?;
+            total_new_nnz += entry_nnz(&new_entry);
+            new_shard_entries.push(new_entry);
+            cumulative_row_offset += shard_rows as u64;
+            continue;
+        }
+
+        // Decode the source shard and re-encode (possibly splitting into
+        // smaller chunks bounded by `shard_target_rows`). The Vec allocations
+        // here are bounded by the source shard, not the whole source file.
+        let (ip_i64, ix_i32, val_f32) = source.read_shard_from_entry(entry)?;
+        let shard_indptr: Vec<u64> = ip_i64
+            .iter()
+            .map(|&v| {
+                if v < 0 {
+                    Err(OpsError::ShapeMismatch {
+                        detail: format!("source shard '{}': negative indptr value {v}", entry.name),
+                    })
+                } else {
+                    Ok(v as u64)
+                }
+            })
+            .collect::<Result<Vec<u64>>>()?;
+        let shard_indices: Vec<u32> = ix_i32
+            .iter()
+            .map(|&v| {
+                if v < 0 {
+                    Err(OpsError::ShapeMismatch {
+                        detail: format!("source shard '{}': negative CSR index {v}", entry.name),
+                    })
+                } else if (v as u64) >= prep.target_n_vars {
+                    Err(OpsError::IndexOutOfBounds {
+                        index: v as u32,
+                        n_vars: prep.target_n_vars,
+                    })
+                } else {
+                    Ok(v as u32)
+                }
+            })
+            .collect::<Result<Vec<u32>>>()?;
+        let shard_values = scx_codec::values_to_raw_bytes(&val_f32, value_encoding)?;
+        drop(ip_i64);
+        drop(ix_i32);
+        drop(val_f32);
+
+        let value_byte_size = value_encoding_byte_width(value_encoding);
+        let mut row_offset = 0usize;
+        while row_offset < shard_rows {
+            let chunk_rows =
+                std::cmp::min(shard_target_rows.get() as usize, shard_rows - row_offset);
+            let chunk_ip_start = shard_indptr[row_offset];
+            let chunk_ip_end = shard_indptr[row_offset + chunk_rows];
+            let chunk_indptr: Vec<u64> = shard_indptr[row_offset..=row_offset + chunk_rows]
+                .iter()
+                .map(|&v| v - chunk_ip_start)
+                .collect();
+            let chunk_indices = &shard_indices[chunk_ip_start as usize..chunk_ip_end as usize];
+            let val_start = chunk_ip_start as usize * value_byte_size;
+            let val_end = chunk_ip_end as usize * value_byte_size;
+            let chunk_values = &shard_values[val_start..val_end];
+
+            let chunk_global_row_start = global_row_start + row_offset as u64;
+            let chunk_shard_idx = prep.old_per_modality_csr + new_shard_entries.len() as u32;
+            let new_entry = write_csr_chunk(
+                &mut lock,
+                &mut write_offset,
+                &prep,
+                &chunk_indptr,
+                chunk_indices,
+                chunk_values,
+                value_encoding,
+                codec_selection,
+                chunk_shard_idx,
+                chunk_global_row_start,
+            )?;
+            total_new_nnz += entry_nnz(&new_entry);
+            new_shard_entries.push(new_entry);
+            row_offset += chunk_rows;
+        }
+
+        cumulative_row_offset += shard_rows as u64;
+    }
+
+    finalize_append(
+        target_path,
+        &mut lock,
+        prep,
+        &old_obs,
+        &new_obs,
+        new_shard_entries,
+        total_new_nnz,
+        cumulative_row_offset,
+        write_offset,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Shared state captured during the prelude of any append: header, catalog,
+/// modality routing, and resolved per-modality `n_vars`. The exclusive
+/// `FileLock` is returned alongside this struct so helper functions can
+/// take `&mut FileLock` and `&AppendPrep` without aliasing.
+struct AppendPrep {
+    header: FileHeader,
+    header_index_dtype: u8,
+    old_catalog: FullCatalog,
+    old_n_obs: u64,
+    old_catalog_offset: u64,
+    modality_table: Option<ModalityTable>,
+    modality_id: u8,
+    modality_name: Option<String>,
+    modality_type: ModalityType,
+    target_n_vars: u64,
+    old_per_modality_csr: u32,
+}
+
+/// Acquire the exclusive lock, read the header + full catalog + modality
+/// table, resolve the requested modality, and apply pre-write validation
+/// that does not depend on the new data.
+fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, AppendPrep)> {
+    let mut lock = FileLock::acquire_exclusive(target_path)?;
+
+    let header = {
+        lock.seek(SeekFrom::Start(0))?;
+        let mut buf = [0u8; HEADER_SIZE];
+        std::io::Read::read_exact(&mut lock, &mut buf)?;
+        FileHeader::read_from(&mut Cursor::new(&buf))?
+    };
+
+    let old_catalog = {
+        let fc_offset = header.full_catalog_offset;
+        let fc_length = header.full_catalog_length;
+        lock.seek(SeekFrom::Start(fc_offset))?;
+        let mut buf = vec![0u8; fc_length as usize];
+        std::io::Read::read_exact(&mut lock, &mut buf)?;
+        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize, true)?
+    };
+
     let mut modality_table = if header.n_modalities > 0
         && header.modality_table_offset != 0
         && header.modality_table_length != 0
@@ -169,9 +466,6 @@ pub fn append_for_modality(
         None
     };
 
-    // Resolve the target modality. modality_id == 0 means "global" /
-    // legacy single-modality behaviour. > 0 must reference an entry
-    // in the modality table.
     if modality_id != 0 {
         let table = modality_table.as_ref().ok_or_else(|| {
             OpsError::Format(scx_format::ScxError::InvalidCatalog(format!(
@@ -188,27 +482,18 @@ pub fn append_for_modality(
             )));
         }
     }
-    // Resolve the target modality's info once. `info_of(0)` returns None
-    // (global / legacy files), so callers naturally fall back to defaults
-    // derived from the file header. For modality_id != 0 the entry is
-    // guaranteed to exist (out-of-range ids are rejected above); the
-    // `unwrap_or` fallbacks below are defensive.
+
     let modality_info = modality_table.as_ref().and_then(|t| t.info_of(modality_id));
     let modality_name: Option<String> = modality_info.map(|info| info.name.clone());
     let modality_type: ModalityType = modality_info
         .map(|info| info.modality_type)
         .unwrap_or(ModalityType::Rna);
-    // Per-modality `n_vars` (used for codec auto-selection and index
-    // bounds checks) may differ from the file-wide max across modalities.
     let target_n_vars: u64 = modality_info
         .map(|info| info.n_vars)
         .unwrap_or(header.n_vars);
 
-    // Per-modality CSR shard count for naming. Global (modality_id == 0)
-    // continues to use the file-wide `header.n_csr_shards`; per-modality
-    // appends count only existing shards with that modality_id.
     let old_per_modality_csr = if modality_id == 0 {
-        old_n_csr_shards
+        header.n_csr_shards
     } else {
         old_catalog
             .entries
@@ -216,58 +501,64 @@ pub fn append_for_modality(
             .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
             .count() as u32
     };
-    // P1 #11: mirror the writer-side `NVarsOverflow` guard
-    // (scx-format/src/writer.rs:496) so an oversized n_vars fires
-    // *before* the file is touched, instead of later when the shard
-    // header's u32 n_minor field would silently truncate.
+
     if target_n_vars > u32::MAX as u64 {
         return Err(OpsError::Format(scx_format::ScxError::NVarsOverflow(
             target_n_vars,
         )));
     }
-    if let Some(&max_idx) = new_indices.iter().max() {
-        if max_idx as u64 >= target_n_vars {
-            return Err(OpsError::IndexOutOfBounds {
-                index: max_idx,
-                n_vars: target_n_vars,
-            });
-        }
-    }
 
-    // Read existing obs section for concatenation. This bypasses
-    // `ScxReader::read_obs`, so apply `downcast_large_types` explicitly
-    // — files written after the LargeUtf8 fix store obs as LargeUtf8 on
-    // disk, but downstream code (and the schema check below) expects
-    // the canonical narrow `Utf8` type.
-    let old_obs = {
-        let obs_entry = old_catalog.get("obs").ok_or_else(|| {
-            OpsError::Format(scx_format::ScxError::SectionNotFound("obs".to_string()))
-        })?;
-        lock.seek(SeekFrom::Start(obs_entry.offset))?;
-        let mut buf = vec![0u8; obs_entry.length as usize];
-        std::io::Read::read_exact(&mut lock, &mut buf)?;
-        let cursor = Cursor::new(buf);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-        let mut batches = reader.into_iter();
-        let batch = batches.next().ok_or_else(|| {
-            OpsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "obs section contains no batches",
-            ))
-        })??;
-        scx_format::downcast_large_types(&batch).map_err(OpsError::Format)?
-    };
+    let old_n_obs = header.n_obs;
+    let old_catalog_offset = header.full_catalog_offset;
+    let header_index_dtype = header.index_dtype;
 
-    // Validate obs schema equivalence between the target file's existing obs
-    // and the new batch. `concat_batches` below runs after `unify_dict_columns`
-    // strips `Dictionary(_, V) → V` on both sides, so the relevant comparison
-    // is over *effective* value types — Arrow IPC round-trips Dictionary columns
-    // down to their value type (e.g. `Dictionary(Int8, Utf8)` → `Utf8`), so a
-    // strict `a.data_type() == b.data_type()` check would reject a legitimate
-    // append where one side came from disk and the other from a fresh
-    // AnnData → Arrow conversion. Surfacing the check here gives a clearer
-    // diagnostic than the downstream `concat_batches` error and avoids any
-    // chance that a partial write precedes it.
+    // suppress unused mut warning when modality_table happens to be None
+    let _ = &mut modality_table;
+
+    Ok((
+        lock,
+        AppendPrep {
+            header,
+            header_index_dtype,
+            old_catalog,
+            old_n_obs,
+            old_catalog_offset,
+            modality_table,
+            modality_id,
+            modality_name,
+            modality_type,
+            target_n_vars,
+            old_per_modality_csr,
+        },
+    ))
+}
+
+/// Read the target file's existing obs Arrow IPC section as a `RecordBatch`,
+/// downcasting LargeUtf8/LargeBinary to their narrow forms so downstream
+/// schema comparison works regardless of when the file was written.
+fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
+    let obs_entry = old_catalog.get("obs").ok_or_else(|| {
+        OpsError::Format(scx_format::ScxError::SectionNotFound("obs".to_string()))
+    })?;
+    lock.seek(SeekFrom::Start(obs_entry.offset))?;
+    let mut buf = vec![0u8; obs_entry.length as usize];
+    std::io::Read::read_exact(&mut *lock, &mut buf)?;
+    let cursor = Cursor::new(buf);
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+    let mut batches = reader.into_iter();
+    let batch = batches.next().ok_or_else(|| {
+        OpsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "obs section contains no batches",
+        ))
+    })??;
+    scx_format::downcast_large_types(&batch).map_err(OpsError::Format)
+}
+
+/// Compare two obs batches by column count and per-column (name, effective
+/// type). Effective type strips `Dictionary(_, V) → V` because Arrow IPC
+/// round-trips dictionaries down to their value type.
+fn validate_obs_schema(old_obs: &RecordBatch, new_obs: &RecordBatch) -> Result<()> {
     let old_schema = old_obs.schema();
     let new_schema = new_obs.schema();
     if old_schema.fields().len() != new_schema.fields().len() {
@@ -292,197 +583,303 @@ pub fn append_for_modality(
             });
         }
     }
+    Ok(())
+}
 
-    // Seek to EOF for appending
-    let mut write_offset = lock.seek(SeekFrom::End(0))?;
+#[inline]
+fn value_encoding_byte_width(value_encoding: ValueEncoding) -> usize {
+    match value_encoding {
+        ValueEncoding::Uint8 => 1,
+        ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
+        ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
+    }
+}
 
-    // Shard the new data and write each shard
-    let index_dtype_u16 = header.index_dtype == 0;
-    let mut new_shard_entries = Vec::new();
-    let mut total_new_nnz = 0u64;
-    let mut row_offset = 0usize;
+#[inline]
+fn entry_nnz(entry: &FullCatalogEntry) -> u64 {
+    entry.stats.as_ref().map(|s| s.nnz).unwrap_or(0)
+}
 
-    while row_offset < n_new_rows {
-        let shard_rows = std::cmp::min(shard_target_rows.get() as usize, n_new_rows - row_offset);
-        let shard_indptr_start = new_indptr[row_offset];
-        let shard_indptr_end = new_indptr[row_offset + shard_rows];
-        let shard_nnz = shard_indptr_end - shard_indptr_start;
+/// Encode a single CSR sub-shard, write it (and its block index) to the
+/// target file at the current `write_offset` (8-byte aligned), and return
+/// the resulting `FullCatalogEntry`. Updates `write_offset` in place.
+#[allow(clippy::too_many_arguments)]
+fn write_csr_chunk(
+    lock: &mut FileLock,
+    write_offset: &mut u64,
+    prep: &AppendPrep,
+    shard_indptr: &[u64],
+    shard_indices: &[u32],
+    shard_values: &[u8],
+    value_encoding: ValueEncoding,
+    codec_selection: CodecSelection,
+    shard_idx: u32,
+    global_row_start: u64,
+) -> Result<FullCatalogEntry> {
+    let shard_rows = shard_indptr.len().saturating_sub(1);
+    let shard_nnz = *shard_indptr.last().unwrap_or(&0);
 
-        // Extract shard-local indptr (rebased to 0)
-        let shard_indptr: Vec<u64> = new_indptr[row_offset..=row_offset + shard_rows]
-            .iter()
-            .map(|&v| v - shard_indptr_start)
-            .collect();
-
-        // Extract shard-local indices
-        let idx_start = shard_indptr_start as usize;
-        let idx_end = shard_indptr_end as usize;
-        let shard_indices = &new_indices[idx_start..idx_end];
-
-        // Extract shard-local values
-        let value_byte_size = match value_encoding {
-            ValueEncoding::Uint8 => 1,
-            ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
-            ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
-        };
-        let val_start = idx_start * value_byte_size;
-        let val_end = idx_end * value_byte_size;
-        let shard_values = &new_values[val_start..val_end];
-
-        // Per-shard codec selection. `Auto` picks data- and modality-
-        // driven codecs per shard; `Explicit(c)` forces `c` for every
-        // appended shard.
-        let shard_codec = match codec_selection {
-            CodecSelection::Auto => {
-                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
-            }
-            CodecSelection::Explicit(c) => c,
-        };
-
-        let shard_idx = old_per_modality_csr + new_shard_entries.len() as u32;
-        // Per-modality shards follow the writer's `X/{name}/shard_{i}`
-        // convention (writer.rs::write_csr_shard_for); global / legacy
-        // entries keep the flat `X_shard_{i}` naming.
-        let shard_name = match modality_name.as_deref() {
-            Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
-            None => format!("X_shard_{shard_idx}"),
-        };
-        let global_row_start = old_n_obs + row_offset as u64;
-
-        // Pad to 8-byte alignment
-        let aligned = align_to_8(write_offset);
-        let pad = (aligned - write_offset) as usize;
-        if pad > 0 {
-            lock.write_all(&vec![0u8; pad])?;
-            write_offset = aligned;
+    let shard_codec = match codec_selection {
+        CodecSelection::Auto => {
+            scx_format::select_codec_for_modality(shard_values, value_encoding, prep.modality_type)
         }
+        CodecSelection::Explicit(c) => c,
+    };
 
-        let shard_global_offset = write_offset;
+    let shard_name = match prep.modality_name.as_deref() {
+        Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
+        None => format!("X_shard_{shard_idx}"),
+    };
 
-        // Encode
-        let encoded = scx_codec::encode_shard(
-            &shard_indptr,
-            shard_indices,
-            shard_values,
-            shard_codec,
-            value_encoding,
-            index_dtype_u16,
-        )?;
+    // Pad to 8-byte alignment
+    let aligned = align_to_8(*write_offset);
+    let pad = (aligned - *write_offset) as usize;
+    if pad > 0 {
+        lock.write_all(&vec![0u8; pad])?;
+        *write_offset = aligned;
+    }
 
-        // Block index (single block)
-        let block_index = BlockIndex {
-            entries: vec![BlockIndexEntry::new(
-                0,
-                shard_rows as u32,
-                0,
-                0,
-                0,
-                shard_nnz,
-            )?],
-        };
-        let mut block_index_bytes = Vec::new();
-        block_index.write_to(&mut block_index_bytes)?;
+    let shard_global_offset = *write_offset;
+    let index_dtype_u16 = prep.header_index_dtype == 0;
 
-        // Shard checksum
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&encoded.indptr_bytes);
-        payload.extend_from_slice(&encoded.indices_bytes);
-        payload.extend_from_slice(&encoded.values_bytes);
-        payload.extend_from_slice(&block_index_bytes);
-        let shard_checksum = blake3_truncated_64(&payload);
+    let encoded = scx_codec::encode_shard(
+        shard_indptr,
+        shard_indices,
+        shard_values,
+        shard_codec,
+        value_encoding,
+        index_dtype_u16,
+    )?;
 
-        // Build shard header
-        let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-        let indptr_length = encoded.indptr_bytes.len() as u32;
-        let indices_rel_offset = indptr_rel_offset + indptr_length;
-        let indices_length = encoded.indices_bytes.len() as u32;
-        let values_rel_offset = indices_rel_offset + indices_length;
-        let values_length = encoded.values_bytes.len() as u32;
-        let block_index_rel_offset = values_rel_offset + values_length;
-        let block_index_length = block_index_bytes.len() as u32;
+    let block_index = BlockIndex {
+        entries: vec![BlockIndexEntry::new(
+            0,
+            shard_rows as u32,
+            0,
+            0,
+            0,
+            shard_nnz,
+        )?],
+    };
+    let mut block_index_bytes = Vec::new();
+    block_index.write_to(&mut block_index_bytes)?;
 
-        let sh = ShardHeader {
-            magic: SHARD_MAGIC,
-            shard_format_version: 1,
-            shard_type: derive_shard_type(SectionType::CsrShard),
-            codec_id: shard_codec as u8,
-            value_encoding: value_encoding as u8,
-            index_dtype: header.index_dtype,
-            reserved_flags: [0; 3],
-            n_major: shard_rows as u32,
-            // PR #68: use the target modality's n_vars (resolved
-            // above) rather than `header.n_vars` (which is the
-            // file-wide max across modalities). Required for v2
-            // multimodal files; identical to the legacy single-
-            // modality path where `target_n_vars == header.n_vars`.
-            n_minor: target_n_vars as u32,
-            nnz: shard_nnz,
-            global_offset: global_row_start,
-            indptr_rel_offset,
-            indptr_length,
-            indices_rel_offset,
-            indices_length,
-            values_rel_offset,
-            values_length,
-            block_index_rel_offset,
-            block_index_length,
-            checksum: shard_checksum,
-        };
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&encoded.indptr_bytes);
+    payload.extend_from_slice(&encoded.indices_bytes);
+    payload.extend_from_slice(&encoded.values_bytes);
+    payload.extend_from_slice(&block_index_bytes);
+    let shard_checksum = blake3_truncated_64(&payload);
 
-        let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
-        sh.write_to(&mut header_buf)?;
+    let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
+    let indptr_length = encoded.indptr_bytes.len() as u32;
+    let indices_rel_offset = indptr_rel_offset + indptr_length;
+    let indices_length = encoded.indices_bytes.len() as u32;
+    let values_rel_offset = indices_rel_offset + indices_length;
+    let values_length = encoded.values_bytes.len() as u32;
+    let block_index_rel_offset = values_rel_offset + values_length;
+    let block_index_length = block_index_bytes.len() as u32;
 
-        // Full section data
-        let mut section_data = Vec::new();
-        section_data.extend_from_slice(&header_buf);
-        section_data.extend_from_slice(&payload);
-        let section_checksum = blake3_hash(&section_data);
-        let section_length = section_data.len() as u64;
+    let sh = ShardHeader {
+        magic: SHARD_MAGIC,
+        shard_format_version: 1,
+        shard_type: derive_shard_type(SectionType::CsrShard),
+        codec_id: shard_codec as u8,
+        value_encoding: value_encoding as u8,
+        index_dtype: prep.header_index_dtype,
+        reserved_flags: [0; 3],
+        n_major: shard_rows as u32,
+        n_minor: prep.target_n_vars as u32,
+        nnz: shard_nnz,
+        global_offset: global_row_start,
+        indptr_rel_offset,
+        indptr_length,
+        indices_rel_offset,
+        indices_length,
+        values_rel_offset,
+        values_length,
+        block_index_rel_offset,
+        block_index_length,
+        checksum: shard_checksum,
+    };
 
-        lock.write_all(&section_data)?;
-        write_offset += section_length;
+    let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
+    sh.write_to(&mut header_buf)?;
 
-        // append.rs always emits row-major CSR shards. Use the
-        // target modality's n_vars (PR #68) — see ShardHeader.n_minor
-        // above for rationale.
-        let stats = compute_shard_stats(
-            shard_values,
+    let mut section_data = Vec::with_capacity(header_buf.len() + payload.len());
+    section_data.extend_from_slice(&header_buf);
+    section_data.extend_from_slice(&payload);
+    let section_checksum = blake3_hash(&section_data);
+    let section_length = section_data.len() as u64;
+
+    lock.write_all(&section_data)?;
+    *write_offset += section_length;
+
+    let stats = compute_shard_stats(
+        shard_values,
+        value_encoding,
+        scx_format::MajorAxis::Row,
+        global_row_start,
+        shard_rows as u64,
+        prep.target_n_vars,
+        shard_nnz,
+    );
+
+    Ok(FullCatalogEntry {
+        name: shard_name,
+        offset: shard_global_offset,
+        length: section_length,
+        section_type: SectionType::CsrShard,
+        checksum: section_checksum,
+        modality_id: prep.modality_id,
+        stats: Some(stats),
+    })
+}
+
+/// Raw-copy a source CSR shard's section bytes into the target, patching
+/// only `ShardHeader.n_minor` and `ShardHeader.global_offset` (and
+/// recomputing the section-level BLAKE3 hash). The payload BLAKE3
+/// (`sh.checksum`) is left untouched because the indptr/indices/values/
+/// block_index bytes are byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn raw_copy_csr_shard(
+    lock: &mut FileLock,
+    write_offset: &mut u64,
+    prep: &AppendPrep,
+    source: &ScxReader,
+    entry: &FullCatalogEntry,
+    sh: &ShardHeader,
+    value_encoding: ValueEncoding,
+    shard_idx: u32,
+    global_row_start: u64,
+) -> Result<FullCatalogEntry> {
+    // Copy the source section into an owned buffer so we can mutate the
+    // header. `read_raw_shard_bytes` returns an mmap slice.
+    let src_bytes: Vec<u8> = source.read_raw_shard_bytes(entry)?.to_vec();
+    if src_bytes.len() < SHARD_HEADER_SIZE {
+        return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+            format!("source shard '{}' too small for header", entry.name),
+        )));
+    }
+
+    // Build the new (patched) header with the same fields except n_minor /
+    // global_offset.
+    let new_sh = ShardHeader {
+        magic: sh.magic,
+        shard_format_version: sh.shard_format_version,
+        shard_type: sh.shard_type,
+        codec_id: sh.codec_id,
+        value_encoding: sh.value_encoding,
+        index_dtype: sh.index_dtype,
+        reserved_flags: sh.reserved_flags,
+        n_major: sh.n_major,
+        n_minor: prep.target_n_vars as u32,
+        nnz: sh.nnz,
+        global_offset: global_row_start,
+        indptr_rel_offset: sh.indptr_rel_offset,
+        indptr_length: sh.indptr_length,
+        indices_rel_offset: sh.indices_rel_offset,
+        indices_length: sh.indices_length,
+        values_rel_offset: sh.values_rel_offset,
+        values_length: sh.values_length,
+        block_index_rel_offset: sh.block_index_rel_offset,
+        block_index_length: sh.block_index_length,
+        checksum: sh.checksum,
+    };
+
+    let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
+    new_sh.write_to(&mut header_buf)?;
+
+    let mut section_data = Vec::with_capacity(src_bytes.len());
+    section_data.extend_from_slice(&header_buf);
+    section_data.extend_from_slice(&src_bytes[SHARD_HEADER_SIZE..]);
+    let section_checksum = blake3_hash(&section_data);
+    let section_length = section_data.len() as u64;
+
+    // Pad to 8-byte alignment.
+    let aligned = align_to_8(*write_offset);
+    let pad = (aligned - *write_offset) as usize;
+    if pad > 0 {
+        lock.write_all(&vec![0u8; pad])?;
+        *write_offset = aligned;
+    }
+    let shard_global_offset = *write_offset;
+    lock.write_all(&section_data)?;
+    *write_offset += section_length;
+
+    // Recompute per-shard stats over the encoded values bytes. The raw-copy
+    // preserves the encoded payload, but `compute_shard_stats` expects raw
+    // values (one entry per nnz). When the source's codec is `None`, the
+    // payload's `values_bytes` already equals the raw values; for compressed
+    // codecs the payload bytes are not raw values, so stats would be wrong.
+    //
+    // To keep the catalog statistics accurate in both cases, decode the
+    // values segment when the codec compresses them. The decoded values are
+    // dropped immediately after stats are computed.
+    let codec_id = CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?;
+    let stats = if codec_id == CodecId::None {
+        // Raw bytes: values segment is verbatim raw little-endian.
+        let values_start = sh.values_rel_offset as usize;
+        let values_end = values_start + sh.values_length as usize;
+        compute_shard_stats(
+            &src_bytes[values_start..values_end],
             value_encoding,
             scx_format::MajorAxis::Row,
             global_row_start,
-            shard_rows as u64,
-            target_n_vars,
-            shard_nnz,
-        );
+            sh.n_major as u64,
+            prep.target_n_vars,
+            sh.nnz,
+        )
+    } else {
+        // Decode to recover raw values for stats. Single-shard cost.
+        let (_, _, val_f32) = source.read_shard_from_entry(entry)?;
+        let raw = scx_codec::values_to_raw_bytes(&val_f32, value_encoding)?;
+        compute_shard_stats(
+            &raw,
+            value_encoding,
+            scx_format::MajorAxis::Row,
+            global_row_start,
+            sh.n_major as u64,
+            prep.target_n_vars,
+            sh.nnz,
+        )
+    };
 
-        new_shard_entries.push(FullCatalogEntry {
-            name: shard_name,
-            offset: shard_global_offset,
-            length: section_length,
-            section_type: SectionType::CsrShard,
-            checksum: section_checksum,
-            // Phase F.3: stamp shards with the chosen modality id (0 =
-            // global / legacy single-modality).
-            modality_id,
-            stats: Some(stats),
-        });
+    let shard_name = match prep.modality_name.as_deref() {
+        Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
+        None => format!("X_shard_{shard_idx}"),
+    };
 
-        total_new_nnz += shard_nnz;
-        row_offset += shard_rows;
-    }
+    Ok(FullCatalogEntry {
+        name: shard_name,
+        offset: shard_global_offset,
+        length: section_length,
+        section_type: SectionType::CsrShard,
+        checksum: section_checksum,
+        modality_id: prep.modality_id,
+        stats: Some(stats),
+    })
+}
 
-    // Concatenate old + new obs and write as new obs section.
-    // Both batches may have dictionary-encoded columns with overlapping
-    // categories. Unify both to non-dictionary types first, then concat.
+/// Post-shard-loop tail: merge obs, write obs/provenance/(modality table)/
+/// catalog, fsync, rebuild root catalog, finalize header with checksum.
+#[allow(clippy::too_many_arguments)]
+fn finalize_append(
+    target_path: &Path,
+    lock: &mut FileLock,
+    mut prep: AppendPrep,
+    old_obs: &RecordBatch,
+    new_obs: &RecordBatch,
+    new_shard_entries: Vec<FullCatalogEntry>,
+    total_new_nnz: u64,
+    n_new_rows: u64,
+    mut write_offset: u64,
+) -> Result<()> {
     let merged_obs = {
-        let old_unified = unify_dict_columns(&old_obs)?;
+        let old_unified = unify_dict_columns(old_obs)?;
         let new_unified = unify_dict_columns(new_obs)?;
         concat_batches(&old_unified.schema(), &[old_unified, new_unified])?
     };
-    // Inline write bypasses `ScxWriter::write_arrow_ipc`, so upcast
-    // explicitly: obs columns may exceed Arrow IPC's 32-bit offset
-    // limit at multi-million-cell scale and need 64-bit `LargeUtf8` /
-    // `LargeBinary` offsets on disk.
     let merged_obs = scx_format::upcast_to_large_types(&merged_obs).map_err(OpsError::Format)?;
     let obs_ipc_bytes = {
         let mut buf = Vec::new();
@@ -493,7 +890,6 @@ pub fn append_for_modality(
         buf
     };
 
-    // Write new obs section
     let aligned = align_to_8(write_offset);
     let pad = (aligned - write_offset) as usize;
     if pad > 0 {
@@ -505,16 +901,17 @@ pub fn append_for_modality(
     let new_obs_length = obs_ipc_bytes.len() as u64;
     let new_obs_checksum = blake3_hash(&obs_ipc_bytes);
 
-    // Write provenance section (read existing, append entry, write)
+    // Provenance
     let prov_entries = {
-        let mut entries = if let Some(prov_entry) = old_catalog
+        let mut entries = if let Some(prov_entry) = prep
+            .old_catalog
             .entries
             .iter()
             .find(|e| e.section_type == SectionType::Provenance)
         {
             lock.seek(SeekFrom::Start(prov_entry.offset))?;
             let mut prov_buf = vec![0u8; prov_entry.length as usize];
-            std::io::Read::read_exact(&mut lock, &mut prov_buf)?;
+            std::io::Read::read_exact(&mut *lock, &mut prov_buf)?;
             let prov = Provenance::read_from(&mut Cursor::new(&prov_buf), prov_buf.len())?;
             prov.operations
         } else {
@@ -539,7 +936,6 @@ pub fn append_for_modality(
     let mut prov_bytes = Vec::new();
     prov.write_to(&mut prov_bytes)?;
 
-    // Seek back to EOF to write provenance
     lock.seek(SeekFrom::End(0))?;
     write_offset = lock.stream_position()?;
     let prov_aligned = align_to_8(write_offset);
@@ -554,20 +950,17 @@ pub fn append_for_modality(
     let prov_checksum = blake3_hash(&prov_bytes);
     write_offset += prov_length;
 
-    // Build new catalog: old entries (minus old obs, minus old provenance,
-    // minus stale CSC shards) + new shards + new obs + new provenance.
-    //
-    // CSC sidecars index global rows: appending rows shifts the row space
-    // but the on-disk CSC `indices` arrays still reference the old row
-    // count, so they must be dropped. Caller can opt back in via
-    // `--rebuild-csc` in the CLI.
-    let had_csc = header.has_csc();
-    let n_dropped_csc = old_catalog
+    // Build new catalog
+    let had_csc = prep.header.has_csc();
+    let n_dropped_csc = prep
+        .old_catalog
         .entries
         .iter()
         .filter(|e| e.section_type == SectionType::CscShard)
         .count();
-    let mut new_entries: Vec<FullCatalogEntry> = old_catalog
+    let n_new_csr_shards = new_shard_entries.len() as u32;
+    let mut new_entries: Vec<FullCatalogEntry> = prep
+        .old_catalog
         .entries
         .into_iter()
         .filter(|e| {
@@ -584,8 +977,6 @@ pub fn append_for_modality(
             target = target_path.display()
         );
     }
-
-    let n_new_csr_shards = new_shard_entries.len() as u32;
     new_entries.extend(new_shard_entries);
     new_entries.push(FullCatalogEntry {
         name: "obs".to_string(),
@@ -593,7 +984,7 @@ pub fn append_for_modality(
         length: new_obs_length,
         section_type: SectionType::ObsMetadata,
         checksum: new_obs_checksum,
-        modality_id: 0, // obs is shared across modalities (global)
+        modality_id: 0,
         stats: None,
     });
     new_entries.push(FullCatalogEntry {
@@ -602,43 +993,28 @@ pub fn append_for_modality(
         length: prov_length,
         section_type: SectionType::Provenance,
         checksum: prov_checksum,
-        modality_id: 0, // provenance is global
+        modality_id: 0,
         stats: None,
     });
 
-    let new_n_obs = old_n_obs + n_new_rows as u64;
-    let new_manifest_sequence = header.manifest_sequence + 1;
+    let new_n_obs = prep.old_n_obs + n_new_rows;
+    let new_manifest_sequence = prep.header.manifest_sequence + 1;
     let new_catalog = FullCatalog {
         catalog_version: scx_format::CURRENT_CATALOG_VERSION,
         manifest_sequence: new_manifest_sequence,
-        prev_catalog_offset: old_catalog_offset,
+        prev_catalog_offset: prep.old_catalog_offset,
         n_obs: new_n_obs,
         entries: new_entries,
     };
 
-    // Phase F.3: re-emit the modality table at a fresh EOF location
-    // (alongside the catalog) before the catalog so the header can
-    // be updated atomically. Per-modality counts:
-    //   - the target modality gets `n_csr_shards += new shards` and
-    //     `nnz += total_new_nnz`
-    //   - every modality drops its CSC sidecar count + HAS_CSC flag
-    //     because the file-wide CSC drop applies uniformly (Phase
-    //     F.3 todo: per-modality CSC preservation when only one
-    //     modality is being appended into requires per-modality
-    //     row-axis decoupling — the writer already writes shared
-    //     obs, so for now match the file-wide drop).
     let (modality_table_offset, modality_table_length) =
-        if let Some(mut table) = modality_table.take() {
-            if modality_id != 0 {
-                if let Some(info) = table.entries.get_mut((modality_id - 1) as usize) {
+        if let Some(mut table) = prep.modality_table.take() {
+            if prep.modality_id != 0 {
+                if let Some(info) = table.entries.get_mut((prep.modality_id - 1) as usize) {
                     info.n_csr_shards += n_new_csr_shards;
                     info.nnz += total_new_nnz;
                 }
             }
-            // CSC sidecars are dropped file-wide on append (matches the
-            // global header.clear_csc() / n_csc_shards = 0 below). Clear
-            // every modality's CSC marker to keep the modality table in
-            // sync with reality.
             for info in table.entries.iter_mut() {
                 info.n_csc_shards = 0;
                 info.flags = scx_format::ModalityFlags::from_bits_truncate(
@@ -659,7 +1035,10 @@ pub fn append_for_modality(
             write_offset += mt_len;
             (mt_aligned, mt_len)
         } else {
-            (header.modality_table_offset, header.modality_table_length)
+            (
+                prep.header.modality_table_offset,
+                prep.header.modality_table_length,
+            )
         };
 
     // Write new catalog
@@ -674,12 +1053,8 @@ pub fn append_for_modality(
     lock.write_all(&catalog_buf)?;
     let new_catalog_length = catalog_buf.len() as u64;
 
-    // --- Crash safety barrier ---
-    // Flush and fsync all appended data (shards, obs, provenance, catalog)
-    // to durable storage BEFORE updating the header and root catalog.
-    // If the process crashes after this point, the old header still points
-    // to the old full catalog, so the file remains valid (new data at EOF
-    // is harmless orphaned bytes recoverable via prev_catalog_offset chain).
+    // Crash safety barrier 1: durable shard / obs / provenance / catalog
+    // before any pointer update.
     lock.flush()?;
     lock.sync_all()?;
 
@@ -693,45 +1068,34 @@ pub fn append_for_modality(
     lock.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
     lock.write_all(&root_buf)?;
 
-    // Durability barrier between root catalog and header. Without this,
-    // a power loss between the two writes could leave the new root catalog
-    // on disk while the header still references the previous one — not
-    // fatal (old root catalog data is still at its previous offset), but
-    // the file's on-disk root catalog would silently go stale relative to
-    // the header. (Finding H7.)
+    // Crash safety barrier 2: durable root catalog before header update.
     lock.flush()?;
     lock.sync_all()?;
 
-    // Update header
-    header.n_obs = new_n_obs;
-    header.nnz += total_new_nnz;
-    header.n_csr_shards = new_catalog
+    // Finalize header
+    prep.header.n_obs = new_n_obs;
+    prep.header.nnz += total_new_nnz;
+    prep.header.n_csr_shards = new_catalog
         .entries
         .iter()
         .filter(|e| e.section_type == SectionType::CsrShard)
         .count() as u32;
-    // CSC sidecars were filtered out of `new_entries` above; reflect
-    // that in the header's count + flag bit so readers don't try to
-    // load shards that are no longer in the catalog.
-    header.n_csc_shards = 0;
-    header.clear_csc();
-    header.full_catalog_offset = new_catalog_offset;
-    header.full_catalog_length = new_catalog_length;
-    header.modality_table_offset = modality_table_offset;
-    header.modality_table_length = modality_table_length;
-    header.manifest_sequence = new_manifest_sequence;
-    header.prev_catalog_offset = old_catalog_offset;
-    header.root_catalog_offset = HEADER_SIZE as u64;
-    header.root_catalog_length = root_catalog_length;
+    prep.header.n_csc_shards = 0;
+    prep.header.clear_csc();
+    prep.header.full_catalog_offset = new_catalog_offset;
+    prep.header.full_catalog_length = new_catalog_length;
+    prep.header.modality_table_offset = modality_table_offset;
+    prep.header.modality_table_length = modality_table_length;
+    prep.header.manifest_sequence = new_manifest_sequence;
+    prep.header.prev_catalog_offset = prep.old_catalog_offset;
+    prep.header.root_catalog_offset = HEADER_SIZE as u64;
+    prep.header.root_catalog_length = root_catalog_length;
 
-    // Clear front catalog flag (stale after append)
-    header.clear_front_catalog();
-    header.front_catalog_offset = 0;
-    header.front_catalog_length = 0;
+    prep.header.clear_front_catalog();
+    prep.header.front_catalog_offset = 0;
+    prep.header.front_catalog_length = 0;
 
-    // Single-write header finalization (H5 + M16) — avoids the crash window
-    // where a zero-checksum header could be the durable on-disk state.
-    finalize_header_with_checksum(&mut lock, &mut header)?;
+    finalize_header_with_checksum(lock, &mut prep.header)?;
     Ok(())
 }
 
@@ -761,7 +1125,6 @@ pub(crate) fn unify_dict_columns(
     let schema = batch.schema();
     let mut needs_unify = false;
 
-    // Check if any columns are dictionary-encoded
     for field in schema.fields() {
         if matches!(field.data_type(), DataType::Dictionary(_, _)) {
             needs_unify = true;
@@ -773,7 +1136,6 @@ pub(crate) fn unify_dict_columns(
         return Ok(batch.clone());
     }
 
-    // Build new columns, casting dictionaries to their value type
     let mut new_fields = Vec::with_capacity(schema.fields().len());
     let mut new_columns = Vec::with_capacity(batch.num_columns());
 
