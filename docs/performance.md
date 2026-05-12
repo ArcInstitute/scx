@@ -160,8 +160,13 @@ For streaming aggregation (row_sums, col_sums), `MADV_DONTNEED` reduces SCX peak
 Full lazy pipeline (open -> QC filter -> normalize -> log1p -> HVG -> PCA -> kNN -> UMAP -> Leiden) on 1M cells:
 
 | | Full materialization | SCX lazy pipeline | Reduction |
-|--|----------------------|-------------------|-----------|
-| Peak RSS | 43.6 GB | **5.1 GB** | **88%** |
+|--|----------------------|-------------------|-----------:|
+| Lazy preprocess only (normalize + log1p) | — | **3.5 GB** | — |
+| Full pipeline through Leiden | 22.3 GB | **10.9 GB** | **51%** |
+
+The lazy preprocessing peak (~3.5 GB) covers QC through streaming PCA; kNN graph
+construction and UMAP dominate the remaining RSS in the full pipeline (~10.9 GB).
+Source: `BENCHMARK_REPORT.md` §12 (Lazy Preprocessing & Out-of-Core Pipeline).
 
 ## Analysis Accelerators (CPU)
 

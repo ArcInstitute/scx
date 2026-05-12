@@ -419,8 +419,11 @@ for batch in dataset:
 ```
 
 `TrainingDataset` wraps the Rust `TrainingPipeline` and implements Python's
-iterator protocol. It detects `num_workers > 0` and raises an error to prevent
-CUDA fork deadlocks.
+iterator protocol. The pipeline is **lazily constructed inside `__iter__`**, so
+`torch.utils.data.DataLoader(num_workers=N)` with fork start-method works:
+each forked worker builds its own pipeline instance. A `RuntimeError` is raised
+only if a pipeline constructed in the parent is reused from a forked child
+(detected by a PID check in `__next__`).
 
 ---
 

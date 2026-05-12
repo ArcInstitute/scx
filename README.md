@@ -29,9 +29,9 @@ sce <- exp$to_sce()              # SingleCellExperiment
 
 - **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.4× faster than Zarr, and produces a file ~1.2–1.7× smaller than gzipped h5ad (4–5× smaller than anndata's default uncompressed h5ad). Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
 - **Scales on CPU and GPU** — shard-level parallelism via rayon delivers up to **7× read** and **3.2× write** scaling. The CUDA path (cuSPARSE · cuSOLVER · cuVS CAGRA · cuGraph) gives **3.8× end-to-end** on PCA → kNN → UMAP → Leiden at 1M cells; the training loader hits **1,405 batches/s** — 82× faster than TileDB-SOMA-ML.
-- **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline runs at **5.1 GB peak RSS** vs 43.6 GB when materialised (88% less). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
+- **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline (open → QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) runs at **~11 GB peak RSS** vs ~22 GB materialised (51% less; lazy preprocessing alone peaks at ~3.5 GB). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
 - **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression, pseudobulk, and [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1). Same scanpy-shaped API, 3–40× faster; every op has a `device="auto"` switch that picks GPU when available.
-- **Mutable without rewriting** — append new cells, mark-delete doublets, compact, merge, or roll back in milliseconds. Append is O(new cells), not O(total cells); delete is a logical mask, not a data rewrite.
+- **Mutable without rewriting** — append new cells, mark-delete doublets, compact, merge, or roll back in milliseconds. Append writes new matrix shards in O(new cells); obs metadata is rewritten as a merged Arrow IPC covering all cells (see [docs/operations.md](docs/operations.md)). Delete is a logical mask, not a data rewrite.
 - **Lazy query engine** — predicate pushdown skips ~55% of shards on realistic queries; selective reads land in under **5 ms**. Filter by cell type, tissue, donor, etc. before paying to read.
 - **Drop-in for scverse and Seurat** — works with AnnData, scanpy, and scVI (Python), and Seurat v5 + SingleCellExperiment (R). Round-trips cleanly with h5ad, 10x HDF5, and Cell Ranger MTX.
 - **Cloud-native** — streaming push/pull to S3, GCS, and Azure with selective download (only the shards you need) and a direct `open_cloud()` path that skips the full download.
@@ -203,7 +203,7 @@ SCX supports append, delete, compact, merge, and rollback — no need to rewrite
 the entire file when adding new cells or removing doublets.
 
 ```python
-# Append new cells (writes at EOF, O(new_cells) not O(total_cells))
+# Append new cells (new CSR shards at EOF; obs metadata rewritten for all cells)
 pyscx.append("atlas.scx", "new_batch.scx")
 
 # Logical deletion (instant, no data rewrite)
@@ -225,7 +225,8 @@ Selective pull downloads only matching shards, saving bandwidth on atlas-scale d
 # Stream from GCS → local packed file (parallel downloads)
 pyscx.pull("gs://bucket/atlas.scxd/", "atlas.scx")
 
-# Selective pull — only download T cells
+# Selective pull — only download shards containing T cells
+# (shard-granular: output may include extra cells from partially matching shards)
 pyscx.pull("gs://bucket/atlas.scxd/", "t_cells.scx",
            filter="cell_type == 'T cell'")
 
@@ -447,7 +448,7 @@ sizes in our benchmarks.
 | Single file | Yes | No (directory) | No (directory) | No (directory) | **Yes** |
 | HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | No (inode flood) | **Yes** (mmap, advisory locks) |
 | Atomic writes | No | No | Fragment-based | Fragment-based | **Yes** (atomic rename) |
-| Integrity verification | Partial | None | Per-fragment | Per-fragment | **Full** (BLAKE3 checksums) |
+| Integrity verification | Partial | None | Per-fragment | Per-fragment | **Full** (BLAKE3: catalog verified on open; `validate()` re-hashes all section payloads) |
 | Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | **Shard-level** (rayon) |
 | Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | **Yes** (append sections) |
 | Cloud-native access | No | Yes | Yes | Yes | **Yes** (explode/pack, selective pull) |
@@ -701,7 +702,7 @@ Headline numbers at Census 1M (CELLxGENE Census, 1M cells):
 | Column projection (2K HVGs) | **3.53 s** | 7.24 s (Zarr lz4) | **2.0× faster** |
 | Parallel read (32 threads) | **3.0 s** | — (no other format scales) | **6.1× vs 1 thread** |
 | Parallel write (32 threads, pcodec) | 11.4 s | — | **3.2× vs 1 thread** |
-| Out-of-core pipeline peak RSS | **5.1 GB** | 43.6 GB (materialized) | **88% reduction** |
+| Out-of-core pipeline peak RSS | **~11 GB** | ~22 GB (materialized) | **51% reduction** |
 | Training loader (batches/s) | **1,405** | 17.1 (TileDB-SOMA-ML) | **82× faster** |
 | GPU end-to-end pipeline (H100) | **286 s** | 1,077 s (CPU) | **3.8× faster** |
 | Selective query (55% shard skip) | **4.2 ms** | — | — |

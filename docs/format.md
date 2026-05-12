@@ -591,6 +591,45 @@ essential sections (layers, embeddings, obsp graphs) may be skipped with a
 warning; corruption in `obs_metadata`, `var_metadata`, or a CSR shard in `X`
 is a hard error.
 
+### 9.1 Verification levels
+
+SCX separates **catalog verification** (fast, always-on) from **payload
+verification** (expensive, opt-in):
+
+| Level | API | What is checked | Cost |
+|-------|-----|-----------------|------|
+| **Catalog verification** | `ScxReader::open()` / `pyscx.open()` | Header magic, format version, catalog structure (offsets, lengths). The catalog checksum (last 32 bytes) authenticates all catalog entries — a bit-flip in any stored per-section checksum is detected here. | O(catalog size) — sub-millisecond for typical files. |
+| **Payload verification** | `pyscx.validate(path)` / `scx validate path` | Re-hashes every section's raw bytes against the 32-byte BLAKE3 stored in the catalog. Also verifies the header `file_checksum` and every per-shard truncated-64 checksum. | O(file size) — full sequential read. |
+
+`pyscx.open(path)` does **not** re-hash individual section payloads; it trusts
+the catalog's stored checksums once the catalog itself is authenticated.
+Payload corruption (e.g., a bit-flip in a CSR shard) is detected only when
+that section is read and decoded (the shard header's truncated-64 checksum
+catches it), or proactively via `pyscx.validate()`.
+
+### 9.2 File checksum semantics
+
+The header field `file_checksum` is a **BLAKE3 hash truncated to 64 bits**
+computed over:
+
+- All file bytes from offset 0 through the end of the active full catalog,
+  with the 8 bytes of the `file_checksum` field itself (at header offset 120)
+  zeroed during computation.
+
+This gives a fast, single-number integrity signal for the entire file extent.
+
+| Event | `file_checksum` behaviour |
+|-------|--------------------------|
+| Initial write | Set during the final header `pwrite()` (step 5 of §7.1). |
+| After `append` | Updated to cover the new file extent (new sections + new catalog). |
+| After `rollback` | Recomputed over the rolled-back extent (header through the reverted catalog). |
+| Trailing garbage after crash | Irrelevant — `file_checksum` covers only bytes up to `full_catalog_offset + full_catalog_length`; bytes beyond are ignored by readers and excluded from the hash. |
+
+**Relationship to per-section checksums**: `file_checksum` and per-section BLAKE3
+checksums are independent. A valid `file_checksum` with a corrupt per-section
+checksum (or vice versa) is possible after partial disk corruption — `validate()`
+checks both independently.
+
 **Encryption**: not in v1. Section types 240–254 are reserved for future
 encrypted section types. For PHI datasets, use filesystem-level encryption
 (LUKS, dm-crypt, GCS CMEK).

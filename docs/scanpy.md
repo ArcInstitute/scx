@@ -718,7 +718,7 @@ csr = adata.X.copy()       # same as to_memory()
 
 ### Complete out-of-core pipeline
 
-This pipeline processes 1M+ cells with ~11 GB peak RSS (vs ~38 GB materialized — 71% reduction). The lazy preprocessing path (normalize + log1p + streaming PCA) avoids materializing the full matrix; the remaining RSS is dominated by kNN graph construction and UMAP:
+This pipeline processes 1M+ cells with ~11 GB peak RSS (vs ~22 GB materialised — 51% reduction). The lazy preprocessing path (normalize + log1p + streaming PCA) peaks at ~3.5 GB; the remaining RSS is dominated by kNN graph construction and UMAP:
 
 ```python
 import pyscx
@@ -1757,8 +1757,8 @@ sc.pl.umap(adata, color="leiden")
 ```
 
 > Peak RSS for this pipeline on census_1m (1M cells × 61K genes) is ~11 GB
-> (vs ~38 GB with the traditional materialize-then-preprocess approach — a
-> 71% reduction). The lazy preprocessing path streams shard-by-shard through
+> (vs ~22 GB with the traditional materialize-then-preprocess approach — a
+> 51% reduction). The lazy preprocessing path streams shard-by-shard through
 > transforms without materializing the full matrix. The remaining RSS is
 > dominated by kNN graph construction and UMAP embedding, not preprocessing.
 > The Python interpreter + library baseline is ~450 MB.
