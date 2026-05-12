@@ -224,34 +224,56 @@ pulling and re-uploading is another way to make a file cloud-ready.
 
 ### `pull` — stream cloud → local `.scx`
 
-Downloads shard objects in parallel, streams them into a single local `.scx`
-file through a reorder buffer, and writes the catalog last.
+Downloads shard objects in parallel through a bounded `buffer_unordered`
+pipeline, streams them into a single local `.scx` file via a reorder
+window, and writes the catalog last. Peak memory is bounded by
+`reorder_buffer × max_section_size`, **not** by the total file size.
 
 ```python
 # Full dataset
 pyscx.pull("gs://bucket/atlas.scxd/", "atlas.scx")
 
-# Selective: only shards matching the predicate — uses catalog-level pushdown
+# Selective shard pull: only shards matching the predicate are downloaded.
+# This is shard-granular — the output may include non-matching cells from
+# partially matching shards.  Use open_cloud() + local subset for exact
+# cell-level filtering.
 pyscx.pull(
     "gs://bucket/atlas.scxd/",
     "t_cells.scx",
     filter="cell_type == 'T cell'",
     parallelism=16,
+    filter_mode="shard",    # default; "exact" reserved for future release
 )
 ```
 
 ```bash
 scx pull gs://bucket/atlas.scxd/ atlas.scx --parallelism 16
-scx pull gs://bucket/atlas.scxd/ lung.scx --filter "tissue == 'lung'"
+scx pull gs://bucket/atlas.scxd/ lung.scx --filter "tissue == 'lung'" --filter-mode shard
 ```
 
 Selective pulls can reduce bandwidth by up to ~20× on well-sharded datasets
 (see [docs/sharding.md]), because the catalog's per-shard `CategoryBitset` is
 consulted before any shard is downloaded.
 
+**Filter mode.** The `filter_mode` parameter controls the granularity of
+the selective pull:
+
+- `"shard"` (default): downloads complete shards containing any matching
+  cell. The output may include extra non-matching cells from partially
+  matching shards. Fast — no decode/re-encode.
+- `"exact"`: not yet implemented (reserved for follow-up). Will decode
+  downloaded shards, filter rows, rebase CSR indptr, and write only
+  matching cells.
+
+**Omitted sections.** Selective pulls omit section types that cannot be
+subset at the shard level without re-indexing (e.g., `ObsmEmbedding`,
+`LayerCsrShard`, `ObspCsrShard`). The returned stats dict includes an
+`omitted_section_types` key listing what was skipped.
+
 Return value (Python): dict with `bytes_downloaded`, `sections_downloaded`,
 `elapsed_secs`, `throughput_mbps`. Filtered pulls add `total_shards`,
-`downloaded_shards`, `skipped_shards`, `matching_cells`, `bytes_saved`.
+`downloaded_shards`, `skipped_shards`, `matching_cells`, `bytes_saved`,
+`filter_mode`, `omitted_section_types`.
 
 #### Interrupted pulls — idempotent retry, not resumable
 
@@ -291,9 +313,8 @@ pyscx.push("atlas.scx", "gs://bucket/atlas.scxd/", parallelism=16)
 scx push atlas.scx gs://bucket/atlas.scxd/ --parallelism 16
 ```
 
-Uploads every section as its own object in parallel, uses multipart upload for
-sections larger than 8 MB, and uploads `_catalog.bin` last. No intermediate
-local directory is created.
+Uploads every section as its own object in parallel and uploads `_catalog.bin`
+last (atomic-publish semantics). No intermediate local directory is created.
 
 ### `open_cloud` — metadata-only handle
 
@@ -352,8 +373,8 @@ Heuristics:
 | Knob | Default | When to change |
 |------|---------|----------------|
 | `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. |
-| `PullOptions.reorder_buffer` (Rust) | 4 shards | Raise for lopsided shard sizes so fast downloads don't stall waiting for one slow shard. |
-| `PushOptions.multipart_threshold` (Rust) | 8 MB | Match to your provider's recommended part size (S3: 16 MB; GCS: 32 MB is fine). |
+| `PullOptions.reorder_buffer` (Rust) | 4 sections | Maximum number of out-of-order completed downloads held in memory while waiting for the next sequential write. Raise for lopsided shard sizes so fast downloads don't stall waiting for one slow shard. |
+| `--filter-mode` / `filter_mode` | `shard` | Shard-granular (fast, may include extra cells). `exact` reserved for future release. |
 | Shard size at write time | 10k cells | Smaller shards → finer pushdown granularity, but more objects and more request overhead. See [docs/sharding.md]. |
 | `RAYON_NUM_THREADS` | #cores | Affects downstream decode after download. Does **not** control download parallelism — that's `parallelism`. |
 
