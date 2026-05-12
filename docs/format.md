@@ -405,6 +405,11 @@ section.
   pyscx readers reconstruct a scipy CSR via
   `scipy.sparse.csr_matrix((data, (row, col)), shape=(n_rows, n_cols))`.
   Data is stored as float32; higher-precision inputs are downcast on write.
+  The on-disk section always retains the original axis lengths. When a
+  deletion vector (or backed-mode `obs_filter`) is active, pyscx subsets
+  `obsp` to the kept rows and columns at read time so the materialized
+  AnnData satisfies `obsp[k].shape == (n_obs, n_obs)`. `varp` lives on the
+  var axis and is not affected by deletion vectors.
 
 ## 6. Predicate Indexes
 

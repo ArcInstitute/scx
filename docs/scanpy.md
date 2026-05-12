@@ -264,10 +264,12 @@ The returned `anndata.AnnData` is fully populated:
 > writes `obsp["distances"]` + `obsp["connectivities"]`; `pyscx.accel.pca`
 > writes `varm["PCs"]`) survive `pyscx.from_anndata` → `to_anndata` since
 > Patch 7. Sparse pairwise matrices are stored as float32 COO; higher
-> precision is downcast on write. `obsp` / `varp` are not filtered by the
-> deletion vector — when cells are logically deleted via `mark_deleted`,
-> the pairwise matrices still cover the full original axis until
-> `compact` rebuilds the file.
+> precision is downcast on write. When cells are logically deleted via
+> `mark_deleted` (or excluded by `obs_filter` in backed mode), `obsp` is
+> subset to the kept rows and columns at read time so the in-memory
+> AnnData stays shape-consistent. The on-disk section keeps its original
+> axis until `compact` rebuilds the file. `varp` and `varm` are unaffected
+> by the deletion vector (var axis).
 
 **Memory implications:** Once materialized, the in-memory AnnData is
 **identical** whether the source was an `.scx` file or an `.h5ad` file —

@@ -261,6 +261,119 @@ pub(crate) fn coo_record_batch_to_scipy<'py>(
     scipy_sparse.call_method("csr_matrix", ((data_np, (row_np, col_np)),), Some(&kwargs))
 }
 
+/// Subset a COO obsp RecordBatch by a kept-row set on both axes.
+///
+/// `obsp` is square (obs × obs); the same kept set applies to rows and cols.
+/// Returns a new batch containing only the entries whose row AND col are kept,
+/// with indices remapped to the user-visible 0..kept_rows.len() range and the
+/// `n_rows` / `n_cols` schema metadata updated to `kept_rows.len()`.
+pub(crate) fn filter_coo_obsp_by_kept_rows(
+    batch: &RecordBatch,
+    kept_rows: &[u64],
+) -> PyResult<RecordBatch> {
+    use arrow::array::{Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
+
+    let meta = batch.schema().metadata().clone();
+    let n_rows: usize = meta
+        .get("n_rows")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| PyRuntimeError::new_err("Missing n_rows in sparse matrix metadata"))?;
+    let n_cols: usize = meta
+        .get("n_cols")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| PyRuntimeError::new_err("Missing n_cols in sparse matrix metadata"))?;
+
+    let row_arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| PyRuntimeError::new_err("Invalid row column in sparse matrix batch"))?;
+    let col_arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| PyRuntimeError::new_err("Invalid col column in sparse matrix batch"))?;
+    let data_arr = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| PyRuntimeError::new_err("Invalid data column in sparse matrix batch"))?;
+
+    // Build original→user-visible remaps. -1 means dropped.
+    let mut row_remap = vec![-1i32; n_rows];
+    for (new_idx, &orig) in kept_rows.iter().enumerate() {
+        let orig_usize = orig as usize;
+        if orig_usize < n_rows {
+            row_remap[orig_usize] = new_idx as i32;
+        }
+    }
+    // For obsp the axes are identical, but n_cols may legitimately differ from
+    // n_rows on a malformed file — build the col remap independently.
+    let col_remap: Vec<i32> = if n_cols == n_rows {
+        row_remap.clone()
+    } else {
+        let mut r = vec![-1i32; n_cols];
+        for (new_idx, &orig) in kept_rows.iter().enumerate() {
+            let orig_usize = orig as usize;
+            if orig_usize < n_cols {
+                r[orig_usize] = new_idx as i32;
+            }
+        }
+        r
+    };
+
+    let nnz = row_arr.len();
+    let mut new_row: Vec<i32> = Vec::with_capacity(nnz);
+    let mut new_col: Vec<i32> = Vec::with_capacity(nnz);
+    let mut new_data: Vec<f32> = Vec::with_capacity(nnz);
+    let row_vals = row_arr.values();
+    let col_vals = col_arr.values();
+    let data_vals = data_arr.values();
+    for k in 0..nnz {
+        let r = row_vals[k];
+        let c = col_vals[k];
+        if r < 0 || c < 0 {
+            continue;
+        }
+        let r_us = r as usize;
+        let c_us = c as usize;
+        if r_us >= n_rows || c_us >= n_cols {
+            continue;
+        }
+        let nr = row_remap[r_us];
+        let nc = col_remap[c_us];
+        if nr >= 0 && nc >= 0 {
+            new_row.push(nr);
+            new_col.push(nc);
+            new_data.push(data_vals[k]);
+        }
+    }
+
+    let kept_len = kept_rows.len();
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), kept_len.to_string()),
+            ("n_cols".to_string(), kept_len.to_string()),
+        ]),
+    ));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(new_row)),
+            Arc::new(Int32Array::from(new_col)),
+            Arc::new(Float32Array::from(new_data)),
+        ],
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 /// Build an AnnData object from an ScxReader.
 ///
 /// When deletion vectors are present, deleted cells are excluded from
@@ -327,7 +440,8 @@ fn to_anndata_with_layers<'py>(
         varm_dict.set_item(name, np_arr)?;
     }
 
-    // obsp (obs × obs sparse — loaded as-is; no per-row deletion filtering for 2D sparse)
+    // obsp (obs × obs sparse — subset to kept rows when a deletion vector is active)
+    let obsp_kept = compute_kept_to_global(reader)?;
     let obsp_map = match reader.read_all_obsp() {
         Ok(map) => map,
         Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
@@ -335,11 +449,16 @@ fn to_anndata_with_layers<'py>(
     };
     let obsp_dict = pyo3::types::PyDict::new(py);
     for (name, batch) in &obsp_map {
-        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
+        let scipy_mat = if let Some(ref kept) = obsp_kept {
+            let filtered = filter_coo_obsp_by_kept_rows(batch, kept)?;
+            coo_record_batch_to_scipy(py, &filtered)?
+        } else {
+            coo_record_batch_to_scipy(py, batch)?
+        };
         obsp_dict.set_item(name, scipy_mat)?;
     }
 
-    // varp (var × var sparse — same as obsp)
+    // varp (var × var sparse — no deletion vector applies to the var axis)
     let varp_map = match reader.read_all_varp() {
         Ok(map) => map,
         Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
@@ -861,7 +980,9 @@ pub fn to_anndata_backed<'py>(
         varm_dict.set_item(name, np_arr)?;
     }
 
-    // --- obsp (eager, obs × obs sparse — no row-level deletion filtering for 2D sparse) ---
+    // --- obsp (eager, obs × obs sparse — subset by the same kept_to_global ---
+    // --- mapping that was applied to X and obs above, composing deletion ---
+    // --- vector + obs_filter) ---
     let obsp_map = match reader.read_all_obsp() {
         Ok(map) => map,
         Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
@@ -869,7 +990,12 @@ pub fn to_anndata_backed<'py>(
     };
     let obsp_dict = pyo3::types::PyDict::new(py);
     for (name, batch) in &obsp_map {
-        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
+        let scipy_mat = if let Some(ref kept) = kept_to_global {
+            let filtered = filter_coo_obsp_by_kept_rows(batch, kept)?;
+            coo_record_batch_to_scipy(py, &filtered)?
+        } else {
+            coo_record_batch_to_scipy(py, batch)?
+        };
         obsp_dict.set_item(name, scipy_mat)?;
     }
 
