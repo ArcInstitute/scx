@@ -227,7 +227,7 @@ pulling and re-uploading is another way to make a file cloud-ready.
 Downloads shard objects in parallel through a bounded `buffer_unordered`
 pipeline, streams them into a single local `.scx` file via a reorder
 window, and writes the catalog last. Peak memory is bounded by
-`reorder_buffer × max_section_size`, **not** by the total file size.
+`parallelism × max_section_size`, **not** by the total file size.
 
 ```python
 # Full dataset
@@ -372,8 +372,7 @@ Heuristics:
 
 | Knob | Default | When to change |
 |------|---------|----------------|
-| `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. |
-| `PullOptions.reorder_buffer` (Rust) | 4 sections | Maximum number of out-of-order completed downloads held in memory while waiting for the next sequential write. Raise for lopsided shard sizes so fast downloads don't stall waiting for one slow shard. |
+| `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. Also bounds the reorder window — peak memory is `parallelism × max_section_size`. |
 | `--filter-mode` / `filter_mode` | `shard` | Shard-granular (fast, may include extra cells). `exact` reserved for future release. |
 | Shard size at write time | 10k cells | Smaller shards → finer pushdown granularity, but more objects and more request overhead. See [docs/sharding.md]. |
 | `RAYON_NUM_THREADS` | #cores | Affects downstream decode after download. Does **not** control download parallelism — that's `parallelism`. |

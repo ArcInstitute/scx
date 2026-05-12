@@ -66,7 +66,6 @@ pub fn pull(
 
     let opts = scx_cloud::PullOptions {
         parallelism: parallelism.unwrap_or(8),
-        reorder_buffer: 4,
         cloud_ready: true,
         filter_mode: mode,
     };

@@ -22,7 +22,6 @@ pub fn run_pull(
 
     let opts = scx_cloud::PullOptions {
         parallelism,
-        reorder_buffer: 4,
         cloud_ready,
         filter_mode: mode,
     };
