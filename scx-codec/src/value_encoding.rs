@@ -3,8 +3,13 @@
 //! Until this module existed, three crates (`pyscx/anndata.rs`,
 //! `scx-cli/convert/dtype.rs`, `scx-mtx/convert.rs`) each carried their own
 //! structurally-identical copy of the detect + encode logic. Per finding
-//! H11, all three now delegate here. Future tweaks to integer detection or
-//! float-fallback policy happen in one place.
+//! H11, all three now delegate here.
+//!
+//! `values_to_raw_bytes` is a thin wrapper around
+//! [`ValueEncoding::encode_f32_batch`](crate::dispatch::ValueEncoding::encode_f32_batch),
+//! which holds the range-checked per-encoding serialiser. Future tweaks to
+//! per-encoding byte layout happen there; this module owns only the
+//! integer-detection policy.
 //!
 //! Conventions:
 //! - Integer detection uses `v.is_finite() && v >= 0.0 && v == v.floor()`.
@@ -12,13 +17,8 @@
 //!   (original pyscx finding 9.4).
 //! - Max-value comparison is done in `f64` so values beyond `2^24` (f32's
 //!   contiguous integer range) don't saturate (finding 9.1).
-//! - `Float16` writes 2-byte little-endian `half::f16` per element. Callers
-//!   opting into Float16 accept the lossy f32 → f16 narrowing inherent to
-//!   the encoding.
 
-use byteorder::{LittleEndian, WriteBytesExt};
-
-use crate::dispatch::ValueEncoding;
+use crate::dispatch::{CodecError, ValueEncoding};
 
 /// Return true if every element is a non-negative finite integer-valued f32.
 #[inline]
@@ -45,38 +45,14 @@ pub fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
 }
 
 /// Serialize f32 values to LE raw bytes according to `encoding`.
-pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
-    match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => {
-            let mut buf = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                buf.write_u16::<LittleEndian>(v as u16).unwrap();
-            }
-            buf
-        }
-        ValueEncoding::Uint32 => {
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.write_u32::<LittleEndian>(v as u32).unwrap();
-            }
-            buf
-        }
-        ValueEncoding::Float16 => {
-            let mut buf = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                buf.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
-            }
-            buf
-        }
-        ValueEncoding::Float32 => {
-            let mut buf = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                buf.write_f32::<LittleEndian>(v).unwrap();
-            }
-            buf
-        }
-    }
+///
+/// Thin wrapper over [`ValueEncoding::encode_f32_batch`] — kept as the
+/// canonical entry point cited by historical call sites (`pyscx/anndata`,
+/// `scx-cli/convert/dtype`, `scx-mtx/convert`). Returns
+/// `Err(CodecError::Io(InvalidData))` if any value falls outside the
+/// range representable by the requested integer encoding.
+pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Result<Vec<u8>, CodecError> {
+    encoding.encode_f32_batch(data)
 }
 
 #[cfg(test)]
@@ -136,7 +112,7 @@ mod tests {
     #[test]
     fn round_trip_uint8() {
         let data = [0.0_f32, 1.0, 128.0, 255.0];
-        let bytes = values_to_raw_bytes(&data, ValueEncoding::Uint8);
+        let bytes = values_to_raw_bytes(&data, ValueEncoding::Uint8).unwrap();
         let decoded: Vec<f32> = bytes.iter().map(|&b| b as f32).collect();
         assert_eq!(data.to_vec(), decoded);
     }
@@ -144,7 +120,7 @@ mod tests {
     #[test]
     fn round_trip_uint16() {
         let data = [0.0_f32, 256.0, 65535.0];
-        let bytes = values_to_raw_bytes(&data, ValueEncoding::Uint16);
+        let bytes = values_to_raw_bytes(&data, ValueEncoding::Uint16).unwrap();
         let decoded: Vec<f32> = bytes
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
@@ -155,7 +131,7 @@ mod tests {
     #[test]
     fn round_trip_float32() {
         let data = [0.0_f32, 1.5, -2.75, std::f32::consts::PI];
-        let bytes = values_to_raw_bytes(&data, ValueEncoding::Float32);
+        let bytes = values_to_raw_bytes(&data, ValueEncoding::Float32).unwrap();
         let decoded: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -166,7 +142,7 @@ mod tests {
     #[test]
     fn round_trip_float16_emits_2_byte_le() {
         let data = [0.0_f32, 1.5, -2.25, 100.0];
-        let bytes = values_to_raw_bytes(&data, ValueEncoding::Float16);
+        let bytes = values_to_raw_bytes(&data, ValueEncoding::Float16).unwrap();
         assert_eq!(bytes.len(), data.len() * 2);
         let decoded: Vec<f32> = bytes
             .chunks_exact(2)
@@ -180,8 +156,8 @@ mod tests {
     #[test]
     fn float16_stride_differs_from_float32() {
         let data = [1.5_f32, 2.25];
-        let f32_bytes = values_to_raw_bytes(&data, ValueEncoding::Float32);
-        let f16_bytes = values_to_raw_bytes(&data, ValueEncoding::Float16);
+        let f32_bytes = values_to_raw_bytes(&data, ValueEncoding::Float32).unwrap();
+        let f16_bytes = values_to_raw_bytes(&data, ValueEncoding::Float16).unwrap();
         assert_eq!(f32_bytes.len(), data.len() * 4);
         assert_eq!(f16_bytes.len(), data.len() * 2);
     }

@@ -26,6 +26,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
+use scx_format::error::ScxError;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
@@ -196,7 +197,8 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             read_x_matrix_at(&file, &x_path, *fmt)?;
         let modality_type = infer_modality_type(mname);
         let (value_encoding, codec_id) =
-            detect_value_encoding_for_modality(&data, opts.codec, modality_type);
+            detect_value_encoding_for_modality(&data, opts.codec, modality_type)
+                .map_err(ScxError::from)?;
 
         // build_csc=opts.csc lets the writer emit per-modality CSC
         // sidecars at finish() time so callers can drop the manual
@@ -261,7 +263,8 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         if let Ok(layers) = read_layers_at(&file, &layers_path) {
             for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
                 let (l_enc, l_codec) =
-                    detect_value_encoding_for_modality(l_data, opts.codec, modality_type);
+                    detect_value_encoding_for_modality(l_data, opts.codec, modality_type)
+                        .map_err(ScxError::from)?;
                 write_modality_layer_shards(
                     &mut writer,
                     modality_id,
@@ -349,7 +352,7 @@ fn write_modality_csr_shards(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding);
+        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
         writer
             .write_csr_shard_for(
@@ -407,7 +410,8 @@ fn write_modality_csc_shards_from_csr(
 
         let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
         let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values = values_to_raw_bytes(&chunk.data, value_encoding);
+        let raw_values =
+            values_to_raw_bytes(&chunk.data, value_encoding).map_err(ScxError::from)?;
 
         writer
             .write_csc_shard_for(
@@ -474,7 +478,7 @@ fn write_modality_layer_shards(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding);
+        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
         writer
             .write_layer_csr_shard_for(

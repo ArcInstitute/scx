@@ -1,9 +1,10 @@
-/// Byte-shuffle pre-filter for LZ4 codec (Phase 2D, SPEC W7).
-///
-/// Reorders an array of N elements of width W bytes so that all byte-0 values
-/// are contiguous, then all byte-1, etc. This is a transpose of an N x W matrix
-/// and dramatically improves compression of typed arrays by grouping similar
-/// bytes together.
+//! Byte-shuffle pre-filter for LZ4 codec (Phase 2D, SPEC W7).
+//!
+//! Reorders an array of N elements of width W bytes so that all byte-0 values
+//! are contiguous, then all byte-1, etc. This is a transpose of an N x W matrix
+//! and dramatically improves compression of typed arrays by grouping similar
+//! bytes together.
+
 use crate::dispatch::CodecError;
 
 /// Byte-shuffle: transpose N elements of `element_width` bytes.

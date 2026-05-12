@@ -22,7 +22,7 @@ use scx_codec::ValueEncoding;
 #[test]
 fn float16_emits_2_byte_le_per_element() {
     let data = [0.0_f32, 1.5, -2.25, 100.0, 1e-3];
-    let bytes = values_to_raw_bytes(&data, ValueEncoding::Float16);
+    let bytes = values_to_raw_bytes(&data, ValueEncoding::Float16).unwrap();
 
     // 2 bytes per element, not 4.
     assert_eq!(bytes.len(), data.len() * 2);
