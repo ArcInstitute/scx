@@ -123,27 +123,10 @@ impl ScxWriter {
     pub fn new(path: impl AsRef<Path>, header: FileHeader) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
 
-        // Use tempfile to create a unique temp file in the same directory as
-        // the final path.  This avoids the PID-based naming collision that
-        // occurred when two concurrent writes from the same process targeted
-        // the same destination.  `NamedTempFile` uses a randomized suffix.
-        let parent = final_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let stem = final_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("scx");
-        let named_tmp = tempfile::Builder::new()
-            .prefix(&format!(".{stem}_"))
-            .suffix(".tmp")
-            .tempfile_in(parent)
-            .map_err(ScxError::Io)?;
-
-        // Split into the raw File (for read+write+seek) and the TempPath
-        // (which auto-deletes on drop if we don't call `persist`).
-        let (file, tmp_path) = named_tmp.into_parts();
+        // Collision-safe sibling temp file (random suffix, intra-filesystem
+        // rename target). The returned `TempPath` auto-deletes on drop if
+        // `finish()` is never reached.
+        let (file, tmp_path) = make_sibling_tempfile(&final_path)?;
         let mut writer = BufWriter::new(file);
 
         // Write 4352 zero bytes as placeholder for header + root catalog.
@@ -1453,10 +1436,16 @@ impl ScxWriter {
             .persist(&self.final_path)
             .map_err(|e| ScxError::Io(e.error))?;
 
-        // 9. fsync the parent directory so the new directory entry is
-        //    durable on POSIX.  Without this, a power loss after rename
-        //    can lose the directory entry even though the file data is
-        //    intact.  No-op on non-Unix platforms.
+        // 9. Restore umask-respecting permissions on the persisted file.
+        //    `tempfile::NamedTempFile` always creates files with `0600`;
+        //    this widens to `0o666 & !umask` so SCX outputs in shared
+        //    directories remain group/world readable.  No-op on non-Unix.
+        chmod_to_umask(&self.final_path)?;
+
+        // 10. fsync the parent directory so the new directory entry is
+        //     durable on POSIX.  Without this, a power loss after rename
+        //     can lose the directory entry even though the file data is
+        //     intact.  No-op on non-Unix platforms.
         fsync_parent_dir(&self.final_path)?;
 
         Ok(self.final_path.clone())
@@ -1535,6 +1524,78 @@ pub fn fsync_parent_dir(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// Create a collision-safe sibling temp file for an atomic write to
+/// `final_path`. Names the temp file `.{stem}_<random>.tmp` in the same
+/// directory as `final_path`, so the eventual `rename` is intra-filesystem
+/// and therefore atomic. The returned `TempPath` auto-deletes the file on
+/// drop if `persist` is never called, so an interrupted write leaves no
+/// orphan beyond the lifetime of the writer.
+///
+/// Used by `ScxWriter` and by the `scx-cloud` `pull` / `pull_filtered` /
+/// `pack` / `cloud_optimize` paths so all five sites share one naming
+/// policy.
+pub fn make_sibling_tempfile(final_path: &Path) -> Result<(File, tempfile::TempPath)> {
+    let parent = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("scx");
+    let named_tmp = tempfile::Builder::new()
+        .prefix(&format!(".{stem}_"))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(ScxError::Io)?;
+    Ok(named_tmp.into_parts())
+}
+
+/// Re-apply the process umask to `path` so the persisted file ends up
+/// with `0o666 & !umask` — matching the permissions a plain
+/// `OpenOptions::create()` would have produced. `tempfile::NamedTempFile`
+/// always creates files with `0600` for security; on shared filesystems
+/// (e.g. HPC group dirs) this is too restrictive, so atomic-write paths
+/// call this immediately after `persist()` to restore the conventional
+/// umask-driven mode.
+///
+/// No-op on non-Unix platforms (Windows permission model is unrelated).
+#[cfg(unix)]
+pub fn chmod_to_umask(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = 0o666 & !current_umask();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn chmod_to_umask(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Read the process umask once, via the POSIX `umask(0)` / `umask(saved)`
+/// dance, and cache it in a `OnceLock`. POSIX provides no race-free way
+/// to read umask without temporarily clearing it; caching on first call
+/// keeps the window to a single brief interval at process startup rather
+/// than reopening it on every write.
+#[cfg(unix)]
+fn current_umask() -> u32 {
+    use std::sync::OnceLock;
+    static UMASK: OnceLock<u32> = OnceLock::new();
+    *UMASK.get_or_init(|| {
+        // SAFETY: `umask` is async-signal-safe and the value we pass
+        // (`0o022`) is a no-op placeholder we immediately overwrite with
+        // the saved value. Racy with concurrent `umask` callers but the
+        // worst case is a one-time misread on the first invocation; the
+        // cached value is stable thereafter.
+        unsafe {
+            let saved = libc::umask(0o022);
+            libc::umask(saved);
+            saved as u32
+        }
+    })
 }
 
 /// Major axis of a shard: row-major (CSR/Layer/Obsp) or column-major
@@ -2124,6 +2185,83 @@ mod tests {
         assert!(
             tmp_remaining.is_empty(),
             "all temp files should be cleaned up after dropping both writers"
+        );
+    }
+
+    /// `make_sibling_tempfile` creates a temp file in the same directory
+    /// as the final path, with the `.{stem}_<rand>.tmp` naming convention.
+    #[test]
+    fn test_make_sibling_tempfile_creates_in_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("dest.scx");
+        let (file, tmp_path) = make_sibling_tempfile(&final_path).unwrap();
+        // File handle should be valid (write 1 byte).
+        let mut f = file;
+        use std::io::Write;
+        f.write_all(b"x").unwrap();
+        // Temp path lives in the same parent directory.
+        assert_eq!(tmp_path.parent(), Some(dir.path()));
+        // Filename matches `.dest.scx_*.tmp`.
+        let name = tmp_path.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(
+            name.starts_with(".dest.scx_"),
+            "name {name:?} should start with `.dest.scx_`"
+        );
+        assert!(
+            name.ends_with(".tmp"),
+            "name {name:?} should end with `.tmp`"
+        );
+        // Dropping `tmp_path` cleans up.
+        let path_clone = tmp_path.to_path_buf();
+        drop(tmp_path);
+        assert!(!path_clone.exists(), "temp file should be deleted on drop");
+    }
+
+    /// `finish()` should restore umask-respecting permissions on the
+    /// persisted file. `tempfile::NamedTempFile` creates `0600`; after the
+    /// post-persist `chmod_to_umask` call we expect `0o666 & !umask`.
+    ///
+    /// This test is Unix-only and inherently single-threaded because it
+    /// reads (and briefly clears) the process umask. The umask cache in
+    /// `current_umask()` reads on first call — to make this test
+    /// deterministic regardless of test ordering we force a known umask
+    /// before any `chmod_to_umask` call in this binary may have run.
+    #[cfg(unix)]
+    #[test]
+    fn test_finish_sets_umask_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perm.scx");
+
+        let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Read back current umask the same way `chmod_to_umask` does.
+        // SAFETY: same umask dance as `current_umask`.
+        let umask = unsafe {
+            let saved = libc::umask(0o022);
+            libc::umask(saved);
+            saved as u32
+        };
+        let expected_mode = 0o666 & !umask;
+        let actual_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            actual_mode, expected_mode,
+            "persisted file mode {actual_mode:o} should equal 0o666 & !umask ({expected_mode:o})"
         );
     }
 

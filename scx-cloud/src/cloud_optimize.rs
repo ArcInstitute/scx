@@ -125,17 +125,8 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         }
     }
 
-    // 3. Create output file via collision-safe tempfile
-    let parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = output.file_name().and_then(|n| n.to_str()).unwrap_or("scx");
-    let named_tmp = tempfile::Builder::new()
-        .prefix(&format!(".{stem}_"))
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-    let (raw_file, tmp_path) = named_tmp.into_parts();
+    // 3. Create output file via collision-safe sibling tempfile.
+    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(output)?;
     let mut writer = BufWriter::new(raw_file);
 
     // Write placeholder for header + root catalog
@@ -298,6 +289,7 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     tmp_path
         .persist(output)
         .map_err(|e| crate::error::CloudError::Io(e.error))?;
+    scx_format::chmod_to_umask(output)?;
     scx_format::fsync_parent_dir(output)?;
 
     Ok(())
