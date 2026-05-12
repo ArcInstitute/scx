@@ -55,7 +55,7 @@ pub const SECTIONS_START_OFFSET: u64 = 4352;
 /// sequential read performance.
 pub struct ScxWriter {
     final_path: PathBuf,
-    tmp_path: PathBuf,
+    tmp_path: Option<tempfile::TempPath>,
     file: Option<BufWriter<File>>,
     current_offset: u64,
     header: FileHeader,
@@ -122,18 +122,28 @@ impl ScxWriter {
     /// write order.
     pub fn new(path: impl AsRef<Path>, header: FileHeader) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
-        let tmp_path = PathBuf::from(format!(
-            "{}.tmp.{}",
-            final_path.display(),
-            std::process::id()
-        ));
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        // Use tempfile to create a unique temp file in the same directory as
+        // the final path.  This avoids the PID-based naming collision that
+        // occurred when two concurrent writes from the same process targeted
+        // the same destination.  `NamedTempFile` uses a randomized suffix.
+        let parent = final_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stem = final_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("scx");
+        let named_tmp = tempfile::Builder::new()
+            .prefix(&format!(".{stem}_"))
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .map_err(ScxError::Io)?;
+
+        // Split into the raw File (for read+write+seek) and the TempPath
+        // (which auto-deletes on drop if we don't call `persist`).
+        let (file, tmp_path) = named_tmp.into_parts();
         let mut writer = BufWriter::new(file);
 
         // Write 4352 zero bytes as placeholder for header + root catalog.
@@ -146,7 +156,7 @@ impl ScxWriter {
 
         Ok(ScxWriter {
             final_path,
-            tmp_path,
+            tmp_path: Some(tmp_path),
             file: Some(writer),
             current_offset: SECTIONS_START_OFFSET,
             header,
@@ -1432,9 +1442,22 @@ impl ScxWriter {
 
         // 7. fsync
         file.sync_all()?;
+        drop(file);
 
-        // 8. Atomic rename
-        std::fs::rename(&self.tmp_path, &self.final_path)?;
+        // 8. Atomic rename via TempPath::persist
+        let tmp_path = self
+            .tmp_path
+            .take()
+            .ok_or(ScxError::WriterAlreadyFinished)?;
+        tmp_path
+            .persist(&self.final_path)
+            .map_err(|e| ScxError::Io(e.error))?;
+
+        // 9. fsync the parent directory so the new directory entry is
+        //    durable on POSIX.  Without this, a power loss after rename
+        //    can lose the directory entry even though the file data is
+        //    intact.  No-op on non-Unix platforms.
+        fsync_parent_dir(&self.final_path)?;
 
         Ok(self.final_path.clone())
     }
@@ -1482,11 +1505,36 @@ impl ScxWriter {
 
 impl Drop for ScxWriter {
     fn drop(&mut self) {
-        // Close file handle first
+        // Close file handle first so the temp file is not held open.
         drop(self.file.take());
-        // Remove temp file (harmless no-op after successful finish+rename)
-        let _ = std::fs::remove_file(&self.tmp_path);
+        // TempPath::drop auto-deletes the temp file if `persist` was never
+        // called (i.e., `finish()` was not reached).  After a successful
+        // `finish()`, `tmp_path` is `None` so this is a no-op.
+        drop(self.tmp_path.take());
     }
+}
+
+/// Fsync the parent directory of `path` so the directory entry is durable.
+///
+/// On POSIX, `rename()` is atomic but the directory entry may not survive
+/// a power loss unless the directory itself is fsynced.  This function
+/// opens the parent directory and calls `sync_all()` on Unix; on
+/// non-Unix platforms it is a no-op.
+pub fn fsync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let dir = File::open(parent)?;
+        dir.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Major axis of a shard: row-major (CSR/Layer/Obsp) or column-major
@@ -1722,19 +1770,36 @@ mod tests {
         }
     }
 
-    /// 10.15: Temp file lifecycle — tmp exists before finish, final after
+    /// 10.15: Temp file lifecycle — tmp exists before finish, final after.
+    /// With randomized temp file names we can't predict the exact path,
+    /// so we scan the directory for `.tmp` files instead.
     #[test]
     fn test_temp_file_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lifecycle.scx");
-        let tmp_path = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
 
         let header = sample_header();
         let mut writer = ScxWriter::new(&path, header).unwrap();
 
-        // Tmp file exists, final doesn't
-        assert!(tmp_path.exists());
-        assert!(!path.exists());
+        // A temp file should exist in the directory; final path should not.
+        let tmp_files_before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !tmp_files_before.is_empty(),
+            "temp file should exist after new()"
+        );
+        assert!(
+            !path.exists(),
+            "final path should not exist before finish()"
+        );
 
         writer.write_obs(&sample_obs()).unwrap();
         writer.write_var(&sample_var()).unwrap();
@@ -1753,9 +1818,22 @@ mod tests {
 
         writer.finish().unwrap();
 
-        // Final exists, tmp doesn't
-        assert!(path.exists());
-        assert!(!tmp_path.exists());
+        // Final file should exist; no temp files should remain.
+        assert!(path.exists(), "final path should exist after finish()");
+        let tmp_files_after: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            tmp_files_after.is_empty(),
+            "no temp files should remain after finish()"
+        );
     }
 
     /// 10.16: Write obs + var + 4 CSR shards → verify catalog entries
@@ -1959,20 +2037,94 @@ mod tests {
         }
     }
 
-    /// Test Drop cleans up temp file when finish() is not called
+    /// Test Drop cleans up temp file when finish() is not called.
+    /// TempPath auto-deletes the temp file on drop.
     #[test]
     fn test_drop_cleans_up_temp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dropped.scx");
-        let tmp_path = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
 
         {
             let _writer = ScxWriter::new(&path, sample_header()).unwrap();
-            assert!(tmp_path.exists());
+            // A temp file should exist somewhere in the directory.
+            let tmp_count = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|s| s.contains(".tmp"))
+                        .unwrap_or(false)
+                })
+                .count();
+            assert!(tmp_count > 0, "temp file should exist before drop");
         }
-        // After drop
-        assert!(!tmp_path.exists());
-        assert!(!path.exists());
+        // After drop: no temp files, no final file.
+        let tmp_count_after = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            tmp_count_after, 0,
+            "temp file should be cleaned up after drop"
+        );
+        assert!(
+            !path.exists(),
+            "final path should not exist after drop without finish"
+        );
+    }
+
+    /// Two concurrent ScxWriters targeting the same final path should use
+    /// different temp files and not trample each other.
+    #[test]
+    fn test_concurrent_writers_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.scx");
+
+        let writer1 = ScxWriter::new(&path, sample_header()).unwrap();
+        let writer2 = ScxWriter::new(&path, sample_header()).unwrap();
+
+        // Both writers should have created separate temp files.
+        let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            tmp_files.len(),
+            2,
+            "two concurrent writers should create two distinct temp files"
+        );
+
+        // Dropping both should clean up both temp files.
+        drop(writer1);
+        drop(writer2);
+
+        let tmp_remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            tmp_remaining.is_empty(),
+            "all temp files should be cleaned up after dropping both writers"
+        );
     }
 
     /// Test compute_shard_stats (row-major branch)

@@ -271,16 +271,18 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     //    disk as they arrive in order, so peak memory is bounded by
     //    `parallelism × max_section_size` instead of `total_file_size`.
     let parallelism = options.parallelism.max(1);
-
-    let tmp_path =
-        std::path::PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
+    // Use tempfile for collision-safe temp file creation.
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = dest.file_name().and_then(|n| n.to_str()).unwrap_or("scx");
+    let named_tmp = tempfile::Builder::new()
+        .prefix(&format!(".{stem}_"))
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    let (raw_file, tmp_path) = named_tmp.into_parts();
+    let mut writer = BufWriter::new(raw_file);
 
     // Write placeholder for header + root catalog
     writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
@@ -467,7 +469,10 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     // 11. fsync + atomic rename
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp_path, dest)?;
+    tmp_path
+        .persist(dest)
+        .map_err(|e| CloudError::Io(e.error))?;
+    scx_format::fsync_parent_dir(dest)?;
 
     let elapsed = start.elapsed();
     let throughput_mbps = if elapsed.as_secs_f64() > 0.0 {
@@ -781,15 +786,18 @@ pub async fn pull_filtered(
     //    in write order, so peak memory is bounded by
     //    `parallelism × max_section_size`.
     let parallelism = options.parallelism.max(1);
-    let tmp_path =
-        std::path::PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
+    // Use tempfile for collision-safe temp file creation.
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = dest.file_name().and_then(|n| n.to_str()).unwrap_or("scx");
+    let named_tmp = tempfile::Builder::new()
+        .prefix(&format!(".{stem}_"))
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    let (raw_file, tmp_path) = named_tmp.into_parts();
+    let mut writer = BufWriter::new(raw_file);
 
     writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
     let mut write_offset = SECTIONS_START_OFFSET;
@@ -1047,7 +1055,10 @@ pub async fn pull_filtered(
 
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp_path, dest)?;
+    tmp_path
+        .persist(dest)
+        .map_err(|e| CloudError::Io(e.error))?;
+    scx_format::fsync_parent_dir(dest)?;
 
     let elapsed = start.elapsed();
 

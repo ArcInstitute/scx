@@ -48,5 +48,6 @@ pub use shard::{
 };
 pub use shard_source::{ColumnShardSource, ShardSource};
 pub use writer::{
-    compute_shard_stats, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
+    compute_shard_stats, fsync_parent_dir, MajorAxis, PreEncodedSection, ScxWriter,
+    SECTIONS_START_OFFSET,
 };
