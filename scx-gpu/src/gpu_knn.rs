@@ -389,25 +389,15 @@ fn load_cuvs_library() -> Result<CuvsLibrary, String> {
             .get(b"cuvsCagraSearch\0")
             .map_err(|e| format!("cuvsCagraSearch: {e}"))?;
 
-        // Best-effort cuVS version check — warn if FFI struct layouts may differ.
+        // cuVS version check — hard-fail if FFI struct layouts may differ.
         // CagraIndexParams/CagraSearchParams are pinned to cuVS 26.02 C headers.
+        // Set SCX_CUVS_TRUST_LAYOUT=1 to downgrade to a warning for newer versions.
         type FnCuvsVersion = unsafe extern "C" fn() -> *const std::ffi::c_char;
         if let Ok(version_sym) = lib.get::<FnCuvsVersion>(b"cuvs_version\0") {
             let version_ptr = (*version_sym)();
             if !version_ptr.is_null() {
                 let version_str = std::ffi::CStr::from_ptr(version_ptr).to_string_lossy();
-                let parts: Vec<&str> = version_str.split('.').collect();
-                if parts.len() >= 2 {
-                    let major_minor = format!("{}.{}", parts[0], parts[1]);
-                    if major_minor != "26.02" {
-                        eprintln!(
-                            "scx-gpu: WARNING — cuVS {version_str} detected, but FFI struct \
-                             layouts are pinned to 26.02. kNN results may be incorrect if \
-                             CagraIndexParams/CagraSearchParams changed. \
-                             See scx-gpu/src/gpu_knn.rs."
-                        );
-                    }
-                }
+                check_cuvs_version(&version_str)?;
             }
         }
 
@@ -425,6 +415,37 @@ fn load_cuvs_library() -> Result<CuvsLibrary, String> {
             search,
         })
     }
+}
+
+/// Check cuVS version compatibility with our pinned FFI struct layouts.
+///
+/// Returns `Ok(())` if the version is compatible (26.02) or if the user has
+/// opted in via `SCX_CUVS_TRUST_LAYOUT=1`. Returns `Err` with a descriptive
+/// message if the version is incompatible and the override is not set.
+fn check_cuvs_version(version_str: &str) -> std::result::Result<(), String> {
+    let parts: Vec<&str> = version_str.split('.').collect();
+    if parts.len() >= 2 {
+        let major_minor = format!("{}.{}", parts[0], parts[1]);
+        if major_minor != "26.02" {
+            if std::env::var("SCX_CUVS_TRUST_LAYOUT").as_deref() == Ok("1") {
+                eprintln!(
+                    "scx-gpu: WARNING — cuVS {version_str} detected, but FFI struct \
+                     layouts are pinned to 26.02. Proceeding because \
+                     SCX_CUVS_TRUST_LAYOUT=1. kNN results may be incorrect if \
+                     CagraIndexParams/CagraSearchParams changed. \
+                     See scx-gpu/src/gpu_knn.rs."
+                );
+            } else {
+                return Err(format!(
+                    "cuVS {version_str} detected, but FFI struct layouts are pinned \
+                     to 26.02. CagraIndexParams/CagraSearchParams may have changed, \
+                     risking incorrect kNN results. Set SCX_CUVS_TRUST_LAYOUT=1 to \
+                     override this check. See scx-gpu/src/gpu_knn.rs."
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn get_cuvs() -> Result<&'static CuvsLibrary, GpuError> {
@@ -601,6 +622,11 @@ pub fn gpu_knn_cagra(
         }
     }
 
+    // Extract device ordinal for DLPack tensor construction.
+    // All DLDevice structs must reference the correct GPU so that cuVS
+    // addresses the right device's memory on multi-GPU hosts.
+    let device_ordinal = dev.context().ordinal() as i32;
+
     // Upload data to GPU
     let d_data = dev.htod_copy(data)?;
 
@@ -660,7 +686,7 @@ pub fn gpu_knn_cagra(
             data: data_ptr as *mut std::ffi::c_void,
             device: DLDevice {
                 device_type: DLDeviceType::CUDA,
-                device_id: 0,
+                device_id: device_ordinal,
             },
             ndim: 2,
             dtype: DLDataType::float32(),
@@ -702,7 +728,7 @@ pub fn gpu_knn_cagra(
             data: data_ptr as *mut std::ffi::c_void,
             device: DLDevice {
                 device_type: DLDeviceType::CUDA,
-                device_id: 0,
+                device_id: device_ordinal,
             },
             ndim: 2,
             dtype: DLDataType::float32(),
@@ -726,7 +752,7 @@ pub fn gpu_knn_cagra(
                 data: neighbors_ptr as *mut std::ffi::c_void,
                 device: DLDevice {
                     device_type: DLDeviceType::CUDA,
-                    device_id: 0,
+                    device_id: device_ordinal,
                 },
                 ndim: 2,
                 dtype: DLDataType::uint32(),
@@ -747,7 +773,7 @@ pub fn gpu_knn_cagra(
                 data: distances_ptr as *mut std::ffi::c_void,
                 device: DLDevice {
                     device_type: DLDeviceType::CUDA,
-                    device_id: 0,
+                    device_id: device_ordinal,
                 },
                 ndim: 2,
                 dtype: DLDataType::float32(),
@@ -902,5 +928,46 @@ mod tests {
                 "point {i} has only {same_cluster}/{n_neighbors} neighbors in same cluster"
             );
         }
+    }
+
+    // --- cuVS version check tests ---
+
+    #[test]
+    fn test_cuvs_version_check_compatible() {
+        // 26.02.x should always pass
+        assert!(check_cuvs_version("26.02.00").is_ok());
+        assert!(check_cuvs_version("26.02.1").is_ok());
+        assert!(check_cuvs_version("26.02").is_ok());
+    }
+
+    #[test]
+    fn test_cuvs_version_check_incompatible_hard_fail() {
+        // Ensure the env var is NOT set for this test.
+        // (We can't unset globally because tests run in parallel, but we
+        // can verify the error message content.)
+        // If SCX_CUVS_TRUST_LAYOUT happens to be set in the environment,
+        // skip this test to avoid flakiness.
+        if std::env::var("SCX_CUVS_TRUST_LAYOUT").as_deref() == Ok("1") {
+            eprintln!("SCX_CUVS_TRUST_LAYOUT=1 is set — skipping hard-fail test");
+            return;
+        }
+        let result = check_cuvs_version("27.01.00");
+        assert!(result.is_err(), "should fail for incompatible version");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("27.01.00"),
+            "error should mention the detected version"
+        );
+        assert!(
+            msg.contains("SCX_CUVS_TRUST_LAYOUT"),
+            "error should mention the override env var"
+        );
+    }
+
+    #[test]
+    fn test_cuvs_version_check_single_component() {
+        // Version strings with < 2 components should pass (no check possible)
+        assert!(check_cuvs_version("26").is_ok());
+        assert!(check_cuvs_version("").is_ok());
     }
 }

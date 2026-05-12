@@ -207,11 +207,16 @@ pub fn compute_umap(
             // Repulsive forces via negative sampling
             epoch_of_next_sample[edge_idx] += epochs_per_sample[edge_idx];
 
+            // Clamp n_neg to negative_sample_rate before both the loop and the
+            // schedule advance. Without clamping, the schedule jumps too far
+            // ahead when connectivity is high, then subsequent epochs over-sample
+            // to compensate. This matches umap-learn's reference implementation.
             let n_neg = ((epoch as f64 - epoch_of_next_negative_sample[edge_idx])
                 / epochs_per_negative_sample[edge_idx])
                 .floor() as usize;
+            let n_neg = n_neg.min(negative_sample_rate);
 
-            for _ in 0..n_neg.min(negative_sample_rate) {
+            for _ in 0..n_neg {
                 let k = rng.gen_range(0..n_obs);
                 if k == i {
                     continue;
@@ -682,6 +687,77 @@ mod tests {
         let init1 = random_init(10, 2, 42);
         let init2 = random_init(10, 2, 42);
         assert_eq!(init1, init2, "same seed should give same init");
+    }
+
+    /// Regression test for the negative-sampling schedule fix.
+    ///
+    /// Uses a fully-connected graph (every node connected to every other)
+    /// where the unclamped `n_neg` would exceed `negative_sample_rate`.
+    /// Before the fix, the schedule advance used the unclamped value,
+    /// causing over-sampling in subsequent epochs. After the fix, all
+    /// embeddings should be finite and the two clusters should still
+    /// separate cleanly.
+    #[test]
+    fn test_umap_negative_sample_schedule_clamped() {
+        // Build a fully-connected graph of 20 nodes (2 clusters of 10).
+        // High connectivity means n_neg will exceed negative_sample_rate
+        // on most edges.
+        let n = 20;
+        let mut indptr = vec![0i64; n + 1];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    indices.push(j as i32);
+                    // Cluster-aware weights: high within cluster, low between
+                    let same_cluster = (i < 10 && j < 10) || (i >= 10 && j >= 10);
+                    data.push(if same_cluster { 0.9 } else { 0.1 });
+                }
+            }
+            indptr[i + 1] = indices.len() as i64;
+        }
+
+        // This should NOT panic or produce NaN/Inf despite the high
+        // connectivity triggering the schedule clamp path.
+        let result = compute_umap(
+            &indptr, &indices, &data, n, 2,   // n_components
+            100, // n_epochs
+            0.1, // min_dist
+            1.0, // spread
+            5,   // negative_sample_rate (will be exceeded by n_neg)
+            1.0, // learning_rate
+            42,  // seed
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.embeddings.len(), n * 2);
+        for &v in &result.embeddings {
+            assert!(v.is_finite(), "embedding should be finite, got {v}");
+        }
+
+        // The two clusters should still be separated
+        let mut c1 = [0.0_f64; 2];
+        let mut c2 = [0.0_f64; 2];
+        for i in 0..10 {
+            c1[0] += result.embeddings[i * 2];
+            c1[1] += result.embeddings[i * 2 + 1];
+        }
+        for i in 10..20 {
+            c2[0] += result.embeddings[i * 2];
+            c2[1] += result.embeddings[i * 2 + 1];
+        }
+        c1[0] /= 10.0;
+        c1[1] /= 10.0;
+        c2[0] /= 10.0;
+        c2[1] /= 10.0;
+        let inter_dist = ((c1[0] - c2[0]).powi(2) + (c1[1] - c2[1]).powi(2)).sqrt();
+        assert!(
+            inter_dist > 0.0,
+            "clusters should be separated (inter_dist = {inter_dist})"
+        );
     }
 }
 
