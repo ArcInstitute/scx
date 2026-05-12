@@ -48,9 +48,17 @@ pub fn read_mtx_directory(dir: &Path) -> Result<MtxData, MtxError> {
         ],
     )?;
 
-    // Parse matrix
+    // Parse matrix. Derive an `nnz` upper bound from the on-disk file
+    // size: the minimum ASCII triplet is "1 1 1\n" = 6 bytes, so for
+    // an uncompressed file nnz <= file_size / 6. For gzipped MTX we
+    // don't know the decompressed size cheaply; sparse-integer MTX
+    // text compresses 5–10×, so a 20× factor is a safe upper bound.
+    let mtx_file_size = std::fs::metadata(&mtx_path)?.len() as usize;
+    let is_gz = mtx_path.extension().is_some_and(|e| e == "gz");
+    let gz_factor: usize = if is_gz { 20 } else { 1 };
+    let max_nnz_bound = mtx_file_size.saturating_mul(gz_factor) / 6;
     let mtx_reader = open_maybe_gzipped(&mtx_path)?;
-    let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(mtx_reader)?;
+    let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(mtx_reader, max_nnz_bound)?;
 
     // Parse barcodes (obs)
     let barcodes_reader = open_maybe_gzipped(&barcodes_path)?;
@@ -116,9 +124,17 @@ fn open_maybe_gzipped(path: &Path) -> Result<Box<dyn BufRead>, MtxError> {
 ///
 /// Returns `(indptr, indices, data, n_rows, n_cols)` in CSR format.
 /// The MTX file is COO (coordinate) format with 1-indexed row/col.
+///
+/// `max_nnz_bound` is an upper bound on the number of triplets we
+/// accept, derived by the caller from the on-disk file size. The
+/// minimum ASCII triplet is "1 1 1\n" = 6 bytes, so for an
+/// uncompressed file the tight bound is `file_size / 6`. This
+/// replaces an earlier hard-coded 2 billion cap that incorrectly
+/// rejected atlas-scale inputs (>50M cells routinely exceed 2B nnz).
 #[allow(clippy::type_complexity)]
 fn parse_mtx_file(
     reader: Box<dyn BufRead>,
+    max_nnz_bound: usize,
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>, usize, usize), MtxError> {
     let mut lines = reader.lines();
 
@@ -190,14 +206,15 @@ fn parse_mtx_file(
         .parse()
         .map_err(|_| MtxError::Parse(format!("invalid nnz count: {}", size_parts[2])))?;
 
-    // Cap nnz to prevent a malformed size line from triggering a multi-GB
-    // allocation. 2 billion triplets × 12 bytes each = 24 GB — already
-    // well beyond any single-cell dataset.
-    const MAX_MTX_NNZ: usize = 2_000_000_000;
-    if nnz > MAX_MTX_NNZ {
+    // Reject a malformed size line whose nnz claim exceeds what the
+    // file could physically encode (at 6 bytes minimum per triplet).
+    // This bounds the up-front `Vec::with_capacity(nnz)` reservation
+    // to the file's actual byte budget rather than a hand-picked
+    // constant, so atlas-scale inputs (>2B nnz) aren't blocked by
+    // the defense.
+    if nnz > max_nnz_bound {
         return Err(MtxError::Parse(format!(
-            "nnz {} exceeds maximum of {} entries",
-            nnz, MAX_MTX_NNZ
+            "nnz {nnz} exceeds upper bound {max_nnz_bound} derived from file size"
         )));
     }
 
@@ -352,8 +369,9 @@ mod tests {
 3 2 4
 3 3 5
 ";
+        let bound = mtx_content.len();
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader).unwrap();
+        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader, bound).unwrap();
 
         assert_eq!(n_rows, 3);
         assert_eq!(n_cols, 4);
@@ -370,8 +388,9 @@ mod tests {
 1 1 1.5
 2 2 2.5
 ";
+        let bound = mtx_content.len();
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader).unwrap();
+        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader, bound).unwrap();
 
         assert_eq!(n_rows, 2);
         assert_eq!(n_cols, 2);
@@ -414,7 +433,7 @@ mod tests {
     fn test_invalid_mtx_header() {
         let content = "not a valid header\n";
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(content)));
-        let result = parse_mtx_file(reader);
+        let result = parse_mtx_file(reader, content.len());
         assert!(result.is_err());
     }
 
@@ -424,18 +443,22 @@ mod tests {
 
     #[test]
     fn test_mtx_rejects_oversized_nnz() {
-        // Craft a valid MTX header that claims nnz > 2 billion.
+        // The MTX body below is only ~80 bytes, so any claim of 3B
+        // nnz vastly exceeds the file's physical encoding budget
+        // (6 bytes minimum per triplet). The file-size-derived bound
+        // must reject it.
         let mtx_content = "\
 %%MatrixMarket matrix coordinate integer general
 2 2 3000000000
 ";
+        let bound = mtx_content.len() / 6;
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let result = parse_mtx_file(reader);
+        let result = parse_mtx_file(reader, bound);
         assert!(result.is_err(), "should reject oversized nnz");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("exceeds maximum"),
-            "error should mention exceeds maximum: {err_msg}"
+            err_msg.contains("exceeds upper bound"),
+            "error should mention exceeds upper bound: {err_msg}"
         );
     }
 }
