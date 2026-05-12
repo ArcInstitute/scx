@@ -419,8 +419,15 @@ for batch in dataset:
 ```
 
 `TrainingDataset` wraps the Rust `TrainingPipeline` and implements Python's
-iterator protocol. It detects `num_workers > 0` and raises an error to prevent
-CUDA fork deadlocks.
+iterator protocol. The pipeline is constructed eagerly in `__new__`, so direct
+use requires `num_workers=0` — a PID check in `__next__` raises `RuntimeError`
+if a `TrainingDataset` constructed in the parent is reused from a forked
+child. For `num_workers>0` with the fork start-method, wrap `TrainingDataset`
+in a thin Python `IterableDataset` that constructs it inside the worker's
+`__iter__` (the pattern used by `cell-load-scx`'s `ScxTrainingDataset` and
+`state-scx`'s `ScxStateAdapter`); the tokio current-thread runtime and rayon
+pool are then built inside the worker process and never inherit fork-hostile
+parent state.
 
 ---
 

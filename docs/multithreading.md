@@ -258,9 +258,11 @@ os.environ["RAYON_NUM_THREADS"] = "4"
 
 ### Tokio worker threads
 
-The training loader's tokio runtime is fixed at 2 worker threads (sufficient
-for sequential disk I/O). The cloud runtime uses tokio's default (one thread
-per core), with parallelism controlled by `PullOptions.parallelism`.
+The training loader's I/O stage uses a `tokio::runtime::Builder::new_current_thread()`
+runtime on a dedicated `std::thread` per epoch — there is no multi-threaded tokio
+executor. The cloud runtime (`scx-cloud`) uses tokio's default multi-threaded
+builder (one thread per core), with download concurrency controlled by
+`PullOptions.parallelism`.
 
 ### Cloud download parallelism
 
