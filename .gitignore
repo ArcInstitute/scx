@@ -1,6 +1,11 @@
 # Environment
 .env
 
+# Docs build artifacts
+docs/_build/
+docs/_autosummary/
+.venv-docs/
+
 # Misc
 archive/
 tasks/
