@@ -129,7 +129,7 @@ fn delta_golomb_ref_basic() {
     // deltas = [150, 130, 220], median=150, k=compute_k(150)
     // k = max(0, floor(log2(0.6931 * 150))) = max(0, floor(log2(103.965))) = floor(6.70) = 6
     let indptr = vec![0u64, 150, 280, 500];
-    let encoded = delta_golomb_encode(&indptr).unwrap();
+    let encoded = delta_golomb_encode(&indptr);
 
     // First 8 bytes: raw LE u64 = 0
     assert_eq!(encoded[0..8], [0, 0, 0, 0, 0, 0, 0, 0]);
@@ -144,7 +144,7 @@ fn delta_golomb_ref_basic() {
 fn delta_golomb_ref_single_entry() {
     // indptr = [42] → just raw u64, no deltas
     let indptr = vec![42u64];
-    let encoded = delta_golomb_encode(&indptr).unwrap();
+    let encoded = delta_golomb_encode(&indptr);
     assert_eq!(encoded.len(), 8);
     assert_eq!(encoded, [42, 0, 0, 0, 0, 0, 0, 0]);
     let decoded = delta_golomb_decode(&encoded, 1).unwrap();
@@ -156,7 +156,7 @@ fn delta_golomb_ref_zero_deltas() {
     // indptr = [0, 0, 0] → deltas = [0, 0], median=0, k=0
     // Each delta: unary(0)=0-bit, no remainder
     let indptr = vec![0u64, 0, 0];
-    let encoded = delta_golomb_encode(&indptr).unwrap();
+    let encoded = delta_golomb_encode(&indptr);
     assert_eq!(encoded[0..8], [0, 0, 0, 0, 0, 0, 0, 0]); // first value
     assert_eq!(encoded[8], 0); // k=0
                                // Two unary(0) = two 0-bits → padded to 1 byte = 0x00

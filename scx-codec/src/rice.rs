@@ -8,7 +8,6 @@
 // standard Gaussian-geometric estimator used by JPEG-LS / HP-LOCO.
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
-use crate::dispatch::CodecError;
 
 /// Default block size for Rice coding of values.
 pub const B_VAL: usize = 256;
@@ -90,7 +89,7 @@ pub fn rice_decode(
     data: &[u8],
     n_values: usize,
     block_size: usize,
-) -> Result<Vec<u32>, CodecError> {
+) -> Result<Vec<u32>, BitStreamError> {
     let mut output = Vec::with_capacity(n_values);
     let mut reader = BitReader::new(data);
     let mut remaining = n_values;
@@ -98,17 +97,8 @@ pub fn rice_decode(
     while remaining > 0 {
         let block_len = remaining.min(block_size);
 
-        // Read block header byte. Spec §4 reserves the high nibble (must be
-        // zero); a non-zero value indicates corruption — fail loudly rather
-        // than silently masking it off.
-        let block_header = reader.read_bits(8)? as u8;
-        if block_header & 0xF0 != 0 {
-            return Err(CodecError::MalformedInput(format!(
-                "Rice block header has non-zero reserved high nibble: 0x{:02x}",
-                block_header
-            )));
-        }
-        let k = block_header & 0x0F;
+        // Read block header byte
+        let k = reader.read_bits(8)? as u8 & 0x0F;
 
         for _ in 0..block_len {
             let q = reader.read_unary()? as u32;

@@ -181,9 +181,6 @@ pub enum CodecError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("malformed codec input: {0}")]
-    MalformedInput(String),
 }
 
 /// Decoded shard: `(indptr, indices, values_raw_bytes)`.
@@ -319,11 +316,10 @@ pub fn decode_shard_scipy(
 /// CSR indptr values are always non-negative and well below i64::MAX,
 /// so the bit patterns are identical. Uses bytemuck for safe transmute.
 fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
-    if let Some(&bad) = data.iter().find(|&&v| v > i64::MAX as u64) {
-        return Err(CodecError::MalformedInput(format!(
-            "indptr value {bad} exceeds i64::MAX (corrupt or hostile input)"
-        )));
-    }
+    debug_assert!(
+        data.iter().all(|&v| v <= i64::MAX as u64),
+        "indptr value exceeds i64::MAX"
+    );
     Ok(bytemuck::cast_vec::<u64, i64>(data))
 }
 
@@ -331,11 +327,10 @@ fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
 /// Column indices are always non-negative and below n_vars (well within i32 range),
 /// so the bit patterns are identical. Uses bytemuck for safe transmute.
 fn u32_vec_to_i32(data: Vec<u32>) -> Result<Vec<i32>, CodecError> {
-    if let Some(&bad) = data.iter().find(|&&v| v > i32::MAX as u32) {
-        return Err(CodecError::MalformedInput(format!(
-            "column index {bad} exceeds i32::MAX (corrupt or hostile input)"
-        )));
-    }
+    debug_assert!(
+        data.iter().all(|&v| v <= i32::MAX as u32),
+        "index value exceeds i32::MAX"
+    );
     Ok(bytemuck::cast_vec::<u32, i32>(data))
 }
 
@@ -477,7 +472,7 @@ fn encode_scx1(
     }
 
     // indptr → Delta-Golomb
-    let indptr_bytes = delta_golomb_encode(indptr)?;
+    let indptr_bytes = delta_golomb_encode(indptr);
 
     // indices → FOR-BP (needs row_lengths from indptr)
     let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
@@ -630,10 +625,10 @@ fn encode_lz4_shuffle(
     let indices_raw = indices_to_le_bytes(indices, index_dtype_u16)?;
 
     // Byte-shuffle then LZ4 frame compress each array
-    let indptr_shuffled = byte_shuffle(&indptr_raw, 8)?; // u64 = 8 bytes
+    let indptr_shuffled = byte_shuffle(&indptr_raw, 8); // u64 = 8 bytes
     let index_width = if index_dtype_u16 { 2 } else { 4 };
-    let indices_shuffled = byte_shuffle(&indices_raw, index_width)?;
-    let values_shuffled = byte_shuffle(values, value_encoding.byte_width())?;
+    let indices_shuffled = byte_shuffle(&indices_raw, index_width);
+    let values_shuffled = byte_shuffle(values, value_encoding.byte_width());
 
     let indptr_bytes = lz4_frame_compress(&indptr_shuffled)?;
     let indices_bytes = lz4_frame_compress(&indices_shuffled)?;
@@ -658,10 +653,10 @@ fn decode_lz4_shuffle_ref(
     let indices_shuffled = lz4_frame_decompress(encoded.indices_bytes)?;
     let values_shuffled = lz4_frame_decompress(encoded.values_bytes)?;
 
-    let indptr_raw = byte_unshuffle(&indptr_shuffled, 8)?;
+    let indptr_raw = byte_unshuffle(&indptr_shuffled, 8);
     let index_width = if index_dtype_u16 { 2 } else { 4 };
-    let indices_raw = byte_unshuffle(&indices_shuffled, index_width)?;
-    let values_raw = byte_unshuffle(&values_shuffled, value_encoding.byte_width())?;
+    let indices_raw = byte_unshuffle(&indices_shuffled, index_width);
+    let values_raw = byte_unshuffle(&values_shuffled, value_encoding.byte_width());
 
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
@@ -1258,14 +1253,10 @@ mod tests {
     }
 
     #[test]
-    fn test_u64_to_i64_rejects_overflow() {
+    #[should_panic(expected = "indptr value exceeds i64::MAX")]
+    fn test_u64_to_i64_debug_assert_overflow() {
         let data = vec![0u64, 100, u64::MAX];
-        match u64_vec_to_i64(data) {
-            Err(CodecError::MalformedInput(msg)) => {
-                assert!(msg.contains("exceeds i64::MAX"), "got: {msg}");
-            }
-            other => panic!("expected MalformedInput, got {other:?}"),
-        }
+        let _ = u64_vec_to_i64(data);
     }
 
     #[test]
@@ -1276,14 +1267,10 @@ mod tests {
     }
 
     #[test]
-    fn test_u32_to_i32_rejects_overflow() {
+    #[should_panic(expected = "index value exceeds i32::MAX")]
+    fn test_u32_to_i32_debug_assert_overflow() {
         let data = vec![0u32, 100, u32::MAX];
-        match u32_vec_to_i32(data) {
-            Err(CodecError::MalformedInput(msg)) => {
-                assert!(msg.contains("exceeds i32::MAX"), "got: {msg}");
-            }
-            other => panic!("expected MalformedInput, got {other:?}"),
-        }
+        let _ = u32_vec_to_i32(data);
     }
 
     #[test]

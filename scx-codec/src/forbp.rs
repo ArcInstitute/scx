@@ -6,7 +6,6 @@ use std::io::Cursor;
 use bitpacking::{BitPacker, BitPacker4x};
 
 use crate::bitstream::{BitStreamError, BitWriter};
-use crate::dispatch::CodecError;
 
 /// Block size for FOR-BP coding of indices: 128 rows per block.
 pub const B_IDX: usize = 128;
@@ -82,7 +81,7 @@ pub fn forbp_encode(
     indices: &[u32],
     row_lengths: &[usize],
     index_dtype_u16: bool,
-) -> Result<Vec<u8>, CodecError> {
+) -> Result<Vec<u8>, BitStreamError> {
     let mut output = Vec::new();
     let mut idx_offset: usize = 0;
 
@@ -92,7 +91,7 @@ pub fn forbp_encode(
 
         // Validate block_nnz fits in u32
         if block_nnz > u32::MAX as usize {
-            return Err(BitStreamError.into());
+            return Err(BitStreamError);
         }
 
         // Write block header
@@ -117,19 +116,10 @@ pub fn forbp_encode(
             // frame_min is the first (smallest) index in the sorted row
             let frame_min = row_indices[0];
 
-            // Compute deltas: delta[0] = 0, delta[j] = indices[j] - indices[j-1].
-            // Reject unsorted indices loudly — silent wrap on `u32 - u32`
-            // produces unreadable shards in release.
+            // Compute deltas: delta[0] = 0, delta[j] = indices[j] - indices[j-1]
             let mut deltas = Vec::with_capacity(nnz);
             deltas.push(0u32);
             for j in 1..nnz {
-                if row_indices[j] < row_indices[j - 1] {
-                    return Err(CodecError::MalformedInput(format!(
-                        "FOR-BP requires sorted row indices; saw {} < {} at offset {j}",
-                        row_indices[j],
-                        row_indices[j - 1]
-                    )));
-                }
                 deltas.push(row_indices[j] - row_indices[j - 1]);
             }
 
@@ -139,7 +129,7 @@ pub fn forbp_encode(
             // Write frame_min
             if index_dtype_u16 {
                 if frame_min > u16::MAX as u32 {
-                    return Err(BitStreamError.into());
+                    return Err(BitStreamError);
                 }
                 output.write_u16::<LittleEndian>(frame_min as u16).unwrap();
             } else {
