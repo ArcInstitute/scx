@@ -237,22 +237,20 @@ fn is_retryable(err: &object_store::Error) -> bool {
 /// Compute the exponential-backoff delay for a given attempt number.
 ///
 /// Delay grows as `base * 2^(attempt-1)`, clamped to `max_delay`, then
-/// multiplied by `1 ± jitter_factor` from a thread-local pseudo-random
-/// source (an LCG seeded from `Instant::now()` — adequate for breaking
-/// thundering-herd patterns, not for security).
+/// multiplied by `1 ± jitter_factor` sampled uniformly from
+/// `rand::thread_rng()`. Concurrent clients sampling independently is
+/// what actually breaks thundering-herd retry spikes — the prior
+/// `Instant::now().elapsed()` LCG seed collapsed to a constant on every
+/// call and is fixed here.
 fn backoff_delay(cfg: &RetryConfig, attempt: usize) -> Duration {
     let exp = (attempt as u32).saturating_sub(1).min(20);
     let raw = cfg.base_delay.saturating_mul(1u32 << exp);
     let bounded = std::cmp::min(raw, cfg.max_delay);
-    let jitter = {
-        // Cheap PRNG seeded from Instant — pure stdlib, no extra dep.
-        // Returns a uniform sample in [-jitter_factor, +jitter_factor].
-        let nanos = Instant::now().elapsed().as_nanos() as u64;
-        let mixed = nanos
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let unit = ((mixed >> 11) as f64) / ((1u64 << 53) as f64);
-        (unit * 2.0 - 1.0) * cfg.jitter_factor
+    let jitter = if cfg.jitter_factor > 0.0 {
+        use rand::Rng;
+        rand::thread_rng().gen_range(-cfg.jitter_factor..=cfg.jitter_factor)
+    } else {
+        0.0
     };
     let nanos = bounded.as_nanos() as f64 * (1.0 + jitter);
     let nanos = nanos.max(0.0) as u64;
@@ -304,10 +302,10 @@ async fn get_with_retry(
                     tokio::time::sleep(backoff_delay(cfg, attempt)).await;
                     continue;
                 }
-                let _ = last_msg;
                 return Err(CloudError::Timeout {
                     duration: cfg.request_timeout,
                     path: path.to_string(),
+                    last_error: last_msg,
                 });
             }
         }
@@ -2616,6 +2614,52 @@ mod tests {
         let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
         match err {
             CloudError::Timeout { path: p, .. } => assert!(p.contains("file.bin")),
+            other => panic!("expected Timeout, got {other}"),
+        }
+    }
+
+    /// Regression: when retries time out, the prior transient error
+    /// (here a synthetic 503) must propagate through
+    /// `CloudError::Timeout::last_error` so on-call can diagnose what
+    /// was actually failing — not just "timed out".
+    #[tokio::test]
+    async fn get_with_retry_timeout_surfaces_last_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // First call: synthetic 503 (retryable). Second call: sleep
+        // past the timeout. Budget allows only one retry, so the
+        // second attempt's timeout exhausts it.
+        let store = FaultyStore::new(
+            inner,
+            vec![
+                FaultMode::TransientError,
+                FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
+            ],
+        );
+        let cfg = RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_millis(50),
+        };
+        let path = ObjPath::from("file.bin");
+        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        match err {
+            CloudError::Timeout {
+                last_error: Some(msg),
+                ..
+            } => {
+                let lower = msg.to_ascii_lowercase();
+                assert!(
+                    lower.contains("503") || lower.contains("service unavailable"),
+                    "last_error must carry the prior 503 message, got: {msg}"
+                );
+            }
+            CloudError::Timeout {
+                last_error: None, ..
+            } => panic!("expected last_error to carry prior 503 message, got None"),
             other => panic!("expected Timeout, got {other}"),
         }
     }

@@ -386,6 +386,13 @@ impl IndexPlanLoader {
     /// call here (always from an `IndexPlanIter`, always post-fork in the
     /// `DataLoader` worker) materializes the runtime; later calls return
     /// the same instance via `OnceLock`.
+    ///
+    /// Note on the build-then-`get_or_init` pattern: `OnceLock::get_or_try_init`
+    /// (which would let us build *inside* the init closure with fallibility)
+    /// is still unstable as of Rust 1.94. The stable build-then-set pattern
+    /// below is race-tolerant — at most one constructed runtime wins
+    /// `get_or_init` and the rest are dropped — at the cost of one extra
+    /// runtime construction in the rare concurrent first-touch case.
     fn runtime(&self) -> Result<&Runtime> {
         if let Some(rt) = self.runtime.get() {
             return Ok(rt);
@@ -400,8 +407,6 @@ impl IndexPlanLoader {
                     "failed to create tokio runtime for IndexPlanLoader: {e}"
                 ))
             })?;
-        // On a thread race the losing thread's `rt` is dropped here. That
-        // costs one extra runtime construction, at most once per loader.
         Ok(self.runtime.get_or_init(|| rt))
     }
 

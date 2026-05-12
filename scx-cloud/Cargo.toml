@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
