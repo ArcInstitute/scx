@@ -693,7 +693,7 @@ pbmc3k (see §8b):
 
 | Operation | Median wall | Dominant throughput |
 |---|---:|---:|
-| append | scales with input-CSR read + re-encode | ~38 MB/s |
+| append | streaming (one shard at a time for SCX→SCX; raw-copy fast path when codec matches) | ~38 MB/s |
 | delete (logical) | independent of n_obs | ~155 k rows/s |
 | compact | base-file read + re-encode bandwidth | ~54 MB/s |
 | rollback | single root-catalog pwrite | ~3 ms |

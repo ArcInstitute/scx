@@ -367,7 +367,10 @@ column-aggregation kernels.
 ## scx-ops — File Operations
 
 ### `scx_ops::append(path, obs, indptr, indices, values, ...) → Result<()>`
-Append new cells at EOF. Advisory flock for concurrent safety.
+Append new cells at EOF from raw CSR arrays. Advisory flock for concurrent safety.
+
+### `scx_ops::append_from_reader(target_path, source_reader, codec, shard_target_rows, target_modality_id, source_modality_id) → Result<()>`
+Streaming SCX → SCX append. Reads one source CSR shard at a time (or copies raw bytes verbatim when codec / value encoding / index dtype / per-modality `n_vars` all match), avoiding materializing the entire source matrix in memory. Supports multimodal targets via `target_modality_id` / `source_modality_id` routing. CSC sidecars are dropped on append (same as `append_for_modality`).
 
 ### `scx_ops::mark_deleted(path, cell_indices) → Result<u64>`
 Logical deletion via Roaring Bitmap deletion vectors. Returns total deleted count.
@@ -539,7 +542,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
 
 ### File operations
-- `pyscx.append(target, input, codec=None, shard_size=None)` — Append from SCX file
+- `pyscx.append(target, input, codec=None, shard_size=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match)
 - `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None)` — Append from AnnData
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
 - `pyscx.compact(input, output)` — Rewrite reclaiming space
@@ -944,7 +947,7 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`
 
 ### File operations
-- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]`
+- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]` — Streaming append (reads source one shard at a time)
 - `scx delete <file> --filter <expr> [--dry-run]`
 - `scx compact <input> --output <path> [--force]`
 - `scx rollback <file> [--to-seq N]`

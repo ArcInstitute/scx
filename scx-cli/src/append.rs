@@ -3,10 +3,8 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 
-use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection};
 use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
 pub fn run_append(
     target: &Path,
@@ -73,9 +71,6 @@ pub fn run_append(
     };
 
     // Resolve the matching input modality when both files are multimodal.
-    // For a multimodal input → multimodal target append, the input must
-    // expose the same modality name. For a single-modality input → any
-    // target, just use the input's global shards.
     let input_modality_id: u8 = if input_reader.is_multimodal() {
         if target_modality_id == 0 {
             return Err("input file is multimodal but target is single-modality; \
@@ -93,7 +88,6 @@ pub fn run_append(
         0
     };
 
-    // n_vars equality between source and target on the matching axis.
     let input_n_vars: u64 = if input_modality_id == 0 {
         input_reader.header().n_vars
     } else {
@@ -110,54 +104,33 @@ pub fn run_append(
         .into());
     }
 
-    // Read CSR data from the matching modality of the input.
-    let csr = if input_modality_id == 0 {
-        input_reader.read_all_csr_shards()?
-    } else {
-        input_reader.read_all_csr_shards_for(input_modality_id)?
-    };
+    // Count cells in the matching modality for the progress message.
+    // Iterate shard headers rather than relying on `entry.stats`, which the
+    // catalog format permits to be `None`. The streaming path also assumes
+    // the source has at least one CSR shard for the requested modality.
+    let csr_entries = input_reader
+        .catalog()
+        .csr_shards_for_modality(input_modality_id);
 
-    if csr.n_rows() == 0 {
+    if csr_entries.is_empty() {
+        println!(
+            "Input file has no CSR shards for modality {input_modality_id}, nothing to append."
+        );
+        return Ok(());
+    }
+
+    let mut n_cells: u64 = 0;
+    for entry in &csr_entries {
+        let sh = input_reader.read_shard_header(entry)?;
+        n_cells += sh.n_major as u64;
+    }
+
+    if n_cells == 0 {
         println!("Input file has 0 cells, nothing to append.");
         return Ok(());
     }
 
-    // Detect ValueEncoding from the matching modality's first CSR shard.
-    let csr_entries: Vec<&scx_format::FullCatalogEntry> = input_reader
-        .catalog()
-        .shards(SectionType::CsrShard)
-        .into_iter()
-        .filter(|e| e.modality_id == input_modality_id)
-        .collect();
-    let value_encoding = if let Some(first_shard) = csr_entries.first() {
-        let bytes = input_reader.section_bytes(first_shard)?;
-        if bytes.len() >= SHARD_HEADER_SIZE {
-            let sh =
-                ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE]))?;
-            ValueEncoding::from_u8(sh.value_encoding)
-                .ok_or_else(|| format!("unknown value encoding: {}", sh.value_encoding))?
-        } else {
-            return Err("input CSR shard too small to read header".into());
-        }
-    } else {
-        return Err("input file has no CSR shards for the requested modality".into());
-    };
-
-    // Convert from scipy in-memory types back to on-disk types
-    // indptr: i64 → u64
-    let new_indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
-    // indices: i32 → u32
-    let new_indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
-    // data: f32 → raw LE bytes matching ValueEncoding
-    let new_values = f32_to_raw_values(&csr.data, value_encoding);
-
-    // Read obs metadata from input (cells are global across modalities,
-    // so we always pull from the global obs table).
-    let new_obs = input_reader.read_obs()?;
-
-    // Resolve codec. `auto` defers per-shard modality-aware selection
-    // to append_for_modality; explicit names force that codec for every
-    // appended shard.
+    // Resolve codec.
     let codec_selection = match codec {
         "auto" => CodecSelection::Auto,
         "none" => CodecSelection::Explicit(CodecId::None),
@@ -174,21 +147,17 @@ pub fn run_append(
         }
     };
 
-    // Drop the target reader before scx_ops::append acquires the file lock.
+    // Drop the target reader before scx_ops::append_from_reader acquires
+    // the file lock.
     drop(target_reader);
 
-    // Call scx_ops::append (per-modality variant).
-    let n_cells = new_indptr.len() - 1;
-    scx_ops::append_for_modality(
+    scx_ops::append_from_reader(
         target,
-        &new_obs,
-        &new_indptr,
-        &new_indices,
-        &new_values,
-        value_encoding,
+        &input_reader,
         codec_selection,
         shard_size,
         target_modality_id,
+        input_modality_id,
     )?;
 
     println!(
@@ -199,47 +168,10 @@ pub fn run_append(
     );
 
     // Re-emit the CSC sidecar that scx_ops::append dropped.
-    // We always run when `--rebuild-csc` is set, even if the target
-    // didn't have CSC before — the user opted in explicitly.
     if rebuild_csc {
         crate::rebuild_csc::rebuild_csc_inplace(target, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", target.display());
     }
 
     Ok(())
-}
-
-/// Convert f32 data to raw LE bytes matching the given ValueEncoding.
-fn f32_to_raw_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
-    match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => {
-            let mut bytes = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                bytes.extend_from_slice(&(v as u16).to_le_bytes());
-            }
-            bytes
-        }
-        ValueEncoding::Uint32 => {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                bytes.extend_from_slice(&(v as u32).to_le_bytes());
-            }
-            bytes
-        }
-        ValueEncoding::Float32 => {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            bytes
-        }
-        ValueEncoding::Float16 => {
-            let mut bytes = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
-            }
-            bytes
-        }
-    }
 }

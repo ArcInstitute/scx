@@ -1899,13 +1899,17 @@ pyscx.from_anndata(adata_clean, "experiment_clean.scx")
 ### Appending new batches
 
 ```python
-# Append cells from another SCX file
+# Append cells from another SCX file (streaming — reads one shard at a time)
 pyscx.append("atlas.scx", "new_batch.scx")
 
 # Append cells from an AnnData object
 new_adata = sc.read_h5ad("new_batch.h5ad")
 pyscx.append_from_anndata("atlas.scx", new_adata)
 ```
+
+`pyscx.append` uses a streaming SCX → SCX path: source shards are decoded
+(or raw-copied when codec and encoding match) one at a time, so memory
+usage is bounded by a single shard rather than the full source matrix.
 
 ### Merging datasets
 
