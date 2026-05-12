@@ -15,7 +15,7 @@ triples:
     format: scx_auto
     dataset: census_1m
 reason: >
-  ~50% throughput drop on workers2 paths after MULTIMODAL-SUPPORT
+  ~50% throughput drop on workers2 paths after the multimodal support work
   Phase A.2 (v2 header + catalog parsing). Hypothesis: per-worker
   BackedCsrReader open() on tabula_sapiens_100k now traverses the
   expanded v2 catalog metadata even on single-modality files, and

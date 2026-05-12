@@ -494,7 +494,7 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] CELLxGENE Census 500K, 1M, 5M subsets (large)
 - [x] 10M-cell synthetic build for training loader (`build_census_*.py`)
 - [x] Smart-seq2 50K (non-UMI protocol — validates codec selection heuristic)
-- [ ] CITE-seq reference dataset — Phase 3.4 multimodal landed (`pyscx.from_mudata` + `MultimodalTrainingDataset` ship), but the comprehensive benchmark suite has not been extended with multimodal compression / training rows yet. Tracked under MULTIMODAL-SUPPORT.md Phase K.3 / K.4.
+- [ ] CITE-seq reference dataset — Phase 3.4 multimodal landed (`pyscx.from_mudata` + `MultimodalTrainingDataset` ship) and multimodal compression benchmarks are live (`benchmarks/comprehensive/benchmarks/multimodal_compression.py`). Still TODO: extend the comprehensive suite with multimodal training loader throughput rows.
 
 ### 5.4 Local HPC Benchmarking (Chimera SLURM) — COMPLETE
 - [x] Parallel SLURM submission via `benchmarks/scripts/submit_benchmarks.py`

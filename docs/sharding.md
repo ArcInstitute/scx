@@ -46,7 +46,7 @@ compresses to ~30–60 MB. Key considerations:
 
 - **Query engine**: Smaller shards → more granular predicate pushdown → fewer cells
   read for selective queries. Diminishing returns below ~1,000 rows.
-- **Training loader**: The triple-buffered pipeline (§8 of SPEC) reads full shards
+- **Training loader**: The triple-buffered pipeline (see [architecture.md §Training Data Loader](architecture.md#training-data-loader-scx-loader)) reads full shards
   sequentially. Very small shards add per-shard overhead; very large shards delay
   shuffling. The default of 10K–16K rows is a good balance.
 - **Cloud access**: The exploded `.scxd` layout stores each shard as a separate

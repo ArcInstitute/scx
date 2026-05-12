@@ -268,7 +268,7 @@ delegates to the §8 heuristic — output is bit-identical to v1 / pre-Phase-E
 files. Multimodal-aware ops in `scx-ops` (`scx append`, `compact`,
 `merge` working on already-written SCX files) currently still use the
 modality-blind `select_codec`; modality-aware routing through ops is
-tracked under MULTIMODAL-SUPPORT Phase F.
+a follow-on (modality-aware routing through ops is not yet implemented).
 
 ## 9. Limitations & Pitfalls
 
