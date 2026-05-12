@@ -3720,5 +3720,14 @@ mod tests {
             "write_preencoded_shard should count CSC shards"
         );
         assert_eq!(reader.header().n_csr_shards, 1);
+        assert_eq!(
+            reader.header().n_csc_shards,
+            1,
+            "header n_csc_shards should reflect the preencoded CSC shard"
+        );
+        assert!(
+            reader.header().has_csc(),
+            "header has_csc flag should be set after writing a CSC shard"
+        );
     }
 }

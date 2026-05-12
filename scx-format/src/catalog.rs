@@ -501,13 +501,7 @@ impl FullCatalog {
         // 2 (stats_len) = 54 bytes.
         // v1 entries lack modality_id: 53 bytes. Use the smaller bound.
         const MIN_ENTRY_BYTES: usize = 53;
-        let max_entries = payload_len / MIN_ENTRY_BYTES.max(1);
-        if n_entries > max_entries {
-            return Err(ScxError::AllocationTooLarge {
-                requested: n_entries * MIN_ENTRY_BYTES,
-                available: payload_len,
-            });
-        }
+        crate::error::validate_allocation(n_entries.saturating_mul(MIN_ENTRY_BYTES), payload_len)?;
 
         let mut entries = Vec::with_capacity(n_entries);
         for _ in 0..n_entries {
