@@ -519,6 +519,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ## Python API (`pyscx`)
 
+> [!NOTE]
+> For the most up-to-date function signatures and type annotations, see the
+> [auto-generated Python API reference](python_api.rst) built from the Rust
+> docstrings via autodoc.
+
 ### Module-level functions
 
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
@@ -601,41 +606,10 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
 
 #### `prefer_format="csr"|"csc"` kwarg
 
-The following entries take an explicit `prefer_format` kwarg that
-chooses the row-major CSR path (default) or the column-major CSC
-sidecar path:
-
-- `pyscx.accel.highly_variable_genes`
-- `pyscx.accel.rank_genes_groups`
-- `pyscx.accel.pseudobulk_dex`
-- `pyscx.accel.calculate_qc_metrics`
-- `pyscx.accel.col_sums`, `col_nnz`, `col_min`, `col_max`, `col_var`
-
-Plus `pyscx.accel.pca`, which accepts the kwarg only to reject
-`prefer_format="csc"` with a `ValueError` — PCA's covariance build and
-randomized SpMM are row-major; CSC offers no measurable speed-up.
-
-**Defaults to `"csr"` everywhere.** No `"auto"` — the runtime can't
-guess whether CSC dispatch is safe (depends on the file having a
-sidecar AND the user's transform chain being column-local). No
-thread-local default. No env-var override. Each call sites the
-choice locally so dispatch never changes under the user's feet.
-
-`prefer_format="csc"` requires *all* of:
-
-1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always")`,
-   `scx convert --csc=always`, or `scx build-csc`).
-2. The transform chain on `adata.X` contains only column-local
-   operations. `Log1p` is column-local; `NormalizeTotal` and
-   `RowScale` are not (they reference per-row state). Mixed chains
-   like `normalize_total → log1p` are *not* column-local.
-3. No active row deletion vector (`adata.X.kept_to_global` is
-   `None`). Row deletions break the global-row indices encoded in
-   CSC `indices` arrays.
-
-When any of these is missing, `prefer_format="csc"` raises
-`RuntimeError` with a message naming the missing capability. Invalid
-`prefer_format` values (e.g. `"auto"`) raise `ValueError`.
+Several accelerators take an explicit `prefer_format` kwarg that selects
+between the row-major CSR path (default) and the column-major CSC sidecar
+path. See [scanpy.md § prefer_format](scanpy.md#prefer_formatcsrcsc-explicit-column-major-dispatch)
+for the full dispatch rules and requirements.
 
 - `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. On GPU: cuSPARSE SpMM + cuSOLVER QR (f32).
 - `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — kNN graph + UMAP-style connectivities. CPU: HNSW. GPU: CAGRA (cuVS). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.

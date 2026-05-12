@@ -842,7 +842,7 @@ sidecar path. Entries that accept it:
 **Default is `"csr"` everywhere.** No `"auto"` — the runtime can't
 guess whether CSC dispatch is safe (depends on the file having a
 sidecar AND the user's transform chain being column-local). No
-thread-local default. No env-var override. Each call sites the
+thread-local default. No env-var override. Each call sets the
 choice locally.
 
 `prefer_format="csc"` requires *all* of the following; otherwise it

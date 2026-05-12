@@ -24,6 +24,7 @@ I/O & file lifecycle
    from_anndata
    from_10x
    from_mtx
+   from_mudata
    to_mtx
 
 Mutating operations
@@ -41,6 +42,26 @@ Mutating operations
    rollback
    save_layer
    preprocess
+
+Cloud operations (requires ``--features cloud``)
+-------------------------------------------------
+
+.. note::
+
+   The RTD build compiles ``pyscx`` without ``--features cloud``, so these
+   entries will have empty autodoc stubs on the rendered site.  For the
+   prose-style reference, see :doc:`api` § Cloud operations.
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   pull
+   push
+   cloud_optimize
+   explode
+   pack
+   open_cloud
 
 Datasets & readers
 ------------------
@@ -63,6 +84,15 @@ ML training datasets
 
    TrainingDataset
    IndexPlanDataset
+
+Multimodal
+----------
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   MultimodalTrainingDataset
 
 Query pipeline
 --------------
