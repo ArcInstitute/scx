@@ -82,21 +82,24 @@ pub fn umap(
     // GPU path
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _gpu_id {
-        // Try native CUDA SGD kernel first
-        match scx_accel::compute_umap_gpu(
-            device_id,
-            &indptr,
-            &indices,
-            &data,
-            n_obs,
-            n_components,
-            n_epochs,
-            min_dist,
-            spread,
-            negative_sample_rate,
-            learning_rate,
-            random_state,
-        ) {
+        // Try native CUDA SGD kernel first — release GIL for duration
+        let gpu_result = py.allow_threads(|| {
+            scx_accel::compute_umap_gpu(
+                device_id,
+                &indptr,
+                &indices,
+                &data,
+                n_obs,
+                n_components,
+                n_epochs,
+                min_dist,
+                spread,
+                negative_sample_rate,
+                learning_rate,
+                random_state,
+            )
+        });
+        match gpu_result {
             Ok(result) => {
                 write_umap_to_adata(py, adata, &result)?;
                 write_umap_backend(py, adata, "scx-gpu-cuda")?;
@@ -133,22 +136,25 @@ pub fn umap(
     // Suppress unused variable warning when gpu feature is not enabled
     let _ = _device;
 
-    // CPU path (default or fallback)
-    let result = scx_accel::compute_umap(
-        &indptr,
-        &indices,
-        &data,
-        n_obs,
-        n_components,
-        n_epochs,
-        min_dist,
-        spread,
-        negative_sample_rate,
-        learning_rate,
-        random_state,
-        None,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // CPU path (default or fallback) — release GIL for the computation
+    let result = py
+        .allow_threads(|| {
+            scx_accel::compute_umap(
+                &indptr,
+                &indices,
+                &data,
+                n_obs,
+                n_components,
+                n_epochs,
+                min_dist,
+                spread,
+                negative_sample_rate,
+                learning_rate,
+                random_state,
+                None,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Write results to adata.obsm["X_umap"]
     write_umap_to_adata(py, adata, &result)?;

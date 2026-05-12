@@ -152,7 +152,7 @@ pub(crate) fn csr_to_scipy<'py>(
     scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
 }
 
-/// Convert an Arrow RecordBatch (obsm) to a numpy 2D array.
+/// Convert an Arrow RecordBatch (obsm/varm) to a numpy 2D array.
 pub(crate) fn obsm_batch_to_numpy<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
@@ -160,6 +160,105 @@ pub(crate) fn obsm_batch_to_numpy<'py>(
     let table = record_batch_to_pyarrow(py, batch)?;
     let df = pyarrow_table_to_pandas(&table)?;
     df.getattr("values")
+}
+
+/// Convert a scipy sparse matrix to a COO Arrow RecordBatch.
+///
+/// The resulting batch has columns `row: Int32`, `col: Int32`, `data: Float32`
+/// (nnz rows) and schema metadata `n_rows` and `n_cols`.  Data is cast to
+/// float32; precision is reduced if the source uses float64.
+pub(crate) fn sparse_to_coo_record_batch(
+    py: Python<'_>,
+    mat: &Bound<'_, PyAny>,
+) -> PyResult<RecordBatch> {
+    use arrow::array::{Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
+
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let coo = scipy_sparse.call_method1("coo_matrix", (mat,))?;
+    let shape: (usize, usize) = coo.getattr("shape")?.extract()?;
+    let np = py.import("numpy")?;
+
+    let row: Vec<i32> = np
+        .call_method1("asarray", (coo.getattr("row")?,))?
+        .call_method1("astype", ("int32",))?
+        .extract()?;
+    let col: Vec<i32> = np
+        .call_method1("asarray", (coo.getattr("col")?,))?
+        .call_method1("astype", ("int32",))?
+        .extract()?;
+    let data: Vec<f32> = np
+        .call_method1("asarray", (coo.getattr("data")?,))?
+        .call_method1("astype", ("float32",))?
+        .extract()?;
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), shape.0.to_string()),
+            ("n_cols".to_string(), shape.1.to_string()),
+        ]),
+    ));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(row)),
+            Arc::new(Int32Array::from(col)),
+            Arc::new(Float32Array::from(data)),
+        ],
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Convert a COO Arrow RecordBatch back to a scipy.sparse.csr_matrix.
+///
+/// Reads `row`, `col`, `data` columns and `n_rows`/`n_cols` schema metadata.
+pub(crate) fn coo_record_batch_to_scipy<'py>(
+    py: Python<'py>,
+    batch: &RecordBatch,
+) -> PyResult<Bound<'py, PyAny>> {
+    use arrow::array::{Float32Array, Int32Array};
+    use numpy::PyArray1;
+
+    let meta = batch.schema().metadata().clone();
+    let n_rows: usize = meta
+        .get("n_rows")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| PyRuntimeError::new_err("Missing n_rows in sparse matrix metadata"))?;
+    let n_cols: usize = meta
+        .get("n_cols")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| PyRuntimeError::new_err("Missing n_cols in sparse matrix metadata"))?;
+
+    let row_arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| PyRuntimeError::new_err("Invalid row column in sparse matrix batch"))?;
+    let col_arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| PyRuntimeError::new_err("Invalid col column in sparse matrix batch"))?;
+    let data_arr = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| PyRuntimeError::new_err("Invalid data column in sparse matrix batch"))?;
+
+    let row_np = PyArray1::from_slice(py, row_arr.values());
+    let col_np = PyArray1::from_slice(py, col_arr.values());
+    let data_np = PyArray1::from_slice(py, data_arr.values());
+
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("shape", (n_rows, n_cols))?;
+    scipy_sparse.call_method("csr_matrix", ((data_np, (row_np, col_np)),), Some(&kwargs))
 }
 
 /// Build an AnnData object from an ScxReader.
@@ -216,6 +315,42 @@ fn to_anndata_with_layers<'py>(
         obsm_dict.set_item(name, np_arr)?;
     }
 
+    // varm (dense, var × components — no deletion vector filtering needed)
+    let varm_map = match reader.read_all_varm() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let varm_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &varm_map {
+        let np_arr = obsm_batch_to_numpy(py, batch)?;
+        varm_dict.set_item(name, np_arr)?;
+    }
+
+    // obsp (obs × obs sparse — loaded as-is; no per-row deletion filtering for 2D sparse)
+    let obsp_map = match reader.read_all_obsp() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let obsp_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &obsp_map {
+        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
+        obsp_dict.set_item(name, scipy_mat)?;
+    }
+
+    // varp (var × var sparse — same as obsp)
+    let varp_map = match reader.read_all_varp() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let varp_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &varp_map {
+        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
+        varp_dict.set_item(name, scipy_mat)?;
+    }
+
     // uns
     let uns_dict = match reader.read_uns() {
         Ok(json_val) => {
@@ -259,6 +394,15 @@ fn to_anndata_with_layers<'py>(
     }
     if !obsm_dict.is_empty() {
         kwargs.set_item("obsm", obsm_dict)?;
+    }
+    if !varm_dict.is_empty() {
+        kwargs.set_item("varm", varm_dict)?;
+    }
+    if !obsp_dict.is_empty() {
+        kwargs.set_item("obsp", obsp_dict)?;
+    }
+    if !varp_dict.is_empty() {
+        kwargs.set_item("varp", varp_dict)?;
     }
     if let Some(uns) = uns_dict {
         kwargs.set_item("uns", uns)?;
@@ -382,18 +526,39 @@ pub fn to_anndata_filtered<'py>(
         if let Some(uns) = uns_dict {
             kwargs.set_item("uns", uns)?;
         }
-        // obsm and layers are not available via QueryResult. Warn if the
-        // source file contains them so users know they're being dropped.
+        // obsm, varm, obsp, varp, and layers are not available via QueryResult.
+        // Warn if the source file contains them so users know they're being dropped.
         let has_obsm = reader
             .read_all_obsm()
             .map(|m| !m.is_empty())
             .unwrap_or(false);
+        let has_varm = reader
+            .read_all_varm()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
+        let has_obsp = reader
+            .read_all_obsp()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
+        let has_varp = reader
+            .read_all_varp()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
         let has_layers = !reader.layer_names().is_empty();
-        if has_obsm || has_layers {
+        if has_obsm || has_varm || has_obsp || has_varp || has_layers {
             let warnings = py.import("warnings")?;
             let mut parts = Vec::new();
             if has_obsm {
                 parts.push("obsm");
+            }
+            if has_varm {
+                parts.push("varm");
+            }
+            if has_obsp {
+                parts.push("obsp");
+            }
+            if has_varp {
+                parts.push("varp");
             }
             if has_layers {
                 parts.push("layers");
@@ -404,7 +569,7 @@ pub fn to_anndata_filtered<'py>(
                     "obs_filter with non-backed mode uses the query engine, which does not \
                      load {}. Pass preserve_slots=True to materialize them (skips predicate \
                      pushdown), use backed=True, or load the full dataset and filter in Python.",
-                    parts.join(" or ")
+                    parts.join(", ")
                 ),),
             )?;
         }
@@ -684,6 +849,42 @@ pub fn to_anndata_backed<'py>(
         }
     }
 
+    // --- varm (eager, dense — no deletion vector filtering needed) ---
+    let varm_map = match reader.read_all_varm() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let varm_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &varm_map {
+        let np_arr = obsm_batch_to_numpy(py, batch)?;
+        varm_dict.set_item(name, np_arr)?;
+    }
+
+    // --- obsp (eager, obs × obs sparse — no row-level deletion filtering for 2D sparse) ---
+    let obsp_map = match reader.read_all_obsp() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let obsp_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &obsp_map {
+        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
+        obsp_dict.set_item(name, scipy_mat)?;
+    }
+
+    // --- varp (eager, var × var sparse) ---
+    let varp_map = match reader.read_all_varp() {
+        Ok(map) => map,
+        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let varp_dict = pyo3::types::PyDict::new(py);
+    for (name, batch) in &varp_map {
+        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
+        varp_dict.set_item(name, scipy_mat)?;
+    }
+
     // --- uns (eager) ---
     let uns_dict = match reader.read_uns() {
         Ok(json_val) => {
@@ -736,6 +937,15 @@ pub fn to_anndata_backed<'py>(
     }
     if !obsm_dict.is_empty() {
         kwargs.set_item("obsm", obsm_dict)?;
+    }
+    if !varm_dict.is_empty() {
+        kwargs.set_item("varm", varm_dict)?;
+    }
+    if !obsp_dict.is_empty() {
+        kwargs.set_item("obsp", obsp_dict)?;
+    }
+    if !varp_dict.is_empty() {
+        kwargs.set_item("varp", varp_dict)?;
     }
     if let Some(uns) = uns_dict {
         kwargs.set_item("uns", uns)?;
@@ -1713,6 +1923,67 @@ pub fn from_anndata_impl(
         })
         .collect::<PyResult<Vec<_>>>()?;
 
+    // 1E.2: Collect varm RecordBatches under GIL (dense, like obsm).
+    // Duck-typed AnnData-likes may omit `varm`/`obsp`/`varp` entirely —
+    // missing attrs are treated as empty, matching the obsm contract.
+    let varm_batches: Vec<(String, RecordBatch)> = match adata.getattr("varm") {
+        Ok(varm) => {
+            let varm_keys: Vec<String> = py
+                .import("builtins")?
+                .call_method1("list", (varm.call_method0("keys")?,))?
+                .extract()?;
+            varm_keys
+                .iter()
+                .map(|key| {
+                    let arr = varm.call_method1("__getitem__", (key,))?;
+                    let pd = py.import("pandas")?;
+                    let df = pd.call_method1("DataFrame", (&arr,))?;
+                    let batch = pandas_to_record_batch(py, &df)?;
+                    Ok((key.clone(), batch))
+                })
+                .collect::<PyResult<Vec<_>>>()?
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // 1E.2: Collect obsp COO RecordBatches under GIL (obs × obs sparse).
+    let obsp_batches: Vec<(String, RecordBatch)> = match adata.getattr("obsp") {
+        Ok(obsp) => {
+            let obsp_keys: Vec<String> = py
+                .import("builtins")?
+                .call_method1("list", (obsp.call_method0("keys")?,))?
+                .extract()?;
+            obsp_keys
+                .iter()
+                .map(|key| {
+                    let mat = obsp.call_method1("__getitem__", (key,))?;
+                    let batch = sparse_to_coo_record_batch(py, &mat)?;
+                    Ok((key.clone(), batch))
+                })
+                .collect::<PyResult<Vec<_>>>()?
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // 1E.2: Collect varp COO RecordBatches under GIL (var × var sparse).
+    let varp_batches: Vec<(String, RecordBatch)> = match adata.getattr("varp") {
+        Ok(varp) => {
+            let varp_keys: Vec<String> = py
+                .import("builtins")?
+                .call_method1("list", (varp.call_method0("keys")?,))?
+                .extract()?;
+            varp_keys
+                .iter()
+                .map(|key| {
+                    let mat = varp.call_method1("__getitem__", (key,))?;
+                    let batch = sparse_to_coo_record_batch(py, &mat)?;
+                    Ok((key.clone(), batch))
+                })
+                .collect::<PyResult<Vec<_>>>()?
+        }
+        Err(_) => Vec::new(),
+    };
+
     // 1E.2: Collect uns JSON under GIL.
     // Use a recursive Python-side normalizer so common AnnData payloads
     // (NumPy arrays/scalars, pandas Index/Series/Categorical) survive the
@@ -1734,10 +2005,19 @@ pub fn from_anndata_impl(
         None
     };
 
-    // 1E.2: Write obsm and uns outside GIL (pure Rust)
+    // 1E.2: Write obsm, varm, obsp, varp, and uns outside GIL (pure Rust)
     py.allow_threads(|| {
         for (key, batch) in &obsm_batches {
             writer.write_obsm(key, batch)?;
+        }
+        for (key, batch) in &varm_batches {
+            writer.write_varm(key, batch)?;
+        }
+        for (key, batch) in &obsp_batches {
+            writer.write_obsp(key, batch)?;
+        }
+        for (key, batch) in &varp_batches {
+            writer.write_varp(key, batch)?;
         }
         if let Some(ref json_val) = uns_json {
             writer.write_uns(json_val)?;

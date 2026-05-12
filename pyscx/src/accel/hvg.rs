@@ -373,7 +373,8 @@ fn hvg_seurat_v3<'py>(
     // GPU kernel doesn't carry per-cell batch membership today.
     #[cfg(feature = "gpu")]
     let batched_stats = if let (Some(dev_id), 1) = (_device_id, n_batches_actual) {
-        let single = scx_accel::streaming_mean_var_with_device(&source, "gpu", dev_id)
+        let single = py
+            .allow_threads(|| scx_accel::streaming_mean_var_with_device(&source, "gpu", dev_id))
             .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var: {e}")))?;
         scx_accel::BatchedHvgStats {
             per_batch: vec![single.clone()],
@@ -381,13 +382,17 @@ fn hvg_seurat_v3<'py>(
             batch_counts: vec![n_obs],
         }
     } else {
-        scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?
+        py.allow_threads(|| {
+            scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?
     };
     #[cfg(not(feature = "gpu"))]
-    let batched_stats =
-        scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?;
+    let batched_stats = py
+        .allow_threads(|| {
+            scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?;
 
     let global_stats = batched_stats.global.clone();
 
@@ -464,31 +469,39 @@ fn hvg_seurat_v3<'py>(
     // ── 4. Batched streaming clipped sums (single pass for ALL batches) ──
     #[cfg(feature = "gpu")]
     let all_clipped = if let (Some(dev_id), 1) = (_device_id, n_batches_actual) {
-        let single = scx_accel::streaming_clip_square_sum_with_device(
-            &source,
-            &all_clip_vals[0],
-            "gpu",
-            dev_id,
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum: {e}")))?;
+        let single = py
+            .allow_threads(|| {
+                scx_accel::streaming_clip_square_sum_with_device(
+                    &source,
+                    &all_clip_vals[0],
+                    "gpu",
+                    dev_id,
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum: {e}")))?;
         vec![single]
     } else {
-        scx_accel::streaming_clip_square_sum_batched(
-            &source,
-            &cell_batch,
-            n_batches_actual,
-            &all_clip_vals,
-        )
+        py.allow_threads(|| {
+            scx_accel::streaming_clip_square_sum_batched(
+                &source,
+                &cell_batch,
+                n_batches_actual,
+                &all_clip_vals,
+            )
+        })
         .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_batched: {e}")))?
     };
     #[cfg(not(feature = "gpu"))]
-    let all_clipped = scx_accel::streaming_clip_square_sum_batched(
-        &source,
-        &cell_batch,
-        n_batches_actual,
-        &all_clip_vals,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_batched: {e}")))?;
+    let all_clipped = py
+        .allow_threads(|| {
+            scx_accel::streaming_clip_square_sum_batched(
+                &source,
+                &cell_batch,
+                n_batches_actual,
+                &all_clip_vals,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_batched: {e}")))?;
 
     // ── 5. Compute normalized variance per batch (in-memory) ─────────────
     let mut all_norm_vars: Vec<Vec<f64>> = Vec::new();
@@ -675,7 +688,8 @@ fn hvg_seurat<'py>(
         n_vars,
         None,
     );
-    let stats = scx_accel::streaming_mean_var(&source)
+    let stats = py
+        .allow_threads(|| scx_accel::streaming_mean_var(&source))
         .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
 
     // ── 2. Compute dispersion (matching scanpy's seurat flavor) ────────
@@ -852,6 +866,9 @@ fn hvg_seurat_v3_csc(
         let n_vars = source.n_vars();
 
         // ── 1. Single-pass per-column mean / var ────────────────────
+        // Note: `&dyn ColumnShardSource` is not `Send`, so this Rust call
+        // runs with the GIL held. Wrapping requires monomorphizing on the
+        // concrete reader type (BackedCscReader / LazyShardSource).
         let stats = scx_accel::streaming_mean_var_csc(source)
             .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?;
 

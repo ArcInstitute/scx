@@ -339,6 +339,67 @@ impl ScxReader {
         Ok(result)
     }
 
+    /// Read a named varm embedding as an Arrow RecordBatch.
+    pub fn read_varm(&self, name: &str) -> Result<RecordBatch> {
+        let key = format!("varm/{name}");
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or_else(|| ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Read all varm embeddings, keyed by name.
+    pub fn read_all_varm(&self) -> Result<HashMap<String, RecordBatch>> {
+        let mut result = HashMap::new();
+        for entry in &self.full_catalog.entries {
+            if entry.section_type == SectionType::VarmEmbedding {
+                let name = entry
+                    .name
+                    .strip_prefix("varm/")
+                    .unwrap_or(&entry.name)
+                    .to_string();
+                let batch = self.read_arrow_ipc(entry)?;
+                result.insert(name, batch);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Read all obsp pairwise sparse matrices (COO format), keyed by name.
+    pub fn read_all_obsp(&self) -> Result<HashMap<String, RecordBatch>> {
+        let mut result = HashMap::new();
+        for entry in &self.full_catalog.entries {
+            if entry.section_type == SectionType::ObspEmbedding {
+                let name = entry
+                    .name
+                    .strip_prefix("obsp/")
+                    .unwrap_or(&entry.name)
+                    .to_string();
+                let batch = self.read_arrow_ipc(entry)?;
+                result.insert(name, batch);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Read all varp pairwise sparse matrices (COO format), keyed by name.
+    pub fn read_all_varp(&self) -> Result<HashMap<String, RecordBatch>> {
+        let mut result = HashMap::new();
+        for entry in &self.full_catalog.entries {
+            if entry.section_type == SectionType::VarpEmbedding {
+                let name = entry
+                    .name
+                    .strip_prefix("varp/")
+                    .unwrap_or(&entry.name)
+                    .to_string();
+                let batch = self.read_arrow_ipc(entry)?;
+                result.insert(name, batch);
+            }
+        }
+        Ok(result)
+    }
+
     // -----------------------------------------------------------------------
     // Phase B: per-modality accessors
     // -----------------------------------------------------------------------

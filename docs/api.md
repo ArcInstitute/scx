@@ -2,7 +2,7 @@
 
 ## Section Types
 
-17 section types are defined in `scx-format/src/section.rs`:
+20 section types are defined in `scx-format/src/section.rs`:
 
 ```
 ObsMetadata (0)        — Arrow IPC metadata for observations
@@ -19,7 +19,8 @@ BitmapShard (6)        — Reserved; not produced by the current writer.
                          future release.
 LayerCsrShard (7)      — Alternative expression layers
 ObsmEmbedding (8)      — Embeddings (obsm)
-ObspCsrShard (9)       — Cell-cell graphs (obsp)
+ObspCsrShard (9)       — Reserved (legacy); current obsp persistence uses
+                         ObspEmbedding (18).
 UnsBlob (10)           — Unstructured metadata (JSON)
 Provenance (11)        — Operation history
 DeletionVectors (12)   — Logical deletion tracking (Roaring Bitmap)
@@ -29,6 +30,14 @@ ModalityTable (15)     — v2; ordered list of named modalities (CITE-seq,
                          10x Multiome, …). See docs/format.md § 13.
 LayerCscShard (16)     — v2; per-modality CSC sidecar for a named layer
                          (parallel to LayerCsrShard).
+VarmEmbedding (17)     — Dense var embeddings (varm); same wire format
+                         as ObsmEmbedding but indexed by var.
+ObspEmbedding (18)     — Sparse obs×obs pairwise matrices (e.g.
+                         kNN connectivities/distances). COO Arrow IPC
+                         with schema metadata n_rows / n_cols; data is
+                         stored as float32.
+VarpEmbedding (19)     — Sparse var×var pairwise matrices. Same wire
+                         format as ObspEmbedding.
 ```
 
 ## ScxReader (`scx-format/src/reader.rs`)
@@ -513,7 +522,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ### Module-level functions
 
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None)` — Write AnnData to SCX
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None)` — Write AnnData to SCX.
+  Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
+  pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
+  Arrow IPC; higher-precision inputs are downcast on write.
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
@@ -544,6 +556,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
   - `layers`: list of layer names to load (default: all)
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
+  - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
+    `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
+    not subject to deletion-vector row filtering — when cells are
+    logically deleted, the pairwise matrices still cover the full
+    original axis; `compact` resolves this by rebuilding from scratch.
 - `query() -> PyQueryPipeline` — Start lazy query pipeline
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`

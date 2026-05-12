@@ -258,6 +258,44 @@ impl ScxWriter {
         )
     }
 
+    /// Write a varm embedding section (Arrow IPC) — dense (n_vars × n_components).
+    pub fn write_varm(&mut self, name: &str, batch: &RecordBatch) -> Result<()> {
+        let data = Self::write_arrow_ipc(batch)?;
+        self.write_section_bytes(
+            format!("varm/{name}"),
+            SectionType::VarmEmbedding,
+            &data,
+            None,
+        )
+    }
+
+    /// Write an obsp pairwise sparse matrix (Arrow IPC, COO format).
+    ///
+    /// The batch must have columns `row: Int32`, `col: Int32`, `data: Float32`
+    /// and schema metadata `n_rows` and `n_cols`.
+    pub fn write_obsp(&mut self, name: &str, batch: &RecordBatch) -> Result<()> {
+        let data = Self::write_arrow_ipc(batch)?;
+        self.write_section_bytes(
+            format!("obsp/{name}"),
+            SectionType::ObspEmbedding,
+            &data,
+            None,
+        )
+    }
+
+    /// Write a varp pairwise sparse matrix (Arrow IPC, COO format).
+    ///
+    /// Same wire format as `write_obsp`.
+    pub fn write_varp(&mut self, name: &str, batch: &RecordBatch) -> Result<()> {
+        let data = Self::write_arrow_ipc(batch)?;
+        self.write_section_bytes(
+            format!("varp/{name}"),
+            SectionType::VarpEmbedding,
+            &data,
+            None,
+        )
+    }
+
     /// Write the provenance section.
     pub fn write_provenance(&mut self, operations: Vec<ProvenanceEntry>) -> Result<()> {
         let prov = Provenance {

@@ -185,7 +185,10 @@ opening a v1 file.
 | 14 | `var_predicate_index` |
 | 15 | `modality_table` (v2; ordered list of modality records — see § 13) |
 | 16 | `layer_csc_shard` (v2; per-modality CSC sidecar for a named layer) |
-| 17–31 | Reserved for multimodal/spatial extensions |
+| 17 | `varm_embedding` (Arrow IPC; dense `n_vars × n_components` embedding — mirror of `obsm_embedding`) |
+| 18 | `obsp_embedding` (Arrow IPC; COO sparse `n_obs × n_obs` pairwise matrix — see § COO wire format below) |
+| 19 | `varp_embedding` (Arrow IPC; COO sparse `n_vars × n_vars` pairwise matrix — same wire format as `obsp_embedding`) |
+| 20–31 | Reserved for multimodal/spatial extensions |
 | 32–239 | Reserved for future use |
 | 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
@@ -390,6 +393,19 @@ section.
   PyArrow — zero-copy for primitive and dictionary types; string columns
   allocate Python heap strings (use categoricals to avoid this).
 
+### Embedding & pairwise sections (`obsm`, `varm`, `obsp`, `varp`)
+
+- **`obsm_embedding` (8) / `varm_embedding` (17)** — Arrow IPC RecordBatch of a
+  dense matrix. `obsm` is `n_obs × n_components`; `varm` is `n_vars × n_components`.
+  Each component is a column. Stored as float32 by convention.
+- **`obsp_embedding` (18) / `varp_embedding` (19)** — Arrow IPC RecordBatch
+  representing a sparse matrix in COO form. The batch has three columns
+  (`row: Int32`, `col: Int32`, `data: Float32`, length `nnz`) plus
+  schema-level metadata (`n_rows`, `n_cols`) recording the logical shape.
+  pyscx readers reconstruct a scipy CSR via
+  `scipy.sparse.csr_matrix((data, (row, col)), shape=(n_rows, n_cols))`.
+  Data is stored as float32; higher-precision inputs are downcast on write.
+
 ## 6. Predicate Indexes
 
 Sorted mappings from column values to shard-local row ranges, attached to
@@ -578,8 +594,8 @@ encrypted section types. For PHI datasets, use filesystem-level encryption
 
 - **`format_version`** — bump for breaking changes. Readers MUST reject files
   with `format_version` higher than their supported maximum.
-- **Unknown section types** (≥13 for v1) are skipped with a warning, enabling
-  incremental extension without breaking old readers.
+- **Unknown section types** (≥20 for the current format) are skipped with a
+  warning, enabling incremental extension without breaking old readers.
 - **`header_length`** reserves space for future header growth — older readers
   that only handle 256-byte headers detect a larger `header_length` and exit
   gracefully.

@@ -78,6 +78,44 @@ def test_layers_obsm_uns_round_trip(synthetic_adata, tmp_dir):
     assert adata2.uns["version"] == 2
 
 
+def test_obsp_varp_varm_round_trip(tmp_dir):
+    """Patch 7 / P0 #6: obsp, varp, varm survive AnnData → SCX → AnnData."""
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(42)
+    n_obs, n_vars = 50, 30
+
+    X = sp.random(
+        n_obs, n_vars, density=0.1, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata = anndata.AnnData(X=X)
+    adata.varm["PCs"] = rng.random((n_vars, 5)).astype(np.float32)
+    conn = sp.random(
+        n_obs, n_obs, density=0.05, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata.obsp["connectivities"] = conn
+    varp_mat = sp.random(
+        n_vars, n_vars, density=0.1, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata.varp["gene_corr"] = varp_mat
+
+    path = str(tmp_dir / "obsp_varp_varm.scx")
+    pyscx.from_anndata(adata, path)
+    adata2 = pyscx.open(path).to_anndata()
+
+    assert "PCs" in adata2.varm
+    np.testing.assert_allclose(adata2.varm["PCs"], adata.varm["PCs"], atol=1e-6)
+
+    assert "connectivities" in adata2.obsp
+    diff = (adata2.obsp["connectivities"] - conn).toarray()
+    assert np.allclose(diff, 0.0, atol=1e-6)
+
+    assert "gene_corr" in adata2.varp
+    diff2 = (adata2.varp["gene_corr"] - varp_mat).toarray()
+    assert np.allclose(diff2, 0.0, atol=1e-6)
+
+
 def test_round_trip_large_values(tmp_dir):
     """Test that uint16 and uint32 ranges round-trip correctly."""
     import anndata
