@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO_ROOT / "pyscx" / "python"))
 
 project = "SCX"
 author = "Arc Institute"
-copyright = "2025, Arc Institute"
+copyright = "2025–2026, Arc Institute"
 
 # Pull the version from pyscx/pyproject.toml so docs match the package.
 def _read_version() -> str:
@@ -53,6 +53,7 @@ extensions = [
     "sphinx.ext.viewcode",
     "sphinx.ext.linkcode",
     "sphinx.ext.intersphinx",
+    "sphinx_autodoc_typehints",
     "sphinx_copybutton",
     "sphinx_design",
 ]
@@ -76,7 +77,6 @@ myst_enable_extensions = [
     "smartquotes",
 ]
 myst_heading_anchors = 4
-myst_linkify_fuzzy_links = False
 
 # -- Autodoc / autosummary ---------------------------------------------------
 
@@ -94,6 +94,10 @@ autodoc_class_signature = "separated"
 # modules for autodoc. `pyscx.pyscx` (the compiled PyO3 extension) is NOT
 # mocked — it's built into the docs venv via `maturin develop` so autodoc
 # can introspect every Rust-defined function/class with its real docstring.
+#
+# NOTE: the RTD build runs `maturin develop` without `--features cloud,gpu`,
+# so cloud operations (pull, push, etc.) and GPU-only symbols are importable
+# at build time but will have empty autodoc stubs on the rendered site.
 autodoc_mock_imports = [
     "torch",
     "lightning",

@@ -40,7 +40,7 @@ and autodoc for the Python-side helpers and integrations.
 :link: performance
 :link-type: doc
 
-Benchmark results, GPU setup, cloud usage, and testing.
+Benchmarks, operational semantics (append/delete/compact), and test infrastructure.
 :::
 
 ::::
@@ -53,6 +53,7 @@ Benchmark results, GPU setup, cloud usage, and testing.
 scanpy
 gpu-setup
 cloud
+operations
 ```
 
 ```{toctree}
@@ -63,6 +64,8 @@ cloud
 architecture
 multithreading
 sharding
+conventions
+multimodal
 ```
 
 ```{toctree}
