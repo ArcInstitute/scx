@@ -111,7 +111,8 @@ mod pipeline {
         let nnz = *indptr.last().unwrap_or(&0) as u64;
 
         // Detect encoding and codec
-        let (value_encoding, codec_id) = detect_value_encoding(&data, opts.codec);
+        let (value_encoding, codec_id) =
+            detect_value_encoding(&data, opts.codec).map_err(ScxError::from)?;
         let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
 
         // Build header
@@ -196,7 +197,8 @@ mod pipeline {
 
         if let Ok(layers) = read_layers(&file) {
             for (layer_name, (l_indptr, l_indices, l_data, l_nobs, l_nvars)) in &layers {
-                let (l_enc, l_codec) = detect_value_encoding(l_data, opts.codec);
+                let (l_enc, l_codec) =
+                    detect_value_encoding(l_data, opts.codec).map_err(ScxError::from)?;
                 let l_index_dtype: u8 = if *l_nvars <= 65535 { 0 } else { 1 };
                 write_layer_shards(
                     &mut writer,
@@ -248,7 +250,8 @@ mod pipeline {
 
         let tenx = read_tenx_h5(&file)?;
         let nnz = *tenx.indptr.last().unwrap_or(&0) as u64;
-        let (value_encoding, codec_id) = detect_value_encoding(&tenx.data, opts.codec);
+        let (value_encoding, codec_id) =
+            detect_value_encoding(&tenx.data, opts.codec).map_err(ScxError::from)?;
         let index_dtype: u8 = if tenx.n_genes <= 65535 { 0 } else { 1 };
 
         let header = FileHeader {
@@ -391,7 +394,8 @@ mod pipeline {
 
             let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
             let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-            let raw_values = values_to_raw_bytes(&chunk.data, value_encoding);
+            let raw_values =
+                values_to_raw_bytes(&chunk.data, value_encoding).map_err(ScxError::from)?;
 
             writer.write_csc_shard(
                 &csc_indptr_u64,
@@ -459,7 +463,8 @@ mod pipeline {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let shard_data = &data[nnz_start..nnz_end];
-            let raw_values = values_to_raw_bytes(shard_data, value_encoding);
+            let raw_values =
+                values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
             writer.write_csr_shard(
                 &shard_indptr,
@@ -528,7 +533,8 @@ mod pipeline {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let shard_data = &data[nnz_start..nnz_end];
-            let raw_values = values_to_raw_bytes(shard_data, value_encoding);
+            let raw_values =
+                values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
             writer.write_layer_csr_shard(
                 &shard_indptr,

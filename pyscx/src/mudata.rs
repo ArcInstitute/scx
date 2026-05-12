@@ -387,7 +387,8 @@ pub fn from_mudata_impl(
         // routing.
         let value_encoding = scx_codec::value_encoding::detect_value_encoding(&payload.data);
         let raw_values_bytes =
-            scx_codec::value_encoding::values_to_raw_bytes(&payload.data, value_encoding);
+            scx_codec::value_encoding::values_to_raw_bytes(&payload.data, value_encoding)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let codec_id = match explicit_codec {
             Some(c) => {
                 if c == CodecId::Scx1 && !value_encoding.is_integer() {

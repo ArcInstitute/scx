@@ -3,7 +3,7 @@
 // The detect/encode primitives live in `scx_codec::value_encoding`. This
 // module adds the codec auto-selection policy on top.
 
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecError, CodecId, ValueEncoding};
 use scx_format::{select_codec, select_codec_for_modality, ModalityType};
 
 pub use scx_codec::value_encoding::{
@@ -18,9 +18,9 @@ pub use scx_codec::value_encoding::{
 pub fn detect_value_encoding(
     data: &[f32],
     explicit_codec: Option<CodecId>,
-) -> (ValueEncoding, CodecId) {
+) -> Result<(ValueEncoding, CodecId), CodecError> {
     let encoding = detect_value_encoding_only(data);
-    let raw_bytes = values_to_raw_bytes(data, encoding);
+    let raw_bytes = values_to_raw_bytes(data, encoding)?;
 
     let codec = match explicit_codec {
         Some(codec_id) => {
@@ -33,7 +33,7 @@ pub fn detect_value_encoding(
         None => select_codec(&raw_bytes, encoding),
     };
 
-    (encoding, codec)
+    Ok((encoding, codec))
 }
 
 /// Modality-aware variant of [`detect_value_encoding`]. Used by the
@@ -43,9 +43,9 @@ pub fn detect_value_encoding_for_modality(
     data: &[f32],
     explicit_codec: Option<CodecId>,
     modality_type: ModalityType,
-) -> (ValueEncoding, CodecId) {
+) -> Result<(ValueEncoding, CodecId), CodecError> {
     let encoding = detect_value_encoding_only(data);
-    let raw_bytes = values_to_raw_bytes(data, encoding);
+    let raw_bytes = values_to_raw_bytes(data, encoding)?;
 
     let codec = match explicit_codec {
         Some(codec_id) => {
@@ -58,5 +58,5 @@ pub fn detect_value_encoding_for_modality(
         None => select_codec_for_modality(&raw_bytes, encoding, modality_type),
     };
 
-    (encoding, codec)
+    Ok((encoding, codec))
 }

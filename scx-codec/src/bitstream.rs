@@ -175,11 +175,13 @@ impl<'a> BitReader<'a> {
         // `n_bits` is a `u8`, so >64 is representable. Everything downstream
         // assumes ≤ 64 (we store the accumulator in a `u64`); a larger value
         // would underflow `bits_left -= n_bits` at the end of this function
-        // and silently corrupt the bitstream position. Fail loud in debug.
-        debug_assert!(
-            n_bits <= 64,
-            "read_bits called with n_bits={n_bits} (>64): only ≤64 fits in the u64 accumulator"
-        );
+        // and silently corrupt the bitstream position. Reject at runtime —
+        // a corrupt on-disk `k` parameter would otherwise advance the
+        // bitstream position incorrectly and produce wrong values without
+        // erroring.
+        if n_bits > 64 {
+            return Err(BitStreamError);
+        }
         if n_bits == 0 {
             return Ok(0);
         }

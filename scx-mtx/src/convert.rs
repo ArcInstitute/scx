@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
+use scx_format::error::ScxError;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::writer::ScxWriter;
@@ -28,7 +29,7 @@ pub fn mtx_to_scx(
 
     let explicit_codec = parse_codec_str(codec_str)?;
     let nnz = *mtx_data.indptr.last().unwrap_or(&0) as u64;
-    let (value_encoding, codec_id) = detect_value_encoding(&mtx_data.data, explicit_codec);
+    let (value_encoding, codec_id) = detect_value_encoding(&mtx_data.data, explicit_codec)?;
     let index_dtype: u8 = if mtx_data.n_vars <= 65535 { 0 } else { 1 };
 
     let header = FileHeader {
@@ -118,9 +119,9 @@ use scx_codec::value_encoding::{
 fn detect_value_encoding(
     data: &[f32],
     explicit_codec: Option<CodecId>,
-) -> (ValueEncoding, CodecId) {
+) -> Result<(ValueEncoding, CodecId), MtxError> {
     let encoding = detect_value_encoding_only(data);
-    let raw_bytes = values_to_raw_bytes(data, encoding);
+    let raw_bytes = values_to_raw_bytes(data, encoding).map_err(ScxError::from)?;
     let codec = match explicit_codec {
         Some(codec_id) => {
             if codec_id == CodecId::Scx1 && !encoding.is_integer() {
@@ -132,7 +133,7 @@ fn detect_value_encoding(
         None => select_codec_for_modality(&raw_bytes, encoding, ModalityType::Rna),
     };
 
-    (encoding, codec)
+    Ok((encoding, codec))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,7 +165,7 @@ fn write_csr_shards(
             .map(|&v| v as u32)
             .collect();
         let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding);
+        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
         writer.write_csr_shard(
             &shard_indptr,

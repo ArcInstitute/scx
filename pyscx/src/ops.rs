@@ -163,7 +163,8 @@ pub fn append(
         .collect::<PyResult<Vec<u32>>>()?;
 
     // Encode f32 → raw LE bytes
-    let values_bytes = anndata::encode_values(&csr.data, value_encoding);
+    let values_bytes = anndata::encode_values(&csr.data, value_encoding)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Read obs metadata
     let obs = input_reader
@@ -264,7 +265,8 @@ pub fn append_from_anndata(
 
     // Detect encoding and encode values
     let value_encoding = anndata::detect_value_encoding(data_slice);
-    let values_bytes = anndata::encode_values(data_slice, value_encoding);
+    let values_bytes = anndata::encode_values(data_slice, value_encoding)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Convert indptr/indices to on-disk types (finding 9.2: validate non-negative).
     let indptr: Vec<u64> = indptr_slice

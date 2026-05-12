@@ -146,7 +146,7 @@ proptest! {
             let delta = (rng_state >> 33) % 500;
             indptr.push(indptr.last().unwrap() + delta);
         }
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         prop_assert_eq!(decoded, indptr);
     }

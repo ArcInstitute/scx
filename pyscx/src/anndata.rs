@@ -72,7 +72,7 @@ fn write_csc_shards_from_csr(
         };
         let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
         let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values = encode_values(&chunk.data, value_encoding);
+        let raw_values = encode_values(&chunk.data, value_encoding)?;
         writer.write_csc_shard(
             &csc_indptr_u64,
             &csc_indices_u32,
@@ -880,10 +880,13 @@ pub(crate) fn i32_to_u32(v: &[i32]) -> PyResult<Vec<u32>> {
 ///
 /// Delegates to the canonical [`scx_codec::value_encoding::values_to_raw_bytes`]
 /// so all three historical call-site copies (pyscx/anndata, scx-cli/dtype,
-/// scx-mtx/convert) share one implementation — and so Float16 no longer
-/// panics here (the canonical impl falls back to Float32 bytes with a
-/// one-shot `log::warn`).
-pub(crate) fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
+/// scx-mtx/convert) share one implementation. Returns
+/// `Err(CodecError)` if any value falls outside the range representable
+/// by the chosen integer encoding.
+pub(crate) fn encode_values(
+    data: &[f32],
+    encoding: ValueEncoding,
+) -> Result<Vec<u8>, scx_codec::CodecError> {
     scx_codec::value_encoding::values_to_raw_bytes(data, encoding)
 }
 
@@ -1323,7 +1326,8 @@ fn parallel_encode_csr_shards(
                 // 3. Detect value encoding and encode values
                 let shard_data = &data_owned[b.nnz_start..b.nnz_end];
                 let shard_value_encoding = detect_value_encoding(shard_data);
-                let shard_values_bytes = encode_values(shard_data, shard_value_encoding);
+                let shard_values_bytes =
+                    encode_values(shard_data, shard_value_encoding).map_err(|e| e.to_string())?;
 
                 // 4. Select codec
                 let shard_codec = match explicit_codec {
@@ -1582,7 +1586,8 @@ pub fn from_anndata_impl(
     };
     let first_shard_data = &data_slice[..first_shard_nnz_end];
     let first_encoding = detect_value_encoding(first_shard_data);
-    let first_values = encode_values(first_shard_data, first_encoding);
+    let first_values = encode_values(first_shard_data, first_encoding)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let header_codec = match explicit_codec {
         Some(codec_id) => {
             if codec_id == CodecId::Scx1 && !first_encoding.is_integer() {
