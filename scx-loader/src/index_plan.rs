@@ -20,7 +20,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use arrow::record_batch::RecordBatch;
@@ -88,6 +88,15 @@ struct PairedDenseGather {
 /// [`Self::process_plan`] for one-shot use, and [`Self::iter_with_plans`] —
 /// an async iterator that pipelines per-plan shard prefetch (via tokio
 /// `spawn_blocking`) ahead of the consumer.
+///
+/// # Fork safety
+///
+/// The tokio runtime is built lazily on first use (see [`Self::runtime`]),
+/// not in [`Self::new`]. This matches the lazy-init pattern in
+/// `TrainingPipeline` and is the contract that lets a parent process
+/// construct an `IndexPlanLoader` and then have a PyTorch `DataLoader`
+/// fork worker processes: the runtime threads never exist in the parent
+/// at fork time, so the child does not inherit a wedged thread pool.
 pub struct IndexPlanLoader {
     backed: BackedCsrReader,
     obs_metadata: RecordBatch,
@@ -104,7 +113,10 @@ pub struct IndexPlanLoader {
     /// `spawn_blocking`. `read_shard_cached_arc` is synchronous and CPU/IO
     /// bound, so it must run on the blocking pool — bare `tokio::spawn` does
     /// not accept it. 2 worker threads matches `TrainingPipeline`.
-    runtime: Runtime,
+    ///
+    /// Lazily built by [`Self::runtime`] on first use so the parent process
+    /// never holds tokio I/O threads that would be inherited across `fork(2)`.
+    runtime: OnceLock<Runtime>,
     /// Effective LRU shard cache size after auto-tuning to fit
     /// `max_memory_mb`. May be less than the user-requested `cache_shards`.
     effective_cache_shards: usize,
@@ -346,7 +358,39 @@ impl IndexPlanLoader {
         // the per-iter snapshot accessor read from this handle.
         let cache_metrics = backed.enable_metrics();
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        // The tokio runtime is built lazily on first use (see `Self::runtime`)
+        // to keep `new` fork-safe — a parent process can construct an
+        // `IndexPlanLoader` and then have a `DataLoader` fork worker
+        // processes without inheriting a wedged thread pool.
+        Ok(Self {
+            backed,
+            obs_metadata,
+            config,
+            hvg_projection,
+            n_output_cols,
+            sort_by_shard,
+            runtime: OnceLock::new(),
+            effective_cache_shards,
+            effective_lookahead,
+            max_plan_size,
+            cache_metrics,
+            budget_breakdown,
+        })
+    }
+
+    /// Return the tokio runtime, building it on first call.
+    ///
+    /// Lazy construction is the fork-safety contract: the parent process
+    /// must not own a multi-threaded tokio runtime at the moment a child
+    /// is forked, so `IndexPlanLoader::new` does not build one. The first
+    /// call here (always from an `IndexPlanIter`, always post-fork in the
+    /// `DataLoader` worker) materializes the runtime; later calls return
+    /// the same instance via `OnceLock`.
+    fn runtime(&self) -> Result<&Runtime> {
+        if let Some(rt) = self.runtime.get() {
+            return Ok(rt);
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .thread_name("scx-index-plan")
@@ -356,21 +400,9 @@ impl IndexPlanLoader {
                     "failed to create tokio runtime for IndexPlanLoader: {e}"
                 ))
             })?;
-
-        Ok(Self {
-            backed,
-            obs_metadata,
-            config,
-            hvg_projection,
-            n_output_cols,
-            sort_by_shard,
-            runtime,
-            effective_cache_shards,
-            effective_lookahead,
-            max_plan_size,
-            cache_metrics,
-            budget_breakdown,
-        })
+        // On a thread race the losing thread's `rt` is dropped here. That
+        // costs one extra runtime construction, at most once per loader.
+        Ok(self.runtime.get_or_init(|| rt))
     }
 
     pub fn n_obs(&self) -> u64 {
@@ -789,10 +821,19 @@ impl IndexPlanIter {
             && self.plan_stream_error.is_none()
         {
             match self.plan_rx.recv() {
-                Ok(Ok(plan)) => {
-                    let prefetches = self.spawn_prefetches(&plan);
-                    self.in_flight.push_back(InFlight { plan, prefetches });
-                }
+                Ok(Ok(plan)) => match self.spawn_prefetches(&plan) {
+                    Ok(prefetches) => {
+                        self.in_flight.push_back(InFlight { plan, prefetches });
+                    }
+                    Err(e) => {
+                        // Tokio runtime construction failed (rare — only on
+                        // OS thread-creation exhaustion). Latch the error
+                        // through the existing plan-stream-error path so it
+                        // surfaces after the in-flight queue drains.
+                        self.plan_stream_error = Some(e);
+                        break;
+                    }
+                },
                 Ok(Err(e)) => {
                     self.plan_stream_error = Some(e);
                     break;
@@ -806,9 +847,9 @@ impl IndexPlanIter {
         }
     }
 
-    fn spawn_prefetches(&self, plan: &[(u64, u64)]) -> Vec<ShardJoin> {
+    fn spawn_prefetches(&self, plan: &[(u64, u64)]) -> Result<Vec<ShardJoin>> {
         if self.lookahead == 0 || plan.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut all_rows: Vec<u64> = Vec::with_capacity(plan.len() * 2);
@@ -827,8 +868,8 @@ impl IndexPlanIter {
         // the redundant decode but the per-task tokio overhead and the
         // associated `runtime.block_on` round-trips are still paid in
         // `await_head`. Filtering here keeps the queue tight.
-        let handle = self.loader.runtime.handle().clone();
-        shards
+        let handle = self.loader.runtime()?.handle().clone();
+        Ok(shards
             .into_iter()
             .filter(|&sidx| {
                 if self.loader.backed.cache_contains(sidx) {
@@ -852,14 +893,15 @@ impl IndexPlanIter {
                 let loader = Arc::clone(&self.loader);
                 handle.spawn_blocking(move || loader.backed.read_shard_cached_arc(sidx))
             })
-            .collect()
+            .collect())
     }
 
     /// Block on every prefetch handle for the head plan. Surfaces the first
     /// shard read error or join panic.
     fn await_head(&self, prefetches: Vec<ShardJoin>) -> std::result::Result<(), LoaderError> {
+        let runtime = self.loader.runtime()?;
         for h in prefetches {
-            match self.loader.runtime.block_on(h) {
+            match runtime.block_on(h) {
                 Ok(Ok(_arc_shard)) => {
                     // Shard is now warm in the LRU cache; subsequent
                     // process_plan calls will hit it through the dense gather.
@@ -1766,6 +1808,75 @@ mod tests {
             }
             Err(other) => panic!("expected ConfigError, got {other}"),
             Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // ─── Lazy runtime / fork safety (Patch 11 § P1 #16) ──────────────
+    //
+    // The loader holds a `OnceLock<Runtime>` and defers tokio runtime
+    // construction to the first `iter_with_plans` call. The contract is
+    // checked here by inspecting `loader.runtime.get()` before and after
+    // touching the iter; constructing the loader must not build a
+    // runtime, since that runtime would otherwise be inherited by
+    // `DataLoader` worker processes after fork.
+
+    #[test]
+    fn lazy_runtime_not_built_at_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader(&path, false);
+        assert!(
+            loader.runtime.get().is_none(),
+            "IndexPlanLoader::new must not eagerly build the tokio runtime — \
+             that would defeat the DataLoader fork-safety contract"
+        );
+    }
+
+    #[test]
+    fn lazy_runtime_built_after_iter_with_plans_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = Arc::new(open_loader(&path, false));
+
+        // Sanity-check the precondition.
+        assert!(loader.runtime.get().is_none());
+
+        let plans = vec![Ok(vec![(0u64, 1u64), (2, 3)])].into_iter();
+        let iter = Arc::clone(&loader).iter_with_plans(plans, /*lookahead*/ 2);
+        // Consume one batch — this drives `refill` → `spawn_prefetches`
+        // → the lazy `runtime()` accessor.
+        let mut iter = iter;
+        let _ = iter.next();
+        assert!(
+            loader.runtime.get().is_some(),
+            "first iter consumption should materialize the runtime via OnceLock"
+        );
+    }
+
+    #[test]
+    fn lazy_runtime_idempotent_under_concurrent_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = Arc::new(open_loader(&path, false));
+
+        // Spawn several threads that each grab the runtime through the
+        // private accessor. Compare pointer addresses to confirm all
+        // observers see the same Runtime instance.
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let l = Arc::clone(&loader);
+            handles.push(std::thread::spawn(move || {
+                let rt = l.runtime().expect("runtime build must succeed");
+                rt as *const Runtime as usize
+            }));
+        }
+        let addrs: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = addrs[0];
+        for a in &addrs[1..] {
+            assert_eq!(
+                *a, first,
+                "all threads must observe the same Runtime instance"
+            );
         }
     }
 }

@@ -24,3 +24,7 @@ tempfile = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = { workspace = true }
 roaring = { workspace = true }
+# For implementing `object_store::ObjectStore` in test-only fault
+# injectors. object_store itself uses `#[async_trait]` on the trait
+# declaration, so wrappers must do the same.
+async-trait = "0.1"

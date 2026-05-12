@@ -3412,6 +3412,7 @@ name = "scx-cloud"
 version = "0.2.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "blake3",
  "bytes",
  "futures",

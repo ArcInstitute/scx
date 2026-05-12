@@ -374,8 +374,22 @@ Heuristics:
 |------|---------|----------------|
 | `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. Also bounds the reorder window — peak memory is `parallelism × max_section_size`. |
 | `--filter-mode` / `filter_mode` | `shard` | Shard-granular (fast, may include extra cells). `exact` reserved for future release. |
+| `retry_config.request_timeout` | 120 s | Per-request wall-clock cap. A timed-out request is retried subject to `max_retries`; final exhaustion surfaces as `CloudError::Timeout`. Raise on slow links pulling very large shards. |
+| `retry_config.max_retries` | 3 | Application-level retries on top of `object_store`'s internal retries. Total HTTP attempts per request ≈ `max_retries × object_store_max_retries` (~9 by default). Lower to 0–1 to fail fast in CI; raise on flaky networks. |
+| `retry_config.base_delay` / `max_delay` / `jitter_factor` | 500 ms / 30 s / 0.1 | Exponential backoff schedule with ±10% jitter for breaking thundering-herd. Defaults rarely need tuning. |
 | Shard size at write time | 10k cells | Smaller shards → finer pushdown granularity, but more objects and more request overhead. See [docs/sharding.md]. |
 | `RAYON_NUM_THREADS` | #cores | Affects downstream decode after download. Does **not** control download parallelism — that's `parallelism`. |
+
+#### Retry layering
+
+`pyscx.pull` (and Rust `scx_cloud::pull`) wraps every cloud `GET` in two
+nested retry loops: the **inner** loop is `object_store`'s built-in retry
+(transient HTTP errors, short backoff, ~3 attempts by default); the
+**outer** loop is `RetryConfig` (application-classified transient errors,
+exponential backoff + jitter, request-level timeout). The outer loop also
+enforces a hard `request_timeout` per attempt via `tokio::time::timeout`,
+which `object_store`'s defaults do not provide. To disable the outer
+loop entirely, pass `retry_config = RetryConfig::disabled()`.
 
 ### Request cost vs. bandwidth cost
 

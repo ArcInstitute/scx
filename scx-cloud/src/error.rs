@@ -24,6 +24,15 @@ pub enum CloudError {
     #[error("Download failed after {retries} retries: {message}")]
     DownloadFailed { retries: usize, message: String },
 
+    #[error("Cloud request timed out after {duration:?}: {path}")]
+    Timeout {
+        duration: std::time::Duration,
+        path: String,
+    },
+
+    #[error("Rate limited by backend: {message}")]
+    RateLimited { message: String },
+
     #[error("Engine error: {0}")]
     Engine(#[from] scx_engine::EngineError),
 
@@ -37,6 +46,15 @@ pub enum CloudError {
         offset: usize,
         length: usize,
         data_len: usize,
+    },
+
+    #[error(
+        "section length mismatch for {name}: declared {declared} bytes, downloaded {downloaded} bytes"
+    )]
+    InvalidSectionLength {
+        name: String,
+        declared: u64,
+        downloaded: u64,
     },
 }
 
