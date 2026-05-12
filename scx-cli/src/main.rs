@@ -266,6 +266,11 @@ enum Commands {
         /// Predicate expression to selectively download matching shards
         #[arg(long)]
         filter: Option<String>,
+        /// Filter granularity for selective pulls: 'shard' (default, fast,
+        /// may include extra cells) or 'exact' (cell-granular, reserved
+        /// for future implementation)
+        #[arg(long, default_value = "shard", value_parser = ["shard", "exact"])]
+        filter_mode: String,
     },
     /// Upload a local .scx file to cloud/local as exploded .scxd directory
     #[cfg(feature = "cloud")]
@@ -508,12 +513,14 @@ fn main() {
             parallelism,
             no_cloud_ready,
             filter,
+            filter_mode,
         } => pull::run_pull(
             &source,
             &dest,
             parallelism,
             !no_cloud_ready,
             filter.as_deref(),
+            &filter_mode,
         ),
         #[cfg(feature = "cloud")]
         Commands::Push {

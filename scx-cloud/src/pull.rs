@@ -16,6 +16,8 @@ use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::stream::StreamExt;
+
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 
@@ -28,6 +30,9 @@ use crate::explode::section_name_to_path;
 
 /// Offset where sections begin: 256 (header) + 4096 (root catalog placeholder).
 const SECTIONS_START_OFFSET: u64 = 4352;
+
+/// Stack-allocated zero buffer for 8-byte alignment padding (max 7 bytes).
+const ZEROS: [u8; 8] = [0u8; 8];
 
 /// Age threshold above which a `{stem}.tmp.*` file whose owning pid is
 /// no longer running (or unparseable) is considered orphaned and safe to
@@ -109,22 +114,39 @@ fn cleanup_stale_tmp_files(dest: &Path) {
 
 /// Options for the pull operation.
 pub struct PullOptions {
-    /// Number of parallel download tasks (default: 8).
+    /// Number of parallel download tasks (default: 8). Also bounds the
+    /// reorder window: at most `parallelism` completed-but-out-of-order
+    /// sections are held in memory while waiting for the next sequential
+    /// write.
     pub parallelism: usize,
-    /// Reorder buffer size in shard slots (default: 4).
-    pub reorder_buffer: usize,
     /// Produce cloud-ready output with front catalog (default: true).
     pub cloud_ready: bool,
+    /// Filter mode for selective pulls (default: `Shard`).
+    pub filter_mode: FilterMode,
 }
 
 impl Default for PullOptions {
     fn default() -> Self {
         Self {
             parallelism: 8,
-            reorder_buffer: 4,
             cloud_ready: true,
+            filter_mode: FilterMode::default(),
         }
     }
+}
+
+/// Controls the granularity of the selective pull filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Shard-granular: download complete shards containing any matching
+    /// cell.  The output may include non-matching cells from partially
+    /// matching shards.  This is the fast default.
+    #[default]
+    Shard,
+    /// Exact (cell-granular): decode downloaded shards, filter rows,
+    /// rebase CSR indptr, and write only matching cells.  Not yet
+    /// implemented — reserved for a follow-up patch.
+    Exact,
 }
 
 /// Statistics from a pull operation.
@@ -245,47 +267,11 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         }
     }
 
-    // 4. Download all section files in parallel batches
+    // 4. Prepare output file BEFORE downloading — sections are written to
+    //    disk as they arrive in order, so peak memory is bounded by
+    //    `parallelism × max_section_size` instead of `total_file_size`.
     let parallelism = options.parallelism.max(1);
-    let mut downloaded_sections: Vec<(usize, Vec<u8>)> = Vec::with_capacity(ordered_entries.len());
 
-    // Build download tasks as (index, filename) pairs
-    let download_tasks: Vec<(usize, String)> = ordered_entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
-                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })?;
-            Ok((i, rel_path))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Download in batches of `parallelism`
-    for chunk in download_tasks.chunks(parallelism) {
-        let mut handles = Vec::with_capacity(chunk.len());
-
-        for &(idx, ref filename) in chunk {
-            let path = make_path(filename);
-            let backend_ref = &backend;
-            handles.push(async move {
-                let result = backend_ref.get(&path).await?.bytes().await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
-            });
-        }
-
-        let results = futures::future::join_all(handles).await;
-        for result in results {
-            let (idx, data) = result?;
-            total_bytes_downloaded += data.len() as u64;
-            downloaded_sections.push((idx, data));
-        }
-    }
-
-    // Sort by index to ensure correct order
-    downloaded_sections.sort_by_key(|(idx, _)| *idx);
-
-    // 5. Write packed output file
     let tmp_path =
         std::path::PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
     let file = std::fs::OpenOptions::new()
@@ -312,7 +298,7 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         let aligned = align_to_8(write_offset);
         let pad = (aligned - write_offset) as usize;
         if pad > 0 {
-            writer.write_all(&vec![0u8; pad])?;
+            writer.write_all(&ZEROS[..pad])?;
             write_offset = aligned;
         }
     } else {
@@ -320,50 +306,94 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         front_catalog_offset = 0;
     }
 
-    // Write each section sequentially
+    // Build download tasks as (index, filename) pairs
+    let download_tasks: Vec<(usize, String)> = ordered_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            Ok((i, rel_path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // 5. Stream downloads through buffer_unordered → reorder window → disk.
+    //    Download concurrency is capped at `parallelism`; the BTreeMap
+    //    reorder window holds at most `parallelism` completed sections
+    //    while waiting for the next sequential index to become available.
     let mut new_entries: Vec<FullCatalogEntry> = Vec::with_capacity(ordered_entries.len());
-    // Phase G.1a: track the modality table's new offset/length so the
-    // header can be updated. The struct-copy of `header` preserves
-    // `n_modalities` and the has_modalities flag.
     let mut modality_table_offset_new: u64 = 0;
     let mut modality_table_length_new: u64 = 0;
 
-    for (i, (_, section_data)) in downloaded_sections.iter().enumerate() {
-        let entry = ordered_entries[i];
+    let download_stream =
+        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+            let path = make_path(&filename);
+            let backend_ref = &backend;
+            async move {
+                let result = backend_ref.get(&path).await?.bytes().await?;
+                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+            }
+        }))
+        .buffer_unordered(parallelism);
 
-        // Pad to 8-byte alignment
-        let aligned = align_to_8(write_offset);
-        let pad = (aligned - write_offset) as usize;
-        if pad > 0 {
-            writer.write_all(&vec![0u8; pad])?;
-            write_offset = aligned;
+    futures::pin_mut!(download_stream);
+
+    let mut next_write_idx: usize = 0;
+    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+
+    while let Some(result) = download_stream.next().await {
+        let (idx, data) = result?;
+        total_bytes_downloaded += data.len() as u64;
+        reorder_buf.insert(idx, data);
+
+        // Flush all contiguously available sections starting from
+        // `next_write_idx`.
+        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
+            let entry = ordered_entries[next_write_idx];
+
+            // Pad to 8-byte alignment
+            let aligned = align_to_8(write_offset);
+            let pad = (aligned - write_offset) as usize;
+            if pad > 0 {
+                writer.write_all(&ZEROS[..pad])?;
+                write_offset = aligned;
+            }
+
+            let new_offset = write_offset;
+            writer.write_all(&section_data)?;
+            write_offset += section_data.len() as u64;
+
+            if entry.section_type == SectionType::ModalityTable {
+                modality_table_offset_new = new_offset;
+                modality_table_length_new = section_data.len() as u64;
+            }
+
+            new_entries.push(FullCatalogEntry {
+                name: entry.name.clone(),
+                offset: new_offset,
+                length: section_data.len() as u64,
+                section_type: entry.section_type,
+                checksum: entry.checksum,
+                modality_id: entry.modality_id,
+                stats: entry.stats.clone(),
+            });
+
+            next_write_idx += 1;
         }
-
-        let new_offset = write_offset;
-        writer.write_all(section_data)?;
-        write_offset += section_data.len() as u64;
-
-        if entry.section_type == SectionType::ModalityTable {
-            modality_table_offset_new = new_offset;
-            modality_table_length_new = section_data.len() as u64;
-        }
-
-        new_entries.push(FullCatalogEntry {
-            name: entry.name.clone(),
-            offset: new_offset,
-            length: section_data.len() as u64,
-            section_type: entry.section_type,
-            checksum: entry.checksum,
-            modality_id: entry.modality_id,
-            stats: entry.stats.clone(),
-        });
     }
+
+    // Sanity: all sections must have been written.
+    assert!(
+        reorder_buf.is_empty() && next_write_idx == ordered_entries.len(),
+        "reorder buffer not fully drained after download stream completed"
+    );
 
     // 6. Write full catalog at EOF
     let catalog_aligned = align_to_8(write_offset);
     let pad = (catalog_aligned - write_offset) as usize;
     if pad > 0 {
-        writer.write_all(&vec![0u8; pad])?;
+        writer.write_all(&ZEROS[..pad])?;
     }
     let full_catalog_offset_new = catalog_aligned;
 
@@ -507,6 +537,7 @@ fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
 }
 
 /// Statistics from a selective pull operation.
+#[derive(Debug)]
 pub struct PullFilteredStats {
     pub total_shards: usize,
     pub downloaded_shards: usize,
@@ -515,6 +546,11 @@ pub struct PullFilteredStats {
     pub bytes_downloaded: u64,
     pub bytes_saved: u64,
     pub elapsed: std::time::Duration,
+    /// Section types present in the source but omitted from the
+    /// selective pull output (e.g., ObsmEmbedding, LayerCsrShard).
+    pub omitted_section_types: Vec<SectionType>,
+    /// The filter mode used for this pull.
+    pub filter_mode: FilterMode,
 }
 
 /// Selective pull: download only shards matching a predicate.
@@ -533,6 +569,15 @@ pub async fn pull_filtered(
     options: PullOptions,
 ) -> Result<PullFilteredStats> {
     let start = Instant::now();
+
+    // Exact cell-granular mode is reserved for a follow-up patch.
+    if options.filter_mode == FilterMode::Exact {
+        return Err(CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exact cell-granular filter mode is not yet implemented; \
+             use filter_mode='shard' (the default) for shard-granular pulls",
+        )));
+    }
 
     // Same orphan-sweep as `pull`: any `.tmp.{pid}` files left by a
     // prior interrupted run are removed before we start downloading.
@@ -649,9 +694,10 @@ pub async fn pull_filtered(
         .map(|(_, e)| e.length)
         .sum();
 
-    // 5. Determine which sections to download
+    // 5. Determine which sections to download; collect omitted types.
     let mut entries_to_download: Vec<&FullCatalogEntry> = Vec::new();
     let mut shard_name_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut omitted_types_set: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
 
     for &si in &needed_shard_indices {
         shard_name_set.insert(sorted_shards[si].name.clone());
@@ -671,52 +717,70 @@ pub async fn pull_filtered(
             SectionType::ModalityTable => {
                 entries_to_download.push(entry);
             }
-            _ => {} // skip obsm, layers, obsp, etc.
+            other => {
+                // Track omitted section types (obsm, layers, obsp, etc.).
+                // Skip ObsIndex since obs is already special-cased above;
+                // skip CsrShard since non-matching shards are tracked in
+                // `skipped_shards`, not `omitted_section_types`.
+                if other != SectionType::ObsIndex && other != SectionType::CsrShard {
+                    omitted_types_set.insert(other as u8);
+                }
+            }
         }
     }
 
-    // Download needed sections
-    let parallelism = options.parallelism.max(1);
-    let mut section_data_map: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
-
-    let download_tasks: Vec<(String, String)> = entries_to_download
+    let omitted_section_types: Vec<SectionType> = omitted_types_set
         .iter()
-        .map(|entry| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
-                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })?;
-            Ok((entry.name.clone(), rel_path))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|&v| SectionType::from_u8(v))
+        .collect();
 
-    for chunk in download_tasks.chunks(parallelism) {
-        let mut handles = Vec::with_capacity(chunk.len());
-
-        for (name, filename) in chunk {
-            let path = make_path(filename);
-            let name_clone = name.clone();
-            let backend_ref = &backend;
-            handles.push(async move {
-                let result = backend_ref.get(&path).await?.bytes().await?;
-                Ok::<(String, Vec<u8>), CloudError>((name_clone, result.to_vec()))
-            });
+    // Sort entries into write order for streaming. ModalityTable is
+    // separated for post-stream rewriting (it depends on the final
+    // catalog entries). The write order matches the section_write_order
+    // used by pull(): var → csr shards → uns.
+    let type_priority = |st: SectionType| -> u8 {
+        match st {
+            SectionType::VarMetadata => 0,
+            SectionType::VarIndex => 1,
+            SectionType::CsrShard => 2,
+            SectionType::UnsBlob => 3,
+            _ => 4,
         }
+    };
 
-        let results = futures::future::join_all(handles).await;
-        for result in results {
-            let (name, data) = result?;
-            total_bytes_downloaded += data.len() as u64;
-            section_data_map.insert(name, data);
+    let mut streamable_entries: Vec<&FullCatalogEntry> = Vec::new();
+    let mut modality_entry: Option<&FullCatalogEntry> = None;
+    for entry in &entries_to_download {
+        if entry.section_type == SectionType::ModalityTable {
+            modality_entry = Some(entry);
+        } else {
+            streamable_entries.push(entry);
         }
     }
+    streamable_entries.sort_by_key(|e| type_priority(e.section_type));
+
+    // Download the modality table separately — it is tiny and requires
+    // post-processing based on the final catalog entries.
+    let modality_table_bytes = if let Some(mt_entry) = modality_entry {
+        let rel_path = section_name_to_path(&mt_entry.name, mt_entry.section_type)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        let path = make_path(&rel_path);
+        let data = backend.get(&path).await?.bytes().await?;
+        total_bytes_downloaded += data.len() as u64;
+        Some(data.to_vec())
+    } else {
+        None
+    };
 
     // 6. Build obs for all rows in downloaded shards (not just predicate-matching
     //    rows) so that obs row count matches shard data.
     let filtered_obs = filter_record_batch(&obs_batch, &shard_row_indices)?;
     let filtered_obs_bytes = record_batch_to_arrow_ipc(&filtered_obs)?;
 
-    // 7. Write packed output
+    // 7. Write packed output — sections stream to disk as they arrive
+    //    in write order, so peak memory is bounded by
+    //    `parallelism × max_section_size`.
+    let parallelism = options.parallelism.max(1);
     let tmp_path =
         std::path::PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
     let file = std::fs::OpenOptions::new()
@@ -737,7 +801,7 @@ pub async fn pull_filtered(
         let aligned = align_to_8(write_offset);
         let pad = (aligned - write_offset) as usize;
         if pad > 0 {
-            writer.write_all(&vec![0u8; pad])?;
+            writer.write_all(&ZEROS[..pad])?;
             write_offset = aligned;
         }
         let obs_checksum = blake3::hash(&filtered_obs_bytes);
@@ -754,38 +818,61 @@ pub async fn pull_filtered(
         write_offset += filtered_obs_bytes.len() as u64;
     }
 
-    // Write sections in order: var, shards (renumbered), uns
-    let section_write_order = [
-        SectionType::VarMetadata,
-        SectionType::VarIndex,
-        SectionType::CsrShard,
-        SectionType::UnsBlob,
-    ];
+    // 8. Stream section downloads through buffer_unordered → reorder → disk.
+    //    Entries are pre-sorted into write order so the reorder window
+    //    drains sequentially. Download concurrency is capped at `parallelism`;
+    //    peak memory is bounded by `parallelism × max_section_size`.
+    let download_tasks: Vec<(usize, String)> = streamable_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            Ok((i, rel_path))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
+    let filtered_dl_stream =
+        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+            let path = make_path(&filename);
+            let backend_ref = &backend;
+            async move {
+                let result = backend_ref.get(&path).await?.bytes().await?;
+                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+            }
+        }))
+        .buffer_unordered(parallelism);
+
+    futures::pin_mut!(filtered_dl_stream);
+
+    let mut next_write_idx: usize = 0;
+    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     let mut new_row_offset: u64 = 0;
 
-    for &st in &section_write_order {
-        for entry in &entries_to_download {
-            if entry.section_type != st {
-                continue;
-            }
-            let data = match section_data_map.get(&entry.name) {
-                Some(d) => d,
-                None => continue,
-            };
+    while let Some(result) = filtered_dl_stream.next().await {
+        let (idx, data) = result?;
+        total_bytes_downloaded += data.len() as u64;
+        reorder_buf.insert(idx, data);
 
+        // Flush all contiguously available sections starting from
+        // `next_write_idx`.
+        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
+            let entry = streamable_entries[next_write_idx];
+
+            // Pad to 8-byte alignment
             let aligned = align_to_8(write_offset);
             let pad = (aligned - write_offset) as usize;
             if pad > 0 {
-                writer.write_all(&vec![0u8; pad])?;
+                writer.write_all(&ZEROS[..pad])?;
                 write_offset = aligned;
             }
 
             let new_offset = write_offset;
-            writer.write_all(data)?;
-            write_offset += data.len() as u64;
+            writer.write_all(&section_data)?;
+            write_offset += section_data.len() as u64;
 
-            let new_stats = if st == SectionType::CsrShard {
+            let new_stats = if entry.section_type == SectionType::CsrShard {
                 if let Some(old_stats) = &entry.stats {
                     let shard_rows = old_stats.row_end - old_stats.row_start;
                     let ns = scx_format::catalog::ShardStats {
@@ -812,14 +899,22 @@ pub async fn pull_filtered(
             new_entries.push(FullCatalogEntry {
                 name: entry.name.clone(),
                 offset: new_offset,
-                length: data.len() as u64,
+                length: section_data.len() as u64,
                 section_type: entry.section_type,
                 checksum: entry.checksum,
                 modality_id: entry.modality_id,
                 stats: new_stats,
             });
+
+            next_write_idx += 1;
         }
     }
+
+    // Sanity: all streamable sections must have been written.
+    assert!(
+        reorder_buf.is_empty() && next_write_idx == streamable_entries.len(),
+        "reorder buffer not fully drained after filtered download stream completed"
+    );
 
     // Phase G.1c: re-emit the ModalityTable section at EOF before
     // the catalog. Per-modality `n_csr_shards` and `nnz` are
@@ -828,68 +923,59 @@ pub async fn pull_filtered(
     // n_csr_shards=0/nnz=0 so the modality table's structure
     // (names, types, n_vars) survives the filter unchanged.
     let (modality_table_offset_new, modality_table_length_new) = if header.n_modalities > 0 {
-        let mt_entry = entries_to_download
-            .iter()
-            .find(|e| e.section_type == SectionType::ModalityTable);
-        if let Some(mt_entry) = mt_entry {
-            if let Some(mt_bytes) = section_data_map.get(&mt_entry.name) {
-                let mut table = scx_format::ModalityTable::read_from(
-                    &mut Cursor::new(mt_bytes),
-                    mt_bytes.len(),
-                )?;
-                // Reset per-modality counts before recomputing from
-                // the filtered catalog. CSC sidecars are dropped
-                // file-wide on pull_filtered (matching the
-                // header.clear_csc() / n_csc_shards = 0 below); zero
-                // each modality's CSC marker too.
-                for info in table.entries.iter_mut() {
-                    info.n_csr_shards = 0;
-                    info.n_csc_shards = 0;
-                    info.nnz = 0;
-                    info.flags = scx_format::ModalityFlags::from_bits_truncate(
-                        info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
-                    );
+        if let Some(mt_bytes) = &modality_table_bytes {
+            let mut table =
+                scx_format::ModalityTable::read_from(&mut Cursor::new(mt_bytes), mt_bytes.len())?;
+            // Reset per-modality counts before recomputing from
+            // the filtered catalog. CSC sidecars are dropped
+            // file-wide on pull_filtered (matching the
+            // header.clear_csc() / n_csc_shards = 0 below); zero
+            // each modality's CSC marker too.
+            for info in table.entries.iter_mut() {
+                info.n_csr_shards = 0;
+                info.n_csc_shards = 0;
+                info.nnz = 0;
+                info.flags = scx_format::ModalityFlags::from_bits_truncate(
+                    info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
+                );
+            }
+            for entry in &new_entries {
+                if entry.modality_id == 0 {
+                    continue;
                 }
-                for entry in &new_entries {
-                    if entry.modality_id == 0 {
-                        continue;
-                    }
-                    let idx = (entry.modality_id - 1) as usize;
-                    if let Some(info) = table.entries.get_mut(idx) {
-                        if entry.section_type == SectionType::CsrShard {
-                            info.n_csr_shards += 1;
-                            if let Some(stats) = &entry.stats {
-                                info.nnz += stats.nnz;
-                            }
+                let idx = (entry.modality_id - 1) as usize;
+                if let Some(info) = table.entries.get_mut(idx) {
+                    if entry.section_type == SectionType::CsrShard {
+                        info.n_csr_shards += 1;
+                        if let Some(stats) = &entry.stats {
+                            info.nnz += stats.nnz;
                         }
                     }
                 }
-                let mt_aligned = align_to_8(write_offset);
-                let pad = (mt_aligned - write_offset) as usize;
-                if pad > 0 {
-                    writer.write_all(&vec![0u8; pad])?;
-                    write_offset = mt_aligned;
-                }
-                let mt_offset_new = write_offset;
-                let mut mt_buf = Vec::new();
-                table.write_to(&mut mt_buf)?;
-                let mt_checksum = blake3::hash(&mt_buf);
-                writer.write_all(&mt_buf)?;
-                let mt_len = mt_buf.len() as u64;
-                write_offset += mt_len;
-                new_entries.push(FullCatalogEntry {
-                    name: "modality_table".to_string(),
-                    offset: mt_offset_new,
-                    length: mt_len,
-                    section_type: SectionType::ModalityTable,
-                    checksum: *mt_checksum.as_bytes(),
-                    modality_id: 0,
-                    stats: None,
-                });
-                (mt_offset_new, mt_len)
-            } else {
-                (0u64, 0u64)
             }
+            let mt_aligned = align_to_8(write_offset);
+            let pad = (mt_aligned - write_offset) as usize;
+            if pad > 0 {
+                writer.write_all(&ZEROS[..pad])?;
+                write_offset = mt_aligned;
+            }
+            let mt_offset_new = write_offset;
+            let mut mt_buf = Vec::new();
+            table.write_to(&mut mt_buf)?;
+            let mt_checksum = blake3::hash(&mt_buf);
+            writer.write_all(&mt_buf)?;
+            let mt_len = mt_buf.len() as u64;
+            write_offset += mt_len;
+            new_entries.push(FullCatalogEntry {
+                name: "modality_table".to_string(),
+                offset: mt_offset_new,
+                length: mt_len,
+                section_type: SectionType::ModalityTable,
+                checksum: *mt_checksum.as_bytes(),
+                modality_id: 0,
+                stats: None,
+            });
+            (mt_offset_new, mt_len)
         } else {
             (0u64, 0u64)
         }
@@ -901,7 +987,7 @@ pub async fn pull_filtered(
     let catalog_aligned = align_to_8(write_offset);
     let pad = (catalog_aligned - write_offset) as usize;
     if pad > 0 {
-        writer.write_all(&vec![0u8; pad])?;
+        writer.write_all(&ZEROS[..pad])?;
     }
     let full_catalog_offset_new = catalog_aligned;
 
@@ -973,6 +1059,8 @@ pub async fn pull_filtered(
         bytes_downloaded: total_bytes_downloaded,
         bytes_saved,
         elapsed,
+        omitted_section_types,
+        filter_mode: options.filter_mode,
     })
 }
 
@@ -1167,8 +1255,8 @@ mod tests {
         let output = dir.path().join(format!("pulled_p{parallelism}.scx"));
         let opts = PullOptions {
             parallelism,
-            reorder_buffer: 4,
             cloud_ready: true,
+            filter_mode: FilterMode::default(),
         };
 
         let source = exploded_dir.to_string_lossy().to_string();
@@ -1222,8 +1310,8 @@ mod tests {
         let output1 = dir.path().join("pulled_p1.scx");
         let opts1 = PullOptions {
             parallelism: 1,
-            reorder_buffer: 4,
             cloud_ready: true,
+            filter_mode: FilterMode::default(),
         };
         pull(&source, &output1, opts1).await.unwrap();
 
@@ -1231,8 +1319,8 @@ mod tests {
         let output8 = dir.path().join("pulled_p8.scx");
         let opts8 = PullOptions {
             parallelism: 8,
-            reorder_buffer: 4,
             cloud_ready: true,
+            filter_mode: FilterMode::default(),
         };
         pull(&source, &output8, opts8).await.unwrap();
 
@@ -1603,5 +1691,223 @@ mod tests {
         assert_eq!(csr_full.indptr, csr_filt.indptr);
         assert_eq!(csr_full.indices, csr_filt.indices);
         assert_eq!(csr_full.data, csr_filt.data);
+    }
+
+    // ===== Patch 5 tests =====
+
+    /// Verify the streaming reorder window drains completely and
+    /// produces correct output across multiple parallelism values.
+    #[tokio::test]
+    async fn test_pull_buffer_unordered_matches_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 200, 60);
+        let exploded_dir = dir.path().join("exploded_stream.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        // Sequential (parallelism=1)
+        let out_seq = dir.path().join("seq.scx");
+        let opts_seq = PullOptions {
+            parallelism: 1,
+            cloud_ready: true,
+            filter_mode: FilterMode::default(),
+        };
+        pull(&source, &out_seq, opts_seq).await.unwrap();
+
+        // Concurrent (parallelism=16)
+        let out_par = dir.path().join("par.scx");
+        let opts_par = PullOptions {
+            parallelism: 16,
+            cloud_ready: true,
+            filter_mode: FilterMode::default(),
+        };
+        pull(&source, &out_par, opts_par).await.unwrap();
+
+        let r_seq = ScxReader::open(&out_seq).unwrap();
+        let r_par = ScxReader::open(&out_par).unwrap();
+
+        assert_eq!(r_seq.n_obs(), r_par.n_obs());
+        assert_eq!(r_seq.n_vars(), r_par.n_vars());
+        assert_eq!(r_seq.nnz(), r_par.nnz());
+
+        let csr_seq = r_seq.read_all_csr_shards().unwrap();
+        let csr_par = r_par.read_all_csr_shards().unwrap();
+        assert_eq!(csr_seq.indptr, csr_par.indptr);
+        assert_eq!(csr_seq.indices, csr_par.indices);
+        assert_eq!(csr_seq.data, csr_par.data);
+    }
+
+    /// Verify that the streaming reorder window does NOT buffer all
+    /// sections simultaneously: with parallelism=1, pull still works.
+    #[tokio::test]
+    async fn test_pull_streaming_parallelism_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = pull_from_exploded(&dir, 100, 50, 1).await;
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.n_obs(), 100);
+        assert_eq!(reader.n_vars(), 50);
+
+        let csr = reader.read_all_csr_shards().unwrap();
+        assert_eq!(csr.shape.0, 100);
+        assert_eq!(csr.shape.1, 50);
+    }
+
+    /// Selective pull should report omitted section types when the source
+    /// contains sections beyond the basic obs/var/csr set.
+    /// The simple test fixture only has CsrShard that didn't match, which
+    /// is tracked in `skipped_shards` rather than `omitted_section_types`.
+    /// No other section types (obsm, layers, etc.) exist in the simple
+    /// fixture, so `omitted_section_types` should be empty.
+    #[tokio::test]
+    async fn test_pull_filtered_reports_filter_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_cell_type(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded_filter.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let output = dir.path().join("filtered_mode.scx");
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        let stats = pull_filtered(
+            &source,
+            &output,
+            "cell_type == 'typeA'",
+            PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Default mode is shard
+        assert_eq!(stats.filter_mode, FilterMode::Shard);
+        // Simple fixture has only obs + var + csr shards. CsrShard is
+        // excluded from omitted_section_types (tracked via skipped_shards),
+        // and no obsm/layers/obsp sections exist, so the list is empty.
+        assert!(
+            !stats.omitted_section_types.contains(&SectionType::CsrShard),
+            "CsrShard should not appear in omitted_section_types; got {:?}",
+            stats.omitted_section_types,
+        );
+        assert!(
+            stats.omitted_section_types.is_empty(),
+            "expected empty omitted list for simple fixture, got {:?}",
+            stats.omitted_section_types,
+        );
+    }
+
+    /// Shard-granular mode includes ALL cells from matching shards,
+    /// not just predicate-matching ones. This test pins that behavior.
+    #[tokio::test]
+    async fn test_pull_filtered_shard_mode_includes_extra_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 cells: 0..49 typeA, 50..99 typeB, shard_size=50
+        // Both types fit cleanly in separate shards, so no extra cells.
+        // Use a shard_size that straddles the type boundary instead.
+        let path = dir.path().join("straddle.scx");
+        let n_obs = 100;
+        let n_vars = 20;
+        let header = sample_header(n_obs as u64, n_vars as u64);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+
+        let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        // Alternate types so every shard contains both typeA and typeB
+        let types: Vec<String> = (0..n_obs)
+            .map(|i| {
+                if i % 2 == 0 {
+                    "typeA".to_string()
+                } else {
+                    "typeB".to_string()
+                }
+            })
+            .collect();
+        let obs_schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", DataType::Utf8, false),
+        ]);
+        let obs_batch = arrow::array::RecordBatch::try_new(
+            Arc::new(obs_schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        writer.write_obs(&obs_batch).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        let rows_per_shard = 50;
+        let mut row_offset = 0;
+        while row_offset < n_obs {
+            let shard_rows = std::cmp::min(rows_per_shard, n_obs - row_offset);
+            let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+            row_offset += shard_rows;
+        }
+        writer.finish().unwrap();
+
+        let exploded_dir = dir.path().join("straddle.scxd");
+        crate::explode::explode(&path, &exploded_dir).unwrap();
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        let output = dir.path().join("straddle_filtered.scx");
+        let stats = pull_filtered(
+            &source,
+            &output,
+            "cell_type == 'typeA'",
+            PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Both shards contain typeA cells, so both are downloaded.
+        assert_eq!(stats.downloaded_shards, 2);
+        // Predicate matches 50 cells, but shard-granular mode returns all 100
+        // (both full shards).
+        assert_eq!(stats.matching_cells, 50);
+
+        let reader = ScxReader::open(&output).unwrap();
+        // n_obs should be ALL cells from downloaded shards (100), not just
+        // the 50 matching ones — that's the shard-granular contract.
+        assert_eq!(reader.n_obs(), 100);
+    }
+
+    /// Exact filter mode should return an error (not yet implemented).
+    #[tokio::test]
+    async fn test_pull_filtered_exact_mode_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_cell_type(&dir, 100, 50);
+        let exploded_dir = dir.path().join("exploded_exact.scxd");
+        crate::explode::explode(&input, &exploded_dir).unwrap();
+
+        let output = dir.path().join("exact.scx");
+        let source = exploded_dir.to_string_lossy().to_string();
+
+        let opts = PullOptions {
+            filter_mode: FilterMode::Exact,
+            ..PullOptions::default()
+        };
+
+        let result = pull_filtered(&source, &output, "cell_type == 'typeA'", opts).await;
+
+        assert!(result.is_err(), "exact mode should return an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not yet implemented"),
+            "error message should mention 'not yet implemented', got: {err_msg}"
+        );
     }
 }

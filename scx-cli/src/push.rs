@@ -6,10 +6,7 @@ pub fn run_push(
     parallelism: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    let opts = scx_cloud::PushOptions {
-        parallelism,
-        multipart_threshold: 8 * 1024 * 1024,
-    };
+    let opts = scx_cloud::PushOptions { parallelism };
 
     let stats = rt.block_on(scx_cloud::push(source, dest, opts))?;
 

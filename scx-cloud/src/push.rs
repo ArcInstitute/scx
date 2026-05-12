@@ -25,17 +25,11 @@ use crate::explode::section_name_to_path;
 pub struct PushOptions {
     /// Number of parallel upload tasks (default: 8).
     pub parallelism: usize,
-    /// Multipart upload threshold in bytes (default: 8 MB).
-    /// Objects larger than this use multipart upload.
-    pub multipart_threshold: usize,
 }
 
 impl Default for PushOptions {
     fn default() -> Self {
-        Self {
-            parallelism: 8,
-            multipart_threshold: 8 * 1024 * 1024,
-        }
+        Self { parallelism: 8 }
     }
 }
 

@@ -19,6 +19,11 @@ use pyo3::types::PyDict;
 ///         must guard at the callsite. Returned dict shape differs
 ///         between the filtered and unfiltered branches (see below).
 ///     parallelism: Number of parallel download tasks (default: 8)
+///     filter_mode: ``"shard"`` (default) or ``"exact"``.  ``"shard"``
+///         downloads complete shards containing any matching cell —
+///         the output may include non-matching cells from partially
+///         matching shards.  ``"exact"`` is reserved for a future
+///         release and currently raises ``RuntimeError``.
 ///
 /// Returns:
 ///     When ``filter=None`` (full pull): dict with keys
@@ -28,8 +33,9 @@ use pyo3::types::PyDict;
 ///     When ``filter`` is set (selective pull): dict with keys
 ///     ``total_shards``, ``downloaded_shards``, ``skipped_shards``,
 ///     ``matching_cells``, ``bytes_downloaded``, ``bytes_saved``,
-///     ``elapsed_secs``. No ``throughput_mbps`` key — selective pulls
-///     pair byte counts with ``bytes_saved`` for shard-skip accounting.
+///     ``elapsed_secs``, ``filter_mode``, ``omitted_section_types``.
+///     No ``throughput_mbps`` key — selective pulls pair byte counts
+///     with ``bytes_saved`` for shard-skip accounting.
 ///
 /// Note:
 ///     Benchmark callers (``cost_model``, ``cloud_reader_vs_pull``)
@@ -39,18 +45,29 @@ use pyo3::types::PyDict;
 ///     ``benchmarks/comprehensive/benchmarks/cloud_reader_vs_pull.py``
 ///     for the skip-when-None pattern.
 #[pyfunction]
-#[pyo3(signature = (source, dest, filter=None, parallelism=None))]
+#[pyo3(signature = (source, dest, filter=None, parallelism=None, filter_mode=None))]
 pub fn pull(
     py: Python<'_>,
     source: &str,
     dest: &str,
     filter: Option<&str>,
     parallelism: Option<usize>,
+    filter_mode: Option<&str>,
 ) -> PyResult<PyObject> {
+    let mode = match filter_mode.unwrap_or("shard") {
+        "shard" => scx_cloud::FilterMode::Shard,
+        "exact" => scx_cloud::FilterMode::Exact,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid filter_mode: '{other}'; expected 'shard' or 'exact'"
+            )));
+        }
+    };
+
     let opts = scx_cloud::PullOptions {
         parallelism: parallelism.unwrap_or(8),
-        reorder_buffer: 4,
         cloud_ready: true,
+        filter_mode: mode,
     };
 
     let rt = tokio::runtime::Runtime::new()
@@ -81,6 +98,19 @@ pub fn pull(
         dict.set_item("bytes_downloaded", stats.bytes_downloaded)?;
         dict.set_item("bytes_saved", stats.bytes_saved)?;
         dict.set_item("elapsed_secs", stats.elapsed.as_secs_f64())?;
+        dict.set_item(
+            "filter_mode",
+            match stats.filter_mode {
+                scx_cloud::FilterMode::Shard => "shard",
+                scx_cloud::FilterMode::Exact => "exact",
+            },
+        )?;
+        let omitted: Vec<String> = stats
+            .omitted_section_types
+            .iter()
+            .map(|st| format!("{st:?}"))
+            .collect();
+        dict.set_item("omitted_section_types", omitted)?;
         Ok(dict.into())
     } else {
         let source = source.to_string();
@@ -116,7 +146,6 @@ pub fn push(
 ) -> PyResult<PyObject> {
     let opts = scx_cloud::PushOptions {
         parallelism: parallelism.unwrap_or(8),
-        multipart_threshold: 8 * 1024 * 1024,
     };
 
     let rt = tokio::runtime::Runtime::new()

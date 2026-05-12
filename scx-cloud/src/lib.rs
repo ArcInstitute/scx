@@ -15,5 +15,5 @@ pub use coalesce::coalesce_ranges;
 pub use error::{CloudError, Result};
 pub use explode::explode;
 pub use pack::pack;
-pub use pull::{pull, pull_filtered, PullFilteredStats, PullOptions, PullStats};
+pub use pull::{pull, pull_filtered, FilterMode, PullFilteredStats, PullOptions, PullStats};
 pub use push::{push, PushOptions, PushStats};
