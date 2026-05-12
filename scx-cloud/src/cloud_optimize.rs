@@ -30,7 +30,7 @@ const SECTIONS_START_OFFSET: u64 = 4352;
 ///
 /// If the input already has a valid front catalog, this is a no-op.
 ///
-/// Uses atomic rename: writes to `output.tmp.PID`, then renames to `output`.
+/// Uses atomic rename: writes to a randomized temp file, then renames to `output`.
 pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     // 1. Open and read the input file
     let input_data = std::fs::read(input)?;
@@ -125,16 +125,9 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         }
     }
 
-    // 3. Create output file (atomic temp path)
-    let tmp_path =
-        std::path::PathBuf::from(format!("{}.tmp.{}", output.display(), std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
+    // 3. Create output file via collision-safe sibling tempfile.
+    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(output)?;
+    let mut writer = BufWriter::new(raw_file);
 
     // Write placeholder for header + root catalog
     writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
@@ -293,7 +286,11 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     // 10. fsync + atomic rename
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp_path, output)?;
+    tmp_path
+        .persist(output)
+        .map_err(|e| crate::error::CloudError::Io(e.error))?;
+    scx_format::chmod_to_umask(output)?;
+    scx_format::fsync_parent_dir(output)?;
 
     Ok(())
 }

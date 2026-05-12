@@ -80,16 +80,9 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
         }
     }
 
-    // 4. Create output via atomic temp file
-    let tmp_path =
-        std::path::PathBuf::from(format!("{}.tmp.{}", output.display(), std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
+    // 4. Create output via collision-safe sibling tempfile.
+    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(output)?;
+    let mut writer = BufWriter::new(raw_file);
 
     // Write placeholder for header + root catalog
     writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
@@ -245,7 +238,11 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
     // 12. fsync + atomic rename
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp_path, output)?;
+    tmp_path
+        .persist(output)
+        .map_err(|e| crate::error::CloudError::Io(e.error))?;
+    scx_format::chmod_to_umask(output)?;
+    scx_format::fsync_parent_dir(output)?;
 
     Ok(())
 }
