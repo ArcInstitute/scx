@@ -68,6 +68,7 @@ pub fn pull(
         parallelism: parallelism.unwrap_or(8),
         cloud_ready: true,
         filter_mode: mode,
+        retry_config: scx_cloud::RetryConfig::default(),
     };
 
     let rt = tokio::runtime::Runtime::new()

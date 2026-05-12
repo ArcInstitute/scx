@@ -24,6 +24,7 @@ pub fn run_pull(
         parallelism,
         cloud_ready,
         filter_mode: mode,
+        retry_config: scx_cloud::RetryConfig::default(),
     };
 
     if let Some(filter_expr) = filter {

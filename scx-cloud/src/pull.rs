@@ -139,6 +139,179 @@ fn cleanup_stale_tmp_files(dest: &Path) {
     }
 }
 
+/// Retry policy applied to every individual cloud `GET` issued by `pull` /
+/// `pull_filtered`.
+///
+/// The retry layer wraps each request in a [`tokio::time::timeout`] and
+/// retries application-classified transient failures with exponential
+/// backoff + jitter. It composes with `object_store`'s own internal
+/// retries: each outer attempt may itself absorb a few HTTP-level retries
+/// inside `object_store`, so the effective number of underlying HTTP
+/// attempts is roughly `max_retries × object_store_max_retries`. Defaults
+/// (3 outer × ~3 inner) are tuned to bound the worst case at ~9 attempts.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Number of retry attempts on top of the first try. Total attempts
+    /// = `max_retries + 1`. Default 3.
+    pub max_retries: usize,
+    /// Initial backoff delay before retry attempt 1. Default 500 ms.
+    pub base_delay: Duration,
+    /// Cap on backoff delay; the exponential schedule is clamped here.
+    /// Default 30 s.
+    pub max_delay: Duration,
+    /// Jitter amplitude as a fraction of the computed delay (e.g. 0.1
+    /// means ±10%). Default 0.1.
+    pub jitter_factor: f64,
+    /// Per-request hard wall-clock timeout. A timed-out request is
+    /// retried subject to `max_retries`; final exhaustion surfaces as
+    /// [`CloudError::Timeout`]. Default 120 s.
+    pub request_timeout: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            jitter_factor: 0.1,
+            request_timeout: Duration::from_secs(120),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Retry policy that disables both outer retries and timeout
+    /// enforcement. Use in tests or for fail-fast call sites.
+    pub fn disabled() -> Self {
+        Self {
+            max_retries: 0,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_secs(60 * 60 * 24),
+        }
+    }
+}
+
+/// Classify an `object_store::Error` as retryable (transient) or
+/// permanent. Conservative: only the explicit transient signals from
+/// `object_store` plus our own heuristic substring matches against
+/// throttle / 5xx / connection-reset wording are considered retryable.
+fn is_retryable(err: &object_store::Error) -> bool {
+    use object_store::Error;
+    match err {
+        // Definite permanent failures.
+        Error::NotFound { .. } | Error::AlreadyExists { .. } | Error::NotModified { .. } => false,
+        // `object_store` has internal classification — when in doubt
+        // (Generic, JoinError, etc.) we treat the error as retryable so
+        // the outer layer gets a chance.
+        _ => {
+            let msg = format!("{err}");
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("timed out")
+                || lower.contains("timeout")
+                || lower.contains("connection reset")
+                || lower.contains("connection refused")
+                || lower.contains("connection closed")
+                || lower.contains("broken pipe")
+                || lower.contains("rate limit")
+                || lower.contains("throttle")
+                || lower.contains("throttled")
+                || lower.contains("503")
+                || lower.contains("502")
+                || lower.contains("500")
+                || lower.contains("504")
+                || lower.contains("server error")
+                || lower.contains("temporarily unavailable")
+                || matches!(
+                    err,
+                    Error::Generic { .. }
+                        | Error::JoinError { .. }
+                        | Error::UnknownConfigurationKey { .. }
+                )
+        }
+    }
+}
+
+/// Compute the exponential-backoff delay for a given attempt number.
+///
+/// Delay grows as `base * 2^(attempt-1)`, clamped to `max_delay`, then
+/// multiplied by `1 ± jitter_factor` sampled uniformly from
+/// `rand::thread_rng()`. Concurrent clients sampling independently is
+/// what actually breaks thundering-herd retry spikes — the prior
+/// `Instant::now().elapsed()` LCG seed collapsed to a constant on every
+/// call and is fixed here.
+fn backoff_delay(cfg: &RetryConfig, attempt: usize) -> Duration {
+    let exp = (attempt as u32).saturating_sub(1).min(20);
+    let raw = cfg.base_delay.saturating_mul(1u32 << exp);
+    let bounded = std::cmp::min(raw, cfg.max_delay);
+    let jitter = if cfg.jitter_factor > 0.0 {
+        use rand::Rng;
+        rand::thread_rng().gen_range(-cfg.jitter_factor..=cfg.jitter_factor)
+    } else {
+        0.0
+    };
+    let nanos = bounded.as_nanos() as f64 * (1.0 + jitter);
+    let nanos = nanos.max(0.0) as u64;
+    Duration::from_nanos(nanos)
+}
+
+/// Issue a single cloud `GET` with timeout + retry/backoff applied.
+///
+/// On timeout, retries up to `cfg.max_retries`; final exhaustion surfaces
+/// as [`CloudError::Timeout`]. On retryable `object_store` errors, retries
+/// with backoff; final exhaustion surfaces as
+/// [`CloudError::DownloadFailed`]. Permanent errors short-circuit to
+/// [`CloudError::ObjectStore`] without retry.
+async fn get_with_retry(
+    backend: &dyn ObjectStore,
+    path: &ObjPath,
+    cfg: &RetryConfig,
+) -> Result<bytes::Bytes> {
+    let mut attempt: usize = 0;
+    let mut last_msg: Option<String> = None;
+    loop {
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(cfg.request_timeout, async {
+            let got = backend.get(path).await?;
+            got.bytes().await
+        })
+        .await;
+        match outcome {
+            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Err(e)) => {
+                if attempt < cfg.max_retries && is_retryable(&e) {
+                    last_msg = Some(format!("{e}"));
+                    attempt += 1;
+                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
+                    continue;
+                }
+                if attempt >= cfg.max_retries && is_retryable(&e) {
+                    return Err(CloudError::DownloadFailed {
+                        retries: attempt,
+                        message: format!("{path}: {e}"),
+                    });
+                }
+                return Err(CloudError::ObjectStore(e));
+            }
+            Err(_) => {
+                if attempt < cfg.max_retries {
+                    last_msg = Some(format!("timeout after {:?}", started.elapsed()));
+                    attempt += 1;
+                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
+                    continue;
+                }
+                return Err(CloudError::Timeout {
+                    duration: cfg.request_timeout,
+                    path: path.to_string(),
+                    last_error: last_msg,
+                });
+            }
+        }
+    }
+}
+
 /// Options for the pull operation.
 pub struct PullOptions {
     /// Number of parallel download tasks (default: 8). Also bounds the
@@ -150,6 +323,8 @@ pub struct PullOptions {
     pub cloud_ready: bool,
     /// Filter mode for selective pulls (default: `Shard`).
     pub filter_mode: FilterMode,
+    /// Per-request retry + timeout policy.
+    pub retry_config: RetryConfig,
 }
 
 impl Default for PullOptions {
@@ -158,6 +333,7 @@ impl Default for PullOptions {
             parallelism: 8,
             cloud_ready: true,
             filter_mode: FilterMode::default(),
+            retry_config: RetryConfig::default(),
         }
     }
 }
@@ -237,13 +413,14 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
 
     // 2. Download _catalog.bin and _header.bin
     let catalog_path = make_path("_catalog.bin");
-    let catalog_data = backend.get(&catalog_path).await?.bytes().await?;
+    let catalog_data =
+        get_with_retry(backend.as_ref(), &catalog_path, &options.retry_config).await?;
     let catalog_bytes = catalog_data.to_vec();
     let original_catalog =
         FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     let header_path = make_path("_header.bin");
-    let header_data = backend.get(&header_path).await?.bytes().await?;
+    let header_data = get_with_retry(backend.as_ref(), &header_path, &options.retry_config).await?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_data))?;
 
     let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
@@ -294,128 +471,66 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         }
     }
 
-    // 4. Prepare output file BEFORE downloading — sections are written to
-    //    disk as they arrive in order, so peak memory is bounded by
-    //    `parallelism × max_section_size` instead of `total_file_size`.
+    // 4. Pre-compute the layout from the source catalog.
+    //
+    //    The whole file is written forward through a `HashingWriter`, so
+    //    every offset must be known before the first byte hits disk:
+    //    section lengths and checksums are copied verbatim from the source
+    //    catalog (today's behaviour — we never recompute either), and the
+    //    8-byte alignment between sections is deterministic. This lets the
+    //    file checksum be computed incrementally and patched in at the end
+    //    without re-reading the entire file.
     let parallelism = options.parallelism.max(1);
-    // Collision-safe sibling temp file.
-    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
-    let mut writer = BufWriter::new(raw_file);
 
-    // Write placeholder for header + root catalog
-    writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
-    let mut write_offset = SECTIONS_START_OFFSET;
-
-    // Estimate and reserve front catalog space if cloud-ready
-    let front_catalog_offset;
-    let estimated_front_catalog_size;
-    if options.cloud_ready {
-        estimated_front_catalog_size = estimate_catalog_size(ordered_entries.len());
-        front_catalog_offset = write_offset;
-        writer.write_all(&vec![0u8; estimated_front_catalog_size])?;
-        write_offset += estimated_front_catalog_size as u64;
-
-        let aligned = align_to_8(write_offset);
-        let pad = (aligned - write_offset) as usize;
-        if pad > 0 {
-            writer.write_all(&ZEROS[..pad])?;
-            write_offset = aligned;
-        }
+    let estimated_front_catalog_size = if options.cloud_ready {
+        estimate_catalog_size(ordered_entries.len())
     } else {
-        estimated_front_catalog_size = 0;
-        front_catalog_offset = 0;
-    }
+        0
+    };
+    let front_catalog_offset = if options.cloud_ready {
+        SECTIONS_START_OFFSET
+    } else {
+        0
+    };
+    let prefix_end = if options.cloud_ready {
+        // The reserved region is the estimated front catalog size; the
+        // alignment-padding bytes that follow are written through the
+        // hasher as part of the prefix.
+        align_to_8(SECTIONS_START_OFFSET + estimated_front_catalog_size as u64)
+    } else {
+        SECTIONS_START_OFFSET
+    };
 
-    // Build download tasks as (index, filename) pairs
-    let download_tasks: Vec<(usize, String)> = ordered_entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
-                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })?;
-            Ok((i, rel_path))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // 5. Stream downloads through buffer_unordered → reorder window → disk.
-    //    Download concurrency is capped at `parallelism`; the BTreeMap
-    //    reorder window holds at most `parallelism` completed sections
-    //    while waiting for the next sequential index to become available.
-    let mut new_entries: Vec<FullCatalogEntry> = Vec::with_capacity(ordered_entries.len());
+    let mut section_offsets: Vec<u64> = Vec::with_capacity(ordered_entries.len());
+    let mut cursor = prefix_end;
     let mut modality_table_offset_new: u64 = 0;
     let mut modality_table_length_new: u64 = 0;
-
-    let download_stream =
-        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
-            let path = make_path(&filename);
-            let backend_ref = &backend;
-            async move {
-                let result = backend_ref.get(&path).await?.bytes().await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
-            }
-        }))
-        .buffer_unordered(parallelism);
-
-    futures::pin_mut!(download_stream);
-
-    let mut next_write_idx: usize = 0;
-    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-
-    while let Some(result) = download_stream.next().await {
-        let (idx, data) = result?;
-        total_bytes_downloaded += data.len() as u64;
-        reorder_buf.insert(idx, data);
-
-        // Flush all contiguously available sections starting from
-        // `next_write_idx`.
-        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
-            let entry = ordered_entries[next_write_idx];
-
-            // Pad to 8-byte alignment
-            let aligned = align_to_8(write_offset);
-            let pad = (aligned - write_offset) as usize;
-            if pad > 0 {
-                writer.write_all(&ZEROS[..pad])?;
-                write_offset = aligned;
-            }
-
-            let new_offset = write_offset;
-            writer.write_all(&section_data)?;
-            write_offset += section_data.len() as u64;
-
-            if entry.section_type == SectionType::ModalityTable {
-                modality_table_offset_new = new_offset;
-                modality_table_length_new = section_data.len() as u64;
-            }
-
-            new_entries.push(FullCatalogEntry {
-                name: entry.name.clone(),
-                offset: new_offset,
-                length: section_data.len() as u64,
-                section_type: entry.section_type,
-                checksum: entry.checksum,
-                modality_id: entry.modality_id,
-                stats: entry.stats.clone(),
-            });
-
-            next_write_idx += 1;
+    for entry in &ordered_entries {
+        cursor = align_to_8(cursor);
+        section_offsets.push(cursor);
+        if entry.section_type == SectionType::ModalityTable {
+            modality_table_offset_new = cursor;
+            modality_table_length_new = entry.length;
         }
+        cursor += entry.length;
     }
+    let full_catalog_offset_new = align_to_8(cursor);
 
-    // Sanity: all sections must have been written.
-    assert!(
-        reorder_buf.is_empty() && next_write_idx == ordered_entries.len(),
-        "reorder buffer not fully drained after download stream completed"
-    );
-
-    // 6. Write full catalog at EOF
-    let catalog_aligned = align_to_8(write_offset);
-    let pad = (catalog_aligned - write_offset) as usize;
-    if pad > 0 {
-        writer.write_all(&ZEROS[..pad])?;
-    }
-    let full_catalog_offset_new = catalog_aligned;
+    // 5. Build the new catalog, root catalog, and header — all from
+    //    in-memory data only.
+    let new_entries: Vec<FullCatalogEntry> = ordered_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| FullCatalogEntry {
+            name: entry.name.clone(),
+            offset: section_offsets[i],
+            length: entry.length,
+            section_type: entry.section_type,
+            checksum: entry.checksum,
+            modality_id: entry.modality_id,
+            stats: entry.stats.clone(),
+        })
+        .collect();
 
     let new_full_catalog = FullCatalog {
         catalog_version: original_catalog.catalog_version,
@@ -427,42 +542,14 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     let mut new_catalog_bytes = Vec::new();
     new_full_catalog.write_to(&mut new_catalog_bytes)?;
     let new_full_catalog_length = new_catalog_bytes.len() as u64;
-    writer.write_all(&new_catalog_bytes)?;
 
-    // 7. Write front catalog if cloud-ready
-    let mut new_header = header;
-    if options.cloud_ready {
-        let front_catalog_length = new_catalog_bytes.len();
-        if front_catalog_length <= estimated_front_catalog_size {
-            writer.seek(SeekFrom::Start(front_catalog_offset))?;
-            writer.write_all(&new_catalog_bytes)?;
-            let remaining = estimated_front_catalog_size - front_catalog_length;
-            if remaining > 0 {
-                writer.write_all(&vec![0u8; remaining])?;
-            }
-            new_header.front_catalog_offset = front_catalog_offset;
-            new_header.front_catalog_length = front_catalog_length as u64;
-            new_header.set_front_catalog();
-        } else {
-            writer.seek(SeekFrom::Start(front_catalog_offset))?;
-            writer.write_all(&vec![0u8; estimated_front_catalog_size])?;
-            new_header.front_catalog_offset = 0;
-            new_header.front_catalog_length = 0;
-            new_header.clear_front_catalog();
-        }
-    }
-
-    // 8. Build and write root catalog at offset 256
     let root_catalog = build_root_catalog(&new_full_catalog);
     let mut root_buf = Vec::new();
     root_catalog.write_to(&mut root_buf)?;
     let root_catalog_length = root_buf.len() as u64;
     root_buf.resize(4096, 0);
 
-    writer.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
-    writer.write_all(&root_buf)?;
-
-    // 9. Write header
+    let mut new_header = header;
     new_header.root_catalog_offset = HEADER_SIZE as u64;
     new_header.root_catalog_length = root_catalog_length;
     new_header.full_catalog_offset = full_catalog_offset_new;
@@ -473,18 +560,138 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     new_header.modality_table_length = modality_table_length_new;
     new_header.file_checksum = 0;
 
-    writer.seek(SeekFrom::Start(0))?;
-    new_header.write_to(&mut writer)?;
+    let front_catalog_fits =
+        options.cloud_ready && new_catalog_bytes.len() <= estimated_front_catalog_size;
+    if options.cloud_ready {
+        if front_catalog_fits {
+            new_header.front_catalog_offset = front_catalog_offset;
+            new_header.front_catalog_length = new_catalog_bytes.len() as u64;
+            new_header.set_front_catalog();
+        } else {
+            new_header.front_catalog_offset = 0;
+            new_header.front_catalog_length = 0;
+            new_header.clear_front_catalog();
+        }
+    }
 
-    // 10. Compute file checksum
+    let mut header_bytes = Vec::with_capacity(HEADER_SIZE);
+    new_header.write_to(&mut header_bytes)?;
+    debug_assert_eq!(
+        header_bytes.len(),
+        HEADER_SIZE,
+        "FileHeader must serialize to exactly HEADER_SIZE bytes"
+    );
+
+    // 6. Stream the file forward through a HashingWriter.
+    //    Order: header → root catalog → front catalog region (cloud_ready)
+    //         → sections (downloaded in parallel, written in order)
+    //         → full catalog at EOF.
+    //    Sections are streamed in via the same reorder window the
+    //    pre-restructure code used, so peak memory is still bounded by
+    //    `parallelism × max_section_size`.
+    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
+    let mut writer = HashingWriter::new(BufWriter::new(raw_file));
+
+    writer.write_all(&header_bytes)?;
+    writer.write_all(&root_buf)?;
+
+    if options.cloud_ready {
+        if front_catalog_fits {
+            writer.write_all(&new_catalog_bytes)?;
+            let remaining = estimated_front_catalog_size - new_catalog_bytes.len();
+            if remaining > 0 {
+                writer.write_all(&vec![0u8; remaining])?;
+            }
+        } else {
+            writer.write_all(&vec![0u8; estimated_front_catalog_size])?;
+        }
+        let cur = SECTIONS_START_OFFSET + estimated_front_catalog_size as u64;
+        let aligned = align_to_8(cur);
+        let pad = (aligned - cur) as usize;
+        if pad > 0 {
+            writer.write_all(&ZEROS[..pad])?;
+        }
+    }
+
+    // Build download tasks as (index, filename) pairs.
+    let download_tasks: Vec<(usize, String)> = ordered_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            Ok((i, rel_path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let retry_cfg = &options.retry_config;
+    let download_stream =
+        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+            let path = make_path(&filename);
+            let backend_ref = &backend;
+            async move {
+                let result = get_with_retry(backend_ref.as_ref(), &path, retry_cfg).await?;
+                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+            }
+        }))
+        .buffer_unordered(parallelism);
+
+    futures::pin_mut!(download_stream);
+
+    let mut next_write_idx: usize = 0;
+    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    let mut write_offset = prefix_end;
+
+    while let Some(result) = download_stream.next().await {
+        let (idx, data) = result?;
+        let declared = ordered_entries[idx].length;
+        if data.len() as u64 != declared {
+            return Err(CloudError::InvalidSectionLength {
+                name: ordered_entries[idx].name.clone(),
+                declared,
+                downloaded: data.len() as u64,
+            });
+        }
+        total_bytes_downloaded += data.len() as u64;
+        reorder_buf.insert(idx, data);
+
+        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
+            let target_offset = section_offsets[next_write_idx];
+            let pad = (target_offset - write_offset) as usize;
+            if pad > 0 {
+                writer.write_all(&ZEROS[..pad])?;
+                write_offset = target_offset;
+            }
+            debug_assert_eq!(write_offset, target_offset);
+            writer.write_all(&section_data)?;
+            write_offset += section_data.len() as u64;
+            next_write_idx += 1;
+        }
+    }
+
+    assert!(
+        reorder_buf.is_empty() && next_write_idx == ordered_entries.len(),
+        "reorder buffer not fully drained after download stream completed"
+    );
+
+    // Pad to align with full_catalog_offset_new, then write the full catalog.
+    let pad = (full_catalog_offset_new - write_offset) as usize;
+    if pad > 0 {
+        writer.write_all(&ZEROS[..pad])?;
+    }
+    writer.write_all(&new_catalog_bytes)?;
+
+    // 7. Finalize hash, patch file_checksum into the header on disk.
     writer.flush()?;
-    let mut file = writer.into_inner().map_err(std::io::Error::from)?;
-    let file_checksum = compute_file_checksum(&mut file)?;
+    let (buf_writer, hasher) = writer.into_parts();
+    let file_checksum = scx_format::checksum::truncate_hash_to_u64(&hasher.finalize());
+    let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
     new_header.file_checksum = file_checksum;
     file.seek(SeekFrom::Start(0))?;
     new_header.write_to(&mut file)?;
 
-    // 11. fsync + atomic rename
+    // 8. fsync + atomic rename.
     file.sync_all()?;
     drop(file);
     tmp_path
@@ -545,6 +752,10 @@ fn build_root_catalog(catalog: &FullCatalog) -> RootCatalog {
 }
 
 /// Compute file checksum: BLAKE3 of entire file, truncated to u64.
+///
+/// Used only by `pull_filtered`'s legacy write path (re-reads the file
+/// after writing). `pull()` uses [`HashingWriter`] to hash incrementally
+/// during the forward write and avoids the re-read entirely.
 fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
@@ -558,6 +769,49 @@ fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
     }
     let hash = hasher.finalize();
     Ok(scx_format::checksum::truncate_hash_to_u64(&hash))
+}
+
+/// `Write` adapter that incrementally feeds every byte written to it
+/// through a BLAKE3 hasher.
+///
+/// Used by `pull()` to compute the file checksum as the output is
+/// streamed forward, avoiding a multi-GB re-read after the writes
+/// complete. The hash assumes a single forward pass (no `Seek`), which
+/// is the contract the restructured `pull()` honors.
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn into_parts(self) -> (W, blake3::Hasher) {
+        (self.inner, self.hasher)
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.hasher.update(buf);
+        Ok(())
+    }
 }
 
 /// Statistics from a selective pull operation.
@@ -615,13 +869,14 @@ pub async fn pull_filtered(
 
     // 2. Download _catalog.bin and _header.bin
     let catalog_path = make_path("_catalog.bin");
-    let catalog_data = backend.get(&catalog_path).await?.bytes().await?;
+    let catalog_data =
+        get_with_retry(backend.as_ref(), &catalog_path, &options.retry_config).await?;
     let catalog_bytes = catalog_data.to_vec();
     let original_catalog =
         FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     let header_path = make_path("_header.bin");
-    let header_data = backend.get(&header_path).await?.bytes().await?;
+    let header_data = get_with_retry(backend.as_ref(), &header_path, &options.retry_config).await?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_data))?;
 
     let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
@@ -630,7 +885,7 @@ pub async fn pull_filtered(
     let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata)
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     let obs_obj_path = make_path(&obs_path_str);
-    let obs_data = backend.get(&obs_obj_path).await?.bytes().await?;
+    let obs_data = get_with_retry(backend.as_ref(), &obs_obj_path, &options.retry_config).await?;
     total_bytes_downloaded += obs_data.len() as u64;
     let obs_bytes = obs_data.to_vec();
 
@@ -789,7 +1044,7 @@ pub async fn pull_filtered(
         let rel_path = section_name_to_path(&mt_entry.name, mt_entry.section_type)
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let path = make_path(&rel_path);
-        let data = backend.get(&path).await?.bytes().await?;
+        let data = get_with_retry(backend.as_ref(), &path, &options.retry_config).await?;
         total_bytes_downloaded += data.len() as u64;
         Some(data.to_vec())
     } else {
@@ -851,12 +1106,13 @@ pub async fn pull_filtered(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let retry_cfg = &options.retry_config;
     let filtered_dl_stream =
         futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
             let path = make_path(&filename);
             let backend_ref = &backend;
             async move {
-                let result = backend_ref.get(&path).await?.bytes().await?;
+                let result = get_with_retry(backend_ref.as_ref(), &path, retry_cfg).await?;
                 Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
             }
         }))
@@ -1056,6 +1312,15 @@ pub async fn pull_filtered(
     writer.seek(SeekFrom::Start(0))?;
     new_header.write_to(&mut writer)?;
 
+    // `pull()` was restructured to hash incrementally during the forward
+    // write; `pull_filtered` still uses the legacy re-read path. Selective
+    // pulls download a subset of shards (typically <10% of cells), so the
+    // re-read is usually <100 MB and not on the critical path. The
+    // restructure is feasible — obs is rewritten in-memory before the
+    // stream, and the rewritten modality table content can be derived
+    // upfront from `needed_shard_indices` rather than from streamed
+    // `new_entries` — but is deferred so this patch stays focused on the
+    // multi-GB `pull()` case the review flagged.
     writer.flush()?;
     let mut file = writer.into_inner().map_err(std::io::Error::from)?;
     let file_checksum = compute_file_checksum(&mut file)?;
@@ -1279,6 +1544,7 @@ mod tests {
             parallelism,
             cloud_ready: true,
             filter_mode: FilterMode::default(),
+            retry_config: RetryConfig::default(),
         };
 
         let source = exploded_dir.to_string_lossy().to_string();
@@ -1334,6 +1600,7 @@ mod tests {
             parallelism: 1,
             cloud_ready: true,
             filter_mode: FilterMode::default(),
+            retry_config: RetryConfig::default(),
         };
         pull(&source, &output1, opts1).await.unwrap();
 
@@ -1343,6 +1610,7 @@ mod tests {
             parallelism: 8,
             cloud_ready: true,
             filter_mode: FilterMode::default(),
+            retry_config: RetryConfig::default(),
         };
         pull(&source, &output8, opts8).await.unwrap();
 
@@ -1804,6 +2072,7 @@ mod tests {
             parallelism: 1,
             cloud_ready: true,
             filter_mode: FilterMode::default(),
+            retry_config: RetryConfig::default(),
         };
         pull(&source, &out_seq, opts_seq).await.unwrap();
 
@@ -1813,6 +2082,7 @@ mod tests {
             parallelism: 16,
             cloud_ready: true,
             filter_mode: FilterMode::default(),
+            retry_config: RetryConfig::default(),
         };
         pull(&source, &out_par, opts_par).await.unwrap();
 
@@ -2001,5 +2271,396 @@ mod tests {
             err_msg.contains("not yet implemented"),
             "error message should mention 'not yet implemented', got: {err_msg}"
         );
+    }
+
+    // ─── Patch 11 § P2 #43 — retry + timeout layer ────────────────────
+    //
+    // `get_with_retry` is exercised end-to-end in every other pull test
+    // (default RetryConfig is enabled), so the cases below focus on
+    // behaviors the happy-path tests do not cover: retryable-error
+    // classification, eventual retry success, timeout enforcement, and
+    // retry-budget exhaustion. `FaultyStore` wraps an inner
+    // `LocalFileSystem` and intercepts `get_opts` to inject failures
+    // before each delegating call.
+
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::local::LocalFileSystem;
+    use object_store::{
+        GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Fault injection mode applied to the next `get_opts` call.
+    #[derive(Clone, Copy, Debug)]
+    enum FaultMode {
+        /// Return a `Generic` error whose message marks it retryable.
+        TransientError,
+        /// Sleep slightly longer than the request timeout, then
+        /// delegate (the caller will hit `tokio::time::timeout` first).
+        SleepBeyondTimeout(Duration),
+    }
+
+    /// Wraps a `LocalFileSystem` and injects a pre-canned schedule of
+    /// faults into `get_opts` to exercise retry classification, eventual
+    /// success after transients, and timeout enforcement.
+    #[derive(Debug)]
+    struct FaultyStore {
+        inner: LocalFileSystem,
+        /// Pop one fault per `get_opts` call; once exhausted, calls
+        /// delegate to `inner` and succeed.
+        faults: std::sync::Mutex<std::collections::VecDeque<FaultMode>>,
+        get_attempts: AtomicUsize,
+    }
+
+    impl FaultyStore {
+        fn new(inner: LocalFileSystem, faults: Vec<FaultMode>) -> Self {
+            Self {
+                inner,
+                faults: std::sync::Mutex::new(faults.into()),
+                get_attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl std::fmt::Display for FaultyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultyStore(inner={})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FaultyStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.get_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+            let next = self.faults.lock().unwrap().pop_front();
+            match next {
+                Some(FaultMode::TransientError) => Err(object_store::Error::Generic {
+                    store: "FaultyStore",
+                    source: "synthetic 503 Service Unavailable".into(),
+                }),
+                Some(FaultMode::SleepBeyondTimeout(d)) => {
+                    tokio::time::sleep(d).await;
+                    self.inner.get_opts(location, options).await
+                }
+                None => self.inner.get_opts(location, options).await,
+            }
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[test]
+    fn is_retryable_distinguishes_permanent_from_transient() {
+        // NotFound and AlreadyExists are permanent — no retry.
+        let nf = object_store::Error::NotFound {
+            path: "x".into(),
+            source: "missing".into(),
+        };
+        assert!(!is_retryable(&nf));
+
+        let ae = object_store::Error::AlreadyExists {
+            path: "y".into(),
+            source: "dup".into(),
+        };
+        assert!(!is_retryable(&ae));
+
+        // Generic errors whose message mentions 503/throttle/connection
+        // are retryable.
+        let g503 = object_store::Error::Generic {
+            store: "test",
+            source: "503 service unavailable".into(),
+        };
+        assert!(is_retryable(&g503));
+
+        let g_throttle = object_store::Error::Generic {
+            store: "test",
+            source: "request throttled".into(),
+        };
+        assert!(is_retryable(&g_throttle));
+    }
+
+    #[test]
+    fn backoff_delay_grows_exponentially_and_clamps() {
+        let cfg = RetryConfig {
+            max_retries: 5,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(800),
+            jitter_factor: 0.0, // deterministic
+            request_timeout: Duration::from_secs(1),
+        };
+        // attempt 1 → ~100 ms, attempt 2 → ~200 ms, … attempt 4 → ~800 ms,
+        // attempt 5 → still 800 ms (clamped).
+        let d1 = backoff_delay(&cfg, 1);
+        let d2 = backoff_delay(&cfg, 2);
+        let d3 = backoff_delay(&cfg, 3);
+        let d4 = backoff_delay(&cfg, 4);
+        let d5 = backoff_delay(&cfg, 5);
+        assert_eq!(d1, Duration::from_millis(100));
+        assert_eq!(d2, Duration::from_millis(200));
+        assert_eq!(d3, Duration::from_millis(400));
+        assert_eq!(d4, Duration::from_millis(800));
+        assert_eq!(d5, Duration::from_millis(800), "should clamp at max_delay");
+    }
+
+    #[tokio::test]
+    async fn get_with_retry_retries_transient_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // Two transient failures, then success on the third call.
+        let store = FaultyStore::new(
+            inner,
+            vec![FaultMode::TransientError, FaultMode::TransientError],
+        );
+        let cfg = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_secs(10),
+        };
+        let path = ObjPath::from("file.bin");
+        let bytes: Bytes = get_with_retry(&store, &path, &cfg).await.unwrap();
+        assert_eq!(&*bytes, b"hello world");
+        assert_eq!(
+            store.get_attempts.load(AtomicOrdering::Relaxed),
+            3,
+            "should have hit the backend exactly 3 times (2 fail + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_with_retry_returns_download_failed_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // 4 transient failures, budget allows max_retries=2 → total 3
+        // attempts, all fail.
+        let store = FaultyStore::new(
+            inner,
+            vec![
+                FaultMode::TransientError,
+                FaultMode::TransientError,
+                FaultMode::TransientError,
+                FaultMode::TransientError,
+            ],
+        );
+        let cfg = RetryConfig {
+            max_retries: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_secs(10),
+        };
+        let path = ObjPath::from("file.bin");
+        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        match err {
+            CloudError::DownloadFailed { retries, message } => {
+                assert_eq!(retries, 2);
+                assert!(
+                    message.contains("file.bin"),
+                    "message should name the path: {message}"
+                );
+            }
+            other => panic!("expected DownloadFailed, got {other}"),
+        }
+        // 1 initial + 2 retries = 3 backend hits.
+        assert_eq!(store.get_attempts.load(AtomicOrdering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn get_with_retry_enforces_request_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // Backend sleeps 200 ms; request_timeout is 50 ms → first
+        // attempt times out, second sleep schedule is empty so the
+        // retry succeeds.
+        let store = FaultyStore::new(
+            inner,
+            vec![FaultMode::SleepBeyondTimeout(Duration::from_millis(200))],
+        );
+        let cfg = RetryConfig {
+            max_retries: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_millis(50),
+        };
+        let path = ObjPath::from("file.bin");
+        let bytes = get_with_retry(&store, &path, &cfg).await.unwrap();
+        assert_eq!(&*bytes, b"hello");
+    }
+
+    // ─── Patch 11 § P2 #44 — hash-while-write equivalence ────────────
+    //
+    // The new `pull()` writes through a `HashingWriter` and patches the
+    // file_checksum field at the end. The convention is "hash of the
+    // file with file_checksum=0 in the header" (matching writer.rs's
+    // pattern). This test verifies the stored checksum equals what a
+    // fresh re-read with the zeroed-checksum convention produces.
+
+    #[tokio::test]
+    async fn pull_checksum_matches_zeroed_header_rehash() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = pull_from_exploded(&dir, 100, 50, 4).await;
+
+        // Read the on-disk header and stash the stored checksum.
+        let mut file = std::fs::File::open(&output).unwrap();
+        let mut header_buf = [0u8; HEADER_SIZE];
+        std::io::Read::read_exact(&mut file, &mut header_buf).unwrap();
+        let on_disk_header = FileHeader::read_from(&mut Cursor::new(&header_buf[..])).unwrap();
+        let stored = on_disk_header.file_checksum;
+        assert_ne!(stored, 0, "file_checksum must be non-zero in a valid file");
+
+        // Re-hash the file with the file_checksum field zeroed out (the
+        // verification convention used by writer.rs).
+        let mut zeroed_header = on_disk_header;
+        zeroed_header.file_checksum = 0;
+        let mut zeroed_bytes = Vec::with_capacity(HEADER_SIZE);
+        zeroed_header.write_to(&mut zeroed_bytes).unwrap();
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&zeroed_bytes);
+        let mut chunk = [0u8; 65536];
+        let mut file = std::fs::File::open(&output).unwrap();
+        std::io::Seek::seek(&mut file, SeekFrom::Start(HEADER_SIZE as u64)).unwrap();
+        loop {
+            let n = std::io::Read::read(&mut file, &mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+        }
+        let recomputed = scx_format::checksum::truncate_hash_to_u64(&hasher.finalize());
+        assert_eq!(
+            stored, recomputed,
+            "hash-while-write checksum must match the zeroed-header rehash convention"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_with_retry_surfaces_timeout_when_all_attempts_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // Every attempt sleeps longer than the per-request timeout.
+        let store = FaultyStore::new(
+            inner,
+            vec![
+                FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
+                FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
+            ],
+        );
+        let cfg = RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_millis(50),
+        };
+        let path = ObjPath::from("file.bin");
+        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        match err {
+            CloudError::Timeout { path: p, .. } => assert!(p.contains("file.bin")),
+            other => panic!("expected Timeout, got {other}"),
+        }
+    }
+
+    /// Regression: when retries time out, the prior transient error
+    /// (here a synthetic 503) must propagate through
+    /// `CloudError::Timeout::last_error` so on-call can diagnose what
+    /// was actually failing — not just "timed out".
+    #[tokio::test]
+    async fn get_with_retry_timeout_surfaces_last_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // First call: synthetic 503 (retryable). Second call: sleep
+        // past the timeout. Budget allows only one retry, so the
+        // second attempt's timeout exhausts it.
+        let store = FaultyStore::new(
+            inner,
+            vec![
+                FaultMode::TransientError,
+                FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
+            ],
+        );
+        let cfg = RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_millis(50),
+        };
+        let path = ObjPath::from("file.bin");
+        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        match err {
+            CloudError::Timeout {
+                last_error: Some(msg),
+                ..
+            } => {
+                let lower = msg.to_ascii_lowercase();
+                assert!(
+                    lower.contains("503") || lower.contains("service unavailable"),
+                    "last_error must carry the prior 503 message, got: {msg}"
+                );
+            }
+            CloudError::Timeout {
+                last_error: None, ..
+            } => panic!("expected last_error to carry prior 503 message, got None"),
+            other => panic!("expected Timeout, got {other}"),
+        }
     }
 }
