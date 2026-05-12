@@ -24,12 +24,19 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 /// when reading a v1 file (single-modality semantic equivalence).
 pub const CURRENT_FORMAT_VERSION: u16 = 2;
 
+/// Bitmask of currently-defined flag bits. Reserved bits (4 and 8..=31)
+/// must be zero per the on-disk spec; `read_from` rejects any header
+/// whose `flags & !KNOWN_FLAGS != 0` so future writers can't sneak
+/// undefined bits past today's readers.
+pub const KNOWN_FLAGS: u32 =
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7);
+
 /// The 256-byte file header that starts every SCX file.
 #[derive(Debug, Clone)]
 pub struct FileHeader {
     /// Magic bytes: b"SCX\x01"
     pub magic: [u8; 4],
-    /// Format version (currently 1)
+    /// Format version (currently 2)
     pub format_version: u16,
     /// Header length in bytes (always 256)
     pub header_length: u16,
@@ -41,11 +48,11 @@ pub struct FileHeader {
     /// |   1 | `has_bitmap`                                         |
     /// |   2 | `has_obsm`                                           |
     /// |   3 | `has_obsp`                                           |
-    /// |   4 | **reserved** — must be zero on write, ignored on read |
+    /// |   4 | **reserved** — must be zero; rejected on read         |
     /// |   5 | `has_deletion_vectors`                               |
     /// |   6 | `has_front_catalog`                                  |
     /// |   7 | `has_modalities` (v2; set when `n_modalities > 0`)    |
-    /// | 8–31 | reserved for future use                              |
+    /// | 8–31 | **reserved** — must be zero; rejected on read         |
     pub flags: u32,
     /// Number of observations (rows)
     pub n_obs: u64,
@@ -187,7 +194,19 @@ impl FileHeader {
         }
 
         let header_length = r.read_u16::<LittleEndian>()?;
+        if header_length as usize != HEADER_SIZE {
+            return Err(ScxError::InvalidCatalog(format!(
+                "header_length {} != HEADER_SIZE {}",
+                header_length, HEADER_SIZE
+            )));
+        }
         let flags = r.read_u32::<LittleEndian>()?;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "reserved flag bits must be zero; got flags = {:#010x}",
+                flags
+            )));
+        }
         let n_obs = r.read_u64::<LittleEndian>()?;
         let n_vars = r.read_u64::<LittleEndian>()?;
         let nnz = r.read_u64::<LittleEndian>()?;
@@ -201,6 +220,12 @@ impl FileHeader {
             return Err(ScxError::UnsupportedEndian);
         }
         let reserved_padding = r.read_u8()?;
+        if reserved_padding != 0 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "reserved_padding must be zero; got {}",
+                reserved_padding
+            )));
+        }
         let root_catalog_offset = r.read_u64::<LittleEndian>()?;
         let root_catalog_length = r.read_u64::<LittleEndian>()?;
         let full_catalog_offset = r.read_u64::<LittleEndian>()?;
@@ -222,7 +247,7 @@ impl FileHeader {
             // always wrote them as zero).
             let mut leading_zero_pad = [0u8; 20];
             r.read_exact(&mut leading_zero_pad)?;
-            if leading_zero_pad.iter().any(|&b| b != 0) {
+            if leading_zero_pad != [0u8; 20] {
                 return Err(ScxError::InvalidCatalog(
                     "v1 header reserved bytes 0..20 must be zero".to_string(),
                 ));
@@ -232,6 +257,11 @@ impl FileHeader {
 
         let mut reserved = [0u8; 112];
         r.read_exact(&mut reserved)?;
+        if reserved != [0u8; 112] {
+            return Err(ScxError::InvalidCatalog(
+                "trailing reserved bytes must all be zero".to_string(),
+            ));
+        }
 
         // Cross-check: modality fields are all-zero or all-set.
         let any_set = n_modalities != 0 || modality_table_offset != 0 || modality_table_length != 0;
@@ -551,6 +581,95 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let err = FileHeader::read_from(&mut cursor).unwrap_err();
         assert!(matches!(err, ScxError::InvalidCatalog(_)));
+    }
+
+    #[test]
+    fn header_rejects_bad_header_length() {
+        let mut header = sample_header();
+        header.header_length = 255;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let err = FileHeader::read_from(&mut cursor).unwrap_err();
+        match err {
+            ScxError::InvalidCatalog(msg) => {
+                assert!(msg.contains("header_length"), "got: {msg}");
+            }
+            other => panic!("expected InvalidCatalog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_rejects_nonzero_reserved_padding() {
+        let mut header = sample_header();
+        header.reserved_padding = 1;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let err = FileHeader::read_from(&mut cursor).unwrap_err();
+        match err {
+            ScxError::InvalidCatalog(msg) => {
+                assert!(msg.contains("reserved_padding"), "got: {msg}");
+            }
+            other => panic!("expected InvalidCatalog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_rejects_nonzero_reserved_bytes() {
+        let mut header = sample_header();
+        header.reserved[0] = 1;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let err = FileHeader::read_from(&mut cursor).unwrap_err();
+        match err {
+            ScxError::InvalidCatalog(msg) => {
+                assert!(msg.contains("reserved"), "got: {msg}");
+            }
+            other => panic!("expected InvalidCatalog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_rejects_reserved_flag_bits() {
+        // Bit 4 is explicitly reserved per the flags doc table.
+        let mut header = sample_header();
+        header.flags = 1 << 4;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let err = FileHeader::read_from(&mut cursor).unwrap_err();
+        match err {
+            ScxError::InvalidCatalog(msg) => {
+                assert!(msg.contains("flag"), "got: {msg}");
+            }
+            other => panic!("expected InvalidCatalog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_accepts_all_known_flag_bits() {
+        // Sanity: every accessor-defined bit must be in KNOWN_FLAGS — guards
+        // against drift if a future maintainer adds a `set_*` method but
+        // forgets to widen KNOWN_FLAGS.
+        let mut header = sample_header();
+        header.flags = KNOWN_FLAGS;
+        // KNOWN_FLAGS includes the modalities bit (7), so the cross-check
+        // also expects n_modalities/offset/length to be all-set.
+        header.n_modalities = 1;
+        header.modality_table_offset = 0x4000;
+        header.modality_table_length = 0x80;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = FileHeader::read_from(&mut cursor).expect("KNOWN_FLAGS must validate");
+        assert_eq!(decoded.flags, KNOWN_FLAGS);
     }
 
     /// has_modalities flag round-trip via setters.
