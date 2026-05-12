@@ -610,13 +610,21 @@ catches it), or proactively via `pyscx.validate()`.
 ### 9.2 File checksum semantics
 
 The header field `file_checksum` is a **BLAKE3 hash truncated to 64 bits**
-computed over:
+computed over the entire active file extent. Concretely, the writer feeds the
+hasher (in order):
 
-- All file bytes from offset 0 through the end of the active full catalog,
-  with the 8 bytes of the `file_checksum` field itself (at header offset 120)
-  zeroed during computation.
+1. The 256-byte header, serialised with the `file_checksum` field (bytes
+   100..108) set to zero.
+2. The root catalog at offset 256, padded with zeros to 4096 bytes (so bytes
+   `256 + root_catalog_length` through 4351 are zero in the hash, matching the
+   zero-padding on disk).
+3. All section bytes from offset 4352 (`SECTIONS_START_OFFSET`) up to
+   `full_catalog_offset`.
+4. The full catalog (length = `full_catalog_length`).
 
-This gives a fast, single-number integrity signal for the entire file extent.
+The result is a fast, single-number integrity signal for the entire file
+extent. Bytes past `full_catalog_offset + full_catalog_length` (e.g. trailing
+garbage from a crashed append) are not covered.
 
 | Event | `file_checksum` behaviour |
 |-------|--------------------------|

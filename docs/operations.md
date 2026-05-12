@@ -27,17 +27,17 @@ UserWarning: CSC sidecar dropped by append; rebuild with `scx build-csc` or pass
 To restore:
 
 ```bash
-# Standalone rebuild
-scx build-csc experiment.scx
+# Standalone rebuild — writes a new file with CSR + CSC shards
+scx build-csc experiment.scx experiment_with_csc.scx
 
 # Or pass --rebuild-csc to the mutating operation
-scx compact experiment.scx output.scx --rebuild-csc
+scx compact experiment.scx --output compacted.scx --rebuild-csc
 ```
 
-```python
-# Python
-pyscx.build_csc("experiment.scx")
-```
+The Python wrappers do not expose a standalone `build_csc` function — use
+`scx build-csc` on the CLI, or set `csc="always"` at conversion time via
+`pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
+initial write.
 
 ## Append Complexity
 
