@@ -48,11 +48,11 @@ pub struct FileHeader {
     /// |   1 | `has_bitmap`                                         |
     /// |   2 | `has_obsm`                                           |
     /// |   3 | `has_obsp`                                           |
-    /// |   4 | **reserved** — must be zero on write, ignored on read |
+    /// |   4 | **reserved** — must be zero; rejected on read         |
     /// |   5 | `has_deletion_vectors`                               |
     /// |   6 | `has_front_catalog`                                  |
     /// |   7 | `has_modalities` (v2; set when `n_modalities > 0`)    |
-    /// | 8–31 | reserved for future use                              |
+    /// | 8–31 | **reserved** — must be zero; rejected on read         |
     pub flags: u32,
     /// Number of observations (rows)
     pub n_obs: u64,
@@ -247,7 +247,7 @@ impl FileHeader {
             // always wrote them as zero).
             let mut leading_zero_pad = [0u8; 20];
             r.read_exact(&mut leading_zero_pad)?;
-            if leading_zero_pad.iter().any(|&b| b != 0) {
+            if leading_zero_pad != [0u8; 20] {
                 return Err(ScxError::InvalidCatalog(
                     "v1 header reserved bytes 0..20 must be zero".to_string(),
                 ));
@@ -257,7 +257,7 @@ impl FileHeader {
 
         let mut reserved = [0u8; 112];
         r.read_exact(&mut reserved)?;
-        if reserved.iter().any(|&b| b != 0) {
+        if reserved != [0u8; 112] {
             return Err(ScxError::InvalidCatalog(
                 "trailing reserved bytes must all be zero".to_string(),
             ));
