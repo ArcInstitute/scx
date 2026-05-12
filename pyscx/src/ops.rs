@@ -64,14 +64,31 @@ fn resolve_codec_selection(
 // Error conversion
 // ---------------------------------------------------------------------------
 
-/// Convert an OpsError to a Python exception.
+/// Convert an OpsError to the most appropriate Python exception.
 ///
-/// IncompatibleVars → ValueError (validation error).
-/// All other variants → RuntimeError.
+/// User-input validation errors → ValueError; missing files → FileNotFoundError;
+/// permission errors → PermissionError; wrapped ScxError → delegates to
+/// `crate::to_pyerr`; everything else → RuntimeError.
 fn ops_to_pyerr(e: OpsError) -> PyErr {
-    match &e {
-        OpsError::IncompatibleVars { .. } => PyValueError::new_err(e.to_string()),
-        _ => PyRuntimeError::new_err(e.to_string()),
+    use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError};
+    let msg = e.to_string();
+    match e {
+        OpsError::Format(inner) => crate::to_pyerr(inner),
+        OpsError::IncompatibleVars { .. }
+        | OpsError::SchemaMismatch { .. }
+        | OpsError::ShapeMismatch { .. }
+        | OpsError::VarLengthMismatch { .. }
+        | OpsError::IndexOutOfBounds { .. }
+        | OpsError::ValueOutOfRange { .. }
+        | OpsError::UnknownCodec(_)
+        | OpsError::UnknownValueEncoding(_) => PyValueError::new_err(msg),
+        OpsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            PyFileNotFoundError::new_err(msg)
+        }
+        OpsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+            PyPermissionError::new_err(msg)
+        }
+        _ => PyRuntimeError::new_err(msg),
     }
 }
 

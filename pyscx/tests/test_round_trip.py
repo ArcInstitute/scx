@@ -78,6 +78,126 @@ def test_layers_obsm_uns_round_trip(synthetic_adata, tmp_dir):
     assert adata2.uns["version"] == 2
 
 
+def test_obsp_varp_varm_round_trip(tmp_dir):
+    """Patch 7 / P0 #6: obsp, varp, varm survive AnnData → SCX → AnnData."""
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(42)
+    n_obs, n_vars = 50, 30
+
+    X = sp.random(
+        n_obs, n_vars, density=0.1, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata = anndata.AnnData(X=X)
+    adata.varm["PCs"] = rng.random((n_vars, 5)).astype(np.float32)
+    conn = sp.random(
+        n_obs, n_obs, density=0.05, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata.obsp["connectivities"] = conn
+    varp_mat = sp.random(
+        n_vars, n_vars, density=0.1, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata.varp["gene_corr"] = varp_mat
+
+    path = str(tmp_dir / "obsp_varp_varm.scx")
+    pyscx.from_anndata(adata, path)
+    adata2 = pyscx.open(path).to_anndata()
+
+    assert "PCs" in adata2.varm
+    np.testing.assert_allclose(adata2.varm["PCs"], adata.varm["PCs"], atol=1e-6)
+
+    assert "connectivities" in adata2.obsp
+    diff = (adata2.obsp["connectivities"] - conn).toarray()
+    assert np.allclose(diff, 0.0, atol=1e-6)
+
+    assert "gene_corr" in adata2.varp
+    diff2 = (adata2.varp["gene_corr"] - varp_mat).toarray()
+    assert np.allclose(diff2, 0.0, atol=1e-6)
+
+
+def test_obsp_round_trip_with_deletions(tmp_dir):
+    """obsp is subset to kept rows/cols when a deletion vector is active.
+
+    Regression for the bug where to_anndata() loaded obsp at the original
+    n_obs × n_obs shape after mark_deleted(), causing AnnData's shape
+    validator to reject the result.
+    """
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(7)
+    n_obs, n_vars = 60, 25
+
+    X = sp.random(
+        n_obs, n_vars, density=0.1, format="csr", dtype=np.float32, random_state=rng
+    )
+    conn = sp.random(
+        n_obs, n_obs, density=0.05, format="csr", dtype=np.float32, random_state=rng
+    )
+    adata = anndata.AnnData(X=X)
+    adata.obsp["connectivities"] = conn
+
+    path = str(tmp_dir / "obsp_del.scx")
+    pyscx.from_anndata(adata, path)
+
+    delete_mask = np.zeros(n_obs, dtype=bool)
+    delete_mask[[3, 7, 11, 42]] = True
+    pyscx.open(path).mark_deleted(delete_mask)
+
+    kept_mask = ~delete_mask
+    n_kept = int(kept_mask.sum())
+    expected = conn.tocsr()[kept_mask][:, kept_mask]
+
+    # Non-backed path
+    adata2 = pyscx.open(path).to_anndata()
+    assert adata2.n_obs == n_kept
+    assert adata2.obsp["connectivities"].shape == (n_kept, n_kept)
+    diff = (adata2.obsp["connectivities"] - expected).toarray()
+    assert np.allclose(diff, 0.0, atol=1e-6)
+
+    # Backed path
+    adata_backed = pyscx.open(path).to_anndata(backed=True)
+    assert adata_backed.n_obs == n_kept
+    assert adata_backed.obsp["connectivities"].shape == (n_kept, n_kept)
+    diff_b = (adata_backed.obsp["connectivities"] - expected).toarray()
+    assert np.allclose(diff_b, 0.0, atol=1e-6)
+
+
+def test_obsp_round_trip_with_deletions_and_obs_filter(tmp_dir):
+    """Backed mode: obsp respects deletion vector + obs_filter composition."""
+    import anndata
+    import pandas as pd
+    import pyscx
+
+    rng = np.random.default_rng(13)
+    n_obs, n_vars = 40, 15
+
+    X = sp.random(
+        n_obs, n_vars, density=0.15, format="csr", dtype=np.float32, random_state=rng
+    )
+    conn = sp.random(
+        n_obs, n_obs, density=0.08, format="csr", dtype=np.float32, random_state=rng
+    )
+    obs = pd.DataFrame({"score": rng.random(n_obs).astype(np.float32)})
+    adata = anndata.AnnData(X=X, obs=obs)
+    adata.obsp["connectivities"] = conn
+
+    path = str(tmp_dir / "obsp_del_filter.scx")
+    pyscx.from_anndata(adata, path)
+
+    delete_mask = np.zeros(n_obs, dtype=bool)
+    delete_mask[[0, 5, 9]] = True
+    pyscx.open(path).mark_deleted(delete_mask)
+
+    # The reader exposes obs.score post-deletion; further filter via obs_filter.
+    adata_filtered = pyscx.open(path).to_anndata(
+        backed=True, obs_filter="score > 0.5"
+    )
+    n_final = adata_filtered.n_obs
+    assert adata_filtered.obsp["connectivities"].shape == (n_final, n_final)
+
+
 def test_round_trip_large_values(tmp_dir):
     """Test that uint16 and uint32 ranges round-trip correctly."""
     import anndata

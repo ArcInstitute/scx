@@ -10,22 +10,22 @@ license = {text = "MIT"}
 authors = [
     {name = "Nick Youngblut", email = "nick.youngblut@arcinstitute.org"}
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "numpy",
-    "scipy",
-    "pyarrow",
-    "anndata",
+    "numpy>=1.24,<3",
+    "scipy>=1.10,<2",
+    "pyarrow>=14,<19",
+    "anndata>=0.10,<0.13",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "scanpy",
+    "pytest>=7.0",
+    "scanpy>=1.9",
     "python-dotenv",
 ]
 eval = [
-    "polars",
+    "polars>=0.20",
 ]
 scvi = [
     "scvi-tools",
@@ -36,7 +36,16 @@ scvi = [
 mudata = [
     "mudata>=0.2,<1.0",
 ]
+gpu = [
+    "cupy-cuda12x>=12.0; platform_system=='Linux'",
+]
+cloud = [
+    "boto3>=1.28",
+    "google-cloud-storage>=2.0",
+    "azure-storage-blob>=12.0",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
+include = [{ path = "python/pyscx/py.typed", format = "sdist" }]

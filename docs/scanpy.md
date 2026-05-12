@@ -244,7 +244,7 @@ exactly what happens:
    `scipy.sparse.csr_matrix` wraps them without conversion.
 4. **Reads obs/var metadata** as Arrow RecordBatches, converts to pandas
    DataFrames via `pyarrow.to_pandas()`.
-5. **Reads obsm, uns, and layers** if present in the file.
+5. **Reads obsm, varm, obsp, varp, uns, and layers** if present in the file.
 
 The returned `anndata.AnnData` is fully populated:
 
@@ -254,8 +254,22 @@ The returned `anndata.AnnData` is fully populated:
 | `obs` | Obs metadata section | pandas DataFrame |
 | `var` | Var metadata section | pandas DataFrame |
 | `obsm` | Obsm sections | dict of numpy arrays (e.g. `X_pca`, `X_umap`) |
+| `varm` | Varm sections | dict of numpy arrays (e.g. `PCs` from `pyscx.accel.pca`) |
+| `obsp` | Obsp sections (COO Arrow IPC) | dict of `scipy.sparse.csr_matrix` (float32) |
+| `varp` | Varp sections (COO Arrow IPC) | dict of `scipy.sparse.csr_matrix` (float32) |
 | `uns` | Uns section | dict (JSON round-tripped) |
 | `layers` | Layer shards | dict of `scipy.sparse.csr_matrix` |
+
+> Scanpy workflows that produce `obsp` / `varp` / `varm` (`sc.pp.neighbors`
+> writes `obsp["distances"]` + `obsp["connectivities"]`; `pyscx.accel.pca`
+> writes `varm["PCs"]`) survive `pyscx.from_anndata` → `to_anndata` since
+> Patch 7. Sparse pairwise matrices are stored as float32 COO; higher
+> precision is downcast on write. When cells are logically deleted via
+> `mark_deleted` (or excluded by `obs_filter` in backed mode), `obsp` is
+> subset to the kept rows and columns at read time so the in-memory
+> AnnData stays shape-consistent. The on-disk section keeps its original
+> axis until `compact` rebuilds the file. `varp` and `varm` are unaffected
+> by the deletion vector (var axis).
 
 **Memory implications:** Once materialized, the in-memory AnnData is
 **identical** whether the source was an `.scx` file or an `.h5ad` file —

@@ -72,9 +72,11 @@ pub fn neighbors(
     if let Some(device_id) = _gpu_id {
         // Check if cuVS CAGRA is available
         if scx_accel::cuvs_available() {
-            let result =
-                scx_accel::build_knn_graph_gpu(device_id, &data, n_obs, n_vars, n_neighbors)
-                    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            let result = py
+                .allow_threads(|| {
+                    scx_accel::build_knn_graph_gpu(device_id, &data, n_obs, n_vars, n_neighbors)
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
 
             write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "cagra")?;
             return Ok(());
@@ -94,17 +96,20 @@ pub fn neighbors(
     // Suppress unused variable warning when gpu feature is not enabled
     let _ = _device;
 
-    // CPU path (default or fallback)
-    let result = scx_accel::build_knn_graph(
-        &data,
-        n_obs,
-        n_vars,
-        n_neighbors,
-        ef_construction,
-        ef_search,
-        random_state,
-    )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // CPU path (default or fallback) — release GIL for the computation
+    let result = py
+        .allow_threads(|| {
+            scx_accel::build_knn_graph(
+                &data,
+                n_obs,
+                n_vars,
+                n_neighbors,
+                ef_construction,
+                ef_search,
+                random_state,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Write results to AnnData
     write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "hnsw")?;

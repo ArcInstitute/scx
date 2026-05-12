@@ -545,6 +545,9 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
             }
             format!("layer-csc ({})", name)
         }
+        SectionType::VarmEmbedding => name.to_string(),
+        SectionType::ObspEmbedding => name.to_string(),
+        SectionType::VarpEmbedding => name.to_string(),
     }
 }
 

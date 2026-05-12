@@ -12,16 +12,32 @@ mod query;
 #[cfg(feature = "cloud")]
 mod cloud;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use experiment::PyExperiment;
 use query::{PyQueryPipeline, PyQueryResult};
 use scx_format::ScxError;
 
-/// Convert an ScxError into a Python RuntimeError.
-fn to_pyerr(e: ScxError) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+/// Convert an ScxError into the most appropriate Python exception.
+///
+/// User-input format errors → ValueError; missing files → FileNotFoundError;
+/// permission errors → PermissionError; everything else → RuntimeError.
+pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
+    let msg = e.to_string();
+    match &e {
+        ScxError::InconsistentCsr
+        | ScxError::NVarsOverflow(_)
+        | ScxError::BlockRowsOverflow(_)
+        | ScxError::BlockNnzOverflow(_) => PyValueError::new_err(msg),
+        ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            PyFileNotFoundError::new_err(msg)
+        }
+        ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+            PyPermissionError::new_err(msg)
+        }
+        _ => PyRuntimeError::new_err(msg),
+    }
 }
 
 /// Open an SCX file and return a PyExperiment handle.

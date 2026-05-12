@@ -25,6 +25,16 @@ pub enum SectionType {
     /// v2: per-modality CSC sidecar for a layer (the column-major
     /// counterpart of `LayerCsrShard = 7`).
     LayerCscShard = 16,
+    /// Dense var × components embedding (Arrow IPC), mirror of `ObsmEmbedding`.
+    /// Section name prefix: `varm/`.
+    VarmEmbedding = 17,
+    /// obs × obs pairwise sparse matrix (Arrow IPC, COO format).
+    /// Section name prefix: `obsp/`. Schema: `row: Int32`, `col: Int32`,
+    /// `data: Float32` + metadata `n_rows`, `n_cols`.
+    ObspEmbedding = 18,
+    /// var × var pairwise sparse matrix (Arrow IPC, COO format).
+    /// Section name prefix: `varp/`. Same wire format as `ObspEmbedding`.
+    VarpEmbedding = 19,
 }
 
 impl SectionType {
@@ -48,13 +58,16 @@ impl SectionType {
             14 => Some(Self::VarPredicateIndex),
             15 => Some(Self::ModalityTable),
             16 => Some(Self::LayerCscShard),
+            17 => Some(Self::VarmEmbedding),
+            18 => Some(Self::ObspEmbedding),
+            19 => Some(Self::VarpEmbedding),
             _ => None,
         }
     }
 
-    /// Returns true if `v` is a known section type ID (0..=16).
+    /// Returns true if `v` is a known section type ID (0..=19).
     pub fn is_known(v: u8) -> bool {
-        v <= 16
+        v <= 19
     }
 }
 
@@ -82,20 +95,23 @@ mod tests {
         );
         assert_eq!(SectionType::from_u8(15), Some(SectionType::ModalityTable));
         assert_eq!(SectionType::from_u8(16), Some(SectionType::LayerCscShard));
+        assert_eq!(SectionType::from_u8(17), Some(SectionType::VarmEmbedding));
+        assert_eq!(SectionType::from_u8(18), Some(SectionType::ObspEmbedding));
+        assert_eq!(SectionType::from_u8(19), Some(SectionType::VarpEmbedding));
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(17), None);
+        assert_eq!(SectionType::from_u8(20), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 
     #[test]
     fn section_type_is_known() {
-        for v in 0..=16 {
+        for v in 0..=19 {
             assert!(SectionType::is_known(v));
         }
-        assert!(!SectionType::is_known(17));
+        assert!(!SectionType::is_known(20));
         assert!(!SectionType::is_known(255));
     }
 

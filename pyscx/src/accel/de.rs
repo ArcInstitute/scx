@@ -220,24 +220,40 @@ fn run_rank_genes_groups_inner(
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let source = backed.as_column_source().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     or a row deletion vector is active",
-                )
-            })?;
-            let result = scx_accel::wilcoxon_rank_sum_streaming_csc(
-                source,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                chunk_size,
-                log_transformed,
-                rankby_abs,
-                tie_correct,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            // Validate CSC availability under the GIL, then clone the Arc so
+            // the Rust kernel can run without holding the GIL.
+            if backed.kept_to_global.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "CSC requested but unavailable: a row deletion vector is active",
+                ));
+            }
+            let csc_reader = backed
+                .backed_csc
+                .as_ref()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(
+                        "CSC requested but unavailable: file has no CSC sidecar",
+                    )
+                })?
+                .clone();
+            drop(backed);
+            // Pass the concrete `BackedCscReader` (not `&dyn`) so the
+            // closure is `Send` — `dyn ColumnShardSource` is not `Send`.
+            let result = py
+                .allow_threads(|| {
+                    scx_accel::wilcoxon_rank_sum_streaming_csc(
+                        csc_reader.as_ref(),
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        log_transformed,
+                        rankby_abs,
+                        tie_correct,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             return Ok((result, unique_groups));
         }
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
@@ -248,18 +264,22 @@ fn run_rank_genes_groups_inner(
                      a row deletion vector is active",
                 )
             })?;
-            let result = scx_accel::wilcoxon_rank_sum_streaming_csc(
-                &lazy_src,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                chunk_size,
-                log_transformed,
-                rankby_abs,
-                tie_correct,
-            )
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            drop(lazy);
+            let result = py
+                .allow_threads(|| {
+                    scx_accel::wilcoxon_rank_sum_streaming_csc(
+                        &lazy_src,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        log_transformed,
+                        rankby_abs,
+                        tie_correct,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             return Ok((result, unique_groups));
         }
         return Err(PyRuntimeError::new_err(
@@ -269,19 +289,24 @@ fn run_rank_genes_groups_inner(
     }
 
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        // Backed mode: stream shards with gene-chunked DE.
+        // Backed mode: stream shards with gene-chunked DE. Clone the Arc
+        // so the kernel runs without holding the GIL.
         let chunk_size = gene_chunk_size.unwrap_or(500);
-        scx_accel::wilcoxon_rank_sum_streaming(
-            &backed.backed,
-            &gene_names,
-            &groups,
-            &unique_groups,
-            ref_idx,
-            chunk_size,
-            log_transformed,
-            rankby_abs,
-            tie_correct,
-        )
+        let reader = std::sync::Arc::clone(&backed.backed);
+        drop(backed);
+        py.allow_threads(|| {
+            scx_accel::wilcoxon_rank_sum_streaming(
+                &reader,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                chunk_size,
+                log_transformed,
+                rankby_abs,
+                tie_correct,
+            )
+        })
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         let is_sparse = scipy_sparse
@@ -308,17 +333,20 @@ fn run_rank_genes_groups_inner(
                 .extract::<Vec<f32>>()?;
 
             let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
-            scx_accel::wilcoxon_rank_sum_sparse(
-                &csr,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                gene_chunk_size.unwrap_or(500),
-                log_transformed,
-                rankby_abs,
-                tie_correct,
-            )
+            let chunk_size = gene_chunk_size.unwrap_or(500);
+            py.allow_threads(|| {
+                scx_accel::wilcoxon_rank_sum_sparse(
+                    &csr,
+                    &gene_names,
+                    &groups,
+                    &unique_groups,
+                    ref_idx,
+                    chunk_size,
+                    log_transformed,
+                    rankby_abs,
+                    tie_correct,
+                )
+            })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
             // Dense numpy array: flatten and use direct wilcoxon_rank_sum
@@ -331,18 +359,20 @@ fn run_rank_genes_groups_inner(
             let flat = dense.call_method0("ravel")?;
             let data: Vec<f32> = flat.extract()?;
 
-            scx_accel::wilcoxon_rank_sum(
-                &data,
-                n_obs,
-                n_vars,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                log_transformed,
-                rankby_abs,
-                tie_correct,
-            )
+            py.allow_threads(|| {
+                scx_accel::wilcoxon_rank_sum(
+                    &data,
+                    n_obs,
+                    n_vars,
+                    &gene_names,
+                    &groups,
+                    &unique_groups,
+                    ref_idx,
+                    log_transformed,
+                    rankby_abs,
+                    tie_correct,
+                )
+            })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         }
     };

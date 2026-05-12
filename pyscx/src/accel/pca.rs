@@ -384,25 +384,29 @@ pub fn pca(
 
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         backend = "scx-accel-cpu";
-        let reader = &*backed.backed;
+        let reader = std::sync::Arc::clone(&backed.backed);
         let (_n_obs, n_vars) = reader.shape();
-        match pick_cpu_method(n_vars) {
-            "covariance" => scx_accel::covariance_pca(reader, n_comps, zero_center),
+        drop(backed);
+        let m = pick_cpu_method(n_vars);
+        py.allow_threads(|| match m {
+            "covariance" => scx_accel::covariance_pca(&*reader, n_comps, zero_center),
             _ => scx_accel::randomized_pca(
-                reader,
+                &*reader,
                 n_comps,
                 n_oversamples,
                 n_power_iterations,
                 zero_center,
                 random_state,
             ),
-        }
+        })
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         backend = "scx-accel-cpu";
         let source = lazy.as_shard_source();
         let (_n_obs, n_vars) = source.shape();
-        match pick_cpu_method(n_vars) {
+        drop(lazy);
+        let m = pick_cpu_method(n_vars);
+        py.allow_threads(|| match m {
             "covariance" => scx_accel::covariance_pca(&source, n_comps, zero_center),
             _ => scx_accel::randomized_pca(
                 &source,
@@ -412,13 +416,14 @@ pub fn pca(
                 zero_center,
                 random_state,
             ),
-        }
+        })
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         backend = "scx-accel-cpu";
         let csr = extract_materialized_csr(py, &x)?;
         let n_vars = csr.n_cols();
-        match pick_cpu_method(n_vars) {
+        let m = pick_cpu_method(n_vars);
+        py.allow_threads(|| match m {
             "covariance" => scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center),
             _ => scx_accel::randomized_pca_inmemory(
                 &csr,
@@ -428,7 +433,7 @@ pub fn pca(
                 zero_center,
                 random_state,
             ),
-        }
+        })
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     };
 
