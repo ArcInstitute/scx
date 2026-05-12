@@ -12,21 +12,13 @@
 //!   (original pyscx finding 9.4).
 //! - Max-value comparison is done in `f64` so values beyond `2^24` (f32's
 //!   contiguous integer range) don't saturate (finding 9.1).
-//! - `Float16` falls back to `Float32` bytes with no panic — the canonical
-//!   rule is that callers should have re-encoded before reaching an
-//!   f32-only path. This matches `scx-ops::compact` and tolerates the
-//!   existing `pyscx::anndata::encode_values` preconditions. A
-//!   `log::warn!` fires at most once per process when the fallback is
-//!   taken, preserving the visibility the prior `scx-cli` `eprintln!`
-//!   warning offered before this module absorbed the three call sites.
-
-use std::sync::Once;
+//! - `Float16` writes 2-byte little-endian `half::f16` per element. Callers
+//!   opting into Float16 accept the lossy f32 → f16 narrowing inherent to
+//!   the encoding.
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::dispatch::ValueEncoding;
-
-static FLOAT16_FALLBACK_WARNED: Once = Once::new();
 
 /// Return true if every element is a non-negative finite integer-valued f32.
 #[inline]
@@ -53,8 +45,6 @@ pub fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
 }
 
 /// Serialize f32 values to LE raw bytes according to `encoding`.
-///
-/// `Float16` falls back to `Float32` bytes — see module docs for rationale.
 pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
     match encoding {
         ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
@@ -72,15 +62,14 @@ pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
             }
             buf
         }
-        ValueEncoding::Float32 | ValueEncoding::Float16 => {
-            if matches!(encoding, ValueEncoding::Float16) {
-                FLOAT16_FALLBACK_WARNED.call_once(|| {
-                    log::warn!(
-                        "Float16 value encoding is not implemented; serializing as Float32 bytes. \
-                         Re-encode upstream to avoid this fallback."
-                    );
-                });
+        ValueEncoding::Float16 => {
+            let mut buf = Vec::with_capacity(data.len() * 2);
+            for &v in data {
+                buf.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
             }
+            buf
+        }
+        ValueEncoding::Float32 => {
             let mut buf = Vec::with_capacity(data.len() * 4);
             for &v in data {
                 buf.write_f32::<LittleEndian>(v).unwrap();
@@ -175,10 +164,25 @@ mod tests {
     }
 
     #[test]
-    fn float16_falls_back_to_float32_bytes() {
+    fn round_trip_float16_emits_2_byte_le() {
+        let data = [0.0_f32, 1.5, -2.25, 100.0];
+        let bytes = values_to_raw_bytes(&data, ValueEncoding::Float16);
+        assert_eq!(bytes.len(), data.len() * 2);
+        let decoded: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        for (orig, dec) in data.iter().zip(decoded.iter()) {
+            assert_eq!(half::f16::from_f32(*orig).to_f32(), *dec);
+        }
+    }
+
+    #[test]
+    fn float16_stride_differs_from_float32() {
         let data = [1.5_f32, 2.25];
         let f32_bytes = values_to_raw_bytes(&data, ValueEncoding::Float32);
         let f16_bytes = values_to_raw_bytes(&data, ValueEncoding::Float16);
-        assert_eq!(f32_bytes, f16_bytes);
+        assert_eq!(f32_bytes.len(), data.len() * 4);
+        assert_eq!(f16_bytes.len(), data.len() * 2);
     }
 }

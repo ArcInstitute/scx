@@ -7,6 +7,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
+use crate::dispatch::CodecError;
 
 /// Compute the floor median of a slice of u64 values.
 ///
@@ -42,10 +43,12 @@ fn compute_k(median: u64) -> u8 {
 /// Encode an indptr array using Delta-Golomb-Rice coding.
 ///
 /// The indptr array must be monotonically non-decreasing u64 values.
-/// Returns the encoded byte vector.
-pub fn delta_golomb_encode(indptr: &[u64]) -> Vec<u8> {
+/// Returns the encoded byte vector. Returns `Err(CodecError::MalformedInput)`
+/// if any window violates monotonicity — silent wrap on `w[1] - w[0]` would
+/// otherwise produce unreadable shards in release.
+pub fn delta_golomb_encode(indptr: &[u64]) -> Result<Vec<u8>, CodecError> {
     if indptr.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut output = Vec::new();
@@ -56,11 +59,22 @@ pub fn delta_golomb_encode(indptr: &[u64]) -> Vec<u8> {
         .expect("write to Vec cannot fail");
 
     if indptr.len() == 1 {
-        return output;
+        return Ok(output);
     }
 
-    // Compute deltas
-    let deltas: Vec<u64> = indptr.windows(2).map(|w| w[1] - w[0]).collect();
+    // Compute deltas with monotonicity check.
+    let deltas: Vec<u64> = indptr
+        .windows(2)
+        .map(|w| {
+            if w[1] < w[0] {
+                return Err(CodecError::MalformedInput(format!(
+                    "indptr must be monotone non-decreasing; saw {} < {}",
+                    w[1], w[0]
+                )));
+            }
+            Ok(w[1] - w[0])
+        })
+        .collect::<Result<_, _>>()?;
 
     // Compute Rice parameter k from floor median of deltas
     let median = floor_median_u64(&deltas);
@@ -81,7 +95,7 @@ pub fn delta_golomb_encode(indptr: &[u64]) -> Vec<u8> {
     }
 
     output.extend_from_slice(&writer.flush());
-    output
+    Ok(output)
 }
 
 /// Decode a Delta-Golomb-Rice encoded byte stream back to an indptr array.
@@ -173,7 +187,7 @@ mod tests {
     #[test]
     fn round_trip_typical_indptr() {
         let indptr = vec![0u64, 150, 280, 500, 700];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
@@ -182,7 +196,7 @@ mod tests {
     #[test]
     fn round_trip_sparse_rows() {
         let indptr = vec![0u64, 5, 5, 5, 10];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
@@ -191,7 +205,7 @@ mod tests {
     #[test]
     fn round_trip_single_row() {
         let indptr = vec![0u64, 1000];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
@@ -200,7 +214,7 @@ mod tests {
     #[test]
     fn round_trip_large_deltas() {
         let indptr = vec![0u64, 50_000, 100_000, 200_000];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
@@ -209,7 +223,7 @@ mod tests {
     #[test]
     fn round_trip_empty_shard() {
         let indptr = vec![0u64];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         assert_eq!(encoded.len(), 8); // just the raw u64
         let decoded = delta_golomb_decode(&encoded, 1).unwrap();
         assert_eq!(decoded, indptr);
@@ -219,7 +233,7 @@ mod tests {
     #[test]
     fn round_trip_empty_slice() {
         let indptr: Vec<u64> = vec![];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         assert!(encoded.is_empty());
         let decoded = delta_golomb_decode(&encoded, 0).unwrap();
         assert!(decoded.is_empty());
@@ -229,7 +243,7 @@ mod tests {
     #[test]
     fn decoded_is_monotonic() {
         let indptr = vec![0u64, 10, 10, 25, 100, 100, 100, 500];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         for w in decoded.windows(2) {
             assert!(w[0] <= w[1], "indptr not monotonic: {} > {}", w[0], w[1]);
@@ -250,7 +264,7 @@ mod tests {
             indptr.push(indptr.last().unwrap() + delta);
         }
 
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
@@ -259,7 +273,7 @@ mod tests {
     #[test]
     fn round_trip_nonzero_start() {
         let indptr = vec![100u64, 200, 300, 400];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
@@ -268,7 +282,7 @@ mod tests {
     #[test]
     fn round_trip_all_zero_deltas() {
         let indptr = vec![0u64; 100];
-        let encoded = delta_golomb_encode(&indptr);
+        let encoded = delta_golomb_encode(&indptr).unwrap();
         let decoded = delta_golomb_decode(&encoded, indptr.len()).unwrap();
         assert_eq!(decoded, indptr);
     }
