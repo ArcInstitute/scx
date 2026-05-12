@@ -5,7 +5,6 @@ use std::path::Path;
 
 use scx_codec::{CodecId, CodecSelection};
 use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
 
 pub fn run_append(
     target: &Path,
@@ -106,29 +105,29 @@ pub fn run_append(
     }
 
     // Count cells in the matching modality for the progress message.
-    // Sums n_major across CSR shard stats — avoids reading obs twice.
-    let n_cells: u64 = input_reader
+    // Iterate shard headers rather than relying on `entry.stats`, which the
+    // catalog format permits to be `None`. The streaming path also assumes
+    // the source has at least one CSR shard for the requested modality.
+    let csr_entries = input_reader
         .catalog()
-        .csr_shards_for_modality(input_modality_id)
-        .iter()
-        .filter_map(|e| e.stats.as_ref())
-        .map(|s| s.row_end - s.row_start)
-        .sum();
+        .csr_shards_for_modality(input_modality_id);
+
+    if csr_entries.is_empty() {
+        println!(
+            "Input file has no CSR shards for modality {input_modality_id}, nothing to append."
+        );
+        return Ok(());
+    }
+
+    let mut n_cells: u64 = 0;
+    for entry in &csr_entries {
+        let sh = input_reader.read_shard_header(entry)?;
+        n_cells += sh.n_major as u64;
+    }
 
     if n_cells == 0 {
         println!("Input file has 0 cells, nothing to append.");
         return Ok(());
-    }
-
-    // Reject pathological input: streaming path assumes the source has at
-    // least one CSR shard. The `n_cells == 0` check above catches that.
-    if input_reader
-        .catalog()
-        .shards(SectionType::CsrShard)
-        .iter()
-        .all(|e| e.modality_id != input_modality_id)
-    {
-        return Err("input file has no CSR shards for the requested modality".into());
     }
 
     // Resolve codec.

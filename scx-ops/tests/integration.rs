@@ -2075,6 +2075,120 @@ fn test_streaming_append_raw_copy_fast_path() {
     assert_eq!(sh.codec_id, CodecId::None as u8);
 }
 
+/// Raw-copy fast path must reuse the source `FullCatalogEntry.stats` for
+/// invariant fields (nnz, value_min/max/sum) and patch only `row_start` /
+/// `row_end`. Exercises a compressed (Zstd) source so the previous code
+/// would have decoded — the new code must skip decode and clone stats.
+#[test]
+fn test_streaming_append_raw_copy_reuses_stats() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build a Zstd-compressed source file directly so we can inspect its
+    // pre-append stats.
+    let source = dir.path().join("stream_raw_stats_source.scx");
+    {
+        let header = sample_header(8, 10);
+        let mut writer = ScxWriter::new(&source, header).unwrap();
+        writer.write_obs(&sample_obs(8)).unwrap();
+        writer.write_var(&sample_var(10)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(8, 10);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Zstd,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_provenance(vec![ProvenanceEntry {
+                timestamp: 1710000000,
+                action: "convert".to_string(),
+                tool: "test".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![],
+            }])
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    // Snapshot the source's stats so we can compare after raw-copy.
+    let src_stats = {
+        let r = ScxReader::open(&source).unwrap();
+        let shards = r
+            .catalog()
+            .shards(scx_format::section::SectionType::CsrShard);
+        assert_eq!(shards.len(), 1);
+        shards[0].stats.clone().expect("source shard has stats")
+    };
+
+    // Target uses the same codec so raw-copy is eligible.
+    let target = dir.path().join("stream_raw_stats_target.scx");
+    {
+        let header = sample_header(4, 10);
+        let mut writer = ScxWriter::new(&target, header).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+        writer.write_var(&sample_var(10)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(4, 10);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Zstd,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_provenance(vec![ProvenanceEntry {
+                timestamp: 1710000000,
+                action: "convert".to_string(),
+                tool: "test".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![],
+            }])
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        CodecSelection::Explicit(CodecId::Zstd),
+        NonZeroU32::new(16384).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let reader = ScxReader::open(&target).unwrap();
+    let appended = reader
+        .catalog()
+        .shards(scx_format::section::SectionType::CsrShard)
+        .into_iter()
+        .find(|e| e.stats.as_ref().map(|s| s.row_start == 4).unwrap_or(false))
+        .expect("appended shard not found");
+    let appended_stats = appended.stats.as_ref().expect("appended shard has stats");
+
+    // Row range must reflect the new global position.
+    assert_eq!(appended_stats.row_start, 4);
+    assert_eq!(appended_stats.row_end, 4 + 8);
+
+    // All invariant fields must match the source exactly — this is what
+    // pins the "reuse stats, don't recompute" contract.
+    assert_eq!(appended_stats.nnz, src_stats.nnz);
+    assert_eq!(appended_stats.value_min, src_stats.value_min);
+    assert_eq!(appended_stats.value_max, src_stats.value_max);
+    assert_eq!(appended_stats.value_sum, src_stats.value_sum);
+    assert_eq!(appended_stats.col_start, src_stats.col_start);
+    assert_eq!(appended_stats.col_end, src_stats.col_end);
+}
+
 /// Streaming append must drop CSC sidecars from the target, same as the
 /// bulk path.
 #[test]

@@ -807,42 +807,48 @@ fn raw_copy_csr_shard(
     lock.write_all(&section_data)?;
     *write_offset += section_length;
 
-    // Recompute per-shard stats over the encoded values bytes. The raw-copy
-    // preserves the encoded payload, but `compute_shard_stats` expects raw
-    // values (one entry per nnz). When the source's codec is `None`, the
-    // payload's `values_bytes` already equals the raw values; for compressed
-    // codecs the payload bytes are not raw values, so stats would be wrong.
-    //
-    // To keep the catalog statistics accurate in both cases, decode the
-    // values segment when the codec compresses them. The decoded values are
-    // dropped immediately after stats are computed.
-    let codec_id = CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?;
-    let stats = if codec_id == CodecId::None {
-        // Raw bytes: values segment is verbatim raw little-endian.
-        let values_start = sh.values_rel_offset as usize;
-        let values_end = values_start + sh.values_length as usize;
-        compute_shard_stats(
-            &src_bytes[values_start..values_end],
-            value_encoding,
-            scx_format::MajorAxis::Row,
-            global_row_start,
-            sh.n_major as u64,
-            prep.target_n_vars,
-            sh.nnz,
-        )
-    } else {
-        // Decode to recover raw values for stats. Single-shard cost.
-        let (_, _, val_f32) = source.read_shard_from_entry(entry)?;
-        let raw = scx_codec::values_to_raw_bytes(&val_f32, value_encoding)?;
-        compute_shard_stats(
-            &raw,
-            value_encoding,
-            scx_format::MajorAxis::Row,
-            global_row_start,
-            sh.n_major as u64,
-            prep.target_n_vars,
-            sh.nnz,
-        )
+    // Reuse the source entry's stats; only the row range is position-dependent.
+    // `nnz`, `value_min/max/sum`, `col_start/col_end`, and `column_stats` are
+    // invariant under raw copy because `raw_copy_ok` already requires
+    // `sh.n_minor == prep.target_n_vars` (so the column extent is preserved).
+    // The fallback path decodes only when the source entry is missing stats
+    // (not produced by the current writer, but format-permitted).
+    let stats = match entry.stats.as_ref() {
+        Some(src_stats) => {
+            let mut s = src_stats.clone();
+            s.row_start = global_row_start;
+            s.row_end = global_row_start + sh.n_major as u64;
+            s
+        }
+        None => {
+            let codec_id =
+                CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?;
+            if codec_id == CodecId::None {
+                let values_start = sh.values_rel_offset as usize;
+                let values_end = values_start + sh.values_length as usize;
+                compute_shard_stats(
+                    &src_bytes[values_start..values_end],
+                    value_encoding,
+                    scx_format::MajorAxis::Row,
+                    global_row_start,
+                    sh.n_major as u64,
+                    prep.target_n_vars,
+                    sh.nnz,
+                )
+            } else {
+                let (_, _, val_f32) = source.read_shard_from_entry(entry)?;
+                let raw = scx_codec::values_to_raw_bytes(&val_f32, value_encoding)?;
+                compute_shard_stats(
+                    &raw,
+                    value_encoding,
+                    scx_format::MajorAxis::Row,
+                    global_row_start,
+                    sh.n_major as u64,
+                    prep.target_n_vars,
+                    sh.nnz,
+                )
+            }
+        }
     };
 
     let shard_name = match prep.modality_name.as_deref() {
