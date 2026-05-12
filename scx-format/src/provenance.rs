@@ -60,33 +60,48 @@ impl Provenance {
     }
 
     /// Deserialize provenance from a reader.
-    pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+    ///
+    /// `section_len` is the total byte length of the enclosing section
+    /// (from the catalog entry). All on-disk length fields are validated
+    /// against this bound before allocating, preventing a single
+    /// malformed `u32` from requesting a multi-GB allocation.
+    pub fn read_from<R: Read>(r: &mut R, section_len: usize) -> Result<Self> {
         let version = r.read_u8()?;
         let n_operations = r.read_u32::<LittleEndian>()? as usize;
+
+        // Minimum serialized bytes per operation entry:
+        // 8 (timestamp) + 2 (action_len) + 2 (tool_len) + 4 (params_len) +
+        // 1 (n_checksums) = 17 bytes. Excluding string/checksum payloads.
+        const MIN_OP_BYTES: usize = 17;
+        crate::error::validate_allocation(n_operations.saturating_mul(MIN_OP_BYTES), section_len)?;
 
         let mut operations = Vec::with_capacity(n_operations);
         for _ in 0..n_operations {
             let timestamp = r.read_i64::<LittleEndian>()?;
 
             let action_len = r.read_u16::<LittleEndian>()? as usize;
+            crate::error::validate_allocation(action_len, section_len)?;
             let mut action_bytes = vec![0u8; action_len];
             r.read_exact(&mut action_bytes)?;
             let action = String::from_utf8(action_bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             let tool_len = r.read_u16::<LittleEndian>()? as usize;
+            crate::error::validate_allocation(tool_len, section_len)?;
             let mut tool_bytes = vec![0u8; tool_len];
             r.read_exact(&mut tool_bytes)?;
             let tool = String::from_utf8(tool_bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             let params_len = r.read_u32::<LittleEndian>()? as usize;
+            crate::error::validate_allocation(params_len, section_len)?;
             let mut params_bytes = vec![0u8; params_len];
             r.read_exact(&mut params_bytes)?;
             let params_json = String::from_utf8(params_bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             let n_checksums = r.read_u8()? as usize;
+            crate::error::validate_allocation(n_checksums.saturating_mul(32), section_len)?;
             let mut input_checksums = Vec::with_capacity(n_checksums);
             for _ in 0..n_checksums {
                 let mut checksum = [0u8; 32];
@@ -141,7 +156,7 @@ mod tests {
         prov.write_to(&mut buf).unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let decoded = Provenance::read_from(&mut cursor).unwrap();
+        let decoded = Provenance::read_from(&mut cursor, buf.len()).unwrap();
         assert_eq!(decoded, prov);
     }
 
@@ -158,7 +173,7 @@ mod tests {
         assert_eq!(buf.len(), 5);
 
         let mut cursor = Cursor::new(&buf);
-        let decoded = Provenance::read_from(&mut cursor).unwrap();
+        let decoded = Provenance::read_from(&mut cursor, buf.len()).unwrap();
         assert_eq!(decoded, prov);
     }
 
@@ -181,8 +196,50 @@ mod tests {
         prov.write_to(&mut buf).unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let decoded = Provenance::read_from(&mut cursor).unwrap();
+        let decoded = Provenance::read_from(&mut cursor, buf.len()).unwrap();
         assert_eq!(decoded.operations[0].input_checksums.len(), 3);
         assert_eq!(decoded, prov);
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive allocation cap tests (Patch 9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provenance_rejects_oversized_n_operations() {
+        use byteorder::WriteBytesExt;
+        let mut buf = Vec::new();
+        buf.write_u8(1).unwrap(); // version
+        buf.write_u32::<byteorder::LittleEndian>(u32::MAX).unwrap(); // n_operations = absurd
+
+        let section_len = buf.len();
+        let result = Provenance::read_from(&mut Cursor::new(&buf), section_len);
+        assert!(result.is_err(), "should reject oversized n_operations");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("allocation too large"),
+            "error should mention allocation: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_oversized_params_len() {
+        use byteorder::WriteBytesExt;
+        let mut buf = Vec::new();
+        buf.write_u8(1).unwrap(); // version
+        buf.write_u32::<byteorder::LittleEndian>(1).unwrap(); // n_operations = 1
+        buf.write_i64::<byteorder::LittleEndian>(1000).unwrap(); // timestamp
+        buf.write_u16::<byteorder::LittleEndian>(0).unwrap(); // action_len = 0
+        buf.write_u16::<byteorder::LittleEndian>(0).unwrap(); // tool_len = 0
+        buf.write_u32::<byteorder::LittleEndian>(u32::MAX).unwrap(); // params_len = absurd
+
+        let section_len = buf.len();
+        let result = Provenance::read_from(&mut Cursor::new(&buf), section_len);
+        assert!(result.is_err(), "should reject oversized params_len");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("allocation too large"),
+            "error should mention allocation: {err_msg}"
+        );
     }
 }

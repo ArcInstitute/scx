@@ -69,13 +69,23 @@ impl DeletionVectors {
     }
 
     /// Deserialize from reader.
-    pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+    ///
+    /// `section_len` is the total byte length of the enclosing section
+    /// (from the catalog entry). All on-disk length fields are validated
+    /// against this bound before allocating, preventing a single
+    /// malformed `u32` from requesting a multi-GB allocation.
+    pub fn read_from<R: Read>(r: &mut R, section_len: usize) -> Result<Self> {
         let dv_version = r.read_u8()?;
         let n_shards = r.read_u32::<LittleEndian>()? as usize;
+
+        // Minimum bytes per shard entry: 4 (shard_id) + 4 (bitmap_len) = 8.
+        crate::error::validate_allocation(n_shards.saturating_mul(8), section_len)?;
+
         let mut shards = BTreeMap::new();
         for _ in 0..n_shards {
             let shard_id = r.read_u32::<LittleEndian>()?;
             let bitmap_len = r.read_u32::<LittleEndian>()? as usize;
+            crate::error::validate_allocation(bitmap_len, section_len)?;
             let mut bitmap_bytes = vec![0u8; bitmap_len];
             r.read_exact(&mut bitmap_bytes)?;
             let bitmap = RoaringBitmap::deserialize_from(&bitmap_bytes[..])
@@ -167,7 +177,8 @@ mod tests {
         let mut buf = Vec::new();
         dv.write_to(&mut buf).unwrap();
 
-        let decoded = DeletionVectors::read_from(&mut std::io::Cursor::new(&buf)).unwrap();
+        let decoded =
+            DeletionVectors::read_from(&mut std::io::Cursor::new(&buf), buf.len()).unwrap();
         assert_eq!(decoded.dv_version, 1);
         assert_eq!(decoded.shards.len(), 2);
         assert!(decoded.is_deleted(0, 0));
@@ -210,7 +221,8 @@ mod tests {
         let dv = DeletionVectors::new();
         let mut buf = Vec::new();
         dv.write_to(&mut buf).unwrap();
-        let decoded = DeletionVectors::read_from(&mut std::io::Cursor::new(&buf)).unwrap();
+        let decoded =
+            DeletionVectors::read_from(&mut std::io::Cursor::new(&buf), buf.len()).unwrap();
         assert_eq!(decoded.shards.len(), 0);
         assert_eq!(decoded.total_deleted(), 0);
     }
@@ -241,5 +253,45 @@ mod tests {
             offset += 8 + bm_len;
         }
         assert_eq!(seen, vec![2, 5, 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive allocation cap tests (Patch 9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dv_rejects_oversized_n_shards() {
+        use byteorder::WriteBytesExt;
+        let mut buf = Vec::new();
+        buf.write_u8(1).unwrap(); // version
+        buf.write_u32::<byteorder::LittleEndian>(u32::MAX).unwrap(); // n_shards = absurd
+
+        let section_len = buf.len();
+        let result = DeletionVectors::read_from(&mut std::io::Cursor::new(&buf), section_len);
+        assert!(result.is_err(), "should reject oversized n_shards");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("allocation too large"),
+            "error should mention allocation: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn dv_rejects_oversized_bitmap_len() {
+        use byteorder::WriteBytesExt;
+        let mut buf = Vec::new();
+        buf.write_u8(1).unwrap(); // version
+        buf.write_u32::<byteorder::LittleEndian>(1).unwrap(); // n_shards = 1
+        buf.write_u32::<byteorder::LittleEndian>(0).unwrap(); // shard_id = 0
+        buf.write_u32::<byteorder::LittleEndian>(u32::MAX).unwrap(); // bitmap_len = absurd
+
+        let section_len = buf.len();
+        let result = DeletionVectors::read_from(&mut std::io::Cursor::new(&buf), section_len);
+        assert!(result.is_err(), "should reject oversized bitmap_len");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("allocation too large"),
+            "error should mention allocation: {err_msg}"
+        );
     }
 }

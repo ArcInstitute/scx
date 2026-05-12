@@ -515,7 +515,7 @@ pub fn append_for_modality(
             lock.seek(SeekFrom::Start(prov_entry.offset))?;
             let mut prov_buf = vec![0u8; prov_entry.length as usize];
             std::io::Read::read_exact(&mut lock, &mut prov_buf)?;
-            let prov = Provenance::read_from(&mut Cursor::new(&prov_buf))?;
+            let prov = Provenance::read_from(&mut Cursor::new(&prov_buf), prov_buf.len())?;
             prov.operations
         } else {
             Vec::new()

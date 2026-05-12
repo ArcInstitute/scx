@@ -48,7 +48,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
             lock.seek(SeekFrom::Start(dv_entry.offset))?;
             let mut buf = vec![0u8; dv_entry.length as usize];
             std::io::Read::read_exact(&mut lock, &mut buf)?;
-            DeletionVectors::read_from(&mut Cursor::new(&buf))?
+            DeletionVectors::read_from(&mut Cursor::new(&buf), buf.len())?
         } else {
             DeletionVectors::new()
         }
@@ -115,7 +115,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         lock.seek(SeekFrom::Start(prov_entry.offset))?;
         let mut prov_buf = vec![0u8; prov_entry.length as usize];
         std::io::Read::read_exact(&mut lock, &mut prov_buf)?;
-        let prov = Provenance::read_from(&mut Cursor::new(&prov_buf))?;
+        let prov = Provenance::read_from(&mut Cursor::new(&prov_buf), prov_buf.len())?;
         prov.operations
     } else {
         Vec::new()

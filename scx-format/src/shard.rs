@@ -295,8 +295,17 @@ impl BlockIndex {
     }
 
     /// Read a block index: u32 count followed by that many entries.
-    pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+    ///
+    /// `section_len` is the total byte length of the enclosing shard
+    /// section. The `n_blocks` count is validated against it before
+    /// allocating, preventing a malformed `u32` from requesting a
+    /// multi-GB allocation.
+    pub fn read_from<R: Read>(r: &mut R, section_len: usize) -> Result<Self> {
         let n_blocks = r.read_u32::<LittleEndian>()?;
+        crate::error::validate_allocation(
+            (n_blocks as usize).saturating_mul(BLOCK_INDEX_ENTRY_SIZE),
+            section_len,
+        )?;
         let mut entries = Vec::with_capacity(n_blocks as usize);
         for _ in 0..n_blocks {
             entries.push(BlockIndexEntry::read_from(r)?);
@@ -427,7 +436,7 @@ mod tests {
         assert_eq!(buf.len(), 4 + 3 * BLOCK_INDEX_ENTRY_SIZE);
 
         let mut cursor = Cursor::new(&buf);
-        let decoded = BlockIndex::read_from(&mut cursor).unwrap();
+        let decoded = BlockIndex::read_from(&mut cursor, buf.len()).unwrap();
 
         assert_eq!(decoded.entries.len(), 3);
         assert_eq!(decoded.entries, index.entries);
@@ -538,7 +547,27 @@ mod tests {
         assert_eq!(buf.len(), 4); // just the count
 
         let mut cursor = Cursor::new(&buf);
-        let decoded = BlockIndex::read_from(&mut cursor).unwrap();
+        let decoded = BlockIndex::read_from(&mut cursor, buf.len()).unwrap();
         assert!(decoded.entries.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive allocation cap tests (Patch 9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_index_rejects_oversized_n_blocks() {
+        use byteorder::WriteBytesExt;
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(u32::MAX).unwrap(); // n_blocks = absurd
+
+        let section_len = buf.len();
+        let result = BlockIndex::read_from(&mut Cursor::new(&buf), section_len);
+        assert!(result.is_err(), "should reject oversized n_blocks");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("allocation too large"),
+            "error should mention allocation: {err_msg}"
+        );
     }
 }

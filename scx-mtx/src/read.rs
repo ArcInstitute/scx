@@ -190,6 +190,17 @@ fn parse_mtx_file(
         .parse()
         .map_err(|_| MtxError::Parse(format!("invalid nnz count: {}", size_parts[2])))?;
 
+    // Cap nnz to prevent a malformed size line from triggering a multi-GB
+    // allocation. 2 billion triplets × 12 bytes each = 24 GB — already
+    // well beyond any single-cell dataset.
+    const MAX_MTX_NNZ: usize = 2_000_000_000;
+    if nnz > MAX_MTX_NNZ {
+        return Err(MtxError::Parse(format!(
+            "nnz {} exceeds maximum of {} entries",
+            nnz, MAX_MTX_NNZ
+        )));
+    }
+
     // Read COO triplets into a single vec for cache-friendly sorting
     let mut entries: Vec<(usize, usize, f32)> = Vec::with_capacity(nnz);
 
@@ -405,5 +416,26 @@ mod tests {
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(content)));
         let result = parse_mtx_file(reader);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive allocation cap tests (Patch 9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mtx_rejects_oversized_nnz() {
+        // Craft a valid MTX header that claims nnz > 2 billion.
+        let mtx_content = "\
+%%MatrixMarket matrix coordinate integer general
+2 2 3000000000
+";
+        let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
+        let result = parse_mtx_file(reader);
+        assert!(result.is_err(), "should reject oversized nnz");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("exceeds maximum"),
+            "error should mention exceeds maximum: {err_msg}"
+        );
     }
 }

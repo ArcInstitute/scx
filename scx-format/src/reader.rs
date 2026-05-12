@@ -1074,7 +1074,7 @@ impl ScxReader {
             .get("provenance")
             .ok_or_else(|| ScxError::SectionNotFound("provenance".to_string()))?;
         let slice = self.section_bytes(entry)?;
-        Provenance::read_from(&mut Cursor::new(slice))
+        Provenance::read_from(&mut Cursor::new(slice), slice.len())
     }
 
     // -----------------------------------------------------------------------
@@ -1128,7 +1128,10 @@ impl ScxReader {
             .find(|e| e.section_type == SectionType::DeletionVectors)
             .ok_or_else(|| ScxError::SectionNotFound("deletion_vectors".to_string()))?;
         let slice = self.section_bytes(entry)?;
-        let dv = crate::deletion_vectors::DeletionVectors::read_from(&mut Cursor::new(slice))?;
+        let dv = crate::deletion_vectors::DeletionVectors::read_from(
+            &mut Cursor::new(slice),
+            slice.len(),
+        )?;
         Ok(Some(dv))
     }
 
