@@ -1,0 +1,16 @@
+{
+  "benchmark": "harmony_integrate",
+  "impl": "scx_accel",
+  "dataset": "census_1m",
+  "timestamp": "2026-01-14T15:30:00",
+  "run": {
+    "wall_s": 42.5,
+    "rss_mb": 2400,
+    "iters": 15
+  },
+  "metadata": {
+    "n_batches": 8,
+    "n_obs": 1000000,
+    "n_components": 30
+  }
+}
