@@ -405,7 +405,7 @@ fn encode_f32_values(data: &[f32], encoding: scx_codec::ValueEncoding) -> crate:
         scx_codec::ValueEncoding::Float16 => Err(crate::EngineError::SchemaError {
             column: "layer_values".to_string(),
             reason: "Float16 value encoding is not yet supported in \
-                     encode_f32_values; transcode to Float32 before calling"
+                     encode_f32_values; use Float32 encoding instead"
                 .to_string(),
         }),
     }

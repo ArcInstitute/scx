@@ -28,8 +28,7 @@ use scx_format::DeletionVectors;
 struct ExecutionPlan {
     candidate_shards: Vec<ShardCandidate>,
     obs_predicates: Vec<Predicate>,
-    /// Stored for future var-level pushdown; not yet consumed at execution time.
-    #[allow(dead_code)]
+    /// Used for var-level filtering during execution (see `execute()`).
     var_predicates: Vec<Predicate>,
     gene_indices: Option<Vec<u32>>,
     normalize: Option<f64>,
