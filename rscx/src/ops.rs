@@ -5,12 +5,10 @@
 // Follows the same pattern as pyscx/src/ops.rs, adapted for extendr.
 
 use std::io::Cursor;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use extendr_api::prelude::*;
 
-use scx_codec::CodecSelection;
 use scx_codec::ValueEncoding;
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
@@ -107,8 +105,7 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
         &indices,
         &values_bytes,
         value_encoding,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(), // default shard target rows
+        &scx_ops::AppendOptions::default(),
     )
     .map_err(|e| Error::Other(e.to_string()))
 }

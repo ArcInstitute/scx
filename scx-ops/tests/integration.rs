@@ -5,6 +5,7 @@ use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::writer::ScxWriter;
 use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
+use scx_ops::AppendOptions;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -260,8 +261,7 @@ fn test_append_read_back_all_cells() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -295,8 +295,7 @@ fn test_append_manifest_sequence_increments() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -375,8 +374,7 @@ fn test_compact_after_appends() {
             &indices,
             &values,
             ValueEncoding::Uint8,
-            CodecSelection::Auto,
-            NonZeroU32::new(16384).unwrap(),
+            &AppendOptions::default(),
         )
         .unwrap();
     }
@@ -428,8 +426,7 @@ fn test_rollback_after_append() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -515,8 +512,7 @@ fn test_flock_serializes_appends() {
                     &indices,
                     &values,
                     ValueEncoding::Uint8,
-                    CodecSelection::Auto,
-                    NonZeroU32::new(16384).unwrap(),
+                    &AppendOptions::default(),
                 )
                 .unwrap();
             })
@@ -550,8 +546,7 @@ fn test_append_provenance() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -610,8 +605,7 @@ fn test_rollback_to_specific_sequence() {
             &indices,
             &values,
             ValueEncoding::Uint8,
-            CodecSelection::Auto,
-            NonZeroU32::new(16384).unwrap(),
+            &AppendOptions::default(),
         )
         .unwrap();
     }
@@ -662,8 +656,10 @@ fn test_append_multi_shard() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(3).unwrap(), // very small target
+        &AppendOptions {
+            shard_target_rows: NonZeroU32::new(3).unwrap(),
+            ..AppendOptions::default()
+        },
     )
     .unwrap();
 
@@ -715,8 +711,7 @@ fn test_compact_correct_nnz() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -844,8 +839,7 @@ fn test_shard_header_global_offset_is_row_index() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -1044,8 +1038,10 @@ fn append_with_explicit_codec(
         &indices,
         &raw_values,
         value_encoding,
-        CodecSelection::Explicit(codec),
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions {
+            codec: CodecSelection::Explicit(codec),
+            ..AppendOptions::default()
+        },
     )
     .unwrap();
 
@@ -1149,8 +1145,7 @@ fn test_append_with_codec_auto_matches_select_codec_for_modality() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -1300,8 +1295,7 @@ fn test_append_empty_rows() {
         &[],
         &[],
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -1331,8 +1325,7 @@ fn test_append_rejects_oob_indices() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     );
 
     assert!(result.is_err(), "append should reject OOB indices");
@@ -1392,8 +1385,7 @@ fn test_append_rejects_n_vars_overflow() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     );
 
     assert!(result.is_err(), "append should reject n_vars > u32::MAX");
@@ -1442,8 +1434,7 @@ fn test_append_drops_csc_from_input() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -1534,8 +1525,7 @@ fn test_append_pure_csr_unaffected() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -1622,8 +1612,7 @@ fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
         &indices,
         &values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
@@ -1740,11 +1729,10 @@ fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
 // Multimodal append tests (PR #68 regression)
 // ---------------------------------------------------------------------------
 
-/// `append_for_modality` must stamp the appended CSR shard's
-/// `ShardHeader.n_minor` and `ShardStats.col_end` with the TARGET
-/// modality's `n_vars`, not the file-wide max. Regression for the bug
-/// where `header.n_vars` (the max across modalities) was used at both
-/// sites in `scx-ops::append::append_for_modality`.
+/// `append` (with `AppendOptions.modality_id` set) must stamp the appended CSR shard's
+/// `ShardHeader.n_minor` with the target modality's `n_vars`, not the
+/// file-wide `header.n_vars`.  This was one of the original validation
+/// sites in `scx-ops::append::append`.
 #[test]
 fn test_append_for_modality_uses_per_modality_n_vars() {
     use scx_format::modality::ModalityType;
@@ -1824,16 +1812,17 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
     // Append two new rows into the "adt" modality.
     let new_obs = sample_obs(2);
     let (new_indptr, new_indices, new_values) = sample_shard_data(2, adt_n_vars as usize);
-    scx_ops::append_for_modality(
+    scx_ops::append(
         &path,
         &new_obs,
         &new_indptr,
         &new_indices,
         &new_values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
-        2, // adt
+        &AppendOptions {
+            modality_id: 2,
+            ..AppendOptions::default()
+        },
     )
     .unwrap();
 
@@ -1906,22 +1895,13 @@ fn test_streaming_append_matches_bulk_append() {
         &bulk_indices,
         &bulk_values,
         ValueEncoding::Uint8,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
+        &AppendOptions::default(),
     )
     .unwrap();
 
     // Streaming path: pass the source reader directly.
     let src_reader = ScxReader::open(&source).unwrap();
-    scx_ops::append_from_reader(
-        &target_b,
-        &src_reader,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
-        0,
-        0,
-    )
-    .unwrap();
+    scx_ops::append_from_reader(&target_b, &src_reader, &AppendOptions::default(), 0).unwrap();
     drop(src_reader);
 
     let ra = ScxReader::open(&target_a).unwrap();
@@ -1954,15 +1934,7 @@ fn test_streaming_append_multi_shard_source() {
     };
 
     let src_reader = ScxReader::open(&source).unwrap();
-    scx_ops::append_from_reader(
-        &target,
-        &src_reader,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
-        0,
-        0,
-    )
-    .unwrap();
+    scx_ops::append_from_reader(&target, &src_reader, &AppendOptions::default(), 0).unwrap();
     drop(src_reader);
 
     let reader = ScxReader::open(&target).unwrap();
@@ -1990,9 +1962,10 @@ fn test_streaming_append_respects_explicit_codec() {
     scx_ops::append_from_reader(
         &target,
         &src_reader,
-        CodecSelection::Explicit(CodecId::Zstd),
-        NonZeroU32::new(16384).unwrap(),
-        0,
+        &AppendOptions {
+            codec: CodecSelection::Explicit(CodecId::Zstd),
+            ..AppendOptions::default()
+        },
         0,
     )
     .unwrap();
@@ -2042,15 +2015,7 @@ fn test_streaming_append_raw_copy_fast_path() {
     };
 
     let src_reader = ScxReader::open(&source).unwrap();
-    scx_ops::append_from_reader(
-        &target,
-        &src_reader,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
-        0,
-        0,
-    )
-    .unwrap();
+    scx_ops::append_from_reader(&target, &src_reader, &AppendOptions::default(), 0).unwrap();
     drop(src_reader);
 
     let reader = ScxReader::open(&target).unwrap();
@@ -2158,9 +2123,10 @@ fn test_streaming_append_raw_copy_reuses_stats() {
     scx_ops::append_from_reader(
         &target,
         &src_reader,
-        CodecSelection::Explicit(CodecId::Zstd),
-        NonZeroU32::new(16384).unwrap(),
-        0,
+        &AppendOptions {
+            codec: CodecSelection::Explicit(CodecId::Zstd),
+            ..AppendOptions::default()
+        },
         0,
     )
     .unwrap();
@@ -2203,15 +2169,7 @@ fn test_streaming_append_drops_csc_from_input() {
     }
 
     let src_reader = ScxReader::open(&source).unwrap();
-    scx_ops::append_from_reader(
-        &target,
-        &src_reader,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
-        0,
-        0,
-    )
-    .unwrap();
+    scx_ops::append_from_reader(&target, &src_reader, &AppendOptions::default(), 0).unwrap();
     drop(src_reader);
 
     let r = ScxReader::open(&target).unwrap();
@@ -2311,9 +2269,10 @@ fn test_streaming_append_multimodal() {
     scx_ops::append_from_reader(
         &path,
         &src_reader,
-        CodecSelection::Auto,
-        NonZeroU32::new(16384).unwrap(),
-        2, // adt
+        &AppendOptions {
+            modality_id: 2,
+            ..AppendOptions::default()
+        },
         0, // source is single-modality
     )
     .unwrap();

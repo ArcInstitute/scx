@@ -24,11 +24,41 @@ use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
 use crate::rollback::build_root_catalog_from_full;
 
+/// Options controlling how new rows are appended to an SCX file.
+///
+/// Bundles codec selection, shard sizing, and modality routing into a
+/// single struct so callers cannot silently mis-order positional
+/// arguments.
+#[derive(Debug, Clone)]
+pub struct AppendOptions {
+    /// Codec selection: `Auto` for per-shard auto-selection, or
+    /// `Explicit(codec)` to force a specific codec on every new shard.
+    pub codec: CodecSelection,
+    /// Target number of rows per CSR shard.  Must be > 0.
+    pub shard_target_rows: NonZeroU32,
+    /// Modality to append into.  `0` = single-modality / global axis
+    /// (legacy behaviour).  On multimodal files, pass the registered
+    /// modality id (1..=n_modalities).
+    pub modality_id: u8,
+}
+
+impl Default for AppendOptions {
+    fn default() -> Self {
+        Self {
+            codec: CodecSelection::Auto,
+            // SAFETY: 16384 != 0
+            shard_target_rows: NonZeroU32::new(16384).unwrap(),
+            modality_id: 0,
+        }
+    }
+}
+
 /// Append new rows to an existing SCX file.
 ///
-/// Single-modality / global-axis convenience. Equivalent to
-/// [`append_for_modality`] with `modality_id = 0`.
-#[allow(clippy::too_many_arguments)]
+/// Uses [`AppendOptions`] to control codec selection, shard sizing,
+/// and modality routing.  Set `options.modality_id` to target a
+/// specific modality on multimodal files (default `0` = global /
+/// single-modality).
 pub fn append(
     target_path: &Path,
     new_obs: &RecordBatch,
@@ -36,47 +66,9 @@ pub fn append(
     new_indices: &[u32],
     new_values: &[u8],
     value_encoding: ValueEncoding,
-    codec_selection: CodecSelection,
-    shard_target_rows: NonZeroU32,
+    options: &AppendOptions,
 ) -> Result<()> {
-    append_for_modality(
-        target_path,
-        new_obs,
-        new_indptr,
-        new_indices,
-        new_values,
-        value_encoding,
-        codec_selection,
-        shard_target_rows,
-        0,
-    )
-}
-
-/// Append new rows to an existing SCX file, stamping new shards with
-/// the given `modality_id` (Phase F.3 of MULTIMODAL-SUPPORT.md).
-///
-/// `modality_id = 0` matches the legacy single-modality / global
-/// behaviour. On multimodal files, the caller MUST pass a registered
-/// modality id (1..=n_modalities) — the modality table is updated
-/// in-place to reflect the new shards' nnz / shard count.
-///
-/// Note: cells (obs) are global across modalities, so even a
-/// per-modality append still updates the file's `n_obs`. The append
-/// callers are expected to feed in CSR data indexed against the
-/// chosen modality's `n_vars`, not the global `header.n_vars`.
-#[allow(clippy::too_many_arguments)]
-pub fn append_for_modality(
-    target_path: &Path,
-    new_obs: &RecordBatch,
-    new_indptr: &[u64],
-    new_indices: &[u32],
-    new_values: &[u8],
-    value_encoding: ValueEncoding,
-    codec_selection: CodecSelection,
-    shard_target_rows: NonZeroU32,
-    modality_id: u8,
-) -> Result<()> {
-    let (mut lock, prep) = prepare_append(target_path, modality_id)?;
+    let (mut lock, prep) = prepare_append(target_path, options.modality_id)?;
 
     if new_indptr.is_empty() {
         return Ok(());
@@ -144,7 +136,10 @@ pub fn append_for_modality(
     let mut row_offset = 0usize;
 
     while row_offset < n_new_rows {
-        let shard_rows = std::cmp::min(shard_target_rows.get() as usize, n_new_rows - row_offset);
+        let shard_rows = std::cmp::min(
+            options.shard_target_rows.get() as usize,
+            n_new_rows - row_offset,
+        );
         let shard_indptr_start = new_indptr[row_offset];
         let shard_indptr_end = new_indptr[row_offset + shard_rows];
 
@@ -172,7 +167,7 @@ pub fn append_for_modality(
             shard_indices,
             shard_values,
             value_encoding,
-            codec_selection,
+            options.codec,
             shard_idx,
             global_row_start,
         )?;
@@ -202,24 +197,22 @@ pub fn append_for_modality(
 /// all match the target's expectations) instead of materialising the entire
 /// source matrix in host memory.
 ///
-/// `target_modality_id = 0` and `source_modality_id = 0` match the legacy
-/// single-modality / global path. For multimodal targets, pass the
-/// registered modality id of the destination; for multimodal sources, pass
-/// the matching source modality.
+/// `options.modality_id = 0` and `source_modality_id = 0` match the legacy
+/// single-modality / global path. For multimodal targets, set
+/// `options.modality_id` to the registered modality id of the destination;
+/// for multimodal sources, pass the matching `source_modality_id`.
 ///
 /// Semantics: obs is global on both files (rows are global across
 /// modalities), so the source's obs is concatenated to the target's obs
 /// regardless of the modality_id arguments. CSC sidecars are dropped from
-/// the target on append (same as [`append_for_modality`]).
+/// the target on append (same as [`append`]).
 pub fn append_from_reader(
     target_path: &Path,
     source: &ScxReader,
-    codec_selection: CodecSelection,
-    shard_target_rows: NonZeroU32,
-    target_modality_id: u8,
+    options: &AppendOptions,
     source_modality_id: u8,
 ) -> Result<()> {
-    let (mut lock, prep) = prepare_append(target_path, target_modality_id)?;
+    let (mut lock, prep) = prepare_append(target_path, options.modality_id)?;
 
     // Enumerate the source's CSR shard catalog entries (already sorted by
     // row_start by `csr_shards_for_modality`).
@@ -231,7 +224,7 @@ pub fn append_from_reader(
         .collect();
 
     if source_csr_entries.is_empty() {
-        // Nothing to append — match `append_for_modality`'s empty-input behaviour.
+        // Nothing to append — match `append`'s empty-input behaviour.
         return Ok(());
     }
 
@@ -294,8 +287,8 @@ pub fn append_from_reader(
         // Raw-copy fast path eligibility.
         let raw_copy_ok = sh.index_dtype == target_index_dtype
             && (sh.n_minor as u64) == prep.target_n_vars
-            && sh.n_major <= shard_target_rows.get()
-            && match codec_selection {
+            && sh.n_major <= options.shard_target_rows.get()
+            && match options.codec {
                 CodecSelection::Auto => true,
                 CodecSelection::Explicit(c) => sh.codec_id == c as u8,
             };
@@ -360,8 +353,10 @@ pub fn append_from_reader(
         let value_byte_size = value_encoding_byte_width(value_encoding);
         let mut row_offset = 0usize;
         while row_offset < shard_rows {
-            let chunk_rows =
-                std::cmp::min(shard_target_rows.get() as usize, shard_rows - row_offset);
+            let chunk_rows = std::cmp::min(
+                options.shard_target_rows.get() as usize,
+                shard_rows - row_offset,
+            );
             let chunk_ip_start = shard_indptr[row_offset];
             let chunk_ip_end = shard_indptr[row_offset + chunk_rows];
             let chunk_indptr: Vec<u64> = shard_indptr[row_offset..=row_offset + chunk_rows]
@@ -383,7 +378,7 @@ pub fn append_from_reader(
                 chunk_indices,
                 chunk_values,
                 value_encoding,
-                codec_selection,
+                options.codec,
                 chunk_shard_idx,
                 chunk_global_row_start,
             )?;

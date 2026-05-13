@@ -151,14 +151,13 @@ pub fn run_append(
     // the file lock.
     drop(target_reader);
 
-    scx_ops::append_from_reader(
-        target,
-        &input_reader,
-        codec_selection,
-        shard_size,
-        target_modality_id,
-        input_modality_id,
-    )?;
+    let append_options = scx_ops::AppendOptions {
+        codec: codec_selection,
+        shard_target_rows: shard_size,
+        modality_id: target_modality_id,
+    };
+
+    scx_ops::append_from_reader(target, &input_reader, &append_options, input_modality_id)?;
 
     println!(
         "Appended {} cells from {} to {}",

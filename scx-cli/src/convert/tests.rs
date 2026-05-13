@@ -1376,7 +1376,7 @@ fn test_compact_multimodal_unsupported() {
     );
 }
 
-/// Phase F.3: `scx_ops::append_for_modality` stamps shards with the
+/// Phase F.3: `scx_ops::append` (with `modality_id` set) stamps shards with the
 /// chosen modality_id and updates the modality table's per-modality
 /// counts. We exercise the full path: build a multimodal file from
 /// h5mu, append to its rna modality, verify the rna modality's
@@ -1415,16 +1415,18 @@ fn test_append_for_modality_updates_table() {
     // Build a new obs batch by truncating the existing obs to 4 rows.
     let new_obs_batch = pre_obs.slice(0, n_new_rows as usize);
 
-    scx_ops::append_for_modality(
+    scx_ops::append(
         &scx_path,
         &new_obs_batch,
         &new_indptr,
         &new_indices,
         &new_values,
         scx_codec::ValueEncoding::Uint8,
-        scx_codec::CodecSelection::Explicit(scx_codec::CodecId::Scx1),
-        NonZeroU32::new(10000).unwrap(),
-        rna_id,
+        &scx_ops::AppendOptions {
+            codec: scx_codec::CodecSelection::Explicit(scx_codec::CodecId::Scx1),
+            shard_target_rows: NonZeroU32::new(10000).unwrap(),
+            modality_id: rna_id,
+        },
     )
     .unwrap();
 
