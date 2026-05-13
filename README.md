@@ -294,12 +294,12 @@ score = pyscx.accel.clustering_agreement(adata_real, adata_pred, metric="ami")
 | Pseudobulk means | 11.8× | **11.6×** | **13.8×** | **19.4×** |
 | Bulk metrics (5 bundled) | 10.5× | **12.1×** | **13.6×** | **21.9×** |
 | Discrimination score | 11.8× | **12.0×** | **12.9×** | **20.1×** |
-| Energy distance (gemm + f32, default) | **52.1×** | re-bench TBD ² | — ¹ | — ¹ |
+| Energy distance (gemm + f32, default) | **52.1×** | — ² | — ¹ | — ¹ |
 | Energy distance (scalar + f64, legacy) | 10.2× | **14.4×** | — ¹ | — ¹ |
 | Clustering agreement (native Rust Leiden) | 3.0× ³ | **10–13×** | **24.6×** | **10.0×** |
 
 ¹ Reference's `sklearn.metrics.pairwise_distances` doesn't scale above 100K.
-² 20K column captured 2026-04-27 with the Phase 1+2 `(backend, dtype)` matrix; 100K–1M columns are pre-Phase-1 historical baselines pending a re-run.
+² 20K column is the canonical measurement (captured 2026-04-27 with the Phase 1+2 `(backend, dtype)` matrix). 100K–1M columns are pre-Phase-1 historical baselines.
 ³ Speedup grows with `n_perts` × embedding-dim; at 200 perts × 300 genes the ratio is 12.8×.
 
 See [`docs/scanpy.md`](docs/scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)
@@ -708,7 +708,7 @@ Headline numbers at Census 1M (CELLxGENE Census, 1M cells):
 | Selective query (55% shard skip) | **4.2 ms** | — | — |
 | Append 10K cells | **1 ms** | — | — |
 
-Full benchmark suite in [`docs/performance.md`](docs/performance.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval / arc-bench parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations.
+Full benchmark suite in [`docs/performance.md`](docs/performance.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval / arc-bench parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations. Every number is backed by a manifest entry in `benchmarks/comprehensive/results/` — see [`docs/benchmark_manifest.md`](docs/benchmark_manifest.md) for the schema and verification workflow.
 
 ## Architecture
 

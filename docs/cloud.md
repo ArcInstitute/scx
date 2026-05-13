@@ -229,6 +229,43 @@ pipeline, streams them into a single local `.scx` file via a reorder
 window, and writes the catalog last. Peak memory is bounded by
 `parallelism × max_section_size`, **not** by the total file size.
 
+```mermaid
+graph TD
+    subgraph "Cloud object store (.scxd/)"
+        CAT["_catalog.bin"]
+        HDR["_header.bin"]
+        S1["X/000000.shard"]
+        S2["X/000001.shard"]
+        SN["X/..."]
+        OBS["obs.arrow"]
+        VAR["var.arrow"]
+    end
+
+    subgraph "scx-cloud pull pipeline"
+        READ["1. Read catalog<br/>(single GET)"]
+        PLAN["2. Plan sections<br/>(apply predicate filter<br/>if --filter supplied)"]
+        DL["3. buffer_unordered<br/>(parallelism concurrent GETs)"]
+        REORD["4. BTreeMap reorder window<br/>(restore section order)"]
+        WRITE["5. Sequential write<br/>to temp file"]
+        HASH["6. HashingWriter<br/>(inline BLAKE3)"]
+        RENAME["7. fsync + rename<br/>(atomic commit)"]
+    end
+
+    CAT --> READ
+    READ --> PLAN
+    PLAN --> DL
+    S1 & S2 & SN & OBS & VAR -.-> DL
+    DL --> REORD
+    REORD --> WRITE
+    WRITE --> HASH
+    HASH --> RENAME
+    RENAME --> OUT["local.scx<br/>(cloud-optimized)"]
+
+    style READ fill:#1a3a5c,color:#fff
+    style HASH fill:#2d5016,color:#fff
+    style RENAME fill:#2d5016,color:#fff
+```
+
 ```python
 # Full dataset
 pyscx.pull("gs://bucket/atlas.scxd/", "atlas.scx")

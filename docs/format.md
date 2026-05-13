@@ -470,6 +470,53 @@ bytes never change. The full catalog is a **manifest** that names the
 currently-active fragments. This is what makes appends, deletions, and
 rollback safe in a single file.
 
+The following diagram shows how catalogs chain across mutations:
+
+```mermaid
+graph TD
+    subgraph "Initial file — manifest 0"
+        H0["Header (seq=0)<br/>full_catalog_offset → FC0"]
+        RC0["Root Catalog<br/>@offset 256"]
+        S0["CSR Shards 0..N"]
+        OBS0["obs_metadata<br/>(Arrow IPC)"]
+        FC0["Full Catalog 0<br/>@EOF<br/>prev=0"]
+    end
+
+    H0 --> RC0
+    H0 --> FC0
+    FC0 -.- S0
+    FC0 -.- OBS0
+
+    subgraph "After append — manifest 1"
+        H1["Header (seq=1)<br/>full_catalog_offset → FC1"]
+        RC1["Root Catalog<br/>@256 (pwrite)"]
+        SN["New CSR Shards"]
+        OBS1["obs_metadata<br/>(merged, all cells)"]
+        FC1["Full Catalog 1<br/>@new EOF"]
+    end
+
+    H1 --> RC1
+    H1 --> FC1
+    FC1 -->|prev_catalog_offset| FC0
+    FC1 -.- S0
+    FC1 -.- SN
+    FC1 -.- OBS1
+
+    subgraph "After rollback to seq=0"
+        H2["Header (seq=0)<br/>full_catalog_offset → FC0"]
+        RC2["Root Catalog<br/>@256 (reverted)"]
+    end
+
+    H2 --> RC2
+    H2 --> FC0
+
+    style FC0 fill:#2d5016,color:#fff
+    style FC1 fill:#2d5016,color:#fff
+    style H0 fill:#1a3a5c,color:#fff
+    style H1 fill:#1a3a5c,color:#fff
+    style H2 fill:#1a3a5c,color:#fff
+```
+
 ### 7.1 Initial file creation (atomic rename)
 
 1. Writer creates a temp file (`experiment.scx.tmp.{pid}`).

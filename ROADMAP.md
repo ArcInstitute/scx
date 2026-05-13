@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-04-16
+**Last updated**: 2026-05-13
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -244,14 +244,8 @@ scGPT train end-to-end on atlas-scale SCX data.
   PCA on a laptop via bitpacked on-disk sparse matrices. BPCells is R-only, but if
   it gets Python bindings or inspires a Python equivalent, it could address some of
   the same performance gaps SCX targets — without requiring a new file format.
-- **PyTorch DataLoader integration is tricky.** `num_workers=0` is required because
-  the Rust pipeline manages its own threads (docs/multithreading.md (Training data loader)). This means the standard
-  PyTorch multiprocessing prefetch doesn't apply — the Rust pipeline must provide
-  equivalent or better prefetching. Users familiar with `num_workers>0` patterns
-  may be confused. Document this clearly.
-- **CUDA fork safety.** If a user accidentally sets `num_workers>0`, forking after
-  CUDA initialization causes deadlocks or crashes. The `TrainingDataset` should
-  detect this and raise a clear error rather than silently deadlocking.
+- **PyTorch DataLoader integration is tricky.** — **RESOLVED.** `TrainingDataset` is now fork-safe under `num_workers > 0` via per-pipeline rayon pool + lazy tokio runtime construction. The PID check in `__next__` catches the eager-construct-then-fork case. See `docs/multithreading.md` § Fork safety.
+- **CUDA fork safety.** — **RESOLVED.** The PID check in `TrainingDataset.__next__` raises a clear `RuntimeError` when a dataset constructed in the parent is used in a forked child. `pyscx/tests/test_fork_safety.py` is the durable regression test.
 - **io_uring on Linux.** Consider `tokio-uring` for Stage 1 shard reads on Linux
   instead of thread-pool async I/O. Eliminates thread overhead for I/O. Fall back
   to `tokio::fs` on macOS. This is a backend swap, not an architecture change.
@@ -259,10 +253,7 @@ scGPT train end-to-end on atlas-scale SCX data.
   skip rate" target assumes queries filter on columns with non-uniform distribution
   across shards (e.g., cell_type). For uniformly distributed columns (e.g.,
   n_counts), skip rates will be much lower. Benchmark with realistic query workloads.
-- **Memory budget enforcement.** The 330 MB projection (docs/multithreading.md (Training data loader)) assumes specific
-  configuration. Make `max_loader_memory_mb` a configurable parameter and auto-tune
-  `shard_group_size` and `prefetch_batches` to fit within it. Users on
-  memory-constrained systems (shared HPC nodes) need this.
+- **Memory budget enforcement.** — **RESOLVED.** `max_loader_memory_mb` is implemented and auto-tunes `shard_group_size` and `prefetch_batches` to fit within the budget. `LoaderConfig::validate()` rejects too-small budgets up front.
 
 ---
 
@@ -596,7 +587,7 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Adoption barrier: new format | High | `to_anndata()` means zero workflow disruption; users keep scanpy |
-| Rice codec complexity | Medium | Scalar reference first, SIMD later; Zstd fallback always available |
+| Rice codec complexity | Medium | **RESOLVED.** Scalar reference is normative; SIMD FOR-BP shipped (44% faster index decode). Rice is <20% of total decode cost. Zstd fallback always available. |
 | GPU driver/GDS compatibility | Medium | CPU path always functional; GDS is opt-in and currently deferred |
 | AnnData zero-copy edge cases | Medium | Extensive round-trip testing; fallback to copy for problematic dtypes |
 | HDF5 crate stability | Low | Only needed for conversion; SCX native path takes over |
