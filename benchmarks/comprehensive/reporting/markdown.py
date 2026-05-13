@@ -29,6 +29,8 @@ def generate_report_model() -> Report:
     
     report.chapters.append(executive.build(store))
     report.chapters.append(methodology.build(store))
+    report.chapters.append(correctness.build(store))
+    report.chapters.append(coverage.build(store))
     report.chapters.append(storage.build(store))
     report.chapters.append(io.build(store))
     report.chapters.append(cloud.build(store))
@@ -36,8 +38,6 @@ def generate_report_model() -> Report:
     report.chapters.append(accelerators.build(store))
     report.chapters.append(specialized.build(store))
     report.chapters.append(operations.build(store))
-    report.chapters.append(correctness.build(store))
-    report.chapters.append(coverage.build(store))
     report.chapters.append(discussion.build(store))
     report.chapters.append(appendix.build(store))
     

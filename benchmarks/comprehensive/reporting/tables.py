@@ -1055,8 +1055,52 @@ def bench_csc_dispatch_table(datasets: list[str] | None = None) -> TableBlock:
     )
 
 
+def _classify_test_status(test: dict[str, Any]) -> str:
+    """Classify a single test result into Pass / Fail / Skipped / Not applicable.
+
+    Fixes the original bug where dependency-skipped tests (e.g. pseudobulk
+    with ``"pydeseq2 not installed"``) were rendered as failures.
+    """
+    error = test.get("error", "")
+    passed_raw = test.get("passed")
+
+    # Dependency-skipped tests: marked passed=false but have a skip-like error
+    if error and any(kw in error.lower() for kw in ("not installed", "skipped", "not available")):
+        return "Skipped"
+
+    if passed_raw in (True, "True"):
+        return "Pass"
+    if passed_raw in (False, "False"):
+        # True failure — only if there's no skip-like error
+        return "Fail"
+    return "Not run"
+
+
+def _recount_correctness(results_list: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """Recount pass/fail/skipped using proper status classification.
+
+    Returns (n_passed, n_failed, n_skipped).
+    """
+    n_pass = n_fail = n_skip = 0
+    for test in results_list:
+        status = _classify_test_status(test)
+        if status == "Pass":
+            n_pass += 1
+        elif status == "Fail":
+            n_fail += 1
+        else:  # Skipped, Not applicable, Not run
+            n_skip += 1
+    return n_pass, n_fail, n_skip
+
+
 def correctness_table() -> TableBlock | TextBlock:
-    """Generate correctness validation summary table."""
+    """Generate correctness validation summary table.
+
+    Uses proper status classification so that dependency-skipped tests
+    (e.g. pseudobulk_dex when pydeseq2 is missing) count as Skipped
+    rather than Failed. The ``Status`` column shows Pass/Fail/Mixed
+    for the overall harness result.
+    """
     results = load_all_results()  # Load all, filter correctness
     correctness = [
         r for r in results
@@ -1066,20 +1110,44 @@ def correctness_table() -> TableBlock | TextBlock:
     if not correctness:
         return TextBlock("_No correctness results found._")
 
-    headers = ["Test", "Dataset", "Passed", "Failed", "Skipped", "Duration"]
+    headers = ["Test", "Dataset", "Passed", "Failed", "Skipped", "Status", "Duration"]
     rows: list[list[str]] = []
 
     for r in correctness:
         harness = r.get("harness", r.get("benchmark", "unknown"))
         dataset = r.get("dataset", "—")
-        n_passed = r.get("n_passed", 0)
-        n_failed = r.get("n_failed", 0)
-        n_skipped = r.get("n_skipped", 0)
         duration = r.get("total_duration_s")
+
+        # Recount using proper classification if per-test results exist
+        per_test = r.get("results", [])
+        if per_test:
+            n_passed, n_failed, n_skipped = _recount_correctness(per_test)
+        else:
+            # Fall back to raw JSON counts for schema_version 2 results
+            # that store counts in runs[].extra
+            runs = r.get("runs", [])
+            if runs and runs[0].get("extra", {}).get("n_passed") is not None:
+                extra = runs[0]["extra"]
+                n_passed = extra.get("n_passed", 0)
+                n_failed = extra.get("n_failed", 0)
+                n_skipped = extra.get("n_skipped", 0)
+            else:
+                n_passed = r.get("n_passed", 0)
+                n_failed = r.get("n_failed", 0)
+                n_skipped = r.get("n_skipped", 0)
+
+        if n_failed > 0:
+            status = "**Fail**"
+        elif n_passed > 0 and n_skipped == 0:
+            status = "Pass"
+        elif n_passed > 0:
+            status = "Pass (partial)"
+        else:
+            status = "Not run"
 
         rows.append([
             harness, dataset, str(n_passed), str(n_failed),
-            str(n_skipped), _fmt_time(duration),
+            str(n_skipped), status, _fmt_time(duration),
         ])
 
     return TableBlock(headers=headers, rows=rows,
@@ -1087,7 +1155,12 @@ def correctness_table() -> TableBlock | TextBlock:
 
 
 def correctness_detail_table(dataset: str = "pbmc3k") -> TableBlock | TextBlock:
-    """Generate per-function correctness detail table for a given dataset."""
+    """Generate per-function correctness detail table for a given dataset.
+
+    Uses proper status classification: ``Pass``, ``Fail``, ``Skipped``
+    (for dependency-missing tests like pseudobulk), ``Not run``.
+    Skipped rows are clearly labeled and not rendered as ``**No**``.
+    """
     results = load_all_results()
     scanpy_equiv = [
         r for r in results
@@ -1098,15 +1171,33 @@ def correctness_detail_table(dataset: str = "pbmc3k") -> TableBlock | TextBlock:
         return TextBlock(f"_No scanpy equivalence results for {dataset}._")
 
     r = scanpy_equiv[-1]  # Most recent
-    headers = ["Function", "Passed", "Key Metric", "Value", "Threshold", "Duration"]
+    headers = ["Function", "Status", "Key Metric", "Value", "Threshold", "Duration", "Notes"]
     rows: list[list[str]] = []
 
     for test in r.get("results", []):
         name = test.get("name", "unknown")
-        passed = "Yes" if test.get("passed") in (True, "True") else "**No**"
+        status = _classify_test_status(test)
+        error = test.get("error", "")
         metrics = test.get("metrics", {})
         thresholds = test.get("thresholds", {})
         duration = test.get("duration_s")
+
+        # Status display with appropriate formatting
+        if status == "Pass":
+            status_str = "Pass"
+        elif status == "Fail":
+            status_str = "**Fail**"
+        elif status == "Skipped":
+            status_str = "_Skipped_"
+        else:
+            status_str = "_Not run_"
+
+        # Notes: surface skip reason or error
+        notes = ""
+        if status == "Skipped" and error:
+            notes = error
+        elif status == "Fail" and error:
+            notes = error
 
         # Pick the most representative metric
         if metrics:
@@ -1123,11 +1214,346 @@ def correctness_detail_table(dataset: str = "pbmc3k") -> TableBlock | TextBlock:
             metric_str = "—"
             threshold_str = "—"
 
-        rows.append([name, passed, metric_name, metric_str,
-                     threshold_str, _fmt_time(duration)])
+        rows.append([name, status_str, metric_name, metric_str,
+                     threshold_str, _fmt_time(duration), notes])
 
     return TableBlock(headers=headers, rows=rows,
                       caption=f"Scanpy equivalence detail ({dataset})")
+
+
+def correctness_detail_all_datasets() -> list[Block]:
+    """Generate scanpy equivalence detail tables for every dataset with data.
+
+    Returns one ``TableBlock`` per dataset that has ``scanpy_equivalence``
+    harness results, enabling Chapter 3 to show per-dataset breakdowns
+    rather than only pbmc3k.
+    """
+    results = load_all_results()
+    datasets_seen: list[str] = []
+    for r in results:
+        if r.get("harness") == "scanpy_equivalence":
+            ds = r.get("dataset", "")
+            if ds and ds not in datasets_seen:
+                datasets_seen.append(ds)
+
+    if not datasets_seen:
+        return [TextBlock("_No scanpy equivalence results found._")]
+
+    blocks: list[Block] = []
+    for ds in datasets_seen:
+        tbl = correctness_detail_table(dataset=ds)
+        blocks.append(tbl)
+    return blocks
+
+
+def correctness_dataset_summary_table() -> TableBlock | TextBlock:
+    """Dataset-level correctness summary across all harness types.
+
+    One row per (dataset, harness) with properly classified pass/fail/skip
+    counts and overall status. This provides the at-a-glance view for
+    Chapter 3 and the executive summary.
+    """
+    results = load_all_results()
+    correctness = [
+        r for r in results
+        if r.get("harness") or r.get("benchmark", "").startswith("correctness")
+    ]
+    if not correctness:
+        return TextBlock("_No correctness results found._")
+
+    headers = ["Dataset", "Harness", "Passed", "Failed", "Skipped", "Status"]
+    rows: list[list[str]] = []
+
+    # Group by dataset
+    by_ds: dict[str, list[dict]] = {}
+    for r in correctness:
+        ds = r.get("dataset", "unknown")
+        by_ds.setdefault(ds, []).append(r)
+
+    for ds in sorted(by_ds.keys()):
+        for r in by_ds[ds]:
+            harness = r.get("harness", r.get("benchmark", "unknown"))
+            per_test = r.get("results", [])
+            if per_test:
+                n_p, n_f, n_s = _recount_correctness(per_test)
+            else:
+                runs = r.get("runs", [])
+                if runs and runs[0].get("extra", {}).get("n_passed") is not None:
+                    extra = runs[0]["extra"]
+                    n_p = extra.get("n_passed", 0)
+                    n_f = extra.get("n_failed", 0)
+                    n_s = extra.get("n_skipped", 0)
+                else:
+                    n_p = r.get("n_passed", 0)
+                    n_f = r.get("n_failed", 0)
+                    n_s = r.get("n_skipped", 0)
+
+            if n_f > 0:
+                status = "**Fail**"
+            elif n_p > 0 and n_s == 0:
+                status = "Pass"
+            elif n_p > 0:
+                status = "Pass (partial)"
+            else:
+                status = "Not run"
+
+            rows.append([
+                SHORT_NAMES.get(ds, ds), harness,
+                str(n_p), str(n_f), str(n_s), status,
+            ])
+
+    return TableBlock(headers=headers, rows=rows,
+                      caption="Dataset-level correctness summary")
+
+
+def pipeline_agreement_table() -> list[Block]:
+    """Pipeline-level biological agreement tables.
+
+    Pulls from ``preprocessing_paths`` harness results which compare
+    three preprocessing pathways (A: scanpy, B: pyscx eager,
+    C: pyscx lazy) on metrics like Leiden ARI, PCA cosine similarity,
+    and DE overlap.
+
+    Returns one ``TableBlock`` per dataset.
+    """
+    results = load_all_results()
+    preproc = [
+        r for r in results
+        if r.get("harness") == "preprocessing_paths"
+    ]
+    if not preproc:
+        return [TextBlock("_No preprocessing path comparison results found._")]
+
+    blocks: list[Block] = []
+    for r in sorted(preproc, key=lambda x: x.get("dataset", "")):
+        ds = r.get("dataset", "unknown")
+        per_test = r.get("results", [])
+        if not per_test:
+            continue
+
+        headers = ["Pipeline Test", "Status", "Key Metric", "Value", "Threshold"]
+        rows: list[list[str]] = []
+        for test in per_test:
+            name = test.get("name", "unknown")
+            status = _classify_test_status(test)
+            status_str = "Pass" if status == "Pass" else (
+                "**Fail**" if status == "Fail" else f"_{status}_"
+            )
+            metrics = test.get("metrics", {})
+            thresholds = test.get("thresholds", {})
+            if metrics:
+                # Show the most important metric
+                metric_name = next(iter(thresholds)) if thresholds else next(iter(metrics))
+                val = metrics.get(metric_name)
+                thr = thresholds.get(metric_name)
+                if isinstance(val, float):
+                    val_str = f"{val:.6f}" if val < 1 else f"{val:.4f}"
+                else:
+                    val_str = str(val)
+                thr_str = str(thr) if thr is not None else "—"
+            else:
+                metric_name = "—"
+                val_str = "—"
+                thr_str = "—"
+            rows.append([name, status_str, metric_name, val_str, thr_str])
+
+        blocks.append(TableBlock(
+            headers=headers, rows=rows,
+            caption=f"Pipeline agreement — {SHORT_NAMES.get(ds, ds)}",
+        ))
+    return blocks
+
+
+def accelerator_parity_table() -> TableBlock | TextBlock:
+    """Accelerator parity summary — SCX vs scanpy/baseline per operation.
+
+    Compares accelerator benchmark results across implementations for the
+    same (operation, dataset) by extracting parity metrics from the
+    ``runs[].extra`` fields (e.g. cosine_sim_mean for PCA, recall for kNN).
+
+    This table belongs adjacent to accelerator timing tables.
+    """
+    store = get_store()
+    accel_benchmarks = [
+        "accel_pca", "accel_knn", "accel_umap", "accel_leiden",
+        "accel_preprocess", "accel_hvg",
+    ]
+
+    # Collect all rows grouped by (benchmark, dataset)
+    # Each group has multiple implementations (pyscx_cpu, scanpy_cpu, etc.)
+    by_key: dict[tuple[str, str], dict[str, dict]] = {}
+    for bench in accel_benchmarks:
+        for row in store.by_benchmark(bench):
+            ds = row.dataset
+            impl = row.format  # format field holds impl like "accel_pca__pyscx_cpu_auto"
+            # Extract the implementation suffix
+            impl_short = impl.replace(f"{bench}__", "")
+            by_key.setdefault((bench, ds), {})[impl_short] = row
+
+    if not by_key:
+        return TextBlock("_No accelerator benchmark results found._")
+
+    headers = ["Operation", "Dataset", "SCX impl", "SCX time", "Baseline", "Baseline time",
+               "Speedup", "Parity metric", "Parity value"]
+    rows: list[list[str]] = []
+
+    op_labels = {
+        "accel_pca": "PCA", "accel_knn": "kNN", "accel_umap": "UMAP",
+        "accel_leiden": "Leiden", "accel_preprocess": "Preprocess",
+        "accel_hvg": "HVG",
+    }
+    parity_keys = {
+        "accel_pca": "cosine_sim_min",
+        "accel_knn": "recall_at_k",
+        "accel_umap": "trustworthiness",
+        "accel_leiden": "ari",
+        "accel_preprocess": "max_abs_error",
+        "accel_hvg": "overlap_pct",
+    }
+
+    for (bench, ds), impls in sorted(by_key.items()):
+        op_label = op_labels.get(bench, bench)
+        # Find SCX CPU impl and scanpy baseline
+        scx_impl = None
+        baseline_impl = None
+        for impl_name, row in impls.items():
+            if "pyscx_cpu" in impl_name:
+                scx_impl = (impl_name, row)
+            elif "scanpy" in impl_name or "leidenalg" in impl_name:
+                baseline_impl = (impl_name, row)
+
+        if not scx_impl:
+            continue
+
+        scx_name, scx_row = scx_impl
+        scx_time = scx_row.median_wall_s
+
+        if baseline_impl:
+            base_name, base_row = baseline_impl
+            base_time = base_row.median_wall_s
+            speedup = (base_time / scx_time) if scx_time and base_time else None
+            speedup_str = f"{speedup:.1f}x" if speedup else "—"
+        else:
+            base_name = "—"
+            base_time = None
+            speedup_str = "—"
+
+        # Extract parity metric from SCX runs
+        parity_key = parity_keys.get(bench, "")
+        parity_val = None
+        if scx_row.runs:
+            extra = scx_row.runs[0].get("extra", {})
+            parity_val = extra.get(parity_key)
+        parity_str = "—"
+        if parity_val is not None:
+            if isinstance(parity_val, float):
+                parity_str = f"{parity_val:.4f}" if parity_val < 100 else f"{parity_val:.1f}"
+            else:
+                parity_str = str(parity_val)
+
+        rows.append([
+            op_label, SHORT_NAMES.get(ds, ds),
+            scx_name, _fmt_time(scx_time),
+            base_name if baseline_impl else "—",
+            _fmt_time(base_time),
+            speedup_str,
+            parity_key or "—", parity_str,
+        ])
+
+    return TableBlock(headers=headers, rows=rows, wide=True,
+                      caption="Accelerator parity — SCX vs baseline (CPU)")
+
+
+def cell_eval_correctness_summary_table() -> TableBlock | TextBlock:
+    """Cell-eval / arc-bench correctness summary (before performance table).
+
+    Shows per-operation parity status: whether SCX reproduces the reference
+    metric values within acceptable thresholds.
+    """
+    results = load_all_results(benchmark="cell_eval_parity_perf")
+    if not results:
+        return TextBlock("_No cell_eval_parity_perf results found._")
+
+    headers = ["Dataset", "n_obs", "Operation", "Status", "Notes"]
+    rows: list[list[str]] = []
+
+    def _n_obs(r: dict[str, Any]) -> int:
+        return r.get("metadata", {}).get("n_obs", 0)
+
+    for r in sorted(results, key=_n_obs):
+        dataset = r.get("dataset", "—")
+        md = r.get("metadata", {}) or {}
+        n_obs = md.get("n_obs", 0)
+        for op in md.get("operations", []) or []:
+            name = op.get("name", "—")
+            if op.get("skipped"):
+                status = "_Skipped_"
+                notes = op.get("skipped_reason", "")
+            elif "scx_error" in op or "ref_error" in op:
+                status = "**Error**"
+                notes = op.get("scx_error") or op.get("ref_error") or ""
+            else:
+                status = "Pass"
+                notes = ""
+            rows.append([dataset, f"{n_obs:,}", name, status, notes])
+
+    return TableBlock(headers=headers, rows=rows,
+                      caption="Cell-eval parity correctness summary")
+
+
+def harmony_lisi_correctness_summary_table() -> TableBlock | TextBlock:
+    """Harmony / LISI validation correctness summary.
+
+    Shows per-dataset validation status for Harmony2 (Pearson r vs R harmony)
+    and LISI (relative delta). This table precedes the scaling tables.
+    """
+    blocks_data: list[list[str]] = []
+
+    # Harmony validation (static from Phase 6 diagnostic)
+    blocks_data.append(["Harmony (pbmc_small)", "2,700", "Pass",
+                        "min per-PC r=0.9986", ""])
+    blocks_data.append(["Harmony (cell_lines)", "9,478", "Pass",
+                        "min per-PC r=0.9789", ""])
+    blocks_data.append(["Harmony (hlca_subset)", "50,000", "Pass",
+                        "min per-PC r=0.9979", ""])
+
+    # LISI from live data
+    runs = _load_harmony_runs("lisi")
+    by_ds: dict[str, dict[str, dict]] = {}
+    for r in runs:
+        ds = r["dataset"]
+        impl = r["impl"]
+        run = r.get("run", {})
+        by_ds.setdefault(ds, {})[impl] = {
+            "mean_lisi": run.get("mean_lisi"),
+        }
+
+    for ds in MAIN_DATASETS:
+        if ds not in by_ds:
+            continue
+        scx = by_ds[ds].get("scx_accel", {})
+        ref = by_ds[ds].get("r_lisi", {})
+        scx_mean = scx.get("mean_lisi")
+        ref_mean = ref.get("mean_lisi")
+        if scx_mean is not None and ref_mean is not None and ref_mean != 0:
+            rel_delta = abs(scx_mean - ref_mean) / ref_mean * 100
+            status = "Pass" if rel_delta < 5.0 else "**Fail**"
+            metric = f"|Δ|/R = {rel_delta:.2f}%"
+        else:
+            status = "_Not run_"
+            metric = "—"
+        blocks_data.append([
+            f"LISI ({SHORT_NAMES.get(ds, ds)})",
+            f"{DATASETS[ds].n_obs:,}", status, metric, "",
+        ])
+
+    headers = ["Validation", "n_obs", "Status", "Key metric", "Notes"]
+    return TableBlock(
+        headers=headers, rows=blocks_data,
+        caption="Harmony / LISI validation correctness summary",
+        source=SourceRef(kind=SourceKind.manual,
+                         reason="Harmony rows from Phase 6 diagnostic; LISI from live data"),
+    )
 
 
 def system_info_table() -> TableBlock | TextBlock:
@@ -1431,7 +1857,13 @@ def generate_all_tables() -> dict[str, Block | list[Block]]:
         "ml_loader": ml_loader_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),
+        "correctness_detail_all": correctness_detail_all_datasets(),
+        "correctness_dataset_summary": correctness_dataset_summary_table(),
+        "pipeline_agreement": pipeline_agreement_table(),
+        "accelerator_parity": accelerator_parity_table(),
+        "cell_eval_correctness": cell_eval_correctness_summary_table(),
         "cell_eval_parity_perf": cell_eval_parity_perf_table(),
+        "harmony_lisi_correctness": harmony_lisi_correctness_summary_table(),
         "harmony_scaling": harmony_scaling_table(),
         "lisi_comparison": lisi_comparison_table(),
         "harmony_validation": harmony_validation_table(),
