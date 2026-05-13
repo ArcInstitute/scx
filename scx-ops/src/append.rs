@@ -1009,12 +1009,13 @@ fn finalize_append(
 
             let pad = write_alignment_padding(&mut *lock, write_offset)?;
             write_offset += pad as u64;
+            let mt_offset = write_offset;
             let mut mt_buf = Vec::new();
             table.write_to(&mut mt_buf)?;
             lock.write_all(&mt_buf)?;
             let mt_len = mt_buf.len() as u64;
             write_offset += mt_len;
-            (write_offset - mt_len, mt_len)
+            (mt_offset, mt_len)
         } else {
             (
                 prep.header.modality_table_offset,
