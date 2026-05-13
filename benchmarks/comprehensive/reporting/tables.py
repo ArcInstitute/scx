@@ -3,6 +3,11 @@ Generate markdown summary tables from raw benchmark JSON results.
 
 Reads from benchmarks/comprehensive/results/raw/ and produces formatted
 markdown tables for each benchmark dimension.
+
+All table functions consume the shared ``ResultStore`` singleton (Phase 2)
+so that raw JSON is loaded once per report-generation run. The legacy
+``load_all_results`` name is preserved as a thin wrapper around the
+store's compatibility layer.
 """
 
 from __future__ import annotations
@@ -11,7 +16,23 @@ import statistics
 from typing import Any
 
 from benchmarks.comprehensive.config import DATASETS, DatasetConfig
-from benchmarks.comprehensive.results import load_all_results
+from benchmarks.comprehensive.reporting.result_store import get_store
+
+
+def load_all_results(
+    benchmark: str | None = None,
+    format_key: str | None = None,
+    dataset: str | None = None,
+) -> list[dict[str, Any]]:
+    """Legacy wrapper — delegates to the ``ResultStore`` singleton.
+
+    Preserves the exact return type (``list[dict]``) so that every
+    existing table function works unchanged during the Phase 2→3
+    migration window.
+    """
+    return get_store().load_all_results_compat(
+        benchmark=benchmark, format_key=format_key, dataset=dataset,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1187,30 +1208,16 @@ def cell_eval_parity_perf_table() -> str:
 #
 # Harmony and LISI results live outside `RAW_RESULTS_DIR` — they are produced
 # by `benchmarks/scripts/benchmark_harmony.py` / `benchmark_lisi.py` and land
-# in `benchmarks/results/harmony/runs/` as a flat set of JSONs. The helpers
-# below read that directory directly (no dependency on `load_all_results`).
-
-import json as _json
-from pathlib import Path as _Path
-
-from benchmarks.comprehensive.config import PROJECT_ROOT as _PROJECT_ROOT
-
-_HARMONY_RUNS_DIR = _PROJECT_ROOT / "benchmarks" / "results" / "harmony" / "runs"
+# in `benchmarks/results/harmony/runs/` as a flat set of JSONs. As of Phase 2,
+# these are loaded by the ``ResultStore`` alongside raw results.
 
 
 def _load_harmony_runs(bench: str) -> list[dict[str, Any]]:
-    """Load JSON results from the harmony benchmark runs directory."""
-    if not _HARMONY_RUNS_DIR.exists():
-        return []
-    rows = []
-    for p in sorted(_HARMONY_RUNS_DIR.glob("*.json")):
-        try:
-            r = _json.loads(p.read_text())
-        except (OSError, _json.JSONDecodeError):
-            continue
-        if r.get("benchmark") == bench:
-            rows.append(r)
-    return rows
+    """Load JSON results for a harmony benchmark type via the ResultStore."""
+    return [
+        row.raw
+        for row in get_store().by_benchmark(bench)
+    ]
 
 
 def harmony_scaling_table() -> str:
