@@ -788,13 +788,13 @@ impl ScxBackedSparseDataset {
                 (Some(cols), Some(kept)) => {
                     let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: u32 = nnz.iter().sum();
+                    let total: u64 = nnz.iter().map(|&v| v as u64).sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
                 (Some(cols), None) => {
                     let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: u32 = nnz.iter().sum();
+                    let total: u64 = nnz.iter().map(|&v| v as u64).sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
                 (None, Some(kept)) => {

@@ -1305,7 +1305,7 @@ impl BackedCsrReader {
             let csr = self.read_shard_uncached(shard_idx)?;
             let partial = csr.col_nnz();
             for (c, p) in counts.iter_mut().zip(partial.iter()) {
-                *c += p;
+                *c = c.saturating_add(*p);
             }
         }
         Ok(counts)
