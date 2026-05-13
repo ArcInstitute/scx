@@ -72,6 +72,36 @@ saturated by overlapping I/O, decode, and consumption:
 └──────────────────┘                    └──────────────────┘               └───────────────┘
 ```
 
+The following sequence diagram shows how the three stages overlap in time:
+
+```mermaid
+sequenceDiagram
+    participant IO as I/O Thread<br/>(tokio current-thread)
+    participant Dec as Decode Thread<br/>(rayon pool)
+    participant Py as Consumer<br/>(Python / GPU)
+
+    Note over IO,Py: start_epoch() — I/O thread spawned, tokio runtime built
+
+    IO->>IO: madvise(WILLNEED) shard group 0
+    IO->>Dec: ShardGroup 0 (tokio::mpsc, cap=2)
+    IO->>IO: madvise(WILLNEED) shard group 1
+
+    Dec->>Dec: pool.install(par_iter):<br/>decode + scatter + normalize
+    Dec->>Py: Batch 0 (crossbeam, cap=prefetch)
+
+    IO->>Dec: ShardGroup 1
+    Dec->>Dec: decode + scatter + normalize
+    Py->>Py: py.allow_threads()<br/>→ model.forward()
+    Dec->>Py: Batch 1
+
+    IO->>Dec: ShardGroup 2
+    Py->>Py: loss.backward()
+    Dec->>Dec: decode + scatter + normalize
+    Dec->>Py: Batch 2
+
+    Note over IO,Py: Consumer drops batch_rx →<br/>decode's send fails → I/O exits → shutdown
+```
+
 ### Stage 1: I/O (dedicated `std::thread` + tokio current-thread runtime)
 
 The I/O stage runs on a dedicated OS thread (`scx-io`) that builds and drives
