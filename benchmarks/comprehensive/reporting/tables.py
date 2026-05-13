@@ -245,6 +245,302 @@ def _pivot_to_tableblock(
 
 
 # ---------------------------------------------------------------------------
+# Headline derivation helpers (Phase 7)
+# ---------------------------------------------------------------------------
+#
+# These functions compute concrete headline metrics from the result store so
+# that executive summaries, chapter summaries, and commentary blocks use
+# data-derived values instead of hardcoded prose.  If data is unavailable,
+# they return ``None`` and callers fall back to a qualified placeholder.
+
+
+def derive_compression_headlines(
+    datasets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Derive headline compression metrics from raw data.
+
+    Returns a dict with keys:
+      - ``best_format``: format with smallest size on largest dataset
+      - ``best_size``: formatted size string
+      - ``best_ratio_dataset``: dataset where best ratio occurs
+      - ``best_ratio``: float ratio value
+      - ``scx_vs_zarr_census_1m``: (scx_size, zarr_size) pair if available
+      - ``scx_vs_zarr_census_5m``: (scx_ratio, zarr_ratio) pair if available
+    """
+    if datasets is None:
+        datasets = MAIN_DATASETS
+    results = load_all_results(benchmark="compression")
+    pivot = _build_pivot(results, "file_size_bytes", datasets)
+
+    # Find h5ad_none baseline for ratios
+    baseline: dict[str, float] = {}
+    for r in results:
+        if r.get("format") == "h5ad_none" and r.get("dataset") in datasets:
+            baseline[r["dataset"]] = r.get("file_size_bytes", 0)
+
+    out: dict[str, Any] = {}
+
+    # Best format on largest available dataset
+    for target_ds in reversed(datasets):
+        if any(target_ds in pivot.get(f, {}) for f in pivot):
+            col_vals = [
+                (f, pivot[f][target_ds])
+                for f in pivot if pivot[f].get(target_ds) is not None
+            ]
+            if col_vals:
+                best_f, best_v = min(col_vals, key=lambda x: x[1])
+                out["best_format"] = FORMAT_DISPLAY.get(best_f, best_f)
+                out["best_size"] = _fmt_size(best_v)
+                out["best_dataset"] = SHORT_NAMES.get(target_ds, target_ds)
+            break
+
+    # Best compression ratio per dataset
+    best_ratio = 0.0
+    best_ratio_ds = ""
+    for ds in datasets:
+        base = baseline.get(ds)
+        if not base:
+            continue
+        for f in pivot:
+            v = pivot[f].get(ds)
+            if v and v > 0:
+                ratio = base / v
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_ratio_ds = ds
+    if best_ratio > 0:
+        out["best_ratio"] = best_ratio
+        out["best_ratio_dataset"] = SHORT_NAMES.get(best_ratio_ds, best_ratio_ds)
+
+    # SCX auto vs Zarr zstd on specific datasets
+    for ds_key in ["census_1m", "census_5m"]:
+        scx_v = pivot.get("scx_auto", {}).get(ds_key) or pivot.get("scx_zstd", {}).get(ds_key)
+        zarr_v = pivot.get("zarr_zstd", {}).get(ds_key)
+        if scx_v is not None and zarr_v is not None:
+            out[f"scx_vs_zarr_{ds_key}"] = (_fmt_size(scx_v), _fmt_size(zarr_v))
+        # Also ratios
+        base = baseline.get(ds_key)
+        if base and scx_v and zarr_v and scx_v > 0 and zarr_v > 0:
+            out[f"scx_ratio_{ds_key}"] = base / scx_v
+            out[f"zarr_ratio_{ds_key}"] = base / zarr_v
+
+    return out
+
+
+def derive_read_headlines(
+    datasets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Derive headline read performance metrics from raw data.
+
+    Returns a dict with keys:
+      - ``fastest_format``: best format on largest dataset
+      - ``scx_vs_zarr_census_1m``: speedup of SCX over Zarr lz4
+      - ``scx_vs_zarr_census_5m``: speedup of SCX over Zarr lz4
+    """
+    if datasets is None:
+        datasets = MAIN_DATASETS
+    results = load_all_results(benchmark="read_full")
+    pivot = _build_pivot(results, "median_wall_s", datasets)
+    out: dict[str, Any] = {}
+
+    # Find fastest on largest dataset
+    for target_ds in reversed(datasets):
+        col_vals = [
+            (f, pivot[f][target_ds])
+            for f in pivot if pivot[f].get(target_ds) is not None
+        ]
+        if col_vals:
+            best_f, _ = min(col_vals, key=lambda x: x[1])
+            out["fastest_format"] = FORMAT_DISPLAY.get(best_f, best_f)
+            break
+
+    # SCX vs Zarr lz4 speedups
+    for ds_key in ["census_1m", "census_5m"]:
+        scx_fmts = ["scx_auto", "scx_lz4", "scx_zstd"]
+        scx_v = None
+        for sf in scx_fmts:
+            v = pivot.get(sf, {}).get(ds_key)
+            if v is not None:
+                if scx_v is None or v < scx_v:
+                    scx_v = v
+        zarr_v = pivot.get("zarr_lz4", {}).get(ds_key)
+        if scx_v is not None and zarr_v is not None and scx_v > 0:
+            out[f"scx_vs_zarr_{ds_key}"] = zarr_v / scx_v
+
+    return out
+
+
+def derive_selective_read_headlines(
+    datasets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Derive headline selective read metrics from raw data.
+
+    Returns a dict with keys:
+      - ``scx_vs_zarr_census_1m``: speedup of SCX over Zarr on census_1m
+      - ``scx_vs_zarr_census_5m``: speedup of SCX over Zarr on census_5m
+    """
+    if datasets is None:
+        datasets = [d for d in MAIN_DATASETS if d not in ("pbmc3k", "pbmc10k")]
+    results = load_all_results(benchmark="read_selective")
+    pivot = _build_pivot(results, "median_wall_s", datasets)
+    out: dict[str, Any] = {}
+
+    for ds_key in ["census_1m", "census_5m"]:
+        scx_fmts = ["scx_auto", "scx_lz4", "scx_zstd"]
+        scx_v = None
+        for sf in scx_fmts:
+            v = pivot.get(sf, {}).get(ds_key)
+            if v is not None:
+                if scx_v is None or v < scx_v:
+                    scx_v = v
+        zarr_v = pivot.get("zarr_zstd", {}).get(ds_key) or pivot.get("zarr_lz4", {}).get(ds_key)
+        if scx_v is not None and zarr_v is not None and scx_v > 0:
+            out[f"scx_vs_zarr_{ds_key}"] = zarr_v / scx_v
+
+    return out
+
+
+def derive_ml_loader_headlines(
+    datasets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Derive headline ML loader metrics from raw data.
+
+    Returns a dict with keys:
+      - ``scx_best_bps``: best SCX batches/sec value
+      - ``scx_best_dataset``: dataset for best value
+      - ``scx_vs_soma``: speedup over TileDB-SOMA-ML
+    """
+    if datasets is None:
+        datasets = MAIN_DATASETS
+    results = load_all_results(benchmark="ml_loader")
+    out: dict[str, Any] = {}
+
+    # Build per-format per-dataset medians
+    bps_pivot: dict[str, dict[str, float]] = {}
+    for r in results:
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        hvg_vals: list[float] = []
+        for run in r.get("runs", []):
+            if run.get("extra", {}).get("scenario") == "hvg_norm":
+                bps = run["extra"].get("batches_per_sec")
+                if bps is not None:
+                    hvg_vals.append(bps)
+        if not hvg_vals:
+            for run in r.get("runs", []):
+                if run.get("extra", {}).get("scenario") == "raw":
+                    bps = run["extra"].get("batches_per_sec")
+                    if bps is not None:
+                        hvg_vals.append(bps)
+        if hvg_vals:
+            bps_pivot.setdefault(fmt, {})[ds] = statistics.median(hvg_vals)
+
+    # Best SCX batches/sec
+    scx_best = 0.0
+    scx_best_ds = ""
+    for fmt in bps_pivot:
+        if not fmt.startswith("scx_"):
+            continue
+        for ds, val in bps_pivot[fmt].items():
+            if val > scx_best:
+                scx_best = val
+                scx_best_ds = ds
+    if scx_best > 0:
+        out["scx_best_bps"] = scx_best
+        out["scx_best_dataset"] = SHORT_NAMES.get(scx_best_ds, scx_best_ds)
+
+    # SCX vs TileDB-SOMA speedup (same dataset)
+    soma_bps = bps_pivot.get("tiledb_soma", {})
+    for fmt in bps_pivot:
+        if not fmt.startswith("scx_"):
+            continue
+        for ds in bps_pivot[fmt]:
+            soma_v = soma_bps.get(ds)
+            if soma_v is not None and soma_v > 0:
+                speedup = bps_pivot[fmt][ds] / soma_v
+                if "scx_vs_soma" not in out or speedup > out["scx_vs_soma"]:
+                    out["scx_vs_soma"] = speedup
+
+    return out
+
+
+def derive_memory_headlines(
+    datasets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Derive headline memory efficiency metrics from raw data.
+
+    Returns a dict with keys:
+      - ``scx_vs_zarr_ratio``: ratio of Zarr RSS / SCX RSS on best dataset
+    """
+    if datasets is None:
+        datasets = [d for d in MAIN_DATASETS if d not in ("pbmc3k", "pbmc10k", "smartseq2")]
+    results = load_all_results(benchmark="memory")
+    out: dict[str, Any] = {}
+
+    rss_pivot: dict[str, dict[str, float | None]] = {}
+    for r in results:
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        rss = r.get("metadata", {}).get("median_delta_rss_mb_read_full")
+        if rss is not None:
+            rss_pivot.setdefault(fmt, {})[ds] = rss
+
+    # SCX vs Zarr
+    for ds in reversed(datasets):
+        scx_v = rss_pivot.get("scx_auto", {}).get(ds) or rss_pivot.get("scx_zstd", {}).get(ds)
+        zarr_v = rss_pivot.get("zarr_zstd", {}).get(ds) or rss_pivot.get("zarr_lz4", {}).get(ds)
+        if scx_v is not None and zarr_v is not None and scx_v > 0:
+            out["scx_vs_zarr_ratio"] = zarr_v / scx_v
+            break
+
+    return out
+
+
+def collect_manual_sources(store: Any = None) -> list[dict[str, str]]:
+    """Collect all manual and external source references from tables.
+
+    Returns a list of dicts with keys ``source_kind``, ``path``,
+    ``reason``, and ``table``.
+    """
+    if store is None:
+        store = get_store()
+    sources: list[dict[str, str]] = []
+
+    # Check tables that carry SourceRef
+    table_funcs: dict[str, Any] = {
+        "harmony_validation": harmony_validation_table,
+        "harmony_lisi_correctness": harmony_lisi_correctness_summary_table,
+    }
+    for name, func in table_funcs.items():
+        try:
+            block = func()
+            if isinstance(block, TableBlock) and block.source:
+                sources.append({
+                    "table": name,
+                    "source_kind": block.source.kind.value,
+                    "path": block.source.path or "",
+                    "reason": block.source.reason or "",
+                })
+        except Exception:
+            pass
+
+    # External-source rows from the store
+    for row in store.external_sources():
+        sources.append({
+            "table": f"external:{row.benchmark}",
+            "source_kind": row.source.kind.value,
+            "path": row.source.path or "",
+            "reason": row.source.reason or "",
+        })
+
+    return sources
+
+
+# ---------------------------------------------------------------------------
 # Public table generators
 # ---------------------------------------------------------------------------
 
@@ -1612,16 +1908,52 @@ def harmony_lisi_correctness_summary_table() -> TableBlock | TextBlock:
 
     Shows per-dataset validation status for Harmony2 (Pearson r vs R harmony)
     and LISI (relative delta). This table precedes the scaling tables.
+
+    Phase 7: Harmony rows are now sourced from external harmony_integrate
+    JSON when available, falling back to the Phase 6 diagnostic values
+    with explicit ``SourceRef(kind=manual)``.
     """
     blocks_data: list[list[str]] = []
+    source_kind = SourceKind.manual
+    source_reason = "Harmony rows from Phase 6 diagnostic; LISI from live data"
 
-    # Harmony validation (static from Phase 6 diagnostic)
-    blocks_data.append(["Harmony (pbmc_small)", "2,700", "Pass",
-                        "min per-PC r=0.9986", ""])
-    blocks_data.append(["Harmony (cell_lines)", "9,478", "Pass",
-                        "min per-PC r=0.9789", ""])
-    blocks_data.append(["Harmony (hlca_subset)", "50,000", "Pass",
-                        "min per-PC r=0.9979", ""])
+    # Try to source Harmony validation from harmony_integrate runs
+    harmony_runs = _load_harmony_runs("harmony_integrate")
+    harmony_by_ds: dict[str, dict] = {}
+    for r in harmony_runs:
+        ds = r.get("dataset", "")
+        run_data = r.get("run", {})
+        if run_data.get("ok") and run_data.get("min_per_pc_r") is not None:
+            harmony_by_ds[ds] = {
+                "n_obs": r.get("n_obs", 0),
+                "min_r": run_data.get("min_per_pc_r"),
+            }
+
+    # Static fallback data from Phase 6 diagnostic
+    _STATIC_HARMONY = [
+        ("pbmc_small", 2_700, 0.9986),
+        ("cell_lines", 9_478, 0.9789),
+        ("hlca_subset", 50_000, 0.9979),
+    ]
+
+    if harmony_by_ds:
+        source_kind = SourceKind.external_report
+        source_reason = "Harmony from harmony_integrate JSON runs; LISI from live data"
+        for ds, info in sorted(harmony_by_ds.items(), key=lambda x: x[1].get("n_obs", 0)):
+            n_obs = info["n_obs"]
+            min_r = info["min_r"]
+            status = "Pass" if min_r >= 0.97 else "**Fail**"
+            blocks_data.append([
+                f"Harmony ({ds})", f"{n_obs:,}", status,
+                f"min per-PC r={min_r:.4f}", "",
+            ])
+    else:
+        # Fall back to static values with manual source
+        for ds_name, n_obs, min_r in _STATIC_HARMONY:
+            blocks_data.append([
+                f"Harmony ({ds_name})", f"{n_obs:,}", "Pass",
+                f"min per-PC r={min_r:.4f}", "",
+            ])
 
     # LISI from live data
     runs = _load_harmony_runs("lisi")
@@ -1657,8 +1989,7 @@ def harmony_lisi_correctness_summary_table() -> TableBlock | TextBlock:
     return TableBlock(
         headers=headers, rows=blocks_data,
         caption="Harmony / LISI validation correctness summary",
-        source=SourceRef(kind=SourceKind.manual,
-                         reason="Harmony rows from Phase 6 diagnostic; LISI from live data"),
+        source=SourceRef(kind=source_kind, reason=source_reason),
     )
 
 
@@ -1911,15 +2242,47 @@ def lisi_comparison_table() -> TableBlock | TextBlock:
 def harmony_validation_table() -> TableBlock:
     """Per-PC Pearson r vs R harmony on the three validation fixtures.
 
-    Reads the validation fixture + re-runs the Rust pipeline is too heavy
-    for the report pass — instead, read the summary embedded in the runs
-    directory if a precomputed validation JSON is present, otherwise emit a
-    static table sourced from the Phase 6 diagnostic (pyscx/tests/
-    test_harmony_validation.py docstring).
+    Phase 7: attempts to source from harmony_integrate external JSON
+    files first. Falls back to static Phase 6 diagnostic values with
+    explicit ``SourceRef(kind=manual)``.
     """
-    # Static numbers from Phase 6 diagnostic (see pyscx/tests/test_harmony_validation.py).
     headers = ["Dataset", "N", "Batches", "d", "K",
                "min per-PC r", "mean per-PC r", "iter (scx / R)"]
+
+    # Try to source from harmony_integrate runs
+    runs = _load_harmony_runs("harmony_integrate")
+    live_rows: list[list[str]] = []
+    for r in runs:
+        run_data = r.get("run", {})
+        params = r.get("params", {})
+        if not run_data.get("ok"):
+            continue
+        min_r = run_data.get("min_per_pc_r")
+        mean_r = run_data.get("mean_per_pc_r")
+        if min_r is None or mean_r is None:
+            continue
+        scx_iters = run_data.get("n_iterations", "—")
+        r_iters = run_data.get("r_iterations", "—")
+        live_rows.append([
+            r.get("dataset", "—"),
+            f"{r.get('n_obs', 0):,}",
+            str(params.get("n_batches", "—")),
+            str(params.get("n_pcs", "—")),
+            str(params.get("n_clusters", "—")),
+            f"{min_r:.4f}",
+            f"{mean_r:.4f}",
+            f"{scx_iters} / {r_iters}",
+        ])
+
+    if live_rows:
+        return TableBlock(
+            headers=headers, rows=live_rows,
+            caption="Harmony validation — per-PC Pearson r vs R harmony",
+            source=SourceRef(kind=SourceKind.external_report,
+                             reason="from harmony_integrate JSON runs"),
+        )
+
+    # Static fallback from Phase 6 diagnostic (pyscx/tests/test_harmony_validation.py).
     rows = [
         ["pbmc_small (D1)", "2,700", "3", "30", "100",
          "0.9986", "0.9992", "5 / 4"],

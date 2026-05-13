@@ -2,6 +2,10 @@
 Assemble the final comprehensive benchmark report as markdown and PDF.
 
 Pulls data from raw JSON results via the report model and chapter builders.
+
+Phase 7 additions:
+- Lint integration: ``write_reports()`` runs ``collect_warnings()`` and
+  logs them.  With ``strict_lint=True``, exits nonzero on lint failures.
 """
 
 from __future__ import annotations
@@ -91,15 +95,50 @@ def _generate_pdf(md_path: Path, pdf_path: Path) -> None:
         logger.warning("PDF generation failed: %s", exc.stderr.decode(errors="replace"))
 
 
-def write_reports(output_dir: Path | None = None) -> Path:
-    """Generate and write the full benchmark report (markdown + PDF + HTML)."""
+def write_reports(
+    output_dir: Path | None = None,
+    *,
+    strict_lint: bool = False,
+) -> Path:
+    """Generate and write the full benchmark report (markdown + PDF + HTML).
+
+    Parameters
+    ----------
+    output_dir : Path, optional
+        Output directory. Defaults to ``REPORTS_DIR``.
+    strict_lint : bool
+        If ``True``, run report-lint checks and exit nonzero (raise) on
+        any error-level findings.  Manual numeric claims in
+        ``CommentaryBlock`` objects are promoted to errors in strict mode.
+    """
     if output_dir is None:
         output_dir = REPORTS_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
     report_model = generate_report_model()
-    
-    # Write markdown
+
+    # ── Report lint ───────────────────────────────────────────────────
+    from benchmarks.comprehensive.reporting.lint import collect_warnings, LintLevel
+    warnings = collect_warnings(report_model, strict=strict_lint)
+    for w in warnings:
+        log_fn = logger.warning if w.level == LintLevel.warning else (
+            logger.error if w.level == LintLevel.error else logger.info
+        )
+        loc = ""
+        if w.chapter:
+            loc += f"[{w.chapter}]"
+        if w.section:
+            loc += f"[{w.section}]"
+        log_fn("lint %s %s: %s", w.check, loc, w.message)
+
+    errors = [w for w in warnings if w.level == LintLevel.error]
+    if strict_lint and errors:
+        raise SystemExit(
+            f"Report lint failed with {len(errors)} error(s). "
+            "Fix the issues above or remove --strict-lint."
+        )
+
+    # ── Write markdown ────────────────────────────────────────────────
     md_body = MarkdownRenderer().render(report_model)
     md_path = output_dir / "BENCHMARK_REPORT.md"
     md_path.write_text(md_body)
@@ -114,5 +153,22 @@ def write_reports(output_dir: Path | None = None) -> Path:
         write_html_snapshot(report_model, output_dir)
     except Exception as exc:
         logger.warning("HTML snapshot emission failed: %s", exc)
+
+    # ── Write lint warnings to JSON manifest ──────────────────────────
+    if warnings:
+        import json
+        lint_path = output_dir / "LINT_WARNINGS.json"
+        lint_data = [
+            {
+                "level": w.level.value,
+                "check": w.check,
+                "message": w.message,
+                "chapter": w.chapter,
+                "section": w.section,
+            }
+            for w in warnings
+        ]
+        lint_path.write_text(json.dumps(lint_data, indent=2))
+        logger.info("Wrote %d lint warnings to %s", len(warnings), lint_path)
 
     return md_path

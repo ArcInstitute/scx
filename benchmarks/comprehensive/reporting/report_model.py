@@ -28,6 +28,7 @@ class BlockType(str, Enum):
     TABLE = "table"
     FIGURE = "figure"
     CALLOUT = "callout"
+    COMMENTARY = "commentary"
 
 
 @dataclass
@@ -49,6 +50,23 @@ class CalloutBlock(Block):
     content: str
     level: str = "info"  # "info", "warning", "success"
     type: BlockType = field(default=BlockType.CALLOUT, init=False)
+
+
+@dataclass
+class CommentaryBlock(Block):
+    """Manually curated commentary with mandatory source provenance.
+
+    Unlike ``TextBlock``, a ``CommentaryBlock`` *requires* a ``SourceRef``
+    so that report-lint can verify that any numeric claims in the prose
+    are backed by data. Use this for narrative summaries that contain
+    concrete figures (speedups, sizes, counts).
+
+    When ``--strict-lint`` is enabled, the linter will warn on any
+    ``CommentaryBlock`` whose ``source`` is ``SourceKind.manual``.
+    """
+    content: str
+    source: SourceRef | None = None
+    type: BlockType = field(default=BlockType.COMMENTARY, init=False)
 
 
 @dataclass
@@ -152,6 +170,8 @@ class MarkdownRenderer:
             return block.content
         elif isinstance(block, CalloutBlock):
             return f"> **{block.level.capitalize()}**\n> {block.content.replace(chr(10), chr(10) + '> ')}"
+        elif isinstance(block, CommentaryBlock):
+            return self._render_commentary(block)
         elif isinstance(block, TableBlock):
             return self._render_table(block)
         elif isinstance(block, FigureBlock):
@@ -192,6 +212,19 @@ class MarkdownRenderer:
             lines.append("")
             lines.append(f"_Source: {table.source.kind.value}" + (f" ({table.source.path})" if table.source.path else "") + "_")
             
+        return "\n".join(lines)
+
+    def _render_commentary(self, block: CommentaryBlock) -> str:
+        """Render a commentary block with source attribution."""
+        lines = [block.content]
+        if block.source:
+            kind = block.source.kind.value
+            detail = ""
+            if block.source.path:
+                detail += f" ({block.source.path})"
+            if block.source.reason:
+                detail += f" — {block.source.reason}"
+            lines.append(f"\n_Source: {kind}{detail}_")
         return "\n".join(lines)
 
 
@@ -297,6 +330,23 @@ class HtmlRenderer:
         elif isinstance(block, CalloutBlock):
             cls = "callout-warning" if block.level == "warning" else "callout"
             return f'<div class="{cls}">{html.escape(block.content)}</div>'
+
+        elif isinstance(block, CommentaryBlock):
+            text = html.escape(block.content)
+            import re
+            text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
+            text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
+            paragraphs = text.split('\n\n')
+            body = "".join(f"<p>{p}</p>" for p in paragraphs if p.strip())
+            src_html = ""
+            if block.source:
+                src_text = block.source.kind.value
+                if block.source.path:
+                    src_text += f" ({block.source.path})"
+                if block.source.reason:
+                    src_text += f" — {block.source.reason}"
+                src_html = f'<div class="source-ref">Source: {html.escape(src_text)}</div>'
+            return f'<div class="commentary">{body}{src_html}</div>'
             
         elif isinstance(block, TableBlock):
             lines = []
@@ -371,6 +421,12 @@ class JsonManifestRenderer:
                 return {"type": "text", "content": block.content}
             elif isinstance(block, CalloutBlock):
                 return {"type": "callout", "level": block.level, "content": block.content}
+            elif isinstance(block, CommentaryBlock):
+                return {
+                    "type": "commentary",
+                    "content": block.content,
+                    "source": _dump_source(block.source),
+                }
             elif isinstance(block, TableBlock):
                 return {
                     "type": "table",
