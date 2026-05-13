@@ -9,29 +9,10 @@
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 use crate::dispatch::CodecError;
+use crate::median::floor_median_u32;
 
 /// Default block size for Rice coding of values.
 pub const B_VAL: usize = 256;
-
-/// Compute the floor median of a slice of u32 values.
-///
-/// For even length, returns the lower of the two middle values.
-/// For odd length, returns the middle value.
-fn floor_median(values: &[u32]) -> u32 {
-    match values.len() {
-        0 => 0,
-        1 => values[0],
-        n => {
-            let mut sorted = values.to_vec();
-            sorted.sort_unstable();
-            if n % 2 == 0 {
-                sorted[n / 2 - 1]
-            } else {
-                sorted[n / 2]
-            }
-        }
-    }
-}
 
 /// Compute the Rice parameter k from the median of shifted values.
 ///
@@ -60,7 +41,7 @@ pub fn rice_encode(values: &[u32], block_size: usize) -> Result<Vec<u8>, BitStre
         let shifted: Vec<u32> = chunk.iter().map(|&v| v - 1).collect();
 
         // Compute Rice parameter k
-        let median = floor_median(&shifted);
+        let median = floor_median_u32(&shifted);
         let k = compute_k(median);
 
         // Write block header: 1 byte with k in low nibble
@@ -136,27 +117,7 @@ mod tests {
 
     // --- Helper tests ---
 
-    #[test]
-    fn test_floor_median_empty() {
-        assert_eq!(floor_median(&[]), 0);
-    }
-
-    #[test]
-    fn test_floor_median_single() {
-        assert_eq!(floor_median(&[42]), 42);
-    }
-
-    #[test]
-    fn test_floor_median_even() {
-        // [1, 2, 3, 4] → lower middle = sorted[1] = 2
-        assert_eq!(floor_median(&[4, 1, 3, 2]), 2);
-    }
-
-    #[test]
-    fn test_floor_median_odd() {
-        // [1, 2, 3] → middle = sorted[1] = 2
-        assert_eq!(floor_median(&[3, 1, 2]), 2);
-    }
+    // floor_median tests have moved to crate::median::tests
 
     // 3.10: k selection verification
     #[test]
@@ -199,7 +160,7 @@ mod tests {
         let values: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
         // shifted = [0, 1, 2, 3, 4, 5, 6, 7], median=3, k=1
         let shifted: Vec<u32> = values.iter().map(|&v| v - 1).collect();
-        assert_eq!(floor_median(&shifted), 3);
+        assert_eq!(floor_median_u32(&shifted), 3);
         assert_eq!(compute_k(3), 1);
 
         let encoded = rice_encode(&values, B_VAL).unwrap();

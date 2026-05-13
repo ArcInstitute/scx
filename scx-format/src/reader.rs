@@ -1283,7 +1283,9 @@ impl ScxReader {
         }
 
         if essential_failed {
-            return Err(ScxError::ChecksumMismatch);
+            return Err(ScxError::ChecksumMismatch {
+                section: "essential section(s)".to_string(),
+            });
         }
 
         Ok(results)
@@ -1410,7 +1412,9 @@ impl ScxReader {
             let mut computed = [0u8; 8];
             computed.copy_from_slice(&hash.as_bytes()[..8]);
             if computed != sh.checksum {
-                return Err(ScxError::ChecksumMismatch);
+                return Err(ScxError::ChecksumMismatch {
+                    section: format!("shard '{}'", entry.name),
+                });
             }
         }
 
@@ -1986,7 +1990,10 @@ mod tests {
         // validate() should detect the corruption and error (essential section)
         let result = reader.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ScxError::ChecksumMismatch));
+        assert!(matches!(
+            result.unwrap_err(),
+            ScxError::ChecksumMismatch { .. }
+        ));
     }
 
     /// Regression guard for Phase 2A: verified path catches corruption,
@@ -2018,7 +2025,7 @@ mod tests {
         assert!(verified_result.is_err());
         assert!(matches!(
             verified_result.unwrap_err(),
-            ScxError::ChecksumMismatch
+            ScxError::ChecksumMismatch { .. }
         ));
 
         // Unchecked path (default) should not error — it skips the checksum

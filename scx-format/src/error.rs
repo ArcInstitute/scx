@@ -12,8 +12,8 @@ pub enum ScxError {
     #[error("unsupported endianness (only little-endian is supported)")]
     UnsupportedEndian,
 
-    #[error("checksum mismatch")]
-    ChecksumMismatch,
+    #[error("checksum mismatch in section '{section}'")]
+    ChecksumMismatch { section: String },
 
     #[error("invalid shard magic bytes")]
     InvalidShardMagic,

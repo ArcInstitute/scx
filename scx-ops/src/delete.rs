@@ -7,7 +7,7 @@ use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::blake3_hash;
 use scx_format::header::{FileHeader, HEADER_SIZE};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
-use scx_format::section::{align_to_8, SectionType};
+use scx_format::section::{write_alignment_padding, SectionType};
 use scx_format::DeletionVectors;
 
 use crate::checksum::finalize_header_with_checksum;
@@ -93,12 +93,8 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
 
     // Write DV section at EOF
     let file_end = lock.seek(SeekFrom::End(0))?;
-    let aligned_offset = align_to_8(file_end);
-    let pad = (aligned_offset - file_end) as usize;
-    if pad > 0 {
-        lock.write_all(&vec![0u8; pad])?;
-    }
-    let dv_section_offset = aligned_offset;
+    let pad = write_alignment_padding(&mut *lock, file_end)?;
+    let dv_section_offset = file_end + pad as u64;
     lock.write_all(&dv_bytes)?;
     let dv_section_length = dv_bytes.len() as u64;
     let dv_checksum = blake3_hash(&dv_bytes);
@@ -161,12 +157,8 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
 
     lock.seek(SeekFrom::End(0))?;
     let prov_write_offset = lock.stream_position()?;
-    let prov_aligned = align_to_8(prov_write_offset);
-    let prov_pad = (prov_aligned - prov_write_offset) as usize;
-    if prov_pad > 0 {
-        lock.write_all(&vec![0u8; prov_pad])?;
-    }
-    let prov_offset = prov_aligned;
+    let prov_pad = write_alignment_padding(&mut *lock, prov_write_offset)?;
+    let prov_offset = prov_write_offset + prov_pad as u64;
     lock.write_all(&prov_bytes)?;
     let prov_length = prov_bytes.len() as u64;
     let prov_checksum = blake3_hash(&prov_bytes);
@@ -191,11 +183,9 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     };
 
     // Write new catalog at current EOF
-    let catalog_start = align_to_8(lock.seek(SeekFrom::End(0))?);
-    let pad2 = (catalog_start - lock.seek(SeekFrom::End(0))?) as usize;
-    if pad2 > 0 {
-        lock.write_all(&vec![0u8; pad2])?;
-    }
+    let eof = lock.seek(SeekFrom::End(0))?;
+    let pad2 = write_alignment_padding(&mut *lock, eof)?;
+    let catalog_start = eof + pad2 as u64;
     let mut catalog_buf = Vec::new();
     new_catalog.write_to(&mut catalog_buf)?;
     lock.write_all(&catalog_buf)?;

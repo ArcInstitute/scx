@@ -472,7 +472,7 @@ fn test_18_4_corrupt_shard_payload() {
     let result = reader.validate();
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), ScxError::ChecksumMismatch),
+        matches!(result.unwrap_err(), ScxError::ChecksumMismatch { .. }),
         "expected ChecksumMismatch error"
     );
 }

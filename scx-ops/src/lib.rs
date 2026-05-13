@@ -4,6 +4,7 @@ pub mod compact;
 pub mod delete;
 pub mod error;
 pub mod flock;
+pub mod helpers;
 pub mod merge;
 pub mod rollback;
 

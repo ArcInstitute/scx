@@ -1,6 +1,7 @@
 // Auto-codec selection based on value distribution
 
 use crate::modality::ModalityType;
+use scx_codec::floor_median_u32;
 use scx_codec::{CodecId, ValueEncoding};
 
 /// Codec selection profile for user-facing codec choice.
@@ -14,15 +15,6 @@ pub enum CodecProfile {
     Compact,
     /// Force the domain-specific Scx1 codec (integer only).
     Scx1,
-}
-
-/// Compute floor median of a u32 slice. Returns 0 for empty input.
-fn floor_median_u32(values: &mut [u32]) -> u32 {
-    if values.is_empty() {
-        return 0;
-    }
-    values.sort_unstable();
-    values[values.len() / 2]
 }
 
 /// Select codec using a profile hint.
@@ -74,7 +66,7 @@ pub fn select_codec(raw_values: &[u8], value_encoding: ValueEncoding) -> CodecId
             let sample_count = n_values.min(10_000);
             let sample_bytes = sample_count * bw;
 
-            let mut sample: Vec<u32> = match value_encoding {
+            let sample: Vec<u32> = match value_encoding {
                 ValueEncoding::Uint8 => raw_values[..sample_bytes]
                     .iter()
                     .map(|&b| b as u32)
@@ -90,7 +82,7 @@ pub fn select_codec(raw_values: &[u8], value_encoding: ValueEncoding) -> CodecId
                 _ => unreachable!(),
             };
 
-            let median = floor_median_u32(&mut sample);
+            let median = floor_median_u32(&sample);
 
             if median <= 8 {
                 CodecId::Scx1
@@ -186,14 +178,15 @@ mod tests {
 
     #[test]
     fn test_floor_median() {
-        let mut vals = vec![5, 1, 3, 2, 4];
-        assert_eq!(floor_median_u32(&mut vals), 3);
+        let vals = vec![5, 1, 3, 2, 4];
+        assert_eq!(floor_median_u32(&vals), 3);
 
-        let mut vals2 = vec![10, 20, 30, 40];
-        assert_eq!(floor_median_u32(&mut vals2), 30);
+        let vals2 = vec![10, 20, 30, 40];
+        // Standardized: even-length returns lower middle (20), not upper (30)
+        assert_eq!(floor_median_u32(&vals2), 20);
 
-        let mut empty: Vec<u32> = vec![];
-        assert_eq!(floor_median_u32(&mut empty), 0);
+        let empty: Vec<u32> = vec![];
+        assert_eq!(floor_median_u32(&empty), 0);
     }
 
     #[test]

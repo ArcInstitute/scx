@@ -8,26 +8,7 @@ use std::io::Cursor;
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 use crate::dispatch::CodecError;
-
-/// Compute the floor median of a slice of u64 values.
-///
-/// For even length, returns the lower of the two middle values.
-/// For odd length, returns the middle value.
-fn floor_median_u64(values: &[u64]) -> u64 {
-    match values.len() {
-        0 => 0,
-        1 => values[0],
-        n => {
-            let mut sorted = values.to_vec();
-            sorted.sort_unstable();
-            if n % 2 == 0 {
-                sorted[n / 2 - 1]
-            } else {
-                sorted[n / 2]
-            }
-        }
-    }
-}
+use crate::median::floor_median_u64;
 
 /// Compute the Rice parameter k from the median of delta values.
 ///
@@ -155,25 +136,7 @@ mod tests {
 
     // --- Helper tests ---
 
-    #[test]
-    fn test_floor_median_u64_empty() {
-        assert_eq!(floor_median_u64(&[]), 0);
-    }
-
-    #[test]
-    fn test_floor_median_u64_single() {
-        assert_eq!(floor_median_u64(&[42]), 42);
-    }
-
-    #[test]
-    fn test_floor_median_u64_even() {
-        assert_eq!(floor_median_u64(&[4, 1, 3, 2]), 2);
-    }
-
-    #[test]
-    fn test_floor_median_u64_odd() {
-        assert_eq!(floor_median_u64(&[3, 1, 2]), 2);
-    }
+    // floor_median_u64 tests have moved to crate::median::tests
 
     #[test]
     fn test_compute_k() {

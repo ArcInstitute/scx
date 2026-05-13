@@ -470,7 +470,9 @@ impl FullCatalog {
     /// where catalog integrity is assumed.
     pub fn read_from<R: Read>(r: &mut R, total_len: usize, verify_checksum: bool) -> Result<Self> {
         if total_len < 32 {
-            return Err(ScxError::ChecksumMismatch);
+            return Err(ScxError::ChecksumMismatch {
+                section: "full_catalog (too short)".to_string(),
+            });
         }
 
         let mut all_bytes = vec![0u8; total_len];
@@ -483,7 +485,9 @@ impl FullCatalog {
             let expected_checksum = &all_bytes[payload_len..];
             let computed = blake3_hash(payload);
             if computed[..] != *expected_checksum {
-                return Err(ScxError::ChecksumMismatch);
+                return Err(ScxError::ChecksumMismatch {
+                    section: "full_catalog".to_string(),
+                });
             }
         }
 
@@ -1178,7 +1182,7 @@ mod tests {
         let total_len = buf.len();
         let mut cursor = Cursor::new(&buf);
         let err = FullCatalog::read_from(&mut cursor, total_len, true).unwrap_err();
-        assert!(matches!(err, ScxError::ChecksumMismatch));
+        assert!(matches!(err, ScxError::ChecksumMismatch { .. }));
     }
 
     /// 9.15: Empty catalog (0 entries) round-trip

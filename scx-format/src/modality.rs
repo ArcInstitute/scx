@@ -314,7 +314,9 @@ impl ModalityTable {
         let on_disk_checksum = &all_bytes[payload_len..];
         let computed_full = blake3_hash(payload);
         if computed_full[..4] != *on_disk_checksum {
-            return Err(ScxError::ChecksumMismatch);
+            return Err(ScxError::ChecksumMismatch {
+                section: "modality_table".to_string(),
+            });
         }
 
         let mut cur = std::io::Cursor::new(payload);
@@ -476,7 +478,7 @@ mod tests {
         buf[10] ^= 0xFF;
         let mut cur = Cursor::new(&buf);
         let err = ModalityTable::read_from(&mut cur, buf.len()).unwrap_err();
-        assert!(matches!(err, ScxError::ChecksumMismatch));
+        assert!(matches!(err, ScxError::ChecksumMismatch { .. }));
     }
 
     #[test]
