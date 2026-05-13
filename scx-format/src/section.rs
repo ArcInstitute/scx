@@ -64,11 +64,6 @@ impl SectionType {
             _ => None,
         }
     }
-
-    /// Returns true if `v` is a known section type ID (0..=19).
-    pub fn is_known(v: u8) -> bool {
-        v <= 19
-    }
 }
 
 /// Round `offset` up to the next 8-byte boundary.
@@ -124,15 +119,6 @@ mod tests {
     fn section_type_from_u8_unknown() {
         assert_eq!(SectionType::from_u8(20), None);
         assert_eq!(SectionType::from_u8(255), None);
-    }
-
-    #[test]
-    fn section_type_is_known() {
-        for v in 0..=19 {
-            assert!(SectionType::is_known(v));
-        }
-        assert!(!SectionType::is_known(20));
-        assert!(!SectionType::is_known(255));
     }
 
     #[test]

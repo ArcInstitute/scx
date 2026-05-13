@@ -28,14 +28,17 @@ use scx_format::DeletionVectors;
 struct ExecutionPlan {
     candidate_shards: Vec<ShardCandidate>,
     obs_predicates: Vec<Predicate>,
+    /// Stored for future var-level pushdown; not yet consumed at execution time.
     #[allow(dead_code)]
     var_predicates: Vec<Predicate>,
     gene_indices: Option<Vec<u32>>,
     normalize: Option<f64>,
     log1p: bool,
     limit: Option<usize>,
-    #[allow(dead_code)] // used when index-level pushdown is wired in
+    /// Stored for future obs index-level pushdown; not yet consumed from struct.
+    #[allow(dead_code)]
     obs_predicate_index: Option<PredicateIndex>,
+    /// Stored for future var-level index pushdown; not yet consumed.
     #[allow(dead_code)]
     var_predicate_index: Option<PredicateIndex>,
     deletion_vectors: Option<DeletionVectors>,

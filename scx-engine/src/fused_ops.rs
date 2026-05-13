@@ -331,7 +331,7 @@ pub fn streaming_save_layer(
 
         let out_indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
         let out_indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
-        let out_values = encode_f32_values(&csr.data, layer_encoding);
+        let out_values = encode_f32_values(&csr.data, layer_encoding)?;
 
         let row_start = shard_entry.stats.as_ref().map_or(0u64, |s| s.row_start);
         writer.write_layer_csr_shard(
@@ -377,39 +377,37 @@ pub fn streaming_save_layer(
 }
 
 /// Encode f32 values to raw LE bytes for the given value encoding.
-fn encode_f32_values(data: &[f32], encoding: scx_codec::ValueEncoding) -> Vec<u8> {
+fn encode_f32_values(data: &[f32], encoding: scx_codec::ValueEncoding) -> crate::Result<Vec<u8>> {
     use byteorder::{LittleEndian, WriteBytesExt};
     match encoding {
-        scx_codec::ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
+        scx_codec::ValueEncoding::Uint8 => Ok(data.iter().map(|&v| v as u8).collect()),
         scx_codec::ValueEncoding::Uint16 => {
             let mut buf = Vec::with_capacity(data.len() * 2);
             for &v in data {
                 buf.write_u16::<LittleEndian>(v as u16).unwrap();
             }
-            buf
+            Ok(buf)
         }
         scx_codec::ValueEncoding::Uint32 => {
             let mut buf = Vec::with_capacity(data.len() * 4);
             for &v in data {
                 buf.write_u32::<LittleEndian>(v as u32).unwrap();
             }
-            buf
+            Ok(buf)
         }
         scx_codec::ValueEncoding::Float32 => {
             let mut buf = Vec::with_capacity(data.len() * 4);
             for &v in data {
                 buf.write_f32::<LittleEndian>(v).unwrap();
             }
-            buf
+            Ok(buf)
         }
-        scx_codec::ValueEncoding::Float16 => {
-            // Float16 encoding is not yet supported. Callers should transcode
-            // to Float32 and update the encoding flag before reaching this point.
-            panic!(
-                "Float16 value encoding is not yet supported in encode_f32_values. \
-                 Transcode to Float32 before calling."
-            );
-        }
+        scx_codec::ValueEncoding::Float16 => Err(crate::EngineError::SchemaError {
+            column: "layer_values".to_string(),
+            reason: "Float16 value encoding is not yet supported in \
+                     encode_f32_values; transcode to Float32 before calling"
+                .to_string(),
+        }),
     }
 }
 

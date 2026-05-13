@@ -540,10 +540,20 @@ impl FullCatalog {
                 None
             };
 
-            // Skip unknown section types (forward-compatibility)
+            // Skip unknown section types (forward-compatibility) with a
+            // warning, matching the spec requirement that readers skip
+            // unrecognised types rather than failing.
             let section_type = match SectionType::from_u8(section_type_raw) {
                 Some(st) => st,
-                None => continue,
+                None => {
+                    log::warn!(
+                        "skipping unknown section type {} (name: '{}') at offset {}",
+                        section_type_raw,
+                        name,
+                        offset,
+                    );
+                    continue;
+                }
             };
 
             // v1 → v2 axis-overload reconciliation for CSC entries:

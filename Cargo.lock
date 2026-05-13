@@ -3473,6 +3473,7 @@ dependencies = [
  "criterion",
  "half",
  "libc",
+ "log",
  "lru",
  "memmap2",
  "proptest",

@@ -287,24 +287,11 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(preprocess::save_layer, m)?)?;
 
     // File operations (scx-ops)
-    m.add_function(wrap_pyfunction!(ops::append, m)?)?;
-    m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
-    m.add_function(wrap_pyfunction!(ops::mark_deleted, m)?)?;
-    m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
-    m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
-    m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
+    register_ops(m)?;
 
     // Cloud operations (optional, behind "cloud" feature)
     #[cfg(feature = "cloud")]
-    {
-        m.add_function(wrap_pyfunction!(cloud::pull, m)?)?;
-        m.add_function(wrap_pyfunction!(cloud::push, m)?)?;
-        m.add_function(wrap_pyfunction!(cloud::cloud_optimize, m)?)?;
-        m.add_function(wrap_pyfunction!(cloud::explode, m)?)?;
-        m.add_function(wrap_pyfunction!(cloud::pack, m)?)?;
-        m.add_function(wrap_pyfunction!(cloud::open_cloud, m)?)?;
-        m.add_class::<cloud::PyCloudExperiment>()?;
-    }
+    register_cloud(m)?;
 
     // Classes
     m.add_class::<PyExperiment>()?;
@@ -521,5 +508,27 @@ fn register_eval_metrics(m: &Bound<'_, PyModule>) -> PyResult<()> {
         accel::eval_metrics::adjusted_rand_index,
         m
     )?)?;
+    Ok(())
+}
+
+fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(ops::append, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::mark_deleted, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
+    Ok(())
+}
+
+#[cfg(feature = "cloud")]
+fn register_cloud(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(cloud::pull, m)?)?;
+    m.add_function(wrap_pyfunction!(cloud::push, m)?)?;
+    m.add_function(wrap_pyfunction!(cloud::cloud_optimize, m)?)?;
+    m.add_function(wrap_pyfunction!(cloud::explode, m)?)?;
+    m.add_function(wrap_pyfunction!(cloud::pack, m)?)?;
+    m.add_function(wrap_pyfunction!(cloud::open_cloud, m)?)?;
+    m.add_class::<cloud::PyCloudExperiment>()?;
     Ok(())
 }
