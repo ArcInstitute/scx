@@ -81,7 +81,7 @@ benchmarks/
 │   │   ├── cloud_{push,pull,read,metadata,filtered,large_atlas,reader_vs_pull}.py, cost_model.py
 │   │   └── cell_eval_parity_perf.py, _pert_synth.py        # perturbation / cell-eval parity
 │   ├── reporting/                       # Report generation (markdown, plots, tables, dashboard)
-│   │   └── markdown.py, plots.py, tables.py, dashboard.py, landing.py, style.py
+│   │   └── report_cli.py, markdown.py, plots.py, tables.py, dashboard.py, lint.py, landing.py, style.py
 │   ├── scripts/                         # Orchestrators and SLURM launchers
 │   │   ├── run_all.py                   # Serial benchmark orchestrator
 │   │   ├── run_parallel.py              # Parallel SLURM launcher via submitit
@@ -778,6 +778,68 @@ To list comprehensive results:
 ls benchmarks/comprehensive/results/raw/*.json | wc -l   # ~500 results
 ls benchmarks/comprehensive/results/raw/*census_1m*       # D6 results
 ```
+
+---
+
+## Report Generation
+
+The benchmark report is generated from raw JSON results via a structured
+pipeline (report model → section builders → lint → renderers). All report
+generation uses the `report_cli.py` entry point:
+
+```bash
+# Generate the full report (markdown + HTML + PDF) from default results
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate
+
+# Generate with strict lint (errors on manual-source numeric claims)
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate --strict-lint
+
+# Generate with public profile (blocks internal Phase N labels)
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate --profile public
+
+# Point at a different results directory
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate \
+    --results-dir /path/to/results/raw --output-dir /path/to/reports
+
+# Save a timestamped snapshot alongside the report
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate \
+    --snapshot-dir benchmarks/comprehensive/results/reports/snapshot_$(date +%Y%m%d)
+
+# Choose specific output formats (md, html, pdf, json)
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate \
+    --format md --format html --format json
+
+# Lint-only mode (no files written)
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli lint
+PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli lint --strict
+```
+
+### Profiles
+
+| Profile | Description |
+|---------|-------------|
+| `default` | Full engineering report with all sections. |
+| `public` | Public-facing report. Internal phase labels in headings produce lint errors. |
+| `engineering` | Engineering report with internal phase labels allowed. |
+
+### Output Artifacts
+
+| File | Description |
+|------|-------------|
+| `BENCHMARK_REPORT.md` | Primary report (GitHub Flavored Markdown). |
+| `BENCHMARK_REPORT.html` | Semantic HTML snapshot with ToC and styling. |
+| `BENCHMARK_REPORT.pdf` | PDF via pandoc (requires `pandoc` + `xelatex`). |
+| `BENCHMARK_REPORT.json` | Machine-readable JSON manifest of the report AST. |
+| `LINT_WARNINGS.json` | Lint findings from the most recent generation. |
+| `dashboard_history.json` | Rolling dashboard snapshot history. |
+| `figures/*.png` | Publication-quality plot PNGs. |
+| `figures/*.provenance.json` | Per-figure provenance sidecars (source benchmark, timestamp, SHA-256). |
+
+### Legacy compatibility
+
+The `write_reports()` function in `reporting/markdown.py` remains as a
+compatibility wrapper. New integrations should use `report_cli.py` or
+the `build_report()` function in `reporting/report_cli.py` directly.
 
 ---
 

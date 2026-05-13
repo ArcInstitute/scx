@@ -1,19 +1,15 @@
 """
-Minimal HTML snapshot renderer (Phase G.4).
+HTML snapshot renderer for the rolling dashboard.
 
-Wraps the markdown body produced by ``markdown.generate_report()`` in a
-self-contained HTML5 shell. No jinja2 / templating dependency — the
-skeleton is a Python string literal and the markdown body is escaped +
-embedded as a ``<pre>`` block with anchor targets parsed from the
-``##`` / ``###`` headings so in-page navigation works.
+Delegates to the semantic ``HtmlRenderer`` from the report model.
+The rendered output is a full HTML5 document with navigable heading
+anchors, styled tables with ``<thead>``/``<tbody>``/``<caption>``,
+and a "← previous snapshot" link threaded through
+``dashboard_history.json``.
 
-The design goal is intentionally minimal: the markdown report is the
-authoritative artifact; the HTML is a browsable snapshot that makes
-rolling-dashboard navigation possible (via the previous-snapshot link
-threaded through ``dashboard_history.json``). A richer rendering — real
-markdown → HTML, syntax highlighting, trend charts — is Phase I.7
-territory; Phase G.4 just lands the link structure so trend work is a
-drop-in later.
+Phase 9 update: ``publish_dashboard.py`` now publishes
+``BENCHMARK_REPORT.json`` (the JSON manifest) and
+``LINT_WARNINGS.json`` alongside the HTML/MD/PDF outputs.
 """
 
 from __future__ import annotations

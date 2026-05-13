@@ -104,15 +104,47 @@ def _setup_style():
     })
 
 
-def _save_fig(fig: plt.Figure, name: str, output_dir: Path | None = None):
-    """Save figure as PNG and PDF."""
+def _save_fig(
+    fig: plt.Figure,
+    name: str,
+    output_dir: Path | None = None,
+    *,
+    source_benchmark: str | None = None,
+    source_datasets: list[str] | None = None,
+):
+    """Save figure as PNG and PDF, plus a provenance JSON sidecar.
+
+    The provenance file records the benchmark source, datasets, and
+    generation timestamp so the report pipeline can verify figure
+    freshness and trace data lineage.
+    """
+    import datetime
+    import hashlib
+    import json
+
     if output_dir is None:
         output_dir = FIGURES_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_dir / f"{name}.png", bbox_inches="tight")
-    fig.savefig(output_dir / f"{name}.pdf", bbox_inches="tight")
+
+    png_path = output_dir / f"{name}.png"
+    pdf_path = output_dir / f"{name}.pdf"
+    fig.savefig(png_path, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved {name}.png and {name}.pdf")
+
+    # Write provenance sidecar
+    provenance = {
+        "figure": name,
+        "files": [f"{name}.png", f"{name}.pdf"],
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source_benchmark": source_benchmark,
+        "source_datasets": source_datasets,
+        "png_sha256": hashlib.sha256(png_path.read_bytes()).hexdigest(),
+    }
+    prov_path = output_dir / f"{name}.provenance.json"
+    prov_path.write_text(json.dumps(provenance, indent=2))
+
 
 
 def plot_is_stale(name: str, output_dir: Path | None = None) -> bool:
