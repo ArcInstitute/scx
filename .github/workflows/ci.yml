@@ -10,6 +10,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  build-cpu-only:
+    name: Build (CPU-only workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Validates that the entire workspace — including scx-gpu (cudarc) —
+      # compiles on machines without CUDA installed. GPU tests gracefully
+      # skip at runtime via require_gpu!().
+      - name: Verify CPU-only workspace build
+        run: cargo build --workspace --exclude rscx
+
   test:
     name: Test
     runs-on: ubuntu-latest
