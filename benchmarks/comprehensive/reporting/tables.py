@@ -16,7 +16,9 @@ import statistics
 from typing import Any
 
 from benchmarks.comprehensive.config import DATASETS, DatasetConfig
-from benchmarks.comprehensive.reporting.result_store import get_store
+from benchmarks.comprehensive.config import DATASETS, DatasetConfig
+from benchmarks.comprehensive.reporting.result_store import get_store, SourceRef, SourceKind
+from benchmarks.comprehensive.reporting.report_model import TableBlock, TextBlock, Block
 
 
 def load_all_results(
@@ -82,7 +84,7 @@ FORMAT_DISPLAY = {
 }
 
 
-def _fmt_size(nbytes: float | None) -> str:
+def _fmt_size(nbytes: float | None) -> Block:
     """Format byte count as human-readable size."""
     if nbytes is None:
         return "—"
@@ -96,7 +98,7 @@ def _fmt_size(nbytes: float | None) -> str:
         return f"{nbytes / 1024 ** 3:.2f} GB"
 
 
-def _fmt_time(seconds: float | None) -> str:
+def _fmt_time(seconds: float | None) -> Block:
     """Format seconds as human-readable time."""
     if seconds is None:
         return "—"
@@ -112,7 +114,7 @@ def _fmt_time(seconds: float | None) -> str:
         return f"{seconds / 3600:.1f}h"
 
 
-def _fmt_mem(mb: float | None) -> str:
+def _fmt_mem(mb: float | None) -> Block:
     """Format memory in MB as human-readable."""
     if mb is None:
         return "—"
@@ -122,7 +124,7 @@ def _fmt_mem(mb: float | None) -> str:
         return f"{mb / 1024:.1f} GB"
 
 
-def _fmt_num(val: float | None, decimals: int = 1) -> str:
+def _fmt_num(val: float | None, decimals: int = 1) -> Block:
     """Format a number."""
     if val is None:
         return "—"
@@ -175,28 +177,33 @@ def _build_pivot(
     return pivot
 
 
-def _pivot_to_table(
+def _pivot_to_tableblock(
     pivot: dict[str, dict[str, float | None]],
     datasets: list[str],
     formatter: callable,
     bold_best: str = "min",
     title: str = "Format",
-) -> str:
-    """Render a pivot dict as a markdown table.
+    caption: str | None = None,
+    wide: bool = False,
+) -> TableBlock:
+    """Construct a ``TableBlock`` directly from a pivot dict.
+
+    This replaces the legacy ``_pivot_to_table`` → ``_lines_to_block``
+    round-trip with direct ``TableBlock`` construction, preserving the
+    bold-best logic as markdown ``**…**`` in cell strings.
 
     Parameters
     ----------
     pivot : format -> dataset -> value
     datasets : column order
     formatter : function to format values
-    bold_best : "min" to bold the minimum per column, "max" for max, None for none
-    title : first column header
+    bold_best : ``"min"`` to bold the minimum per column, ``"max"`` for
+        maximum, ``None`` for no bolding
+    title : first column header (default ``"Format"``)
+    caption : optional table caption
+    wide : if ``True``, hint renderers to use wide-table layout
     """
-    headers = [SHORT_NAMES.get(d, d) for d in datasets]
-    lines = [
-        f"| {title} | " + " | ".join(headers) + " |",
-        "|---|" + "|".join(["---:" for _ in datasets]) + "|",
-    ]
+    headers = [title] + [SHORT_NAMES.get(d, d) for d in datasets]
 
     # Determine best per column
     best_per_col: dict[str, float | None] = {}
@@ -216,10 +223,11 @@ def _pivot_to_table(
         key=lambda f: FORMAT_ORDER.index(f) if f in FORMAT_ORDER else 999,
     )
 
+    rows: list[list[str]] = []
     for fmt in sorted_fmts:
         row = pivot[fmt]
         display = FORMAT_DISPLAY.get(fmt, fmt)
-        cells = []
+        cells = [display]
         for ds in datasets:
             v = row.get(ds)
             cell = formatter(v)
@@ -231,25 +239,28 @@ def _pivot_to_table(
             ):
                 cell = f"**{cell}**"
             cells.append(cell)
-        lines.append(f"| {display} | " + " | ".join(cells) + " |")
+        rows.append(cells)
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows, caption=caption, wide=wide)
 
 
 # ---------------------------------------------------------------------------
 # Public table generators
 # ---------------------------------------------------------------------------
 
-def compression_table(datasets: list[str] | None = None) -> str:
+def compression_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate compression matrix: Format x Dataset showing file size."""
     if datasets is None:
         datasets = MAIN_DATASETS
     results = load_all_results(benchmark="compression")
     pivot = _build_pivot(results, "file_size_bytes", datasets)
-    return _pivot_to_table(pivot, datasets, _fmt_size, bold_best="min")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_size, bold_best="min",
+        caption="File sizes by format and dataset",
+    )
 
 
-def compression_ratio_table(datasets: list[str] | None = None) -> str:
+def compression_ratio_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate compression ratio matrix: Format x Dataset showing ratio vs h5ad_none."""
     if datasets is None:
         datasets = MAIN_DATASETS
@@ -281,37 +292,49 @@ def compression_ratio_table(datasets: list[str] | None = None) -> str:
             return "—"
         return f"{v:.2f}x"
 
-    return _pivot_to_table(pivot, datasets, fmt_ratio, bold_best="max")
+    return _pivot_to_tableblock(
+        pivot, datasets, fmt_ratio, bold_best="max",
+        caption="Compression ratio vs uncompressed h5ad by format and dataset",
+    )
 
 
-def read_speed_table(datasets: list[str] | None = None) -> str:
+def read_speed_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate read speed matrix: Format x Dataset showing median read time."""
     if datasets is None:
         datasets = MAIN_DATASETS
     results = load_all_results(benchmark="read_full")
     pivot = _build_pivot(results, "median_wall_s", datasets)
-    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min",
+        caption="Median full-read wall time by format and dataset",
+    )
 
 
-def read_selective_table(datasets: list[str] | None = None) -> str:
+def read_selective_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate selective read table: Format x Dataset showing column projection time."""
     if datasets is None:
         datasets = [d for d in MAIN_DATASETS if d != "pbmc3k" and d != "pbmc10k"]
     results = load_all_results(benchmark="read_selective")
     pivot = _build_pivot(results, "median_wall_s", datasets)
-    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min",
+        caption="Median selective-read (column projection) wall time by format and dataset",
+    )
 
 
-def write_speed_table(datasets: list[str] | None = None) -> str:
+def write_speed_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate write speed matrix: Format x Dataset showing conversion time."""
     if datasets is None:
         datasets = MAIN_DATASETS
     results = load_all_results(benchmark="write")
     pivot = _build_pivot(results, "median_wall_s", datasets)
-    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min",
+        caption="Median write/conversion wall time by format and dataset",
+    )
 
 
-def memory_table(datasets: list[str] | None = None) -> str:
+def memory_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate memory matrix: Format x Dataset showing peak RSS."""
     if datasets is None:
         datasets = [d for d in MAIN_DATASETS if d not in ("pbmc3k", "pbmc10k", "smartseq2")]
@@ -336,24 +359,28 @@ def memory_table(datasets: list[str] | None = None) -> str:
                 rss = statistics.median(run["peak_rss_mb"] for run in read_full_runs)
         pivot.setdefault(fmt, {})[ds] = rss
 
-    return _pivot_to_table(pivot, datasets, _fmt_mem, bold_best="min")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_mem, bold_best="min",
+        caption="Median peak RSS (delta) during full read by format and dataset",
+    )
 
 
-def parallel_scaling_table(datasets: list[str] | None = None) -> str:
-    """Generate parallel scaling table: Format x Thread count showing wall time and speedup."""
+def parallel_scaling_table(datasets: list[str] | None = None) -> list[Block]:
+    """Generate parallel scaling table: Format x Thread count showing wall time and speedup.
+
+    Returns a list of blocks — one ``TextBlock`` header + ``TableBlock`` per dataset.
+    """
     if datasets is None:
         datasets = ["census_500k", "census_1m", "census_5m"]
     results = load_all_results(benchmark="parallel_scaling")
 
-    lines = []
+    thread_cols = ["1 thread", "2 threads", "4 threads", "8 threads",
+                   "16 threads", "32 threads", "Max speedup"]
+    blocks: list[Block] = []
     for ds in datasets:
         ds_results = [r for r in results if r.get("dataset") == ds]
         if not ds_results:
             continue
-
-        lines.append(f"\n**{SHORT_NAMES.get(ds, ds)}**\n")
-        lines.append("| Format | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads | Max speedup |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
 
         sorted_results = sorted(
             ds_results,
@@ -361,13 +388,14 @@ def parallel_scaling_table(datasets: list[str] | None = None) -> str:
             if r.get("format", "") in FORMAT_ORDER else 999,
         )
 
+        rows: list[list[str]] = []
         for r in sorted_results:
             fmt = r.get("format", "")
             display = FORMAT_DISPLAY.get(fmt, fmt)
             scaling = r.get("metadata", {}).get("scaling_wall_s", {})
             speedup = r.get("metadata", {}).get("speedup", {})
 
-            cells = []
+            cells = [display]
             for t in ["1", "2", "4", "8", "16", "32"]:
                 wall = scaling.get(t)
                 spd = speedup.get(t)
@@ -381,14 +409,19 @@ def parallel_scaling_table(datasets: list[str] | None = None) -> str:
 
             max_spd = max(speedup.values()) if speedup else None
             cells.append(f"{max_spd:.1f}x" if max_spd else "—")
-            lines.append(f"| {display} | " + " | ".join(cells) + " |")
+            rows.append(cells)
 
-    return "\n".join(lines)
+        blocks.append(TableBlock(
+            headers=["Format"] + thread_cols, rows=rows,
+            caption=f"Parallel read scaling — {SHORT_NAMES.get(ds, ds)}",
+        ))
+
+    return blocks or [TextBlock("*No parallel scaling results available.*")]
 
 
 def scx_parallel_write_callout_table(
     datasets: list[str] | None = None,
-) -> str:
+) -> TableBlock | TextBlock:
     """Compact SCX-only 1T → 32T → speedup table for the Write Performance section.
 
     Pulled from the `parallel_write_scaling` results, `full` mode only (the
@@ -402,23 +435,20 @@ def scx_parallel_write_callout_table(
         datasets = ["census_500k", "census_1m"]
     results = load_all_results(benchmark="parallel_write_scaling")
     if not results:
-        return "*No parallel write scaling results available yet.*"
+        return TextBlock("*No parallel write scaling results available yet.*")
 
     # Keep SCX rows only; other formats do not parallelise at all.
     scx_formats = [f for f in FORMAT_ORDER if f.startswith("scx_")]
 
-    header_cells = ["Format"]
+    headers = ["Format"]
     for ds in datasets:
-        header_cells += [
+        headers += [
             f"{SHORT_NAMES.get(ds, ds)} @1T",
             f"{SHORT_NAMES.get(ds, ds)} @32T",
             f"{SHORT_NAMES.get(ds, ds)} Δ",
         ]
-    lines = [
-        "| " + " | ".join(header_cells) + " |",
-        "|" + "|".join(["---"] + ["---:"] * (len(header_cells) - 1)) + "|",
-    ]
 
+    rows: list[list[str]] = []
     for fmt in scx_formats:
         row = [FORMAT_DISPLAY.get(fmt, fmt)]
         any_cell = False
@@ -442,24 +472,24 @@ def scx_parallel_write_callout_table(
             else:
                 row += ["—", "—", "—"]
         if any_cell:
-            lines.append("| " + " | ".join(row) + " |")
+            rows.append(row)
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption="SCX parallel write scaling (1T vs 32T, full pipeline)")
 
 
-def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
+def parallel_write_scaling_table(datasets: list[str] | None = None) -> list[Block]:
     """Generate parallel write scaling table: Format x Thread count showing wall time and speedup.
 
-    Produces separate sub-tables for each mode (full pipeline vs write-only).
+    Returns a list of blocks — grouped by mode (full pipeline / write-only)
+    and dataset, with one ``TableBlock`` per (mode, dataset) combination.
     """
     if datasets is None:
         datasets = ["census_500k", "census_1m", "census_5m"]
     results = load_all_results(benchmark="parallel_write_scaling")
 
     if not results:
-        return "*No parallel write scaling results available yet.*"
-
-    lines = []
+        return [TextBlock("*No parallel write scaling results available yet.*")]
 
     # Collect all modes present in results.
     all_modes: set[str] = set()
@@ -468,22 +498,20 @@ def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
         speedup = meta.get("speedup", {})
         all_modes.update(speedup.keys())
 
-    mode_labels = {"full": "Full pipeline (h5ad read + write)", "write_only": "Write only (in-memory AnnData)"}
+    mode_labels = {"full": "Full pipeline (h5ad read + write)",
+                   "write_only": "Write only (in-memory AnnData)"}
+    thread_cols = ["1 thread", "2 threads", "4 threads", "8 threads",
+                   "16 threads", "32 threads", "Max speedup"]
 
+    blocks: list[Block] = []
     for mode in ["full", "write_only"]:
         if mode not in all_modes:
             continue
-
-        lines.append(f"\n**{mode_labels.get(mode, mode)}**\n")
 
         for ds in datasets:
             ds_results = [r for r in results if r.get("dataset") == ds]
             if not ds_results:
                 continue
-
-            lines.append(f"\n*{SHORT_NAMES.get(ds, ds)}*\n")
-            lines.append("| Format | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads | 32 threads | Max speedup |")
-            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
 
             sorted_results = sorted(
                 ds_results,
@@ -491,6 +519,7 @@ def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
                 if r.get("format", "") in FORMAT_ORDER else 999,
             )
 
+            rows: list[list[str]] = []
             for r in sorted_results:
                 fmt = r.get("format", "")
                 display = FORMAT_DISPLAY.get(fmt, fmt)
@@ -501,7 +530,7 @@ def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
                 if not scaling:
                     continue
 
-                cells = []
+                cells = [display]
                 for t in ["1", "2", "4", "8", "16", "32"]:
                     wall = scaling.get(t)
                     spd = speedup.get(t)
@@ -515,12 +544,19 @@ def parallel_write_scaling_table(datasets: list[str] | None = None) -> str:
 
                 max_spd = max(speedup.values()) if speedup else None
                 cells.append(f"{max_spd:.1f}x" if max_spd is not None else "—")
-                lines.append(f"| {display} | " + " | ".join(cells) + " |")
+                rows.append(cells)
 
-    return "\n".join(lines)
+            if rows:
+                label = mode_labels.get(mode, mode)
+                blocks.append(TableBlock(
+                    headers=["Format"] + thread_cols, rows=rows,
+                    caption=f"Parallel write scaling — {label} — {SHORT_NAMES.get(ds, ds)}",
+                ))
+
+    return blocks or [TextBlock("*No parallel write scaling data to render.*")]
 
 
-def fragment_ops_table(datasets: list[str] | None = None) -> str:
+def fragment_ops_table(datasets: list[str] | None = None) -> TableBlock | TextBlock:
     """Fragment/manifest operation throughput — Operation x Dataset.
 
     Each cell shows median wall-clock with a secondary metric in
@@ -531,7 +567,7 @@ def fragment_ops_table(datasets: list[str] | None = None) -> str:
         datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
     results = load_all_results(benchmark="fragment_ops")
     if not results:
-        return "*No fragment-ops results available yet.*"
+        return TextBlock("*No fragment-ops results available yet.*")
 
     # Operation -> dataset -> (median_wall, median_secondary, secondary_unit)
     ops_order = ["append", "delete", "compact", "rollback"]
@@ -556,14 +592,11 @@ def fragment_ops_table(datasets: list[str] | None = None) -> str:
             elif op == "rollback":
                 pivot.setdefault(op, {})[ds] = (wall, None, "")
 
-    headers = [SHORT_NAMES.get(d, d) for d in datasets]
-    lines = [
-        "| Operation | " + " | ".join(headers) + " |",
-        "|---|" + "|".join(["---:" for _ in datasets]) + "|",
-    ]
+    headers = ["Operation"] + [SHORT_NAMES.get(d, d) for d in datasets]
+    rows: list[list[str]] = []
     for op in ops_order:
         row_data = pivot.get(op, {})
-        cells = []
+        cells = [f"`{op}`"]
         for ds in datasets:
             entry = row_data.get(ds)
             if entry is None:
@@ -577,24 +610,27 @@ def fragment_ops_table(datasets: list[str] | None = None) -> str:
                 else:
                     cell += f" ({secondary:,.1f} {unit})"
             cells.append(cell)
-        lines.append(f"| `{op}` | " + " | ".join(cells) + " |")
+        rows.append(cells)
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption="Fragment operation throughput")
 
 
-def cloud_filtered_table(datasets: list[str] | None = None) -> str:
+def cloud_filtered_table(datasets: list[str] | None = None) -> list[Block]:
     """Cloud filtered-query parity table — Format × Query.
 
     Each cell shows median wall-clock over the ``(dataset, query, format)``
     triple with p95 in parentheses, sourced from ``cloud_filtered`` raw JSONs.
     Only formats that declared ``"cloud_filtered"`` appear; runners that
     silently skipped (no capability) are omitted rather than rendered as —.
+
+    Returns a list of blocks — one ``TableBlock`` per dataset.
     """
     if datasets is None:
         datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
     results = load_all_results(benchmark="cloud_filtered")
     if not results:
-        return "*No cloud_filtered results available yet.*"
+        return [TextBlock("*No cloud_filtered results available yet.*")]
 
     # format -> dataset -> predicate -> (median, p95, n_runs)
     pivot: dict[str, dict[str, dict[str, tuple[float, float, int]]]] = {}
@@ -614,33 +650,26 @@ def cloud_filtered_table(datasets: list[str] | None = None) -> str:
             )
 
     if not predicates_seen:
-        return "*No cloud_filtered per-predicate summaries present.*"
+        return [TextBlock("*No cloud_filtered per-predicate summaries present.*")]
 
     predicate_order = sorted(predicates_seen)
     format_order = [f for f in FORMAT_ORDER if f in pivot] + [
         f for f in sorted(pivot) if f not in FORMAT_ORDER
     ]
 
-    lines: list[str] = []
+    blocks: list[Block] = []
     for ds in datasets:
         ds_any = any(ds in pivot.get(f, {}) for f in format_order)
         if not ds_any:
             continue
-        lines.append(f"**{SHORT_NAMES.get(ds, ds)}** — median wall-clock (p95 in parens), n_runs per cell")
-        lines.append("")
-        lines.append(
-            "| Format | " + " | ".join(predicate_order) + " |"
-        )
-        lines.append(
-            "|---|" + "|".join(["---:" for _ in predicate_order]) + "|"
-        )
+        rows: list[list[str]] = []
         for fmt in format_order:
-            row = pivot.get(fmt, {}).get(ds)
-            if row is None:
+            row_data = pivot.get(fmt, {}).get(ds)
+            if row_data is None:
                 continue
-            cells = []
+            cells = [FORMAT_DISPLAY.get(fmt, fmt)]
             for pname in predicate_order:
-                entry = row.get(pname)
+                entry = row_data.get(pname)
                 if entry is None:
                     cells.append("—")
                     continue
@@ -651,26 +680,29 @@ def cloud_filtered_table(datasets: list[str] | None = None) -> str:
                 if n:
                     cell += f" ×{n}"
                 cells.append(cell)
-            lines.append(
-                f"| {FORMAT_DISPLAY.get(fmt, fmt)} | " + " | ".join(cells) + " |"
-            )
-        lines.append("")
-    return "\n".join(lines).rstrip() or "*No cloud_filtered rows to render.*"
+            rows.append(cells)
+        blocks.append(TableBlock(
+            headers=["Format"] + predicate_order, rows=rows,
+            caption=f"Cloud filtered query — {SHORT_NAMES.get(ds, ds)} (median wall-clock, p95 in parens)",
+        ))
+    return blocks or [TextBlock("*No cloud_filtered rows to render.*")]
 
 
-def cloud_reader_vs_pull_table(datasets: list[str] | None = None) -> str:
+def cloud_reader_vs_pull_table(datasets: list[str] | None = None) -> list[Block]:
     """CloudReader vs full-pull table — per (dataset, scenario, method).
 
     Shows median wall-clock and bytes-downloaded across the four scenarios
     (``metadata_only``, ``selective_{5,20,80}pct``) and the two methods
     each scenario compares (``open_cloud`` / ``pull_full`` for metadata;
     ``pull_filtered`` / ``pull_full`` for selectivities).
+
+    Returns a list of blocks — one ``TableBlock`` per dataset.
     """
     if datasets is None:
         datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
     results = load_all_results(benchmark="cloud_reader_vs_pull")
     if not results:
-        return "*No cloud_reader_vs_pull results available yet.*"
+        return [TextBlock("*No cloud_reader_vs_pull results available yet.*")]
 
     # dataset -> scenario -> method -> (median_wall, median_bytes, n_runs)
     pivot: dict[str, dict[str, dict[str, tuple[float, int, int]]]] = {}
@@ -687,40 +719,43 @@ def cloud_reader_vs_pull_table(datasets: list[str] | None = None) -> str:
                     int(bucket.get("n_runs", 0)),
                 )
     if not pivot:
-        return "*No per-scenario cloud_reader_vs_pull summaries present.*"
+        return [TextBlock("*No per-scenario cloud_reader_vs_pull summaries present.*")]
 
-    lines: list[str] = []
+    headers = ["Scenario", "Method", "Median wall", "Bytes downloaded", "n"]
+    blocks: list[Block] = []
     for ds in datasets:
         per_scen = pivot.get(ds)
         if not per_scen:
             continue
-        lines.append(f"**{SHORT_NAMES.get(ds, ds)}**")
-        lines.append("")
-        lines.append("| Scenario | Method | Median wall | Bytes downloaded | n |")
-        lines.append("|---|---|---:|---:|---:|")
+        rows: list[list[str]] = []
         for scen in sorted(per_scen):
             for method, (wall, byts, n) in sorted(per_scen[scen].items()):
-                lines.append(
-                    f"| {scen} | `{method}` | {_fmt_time(wall)} | "
-                    f"{_fmt_size(byts)} | {n} |"
-                )
-        lines.append("")
-    return "\n".join(lines).rstrip()
+                rows.append([
+                    scen, f"`{method}`", _fmt_time(wall),
+                    _fmt_size(byts), str(n),
+                ])
+        blocks.append(TableBlock(
+            headers=headers, rows=rows,
+            caption=f"CloudReader vs full pull — {SHORT_NAMES.get(ds, ds)}",
+        ))
+    return blocks or [TextBlock("*No cloud_reader_vs_pull rows to render.*")]
 
 
-def cost_model_table(datasets: list[str] | None = None) -> str:
+def cost_model_table(datasets: list[str] | None = None) -> list[Block]:
     """Cost model table — USD per 1M cells queried × (layout, scenario).
 
     Pulled from ``cost_model`` raw JSONs' ``per_layout_scenario_median_usd
     _per_million`` metadata bucket. Scenarios run across the four canonical
     points (metadata, selective_5pct, selective_20pct, full_read) for
     every cloud layout declared in the benchmark's ``_LAYOUTS`` list.
+
+    Returns a list of blocks — one ``TableBlock`` per dataset.
     """
     if datasets is None:
         datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
     results = load_all_results(benchmark="cost_model")
     if not results:
-        return "*No cost_model results available yet.*"
+        return [TextBlock("*No cost_model results available yet.*")]
 
     scenarios = ["metadata", "selective_5pct", "selective_20pct", "full_read"]
     # (dataset, layout, scenario) -> median_usd_per_million
@@ -741,29 +776,30 @@ def cost_model_table(datasets: list[str] | None = None) -> str:
             pivot[(ds, layout, scen)] = float(val)
 
     if not layouts_seen:
-        return "*No cost_model per-(layout, scenario) medians present.*"
+        return [TextBlock("*No cost_model per-(layout, scenario) medians present.*")]
 
-    lines: list[str] = []
+    headers = ["Layout"] + scenarios
+    blocks: list[Block] = []
     for ds in datasets:
         ds_any = any((ds, layout, scen) in pivot
                      for layout in layouts_seen for scen in scenarios)
         if not ds_any:
             continue
-        lines.append(f"**{SHORT_NAMES.get(ds, ds)}** — USD per 1M cells queried (GCS same-region pricing)")
-        lines.append("")
-        lines.append("| Layout | " + " | ".join(scenarios) + " |")
-        lines.append("|---|" + "|".join(["---:" for _ in scenarios]) + "|")
+        rows: list[list[str]] = []
         for layout in sorted(layouts_seen):
-            cells = []
+            cells = [f"`{layout}`"]
             for scen in scenarios:
                 v = pivot.get((ds, layout, scen))
                 cells.append(f"${v:.6f}" if v is not None else "—")
-            lines.append(f"| `{layout}` | " + " | ".join(cells) + " |")
-        lines.append("")
-    return "\n".join(lines).rstrip() or "*No cost_model rows to render.*"
+            rows.append(cells)
+        blocks.append(TableBlock(
+            headers=headers, rows=rows,
+            caption=f"Cost model — {SHORT_NAMES.get(ds, ds)} (USD per 1M cells, GCS same-region)",
+        ))
+    return blocks or [TextBlock("*No cost_model rows to render.*")]
 
 
-def gcp_matrix_table(datasets: list[str] | None = None) -> str:
+def gcp_matrix_table(datasets: list[str] | None = None) -> TableBlock | TextBlock:
     """GCP compute-node matrix — Instance × Format × Dataset.
 
     Pivots ``cloud_read`` results that carry ``system.gcp.instance_type``
@@ -784,7 +820,7 @@ def gcp_matrix_table(datasets: list[str] | None = None) -> str:
         if r.get("system", {}).get("gcp", {}).get("instance_type")
     ]
     if not results:
-        return "*No GCP-matrix cloud_read results available yet.*"
+        return TextBlock("*No GCP-matrix cloud_read results available yet.*")
 
     # (instance, format) -> dataset -> (median, p95)
     pivot: dict[tuple[str, str], dict[str, tuple[float, float]]] = {}
@@ -806,16 +842,13 @@ def gcp_matrix_table(datasets: list[str] | None = None) -> str:
         instances_seen.add(instance)
 
     if not pivot:
-        return "*No GCP-matrix cloud_read rows match the selected datasets.*"
+        return TextBlock("*No GCP-matrix cloud_read rows match the selected datasets.*")
 
     instance_order = [i for i in GCP_INSTANCE_TYPES if i in instances_seen] + [
         i for i in sorted(instances_seen) if i not in GCP_INSTANCE_TYPES
     ]
-    headers = [SHORT_NAMES.get(d, d) for d in datasets]
-    lines = [
-        "| Instance | Format | " + " | ".join(headers) + " |",
-        "|---|---|" + "|".join(["---:" for _ in datasets]) + "|",
-    ]
+    headers = ["Instance", "Format"] + [SHORT_NAMES.get(d, d) for d in datasets]
+    rows: list[list[str]] = []
     for instance in instance_order:
         fmt_rows = sorted(
             {fmt for (i, fmt) in pivot if i == instance},
@@ -825,7 +858,7 @@ def gcp_matrix_table(datasets: list[str] | None = None) -> str:
         )
         for fmt in fmt_rows:
             per_ds = pivot.get((instance, fmt), {})
-            cells = []
+            cells = [f"`{instance}`", FORMAT_DISPLAY.get(fmt, fmt)]
             for ds in datasets:
                 entry = per_ds.get(ds)
                 if entry is None:
@@ -836,23 +869,21 @@ def gcp_matrix_table(datasets: list[str] | None = None) -> str:
                 if p95 != median:
                     cell += f" ({_fmt_time(p95)})"
                 cells.append(cell)
-            lines.append(
-                f"| `{instance}` | {FORMAT_DISPLAY.get(fmt, fmt)} | "
-                + " | ".join(cells) + " |"
-            )
+            rows.append(cells)
 
-    # Footer: per-instance egress class from the config table, so the
-    # reader can contextualize throughput numbers against the VM's
-    # published egress bandwidth.
-    lines.append("")
-    lines.append("*Egress class per instance:* " + ", ".join(
+    # Egress class annotation goes into TableBlock.notes
+    egress_note = "*Egress class per instance:* " + ", ".join(
         f"`{i}`={GCP_INSTANCE_TYPES[i]['egress_gbps']} Gbps"
         for i in instance_order if i in GCP_INSTANCE_TYPES
-    ))
-    return "\n".join(lines)
+    )
+    return TableBlock(
+        headers=headers, rows=rows,
+        caption="GCP compute-node matrix (median wall-clock, p95 in parens)",
+        notes=[egress_note],
+    )
 
 
-def ml_loader_table(datasets: list[str] | None = None) -> str:
+def ml_loader_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate ML loader comparison table: Format x Dataset showing b/s and TTFB."""
     if datasets is None:
         datasets = ["pbmc3k", "tabula_sapiens_100k", "census_1m"]
@@ -890,10 +921,13 @@ def ml_loader_table(datasets: list[str] | None = None) -> str:
             return "—"
         return f"{v:,.1f}"
 
-    return _pivot_to_table(pivot, datasets, fmt_bps, bold_best="max", title="Loader")
+    return _pivot_to_tableblock(
+        pivot, datasets, fmt_bps, bold_best="max", title="Loader",
+        caption="ML training loader throughput (batches/sec, hvg_norm scenario)",
+    )
 
 
-def multimodal_compression_table(datasets: list[str] | None = None) -> str:
+def multimodal_compression_table(datasets: list[str] | None = None) -> TableBlock:
     """File-size + compression ratio for multimodal_compression rows.
 
     Compares SCX v2 multimodal (per-modality auto + uniform auto) vs
@@ -905,10 +939,13 @@ def multimodal_compression_table(datasets: list[str] | None = None) -> str:
         datasets = ["cite_seq_pbmc_5k", "multiome_pbmc_10k"]
     results = load_all_results(benchmark="multimodal_compression")
     pivot = _build_pivot(results, "file_size_bytes", datasets)
-    return _pivot_to_table(pivot, datasets, _fmt_size, bold_best="min", title="Format")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_size, bold_best="min", title="Format",
+        caption="Multimodal file sizes by format and dataset",
+    )
 
 
-def multimodal_compression_ratio_table(datasets: list[str] | None = None) -> str:
+def multimodal_compression_ratio_table(datasets: list[str] | None = None) -> TableBlock:
     """Compression ratio relative to h5mu uncompressed for the same dataset.
 
     Higher is better. Pulled from each row's
@@ -930,10 +967,13 @@ def multimodal_compression_ratio_table(datasets: list[str] | None = None) -> str
     def fmt_ratio(v):
         return "—" if v is None else f"{v:.2f}x"
 
-    return _pivot_to_table(pivot, datasets, fmt_ratio, bold_best="max", title="Format")
+    return _pivot_to_tableblock(
+        pivot, datasets, fmt_ratio, bold_best="max", title="Format",
+        caption="Multimodal compression ratio vs h5mu uncompressed",
+    )
 
 
-def multimodal_training_table(datasets: list[str] | None = None) -> str:
+def multimodal_training_table(datasets: list[str] | None = None) -> TableBlock:
     """Multimodal training-loader throughput (batches/sec) — median across runs.
 
     Pulls ``batches_per_sec`` from each row's ``runs[].extra``. Higher is
@@ -963,10 +1003,13 @@ def multimodal_training_table(datasets: list[str] | None = None) -> str:
     def fmt_bps(v):
         return "—" if v is None else f"{v:,.1f}"
 
-    return _pivot_to_table(pivot, datasets, fmt_bps, bold_best="max", title="Format")
+    return _pivot_to_tableblock(
+        pivot, datasets, fmt_bps, bold_best="max", title="Format",
+        caption="Multimodal training loader throughput (batches/sec)",
+    )
 
 
-def multimodal_training_ttfb_table(datasets: list[str] | None = None) -> str:
+def multimodal_training_ttfb_table(datasets: list[str] | None = None) -> TableBlock:
     """Time-to-first-batch (seconds) for multimodal_training. Lower is better."""
     if datasets is None:
         datasets = ["cite_seq_pbmc_5k", "multiome_pbmc_10k"]
@@ -989,10 +1032,13 @@ def multimodal_training_ttfb_table(datasets: list[str] | None = None) -> str:
         if ttfbs:
             pivot.setdefault(fmt, {})[ds] = statistics.median(ttfbs)
 
-    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min", title="Format")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min", title="Format",
+        caption="Multimodal training time-to-first-batch (seconds)",
+    )
 
 
-def bench_csc_dispatch_table(datasets: list[str] | None = None) -> str:
+def bench_csc_dispatch_table(datasets: list[str] | None = None) -> TableBlock:
     """CSC vs CSR dispatch perf for qc_metrics / hvg / de / pseudobulk.
 
     Format keys are ``bench_csc__<op>_<axis>``; we surface the median
@@ -1003,10 +1049,13 @@ def bench_csc_dispatch_table(datasets: list[str] | None = None) -> str:
         datasets = MAIN_DATASETS
     results = load_all_results(benchmark="bench_csc_dispatch")
     pivot = _build_pivot(results, "median_wall_s", datasets)
-    return _pivot_to_table(pivot, datasets, _fmt_time, bold_best="min", title="Variant")
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min", title="Variant",
+        caption="CSC vs CSR dispatch wall time by variant and dataset",
+    )
 
 
-def correctness_table() -> str:
+def correctness_table() -> TableBlock | TextBlock:
     """Generate correctness validation summary table."""
     results = load_all_results()  # Load all, filter correctness
     correctness = [
@@ -1015,10 +1064,10 @@ def correctness_table() -> str:
     ]
 
     if not correctness:
-        return "_No correctness results found._"
+        return TextBlock("_No correctness results found._")
 
-    lines = ["| Test | Dataset | Passed | Failed | Skipped | Duration |"]
-    lines.append("|---|---|---:|---:|---:|---:|")
+    headers = ["Test", "Dataset", "Passed", "Failed", "Skipped", "Duration"]
+    rows: list[list[str]] = []
 
     for r in correctness:
         harness = r.get("harness", r.get("benchmark", "unknown"))
@@ -1027,17 +1076,17 @@ def correctness_table() -> str:
         n_failed = r.get("n_failed", 0)
         n_skipped = r.get("n_skipped", 0)
         duration = r.get("total_duration_s")
-        status = "PASS" if r.get("overall_passed") else "**FAIL**"
 
-        lines.append(
-            f"| {harness} | {dataset} | {n_passed} | {n_failed} | {n_skipped} "
-            f"| {_fmt_time(duration)} |"
-        )
+        rows.append([
+            harness, dataset, str(n_passed), str(n_failed),
+            str(n_skipped), _fmt_time(duration),
+        ])
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption="Correctness validation summary")
 
 
-def correctness_detail_table(dataset: str = "pbmc3k") -> str:
+def correctness_detail_table(dataset: str = "pbmc3k") -> TableBlock | TextBlock:
     """Generate per-function correctness detail table for a given dataset."""
     results = load_all_results()
     scanpy_equiv = [
@@ -1046,11 +1095,11 @@ def correctness_detail_table(dataset: str = "pbmc3k") -> str:
     ]
 
     if not scanpy_equiv:
-        return f"_No scanpy equivalence results for {dataset}._"
+        return TextBlock(f"_No scanpy equivalence results for {dataset}._")
 
     r = scanpy_equiv[-1]  # Most recent
-    lines = ["| Function | Passed | Key Metric | Value | Threshold | Duration |"]
-    lines.append("|---|:---:|---|---:|---:|---:|")
+    headers = ["Function", "Passed", "Key Metric", "Value", "Threshold", "Duration"]
+    rows: list[list[str]] = []
 
     for test in r.get("results", []):
         name = test.get("name", "unknown")
@@ -1074,19 +1123,18 @@ def correctness_detail_table(dataset: str = "pbmc3k") -> str:
             metric_str = "—"
             threshold_str = "—"
 
-        lines.append(
-            f"| {name} | {passed} | {metric_name} | {metric_str} "
-            f"| {threshold_str} | {_fmt_time(duration)} |"
-        )
+        rows.append([name, passed, metric_name, metric_str,
+                     threshold_str, _fmt_time(duration)])
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption=f"Scanpy equivalence detail ({dataset})")
 
 
-def system_info_table() -> str:
+def system_info_table() -> TableBlock | TextBlock:
     """Generate system configuration table from the most recent result."""
     results = load_all_results()
     if not results:
-        return "_No results found._"
+        return TextBlock("_No results found._")
 
     # Get system info from the most recent result that has it
     sys_info = None
@@ -1096,7 +1144,7 @@ def system_info_table() -> str:
             break
 
     if not sys_info:
-        return "_No system information found._"
+        return TextBlock("_No system information found._")
 
     libs = sys_info.get("library_versions", {})
     key_libs = ", ".join(
@@ -1110,45 +1158,45 @@ def system_info_table() -> str:
     if storage.get("has_nvme"):
         storage_desc += " (NVMe-backed)"
 
-    lines = [
-        "| Property | Value |",
-        "|---|---|",
-        f"| CPU | {sys_info.get('cpu', 'unknown')} |",
-        f"| Cores | {sys_info.get('cpu_cores_physical', 'unknown')} |",
-        f"| RAM | {sys_info.get('ram_gb', 'unknown')} GB |",
-        f"| OS | {sys_info.get('os', 'unknown')} ({sys_info.get('arch', '')}) |",
-        f"| Storage | {storage_desc} |",
-        f"| Python | {sys_info.get('python_version', 'unknown')} |",
-        f"| Rust | {sys_info.get('rust_version', 'unknown')} |",
-        f"| Key Libraries | {key_libs} |",
+    headers = ["Property", "Value"]
+    rows = [
+        ["CPU", str(sys_info.get('cpu', 'unknown'))],
+        ["Cores", str(sys_info.get('cpu_cores_physical', 'unknown'))],
+        ["RAM", f"{sys_info.get('ram_gb', 'unknown')} GB"],
+        ["OS", f"{sys_info.get('os', 'unknown')} ({sys_info.get('arch', '')})"],
+        ["Storage", storage_desc],
+        ["Python", str(sys_info.get('python_version', 'unknown'))],
+        ["Rust", str(sys_info.get('rust_version', 'unknown'))],
+        ["Key Libraries", key_libs],
     ]
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption="System configuration")
 
 
-def datasets_table(datasets: list[str] | None = None) -> str:
+def datasets_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate datasets metadata table."""
     if datasets is None:
         datasets = MAIN_DATASETS
 
-    lines = [
-        "| ID | Name | Cells | Genes | Protocol | Source | h5ad Size |",
-        "|---|---|---:|---:|---|---|---:|",
-    ]
+    headers = ["ID", "Name", "Cells", "Genes", "Protocol", "Source", "h5ad Size"]
+    rows: list[list[str]] = []
 
     for ds_name in datasets:
         cfg = DATASETS.get(ds_name)
         if cfg is None:
             continue
-        lines.append(
-            f"| {cfg.id} | {cfg.name} | {cfg.n_obs:,} | {cfg.n_vars:,} "
-            f"| {cfg.protocol} | {cfg.source} | {_fmt_size(cfg.approx_h5ad_mb * 1024 * 1024)} |"
-        )
+        rows.append([
+            cfg.id, cfg.name, f"{cfg.n_obs:,}", f"{cfg.n_vars:,}",
+            cfg.protocol, cfg.source,
+            _fmt_size(cfg.approx_h5ad_mb * 1024 * 1024),
+        ])
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption="Benchmark datasets")
 
 
-def cell_eval_parity_perf_table() -> str:
+def cell_eval_parity_perf_table() -> TableBlock | TextBlock:
     """SCX vs cell-eval / arc-bench perturbation-metric performance.
 
     One row per (dataset, operation). Columns: dataset size, operation,
@@ -1157,12 +1205,11 @@ def cell_eval_parity_perf_table() -> str:
     """
     results = load_all_results(benchmark="cell_eval_parity_perf")
     if not results:
-        return "_No cell_eval_parity_perf results found._"
+        return TextBlock("_No cell_eval_parity_perf results found._")
 
-    lines = [
-        "| Dataset | n_obs | Operation | SCX | cell-eval | Speedup | SCX RSS | ref RSS | Notes |",
-        "|---|---:|---|---:|---:|---:|---:|---:|---|",
-    ]
+    headers = ["Dataset", "n_obs", "Operation", "SCX", "cell-eval",
+               "Speedup", "SCX RSS", "ref RSS", "Notes"]
+    rows: list[list[str]] = []
 
     # Order datasets by ascending n_obs where possible
     def _n_obs(r: dict[str, Any]) -> int:
@@ -1176,30 +1223,33 @@ def cell_eval_parity_perf_table() -> str:
             name = op.get("name", "—")
             if op.get("skipped"):
                 note = f"_skipped: {op.get('skipped_reason', '—')}_"
-                lines.append(
-                    f"| {dataset} | {n_obs:,} | {name} | — | — | — | — | — | {note} |"
-                )
+                rows.append([
+                    dataset, f"{n_obs:,}", name,
+                    "—", "—", "—", "—", "—", note,
+                ])
                 continue
             if "scx_error" in op or "ref_error" in op:
                 err = op.get("scx_error") or op.get("ref_error") or "unknown"
-                lines.append(
-                    f"| {dataset} | {n_obs:,} | {name} | — | — | — | — | — "
-                    f"| **err**: {err} |"
-                )
+                rows.append([
+                    dataset, f"{n_obs:,}", name,
+                    "—", "—", "—", "—", "—", f"**err**: {err}",
+                ])
                 continue
 
             speedup = op.get("speedup")
             speedup_str = f"{speedup:.1f}x" if speedup is not None else "—"
-            lines.append(
-                f"| {dataset} | {n_obs:,} | {name} "
-                f"| {_fmt_time(op.get('scx_median_s'))} "
-                f"| {_fmt_time(op.get('ref_median_s'))} "
-                f"| {speedup_str} "
-                f"| {_fmt_mem(op.get('scx_peak_rss_mb'))} "
-                f"| {_fmt_mem(op.get('ref_peak_rss_mb'))} |  |"
-            )
+            rows.append([
+                dataset, f"{n_obs:,}", name,
+                _fmt_time(op.get('scx_median_s')),
+                _fmt_time(op.get('ref_median_s')),
+                speedup_str,
+                _fmt_mem(op.get('scx_peak_rss_mb')),
+                _fmt_mem(op.get('ref_peak_rss_mb')),
+                "",
+            ])
 
-    return "\n".join(lines)
+    return TableBlock(headers=headers, rows=rows,
+                      caption="SCX vs cell-eval perturbation-metric performance")
 
 
 # ---------------------------------------------------------------------------
@@ -1220,16 +1270,16 @@ def _load_harmony_runs(bench: str) -> list[dict[str, Any]]:
     ]
 
 
-def harmony_scaling_table() -> str:
+def harmony_scaling_table() -> list[Block]:
     """Harmony2 wall-time + peak-RSS scaling across D1–D7.
 
-    Pivot: rows = (impl, device), columns = MAIN_DATASETS. One pair of
-    sub-tables (wall / RSS). Only includes the canonical d=30, K=100 sweep —
-    secondary PC/K sweeps on D4 render separately.
+    Pivot: rows = (impl, device), columns = MAIN_DATASETS. Returns three
+    ``TableBlock``s (wall / RSS / iterations). Only includes the canonical
+    d=30, K=100 sweep — secondary PC/K sweeps on D4 render separately.
     """
     runs = _load_harmony_runs("harmony_integrate")
     if not runs:
-        return "_No harmony_integrate results found._"
+        return [TextBlock("_No harmony_integrate results found._")]
 
     # (impl, device) -> dataset -> {wall_s, peak_rss_mb, n_iters, ok}
     pivot: dict[tuple[str, str], dict[str, dict]] = {}
@@ -1247,44 +1297,41 @@ def harmony_scaling_table() -> str:
         }
 
     if not pivot:
-        return "_No harmony_integrate d=30/K=100 scaling runs found._"
+        return [TextBlock("_No harmony_integrate d=30/K=100 scaling runs found._")]
 
     header_cells = [f"{SHORT_NAMES[d]} ({DATASETS[d].n_obs:,})" for d in MAIN_DATASETS]
-    sep = ["---"] + ["---:"] * len(MAIN_DATASETS)
+    headers = ["impl / device"] + header_cells
 
-    def _section(title: str, field: str, fmt) -> list[str]:
-        out = [f"\n**{title}**\n",
-               "| impl / device | " + " | ".join(header_cells) + " |",
-               "|" + "|".join(sep) + "|"]
+    def _make_table(caption: str, field: str, fmt) -> TableBlock:
+        rows: list[list[str]] = []
         for (impl, dev), cols in sorted(pivot.items()):
-            row = [f"`{impl}` / {dev}"]
+            cells = [f"`{impl}` / {dev}"]
             for ds in MAIN_DATASETS:
                 cell = cols.get(ds)
                 if cell and cell.get(field) is not None and cell.get("ok"):
-                    row.append(fmt(cell[field]))
+                    cells.append(fmt(cell[field]))
                 elif cell and not cell.get("ok"):
-                    row.append("_OOM_")
+                    cells.append("_OOM_")
                 else:
-                    row.append("—")
-            out.append("| " + " | ".join(row) + " |")
-        return out
+                    cells.append("—")
+            rows.append(cells)
+        return TableBlock(headers=headers, rows=rows, caption=caption)
 
-    lines: list[str] = []
-    lines += _section("Wall time (s)", "wall_s", lambda v: _fmt_time(v))
-    lines += _section("Peak RSS", "peak_rss_mb", lambda v: _fmt_mem(v))
-    lines += _section("Harmony iterations", "n_iters",
-                      lambda v: f"{int(v)}")
-    return "\n".join(lines)
+    return [
+        _make_table("Harmony scaling — wall time (s)", "wall_s", lambda v: _fmt_time(v)),
+        _make_table("Harmony scaling — peak RSS", "peak_rss_mb", lambda v: _fmt_mem(v)),
+        _make_table("Harmony scaling — iterations", "n_iters", lambda v: f"{int(v)}"),
+    ]
 
 
-def lisi_comparison_table() -> str:
+def lisi_comparison_table() -> TableBlock | TextBlock:
     """LISI: scx-accel vs R lisi on D1–D4.
 
     Columns: dataset, impl, wall_s, peak_rss_mb, mean_lisi, |Δ|/R_mean.
     """
     runs = _load_harmony_runs("lisi")
     if not runs:
-        return "_No LISI results found._"
+        return TextBlock("_No LISI results found._")
 
     # Group by dataset so we can compute the relative-delta column.
     by_ds: dict[str, dict[str, dict]] = {}
@@ -1299,11 +1346,9 @@ def lisi_comparison_table() -> str:
             "median_lisi": run.get("median_lisi"),
         }
 
-    lines = [
-        "| Dataset | n_obs | Impl | wall | peak RSS | mean LISI | median | "
-        "|Δ| / R mean |",
-        "|---|---:|---|---:|---:|---:|---:|---:|",
-    ]
+    headers = ["Dataset", "n_obs", "Impl", "wall", "peak RSS",
+               "mean LISI", "median", "|Δ| / R mean"]
+    rows: list[list[str]] = []
     for ds in MAIN_DATASETS:
         if ds not in by_ds:
             continue
@@ -1319,18 +1364,19 @@ def lisi_comparison_table() -> str:
                 rel = f"{abs(scx_m - ref) / ref * 100:.2f}%"
             else:
                 rel = "—"
-            lines.append(
-                f"| {SHORT_NAMES[ds]} | {n_obs:,} | `{impl}` "
-                f"| {_fmt_time(m.get('wall_s'))} "
-                f"| {_fmt_mem(m.get('peak_rss_mb'))} "
-                f"| {_fmt_num(m.get('mean_lisi'), 3)} "
-                f"| {_fmt_num(m.get('median_lisi'), 3)} "
-                f"| {rel} |"
-            )
-    return "\n".join(lines)
+            rows.append([
+                SHORT_NAMES[ds], f"{n_obs:,}", f"`{impl}`",
+                _fmt_time(m.get('wall_s')),
+                _fmt_mem(m.get('peak_rss_mb')),
+                _fmt_num(m.get('mean_lisi'), 3),
+                _fmt_num(m.get('median_lisi'), 3),
+                rel,
+            ])
+    return TableBlock(headers=headers, rows=rows,
+                      caption="LISI: scx-accel vs R lisi")
 
 
-def harmony_validation_table() -> str:
+def harmony_validation_table() -> TableBlock:
     """Per-PC Pearson r vs R harmony on the three validation fixtures.
 
     Reads the validation fixture + re-runs the Rust pipeline is too heavy
@@ -1340,20 +1386,31 @@ def harmony_validation_table() -> str:
     test_harmony_validation.py docstring).
     """
     # Static numbers from Phase 6 diagnostic (see pyscx/tests/test_harmony_validation.py).
-    return "\n".join([
-        "| Dataset | N | Batches | d | K | min per-PC r | mean per-PC r | "
-        "iter (scx / R) |",
-        "|---|---:|---:|---:|---:|---:|---:|---|",
-        "| pbmc_small (D1) | 2,700 | 3 | 30 | 100 | 0.9986 | 0.9992 | 5 / 4 |",
-        "| cell_lines (smartseq2) | 9,478 | 47 | 20 | 100 | 0.9789 | "
-        "0.9885 | 10 / 8 |",
-        "| hlca_subset (tabula) | 50,000 | 118 | 30 | 100 | 0.9979 | 0.9991 "
-        "| 10 / 5 |",
-    ])
+    headers = ["Dataset", "N", "Batches", "d", "K",
+               "min per-PC r", "mean per-PC r", "iter (scx / R)"]
+    rows = [
+        ["pbmc_small (D1)", "2,700", "3", "30", "100",
+         "0.9986", "0.9992", "5 / 4"],
+        ["cell_lines (smartseq2)", "9,478", "47", "20", "100",
+         "0.9789", "0.9885", "10 / 8"],
+        ["hlca_subset (tabula)", "50,000", "118", "30", "100",
+         "0.9979", "0.9991", "10 / 5"],
+    ]
+    return TableBlock(
+        headers=headers, rows=rows,
+        caption="Harmony validation — per-PC Pearson r vs R harmony",
+        source=SourceRef(kind=SourceKind.manual,
+                         reason="Phase 6 diagnostic (pyscx/tests/test_harmony_validation.py)"),
+    )
 
 
-def generate_all_tables() -> dict[str, str]:
-    """Generate all summary tables, returning a dict of table_name -> markdown."""
+def generate_all_tables() -> dict[str, Block | list[Block]]:
+    """Generate all summary tables, returning a dict of table_name -> block(s).
+
+    Most entries are a single ``Block``; ``parallel_scaling`` and
+    ``parallel_write_scaling`` return ``list[Block]`` because they
+    produce one sub-table per dataset/mode combination.
+    """
     return {
         "system_info": system_info_table(),
         "datasets": datasets_table(),

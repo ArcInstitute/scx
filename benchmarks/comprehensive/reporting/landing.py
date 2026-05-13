@@ -20,8 +20,18 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import REPORTS_DIR
 from benchmarks.comprehensive.reporting import dashboard, tables
+from benchmarks.comprehensive.reporting.report_model import (
+    Block, TableBlock, TextBlock, MarkdownRenderer,
+)
 
 logger = logging.getLogger(__name__)
+
+_renderer = MarkdownRenderer()
+
+
+def _block_to_md(block: Block) -> str:
+    """Render a single Block to markdown text."""
+    return _renderer._render_block(block)
 
 
 _SECTIONS = [
@@ -58,7 +68,16 @@ def build_index_markdown() -> str:
             body = fn()
         except Exception as exc:  # noqa: BLE001
             body = f"*Section failed to render: {exc}*"
-        chunks.append(body if body.strip() else f"*no data for {title}*")
+        # Handle block objects, list[Block], and legacy strings
+        if isinstance(body, list):
+            rendered = "\n\n".join(_block_to_md(b) for b in body)
+        elif isinstance(body, Block):
+            rendered = _block_to_md(body)
+        elif isinstance(body, str):
+            rendered = body
+        else:
+            rendered = str(body)
+        chunks.append(rendered if rendered.strip() else f"*no data for {title}*")
         chunks.append("\n\n")
 
     # Cross-dimension join: cost × cloud query parity. Only meaningful
