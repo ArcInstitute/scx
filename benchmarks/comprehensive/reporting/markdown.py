@@ -99,6 +99,7 @@ def write_reports(
     output_dir: Path | None = None,
     *,
     strict_lint: bool = False,
+    public_profile: bool = False,
 ) -> Path:
     """Generate and write the full benchmark report (markdown + PDF + HTML).
 
@@ -110,6 +111,9 @@ def write_reports(
         If ``True``, run report-lint checks and exit nonzero (raise) on
         any error-level findings.  Manual numeric claims in
         ``CommentaryBlock`` objects are promoted to errors in strict mode.
+    public_profile : bool
+        If ``True``, enable public-profile lint checks that block internal
+        phase labels in chapter/section headings.
     """
     if output_dir is None:
         output_dir = REPORTS_DIR
@@ -119,7 +123,12 @@ def write_reports(
 
     # ── Report lint ───────────────────────────────────────────────────
     from benchmarks.comprehensive.reporting.lint import collect_warnings, LintLevel
-    warnings = collect_warnings(report_model, strict=strict_lint)
+    warnings = collect_warnings(
+        report_model,
+        strict=strict_lint,
+        public=public_profile,
+        figures_root=output_dir,
+    )
     for w in warnings:
         log_fn = logger.warning if w.level == LintLevel.warning else (
             logger.error if w.level == LintLevel.error else logger.info
