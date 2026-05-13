@@ -15,6 +15,7 @@ use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
+use crate::helpers::encode_value;
 
 /// Merge multiple SCX files into a single output file.
 /// All inputs must have the same n_vars.
@@ -344,47 +345,6 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     writer.write_provenance(all_prov_entries)?;
 
     writer.finish()?;
-    Ok(())
-}
-
-fn encode_value(buf: &mut Vec<u8>, value: f32, encoding: ValueEncoding) -> Result<()> {
-    match encoding {
-        ValueEncoding::Uint8 => {
-            if value < 0.0 || value > u8::MAX as f32 {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint8",
-                    max: u8::MAX as f32,
-                });
-            }
-            buf.push(value as u8);
-        }
-        ValueEncoding::Uint16 => {
-            if value < 0.0 || value > u16::MAX as f32 {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint16",
-                    max: u16::MAX as f32,
-                });
-            }
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
-        }
-        ValueEncoding::Uint32 => {
-            if value < 0.0 || value > u32::MAX as f32 {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint32",
-                    max: u32::MAX as f32,
-                });
-            }
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
-        ValueEncoding::Float16 => {
-            let f16_val = half::f16::from_f32(value);
-            buf.extend_from_slice(&f16_val.to_le_bytes());
-        }
-    }
     Ok(())
 }
 

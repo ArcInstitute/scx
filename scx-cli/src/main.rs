@@ -18,6 +18,7 @@ mod rollback;
 mod subset;
 mod upgrade;
 mod validate;
+mod validators;
 
 #[cfg(test)]
 mod test_utils;
@@ -55,7 +56,7 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
         /// Target rows per shard
-        #[arg(long, default_value = "10000")]
+        #[arg(long, default_value = "10000", value_parser = validators::positive_u32)]
         shard_size: u32,
         /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
@@ -219,7 +220,7 @@ enum Commands {
         #[arg(long)]
         compare_h5ad: Option<PathBuf>,
         /// Number of benchmark runs
-        #[arg(long, default_value = "5")]
+        #[arg(long, default_value = "5", value_parser = validators::positive_usize)]
         runs: usize,
         /// Output results as JSON
         #[arg(long)]
@@ -328,7 +329,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
         /// Target rows per shard in the output file
-        #[arg(long, default_value = "10000")]
+        #[arg(long, default_value = "10000", value_parser = validators::positive_u32)]
         shard_size: u32,
         /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]

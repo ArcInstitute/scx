@@ -14,7 +14,7 @@ use scx_format::header::{FileHeader, HEADER_SIZE};
 use scx_format::modality::{ModalityTable, ModalityType};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::reader::ScxReader;
-use scx_format::section::{align_to_8, SectionType};
+use scx_format::section::{write_alignment_padding, SectionType};
 use scx_format::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
@@ -627,12 +627,8 @@ fn write_csr_chunk(
     };
 
     // Pad to 8-byte alignment
-    let aligned = align_to_8(*write_offset);
-    let pad = (aligned - *write_offset) as usize;
-    if pad > 0 {
-        lock.write_all(&vec![0u8; pad])?;
-        *write_offset = aligned;
-    }
+    let pad = write_alignment_padding(&mut *lock, *write_offset)?;
+    *write_offset += pad as u64;
 
     let shard_global_offset = *write_offset;
     let index_dtype_u16 = prep.header_index_dtype == 0;
@@ -792,12 +788,8 @@ fn raw_copy_csr_shard(
     let section_length = section_data.len() as u64;
 
     // Pad to 8-byte alignment.
-    let aligned = align_to_8(*write_offset);
-    let pad = (aligned - *write_offset) as usize;
-    if pad > 0 {
-        lock.write_all(&vec![0u8; pad])?;
-        *write_offset = aligned;
-    }
+    let pad = write_alignment_padding(&mut *lock, *write_offset)?;
+    *write_offset += pad as u64;
     let shard_global_offset = *write_offset;
     lock.write_all(&section_data)?;
     *write_offset += section_length;
@@ -891,12 +883,8 @@ fn finalize_append(
         buf
     };
 
-    let aligned = align_to_8(write_offset);
-    let pad = (aligned - write_offset) as usize;
-    if pad > 0 {
-        lock.write_all(&vec![0u8; pad])?;
-        write_offset = aligned;
-    }
+    let pad = write_alignment_padding(&mut *lock, write_offset)?;
+    write_offset += pad as u64;
     let new_obs_offset = write_offset;
     lock.write_all(&obs_ipc_bytes)?;
     let new_obs_length = obs_ipc_bytes.len() as u64;
@@ -939,12 +927,8 @@ fn finalize_append(
 
     lock.seek(SeekFrom::End(0))?;
     write_offset = lock.stream_position()?;
-    let prov_aligned = align_to_8(write_offset);
-    let pad = (prov_aligned - write_offset) as usize;
-    if pad > 0 {
-        lock.write_all(&vec![0u8; pad])?;
-        write_offset = prov_aligned;
-    }
+    let pad = write_alignment_padding(&mut *lock, write_offset)?;
+    write_offset += pad as u64;
     let prov_offset = write_offset;
     lock.write_all(&prov_bytes)?;
     let prov_length = prov_bytes.len() as u64;
@@ -1023,18 +1007,15 @@ fn finalize_append(
                 );
             }
 
-            let mt_aligned = align_to_8(write_offset);
-            let pad = (mt_aligned - write_offset) as usize;
-            if pad > 0 {
-                lock.write_all(&vec![0u8; pad])?;
-                write_offset = mt_aligned;
-            }
+            let pad = write_alignment_padding(&mut *lock, write_offset)?;
+            write_offset += pad as u64;
+            let mt_offset = write_offset;
             let mut mt_buf = Vec::new();
             table.write_to(&mut mt_buf)?;
             lock.write_all(&mt_buf)?;
             let mt_len = mt_buf.len() as u64;
             write_offset += mt_len;
-            (mt_aligned, mt_len)
+            (mt_offset, mt_len)
         } else {
             (
                 prep.header.modality_table_offset,
@@ -1043,12 +1024,9 @@ fn finalize_append(
         };
 
     // Write new catalog
-    let catalog_aligned = align_to_8(write_offset);
-    let pad = (catalog_aligned - write_offset) as usize;
-    if pad > 0 {
-        lock.write_all(&vec![0u8; pad])?;
-    }
-    let new_catalog_offset = catalog_aligned;
+    let pad = write_alignment_padding(&mut *lock, write_offset)?;
+    write_offset += pad as u64;
+    let new_catalog_offset = write_offset;
     let mut catalog_buf = Vec::new();
     new_catalog.write_to(&mut catalog_buf)?;
     lock.write_all(&catalog_buf)?;

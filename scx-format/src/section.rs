@@ -76,6 +76,26 @@ pub fn align_to_8(offset: u64) -> u64 {
     (offset + 7) & !7
 }
 
+/// Pre-allocated zero buffer for 8-byte alignment padding. Stack-based,
+/// avoids the heap allocation of `vec![0u8; pad]` for at most 7 bytes.
+const ZERO_PAD: [u8; 7] = [0u8; 7];
+
+/// Write zero-padding bytes to align `current_offset` to an 8-byte
+/// boundary. Returns the number of padding bytes written (0–7).
+///
+/// Use this instead of `writer.write_all(&vec![0u8; pad])` to avoid
+/// a heap allocation for ≤ 7 zero bytes.
+pub fn write_alignment_padding<W: std::io::Write>(
+    w: &mut W,
+    current_offset: u64,
+) -> std::io::Result<usize> {
+    let pad = (8 - (current_offset % 8) as usize) % 8;
+    if pad > 0 {
+        w.write_all(&ZERO_PAD[..pad])?;
+    }
+    Ok(pad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

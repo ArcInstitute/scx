@@ -10,11 +10,12 @@ use crate::error::{OpsError, Result};
 ///
 /// The inner `Option<File>` is a necessary quirk of the `into_file()`
 /// consumer — it lets `Drop` run `unlock()` even after the file has been
-/// moved out. None of the `expect("FileLock already consumed")` paths below
-/// are reachable from safe user code: every public API that accesses the
-/// file (Deref, DerefMut, Read, Write, Seek, `file()`) takes `&self` or
-/// `&mut self`, and `into_file()` consumes `self` by value — so observing
-/// a `None` requires an impossible borrow.
+/// moved out. The `file_ref()` / `file_mut()` helpers centralise the
+/// `None` check so every trait impl routes through a single site. None
+/// of these paths are reachable from safe user code: every public API
+/// that accesses the file (Deref, DerefMut, Read, Write, Seek, `file()`)
+/// takes `&self` or `&mut self`, and `into_file()` consumes `self` by
+/// value — so observing a `None` requires an impossible borrow.
 pub struct FileLock {
     file: Option<File>,
 }
@@ -33,13 +34,40 @@ impl FileLock {
 
     /// Return a reference to the inner file.
     pub fn file(&self) -> &File {
-        self.file.as_ref().expect("FileLock already consumed")
+        self.file_ref()
     }
 
     /// Consume the lock and return the inner file (lock remains held
     /// until the returned File is dropped).
     pub fn into_file(mut self) -> File {
         self.file.take().expect("FileLock already consumed")
+    }
+
+    /// Internal shared reference to the underlying `File`.
+    ///
+    /// `None` is structurally unreachable from safe code because every
+    /// method that calls this takes `&self` (which is impossible after
+    /// `into_file()` has consumed `self`). `unreachable!()` is preferred
+    /// over `expect()` to communicate intent: this is not a user-facing
+    /// error, but an invariant violation that would indicate a soundness
+    /// bug in the `FileLock` API itself.
+    #[inline]
+    fn file_ref(&self) -> &File {
+        match self.file.as_ref() {
+            Some(f) => f,
+            None => unreachable!("FileLock::file is None with &self still alive"),
+        }
+    }
+
+    /// Internal mutable reference to the underlying `File`.
+    ///
+    /// Same invariant as [`file_ref`] — see that method's doc comment.
+    #[inline]
+    fn file_mut(&mut self) -> &mut File {
+        match self.file.as_mut() {
+            Some(f) => f,
+            None => unreachable!("FileLock::file is None with &mut self still alive"),
+        }
     }
 }
 
@@ -76,45 +104,33 @@ impl Drop for FileLock {
 impl std::ops::Deref for FileLock {
     type Target = File;
     fn deref(&self) -> &File {
-        self.file.as_ref().expect("FileLock already consumed")
+        self.file_ref()
     }
 }
 
 impl std::ops::DerefMut for FileLock {
     fn deref_mut(&mut self) -> &mut File {
-        self.file.as_mut().expect("FileLock already consumed")
+        self.file_mut()
     }
 }
 
 impl std::io::Read for FileLock {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file
-            .as_mut()
-            .expect("FileLock already consumed")
-            .read(buf)
+        self.file_mut().read(buf)
     }
 }
 
 impl std::io::Write for FileLock {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file
-            .as_mut()
-            .expect("FileLock already consumed")
-            .write(buf)
+        self.file_mut().write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file
-            .as_mut()
-            .expect("FileLock already consumed")
-            .flush()
+        self.file_mut().flush()
     }
 }
 
 impl std::io::Seek for FileLock {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.file
-            .as_mut()
-            .expect("FileLock already consumed")
-            .seek(pos)
+        self.file_mut().seek(pos)
     }
 }
