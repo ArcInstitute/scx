@@ -66,7 +66,7 @@ KNOWN_TABLES: list[TableSpec] = [
     # Memory streaming table: single-dataset (census_1m)
     TableSpec(
         header_match="h5ad (full load)",
-        benchmark="memory_streaming",
+        benchmark="memory",
         dataset_column=None,
         default_dataset="census_1m",
     ),
@@ -80,9 +80,9 @@ KNOWN_TABLES: list[TableSpec] = [
     # Perturbation metrics table
     TableSpec(
         header_match="20K × 2K × 50",
-        benchmark="accel_perturbation",
+        benchmark="cell_eval_parity_perf",
         dataset_column=None,
-        default_dataset="pbmc10k",  # closest match
+        default_dataset="pert_synth_10k",
     ),
     # Headline benchmarks table
     TableSpec(
@@ -94,16 +94,17 @@ KNOWN_TABLES: list[TableSpec] = [
 ]
 
 # For the headline table, each row maps to a specific (benchmark, format).
+# Keys must match the `benchmark` field emitted by the harness into results/raw/.
 HEADLINE_ROW_MAP: dict[str, tuple[str, str]] = {
     "file size": ("compression", "scx_auto"),
     "read (full load": ("read_full", "scx_auto"),
     "column projection": ("read_selective", "scx_auto"),
-    "parallel read": ("parallel_read", "scx_auto"),
-    "parallel write": ("parallel_write", "scx_auto"),
-    "out-of-core": ("memory_ooc", "scx_auto"),
+    "parallel read": ("parallel_scaling", "scx_auto"),
+    "parallel write": ("parallel_write_scaling", "scx_auto"),
+    "out-of-core": ("memory", "scx_auto"),
     "training loader": ("ml_loader", "scx_auto"),
-    "gpu end-to-end": ("gpu_pipeline", "scx_auto"),
-    "selective query": ("query_engine", "scx_auto"),
+    "gpu end-to-end": ("accel_pca", "scx_auto"),  # GPU pipeline headline uses PCA as proxy
+    "selective query": ("index_plan", "scx_auto"),
     "append": ("fragment_ops", "scx_auto"),
 }
 
@@ -167,13 +168,6 @@ _NUM_RE = re.compile(
     r"(?:\s*(?:×|s|ms|GB|MB|%|batches/s(?:ec)?))?"
 )
 
-# Cells that are clearly metadata (cell counts), not benchmark values.
-_SKIP_CELLS = re.compile(
-    r"^\s*\|?\s*(?:\d[\d,]*\s*$"  # bare numbers (cell counts)
-    r"|Dataset|Cells|Area|Operation|Component|Issue|Project"  # header words
-    r"|\w+\s+\w+\s+\w+\s+\w+\s+\w+)",  # long prose (>5 words)
-    re.IGNORECASE,
-)
 
 
 def extract_claims(readme_path: Path) -> list[Claim]:
@@ -291,8 +285,8 @@ def load_raw_manifests(raw_dir: Path) -> dict[str, dict[str, Any]]:
             data = json.loads(path.read_text())
             key = f"{data.get('benchmark', '')}__{data.get('format', '')}__{data.get('dataset', '')}"
             manifests[key] = data
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: Failed to load or parse manifest {path}: {e}", file=sys.stderr)
     return manifests
 
 
@@ -303,7 +297,8 @@ def load_baseline_summary(path: Path) -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(path.read_text())
         return data.get("rows", {})
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: Failed to load or parse baseline summary {path}: {e}", file=sys.stderr)
         return {}
 
 
@@ -326,22 +321,22 @@ def check_claim(
     if key in baseline_rows:
         return True, f"backed by baselines/LATEST ({key})"
 
-    # Broader: same benchmark + dataset, any format
-    for rk in raw_manifests:
-        parts = rk.split("__")
-        if len(parts) == 3 and parts[0] == claim.benchmark and parts[2] == claim.dataset:
-            return True, f"backed by raw/{rk}.json (format: {parts[1]})"
+    # Broader: same benchmark + dataset, any format.
+    # Use the manifest's actual fields rather than __-splitting the key,
+    # because format strings can themselves contain "__" (e.g.
+    # "accel_pca__pyscx_gpu_cov").
+    for rk, rdata in raw_manifests.items():
+        if rdata.get("benchmark") == claim.benchmark and rdata.get("dataset") == claim.dataset:
+            return True, f"backed by raw/{rk}.json (format: {rdata.get('format', '?')})"
 
     for bk in baseline_rows:
         parts = bk.split("__")
-        if len(parts) == 3 and parts[0] == claim.benchmark and parts[2] == claim.dataset:
+        if len(parts) >= 3 and parts[0] == claim.benchmark and parts[-1] == claim.dataset:
             return True, f"backed by baseline ({bk})"
 
-    # Even broader: just the dataset exists in any raw result
-    for rk in raw_manifests:
-        parts = rk.split("__")
-        if len(parts) == 3 and parts[2] == claim.dataset:
-            return True, f"backed by raw/{rk}.json (benchmark/format differ)"
+    # NOTE: A dataset-only fallback was removed here. Previously, any manifest
+    # for the same dataset (regardless of benchmark or format) would satisfy
+    # the check — too permissive for a verification gate.
 
     return False, f"no manifest for {key}"
 
