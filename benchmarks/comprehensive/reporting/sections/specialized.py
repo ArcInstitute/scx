@@ -1,8 +1,9 @@
-"""Chapter 10: Specialized Workloads (Phase 5 — correctness before perf).
+"""Chapter 10: Specialized Workloads (Phase 6 — multimodal training moved).
 
-Adds correctness/validation summaries before the performance tables for
-cell-eval and Harmony/LISI, so readers confirm parity before interpreting
-speedups.
+Phase 6 changes:
+- Multimodal training-loader tables moved to ml_loader chapter (Ch 8).
+- Multimodal compression stays here as it's a format/codec concern.
+- Cell-eval and Harmony/LISI unchanged from Phase 5 (correctness first).
 """
 
 from benchmarks.comprehensive.reporting.report_model import (
@@ -15,14 +16,17 @@ from benchmarks.comprehensive.reporting import tables
 def build(store: ResultStore) -> Chapter:
     c = Chapter(title="Specialized Workloads")
 
-    # ── Multimodal ────────────────────────────────────────────────────
+    # ── Multimodal compression ────────────────────────────────────────
     c.sections.append(Section(
-        title="Multimodal (CITE-seq / Multiome)",
+        title="Multimodal Compression (CITE-seq / Multiome)",
         blocks=[
+            TextBlock(
+                "File sizes and compression ratios for multimodal datasets. "
+                "Training-loader throughput for multimodal data is in "
+                "Chapter 8 (ML Data Loading)."
+            ),
             tables.multimodal_compression_table(),
             tables.multimodal_compression_ratio_table(),
-            tables.multimodal_training_table(),
-            tables.multimodal_training_ttfb_table(),
         ],
     ))
 

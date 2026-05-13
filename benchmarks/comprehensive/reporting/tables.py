@@ -334,6 +334,112 @@ def write_speed_table(datasets: list[str] | None = None) -> TableBlock:
     )
 
 
+def write_conversion_table(datasets: list[str] | None = None) -> TableBlock:
+    """Write/conversion pipeline wall time — reads h5ad then writes target format.
+
+    This is identical to ``write_speed_table`` but explicitly labeled as
+    the *full conversion pipeline* (h5ad read → encode → write) to
+    distinguish it from a write-only benchmark that starts from in-memory
+    data. Phase 6 splits the I/O chapter so readers know which timing
+    includes h5ad read overhead.
+    """
+    if datasets is None:
+        datasets = MAIN_DATASETS
+    results = load_all_results(benchmark="write")
+    pivot = _build_pivot(results, "median_wall_s", datasets)
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min",
+        caption="Median conversion-pipeline wall time (h5ad read + encode + write)",
+    )
+
+
+def write_only_table(datasets: list[str] | None = None) -> TableBlock | TextBlock:
+    """Write-only wall time — encoding from in-memory AnnData (1 thread).
+
+    Extracts the single-threaded (``"1"``) timing from the
+    ``parallel_write_scaling`` benchmark's ``write_only`` mode, giving an
+    apples-to-apples comparison of codec/write cost without h5ad read
+    overhead.
+    """
+    if datasets is None:
+        datasets = ["census_500k", "census_1m"]
+    results = load_all_results(benchmark="parallel_write_scaling")
+    if not results:
+        return TextBlock("*No parallel_write_scaling results with write_only mode available yet.*")
+
+    pivot: dict[str, dict[str, float | None]] = {}
+    for r in results:
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        scaling = (r.get("metadata") or {}).get("scaling_wall_s", {}).get("write_only", {})
+        t1 = scaling.get("1")
+        if t1 is not None:
+            pivot.setdefault(fmt, {})[ds] = t1
+
+    if not pivot:
+        return TextBlock("*No write_only timing data found in parallel_write_scaling results.*")
+
+    return _pivot_to_tableblock(
+        pivot, datasets, _fmt_time, bold_best="min",
+        caption="Median write-only wall time (in-memory AnnData, 1 thread)",
+    )
+
+
+def memory_by_mode_tables(datasets: list[str] | None = None) -> list[Block]:
+    """Memory tables grouped by measurement mode (full read vs subset).
+
+    Returns separate ``TableBlock``s for each memory-measurement mode
+    found in the raw results (``read_full``, ``read_subset_1k``, etc.)
+    so that narrative takeaways can reference a specific mode without
+    mixing definitions.
+    """
+    if datasets is None:
+        datasets = [d for d in MAIN_DATASETS if d not in ("pbmc3k", "pbmc10k", "smartseq2")]
+    results = load_all_results(benchmark="memory")
+
+    # Collect per-mode pivots: mode -> format -> dataset -> delta_rss_mb
+    mode_pivots: dict[str, dict[str, dict[str, float | None]]] = {}
+
+    for r in results:
+        fmt = r.get("format", "")
+        ds = r.get("dataset", "")
+        if ds not in datasets:
+            continue
+        md = r.get("metadata", {}) or {}
+
+        # Full-read RSS
+        full_rss = md.get("median_delta_rss_mb_read_full")
+        if full_rss is not None:
+            mode_pivots.setdefault("Full read (materialized)", {}).setdefault(fmt, {})[ds] = full_rss
+
+        # Subset/query RSS
+        subset_rss = md.get("median_delta_rss_mb_read_subset_1k")
+        if subset_rss is not None:
+            mode_pivots.setdefault("Subset read (1K cells)", {}).setdefault(fmt, {})[ds] = subset_rss
+
+        # Fallback: parse per-run operations
+        if not full_rss and not subset_rss:
+            for run in r.get("runs", []):
+                op = (run.get("extra") or {}).get("operation", "read_full")
+                delta = (run.get("extra") or {}).get("delta_rss_mb")
+                if delta is None:
+                    delta = run.get("peak_rss_mb")
+                if delta is not None:
+                    label = "Full read (materialized)" if op == "read_full" else f"{op}"
+                    mode_pivots.setdefault(label, {}).setdefault(fmt, {})[ds] = delta
+
+    blocks: list[Block] = []
+    for mode_label in sorted(mode_pivots.keys()):
+        pivot = mode_pivots[mode_label]
+        blocks.append(_pivot_to_tableblock(
+            pivot, datasets, _fmt_mem, bold_best="min",
+            caption=f"Peak RSS (delta) — {mode_label}",
+        ))
+    return blocks or [TextBlock("*No per-mode memory results available.*")]
+
+
 def memory_table(datasets: list[str] | None = None) -> TableBlock:
     """Generate memory matrix: Format x Dataset showing peak RSS."""
     if datasets is None:
@@ -1843,18 +1949,26 @@ def generate_all_tables() -> dict[str, Block | list[Block]]:
         "compression": compression_table(),
         "compression_ratio": compression_ratio_table(),
         "write_speed": write_speed_table(),
+        "write_conversion": write_conversion_table(),
+        "write_only": write_only_table(),
         "scx_parallel_write_callout": scx_parallel_write_callout_table(),
         "read_speed": read_speed_table(),
         "read_selective": read_selective_table(),
         "parallel_scaling": parallel_scaling_table(),
         "parallel_write_scaling": parallel_write_scaling_table(),
         "memory": memory_table(),
+        "memory_by_mode": memory_by_mode_tables(),
         "fragment_ops": fragment_ops_table(),
         "cloud_filtered": cloud_filtered_table(),
         "gcp_matrix": gcp_matrix_table(),
         "cloud_reader_vs_pull": cloud_reader_vs_pull_table(),
         "cost_model": cost_model_table(),
         "ml_loader": ml_loader_table(),
+        "multimodal_compression": multimodal_compression_table(),
+        "multimodal_compression_ratio": multimodal_compression_ratio_table(),
+        "multimodal_training": multimodal_training_table(),
+        "multimodal_training_ttfb": multimodal_training_ttfb_table(),
+        "bench_csc_dispatch": bench_csc_dispatch_table(),
         "correctness_summary": correctness_table(),
         "correctness_detail": correctness_detail_table(),
         "correctness_detail_all": correctness_detail_all_datasets(),
