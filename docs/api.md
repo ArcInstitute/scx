@@ -366,11 +366,11 @@ column-aggregation kernels.
 
 ## scx-ops — File Operations
 
-### `scx_ops::append(path, obs, indptr, indices, values, ...) → Result<()>`
-Append new cells at EOF from raw CSR arrays. Advisory flock for concurrent safety.
+### `scx_ops::append(path, obs, indptr, indices, values, value_encoding, options: &AppendOptions) → Result<()>`
+Append new cells at EOF from raw CSR arrays. `AppendOptions` bundles codec selection, shard sizing, and modality routing. Advisory flock for concurrent safety.
 
-### `scx_ops::append_from_reader(target_path, source_reader, codec, shard_target_rows, target_modality_id, source_modality_id) → Result<()>`
-Streaming SCX → SCX append. Reads one source CSR shard at a time (or copies raw bytes verbatim when codec / value encoding / index dtype / per-modality `n_vars` all match), avoiding materializing the entire source matrix in memory. Supports multimodal targets via `target_modality_id` / `source_modality_id` routing. CSC sidecars are dropped on append (same as `append_for_modality`).
+### `scx_ops::append_from_reader(target_path, source_reader, options: &AppendOptions, source_modality_id) → Result<()>`
+Streaming SCX → SCX append. Reads one source CSR shard at a time (or copies raw bytes verbatim when codec / value encoding / index dtype / per-modality `n_vars` all match), avoiding materializing the entire source matrix in memory. Supports multimodal targets via `options.modality_id` / `source_modality_id` routing. CSC sidecars are dropped on append.
 
 ### `scx_ops::mark_deleted(path, cell_indices) → Result<u64>`
 Logical deletion via Roaring Bitmap deletion vectors. Returns total deleted count.

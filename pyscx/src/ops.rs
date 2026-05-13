@@ -152,18 +152,15 @@ pub fn append(
     // (Scx1 only encodes integers).
     let codec_selection = resolve_codec_selection(explicit_codec, value_encoding);
 
+    let options = scx_ops::AppendOptions {
+        codec: codec_selection,
+        shard_target_rows,
+        modality_id: 0,
+    };
+
     let target_path = PathBuf::from(target);
-    py.allow_threads(|| {
-        scx_ops::append_from_reader(
-            &target_path,
-            &input_reader,
-            codec_selection,
-            shard_target_rows,
-            0,
-            0,
-        )
-    })
-    .map_err(ops_to_pyerr)?;
+    py.allow_threads(|| scx_ops::append_from_reader(&target_path, &input_reader, &options, 0))
+        .map_err(ops_to_pyerr)?;
 
     Ok(())
 }
@@ -275,6 +272,12 @@ pub fn append_from_anndata(
     // (Scx1 only encodes integers).
     let codec_selection = resolve_codec_selection(explicit_codec, value_encoding);
 
+    let options = scx_ops::AppendOptions {
+        codec: codec_selection,
+        shard_target_rows,
+        modality_id: 0,
+    };
+
     let target_path = PathBuf::from(target);
     py.allow_threads(|| {
         scx_ops::append(
@@ -284,8 +287,7 @@ pub fn append_from_anndata(
             &indices,
             &values_bytes,
             value_encoding,
-            codec_selection,
-            shard_target_rows,
+            &options,
         )
     })
     .map_err(ops_to_pyerr)?;
