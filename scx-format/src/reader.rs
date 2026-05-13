@@ -1349,20 +1349,6 @@ impl ScxReader {
         self.read_shard_from_entry_inner(entry, false)
     }
 
-    /// Read and decode a single shard without verifying checksums.
-    ///
-    /// Alias for [`read_shard_from_entry`] — both skip checksums.
-    /// Retained for call-site clarity (e.g., in the training loader).
-    #[deprecated(note = "call `read_shard_from_entry` (identical behavior) or \
-                `read_shard_from_entry_verified` when per-shard checksum \
-                verification is required.")]
-    pub fn read_shard_from_entry_unchecked(
-        &self,
-        entry: &FullCatalogEntry,
-    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
-        self.read_shard_from_entry_inner(entry, false)
-    }
-
     /// Read and decode a single shard with explicit checksum verification.
     ///
     /// Computes the BLAKE3 hash of the shard payload and compares it to the
@@ -2050,7 +2036,7 @@ mod tests {
 
         // All entries should have known section types
         for entry in &catalog.entries {
-            assert!(SectionType::is_known(entry.section_type as u8));
+            assert!(SectionType::from_u8(entry.section_type as u8).is_some());
         }
 
         // All section reads should succeed

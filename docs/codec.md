@@ -309,5 +309,5 @@ values. Future codec versions should prioritize index improvements.
 | Delta-Golomb-Rice indptr | `scx-codec/src/deltagolomb.rs` |
 | LZ4+Shuffle byte permutation | `scx-codec/src/shuffle.rs` |
 | Codec dispatch (`codec_id`) | `scx-codec/src/dispatch.rs` |
-| Auto codec selection | `scx-codec/src/codec_select.rs` |
+| Auto codec selection | `scx-format/src/codec_select.rs` |
 | CUDA kernel decoders | `scx-gpu/src/kernels/` |
