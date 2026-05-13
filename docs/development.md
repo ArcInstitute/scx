@@ -31,14 +31,16 @@ toolkit installed; GPU functionality is only exercised at runtime. GPU tests
 gracefully skip via the `require_gpu!()` macro when no CUDA device is present.
 
 ```bash
-# Build all default-members (excludes rscx which needs R)
-cargo build --workspace
+# Build all crates except rscx (which requires the R toolchain).
+# Note: --workspace includes all `members`, not just `default-members`,
+# so --exclude rscx is needed on machines without R.
+cargo build --workspace --exclude rscx
 
 # Run all tests
-cargo test --workspace
+cargo test --workspace --exclude rscx
 
 # Lint
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --exclude rscx -- -D warnings
 
 # Format check
 cargo fmt --check
@@ -112,7 +114,7 @@ Python or pip directly.
 uv venv .venv
 
 # Install Python dependencies
-.venv/bin/pip install maturin numpy scipy pyarrow anndata scanpy \
+uv pip install maturin pytest numpy scipy pyarrow anndata scanpy \
     scikit-learn leidenalg python-dotenv
 
 # Build and install pyscx in development mode
@@ -138,7 +140,7 @@ Requires R ≥ 4.2, the `Matrix` package, and a Rust toolchain. `rscx` uses
 
 ```bash
 # Install R dependencies
-Rscript -e 'install.packages(c("Matrix", "testthat"))'
+Rscript -e 'install.packages(c("Matrix", "testthat"), repos="https://cloud.r-project.org")'
 
 # Build and install
 cd rscx && R CMD INSTALL . && cd ..
@@ -155,7 +157,7 @@ cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
 
 ### Rust tests
 
-`cargo test --workspace` covers all default-members. Key test locations:
+`cargo test --workspace --exclude rscx` covers all crates except `rscx`. Key test locations:
 
 | Crate | Location | What it covers |
 |-------|----------|----------------|
@@ -212,8 +214,8 @@ combinations that are not covered by the default workspace build:
 
 `scx-gpu` is deliberately included in `default-members` because `cudarc`
 compiles without CUDA installed. This ensures that:
-- `cargo build --workspace` works on any machine with a Rust toolchain
-- `cargo test --workspace` runs all non-GPU tests everywhere
+- `cargo build --workspace --exclude rscx` works on any machine with a Rust toolchain
+- `cargo test --workspace --exclude rscx` runs all non-GPU tests everywhere
 - GPU tests gracefully skip via `require_gpu!()`
 - CI validates the CPU-only build contract on every PR
 
@@ -244,13 +246,14 @@ Targets malformed codec bitstreams:
 cargo install cargo-fuzz
 
 # List available targets
-cd scx-codec && cargo fuzz list
+cd scx-codec
+cargo fuzz list
 
 # Run a specific target (runs indefinitely; Ctrl-C to stop)
-cd scx-codec && cargo +nightly fuzz run fuzz_bitstream
-cd scx-codec && cargo +nightly fuzz run fuzz_rice
-cd scx-codec && cargo +nightly fuzz run fuzz_forbp
-cd scx-codec && cargo +nightly fuzz run fuzz_delta_golomb
+cargo +nightly fuzz run fuzz_bitstream
+cargo +nightly fuzz run fuzz_rice
+cargo +nightly fuzz run fuzz_forbp
+cargo +nightly fuzz run fuzz_delta_golomb
 ```
 
 ### scx-format fuzzing
@@ -258,12 +261,13 @@ cd scx-codec && cargo +nightly fuzz run fuzz_delta_golomb
 Targets malformed file structures (headers, catalogs, shards):
 
 ```bash
-cd scx-format && cargo fuzz list
+cd scx-format
+cargo fuzz list
 
-cd scx-format && cargo +nightly fuzz run fuzz_header
-cd scx-format && cargo +nightly fuzz run fuzz_shard
-cd scx-format && cargo +nightly fuzz run fuzz_catalog
-cd scx-format && cargo +nightly fuzz run fuzz_csc_shard
+cargo +nightly fuzz run fuzz_header
+cargo +nightly fuzz run fuzz_shard
+cargo +nightly fuzz run fuzz_catalog
+cargo +nightly fuzz run fuzz_csc_shard
 ```
 
 > **Note**: `cargo fuzz` requires the nightly toolchain. Install with
