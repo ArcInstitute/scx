@@ -758,12 +758,12 @@ impl ScxBackedSparseDataset {
                     (Some(cols), None) => projected_agg::col_nnz_projected(&self.backed, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
                     (None, Some(kept)) => {
-                        // Masked version returns Vec<f64>, convert to Vec<i64>
+                        // Masked version returns Vec<f64>, convert to Vec<u32>
                         let f_counts = self
                             .backed
                             .col_nnz_masked(kept)
                             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        f_counts.iter().map(|&v| v as i64).collect::<Vec<i64>>()
+                        f_counts.iter().map(|&v| v as u32).collect::<Vec<u32>>()
                     }
                     (None, None) => self
                         .backed
@@ -788,13 +788,13 @@ impl ScxBackedSparseDataset {
                 (Some(cols), Some(kept)) => {
                     let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: i64 = nnz.iter().sum();
+                    let total: u32 = nnz.iter().sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
                 (Some(cols), None) => {
                     let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: i64 = nnz.iter().sum();
+                    let total: u32 = nnz.iter().sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
                 (None, Some(kept)) => {
@@ -850,12 +850,12 @@ impl ScxBackedSparseDataset {
             (Some(cols), Some(kept)) => {
                 let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(nnz.iter().sum::<i64>() as usize)
+                Ok(nnz.iter().sum::<u32>() as usize)
             }
             (Some(cols), None) => {
                 let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(nnz.iter().sum::<i64>() as usize)
+                Ok(nnz.iter().sum::<u32>() as usize)
             }
             (None, Some(kept)) => {
                 let all_nnz = self
@@ -1937,7 +1937,7 @@ impl ScxComparisonResult {
                             .backed
                             .col_nnz_masked(kept)
                             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        f_counts.iter().map(|&v| v as i64).collect::<Vec<i64>>()
+                        f_counts.iter().map(|&v| v as u32).collect::<Vec<u32>>()
                     } else {
                         self.backed
                             .col_nnz()

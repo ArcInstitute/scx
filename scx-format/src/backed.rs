@@ -1298,9 +1298,9 @@ impl BackedCsrReader {
     }
 
     /// Compute per-column NNZ counts without materializing the full matrix.
-    pub fn col_nnz(&self) -> Result<Vec<i64>> {
+    pub fn col_nnz(&self) -> Result<Vec<u32>> {
         let n_shards = self.index.n_shards();
-        let mut counts = vec![0i64; self.n_vars];
+        let mut counts = vec![0u32; self.n_vars];
         for shard_idx in 0..n_shards {
             let csr = self.read_shard_uncached(shard_idx)?;
             let partial = csr.col_nnz();

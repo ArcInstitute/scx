@@ -359,7 +359,7 @@ pub fn calculate_qc_metrics<'py>(
     };
 
     // Compute per-gene total_counts and n_cells_by_counts.
-    let (gene_total_counts, n_cells): (Vec<f64>, Vec<i64>) = if prefer_format == "csc" {
+    let (gene_total_counts, n_cells): (Vec<f64>, Vec<u32>) = if prefer_format == "csc" {
         // CSC dispatch: capability gate + projected_agg twins.
         compute_gene_axis_csc(&x)?
     } else if is_backed {
@@ -380,7 +380,7 @@ pub fn calculate_qc_metrics<'py>(
                 .col_nnz_masked(kept)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
                 .iter()
-                .map(|&v| v as i64)
+                .map(|&v| v as u32)
                 .collect(),
             None => backed
                 .backed
@@ -400,7 +400,7 @@ pub fn calculate_qc_metrics<'py>(
                 .col_nnz_masked(kept)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
                 .iter()
-                .map(|&v| v as i64)
+                .map(|&v| v as u32)
                 .collect()
         } else {
             lazy.backed
@@ -816,7 +816,7 @@ fn gpu_log1p_dispatch(
 /// transforms / row deletion vector active) is delegated to
 /// `as_column_source()`. Honors `col_projection` if set on the
 /// dataset.
-fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<i64>)> {
+fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)> {
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let source = backed.as_column_source().ok_or_else(|| {
             PyRuntimeError::new_err(
