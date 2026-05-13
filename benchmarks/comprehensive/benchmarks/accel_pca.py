@@ -286,6 +286,17 @@ def run(
         benchmark="accel_pca",
         format=variant_key,
         dataset=dataset.name,
+        scenario={
+            "name": "pca",
+            "device": "gpu" if requires_gpu else "cpu",
+            "n_comps": n_comps,
+        },
+        comparison={
+            "subject": {"impl": variant_key},
+            "baseline": {"impl": "accel_pca__scanpy_cpu"},
+            "metric": "subspace_cos_min",
+            "status": "pending",
+        },
         metadata={
             "cold_cache": cold_cache,
             "n_warmup": N_WARMUP_RUNS,

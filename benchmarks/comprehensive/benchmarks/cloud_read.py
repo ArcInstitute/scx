@@ -83,6 +83,13 @@ def run(
         benchmark="cloud_read",
         format=format_variant.key,
         dataset=dataset.name,
+        scenario={
+            "name": "cloud_full_read",
+            "mode": "full_pipeline",
+            "cache_state": "cold" if cold_cache else "warm",
+            "device": "cpu",
+            "storage_backend": provider,
+        },
         metadata={
             "provider": provider,
             "bucket": GCS_TEST_BUCKET,

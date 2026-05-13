@@ -843,6 +843,12 @@ def run(
         benchmark="ml_loader",
         format=format_variant.key,
         dataset=dataset.name,
+        scenario={
+            "name": "default",
+            "batch_size": ML_BATCH_SIZE,
+            "n_hvgs": QUERY_N_HVGS,
+            "device": "gpu" if gpu_available else "cpu",
+        },
         metadata={
             "batch_size": ML_BATCH_SIZE,
             "n_hvgs": QUERY_N_HVGS,

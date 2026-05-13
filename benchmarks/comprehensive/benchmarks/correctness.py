@@ -165,6 +165,15 @@ def run(
         benchmark="correctness",
         format="scx_auto",
         dataset=dataset.name,
+        overall_passed=overall_passed,
+        comparison={
+            "subject": {"impl": "scx_auto"},
+            "baseline": {"impl": "scanpy"},
+            "metric": "equivalence",
+            "value": n_passed / max(len(all_checks), 1),
+            "threshold": 1.0,
+            "status": "pass" if overall_passed else "fail",
+        },
         metadata={
             "overall_passed": overall_passed,
             "n_passed": n_passed,
@@ -174,6 +183,18 @@ def run(
             "suites": {name: [c.to_dict() for c in checks]
                        for name, checks in suites.items()},
             "suite_counts": suite_counts,
+            # Per-operation records for the reporting pipeline.
+            "operations": [
+                {
+                    "name": c.name,
+                    "passed": c.passed,
+                    "error": c.error,
+                    "metrics": c.metrics,
+                    "thresholds": c.thresholds,
+                    "duration_s": c.duration_s,
+                }
+                for c in all_checks
+            ],
         },
     )
 

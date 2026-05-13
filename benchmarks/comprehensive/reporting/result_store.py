@@ -564,6 +564,7 @@ def _float_or_none(v: Any) -> float | None:
 
 def _normalize_raw(data: dict[str, Any], source_path: str) -> ResultRow:
     """Normalize a raw comprehensive-harness JSON into a ``ResultRow``."""
+    missing = data.get("missing_reason")
     return ResultRow(
         benchmark=data.get("benchmark", ""),
         format=data.get("format", ""),
@@ -577,6 +578,10 @@ def _normalize_raw(data: dict[str, Any], source_path: str) -> ResultRow:
         source=SourceRef(kind=SourceKind.raw_json, path=source_path),
         scenario=ScenarioMeta.from_raw(data),
         comparison=ComparisonMeta.from_raw(data),
+        missing_reason=(
+            MissingReason(missing) if missing and missing in MissingReason.__members__
+            else None
+        ),
     )
 
 

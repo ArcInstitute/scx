@@ -73,6 +73,14 @@ class BenchmarkResult:
     timestamp: str = ""
     system: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    scenario: dict[str, Any] | None = None
+    """Optional scenario metadata (mode, cache_state, device, etc.)."""
+    comparison: dict[str, Any] | None = None
+    """Optional comparison metadata for equivalency/parity benchmarks."""
+    missing_reason: str | None = None
+    """If set, this result represents a known-missing benchmark triple."""
+    overall_passed: bool | None = None
+    """Top-level correctness pass/fail for equivalency benchmarks."""
 
     def __post_init__(self) -> None:
         if not self.timestamp:
@@ -157,8 +165,16 @@ class BenchmarkResult:
         }
         if self.file_size_bytes is not None:
             d["file_size_bytes"] = self.file_size_bytes
+        if self.overall_passed is not None:
+            d["overall_passed"] = self.overall_passed
         if self.metadata:
             d["metadata"] = self.metadata
+        if self.scenario:
+            d["scenario"] = self.scenario
+        if self.comparison:
+            d["comparison"] = self.comparison
+        if self.missing_reason:
+            d["missing_reason"] = self.missing_reason
         return d
 
 
@@ -178,6 +194,29 @@ def write_result(result: BenchmarkResult) -> Path:
     with open(path, "w") as f:
         json.dump(result.to_dict(), f, indent=2, default=str)
     return path
+
+
+def write_missing_result(
+    benchmark: str,
+    format_key: str,
+    dataset: str,
+    missing_reason: str,
+    notes: str = "",
+) -> Path:
+    """Write a stub result JSON for an omitted benchmark triple.
+
+    Creates a minimal ``BenchmarkResult`` with ``missing_reason`` set so
+    the reporting pipeline can distinguish "not run" from "not applicable"
+    and surface typed coverage gaps.
+    """
+    result = BenchmarkResult(
+        benchmark=benchmark,
+        format=format_key,
+        dataset=dataset,
+        missing_reason=missing_reason,
+        metadata={"notes": notes} if notes else {},
+    )
+    return write_result(result)
 
 
 def load_result(path: str | Path) -> dict[str, Any]:
