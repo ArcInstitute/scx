@@ -39,9 +39,9 @@ pub fn col_sums_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resu
 }
 
 /// Streaming per-column NNZ restricted to a subset of columns.
-pub fn col_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Result<Vec<i64>> {
+pub fn col_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Result<Vec<u32>> {
     let n_proj = col_indices.len();
-    let mut counts = vec![0i64; n_proj];
+    let mut counts = vec![0u32; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
         let csr = reader.read_shard_uncached(shard_idx)?;
@@ -310,9 +310,9 @@ pub fn col_nnz_masked_projected(
     reader: &BackedCsrReader,
     kept_rows: &[u64],
     col_indices: &[u32],
-) -> Result<Vec<i64>> {
+) -> Result<Vec<u32>> {
     let n_proj = col_indices.len();
-    let mut counts = vec![0i64; n_proj];
+    let mut counts = vec![0u32; n_proj];
 
     for shard_idx in 0..reader.index().n_shards() {
         let csr = reader.read_shard_uncached(shard_idx)?;
@@ -563,13 +563,13 @@ pub fn col_sums_projected_csc(
 pub fn col_nnz_projected_csc(
     source: &dyn ColumnShardSource,
     col_indices: &[u32],
-) -> Result<Vec<i64>> {
+) -> Result<Vec<u32>> {
     let n_proj = col_indices.len();
-    let mut counts = vec![0i64; n_proj];
+    let mut counts = vec![0u32; n_proj];
     walk_csc_runs(source, col_indices, |local_col, output_col, csc| {
         let s = csc.indptr[local_col] as usize;
         let e = csc.indptr[local_col + 1] as usize;
-        counts[output_col] += (e - s) as i64;
+        counts[output_col] += (e - s) as u32;
     })?;
     Ok(counts)
 }
@@ -726,9 +726,9 @@ pub fn col_nnz_masked_projected_csc(
     source: &dyn ColumnShardSource,
     kept_rows: &[u64],
     col_indices: &[u32],
-) -> Result<Vec<i64>> {
+) -> Result<Vec<u32>> {
     let n_proj = col_indices.len();
-    let mut counts = vec![0i64; n_proj];
+    let mut counts = vec![0u32; n_proj];
     walk_csc_runs(source, col_indices, |local_col, output_col, csc| {
         let s = csc.indptr[local_col] as usize;
         let e = csc.indptr[local_col + 1] as usize;

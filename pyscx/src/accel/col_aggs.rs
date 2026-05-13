@@ -142,7 +142,7 @@ fn col_sums_csc_dispatch<'py>(
     ))
 }
 
-/// Streaming column NNZ (axis=0). Returns 1-D int64 array.
+/// Streaming column NNZ (axis=0). Returns 1-D uint32 array.
 #[pyfunction]
 #[pyo3(signature = (dataset, prefer_format="csr"))]
 pub fn col_nnz<'py>(
@@ -156,24 +156,25 @@ pub fn col_nnz<'py>(
         return col_nnz_csc_dispatch(py, dataset);
     }
 
-    // CSR path: returns Vec<i64>.
+    // CSR path: returns Vec<u32>.
     if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
         let kept = backed.kept_to_global.as_ref().map(|a| a.as_slice());
         let cols = backed.col_projection();
-        let counts: Vec<i64> = match (cols, kept) {
+        let counts: Vec<u32> = match (cols, kept) {
             (Some(cols), Some(kept)) => {
                 projected_agg::col_nnz_masked_projected(&backed.backed, kept, cols)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             }
             (Some(cols), None) => projected_agg::col_nnz_projected(&backed.backed, cols)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            (None, Some(kept)) => backed
-                .backed
-                .col_nnz_masked(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                .iter()
-                .map(|&v| v as i64)
-                .collect(),
+            (None, Some(kept)) => {
+                // Masked version returns Vec<f64>, convert to Vec<u32>
+                let f_counts = backed
+                    .backed
+                    .col_nnz_masked(kept)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                f_counts.iter().map(|&v| v as u32).collect::<Vec<u32>>()
+            }
             (None, None) => backed
                 .backed
                 .col_nnz()

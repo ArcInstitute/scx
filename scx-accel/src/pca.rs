@@ -785,7 +785,7 @@ fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
         // Add zero contributions per column
         let col_nnz = csr.col_nnz();
         for c in 0..n_vars {
-            let n_zeros = n_obs as i64 - col_nnz[c];
+            let n_zeros = n_obs.saturating_sub(col_nnz[c] as usize);
             total += n_zeros as f64 * mu[c] * mu[c];
         }
         total / (n_obs as f64 - 1.0).max(1.0)

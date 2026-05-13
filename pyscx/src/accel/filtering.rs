@@ -62,7 +62,7 @@ fn backed_row_nnz_and_sums(backed: &ScxBackedSparseDataset) -> PyResult<(Vec<i64
 }
 
 /// Helper: compute col NNZ for a backed dataset (4-way dispatch).
-fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<i64>> {
+fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<u32>> {
     let counts = match (backed.col_projection(), &backed.kept_to_global) {
         (Some(cols), Some(kept)) => {
             projected_agg::col_nnz_masked_projected(&backed.backed, kept, cols)
@@ -75,7 +75,7 @@ fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<i64>> {
                 .backed
                 .col_nnz_masked(kept)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            f_counts.iter().map(|&v| v as i64).collect()
+            f_counts.iter().map(|&v| v as u32).collect()
         }
         (None, None) => backed
             .backed
@@ -485,8 +485,13 @@ pub fn filter_genes(
     // Case 1: X is ScxBackedSparseDataset
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
         let n_vars = backed.borrow().shape_val.1;
-        let col_nnz = if need_nnz {
-            Some(backed_col_nnz(&backed.borrow())?)
+        let col_nnz: Option<Vec<i64>> = if need_nnz {
+            Some(
+                backed_col_nnz(&backed.borrow())?
+                    .iter()
+                    .map(|&v| v as i64)
+                    .collect(),
+            )
         } else {
             None
         };
@@ -545,8 +550,8 @@ pub fn filter_genes(
 
         // For lazy datasets, NNZ is transform-invariant: use underlying backed reader
         // with the lazy dataset's col_projection and kept_to_global
-        let col_nnz = if need_nnz {
-            let counts = match (lazy_ref.col_projection(), &lazy_ref.kept_to_global) {
+        let col_nnz: Option<Vec<i64>> = if need_nnz {
+            let counts: Vec<u32> = match (lazy_ref.col_projection(), &lazy_ref.kept_to_global) {
                 (Some(cols), Some(kept)) => {
                     projected_agg::col_nnz_masked_projected(&lazy_ref.backed, kept, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
@@ -558,14 +563,14 @@ pub fn filter_genes(
                         .backed
                         .col_nnz_masked(kept)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    f_counts.iter().map(|&v| v as i64).collect()
+                    f_counts.iter().map(|&v| v as u32).collect()
                 }
                 (None, None) => lazy_ref
                     .backed
                     .col_nnz()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
             };
-            Some(counts)
+            Some(counts.iter().map(|&v| v as i64).collect())
         } else {
             None
         };

@@ -282,8 +282,8 @@ impl ScxCsr {
     }
 
     /// Compute per-column NNZ counts.
-    pub fn col_nnz(&self) -> Vec<i64> {
-        let mut counts = vec![0i64; self.shape.1];
+    pub fn col_nnz(&self) -> Vec<u32> {
+        let mut counts = vec![0u32; self.shape.1];
         for &col in &self.indices {
             counts[col as usize] += 1;
         }
