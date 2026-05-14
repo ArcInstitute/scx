@@ -30,6 +30,9 @@ pub enum OpsError {
     #[error("CSR index {index} out of bounds for n_vars={n_vars}")]
     IndexOutOfBounds { index: u32, n_vars: u64 },
 
+    #[error("cell index {index} out of bounds for n_obs={n_obs}")]
+    CellIndexOutOfBounds { index: u64, n_obs: u64 },
+
     #[error("layer '{name}' missing in input file {file_index}")]
     LayerMissing { name: String, file_index: usize },
 

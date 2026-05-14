@@ -11,7 +11,7 @@ use scx_format::section::{write_alignment_padding, SectionType};
 use scx_format::DeletionVectors;
 
 use crate::checksum::finalize_header_with_checksum;
-use crate::error::Result;
+use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
 use crate::rollback::build_root_catalog_from_full;
 
@@ -27,6 +27,18 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         std::io::Read::read_exact(&mut lock, &mut buf)?;
         FileHeader::read_from(&mut Cursor::new(&buf))?
     };
+
+    // Reject any index >= n_obs before mutating the file. Without this guard
+    // such indices silently fall outside the shard range search below and the
+    // returned total_deleted omits them, making user mistakes look successful.
+    for &idx in cell_indices {
+        if idx >= header.n_obs {
+            return Err(OpsError::CellIndexOutOfBounds {
+                index: idx,
+                n_obs: header.n_obs,
+            });
+        }
+    }
 
     // Read current full catalog
     let catalog = {
