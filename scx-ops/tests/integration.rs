@@ -326,6 +326,26 @@ fn test_delete_marks_cells() {
     assert!(!dv.is_deleted(0, 1));
 }
 
+#[test]
+fn test_mark_deleted_rejects_oob_indices() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "del_oob.scx", 6, 10, 1);
+
+    let err = scx_ops::mark_deleted(&path, &[0, 999_999_999]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            scx_ops::OpsError::CellIndexOutOfBounds { index, n_obs }
+                if index == 999_999_999 && n_obs == 6
+        ),
+        "expected CellIndexOutOfBounds, got: {err}"
+    );
+
+    // File untouched: no deletion vectors written.
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(!reader.header().has_deletion_vectors());
+}
+
 // ---------------------------------------------------------------------------
 // Delete + Compact tests
 // ---------------------------------------------------------------------------

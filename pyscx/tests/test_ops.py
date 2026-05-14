@@ -127,6 +127,16 @@ def test_mark_deleted_indices(query_adata, scx_from_adata):
     assert adata.n_obs == original_n - len(indices_to_delete)
 
 
+def test_mark_deleted_rejects_oob_index(query_adata, scx_from_adata):
+    """mark_deleted() rejects positive cell indices >= n_obs."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "del_oob.scx")
+    n_obs = pyscx.open(path).n_obs
+    with pytest.raises(ValueError, match="out of bounds"):
+        pyscx.mark_deleted(path, [0, n_obs + 1_000_000])
+
+
 def test_mark_deleted_boolean_mask(query_adata, scx_from_adata):
     """PyExperiment.mark_deleted(mask) with boolean mask."""
     import pyscx

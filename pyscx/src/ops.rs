@@ -79,6 +79,7 @@ fn ops_to_pyerr(e: OpsError) -> PyErr {
         | OpsError::ShapeMismatch { .. }
         | OpsError::VarLengthMismatch { .. }
         | OpsError::IndexOutOfBounds { .. }
+        | OpsError::CellIndexOutOfBounds { .. }
         | OpsError::ValueOutOfRange { .. }
         | OpsError::UnknownCodec(_)
         | OpsError::UnknownValueEncoding(_) => PyValueError::new_err(msg),
