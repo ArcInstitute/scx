@@ -216,6 +216,26 @@ All section access is via offset+length from the catalog — no sequential scann
 - `MADV_WILLNEED` on next N shards in `BackedCsrReader::read_shard_cached()` — prefetches upcoming shards after a cache miss
 - `MADV_DONTNEED` after `read_shard_uncached()` — releases page cache for decoded shards during streaming aggregation (67% RSS reduction on 1M cells)
 
+### Catalog representations (`FullCatalog`, `CatalogView`, `LazyShardStats`)
+
+`ScxReader` exposes three catalog representations that trade completeness against per-entry cost:
+
+| Type | Location | When to use |
+|------|----------|-------------|
+| `FullCatalog` | `scx-format/src/catalog.rs` | Validation, mutation (append/compact/delete/rollback), metadata inspection, the writer round-trip, and all `scx-ops` / `scx-engine` tooling that needs the full per-entry record (`name: String`, `checksum: [u8; 32]`, `ShardStats` with all scalar + indexed-column fields). This is what `ScxReader::open` parses eagerly; the value is held internally as `Arc<FullCatalog>`. |
+| `CatalogView` | `scx-format/src/catalog_view.rs` | Reader/open hot path. Drops the 32-byte `checksum`, the diagnostic `value_*` fields, and `col_*` on row-major shards; drops the `name: String` on `CsrShard` / `CscShard` / `ObspCsrShard` entries (looked up by `(section_type, major_start)` instead). Stats collapse to `ShardStatsLite { major_start, major_end, nnz }` — dispatched on `section_type` so the consumer reads the right axis without branching per access. Designed to wrap in `Arc<CatalogView>`. |
+| `LazyShardStats` | `scx-format/src/catalog.rs` | Sibling of `ShardStats`. Eagerly decodes every fixed-width scalar field (`row_*`, `col_*`, `nnz`, `value_*`, `n_indexed_columns`) but retains the variable-length per-column stats payload as `Box<[u8]>` until `decode_column_stats()` (or `to_full()`) is called. Files with `n_indexed_columns == 0` never allocate the tail. |
+
+**Which reader paths use which representation:**
+
+- `ScxReader::open` and `ScxReader::open_unchecked` parse and retain `Arc<FullCatalog>` — the tooling-facing path. Compatibility-preserving for `scx-engine` predicate pushdown (needs `column_stats`), `scx-ops` mutations (needs per-entry checksums), and any caller of `ScxReader::catalog()`.
+- `ScxReader::open_with_shared_catalog(path, Arc<FullCatalog>)` skips the catalog parse entirely; used by `pyscx::to_anndata_backed` to amortise a single parse across the N+3 sibling readers (main + X CSR + CSC sidecar + per-layer) it opens against the same file. The reused `Arc<FullCatalog>` is byte-identical to what an independent open would produce.
+- `BackedCsrReader::new*` constructors (and `for_modality` / `new_for_layer_*`) build a `CatalogView` from the reader's `FullCatalog`, then walk the view's `csr_shards_sorted` / `csr_shards_for_modality` / `layer_csr_shards_sorted_with_prefix` helpers to construct a `Vec<ShardEntryLite>` per-shard table. They never clone `FullCatalogEntry`. Per-shard retained footprint drops from ~250 B → 32 B (with alignment), which compounds at the ~16K entries census-scale shards produce.
+- `BackedCsrIndex::from_view_sorted(&[&CatalogViewEntry])` zips the major-axis range into `ShardRange` rows in a single pass over the pre-sorted view; it never re-walks the catalog.
+- `scx-engine` predicate pushdown still reads `ShardStats` via `FullCatalog` — `LazyShardStats` is wired up but the pushdown evaluator has not been migrated. The shape of `LazyShardStats` is the eventual landing site for the cold-column-stats deferral.
+
+**Fork safety:** `Arc<FullCatalog>` and `Arc<CatalogView>` have no interior mutability. `FullCatalog::reconcile_v1_csr_col_range` mutates entries once during `read_from` *before* the `Arc` wrap; after that point every reader path treats both types as frozen. A `fork()` from a Python DataLoader worker COW-duplicates the parent's catalog into each child — no shared mutex, no shared singleflight table, no atomic refcount contention across processes. See [docs/multithreading.md § Fork safety](multithreading.md#fork-safety).
+
 ---
 
 ## Fragment/Manifest Model (scx-ops)

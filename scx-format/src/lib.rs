@@ -1,6 +1,7 @@
 pub mod arrow_compat;
 pub mod backed;
 pub mod catalog;
+pub mod catalog_view;
 pub mod checksum;
 pub mod codec_select;
 #[cfg(feature = "deletion-vectors")]
@@ -23,10 +24,11 @@ pub use backed::{
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;
 pub use catalog::{
-    column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry,
-    ShardStats, CURRENT_CATALOG_VERSION, ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE,
-    SHARD_STATS_BASE_SIZE_V1, SHARD_STATS_BASE_SIZE_V2,
+    column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, LazyShardStats, RootCatalog,
+    RootCatalogEntry, ShardStats, CURRENT_CATALOG_VERSION, ROOT_CATALOG_ENTRY_SIZE,
+    ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE_V1, SHARD_STATS_BASE_SIZE_V2,
 };
+pub use catalog_view::{CatalogView, CatalogViewEntry, ShardStatsLite};
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::{
     select_codec, select_codec_for_modality, select_codec_with_profile, CodecProfile,

@@ -488,12 +488,20 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 /// Gene-chunked streaming Wilcoxon rank-sum from `BackedCsrReader`.
 ///
 /// Instead of materializing the full matrix, processes genes in chunks:
-/// 1. For each gene chunk, iterate all shards via `read_shard_uncached()`,
-///    apply `project_csr()` per shard, scatter into a dense buffer.
+/// 1. For each gene chunk, iterate all shards via `read_shard_cached_arc()`,
+///    apply `project_csr()` per shard, scatter into a dense buffer. The
+///    cache is populated on the first chunk and reused by every subsequent
+///    chunk; sizing `cache_shards >= n_shards` on the `BackedCsrReader`
+///    makes the inner loop fully cache-resident after the first pass.
+///    A too-small cache evicts the shard the next chunk needs first (the
+///    iteration order is linear `0..n_shards`), which defeats the win.
 /// 2. Run `wilcoxon_rank_sum()` on the dense buffer for that chunk.
 /// 3. Merge all chunk results with global BH correction.
 ///
-/// Peak memory: O(n_obs × gene_chunk_size) instead of O(n_obs × n_vars).
+/// Peak memory:
+///   * O(n_obs × gene_chunk_size) for the dense buffer per chunk
+///   * + O(min(cache_shards, n_shards) × decoded-shard-bytes) for the LRU
+///       shard cache (≈ 640 MB / shard on Replogle-scale inputs)
 #[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum_streaming(
     reader: &scx_format::backed::BackedCsrReader,
@@ -523,6 +531,27 @@ pub fn wilcoxon_rank_sum_streaming(
     }
 
     let n_shards = reader.index().n_shards();
+
+    // Cache-sizing footgun guard. The kernel walks every shard once per
+    // gene chunk; if the LRU can't hold all `n_shards` decoded shards
+    // simultaneously, the iteration order `0..n_shards` evicts the
+    // shard the next chunk re-requests *first*, so the cached path is
+    // strictly slower than `read_shard_uncached` (LRU bookkeeping +
+    // re-decode). Warn once per call so the caller sees it without
+    // spamming per-shard.
+    let cache_cap = reader.cache_capacity();
+    let n_chunks = n_vars.div_ceil(gene_chunk_size);
+    if n_chunks > 1 && cache_cap < n_shards {
+        log::warn!(
+            "wilcoxon_rank_sum_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
+             the cached read path will evict and re-decode every shard on each chunk. \
+             Size the BackedCsrReader cache to >= n_shards for the documented speedup.",
+            cache_cap,
+            n_shards,
+            n_chunks,
+        );
+    }
+
     let mut all_chunk_results = Vec::new();
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
@@ -534,10 +563,17 @@ pub fn wilcoxon_rank_sum_streaming(
         let mut dense = vec![0.0f32; n_obs * chunk_size];
 
         // Stream all shards, project each, scatter into dense buffer.
+        //
+        // Use the cached API: this kernel makes one pass per gene chunk,
+        // so every shard is read O(n_chunks) times. With `cache_shards`
+        // sized to hold all shards (the typical Python-side default for
+        // full-matrix DE), the second chunk onward is fully cache-resident
+        // and the inner loop pays no decompression cost. `&Arc<ScxCsr>`
+        // auto-derefs to `&ScxCsr` for `project_csr` — no extra clone.
         let mut global_row = 0usize;
         for shard_idx in 0..n_shards {
             let shard_csr = reader
-                .read_shard_uncached(shard_idx)
+                .read_shard_cached_arc(shard_idx)
                 .map_err(crate::AccelError::Scx)?;
             let projected = scx_engine::project_csr(&shard_csr, &col_indices);
 
@@ -1204,5 +1240,312 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Multi-shard streaming + cache regression coverage ───────────────────
+    // These tests guard the cache-bypass fix at the `read_shard_cached_arc`
+    // call site above. They write an SCX file with > 1 CSR shard, then run
+    // `wilcoxon_rank_sum_streaming` against a `BackedCsrReader` and compare
+    // results to `wilcoxon_rank_sum_sparse` on the same data in memory.
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format::header::{FileHeader, MAGIC};
+    use scx_format::{BackedCsrReader, ScxReader, ScxWriter};
+    use std::path::Path;
+    use std::sync::Arc as StdArc;
+
+    /// Deterministic dense matrix where ~1/3 of cells are non-zero. The
+    /// pattern guarantees nontrivial rank-sum statistics across two groups
+    /// because column values vary with both row and column index.
+    fn make_dense(n_obs: usize, n_vars: usize) -> Vec<u8> {
+        let mut dense = vec![0u8; n_obs * n_vars];
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                if (r + c) % 3 == 0 {
+                    dense[r * n_vars + c] = ((r * 7 + c * 11) % 200 + 1) as u8;
+                }
+            }
+        }
+        dense
+    }
+
+    /// Write a `.scx` file with `n_shards` CSR shards built from a row
+    /// partition of `dense`. The shards split rows evenly (last shard
+    /// absorbs the remainder).
+    fn write_multi_shard_csr(
+        path: &Path,
+        n_obs: usize,
+        n_vars: usize,
+        dense: &[u8],
+        n_shards: usize,
+    ) -> std::io::Result<()> {
+        let header = FileHeader {
+            magic: MAGIC,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            header_length: 256,
+            flags: 0,
+            n_obs: n_obs as u64,
+            n_vars: n_vars as u64,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: 16384,
+            codec_id: 0,
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
+        };
+        let mut writer = ScxWriter::new(path, header).unwrap();
+
+        let obs_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let obs = RecordBatch::try_new(
+            StdArc::new(obs_schema),
+            vec![StdArc::new(StringArray::from(
+                obs_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+
+        let var_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+        let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+        let var = RecordBatch::try_new(
+            StdArc::new(var_schema),
+            vec![StdArc::new(StringArray::from(
+                var_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_var(&var).unwrap();
+
+        let rows_per_shard = n_obs.div_ceil(n_shards);
+        for s in 0..n_shards {
+            let row_start = s * rows_per_shard;
+            if row_start >= n_obs {
+                break;
+            }
+            let row_end = (row_start + rows_per_shard).min(n_obs);
+
+            let mut indptr: Vec<u64> = vec![0];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for r in row_start..row_end {
+                for c in 0..n_vars {
+                    let v = dense[r * n_vars + c];
+                    if v != 0 {
+                        indices.push(c as u32);
+                        values.push(v);
+                    }
+                }
+                indptr.push(indices.len() as u64);
+            }
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        Ok(())
+    }
+
+    /// Build an in-memory `ScxCsr` covering the full dense matrix.
+    fn dense_to_full_csr(dense: &[u8], n_obs: usize, n_vars: usize) -> scx_sparse::ScxCsr {
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = dense[r * n_vars + c];
+                if v != 0 {
+                    indices.push(c as i32);
+                    data.push(v as f32);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, data)
+    }
+
+    fn assert_diffexp_results_match(
+        cached: &DiffExpResult,
+        reference: &DiffExpResult,
+        score_atol: f64,
+        pval_atol: f64,
+    ) {
+        assert_eq!(cached.group_names, reference.group_names);
+        for g in 0..cached.group_names.len() {
+            assert_eq!(
+                cached.names[g], reference.names[g],
+                "gene ordering diverges for group {g}"
+            );
+            for k in 0..cached.scores[g].len() {
+                let ds = (cached.scores[g][k] - reference.scores[g][k]).abs();
+                assert!(
+                    ds < score_atol,
+                    "score mismatch at group {g} rank {k}: {} vs {} (Δ={ds})",
+                    cached.scores[g][k],
+                    reference.scores[g][k]
+                );
+                let dp = (cached.pvals[g][k] - reference.pvals[g][k]).abs();
+                assert!(
+                    dp < pval_atol,
+                    "pval mismatch at group {g} rank {k}: {} vs {} (Δ={dp})",
+                    cached.pvals[g][k],
+                    reference.pvals[g][k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_with_cache_matches_sparse_kernel() {
+        // n_obs=120, n_vars=80, n_shards=4, gene_chunk_size=25
+        //   → ⌈80/25⌉ = 4 gene chunks, so the outer loop visits every
+        //     shard 4× — the exact multi-pass pattern the cache should
+        //     short-circuit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wilcox_cached.scx");
+        let n_obs = 120usize;
+        let n_vars = 80usize;
+        let n_shards = 4usize;
+        let gene_chunk_size = 25usize;
+
+        let dense = make_dense(n_obs, n_vars);
+        write_multi_shard_csr(&path, n_obs, n_vars, &dense, n_shards).unwrap();
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("gene_{j}")).collect();
+        let group_names = vec!["A".to_string(), "B".to_string()];
+        let groups: Vec<usize> = (0..n_obs)
+            .map(|i| if i < n_obs / 2 { 0 } else { 1 })
+            .collect();
+
+        // Cache sized to cover all shards plus a couple slack slots, matching
+        // the documented `cache_shards >= n_shards` recommendation.
+        let mut reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), n_shards + 2);
+        let metrics = reader.enable_metrics();
+        assert_eq!(reader.index().n_shards(), n_shards);
+
+        let cached_res = wilcoxon_rank_sum_streaming(
+            &reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            gene_chunk_size,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // The cache must actually have been consulted: with 4 chunks × 4
+        // shards = 16 lookups and 4 unique shards, we expect exactly 4
+        // misses (cold population) and 12 hits.
+        use std::sync::atomic::Ordering;
+        let hits = metrics.hits.load(Ordering::Relaxed);
+        let misses = metrics.misses.load(Ordering::Relaxed);
+        assert_eq!(
+            misses, n_shards as u64,
+            "expected one miss per unique shard, got {misses}"
+        );
+        assert_eq!(
+            hits,
+            (n_shards * (n_vars.div_ceil(gene_chunk_size) - 1)) as u64,
+            "expected cache hits on every chunk after the first"
+        );
+
+        let in_mem = dense_to_full_csr(&dense, n_obs, n_vars);
+        let reference = wilcoxon_rank_sum_sparse(
+            &in_mem,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            gene_chunk_size,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_diffexp_results_match(&cached_res, &reference, 1e-5, 1e-5);
+    }
+
+    #[test]
+    fn streaming_with_zero_cache_still_correct() {
+        // Same dataset; force `cache_shards = 0` so the LRU is `None` and
+        // `read_shard_cached_arc` falls through to decode-on-each-call.
+        // Result must still equal the sparse kernel.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wilcox_uncached.scx");
+        let n_obs = 120usize;
+        let n_vars = 80usize;
+        let n_shards = 4usize;
+        let gene_chunk_size = 25usize;
+
+        let dense = make_dense(n_obs, n_vars);
+        write_multi_shard_csr(&path, n_obs, n_vars, &dense, n_shards).unwrap();
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("gene_{j}")).collect();
+        let group_names = vec!["A".to_string(), "B".to_string()];
+        let groups: Vec<usize> = (0..n_obs)
+            .map(|i| if i < n_obs / 2 { 0 } else { 1 })
+            .collect();
+
+        let reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        assert!(
+            !reader.cache_contains(0),
+            "cache should be None when cache_shards=0"
+        );
+
+        let uncached_res = wilcoxon_rank_sum_streaming(
+            &reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            gene_chunk_size,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let in_mem = dense_to_full_csr(&dense, n_obs, n_vars);
+        let reference = wilcoxon_rank_sum_sparse(
+            &in_mem,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            gene_chunk_size,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_diffexp_results_match(&uncached_res, &reference, 1e-5, 1e-5);
     }
 }

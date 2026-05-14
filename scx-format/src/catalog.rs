@@ -354,6 +354,209 @@ impl ShardStats {
 }
 
 // ---------------------------------------------------------------------------
+// LazyShardStats — eager scalars, lazy column_stats decode
+// ---------------------------------------------------------------------------
+
+/// `ShardStats` whose per-column statistics payload is retained as
+/// opaque bytes and parsed on demand. All fixed-width scalar fields
+/// (`row_*`, `col_*`, `nnz`, `value_*`, `n_indexed_columns`) are
+/// decoded eagerly at parse time — they are cheap and most read-path
+/// consumers need them. The variable-length `column_stats` tail is
+/// consumed only by `scx-engine::pushdown` during predicate
+/// evaluation; callers without a predicate (the dominant case) never
+/// allocate the `Vec<ColumnStat>` or the per-`CategoryBitset`
+/// `Vec<u8>` payloads.
+///
+/// Compared to `ShardStats`:
+///
+/// - Files with `n_indexed_columns == 0` retain an empty
+///   `column_stats_bytes`; `decode_column_stats()` returns `Vec::new`
+///   without I/O. The byte-level cost matches the existing
+///   `ShardStats::read_from` for these files.
+/// - Files with column stats pay the column-stats payload **copy**
+///   (into `Box<[u8]>`) eagerly but defer the per-stat
+///   `Vec<ColumnStat>` decoding — the larger of the two costs — until
+///   `decode_column_stats()` or `to_full()` is called.
+///
+/// The type does NOT replace `ShardStats` in public APIs; it is a
+/// sibling. Callers that need the full eagerly-parsed struct (writer
+/// round-trips, validation, metadata inspection) keep using
+/// `ShardStats::read_from`. Callers that read the column stats only
+/// sometimes (the predicate-pushdown path, future reader integrations)
+/// can adopt `LazyShardStats` to skip the per-entry column-stats
+/// allocation on the cold case.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LazyShardStats {
+    pub row_start: u64,
+    pub row_end: u64,
+    pub col_start: u64,
+    pub col_end: u64,
+    pub nnz: u64,
+    pub value_min: u32,
+    pub value_max: u32,
+    pub value_sum: u64,
+    pub n_indexed_columns: u8,
+    /// Raw bytes of the `column_stats` payload. Empty when
+    /// `n_indexed_columns == 0`. Decoded on demand via
+    /// `decode_column_stats()`. Owned (`Box<[u8]>`) so the type can be
+    /// freely cloned and shared without lifetime constraints; the
+    /// per-stats copy is bounded by the actual `column_stats` size,
+    /// not the full stats payload.
+    column_stats_bytes: Box<[u8]>,
+    /// Catalog version snapshot. Needed at decode time because v1
+    /// `ColumnStat` layout is identical to v2 (Phase 1 column stats
+    /// did not exist on v1 in practice, but the field-level decoder
+    /// branches on it for forward-compat).
+    catalog_version: u16,
+}
+
+impl LazyShardStats {
+    /// Parse from a stats payload reader. `stats_payload_len` is the
+    /// `stats_len: u16` value the outer catalog parser already
+    /// extracted — it bounds the column-stats tail without requiring
+    /// another walk through `ColumnStat::read_from`.
+    ///
+    /// Returns an error if `stats_payload_len` is smaller than the
+    /// fixed-width prefix for the given catalog version.
+    pub fn read_from<R: Read>(
+        r: &mut R,
+        catalog_version: u16,
+        stats_payload_len: usize,
+    ) -> Result<Self> {
+        let prefix_len = if catalog_version >= 2 {
+            SHARD_STATS_BASE_SIZE_V2
+        } else {
+            SHARD_STATS_BASE_SIZE_V1
+        };
+        if stats_payload_len < prefix_len {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "stats payload too short for v{}: have {}, need >= {}",
+                    catalog_version, stats_payload_len, prefix_len
+                ),
+            )));
+        }
+
+        let row_start = r.read_u64::<LittleEndian>()?;
+        let row_end = r.read_u64::<LittleEndian>()?;
+        let (col_start, col_end) = if catalog_version >= 2 {
+            let cs = r.read_u64::<LittleEndian>()?;
+            let ce = r.read_u64::<LittleEndian>()?;
+            (cs, ce)
+        } else {
+            (0u64, 0u64)
+        };
+        let nnz = r.read_u64::<LittleEndian>()?;
+        let value_min = r.read_u32::<LittleEndian>()?;
+        let value_max = r.read_u32::<LittleEndian>()?;
+        let value_sum = r.read_u64::<LittleEndian>()?;
+        let n_indexed_columns = r.read_u8()?;
+
+        let tail_len = stats_payload_len - prefix_len;
+        let column_stats_bytes = if tail_len == 0 {
+            // Common case: `n_indexed_columns == 0`. No heap
+            // allocation for the column-stats tail.
+            Vec::new().into_boxed_slice()
+        } else {
+            let mut buf = vec![0u8; tail_len];
+            r.read_exact(&mut buf)?;
+            buf.into_boxed_slice()
+        };
+
+        Ok(Self {
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+            nnz,
+            value_min,
+            value_max,
+            value_sum,
+            n_indexed_columns,
+            column_stats_bytes,
+            catalog_version,
+        })
+    }
+
+    /// Return the retained column-stats byte payload (empty when
+    /// `n_indexed_columns == 0`). Exposed primarily for diagnostics
+    /// and tests; production callers should use `decode_column_stats`.
+    pub fn column_stats_bytes(&self) -> &[u8] {
+        &self.column_stats_bytes
+    }
+
+    /// Snapshot of the catalog version that produced this stats
+    /// payload. Required for forward-compat decoding of column stats
+    /// when v2-only `ColumnStat` variants are added in future
+    /// catalog versions.
+    pub fn catalog_version(&self) -> u16 {
+        self.catalog_version
+    }
+
+    /// Decode the retained `column_stats` bytes into a fresh
+    /// `Vec<ColumnStat>`. Returns `Vec::new` for files with
+    /// `n_indexed_columns == 0` (without touching the byte buffer).
+    /// Allocates `n_indexed_columns` × `ColumnStat` + the per-
+    /// `CategoryBitset` `Vec<u8>` payloads — i.e., exactly what the
+    /// eager `ShardStats::read_from` would have allocated.
+    pub fn decode_column_stats(&self) -> Result<Vec<ColumnStat>> {
+        if self.n_indexed_columns == 0 {
+            return Ok(Vec::new());
+        }
+        let mut cur: &[u8] = &self.column_stats_bytes;
+        let mut out = Vec::with_capacity(self.n_indexed_columns as usize);
+        for _ in 0..self.n_indexed_columns {
+            out.push(ColumnStat::read_from(&mut cur)?);
+        }
+        Ok(out)
+    }
+
+    /// Force full `ShardStats` decoding for metadata inspection,
+    /// validation, or writer round-trips. Allocates the
+    /// `column_stats` `Vec`.
+    pub fn to_full(&self) -> Result<ShardStats> {
+        Ok(ShardStats {
+            row_start: self.row_start,
+            row_end: self.row_end,
+            col_start: self.col_start,
+            col_end: self.col_end,
+            nnz: self.nnz,
+            value_min: self.value_min,
+            value_max: self.value_max,
+            value_sum: self.value_sum,
+            n_indexed_columns: self.n_indexed_columns,
+            column_stats: self.decode_column_stats()?,
+        })
+    }
+
+    /// Build a `LazyShardStats` from an already-decoded `ShardStats`.
+    /// Re-serialises the `column_stats` payload into the retained
+    /// byte buffer so `to_full()` round-trips byte-identically.
+    /// Useful for callers that hold a fully-decoded `ShardStats` and
+    /// want to construct a lazy version for downstream APIs.
+    pub fn from_full(full: &ShardStats, catalog_version: u16) -> Result<Self> {
+        let mut buf = Vec::new();
+        for cs in &full.column_stats {
+            cs.write_to(&mut buf)?;
+        }
+        Ok(Self {
+            row_start: full.row_start,
+            row_end: full.row_end,
+            col_start: full.col_start,
+            col_end: full.col_end,
+            nnz: full.nnz,
+            value_min: full.value_min,
+            value_max: full.value_max,
+            value_sum: full.value_sum,
+            n_indexed_columns: full.n_indexed_columns,
+            column_stats_bytes: buf.into_boxed_slice(),
+            catalog_version,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FullCatalog
 // ---------------------------------------------------------------------------
 
@@ -479,10 +682,9 @@ impl FullCatalog {
         r.read_exact(&mut all_bytes)?;
 
         let payload_len = total_len - 32;
-        let payload = &all_bytes[..payload_len];
+        let (payload, expected_checksum) = all_bytes.split_at(payload_len);
 
         if verify_checksum {
-            let expected_checksum = &all_bytes[payload_len..];
             let computed = blake3_hash(payload);
             if computed[..] != *expected_checksum {
                 return Err(ScxError::ChecksumMismatch {
@@ -491,8 +693,11 @@ impl FullCatalog {
             }
         }
 
-        // Parse the payload
-        let mut cur = std::io::Cursor::new(payload);
+        // Parse the payload through a `&mut &[u8]` reader so we can
+        // peel off name and stats payloads as borrowed sub-slices of
+        // `payload` without copying into per-entry `Vec<u8>` buffers
+        // or wrapping them in nested `Cursor`s.
+        let mut cur: &[u8] = payload;
         let catalog_version = cur.read_u16::<LittleEndian>()?;
         let manifest_sequence = cur.read_u64::<LittleEndian>()?;
         let prev_catalog_offset = cur.read_u64::<LittleEndian>()?;
@@ -510,10 +715,21 @@ impl FullCatalog {
         let mut entries = Vec::with_capacity(n_entries);
         for _ in 0..n_entries {
             let name_len = cur.read_u16::<LittleEndian>()? as usize;
-            let mut name_bytes = vec![0u8; name_len];
-            cur.read_exact(&mut name_bytes)?;
-            let name = String::from_utf8(name_bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            // Borrow the name bytes directly out of the outer payload
+            // slice — no per-entry `vec![0u8; name_len]` copy. UTF-8
+            // is validated in place against the borrowed slice; the
+            // single `String` allocation below replaces the previous
+            // (zero-init Vec + into-String) pair.
+            let (name_bytes, rest) = cur.split_at_checked(name_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "catalog entry name truncated",
+                )
+            })?;
+            cur = rest;
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .to_string();
 
             let offset = cur.read_u64::<LittleEndian>()?;
             let length = cur.read_u64::<LittleEndian>()?;
@@ -532,10 +748,21 @@ impl FullCatalog {
 
             let stats_len = cur.read_u16::<LittleEndian>()? as usize;
             let stats = if stats_len > 0 {
-                let mut stats_bytes = vec![0u8; stats_len];
-                cur.read_exact(&mut stats_bytes)?;
-                let mut stats_cur = std::io::Cursor::new(&stats_bytes);
-                Some(ShardStats::read_from(&mut stats_cur, catalog_version)?)
+                // Parse `ShardStats` directly out of a borrowed
+                // sub-slice — no `vec![0u8; stats_len]` copy, no
+                // nested `Cursor`. The outer reader advances by
+                // exactly `stats_len` bytes regardless of how many
+                // `ShardStats::read_from` consumes, preserving the
+                // forward-compat property of the length prefix.
+                let (stats_bytes, rest) = cur.split_at_checked(stats_len).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "catalog entry stats payload truncated",
+                    )
+                })?;
+                cur = rest;
+                let mut stats_reader: &[u8] = stats_bytes;
+                Some(ShardStats::read_from(&mut stats_reader, catalog_version)?)
             } else {
                 None
             };
@@ -1109,6 +1336,261 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // LazyShardStats tests
+    // -----------------------------------------------------------------------
+
+    fn stats_with_column_stats() -> ShardStats {
+        ShardStats {
+            row_start: 0,
+            row_end: 256,
+            col_start: 0,
+            col_end: 5_000,
+            nnz: 50_000,
+            value_min: 1,
+            value_max: 255,
+            value_sum: 1_000_000,
+            n_indexed_columns: 2,
+            column_stats: vec![
+                ColumnStat::MinMax {
+                    column_name_hash: column_name_hash("n_genes"),
+                    min: 100.0,
+                    max: 5000.0,
+                },
+                ColumnStat::CategoryBitset {
+                    column_name_hash: column_name_hash("cell_type"),
+                    bitset: vec![0xFF, 0x0F, 0xA5],
+                },
+            ],
+        }
+    }
+
+    /// `n_indexed_columns == 0`: the retained `column_stats_bytes`
+    /// must be empty (no heap allocation) and `decode_column_stats`
+    /// must return `Vec::new` without parsing.
+    #[test]
+    fn lazy_shard_stats_zero_indexed_columns_empty_tail() {
+        let full = sample_stats(); // n_indexed_columns == 0
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), SHARD_STATS_BASE_SIZE_V2);
+
+        let lazy =
+            LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
+                .unwrap();
+
+        assert_eq!(lazy.n_indexed_columns, 0);
+        assert!(
+            lazy.column_stats_bytes().is_empty(),
+            "n_indexed_columns=0 must retain zero bytes, got {} bytes",
+            lazy.column_stats_bytes().len(),
+        );
+
+        let decoded = lazy.decode_column_stats().unwrap();
+        assert!(decoded.is_empty());
+
+        // to_full() must round-trip cleanly back to the original.
+        assert_eq!(lazy.to_full().unwrap(), full);
+    }
+
+    /// `n_indexed_columns > 0`: the retained byte payload is the
+    /// suffix beyond the fixed-width prefix, and `decode_column_stats`
+    /// yields exactly the `Vec<ColumnStat>` an eager
+    /// `ShardStats::read_from` would have produced.
+    #[test]
+    fn lazy_shard_stats_with_column_stats_decode_matches_eager() {
+        let full = stats_with_column_stats();
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+        assert!(buf.len() > SHARD_STATS_BASE_SIZE_V2);
+
+        let lazy =
+            LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
+                .unwrap();
+
+        assert_eq!(lazy.row_start, full.row_start);
+        assert_eq!(lazy.row_end, full.row_end);
+        assert_eq!(lazy.col_start, full.col_start);
+        assert_eq!(lazy.col_end, full.col_end);
+        assert_eq!(lazy.nnz, full.nnz);
+        assert_eq!(lazy.value_min, full.value_min);
+        assert_eq!(lazy.value_max, full.value_max);
+        assert_eq!(lazy.value_sum, full.value_sum);
+        assert_eq!(lazy.n_indexed_columns, full.n_indexed_columns);
+        assert_eq!(
+            lazy.column_stats_bytes().len(),
+            buf.len() - SHARD_STATS_BASE_SIZE_V2,
+        );
+
+        let decoded = lazy.decode_column_stats().unwrap();
+        assert_eq!(decoded, full.column_stats);
+
+        // Re-decoding is idempotent (no internal mutation).
+        assert_eq!(lazy.decode_column_stats().unwrap(), full.column_stats);
+    }
+
+    /// `to_full()` produces a struct byte-identical to the eager
+    /// `ShardStats::read_from` of the same payload.
+    #[test]
+    fn lazy_shard_stats_to_full_round_trip() {
+        let full = stats_with_column_stats();
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+
+        let eager = ShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION).unwrap();
+        let lazy =
+            LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
+                .unwrap();
+        assert_eq!(lazy.to_full().unwrap(), eager);
+    }
+
+    /// `from_full().to_full()` round-trips an in-memory `ShardStats`
+    /// without touching disk.
+    #[test]
+    fn lazy_shard_stats_from_full_round_trip() {
+        let full = stats_with_column_stats();
+        let lazy = LazyShardStats::from_full(&full, CURRENT_CATALOG_VERSION).unwrap();
+        assert_eq!(lazy.to_full().unwrap(), full);
+
+        let empty = sample_stats();
+        let lazy_empty = LazyShardStats::from_full(&empty, CURRENT_CATALOG_VERSION).unwrap();
+        assert!(lazy_empty.column_stats_bytes().is_empty());
+        assert_eq!(lazy_empty.to_full().unwrap(), empty);
+    }
+
+    /// v1 stats: 41-byte prefix, no `col_start`/`col_end`. Lazy parser
+    /// must accept the legacy layout and leave `col_*` zero. v1 files
+    /// did not ship `column_stats` in practice (`n_indexed_columns`
+    /// was always 0 in Phase 1), but the decode pipeline still has to
+    /// support a future v1 catalog with a non-empty tail — confirm
+    /// the byte buffer is sized correctly off the `stats_payload_len`
+    /// argument rather than a hard-coded prefix.
+    #[test]
+    fn lazy_shard_stats_v1_layout() {
+        // Hand-build a 41-byte v1 stats payload.
+        let mut v1 = Vec::new();
+        v1.write_u64::<LittleEndian>(0).unwrap();
+        v1.write_u64::<LittleEndian>(256).unwrap();
+        v1.write_u64::<LittleEndian>(50_000).unwrap(); // nnz
+        v1.write_u32::<LittleEndian>(1).unwrap();
+        v1.write_u32::<LittleEndian>(255).unwrap();
+        v1.write_u64::<LittleEndian>(1_000_000).unwrap();
+        v1.push(0); // n_indexed_columns = 0
+        assert_eq!(v1.len(), SHARD_STATS_BASE_SIZE_V1);
+
+        let lazy = LazyShardStats::read_from(&mut Cursor::new(&v1), 1, v1.len()).unwrap();
+        assert_eq!(lazy.row_start, 0);
+        assert_eq!(lazy.row_end, 256);
+        assert_eq!(lazy.col_start, 0, "v1 must leave col_start zero");
+        assert_eq!(lazy.col_end, 0, "v1 must leave col_end zero");
+        assert_eq!(lazy.nnz, 50_000);
+        assert_eq!(lazy.value_min, 1);
+        assert_eq!(lazy.value_max, 255);
+        assert_eq!(lazy.value_sum, 1_000_000);
+        assert_eq!(lazy.n_indexed_columns, 0);
+        assert!(lazy.column_stats_bytes().is_empty());
+        assert_eq!(lazy.catalog_version(), 1);
+    }
+
+    /// A `stats_payload_len` smaller than the fixed-width prefix
+    /// must produce a clean error rather than reading past the
+    /// buffer or returning garbage scalars.
+    #[test]
+    fn lazy_shard_stats_rejects_undersize_payload() {
+        let mut buf = vec![0u8; 8];
+        let err =
+            LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("too short") || msg.contains("UnexpectedEof"),
+            "expected size-rejection error, got: {msg}"
+        );
+
+        // v1 prefix is 41 bytes; passing 40 must also reject.
+        buf.resize(40, 0);
+        let err = LazyShardStats::read_from(&mut Cursor::new(&buf), 1, buf.len()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("too short") || msg.contains("UnexpectedEof"));
+    }
+
+    /// Predicate-pushdown analogue: when a query requires column
+    /// statistics, `decode_column_stats()` produces the same
+    /// `Vec<ColumnStat>` that `scx-engine::pushdown` would receive
+    /// from an eagerly-parsed `ShardStats`. This is the test the
+    /// Phase 4 spec calls out as "predicate pushdown paths that
+    /// force lazy stats decoding".
+    #[test]
+    fn lazy_shard_stats_pushdown_force_decode() {
+        // Build a stats payload whose column_stats describe a
+        // realistic obs-predicate filter (numeric range + categorical
+        // bitset). Then confirm the lazy path returns exactly the
+        // structures the eager `ShardStats::column_stats` would expose.
+        let full = ShardStats {
+            row_start: 16_384,
+            row_end: 32_768,
+            col_start: 0,
+            col_end: 60_000,
+            nnz: 5_000_000,
+            value_min: 0,
+            value_max: 65_535,
+            value_sum: 100_000_000,
+            n_indexed_columns: 2,
+            column_stats: vec![
+                ColumnStat::MinMax {
+                    column_name_hash: column_name_hash("total_counts"),
+                    min: 500.0,
+                    max: 50_000.0,
+                },
+                ColumnStat::CategoryBitset {
+                    column_name_hash: column_name_hash("cell_type"),
+                    bitset: vec![0b0000_1011, 0b1100_0000, 0b0000_0001],
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+
+        let lazy =
+            LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
+                .unwrap();
+
+        // Cold scalar access: no column-stats decoding has happened.
+        assert_eq!(lazy.nnz, 5_000_000);
+        assert_eq!(lazy.n_indexed_columns, 2);
+        assert!(!lazy.column_stats_bytes().is_empty());
+
+        // Force decode (the predicate-pushdown analogue).
+        let forced = lazy.decode_column_stats().unwrap();
+        assert_eq!(forced.len(), 2);
+        match &forced[0] {
+            ColumnStat::MinMax {
+                column_name_hash,
+                min,
+                max,
+            } => {
+                assert_eq!(*column_name_hash, column_name_hash_of("total_counts"));
+                assert_eq!(*min, 500.0);
+                assert_eq!(*max, 50_000.0);
+            }
+            _ => panic!("expected MinMax for total_counts"),
+        }
+        match &forced[1] {
+            ColumnStat::CategoryBitset {
+                column_name_hash,
+                bitset,
+            } => {
+                assert_eq!(*column_name_hash, column_name_hash_of("cell_type"));
+                assert_eq!(bitset, &vec![0b0000_1011, 0b1100_0000, 0b0000_0001]);
+            }
+            _ => panic!("expected CategoryBitset for cell_type"),
+        }
+    }
+
+    fn column_name_hash_of(name: &str) -> u64 {
+        column_name_hash(name)
+    }
+
+    // -----------------------------------------------------------------------
     // FullCatalog tests (9.13–9.16)
     // -----------------------------------------------------------------------
 
@@ -1455,6 +1937,121 @@ mod tests {
         assert!(
             err_msg.contains("allocation too large"),
             "error should mention allocation: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 parser: malformed-input regression tests
+    // -----------------------------------------------------------------------
+
+    /// `stats_len` claims more bytes than remain in the payload. The
+    /// borrowed-slice parser must raise `UnexpectedEof` rather than
+    /// reading past the buffer or silently truncating the next entry.
+    #[test]
+    fn catalog_rejects_truncated_stats_payload() {
+        // v2 header for a single CSR entry whose stats_len lies.
+        let mut payload = Vec::new();
+        payload.write_u16::<LittleEndian>(2).unwrap(); // catalog_version
+        payload.write_u64::<LittleEndian>(0).unwrap(); // manifest_sequence
+        payload.write_u64::<LittleEndian>(0).unwrap(); // prev_catalog_offset
+        payload.write_u64::<LittleEndian>(100).unwrap(); // n_obs
+        payload.write_u32::<LittleEndian>(1).unwrap(); // n_entries = 1
+
+        let name = b"X_shard_0";
+        payload
+            .write_u16::<LittleEndian>(name.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(name);
+        payload.write_u64::<LittleEndian>(4352).unwrap(); // offset
+        payload.write_u64::<LittleEndian>(1000).unwrap(); // length
+        payload.push(SectionType::CsrShard as u8);
+        payload.extend_from_slice(&[0u8; 32]); // checksum
+        payload.push(0); // modality_id (v2)
+                         // Claim 200 bytes of stats but only write 8 (the row_start u64).
+        payload.write_u16::<LittleEndian>(200).unwrap();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+
+        payload.extend_from_slice(&[0u8; 32]); // trailing checksum slot
+        let total_len = payload.len();
+        let err = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stats payload truncated") || msg.contains("UnexpectedEof"),
+            "expected stats-truncated error, got: {msg}"
+        );
+    }
+
+    /// Invalid UTF-8 in a catalog entry's `name` field must surface as
+    /// an `InvalidData` IO error. The borrowed-slice parser validates
+    /// in place against the payload slice; we must still produce the
+    /// same diagnostic the old `String::from_utf8` path produced.
+    #[test]
+    fn catalog_rejects_invalid_utf8_name() {
+        let mut payload = Vec::new();
+        payload.write_u16::<LittleEndian>(2).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u32::<LittleEndian>(1).unwrap();
+
+        // Lone continuation byte 0x80 — invalid UTF-8 start byte.
+        let bad_name: &[u8] = &[0x80, 0x80, 0x80];
+        payload
+            .write_u16::<LittleEndian>(bad_name.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(bad_name);
+        payload.write_u64::<LittleEndian>(4352).unwrap();
+        payload.write_u64::<LittleEndian>(1000).unwrap();
+        payload.push(SectionType::ObsMetadata as u8);
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.push(0); // modality_id (v2)
+        payload.write_u16::<LittleEndian>(0).unwrap(); // no stats
+
+        payload.extend_from_slice(&[0u8; 32]);
+        let total_len = payload.len();
+        let err = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid utf-8") || msg.contains("InvalidData") || msg.contains("utf-8"),
+            "expected utf-8 error, got: {msg}"
+        );
+    }
+
+    /// `name_len` exceeds the bytes remaining in the payload. Mirror
+    /// of the stats-truncation case but on the name field — exercises
+    /// the per-entry `split_at_checked` rather than the upfront
+    /// `validate_allocation` cap. The payload is padded so that
+    /// `n_entries * MIN_ENTRY_BYTES <= payload_len` (the cap accepts
+    /// it); only the in-loop check catches the lie.
+    #[test]
+    fn catalog_rejects_truncated_entry_name() {
+        let mut payload = Vec::new();
+        payload.write_u16::<LittleEndian>(2).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u32::<LittleEndian>(1).unwrap();
+
+        // Claim 1024 bytes of name but only write 4 ("abcd"). The
+        // parser must reject rather than reading garbage out of the
+        // following fixed-width fields.
+        payload.write_u16::<LittleEndian>(1024).unwrap();
+        payload.extend_from_slice(b"abcd");
+        // Pad past `MIN_ENTRY_BYTES = 53` so the upfront allocation
+        // cap doesn't short-circuit the test before the entry loop
+        // runs.
+        payload.extend_from_slice(&[0u8; 100]);
+
+        payload.extend_from_slice(&[0u8; 32]); // trailing checksum slot
+        let total_len = payload.len();
+        let err = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("name truncated") || msg.contains("UnexpectedEof"),
+            "expected name-truncated error, got: {msg}"
         );
     }
 }

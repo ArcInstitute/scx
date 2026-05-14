@@ -15,9 +15,77 @@ use rayon::prelude::*;
 use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry};
+use crate::catalog_view::{CatalogView, CatalogViewEntry};
 use crate::error::{Result, ScxError};
 use crate::reader::ScxReader;
 use crate::section::SectionType;
+
+// ---------------------------------------------------------------------------
+// ShardEntryLite — internal per-shard row
+// ---------------------------------------------------------------------------
+
+/// Per-shard catalog row retained by `BackedCsrReader` for read-path
+/// dispatch. Drops the `String` name and 32-byte BLAKE3 `checksum`
+/// from `FullCatalogEntry`, plus the `value_*` / `col_*` /
+/// `column_stats` fields the read path never reads. The remaining
+/// 25 bytes (with alignment padding to 32) carry exactly what
+/// `read_shard_from_entry`, the MADV_WILLNEED prefetch, and
+/// `total_nnz` consume.
+///
+/// The `to_anndata_backed` worker amplification — N+3 reader opens
+/// across W workers × thousands of catalog entries — used to clone
+/// ~250-byte `FullCatalogEntry` values per shard. With `ShardEntryLite`
+/// the per-shard retained footprint drops ~8× and the per-entry
+/// `String` / `Vec<ColumnStat>` allocations disappear from the
+/// construction path entirely.
+#[derive(Debug, Clone, Copy)]
+struct ShardEntryLite {
+    offset: u64,
+    length: u64,
+    /// `nnz` for `total_nnz()` aggregation. Stored even though
+    /// `read_shard_from_entry` doesn't need it — it's cheaper to
+    /// retain the `u64` than to re-walk the catalog when total_nnz
+    /// is called.
+    nnz: u64,
+    section_type: SectionType,
+    modality_id: u8,
+}
+
+impl ShardEntryLite {
+    /// Build from a `CatalogView` entry whose `stats` is `Some`. The
+    /// view's `ShardStatsLite` already carries the dispatched major
+    /// axis range; we only need `nnz` here, since row-range lookups
+    /// go through `BackedCsrIndex`.
+    fn from_view_entry(e: &CatalogViewEntry) -> Self {
+        Self {
+            offset: e.offset,
+            length: e.length,
+            nnz: e.stats.as_ref().map_or(0, |s| s.nnz),
+            section_type: e.section_type,
+            modality_id: e.modality_id,
+        }
+    }
+
+    /// Synthesise a transient `FullCatalogEntry` for the few reader
+    /// APIs (`ScxReader::read_shard_from_entry`,
+    /// `ScxReader::section_bytes`) that still take it. `String::new()`
+    /// is heap-free and `[0u8; 32]` is a stack array — total cost is
+    /// a small stack copy per call, with no allocation. Used by
+    /// `read_shard_uncached` and `decode_and_cache` to bridge into
+    /// the existing reader API without paying for retained
+    /// `FullCatalogEntry` clones.
+    fn into_transient_full_entry(self) -> FullCatalogEntry {
+        FullCatalogEntry {
+            name: String::new(),
+            offset: self.offset,
+            length: self.length,
+            section_type: self.section_type,
+            checksum: [0u8; 32],
+            modality_id: self.modality_id,
+            stats: None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BackedCsrIndex
@@ -128,6 +196,28 @@ impl BackedCsrIndex {
         BackedCsrIndex {
             shard_ranges: shard_entries,
         }
+    }
+
+    /// Build the row-range index directly from a pre-sorted
+    /// `&[&CatalogViewEntry]`. The caller is responsible for sorting
+    /// by `stats.major_start`; we just zip the row range pair into
+    /// `ShardRange` and stamp the sequential `sorted_shard_idx`. This
+    /// is the function that pairs with the `ShardEntryLite::from_view_entry`
+    /// builder — both index and lightweight entry list are produced
+    /// in a single pass over the catalog view.
+    fn from_view_sorted(sorted_view_entries: &[&CatalogViewEntry]) -> Self {
+        let shard_ranges: Vec<ShardRange> = sorted_view_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                e.stats.as_ref().map(|s| ShardRange {
+                    row_start: s.major_start,
+                    row_end: s.major_end,
+                    sorted_shard_idx: i,
+                })
+            })
+            .collect();
+        BackedCsrIndex { shard_ranges }
     }
 
     /// Number of shards in the index.
@@ -442,10 +532,15 @@ pub struct BackedCsrReader {
     n_obs: usize,
     /// If set, this reader targets a specific layer rather than X.
     layer_name: Option<String>,
-    /// Pre-sorted catalog entries for X shards.
-    x_sorted_entries: Vec<FullCatalogEntry>,
-    /// Pre-sorted catalog entries for layer shards (empty for X shards).
-    sorted_entries: Vec<FullCatalogEntry>,
+    /// Pre-sorted lightweight catalog rows for X shards. Drops the
+    /// per-shard `String` name and 32-byte BLAKE3 checksum that the
+    /// read path never consumes. See [`ShardEntryLite`] for the
+    /// field set and per-shard footprint.
+    x_sorted_entries: Vec<ShardEntryLite>,
+    /// Pre-sorted lightweight catalog rows for layer shards (empty
+    /// when this reader targets X). Same `ShardEntryLite` shape as
+    /// `x_sorted_entries`.
+    sorted_entries: Vec<ShardEntryLite>,
     /// Per-instance shard cache. **Must remain per-instance** — see the
     /// "Fork safety" section in the type doc above.
     cache: Option<Mutex<WeightedLruCache>>,
@@ -488,7 +583,17 @@ impl BackedCsrReader {
         cache_shards: usize,
         bytes_budget: usize,
     ) -> Self {
-        let index = BackedCsrIndex::from_catalog(reader.catalog());
+        // Derive both the row-range index and the lightweight per-shard
+        // table from a single `CatalogView` pass — avoids the double
+        // scan + per-entry clone the old `FullCatalog::shards_sorted()`
+        // path performed.
+        let view = CatalogView::from_full(reader.catalog());
+        let sorted = view.csr_shards_sorted();
+        let index = BackedCsrIndex::from_view_sorted(&sorted);
+        let x_sorted_entries: Vec<ShardEntryLite> = sorted
+            .iter()
+            .map(|e| ShardEntryLite::from_view_entry(e))
+            .collect();
         let n_vars = reader.n_vars() as usize;
         let n_obs = reader.n_obs() as usize;
         let cache = Self::make_cache(cache_shards, bytes_budget);
@@ -497,12 +602,6 @@ impl BackedCsrReader {
         } else {
             None
         };
-        let x_sorted_entries = reader
-            .catalog()
-            .shards_sorted()
-            .into_iter()
-            .cloned()
-            .collect();
         let prefetch_count = cache_shards.max(2);
         BackedCsrReader {
             reader,
@@ -529,7 +628,13 @@ impl BackedCsrReader {
     /// file-wide `header.n_vars` (which is the max across modalities
     /// on multimodal v2 files).
     pub fn for_modality(reader: ScxReader, modality_id: u8, cache_shards: usize) -> Self {
-        let index = BackedCsrIndex::from_catalog_for_modality(reader.catalog(), modality_id);
+        let view = CatalogView::from_full(reader.catalog());
+        let sorted = view.csr_shards_for_modality(modality_id);
+        let index = BackedCsrIndex::from_view_sorted(&sorted);
+        let x_sorted_entries: Vec<ShardEntryLite> = sorted
+            .iter()
+            .map(|e| ShardEntryLite::from_view_entry(e))
+            .collect();
         let n_vars = match reader.modality_info(modality_id) {
             Some(info) => info.n_vars as usize,
             None => reader.n_vars() as usize,
@@ -541,12 +646,6 @@ impl BackedCsrReader {
         } else {
             None
         };
-        let x_sorted_entries = reader
-            .catalog()
-            .csr_shards_for_modality(modality_id)
-            .into_iter()
-            .cloned()
-            .collect();
         let prefetch_count = cache_shards.max(2);
         BackedCsrReader {
             reader,
@@ -580,7 +679,24 @@ impl BackedCsrReader {
         cache_shards: usize,
         bytes_budget: usize,
     ) -> Self {
-        let index = BackedCsrIndex::from_catalog_layer(reader.catalog(), layer_name);
+        // Single `CatalogView` pass produces both the layer table
+        // (filtered by `LayerCsrShard` + name prefix) and the X table
+        // (kept alongside so layer-mode readers can still serve X reads
+        // through their `shard_entry` dispatch).
+        let view = CatalogView::from_full(reader.catalog());
+        let prefix = format!("{layer_name}_shard_");
+        let sorted_layer = view.layer_csr_shards_sorted_with_prefix(&prefix);
+        let index = BackedCsrIndex::from_view_sorted(&sorted_layer);
+        let sorted_entries: Vec<ShardEntryLite> = sorted_layer
+            .iter()
+            .map(|e| ShardEntryLite::from_view_entry(e))
+            .collect();
+        let sorted_x = view.csr_shards_sorted();
+        let x_sorted_entries: Vec<ShardEntryLite> = sorted_x
+            .iter()
+            .map(|e| ShardEntryLite::from_view_entry(e))
+            .collect();
+
         let n_vars = reader.n_vars() as usize;
         // n_obs for layers is the same as for X — layer shards cover the same rows.
         let n_obs = reader.n_obs() as usize;
@@ -591,23 +707,6 @@ impl BackedCsrReader {
             None
         };
 
-        // Pre-compute sorted layer shard entries to avoid re-scanning catalog on every access
-        let prefix = format!("{layer_name}_shard_");
-        let mut sorted_entries: Vec<FullCatalogEntry> = reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix))
-            .cloned()
-            .collect();
-        sorted_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-
-        let x_sorted_entries = reader
-            .catalog()
-            .shards_sorted()
-            .into_iter()
-            .cloned()
-            .collect();
         let prefetch_count = cache_shards.max(2);
         BackedCsrReader {
             reader,
@@ -665,6 +764,15 @@ impl BackedCsrReader {
         }
     }
 
+    /// Configured count cap on the decoded-shard LRU. `0` means no
+    /// cache was installed and the cached read APIs decode on every
+    /// call. Multi-pass kernels (e.g. streaming Wilcoxon) use this to
+    /// detect cache-too-small footguns and warn before paying the
+    /// silent perf cliff.
+    pub fn cache_capacity(&self) -> usize {
+        self.cache_shards
+    }
+
     /// Peek the singleflight table for `shard_idx`. Returns `false` when no
     /// cache (and therefore no singleflight) is configured.
     pub fn in_flight_contains(&self, shard_idx: usize) -> bool {
@@ -694,10 +802,10 @@ impl BackedCsrReader {
         &self.index
     }
 
-    /// Get the catalog entry for a shard by index.
+    /// Get the lightweight catalog row for a shard by index.
     ///
     /// Uses `sorted_entries` for layer readers, `x_sorted_entries` for X readers.
-    fn shard_entry(&self, shard_idx: usize) -> Option<&FullCatalogEntry> {
+    fn shard_entry(&self, shard_idx: usize) -> Option<&ShardEntryLite> {
         if self.layer_name.is_some() {
             self.sorted_entries.get(shard_idx)
         } else {
@@ -940,14 +1048,15 @@ impl BackedCsrReader {
         let (indptr, indices, data) = match &self.layer_name {
             None => self.reader.read_csr_shard(shard_idx)?,
             Some(_) => {
-                let entry =
+                let lite =
                     self.sorted_entries
                         .get(shard_idx)
                         .ok_or(ScxError::ShardIndexOutOfBounds {
                             index: shard_idx,
                             count: self.sorted_entries.len(),
                         })?;
-                self.reader.read_shard_from_entry(entry)?
+                self.reader
+                    .read_shard_from_entry(&lite.into_transient_full_entry())?
             }
         };
 
@@ -1084,14 +1193,15 @@ impl BackedCsrReader {
         let (indptr, indices, data) = match &self.layer_name {
             None => self.reader.read_csr_shard(shard_idx)?,
             Some(_) => {
-                let entry =
+                let lite =
                     self.sorted_entries
                         .get(shard_idx)
                         .ok_or(ScxError::ShardIndexOutOfBounds {
                             index: shard_idx,
                             count: self.sorted_entries.len(),
                         })?;
-                self.reader.read_shard_from_entry(entry)?
+                self.reader
+                    .read_shard_from_entry(&lite.into_transient_full_entry())?
             }
         };
         let n_rows = indptr.len().saturating_sub(1);
@@ -1323,10 +1433,9 @@ impl BackedCsrReader {
         } else {
             &self.sorted_entries
         };
-        let total: u64 = entries
-            .iter()
-            .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
-            .sum();
+        // `ShardEntryLite` carries `nnz` directly — no `.stats`
+        // indirection per shard.
+        let total: u64 = entries.iter().map(|e| e.nnz).sum();
         Ok(total as usize)
     }
 

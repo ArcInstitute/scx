@@ -260,11 +260,80 @@ kernels and manages memory transfers.
 
 | Type | Thread-safe? | Notes |
 |------|-------------|-------|
-| `ScxReader` | `Send + Sync` | Backed by `mmap` (immutable `&[u8]`). Safe to share via `Arc<ScxReader>` across threads. |
+| `ScxReader` | `Send + Sync` | Backed by `mmap` (immutable `&[u8]`). Internal `Arc<FullCatalog>` is also `Send + Sync`. Safe to share via `Arc<ScxReader>` across threads or to reopen sibling readers with `ScxReader::open_with_shared_catalog`. |
+| `FullCatalog` / `CatalogView` | `Send + Sync` | Frozen after parse. `FullCatalog::reconcile_v1_csr_col_range` runs once before the `Arc` wrap; afterward both types are immutable. See [Fork safety](#fork-safety) for the constraints any future memoisation must respect. |
+| `BackedCsrReader` | `Send + Sync` | `mmap`-backed catalog data + per-instance `WeightedLruCache` and singleflight `Mutex`. **Must remain per-process** — see [Why mutable reader state stays per-instance](#why-mutable-reader-state-stays-per-instance). |
 | `ScxWriter` | `Send` only | Single-owner, sequential writes. Not shared across threads. |
 | `QueryPipeline` | `Send` | Built on one thread, executed on another. Not shared. |
 | `TrainingPipeline` | `Send` | Owns its tokio runtime and thread handles. Called from one thread at a time. |
 | `FileLock` | `Send` | Lock transferred to a single owner. Released on drop. |
+
+### Why mutable reader state stays per-instance
+
+`BackedCsrReader` holds two pieces of fork-hostile state that must never be
+shared across forked workers:
+
+- The `WeightedLruCache` of decoded shards. Its `parking_lot::Mutex`-protected
+  internal linked list can be held by a thread at the instant of `fork()`. The
+  child inherits a held lock with no owning thread; the next acquire
+  deadlocks. This is the same family of bugs that motivates `pthread_atfork`
+  handlers; `parking_lot` does not register any.
+- The singleflight table that deduplicates concurrent decode requests. Its
+  `Mutex<HashMap<ShardKey, ...>>` is held during decode dispatch. Same
+  inherit-held-lock failure mode as the LRU cache.
+
+`mmap`-backed memory and the `Arc<FullCatalog>` / `Arc<CatalogView>` payloads
+that reader-open paths reuse are immutable, so they survive `fork()` cleanly
+and are the **only** state that may be shared across worker boundaries.
+Anything that allocates or takes a lock during reads — caches, decompression
+buffers, singleflight maps, open file descriptors that hold OS-level locks —
+stays per-instance.
+
+### Catalog sharing within a process
+
+`pyscx::to_anndata_backed` opens N+3 sibling `ScxReader` instances per call
+(main reader + X CSR + CSC sidecar + one per backed layer). Each shares the
+parent's parsed catalog via `ScxReader::open_with_shared_catalog`, which
+takes an `Arc<FullCatalog>` produced by `ScxReader::catalog_arc()`. The
+shared catalog cuts catalog-parse cost from `O(N+3)` to `O(1)` per call; the
+per-instance mmap, shard cache, and singleflight table stay independent so
+fork safety is preserved.
+
+The Arc is **call-scoped**, not process-global. There is no global registry
+or cache of catalogs. Two unrelated calls to `to_anndata(backed=True)` on
+the same file parse the catalog twice — by design, so that:
+
+1. Each call's catalog reflects the on-disk state at the moment of open
+   (append/compact/rollback semantics from `scx-ops` keep working without
+   cache invalidation hooks).
+2. No global state needs to survive `fork()`.
+
+### Fork-safety constraints for future catalog memoisation
+
+If cross-call catalog memoisation is added later, the implementation MUST
+NOT:
+
+- Cache `BackedCsrReader`, `ScxReader`, or any per-shard cache. Mutable
+  reader state is the exact failure mode above.
+- Cache file handles or memory-mapped regions across workers — `fork()`
+  duplicates the descriptor but POSIX file locks (where present) are
+  process-attached, not handle-attached.
+- Hold the cache itself behind a lock that may be acquired during a `fork()`
+  call. `Arc::clone` on a fully constructed entry is fine; insertion under a
+  `Mutex` is not.
+
+It MUST:
+
+- Key on a (path, file length, manifest sequence) tuple — or any equivalent
+  identity-triple that mutation invalidates. `manifest_sequence` increments
+  on every append / delete / rollback, so it is sufficient as the
+  invalidation signal.
+- Store only immutable parsed catalog data — `Arc<FullCatalog>` and/or
+  `Arc<CatalogView>`. Both are `Send + Sync` and frozen after parse.
+- Use weak references or bounded capacity. A long-running worker that opens
+  thousands of files must not retain every catalog indefinitely.
+- Provide an opt-out (env var or builder switch) for debugging and for
+  callers that want to stress the cold-open path.
 
 ## How to control parallelism
 
