@@ -20,9 +20,6 @@ benchmarks/comprehensive/results/raw/
 benchmarks/comprehensive/results/raw_archive_*/
 benchmarks/comprehensive/results/reports/figures/
 benchmarks/comprehensive/results/reports_archive_*/
-benchmarks/comprehensive/reports/*.html
-benchmarks/comprehensive/reports/*.pdf
-benchmarks/comprehensive/reports/*.json
 benchmarks/comprehensive/logs/
 benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/

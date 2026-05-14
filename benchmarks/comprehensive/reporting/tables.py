@@ -1806,11 +1806,11 @@ def accelerator_parity_table() -> TableBlock | TextBlock:
     }
     parity_keys = {
         "accel_pca": "cosine_sim_min",
-        "accel_knn": "recall_at_k",
+        "accel_knn": "recall_vs_scanpy",
         "accel_umap": "trustworthiness",
-        "accel_leiden": "ari",
-        "accel_preprocess": "max_abs_error",
-        "accel_hvg": "overlap_pct",
+        "accel_leiden": "ari_vs_leidenalg",
+        "accel_preprocess": "max_abs_diff_vs_scanpy",
+        "accel_hvg": "hvg_overlap_vs_scanpy",
     }
 
     for (bench, ds), impls in sorted(by_key.items()):
@@ -1840,12 +1840,15 @@ def accelerator_parity_table() -> TableBlock | TextBlock:
             base_time = None
             speedup_str = "—"
 
-        # Extract parity metric from SCX runs
+        # Extract parity metric from SCX runs; fall back to the result-level
+        # metadata (some runners populate metadata but not every run's extra).
         parity_key = parity_keys.get(bench, "")
         parity_val = None
         if scx_row.runs:
             extra = scx_row.runs[0].get("extra", {})
             parity_val = extra.get(parity_key)
+        if parity_val is None and parity_key:
+            parity_val = scx_row.metadata.get(parity_key)
         parity_str = "—"
         if parity_val is not None:
             if isinstance(parity_val, float):

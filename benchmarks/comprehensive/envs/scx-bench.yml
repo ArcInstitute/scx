@@ -91,3 +91,8 @@ dependencies:
     - pdex>=0.2.0
     - polars>=1.30.0
     - tqdm>=4.67
+    # Required by validate_scanpy_equivalence.check_pseudobulk_dex /
+    # check_pseudobulk_dex_stratified — without it those tests
+    # self-classify as Skipped and the 4 pseudobulk rows in the Scanpy
+    # API Equivalence table render as "pydeseq2 not installed — skipped".
+    - pydeseq2>=0.5.4

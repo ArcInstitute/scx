@@ -2812,6 +2812,7 @@ name = "pyscx"
 version = "0.2.1"
 dependencies = [
  "arrow",
+ "base64",
  "blake3",
  "byteorder",
  "log",

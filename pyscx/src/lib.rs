@@ -101,11 +101,24 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// → Scx1 (Rice); larger integers → Zstd. Explicit options:
 /// `"none"`, `"scx1"`, `"zstd"`, `"lz4"`, `"pcodec"`.
 ///
-/// `adata.uns` is serialized as JSON. NumPy arrays/scalars, pandas
-/// Index/Series/Categorical, lists, tuples, and dicts of these are converted
-/// recursively. NumPy arrays become plain Python lists on readback (lossy:
-/// dtype/shape are not preserved). Non-finite floats and `bytes` raise
-/// `ValueError` rather than being silently coerced.
+/// `adata.uns` is serialized as JSON. The `uns_format` kwarg selects the
+/// envelope:
+///
+/// - `uns_format="tagged"` (default) wraps NumPy arrays / scalars,
+///   `tuple`s, structured recarrays, and `pandas.Categorical` / `Index` /
+///   `Series` in a `__scx_type__` JSON envelope. Numeric arrays are
+///   stored as base64-encoded little-endian bytes, so dtype, shape, and
+///   `NaN`/`Inf` round-trip bit-exact. Object/string arrays use a JSON
+///   list of strings for portability. Plain dicts/lists/scalars pass
+///   through as plain JSON.
+/// - `uns_format="plain"` (legacy) collapses NumPy arrays / pandas
+///   containers to plain Python lists on readback. Use this only if a
+///   downstream pipeline relies on the old list types.
+///
+/// In both modes, non-finite raw Python `float` values and `bytes` objects
+/// still raise `ValueError` rather than being silently coerced — finite
+/// floats serialize as JSON numbers either way, and the in-array NaN/Inf
+/// case is only handled by the base64 path under `"tagged"`.
 ///
 /// By default `from_anndata()` does not mutate `adata.X` or `adata.layers`.
 /// CSR inputs with unsorted indices are copied via
@@ -130,7 +143,7 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
 ///   Pass `0` to disable the cap (single CSC shard, memory permitting).
 #[pyfunction]
-#[pyo3(signature = (adata, path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000))]
+#[pyo3(signature = (adata, path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
     py: Python<'_>,
@@ -141,6 +154,7 @@ fn from_anndata(
     in_place: bool,
     csc: &str,
     csc_cols_per_shard: usize,
+    uns_format: &str,
 ) -> PyResult<()> {
     anndata::from_anndata_impl(
         py,
@@ -151,6 +165,7 @@ fn from_anndata(
         in_place,
         csc,
         csc_cols_per_shard,
+        uns_format,
     )
 }
 
@@ -161,9 +176,10 @@ fn from_anndata(
 /// effect because the AnnData object returned by scanpy is freshly
 /// constructed and has no other reference.
 ///
-/// `csc` and `csc_cols_per_shard` mirror `from_anndata` — see those docs.
+/// `csc`, `csc_cols_per_shard`, and `uns_format` mirror `from_anndata`
+/// — see those docs.
 #[pyfunction]
-#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000))]
+#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
 #[allow(clippy::too_many_arguments)]
 fn from_10x(
     py: Python<'_>,
@@ -174,6 +190,7 @@ fn from_10x(
     in_place: bool,
     csc: &str,
     csc_cols_per_shard: usize,
+    uns_format: &str,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy")?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
@@ -186,6 +203,7 @@ fn from_10x(
         in_place,
         csc,
         csc_cols_per_shard,
+        uns_format,
     )
 }
 
