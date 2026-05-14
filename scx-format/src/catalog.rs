@@ -479,10 +479,9 @@ impl FullCatalog {
         r.read_exact(&mut all_bytes)?;
 
         let payload_len = total_len - 32;
-        let payload = &all_bytes[..payload_len];
+        let (payload, expected_checksum) = all_bytes.split_at(payload_len);
 
         if verify_checksum {
-            let expected_checksum = &all_bytes[payload_len..];
             let computed = blake3_hash(payload);
             if computed[..] != *expected_checksum {
                 return Err(ScxError::ChecksumMismatch {
@@ -491,8 +490,11 @@ impl FullCatalog {
             }
         }
 
-        // Parse the payload
-        let mut cur = std::io::Cursor::new(payload);
+        // Parse the payload through a `&mut &[u8]` reader so we can
+        // peel off name and stats payloads as borrowed sub-slices of
+        // `payload` without copying into per-entry `Vec<u8>` buffers
+        // or wrapping them in nested `Cursor`s.
+        let mut cur: &[u8] = payload;
         let catalog_version = cur.read_u16::<LittleEndian>()?;
         let manifest_sequence = cur.read_u64::<LittleEndian>()?;
         let prev_catalog_offset = cur.read_u64::<LittleEndian>()?;
@@ -510,10 +512,21 @@ impl FullCatalog {
         let mut entries = Vec::with_capacity(n_entries);
         for _ in 0..n_entries {
             let name_len = cur.read_u16::<LittleEndian>()? as usize;
-            let mut name_bytes = vec![0u8; name_len];
-            cur.read_exact(&mut name_bytes)?;
-            let name = String::from_utf8(name_bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            // Borrow the name bytes directly out of the outer payload
+            // slice — no per-entry `vec![0u8; name_len]` copy. UTF-8
+            // is validated in place against the borrowed slice; the
+            // single `String` allocation below replaces the previous
+            // (zero-init Vec + into-String) pair.
+            let (name_bytes, rest) = cur.split_at_checked(name_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "catalog entry name truncated",
+                )
+            })?;
+            cur = rest;
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .to_string();
 
             let offset = cur.read_u64::<LittleEndian>()?;
             let length = cur.read_u64::<LittleEndian>()?;
@@ -532,10 +545,21 @@ impl FullCatalog {
 
             let stats_len = cur.read_u16::<LittleEndian>()? as usize;
             let stats = if stats_len > 0 {
-                let mut stats_bytes = vec![0u8; stats_len];
-                cur.read_exact(&mut stats_bytes)?;
-                let mut stats_cur = std::io::Cursor::new(&stats_bytes);
-                Some(ShardStats::read_from(&mut stats_cur, catalog_version)?)
+                // Parse `ShardStats` directly out of a borrowed
+                // sub-slice — no `vec![0u8; stats_len]` copy, no
+                // nested `Cursor`. The outer reader advances by
+                // exactly `stats_len` bytes regardless of how many
+                // `ShardStats::read_from` consumes, preserving the
+                // forward-compat property of the length prefix.
+                let (stats_bytes, rest) = cur.split_at_checked(stats_len).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "catalog entry stats payload truncated",
+                    )
+                })?;
+                cur = rest;
+                let mut stats_reader: &[u8] = stats_bytes;
+                Some(ShardStats::read_from(&mut stats_reader, catalog_version)?)
             } else {
                 None
             };
@@ -1455,6 +1479,121 @@ mod tests {
         assert!(
             err_msg.contains("allocation too large"),
             "error should mention allocation: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 parser: malformed-input regression tests
+    // -----------------------------------------------------------------------
+
+    /// `stats_len` claims more bytes than remain in the payload. The
+    /// borrowed-slice parser must raise `UnexpectedEof` rather than
+    /// reading past the buffer or silently truncating the next entry.
+    #[test]
+    fn catalog_rejects_truncated_stats_payload() {
+        // v2 header for a single CSR entry whose stats_len lies.
+        let mut payload = Vec::new();
+        payload.write_u16::<LittleEndian>(2).unwrap(); // catalog_version
+        payload.write_u64::<LittleEndian>(0).unwrap(); // manifest_sequence
+        payload.write_u64::<LittleEndian>(0).unwrap(); // prev_catalog_offset
+        payload.write_u64::<LittleEndian>(100).unwrap(); // n_obs
+        payload.write_u32::<LittleEndian>(1).unwrap(); // n_entries = 1
+
+        let name = b"X_shard_0";
+        payload
+            .write_u16::<LittleEndian>(name.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(name);
+        payload.write_u64::<LittleEndian>(4352).unwrap(); // offset
+        payload.write_u64::<LittleEndian>(1000).unwrap(); // length
+        payload.push(SectionType::CsrShard as u8);
+        payload.extend_from_slice(&[0u8; 32]); // checksum
+        payload.push(0); // modality_id (v2)
+                         // Claim 200 bytes of stats but only write 8 (the row_start u64).
+        payload.write_u16::<LittleEndian>(200).unwrap();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+
+        payload.extend_from_slice(&[0u8; 32]); // trailing checksum slot
+        let total_len = payload.len();
+        let err = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stats payload truncated") || msg.contains("UnexpectedEof"),
+            "expected stats-truncated error, got: {msg}"
+        );
+    }
+
+    /// Invalid UTF-8 in a catalog entry's `name` field must surface as
+    /// an `InvalidData` IO error. The borrowed-slice parser validates
+    /// in place against the payload slice; we must still produce the
+    /// same diagnostic the old `String::from_utf8` path produced.
+    #[test]
+    fn catalog_rejects_invalid_utf8_name() {
+        let mut payload = Vec::new();
+        payload.write_u16::<LittleEndian>(2).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u32::<LittleEndian>(1).unwrap();
+
+        // Lone continuation byte 0x80 — invalid UTF-8 start byte.
+        let bad_name: &[u8] = &[0x80, 0x80, 0x80];
+        payload
+            .write_u16::<LittleEndian>(bad_name.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(bad_name);
+        payload.write_u64::<LittleEndian>(4352).unwrap();
+        payload.write_u64::<LittleEndian>(1000).unwrap();
+        payload.push(SectionType::ObsMetadata as u8);
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.push(0); // modality_id (v2)
+        payload.write_u16::<LittleEndian>(0).unwrap(); // no stats
+
+        payload.extend_from_slice(&[0u8; 32]);
+        let total_len = payload.len();
+        let err = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid utf-8") || msg.contains("InvalidData") || msg.contains("utf-8"),
+            "expected utf-8 error, got: {msg}"
+        );
+    }
+
+    /// `name_len` exceeds the bytes remaining in the payload. Mirror
+    /// of the stats-truncation case but on the name field — exercises
+    /// the per-entry `split_at_checked` rather than the upfront
+    /// `validate_allocation` cap. The payload is padded so that
+    /// `n_entries * MIN_ENTRY_BYTES <= payload_len` (the cap accepts
+    /// it); only the in-loop check catches the lie.
+    #[test]
+    fn catalog_rejects_truncated_entry_name() {
+        let mut payload = Vec::new();
+        payload.write_u16::<LittleEndian>(2).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u64::<LittleEndian>(0).unwrap();
+        payload.write_u32::<LittleEndian>(1).unwrap();
+
+        // Claim 1024 bytes of name but only write 4 ("abcd"). The
+        // parser must reject rather than reading garbage out of the
+        // following fixed-width fields.
+        payload.write_u16::<LittleEndian>(1024).unwrap();
+        payload.extend_from_slice(b"abcd");
+        // Pad past `MIN_ENTRY_BYTES = 53` so the upfront allocation
+        // cap doesn't short-circuit the test before the entry loop
+        // runs.
+        payload.extend_from_slice(&[0u8; 100]);
+
+        payload.extend_from_slice(&[0u8; 32]); // trailing checksum slot
+        let total_len = payload.len();
+        let err = FullCatalog::read_from(&mut std::io::Cursor::new(&payload), total_len, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("name truncated") || msg.contains("UnexpectedEof"),
+            "expected name-truncated error, got: {msg}"
         );
     }
 }
