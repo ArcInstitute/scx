@@ -900,6 +900,40 @@ def test_from_anndata_uns_tagged_unknown_marker_warns(tmp_dir):
     assert out.uns["future_marker"] == {"__scx_type__": "future_thing", "data": 1}
 
 
+def test_from_anndata_uns_known_tag_with_missing_keys_treated_as_plain_dict(tmp_dir):
+    """A user dict whose `__scx_type__` matches a known tag (e.g. "ndarray")
+    but is missing the envelope's required structural keys must round-trip
+    verbatim as a plain dict, with **no** warning.
+
+    Regression for the Codex review on PR #89: the previous read path
+    unconditionally dispatched any string-valued `__scx_type__` to the
+    matching envelope decoder, which then raised ValueError on missing
+    keys. Legitimate user metadata that happens to use our sentinel key
+    should be silently passed through.
+    """
+    import warnings as _warnings
+
+    import pyscx
+
+    # Each tag with a payload that is *not* a valid envelope (missing one or
+    # more required keys per `envelope_required_keys`). plain mode is the
+    # vehicle because the writer doesn't introspect user dict contents.
+    payloads = {
+        "fake_ndarray": {"__scx_type__": "ndarray", "foo": 1},
+        "fake_scalar": {"__scx_type__": "scalar"},
+        "fake_categorical": {"__scx_type__": "categorical", "codes": [0, 1]},
+        "fake_index": {"__scx_type__": "pandas.Index", "data": [1, 2]},
+    }
+    adata = _adata_with_uns(payloads)
+    path = str(tmp_dir / "uns_collision.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")  # any warning fails the test
+        out = pyscx.open(path).to_anndata()
+    for key, original in payloads.items():
+        assert out.uns[key] == original, f"plain-dict fallback failed for {key}"
+
+
 # ---------------------------------------------------------------------------
 # Issue #5: ensure_csr() must not mutate caller-owned CSR matrices by default.
 # ---------------------------------------------------------------------------
