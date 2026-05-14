@@ -23,7 +23,7 @@ use crate::anndata;
 // Helpers
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SHARD_SIZE: i64 = 16384;
+const DEFAULT_SHARD_SIZE: i64 = scx_format::DEFAULT_SHARD_TARGET_ROWS as i64;
 
 /// Validate the Python-side `shard_size` kwarg and convert to NonZeroU32.
 ///

@@ -145,6 +145,41 @@ def test_mark_deleted_boolean_mask(query_adata, scx_from_adata):
     assert adata.n_obs == original_n - 40
 
 
+def test_mark_deleted_mask_too_short(query_adata, scx_from_adata):
+    """mark_deleted() rejects masks shorter than n_obs."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_short.scx")
+    exp = pyscx.open(path)
+    short_mask = np.zeros(exp.n_obs - 10, dtype=bool)
+    with pytest.raises(ValueError, match="does not match n_obs"):
+        exp.mark_deleted(short_mask)
+
+
+def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
+    """mark_deleted() rejects masks longer than n_obs."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_long.scx")
+    exp = pyscx.open(path)
+    long_mask = np.zeros(exp.n_obs + 10, dtype=bool)
+    with pytest.raises(ValueError, match="does not match n_obs"):
+        exp.mark_deleted(long_mask)
+
+
+def test_mark_deleted_mask_exact_length(query_adata, scx_from_adata):
+    """mark_deleted() accepts masks of exactly n_obs length."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_exact.scx")
+    exp = pyscx.open(path)
+    exact_mask = np.zeros(exp.n_obs, dtype=bool)
+    exact_mask[0] = True
+    exact_mask[-1] = True
+    total = exp.mark_deleted(exact_mask)
+    assert total == 2
+
+
 def test_compact(query_adata, tmp_dir):
     """After append + delete, compact produces smaller valid file."""
     import anndata

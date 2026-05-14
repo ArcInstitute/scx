@@ -44,14 +44,18 @@ pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
 ///
 /// Args:
 ///     path: Path to the SCX file.
-///     verify: If True (default), verify the file header magic/version and
-///         the trailing BLAKE3 checksum over the full catalog. This
-///         authenticates the catalog payload (offsets, lengths, per-section
-///         checksums) but does not re-hash section bytes — call
-///         `pyscx.validate(path)` (or `scx validate`) when section-level
-///         payload integrity must be confirmed. Set to False for
-///         performance-sensitive paths where the file is trusted (e.g.,
-///         repeated reads of a file that was already validated).
+///     verify: Verifies the file header and catalog checksum only.
+///         Does NOT re-hash section payload bytes — for full payload
+///         integrity (after write, after cloud pull, after transfer)
+///         call `pyscx.validate(path)` (or `scx validate`). Default: True.
+///
+///         More precisely, with `verify=True` pyscx checks the header
+///         magic/version and the trailing BLAKE3 checksum over the full
+///         catalog. This authenticates the catalog payload (offsets,
+///         lengths, per-section checksums) but does not touch section
+///         bytes. Set to False for performance-sensitive paths where the
+///         file is trusted (e.g., repeated reads of a file that was
+///         already validated).
 ///
 /// Example:
 ///     exp = pyscx.open("data.scx")
@@ -192,7 +196,16 @@ fn from_10x(
     csc_cols_per_shard: usize,
     uns_format: &str,
 ) -> PyResult<()> {
-    let scanpy = py.import("scanpy")?;
+    let scanpy = py.import("scanpy").map_err(|e| {
+        if e.is_instance_of::<pyo3::exceptions::PyModuleNotFoundError>(py) {
+            pyo3::exceptions::PyModuleNotFoundError::new_err(
+                "pyscx.from_10x() requires scanpy. Install it with: \
+                 pip install 'pyscx[10x]'",
+            )
+        } else {
+            e
+        }
+    })?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
     anndata::from_anndata_impl(
         py,

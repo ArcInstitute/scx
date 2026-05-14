@@ -432,6 +432,12 @@ def check_pseudobulk_dex(adata_raw) -> ValidationCheck:
     adata = adata_raw.copy()
     ensure_metadata_columns(adata)
 
+    # Pick a reference category that actually exists in this dataset's
+    # cell_type column. pbmc3k uses synthetic categories from
+    # ensure_metadata_columns (incl. "T cell"); real atlases like
+    # tabula_sapiens_100k have biological subtypes instead.
+    reference = str(adata.obs["cell_type"].value_counts().index[0])
+
     # Need at least 2 cell types with enough cells
     # pyscx.accel.pseudobulk_dex needs groupby columns in obs
     try:
@@ -439,7 +445,7 @@ def check_pseudobulk_dex(adata_raw) -> ValidationCheck:
             adata,
             groupby=["cell_type", "donor"],
             test_col="cell_type",
-            reference="T cell",
+            reference=reference,
             min_cells_per_group=5,
         )
     except Exception as e:
@@ -496,6 +502,7 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
 
     adata = adata_raw.copy()
     ensure_metadata_columns(adata)
+    reference = str(adata.obs["cell_type"].value_counts().index[0])
 
     try:
         # Stratified call
@@ -503,7 +510,7 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
             adata,
             groupby=["cell_type", "donor"],
             test_col="cell_type",
-            reference="T cell",
+            reference=reference,
             stratify_by=["batch"],
             min_cells_per_group=3,
             min_cells_per_stratum=10,
@@ -521,7 +528,7 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
                     adata_sub,
                     groupby=["cell_type", "donor"],
                     test_col="cell_type",
-                    reference="T cell",
+                    reference=reference,
                     min_cells_per_group=3,
                 )
                 if res is not None and len(res) > 0:

@@ -212,6 +212,35 @@ pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "dataset.scx")
 pyscx.to_mtx("dataset.scx", "/path/to/output_dir")
 ```
 
+## Validating files after write or transfer
+
+`pyscx.open(path)` and `pyscx.open(path, verify=True)` authenticate the file
+header, catalog offsets/lengths, and the catalog checksum, but they do **not**
+re-hash section payload bytes. That's the right default for normal reads —
+the catalog already records per-section BLAKE3 checksums, so opening is fast
+and detects file-header / catalog corruption immediately.
+
+For full payload integrity, run `pyscx.validate(path)` (or `scx validate`
+from the CLI), which BLAKE3-hashes every section's bytes against the
+catalog and reports per-section pass/fail. Cost is proportional to total
+section bytes.
+
+Production checkpoints to call `pyscx.validate()`:
+
+- After `pyscx.from_anndata(...)` / `pyscx.from_10x(...)` writes a new
+  file, before downstream consumers depend on it.
+- After `pyscx.pull(...)` (or `scx pull`) downloads from cloud, before
+  treating the local file as canonical.
+- After any file transfer (rsync, gcloud cp, scp, etc.) into a path that
+  will be read by training or analysis pipelines.
+
+```python
+results = pyscx.validate("data.scx")
+for name, passed in results:
+    if not passed:
+        raise RuntimeError(f"section {name} failed checksum")
+```
+
 ## Understanding `to_anndata()`
 
 ### Full signature

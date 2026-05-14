@@ -1776,7 +1776,7 @@ mod tests {
             nnz: 500,
             n_csr_shards: 0,
             n_csc_shards: 0,
-            shard_target_rows: 16384,
+            shard_target_rows: crate::DEFAULT_SHARD_TARGET_ROWS,
             codec_id: 0,
             index_dtype: 0, // u16
             endian: 0,
@@ -2727,7 +2727,7 @@ mod tests {
             nnz: 0,
             n_csr_shards: 0,
             n_csc_shards: 0,
-            shard_target_rows: 16384,
+            shard_target_rows: crate::DEFAULT_SHARD_TARGET_ROWS,
             codec_id: 0,
             // u32 indices on disk (Phase A test fixtures use n_vars=6
             // which fits in u16, but we want index_dtype to track

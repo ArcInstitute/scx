@@ -212,13 +212,29 @@ operate, then merge back). This is a Phase F+ follow-on.
 
 ## 6. Limitations and follow-ons
 
+### Supported multimodal operations
+
+| Operation | Status | Workaround |
+|---|---|---|
+| `pyscx.from_mudata` / `PyExperiment.to_mudata` | Supported | — |
+| `scx convert --from/--to h5mu` | Supported | — |
+| `pyscx.MultimodalTrainingDataset` | Supported | — |
+| `scx subset --modality NAME` | Supported | — |
+| `scx append --modality NAME` | Supported (drops CSC sidecar) | `--rebuild-csc` |
+| `scx merge` on multimodal inputs | Rejected with friendly error | `scx subset --modality NAME` per modality, then merge per-modality, re-compose |
+| `scx compact` on multimodal inputs | Rejected with friendly error | Same workaround |
+| Per-modality CSC sidecar on `scx append` | Drops file-wide sidecar | `scx build-csc` after append |
+
+### Detail
+
 - **Per-modality CSC sidecars on append**: `scx append --modality rna`
   drops the file-wide CSC sidecar (matching the existing single-
   modality behaviour). Per-modality CSC preservation (leaving ADT's
   CSC intact while appending into RNA) is a Phase F+ follow-on. Pass
   `--rebuild-csc` to re-emit the sidecar.
 - **Multimodal merge / compact**: not yet implemented; the operations
-  reject multimodal inputs explicitly. Use `scx subset --modality
+  reject multimodal inputs with `OpsError::MultimodalUnsupported`
+  (surfaces as `RuntimeError` in Python). Use `scx subset --modality
   NAME` to extract single modalities and operate on those.
 - **`subset --modality NAME` + `--filter` / `--genes`**: not yet
   combined; extract first, then filter. The QueryPipeline backing

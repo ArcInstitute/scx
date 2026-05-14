@@ -76,13 +76,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         // not yet implemented — the existing merge logic below
         // assumes single-modality and would silently flatten the
         // file. Refuse rather than corrupt.
-        return Err(OpsError::ModalityMismatch {
-            detail: "all inputs are multimodal with matching structures, but multimodal \
-                 merge (preserving the modality table) is not yet implemented; \
-                 use `scx subset --modality NAME` on each input to extract a \
-                 single modality first, then `scx merge` the single-modality files"
-                .to_string(),
-        });
+        return Err(OpsError::MultimodalUnsupported { op: "scx merge" });
     }
 
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
