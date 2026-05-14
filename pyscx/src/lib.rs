@@ -197,14 +197,23 @@ fn from_10x(
     uns_format: &str,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy").map_err(|e| {
+        // Only rewrite when scanpy itself is the missing module — if scanpy
+        // is installed but one of its transitive deps fails to import, we
+        // must propagate the original error so users can diagnose it.
         if e.is_instance_of::<pyo3::exceptions::PyModuleNotFoundError>(py) {
-            pyo3::exceptions::PyModuleNotFoundError::new_err(
-                "pyscx.from_10x() requires scanpy. Install it with: \
-                 pip install 'pyscx[10x]'",
-            )
-        } else {
-            e
+            let missing = e
+                .value(py)
+                .getattr("name")
+                .ok()
+                .and_then(|n| n.extract::<String>().ok());
+            if missing.as_deref() == Some("scanpy") {
+                return pyo3::exceptions::PyModuleNotFoundError::new_err(
+                    "pyscx.from_10x() requires scanpy. Install it with: \
+                     pip install 'pyscx[10x]'",
+                );
+            }
         }
+        e
     })?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
     anndata::from_anndata_impl(
