@@ -56,7 +56,7 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
         /// Target rows per shard
-        #[arg(long, default_value = "10000", value_parser = validators::positive_u32)]
+        #[arg(long, default_value_t = scx_format::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
         /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
@@ -115,7 +115,7 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Target rows per shard (must be > 0)
-        #[arg(long, default_value_t = NonZeroU32::new(10000).unwrap())]
+        #[arg(long, default_value_t = NonZeroU32::new(scx_format::DEFAULT_SHARD_TARGET_ROWS).unwrap())]
         shard_size: NonZeroU32,
         /// Rebuild the CSC sidecar after appending (drops + re-emits via
         /// `scx build-csc`). Without this flag, append drops the CSC
@@ -267,10 +267,9 @@ enum Commands {
         /// Predicate expression to selectively download matching shards
         #[arg(long)]
         filter: Option<String>,
-        /// Filter granularity for selective pulls: 'shard' (default, fast,
-        /// may include extra cells) or 'exact' (cell-granular, reserved
-        /// for future implementation)
-        #[arg(long, default_value = "shard", value_parser = ["shard", "exact"])]
+        /// Filter granularity for selective pulls: 'shard' (currently the
+        /// only supported mode; cell-granular filtering is a follow-on).
+        #[arg(long, default_value = "shard", value_parser = ["shard"])]
         filter_mode: String,
     },
     /// Upload a local .scx file to cloud/local as exploded .scxd directory
@@ -329,7 +328,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
         /// Target rows per shard in the output file
-        #[arg(long, default_value = "10000", value_parser = validators::positive_u32)]
+        #[arg(long, default_value_t = scx_format::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
         /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]

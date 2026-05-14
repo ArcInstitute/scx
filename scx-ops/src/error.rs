@@ -61,6 +61,13 @@ pub enum OpsError {
     #[error("modality mismatch on merge: {detail}")]
     ModalityMismatch { detail: String },
 
+    #[error(
+        "{op} is not yet supported for multimodal files; \
+         extract individual modalities first with \
+         `scx subset --modality NAME`"
+    )]
+    MultimodalUnsupported { op: &'static str },
+
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }

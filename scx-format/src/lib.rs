@@ -53,3 +53,12 @@ pub use writer::{
     chmod_to_umask, compute_shard_stats, fsync_parent_dir, make_sibling_tempfile, MajorAxis,
     PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
 };
+
+/// Default number of rows per CSR shard when callers don't override it.
+///
+/// 16 384 is a power of two (aligns with typical GPU batch sizes and
+/// memory page boundaries) and matches the `ScxWriter` test-fixture
+/// default. Used by the pyscx ops bindings and the `scx convert` /
+/// `scx append` / `scx subset` CLI subcommands so identical inputs
+/// through CLI and Python produce identical shard layouts.
+pub const DEFAULT_SHARD_TARGET_ROWS: u32 = 16384;

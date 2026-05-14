@@ -44,6 +44,11 @@ cloud = [
     "google-cloud-storage>=2.0",
     "azure-storage-blob>=12.0",
 ]
+# 10x Genomics ingestion via `pyscx.from_10x`. Pulls in scanpy for its
+# `read_10x_h5` reader. Optional — only required if calling `from_10x`.
+"10x" = [
+    "scanpy>=1.9",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

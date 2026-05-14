@@ -104,6 +104,15 @@ impl PyExperiment {
             .as_slice()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
+        let expected = self.reader.n_obs() as usize;
+        if mask_slice.len() != expected {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "mask length {} does not match n_obs {}",
+                mask_slice.len(),
+                expected
+            )));
+        }
+
         // Collect indices where mask is True
         let indices: Vec<u64> = mask_slice
             .iter()

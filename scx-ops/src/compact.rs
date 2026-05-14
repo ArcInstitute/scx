@@ -30,14 +30,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     // modality table and stamp every shard with `modality_id = 0`.
     // Refuse rather than corrupt.
     if reader.is_multimodal() {
-        return Err(crate::error::OpsError::Format(
-            scx_format::ScxError::InvalidCatalog(format!(
-                "compact does not yet support multimodal files ({} modalities). \
-                 Use `scx subset --modality NAME` to extract a single modality first, \
-                 then `scx compact` it.",
-                reader.n_modalities()
-            )),
-        ));
+        return Err(crate::error::OpsError::MultimodalUnsupported { op: "scx compact" });
     }
 
     // Load deletion vectors
