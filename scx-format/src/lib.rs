@@ -24,9 +24,9 @@ pub use backed::{
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;
 pub use catalog::{
-    column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry,
-    ShardStats, CURRENT_CATALOG_VERSION, ROOT_CATALOG_ENTRY_SIZE, ROOT_CATALOG_MAX_SIZE,
-    SHARD_STATS_BASE_SIZE_V1, SHARD_STATS_BASE_SIZE_V2,
+    column_name_hash, ColumnStat, FullCatalog, FullCatalogEntry, LazyShardStats, RootCatalog,
+    RootCatalogEntry, ShardStats, CURRENT_CATALOG_VERSION, ROOT_CATALOG_ENTRY_SIZE,
+    ROOT_CATALOG_MAX_SIZE, SHARD_STATS_BASE_SIZE_V1, SHARD_STATS_BASE_SIZE_V2,
 };
 pub use catalog_view::{CatalogView, CatalogViewEntry, ShardStatsLite};
 pub use checksum::{blake3_hash, blake3_truncated_64};
