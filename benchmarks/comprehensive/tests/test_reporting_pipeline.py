@@ -758,3 +758,49 @@ class TestSourceRef:
 
     def test_all_kinds(self):
         assert len(SourceKind) == 5
+
+
+# ===================================================================
+# 23. Dashboard render_html backward compatibility
+# ===================================================================
+class TestDashboardRenderHtml:
+    """Ensures render_html accepts both Report objects and plain strings."""
+
+    def test_report_object_path(self):
+        from benchmarks.comprehensive.reporting.dashboard import render_html
+        r = _minimal_report()
+        h = render_html(r, title="Test")
+        assert "<!DOCTYPE html>" in h
+        assert "Test Report" in h  # title from the Report object
+
+    def test_string_path(self):
+        """String input is the landing.py code path that previously crashed."""
+        from benchmarks.comprehensive.reporting.dashboard import render_html
+        h = render_html("# Landing\nSome content", title="Landing")
+        assert "<!DOCTYPE html>" in h
+        assert "Landing" in h
+        assert "Some content" in h
+
+    def test_string_path_with_prev_url(self):
+        from benchmarks.comprehensive.reporting.dashboard import render_html
+        h = render_html("body", prev_url="prev.html")
+        assert "previous snapshot" in h
+        assert "prev.html" in h
+
+
+# ===================================================================
+# 24. set_store public API
+# ===================================================================
+class TestSetStore:
+    def test_set_and_get(self):
+        from benchmarks.comprehensive.reporting.result_store import (
+            set_store, get_store, reset_store, ResultStore,
+        )
+        original = get_store()
+        try:
+            custom = ResultStore()
+            set_store(custom)
+            assert get_store() is custom
+        finally:
+            # Restore original to avoid polluting other tests
+            set_store(original)

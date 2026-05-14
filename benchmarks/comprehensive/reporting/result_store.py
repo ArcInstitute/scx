@@ -486,6 +486,15 @@ def get_store() -> ResultStore:
     return _default_store
 
 
+def set_store(store: ResultStore) -> None:
+    """Install *store* as the module-level default singleton.
+
+    Prefer this over reaching into ``_default_store`` directly.
+    """
+    global _default_store
+    _default_store = store
+
+
 def reset_store() -> None:
     """Reset the cached store (useful in tests)."""
     global _default_store
@@ -562,6 +571,20 @@ def _float_or_none(v: Any) -> float | None:
         return None
 
 
+def _try_missing_reason(value: Any) -> MissingReason | None:
+    """Convert *value* to a ``MissingReason`` if it matches, else ``None``.
+
+    Uses value-based lookup (try/except) instead of the fragile
+    ``__members__`` name-based check.
+    """
+    if not value:
+        return None
+    try:
+        return MissingReason(value)
+    except ValueError:
+        return None
+
+
 def _normalize_raw(data: dict[str, Any], source_path: str) -> ResultRow:
     """Normalize a raw comprehensive-harness JSON into a ``ResultRow``."""
     missing = data.get("missing_reason")
@@ -578,10 +601,7 @@ def _normalize_raw(data: dict[str, Any], source_path: str) -> ResultRow:
         source=SourceRef(kind=SourceKind.raw_json, path=source_path),
         scenario=ScenarioMeta.from_raw(data),
         comparison=ComparisonMeta.from_raw(data),
-        missing_reason=(
-            MissingReason(missing) if missing and missing in MissingReason.__members__
-            else None
-        ),
+        missing_reason=_try_missing_reason(missing),
     )
 
 

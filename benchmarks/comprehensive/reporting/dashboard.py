@@ -27,17 +27,60 @@ logger = logging.getLogger(__name__)
 from benchmarks.comprehensive.reporting.report_model import Report, HtmlRenderer
 
 def render_html(
-    report: Report,
+    report: Report | str,
     *,
     title: str = "SCX Benchmark Report",
     prev_url: str | None = None,
     generated_at: _dt.datetime | None = None,
 ) -> str:
     """Render a full semantic HTML snapshot of the benchmark report.
-    
-    Delegates entirely to ``HtmlRenderer`` from the new report model.
+
+    Accepts either a ``Report`` model (used by the main report pipeline)
+    or a plain markdown **string** (used by ``landing.py`` and other
+    lightweight callers that don't build a full report AST).
+
+    When *report* is a ``Report``, delegates to ``HtmlRenderer``.
+    When *report* is a ``str``, wraps the raw text in a styled HTML page
+    with the same CSS chrome (header, prev-link, body).
     """
-    return HtmlRenderer().render(report, prev_url=prev_url)
+    if isinstance(report, Report):
+        return HtmlRenderer().render(report, prev_url=prev_url)
+
+    # Legacy path: plain markdown/text string → simple HTML wrapper.
+    body_text = report  # it's a str
+    ts = (generated_at or _dt.datetime.now()).isoformat(timespec="seconds")
+    prev_link = (
+        f'<div class="prev-link"><a href="{_html.escape(prev_url)}">'
+        f"&larr; previous snapshot</a></div>"
+        if prev_url
+        else ""
+    )
+    css = (
+        "* { box-sizing: border-box; }"
+        " body { font-family: -apple-system, BlinkMacSystemFont,"
+        ' "Segoe UI", Helvetica, Arial, sans-serif;'
+        " max-width: 1100px; margin: 0 auto;"
+        " padding: 1.5rem 2rem 4rem; color: #1f2328; line-height: 1.55; }"
+        " header { border-bottom: 1px solid #d0d7de;"
+        " padding-bottom: 0.75rem; margin-bottom: 1.25rem;"
+        " display: flex; align-items: baseline;"
+        " justify-content: space-between; gap: 1rem; flex-wrap: wrap; }"
+        " header h1 { font-size: 1.5rem; margin: 0; }"
+        " pre { white-space: pre-wrap; word-break: break-word; }"
+    )
+    return (
+        f"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        f"  <meta charset=\"UTF-8\">\n"
+        f"  <title>{_html.escape(title)}</title>\n"
+        f"  <style>{css}</style>\n"
+        f"</head>\n<body>\n"
+        f"<header>\n"
+        f"  <div>\n    <h1>{_html.escape(title)}</h1>\n"
+        f'    <div class="meta">Generated {ts}</div>\n'
+        f"  </div>\n  {prev_link}\n</header>\n"
+        f"<pre>{_html.escape(body_text)}</pre>\n"
+        f"</body>\n</html>"
+    )
 
 
 # ---------------------------------------------------------------------------

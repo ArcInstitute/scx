@@ -9,12 +9,24 @@ and the ``<pre>`` HTML snapshot approach in ``dashboard.py``.
 
 from __future__ import annotations
 
+import datetime
 import html
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+# Compiled regex patterns for inline markdown → HTML conversion.
+# Shared by _md_to_html() and table-cell formatting in _render_block().
+_RE_BOLD = re.compile(r'\*\*(.*?)\*\*')
+_RE_ITALIC_STAR = re.compile(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
+_RE_ITALIC_UNDER = re.compile(r'(?<!\w)_(.+?)_(?!\w)')
+_RE_INLINE_CODE = re.compile(r'`(.*?)`')
+_RE_PARA_SPLIT = re.compile(r'\n{2,}')
+_RE_SLUG_STRIP = re.compile(r'[^\w\s-]')
+_RE_SLUG_COLLAPSE = re.compile(r'[\s-]+')
 
 from benchmarks.comprehensive.reporting.result_store import SourceRef
 
@@ -131,9 +143,8 @@ class Report:
 
 
 def _slugify(text: str) -> str:
-    import re
-    slug = re.sub(r"[^\w\s-]", "", text.strip().lower())
-    return re.sub(r"[\s-]+", "-", slug).strip("-") or "section"
+    slug = _RE_SLUG_STRIP.sub("", text.strip().lower())
+    return _RE_SLUG_COLLAPSE.sub("-", slug).strip("-") or "section"
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +292,6 @@ class HtmlRenderer:
         
         prev_link_html = f'<div class="prev-link"><a href="{html.escape(prev_url)}">← previous snapshot</a></div>' if prev_url else ""
         
-        import datetime
         generated_at = datetime.datetime.now().isoformat(timespec="seconds")
 
         return f"""<!DOCTYPE html>
@@ -331,23 +341,17 @@ class HtmlRenderer:
 
         Input is assumed to be *already escaped* via ``html.escape()``.
         """
-        import re
-
         # ── Inline formatting ─────────────────────────────────────────
         def _inline(t: str) -> str:
-            # Bold **...**
-            t = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', t)
-            # Italic *...* (but not **)
-            t = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', t)
-            # Italic _..._
-            t = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', t)
-            # Inline code `...`
-            t = re.sub(r'`(.*?)`', r'<code>\1</code>', t)
+            t = _RE_BOLD.sub(r'<strong>\1</strong>', t)
+            t = _RE_ITALIC_STAR.sub(r'<em>\1</em>', t)
+            t = _RE_ITALIC_UNDER.sub(r'<em>\1</em>', t)
+            t = _RE_INLINE_CODE.sub(r'<code>\1</code>', t)
             return t
 
         # ── Block-level processing ────────────────────────────────────
         # Split into paragraphs on blank lines.
-        paragraphs = re.split(r'\n{2,}', text)
+        paragraphs = _RE_PARA_SPLIT.split(text)
         out_parts: list[str] = []
 
         for para in paragraphs:
@@ -369,7 +373,9 @@ class HtmlRenderer:
                     stripped = ln.lstrip()
                     if stripped.startswith('- '):
                         items.append(stripped[2:])
-                    elif items:
+                    elif items and stripped:
+                        # Continuation of the previous bullet; skip
+                        # orphaned continuation lines before any bullet.
                         items[-1] += ' ' + stripped
                 out_parts.append(
                     '<ul>'
@@ -428,11 +434,10 @@ class HtmlRenderer:
                 for cell in row:
                     cell_html = html.escape(str(cell))
                     # Preserve inline bold / italic / code in table cells
-                    import re
-                    cell_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', cell_html)
-                    cell_html = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', cell_html)
-                    cell_html = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', cell_html)
-                    cell_html = re.sub(r'`(.*?)`', r'<code>\1</code>', cell_html)
+                    cell_html = _RE_BOLD.sub(r'<strong>\1</strong>', cell_html)
+                    cell_html = _RE_ITALIC_STAR.sub(r'<em>\1</em>', cell_html)
+                    cell_html = _RE_ITALIC_UNDER.sub(r'<em>\1</em>', cell_html)
+                    cell_html = _RE_INLINE_CODE.sub(r'<code>\1</code>', cell_html)
                     lines.append(f'<td>{cell_html}</td>')
                 lines.append('</tr>')
             lines.append('</tbody></table>')

@@ -39,7 +39,7 @@ from benchmarks.comprehensive.config import (  # noqa: E402
     REPORTS_DIR, RAW_RESULTS_DIR, FIGURES_DIR,
 )
 from benchmarks.comprehensive.reporting.result_store import (  # noqa: E402
-    ResultStore, reset_store,
+    ResultStore, reset_store, set_store,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,8 +122,7 @@ def build_report(
     store.load_harmony_dir()
 
     # Inject the store as the default so section builders can use get_store()
-    import benchmarks.comprehensive.reporting.result_store as _rs
-    _rs._default_store = store
+    set_store(store)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,9 +171,23 @@ def build_report(
         logger.info("Wrote markdown report to %s", md_path)
 
     # ── Generate PDF ──────────────────────────────────────────────────
-    if "pdf" in formats and md_path:
+    if "pdf" in formats:
         pdf_path = output_dir / "BENCHMARK_REPORT.pdf"
-        _generate_pdf(md_path, pdf_path)
+        if md_path:
+            _generate_pdf(md_path, pdf_path)
+        else:
+            # PDF requested without md output — render to a temp file.
+            import tempfile
+            md_body = MarkdownRenderer().render(report_model)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".md", dir=str(output_dir), delete=False,
+            ) as tmp:
+                tmp.write(md_body)
+                tmp_md = Path(tmp.name)
+            try:
+                _generate_pdf(tmp_md, pdf_path)
+            finally:
+                tmp_md.unlink(missing_ok=True)
 
     # ── Emit HTML snapshot ────────────────────────────────────────────
     if "html" in formats:
@@ -247,8 +260,7 @@ def lint_only(
     store.load_raw_dir(results_dir)
     store.load_harmony_dir()
 
-    import benchmarks.comprehensive.reporting.result_store as _rs
-    _rs._default_store = store
+    set_store(store)
 
     from benchmarks.comprehensive.reporting.markdown import generate_report_model
     from benchmarks.comprehensive.reporting.lint import collect_warnings, LintLevel

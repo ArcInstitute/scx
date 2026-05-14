@@ -91,7 +91,7 @@ _PHASE_LABEL_RE = re.compile(
 )
 
 # Empty cell sentinels
-_EMPTY_CELL_VALUES = {"", "—", "-", "–", "n/a", "N/A", "—"}
+_EMPTY_CELL_VALUES = {"", "—", "-", "–", "n/a", "N/A"}
 
 
 def _iter_sections(report: Report):
@@ -308,13 +308,7 @@ def check_executive_summary_consistency(report: Report) -> list[LintWarning]:
             if isinstance(block, TableBlock) and block.caption:
                 if "dataset-level" in block.caption.lower() or \
                    "correctness" in block.caption.lower():
-                    for row in block.rows:
-                        # Look for pass/fail/skip columns
-                        for cell in row:
-                            m = re.match(r"^(\d+)$", cell.strip())
-                            if m:
-                                pass  # Can't reliably parse without header context
-                    # Use a simpler approach: count pass/fail in status columns
+                    # Use header context to find pass/fail/skip columns.
                     if block.headers:
                         pass_idx = None
                         fail_idx = None
