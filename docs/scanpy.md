@@ -257,7 +257,7 @@ The returned `anndata.AnnData` is fully populated:
 | `varm` | Varm sections | dict of numpy arrays (e.g. `PCs` from `pyscx.accel.pca`) |
 | `obsp` | Obsp sections (COO Arrow IPC) | dict of `scipy.sparse.csr_matrix` (float32) |
 | `varp` | Varp sections (COO Arrow IPC) | dict of `scipy.sparse.csr_matrix` (float32) |
-| `uns` | Uns section | dict (JSON round-tripped) |
+| `uns` | Uns section | dict (tagged-JSON round-tripped; see below) |
 | `layers` | Layer shards | dict of `scipy.sparse.csr_matrix` |
 
 > Scanpy workflows that produce `obsp` / `varp` / `varm` (`sc.pp.neighbors`
@@ -270,6 +270,20 @@ The returned `anndata.AnnData` is fully populated:
 > AnnData stays shape-consistent. The on-disk section keeps its original
 > axis until `compact` rebuilds the file. `varp` and `varm` are unaffected
 > by the deletion vector (var axis).
+
+> **`uns` round-trip fidelity:** `from_anndata()` defaults to
+> `uns_format="tagged"`, which preserves NumPy `dtype` and `shape`,
+> bit-exact `float32` values, NaN/Inf inside arrays, structured
+> recarrays (e.g. `uns["rank_genes_groups"]["names"]`), and
+> `pd.Categorical` / `pd.Index` / `pd.Series` metadata (`name`, `codes`,
+> `categories`, `ordered`). Legacy callers that depended on the previous
+> behavior — where every NumPy array readback was a plain `list` — can
+> opt back into it with `pyscx.from_anndata(adata, path,
+> uns_format="plain")`. Both modes are read-compatible: the
+> auto-detecting reader passes plain JSON through unchanged and decodes
+> tagged envelopes back to their original Python types. See
+> [`docs/api.md` § `uns` serialization](api.md#uns-serialization) for
+> the on-disk envelope schema.
 
 **Memory implications:** Once materialized, the in-memory AnnData is
 **identical** whether the source was an `.scx` file or an `.h5ad` file —

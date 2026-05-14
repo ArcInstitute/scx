@@ -530,10 +530,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ### Module-level functions
 
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None)` — Write AnnData to SCX.
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged")` — Write AnnData to SCX.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
-  Arrow IPC; higher-precision inputs are downcast on write.
+  Arrow IPC; higher-precision inputs are downcast on write. `uns_format`
+  selects how `adata.uns` is serialized — see [`uns` serialization](#uns-serialization).
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
@@ -573,6 +574,41 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`
 - Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `layer_names`
+
+### `uns` serialization
+
+`adata.uns` is written into the `UnsBlob` section (id 10) as JSON. The
+`uns_format` kwarg on `from_anndata()` / `from_10x()` selects the envelope:
+
+| Mode | Default | NumPy ndarray | NumPy scalar | tuple | pandas Cat/Index/Series | NaN/Inf in array |
+| --- | --- | --- | --- | --- | --- | --- |
+| `"tagged"` | ✓ | `__scx_type__: "ndarray"` envelope (base64-LE bytes for numeric; JSON string list for object/string; `__scx_type__: "recarray"` for structured) | `__scx_type__: "scalar"` envelope (1-element base64) | `__scx_type__: "tuple"` envelope | `__scx_type__: "categorical" / "pandas.Index" / "pandas.Series"` envelope preserving name/codes/categories/ordered | preserved bit-exact (numeric path) |
+| `"plain"` |  | collapses to nested list (`.tolist()`) | collapses to Python scalar | collapses to JSON array | collapses to JSON array via `.tolist()` | raises `ValueError` |
+
+The reader **auto-detects** per value: dicts with a `__scx_type__` key are
+decoded back to their original Python type; everything else passes through
+as plain JSON. This means files written by older `pyscx` (or with
+`uns_format="plain"`) read identically on a modern build, and modern
+tagged files are forward-compatible — unknown future tags emit a
+`UserWarning` and return the raw envelope dict for inspection.
+
+Unsupported in both modes: `bytes` objects (no portable JSON
+representation) and `datetime64` / `complex` / `timedelta` ndarray dtypes.
+Non-finite raw Python `float` *scalars* (outside an ndarray) still raise.
+
+The tagged envelope is plain JSON, so the section can be inspected with
+any JSON tool. Example for a `float32` array:
+```json
+{
+  "pca_variance": {
+    "__scx_type__": "ndarray",
+    "dtype": "float32",
+    "shape": [50],
+    "encoding": "base64le",
+    "data": "zczMPc3MTD4AAIA/..."
+  }
+}
+```
 
 ### PyQueryPipeline
 

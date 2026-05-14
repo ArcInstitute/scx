@@ -471,12 +471,16 @@ def _adata_with_uns(uns):
 
 
 def test_from_anndata_uns_numpy_arrays_roundtrip(tmp_dir):
-    """Numeric and object NumPy arrays in `uns` survive the JSON boundary.
+    """Numeric and object NumPy arrays in `uns` survive the JSON boundary
+    *and* preserve dtype/shape under the default `uns_format="tagged"`.
 
     Regression for issue #4: prior code called json.dumps(adata.uns) which
     raised TypeError on NumPy arrays. STATE/State Designer store HVG names
     as np.ndarray(dtype=object) in adata.uns['X_hvg_var_names']; Scanpy
     writes structured arrays into adata.uns['rank_genes_groups'].
+
+    Under `uns_format="tagged"` (default since the review-#10 fix) these
+    return as real `np.ndarray` instances with original dtype and shape.
     """
     import pyscx
 
@@ -496,14 +500,31 @@ def test_from_anndata_uns_numpy_arrays_roundtrip(tmp_dir):
     pyscx.from_anndata(adata, path)
     out = pyscx.open(path).to_anndata()
 
-    assert out.uns["X_hvg_var_names"] == ["g0", "g1", "g2"]
-    assert out.uns["numeric_arr"] == [[1, 2], [3, 4]]
-    assert out.uns["rank_genes_groups"]["names"] == [["g0", "g1"], ["g2", "g0"]]
-    assert len(out.uns["rank_genes_groups"]["pvals"]) == 2
+    hvg = out.uns["X_hvg_var_names"]
+    assert isinstance(hvg, np.ndarray)
+    assert hvg.dtype == np.dtype("O")
+    assert list(hvg) == ["g0", "g1", "g2"]
+
+    num = out.uns["numeric_arr"]
+    assert isinstance(num, np.ndarray)
+    assert num.dtype == np.int32
+    assert num.shape == (2, 2)
+    assert np.array_equal(num, np.array([[1, 2], [3, 4]], dtype=np.int32))
+
+    names = out.uns["rank_genes_groups"]["names"]
+    assert isinstance(names, np.ndarray)
+    assert names.dtype.names == ("A", "B")
+    assert names["A"][0] == "g0" and names["B"][0] == "g1"
+    assert names["A"][1] == "g2" and names["B"][1] == "g0"
+
+    pvals = out.uns["rank_genes_groups"]["pvals"]
+    assert isinstance(pvals, np.ndarray)
+    assert pvals.dtype == np.float32
+    assert np.allclose(pvals, [1e-3, 1e-2])
 
 
 def test_from_anndata_uns_numpy_scalars_roundtrip(tmp_dir):
-    """NumPy scalars (np.int64, np.float32, np.bool_) collapse to Python scalars."""
+    """NumPy scalars retain their dtype under tagged mode."""
     import pyscx
 
     adata = _adata_with_uns({
@@ -517,14 +538,16 @@ def test_from_anndata_uns_numpy_scalars_roundtrip(tmp_dir):
     pyscx.from_anndata(adata, path)
     out = pyscx.open(path).to_anndata()
 
-    assert out.uns["i"] == 42 and isinstance(out.uns["i"], int)
-    assert abs(out.uns["f"] - 2.5) < 1e-6 and isinstance(out.uns["f"], float)
-    assert out.uns["b"] is True
-    assert out.uns["u"] == 7 and isinstance(out.uns["u"], int)
+    assert out.uns["i"] == 42 and isinstance(out.uns["i"], np.int64)
+    assert isinstance(out.uns["f"], np.float32)
+    assert out.uns["f"] == np.float32(2.5)
+    assert out.uns["b"] is np.True_ or bool(out.uns["b"]) is True
+    assert isinstance(out.uns["b"], np.bool_)
+    assert out.uns["u"] == 7 and isinstance(out.uns["u"], np.uint32)
 
 
 def test_from_anndata_uns_nested_dicts_roundtrip(tmp_dir):
-    """Nested dicts mixing dict / list / tuple / NumPy survive the round-trip."""
+    """Nested dicts mix dict / list / tuple / NumPy and round-trip with types intact."""
     import pyscx
 
     adata = _adata_with_uns({
@@ -542,46 +565,77 @@ def test_from_anndata_uns_nested_dicts_roundtrip(tmp_dir):
     out = pyscx.open(path).to_anndata()
 
     inner = out.uns["level1"]["level2"]
-    assert inner["arr"] == [1, 2, 3]
-    assert inner["tup"] == [1, "two", 3.5]
-    assert [d["k"] for d in inner["list_of_dicts"]] == pytest.approx([0.5, 1.5])
+
+    assert isinstance(inner["arr"], np.ndarray)
+    assert np.array_equal(inner["arr"], np.array([1, 2, 3]))
+
+    # Tuple survives as a tuple, including the inner np.int64.
+    assert isinstance(inner["tup"], tuple)
+    assert isinstance(inner["tup"][0], np.int64)
+    assert inner["tup"][0] == 1
+    assert inner["tup"][1] == "two"
+    assert inner["tup"][2] == 3.5
+
+    ks = [d["k"] for d in inner["list_of_dicts"]]
+    assert all(isinstance(k, np.float32) for k in ks)
+    assert ks == [np.float32(0.5), np.float32(1.5)]
 
 
 def test_from_anndata_uns_pandas_categorical_roundtrip(tmp_dir):
-    """pandas Index / Categorical / Series in `uns` collapse to lists."""
+    """pandas Index / Categorical / Series round-trip with name, codes,
+    categories, and ordered preserved under tagged mode."""
     import pandas as pd
     import pyscx
 
     adata = _adata_with_uns({
-        "idx": pd.Index(["x", "y", "z"]),
+        "idx": pd.Index(["x", "y", "z"], name="g"),
         "cat": pd.Categorical(["a", "b", "a"], categories=["a", "b"], ordered=True),
-        "series": pd.Series([10, 20, 30]),
+        "series": pd.Series([10, 20, 30], name="s"),
     })
 
     path = str(tmp_dir / "uns_pandas.scx")
     pyscx.from_anndata(adata, path)
     out = pyscx.open(path).to_anndata()
 
-    assert out.uns["idx"] == ["x", "y", "z"]
-    assert out.uns["cat"] == ["a", "b", "a"]
-    assert out.uns["series"] == [10, 20, 30]
+    idx = out.uns["idx"]
+    assert isinstance(idx, pd.Index)
+    assert list(idx) == ["x", "y", "z"]
+    assert idx.name == "g"
+
+    cat = out.uns["cat"]
+    assert isinstance(cat, pd.Categorical)
+    assert list(cat) == ["a", "b", "a"]
+    assert list(cat.categories) == ["a", "b"]
+    assert cat.ordered is True
+
+    s = out.uns["series"]
+    assert isinstance(s, pd.Series)
+    assert list(s) == [10, 20, 30]
+    assert s.name == "s"
 
 
 def test_from_anndata_uns_bytes_raises(tmp_dir):
-    """`bytes` are not JSON-serializable and should error explicitly."""
+    """`bytes` are not JSON-serializable and should error explicitly in both modes."""
     import pyscx
 
     adata = _adata_with_uns({"k": b"hello"})
     path = str(tmp_dir / "uns_bytes.scx")
     with pytest.raises(ValueError, match=r"uns at uns\['k'\]: bytes are not JSON-serializable"):
         pyscx.from_anndata(adata, path)
+    # Same behavior under plain mode.
+    with pytest.raises(ValueError, match=r"uns at uns\['k'\]: bytes are not JSON-serializable"):
+        pyscx.from_anndata(adata, str(tmp_dir / "uns_bytes_plain.scx"), uns_format="plain")
 
 
-def test_from_anndata_uns_non_finite_float_raises(tmp_dir):
-    """NaN / inf in floats fail loudly with a key path, even when nested in arrays."""
+def test_from_anndata_uns_non_finite_python_float_raises(tmp_dir):
+    """Top-level Python `float('nan')` still errors loudly with a key path.
+
+    Tagged mode only preserves NaN/Inf when the value is inside an
+    `np.ndarray` (base64-LE bytes); a raw Python scalar has no dtype to
+    pin down, so we keep the explicit error for that case.
+    """
     import pyscx
 
-    # Top-level NaN
     adata = _adata_with_uns({"top": float("nan")})
     with pytest.raises(
         ValueError,
@@ -589,13 +643,40 @@ def test_from_anndata_uns_non_finite_float_raises(tmp_dir):
     ):
         pyscx.from_anndata(adata, str(tmp_dir / "nan.scx"))
 
-    # NaN inside a NumPy array — error path includes the index.
-    adata2 = _adata_with_uns({"arr": np.array([1.0, float("nan"), 3.0])})
+
+def test_from_anndata_uns_nan_in_array_roundtrips_under_tagged(tmp_dir):
+    """NaN / +Inf / -Inf inside an `np.ndarray` round-trip bit-exact under
+    the default tagged mode — the array bytes are stored as base64 so the
+    IEEE-754 bit pattern survives the JSON envelope.
+
+    Same payload still raises under `uns_format="plain"` because the
+    legacy path goes through `.tolist()` → Python `float` → JSON number,
+    and JSON has no representation for NaN/Inf.
+    """
+    import pyscx
+
+    src = np.array([1.0, float("nan"), float("inf"), -float("inf"), 1.5], dtype=np.float64)
+    adata = _adata_with_uns({"arr": src})
+
+    path = str(tmp_dir / "nan_arr_tagged.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+    rt = out.uns["arr"]
+    assert isinstance(rt, np.ndarray)
+    assert rt.dtype == np.float64
+    # Bit-exact: identical bytes via view(uint64).
+    assert np.array_equal(rt.view(np.uint64), src.view(np.uint64))
+
+    # Under plain mode the same payload errors (NaN/Inf rejected).
     with pytest.raises(
         ValueError,
         match=r"uns at uns\['arr'\]\[1\]: non-finite float \(NaN\) cannot be serialized",
     ):
-        pyscx.from_anndata(adata2, str(tmp_dir / "nan_arr.scx"))
+        pyscx.from_anndata(
+            _adata_with_uns({"arr": src}),
+            str(tmp_dir / "nan_arr_plain.scx"),
+            uns_format="plain",
+        )
 
 
 def test_from_anndata_uns_unsupported_type_reports_path(tmp_dir):
@@ -664,6 +745,159 @@ def test_from_anndata_uns_non_string_dict_keys_stringified(tmp_dir):
     out = pyscx.open(path).to_anndata()
 
     assert out.uns["by_int"] == {"1": "a", "2": "b"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #10 (review): `uns_format="plain"` regression suite.
+#
+# The legacy lossy path is preserved as an explicit opt-in so downstream
+# pipelines that depend on `list`-typed readback can keep working. These
+# tests mirror the historical behavior asserted in the original tests, now
+# pinned behind `uns_format="plain"`.
+# ---------------------------------------------------------------------------
+
+
+def test_from_anndata_uns_plain_mode_numpy_arrays_collapse_to_lists(tmp_dir):
+    """Under `uns_format="plain"`, NumPy arrays collapse to nested lists."""
+    import pyscx
+
+    adata = _adata_with_uns({
+        "X_hvg_var_names": np.array(["g0", "g1", "g2"], dtype=object),
+        "numeric_arr": np.array([[1, 2], [3, 4]], dtype=np.int32),
+    })
+    path = str(tmp_dir / "uns_plain_arrays.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    out = pyscx.open(path).to_anndata()
+    assert out.uns["X_hvg_var_names"] == ["g0", "g1", "g2"]
+    assert out.uns["numeric_arr"] == [[1, 2], [3, 4]]
+
+
+def test_from_anndata_uns_plain_mode_scalars_collapse(tmp_dir):
+    """Under `plain`, NumPy scalars collapse to Python scalars (dtype lost)."""
+    import pyscx
+
+    adata = _adata_with_uns({
+        "i": np.int64(42),
+        "f": np.float32(2.5),
+        "b": np.bool_(True),
+    })
+    path = str(tmp_dir / "uns_plain_scalars.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    out = pyscx.open(path).to_anndata()
+    assert isinstance(out.uns["i"], int) and out.uns["i"] == 42
+    assert isinstance(out.uns["f"], float) and abs(out.uns["f"] - 2.5) < 1e-6
+    assert out.uns["b"] is True
+
+
+def test_from_anndata_uns_plain_mode_tuple_becomes_list(tmp_dir):
+    """Under `plain`, tuples collapse to lists."""
+    import pyscx
+
+    adata = _adata_with_uns({"tup": (1, "two", 3.5)})
+    path = str(tmp_dir / "uns_plain_tuple.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    out = pyscx.open(path).to_anndata()
+    assert out.uns["tup"] == [1, "two", 3.5]
+
+
+def test_from_anndata_uns_plain_mode_pandas_collapses(tmp_dir):
+    """Under `plain`, pandas Index/Categorical/Series collapse to lists."""
+    import pandas as pd
+    import pyscx
+
+    adata = _adata_with_uns({
+        "idx": pd.Index(["x", "y", "z"]),
+        "cat": pd.Categorical(["a", "b", "a"], categories=["a", "b"], ordered=True),
+        "series": pd.Series([10, 20, 30]),
+    })
+    path = str(tmp_dir / "uns_plain_pandas.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    out = pyscx.open(path).to_anndata()
+    assert out.uns["idx"] == ["x", "y", "z"]
+    assert out.uns["cat"] == ["a", "b", "a"]
+    assert out.uns["series"] == [10, 20, 30]
+
+
+def test_from_anndata_uns_plain_mode_nan_in_array_still_raises(tmp_dir):
+    """Under `plain`, NaN inside an array still raises because the path
+    goes through `.tolist()` → Python float → JSON."""
+    import pyscx
+
+    adata = _adata_with_uns({"arr": np.array([1.0, float("nan"), 3.0])})
+    with pytest.raises(
+        ValueError,
+        match=r"uns at uns\['arr'\]\[1\]: non-finite float \(NaN\) cannot be serialized",
+    ):
+        pyscx.from_anndata(
+            adata, str(tmp_dir / "nan_arr_plain.scx"), uns_format="plain"
+        )
+
+
+def test_from_anndata_uns_invalid_format_raises(tmp_dir):
+    """Unknown `uns_format` values raise ValueError."""
+    import pyscx
+
+    adata = _adata_with_uns({"a": 1})
+    with pytest.raises(ValueError, match=r"invalid uns_format 'weird'"):
+        pyscx.from_anndata(adata, str(tmp_dir / "bad.scx"), uns_format="weird")
+
+
+# ---------------------------------------------------------------------------
+# Issue #10 (review): tagged-mode-only round-trip cases.
+# ---------------------------------------------------------------------------
+
+
+def test_from_anndata_uns_tagged_float32_bit_exact(tmp_dir):
+    """A `np.float32` array round-trips bit-exact (no f32→f64→f32 drift)."""
+    import pyscx
+
+    src = np.array(
+        [1.1, 2.2, 3.3, np.float32("inf"), -np.float32("inf"), np.float32("nan")],
+        dtype=np.float32,
+    )
+    adata = _adata_with_uns({"x": src})
+    path = str(tmp_dir / "uns_f32_exact.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+    rt = out.uns["x"]
+    assert isinstance(rt, np.ndarray)
+    assert rt.dtype == np.float32
+    assert rt.shape == src.shape
+    # Bit-exact via uint32 view.
+    assert np.array_equal(rt.view(np.uint32), src.view(np.uint32))
+
+
+def test_from_anndata_uns_tagged_reads_plain_file(tmp_dir):
+    """A file written with `uns_format="plain"` reads correctly back —
+    the auto-detecting reader passes plain JSON through unchanged."""
+    import pyscx
+
+    adata = _adata_with_uns({"a": [1, 2, 3], "b": "hi"})
+    path = str(tmp_dir / "auto_plain.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    out = pyscx.open(path).to_anndata()
+    assert out.uns["a"] == [1, 2, 3]
+    assert out.uns["b"] == "hi"
+
+
+def test_from_anndata_uns_tagged_unknown_marker_warns(tmp_dir):
+    """A dict with an unknown `__scx_type__` tag triggers a warning on
+    read and is returned verbatim (forward-compat for future schemas).
+
+    The writer doesn't introspect user-supplied dict keys, so we can
+    construct the future-tag scenario by handing the writer a plain
+    Python dict that happens to look like an envelope.
+    """
+    import pyscx
+
+    adata = _adata_with_uns({
+        "future_marker": {"__scx_type__": "future_thing", "data": 1},
+    })
+    path = str(tmp_dir / "uns_future.scx")
+    pyscx.from_anndata(adata, path, uns_format="plain")
+    with pytest.warns(UserWarning, match=r"unknown __scx_type__ tag 'future_thing'"):
+        out = pyscx.open(path).to_anndata()
+    assert out.uns["future_marker"] == {"__scx_type__": "future_thing", "data": 1}
 
 
 # ---------------------------------------------------------------------------

@@ -470,17 +470,10 @@ fn to_anndata_with_layers<'py>(
         varp_dict.set_item(name, scipy_mat)?;
     }
 
-    // uns
-    let uns_dict = match reader.read_uns() {
-        Ok(json_val) => {
-            let json_str = serde_json::to_string(&json_val)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let json_mod = py.import("json")?;
-            Some(json_mod.call_method1("loads", (json_str,))?)
-        }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
-        Err(e) => return Err(to_pyerr(e)),
-    };
+    // uns — reconstruct any `__scx_type__` envelopes back into NumPy
+    // ndarrays / scalars / tuples / pandas Index/Series/Categorical /
+    // structured recarrays. Plain JSON passes through unchanged.
+    let uns_dict = read_uns_as_pyobject(py, reader)?;
 
     // layers (with optional filtering)
     let all_layer_names = reader.layer_names();
@@ -626,17 +619,9 @@ pub fn to_anndata_filtered<'py>(
         let var_table = record_batch_to_pyarrow(py, &result.var)?;
         let var_df = pyarrow_table_to_pandas(&var_table)?;
 
-        // uns (still loaded from reader)
-        let uns_dict = match reader.read_uns() {
-            Ok(json_val) => {
-                let json_str = serde_json::to_string(&json_val)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let json_mod = py.import("json")?;
-                Some(json_mod.call_method1("loads", (json_str,))?)
-            }
-            Err(scx_format::ScxError::SectionNotFound(_)) => None,
-            Err(e) => return Err(to_pyerr(e)),
-        };
+        // uns (still loaded from reader; see read_uns_as_pyobject for the
+        // tagged-envelope reconstruction).
+        let uns_dict = read_uns_as_pyobject(py, reader)?;
 
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("X", x)?;
@@ -1024,17 +1009,8 @@ pub fn to_anndata_backed<'py>(
         varp_dict.set_item(name, scipy_mat)?;
     }
 
-    // --- uns (eager) ---
-    let uns_dict = match reader.read_uns() {
-        Ok(json_val) => {
-            let json_str = serde_json::to_string(&json_val)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let json_mod = py.import("json")?;
-            Some(json_mod.call_method1("loads", (json_str,))?)
-        }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
-        Err(e) => return Err(to_pyerr(e)),
-    };
+    // --- uns (eager; tagged envelopes reconstructed) ---
+    let uns_dict = read_uns_as_pyobject(py, &reader)?;
 
     // --- layers (backed, with optional filtering) ---
     let all_layer_names = reader.layer_names();
@@ -1408,53 +1384,127 @@ fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult
 // uns serialization
 // ---------------------------------------------------------------------------
 
-/// Recursively normalize a Python value into a `serde_json::Value` so it can
-/// be written into the SCX `uns` section. Replaces a previous `json.dumps`
-/// call that errored on common AnnData payloads (NumPy arrays/scalars,
-/// pandas Index/Series).
+/// Encoding mode for `uns` serialization.
 ///
-/// Conversion rules:
+/// `Plain` (legacy) collapses NumPy arrays / pandas containers to plain JSON
+/// lists, losing dtype, shape, and pandas metadata on read.
+///
+/// `Tagged` (default) wraps non-trivial values in a JSON envelope keyed by
+/// `__scx_type__`. Numeric ndarray buffers are stored as base64-encoded
+/// little-endian bytes so dtype, shape, and NaN/Inf round-trip bit-exact.
+/// On-disk JSON is still valid plain JSON — the envelope adds metadata
+/// alongside the data, so old readers see ugly dicts but not crashes.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum UnsFormat {
+    Plain,
+    Tagged,
+}
+
+pub(crate) fn parse_uns_format(s: &str) -> PyResult<UnsFormat> {
+    match s {
+        "plain" => Ok(UnsFormat::Plain),
+        "tagged" => Ok(UnsFormat::Tagged),
+        other => Err(PyValueError::new_err(format!(
+            "invalid uns_format '{other}'; expected 'plain' or 'tagged'"
+        ))),
+    }
+}
+
+/// Sentinel key marking a tagged envelope in the on-disk JSON.
+const SCX_TYPE_KEY: &str = "__scx_type__";
+
+/// Mutable context threaded through the writer so per-value handlers share
+/// the NumPy module handles and a lazy-imported pandas module without
+/// repeating `py.import("pandas")` on every dispatch.
+struct UnsWriteCtx<'a, 'py> {
+    format: UnsFormat,
+    np_generic: &'a Bound<'py, PyAny>,
+    np_ndarray: &'a Bound<'py, PyAny>,
+    pd_lazy: Option<Bound<'py, PyModule>>,
+    visiting: HashSet<usize>,
+}
+
+impl<'a, 'py> UnsWriteCtx<'a, 'py> {
+    fn new(
+        format: UnsFormat,
+        np_generic: &'a Bound<'py, PyAny>,
+        np_ndarray: &'a Bound<'py, PyAny>,
+    ) -> Self {
+        Self {
+            format,
+            np_generic,
+            np_ndarray,
+            pd_lazy: None,
+            visiting: HashSet::new(),
+        }
+    }
+
+    /// Lazy pandas import. Cached per write so we pay at most one
+    /// `import pandas` per `from_anndata()` call, and only when the input
+    /// actually contains a pandas object under tagged mode.
+    fn pandas(&mut self, py: Python<'py>) -> PyResult<&Bound<'py, PyModule>> {
+        if self.pd_lazy.is_none() {
+            self.pd_lazy = Some(py.import("pandas")?);
+        }
+        Ok(self.pd_lazy.as_ref().unwrap())
+    }
+}
+
+/// True if a NumPy dtype name corresponds to a fixed-width numeric kind
+/// whose buffer can be stored verbatim as little-endian bytes.
+fn is_numeric_dtype_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float16"
+            | "float32"
+            | "float64"
+    )
+}
+
+/// Recursively normalize a Python value into a `serde_json::Value` so it can
+/// be written into the SCX `uns` section. Two modes:
+///
+/// - `Plain` — legacy lossy path. NumPy arrays/scalars and pandas
+///   `Index`/`Series`/`Categorical` collapse to plain JSON lists. `.tolist()`
+///   fallback covers duck-typed array-likes.
+/// - `Tagged` — wraps NumPy arrays, NumPy scalars, tuples, structured
+///   recarrays, and the three pandas container types in `__scx_type__`
+///   envelopes so the read path can reconstruct the original Python type.
+///   Numeric arrays/scalars store raw bytes as base64-LE; object/string
+///   arrays store a JSON list of elements. See [`UnsFormat::Tagged`].
+///
+/// In both modes:
 /// - `None` → `null`
-/// - `bool` → `bool` (checked before `int`, since Python `bool` ⊂ `int`)
-/// - `int` → JSON number (i64 or u64; out-of-range integers error)
-/// - `float` → JSON number (non-finite values error rather than become null,
-///   to avoid silent data loss in scientific metadata)
+/// - `bool` → `bool` (checked before `int`)
+/// - `int` → JSON number (i64 / u64; out-of-range errors)
+/// - `float` → JSON number (non-finite raw Python floats still error in
+///   tagged mode — only ndarray-backed NaN/Inf round-trips, since the base64
+///   envelope preserves raw bytes)
 /// - `str` → string
 /// - `dict` → object; non-string keys are stringified via `str(k)`
-/// - `list` / `tuple` → array
+/// - `list` → JSON array
 /// - `bytes` → error (no portable JSON representation)
-/// - NumPy scalar (`np.generic`) → recurse on `.item()`
-/// - NumPy array (`np.ndarray`) → recurse on `.tolist()` (multi-dim arrays
-///   produce nested lists; object arrays are recursed element-wise)
-/// - Any other object exposing a callable `.tolist()` → recurse on its
-///   result. This covers pandas `Index`, `Series`, and `Categorical`, but
-///   also any duck-typed array-like (e.g. third-party tensors). The
-///   fallback is intentionally broad — narrowing it would reject
-///   legitimate user payloads with no compensating safety win.
-/// - Anything else → error naming the offending type and key path
 ///
 /// `key_path` accumulates a Python-style accessor (e.g.
 /// `uns['rank_genes_groups']['names'][0]`) for inclusion in error messages.
 ///
-/// `visiting` tracks PyObject identities currently on the recursion stack
+/// `ctx.visiting` tracks PyObject identities currently on the recursion stack
 /// for container branches (dict / list / tuple / `.tolist()` fallback). A
-/// repeat hit means the input contains a cycle (e.g. `d = {}; d["x"] = d`,
-/// or a class whose `.tolist()` returns `self`). We raise `ValueError`
-/// instead of recursing into a Rust stack overflow — the latter would
-/// abort the Python process. NumPy `ndarray.tolist()` always returns a
-/// fresh list, so that branch doesn't need tracking. Scalar leaves
-/// (int/float/str) aren't tracked either: Python's small-int / interned-
-/// string caches share PyObject identity across uses and would produce
-/// false positives.
-///
-/// Note: this is one-way. Round-tripping through SCX converts NumPy arrays
-/// to plain Python lists on readback, since the `uns` section stores JSON.
+/// repeat hit means the input contains a cycle (e.g. `d = {}; d["x"] = d`).
+/// We raise `ValueError` instead of recursing into a Rust stack overflow.
 fn normalize_uns_value<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
-    np_generic: &Bound<'py, PyAny>,
-    np_ndarray: &Bound<'py, PyAny>,
-    visiting: &mut HashSet<usize>,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
 ) -> PyResult<serde_json::Value> {
     if obj.is_none() {
         return Ok(serde_json::Value::Null);
@@ -1462,13 +1512,27 @@ fn normalize_uns_value<'py>(
 
     // NumPy scalar / array first: in NumPy 1.x some scalars subclass Python
     // numeric types, so we must dispatch on np.generic before bool/int/float.
-    if obj.is_instance(np_generic)? {
-        let item = obj.call_method0("item")?;
-        return normalize_uns_value(&item, key_path, np_generic, np_ndarray, visiting);
+    if obj.is_instance(ctx.np_generic)? {
+        match ctx.format {
+            UnsFormat::Plain => {
+                let item = obj.call_method0("item")?;
+                return normalize_uns_value(&item, key_path, ctx);
+            }
+            UnsFormat::Tagged => {
+                return encode_np_scalar_tagged(obj, key_path, ctx);
+            }
+        }
     }
-    if obj.is_instance(np_ndarray)? {
-        let lst = obj.call_method0("tolist")?;
-        return normalize_uns_value(&lst, key_path, np_generic, np_ndarray, visiting);
+    if obj.is_instance(ctx.np_ndarray)? {
+        match ctx.format {
+            UnsFormat::Plain => {
+                let lst = obj.call_method0("tolist")?;
+                return normalize_uns_value(&lst, key_path, ctx);
+            }
+            UnsFormat::Tagged => {
+                return encode_ndarray_tagged(obj, key_path, ctx);
+            }
+        }
     }
 
     // bool before int: Python bool is a subclass of int.
@@ -1515,13 +1579,13 @@ fn normalize_uns_value<'py>(
     }
 
     let id = obj.as_ptr() as usize;
-    if !visiting.insert(id) {
+    if !ctx.visiting.insert(id) {
         return Err(PyValueError::new_err(format!(
             "uns at {key_path}: circular reference detected"
         )));
     }
-    let result = normalize_container(obj, key_path, np_generic, np_ndarray, visiting);
-    visiting.remove(&id);
+    let result = normalize_container(obj, key_path, ctx);
+    ctx.visiting.remove(&id);
     result
 }
 
@@ -1530,19 +1594,14 @@ fn normalize_uns_value<'py>(
 fn normalize_container<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
-    np_generic: &Bound<'py, PyAny>,
-    np_ndarray: &Bound<'py, PyAny>,
-    visiting: &mut HashSet<usize>,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
 ) -> PyResult<serde_json::Value> {
     if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (k, v) in dict.iter() {
             let key_str: String = k.str()?.extract()?;
             let new_path = format!("{key_path}['{key_str}']");
-            map.insert(
-                key_str,
-                normalize_uns_value(&v, &new_path, np_generic, np_ndarray, visiting)?,
-            );
+            map.insert(key_str, normalize_uns_value(&v, &new_path, ctx)?);
         }
         return Ok(serde_json::Value::Object(map));
     }
@@ -1551,9 +1610,7 @@ fn normalize_container<'py>(
         let mut arr = Vec::with_capacity(lst.len());
         for (i, item) in lst.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
-            arr.push(normalize_uns_value(
-                &item, &new_path, np_generic, np_ndarray, visiting,
-            )?);
+            arr.push(normalize_uns_value(&item, &new_path, ctx)?);
         }
         return Ok(serde_json::Value::Array(arr));
     }
@@ -1562,19 +1619,38 @@ fn normalize_container<'py>(
         let mut arr = Vec::with_capacity(tup.len());
         for (i, item) in tup.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
-            arr.push(normalize_uns_value(
-                &item, &new_path, np_generic, np_ndarray, visiting,
-            )?);
+            arr.push(normalize_uns_value(&item, &new_path, ctx)?);
         }
-        return Ok(serde_json::Value::Array(arr));
+        match ctx.format {
+            UnsFormat::Plain => return Ok(serde_json::Value::Array(arr)),
+            UnsFormat::Tagged => {
+                let mut env = serde_json::Map::with_capacity(2);
+                env.insert(
+                    SCX_TYPE_KEY.to_string(),
+                    serde_json::Value::String("tuple".to_string()),
+                );
+                env.insert("data".to_string(), serde_json::Value::Array(arr));
+                return Ok(serde_json::Value::Object(env));
+            }
+        }
+    }
+
+    // Tagged mode: detect pandas Index / Series / Categorical before the
+    // generic `.tolist()` fallback so the original container type round-trips
+    // with its metadata (name, codes, categories, ordered).
+    if ctx.format == UnsFormat::Tagged {
+        if let Some(env) = encode_pandas_tagged(obj, key_path, ctx)? {
+            return Ok(env);
+        }
     }
 
     // Generic fallback: any object exposing a callable `.tolist()`. Covers
-    // pandas Index / Series / Categorical and most array-like duck types.
+    // pandas Index / Series / Categorical (in `Plain` mode) and any
+    // duck-typed array-like.
     if let Ok(method) = obj.getattr("tolist") {
         if method.is_callable() {
             let lst = method.call0()?;
-            return normalize_uns_value(&lst, key_path, np_generic, np_ndarray, visiting);
+            return normalize_uns_value(&lst, key_path, ctx);
         }
     }
 
@@ -1582,6 +1658,680 @@ fn normalize_container<'py>(
     Err(PyValueError::new_err(format!(
         "uns at {key_path}: cannot serialize {type_name} to JSON; supported types are None, bool, int, float, str, dict, list, tuple, NumPy arrays/scalars, and any object exposing a callable .tolist() (pandas Series/Index/Categorical)"
     )))
+}
+
+/// Wrap a NumPy scalar (`np.generic` instance) in a `scalar` envelope under
+/// tagged mode. The 1-element raw byte buffer is base64-LE-encoded so the
+/// scalar's dtype (e.g. `float32`, `int64`, `bool`) survives the round-trip.
+/// Non-base64 dtypes (datetime, complex, …) fall back to `.item()` and the
+/// usual plain-JSON path so the value still serializes.
+fn encode_np_scalar_tagged<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let dtype = obj.getattr("dtype")?;
+    let dtype_name: String = dtype.getattr("name")?.extract()?;
+    if !is_numeric_dtype_name(&dtype_name) {
+        let item = obj.call_method0("item")?;
+        return normalize_uns_value(&item, key_path, ctx);
+    }
+    // Wrap the scalar in a 0-d array so we can reuse ndarray byte conversion.
+    let np = ctx.np_generic.py().import("numpy")?;
+    let arr = np.call_method1("asarray", (obj,))?;
+    let bytes = ndarray_bytes_le(&arr, key_path)?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mut env = serde_json::Map::with_capacity(3);
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("scalar".to_string()),
+    );
+    env.insert("dtype".to_string(), serde_json::Value::String(dtype_name));
+    env.insert("data".to_string(), serde_json::Value::String(b64));
+    Ok(serde_json::Value::Object(env))
+}
+
+/// Encode an `np.ndarray` as a tagged JSON envelope.
+///
+/// Dispatch by `dtype.kind`:
+/// - `b`/`i`/`u`/`f` (bool/int/uint/float): base64-LE raw bytes.
+/// - `O`/`U`/`S` (object/unicode/bytes string): JSON list of strings.
+/// - `V` (structured): `recarray` envelope with `dtype.descr` + base64-LE
+///   raw bytes. Lets `rank_genes_groups["names"]`-style structured arrays
+///   round-trip with their field names and per-field dtypes intact.
+/// - `M`/`m`/`c` (datetime / timedelta / complex): error, not yet supported.
+fn encode_ndarray_tagged<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    _ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let dtype = obj.getattr("dtype")?;
+    let kind: String = dtype.getattr("kind")?.extract()?;
+    let shape: Vec<usize> = obj.getattr("shape")?.extract()?;
+    let shape_json: Vec<serde_json::Value> = shape
+        .iter()
+        .map(|s| serde_json::Value::Number((*s as u64).into()))
+        .collect();
+
+    let mut env = serde_json::Map::new();
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("ndarray".to_string()),
+    );
+
+    match kind.as_str() {
+        "b" | "i" | "u" | "f" => {
+            let dtype_name: String = dtype.getattr("name")?.extract()?;
+            let bytes = ndarray_bytes_le(obj, key_path)?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            env.insert(
+                "dtype".to_string(),
+                serde_json::Value::String(dtype_name),
+            );
+            env.insert("shape".to_string(), serde_json::Value::Array(shape_json));
+            env.insert(
+                "encoding".to_string(),
+                serde_json::Value::String("base64le".to_string()),
+            );
+            env.insert("data".to_string(), serde_json::Value::String(b64));
+            Ok(serde_json::Value::Object(env))
+        }
+        "O" | "U" | "S" => {
+            let lst = obj.call_method0("tolist")?;
+            let data = pylist_to_string_json_array(&lst, key_path)?;
+            let dtype_label = match kind.as_str() {
+                "O" => "object".to_string(),
+                "U" => format!("<U{}", dtype.getattr("itemsize")?.extract::<usize>()? / 4),
+                "S" => format!("|S{}", dtype.getattr("itemsize")?.extract::<usize>()?),
+                _ => unreachable!(),
+            };
+            env.insert(
+                "dtype".to_string(),
+                serde_json::Value::String(dtype_label),
+            );
+            env.insert("shape".to_string(), serde_json::Value::Array(shape_json));
+            env.insert(
+                "encoding".to_string(),
+                serde_json::Value::String("json".to_string()),
+            );
+            env.insert("data".to_string(), data);
+            Ok(serde_json::Value::Object(env))
+        }
+        "V" => {
+            // Structured ndarray (recarray-like). Save descr + raw bytes.
+            let descr_py = dtype.getattr("descr")?;
+            let descr_json = pytuple_descr_to_json(&descr_py, key_path)?;
+            let bytes = ndarray_bytes_le(obj, key_path)?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let mut env = serde_json::Map::new();
+            env.insert(
+                SCX_TYPE_KEY.to_string(),
+                serde_json::Value::String("recarray".to_string()),
+            );
+            env.insert("descr".to_string(), descr_json);
+            env.insert("shape".to_string(), serde_json::Value::Array(shape_json));
+            env.insert(
+                "encoding".to_string(),
+                serde_json::Value::String("base64le".to_string()),
+            );
+            env.insert("data".to_string(), serde_json::Value::String(b64));
+            Ok(serde_json::Value::Object(env))
+        }
+        other => Err(PyValueError::new_err(format!(
+            "uns at {key_path}: ndarray dtype kind '{other}' is not supported in uns_format='tagged' (got dtype.kind={other:?}); supported kinds are b/i/u/f (numeric), O/U/S (object/string), V (structured)"
+        ))),
+    }
+}
+
+/// Walk a Python list-of-strings (possibly nested for multi-dim arrays) into
+/// a JSON array, asserting that every leaf is a `str`. Used for object/string
+/// dtype ndarrays in tagged mode.
+fn pylist_to_string_json_array<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+) -> PyResult<serde_json::Value> {
+    if let Ok(lst) = obj.downcast::<PyList>() {
+        let mut arr = Vec::with_capacity(lst.len());
+        for (i, item) in lst.iter().enumerate() {
+            let new_path = format!("{key_path}[{i}]");
+            arr.push(pylist_to_string_json_array(&item, &new_path)?);
+        }
+        return Ok(serde_json::Value::Array(arr));
+    }
+    if let Ok(s) = obj.downcast::<PyString>() {
+        return Ok(serde_json::Value::String(s.extract()?));
+    }
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if obj.downcast::<PyBytes>().is_ok() {
+        // Decode UTF-8 bytes; reject otherwise.
+        let b: &[u8] = obj.downcast::<PyBytes>().unwrap().as_bytes();
+        let s = std::str::from_utf8(b).map_err(|_| {
+            PyValueError::new_err(format!(
+                "uns at {key_path}: bytes element in object/string array is not valid UTF-8"
+            ))
+        })?;
+        return Ok(serde_json::Value::String(s.to_string()));
+    }
+    let type_name: String = obj.get_type().getattr("__name__")?.extract()?;
+    Err(PyValueError::new_err(format!(
+        "uns at {key_path}: object/string ndarray element must be str or None, got {type_name}"
+    )))
+}
+
+/// Convert a NumPy `dtype.descr` (a list of `(name, fmt)` or
+/// `(name, fmt, shape)` tuples) into a JSON-friendly array of arrays.
+fn pytuple_descr_to_json<'py>(
+    descr: &Bound<'py, PyAny>,
+    key_path: &str,
+) -> PyResult<serde_json::Value> {
+    let lst = descr.downcast::<PyList>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "uns at {key_path}: structured dtype.descr is not a list"
+        ))
+    })?;
+    let mut out = Vec::with_capacity(lst.len());
+    for (i, item) in lst.iter().enumerate() {
+        let tup = item.downcast::<PyTuple>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "uns at {key_path}: dtype.descr[{i}] is not a tuple"
+            ))
+        })?;
+        let mut row = Vec::with_capacity(tup.len());
+        for el in tup.iter() {
+            if let Ok(s) = el.downcast::<PyString>() {
+                row.push(serde_json::Value::String(s.extract()?));
+            } else if let Ok(t) = el.downcast::<PyTuple>() {
+                // Nested shape tuple, e.g. ('a', '<i4', (3,)).
+                let mut inner = Vec::with_capacity(t.len());
+                for d in t.iter() {
+                    let n: u64 = d.extract()?;
+                    inner.push(serde_json::Value::Number(n.into()));
+                }
+                row.push(serde_json::Value::Array(inner));
+            } else if let Ok(l) = el.downcast::<PyList>() {
+                // Nested descr for sub-record (recursive).
+                let nested = pytuple_descr_to_json(l.as_any(), key_path)?;
+                row.push(nested);
+            } else {
+                let type_name: String = el.get_type().getattr("__name__")?.extract()?;
+                return Err(PyValueError::new_err(format!(
+                    "uns at {key_path}: unsupported dtype.descr element type {type_name}"
+                )));
+            }
+        }
+        out.push(serde_json::Value::Array(row));
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// Get a `Vec<u8>` of an ndarray's raw little-endian bytes, copying as
+/// needed to guarantee LE byte order and C-contiguous layout. The byte
+/// order conversion is a no-op on typical LE platforms; on BE platforms it
+/// produces the correct bytes for the on-disk envelope.
+fn ndarray_bytes_le<'py>(arr: &Bound<'py, PyAny>, key_path: &str) -> PyResult<Vec<u8>> {
+    let dtype = arr.getattr("dtype")?;
+    let le_dtype = dtype.call_method1("newbyteorder", ("<",))?;
+    let arr_le = arr.call_method1("astype", (le_dtype,))?;
+    let np = arr.py().import("numpy")?;
+    let arr_c = np.call_method1("ascontiguousarray", (arr_le,))?;
+    let bytes_obj = arr_c.call_method0("tobytes")?;
+    let pybytes = bytes_obj.downcast::<PyBytes>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "uns at {key_path}: ndarray.tobytes() did not return bytes"
+        ))
+    })?;
+    Ok(pybytes.as_bytes().to_vec())
+}
+
+/// In tagged mode, recognize a pandas `Index` / `Series` / `Categorical`
+/// and emit the corresponding envelope. Returns `Ok(None)` if `obj` is not
+/// a pandas object (caller falls back to the generic `.tolist()` path).
+fn encode_pandas_tagged<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<Option<serde_json::Value>> {
+    let py = obj.py();
+    let pd = ctx.pandas(py)?.clone();
+    let cat_cls = pd.getattr("Categorical")?;
+    let idx_cls = pd.getattr("Index")?;
+    let series_cls = pd.getattr("Series")?;
+
+    if obj.is_instance(&cat_cls)? {
+        let categories = obj.getattr("categories")?;
+        let codes = obj.getattr("codes")?;
+        let ordered: bool = obj.getattr("ordered")?.extract()?;
+        let cats_inner = encode_ndarray_tagged(
+            &categories.call_method1("to_numpy", ())?,
+            &format!("{key_path}.categories"),
+            ctx,
+        )?;
+        let codes_inner = encode_ndarray_tagged(&codes, &format!("{key_path}.codes"), ctx)?;
+        let mut env = serde_json::Map::new();
+        env.insert(
+            SCX_TYPE_KEY.to_string(),
+            serde_json::Value::String("categorical".to_string()),
+        );
+        env.insert("categories".to_string(), cats_inner);
+        env.insert("codes".to_string(), codes_inner);
+        env.insert("ordered".to_string(), serde_json::Value::Bool(ordered));
+        return Ok(Some(serde_json::Value::Object(env)));
+    }
+
+    if obj.is_instance(&idx_cls)? {
+        let name = obj.getattr("name")?;
+        let values = obj.call_method1("to_numpy", ())?;
+        let inner = encode_ndarray_tagged(&values, key_path, ctx)?;
+        let mut env = serde_json::Map::new();
+        env.insert(
+            SCX_TYPE_KEY.to_string(),
+            serde_json::Value::String("pandas.Index".to_string()),
+        );
+        env.insert("name".to_string(), pyobj_to_simple_json(&name, key_path)?);
+        env.insert("data".to_string(), inner);
+        return Ok(Some(serde_json::Value::Object(env)));
+    }
+
+    if obj.is_instance(&series_cls)? {
+        let name = obj.getattr("name")?;
+        let values = obj.call_method1("to_numpy", ())?;
+        let inner = encode_ndarray_tagged(&values, key_path, ctx)?;
+        let mut env = serde_json::Map::new();
+        env.insert(
+            SCX_TYPE_KEY.to_string(),
+            serde_json::Value::String("pandas.Series".to_string()),
+        );
+        env.insert("name".to_string(), pyobj_to_simple_json(&name, key_path)?);
+        env.insert("data".to_string(), inner);
+        return Ok(Some(serde_json::Value::Object(env)));
+    }
+
+    Ok(None)
+}
+
+/// Encode a small, scalar-like Python value (string, int, float, bool, None)
+/// to JSON. Used for the `name` field of `pd.Index` / `pd.Series` envelopes,
+/// which is conventionally a hashable scalar.
+fn pyobj_to_simple_json<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+) -> PyResult<serde_json::Value> {
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(s) = obj.downcast::<PyString>() {
+        return Ok(serde_json::Value::String(s.extract()?));
+    }
+    if obj.downcast::<PyBool>().is_ok() {
+        return Ok(serde_json::Value::Bool(obj.extract()?));
+    }
+    if obj.downcast::<PyInt>().is_ok() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(serde_json::Value::Number(i.into()));
+        }
+        if let Ok(u) = obj.extract::<u64>() {
+            return Ok(serde_json::Value::Number(u.into()));
+        }
+    }
+    if obj.downcast::<PyFloat>().is_ok() {
+        let f: f64 = obj.extract()?;
+        if f.is_finite() {
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                return Ok(serde_json::Value::Number(n));
+            }
+        }
+    }
+    // Fallback: stringify.
+    let s: String = obj.str()?.extract()?;
+    Err(PyValueError::new_err(format!(
+        "uns at {key_path}: unsupported scalar name value {s}"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// uns deserialization (tagged-JSON envelopes → Python types)
+// ---------------------------------------------------------------------------
+
+/// Mutable context for the uns reader. Lazy-imports pandas so files that
+/// only contain plain JSON never pay for the import.
+struct UnsReadCtx<'py> {
+    py: Python<'py>,
+    np: Bound<'py, PyModule>,
+    pd_lazy: Option<Bound<'py, PyModule>>,
+}
+
+impl<'py> UnsReadCtx<'py> {
+    fn new(py: Python<'py>) -> PyResult<Self> {
+        Ok(Self {
+            py,
+            np: py.import("numpy")?,
+            pd_lazy: None,
+        })
+    }
+
+    fn pandas(&mut self) -> PyResult<&Bound<'py, PyModule>> {
+        if self.pd_lazy.is_none() {
+            self.pd_lazy = Some(self.py.import("pandas")?);
+        }
+        Ok(self.pd_lazy.as_ref().unwrap())
+    }
+}
+
+/// Walk a Python value produced by `json.loads()` and reconstruct any
+/// `__scx_type__`-tagged envelopes into their original Python types
+/// (numpy ndarrays/scalars, tuples, structured recarrays,
+/// pd.Categorical/Index/Series).
+///
+/// Plain JSON (no `__scx_type__` keys) passes through unchanged, so files
+/// written by older `pyscx` (or with `uns_format="plain"`) read identically.
+fn denormalize_uns_value<'py>(
+    val: &Bound<'py, PyAny>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(dict) = val.downcast::<PyDict>() {
+        if let Some(tag_val) = dict.get_item(SCX_TYPE_KEY)? {
+            if let Ok(tag_s) = tag_val.downcast::<PyString>() {
+                let tag: String = tag_s.extract()?;
+                return decode_tagged_envelope(dict, &tag, ctx);
+            }
+        }
+        // Plain dict: recurse over values.
+        let out = PyDict::new(ctx.py);
+        for (k, v) in dict.iter() {
+            let decoded = denormalize_uns_value(&v, ctx)?;
+            out.set_item(k, decoded)?;
+        }
+        return Ok(out.into_any());
+    }
+
+    if let Ok(lst) = val.downcast::<PyList>() {
+        let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(lst.len());
+        for item in lst.iter() {
+            items.push(denormalize_uns_value(&item, ctx)?);
+        }
+        let out = PyList::new(ctx.py, items)?;
+        return Ok(out.into_any());
+    }
+
+    Ok(val.clone())
+}
+
+fn decode_tagged_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    tag: &str,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    match tag {
+        "ndarray" => decode_ndarray_envelope(dict, ctx),
+        "scalar" => decode_scalar_envelope(dict, ctx),
+        "tuple" => decode_tuple_envelope(dict, ctx),
+        "recarray" => decode_recarray_envelope(dict, ctx),
+        "categorical" => decode_categorical_envelope(dict, ctx),
+        "pandas.Index" => decode_pandas_index_envelope(dict, ctx),
+        "pandas.Series" => decode_pandas_series_envelope(dict, ctx),
+        other => {
+            // Unknown tag — forward-compat: warn once and return the
+            // envelope dict as-is so users can still introspect it.
+            let warnings = ctx.py.import("warnings")?;
+            let msg = format!(
+                "uns: unknown __scx_type__ tag '{other}' — returning the raw tagged dict; \
+                 upgrade pyscx if you wrote this file with a newer version"
+            );
+            warnings.call_method1("warn", (msg,))?;
+            Ok(dict.clone().into_any())
+        }
+    }
+}
+
+fn require_str<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<String> {
+    let v = dict
+        .get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("uns envelope missing key '{key}'")))?;
+    let s = v
+        .downcast::<PyString>()
+        .map_err(|_| PyValueError::new_err(format!("uns envelope '{key}' is not a string")))?;
+    s.extract()
+}
+
+fn require_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+    dict.get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("uns envelope missing key '{key}'")))
+}
+
+fn decode_base64_bytes<'py>(
+    py: Python<'py>,
+    dict: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    use base64::Engine;
+    let b64 = require_str(dict, "data")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| PyValueError::new_err(format!("uns: base64 decode failed: {e}")))?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
+fn extract_shape<'py>(dict: &Bound<'py, PyDict>) -> PyResult<Vec<usize>> {
+    let shape_v = require_item(dict, "shape")?;
+    let lst = shape_v
+        .downcast::<PyList>()
+        .map_err(|_| PyValueError::new_err("uns: envelope 'shape' is not a list"))?;
+    let mut out = Vec::with_capacity(lst.len());
+    for v in lst.iter() {
+        out.push(v.extract::<usize>()?);
+    }
+    Ok(out)
+}
+
+fn decode_ndarray_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dtype = require_str(dict, "dtype")?;
+    let shape = extract_shape(dict)?;
+    let encoding = require_str(dict, "encoding")?;
+    let py = ctx.py;
+    let np = &ctx.np;
+    let arr: Bound<'py, PyAny> = match encoding.as_str() {
+        "base64le" => {
+            let pybytes = decode_base64_bytes(py, dict)?;
+            let dtype_arg = np.call_method1("dtype", (dtype.as_str(),))?;
+            np.call_method1("frombuffer", (pybytes, dtype_arg))?
+        }
+        "json" => {
+            // Object or fixed-width string array. `data` is a JSON list of
+            // strings (already a Python list).
+            let data = require_item(dict, "data")?;
+            // NumPy str fixed-width: dtype "<UN" / "|SN"; object: "object".
+            let dtype_str: &str = dtype.as_str();
+            let np_dtype: Bound<'py, PyAny> = if dtype_str == "object" {
+                np.call_method1("dtype", ("object",))?
+            } else {
+                // pass the dtype string through to np.dtype()
+                np.call_method1("dtype", (dtype_str,))?
+            };
+            np.call_method1("array", (data, np_dtype))?
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "uns ndarray envelope: unknown encoding '{other}'"
+            )))
+        }
+    };
+    // Reshape and copy so the returned array owns its buffer.
+    let shape_tup = pyo3::types::PyTuple::new(py, shape.iter().map(|s| *s as i64))?;
+    let reshaped = arr.call_method1("reshape", (shape_tup,))?;
+    reshaped.call_method0("copy")
+}
+
+fn decode_scalar_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dtype = require_str(dict, "dtype")?;
+    let pybytes = decode_base64_bytes(ctx.py, dict)?;
+    let dtype_arg = ctx.np.call_method1("dtype", (dtype.as_str(),))?;
+    let arr = ctx.np.call_method1("frombuffer", (pybytes, dtype_arg))?;
+    // Index 0 returns a NumPy scalar (np.generic).
+    let zero: i64 = 0;
+    let scalar = arr.call_method1("__getitem__", (zero,))?;
+    Ok(scalar)
+}
+
+fn decode_tuple_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let data = require_item(dict, "data")?;
+    let lst = data
+        .downcast::<PyList>()
+        .map_err(|_| PyValueError::new_err("uns tuple envelope: 'data' is not a list"))?;
+    let mut decoded: Vec<Bound<'py, PyAny>> = Vec::with_capacity(lst.len());
+    for item in lst.iter() {
+        decoded.push(denormalize_uns_value(&item, ctx)?);
+    }
+    let tup = pyo3::types::PyTuple::new(ctx.py, decoded)?;
+    Ok(tup.into_any())
+}
+
+fn decode_recarray_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let descr = require_item(dict, "descr")?;
+    let shape = extract_shape(dict)?;
+    let pybytes = decode_base64_bytes(ctx.py, dict)?;
+    let np = &ctx.np;
+    let dtype = build_structured_dtype(np, &descr)?;
+    let arr = np.call_method1("frombuffer", (pybytes, dtype))?;
+    let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
+    let reshaped = arr.call_method1("reshape", (shape_tup,))?;
+    reshaped.call_method0("copy")
+}
+
+/// Rebuild a structured `np.dtype` from a descr JSON tree (a list of
+/// `[name, fmt]` or `[name, fmt, [shape...]]` entries; fmt may itself be a
+/// nested descr list).
+fn build_structured_dtype<'py>(
+    np: &Bound<'py, PyModule>,
+    descr: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let lst = descr
+        .downcast::<PyList>()
+        .map_err(|_| PyValueError::new_err("uns recarray: descr is not a list"))?;
+    let py = np.py();
+    let mut entries: Vec<Bound<'py, PyAny>> = Vec::with_capacity(lst.len());
+    for entry in lst.iter() {
+        let row = entry
+            .downcast::<PyList>()
+            .map_err(|_| PyValueError::new_err("uns recarray: descr entry is not a list"))?;
+        let mut tup_items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(row.len());
+        for el in row.iter() {
+            if let Ok(s) = el.downcast::<PyString>() {
+                tup_items.push(s.clone().into_any());
+            } else if let Ok(inner) = el.downcast::<PyList>() {
+                // Either a sub-descr list or a shape list. Distinguish by
+                // looking at the first element: a list-of-lists means
+                // sub-descr; a list of ints means a shape tuple.
+                let first_is_list = inner
+                    .get_item(0)
+                    .ok()
+                    .map(|x| x.downcast::<PyList>().is_ok())
+                    .unwrap_or(false);
+                if first_is_list {
+                    tup_items.push(build_structured_dtype(np, inner.as_any())?);
+                } else {
+                    // Shape tuple.
+                    let mut shape_items: Vec<i64> = Vec::with_capacity(inner.len());
+                    for d in inner.iter() {
+                        shape_items.push(d.extract()?);
+                    }
+                    let tup = pyo3::types::PyTuple::new(py, shape_items)?;
+                    tup_items.push(tup.into_any());
+                }
+            } else {
+                return Err(PyValueError::new_err(
+                    "uns recarray: unsupported descr element type",
+                ));
+            }
+        }
+        let tup = pyo3::types::PyTuple::new(py, tup_items)?;
+        entries.push(tup.into_any());
+    }
+    let descr_list = PyList::new(py, entries)?;
+    np.call_method1("dtype", (descr_list,))
+}
+
+fn decode_categorical_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let categories_v = require_item(dict, "categories")?;
+    let codes_v = require_item(dict, "codes")?;
+    let ordered_v = require_item(dict, "ordered")?;
+    let categories = denormalize_uns_value(&categories_v, ctx)?;
+    let codes = denormalize_uns_value(&codes_v, ctx)?;
+    let ordered: bool = ordered_v.extract()?;
+    let pd = ctx.pandas()?.clone();
+    let cat_cls = pd.getattr("Categorical")?;
+    let kwargs = PyDict::new(ctx.py);
+    kwargs.set_item("categories", categories)?;
+    kwargs.set_item("ordered", ordered)?;
+    cat_cls.call_method("from_codes", (codes,), Some(&kwargs))
+}
+
+fn decode_pandas_index_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let data_v = require_item(dict, "data")?;
+    let name_v = require_item(dict, "name")?;
+    let data = denormalize_uns_value(&data_v, ctx)?;
+    let pd = ctx.pandas()?.clone();
+    let idx_cls = pd.getattr("Index")?;
+    let kwargs = PyDict::new(ctx.py);
+    kwargs.set_item("name", name_v)?;
+    idx_cls.call((data,), Some(&kwargs))
+}
+
+fn decode_pandas_series_envelope<'py>(
+    dict: &Bound<'py, PyDict>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let data_v = require_item(dict, "data")?;
+    let name_v = require_item(dict, "name")?;
+    let data = denormalize_uns_value(&data_v, ctx)?;
+    let pd = ctx.pandas()?.clone();
+    let series_cls = pd.getattr("Series")?;
+    let kwargs = PyDict::new(ctx.py);
+    kwargs.set_item("name", name_v)?;
+    series_cls.call((data,), Some(&kwargs))
+}
+
+/// Read the `uns` section from an SCX file and reconstruct any tagged
+/// envelopes into Python types. Returns `None` if the file has no uns.
+/// Shared by all three to_anndata entry points so the reconstruction is
+/// applied consistently.
+fn read_uns_as_pyobject<'py>(
+    py: Python<'py>,
+    reader: &ScxReader,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let json_val = match reader.read_uns() {
+        Ok(v) => v,
+        Err(scx_format::ScxError::SectionNotFound(_)) => return Ok(None),
+        Err(e) => return Err(to_pyerr(e)),
+    };
+    let json_str =
+        serde_json::to_string(&json_val).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json_mod = py.import("json")?;
+    let parsed = json_mod.call_method1("loads", (json_str,))?;
+    let mut ctx = UnsReadCtx::new(py)?;
+    let decoded = denormalize_uns_value(&parsed, &mut ctx)?;
+    Ok(Some(decoded))
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,6 +2580,7 @@ pub fn from_anndata_impl(
     in_place: bool,
     csc: &str,
     csc_cols_per_shard: usize,
+    uns_format: &str,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
@@ -1842,6 +2593,7 @@ pub fn from_anndata_impl(
             )))
         }
     };
+    let uns_format_parsed = parse_uns_format(uns_format)?;
 
     // Extract X as CSR. By default we do not mutate caller-owned CSR
     // matrices; pass `in_place=true` to opt into the original in-place
@@ -2127,20 +2879,16 @@ pub fn from_anndata_impl(
     // 1E.2: Collect uns JSON under GIL.
     // Use a recursive Python-side normalizer so common AnnData payloads
     // (NumPy arrays/scalars, pandas Index/Series/Categorical) survive the
-    // JSON boundary instead of erroring out of `json.dumps`.
+    // JSON boundary instead of erroring out of `json.dumps`. Under
+    // `UnsFormat::Tagged` (default), payloads are wrapped in `__scx_type__`
+    // envelopes so dtype/shape/NaN/Inf round-trip losslessly.
     let uns = adata.getattr("uns")?;
     let uns_len: usize = uns.call_method0("__len__")?.extract()?;
     let uns_json: Option<serde_json::Value> = if uns_len > 0 {
         let np_generic = np.getattr("generic")?;
         let np_ndarray = np.getattr("ndarray")?;
-        let mut visiting = HashSet::new();
-        Some(normalize_uns_value(
-            &uns,
-            "uns",
-            &np_generic,
-            &np_ndarray,
-            &mut visiting,
-        )?)
+        let mut ctx = UnsWriteCtx::new(uns_format_parsed, &np_generic, &np_ndarray);
+        Some(normalize_uns_value(&uns, "uns", &mut ctx)?)
     } else {
         None
     };
