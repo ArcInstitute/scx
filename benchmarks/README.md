@@ -1373,9 +1373,16 @@ Kernel-level benches live alongside the crates they exercise. Run via
 | Bench | Crate | What it measures |
 |-------|-------|-----------------|
 | `codec_bench` | `scx-codec` | Encode/decode throughput per codec (Rice, FOR-BP, Delta-Golomb, LZ4-shuffle, Zstd) |
+| `catalog_parse` | `scx-format` | Round-trip cost of `FullCatalog::read_from` at census scale. Synthesises a catalog with `n_shards ∈ {64, 1024, 16384}` v2 CSR entries + the usual obs/var/index/provenance/uns entries, serialises it to bytes, then measures the parse-back cycle. Used to baseline the per-entry `String` / stats-payload allocation reductions; the 16K shard size matches the worst case the `index_plan/scx_auto/census_1m` cells hit when the workers2 path opens one `BackedCsrReader` per worker. |
 | `distances` | `scx-accel` | `mean_pairwise_distance` and `mean_pairwise_distance_self` across `(n_a, n_b, n_dims)` shapes × `metric ∈ {euclidean, l1, cosine}` × `backend ∈ {scalar, gemm}` × `dtype ∈ {f32, f64}`. Filter by criterion regex, e.g. `cargo bench -p scx-accel --bench distances -- 'gemm/cosine'`. |
 
 ```bash
+# Catalog parse: full sweep (64 / 1024 / 16384 shards)
+cargo bench -p scx-format --bench catalog_parse
+
+# Just the 16K-entry workload (matches census_1m amplification)
+cargo bench -p scx-format --bench catalog_parse -- 'parse/16384'
+
 # All distance microbenches (full grid takes ~30 minutes)
 cargo bench -p scx-accel --bench distances
 
@@ -1389,3 +1396,11 @@ cargo bench -p scx-accel --bench distances -- --list
 Sample budgets are tuned per shape so the full grid stays under tens of
 minutes; the heaviest combos (5000×2000×18000 scalar f64) drop to
 `sample_size=10` / `measurement_time=30s` to stay tractable.
+
+`catalog_parse` baselines the `FullCatalog::read_from` path only — the
+lightweight `CatalogView::read_from_bytes` and the `Arc<FullCatalog>`
+sharing across the N+3 `to_anndata_backed` opens are not exercised by this
+bench. Comparing those paths requires a dedicated `backed_open` microbench
+against a 16K-entry catalog (flagged as a follow-up; not landed). The
+ML-loader-level signal lives in `comprehensive/results/baselines/LATEST`'s
+`ml_loader/pyscx_index_plan_dataset_*` floors.
