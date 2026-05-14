@@ -51,6 +51,13 @@ def run(
         benchmark="write",
         format=format_variant.key,
         dataset=dataset.name,
+        scenario={
+            "name": "conversion",
+            "mode": "full_pipeline",
+            "cache_state": "cold" if cold_cache else "warm",
+            "device": "cpu",
+            "storage_backend": "local",
+        },
         metadata={
             "source_h5ad_bytes": source_h5ad_bytes,
             "cold_cache": cold_cache,

@@ -57,6 +57,13 @@ def run(
         benchmark="read_full",
         format=format_variant.key,
         dataset=dataset.name,
+        scenario={
+            "name": "full_read",
+            "mode": "full_pipeline",
+            "cache_state": "cold" if cold_cache else "warm",
+            "device": "cpu",
+            "storage_backend": "local",
+        },
         metadata={
             "cold_cache": cold_cache,
             "n_warmup": N_WARMUP_RUNS,

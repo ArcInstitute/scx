@@ -104,15 +104,47 @@ def _setup_style():
     })
 
 
-def _save_fig(fig: plt.Figure, name: str, output_dir: Path | None = None):
-    """Save figure as PNG and PDF."""
+def _save_fig(
+    fig: plt.Figure,
+    name: str,
+    output_dir: Path | None = None,
+    *,
+    source_benchmark: str | None = None,
+    source_datasets: list[str] | None = None,
+):
+    """Save figure as PNG and PDF, plus a provenance JSON sidecar.
+
+    The provenance file records the benchmark source, datasets, and
+    generation timestamp so the report pipeline can verify figure
+    freshness and trace data lineage.
+    """
+    import datetime
+    import hashlib
+    import json
+
     if output_dir is None:
         output_dir = FIGURES_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_dir / f"{name}.png", bbox_inches="tight")
-    fig.savefig(output_dir / f"{name}.pdf", bbox_inches="tight")
+
+    png_path = output_dir / f"{name}.png"
+    pdf_path = output_dir / f"{name}.pdf"
+    fig.savefig(png_path, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved {name}.png and {name}.pdf")
+
+    # Write provenance sidecar
+    provenance = {
+        "figure": name,
+        "files": [f"{name}.png", f"{name}.pdf"],
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source_benchmark": source_benchmark,
+        "source_datasets": source_datasets,
+        "png_sha256": hashlib.sha256(png_path.read_bytes()).hexdigest(),
+    }
+    prov_path = output_dir / f"{name}.provenance.json"
+    prov_path.write_text(json.dumps(provenance, indent=2))
+
 
 
 def plot_is_stale(name: str, output_dir: Path | None = None) -> bool:
@@ -460,7 +492,7 @@ def plot_memory_scaling(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 6. Lazy vs materialized RSS comparison (Phase 4d)
+# 6. Lazy vs materialized RSS comparison
 # ---------------------------------------------------------------------------
 
 def plot_lazy_vs_materialized_rss(output_dir: Path | None = None):
@@ -501,7 +533,7 @@ def plot_lazy_vs_materialized_rss(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 7. Column-projected aggregation latency (Phase 4d)
+# 7. Column-projected aggregation latency
 # ---------------------------------------------------------------------------
 
 def plot_column_projection_latency(output_dir: Path | None = None):
@@ -530,7 +562,7 @@ def plot_column_projection_latency(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 8. Out-of-core pipeline RSS time-series (Phase 4d)
+# 8. Out-of-core pipeline RSS time-series
 # ---------------------------------------------------------------------------
 
 def plot_ooc_pipeline_rss(output_dir: Path | None = None):
@@ -863,7 +895,7 @@ def plot_streaming_preprocess_memory(output_dir: Path | None = None):
     # Historical fragment-ops baseline numbers.
     datasets_names = ["tabula_100k\n(100K)", "census_1m\n(1M)"]
 
-    # Phase 4e data
+    # Extended data
     scx_ooc_rss = [1108, 2399]  # MB
     scanpy_rss = [1605, 9871]  # MB
 

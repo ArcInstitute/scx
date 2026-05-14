@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "benchmark": "read_full",
+  "format": "scx_auto",
+  "dataset": "pbmc3k",
+  "timestamp": "2026-01-15T10:01:00",
+  "system": {
+    "hostname": "test-host",
+    "os": "Linux 5.15.0",
+    "arch": "x86_64"
+  },
+  "runs": [
+    {"wall_s": 0.123, "rss_mb": 45.2},
+    {"wall_s": 0.118, "rss_mb": 44.8},
+    {"wall_s": 0.130, "rss_mb": 46.1}
+  ],
+  "median_wall_s": 0.123,
+  "wall_s_iqr": 0.012,
+  "n_runs": 3,
+  "metadata": {
+    "median_delta_rss_mb_read_full": 45.2,
+    "mode": "full_pipeline"
+  },
+  "scenario": {
+    "name": "full_read",
+    "mode": "full_pipeline",
+    "thread_count": 8,
+    "cache_state": "warm",
+    "device": "cpu",
+    "storage_backend": "local"
+  }
+}

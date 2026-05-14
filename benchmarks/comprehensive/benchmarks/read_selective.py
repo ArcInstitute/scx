@@ -166,6 +166,13 @@ def run(
         benchmark="read_selective",
         format=format_variant.key,
         dataset=dataset.name,
+        scenario={
+            "name": "selective_read",
+            "mode": "query",
+            "cache_state": "cold" if cold_cache else "warm",
+            "device": "cpu",
+            "storage_backend": "local",
+        },
         metadata={
             "cold_cache": cold_cache,
             "query_n_cells": int(len(cell_idx)),

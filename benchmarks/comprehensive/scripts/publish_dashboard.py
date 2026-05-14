@@ -41,6 +41,8 @@ _PUBLISH_ITEMS = (
     "BENCHMARK_REPORT.html",
     "BENCHMARK_REPORT.md",
     "BENCHMARK_REPORT.pdf",
+    "BENCHMARK_REPORT.json",
+    "LINT_WARNINGS.json",
     "dashboard_history.json",
     "figures",
 )

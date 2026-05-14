@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "benchmark": "ml_loader",
+  "format": "bpcells",
+  "dataset": "pbmc3k",
+  "timestamp": "2026-01-15T10:05:00",
+  "system": {
+    "hostname": "test-host",
+    "os": "Linux 5.15.0",
+    "arch": "x86_64"
+  },
+  "runs": [],
+  "median_wall_s": null,
+  "n_runs": 0,
+  "metadata": {
+    "missing_reason": "not_supported",
+    "notes": "BPCells does not provide a Python ML data loader"
+  },
+  "scenario": {
+    "name": "default",
+    "batch_size": 256,
+    "n_hvgs": 2000,
+    "device": "cpu"
+  }
+}

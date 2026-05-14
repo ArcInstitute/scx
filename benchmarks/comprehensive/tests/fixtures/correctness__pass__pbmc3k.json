@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "benchmark": "correctness",
+  "format": "h5ad_gzip",
+  "dataset": "pbmc3k",
+  "timestamp": "2026-01-15T10:03:00",
+  "system": {
+    "hostname": "test-host",
+    "os": "Linux 5.15.0",
+    "arch": "x86_64"
+  },
+  "runs": [],
+  "median_wall_s": 2.1,
+  "n_runs": 1,
+  "overall_passed": true,
+  "metadata": {
+    "overall_passed": true,
+    "tests_passed": 11,
+    "tests_failed": 0,
+    "tests_skipped": 0
+  },
+  "harness": "scanpy"
+}

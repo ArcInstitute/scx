@@ -1,0 +1,24 @@
+{
+  "schema_version": 2,
+  "benchmark": "cloud_read",
+  "format": "zarr",
+  "dataset": "census_1m",
+  "timestamp": "2026-01-15T10:04:00",
+  "system": {
+    "hostname": "test-host",
+    "os": "Linux 5.15.0",
+    "arch": "x86_64"
+  },
+  "runs": [],
+  "median_wall_s": null,
+  "n_runs": 0,
+  "metadata": {
+    "missing_reason": "skipped_too_expensive",
+    "notes": "Census 1M cloud read too expensive for CI"
+  },
+  "scenario": {
+    "name": "cloud_full_read",
+    "storage_backend": "gcs",
+    "cache_state": "cold"
+  }
+}

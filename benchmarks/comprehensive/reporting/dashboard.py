@@ -1,19 +1,15 @@
 """
-Minimal HTML snapshot renderer (Phase G.4).
+HTML snapshot renderer for the rolling dashboard.
 
-Wraps the markdown body produced by ``markdown.generate_report()`` in a
-self-contained HTML5 shell. No jinja2 / templating dependency — the
-skeleton is a Python string literal and the markdown body is escaped +
-embedded as a ``<pre>`` block with anchor targets parsed from the
-``##`` / ``###`` headings so in-page navigation works.
+Delegates to the semantic ``HtmlRenderer`` from the report model.
+The rendered output is a full HTML5 document with navigable heading
+anchors, styled tables with ``<thead>``/``<tbody>``/``<caption>``,
+and a "← previous snapshot" link threaded through
+``dashboard_history.json``.
 
-The design goal is intentionally minimal: the markdown report is the
-authoritative artifact; the HTML is a browsable snapshot that makes
-rolling-dashboard navigation possible (via the previous-snapshot link
-threaded through ``dashboard_history.json``). A richer rendering — real
-markdown → HTML, syntax highlighting, trend charts — is Phase I.7
-territory; Phase G.4 just lands the link structure so trend work is a
-drop-in later.
+``publish_dashboard.py`` now publishes
+``BENCHMARK_REPORT.json`` (the JSON manifest) and
+``LINT_WARNINGS.json`` alongside the HTML/MD/PDF outputs.
 """
 
 from __future__ import annotations
@@ -28,175 +24,63 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-_CSS = """
-* { box-sizing: border-box; }
-body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 1.5rem 2rem 4rem;
-    color: #1f2328;
-    line-height: 1.55;
-}
-header {
-    border-bottom: 1px solid #d0d7de;
-    padding-bottom: 0.75rem;
-    margin-bottom: 1.25rem;
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 1rem;
-    flex-wrap: wrap;
-}
-header h1 {
-    font-size: 1.5rem;
-    margin: 0;
-}
-header .meta {
-    font-size: 0.875rem;
-    color: #656d76;
-}
-header .prev-link a {
-    font-size: 0.875rem;
-    text-decoration: none;
-    color: #0969da;
-}
-header .prev-link a:hover { text-decoration: underline; }
-nav.toc {
-    background: #f6f8fa;
-    border: 1px solid #d0d7de;
-    border-radius: 6px;
-    padding: 0.75rem 1rem;
-    margin-bottom: 1.5rem;
-    font-size: 0.9rem;
-}
-nav.toc ul { margin: 0.25rem 0 0 1rem; padding: 0; }
-nav.toc a {
-    color: #0969da;
-    text-decoration: none;
-}
-nav.toc a:hover { text-decoration: underline; }
-pre.report {
-    background: #f6f8fa;
-    border: 1px solid #d0d7de;
-    border-radius: 6px;
-    padding: 1rem 1.25rem;
-    overflow-x: auto;
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    font-size: 0.85rem;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-}
-""".strip()
-
-
-_HEADING_RE = re.compile(r"^(##+)\s+(.+)$", re.MULTILINE)
-
-
-def _slugify(text: str) -> str:
-    slug = re.sub(r"[^\w\s-]", "", text.strip().lower())
-    slug = re.sub(r"[\s-]+", "-", slug)
-    return slug.strip("-") or "section"
-
-
-def _extract_toc(markdown_body: str) -> list[tuple[int, str, str]]:
-    """Return ``(level, text, slug)`` for each ``##``/``###`` heading.
-
-    The top-level ``#`` title is excluded; the TOC starts at ``##`` so
-    Phase sections (§1, §2, ...) show up without the document header.
-    """
-    out = []
-    seen: dict[str, int] = {}
-    for m in _HEADING_RE.finditer(markdown_body):
-        level = len(m.group(1))
-        text = m.group(2).strip()
-        slug = _slugify(text)
-        # De-duplicate slugs with a numeric suffix so anchors remain unique.
-        if slug in seen:
-            seen[slug] += 1
-            slug = f"{slug}-{seen[slug]}"
-        else:
-            seen[slug] = 1
-        out.append((level, text, slug))
-    return out
-
-
-def _annotate_body(markdown_body: str, toc: list[tuple[int, str, str]]) -> str:
-    """Inject HTML anchor tags above each heading for in-page navigation."""
-    anchors_iter = iter(toc)
-
-    def repl(m: re.Match) -> str:
-        try:
-            _lvl, _text, slug = next(anchors_iter)
-        except StopIteration:
-            return m.group(0)
-        return f'<span id="{slug}"></span>{m.group(0)}'
-
-    return _HEADING_RE.sub(repl, markdown_body)
-
+from benchmarks.comprehensive.reporting.report_model import Report, HtmlRenderer
 
 def render_html(
-    markdown_body: str,
+    report: Report | str,
     *,
     title: str = "SCX Benchmark Report",
     prev_url: str | None = None,
     generated_at: _dt.datetime | None = None,
 ) -> str:
-    """Wrap ``markdown_body`` in a browsable HTML snapshot.
+    """Render a full semantic HTML snapshot of the benchmark report.
 
-    The markdown body is embedded verbatim inside a ``<pre>`` block so
-    readers get the raw report with table alignment intact. A small TOC
-    auto-built from ``##``/``###`` headings anchors each section.
+    Accepts either a ``Report`` model (used by the main report pipeline)
+    or a plain markdown **string** (used by ``landing.py`` and other
+    lightweight callers that don't build a full report AST).
+
+    When *report* is a ``Report``, delegates to ``HtmlRenderer``.
+    When *report* is a ``str``, wraps the raw text in a styled HTML page
+    with the same CSS chrome (header, prev-link, body).
     """
-    toc = _extract_toc(markdown_body)
-    # Escape HTML-special chars in the markdown BEFORE injecting anchor
-    # <span> tags. If we escape after annotation, the span tags themselves
-    # are rendered as literal text and in-page navigation breaks.
-    # ``_HEADING_RE`` only matches leading ``##``, which is preserved by
-    # ``html.escape`` verbatim, so post-escape substitution still finds
-    # every heading.
-    body_with_anchors = _annotate_body(_html.escape(markdown_body), toc)
-    generated_at = generated_at or _dt.datetime.now()
+    if isinstance(report, Report):
+        return HtmlRenderer().render(report, prev_url=prev_url)
 
-    toc_html = ""
-    if toc:
-        toc_items = "\n".join(
-            f'    <li style="margin-left: {(lvl - 2) * 1.25}rem">'
-            f'<a href="#{slug}">{_html.escape(text)}</a></li>'
-            for (lvl, text, slug) in toc
-        )
-        toc_html = (
-            '<nav class="toc"><strong>Contents</strong><ul>\n'
-            + toc_items + "\n</ul></nav>"
-        )
-
-    prev_link_html = ""
-    if prev_url:
-        prev_link_html = (
-            f'<div class="prev-link"><a href="{_html.escape(prev_url)}">'
-            "← previous snapshot</a></div>"
-        )
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>{_html.escape(title)}</title>
-  <style>{_CSS}</style>
-</head>
-<body>
-<header>
-  <div>
-    <h1>{_html.escape(title)}</h1>
-    <div class="meta">Generated {generated_at.isoformat(timespec="seconds")}</div>
-  </div>
-  {prev_link_html}
-</header>
-{toc_html}
-<pre class="report">{body_with_anchors}</pre>
-</body>
-</html>
-"""
+    # Legacy path: plain markdown/text string → simple HTML wrapper.
+    body_text = report  # it's a str
+    ts = (generated_at or _dt.datetime.now()).isoformat(timespec="seconds")
+    prev_link = (
+        f'<div class="prev-link"><a href="{_html.escape(prev_url)}">'
+        f"&larr; previous snapshot</a></div>"
+        if prev_url
+        else ""
+    )
+    css = (
+        "* { box-sizing: border-box; }"
+        " body { font-family: -apple-system, BlinkMacSystemFont,"
+        ' "Segoe UI", Helvetica, Arial, sans-serif;'
+        " max-width: 1100px; margin: 0 auto;"
+        " padding: 1.5rem 2rem 4rem; color: #1f2328; line-height: 1.55; }"
+        " header { border-bottom: 1px solid #d0d7de;"
+        " padding-bottom: 0.75rem; margin-bottom: 1.25rem;"
+        " display: flex; align-items: baseline;"
+        " justify-content: space-between; gap: 1rem; flex-wrap: wrap; }"
+        " header h1 { font-size: 1.5rem; margin: 0; }"
+        " pre { white-space: pre-wrap; word-break: break-word; }"
+    )
+    return (
+        f"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        f"  <meta charset=\"UTF-8\">\n"
+        f"  <title>{_html.escape(title)}</title>\n"
+        f"  <style>{css}</style>\n"
+        f"</head>\n<body>\n"
+        f"<header>\n"
+        f"  <div>\n    <h1>{_html.escape(title)}</h1>\n"
+        f'    <div class="meta">Generated {ts}</div>\n'
+        f"  </div>\n  {prev_link}\n</header>\n"
+        f"<pre>{_html.escape(body_text)}</pre>\n"
+        f"</body>\n</html>"
+    )
 
 
 # ---------------------------------------------------------------------------

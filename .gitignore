@@ -20,12 +20,17 @@ benchmarks/comprehensive/results/raw/
 benchmarks/comprehensive/results/raw_archive_*/
 benchmarks/comprehensive/results/reports/figures/
 benchmarks/comprehensive/results/reports_archive_*/
+benchmarks/comprehensive/reports/*.html
+benchmarks/comprehensive/reports/*.pdf
+benchmarks/comprehensive/reports/*.json
 benchmarks/comprehensive/logs/
 benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/
 benchmarks/comprehensive/results/accel_smoke_*/
 benchmarks/comprehensive/results/tier*/
 build_artifacts/
+LINT_WARNINGS.json
+dashboard_history.json
 
 # Generated report artifacts — regenerable via write_report() / write_landing()
 # from results/raw/ or a promoted baseline snapshot. Publish via

@@ -1,0 +1,24 @@
+{
+  "schema_version": 2,
+  "benchmark": "compression",
+  "format": "scx_auto",
+  "dataset": "pbmc3k",
+  "timestamp": "2026-01-15T10:00:00",
+  "system": {
+    "hostname": "test-host",
+    "os": "Linux 5.15.0",
+    "arch": "x86_64"
+  },
+  "runs": [],
+  "median_wall_s": null,
+  "wall_s_iqr": null,
+  "n_runs": 3,
+  "file_size_bytes": 4720280,
+  "metadata": {
+    "source_h5ad_bytes": 19456000,
+    "compression_ratio": 4.12,
+    "bits_per_nnz": 3.8,
+    "n_obs": 2700,
+    "n_vars": 32738
+  }
+}
