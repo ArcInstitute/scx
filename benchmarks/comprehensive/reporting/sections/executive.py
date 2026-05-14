@@ -1,8 +1,8 @@
-"""Chapter 1: Executive Summary (Phase 7 — data-derived headlines).
+"""Chapter 1: Executive Summary — data-derived headlines.
 
 All numeric claims in the executive summary are now derived from the
 result store via ``derive_*_headlines()`` functions.  Correctness counts
-are derived from live data (Phase 5 carry-forward).  When raw data is
+are derived from live data.  When raw data is
 unavailable for a particular metric, a qualified placeholder is used
 instead of silently hardcoding a stale number.
 """

@@ -1,14 +1,11 @@
-"""Chapter 9: Accelerators (Phase 7 — source-tracked GPU tables).
+"""Chapter 9: Accelerators — source-tracked GPU and CPU timing.
 
-Phase 7 changes:
-- GPU accelerator timing is now sourced from raw JSON (``accel_*``
-  benchmark keys) when available, or declared as external-source when
-  not yet in the comprehensive harness.
+- GPU accelerator timing sourced from raw JSON (``accel_*`` benchmark keys)
+  when available, or declared as external-source when not yet in the
+  comprehensive harness.
 - ``CommentaryBlock`` with ``SourceRef`` for all numeric narrative.
-
-Phase 6 carry-forward:
-- CSC/CSR dispatch moved here from operations chapter.
-- Parity tables adjacent to timing tables (Phase 5).
+- CSC/CSR dispatch included here (storage-layout concern for accelerators).
+- Parity tables adjacent to timing tables.
 """
 
 from benchmarks.comprehensive.reporting.report_model import (

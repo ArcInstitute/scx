@@ -7,7 +7,7 @@ anchors, styled tables with ``<thead>``/``<tbody>``/``<caption>``,
 and a "← previous snapshot" link threaded through
 ``dashboard_history.json``.
 
-Phase 9 update: ``publish_dashboard.py`` now publishes
+``publish_dashboard.py`` now publishes
 ``BENCHMARK_REPORT.json`` (the JSON manifest) and
 ``LINT_WARNINGS.json`` alongside the HTML/MD/PDF outputs.
 """

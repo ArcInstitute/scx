@@ -1,5 +1,5 @@
 """
-Report data model and semantic renderers (Phase 3).
+Report data model and semantic renderers.
 
 Provides typed AST-like blocks for the benchmark report (Report, Chapter,
 Section, Table, Figure, Text, Callout) and renderers for Markdown, HTML,
@@ -314,30 +314,89 @@ class HtmlRenderer:
             lines.append(self._render_section(subsec, level + 1))
         return "\n".join(lines)
 
+    @staticmethod
+    def _md_to_html(text: str) -> str:
+        """Convert markdown text to HTML.
+
+        Handles the subset of markdown used by the report's TextBlock,
+        CalloutBlock, and CommentaryBlock content:
+
+        - ``**bold**`` → ``<strong>``
+        - ``*italic*`` → ``<em>`` (single star, not inside **)
+        - ``_italic_`` → ``<em>`` (underscore form)
+        - `` `code` `` → ``<code>``
+        - Unordered lists (``- item``)
+        - Paragraphs (double-newline separated)
+        - Single newlines inside a paragraph → ``<br>``
+
+        Input is assumed to be *already escaped* via ``html.escape()``.
+        """
+        import re
+
+        # ── Inline formatting ─────────────────────────────────────────
+        def _inline(t: str) -> str:
+            # Bold **...**
+            t = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', t)
+            # Italic *...* (but not **)
+            t = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', t)
+            # Italic _..._
+            t = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', t)
+            # Inline code `...`
+            t = re.sub(r'`(.*?)`', r'<code>\1</code>', t)
+            return t
+
+        # ── Block-level processing ────────────────────────────────────
+        # Split into paragraphs on blank lines.
+        paragraphs = re.split(r'\n{2,}', text)
+        out_parts: list[str] = []
+
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+
+            lines = para.split('\n')
+
+            # Check if this paragraph is a bullet list (all lines start
+            # with ``- `` or are continuation indents).
+            if all(
+                ln.lstrip().startswith('- ') or ln.startswith('  ')
+                for ln in lines if ln.strip()
+            ) and any(ln.lstrip().startswith('- ') for ln in lines):
+                # Merge continuation lines into their parent bullet.
+                items: list[str] = []
+                for ln in lines:
+                    stripped = ln.lstrip()
+                    if stripped.startswith('- '):
+                        items.append(stripped[2:])
+                    elif items:
+                        items[-1] += ' ' + stripped
+                out_parts.append(
+                    '<ul>'
+                    + ''.join(f'<li>{_inline(it)}</li>' for it in items)
+                    + '</ul>'
+                )
+            else:
+                # Regular paragraph.  Convert single newlines to <br>.
+                body = '<br>\n'.join(_inline(ln) for ln in lines)
+                out_parts.append(f'<p>{body}</p>')
+
+        return '\n'.join(out_parts)
+
     def _render_block(self, block: Block) -> str:
         if isinstance(block, TextBlock):
-            # Very basic markdown to HTML for text blocks (could use a library in the future)
-            # For now, just wrap in paragraphs
             text = html.escape(block.content)
-            # Convert basic markdown formatting
-            import re
-            text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
-            text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
-            # Split by double newlines for paragraphs
-            paragraphs = text.split('\n\n')
-            return "".join(f"<p>{p}</p>" for p in paragraphs if p.strip())
-            
+            return self._md_to_html(text)
+
         elif isinstance(block, CalloutBlock):
             cls = "callout-warning" if block.level == "warning" else "callout"
-            return f'<div class="{cls}">{html.escape(block.content)}</div>'
+            text = html.escape(block.content)
+            body = self._md_to_html(text)
+            return f'<div class="{cls}">{body}</div>'
 
         elif isinstance(block, CommentaryBlock):
             text = html.escape(block.content)
-            import re
-            text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
-            text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
-            paragraphs = text.split('\n\n')
-            body = "".join(f"<p>{p}</p>" for p in paragraphs if p.strip())
+            body = self._md_to_html(text)
             src_html = ""
             if block.source:
                 src_text = block.source.kind.value
@@ -347,46 +406,53 @@ class HtmlRenderer:
                     src_text += f" — {block.source.reason}"
                 src_html = f'<div class="source-ref">Source: {html.escape(src_text)}</div>'
             return f'<div class="commentary">{body}{src_html}</div>'
-            
+
         elif isinstance(block, TableBlock):
             lines = []
             if block.wide:
                 lines.append('<div class="table-wide">')
             lines.append('<table>')
-            
+
             if block.caption:
                 lines.append(f'<caption>{html.escape(block.caption)}</caption>')
-                
+
             if block.headers:
                 lines.append('<thead><tr>')
                 for h in block.headers:
                     lines.append(f'<th>{html.escape(h)}</th>')
                 lines.append('</tr></thead>')
-                
+
             lines.append('<tbody>')
             for row in block.rows:
                 lines.append('<tr>')
                 for cell in row:
-                    lines.append(f'<td>{html.escape(str(cell))}</td>')
+                    cell_html = html.escape(str(cell))
+                    # Preserve inline bold / italic / code in table cells
+                    import re
+                    cell_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', cell_html)
+                    cell_html = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', cell_html)
+                    cell_html = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', cell_html)
+                    cell_html = re.sub(r'`(.*?)`', r'<code>\1</code>', cell_html)
+                    lines.append(f'<td>{cell_html}</td>')
                 lines.append('</tr>')
             lines.append('</tbody></table>')
             if block.wide:
                 lines.append('</div>')
-                
+
             if block.notes:
                 lines.append('<div class="notes">')
                 for note in block.notes:
                     lines.append(f'<div>{html.escape(note)}</div>')
                 lines.append('</div>')
-                
+
             if block.source:
                 src_text = block.source.kind.value
                 if block.source.path:
                     src_text += f" ({block.source.path})"
                 lines.append(f'<div class="source-ref">Source: {html.escape(src_text)}</div>')
-                
+
             return "\n".join(lines)
-            
+
         elif isinstance(block, FigureBlock):
             cap = f'<figcaption>{html.escape(block.caption)}</figcaption>' if block.caption else ""
             src = ""
@@ -395,9 +461,9 @@ class HtmlRenderer:
                 if block.source.path:
                     src_text += f" ({block.source.path})"
                 src = f'<div class="source-ref">Source: {html.escape(src_text)}</div>'
-            
+
             return f'<figure><img src="{html.escape(block.path)}" alt="{html.escape(block.caption or "")}">{cap}{src}</figure>'
-            
+
         return ""
 
 

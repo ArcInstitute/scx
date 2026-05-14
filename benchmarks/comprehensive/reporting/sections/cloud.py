@@ -1,7 +1,7 @@
-"""Chapter 7: Cloud and Object-Store Behavior (Phase 6 — consolidated).
+"""Chapter 7: Cloud and Object-Store Behavior.
 
-Phase 6 change: move all cloud read/query/cost sections into one
-cohesive cloud chapter with a clear structure:
+Consolidates all cloud read/query/cost sections into one cohesive
+chapter:
   1. Filtered / query performance
   2. CloudReader vs full pull
   3. GCP compute-node matrix

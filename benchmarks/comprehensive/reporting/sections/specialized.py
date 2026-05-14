@@ -1,9 +1,9 @@
-"""Chapter 10: Specialized Workloads (Phase 6 — multimodal training moved).
+"""Chapter 10: Specialized Workloads.
 
-Phase 6 changes:
+Includes:
 - Multimodal training-loader tables moved to ml_loader chapter (Ch 8).
 - Multimodal compression stays here as it's a format/codec concern.
-- Cell-eval and Harmony/LISI unchanged from Phase 5 (correctness first).
+- Cell-eval and Harmony/LISI correctness tables included.
 """
 
 from benchmarks.comprehensive.reporting.report_model import (

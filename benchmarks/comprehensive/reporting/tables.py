@@ -4,7 +4,7 @@ Generate markdown summary tables from raw benchmark JSON results.
 Reads from benchmarks/comprehensive/results/raw/ and produces formatted
 markdown tables for each benchmark dimension.
 
-All table functions consume the shared ``ResultStore`` singleton (Phase 2)
+All table functions consume the shared ``ResultStore`` singleton
 so that raw JSON is loaded once per report-generation run. The legacy
 ``load_all_results`` name is preserved as a thin wrapper around the
 store's compatibility layer.
@@ -29,7 +29,7 @@ def load_all_results(
     """Legacy wrapper — delegates to the ``ResultStore`` singleton.
 
     Preserves the exact return type (``list[dict]``) so that every
-    existing table function works unchanged during the Phase 2→3
+    existing table function works unchanged during the
     migration window.
     """
     return get_store().load_all_results_compat(
@@ -245,7 +245,7 @@ def _pivot_to_tableblock(
 
 
 # ---------------------------------------------------------------------------
-# Headline derivation helpers (Phase 7)
+# Headline derivation helpers
 # ---------------------------------------------------------------------------
 #
 # These functions compute concrete headline metrics from the result store so
@@ -636,7 +636,7 @@ def write_conversion_table(datasets: list[str] | None = None) -> TableBlock:
     This is identical to ``write_speed_table`` but explicitly labeled as
     the *full conversion pipeline* (h5ad read → encode → write) to
     distinguish it from a write-only benchmark that starts from in-memory
-    data. Phase 6 splits the I/O chapter so readers know which timing
+    data. The I/O chapter splits so readers know which timing
     includes h5ad read overhead.
     """
     if datasets is None:
@@ -1909,13 +1909,13 @@ def harmony_lisi_correctness_summary_table() -> TableBlock | TextBlock:
     Shows per-dataset validation status for Harmony2 (Pearson r vs R harmony)
     and LISI (relative delta). This table precedes the scaling tables.
 
-    Phase 7: Harmony rows are now sourced from external harmony_integrate
-    JSON when available, falling back to the Phase 6 diagnostic values
-    with explicit ``SourceRef(kind=manual)``.
+    Harmony rows are sourced from external ``harmony_integrate`` JSON when
+    available, falling back to static diagnostic values with explicit
+    ``SourceRef(kind=manual)``.
     """
     blocks_data: list[list[str]] = []
     source_kind = SourceKind.manual
-    source_reason = "Harmony rows from Phase 6 diagnostic; LISI from live data"
+    source_reason = "Harmony rows from static diagnostic; LISI from live data"
 
     # Try to source Harmony validation from harmony_integrate runs
     harmony_runs = _load_harmony_runs("harmony_integrate")
@@ -1929,7 +1929,7 @@ def harmony_lisi_correctness_summary_table() -> TableBlock | TextBlock:
                 "min_r": run_data.get("min_per_pc_r"),
             }
 
-    # Static fallback data from Phase 6 diagnostic
+    # Static fallback data from diagnostic (pyscx/tests/test_harmony_validation.py)
     _STATIC_HARMONY = [
         ("pbmc_small", 2_700, 0.9986),
         ("cell_lines", 9_478, 0.9789),
@@ -2116,13 +2116,13 @@ def cell_eval_parity_perf_table() -> TableBlock | TextBlock:
 
 
 # ---------------------------------------------------------------------------
-# Harmony2 + LISI (Phase 6)
+# Harmony2 + LISI
 # ---------------------------------------------------------------------------
 #
 # Harmony and LISI results live outside `RAW_RESULTS_DIR` — they are produced
 # by `benchmarks/scripts/benchmark_harmony.py` / `benchmark_lisi.py` and land
-# in `benchmarks/results/harmony/runs/` as a flat set of JSONs. As of Phase 2,
-# these are loaded by the ``ResultStore`` alongside raw results.
+# in `benchmarks/results/harmony/runs/` as a flat set of JSONs.  They are
+# loaded by the ``ResultStore`` alongside raw results.
 
 
 def _load_harmony_runs(bench: str) -> list[dict[str, Any]]:
@@ -2242,9 +2242,9 @@ def lisi_comparison_table() -> TableBlock | TextBlock:
 def harmony_validation_table() -> TableBlock:
     """Per-PC Pearson r vs R harmony on the three validation fixtures.
 
-    Phase 7: attempts to source from harmony_integrate external JSON
-    files first. Falls back to static Phase 6 diagnostic values with
-    explicit ``SourceRef(kind=manual)``.
+    Attempts to source from ``harmony_integrate`` external JSON files
+    first.  Falls back to static diagnostic values with explicit
+    ``SourceRef(kind=manual)``.
     """
     headers = ["Dataset", "N", "Batches", "d", "K",
                "min per-PC r", "mean per-PC r", "iter (scx / R)"]
@@ -2282,7 +2282,7 @@ def harmony_validation_table() -> TableBlock:
                              reason="from harmony_integrate JSON runs"),
         )
 
-    # Static fallback from Phase 6 diagnostic (pyscx/tests/test_harmony_validation.py).
+    # Static fallback from diagnostic (pyscx/tests/test_harmony_validation.py).
     rows = [
         ["pbmc_small (D1)", "2,700", "3", "30", "100",
          "0.9986", "0.9992", "5 / 4"],
@@ -2295,7 +2295,7 @@ def harmony_validation_table() -> TableBlock:
         headers=headers, rows=rows,
         caption="Harmony validation — per-PC Pearson r vs R harmony",
         source=SourceRef(kind=SourceKind.manual,
-                         reason="Phase 6 diagnostic (pyscx/tests/test_harmony_validation.py)"),
+                         reason="static diagnostic (pyscx/tests/test_harmony_validation.py)"),
     )
 
 

@@ -1,9 +1,8 @@
-"""Appendix (Phase 7 — external/manual sources appendix).
+"""Appendix — external/manual sources and glossary.
 
-Phase 7 changes:
-- Add an "External and Manual Data Sources" appendix that automatically
+- Includes an "External and Manual Data Sources" appendix that automatically
   lists every table and result row sourced from manual or external data.
-- Keep the glossary from Phase 4.
+- Glossary of key terms.
 """
 
 from benchmarks.comprehensive.reporting.report_model import (

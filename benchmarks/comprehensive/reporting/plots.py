@@ -492,7 +492,7 @@ def plot_memory_scaling(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 6. Lazy vs materialized RSS comparison (Phase 4d)
+# 6. Lazy vs materialized RSS comparison
 # ---------------------------------------------------------------------------
 
 def plot_lazy_vs_materialized_rss(output_dir: Path | None = None):
@@ -533,7 +533,7 @@ def plot_lazy_vs_materialized_rss(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 7. Column-projected aggregation latency (Phase 4d)
+# 7. Column-projected aggregation latency
 # ---------------------------------------------------------------------------
 
 def plot_column_projection_latency(output_dir: Path | None = None):
@@ -562,7 +562,7 @@ def plot_column_projection_latency(output_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 8. Out-of-core pipeline RSS time-series (Phase 4d)
+# 8. Out-of-core pipeline RSS time-series
 # ---------------------------------------------------------------------------
 
 def plot_ooc_pipeline_rss(output_dir: Path | None = None):
@@ -895,7 +895,7 @@ def plot_streaming_preprocess_memory(output_dir: Path | None = None):
     # Historical fragment-ops baseline numbers.
     datasets_names = ["tabula_100k\n(100K)", "census_1m\n(1M)"]
 
-    # Phase 4e data
+    # Extended data
     scx_ooc_rss = [1108, 2399]  # MB
     scanpy_rss = [1605, 9871]  # MB
 

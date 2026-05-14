@@ -1,11 +1,11 @@
-"""Chapter 5: Storage Efficiency (Phase 7 — data-derived commentary).
+"""Chapter 5: Storage Efficiency — data-derived commentary.
 
-Phase 7 changes:
+Changes:
 - Replace hardcoded file-size and ratio claims with data-derived values
   from ``derive_compression_headlines()``.
 - Use ``CommentaryBlock`` with ``SourceRef`` for numeric takeaways.
 
-Phase 6 carry-forward:
+Additional:
 - Chapter-level summary card at the top.
 """
 

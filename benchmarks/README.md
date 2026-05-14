@@ -46,7 +46,7 @@ benchmarks/
 │   # use comprehensive/scripts/run_parallel.py instead. See scripts/README.md.
 ├── r_scripts/             # Top-level R benchmark scripts
 │   └── benchmark_bpcells.R              # BPCells benchmark driver (called via Rscript)
-├── comprehensive/         # Comprehensive benchmark suite (Phase 3+)
+├── comprehensive/         # Comprehensive benchmark suite
 │   ├── config.py                        # Dataset paths, format configs, constants
 │   ├── sysinfo.py                       # System info collector (CPU, RAM, OS, disk)
 │   ├── results.py                       # BenchmarkResult schema + JSON writer
@@ -77,7 +77,7 @@ benchmarks/
 │   │   ├── compression.py, write.py, read_full.py, read_selective.py
 │   │   ├── parallel_scaling.py, parallel_write_scaling.py, memory.py, ml_loader.py
 │   │   ├── fragment_ops.py, correctness.py
-│   │   ├── accel_{pca,knn,umap,leiden,preprocess,hvg}.py   # Phase 9 accel surface
+│   │   ├── accel_{pca,knn,umap,leiden,preprocess,hvg}.py   # Accelerator surface
 │   │   ├── cloud_{push,pull,read,metadata,filtered,large_atlas,reader_vs_pull}.py, cost_model.py
 │   │   └── cell_eval_parity_perf.py, _pert_synth.py        # perturbation / cell-eval parity
 │   ├── reporting/                       # Report generation (markdown, plots, tables, dashboard)
@@ -126,7 +126,7 @@ benchmarks/
 │       ├── flakiness/                   # Markdown flakiness ledger (per-row relaxed tolerances)
 │       └── candidate_*/, tier*_*/, baseline_*/  # Dated capture snapshots
 ├── results/               # Per-script benchmark output (JSON + Markdown reports)
-│   ├── pre_phases_1_7_baseline_2026_03/ # Frozen pre-Phase-1-7 GPU baseline (see §GPU workflow)
+│   ├── pre_phases_1_7_baseline_2026_03/ # Frozen pre-GPU-accel baseline (see §GPU workflow)
 │   └── harmony/                         # Harmony2 validation fixtures + run outputs
 └── logs/                  # SLURM job logs (.out, .err, .log)
 ```
@@ -264,11 +264,11 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 > `slafdb`, `BPCells`, or other format-runner deps. The cascade
 > failure mode is recurring + expensive:
 >
-> 1. Phase A: many `convert_from_h5ad` jobs ImportError at runtime
+> 1. Convert phase: many `convert_from_h5ad` jobs ImportError at runtime
 >    because the dependency isn't on `.venv/bin/python`.
-> 2. Phase B: hundreds of dependent bench jobs queue as
+> 2. Benchmark phase: hundreds of dependent bench jobs queue as
 >    `DependencyNeverSatisfied`, pinning the QOS-cap throttle.
-> 3. Phase B post-submit: orchestrator's `job.result()` loop spends
+> 3. Post-submit: orchestrator's `job.result()` loop spends
 >    ~15 s per cancelled job, multiplying into hour-long drains.
 >
 > **Always:**
@@ -324,9 +324,9 @@ bash benchmarks/comprehensive/scripts/run_slurm.sh --conda-env scx-bench-gpu
 
 The serial orchestrator (`run_all.py`) processes benchmarks sequentially within a single SLURM job. For faster execution, `run_parallel.py` uses two-phase parallel execution via `submitit`:
 
-**Phase A — Convert once.** Each (dataset, format) pair is converted exactly once and written to a persistent path. Conversions run as independent parallel SLURM jobs. Existing files are skipped automatically (`--overwrite` to force).
+**Convert phase — Convert once.** Each (dataset, format) pair is converted exactly once and written to a persistent path. Conversions run as independent parallel SLURM jobs. Existing files are skipped automatically (`--overwrite` to force).
 
-**Phase B — Benchmark in parallel.** Each (benchmark, dataset, format) triple is submitted as an independent SLURM job reading from the pre-converted file. All jobs run concurrently.
+**Benchmark phase — Benchmark in parallel.** Each (benchmark, dataset, format) triple is submitted as an independent SLURM job reading from the pre-converted file. All jobs run concurrently.
 
 ```
 Serial (run_all.py):     420 tasks x avg 3 min = ~21 hours wall time
@@ -770,7 +770,7 @@ See [docs/gpu-setup.md](../docs/gpu-setup.md) for full GPU environment setup ins
 Benchmark outputs are organized into two directories:
 
 - **`benchmarks/results/`** — Per-script benchmark results (JSON + Markdown reports, GPU Go/No-Go gates)
-- **`benchmarks/comprehensive/results/raw/`** — Phase 3 comprehensive benchmarks (500+ JSON files, one per benchmark×format×dataset)
+- **`benchmarks/comprehensive/results/raw/`** — Comprehensive benchmarks (500+ JSON files, one per benchmark×format×dataset)
 
 To list comprehensive results:
 
@@ -794,7 +794,7 @@ PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate
 # Generate with strict lint (errors on manual-source numeric claims)
 PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate --strict-lint
 
-# Generate with public profile (blocks internal Phase N labels)
+# Generate with public profile (blocks internal phase labels)
 PYTHONPATH=. python -m benchmarks.comprehensive.reporting.report_cli generate --profile public
 
 # Point at a different results directory
@@ -1238,7 +1238,7 @@ Run it locally before opening a PR that touches the gate.
 
 ## GPU accelerator regression workflow
 
-Post-Phase-9, the comprehensive baseline at
+The comprehensive baseline at
 `comprehensive/results/baselines/LATEST` (currently
 `v0.6.0-gpu-phase1-7-multidataset`) covers both format-level **and**
 GPU-accelerator benchmarks (`accel_pca`, `accel_knn`, `accel_umap`,
@@ -1252,7 +1252,7 @@ floors in `thresholds.yaml` evaluate real values, not
 
 **You should not need separate GPU tooling.** The standard
 [Regression Gating workflow](#regression-gating) handles accelerator
-PRs end-to-end. The Phase-8 stop-gap wrappers
+PRs end-to-end. The stop-gap wrappers
 (`gpu_regression_driver.sh`, `gpu_regression_diff.py`,
 `slurm_gpu_regression*.sh`) have been deleted — use
 `gate_candidate.py` for everything below.
@@ -1334,7 +1334,7 @@ versions table.
 
 ### Historical baselines
 
-The frozen pre-Phases-1-7 snapshot at
+The frozen pre-GPU-accel snapshot at
 `benchmarks/results/pre_phases_1_7_baseline_2026_03/` is retained for
 historical bisects but is not the gate target.
 

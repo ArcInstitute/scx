@@ -3,11 +3,11 @@ Assemble the final comprehensive benchmark report as markdown and PDF.
 
 Pulls data from raw JSON results via the report model and chapter builders.
 
-Phase 7 additions:
-- Lint integration: ``write_reports()`` runs ``collect_warnings()`` and
+Lint integration:
+- ``write_reports()`` runs ``collect_warnings()`` and
   logs them.  With ``strict_lint=True``, exits nonzero on lint failures.
 
-Phase 9 additions:
+CLI integration:
 - ``write_reports()`` is now a compatibility wrapper.  For new
   integrations, use ``report_cli.py`` or its ``build_report()``
   function, which support ``--profile``, ``--results-dir``,

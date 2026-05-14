@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report-generation CLI (Phase 9).
+"""Report-generation CLI.
 
 Provides a proper command-line interface for generating, linting, and
 publishing the SCX comprehensive benchmark report.

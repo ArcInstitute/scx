@@ -1,11 +1,11 @@
-"""Chapter 8: ML Data Loading (Phase 7 — data-derived commentary).
+"""Chapter 8: ML Data Loading — data-derived commentary.
 
-Phase 7 changes:
+Changes:
 - Replace hardcoded '1,405 batches/sec' and '82x' claims with values
   derived from ``derive_ml_loader_headlines()``.
 - Use ``CommentaryBlock`` with ``SourceRef`` for numeric takeaways.
 
-Phase 6 carry-forward:
+Additional:
 - Unified single + multimodal loader sections.
 """
 

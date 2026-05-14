@@ -1,6 +1,6 @@
-"""Chapter 11: SCX-specific Format Operations (Phase 6 — focused).
+"""Chapter 11: SCX-specific Format Operations.
 
-Phase 6 changes:
+Includes:
 - CSC/CSR dispatch moved to the accelerator chapter (Ch 9).
 - This chapter is now purely about fragment/manifest operations
   (append, delete, compact, rollback) — SCX-specific file operations

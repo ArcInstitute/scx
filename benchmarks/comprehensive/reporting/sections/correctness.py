@@ -1,4 +1,4 @@
-"""Chapter 3: Correctness & Equivalence (Phase 5).
+"""Chapter 3: Correctness & Equivalence.
 
 Presents correctness/equivalency first-class, before performance chapters.
 Uses proper status classification (Pass/Fail/Skipped/Not applicable) and

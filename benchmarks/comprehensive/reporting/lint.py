@@ -1,4 +1,4 @@
-"""Report-lint checks (Phase 8 — full implementation).
+"""Report-lint checks.
 
 Phases 7+8 lint checks:
 
@@ -119,7 +119,7 @@ def _section_blocks(chapter_title: str, section: Section):
 
 
 # ---------------------------------------------------------------------------
-# 1. Manual numeric claims (Phase 7 carry-forward)
+# 1. Manual numeric claims
 # ---------------------------------------------------------------------------
 
 
@@ -144,7 +144,7 @@ def check_manual_numeric_claims(report: Report) -> list[LintWarning]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Table source references (Phase 7 carry-forward)
+# 2. Table source references
 # ---------------------------------------------------------------------------
 
 
@@ -589,7 +589,7 @@ def check_public_profile(
 ) -> list[LintWarning]:
     """Block internal phase labels in headings when public profile is active.
 
-    Phase labels like "Phase 5", "P6", etc. are internal development
+    Phase labels like "Phase N", "PN", etc. are internal development
     milestones and should not appear in public-facing headings.
     """
     if not public:
@@ -728,11 +728,11 @@ def collect_warnings(
     """
     warnings: list[LintWarning] = []
 
-    # Phase 7 checks
+    # Core checks
     warnings.extend(check_manual_numeric_claims(report))
     warnings.extend(check_tables_have_sources(report))
 
-    # Phase 8 checks
+    # Extended checks
     warnings.extend(check_duplicate_headings(report))
     warnings.extend(check_missing_figures(report, figures_root=figures_root))
     warnings.extend(check_executive_summary_consistency(report))

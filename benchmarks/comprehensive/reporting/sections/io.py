@@ -1,12 +1,12 @@
-"""Chapter 6: Local I/O Performance (Phase 7 — data-derived commentary).
+"""Chapter 6: Local I/O Performance — data-derived commentary.
 
-Phase 7 changes:
+Changes:
 - Replace hardcoded speedup/size claims in takeaway commentary with
   data-derived values from ``derive_*_headlines()`` functions.
 - Use ``CommentaryBlock`` with ``SourceRef(kind=SourceKind.raw_json)``
   for all numeric takeaways so report-lint can trace claims to sources.
 
-Phase 6 carry-forward:
+Additional:
 - Split conversion-pipeline write timing from write-only timing.
 - Split full read, selective read, and backed/streaming read modes.
 - Chapter-level summary card at the top.
