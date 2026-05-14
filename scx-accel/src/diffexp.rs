@@ -531,6 +531,27 @@ pub fn wilcoxon_rank_sum_streaming(
     }
 
     let n_shards = reader.index().n_shards();
+
+    // Cache-sizing footgun guard. The kernel walks every shard once per
+    // gene chunk; if the LRU can't hold all `n_shards` decoded shards
+    // simultaneously, the iteration order `0..n_shards` evicts the
+    // shard the next chunk re-requests *first*, so the cached path is
+    // strictly slower than `read_shard_uncached` (LRU bookkeeping +
+    // re-decode). Warn once per call so the caller sees it without
+    // spamming per-shard.
+    let cache_cap = reader.cache_capacity();
+    let n_chunks = n_vars.div_ceil(gene_chunk_size);
+    if n_chunks > 1 && cache_cap < n_shards {
+        log::warn!(
+            "wilcoxon_rank_sum_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
+             the cached read path will evict and re-decode every shard on each chunk. \
+             Size the BackedCsrReader cache to >= n_shards for the documented speedup.",
+            cache_cap,
+            n_shards,
+            n_chunks,
+        );
+    }
+
     let mut all_chunk_results = Vec::new();
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {

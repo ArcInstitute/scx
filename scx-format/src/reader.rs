@@ -179,20 +179,24 @@ impl ScxReader {
     /// `FullCatalog::read_from` entirely — the expensive part of
     /// `open()` for files with thousands of catalog entries.
     ///
-    /// Phase 6 use case: `to_anndata_backed` opens N+3 `ScxReader`
-    /// instances per call (main reader + X CSR + CSC sidecar + N
-    /// backed layers). The catalog is identical bytes-for-bytes
-    /// across all of them; sharing one parsed copy collapses the
-    /// per-call parse cost from `(N+3) ×` to `1×` on the worker
-    /// construction path that `cell-load-scx` / `state-scx` hit
-    /// inside their DataLoader iterators.
+    /// Worker-amplification use case: `to_anndata_backed` opens N+3
+    /// `ScxReader` instances per call (main reader + X CSR + CSC
+    /// sidecar + N backed layers). The catalog is identical
+    /// bytes-for-bytes across all of them; sharing one parsed copy
+    /// collapses the per-call parse cost from `(N+3) ×` to `1×` on
+    /// the worker construction path that `cell-load-scx` /
+    /// `state-scx` hit inside their DataLoader iterators.
     ///
     /// The header magic / version / endianness and the root catalog
-    /// at offset 256 are still validated against the fresh mmap. The
-    /// caller is responsible for passing a catalog parsed from the
-    /// same file — the function does not re-verify the trailing
-    /// BLAKE3 catalog checksum, since the source `ScxReader` already
-    /// did that work at its own open.
+    /// at offset 256 are still validated against the fresh mmap, and
+    /// the fresh header's `manifest_sequence` is compared against the
+    /// shared catalog's — any divergence means the file was mutated
+    /// between opens (`scx-ops` append / compact / rollback bumps the
+    /// sequence) and the shared catalog no longer describes this mmap.
+    /// The function does not re-verify the trailing BLAKE3 catalog
+    /// checksum: the source `ScxReader` already did that at its own
+    /// open, and the sequence check covers the mutation case the
+    /// checksum would otherwise have to catch.
     ///
     /// # Fork safety
     ///
@@ -226,6 +230,13 @@ impl ScxReader {
         }
 
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
+        if header.manifest_sequence != catalog.manifest_sequence {
+            return Err(ScxError::InvalidCatalog(format!(
+                "shared catalog manifest_sequence ({}) does not match file header ({}) — \
+                 file was mutated between opens",
+                catalog.manifest_sequence, header.manifest_sequence,
+            )));
+        }
         let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..]))?;
 
         // Re-parse the (small) modality table from this instance's mmap.
@@ -2746,13 +2757,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 6: shared-catalog open
+    // Shared-catalog open (open_with_shared_catalog)
     // -----------------------------------------------------------------------
 
     /// `open_with_shared_catalog` must produce a reader whose
     /// metadata (header, root catalog, full catalog, shard reads) is
     /// indistinguishable from a fresh `open()` against the same file.
-    /// This is the load-bearing correctness check for the Phase 6
+    /// This is the load-bearing correctness check for the
     /// `to_anndata_backed` catalog-sharing path.
     #[test]
     fn test_open_with_shared_catalog_matches_open() {
@@ -2831,5 +2842,31 @@ mod tests {
         // Dropping a secondary decrements the refcount.
         drop(secondaries);
         assert_eq!(Arc::strong_count(&shared), 2);
+    }
+
+    /// `open_with_shared_catalog` must reject a catalog whose
+    /// `manifest_sequence` disagrees with the freshly-read file
+    /// header. This is the guardrail against silently combining a
+    /// stale catalog with a mutated file (append / compact / rollback
+    /// in `scx-ops` bumps the sequence on every mutation).
+    #[test]
+    fn test_open_with_shared_catalog_rejects_manifest_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "manifest_mismatch.scx", 6, 8, 2, false);
+
+        let primary = ScxReader::open(&path).unwrap();
+        let mut tweaked = (*primary.catalog_arc()).clone();
+        tweaked.manifest_sequence = primary.header().manifest_sequence.wrapping_add(1);
+
+        match ScxReader::open_with_shared_catalog(&path, Arc::new(tweaked)) {
+            Err(ScxError::InvalidCatalog(msg)) => {
+                assert!(
+                    msg.contains("manifest_sequence"),
+                    "error must name the mismatched field, got: {msg}",
+                );
+            }
+            Err(other) => panic!("expected InvalidCatalog, got {other:?}"),
+            Ok(_) => panic!("manifest_sequence mismatch must surface as an error"),
+        }
     }
 }

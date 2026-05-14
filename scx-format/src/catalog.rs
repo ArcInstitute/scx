@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LazyShardStats tests (Phase 4)
+    // LazyShardStats tests
     // -----------------------------------------------------------------------
 
     fn stats_with_column_stats() -> ShardStats {

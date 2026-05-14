@@ -764,6 +764,15 @@ impl BackedCsrReader {
         }
     }
 
+    /// Configured count cap on the decoded-shard LRU. `0` means no
+    /// cache was installed and the cached read APIs decode on every
+    /// call. Multi-pass kernels (e.g. streaming Wilcoxon) use this to
+    /// detect cache-too-small footguns and warn before paying the
+    /// silent perf cliff.
+    pub fn cache_capacity(&self) -> usize {
+        self.cache_shards
+    }
+
     /// Peek the singleflight table for `shard_idx`. Returns `false` when no
     /// cache (and therefore no singleflight) is configured.
     pub fn in_flight_contains(&self, shard_idx: usize) -> bool {
@@ -1424,8 +1433,8 @@ impl BackedCsrReader {
         } else {
             &self.sorted_entries
         };
-        // `ShardEntryLite` carries `nnz` directly — no `.stats` indirection
-        // and no re-walk of the catalog as in the pre-Phase-5 implementation.
+        // `ShardEntryLite` carries `nnz` directly — no `.stats`
+        // indirection per shard.
         let total: u64 = entries.iter().map(|e| e.nnz).sum();
         Ok(total as usize)
     }
