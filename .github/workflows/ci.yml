@@ -103,10 +103,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Pin pyarrow to the new upper bound of the supported range
+      # (pyscx/pyproject.toml: pyarrow>=14,<24) so CI exercises the
+      # widened cap rather than whatever pyarrow pip happens to resolve.
       # `torch` is added so `pyscx/tests/test_fork_safety.py` runs
       # instead of being skipped via `pytest.importorskip("torch")`.
       # CPU build only — the fork-safety test does no GPU work.
-      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy pyarrow anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
+      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
       - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud && pytest --ignore=tests/test_scvi_integration.py
 
   # NOTE: the fork-safety tests should also run on Linux aarch64 in
