@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use memmap2::Mmap;
@@ -32,7 +33,14 @@ pub struct ScxReader {
     mmap: Mmap,
     header: FileHeader,
     root_catalog: RootCatalog,
-    full_catalog: FullCatalog,
+    /// Phase 6: stored as `Arc<FullCatalog>` so the same parsed
+    /// catalog can back multiple `ScxReader` instances opened against
+    /// the same file (the N+3 amplification path in
+    /// `pyscx::to_anndata_backed`). The Arc is immutable after
+    /// construction — `FullCatalog` has no interior mutability, so
+    /// sharing across threads (and forked workers) is safe without
+    /// synchronisation.
+    full_catalog: Arc<FullCatalog>,
     /// `Some(table)` for v2 multimodal files; `None` for
     /// single-modality v2 files (`n_modalities == 0`) and all v1
     /// files. Parsed lazily-eagerly: the table is parsed once during
@@ -161,7 +169,107 @@ impl ScxReader {
             mmap,
             header,
             root_catalog,
-            full_catalog,
+            full_catalog: Arc::new(full_catalog),
+            modality_table,
+        })
+    }
+
+    /// Open an SCX file reusing an already-parsed `FullCatalog` from a
+    /// sibling `ScxReader` against the same file. Skips
+    /// `FullCatalog::read_from` entirely — the expensive part of
+    /// `open()` for files with thousands of catalog entries.
+    ///
+    /// Phase 6 use case: `to_anndata_backed` opens N+3 `ScxReader`
+    /// instances per call (main reader + X CSR + CSC sidecar + N
+    /// backed layers). The catalog is identical bytes-for-bytes
+    /// across all of them; sharing one parsed copy collapses the
+    /// per-call parse cost from `(N+3) ×` to `1×` on the worker
+    /// construction path that `cell-load-scx` / `state-scx` hit
+    /// inside their DataLoader iterators.
+    ///
+    /// The header magic / version / endianness and the root catalog
+    /// at offset 256 are still validated against the fresh mmap. The
+    /// caller is responsible for passing a catalog parsed from the
+    /// same file — the function does not re-verify the trailing
+    /// BLAKE3 catalog checksum, since the source `ScxReader` already
+    /// did that work at its own open.
+    ///
+    /// # Fork safety
+    ///
+    /// `Arc<FullCatalog>` is `Send + Sync` and has no interior
+    /// mutability. When pyscx's worker iterators fork after the
+    /// parent has constructed a `BackedCsrReader` ladder, the
+    /// shared catalog is COW-duplicated into each child — no locks,
+    /// no mutexes, no shared mutable state.
+    pub fn open_with_shared_catalog(
+        path: impl AsRef<Path>,
+        catalog: Arc<FullCatalog>,
+    ) -> Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            let _ = mmap.advise(Advice::Normal);
+        }
+
+        if mmap.len() < HEADER_SIZE {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file too small: {} bytes (minimum {})",
+                    mmap.len(),
+                    HEADER_SIZE
+                ),
+            )));
+        }
+
+        let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
+        let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..]))?;
+
+        // Re-parse the (small) modality table from this instance's mmap.
+        // It's only present on multimodal v2 files and is small; the
+        // parse cost is negligible vs the full catalog.
+        let modality_table = if header.n_modalities > 0
+            && header.modality_table_offset != 0
+            && header.modality_table_length != 0
+        {
+            let mt_off = header.modality_table_offset as usize;
+            let mt_len = header.modality_table_length as usize;
+            let mt_end = mt_off
+                .checked_add(mt_len)
+                .ok_or(ScxError::SectionOutOfBounds {
+                    offset: header.modality_table_offset,
+                    length: header.modality_table_length,
+                    file_size: mmap.len(),
+                })?;
+            if mt_end > mmap.len() {
+                return Err(ScxError::SectionOutOfBounds {
+                    offset: header.modality_table_offset,
+                    length: header.modality_table_length,
+                    file_size: mmap.len(),
+                });
+            }
+            let mt_slice = &mmap[mt_off..mt_end];
+            let table = ModalityTable::read_from(&mut Cursor::new(mt_slice), mt_len)?;
+            if table.len() as u32 != header.n_modalities {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "header.n_modalities ({}) != ModalityTable.len() ({})",
+                    header.n_modalities,
+                    table.len()
+                )));
+            }
+            Some(table)
+        } else {
+            None
+        };
+
+        Ok(ScxReader {
+            mmap,
+            header,
+            root_catalog,
+            full_catalog: catalog,
             modality_table,
         })
     }
@@ -179,7 +287,16 @@ impl ScxReader {
     }
 
     pub fn catalog(&self) -> &FullCatalog {
-        &self.full_catalog
+        self.full_catalog.as_ref()
+    }
+
+    /// Clone the internal `Arc<FullCatalog>` for cheap reuse across
+    /// sibling `ScxReader` instances opened with
+    /// [`open_with_shared_catalog`](Self::open_with_shared_catalog).
+    /// Cloning an `Arc` is one atomic refcount bump — the catalog
+    /// itself is not copied.
+    pub fn catalog_arc(&self) -> Arc<FullCatalog> {
+        Arc::clone(&self.full_catalog)
     }
 
     pub fn n_obs(&self) -> u64 {
@@ -2626,5 +2743,93 @@ mod tests {
         let result = values_to_f32(&raw, ValueEncoding::Float32);
         assert_eq!(result.len(), 1);
         assert!((result[0] - 1.23456).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: shared-catalog open
+    // -----------------------------------------------------------------------
+
+    /// `open_with_shared_catalog` must produce a reader whose
+    /// metadata (header, root catalog, full catalog, shard reads) is
+    /// indistinguishable from a fresh `open()` against the same file.
+    /// This is the load-bearing correctness check for the Phase 6
+    /// `to_anndata_backed` catalog-sharing path.
+    #[test]
+    fn test_open_with_shared_catalog_matches_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "shared_catalog.scx", 8, 12, 2, false);
+
+        let primary = ScxReader::open(&path).unwrap();
+        let primary_catalog = primary.catalog_arc();
+
+        let shared = ScxReader::open_with_shared_catalog(&path, primary_catalog).unwrap();
+
+        // Header / root catalog must be identical (parsed fresh from
+        // the secondary mmap, but the file is the same).
+        assert_eq!(shared.header().n_obs, primary.header().n_obs);
+        assert_eq!(shared.header().n_vars, primary.header().n_vars);
+        assert_eq!(
+            shared.header().full_catalog_offset,
+            primary.header().full_catalog_offset
+        );
+
+        // Catalog entries must match field-for-field — the shared
+        // path didn't re-parse, so this verifies the Arc shared
+        // through.
+        let primary_entries = &primary.catalog().entries;
+        let shared_entries = &shared.catalog().entries;
+        assert_eq!(primary_entries.len(), shared_entries.len());
+        for (a, b) in primary_entries.iter().zip(shared_entries.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.length, b.length);
+            assert_eq!(a.section_type, b.section_type);
+            assert_eq!(a.modality_id, b.modality_id);
+            assert_eq!(a.checksum, b.checksum);
+        }
+
+        // Shard reads against the shared reader must produce the same
+        // bytes as against the primary — confirms the mmap path is
+        // independent and the cached catalog still drives correct
+        // section addressing.
+        let csr_shards = primary.catalog().shards_sorted();
+        for entry in &csr_shards {
+            let (ip_a, ix_a, dv_a) = primary.read_shard_from_entry(entry).unwrap();
+            let (ip_b, ix_b, dv_b) = shared.read_shard_from_entry(entry).unwrap();
+            assert_eq!(ip_a, ip_b);
+            assert_eq!(ix_a, ix_b);
+            assert_eq!(dv_a, dv_b);
+        }
+    }
+
+    /// Smoke test: many readers can share a single `Arc<FullCatalog>`
+    /// without contention. Mirrors the `to_anndata_backed` shape (one
+    /// primary reader + several secondary readers sharing its catalog).
+    #[test]
+    fn test_shared_catalog_n_plus_3_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "n_plus_3.scx", 6, 8, 2, false);
+
+        let primary = ScxReader::open(&path).unwrap();
+        let shared = primary.catalog_arc();
+
+        // Strong refcount before the secondaries: 1 (held by primary).
+        assert_eq!(Arc::strong_count(&shared), 2); // primary + this binding
+
+        let secondaries: Vec<ScxReader> = (0..5)
+            .map(|_| ScxReader::open_with_shared_catalog(&path, Arc::clone(&shared)).unwrap())
+            .collect();
+
+        // Each secondary holds a refcount; primary + binding + 5 = 7.
+        assert_eq!(Arc::strong_count(&shared), 7);
+
+        // All secondaries see the same catalog content.
+        for s in &secondaries {
+            assert_eq!(s.catalog().entries.len(), primary.catalog().entries.len());
+        }
+
+        // Dropping a secondary decrements the refcount.
+        drop(secondaries);
+        assert_eq!(Arc::strong_count(&shared), 2);
     }
 }

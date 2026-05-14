@@ -799,6 +799,13 @@ pub fn to_anndata_backed<'py>(
 
     let anndata_mod = py.import("anndata")?;
     let reader = ScxReader::open(path).map_err(to_pyerr)?;
+    // Phase 6: share one parsed `FullCatalog` across the N+3
+    // `ScxReader` instances this function constructs (main reader +
+    // X CSR + CSC sidecar + per-layer). The catalog is identical
+    // bytes-for-bytes across all opens of the same file — re-parsing
+    // it N+3 times per worker was the dominant amplification factor
+    // confirmed in Phase 1's inventory.
+    let shared_catalog = reader.catalog_arc();
 
     // --- Compute kept_to_global from deletion vectors (if present) ---
     // Cache the deletion-vector-only mapping; obs_filter may mutate kept_to_global
@@ -873,15 +880,18 @@ pub fn to_anndata_backed<'py>(
     };
 
     // --- X: backed ---
-    let x_reader = ScxReader::open(path).map_err(to_pyerr)?;
+    let x_reader =
+        ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog)).map_err(to_pyerr)?;
     let has_csc = x_reader.header().has_csc();
     let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
     let x_backed_csc: Option<Arc<scx_format::BackedCscReader>> = if has_csc {
         // Open a separate ScxReader for the CSC sidecar (BackedCscReader
         // takes ownership). Header check is cheap; the reader holds a
         // mmap and per-shard catalog, but no shards decode until we
-        // actually call read_csc_shard().
-        let csc_reader = ScxReader::open(path).map_err(to_pyerr)?;
+        // actually call read_csc_shard(). Catalog parse is skipped via
+        // the shared `Arc<FullCatalog>`.
+        let csc_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+            .map_err(to_pyerr)?;
         Some(Arc::new(
             scx_format::BackedCscReader::new(csc_reader, cache_shards).map_err(to_pyerr)?,
         ))
@@ -1033,7 +1043,8 @@ pub fn to_anndata_backed<'py>(
                 continue;
             }
         }
-        let l_reader = ScxReader::open(path).map_err(to_pyerr)?;
+        let l_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+            .map_err(to_pyerr)?;
         let l_backed = Arc::new(BackedCsrReader::new_for_layer(l_reader, name, cache_shards));
         let mut l_dataset = match &kept_to_global {
             Some(mapping) => ScxBackedLayerDataset::from_reader_with_deletions(
