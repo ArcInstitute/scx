@@ -501,7 +501,7 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 /// Peak memory:
 ///   * O(n_obs × gene_chunk_size) for the dense buffer per chunk
 ///   * + O(min(cache_shards, n_shards) × decoded-shard-bytes) for the LRU
-///     shard cache (≈ 640 MB / shard on Replogle-scale inputs)
+///       shard cache (≈ 640 MB / shard on Replogle-scale inputs)
 #[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum_streaming(
     reader: &scx_format::backed::BackedCsrReader,
