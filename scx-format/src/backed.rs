@@ -21,7 +21,7 @@ use crate::reader::ScxReader;
 use crate::section::SectionType;
 
 // ---------------------------------------------------------------------------
-// ShardEntryLite — Phase 5 internal per-shard row
+// ShardEntryLite — internal per-shard row
 // ---------------------------------------------------------------------------
 
 /// Per-shard catalog row retained by `BackedCsrReader` for read-path
@@ -198,11 +198,11 @@ impl BackedCsrIndex {
         }
     }
 
-    /// Phase 5: build the row-range index directly from a pre-sorted
+    /// Build the row-range index directly from a pre-sorted
     /// `&[&CatalogViewEntry]`. The caller is responsible for sorting
     /// by `stats.major_start`; we just zip the row range pair into
     /// `ShardRange` and stamp the sequential `sorted_shard_idx`. This
-    /// is the function that pairs with the fused `ShardEntryLite`
+    /// is the function that pairs with the `ShardEntryLite::from_view_entry`
     /// builder — both index and lightweight entry list are produced
     /// in a single pass over the catalog view.
     fn from_view_sorted(sorted_view_entries: &[&CatalogViewEntry]) -> Self {
@@ -532,10 +532,10 @@ pub struct BackedCsrReader {
     n_obs: usize,
     /// If set, this reader targets a specific layer rather than X.
     layer_name: Option<String>,
-    /// Pre-sorted lightweight catalog rows for X shards. Replaced
-    /// `Vec<FullCatalogEntry>` in Phase 5 — drops the per-shard
-    /// `String` name and 32-byte BLAKE3 checksum the read path never
-    /// consumes. See [`ShardEntryLite`] for the field set.
+    /// Pre-sorted lightweight catalog rows for X shards. Drops the
+    /// per-shard `String` name and 32-byte BLAKE3 checksum that the
+    /// read path never consumes. See [`ShardEntryLite`] for the
+    /// field set and per-shard footprint.
     x_sorted_entries: Vec<ShardEntryLite>,
     /// Pre-sorted lightweight catalog rows for layer shards (empty
     /// when this reader targets X). Same `ShardEntryLite` shape as
@@ -583,10 +583,10 @@ impl BackedCsrReader {
         cache_shards: usize,
         bytes_budget: usize,
     ) -> Self {
-        // Phase 5: derive both the row-range index and the lightweight
-        // per-shard table from a single `CatalogView` pass instead of
-        // the previous double scan (index built from `FullCatalog` +
-        // `x_sorted_entries` cloned from `shards_sorted()`).
+        // Derive both the row-range index and the lightweight per-shard
+        // table from a single `CatalogView` pass — avoids the double
+        // scan + per-entry clone the old `FullCatalog::shards_sorted()`
+        // path performed.
         let view = CatalogView::from_full(reader.catalog());
         let sorted = view.csr_shards_sorted();
         let index = BackedCsrIndex::from_view_sorted(&sorted);
@@ -679,10 +679,10 @@ impl BackedCsrReader {
         cache_shards: usize,
         bytes_budget: usize,
     ) -> Self {
-        // Phase 5: single `CatalogView` pass produces both the layer
-        // table (filtered by `LayerCsrShard` + name prefix) and the X
-        // table (kept alongside so layer-mode readers can still serve
-        // X reads through their `shard_entry` dispatch).
+        // Single `CatalogView` pass produces both the layer table
+        // (filtered by `LayerCsrShard` + name prefix) and the X table
+        // (kept alongside so layer-mode readers can still serve X reads
+        // through their `shard_entry` dispatch).
         let view = CatalogView::from_full(reader.catalog());
         let prefix = format!("{layer_name}_shard_");
         let sorted_layer = view.layer_csr_shards_sorted_with_prefix(&prefix);

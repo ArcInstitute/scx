@@ -9,15 +9,17 @@
 //! are the major-axis range and `nnz`; for layer prefix filtering the
 //! name is needed, but for ordinary X-shard construction it is not.
 //!
-//! This module covers Phase 3 of `INDEX-PLAN-WORKERS2-FIX.md`. Phase 5
-//! integrates the view with `BackedCsrReader::new`; for now we only
-//! define the type, the byte parser, and a conversion from
-//! `FullCatalog` so test code can verify field-for-field equivalence.
+//! `CatalogView` integrates with `BackedCsrReader::new*` (see
+//! [`crate::backed`]); see [`crate::catalog::FullCatalog`] for the
+//! full eagerly-parsed representation used by validation, mutation,
+//! and `scx-engine` predicate pushdown. The `from_full` constructor
+//! is exposed primarily for tests and for callers that hold a
+//! `FullCatalog` from a non-byte source.
 //!
 //! The parser is intentionally a direct read of the catalog payload
 //! slice — no per-entry `vec![0u8; name_len]`, no per-entry
 //! `String::from_utf8` for shard entries, and no second `Cursor`
-//! wrapper around stats bytes (matching the Phase 2 fixes that landed
+//! wrapper around stats bytes (matching the same fixes that landed
 //! in `FullCatalog::read_from`).
 
 use std::sync::Arc;
@@ -37,8 +39,9 @@ use crate::section::SectionType;
 /// 24 bytes / entry vs. the ≥73-byte `ShardStats` it replaces on the
 /// hot path. The diagnostic / pushdown-only fields the full struct
 /// carries (`value_min` / `value_max` / `value_sum`,
-/// `n_indexed_columns`, `column_stats`) are dropped — Phase 4 will
-/// expose them via a lazy decoder for callers that need them.
+/// `n_indexed_columns`, `column_stats`) are dropped here; callers that
+/// need them go through [`crate::catalog::LazyShardStats`] (lazy
+/// `column_stats` decode) or [`crate::catalog::ShardStats`] (eager).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardStatsLite {
     /// Major-axis start. For row-major shards: `row_start`. For v2
@@ -236,9 +239,9 @@ impl CatalogView {
             let section_type_raw = cur.read_u8()?;
 
             // Skip the 32-byte BLAKE3 entry checksum without copying.
-            // The lightweight view doesn't retain it (Phase 3 drops
-            // the largest per-entry field that the read path never
-            // looks at — 32 bytes saved per entry).
+            // The lightweight view doesn't retain it — it's the largest
+            // per-entry field that the read path never looks at
+            // (32 bytes saved per entry).
             let (_skip, rest) = cur.split_at_checked(32).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -389,8 +392,8 @@ impl CatalogView {
     /// references to every `entries[i]` matching the predicate, sorted
     /// by `stats.major_start` (entries without stats sink to the end).
     /// Mirrors `FullCatalog::shards_sorted` semantics — the
-    /// Phase 5 `BackedCsrReader` construction path uses this to build
-    /// its lightweight per-shard table in a single pass over the view.
+    /// `BackedCsrReader::new*` constructors use this to build their
+    /// lightweight per-shard table in a single pass over the view.
     fn shards_filter_sorted<F: FnMut(&CatalogViewEntry) -> bool>(
         &self,
         mut keep: F,
@@ -496,8 +499,8 @@ mod tests {
 
     /// Field-for-field equivalence between a `CatalogView` parsed
     /// directly from bytes and one derived from `FullCatalog`. This is
-    /// the load-bearing correctness check for Phase 5 — substituting
-    /// the lightweight path in reader construction must not change
+    /// the load-bearing correctness check for the lightweight path —
+    /// substituting the view in reader construction must not change
     /// any read-relevant metadata.
     #[test]
     fn read_from_bytes_matches_from_full() {
@@ -746,8 +749,8 @@ mod tests {
     }
 
     /// Multimodal v2 catalog with three modalities. The lightweight
-    /// view must round-trip `modality_id` per entry so Phase 5's
-    /// `for_modality` reader construction works against it.
+    /// view must round-trip `modality_id` per entry so the
+    /// `BackedCsrReader::for_modality` constructor works against it.
     #[test]
     fn v2_multimodal_modality_ids_preserved() {
         let entries = vec![

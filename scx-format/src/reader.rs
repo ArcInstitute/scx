@@ -33,13 +33,13 @@ pub struct ScxReader {
     mmap: Mmap,
     header: FileHeader,
     root_catalog: RootCatalog,
-    /// Phase 6: stored as `Arc<FullCatalog>` so the same parsed
-    /// catalog can back multiple `ScxReader` instances opened against
-    /// the same file (the N+3 amplification path in
-    /// `pyscx::to_anndata_backed`). The Arc is immutable after
-    /// construction — `FullCatalog` has no interior mutability, so
-    /// sharing across threads (and forked workers) is safe without
-    /// synchronisation.
+    /// Stored as `Arc<FullCatalog>` so the same parsed catalog can
+    /// back multiple `ScxReader` instances opened against the same
+    /// file — see `ScxReader::open_with_shared_catalog` and the
+    /// N+3 amplification path in `pyscx::to_anndata_backed`. The Arc
+    /// is immutable after construction (`FullCatalog` has no interior
+    /// mutability), so sharing across threads and forked workers is
+    /// safe without synchronisation.
     full_catalog: Arc<FullCatalog>,
     /// `Some(table)` for v2 multimodal files; `None` for
     /// single-modality v2 files (`n_modalities == 0`) and all v1

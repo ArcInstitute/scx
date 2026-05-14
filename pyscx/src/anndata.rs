@@ -799,12 +799,15 @@ pub fn to_anndata_backed<'py>(
 
     let anndata_mod = py.import("anndata")?;
     let reader = ScxReader::open(path).map_err(to_pyerr)?;
-    // Phase 6: share one parsed `FullCatalog` across the N+3
-    // `ScxReader` instances this function constructs (main reader +
-    // X CSR + CSC sidecar + per-layer). The catalog is identical
-    // bytes-for-bytes across all opens of the same file — re-parsing
-    // it N+3 times per worker was the dominant amplification factor
-    // confirmed in Phase 1's inventory.
+    // Share one parsed `FullCatalog` across the N+3 `ScxReader`
+    // instances this function constructs (main reader + X CSR + CSC
+    // sidecar + one per backed layer). The catalog is bytes-identical
+    // across all opens of the same file, so re-parsing it N+3 times
+    // per worker is pure overhead — the worker-amplification path that
+    // motivated the Arc-sharing change. The shard cache and
+    // singleflight table stay per-instance; only the immutable
+    // catalog is reused. See docs/multithreading.md for the
+    // fork-safety contract.
     let shared_catalog = reader.catalog_arc();
 
     // --- Compute kept_to_global from deletion vectors (if present) ---

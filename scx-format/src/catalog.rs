@@ -367,7 +367,7 @@ impl ShardStats {
 /// allocate the `Vec<ColumnStat>` or the per-`CategoryBitset`
 /// `Vec<u8>` payloads.
 ///
-/// Phase 4 of `INDEX-PLAN-WORKERS2-FIX.md`. Compared to `ShardStats`:
+/// Compared to `ShardStats`:
 ///
 /// - Files with `n_indexed_columns == 0` retain an empty
 ///   `column_stats_bytes`; `decode_column_stats()` returns `Vec::new`
