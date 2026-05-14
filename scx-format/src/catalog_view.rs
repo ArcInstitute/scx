@@ -384,6 +384,51 @@ impl CatalogView {
             .iter()
             .find(|e| e.name.as_deref() == Some(name))
     }
+
+    /// Filter + sort helper for reader construction. Returns borrowed
+    /// references to every `entries[i]` matching the predicate, sorted
+    /// by `stats.major_start` (entries without stats sink to the end).
+    /// Mirrors `FullCatalog::shards_sorted` semantics — the
+    /// Phase 5 `BackedCsrReader` construction path uses this to build
+    /// its lightweight per-shard table in a single pass over the view.
+    fn shards_filter_sorted<F: FnMut(&CatalogViewEntry) -> bool>(
+        &self,
+        mut keep: F,
+    ) -> Vec<&CatalogViewEntry> {
+        let mut shards: Vec<&CatalogViewEntry> = self.entries.iter().filter(|e| keep(e)).collect();
+        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.major_start));
+        shards
+    }
+
+    /// CSR shard entries (`SectionType::CsrShard`) sorted by row range.
+    /// Used by `BackedCsrReader::new` to build the X-shard table.
+    pub fn csr_shards_sorted(&self) -> Vec<&CatalogViewEntry> {
+        self.shards_filter_sorted(|e| e.section_type == SectionType::CsrShard)
+    }
+
+    /// CSR shard entries belonging to `modality_id`, sorted by row
+    /// range. Used by `BackedCsrReader::for_modality`. `modality_id = 0`
+    /// returns the global / single-modality shards on v1 and on
+    /// single-modality v2 files.
+    pub fn csr_shards_for_modality(&self, modality_id: u8) -> Vec<&CatalogViewEntry> {
+        self.shards_filter_sorted(|e| {
+            e.section_type == SectionType::CsrShard && e.modality_id == modality_id
+        })
+    }
+
+    /// Layer-CSR shard entries whose retained name starts with
+    /// `name_prefix`, sorted by row range. Used by
+    /// `BackedCsrReader::new_for_layer`. Pure CSR shard entries dropped
+    /// their name in the view; layer entries retain it specifically so
+    /// this prefix filter still works.
+    pub fn layer_csr_shards_sorted_with_prefix(&self, name_prefix: &str) -> Vec<&CatalogViewEntry> {
+        self.shards_filter_sorted(|e| {
+            e.section_type == SectionType::LayerCsrShard
+                && e.name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with(name_prefix))
+        })
+    }
 }
 
 /// Compile-time guarantee that `CatalogView` is safe to share across
