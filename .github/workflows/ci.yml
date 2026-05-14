@@ -86,7 +86,7 @@ jobs:
         run: cargo clippy ${{ matrix.flags }} -- -D warnings
 
   python:
-    name: Python bindings
+    name: Python bindings (pyarrow ${{ matrix.pyarrow }})
     runs-on: ubuntu-latest
     # Fork-safety regression tests run inside the same job.
     # `OMP_NUM_THREADS=1` keeps OpenMP-using deps (scanpy, numpy via
@@ -97,6 +97,14 @@ jobs:
     env:
       OMP_NUM_THREADS: "1"
       RUST_LOG: "warn"
+    strategy:
+      fail-fast: false
+      matrix:
+        # Covers the floor, an intermediate, and the new upper bound of the
+        # pyarrow range declared in pyscx/pyproject.toml. Rust→Python data
+        # transfer goes through Arrow IPC bytes (no FFI), so the only
+        # compatibility surface is the IPC reader inside pyarrow.
+        pyarrow: ["14.0.2", "18.1.0", "23.0.1"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -106,7 +114,7 @@ jobs:
       # `torch` is added so `pyscx/tests/test_fork_safety.py` runs
       # instead of being skipped via `pytest.importorskip("torch")`.
       # CPU build only — the fork-safety test does no GPU work.
-      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy pyarrow anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
+      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy "pyarrow==${{ matrix.pyarrow }}" anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
       - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud && pytest --ignore=tests/test_scvi_integration.py
 
   # NOTE: the fork-safety tests should also run on Linux aarch64 in
