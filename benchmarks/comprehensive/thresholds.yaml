@@ -788,6 +788,27 @@ absolute_floors:
     metric: time_to_first_batch_s
     max: 4.0         # ~2.2× measured 1.84s
 
+  # ─── Streaming h5ad → SCX conversion (Phase 10) ─────────────────────
+  # The streaming converter's whole point is bounded peak memory: at
+  # `DEFAULT_SHARD_TARGET_ROWS = 16384`, ~5% density, ~20 000 vars, the
+  # per-shard ceiling is ~130 MB and the always-resident indptr is
+  # ~80 MB at 10M cells (see docs/performance.md § "Streaming
+  # conversion"). A regression on the streaming row that pushes
+  # `peak_rss_mb` above a generous multiple of that bound means
+  # something has started accumulating across shards — exactly the
+  # failure mode the streaming design exists to prevent.
+  #
+  # Wall-clock is intentionally NOT gated: the materialise path naturally
+  # wins on datasets that fit in RAM (parallel shard encode over
+  # pre-computed boundaries), and a streaming wall regression doesn't
+  # change the bounded-memory contract. Track wall numbers in
+  # docs/performance.md; gate only the memory ceiling here.
+  - benchmark: conversion_streaming
+    format: scx_streaming_vs_materialize
+    dataset: census_1m
+    metric: streaming_peak_rss_mb     # only streaming runs carry this key
+    max: 2048.0       # ~10× the design ceiling; trips on accumulator leaks.
+
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
 # missing and why. Add entries above this block once the blockers below
