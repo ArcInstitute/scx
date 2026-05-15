@@ -1358,41 +1358,10 @@ pub(crate) fn astype_if_needed<'py>(
 
 /// Fast upfront validation of CSR arrays (1C.2).
 ///
-/// Single O(nnz) pass checking:
-/// - indptr is monotonically non-decreasing with indptr\[0\] >= 0
-/// - All indices are non-negative and < n_vars
-///
-/// When this passes, the shard loop can skip per-element validation.
-fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult<()> {
-    if !indptr.is_empty() && indptr[0] < 0 {
-        return Err(PyRuntimeError::new_err(format!(
-            "negative indptr value {} at position 0",
-            indptr[0]
-        )));
-    }
-    for i in 1..indptr.len() {
-        if indptr[i] < indptr[i - 1] {
-            return Err(PyRuntimeError::new_err(format!(
-                "non-monotonic indptr: value {} at position {} < {} at position {}",
-                indptr[i],
-                i,
-                indptr[i - 1],
-                i - 1
-            )));
-        }
-    }
-
-    for (i, &idx) in indices.iter().enumerate() {
-        if idx < 0 || (idx as u64) >= n_vars {
-            return Err(PyRuntimeError::new_err(format!(
-                "CSR index {} out of valid range [0, {}) at position {}",
-                idx, n_vars, i
-            )));
-        }
-    }
-
-    Ok(())
-}
+// `validate_csr_arrays` moved to `scx_sparse::validate_csr_arrays` in
+// Phase 2 of STREAMING-CONVERSION.md so the streaming and in-memory
+// paths share the same validation. Call sites below invoke the
+// scx-sparse version and map `CsrError` to `PyRuntimeError`.
 
 // ---------------------------------------------------------------------------
 // uns serialization
@@ -2757,7 +2726,8 @@ pub fn from_anndata_impl(
     // 1C.2: Fast upfront validation when CSR bypass is active.
     // After this, the shard loop can skip per-element checks.
     if csr_validated {
-        validate_csr_arrays(indptr_slice, indices_slice, n_vars)?;
+        scx_sparse::validate_csr_arrays(indptr_slice, indices_slice, n_vars)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
 
     // Determine index dtype.
@@ -3067,7 +3037,8 @@ pub fn from_anndata_impl(
 
         // 1C.2: Upfront validation for layer bypass
         if l_csr_validated {
-            validate_csr_arrays(l_indptr_slice, l_indices_slice, n_vars)?;
+            scx_sparse::validate_csr_arrays(l_indptr_slice, l_indices_slice, n_vars)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
 
         // 1D: Parallel shard encoding for layers

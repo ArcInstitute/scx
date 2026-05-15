@@ -167,17 +167,6 @@ impl XStreamReader {
             )));
         }
 
-        // Rebase the shard-local indptr to start at 0.
-        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows + 1);
-        for &v in &self.indptr[row_start..=row_end] {
-            if v < base {
-                return Err(ConvertError::Other(format!(
-                    "indptr value {v} less than shard base {base}"
-                )));
-            }
-            shard_indptr.push((v - base) as u64);
-        }
-
         // Read the indices / data slices. Empty shards (nnz_start ==
         // nnz_end) skip the hdf5 read entirely — `read_slice_1d` on
         // an empty range is not well-defined across hdf5-rust
@@ -190,7 +179,24 @@ impl XStreamReader {
             (i, v)
         };
 
-        validate_shard_csr(&shard_indptr, &shard_indices_i32, self.n_vars as u64)?;
+        // Validate the on-disk i64 indptr slice + i32 indices before
+        // any dtype coercion. Phase 2 hoisted this helper into
+        // scx-sparse; both this streaming reader and the in-memory
+        // pyscx path share it.
+        scx_sparse::validate_csr_arrays(
+            &self.indptr[row_start..=row_end],
+            &shard_indices_i32,
+            self.n_vars as u64,
+        )
+        .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
+
+        // Rebase the shard-local indptr to start at 0. Validation
+        // above guarantees monotonicity, so `(v - base)` is non-
+        // negative and `as u64` is lossless.
+        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows + 1);
+        for &v in &self.indptr[row_start..=row_end] {
+            shard_indptr.push((v - base) as u64);
+        }
 
         let shard_indices: Vec<u32> = shard_indices_i32.into_iter().map(|v| v as u32).collect();
 
@@ -203,35 +209,6 @@ impl XStreamReader {
             values: shard_values,
         })
     }
-}
-
-/// Per-shard sanity check. TODO(phase-2): replace with
-/// `scx_sparse::validate_csr_arrays` once Phase 2 lands.
-fn validate_shard_csr(
-    shard_indptr: &[u64],
-    shard_indices: &[i32],
-    n_vars: u64,
-) -> Result<(), ConvertError> {
-    for w in shard_indptr.windows(2) {
-        if w[1] < w[0] {
-            return Err(ConvertError::Other(format!(
-                "non-monotonic indptr in shard: {} > {}",
-                w[0], w[1]
-            )));
-        }
-    }
-    let n_vars_i64 = n_vars as i64;
-    for &idx in shard_indices {
-        if idx < 0 {
-            return Err(ConvertError::Other(format!("negative column index {idx}")));
-        }
-        if (idx as i64) >= n_vars_i64 {
-            return Err(ConvertError::Other(format!(
-                "column index {idx} out of range [0, {n_vars})"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.
