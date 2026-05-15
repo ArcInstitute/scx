@@ -22,6 +22,15 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
+# Streaming conversion lives behind the `hdf5` feature: `pyscx.from_h5ad`
+# is only exposed in hdf5 builds, and `from_anndata` on a backed AnnData
+# routes through the same path. CI's Python-bindings job builds with
+# `--features cloud` only, so skip the whole module there. Mirrors the
+# guard used in `test_cloud.py` for cloud-gated features.
+_pyscx = pytest.importorskip("pyscx")
+if not hasattr(_pyscx, "from_h5ad"):
+    pytest.skip("pyscx built without hdf5 feature", allow_module_level=True)
+
 
 def _write_h5ad(adata, path):
     """Persist an in-memory AnnData to disk."""
