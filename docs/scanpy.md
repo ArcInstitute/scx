@@ -382,6 +382,54 @@ adata = pyscx.open("atlas.scx").to_anndata(
 )
 ```
 
+##### Filter Expression Compatibility
+
+`to_anndata()` has two filter-evaluation paths that accept overlapping but
+**not identical** grammars. Knowing which subset is portable matters when a
+filter string is reused across calls or pipelines.
+
+| Path | Engine | When it fires |
+|---|---|---|
+| SCX predicate engine | `scx-engine` predicate parser | `preserve_slots=False` (default), `backed=True`, `pyscx.pull(...)` selective pulls |
+| pandas.eval | `pandas.DataFrame.eval` | `preserve_slots=True` with `obs_filter` set |
+
+**Portable subset (works in both paths):**
+
+```python
+"cell_type == 'T cell'"
+"n_counts > 50"
+"n_counts >= 50 and cell_type == 'T cell'"
+"cell_type in ['T cell', 'B cell']"           # bracket-delimited list
+"not (cell_type == 'NK cell')"
+"(n_counts > 50) or (cell_type == 'NK cell')"
+```
+
+This subset uses comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`),
+keyword-form boolean operators (`and`, `or`, `not`), the `in` operator
+against a `[...]` list literal, and parenthesised sub-expressions. Tests in
+`pyscx/tests/test_to_anndata_integration.py` (`test_obs_filter_grammar_parity_common_ground`)
+assert that both paths select identical rows for the entries above.
+
+**Divergences (work in one path only):**
+
+| Expression | SCX engine | pandas.eval |
+|---|---|---|
+| `n_counts > 50 & cell_type == 'T cell'` | ❌ parse error — use `and` | ✅ accepted as bitwise-and |
+| `cell_type in ('T cell', 'B cell')` (tuple) | ❌ parse error — `in` requires `[...]` | ✅ accepted |
+| `n_counts > 50 \| cell_type == 'NK cell'` | ❌ parse error — use `or` | ✅ accepted |
+| Arithmetic on obs columns (e.g. `n_counts + n_genes > 100`) | ❌ not supported | ✅ accepted |
+| String-method calls (e.g. `cell_type.str.startswith('T')`) | ❌ not supported | ✅ accepted |
+
+When `preserve_slots=True` is used with an `obs_filter`, `to_anndata()` emits
+a `UserWarning` noting that the filter was evaluated via pandas.eval — this
+surfaces in notebook output so the grammar shift is visible without reading
+this section.
+
+**Recommendation:** write filters in the portable subset above. If a filter
+truly needs pandas-only syntax, do the row selection in Python after
+`to_anndata()` instead of inside `obs_filter` — that keeps the SCX call site
+portable across `preserve_slots`, `backed=True`, and cloud selective pulls.
+
 #### Layer selection (`layers`)
 
 Load only specific layers instead of all:

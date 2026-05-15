@@ -580,6 +580,20 @@ pub fn to_anndata_filtered<'py>(
             )));
         }
 
+        // Surface the grammar shift: this path evaluates obs_filter via
+        // pandas.eval, which does not match the SCX predicate engine
+        // (e.g. pandas accepts `&` / `|` / `~`; SCX accepts only
+        // `and` / `or` / `not`). Users opted into preserve_slots=True, so
+        // one warning per call is appropriate.
+        py.import("warnings")?.call_method1(
+            "warn",
+            (format!(
+                "preserve_slots=True evaluated obs_filter {expr:?} via pandas.eval; \
+                 grammar differs from the SCX predicate engine used by \
+                 preserve_slots=False (see docs/scanpy.md \"Filter Expression Compatibility\")."
+            ),),
+        )?;
+
         let builtins = py.import("builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
         let col_idx = if let Some(names) = var_names {

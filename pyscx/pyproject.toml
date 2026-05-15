@@ -4,13 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "pyscx"
-version = "0.3.1"
+version = "0.3.2"
 description = "Python bindings for SCX (Sparse Cell eXpression System)"
 license = {text = "MIT"}
 authors = [
     {name = "Nick Youngblut", email = "nick.youngblut@arcinstitute.org"}
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.24,<3",
     "scipy>=1.10,<2",
@@ -21,11 +21,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "scanpy>=1.9",
+    "scanpy>=1.10",
     "python-dotenv",
 ]
 eval = [
-    "polars>=0.20",
+    "polars>=1.0",
 ]
 scvi = [
     "scvi-tools",
@@ -47,7 +47,7 @@ cloud = [
 # 10x Genomics ingestion via `pyscx.from_10x`. Pulls in scanpy for its
 # `read_10x_h5` reader. Optional — only required if calling `from_10x`.
 "10x" = [
-    "scanpy>=1.9",
+    "scanpy>=1.10",
 ]
 
 [tool.maturin]

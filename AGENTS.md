@@ -21,6 +21,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/multimodal.md](docs/multimodal.md)** — Multimodal (CITE-seq / Multiome / TEA-seq / spatial) layout and APIs.
 - **[docs/cloud.md](docs/cloud.md)** — Cloud auth, layouts, tuning, provider-specific notes.
 - **[docs/conventions.md](docs/conventions.md)** — Coding conventions (serialization, error handling, checksums, language binding rules, GPU/accel constraints).
+- **[docs/compatibility-matrix.md](docs/compatibility-matrix.md)** — Tested vs. declared Python / numpy / scipy / pyarrow / anndata / scanpy combinations for `pyscx`.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide: SLURM job submission, dataset prep, [Regression Gating](benchmarks/README.md#regression-gating) (`gate_candidate.py` against `results/baselines/LATEST`), and the [GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow). **Always use parallel SLURM job submission** (one job per benchmark × dataset pair). No CI-side gate today — local gate is the canonical signal.
 
 ## Build and Test
