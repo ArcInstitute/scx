@@ -52,7 +52,7 @@ def _structural_summary(scx_path: Path) -> dict[str, int]:
     tests — see Phase 8."""
     import pyscx
 
-    reader = pyscx.open(scx_path)
+    reader = pyscx.open(str(scx_path))
     return {
         "n_obs": int(reader.n_obs),
         "n_vars": int(reader.n_vars),

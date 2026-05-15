@@ -89,9 +89,13 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
     let n_obs = shape[0];
     let n_vars = shape[1];
 
-    // Read 2D dataset as ndarray then flatten to Vec<f32>
+    // Read 2D dataset as ndarray then flatten to Vec<f32>.
+    // ndarray 0.16 renamed `into_raw_vec` → `into_raw_vec_and_offset`,
+    // which returns `(Vec<T>, Option<usize>)`. The offset is `None`
+    // here because `read_2d` returns an owned, contiguous Array2 that
+    // hasn't been view-sliced.
     let nd: ndarray::Array2<f32> = ds.read_2d()?;
-    let flat: Vec<f32> = nd.into_raw_vec();
+    let (flat, _offset) = nd.into_raw_vec_and_offset();
     let csr = scx_sparse::dense_to_csr(&flat, n_obs, n_vars)
         .map_err(|e| ConvertError::Other(format!("CSR conversion error: {e}")))?;
 

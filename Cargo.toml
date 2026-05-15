@@ -24,7 +24,7 @@ byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-ndarray = "0.15"
+ndarray = "0.16"
 rayon = "1"
 crossbeam-channel = "0.5"
 rand = "0.8"
@@ -38,9 +38,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "io-util"]
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 
-# HDF5 — `hdf5-rust` is unmaintained upstream; only used for h5ad
-# conversion. Fallback path is a Python subprocess via h5py.
-hdf5 = "0.8"
+# HDF5 — `hdf5` on crates.io is frozen at 0.8.1 (the original
+# `aldanor/hdf5-rust` repo went unmaintained). The active 0.9.x line
+# lives at `hdf5-metno` (metno fork). Renamed via Cargo's
+# `package = …` so consumer source `use hdf5::…` is unchanged.
+# 0.9.0 fixed the `H5Pget_fapl_direct` feature-gate mismatch that
+# blocked builds against conda-forge `hdf5=1.12.*=nompi*`. Only used
+# for h5ad conversion; fallback path is a Python subprocess via h5py.
+hdf5 = { package = "hdf5-metno", version = "0.9.4" }
 
 half = "2"
 base64 = "0.22"

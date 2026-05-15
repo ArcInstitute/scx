@@ -89,12 +89,27 @@ echo ""
 # Step 1: ensure hdf5 + maturin are present. `conda` lives in
 # ${CONDA_BASE}/bin, not in the per-env bin/ — use the base
 # binary and pass --prefix to target our env. Idempotent.
+#
+# hdf5-sys 0.8.1 (the dep that scx-convert's --features hdf5 pulls
+# in) parses H5_VERSION at build time and panics on 1.14.x with
+# "Invalid H5_VERSION". Pin to 1.12.x — the highest 1.x the crate
+# accepts. Upstream hdf5-rust 0.9 tracks 1.14 but pyscx hasn't
+# moved to it yet.
 echo "--- Bootstrapping conda env (hdf5 + maturin) ---"
 "${CONDA_BASE}/bin/conda" install -y --prefix "\${CONDA_PREFIX}" \\
-    -c conda-forge "hdf5=1.14.*=nompi*" maturin 2>&1 | tail -10
+    -c conda-forge "hdf5=1.12.*=nompi*" maturin 2>&1 | tail -10
 echo ""
 
 # Step 2: build pyscx in release mode with hdf5.
+# Clean pyscx + maturin staging before building. Without this, a
+# prior interrupted build can leave both `target/release/libpyscx.so`
+# and `target/maturin/libpyscx.so` truncated to 0 bytes; cargo's
+# fingerprint cache then declares the crate "up to date" and skips
+# the rebuild, after which maturin tries to parse the empty file as
+# ELF and dies with "Malformed entity: Object is too small". Forcing
+# a clean rebuild of pyscx ensures a fresh .so on every smoke run.
+"\${HOME}/.cargo/bin/cargo" clean -p pyscx --release 2>&1 | tail -3 || true
+rm -rf "\${REPO_ROOT}/target/maturin"
 echo "--- Building pyscx (--features hdf5, release) ---"
 cd "\${REPO_ROOT}/pyscx"
 "\${CONDA_PREFIX}/bin/maturin" develop --release 2>&1 | tail -10
@@ -106,8 +121,15 @@ echo "--- pyscx smoke ---"
 "\${CONDA_PREFIX}/bin/python" -c "import pyscx; assert hasattr(pyscx, 'from_h5ad'); print('from_h5ad OK')"
 echo ""
 
-# Step 4: generate a synthetic h5ad on /scratch (per-node SSD).
-SCRATCH_DIR="/scratch/\$(id -u)/scx_conv_smoke_\${SLURM_JOB_ID:-local}"
+# Step 4: generate a synthetic h5ad in a writable per-node directory.
+# Prefer /scratch (per-node SSD; documented at /scratch/<uid>) but
+# fall back to /tmp if it isn't accessible — observed on some
+# preemptible_low workers where /scratch isn't writable.
+if [[ -w /scratch ]]; then
+    SCRATCH_DIR="/scratch/\$(id -u)/scx_conv_smoke_\${SLURM_JOB_ID:-local}"
+else
+    SCRATCH_DIR="/tmp/scx_conv_smoke_\$(id -u)_\${SLURM_JOB_ID:-local}"
+fi
 mkdir -p "\${SCRATCH_DIR}/datasets"
 "\${CONDA_PREFIX}/bin/python" "\${REPO_ROOT}/benchmarks/comprehensive/scripts/_synth_h5ad.py" \\
     --out "\${SCRATCH_DIR}/datasets/streaming_smoke.h5ad" \\
@@ -127,12 +149,20 @@ echo "--- Running conversion_streaming benchmark ---"
     --datasets streaming_smoke \\
     --formats scx_auto
 
-# Copy results back to repo logs so they don't vanish with /scratch.
-RESULTS_OUT="\${REPO_ROOT}/benchmarks/comprehensive/results"
-mkdir -p "\${RESULTS_OUT}"
+# Surface the result JSON the harness just wrote. `run_all.py`
+# writes to `benchmarks/comprehensive/results/raw/`; print the most
+# recent matching file in full so the smoke run's numbers land in
+# the SLURM stdout.
+RESULTS_RAW="\${REPO_ROOT}/benchmarks/comprehensive/results/raw"
 echo ""
 echo "--- Results summary ---"
-find "\${RESULTS_OUT}" -name "conversion_streaming__*.json" -newer "\${JOB_SCRIPT}" -print -exec head -20 {} \\;
+LATEST_JSON="\$(find "\${RESULTS_RAW}" -maxdepth 1 -name 'conversion_streaming__*.json' -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -1 | awk '{print \$2}')"
+if [[ -n "\${LATEST_JSON}" ]]; then
+    echo "Latest result: \${LATEST_JSON}"
+    cat "\${LATEST_JSON}"
+else
+    echo "No conversion_streaming result JSON found under \${RESULTS_RAW}"
+fi
 
 echo ""
 echo "=============================================="

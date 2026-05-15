@@ -27,7 +27,10 @@ scx-mtx = { path = "../scx-mtx" }
 scx-ops = { path = "../scx-ops" }
 
 hdf5 = { workspace = true, optional = true }
-hdf5-sys = { version = "0.8", optional = true }
+# Renamed: the 0.9.x line of `hdf5-rust` ships the `hdf5-sys` companion
+# as `hdf5-metno-sys`. Local dep alias stays `hdf5-sys` so the feature
+# paths in `[features]` (e.g. `hdf5-sys/static`) keep resolving.
+hdf5-sys = { package = "hdf5-metno-sys", version = "0.10", optional = true }
 libz-sys = { version = "1", optional = true, default-features = false }
 ndarray = { workspace = true, optional = true }
 
