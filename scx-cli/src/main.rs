@@ -75,6 +75,13 @@ enum Commands {
         /// a multimodal SCX input; ignored otherwise.
         #[arg(long)]
         modality: Option<String>,
+        /// Stream h5ad → SCX without materializing the full X matrix
+        /// in memory. Required for files larger than RAM. Only
+        /// supported on `h5ad → scx`; combine with `--csc always` to
+        /// emit a CSC sidecar via a two-pass rebuild after the
+        /// streaming write completes.
+        #[arg(long)]
+        stream: bool,
     },
     /// Display SCX file information
     Info {
@@ -371,6 +378,7 @@ fn main() {
             csc,
             csc_cols_per_shard,
             modality,
+            stream,
         } => run_convert(
             &input,
             &output,
@@ -381,6 +389,7 @@ fn main() {
             &csc,
             csc_cols_per_shard,
             modality.as_deref(),
+            stream,
         ),
         Commands::Info {
             file,
@@ -544,6 +553,7 @@ fn run_convert(
     csc: &str,
     csc_cols_per_shard: usize,
     modality: Option<&str>,
+    stream: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -557,6 +567,18 @@ fn run_convert(
         // arm is defensive.
         other => return Err(format!("invalid --csc value: {other}").into()),
     };
+
+    // `--stream` is only valid for h5ad → scx. Reject other directions
+    // up front so the user gets a clear error rather than a confusing
+    // downstream failure. h5mu streaming is explicitly out of scope
+    // (single-modality streaming only).
+    if stream && direction != "h5ad_to_scx" {
+        return Err(format!(
+            "--stream is only supported for h5ad → scx; got direction '{direction}'. \
+             For h5mu, drop --stream (multimodal streaming is not yet implemented)."
+        )
+        .into());
+    }
 
     // MTX conversions are always available (no hdf5 feature needed)
     match direction {
@@ -583,6 +605,7 @@ fn run_convert(
         csc_always,
         csc_cols_per_shard,
         modality,
+        stream,
     )
 }
 
@@ -597,6 +620,7 @@ fn dispatch_convert(
     csc_always: bool,
     csc_cols_per_shard: usize,
     modality: Option<&str>,
+    stream: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -637,7 +661,13 @@ fn dispatch_convert(
     // `--modality` flag and route through `scx_modality_to_h5ad` when
     // present. The plain single-modality path stays untouched.
     let result: Result<(), ConvertError> = match direction {
-        "h5ad_to_scx" => convert::h5ad_to_scx(input, output, &opts),
+        "h5ad_to_scx" => {
+            if stream {
+                convert::h5ad_to_scx_streaming(input, output, &opts)
+            } else {
+                convert::h5ad_to_scx(input, output, &opts)
+            }
+        }
         "h5mu_to_scx" => convert::h5mu_to_scx(input, output, &opts),
         "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts),
         "scx_to_h5ad" => match modality {
@@ -692,6 +722,7 @@ fn dispatch_convert(
     _csc_always: bool,
     _csc_cols_per_shard: usize,
     _modality: Option<&str>,
+    _stream: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
