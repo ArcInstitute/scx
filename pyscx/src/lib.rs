@@ -173,6 +173,79 @@ fn from_anndata(
     )
 }
 
+/// Stream an h5ad file directly to SCX without materialising the full
+/// X matrix in Python or Rust.
+///
+/// `pyscx.from_h5ad(path, out)` reads `path` from disk through the
+/// `scx-convert` streaming pipeline (see Phase 4 of
+/// `STREAMING-CONVERSION.md`) and writes `out` shard-by-shard. Peak
+/// memory is bounded by one shard's worth of CSR plus encode buffers
+/// (plus the always-resident `indptr`, ~80 MB at 10M cells), so this
+/// is the recommended entry point for h5ad files larger than node
+/// RAM. For files that comfortably fit in memory, `from_anndata`
+/// remains a touch faster.
+///
+/// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
+/// `from_anndata` exactly.
+///
+/// `uns_format` is accepted for API parity but has no effect — the
+/// streaming path reads `uns` directly from the h5ad file (not from
+/// Python objects), so the tagged/raw distinction doesn't apply.
+///
+/// `csc="always"` performs a two-pass write: the streaming converter
+/// emits CSR shards, then `scx_ops::rebuild_csc_inplace` regenerates
+/// the CSC sidecar over the just-written file. Peak disk briefly
+/// reaches ~2× the output size during the rebuild.
+///
+/// Limitations (Phase 4 MVP):
+///   * CSC-on-disk h5ad and dense X are rejected with a clear error.
+///   * `varm` is preserved; `obsp` / `varp` are silently skipped (same
+///     gap the non-streaming CLI converter has).
+///
+/// Example:
+///     pyscx.from_h5ad("big.h5ad", "big.scx")
+///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
+#[pyfunction]
+#[pyo3(signature = (path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
+#[allow(clippy::too_many_arguments)]
+fn from_h5ad(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    codec: Option<&str>,
+    shard_size: Option<u32>,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    uns_format: &str,
+) -> PyResult<()> {
+    let _ = uns_format; // accepted for API parity; streaming reads uns from disk.
+
+    let explicit_codec = anndata::parse_codec(codec)?;
+    let csc_always = match csc {
+        "off" => false,
+        "always" => true,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "invalid csc value '{other}'; expected 'off' or 'always'"
+            )));
+        }
+    };
+
+    let opts = scx_convert::ConvertOptions {
+        shard_target_rows: shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS),
+        codec: explicit_codec,
+        csc: csc_always,
+        csc_cols_per_shard,
+    };
+
+    let input = std::path::PathBuf::from(path);
+    let output = std::path::PathBuf::from(out);
+
+    let overrides = scx_convert::StreamingOverrides::default();
+    py.allow_threads(|| scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 /// Convert a 10x HDF5 file to SCX via scanpy.
 ///
 /// Reads the 10x file with scanpy.read_10x_h5(), then writes via from_anndata.
@@ -317,6 +390,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
+    m.add_function(wrap_pyfunction!(from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
     m.add_function(wrap_pyfunction!(to_mtx, m)?)?;

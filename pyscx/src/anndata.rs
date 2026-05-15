@@ -2523,6 +2523,179 @@ fn parallel_encode_csr_shards(
     result.map_err(PyRuntimeError::new_err)
 }
 
+/// Phase 7: route a backed AnnData object through the streaming
+/// converter. Extracts in-memory `obs` / `var` / `uns` / `obsm` /
+/// `varm` / `obsp` / `varp` into Rust types so any caller mutations
+/// are preserved, then invokes
+/// `scx_convert::h5ad_to_scx_streaming` on the backing h5ad file.
+///
+/// X and layers always come from disk via streaming — there's no
+/// override hook for those (they're potentially too large to extract
+/// from a backed AnnData into memory). Emits a `UserWarning` when
+/// the backed AnnData has any layers, because the streaming reads
+/// will overwrite any in-memory layer mutations.
+#[allow(clippy::too_many_arguments)]
+fn route_backed_anndata_to_streaming(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    path: &str,
+    explicit_codec: Option<CodecId>,
+    shard_target_rows: u32,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
+    uns_format_parsed: UnsFormat,
+) -> PyResult<()> {
+    // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
+    // `adata.filename` (preferred) and `adata.file.filename` (older
+    // name); we try both.
+    let filename: String = match adata.getattr("filename") {
+        Ok(v) => v.extract::<String>().unwrap_or_default(),
+        Err(_) => adata
+            .getattr("file")
+            .ok()
+            .and_then(|f| f.getattr("filename").ok())
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_default(),
+    };
+    if filename.is_empty() || !std::path::Path::new(&filename).exists() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "backed AnnData has no resolvable h5ad filename; use \
+             pyscx.from_h5ad(path, out) or convert to a non-backed \
+             AnnData first",
+        ));
+    }
+
+    // Build the overrides from the in-memory AnnData. Each extraction
+    // mirrors the inline logic used by the non-backed path
+    // (`pandas_to_record_batch`, `sparse_to_coo_record_batch`,
+    // `normalize_uns_value`) so the on-disk SCX output matches what
+    // the user sees in Python.
+    let obs_override = pandas_to_record_batch(py, &adata.getattr("obs")?)?;
+    let var_override = pandas_to_record_batch(py, &adata.getattr("var")?)?;
+
+    let obsm_override = extract_dense_mapping(py, adata, "obsm")?;
+    let varm_override = extract_dense_mapping(py, adata, "varm")?;
+    let obsp_override = extract_coo_mapping(py, adata, "obsp")?;
+    let varp_override = extract_coo_mapping(py, adata, "varp")?;
+    let uns_override = extract_uns_value(py, adata, uns_format_parsed)?;
+
+    // Layer mutations on a backed AnnData are not propagated — the
+    // streaming pipeline always reads layers from disk. Warn so the
+    // user knows.
+    if let Ok(layers) = adata.getattr("layers") {
+        if let Ok(len_val) = layers.call_method0("__len__") {
+            if let Ok(len) = len_val.extract::<usize>() {
+                if len > 0 {
+                    let msg = format!(
+                        "backed AnnData has {len} layer(s); layer data will be read \
+                         from the on-disk h5ad file. Any in-memory layer mutations \
+                         will be lost. Use pyscx.from_h5ad(path, out) on a \
+                         freshly-written h5ad if you need mutated layers preserved.",
+                    );
+                    let _ = py
+                        .import("warnings")
+                        .and_then(|w| w.call_method1("warn", (msg,)));
+                }
+            }
+        }
+    }
+
+    let overrides = scx_convert::StreamingOverrides {
+        obs: Some(obs_override),
+        var: Some(var_override),
+        uns: uns_override,
+        obsm: Some(obsm_override),
+        varm: Some(varm_override),
+        obsp: Some(obsp_override),
+        varp: Some(varp_override),
+    };
+
+    let opts = scx_convert::ConvertOptions {
+        shard_target_rows,
+        codec: explicit_codec,
+        csc: csc_always,
+        csc_cols_per_shard,
+    };
+    let input = std::path::PathBuf::from(filename);
+    let output = std::path::PathBuf::from(path);
+
+    py.allow_threads(|| scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Helper for the backed-routing path. Reads a dense mapping
+/// (`obsm` / `varm`) from a Python AnnData and returns
+/// `Vec<(name, RecordBatch)>`. Missing groups → empty Vec.
+fn extract_dense_mapping(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    attr: &str,
+) -> PyResult<Vec<(String, RecordBatch)>> {
+    let group = match adata.getattr(attr) {
+        Ok(g) => g,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let keys: Vec<String> = py
+        .import("builtins")?
+        .call_method1("list", (group.call_method0("keys")?,))?
+        .extract()?;
+    keys.iter()
+        .map(|key| {
+            let arr = group.call_method1("__getitem__", (key,))?;
+            let pd = py.import("pandas")?;
+            let df = pd.call_method1("DataFrame", (&arr,))?;
+            let batch = pandas_to_record_batch(py, &df)?;
+            Ok((key.clone(), batch))
+        })
+        .collect()
+}
+
+/// Helper for the backed-routing path. Reads a sparse pairwise
+/// mapping (`obsp` / `varp`) as COO RecordBatches. Missing groups →
+/// empty Vec.
+fn extract_coo_mapping(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    attr: &str,
+) -> PyResult<Vec<(String, RecordBatch)>> {
+    let group = match adata.getattr(attr) {
+        Ok(g) => g,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let keys: Vec<String> = py
+        .import("builtins")?
+        .call_method1("list", (group.call_method0("keys")?,))?
+        .extract()?;
+    keys.iter()
+        .map(|key| {
+            let mat = group.call_method1("__getitem__", (key,))?;
+            let batch = sparse_to_coo_record_batch(py, &mat)?;
+            Ok((key.clone(), batch))
+        })
+        .collect()
+}
+
+/// Helper for the backed-routing path. Extracts `uns` from a Python
+/// AnnData into an optional `serde_json::Value`. Returns `None` if
+/// `uns` is empty (no `__scx_uns__` section written), matching the
+/// non-backed path.
+fn extract_uns_value(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    uns_format_parsed: UnsFormat,
+) -> PyResult<Option<serde_json::Value>> {
+    let uns = adata.getattr("uns")?;
+    let uns_len: usize = uns.call_method0("__len__")?.extract()?;
+    if uns_len == 0 {
+        return Ok(None);
+    }
+    let np = py.import("numpy")?;
+    let np_generic = np.getattr("generic")?;
+    let np_ndarray = np.getattr("ndarray")?;
+    let mut ctx = UnsWriteCtx::new(uns_format_parsed, &np_generic, &np_ndarray);
+    Ok(Some(normalize_uns_value(&uns, "uns", &mut ctx)?))
+}
+
 /// Implementation of from_anndata: extract data from AnnData and write SCX.
 ///
 /// `in_place`: when true, allow [`ensure_csr`] to sort caller-owned CSR
@@ -2553,6 +2726,32 @@ pub fn from_anndata_impl(
         }
     };
     let uns_format_parsed = parse_uns_format(uns_format)?;
+
+    // Phase 7: backed AnnData → route through the streaming converter
+    // (`scx_convert::h5ad_to_scx_streaming`) instead of the in-memory
+    // path, which would fail at the `ensure_csr` step (backed `X` is
+    // an `_CSRDataset`, not a scipy sparse matrix). In-memory
+    // mutations on `obs` / `var` / `uns` / `obsm` / `varm` / `obsp` /
+    // `varp` are extracted to Rust and passed as `StreamingOverrides`
+    // so user edits aren't silently overwritten by the on-disk
+    // version.
+    let is_backed: bool = adata
+        .getattr("isbacked")
+        .ok()
+        .and_then(|v| v.extract::<bool>().ok())
+        .unwrap_or(false);
+    if is_backed {
+        return route_backed_anndata_to_streaming(
+            py,
+            adata,
+            path,
+            explicit_codec,
+            shard_target_rows,
+            csc_always,
+            csc_cols_per_shard,
+            uns_format_parsed,
+        );
+    }
 
     // Extract X as CSR. By default we do not mutate caller-owned CSR
     // matrices; pass `in_place=true` to opt into the original in-place

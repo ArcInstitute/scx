@@ -663,7 +663,12 @@ fn dispatch_convert(
     let result: Result<(), ConvertError> = match direction {
         "h5ad_to_scx" => {
             if stream {
-                convert::h5ad_to_scx_streaming(input, output, &opts)
+                convert::h5ad_to_scx_streaming(
+                    input,
+                    output,
+                    &opts,
+                    &convert::StreamingOverrides::default(),
+                )
             } else {
                 convert::h5ad_to_scx(input, output, &opts)
             }

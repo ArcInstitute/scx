@@ -34,6 +34,7 @@ pub mod pipeline;
 #[cfg(feature = "hdf5")]
 pub use pipeline::{
     h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions,
+    StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]

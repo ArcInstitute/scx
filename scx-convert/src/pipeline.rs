@@ -336,10 +336,37 @@ pub fn scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), ConvertError
 ///   converter had before Phase 4).
 /// - **CSC-on-disk and dense X** are rejected by
 ///   `open_x_streaming` with [`ConvertError::StreamingUnsupported`].
+/// Override hooks for `h5ad_to_scx_streaming`. Each `Some(...)` field
+/// skips the corresponding on-disk read and uses the provided value
+/// instead.
+///
+/// Phase 7 of `STREAMING-CONVERSION.md` introduced this for the
+/// backed-AnnData routing path in `pyscx.from_anndata`: when a caller
+/// has already mutated `obs` / `var` / `uns` / `obsm` / `varm` /
+/// `obsp` / `varp` in Python, those edits would be silently lost if
+/// the streaming pipeline re-read them from disk. Pass the mutated
+/// values here to preserve them.
+///
+/// Layers are intentionally not overridable — they're streamed
+/// directly from disk per shard, and the pyscx backed-mode path
+/// emits a `UserWarning` if the in-memory AnnData has layers (where
+/// any in-memory mutations would be dropped).
+#[derive(Default)]
+pub struct StreamingOverrides {
+    pub obs: Option<arrow::record_batch::RecordBatch>,
+    pub var: Option<arrow::record_batch::RecordBatch>,
+    pub uns: Option<serde_json::Value>,
+    pub obsm: Option<Vec<(String, arrow::record_batch::RecordBatch)>>,
+    pub varm: Option<Vec<(String, arrow::record_batch::RecordBatch)>>,
+    pub obsp: Option<Vec<(String, arrow::record_batch::RecordBatch)>>,
+    pub varp: Option<Vec<(String, arrow::record_batch::RecordBatch)>>,
+}
+
 pub fn h5ad_to_scx_streaming(
     input: &Path,
     output: &Path,
     opts: &ConvertOptions,
+    overrides: &StreamingOverrides,
 ) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
 
@@ -400,9 +427,17 @@ pub fn h5ad_to_scx_streaming(
 
     let mut writer = ScxWriter::new(output, header)?;
 
-    // obs / var.
-    let obs = read_dataframe_group(&file, "obs")?;
-    let var = read_dataframe_group(&file, "var")?;
+    // obs / var. Override-or-disk per section: any `Some(...)` field
+    // wins over the on-disk read so the backed-AnnData routing path
+    // can preserve in-memory mutations.
+    let obs = match overrides.obs.as_ref() {
+        Some(batch) => batch.clone(),
+        None => read_dataframe_group(&file, "obs")?,
+    };
+    let var = match overrides.var.as_ref() {
+        Some(batch) => batch.clone(),
+        None => read_dataframe_group(&file, "var")?,
+    };
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
@@ -430,19 +465,55 @@ pub fn h5ad_to_scx_streaming(
     }
     drop(x_reader);
 
-    // obsm / varm / uns. Small dense sections — non-streaming reads.
-    if let Ok(obsm_map) = read_obsm(&file) {
-        for (name, batch) in &obsm_map {
-            writer.write_obsm(name, batch)?;
+    // obsm / varm / uns. Small dense sections — non-streaming reads,
+    // override-or-disk per section. obsp / varp have no on-disk
+    // readers yet, so they're only written when an override supplies
+    // them (matches the non-streaming converter's gap for now).
+    match overrides.obsm.as_ref() {
+        Some(entries) => {
+            for (name, batch) in entries {
+                writer.write_obsm(name, batch)?;
+            }
+        }
+        None => {
+            if let Ok(obsm_map) = read_obsm(&file) {
+                for (name, batch) in &obsm_map {
+                    writer.write_obsm(name, batch)?;
+                }
+            }
         }
     }
-    if let Ok(varm_map) = read_varm(&file) {
-        for (name, batch) in &varm_map {
-            writer.write_varm(name, batch)?;
+    match overrides.varm.as_ref() {
+        Some(entries) => {
+            for (name, batch) in entries {
+                writer.write_varm(name, batch)?;
+            }
+        }
+        None => {
+            if let Ok(varm_map) = read_varm(&file) {
+                for (name, batch) in &varm_map {
+                    writer.write_varm(name, batch)?;
+                }
+            }
         }
     }
-    if let Ok(uns) = read_uns(&file) {
-        writer.write_uns(&uns)?;
+    if let Some(entries) = overrides.obsp.as_ref() {
+        for (name, batch) in entries {
+            writer.write_obsp(name, batch)?;
+        }
+    }
+    if let Some(entries) = overrides.varp.as_ref() {
+        for (name, batch) in entries {
+            writer.write_varp(name, batch)?;
+        }
+    }
+    match overrides.uns.as_ref() {
+        Some(json) => writer.write_uns(json)?,
+        None => {
+            if let Ok(uns) = read_uns(&file) {
+                writer.write_uns(&uns)?;
+            }
+        }
     }
 
     // Layers (one streaming pass per layer).
