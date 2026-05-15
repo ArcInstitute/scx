@@ -289,7 +289,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ### Module-level functions
 
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None)` — Write AnnData to SCX
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, *, chunked=False, n_chunks=None)` — Write AnnData to SCX. With `chunked=True`, streams the conversion in `n_chunks` row chunks via `from_anndata` + repeated `append_from_anndata`; `X` is never fully materialised. Defaults `n_chunks` to `ceil(n_obs / 16384)` (~one shard per chunk). Drops `obsm`/`varm`/`obsp`/`varp`/`layers` from the input with a `UserWarning` because the append primitive does not extend those aligned mappings — use `chunked=False` to preserve them. Categorical obs dtypes and the obs index name on appended chunks may be normalised by the append path
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
