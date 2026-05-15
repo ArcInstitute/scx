@@ -13,10 +13,9 @@ use rayon::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::MAGIC;
 use scx_format::section::SectionType;
-use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
 use scx_format::{
-    compute_shard_stats, select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection,
-    ProvenanceEntry, ScxReader, ScxWriter,
+    select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection, ProvenanceEntry,
+    ScxReader, ScxWriter,
 };
 
 use crate::to_pyerr;
@@ -2449,7 +2448,6 @@ fn parallel_encode_csr_shards(
     let indices_owned: Arc<[i32]> = indices.to_vec().into();
     let data_owned: Arc<[f32]> = data.to_vec().into();
     let name_prefix = name_prefix.to_string();
-    let index_dtype_u16 = index_dtype == 0;
 
     let result: Result<Vec<PreEncodedSection>, String> = py.allow_threads(|| {
         boundaries
@@ -2496,140 +2494,28 @@ fn parallel_encode_csr_shards(
                         .collect::<Result<Vec<u32>, String>>()?
                 };
 
-                // 3. Detect value encoding and encode values
+                // Steps 3–10 (detect encoding, select codec, encode,
+                // build BlockIndex, compute checksums, build
+                // ShardHeader, compute shard stats) live in
+                // `scx_format::encode_one_shard`. Phase 3 of
+                // STREAMING-CONVERSION.md moved them out of this
+                // closure so the streaming pipeline shares the same
+                // implementation.
                 let shard_data = &data_owned[b.nnz_start..b.nnz_end];
-                let shard_value_encoding = detect_value_encoding(shard_data);
-                let shard_values_bytes =
-                    encode_values(shard_data, shard_value_encoding).map_err(|e| e.to_string())?;
-
-                // 4. Select codec
-                let shard_codec = match explicit_codec {
-                    Some(codec_id) => {
-                        if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
-                            CodecId::Zstd
-                        } else {
-                            codec_id
-                        }
-                    }
-                    None => select_codec_for_modality(
-                        &shard_values_bytes,
-                        shard_value_encoding,
-                        ModalityType::Rna,
-                    ),
-                };
-
-                // 5. Encode shard
-                let encoded = scx_codec::encode_shard(
+                let name = format!("{name_prefix}_shard_{}", b.shard_idx);
+                scx_format::encode_one_shard(
                     &shard_indptr,
                     &shard_indices,
-                    &shard_values_bytes,
-                    shard_codec,
-                    shard_value_encoding,
-                    index_dtype_u16,
-                )
-                .map_err(|e| format!("encode_shard failed: {e}"))?;
-
-                // 6. Build block index (Phase 1: single entry covering entire shard)
-                let n_major = (shard_indptr.len() - 1) as u32;
-                let nnz = *shard_indptr.last().unwrap_or(&0);
-                let block_index = BlockIndex {
-                    entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz)
-                        .map_err(|e| format!("{e}"))?],
-                };
-                let mut block_index_bytes = Vec::new();
-                block_index
-                    .write_to(&mut block_index_bytes)
-                    .map_err(|e| format!("{e}"))?;
-
-                // 7. Shard-level checksum (8-byte truncated BLAKE3)
-                let mut shard_hasher = blake3::Hasher::new();
-                shard_hasher.update(&encoded.indptr_bytes);
-                shard_hasher.update(&encoded.indices_bytes);
-                shard_hasher.update(&encoded.values_bytes);
-                shard_hasher.update(&block_index_bytes);
-                let shard_hash = shard_hasher.finalize();
-                let mut shard_checksum = [0u8; 8];
-                shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
-
-                // 8. Build ShardHeader with relative offsets
-                let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-                let indptr_length = encoded.indptr_bytes.len() as u32;
-                let indices_rel_offset = indptr_rel_offset + indptr_length;
-                let indices_length = encoded.indices_bytes.len() as u32;
-                let values_rel_offset = indices_rel_offset + indices_length;
-                let values_length = encoded.values_bytes.len() as u32;
-                let block_index_rel_offset = values_rel_offset + values_length;
-                let block_index_length = block_index_bytes.len() as u32;
-
-                let shard_header = ShardHeader {
-                    magic: SHARD_MAGIC,
-                    shard_format_version: 1,
-                    shard_type: 0, // CSR
-                    codec_id: shard_codec as u8,
-                    value_encoding: shard_value_encoding as u8,
+                    shard_data,
+                    explicit_codec,
                     index_dtype,
-                    reserved_flags: [0; 3],
-                    n_major,
-                    n_minor: n_vars,
-                    nnz,
-                    global_offset: b.row_start as u64,
-                    indptr_rel_offset,
-                    indptr_length,
-                    indices_rel_offset,
-                    indices_length,
-                    values_rel_offset,
-                    values_length,
-                    block_index_rel_offset,
-                    block_index_length,
-                    checksum: shard_checksum,
-                };
-
-                let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
-                shard_header
-                    .write_to(&mut header_buf)
-                    .map_err(|e| format!("{e}"))?;
-
-                // 9. Section-level checksum (full 32-byte BLAKE3)
-                let mut section_hasher = blake3::Hasher::new();
-                section_hasher.update(&header_buf);
-                section_hasher.update(&encoded.indptr_bytes);
-                section_hasher.update(&encoded.indices_bytes);
-                section_hasher.update(&encoded.values_bytes);
-                section_hasher.update(&block_index_bytes);
-                let section_checksum = *section_hasher.finalize().as_bytes();
-
-                let section_length = (header_buf.len()
-                    + encoded.indptr_bytes.len()
-                    + encoded.indices_bytes.len()
-                    + encoded.values_bytes.len()
-                    + block_index_bytes.len()) as u64;
-
-                // 10. Compute shard stats. pyscx writes row-major CSR
-                // shards exclusively (CSC sidecars are emitted via a
-                // separate path, see scx-cli/src/build_csc.rs).
-                let stats = compute_shard_stats(
-                    &shard_values_bytes,
-                    shard_value_encoding,
-                    scx_format::MajorAxis::Row,
+                    n_vars,
                     b.row_start as u64,
-                    n_major as u64,
-                    n_vars as u64,
-                    nnz,
-                );
-
-                let name = format!("{name_prefix}_shard_{}", b.shard_idx);
-
-                Ok(PreEncodedSection {
-                    encoded,
-                    block_index_bytes,
-                    header_buf,
-                    section_checksum,
-                    section_length,
-                    stats,
-                    name,
                     section_type,
-                    nnz,
-                })
+                    ModalityType::Rna,
+                    name,
+                )
+                .map_err(|e| e.to_string())
             })
             .collect()
     });
