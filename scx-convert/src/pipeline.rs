@@ -36,6 +36,9 @@ pub enum ConvertError {
     #[error("format mismatch: expected {expected}, got {got}")]
     FormatMismatch { expected: String, got: String },
 
+    #[error("streaming unsupported: {0}")]
+    StreamingUnsupported(String),
+
     #[error("{0}")]
     Other(String),
 }

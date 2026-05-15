@@ -15,6 +15,8 @@ mod dtype;
 #[cfg(feature = "hdf5")]
 mod h5ad_read;
 #[cfg(feature = "hdf5")]
+mod h5ad_stream;
+#[cfg(feature = "hdf5")]
 mod h5ad_write;
 #[cfg(feature = "hdf5")]
 mod mudata_pipeline;
@@ -22,6 +24,9 @@ mod mudata_pipeline;
 mod mudata_write;
 #[cfg(feature = "hdf5")]
 mod tenx_read;
+
+#[cfg(feature = "hdf5")]
+pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
 
 #[cfg(feature = "hdf5")]
 pub mod pipeline;

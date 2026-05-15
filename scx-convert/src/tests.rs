@@ -1407,3 +1407,231 @@ fn test_append_for_modality_updates_table() {
         .collect();
     assert!(new_shards.len() as u32 >= rna_post.n_csr_shards);
 }
+
+// -----------------------------------------------------------------------
+// Phase 1 — streaming reader (XStreamReader / open_x_streaming /
+// open_layer_streaming). Verifies the row-range reader yields the same
+// data as the existing bulk `read_x_matrix` path and refuses
+// unsupported on-disk layouts (CSC, dense).
+// -----------------------------------------------------------------------
+
+use super::h5ad_read::read_x_matrix;
+use super::h5ad_stream::{open_layer_streaming, open_x_streaming};
+
+/// Drive `next_shard` to exhaustion, returning the concatenated
+/// (indptr, indices, values) in their full-matrix layout. Re-bases
+/// the per-shard local indptr to a global running total.
+fn drain_streaming(
+    reader: &mut super::h5ad_stream::XStreamReader,
+    target_rows: usize,
+) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+    let n_obs = reader.n_obs;
+    let mut full_indptr: Vec<u64> = Vec::with_capacity(n_obs + 1);
+    full_indptr.push(0);
+    let mut full_indices: Vec<u32> = Vec::new();
+    let mut full_values: Vec<f32> = Vec::new();
+    let mut row_count = 0usize;
+
+    while let Some(shard) = reader.next_shard(target_rows) {
+        let shard = shard.expect("shard read failed");
+        assert_eq!(
+            shard.row_start, row_count,
+            "row_start must equal cumulative row count"
+        );
+        let base = *full_indptr.last().unwrap();
+        for &v in &shard.indptr[1..] {
+            full_indptr.push(base + v);
+        }
+        full_indices.extend_from_slice(&shard.indices);
+        full_values.extend_from_slice(&shard.values);
+        row_count += shard.n_rows;
+    }
+    assert_eq!(row_count, n_obs);
+    (full_indptr, full_indices, full_values)
+}
+
+#[test]
+fn streaming_csr_round_trip_matches_bulk_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_csr.h5ad");
+    let n_obs = 37;
+    let n_vars = 15;
+    create_test_h5ad(&path, n_obs, n_vars, "csr", false);
+
+    let (bulk_indptr, bulk_indices, bulk_data, bulk_n_obs, bulk_n_vars) = {
+        let f = hdf5::File::open(&path).unwrap();
+        read_x_matrix(&f, MatrixFormat::Csr).unwrap()
+    };
+    assert_eq!(bulk_n_obs, n_obs);
+    assert_eq!(bulk_n_vars, n_vars);
+
+    let file = hdf5::File::open(&path).unwrap();
+    let mut reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    assert_eq!(reader.n_obs, n_obs);
+    assert_eq!(reader.n_vars, n_vars);
+
+    let (stream_indptr, stream_indices, stream_values) = drain_streaming(&mut reader, 10);
+
+    let bulk_indptr_u64: Vec<u64> = bulk_indptr.iter().map(|&v| v as u64).collect();
+    let bulk_indices_u32: Vec<u32> = bulk_indices.iter().map(|&v| v as u32).collect();
+    assert_eq!(stream_indptr, bulk_indptr_u64);
+    assert_eq!(stream_indices, bulk_indices_u32);
+    assert_eq!(stream_values, bulk_data);
+}
+
+#[test]
+fn streaming_layer_matches_x_for_synthetic_fixture() {
+    // create_test_h5ad with include_extras=true writes a "raw" layer
+    // that mirrors X exactly. Streaming the layer must therefore
+    // yield the same content as streaming X.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_layer.h5ad");
+    let n_obs = 24;
+    let n_vars = 10;
+    create_test_h5ad(&path, n_obs, n_vars, "csr", true);
+
+    let file = hdf5::File::open(&path).unwrap();
+    let mut x_reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let (x_indptr, x_indices, x_values) = drain_streaming(&mut x_reader, 7);
+
+    let mut layer_reader = open_layer_streaming(&file, "raw").unwrap();
+    assert_eq!(layer_reader.n_obs, n_obs);
+    assert_eq!(layer_reader.n_vars, n_vars);
+    let (l_indptr, l_indices, l_values) = drain_streaming(&mut layer_reader, 7);
+
+    assert_eq!(x_indptr, l_indptr);
+    assert_eq!(x_indices, l_indices);
+    assert_eq!(x_values, l_values);
+}
+
+#[test]
+fn streaming_rejects_csc_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_csc.h5ad");
+    create_test_h5ad(&path, 6, 5, "csc", false);
+
+    let file = hdf5::File::open(&path).unwrap();
+    let err = open_x_streaming(&file, "X", MatrixFormat::Csc).unwrap_err();
+    match err {
+        ConvertError::StreamingUnsupported(msg) => {
+            assert!(
+                msg.contains("CSC"),
+                "error message should mention CSC; got: {msg}"
+            );
+        }
+        other => panic!("expected StreamingUnsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn streaming_rejects_dense_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_dense.h5ad");
+    create_test_h5ad(&path, 6, 5, "dense", false);
+
+    let file = hdf5::File::open(&path).unwrap();
+    let err = open_x_streaming(&file, "X", MatrixFormat::Dense).unwrap_err();
+    match err {
+        ConvertError::StreamingUnsupported(msg) => {
+            assert!(
+                msg.contains("dense"),
+                "error message should mention dense; got: {msg}"
+            );
+        }
+        other => panic!("expected StreamingUnsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn streaming_empty_matrix_yields_no_shards() {
+    // Build a minimal h5ad with n_obs = 0 by hand — create_test_h5ad's
+    // loop is unbounded but works at zero, producing indptr = [0] and
+    // empty indices / data datasets.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_empty.h5ad");
+    let n_vars = 5;
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let x = file.create_group("X").unwrap();
+        let indptr: Vec<i64> = vec![0];
+        x.new_dataset::<i64>()
+            .shape([1])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        // hdf5 doesn't allow zero-sized writes via the typed builder;
+        // create empty datasets via shape=[0] and skip the .write().
+        x.new_dataset::<i32>().shape([0]).create("indices").unwrap();
+        x.new_dataset::<f32>().shape([0]).create("data").unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[0i64, n_vars as i64])
+            .unwrap();
+    }
+
+    let file = hdf5::File::open(&path).unwrap();
+    let mut reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    assert_eq!(reader.n_obs, 0);
+    assert_eq!(reader.n_vars, n_vars);
+    assert!(reader.next_shard(16).is_none());
+}
+
+#[test]
+fn streaming_handles_empty_rows() {
+    // Hand-build a CSR fixture where some rows have zero nnz. The
+    // streaming reader must yield row counts unchanged and nnz == 4.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stream_empty_rows.h5ad");
+    let n_vars: usize = 4;
+    let indptr: Vec<i64> = vec![0, 2, 2, 2, 4, 4]; // 5 rows, rows 1/2/4 empty
+    let indices: Vec<i32> = vec![0, 1, 2, 3];
+    let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[5i64, n_vars as i64])
+            .unwrap();
+    }
+
+    let file = hdf5::File::open(&path).unwrap();
+    let mut reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let (full_indptr, full_indices, full_values) = drain_streaming(&mut reader, 2);
+    assert_eq!(full_indptr, vec![0, 2, 2, 2, 4, 4]);
+    assert_eq!(full_indices, vec![0u32, 1, 2, 3]);
+    assert_eq!(full_values, vec![1.0, 2.0, 3.0, 4.0]);
+}
