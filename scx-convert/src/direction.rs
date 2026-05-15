@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub(crate) fn determine_convert_direction(
+pub fn determine_convert_direction(
     from: Option<&str>,
     to: Option<&str>,
     input: &Path,

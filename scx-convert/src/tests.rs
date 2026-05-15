@@ -1246,51 +1246,6 @@ fn test_info_modality_table_exposed() {
     }
 }
 
-/// Phase F.4: `scx subset --modality NAME` extracts a single modality
-/// to a fresh single-modality SCX file. The extract preserves the
-/// modality's per-modality `n_vars` and the file's global obs.
-#[test]
-fn test_subset_extract_modality() {
-    use super::mudata_pipeline::h5mu_to_scx;
-
-    let dir = tempfile::tempdir().unwrap();
-    let h5mu_in = dir.path().join("in.h5mu");
-    let scx_in = dir.path().join("multi.scx");
-    let scx_out = dir.path().join("rna_only.scx");
-    create_test_h5mu(&h5mu_in, 10, 25, 6);
-
-    let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_in, &scx_in, &opts).unwrap();
-
-    crate::subset::run_subset(
-        &scx_in,
-        Some(&scx_out),
-        None,
-        None,
-        Some("rna"),
-        false,
-        10000,
-        "auto",
-        false,
-        5000,
-    )
-    .unwrap();
-
-    let out = ScxReader::open(&scx_out).unwrap();
-    assert!(
-        !out.is_multimodal(),
-        "extracted file should be single-modality"
-    );
-    assert_eq!(out.header().n_obs, 10);
-    assert_eq!(
-        out.header().n_vars,
-        25,
-        "rna's n_vars (not the file-wide max)"
-    );
-    let csr = out.read_all_csr_shards().unwrap();
-    assert_eq!(csr.shape, (10, 25));
-}
-
 /// Phase F.4: `scx merge` rejects two multimodal files with mismatched
 /// modality structures. The user-facing error directs to extract-then-
 /// merge.

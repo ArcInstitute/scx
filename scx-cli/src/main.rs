@@ -7,7 +7,7 @@ mod append;
 mod benchmark;
 mod build_csc;
 mod compact;
-mod convert;
+use scx_convert as convert;
 mod delete;
 mod info;
 mod merge;

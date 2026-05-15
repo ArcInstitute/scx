@@ -1,0 +1,35 @@
+[package]
+name = "scx-convert"
+version = "0.3.0"
+edition = "2021"
+description = "External format <-> SCX conversion (h5ad, h5mu, MTX, 10x)"
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+hdf5 = ["dep:hdf5", "dep:hdf5-sys", "dep:libz-sys", "dep:ndarray"]
+# Bundles libhdf5 + zlib statically — mirrors scx-cli's hdf5-static feature.
+hdf5-static = ["hdf5", "hdf5-sys/static", "hdf5-sys/zlib", "libz-sys/static"]
+
+[dependencies]
+arrow = { workspace = true }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+half = { workspace = true }
+chrono = "0.4"
+scx-format = { path = "../scx-format" }
+scx-codec = { path = "../scx-codec" }
+scx-sparse = { path = "../scx-sparse" }
+scx-mtx = { path = "../scx-mtx" }
+
+hdf5 = { workspace = true, optional = true }
+hdf5-sys = { version = "0.8", optional = true }
+libz-sys = { version = "1", optional = true, default-features = false }
+ndarray = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+flate2 = "1"

@@ -2823,6 +2823,7 @@ dependencies = [
  "scx-accel",
  "scx-cloud",
  "scx-codec",
+ "scx-convert",
  "scx-engine",
  "scx-format",
  "scx-loader",
@@ -3390,13 +3391,11 @@ dependencies = [
  "flate2",
  "half",
  "hdf5",
- "hdf5-sys",
  "indicatif",
- "libz-sys",
  "log",
- "ndarray 0.15.6",
  "scx-cloud",
  "scx-codec",
+ "scx-convert",
  "scx-engine",
  "scx-format",
  "scx-mtx",
@@ -3445,6 +3444,29 @@ dependencies = [
  "proptest",
  "thiserror 2.0.18",
  "zstd",
+]
+
+[[package]]
+name = "scx-convert"
+version = "0.3.0"
+dependencies = [
+ "arrow",
+ "byteorder",
+ "chrono",
+ "flate2",
+ "half",
+ "hdf5",
+ "hdf5-sys",
+ "libz-sys",
+ "log",
+ "ndarray 0.15.6",
+ "scx-codec",
+ "scx-format",
+ "scx-mtx",
+ "scx-sparse",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

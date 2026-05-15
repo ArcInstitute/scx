@@ -8,20 +8,23 @@ authors.workspace = true
 
 [features]
 default = []
-hdf5 = ["dep:hdf5", "dep:ndarray"]
+# Conversion paths that need libhdf5: h5ad, h5mu, 10x. The actual code
+# lives in scx-convert; this feature is just the toggle.
+hdf5 = ["scx-convert/hdf5", "dep:hdf5"]
 # Bundles libhdf5 + zlib statically into the binary via hdf5-src + libz-sys.
 # Used by the release workflow so downloaded binaries have no system libhdf5
 # runtime requirement. Pulls in CMake at build time.
-hdf5-static = ["hdf5", "hdf5-sys/static", "hdf5-sys/zlib", "libz-sys/static"]
+hdf5-static = ["hdf5", "scx-convert/hdf5-static"]
 cloud = ["dep:scx-cloud", "dep:tokio"]
 
 [dependencies]
 clap = { workspace = true }
 indicatif = { workspace = true }
+# `hdf5` is still pulled in here so the integration test under
+# tests/convert_subset.rs (which constructs an h5mu fixture directly)
+# can build under `--features hdf5`. The conversion pipelines themselves
+# live in scx-convert.
 hdf5 = { workspace = true, optional = true }
-hdf5-sys = { version = "0.8", optional = true }
-libz-sys = { version = "1", optional = true, default-features = false }
-ndarray = { workspace = true, optional = true }
 arrow = { workspace = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
@@ -32,6 +35,7 @@ scx-sparse = { path = "../scx-sparse" }
 scx-ops = { path = "../scx-ops" }
 scx-engine = { path = "../scx-engine" }
 scx-mtx = { path = "../scx-mtx" }
+scx-convert = { path = "../scx-convert" }
 scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 chrono = "0.4"
