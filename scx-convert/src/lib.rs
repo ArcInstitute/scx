@@ -9,6 +9,8 @@ pub use direction::determine_convert_direction;
 #[cfg(feature = "hdf5")]
 mod csc_transpose;
 #[cfg(feature = "hdf5")]
+mod dense_stream;
+#[cfg(feature = "hdf5")]
 mod detect;
 #[cfg(feature = "hdf5")]
 mod dtype;
@@ -32,6 +34,8 @@ mod stream;
 #[cfg(feature = "hdf5")]
 mod warnings;
 
+#[cfg(feature = "hdf5")]
+pub use dense_stream::{open_dense_layer_streaming, open_dense_streaming, DenseXStreamReader};
 #[cfg(feature = "hdf5")]
 pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
 

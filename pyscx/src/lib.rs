@@ -228,7 +228,11 @@ fn from_anndata(
 ///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
 #[cfg(feature = "hdf5")]
 #[pyfunction]
-#[pyo3(signature = (path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
+#[pyo3(signature = (
+    path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
+    uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
+    memory_budget=None,
+))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
     py: Python<'_>,
@@ -239,6 +243,10 @@ fn from_h5ad(
     csc: &str,
     csc_cols_per_shard: usize,
     uns_format: &str,
+    stream: bool,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
+    memory_budget: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -252,6 +260,7 @@ fn from_h5ad(
     };
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
+    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
 
     // Open the h5ad in backed mode so obs / var / obsm / varm / uns
     // are extractable as Python objects but X stays on disk. The
@@ -273,6 +282,10 @@ fn from_h5ad(
         csc_always,
         csc_cols_per_shard,
         uns_format_parsed,
+        stream,
+        strict_uns,
+        dense_zero_epsilon,
+        memory_budget_bytes,
     )
 }
 

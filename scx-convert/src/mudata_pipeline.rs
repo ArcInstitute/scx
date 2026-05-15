@@ -116,7 +116,7 @@ pub fn h5mu_to_scx(
     let mut max_n_vars: u64 = 0;
     for mname in &modality_names {
         let x_path = format!("mod/{mname}/X");
-        let fmt = detect_matrix_format_at(&file, &x_path)?;
+        let fmt = detect_matrix_format_at(&file, &x_path, sink)?;
         let (indptr, _indices, _data, mod_n_obs, mod_n_vars) =
             read_x_matrix_at(&file, &x_path, fmt)?;
         if mod_n_obs != n_obs {
@@ -185,7 +185,8 @@ pub fn h5mu_to_scx(
     }
 
     // Outer uns (global) → write as the global uns blob.
-    if let Ok(uns) = super::h5ad_read::read_uns(&file) {
+    if file.group("uns").is_ok() {
+        let uns = super::h5ad_read::read_uns(&file, opts.strict_uns, sink)?;
         writer.write_uns(&uns)?;
     }
 

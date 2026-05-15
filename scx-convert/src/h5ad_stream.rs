@@ -13,6 +13,7 @@ use super::detect::MatrixFormat;
 use super::h5ad_read::read_i64_dataset;
 use super::pipeline::ConvertError;
 use super::stream::{CsrShardStream, StreamedCsrShard};
+use super::warnings::{ConvertWarning, WarningSink};
 
 /// A single shard's worth of CSR rows read from an h5ad file.
 ///
@@ -57,6 +58,7 @@ pub fn open_x_streaming(
     file: &hdf5::File,
     group_path: &str,
     format: MatrixFormat,
+    sink: &mut WarningSink,
 ) -> Result<XStreamReader, ConvertError> {
     if matches!(format, MatrixFormat::Dense) {
         return Err(ConvertError::StreamingUnsupported(
@@ -85,22 +87,31 @@ pub fn open_x_streaming(
 
     // Best-effort encoding-type sanity check. Newer h5ad files set
     // this attribute; older files omit it — in that case we trust the
-    // caller's `format` argument.
-    if let Ok(attr) = group.attr("encoding-type") {
-        if let Ok(enc) = attr.read_scalar::<VarLenUnicode>() {
-            let enc_s = enc.as_str();
-            if enc_s == "csc_matrix" {
-                return Err(ConvertError::StreamingUnsupported(
-                    "CSC-on-disk h5ad cannot stream; pass --stream=false or \
-                     pre-convert to CSR"
-                        .into(),
-                ));
+    // caller's `format` argument and emit a warning so the conversion
+    // record reflects the inference.
+    match group.attr("encoding-type") {
+        Ok(attr) => {
+            if let Ok(enc) = attr.read_scalar::<VarLenUnicode>() {
+                let enc_s = enc.as_str();
+                if enc_s == "csc_matrix" {
+                    return Err(ConvertError::StreamingUnsupported(
+                        "CSC-on-disk h5ad cannot stream; pass --stream=false or \
+                         pre-convert to CSR"
+                            .into(),
+                    ));
+                }
+                if enc_s != "csr_matrix" {
+                    return Err(ConvertError::StreamingUnsupported(format!(
+                        "unsupported encoding-type '{enc_s}' for streaming"
+                    )));
+                }
             }
-            if enc_s != "csr_matrix" {
-                return Err(ConvertError::StreamingUnsupported(format!(
-                    "unsupported encoding-type '{enc_s}' for streaming"
-                )));
-            }
+        }
+        Err(_) => {
+            sink.emit(ConvertWarning::InferredEncoding {
+                path: group_path.to_string(),
+                inferred: "csr_matrix (no encoding-type attr)".into(),
+            });
         }
     }
 
@@ -133,8 +144,14 @@ pub fn open_x_streaming(
 pub fn open_layer_streaming(
     file: &hdf5::File,
     layer_name: &str,
+    sink: &mut WarningSink,
 ) -> Result<XStreamReader, ConvertError> {
-    open_x_streaming(file, &format!("layers/{layer_name}"), MatrixFormat::Csr)
+    open_x_streaming(
+        file,
+        &format!("layers/{layer_name}"),
+        MatrixFormat::Csr,
+        sink,
+    )
 }
 
 impl XStreamReader {

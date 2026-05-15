@@ -82,6 +82,22 @@ enum Commands {
         /// streaming write completes.
         #[arg(long)]
         stream: bool,
+        /// Memory budget for slab-sizing heuristics (Phase 1 dense
+        /// streaming, Phase 2 transpose buffers, Phase 8c worker
+        /// derate). Accepts bare bytes, `K`/`M`/`G`/`T`, or
+        /// `KiB`/`MiB`/`GiB`/`TiB`. Decimal suffixes (`KB`, `MB`)
+        /// are rejected as ambiguous. None = each phase's default.
+        #[arg(long, value_name = "SIZE")]
+        memory_budget: Option<String>,
+        /// Fail conversion on the first unsupported `uns` key
+        /// instead of skipping it with a warning.
+        #[arg(long)]
+        strict_uns: bool,
+        /// Drop dense values with `|v| <= EPSILON` during
+        /// sparsification. Default `0.0` keeps the equality-to-zero
+        /// filtering that matches scipy `csr_matrix(dense)`.
+        #[arg(long, value_name = "EPSILON", default_value_t = 0.0)]
+        dense_zero_epsilon: f32,
     },
     /// Display SCX file information
     Info {
@@ -379,6 +395,9 @@ fn main() {
             csc_cols_per_shard,
             modality,
             stream,
+            memory_budget,
+            strict_uns,
+            dense_zero_epsilon,
         } => run_convert(
             &input,
             &output,
@@ -390,6 +409,9 @@ fn main() {
             csc_cols_per_shard,
             modality.as_deref(),
             stream,
+            memory_budget.as_deref(),
+            strict_uns,
+            dense_zero_epsilon,
         ),
         Commands::Info {
             file,
@@ -554,6 +576,9 @@ fn run_convert(
     csc_cols_per_shard: usize,
     modality: Option<&str>,
     stream: bool,
+    memory_budget: Option<&str>,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -596,6 +621,23 @@ fn run_convert(
         _ => {}
     }
 
+    // Parse `--memory-budget` once here so an invalid value fails the
+    // command before we touch the file. Empty string and `None` both
+    // mean "use default heuristics" (= `ConvertOptions::memory_budget = None`).
+    // The parser lives behind scx-convert's `hdf5` feature gate; the
+    // non-hdf5 CLI stub never reaches the dispatch, so silently drop
+    // the budget there (it would be unused anyway).
+    #[cfg(feature = "hdf5")]
+    let memory_budget_bytes: Option<u64> = match memory_budget {
+        None => None,
+        Some(s) => Some(convert::MemoryBudget::parse(s)?),
+    };
+    #[cfg(not(feature = "hdf5"))]
+    let memory_budget_bytes: Option<u64> = {
+        let _ = memory_budget;
+        None
+    };
+
     dispatch_convert(
         direction,
         input,
@@ -606,6 +648,9 @@ fn run_convert(
         csc_cols_per_shard,
         modality,
         stream,
+        memory_budget_bytes,
+        strict_uns,
+        dense_zero_epsilon,
     )
 }
 
@@ -621,6 +666,9 @@ fn dispatch_convert(
     csc_cols_per_shard: usize,
     modality: Option<&str>,
     stream: bool,
+    memory_budget: Option<u64>,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -648,7 +696,10 @@ fn dispatch_convert(
         csc: csc_always,
         csc_cols_per_shard,
         tool: "scx-cli".into(),
-        ..ConvertOptions::default()
+        memory_budget,
+        stream,
+        strict_uns,
+        dense_zero_epsilon,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -745,6 +796,9 @@ fn dispatch_convert(
     _csc_cols_per_shard: usize,
     _modality: Option<&str>,
     _stream: bool,
+    _memory_budget: Option<u64>,
+    _strict_uns: bool,
+    _dense_zero_epsilon: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

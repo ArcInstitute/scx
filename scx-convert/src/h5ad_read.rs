@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::csc_transpose::csc_to_csr;
 use super::detect::MatrixFormat;
 use super::pipeline::ConvertError;
+use super::warnings::{ConvertWarning, WarningSink};
 
 /// CSR matrix arrays + shape: (indptr, indices, data, n_obs, n_vars)
 type CsrArrays = (Vec<i64>, Vec<i32>, Vec<f32>, usize, usize);
@@ -560,19 +561,33 @@ fn read_obsm_entry(obsm_group: &hdf5::Group, name: &str) -> Result<RecordBatch, 
 }
 
 /// Read uns (unstructured) section from h5ad file as JSON.
-pub fn read_uns(file: &hdf5::File) -> Result<serde_json::Value, ConvertError> {
+///
+/// `strict_uns = false` (default) skips unsupported keys with a
+/// [`ConvertWarning::SkippedUnsKey`] emission. `strict_uns = true`
+/// aborts on the first unsupported key.
+pub fn read_uns(
+    file: &hdf5::File,
+    strict_uns: bool,
+    sink: &mut WarningSink,
+) -> Result<serde_json::Value, ConvertError> {
     let uns_group = file.group("uns")?;
     let member_names = uns_group.member_names()?;
 
     let mut map = serde_json::Map::new();
 
     for name in &member_names {
-        match read_uns_entry(&uns_group, name) {
+        match read_uns_entry(&uns_group, name, strict_uns, sink) {
             Ok(value) => {
                 map.insert(name.clone(), value);
             }
             Err(e) => {
-                eprintln!("warning: skipping uns/{name}: {e}");
+                if strict_uns {
+                    return Err(e);
+                }
+                sink.emit(ConvertWarning::SkippedUnsKey {
+                    key: name.clone(),
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -580,7 +595,12 @@ pub fn read_uns(file: &hdf5::File) -> Result<serde_json::Value, ConvertError> {
     Ok(serde_json::Value::Object(map))
 }
 
-fn read_uns_entry(group: &hdf5::Group, name: &str) -> Result<serde_json::Value, ConvertError> {
+fn read_uns_entry(
+    group: &hdf5::Group,
+    name: &str,
+    strict_uns: bool,
+    sink: &mut WarningSink,
+) -> Result<serde_json::Value, ConvertError> {
     // Try reading as dataset first
     if let Ok(ds) = group.dataset(name) {
         let desc = ds.dtype()?.to_descriptor()?;
@@ -651,12 +671,18 @@ fn read_uns_entry(group: &hdf5::Group, name: &str) -> Result<serde_json::Value, 
         let sub_members = subgroup.member_names()?;
         let mut sub_map = serde_json::Map::new();
         for sub_name in &sub_members {
-            match read_uns_entry(&subgroup, sub_name) {
+            match read_uns_entry(&subgroup, sub_name, strict_uns, sink) {
                 Ok(v) => {
                     sub_map.insert(sub_name.clone(), v);
                 }
                 Err(e) => {
-                    eprintln!("warning: skipping uns/{name}/{sub_name}: {e}");
+                    if strict_uns {
+                        return Err(e);
+                    }
+                    sink.emit(ConvertWarning::SkippedUnsKey {
+                        key: format!("{name}/{sub_name}"),
+                        reason: e.to_string(),
+                    });
                 }
             }
         }

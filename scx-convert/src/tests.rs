@@ -939,7 +939,10 @@ fn test_format_detection() {
     create_test_h5ad(&h5ad_path, 5, 3, "csr", false);
     let file = hdf5::File::open(&h5ad_path).unwrap();
     assert_eq!(detect_input_format(&file).unwrap(), InputFormat::H5ad);
-    assert_eq!(detect_matrix_format(&file).unwrap(), MatrixFormat::Csr);
+    assert_eq!(
+        detect_matrix_format(&file, &mut WarningSink::log()).unwrap(),
+        MatrixFormat::Csr
+    );
 
     // 10x
     let tenx_path = dir.path().join("det.h5");
@@ -1468,7 +1471,8 @@ fn streaming_csr_round_trip_matches_bulk_reader() {
     assert_eq!(bulk_n_vars, n_vars);
 
     let file = hdf5::File::open(&path).unwrap();
-    let mut reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let mut reader =
+        open_x_streaming(&file, "X", MatrixFormat::Csr, &mut WarningSink::log()).unwrap();
     assert_eq!(reader.n_obs, n_obs);
     assert_eq!(reader.n_vars, n_vars);
 
@@ -1493,10 +1497,11 @@ fn streaming_layer_matches_x_for_synthetic_fixture() {
     create_test_h5ad(&path, n_obs, n_vars, "csr", true);
 
     let file = hdf5::File::open(&path).unwrap();
-    let mut x_reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let mut x_reader =
+        open_x_streaming(&file, "X", MatrixFormat::Csr, &mut WarningSink::log()).unwrap();
     let (x_indptr, x_indices, x_values) = drain_streaming(&mut x_reader, 7);
 
-    let mut layer_reader = open_layer_streaming(&file, "raw").unwrap();
+    let mut layer_reader = open_layer_streaming(&file, "raw", &mut WarningSink::log()).unwrap();
     assert_eq!(layer_reader.n_obs, n_obs);
     assert_eq!(layer_reader.n_vars, n_vars);
     let (l_indptr, l_indices, l_values) = drain_streaming(&mut layer_reader, 7);
@@ -1513,7 +1518,7 @@ fn streaming_rejects_csc_on_disk() {
     create_test_h5ad(&path, 6, 5, "csc", false);
 
     let file = hdf5::File::open(&path).unwrap();
-    let err = open_x_streaming(&file, "X", MatrixFormat::Csc).unwrap_err();
+    let err = open_x_streaming(&file, "X", MatrixFormat::Csc, &mut WarningSink::log()).unwrap_err();
     match err {
         ConvertError::StreamingUnsupported(msg) => {
             assert!(
@@ -1532,7 +1537,8 @@ fn streaming_rejects_dense_on_disk() {
     create_test_h5ad(&path, 6, 5, "dense", false);
 
     let file = hdf5::File::open(&path).unwrap();
-    let err = open_x_streaming(&file, "X", MatrixFormat::Dense).unwrap_err();
+    let err =
+        open_x_streaming(&file, "X", MatrixFormat::Dense, &mut WarningSink::log()).unwrap_err();
     match err {
         ConvertError::StreamingUnsupported(msg) => {
             assert!(
@@ -1580,7 +1586,8 @@ fn streaming_empty_matrix_yields_no_shards() {
     }
 
     let file = hdf5::File::open(&path).unwrap();
-    let mut reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let mut reader =
+        open_x_streaming(&file, "X", MatrixFormat::Csr, &mut WarningSink::log()).unwrap();
     assert_eq!(reader.n_obs, 0);
     assert_eq!(reader.n_vars, n_vars);
     assert!(reader.next_shard(16).is_none());
@@ -1631,7 +1638,8 @@ fn streaming_handles_empty_rows() {
     }
 
     let file = hdf5::File::open(&path).unwrap();
-    let mut reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let mut reader =
+        open_x_streaming(&file, "X", MatrixFormat::Csr, &mut WarningSink::log()).unwrap();
     let (full_indptr, full_indices, full_values) = drain_streaming(&mut reader, 2);
     assert_eq!(full_indptr, vec![0, 2, 2, 2, 4, 4]);
     assert_eq!(full_indices, vec![0u32, 1, 2, 3]);
@@ -2201,8 +2209,10 @@ fn streaming_through_trait_object() {
     create_test_h5ad(&h5ad, 53, 7, "csr", false);
     let file = hdf5::File::open(&h5ad).unwrap();
 
-    let mut concrete = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
-    let mut trait_reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let mut concrete =
+        open_x_streaming(&file, "X", MatrixFormat::Csr, &mut WarningSink::log()).unwrap();
+    let mut trait_reader =
+        open_x_streaming(&file, "X", MatrixFormat::Csr, &mut WarningSink::log()).unwrap();
     let dyn_reader: &mut dyn CsrShardStream = &mut trait_reader;
 
     let target = 16usize;
@@ -2236,4 +2246,427 @@ fn streaming_through_trait_object() {
     assert_eq!(dyn_reader.n_obs(), 53);
     assert_eq!(dyn_reader.n_vars(), 7);
     assert_eq!(dyn_reader.source_matrix_name(), "X");
+}
+
+// -----------------------------------------------------------------------
+// Phase 1 — dense h5ad streaming + wild-h5ad hardening.
+// -----------------------------------------------------------------------
+
+#[test]
+fn phase1_streaming_dense_int_matches_non_streaming() {
+    // Dense /X (f32 with integer values 1-200) → both pipelines must
+    // produce the same CSR header counts and the same per-shard CSR
+    // arrays. Exercises `DenseXStreamReader` via the new dispatch.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense_int.h5ad");
+    create_test_h5ad(&h5ad, 47, 11, "dense", false);
+
+    let scx_stream = dir.path().join("dense_int_stream.scx");
+    let scx_bulk = dir.path().join("dense_int_bulk.scx");
+    let opts = streaming_opts(16);
+
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_stream,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &opts, &mut WarningSink::log()).unwrap();
+
+    let a = ScxReader::open(&scx_stream).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+    assert_eq!(a.header().n_obs, b.header().n_obs);
+    assert_eq!(a.header().n_vars, b.header().n_vars);
+    assert_eq!(a.header().nnz, b.header().nnz);
+    let csr_a = a.read_all_csr_shards().unwrap();
+    let csr_b = b.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.shape, csr_b.shape);
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+}
+
+#[test]
+fn phase1_streaming_dense_float_round_trip() {
+    // Fractional values force `ValueEncoding::Float32` and exercise
+    // the codec dispatch on a float dense fixture. Verify the
+    // round-trip preserves every nonzero within f32 tolerance.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense_float.h5ad");
+    let n_obs = 9usize;
+    let n_vars = 5usize;
+    // hand-built float dense matrix with fractional values
+    let mut dense = vec![0.0f32; n_obs * n_vars];
+    dense[0] = 0.5;
+    dense[3] = 1.25;
+    dense[n_vars + 1] = 2.75;
+    dense[3 * n_vars + 4] = -3.5;
+    dense[7 * n_vars + 2] = 100.125;
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+
+    let scx = dir.path().join("dense_float.scx");
+    let opts = streaming_opts(4);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    assert_eq!(reader.header().n_obs, n_obs as u64);
+    assert_eq!(reader.header().n_vars, n_vars as u64);
+    assert_eq!(reader.header().nnz, 5);
+    let csr = reader.read_all_csr_shards().unwrap();
+    // Reconstruct dense and compare element-wise within tolerance.
+    let mut rebuilt = vec![0.0f32; n_obs * n_vars];
+    for row in 0..n_obs {
+        let start = csr.indptr[row] as usize;
+        let end = csr.indptr[row + 1] as usize;
+        for k in start..end {
+            let col = csr.indices[k] as usize;
+            rebuilt[row * n_vars + col] = csr.data[k];
+        }
+    }
+    for i in 0..(n_obs * n_vars) {
+        let diff = (dense[i] - rebuilt[i]).abs();
+        assert!(
+            diff < 1e-5,
+            "value at index {i}: dense={}, scx={}, diff={diff}",
+            dense[i],
+            rebuilt[i]
+        );
+    }
+}
+
+#[test]
+fn phase1_streaming_dense_empty_rows_round_trip() {
+    // Rows of all zeros must preserve scipy CSR invariants:
+    // `indptr[i] == indptr[i+1]` per empty row, total length n_obs+1.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("empty_rows.h5ad");
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    let mut dense = vec![0.0f32; n_obs * n_vars];
+    // Row 0 has one nonzero, rows 1-3 are empty, row 4 has two, row 5 empty.
+    dense[2] = 7.0;
+    dense[4 * n_vars] = 3.0;
+    dense[4 * n_vars + 3] = 4.0;
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+
+    let scx = dir.path().join("empty_rows.scx");
+    let opts = streaming_opts(8);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.indptr.len(), n_obs + 1);
+    // Empty rows: indptr[i] == indptr[i+1].
+    for i in [1usize, 2, 3, 5] {
+        assert_eq!(
+            csr.indptr[i],
+            csr.indptr[i + 1],
+            "row {i} should be empty (indptr[{i}]={}, indptr[{}]={})",
+            csr.indptr[i],
+            i + 1,
+            csr.indptr[i + 1]
+        );
+    }
+    assert_eq!(csr.indptr[n_obs], 3); // total nnz
+}
+
+#[test]
+fn phase1_streaming_inferred_encoding_emits_warning() {
+    // Build an h5ad whose `/X` group is sparse but has NO
+    // `encoding-type` attribute. The streaming open path infers CSR
+    // from the indptr+indices children and must emit one
+    // `InferredEncoding` warning.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("no_enc.h5ad");
+    write_csr_h5ad_without_encoding_type(&h5ad, 4, 3);
+
+    let scx = dir.path().join("no_enc.scx");
+    let opts = streaming_opts(8);
+    let mut sink = WarningSink::log();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut sink,
+    )
+    .unwrap();
+    // The Phase 1 inference is emitted by both `detect_matrix_format`
+    // (children-based fallback) and `open_x_streaming` (attr-absent
+    // fallback). Either way the category counter must be non-zero.
+    let n = sink.counts().get("inferred_encoding").copied().unwrap_or(0);
+    assert!(n >= 1, "expected ≥1 inferred_encoding warning, got {n}");
+}
+
+#[test]
+fn phase1_streaming_strict_uns_errors_on_unsupported_key() {
+    // Build an h5ad with an unsupported `uns/bad3d` entry (3D
+    // dataset). Lenient: convert succeeds + SkippedUnsKey warning.
+    // Strict: convert returns ConvertError.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("bad_uns.h5ad");
+    create_test_h5ad(&h5ad, 4, 3, "csr", false);
+    {
+        let file = hdf5::File::open_rw(&h5ad).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        // 3D dataset → read_uns_entry rejects shape.len() == 3.
+        let nd = ndarray::Array3::<f32>::zeros((2, 2, 2));
+        uns.new_dataset::<f32>()
+            .shape([2, 2, 2])
+            .create("bad3d")
+            .unwrap()
+            .write(&nd)
+            .unwrap();
+    }
+    let opts_lenient = streaming_opts(8);
+    let scx = dir.path().join("bad_uns_lenient.scx");
+    let mut sink = WarningSink::log();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts_lenient,
+        &StreamingOverrides::default(),
+        &mut sink,
+    )
+    .expect("lenient mode must accept unsupported uns key");
+    assert!(sink.counts().get("skipped_uns_key").copied().unwrap_or(0) >= 1);
+
+    let mut opts_strict = streaming_opts(8);
+    opts_strict.strict_uns = true;
+    let scx_strict = dir.path().join("bad_uns_strict.scx");
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_strict,
+        &opts_strict,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect_err("strict mode must error on first unsupported uns key");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("uns") || msg.contains("dataset shape") || msg.contains("scalar"),
+        "expected unsupported-uns error, got: {msg}"
+    );
+}
+
+#[test]
+fn phase1_streaming_dense_determinism() {
+    // Re-running the streaming dense pipeline on the same fixture
+    // must produce byte-identical output.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("det.h5ad");
+    create_test_h5ad(&h5ad, 20, 6, "dense", false);
+    let opts = streaming_opts(5);
+
+    let scx_a = dir.path().join("a.scx");
+    let scx_b = dir.path().join("b.scx");
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_a,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_b,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let bytes_a = std::fs::read(&scx_a).unwrap();
+    let bytes_b = std::fs::read(&scx_b).unwrap();
+    // SCX provenance carries a timestamp — strip the on-disk file
+    // checksum from the comparison by comparing the CSR shards
+    // directly instead of full file bytes.
+    let ra = ScxReader::open(&scx_a).unwrap();
+    let rb = ScxReader::open(&scx_b).unwrap();
+    let csr_a = ra.read_all_csr_shards().unwrap();
+    let csr_b = rb.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+    // Both writes should have produced the same number of bytes
+    // even though provenance timestamps may differ.
+    assert_eq!(
+        bytes_a.len(),
+        bytes_b.len(),
+        "two streaming runs produced different output sizes"
+    );
+}
+
+#[test]
+fn phase1_streaming_dense_memory_budget_caps_slab() {
+    // With `memory_budget` set so the per-row dense cost forces
+    // `max_slab_rows < shard_target_rows`, the first emitted shard
+    // must have `n_rows < shard_target_rows`.
+    use super::dense_stream::open_dense_streaming;
+    use super::stream::CsrShardStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("budget.h5ad");
+    let n_obs = 32usize;
+    let n_vars = 1000usize;
+    let dense = vec![0.0f32; n_obs * n_vars];
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+
+    let file = hdf5::File::open(&h5ad).unwrap();
+    // Budget = n_vars * 4 (f32) * shard_target_rows / 2 — half what
+    // a full shard would need, so the slab cap activates.
+    let shard_target_rows: usize = 16;
+    let budget = (n_vars as u64) * 4 * (shard_target_rows as u64) / 2;
+
+    let opts = ConvertOptions {
+        memory_budget: Some(budget),
+        shard_target_rows: shard_target_rows as u32,
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    let mut reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
+    let shard = reader
+        .next_csr_shard(shard_target_rows)
+        .unwrap()
+        .expect("expected at least one shard");
+    assert!(
+        (shard.n_rows as usize) < shard_target_rows,
+        "memory_budget should cap slab to <{shard_target_rows} rows; got {}",
+        shard.n_rows
+    );
+    assert!(shard.n_rows >= 1);
+}
+
+// -----------------------------------------------------------------------
+// Phase 1 fixture helpers
+// -----------------------------------------------------------------------
+
+/// Write a 2D f32 dense `/X` with obs/var index but no extras.
+#[cfg(test)]
+fn write_dense_h5ad(path: &Path, n_obs: usize, n_vars: usize, dense: &[f32]) {
+    assert_eq!(dense.len(), n_obs * n_vars);
+    let file = hdf5::File::create(path).unwrap();
+    let nd = ndarray::Array2::from_shape_vec((n_obs, n_vars), dense.to_vec()).unwrap();
+    file.new_dataset::<f32>()
+        .shape([n_obs, n_vars])
+        .create("X")
+        .unwrap()
+        .write(&nd)
+        .unwrap();
+
+    let obs = file.create_group("obs").unwrap();
+    let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+    obs.new_dataset::<VarLenUnicode>()
+        .shape([n_obs])
+        .create("_index")
+        .unwrap()
+        .write(&obs_index)
+        .unwrap();
+    obs.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+
+    let var = file.create_group("var").unwrap();
+    let var_index: Vec<VarLenUnicode> = (0..n_vars).map(|i| vlu(&format!("gene_{i}"))).collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([n_vars])
+        .create("_index")
+        .unwrap()
+        .write(&var_index)
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+}
+
+/// Write a CSR `/X` group with `indptr`/`indices`/`data` children
+/// AND a `shape` attribute, but deliberately omit `encoding-type`.
+/// Used to test the inference path.
+#[cfg(test)]
+fn write_csr_h5ad_without_encoding_type(path: &Path, n_obs: usize, n_vars: usize) {
+    let file = hdf5::File::create(path).unwrap();
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for row in 0..n_obs {
+        let col = row % n_vars;
+        indices.push(col as i32);
+        data.push((row as f32) + 1.0);
+        indptr.push(data.len() as i64);
+    }
+    let x = file.create_group("X").unwrap();
+    x.new_dataset::<i64>()
+        .shape([indptr.len()])
+        .create("indptr")
+        .unwrap()
+        .write(&indptr)
+        .unwrap();
+    x.new_dataset::<i32>()
+        .shape([indices.len()])
+        .create("indices")
+        .unwrap()
+        .write(&indices)
+        .unwrap();
+    x.new_dataset::<f32>()
+        .shape([data.len()])
+        .create("data")
+        .unwrap()
+        .write(&data)
+        .unwrap();
+    x.new_attr::<i64>()
+        .shape([2])
+        .create("shape")
+        .unwrap()
+        .write(&[n_obs as i64, n_vars as i64])
+        .unwrap();
+    // NB: NO `encoding-type` attr → triggers the inference path.
+
+    let obs = file.create_group("obs").unwrap();
+    let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+    obs.new_dataset::<VarLenUnicode>()
+        .shape([n_obs])
+        .create("_index")
+        .unwrap()
+        .write(&obs_index)
+        .unwrap();
+    obs.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+
+    let var = file.create_group("var").unwrap();
+    let var_index: Vec<VarLenUnicode> = (0..n_vars).map(|i| vlu(&format!("gene_{i}"))).collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([n_vars])
+        .create("_index")
+        .unwrap()
+        .write(&var_index)
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
 }
