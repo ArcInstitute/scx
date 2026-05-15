@@ -2602,6 +2602,7 @@ fn route_backed_anndata_to_streaming(
         codec: explicit_codec,
         csc: csc_always,
         csc_cols_per_shard,
+        tool: "pyscx".into(),
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);

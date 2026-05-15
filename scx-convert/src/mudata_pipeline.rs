@@ -290,8 +290,12 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
-        tool: "scx-cli".to_string(),
-        params_json: format!("{{\"input\":\"{}\",\"format\":\"h5mu\"}}", input.display()),
+        tool: opts.tool.clone(),
+        params_json: serde_json::json!({
+            "input": input.display().to_string(),
+            "format": "h5mu",
+        })
+        .to_string(),
         input_checksums: vec![],
     }])?;
 

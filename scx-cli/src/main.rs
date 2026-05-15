@@ -647,6 +647,7 @@ fn dispatch_convert(
         codec: explicit_codec,
         csc: csc_always,
         csc_cols_per_shard,
+        tool: "scx-cli".into(),
     };
 
     let pb = ProgressBar::new_spinner();

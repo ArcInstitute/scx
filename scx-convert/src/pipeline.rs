@@ -62,6 +62,10 @@ pub struct ConvertOptions {
     /// Columns per CSC shard when `csc == true`. `0` disables the
     /// cap (single CSC shard, memory permitting).
     pub csc_cols_per_shard: usize,
+    /// Tool name recorded in the provenance entry. Defaults to
+    /// `"scx-cli"`; `pyscx` overrides this to `"pyscx"` so the
+    /// recorded provenance reflects the actual caller.
+    pub tool: String,
 }
 
 impl Default for ConvertOptions {
@@ -71,6 +75,7 @@ impl Default for ConvertOptions {
             codec: None,
             csc: false,
             csc_cols_per_shard: 5000,
+            tool: "scx-cli".into(),
         }
     }
 }
@@ -206,8 +211,12 @@ pub fn h5ad_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
-        tool: "scx-cli".to_string(),
-        params_json: format!("{{\"input\":\"{}\",\"format\":\"h5ad\"}}", input.display()),
+        tool: opts.tool.clone(),
+        params_json: serde_json::json!({
+            "input": input.display().to_string(),
+            "format": "h5ad",
+        })
+        .to_string(),
         input_checksums: vec![],
     }])?;
 
@@ -301,8 +310,12 @@ pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
-        tool: "scx-cli".to_string(),
-        params_json: format!("{{\"input\":\"{}\",\"format\":\"10x\"}}", input.display()),
+        tool: opts.tool.clone(),
+        params_json: serde_json::json!({
+            "input": input.display().to_string(),
+            "format": "10x",
+        })
+        .to_string(),
         input_checksums: vec![],
     }])?;
 
@@ -439,8 +452,8 @@ pub fn h5ad_to_scx_streaming(
     let mut shard_idx: u32 = 0;
     while let Some(slice_result) = x_reader.next_shard(target_rows) {
         let mut slice = slice_result?;
-        sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
         drop_explicit_zeros_inplace(&mut slice.indptr, &mut slice.indices, &mut slice.values);
+        sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
         let pre = encode_one_shard(
             &slice.indptr,
             &slice.indices,
@@ -509,27 +522,59 @@ pub fn h5ad_to_scx_streaming(
         }
     }
 
-    // Layers (one streaming pass per layer).
+    // Layers (one streaming pass per layer). Best-effort per layer:
+    // an open failure (dense/CSC layer, malformed encoding, shape
+    // mismatch with X) is logged and skipped, mirroring the
+    // non-streaming `read_layers` warn-and-continue behaviour
+    // (scx-convert/src/h5ad_read.rs). Once a layer's shards start
+    // writing, a mid-stream shard error aborts — leaving a
+    // half-written layer in the SCX file would be worse than failing
+    // loudly. Width-dependent encoding values are recomputed per
+    // layer instead of inheriting `X`'s.
     if let Ok(layers_group) = file.group("layers") {
         let layer_names = layers_group.member_names()?;
         for layer_name in &layer_names {
-            let mut layer_reader = open_layer_streaming(&file, layer_name)?;
+            let mut layer_reader = match open_layer_streaming(&file, layer_name) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("warning: skipping streaming layer '{layer_name}': {e}");
+                    continue;
+                }
+            };
+            if layer_reader.n_obs != n_obs {
+                eprintln!(
+                    "warning: skipping streaming layer '{layer_name}': n_obs {} does not match X n_obs {}",
+                    layer_reader.n_obs, n_obs
+                );
+                continue;
+            }
+            let l_n_vars = layer_reader.n_vars;
+            let l_n_vars_u32 = match u32::try_from(l_n_vars) {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!(
+                        "warning: skipping streaming layer '{layer_name}': n_vars {l_n_vars} exceeds u32::MAX"
+                    );
+                    continue;
+                }
+            };
+            let l_index_dtype: u8 = if l_n_vars <= 65535 { 0 } else { 1 };
             let mut layer_shard_idx: u32 = 0;
             while let Some(slice_result) = layer_reader.next_shard(target_rows) {
                 let mut slice = slice_result?;
-                sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
                 drop_explicit_zeros_inplace(
                     &mut slice.indptr,
                     &mut slice.indices,
                     &mut slice.values,
                 );
+                sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
                 let pre = encode_one_shard(
                     &slice.indptr,
                     &slice.indices,
                     &slice.values,
                     opts.codec,
-                    index_dtype,
-                    n_vars_u32,
+                    l_index_dtype,
+                    l_n_vars_u32,
                     slice.row_start as u64,
                     SectionType::LayerCsrShard,
                     ModalityType::Rna,
@@ -550,11 +595,13 @@ pub fn h5ad_to_scx_streaming(
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
-        tool: "scx-cli".to_string(),
-        params_json: format!(
-            "{{\"input\":\"{}\",\"format\":\"h5ad\",\"stream\":true}}",
-            input.display()
-        ),
+        tool: opts.tool.clone(),
+        params_json: serde_json::json!({
+            "input": input.display().to_string(),
+            "format": "h5ad",
+            "stream": true,
+        })
+        .to_string(),
         input_checksums: vec![],
     }])?;
 

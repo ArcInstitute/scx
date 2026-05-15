@@ -215,11 +215,11 @@ fn read_slice_i32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<i3
     let sel = s![start..end];
     match desc {
         TypeDescriptor::Integer(IntSize::U4) => {
-            let data: Vec<i32> = ds.read_slice_1d::<i32, _>(sel)?.to_vec();
+            let (data, _) = ds.read_slice_1d::<i32, _>(sel)?.into_raw_vec_and_offset();
             Ok(data)
         }
         TypeDescriptor::Integer(IntSize::U8) => {
-            let data: Vec<i64> = ds.read_slice_1d::<i64, _>(sel)?.to_vec();
+            let (data, _) = ds.read_slice_1d::<i64, _>(sel)?.into_raw_vec_and_offset();
             if let Some(&v) = data
                 .iter()
                 .find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64)
@@ -228,16 +228,16 @@ fn read_slice_i32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<i3
                     "i64 index value {v} out of i32 range"
                 )));
             }
-            Ok(data.iter().map(|&v| v as i32).collect())
+            Ok(data.into_iter().map(|v| v as i32).collect())
         }
         TypeDescriptor::Unsigned(IntSize::U4) => {
-            let data: Vec<u32> = ds.read_slice_1d::<u32, _>(sel)?.to_vec();
+            let (data, _) = ds.read_slice_1d::<u32, _>(sel)?.into_raw_vec_and_offset();
             if let Some(&v) = data.iter().find(|&&v| v > i32::MAX as u32) {
                 return Err(ConvertError::Other(format!(
                     "u32 index value {v} exceeds i32::MAX"
                 )));
             }
-            Ok(data.iter().map(|&v| v as i32).collect())
+            Ok(data.into_iter().map(|v| v as i32).collect())
         }
         other => Err(ConvertError::UnsupportedDtype(format!(
             "indices dtype {other:?} not supported by streaming reader"
@@ -251,20 +251,20 @@ fn read_slice_f32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<f3
     let sel = s![start..end];
     match desc {
         TypeDescriptor::Float(hdf5::types::FloatSize::U4) => {
-            let data: Vec<f32> = ds.read_slice_1d::<f32, _>(sel)?.to_vec();
+            let (data, _) = ds.read_slice_1d::<f32, _>(sel)?.into_raw_vec_and_offset();
             Ok(data)
         }
         TypeDescriptor::Float(hdf5::types::FloatSize::U8) => {
-            let data: Vec<f64> = ds.read_slice_1d::<f64, _>(sel)?.to_vec();
-            Ok(data.iter().map(|&v| v as f32).collect())
+            let (data, _) = ds.read_slice_1d::<f64, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(|v| v as f32).collect())
         }
         TypeDescriptor::Integer(IntSize::U4) => {
-            let data: Vec<i32> = ds.read_slice_1d::<i32, _>(sel)?.to_vec();
-            Ok(data.iter().map(|&v| v as f32).collect())
+            let (data, _) = ds.read_slice_1d::<i32, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(|v| v as f32).collect())
         }
         TypeDescriptor::Unsigned(IntSize::U4) => {
-            let data: Vec<u32> = ds.read_slice_1d::<u32, _>(sel)?.to_vec();
-            Ok(data.iter().map(|&v| v as f32).collect())
+            let (data, _) = ds.read_slice_1d::<u32, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(|v| v as f32).collect())
         }
         other => Err(ConvertError::UnsupportedDtype(format!(
             "data dtype {other:?} not supported by streaming reader"

@@ -189,6 +189,77 @@ fn convert_stream_csc_always_emits_sidecar() {
     );
 }
 
+/// Attach a dense `/layers/{name}` group to an existing h5ad fixture.
+/// `open_layer_streaming` rejects dense layers; this lets us exercise
+/// the warn-and-skip path through the CLI surface.
+fn attach_dense_layer(h5ad: &Path, layer_name: &str, n_obs: usize, n_vars: usize) {
+    let file = hdf5::File::open_rw(h5ad).unwrap();
+    let layers = match file.group("layers") {
+        Ok(g) => g,
+        Err(_) => file.create_group("layers").unwrap(),
+    };
+    let dense = layers.create_group(layer_name).unwrap();
+    dense
+        .new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("array"))
+        .unwrap();
+    dense
+        .new_attr::<i64>()
+        .shape([2])
+        .create("shape")
+        .unwrap()
+        .write(&[n_obs as i64, n_vars as i64])
+        .unwrap();
+}
+
+#[test]
+fn convert_stream_skips_unreadable_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("with_bad_layer.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 32, 8);
+    attach_dense_layer(&h5ad, "dense_bad", 32, 8);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let status = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--stream",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scx convert --stream failed to spawn");
+    assert!(
+        status.success(),
+        "scx convert --stream must skip the bad layer, not abort; exited {status}"
+    );
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let hdr = reader.header();
+    assert_eq!(hdr.n_obs, 32);
+    assert_eq!(hdr.n_vars, 8);
+    assert!(hdr.n_csr_shards >= 1, "expected at least one CSR shard");
+    let dense_count = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| {
+            e.section_type == SectionType::LayerCsrShard && e.name.starts_with("dense_bad_shard_")
+        })
+        .count();
+    assert_eq!(
+        dense_count, 0,
+        "the dense layer must be silently skipped, not emit shards"
+    );
+}
+
 #[test]
 fn convert_stream_rejects_h5mu_direction() {
     // We don't need a valid h5mu file — `--from h5mu` selects the

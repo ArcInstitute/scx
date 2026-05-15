@@ -1655,6 +1655,7 @@ fn streaming_opts(shard_size: u32) -> ConvertOptions {
         codec: None,
         csc: false,
         csc_cols_per_shard: 5000,
+        tool: "scx-cli".into(),
     }
 }
 
@@ -1888,6 +1889,7 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
         codec: None,
         csc: true,
         csc_cols_per_shard: 5,
+        tool: "scx-cli".into(),
     };
     h5ad_to_scx_streaming(&h5ad, &scx_stream, &opts, &StreamingOverrides::default()).unwrap();
     h5ad_to_scx(&h5ad, &scx_bulk, &opts).unwrap();
@@ -2002,4 +2004,119 @@ fn streaming_two_layer_round_trip() {
         counts_count >= 1,
         "expected at least one 'counts' layer shard"
     );
+}
+
+#[test]
+fn streaming_skips_unreadable_layer() {
+    // A dense `/layers/{name}` group must not abort the streaming
+    // convert — `open_layer_streaming` rejects dense layers, the
+    // pipeline should warn and continue. Mirrors the non-streaming
+    // `read_layers` best-effort behaviour.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("bad_layer.h5ad");
+    let n_obs = 12;
+    let n_vars = 5;
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", true);
+    {
+        let file = hdf5::File::open_rw(&h5ad).unwrap();
+        let layers = file.group("layers").unwrap();
+        let dense = layers.create_group("dense_bad").unwrap();
+        // Mark as a dense matrix so `open_layer_streaming` rejects it.
+        dense
+            .new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("array"))
+            .unwrap();
+        dense
+            .new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+    }
+
+    let scx = dir.path().join("bad_layer.scx");
+    let opts = streaming_opts(8);
+    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default())
+        .expect("streaming convert must skip the bad layer, not abort");
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let layer_entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::LayerCsrShard)
+        .collect();
+    let raw_count = layer_entries
+        .iter()
+        .filter(|e| e.name.starts_with("raw_shard_"))
+        .count();
+    let dense_count = layer_entries
+        .iter()
+        .filter(|e| e.name.starts_with("dense_bad_shard_"))
+        .count();
+    assert!(
+        raw_count >= 1,
+        "expected the valid 'raw' layer to still be converted"
+    );
+    assert_eq!(
+        dense_count, 0,
+        "the dense 'dense_bad' layer must be silently skipped, not emit shards"
+    );
+}
+
+#[test]
+fn streaming_provenance_escapes_path_quotes() {
+    // A path containing a `"` would break the previous
+    // `format!`-built JSON; the `serde_json::json!` construction
+    // must produce parseable JSON for any path.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("has\"quote.h5ad");
+    create_test_h5ad(&h5ad, 8, 4, "csr", false);
+
+    let scx = dir.path().join("out.scx");
+    let opts = streaming_opts(4);
+    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let prov = reader.read_provenance().unwrap();
+    assert_eq!(prov.operations.len(), 1);
+    let entry = &prov.operations[0];
+    assert_eq!(entry.action, "convert");
+    assert_eq!(entry.tool, "scx-cli");
+    // `params_json` must round-trip through serde_json::from_str —
+    // proves the path was escaped correctly.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&entry.params_json).expect("params_json must be valid JSON");
+    assert_eq!(parsed["format"], "h5ad");
+    assert_eq!(parsed["stream"], true);
+    let recorded = parsed["input"]
+        .as_str()
+        .expect("input field must be a string");
+    assert!(
+        recorded.ends_with("has\"quote.h5ad"),
+        "input path must contain the literal quote, got {recorded:?}"
+    );
+}
+
+#[test]
+fn streaming_provenance_uses_configured_tool_name() {
+    // `ConvertOptions::tool` must flow through to the provenance
+    // entry verbatim — `pyscx` overrides it to "pyscx" so the
+    // recorded provenance reflects the actual caller.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("rt.h5ad");
+    create_test_h5ad(&h5ad, 6, 3, "csr", false);
+
+    let scx = dir.path().join("out.scx");
+    let mut opts = streaming_opts(4);
+    opts.tool = "pyscx".into();
+    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let prov = reader.read_provenance().unwrap();
+    assert_eq!(prov.operations.len(), 1);
+    assert_eq!(prov.operations[0].tool, "pyscx");
 }

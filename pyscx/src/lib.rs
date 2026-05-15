@@ -252,6 +252,7 @@ fn from_h5ad(
         codec: explicit_codec,
         csc: csc_always,
         csc_cols_per_shard,
+        tool: "pyscx".into(),
     };
 
     let input = std::path::PathBuf::from(path);
