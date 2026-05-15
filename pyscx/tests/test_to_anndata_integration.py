@@ -1215,3 +1215,146 @@ def test_obs_filter_preserve_slots_rejects_non_boolean_expression(tmp_dir):
 
     with pytest.raises(ValueError, match="boolean mask"):
         pyscx.open(path).to_anndata(obs_filter="n_counts", preserve_slots=True)
+
+
+# ---------------------------------------------------------------------------
+# Review issue #8: predicate grammar parity between preserve_slots=True
+# (pandas.eval) and preserve_slots=False (SCX predicate engine).
+# ---------------------------------------------------------------------------
+
+
+def _adata_for_grammar_parity():
+    """8×2 AnnData with cell_type + integer n_counts for predicate testing."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    x = sp.csr_matrix(np.eye(8, 2, dtype=np.float32))
+    obs = pd.DataFrame(
+        {
+            "cell_type": pd.Categorical(
+                [
+                    "T cell",
+                    "B cell",
+                    "T cell",
+                    "NK cell",
+                    "B cell",
+                    "T cell",
+                    "NK cell",
+                    "B cell",
+                ]
+            ),
+            "n_counts": np.array([10, 30, 70, 90, 50, 20, 80, 40], dtype=np.int64),
+        },
+        index=[f"c{i}" for i in range(8)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(2)])
+    return anndata.AnnData(X=x, obs=obs, var=var)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "cell_type == 'T cell'",
+        "n_counts > 50",
+        "n_counts >= 50",
+        "n_counts > 30 and cell_type == 'T cell'",
+        "cell_type in ['T cell', 'B cell']",
+        "not (cell_type == 'NK cell')",
+        "(n_counts > 50) or (cell_type == 'NK cell')",
+    ],
+)
+def test_obs_filter_grammar_parity_common_ground(tmp_dir, expr):
+    """Expressions accepted by both the SCX engine and pandas.eval must
+    select identical row sets.
+
+    The common-ground subset that users can rely on across both paths:
+    comparison operators (==, !=, <, <=, >, >=), keyword-form boolean
+    operators (`and` / `or` / `not`), `in [...]` against a bracket-delimited
+    list literal, and parenthesised sub-expressions. Divergences are
+    documented in docs/scanpy.md (see "Filter Expression Compatibility").
+    """
+    import warnings as warnings_mod
+
+    import pyscx
+
+    adata = _adata_for_grammar_parity()
+    path = str(tmp_dir / "grammar_parity.scx")
+    pyscx.from_anndata(adata, path)
+
+    eager = pyscx.open(path).to_anndata(obs_filter=expr, preserve_slots=False)
+    with warnings_mod.catch_warnings():
+        # Suppress the pandas.eval grammar-shift warning emitted by the
+        # preserve_slots=True path; the surrounding test is the parity
+        # check itself, not the warning assertion.
+        warnings_mod.simplefilter("ignore")
+        preserved = pyscx.open(path).to_anndata(obs_filter=expr, preserve_slots=True)
+
+    assert list(eager.obs.index) == list(preserved.obs.index), (
+        f"obs index mismatch for {expr!r}: "
+        f"engine={list(eager.obs.index)} pandas={list(preserved.obs.index)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "expr,reason",
+    [
+        (
+            "n_counts > 50 & cell_type == 'T cell'",
+            "pandas.eval accepts `&` as bitwise-and; SCX requires `and`",
+        ),
+        (
+            "cell_type in ('T cell', 'B cell')",
+            "pandas.eval accepts tuple literals; SCX `in` requires `[...]`",
+        ),
+    ],
+)
+def test_obs_filter_grammar_divergence_scx_rejects(tmp_dir, expr, reason):
+    """Expressions valid in pandas.eval but rejected by the SCX predicate
+    engine. These are intentional divergences — the SCX grammar is the
+    canonical form for preserve_slots=False / backed=True / cloud
+    selective-pull. Users hitting these errors should rewrite the
+    expression in the common-ground subset above.
+    """
+    import warnings as warnings_mod
+
+    import pyscx
+
+    adata = _adata_for_grammar_parity()
+    path = str(tmp_dir / "grammar_divergence.scx")
+    pyscx.from_anndata(adata, path)
+
+    # SCX path raises; the precise error class is RuntimeError today
+    # (predicate parse errors wrap through QueryPipeline).
+    with pytest.raises((RuntimeError, ValueError)):
+        pyscx.open(path).to_anndata(obs_filter=expr, preserve_slots=False)
+
+    # pandas.eval path accepts the expression (the point of the divergence).
+    with warnings_mod.catch_warnings():
+        warnings_mod.simplefilter("ignore")
+        result = pyscx.open(path).to_anndata(obs_filter=expr, preserve_slots=True)
+    assert result.n_obs >= 0, reason
+
+
+def test_obs_filter_preserve_slots_emits_pandas_eval_warning(tmp_dir):
+    """preserve_slots=True must surface the pandas.eval grammar shift via
+    warnings.warn so notebook users see it without reading docs."""
+    import warnings as warnings_mod
+
+    import pyscx
+
+    adata = _adata_for_grammar_parity()
+    path = str(tmp_dir / "grammar_warning.scx")
+    pyscx.from_anndata(adata, path)
+
+    with warnings_mod.catch_warnings(record=True) as caught:
+        warnings_mod.simplefilter("always")
+        pyscx.open(path).to_anndata(
+            obs_filter="cell_type == 'T cell'", preserve_slots=True
+        )
+
+    matching = [w for w in caught if "pandas.eval" in str(w.message)]
+    assert matching, [str(w.message) for w in caught]
+    msg = str(matching[0].message)
+    assert "preserve_slots" in msg
+    assert "SCX predicate engine" in msg
