@@ -26,6 +26,8 @@ use scx_codec::value_encoding::is_integer_data;
 
 use super::dtype::detect_value_encoding;
 use super::pipeline::{h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions};
+use super::stream::{CsrShardStream, StreamedCsrShard};
+use super::warnings::WarningSink;
 
 // -----------------------------------------------------------------------
 // Test helpers: create synthetic h5ad and 10x files
@@ -401,7 +403,7 @@ fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
 
     // h5ad → scx
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Verify scx
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -409,7 +411,7 @@ fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
     assert_eq!(reader.n_vars(), n_vars as u64);
 
     // scx → h5ad
-    scx_to_h5ad(&scx_path, &h5ad_out).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
     // Verify round-trip: read back and compare X data
     let orig_file = hdf5::File::open(&h5ad_path).unwrap();
@@ -463,7 +465,7 @@ fn test_dense_x() {
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "dense", false);
 
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     assert_eq!(reader.n_obs(), n_obs as u64);
@@ -484,13 +486,13 @@ fn test_csc_x() {
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csc", false);
 
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Compare with CSR version
     let csr_h5ad = dir.path().join("csr.h5ad");
     let csr_scx = dir.path().join("csr.scx");
     create_test_h5ad(&csr_h5ad, n_obs, n_vars, "csr", false);
-    h5ad_to_scx(&csr_h5ad, &csr_scx, &opts).unwrap();
+    h5ad_to_scx(&csr_h5ad, &csr_scx, &opts, &mut WarningSink::log()).unwrap();
 
     let csc_reader = ScxReader::open(&scx_path).unwrap();
     let csr_reader = ScxReader::open(&csr_scx).unwrap();
@@ -535,7 +537,7 @@ fn test_uns_skip_non_serializable() {
     }
 
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     let uns = reader.read_uns().unwrap();
@@ -601,8 +603,8 @@ fn test_categorical_columns() {
     }
 
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
-    scx_to_h5ad(&scx_path, &h5ad_out).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
     // Verify categorical survived
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -626,7 +628,7 @@ fn test_format_detection_mismatch() {
 
     // Try converting as h5ad → should error with helpful message
     let opts = ConvertOptions::default();
-    let result = h5ad_to_scx(&tenx_path, &scx_path, &opts);
+    let result = h5ad_to_scx(&tenx_path, &scx_path, &opts, &mut WarningSink::log());
     assert!(result.is_err());
     match result.unwrap_err() {
         ConvertError::FormatMismatch { expected, got } => {
@@ -674,19 +676,19 @@ fn test_integer_dtype_detection() {
 
     // detect_value_encoding (auto-codec selection: pass `None` for the
     // explicit-codec override).
-    let (enc, codec) = detect_value_encoding(&[1.0, 2.0, 255.0], None);
+    let (enc, codec) = detect_value_encoding(&[1.0, 2.0, 255.0], None).unwrap();
     assert_eq!(enc, ValueEncoding::Uint8);
     assert_eq!(codec, CodecId::Scx1);
 
-    let (enc, codec) = detect_value_encoding(&[1.0, 256.0], None);
+    let (enc, codec) = detect_value_encoding(&[1.0, 256.0], None).unwrap();
     assert_eq!(enc, ValueEncoding::Uint16);
     assert_eq!(codec, CodecId::Scx1);
 
-    let (enc, codec) = detect_value_encoding(&[1.0, 70000.0], None);
+    let (enc, codec) = detect_value_encoding(&[1.0, 70000.0], None).unwrap();
     assert_eq!(enc, ValueEncoding::Uint32);
     assert_eq!(codec, CodecId::Scx1);
 
-    let (enc, codec) = detect_value_encoding(&[0.5, 1.5], None);
+    let (enc, codec) = detect_value_encoding(&[0.5, 1.5], None).unwrap();
     assert_eq!(enc, ValueEncoding::Float32);
     assert_eq!(codec, CodecId::Zstd);
 }
@@ -729,7 +731,7 @@ fn test_multi_shard() {
         shard_target_rows: 10,
         ..ConvertOptions::default()
     };
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     assert_eq!(reader.header().n_csr_shards, 3); // 10 + 10 + 5
@@ -823,7 +825,7 @@ fn test_float_data_uses_zstd() {
     }
 
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     // Should use Zstd for float data
@@ -850,7 +852,7 @@ fn test_h5ad_to_scx_csc_always() {
         csc_cols_per_shard: 4, // → ceil(10/4) = 3 CSC shards
         ..ConvertOptions::default()
     };
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     let hdr = reader.header();
@@ -921,7 +923,7 @@ fn test_h5ad_default_csc_off() {
     create_test_h5ad(&h5ad_path, 10, 8, "csr", true);
 
     let opts = ConvertOptions::default();
-    h5ad_to_scx(&h5ad_path, &scx_path, &opts).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     assert!(!reader.header().has_csc());
@@ -1054,7 +1056,7 @@ fn test_h5mu_round_trip() {
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     assert!(reader.is_multimodal());
@@ -1106,7 +1108,7 @@ fn test_h5mu_per_modality_codec_routing() {
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     let rna_id = reader.modality_id("rna").unwrap();
@@ -1171,7 +1173,7 @@ fn test_scx_to_h5mu_round_trip() {
     create_test_h5mu(&h5mu_in, 8, 30, 5);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_in, &scx_path, &opts).unwrap();
+    h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5mu(&scx_path, &h5mu_out).unwrap();
 
     let file = hdf5::File::open(&h5mu_out).unwrap();
@@ -1203,7 +1205,7 @@ fn test_modality_extract_to_h5ad() {
     create_test_h5mu(&h5mu_in, 6, 40, 7);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_in, &scx_path, &opts).unwrap();
+    h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna").unwrap();
 
     let file = hdf5::File::open(&h5ad_out).unwrap();
@@ -1230,7 +1232,7 @@ fn test_info_modality_table_exposed() {
     create_test_h5mu(&h5mu_path, 8, 30, 5);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     let table = reader.modality_table().expect("modality table present");
@@ -1264,8 +1266,8 @@ fn test_merge_multimodal_mismatch_raises() {
     create_test_h5mu(&h5mu_a, 6, 30, 5);
     create_test_h5mu(&h5mu_b, 6, 50, 5); // different rna n_vars
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_a, &scx_a, &opts).unwrap();
-    h5mu_to_scx(&h5mu_b, &scx_b, &opts).unwrap();
+    h5mu_to_scx(&h5mu_a, &scx_a, &opts, &mut WarningSink::log()).unwrap();
+    h5mu_to_scx(&h5mu_b, &scx_b, &opts, &mut WarningSink::log()).unwrap();
 
     // The pre-existing n_vars mismatch trips first (header.n_vars
     // is the per-file max). Either way the merge must fail with a
@@ -1297,8 +1299,8 @@ fn test_merge_multimodal_match_still_unsupported() {
     create_test_h5mu(&h5mu_a, 6, 30, 5);
     create_test_h5mu(&h5mu_b, 6, 30, 5); // matching modality structure
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_a, &scx_a, &opts).unwrap();
-    h5mu_to_scx(&h5mu_b, &scx_b, &opts).unwrap();
+    h5mu_to_scx(&h5mu_a, &scx_a, &opts, &mut WarningSink::log()).unwrap();
+    h5mu_to_scx(&h5mu_b, &scx_b, &opts, &mut WarningSink::log()).unwrap();
 
     let err = scx_ops::merge(&[&scx_a, &scx_b], &merged).unwrap_err();
     let msg = err.to_string();
@@ -1321,7 +1323,7 @@ fn test_compact_multimodal_unsupported() {
     create_test_h5mu(&h5mu_in, 6, 20, 5);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_in, &scx_in, &opts).unwrap();
+    h5mu_to_scx(&h5mu_in, &scx_in, &opts, &mut WarningSink::log()).unwrap();
 
     let err = scx_ops::compact(&scx_in, &scx_out).unwrap_err();
     let msg = err.to_string();
@@ -1347,7 +1349,7 @@ fn test_append_for_modality_updates_table() {
     create_test_h5mu(&h5mu_path, 8, 20, 5);
 
     let opts = ConvertOptions::default();
-    h5mu_to_scx(&h5mu_path, &scx_path, &opts).unwrap();
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Capture pre-append per-modality state.
     let pre = ScxReader::open(&scx_path).unwrap();
@@ -1656,6 +1658,7 @@ fn streaming_opts(shard_size: u32) -> ConvertOptions {
         csc: false,
         csc_cols_per_shard: 5000,
         tool: "scx-cli".into(),
+        ..ConvertOptions::default()
     }
 }
 
@@ -1669,8 +1672,15 @@ fn streaming_round_trip_matches_non_streaming() {
     let scx_bulk = dir.path().join("bulk.scx");
 
     let opts = streaming_opts(16);
-    h5ad_to_scx_streaming(&h5ad, &scx_stream, &opts, &StreamingOverrides::default()).unwrap();
-    h5ad_to_scx(&h5ad, &scx_bulk, &opts).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_stream,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &opts, &mut WarningSink::log()).unwrap();
 
     let a = ScxReader::open(&scx_stream).unwrap();
     let b = ScxReader::open(&scx_bulk).unwrap();
@@ -1747,7 +1757,14 @@ fn streaming_empty_n_obs_produces_valid_scx() {
 
     let scx = dir.path().join("empty.scx");
     let opts = streaming_opts(16);
-    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let reader = ScxReader::open(&scx).unwrap();
     assert_eq!(reader.header().n_obs, 0);
@@ -1844,7 +1861,14 @@ fn streaming_sets_index_dtype_1_when_n_vars_above_u16() {
 
     let scx = dir.path().join("wide.scx");
     let opts = streaming_opts(16);
-    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let reader = ScxReader::open(&scx).unwrap();
     assert_eq!(reader.header().n_vars, n_vars as u64);
@@ -1863,8 +1887,14 @@ fn streaming_csc_on_disk_errors_at_pipeline_level() {
 
     let scx = dir.path().join("csc.scx");
     let opts = streaming_opts(16);
-    let err = h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default())
-        .expect_err("CSC-on-disk h5ad must be rejected by the streaming pipeline");
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect_err("CSC-on-disk h5ad must be rejected by the streaming pipeline");
     match err {
         ConvertError::StreamingUnsupported(msg) => {
             assert!(
@@ -1890,9 +1920,17 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
         csc: true,
         csc_cols_per_shard: 5,
         tool: "scx-cli".into(),
+        ..ConvertOptions::default()
     };
-    h5ad_to_scx_streaming(&h5ad, &scx_stream, &opts, &StreamingOverrides::default()).unwrap();
-    h5ad_to_scx(&h5ad, &scx_bulk, &opts).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_stream,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &opts, &mut WarningSink::log()).unwrap();
 
     let a = ScxReader::open(&scx_stream).unwrap();
     let b = ScxReader::open(&scx_bulk).unwrap();
@@ -1982,7 +2020,14 @@ fn streaming_two_layer_round_trip() {
 
     let scx = dir.path().join("layers.scx");
     let opts = streaming_opts(8);
-    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let reader = ScxReader::open(&scx).unwrap();
     let layer_entries: Vec<_> = reader
@@ -2039,8 +2084,14 @@ fn streaming_skips_unreadable_layer() {
 
     let scx = dir.path().join("bad_layer.scx");
     let opts = streaming_opts(8);
-    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default())
-        .expect("streaming convert must skip the bad layer, not abort");
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("streaming convert must skip the bad layer, not abort");
 
     let reader = ScxReader::open(&scx).unwrap();
     let layer_entries: Vec<_> = reader
@@ -2078,7 +2129,14 @@ fn streaming_provenance_escapes_path_quotes() {
 
     let scx = dir.path().join("out.scx");
     let opts = streaming_opts(4);
-    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let reader = ScxReader::open(&scx).unwrap();
     let prov = reader.read_provenance().unwrap();
@@ -2113,10 +2171,69 @@ fn streaming_provenance_uses_configured_tool_name() {
     let scx = dir.path().join("out.scx");
     let mut opts = streaming_opts(4);
     opts.tool = "pyscx".into();
-    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let reader = ScxReader::open(&scx).unwrap();
     let prov = reader.read_provenance().unwrap();
     assert_eq!(prov.operations.len(), 1);
     assert_eq!(prov.operations[0].tool, "pyscx");
+}
+
+#[test]
+fn streaming_through_trait_object() {
+    // Phase 0 acceptance criterion 5: the existing concrete reader
+    // must drive the streaming pipeline equivalently when accessed
+    // through `&mut dyn CsrShardStream`. Drains a fixture twice —
+    // once through the inherent `next_shard` (which the in-tree
+    // pipeline uses today) and once through `next_csr_shard` on the
+    // trait — and asserts every emitted shard matches.
+    use super::h5ad_stream::open_x_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("rt.h5ad");
+    create_test_h5ad(&h5ad, 53, 7, "csr", false);
+    let file = hdf5::File::open(&h5ad).unwrap();
+
+    let mut concrete = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let mut trait_reader = open_x_streaming(&file, "X", MatrixFormat::Csr).unwrap();
+    let dyn_reader: &mut dyn CsrShardStream = &mut trait_reader;
+
+    let target = 16usize;
+    let mut total_concrete_rows: usize = 0;
+    let mut total_trait_rows: u64 = 0;
+
+    loop {
+        let lhs = concrete.next_shard(target);
+        let rhs: Option<StreamedCsrShard> = dyn_reader.next_csr_shard(target).unwrap();
+        match (lhs, rhs) {
+            (None, None) => break,
+            (None, Some(_)) | (Some(_), None) => {
+                panic!("inherent and trait drains disagreed on termination")
+            }
+            (Some(Ok(l)), Some(r)) => {
+                assert_eq!(l.row_start as u64, r.row_start);
+                assert_eq!(l.n_rows as u32, r.n_rows);
+                assert_eq!(l.indptr, r.indptr);
+                assert_eq!(l.indices, r.indices);
+                assert_eq!(l.values, r.values);
+                total_concrete_rows += l.n_rows;
+                total_trait_rows += r.n_rows as u64;
+            }
+            (Some(Err(e)), _) => panic!("inherent reader returned error: {e}"),
+        }
+    }
+    assert_eq!(total_concrete_rows, 53);
+    assert_eq!(total_trait_rows, 53);
+
+    // Trait-object exposes shape and source name.
+    assert_eq!(dyn_reader.n_obs(), 53);
+    assert_eq!(dyn_reader.n_vars(), 7);
+    assert_eq!(dyn_reader.source_matrix_name(), "X");
 }

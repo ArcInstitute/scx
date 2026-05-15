@@ -43,5 +43,9 @@ tracing-subscriber = { workspace = true }
 # `NotImplementedError` directing the caller to rebuild with
 # `maturin develop --features hdf5`.
 hdf5 = ["dep:scx-convert", "scx-convert/hdf5"]
+# Bundles libhdf5 + zlib statically — mirrors scx-cli's hdf5-static
+# feature. Used by `maturin build --features hdf5-static` so wheel
+# builds don't depend on a system libhdf5.
+hdf5-static = ["hdf5", "scx-convert/hdf5-static"]
 cloud = ["scx-cloud", "tokio"]
 gpu = ["scx-accel/gpu"]

@@ -648,6 +648,7 @@ fn dispatch_convert(
         csc: csc_always,
         csc_cols_per_shard,
         tool: "scx-cli".into(),
+        ..ConvertOptions::default()
     };
 
     let pb = ProgressBar::new_spinner();
@@ -657,6 +658,11 @@ fn dispatch_convert(
             .expect("valid template"),
     );
     pb.set_message(format!("Converting {}...", input.display()));
+
+    // Structured warning channel (Phase 0.3). Default backend forwards
+    // each emission to `log::warn!`; we also print a per-category
+    // summary at the end of the command.
+    let mut sink = convert::WarningSink::log();
 
     // Special-case scx_to_h5ad on multimodal input: gate on the
     // `--modality` flag and route through `scx_modality_to_h5ad` when
@@ -669,12 +675,13 @@ fn dispatch_convert(
                     output,
                     &opts,
                     &convert::StreamingOverrides::default(),
+                    &mut sink,
                 )
             } else {
-                convert::h5ad_to_scx(input, output, &opts)
+                convert::h5ad_to_scx(input, output, &opts, &mut sink)
             }
         }
-        "h5mu_to_scx" => convert::h5mu_to_scx(input, output, &opts),
+        "h5mu_to_scx" => convert::h5mu_to_scx(input, output, &opts, &mut sink),
         "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts),
         "scx_to_h5ad" => match modality {
             Some(name) => convert::scx_modality_to_h5ad(input, output, name),
@@ -699,7 +706,7 @@ fn dispatch_convert(
                     .into());
                 }
                 drop(reader);
-                convert::scx_to_h5ad(input, output)
+                convert::scx_to_h5ad(input, output, &mut sink)
             }
         },
         "scx_to_h5mu" => convert::scx_to_h5mu(input, output),
@@ -707,6 +714,15 @@ fn dispatch_convert(
     };
 
     pb.finish_and_clear();
+
+    if sink.total() > 0 {
+        let parts: Vec<String> = sink
+            .counts()
+            .iter()
+            .map(|(cat, n)| format!("{cat}={n}"))
+            .collect();
+        eprintln!("{} conversion warnings: {}", sink.total(), parts.join(", "));
+    }
 
     match result {
         Ok(()) => {

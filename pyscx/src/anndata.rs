@@ -2509,6 +2509,32 @@ fn parallel_encode_csr_shards(
     result.map_err(PyRuntimeError::new_err)
 }
 
+/// Forward each non-empty category in `sink` as a single
+/// `warnings.warn(..., UserWarning)` call on the Python side.
+///
+/// The conversion itself runs under `py.allow_threads`, so emission
+/// happens after the GIL is reacquired. One Python-side warning per
+/// category (with its aggregate count) is enough for Phase 0; per-
+/// emission forwarding would require holding the GIL across the
+/// whole conversion.
+#[cfg(feature = "hdf5")]
+pub(crate) fn emit_python_warnings(
+    py: Python<'_>,
+    sink: &scx_convert::WarningSink,
+) -> PyResult<()> {
+    if sink.total() == 0 {
+        return Ok(());
+    }
+    let warnings_mod = py.import("warnings")?;
+    let warn = warnings_mod.getattr("warn")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    for (cat, count) in sink.counts() {
+        let msg = format!("scx conversion: {count} warning(s) of type '{cat}'");
+        warn.call1((msg, user_warning.clone()))?;
+    }
+    Ok(())
+}
+
 /// Route a backed AnnData object through the streaming converter.
 /// Extracts in-memory `obs` / `var` / `uns` / `obsm` / `varm` /
 /// `obsp` / `varp` into Rust types so any caller mutations are
@@ -2617,12 +2643,18 @@ pub(crate) fn route_backed_anndata_to_streaming(
         csc: csc_always,
         csc_cols_per_shard,
         tool: "pyscx".into(),
+        ..scx_convert::ConvertOptions::default()
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);
 
-    py.allow_threads(|| scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    let mut sink = scx_convert::WarningSink::log();
+    py.allow_threads(|| {
+        scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    emit_python_warnings(py, &sink)?;
+    Ok(())
 }
 
 /// Helper for the backed-routing path. Reads a dense mapping

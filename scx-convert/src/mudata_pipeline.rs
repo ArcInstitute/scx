@@ -68,7 +68,12 @@ fn infer_modality_type(name: &str) -> ModalityType {
 }
 
 /// Convert an h5mu file to a multimodal SCX v2 file.
-pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<(), ConvertError> {
+pub fn h5mu_to_scx(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+    sink: &mut super::warnings::WarningSink,
+) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
 
     if !is_h5mu_file(&file) {
@@ -294,6 +299,7 @@ pub fn h5mu_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         params_json: serde_json::json!({
             "input": input.display().to_string(),
             "format": "h5mu",
+            "warnings": sink.summary_json(),
         })
         .to_string(),
         input_checksums: vec![],
