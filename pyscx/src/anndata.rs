@@ -2748,7 +2748,12 @@ pub fn from_anndata_impl(
         }
         #[cfg(not(feature = "hdf5"))]
         {
-            let _ = (explicit_codec, csc_always, csc_cols_per_shard, uns_format_parsed);
+            let _ = (
+                explicit_codec,
+                csc_always,
+                csc_cols_per_shard,
+                uns_format_parsed,
+            );
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "pyscx was built without the `hdf5` feature; backed AnnData \
                  routing requires libhdf5. Rebuild with \
