@@ -194,6 +194,64 @@ The `codec` parameter accepts `"auto"` (default — selects best codec per shard
 `"lz4"` (byte-shuffle + LZ4 frame), or `"none"`. With `"auto"`, integer data uses Scx1 or Zstd
 and float data (e.g., log-normalized layers) uses Pcodec for 7–16% better compression than Zstd.
 
+### From h5ad on disk — streaming (`from_h5ad`)
+
+For h5ad files that don't fit in RAM, use `pyscx.from_h5ad(path, out)`. It
+opens the file in Rust via `scx-convert` and writes one shard's worth of
+rows at a time, bounding peak memory to roughly `shard_target_rows × n_vars × density × ~16 bytes` plus the always-resident `indptr` (`(n_obs + 1) × 8`
+bytes — ~80 MB at 10M cells, ~800 MB at 100M cells).
+No Python AnnData object is constructed.
+
+```python
+import pyscx
+
+# Stream directly from disk — works on files larger than RAM.
+pyscx.from_h5ad("very_large.h5ad", "very_large.scx")
+
+# Same codec / shard / CSC options as from_anndata.
+pyscx.from_h5ad("very_large.h5ad", "very_large.scx",
+                codec="auto", csc="always")
+```
+
+`csc="always"` performs a two-pass write: the streaming path emits CSR
+shards, then `scx_ops::rebuild_csc_inplace` regenerates the CSC sidecar
+over the just-written file. Peak disk briefly reaches ~2× the output
+size during the rebuild.
+
+Limitations:
+
+- The on-disk `X` must be CSR or absent — CSC-on-disk and dense `X`
+  are rejected with a clear error. Pre-convert upstream or use the
+  non-streaming `from_anndata` path with enough RAM.
+- `obsp` / `varp` are silently skipped (no on-disk readers yet — same
+  gap the non-streaming CLI converter has had).
+
+### Backed AnnData — auto-streams via `from_anndata`
+
+`pyscx.from_anndata(adata, out)` now accepts a backed AnnData (one
+loaded with `sc.read_h5ad(path, backed='r')`). When `adata.isbacked` is
+true, the call routes to the streaming pipeline against the underlying
+h5ad file. In-memory mutations to `obs` / `var` / `uns` / `obsm` /
+`varm` / `obsp` / `varp` made before the call are preserved verbatim —
+they're extracted from Python and passed as overrides so the on-disk
+read doesn't clobber them.
+
+```python
+adata = sc.read_h5ad("big.h5ad", backed="r")
+adata.obs["pheno"] = compute_phenotype(adata)   # in-memory mutation OK
+pyscx.from_anndata(adata, "big.scx")            # mutation preserved
+```
+
+Caveats:
+
+- Layers always come from the on-disk h5ad. If you mutated
+  `adata.layers["foo"]` in Python, `from_anndata` will warn you that
+  the in-memory edit is dropped and the on-disk layer is used
+  instead. Write the AnnData out to a fresh h5ad first, then convert.
+- Zarr-backed or duck-typed AnnData-likes without a resolvable
+  `filename` raise `NotImplementedError` pointing at
+  `pyscx.from_h5ad(path, out)`.
+
 ### From 10x HDF5
 
 ```python

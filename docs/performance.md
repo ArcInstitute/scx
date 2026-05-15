@@ -108,6 +108,28 @@ Takeaways:
 
 Source: `benchmarks/comprehensive/results/raw/parallel_write_scaling__{codec}__{dataset}.json` (`metadata.scaling_wall_s.full` and `metadata.scaling_wall_s.write_only`).
 
+### Streaming conversion (h5ad → SCX)
+
+`scx convert --stream` and `pyscx.from_h5ad(path, out)` use a
+shard-at-a-time pipeline (`scx_convert::h5ad_to_scx_streaming`) that
+holds only one shard's worth of CSR in memory plus the always-resident
+`indptr`. Recommended whenever the input doesn't comfortably fit in
+node RAM.
+
+Peak RSS bound: `shard_target_rows × n_vars × density × ~16` bytes +
+`(n_obs + 1) × 8` bytes for indptr. At default
+`shard_target_rows = 16384`, ~5% density, ~20 000 vars → ~130 MB per
+shard plus ~80 MB indptr at 10M cells (~800 MB at 100M cells).
+
+Wall-clock vs. the materialising path is dataset-dependent: for files
+that fit in RAM, the non-streaming converter wins (it can parallel-
+encode all shards via rayon over pre-computed boundaries). Streaming
+trades that for a memory ceiling that's independent of dataset size.
+
+Concrete numbers across `pbmc3k`, `tabula_sapiens_100k`, and
+`census_1m` land with Phase 10's benchmark harness
+(`benchmarks/comprehensive/benchmarks/conversion_streaming.py`).
+
 ## Column Projection (2000 HVGs)
 
 | Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA | SLAF |

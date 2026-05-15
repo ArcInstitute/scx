@@ -1635,3 +1635,371 @@ fn streaming_handles_empty_rows() {
     assert_eq!(full_indices, vec![0u32, 1, 2, 3]);
     assert_eq!(full_values, vec![1.0, 2.0, 3.0, 4.0]);
 }
+
+// -----------------------------------------------------------------------
+// Phase 8 — end-to-end streaming pipeline (h5ad_to_scx_streaming).
+//
+// These differ from the Phase 1 streaming reader tests above: they
+// exercise the full converter (open input → write obs/var → stream
+// shards → write metadata → finish) and assert the resulting SCX
+// file matches the materialising path. CSC sidecar parity and
+// multi-layer round-trips are the load-bearing cases.
+// -----------------------------------------------------------------------
+
+use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+use scx_format::section::SectionType as FmtSectionType;
+
+fn streaming_opts(shard_size: u32) -> ConvertOptions {
+    ConvertOptions {
+        shard_target_rows: shard_size,
+        codec: None,
+        csc: false,
+        csc_cols_per_shard: 5000,
+    }
+}
+
+#[test]
+fn streaming_round_trip_matches_non_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("rt.h5ad");
+    create_test_h5ad(&h5ad, 53, 17, "csr", false);
+
+    let scx_stream = dir.path().join("stream.scx");
+    let scx_bulk = dir.path().join("bulk.scx");
+
+    let opts = streaming_opts(16);
+    h5ad_to_scx_streaming(&h5ad, &scx_stream, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &opts).unwrap();
+
+    let a = ScxReader::open(&scx_stream).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+    assert_eq!(a.header().n_obs, b.header().n_obs);
+    assert_eq!(a.header().n_vars, b.header().n_vars);
+    assert_eq!(a.header().nnz, b.header().nnz);
+    assert_eq!(a.header().n_csr_shards, b.header().n_csr_shards);
+
+    let csr_a = a.read_all_csr_shards().unwrap();
+    let csr_b = b.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.shape, csr_b.shape);
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+}
+
+#[test]
+fn streaming_empty_n_obs_produces_valid_scx() {
+    // Hand-build a 0-row CSR h5ad — `create_test_h5ad`'s loop assumes
+    // n_obs > 0 so we skip it.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("empty.h5ad");
+    let n_vars: usize = 7;
+    {
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([1])
+            .create("indptr")
+            .unwrap()
+            .write(&[0i64])
+            .unwrap();
+        x.new_dataset::<i32>().shape([0]).create("indices").unwrap();
+        x.new_dataset::<f32>().shape([0]).create("data").unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[0i64, n_vars as i64])
+            .unwrap();
+
+        // Minimal obs / var so write_obs / write_var don't error.
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = Vec::new();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([0])
+            .create("_index")
+            .unwrap();
+        let _ = obs_index;
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+        let var = file.create_group("var").unwrap();
+        let var_idx: Vec<VarLenUnicode> = (0..n_vars).map(|i| vlu(&format!("g{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_idx)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let scx = dir.path().join("empty.scx");
+    let opts = streaming_opts(16);
+    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    assert_eq!(reader.header().n_obs, 0);
+    assert_eq!(reader.header().n_vars, n_vars as u64);
+    assert_eq!(reader.header().n_csr_shards, 0);
+    assert_eq!(reader.header().nnz, 0);
+}
+
+#[test]
+fn streaming_sets_index_dtype_1_when_n_vars_above_u16() {
+    // 70_000 vars > u16::MAX (65535) → index_dtype must be 1 (u32 indices).
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("wide.h5ad");
+    let n_obs: usize = 8;
+    let n_vars: usize = 70_000;
+    {
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let x = file.create_group("X").unwrap();
+
+        // One nnz per row, evenly spread across columns up to and
+        // beyond the u16 limit so the on-disk index dtype must be u32
+        // (i32 in scipy's CSR layout).
+        let mut indptr = vec![0i64];
+        let mut indices: Vec<i32> = Vec::with_capacity(n_obs);
+        let mut data: Vec<f32> = Vec::with_capacity(n_obs);
+        let stride = n_vars / n_obs;
+        for row in 0..n_obs {
+            indices.push((row * stride) as i32);
+            data.push((row + 1) as f32);
+            indptr.push(data.len() as i64);
+        }
+
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("c{i}"))).collect();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([n_obs])
+            .create("_index")
+            .unwrap()
+            .write(&obs_index)
+            .unwrap();
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+
+        let var = file.create_group("var").unwrap();
+        // Wide var index: writing 70k VarLenUnicode strings is fast
+        // enough for a test and exercises the read_dataframe_group
+        // path on a large dimension.
+        let var_index: Vec<VarLenUnicode> = (0..n_vars).map(|i| vlu(&format!("g{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let scx = dir.path().join("wide.scx");
+    let opts = streaming_opts(16);
+    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    assert_eq!(reader.header().n_vars, n_vars as u64);
+    assert_eq!(
+        reader.header().index_dtype,
+        1,
+        "n_vars > u16::MAX requires index_dtype = 1 (u32 indices)"
+    );
+}
+
+#[test]
+fn streaming_csc_on_disk_errors_at_pipeline_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc.h5ad");
+    create_test_h5ad(&h5ad, 6, 5, "csc", false);
+
+    let scx = dir.path().join("csc.scx");
+    let opts = streaming_opts(16);
+    let err = h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default())
+        .expect_err("CSC-on-disk h5ad must be rejected by the streaming pipeline");
+    match err {
+        ConvertError::StreamingUnsupported(msg) => {
+            assert!(
+                msg.contains("CSC"),
+                "expected CSC-on-disk error message; got: {msg}"
+            );
+        }
+        other => panic!("expected StreamingUnsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("rt_csc.h5ad");
+    create_test_h5ad(&h5ad, 41, 13, "csr", false);
+
+    let scx_stream = dir.path().join("stream_csc.scx");
+    let scx_bulk = dir.path().join("bulk_csc.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 16,
+        codec: None,
+        csc: true,
+        csc_cols_per_shard: 5,
+    };
+    h5ad_to_scx_streaming(&h5ad, &scx_stream, &opts, &StreamingOverrides::default()).unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &opts).unwrap();
+
+    let a = ScxReader::open(&scx_stream).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+
+    // CSC sidecars present on both files, same shape.
+    assert!(
+        a.header().n_csc_shards >= 1,
+        "streaming run should emit at least one CSC shard, got {}",
+        a.header().n_csc_shards
+    );
+    assert_eq!(a.header().n_csc_shards, b.header().n_csc_shards);
+
+    // Catalog CSC entries align.
+    let csc_a: Vec<_> = a
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::CscShard)
+        .collect();
+    let csc_b: Vec<_> = b
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::CscShard)
+        .collect();
+    assert_eq!(csc_a.len(), csc_b.len());
+    // Section lengths should match — `rebuild_csc_inplace` deterministic
+    // on the same CSR.
+    for (ea, eb) in csc_a.iter().zip(csc_b.iter()) {
+        assert_eq!(ea.length, eb.length, "CSC shard length parity");
+    }
+}
+
+#[test]
+fn streaming_two_layer_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("layers.h5ad");
+    // `create_test_h5ad` with include_extras=true writes a single
+    // "raw" layer. Add a second layer by hand so we exercise the
+    // multi-layer streaming loop.
+    create_test_h5ad(&h5ad, 33, 9, "csr", true);
+    {
+        let file = hdf5::File::open_rw(&h5ad).unwrap();
+        let layers = file.group("layers").unwrap();
+        let counts = layers.create_group("counts").unwrap();
+        // Reuse the same CSR triplet as "raw" — same shape, different
+        // catalog name is enough to verify the multi-layer path.
+        let raw = layers.group("raw").unwrap();
+        let raw_indptr: Vec<i64> = raw.dataset("indptr").unwrap().read_1d().unwrap().to_vec();
+        let raw_indices: Vec<i32> = raw.dataset("indices").unwrap().read_1d().unwrap().to_vec();
+        let raw_data: Vec<f32> = raw.dataset("data").unwrap().read_1d().unwrap().to_vec();
+        counts
+            .new_dataset::<i64>()
+            .shape([raw_indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&raw_indptr)
+            .unwrap();
+        counts
+            .new_dataset::<i32>()
+            .shape([raw_indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&raw_indices)
+            .unwrap();
+        counts
+            .new_dataset::<f32>()
+            .shape([raw_data.len()])
+            .create("data")
+            .unwrap()
+            .write(&raw_data)
+            .unwrap();
+        counts
+            .new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        counts
+            .new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[33i64, 9])
+            .unwrap();
+    }
+
+    let scx = dir.path().join("layers.scx");
+    let opts = streaming_opts(8);
+    h5ad_to_scx_streaming(&h5ad, &scx, &opts, &StreamingOverrides::default()).unwrap();
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let layer_entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::LayerCsrShard)
+        .collect();
+    let raw_count = layer_entries
+        .iter()
+        .filter(|e| e.name.starts_with("raw_shard_"))
+        .count();
+    let counts_count = layer_entries
+        .iter()
+        .filter(|e| e.name.starts_with("counts_shard_"))
+        .count();
+    assert!(raw_count >= 1, "expected at least one 'raw' layer shard");
+    assert!(
+        counts_count >= 1,
+        "expected at least one 'counts' layer shard"
+    );
+}

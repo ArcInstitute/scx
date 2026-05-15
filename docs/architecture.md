@@ -582,6 +582,24 @@ MTX conversion is **always available** — no feature flag required.
   experiment.scx
 ```
 
+The conversion code lives in the **`scx-convert`** crate (workspace
+member 15, opt-in `hdf5` feature). Both `scx-cli` and `pyscx` depend on
+it; the previous in-line `scx-cli/src/convert/` module was extracted
+when streaming conversion landed so `pyscx` could share the pipeline
+without depending on the binary-only `scx-cli`. See
+[STREAMING-CONVERSION.md](../STREAMING-CONVERSION.md) for the full
+design.
+
+**Streaming variant** (`scx convert --stream`, `pyscx.from_h5ad`,
+auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`
+loads the full `indptr` then iterates `XStreamReader::next_shard`,
+running `sort_csr_rows_in_place` + `drop_explicit_zeros_inplace` per
+shard before `encode_one_shard` → `ScxWriter::write_preencoded_shard`.
+Peak memory is bounded by one shard's worth of CSR plus the resident
+indptr, independent of total dataset size. `csc="always"` triggers a
+post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
+~2× the output size during the rebuild).
+
 ### Conversion: MTX ↔ SCX
 
 Cell Ranger MTX conversion uses the `scx-mtx` crate (always-on, no HDF5 dependency):
