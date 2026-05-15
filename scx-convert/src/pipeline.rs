@@ -341,15 +341,6 @@ pub fn h5ad_to_scx_streaming(
     output: &Path,
     opts: &ConvertOptions,
 ) -> Result<(), ConvertError> {
-    if opts.csc {
-        return Err(ConvertError::StreamingUnsupported(
-            "csc sidecar via streaming is not yet implemented; \
-             run `scx build-csc` on the streamed output, or use the \
-             non-streaming converter"
-                .into(),
-        ));
-    }
-
     let file = hdf5::File::open(input)?;
 
     // Format gating. `open_x_streaming` re-checks CSC/dense and the
@@ -504,6 +495,17 @@ pub fn h5ad_to_scx_streaming(
     }])?;
 
     writer.finish()?;
+
+    // CSC sidecar (opt-in). Two-pass: streaming write produces CSR
+    // shards only; if requested, rebuild the CSC sidecar in place
+    // over the just-finished file. Peak disk briefly reaches ~2×
+    // output size for the duration of the rebuild (writes to a
+    // sibling `.rebuild_csc.tmp` and renames).
+    if opts.csc {
+        scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
+            .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
+    }
+
     Ok(())
 }
 

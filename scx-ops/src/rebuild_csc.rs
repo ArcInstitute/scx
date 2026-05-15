@@ -15,7 +15,7 @@ use crate::build_csc;
 /// `target` must exist and contain CSR shards. `csc_cols_per_shard`
 /// and `memory_limit` mirror the `scx build-csc` CLI defaults
 /// (5000 cols/shard, 4G memory budget).
-pub(crate) fn rebuild_csc_inplace(
+pub fn rebuild_csc_inplace(
     target: &Path,
     csc_cols_per_shard: usize,
     memory_limit: &str,

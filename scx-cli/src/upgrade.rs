@@ -10,8 +10,6 @@ use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format::reader::ScxReader;
 use scx_format::writer::ScxWriter;
 
-use crate::rewrite_helpers;
-
 pub fn run_upgrade(
     input: &Path,
     output: Option<&Path>,
@@ -178,7 +176,7 @@ fn rewrite_with_current_version(
     }
 
     // Copy auxiliary sections (layers, obsm, uns, predicate indices, provenance)
-    rewrite_helpers::copy_auxiliary_sections(reader, &mut writer, "upgrade", "{}")?;
+    scx_ops::copy_auxiliary_sections(reader, &mut writer, "upgrade", "{}")?;
 
     writer.finish()?;
     Ok(())
