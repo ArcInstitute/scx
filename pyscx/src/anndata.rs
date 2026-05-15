@@ -2522,7 +2522,7 @@ fn parallel_encode_csr_shards(
 /// will overwrite any in-memory layer mutations.
 #[cfg(feature = "hdf5")]
 #[allow(clippy::too_many_arguments)]
-fn route_backed_anndata_to_streaming(
+pub(crate) fn route_backed_anndata_to_streaming(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     path: &str,
@@ -2534,16 +2534,30 @@ fn route_backed_anndata_to_streaming(
 ) -> PyResult<()> {
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older
-    // name); we try both.
-    let filename: String = match adata.getattr("filename") {
-        Ok(v) => v.extract::<String>().unwrap_or_default(),
-        Err(_) => adata
-            .getattr("file")
+    // name); we try both. Recent anndata returns `pathlib.PosixPath`
+    // rather than a bare `str`, so go through Python's `str(...)` —
+    // it's a no-op on `str` and stringifies `Path` cleanly.
+    fn fspath_str(v: &Bound<'_, PyAny>) -> Option<String> {
+        if v.is_none() {
+            return None;
+        }
+        v.str()
             .ok()
-            .and_then(|f| f.getattr("filename").ok())
-            .and_then(|v| v.extract::<String>().ok())
-            .unwrap_or_default(),
-    };
+            .and_then(|s| s.extract::<String>().ok())
+            .filter(|s| !s.is_empty())
+    }
+    let filename: String = adata
+        .getattr("filename")
+        .ok()
+        .and_then(|v| fspath_str(&v))
+        .or_else(|| {
+            adata
+                .getattr("file")
+                .ok()
+                .and_then(|f| f.getattr("filename").ok())
+                .and_then(|v| fspath_str(&v))
+        })
+        .unwrap_or_default();
     if filename.is_empty() || !std::path::Path::new(&filename).exists() {
         return Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "backed AnnData has no resolvable h5ad filename; use \

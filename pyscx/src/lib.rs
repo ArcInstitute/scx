@@ -203,9 +203,14 @@ fn from_anndata(
 /// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
 /// `from_anndata` exactly.
 ///
-/// `uns_format` is accepted for API parity but has no effect — the
-/// streaming path reads `uns` directly from the h5ad file (not from
-/// Python objects), so the tagged/raw distinction doesn't apply.
+/// Internally this opens the h5ad in `anndata.read_h5ad(path,
+/// backed="r")` mode and delegates to the same backed-AnnData router
+/// `from_anndata` uses on backed input. Backed mode only reads
+/// metadata (obs / var / obsm / varm / uns) into Python; X and layers
+/// stay on disk and are streamed shard-by-shard by `scx-convert`.
+/// Going through Python's pyarrow on the metadata path preserves the
+/// pandas `index_columns` schema metadata so `obs.index` round-trips
+/// correctly through SCX → `to_anndata()`.
 ///
 /// `csc="always"` performs a two-pass write: the streaming converter
 /// emits CSR shards, then `scx_ops::rebuild_csc_inplace` regenerates
@@ -214,8 +219,9 @@ fn from_anndata(
 ///
 /// Limitations:
 ///   * CSC-on-disk h5ad and dense X are rejected with a clear error.
-///   * `varm` is preserved; `obsp` / `varp` are silently skipped (same
-///     gap the non-streaming CLI converter has).
+///   * `varm` is preserved; `obsp` / `varp` come through only when
+///     the on-disk h5ad has them in a form anndata exposes (matches
+///     the non-streaming CLI converter).
 ///
 /// Example:
 ///     pyscx.from_h5ad("big.h5ad", "big.scx")
@@ -234,8 +240,6 @@ fn from_h5ad(
     csc_cols_per_shard: usize,
     uns_format: &str,
 ) -> PyResult<()> {
-    let _ = uns_format; // accepted for API parity; streaming reads uns from disk.
-
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
         "off" => false,
@@ -246,21 +250,30 @@ fn from_h5ad(
             )));
         }
     };
+    let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
+    let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
 
-    let opts = scx_convert::ConvertOptions {
-        shard_target_rows: shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS),
-        codec: explicit_codec,
-        csc: csc_always,
+    // Open the h5ad in backed mode so obs / var / obsm / varm / uns
+    // are extractable as Python objects but X stays on disk. The
+    // backed-router then runs the same Python → Arrow conversion path
+    // `from_anndata` uses, which embeds pandas metadata in the obs /
+    // var schemas — the bit that's missing if we let scx-convert's
+    // pure-Rust `read_dataframe_group` build the records.
+    let anndata_mod = py.import("anndata")?;
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("backed", "r")?;
+    let backed = anndata_mod.call_method("read_h5ad", (path,), Some(&kwargs))?;
+
+    anndata::route_backed_anndata_to_streaming(
+        py,
+        &backed,
+        out,
+        explicit_codec,
+        shard_target_rows,
+        csc_always,
         csc_cols_per_shard,
-        tool: "pyscx".into(),
-    };
-
-    let input = std::path::PathBuf::from(path);
-    let output = std::path::PathBuf::from(out);
-
-    let overrides = scx_convert::StreamingOverrides::default();
-    py.allow_threads(|| scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        uns_format_parsed,
+    )
 }
 
 /// Convert a 10x HDF5 file to SCX via scanpy.
