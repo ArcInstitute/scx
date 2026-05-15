@@ -108,6 +108,61 @@ Takeaways:
 
 Source: `benchmarks/comprehensive/results/raw/parallel_write_scaling__{codec}__{dataset}.json` (`metadata.scaling_wall_s.full` and `metadata.scaling_wall_s.write_only`).
 
+### Streaming conversion (h5ad → SCX)
+
+`scx convert --stream` and `pyscx.from_h5ad(path, out)` use a
+shard-at-a-time pipeline (`scx_convert::h5ad_to_scx_streaming`) that
+holds only one shard's worth of CSR in memory plus the always-resident
+`indptr`. `pyscx.from_anndata(backed_adata, out)` auto-routes to the
+same pipeline. Recommended whenever the input doesn't comfortably fit
+in node RAM.
+
+Peak RSS bound: `shard_target_rows × n_vars × density × ~16` bytes +
+`(n_obs + 1) × 8` bytes for indptr. At default
+`shard_target_rows = 16384`, ~5% density, ~20 000 vars → ~130 MB per
+shard plus ~80 MB indptr at 10M cells (~800 MB at 100M cells).
+
+**Measured on `census_1m`** (1 000 000 × 61 497, 1.57 B nnz,
+12.7 GB h5ad → 3.04 GB streaming SCX vs 3.11 GB materialise SCX;
+median of 3 paired runs on a 16-core Lambda `standard` node):
+
+| Path | Median wall | Peak RSS |
+|---|---:|---:|
+| streaming (`pyscx.from_h5ad`)        |  98.2 s | **851 MB** |
+| materialise (`pyscx.from_anndata`)   |  60.2 s |  13.6 GB |
+
+Streaming uses ~16× less peak RSS at ~63% wall-clock premium on
+this size. Both paths emit byte-equivalent SCX (identical n_obs /
+n_vars / nnz / 62-shard catalog).
+
+**Thread scaling on the same fixture** (median wall in seconds across
+3 paired runs, `RAYON_NUM_THREADS` set per subprocess):
+
+| Threads | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| streaming   | 87.6 | 87.8 | 88.4 | 87.6 | 87.9 | 88.9 |
+| materialise | 92.2 | 72.6 | 61.8 | 58.0 | 55.4 | 54.6 |
+
+The streaming pipeline is currently sequential by design — wall is
+flat (±1.5 %) across the whole range. Materialise scales sub-linearly
+(1.69× peak at 32 threads, efficiency 5 %) because the upstream
+`anndata.read_h5ad` is single-threaded HDF5 and the rayon-parallel
+encode pool runs into Amdahl's law on top of that. Materialise peak
+RSS is thread-independent at ~13.6 GB.
+
+**Crossover regime**: materialise wins on wall whenever the
+in-memory CSR triplet fits comfortably; streaming becomes the only
+viable path once that working set exceeds node RAM (somewhere above
+the `census_1m` 13.6 GB working set; `census_5m` / `census_10m`
+push it well past most workstation memory). Streaming also fits the
+backed-AnnData path used by `pyscx.from_anndata(adata)` when
+`adata.isbacked` is true.
+
+Source data:
+`benchmarks/comprehensive/results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`
+(absolute floor: `streaming_peak_rss_mb max: 2048` on `census_1m`,
+declared in `benchmarks/comprehensive/thresholds.yaml`).
+
 ## Column Projection (2000 HVGs)
 
 | Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA | SLAF |

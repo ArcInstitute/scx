@@ -535,6 +535,20 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
   Arrow IPC; higher-precision inputs are downcast on write. `uns_format`
   selects how `adata.uns` is serialized — see [`uns` serialization](#uns-serialization).
+  Accepts backed AnnData (`sc.read_h5ad(path, backed='r')`) and auto-routes
+  to the streaming converter — see `pyscx.from_h5ad` below for the
+  underlying mechanics.
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged")` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+  Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
+  plus the always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
+  entry point for files larger than RAM. `csc="always"` performs a
+  two-pass write (streaming CSR → `rebuild_csc_inplace` on the
+  finished file) — peak disk briefly reaches ~2× the output size during
+  the rebuild. `uns_format` is accepted for API parity with
+  `from_anndata` but is a no-op here (streaming reads `uns` from the
+  h5ad file directly, not from Python). Rejects CSC-on-disk and dense
+  `X` with `RuntimeError`; `obsp` / `varp` on the input are silently
+  skipped.
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
@@ -977,7 +991,7 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]`
+- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream] [--csc off|always] [--csc-cols-per-shard N]` — `--stream` reads the h5ad one shard at a time so peak memory is bounded by `shard_size × n_vars × density` plus the resident `indptr`. h5ad → SCX only; combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output).
 - `scx info <file> [--json] [--history]`
 - `scx validate <file> [--verbose]`
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`

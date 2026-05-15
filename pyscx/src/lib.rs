@@ -134,11 +134,27 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// (`int64` / `int32` / `float32`) may allocate fresh numpy arrays — those
 /// allocations never alias or mutate the caller's data.
 ///
+/// **Backed AnnData auto-routes to streaming.** When `adata.isbacked` is
+/// true and `adata.filename` (or `adata.file.filename`) resolves to a
+/// readable h5ad path, the call dispatches to the streaming pipeline
+/// instead of materialising `X`. Peak memory becomes bounded by one
+/// shard's worth of CSR plus encode buffers, matching `from_h5ad`.
+/// In-Python mutations to `obs` / `var` / `uns` / `obsm` / `varm` /
+/// `obsp` / `varp` are preserved verbatim — the on-disk values are
+/// overridden by the caller's. Layers are streamed directly from disk;
+/// if the in-memory AnnData has layer mutations, a `UserWarning` fires
+/// (use `from_h5ad` after rewriting an h5ad if you need them
+/// preserved). Backed AnnDatas without a resolvable filename (e.g.
+/// zarr-backed) raise `NotImplementedError`.
+///
 /// Example:
 ///     pyscx.from_anndata(adata, "output.scx")
 ///     pyscx.from_anndata(adata, "output.scx", codec="scx1", shard_size=8192)
 ///     pyscx.from_anndata(adata, "output.scx", in_place=True)
 ///     pyscx.from_anndata(adata, "output.scx", csc="always")
+///     # Backed AnnData (auto-streams):
+///     backed = sc.read_h5ad("big.h5ad", backed="r")
+///     pyscx.from_anndata(backed, "big.scx")
 ///
 /// `csc`: when `"always"`, also writes a CSC (column-major) sidecar.
 ///   `"off"` (default) emits CSR shards only. No `"auto"` mode — CSC is
@@ -170,6 +186,93 @@ fn from_anndata(
         csc,
         csc_cols_per_shard,
         uns_format,
+    )
+}
+
+/// Stream an h5ad file directly to SCX without materialising the full
+/// X matrix in Python or Rust.
+///
+/// `pyscx.from_h5ad(path, out)` reads `path` from disk through the
+/// `scx-convert` streaming pipeline and writes `out` shard-by-shard.
+/// Peak memory is bounded by one shard's worth of CSR plus encode
+/// buffers (plus the always-resident `indptr`, ~80 MB at 10M cells),
+/// so this is the recommended entry point for h5ad files larger than
+/// node RAM. For files that comfortably fit in memory, `from_anndata`
+/// remains a touch faster.
+///
+/// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
+/// `from_anndata` exactly.
+///
+/// Internally this opens the h5ad in `anndata.read_h5ad(path,
+/// backed="r")` mode and delegates to the same backed-AnnData router
+/// `from_anndata` uses on backed input. Backed mode only reads
+/// metadata (obs / var / obsm / varm / uns) into Python; X and layers
+/// stay on disk and are streamed shard-by-shard by `scx-convert`.
+/// Going through Python's pyarrow on the metadata path preserves the
+/// pandas `index_columns` schema metadata so `obs.index` round-trips
+/// correctly through SCX → `to_anndata()`.
+///
+/// `csc="always"` performs a two-pass write: the streaming converter
+/// emits CSR shards, then `scx_ops::rebuild_csc_inplace` regenerates
+/// the CSC sidecar over the just-written file. Peak disk briefly
+/// reaches ~2× the output size during the rebuild.
+///
+/// Limitations:
+///   * CSC-on-disk h5ad and dense X are rejected with a clear error.
+///   * `varm` is preserved; `obsp` / `varp` come through only when
+///     the on-disk h5ad has them in a form anndata exposes (matches
+///     the non-streaming CLI converter).
+///
+/// Example:
+///     pyscx.from_h5ad("big.h5ad", "big.scx")
+///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
+#[allow(clippy::too_many_arguments)]
+fn from_h5ad(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    codec: Option<&str>,
+    shard_size: Option<u32>,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    uns_format: &str,
+) -> PyResult<()> {
+    let explicit_codec = anndata::parse_codec(codec)?;
+    let csc_always = match csc {
+        "off" => false,
+        "always" => true,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "invalid csc value '{other}'; expected 'off' or 'always'"
+            )));
+        }
+    };
+    let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
+    let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
+
+    // Open the h5ad in backed mode so obs / var / obsm / varm / uns
+    // are extractable as Python objects but X stays on disk. The
+    // backed-router then runs the same Python → Arrow conversion path
+    // `from_anndata` uses, which embeds pandas metadata in the obs /
+    // var schemas — the bit that's missing if we let scx-convert's
+    // pure-Rust `read_dataframe_group` build the records.
+    let anndata_mod = py.import("anndata")?;
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("backed", "r")?;
+    let backed = anndata_mod.call_method("read_h5ad", (path,), Some(&kwargs))?;
+
+    anndata::route_backed_anndata_to_streaming(
+        py,
+        &backed,
+        out,
+        explicit_codec,
+        shard_target_rows,
+        csc_always,
+        csc_cols_per_shard,
+        uns_format_parsed,
     )
 }
 
@@ -317,6 +420,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
     m.add_function(wrap_pyfunction!(to_mtx, m)?)?;

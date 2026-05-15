@@ -3,6 +3,7 @@ pub mod csc;
 pub mod csr;
 pub mod transpose;
 pub mod umap_math;
+pub mod validate;
 
 pub use convert::{csr_to_dense, dense_to_csr};
 pub use csc::{CscError, ScxCsc};
@@ -12,3 +13,4 @@ pub use transpose::{
     TransposeError,
 };
 pub use umap_math::{compute_epochs_per_sample, find_ab_params, random_init_f32, random_init_f64};
+pub use validate::{drop_explicit_zeros_inplace, sort_csr_rows_in_place, validate_csr_arrays};

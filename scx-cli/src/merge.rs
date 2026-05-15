@@ -77,7 +77,7 @@ pub fn run_merge(
 
     // Re-emit the CSC sidecar against the merged output.
     if rebuild_csc {
-        crate::rebuild_csc::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

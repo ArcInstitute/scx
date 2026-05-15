@@ -81,6 +81,7 @@ AVAILABLE_BENCHMARKS = [
     "lazy_preproc",        # Lazy preprocessing & column-projected agg
     "correctness",         # Correctness validation suite
     "cell_eval_parity_perf",  # cell-eval / arc-bench parity perf
+    "conversion_streaming",   # Streaming vs materialising h5ad → SCX (Phase 10)
 ]
 
 # Benchmarks appropriate for smoke testing

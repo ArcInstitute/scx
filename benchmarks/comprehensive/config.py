@@ -494,6 +494,17 @@ DATASETS: dict[str, DatasetConfig] = {
         approx_h5ad_mb=1_086, available=True,
         multimodal=True, modality_names=("rna", "atac"),
     ),
+    # Tiny synthetic h5ad used by the streaming-conversion smoke job.
+    # The fixture is generated on-node by `scripts/_synth_h5ad.py` and
+    # lives under SCX_DATA_DIR, so it's marked `synthetic=False` (the
+    # generator runs outside the harness rather than via the harness's
+    # own synth path).
+    "streaming_smoke": DatasetConfig(
+        id="S1", name="streaming_smoke",
+        n_obs=50_000, n_vars=5_000,
+        protocol="synthetic (uint8)", source="generated on /scratch",
+        approx_h5ad_mb=40, available=True,
+    ),
 }
 
 

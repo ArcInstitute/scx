@@ -3586,7 +3586,7 @@ mod tests {
         use crate::shard::{
             BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
         };
-        use scx_codec::{CodecId, EncodedShard, ValueEncoding};
+        use scx_codec::{CodecId, ValueEncoding};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("csc_preencoded.scx");

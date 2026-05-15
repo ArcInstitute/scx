@@ -13,10 +13,9 @@ use rayon::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::MAGIC;
 use scx_format::section::SectionType;
-use scx_format::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
 use scx_format::{
-    compute_shard_stats, select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection,
-    ProvenanceEntry, ScxReader, ScxWriter,
+    select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection, ProvenanceEntry,
+    ScxReader, ScxWriter,
 };
 
 use crate::to_pyerr;
@@ -1356,44 +1355,6 @@ pub(crate) fn astype_if_needed<'py>(
     }
 }
 
-/// Fast upfront validation of CSR arrays (1C.2).
-///
-/// Single O(nnz) pass checking:
-/// - indptr is monotonically non-decreasing with indptr\[0\] >= 0
-/// - All indices are non-negative and < n_vars
-///
-/// When this passes, the shard loop can skip per-element validation.
-fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> PyResult<()> {
-    if !indptr.is_empty() && indptr[0] < 0 {
-        return Err(PyRuntimeError::new_err(format!(
-            "negative indptr value {} at position 0",
-            indptr[0]
-        )));
-    }
-    for i in 1..indptr.len() {
-        if indptr[i] < indptr[i - 1] {
-            return Err(PyRuntimeError::new_err(format!(
-                "non-monotonic indptr: value {} at position {} < {} at position {}",
-                indptr[i],
-                i,
-                indptr[i - 1],
-                i - 1
-            )));
-        }
-    }
-
-    for (i, &idx) in indices.iter().enumerate() {
-        if idx < 0 || (idx as u64) >= n_vars {
-            return Err(PyRuntimeError::new_err(format!(
-                "CSR index {} out of valid range [0, {}) at position {}",
-                idx, n_vars, i
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // uns serialization
 // ---------------------------------------------------------------------------
@@ -2480,7 +2441,6 @@ fn parallel_encode_csr_shards(
     let indices_owned: Arc<[i32]> = indices.to_vec().into();
     let data_owned: Arc<[f32]> = data.to_vec().into();
     let name_prefix = name_prefix.to_string();
-    let index_dtype_u16 = index_dtype == 0;
 
     let result: Result<Vec<PreEncodedSection>, String> = py.allow_threads(|| {
         boundaries
@@ -2527,145 +2487,218 @@ fn parallel_encode_csr_shards(
                         .collect::<Result<Vec<u32>, String>>()?
                 };
 
-                // 3. Detect value encoding and encode values
                 let shard_data = &data_owned[b.nnz_start..b.nnz_end];
-                let shard_value_encoding = detect_value_encoding(shard_data);
-                let shard_values_bytes =
-                    encode_values(shard_data, shard_value_encoding).map_err(|e| e.to_string())?;
-
-                // 4. Select codec
-                let shard_codec = match explicit_codec {
-                    Some(codec_id) => {
-                        if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
-                            CodecId::Zstd
-                        } else {
-                            codec_id
-                        }
-                    }
-                    None => select_codec_for_modality(
-                        &shard_values_bytes,
-                        shard_value_encoding,
-                        ModalityType::Rna,
-                    ),
-                };
-
-                // 5. Encode shard
-                let encoded = scx_codec::encode_shard(
+                let name = format!("{name_prefix}_shard_{}", b.shard_idx);
+                scx_format::encode_one_shard(
                     &shard_indptr,
                     &shard_indices,
-                    &shard_values_bytes,
-                    shard_codec,
-                    shard_value_encoding,
-                    index_dtype_u16,
-                )
-                .map_err(|e| format!("encode_shard failed: {e}"))?;
-
-                // 6. Build block index (Phase 1: single entry covering entire shard)
-                let n_major = (shard_indptr.len() - 1) as u32;
-                let nnz = *shard_indptr.last().unwrap_or(&0);
-                let block_index = BlockIndex {
-                    entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz)
-                        .map_err(|e| format!("{e}"))?],
-                };
-                let mut block_index_bytes = Vec::new();
-                block_index
-                    .write_to(&mut block_index_bytes)
-                    .map_err(|e| format!("{e}"))?;
-
-                // 7. Shard-level checksum (8-byte truncated BLAKE3)
-                let mut shard_hasher = blake3::Hasher::new();
-                shard_hasher.update(&encoded.indptr_bytes);
-                shard_hasher.update(&encoded.indices_bytes);
-                shard_hasher.update(&encoded.values_bytes);
-                shard_hasher.update(&block_index_bytes);
-                let shard_hash = shard_hasher.finalize();
-                let mut shard_checksum = [0u8; 8];
-                shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
-
-                // 8. Build ShardHeader with relative offsets
-                let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-                let indptr_length = encoded.indptr_bytes.len() as u32;
-                let indices_rel_offset = indptr_rel_offset + indptr_length;
-                let indices_length = encoded.indices_bytes.len() as u32;
-                let values_rel_offset = indices_rel_offset + indices_length;
-                let values_length = encoded.values_bytes.len() as u32;
-                let block_index_rel_offset = values_rel_offset + values_length;
-                let block_index_length = block_index_bytes.len() as u32;
-
-                let shard_header = ShardHeader {
-                    magic: SHARD_MAGIC,
-                    shard_format_version: 1,
-                    shard_type: 0, // CSR
-                    codec_id: shard_codec as u8,
-                    value_encoding: shard_value_encoding as u8,
+                    shard_data,
+                    explicit_codec,
                     index_dtype,
-                    reserved_flags: [0; 3],
-                    n_major,
-                    n_minor: n_vars,
-                    nnz,
-                    global_offset: b.row_start as u64,
-                    indptr_rel_offset,
-                    indptr_length,
-                    indices_rel_offset,
-                    indices_length,
-                    values_rel_offset,
-                    values_length,
-                    block_index_rel_offset,
-                    block_index_length,
-                    checksum: shard_checksum,
-                };
-
-                let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
-                shard_header
-                    .write_to(&mut header_buf)
-                    .map_err(|e| format!("{e}"))?;
-
-                // 9. Section-level checksum (full 32-byte BLAKE3)
-                let mut section_hasher = blake3::Hasher::new();
-                section_hasher.update(&header_buf);
-                section_hasher.update(&encoded.indptr_bytes);
-                section_hasher.update(&encoded.indices_bytes);
-                section_hasher.update(&encoded.values_bytes);
-                section_hasher.update(&block_index_bytes);
-                let section_checksum = *section_hasher.finalize().as_bytes();
-
-                let section_length = (header_buf.len()
-                    + encoded.indptr_bytes.len()
-                    + encoded.indices_bytes.len()
-                    + encoded.values_bytes.len()
-                    + block_index_bytes.len()) as u64;
-
-                // 10. Compute shard stats. pyscx writes row-major CSR
-                // shards exclusively (CSC sidecars are emitted via a
-                // separate path, see scx-cli/src/build_csc.rs).
-                let stats = compute_shard_stats(
-                    &shard_values_bytes,
-                    shard_value_encoding,
-                    scx_format::MajorAxis::Row,
+                    n_vars,
                     b.row_start as u64,
-                    n_major as u64,
-                    n_vars as u64,
-                    nnz,
-                );
-
-                let name = format!("{name_prefix}_shard_{}", b.shard_idx);
-
-                Ok(PreEncodedSection {
-                    encoded,
-                    block_index_bytes,
-                    header_buf,
-                    section_checksum,
-                    section_length,
-                    stats,
-                    name,
                     section_type,
-                    nnz,
-                })
+                    ModalityType::Rna,
+                    name,
+                )
+                .map_err(|e| e.to_string())
             })
             .collect()
     });
 
     result.map_err(PyRuntimeError::new_err)
+}
+
+/// Route a backed AnnData object through the streaming converter.
+/// Extracts in-memory `obs` / `var` / `uns` / `obsm` / `varm` /
+/// `obsp` / `varp` into Rust types so any caller mutations are
+/// preserved, then invokes `scx_convert::h5ad_to_scx_streaming` on
+/// the backing h5ad file.
+///
+/// X and layers always come from disk via streaming — there's no
+/// override hook for those (they're potentially too large to extract
+/// from a backed AnnData into memory). Emits a `UserWarning` when
+/// the backed AnnData has any layers, because the streaming reads
+/// will overwrite any in-memory layer mutations.
+#[cfg(feature = "hdf5")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_backed_anndata_to_streaming(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    path: &str,
+    explicit_codec: Option<CodecId>,
+    shard_target_rows: u32,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
+    uns_format_parsed: UnsFormat,
+) -> PyResult<()> {
+    // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
+    // `adata.filename` (preferred) and `adata.file.filename` (older
+    // name); we try both. Recent anndata returns `pathlib.PosixPath`
+    // rather than a bare `str`, so go through Python's `str(...)` —
+    // it's a no-op on `str` and stringifies `Path` cleanly.
+    fn fspath_str(v: &Bound<'_, PyAny>) -> Option<String> {
+        if v.is_none() {
+            return None;
+        }
+        v.str()
+            .ok()
+            .and_then(|s| s.extract::<String>().ok())
+            .filter(|s| !s.is_empty())
+    }
+    let filename: String = adata
+        .getattr("filename")
+        .ok()
+        .and_then(|v| fspath_str(&v))
+        .or_else(|| {
+            adata
+                .getattr("file")
+                .ok()
+                .and_then(|f| f.getattr("filename").ok())
+                .and_then(|v| fspath_str(&v))
+        })
+        .unwrap_or_default();
+    if filename.is_empty() || !std::path::Path::new(&filename).exists() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "backed AnnData has no resolvable h5ad filename; use \
+             pyscx.from_h5ad(path, out) or convert to a non-backed \
+             AnnData first",
+        ));
+    }
+
+    // Build the overrides from the in-memory AnnData. Each extraction
+    // mirrors the inline logic used by the non-backed path
+    // (`pandas_to_record_batch`, `sparse_to_coo_record_batch`,
+    // `normalize_uns_value`) so the on-disk SCX output matches what
+    // the user sees in Python.
+    let obs_override = pandas_to_record_batch(py, &adata.getattr("obs")?)?;
+    let var_override = pandas_to_record_batch(py, &adata.getattr("var")?)?;
+
+    let obsm_override = extract_dense_mapping(py, adata, "obsm")?;
+    let varm_override = extract_dense_mapping(py, adata, "varm")?;
+    let obsp_override = extract_coo_mapping(py, adata, "obsp")?;
+    let varp_override = extract_coo_mapping(py, adata, "varp")?;
+    let uns_override = extract_uns_value(py, adata, uns_format_parsed)?;
+
+    // Layer mutations on a backed AnnData are not propagated — the
+    // streaming pipeline always reads layers from disk. Warn so the
+    // user knows.
+    if let Ok(layers) = adata.getattr("layers") {
+        if let Ok(len_val) = layers.call_method0("__len__") {
+            if let Ok(len) = len_val.extract::<usize>() {
+                if len > 0 {
+                    let msg = format!(
+                        "backed AnnData has {len} layer(s); layer data will be read \
+                         from the on-disk h5ad file. Any in-memory layer mutations \
+                         will be lost. Use pyscx.from_h5ad(path, out) on a \
+                         freshly-written h5ad if you need mutated layers preserved.",
+                    );
+                    let _ = py
+                        .import("warnings")
+                        .and_then(|w| w.call_method1("warn", (msg,)));
+                }
+            }
+        }
+    }
+
+    let overrides = scx_convert::StreamingOverrides {
+        obs: Some(obs_override),
+        var: Some(var_override),
+        uns: uns_override,
+        obsm: Some(obsm_override),
+        varm: Some(varm_override),
+        obsp: Some(obsp_override),
+        varp: Some(varp_override),
+    };
+
+    let opts = scx_convert::ConvertOptions {
+        shard_target_rows,
+        codec: explicit_codec,
+        csc: csc_always,
+        csc_cols_per_shard,
+        tool: "pyscx".into(),
+    };
+    let input = std::path::PathBuf::from(filename);
+    let output = std::path::PathBuf::from(path);
+
+    py.allow_threads(|| scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Helper for the backed-routing path. Reads a dense mapping
+/// (`obsm` / `varm`) from a Python AnnData and returns
+/// `Vec<(name, RecordBatch)>`. Missing groups → empty Vec.
+#[cfg(feature = "hdf5")]
+fn extract_dense_mapping(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    attr: &str,
+) -> PyResult<Vec<(String, RecordBatch)>> {
+    let group = match adata.getattr(attr) {
+        Ok(g) => g,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let keys: Vec<String> = py
+        .import("builtins")?
+        .call_method1("list", (group.call_method0("keys")?,))?
+        .extract()?;
+    keys.iter()
+        .map(|key| {
+            let arr = group.call_method1("__getitem__", (key,))?;
+            let pd = py.import("pandas")?;
+            let df = pd.call_method1("DataFrame", (&arr,))?;
+            let batch = pandas_to_record_batch(py, &df)?;
+            Ok((key.clone(), batch))
+        })
+        .collect()
+}
+
+/// Helper for the backed-routing path. Reads a sparse pairwise
+/// mapping (`obsp` / `varp`) as COO RecordBatches. Missing groups →
+/// empty Vec.
+#[cfg(feature = "hdf5")]
+fn extract_coo_mapping(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    attr: &str,
+) -> PyResult<Vec<(String, RecordBatch)>> {
+    let group = match adata.getattr(attr) {
+        Ok(g) => g,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let keys: Vec<String> = py
+        .import("builtins")?
+        .call_method1("list", (group.call_method0("keys")?,))?
+        .extract()?;
+    keys.iter()
+        .map(|key| {
+            let mat = group.call_method1("__getitem__", (key,))?;
+            let batch = sparse_to_coo_record_batch(py, &mat)?;
+            Ok((key.clone(), batch))
+        })
+        .collect()
+}
+
+/// Helper for the backed-routing path. Extracts `uns` from a Python
+/// AnnData into an optional `serde_json::Value`. Returns `None` if
+/// `uns` is empty (no `__scx_uns__` section written), matching the
+/// non-backed path.
+#[cfg(feature = "hdf5")]
+fn extract_uns_value(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    uns_format_parsed: UnsFormat,
+) -> PyResult<Option<serde_json::Value>> {
+    let uns = adata.getattr("uns")?;
+    let uns_len: usize = uns.call_method0("__len__")?.extract()?;
+    if uns_len == 0 {
+        return Ok(None);
+    }
+    let np = py.import("numpy")?;
+    let np_generic = np.getattr("generic")?;
+    let np_ndarray = np.getattr("ndarray")?;
+    let mut ctx = UnsWriteCtx::new(uns_format_parsed, &np_generic, &np_ndarray);
+    Ok(Some(normalize_uns_value(&uns, "uns", &mut ctx)?))
 }
 
 /// Implementation of from_anndata: extract data from AnnData and write SCX.
@@ -2698,6 +2731,52 @@ pub fn from_anndata_impl(
         }
     };
     let uns_format_parsed = parse_uns_format(uns_format)?;
+
+    // Backed AnnData → route through the streaming converter
+    // (`scx_convert::h5ad_to_scx_streaming`) instead of the in-memory
+    // path, which would fail at the `ensure_csr` step (backed `X` is
+    // an `_CSRDataset`, not a scipy sparse matrix). In-memory
+    // mutations on `obs` / `var` / `uns` / `obsm` / `varm` / `obsp` /
+    // `varp` are extracted to Rust and passed as `StreamingOverrides`
+    // so user edits aren't silently overwritten by the on-disk
+    // version. Available only when pyscx was built with the `hdf5`
+    // feature; without it the call falls through to the in-memory
+    // path which raises a clear error on the backed `_CSRDataset`.
+    let is_backed: bool = adata
+        .getattr("isbacked")
+        .ok()
+        .and_then(|v| v.extract::<bool>().ok())
+        .unwrap_or(false);
+    if is_backed {
+        #[cfg(feature = "hdf5")]
+        {
+            return route_backed_anndata_to_streaming(
+                py,
+                adata,
+                path,
+                explicit_codec,
+                shard_target_rows,
+                csc_always,
+                csc_cols_per_shard,
+                uns_format_parsed,
+            );
+        }
+        #[cfg(not(feature = "hdf5"))]
+        {
+            let _ = (
+                explicit_codec,
+                csc_always,
+                csc_cols_per_shard,
+                uns_format_parsed,
+            );
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "pyscx was built without the `hdf5` feature; backed AnnData \
+                 routing requires libhdf5. Rebuild with \
+                 `maturin develop --features hdf5` or convert the AnnData \
+                 to a non-backed form first.",
+            ));
+        }
+    }
 
     // Extract X as CSR. By default we do not mutate caller-owned CSR
     // matrices; pass `in_place=true` to opt into the original in-place
@@ -2757,7 +2836,8 @@ pub fn from_anndata_impl(
     // 1C.2: Fast upfront validation when CSR bypass is active.
     // After this, the shard loop can skip per-element checks.
     if csr_validated {
-        validate_csr_arrays(indptr_slice, indices_slice, n_vars)?;
+        scx_sparse::validate_csr_arrays(indptr_slice, indices_slice, n_vars)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
 
     // Determine index dtype.
@@ -3067,7 +3147,8 @@ pub fn from_anndata_impl(
 
         // 1C.2: Upfront validation for layer bypass
         if l_csr_validated {
-            validate_csr_arrays(l_indptr_slice, l_indices_slice, n_vars)?;
+            scx_sparse::validate_csr_arrays(l_indptr_slice, l_indices_slice, n_vars)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
 
         // 1D: Parallel shard encoding for layers

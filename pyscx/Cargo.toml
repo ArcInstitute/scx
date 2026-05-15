@@ -22,6 +22,7 @@ scx-engine = { path = "../scx-engine" }
 scx-mtx = { path = "../scx-mtx" }
 scx-ops = { path = "../scx-ops" }
 scx-accel = { path = "../scx-accel" }
+scx-convert = { path = "../scx-convert", optional = true }
 scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 serde_json = { workspace = true }
@@ -35,5 +36,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [features]
+# `hdf5` gates `pyscx.from_h5ad` and the backed-AnnData auto-routing in
+# `pyscx.from_anndata`. Both reach into `scx_convert::h5ad_to_scx_streaming`,
+# which requires libhdf5 at build time. Without this feature the
+# bindings still build (CPU-only CI lane), but backed AnnDatas raise
+# `NotImplementedError` directing the caller to rebuild with
+# `maturin develop --features hdf5`.
+hdf5 = ["dep:scx-convert", "scx-convert/hdf5"]
 cloud = ["scx-cloud", "tokio"]
 gpu = ["scx-accel/gpu"]

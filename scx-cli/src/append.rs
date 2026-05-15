@@ -168,7 +168,7 @@ pub fn run_append(
 
     // Re-emit the CSC sidecar that scx_ops::append dropped.
     if rebuild_csc {
-        crate::rebuild_csc::rebuild_csc_inplace(target, csc_cols_per_shard, "4G")?;
+        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", target.display());
     }
 

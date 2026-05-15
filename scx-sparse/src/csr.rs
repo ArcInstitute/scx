@@ -12,6 +12,9 @@ pub enum CsrError {
     #[error("indptr[0] must be 0, got {0}")]
     IndptrNonZeroStart(i64),
 
+    #[error("indptr value {value} at position {position} is negative")]
+    IndptrNegative { value: i64, position: usize },
+
     #[error("indices.len() ({indices}) != data.len() ({data})")]
     IndicesDataMismatch { indices: usize, data: usize },
 

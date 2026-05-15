@@ -110,7 +110,12 @@ jobs:
       # instead of being skipped via `pytest.importorskip("torch")`.
       # CPU build only — the fork-safety test does no GPU work.
       - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
-      - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud && pytest --ignore=tests/test_scvi_integration.py
+      # libhdf5 is needed by the `hdf5` pyscx feature, which exposes
+      # `pyscx.from_h5ad` and the backed-AnnData → streaming router that
+      # `tests/test_streaming_conversion.py` exercises.
+      - name: Install hdf5 dev headers
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+      - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud,hdf5 && pytest --ignore=tests/test_scvi_integration.py
 
   # NOTE: the fork-safety tests should also run on Linux aarch64 in
   # addition to x86_64 — aarch64 + glibc fork semantics differ subtly
