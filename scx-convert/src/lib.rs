@@ -32,7 +32,9 @@ pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XSt
 pub mod pipeline;
 
 #[cfg(feature = "hdf5")]
-pub use pipeline::{h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions};
+pub use pipeline::{
+    h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions,
+};
 
 #[cfg(feature = "hdf5")]
 pub use mudata_pipeline::{h5mu_to_scx, is_h5mu_file};

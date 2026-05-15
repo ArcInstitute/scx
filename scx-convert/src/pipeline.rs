@@ -2,14 +2,21 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
+use scx_format::encode_one_shard;
 use scx_format::error::ScxError;
 use scx_format::header::{FileHeader, MAGIC};
+use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
+use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
+use scx_sparse::{drop_explicit_zeros_inplace, sort_csr_rows_in_place};
 
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat};
 use super::dtype::{detect_value_encoding, values_to_raw_bytes};
-use super::h5ad_read::{read_dataframe_group, read_layers, read_obsm, read_uns, read_x_matrix};
+use super::h5ad_read::{
+    read_dataframe_group, read_layers, read_obsm, read_uns, read_varm, read_x_matrix,
+};
+use super::h5ad_stream::{open_layer_streaming, open_x_streaming};
 use super::h5ad_write::write_scx_to_h5ad;
 use super::tenx_read::read_tenx_h5;
 
@@ -305,6 +312,199 @@ pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
 
 pub fn scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), ConvertError> {
     write_scx_to_h5ad(scx_path, h5ad_path)
+}
+
+/// Streaming h5ad → SCX conversion. Reads the input one shard's worth
+/// of rows at a time via [`super::h5ad_stream::XStreamReader`] so peak
+/// memory is bounded by `shard_target_rows × n_vars × density × ~16
+/// bytes` plus the always-resident indptr (`(n_obs + 1) × 8 bytes`).
+///
+/// Behaviour notes (Phase 4 MVP):
+/// - **Sequential**: one shard read → sort → drop-zeros → encode →
+///   write per iteration. No concurrent encoder pool yet. Worker
+///   parallelism is a planned follow-on if benchmarks show I/O
+///   starvation.
+/// - **CSC sidecar (`opts.csc == true`)**: not yet supported via
+///   streaming. The two-pass design (`rebuild_csc_inplace` on the
+///   finished file) requires that helper to be reachable from
+///   `scx-convert`; it currently lives in `scx-cli`. Returns
+///   [`ConvertError::StreamingUnsupported`] until the move lands.
+///   Users can still run `scx build-csc` on the streamed output.
+/// - **`varm`** is read and written via [`read_varm`]; `obsp`/`varp`
+///   readers are still missing and any present sections on the input
+///   will be silently skipped (same gap the non-streaming CLI
+///   converter had before Phase 4).
+/// - **CSC-on-disk and dense X** are rejected by
+///   `open_x_streaming` with [`ConvertError::StreamingUnsupported`].
+pub fn h5ad_to_scx_streaming(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+) -> Result<(), ConvertError> {
+    if opts.csc {
+        return Err(ConvertError::StreamingUnsupported(
+            "csc sidecar via streaming is not yet implemented; \
+             run `scx build-csc` on the streamed output, or use the \
+             non-streaming converter"
+                .into(),
+        ));
+    }
+
+    let file = hdf5::File::open(input)?;
+
+    // Format gating. `open_x_streaming` re-checks CSC/dense and the
+    // encoding-type attribute; this branch only catches the 10x case
+    // (which has no `X` group at all).
+    let input_format = detect_input_format(&file)?;
+    if matches!(input_format, InputFormat::TenX) {
+        return Err(ConvertError::FormatMismatch {
+            expected: "h5ad".to_string(),
+            got: "10x".to_string(),
+        });
+    }
+    let matrix_format = detect_matrix_format(&file)?;
+
+    // Open the X reader first — it loads the full indptr and surfaces
+    // shape via `n_obs` / `n_vars`, both of which the file header
+    // needs before any section write.
+    let mut x_reader = open_x_streaming(&file, "X", matrix_format)?;
+    let n_obs = x_reader.n_obs;
+    let n_vars = x_reader.n_vars;
+    let n_vars_u32: u32 = u32::try_from(n_vars)
+        .map_err(|_| ConvertError::Other(format!("n_vars {n_vars} exceeds u32::MAX")))?;
+    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
+
+    // Placeholder header. `nnz`, `n_csr_shards`, `n_csc_shards`, and
+    // `codec_id` are overwritten by `ScxWriter::finish()` from
+    // running accumulators (see scx-format/src/writer.rs).
+    let header = FileHeader {
+        magic: MAGIC,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs as u64,
+        n_vars: n_vars as u64,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: opts.shard_target_rows,
+        codec_id: 0,
+        index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    };
+
+    let mut writer = ScxWriter::new(output, header)?;
+
+    // obs / var.
+    let obs = read_dataframe_group(&file, "obs")?;
+    let var = read_dataframe_group(&file, "var")?;
+    writer.write_obs(&obs)?;
+    writer.write_var(&var)?;
+
+    // X shards (streaming).
+    let target_rows = opts.shard_target_rows as usize;
+    let mut shard_idx: u32 = 0;
+    while let Some(slice_result) = x_reader.next_shard(target_rows) {
+        let mut slice = slice_result?;
+        sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
+        drop_explicit_zeros_inplace(&mut slice.indptr, &mut slice.indices, &mut slice.values);
+        let pre = encode_one_shard(
+            &slice.indptr,
+            &slice.indices,
+            &slice.values,
+            opts.codec,
+            index_dtype,
+            n_vars_u32,
+            slice.row_start as u64,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            format!("x_shard_{shard_idx}"),
+        )?;
+        writer.write_preencoded_shard(pre)?;
+        shard_idx += 1;
+    }
+    drop(x_reader);
+
+    // obsm / varm / uns. Small dense sections — non-streaming reads.
+    if let Ok(obsm_map) = read_obsm(&file) {
+        for (name, batch) in &obsm_map {
+            writer.write_obsm(name, batch)?;
+        }
+    }
+    if let Ok(varm_map) = read_varm(&file) {
+        for (name, batch) in &varm_map {
+            writer.write_varm(name, batch)?;
+        }
+    }
+    if let Ok(uns) = read_uns(&file) {
+        writer.write_uns(&uns)?;
+    }
+
+    // Layers (one streaming pass per layer).
+    if let Ok(layers_group) = file.group("layers") {
+        let layer_names = layers_group.member_names()?;
+        for layer_name in &layer_names {
+            let mut layer_reader = open_layer_streaming(&file, layer_name)?;
+            let mut layer_shard_idx: u32 = 0;
+            while let Some(slice_result) = layer_reader.next_shard(target_rows) {
+                let mut slice = slice_result?;
+                sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
+                drop_explicit_zeros_inplace(
+                    &mut slice.indptr,
+                    &mut slice.indices,
+                    &mut slice.values,
+                );
+                let pre = encode_one_shard(
+                    &slice.indptr,
+                    &slice.indices,
+                    &slice.values,
+                    opts.codec,
+                    index_dtype,
+                    n_vars_u32,
+                    slice.row_start as u64,
+                    SectionType::LayerCsrShard,
+                    ModalityType::Rna,
+                    format!("{layer_name}_shard_{layer_shard_idx}"),
+                )?;
+                writer.write_preencoded_shard(pre)?;
+                layer_shard_idx += 1;
+            }
+        }
+    }
+
+    // Provenance carries the streaming flag so consumers can tell at
+    // a glance how the file was produced.
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    writer.write_provenance(vec![ProvenanceEntry {
+        timestamp,
+        action: "convert".to_string(),
+        tool: "scx-cli".to_string(),
+        params_json: format!(
+            "{{\"input\":\"{}\",\"format\":\"h5ad\",\"stream\":true}}",
+            input.display()
+        ),
+        input_checksums: vec![],
+    }])?;
+
+    writer.finish()?;
+    Ok(())
 }
 
 /// Memory budget for the streaming CSR→CSC transpose at convert time.

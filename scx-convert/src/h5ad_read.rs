@@ -488,6 +488,18 @@ pub fn read_obsm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, Conv
     read_obsm_at(file, "obsm")
 }
 
+/// Read varm embeddings from h5ad file (root `/varm`).
+///
+/// `varm` has the same on-disk shape as `obsm`: a group of 2-D dense
+/// matrices, each `(n_vars, k)`. Phase 4 of STREAMING-CONVERSION.md
+/// added this helper to close part of the varm/obsp/varp parity gap
+/// the non-streaming CLI converter left open. obsp/varp readers are
+/// a follow-on (they're typically pairwise sparse and need a
+/// different shape).
+pub fn read_varm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, ConvertError> {
+    read_obsm_at(file, "varm")
+}
+
 /// Read an obsm group at an arbitrary path (e.g. `mod/rna/obsm` for an
 /// h5mu file's per-modality embeddings). Returns the same
 /// `name -> RecordBatch` map as `read_obsm`. Missing groups return an
