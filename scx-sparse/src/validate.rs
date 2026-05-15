@@ -1,10 +1,8 @@
-// Per-shard CSR validation and normalisation helpers.
-//
-// These three functions are shared between the in-memory pyscx
-// converter (`pyscx::anndata`) and the streaming converter
-// (`scx_convert::h5ad_stream`). Phase 2 of STREAMING-CONVERSION.md
-// hoisted them out of their private homes so both paths apply the
-// same canonical pre-encode normalisation.
+// Per-shard CSR validation and normalisation helpers shared by the
+// in-memory pyscx converter (`pyscx::anndata`) and the streaming
+// converter (`scx_convert::h5ad_stream`). Centralising them here
+// keeps the canonical pre-encode normalisation identical across
+// both paths.
 
 use crate::csr::CsrError;
 

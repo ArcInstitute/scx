@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 """Emit a small synthetic h5ad fixture for the streaming-conversion
-benchmark smoke test (Phase 10 of STREAMING-CONVERSION.md). The real
-canonical fixtures (`census_1m` / `census_5m` / `census_10m`) live
-elsewhere; this exists so the SLURM smoke job can prove the harness
-end-to-end on a tiny in-memory matrix without bringing those onto
-the local node.
+benchmark smoke test. The real canonical fixtures (`census_1m` /
+`census_5m` / `census_10m`) live elsewhere; this exists so the SLURM
+smoke job can prove the harness end-to-end on a tiny in-memory matrix
+without bringing those onto the local node.
 
 Output is a CSR h5ad with uint8 integer counts, no obsm / varm / uns /
 layers — that's the simplest shape that exercises both the

@@ -1,10 +1,10 @@
-"""Phase 8 tests for streaming h5ad → SCX conversion.
+"""Tests for streaming h5ad → SCX conversion.
 
 Cover:
 - `pyscx.from_h5ad(path, out)` produces the same logical SCX content as
   `pyscx.from_anndata(adata, out)` for the same underlying h5ad.
-- `pyscx.from_anndata(sc.read_h5ad(path, backed='r'), out)` now succeeds
-  (Phase 7 routing) and matches the non-backed conversion.
+- `pyscx.from_anndata(sc.read_h5ad(path, backed='r'), out)` auto-routes
+  to streaming and matches the non-backed conversion.
 - In-memory `obs` mutation on a backed AnnData is preserved end-to-end
   (validates the `StreamingOverrides` plumbing).
 - CSC sidecar parity: `from_h5ad(... csc='always')` and
@@ -95,8 +95,8 @@ def test_from_h5ad_matches_from_anndata(synthetic_adata, h5ad_path, tmp_dir):
 
 
 def test_from_anndata_backed_routes_to_streaming(h5ad_path, tmp_dir):
-    """`from_anndata` on a backed AnnData must succeed (Phase 7 routing)
-    and produce the same SCX content as the non-backed path."""
+    """`from_anndata` on a backed AnnData must auto-route to the streaming
+    pipeline and produce the same SCX content as the non-backed path."""
     import anndata as ad
     import pyscx
 
@@ -115,7 +115,7 @@ def test_from_anndata_backed_routes_to_streaming(h5ad_path, tmp_dir):
 
 def test_backed_obs_mutation_preserved(h5ad_path, tmp_dir):
     """Mutating `obs` on a backed AnnData before `from_anndata` should
-    write the *mutated* values to SCX (option (b) override path)."""
+    write the *mutated* values to SCX via `StreamingOverrides`."""
     import anndata as ad
     import pyscx
 

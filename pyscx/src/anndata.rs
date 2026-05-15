@@ -1355,13 +1355,6 @@ pub(crate) fn astype_if_needed<'py>(
     }
 }
 
-/// Fast upfront validation of CSR arrays (1C.2).
-///
-// `validate_csr_arrays` moved to `scx_sparse::validate_csr_arrays` in
-// Phase 2 of STREAMING-CONVERSION.md so the streaming and in-memory
-// paths share the same validation. Call sites below invoke the
-// scx-sparse version and map `CsrError` to `PyRuntimeError`.
-
 // ---------------------------------------------------------------------------
 // uns serialization
 // ---------------------------------------------------------------------------
@@ -2494,13 +2487,6 @@ fn parallel_encode_csr_shards(
                         .collect::<Result<Vec<u32>, String>>()?
                 };
 
-                // Steps 3–10 (detect encoding, select codec, encode,
-                // build BlockIndex, compute checksums, build
-                // ShardHeader, compute shard stats) live in
-                // `scx_format::encode_one_shard`. Phase 3 of
-                // STREAMING-CONVERSION.md moved them out of this
-                // closure so the streaming pipeline shares the same
-                // implementation.
                 let shard_data = &data_owned[b.nnz_start..b.nnz_end];
                 let name = format!("{name_prefix}_shard_{}", b.shard_idx);
                 scx_format::encode_one_shard(

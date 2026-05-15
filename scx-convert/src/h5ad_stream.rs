@@ -5,10 +5,6 @@
 // `indices` or `data` arrays. The full `indptr` is loaded eagerly —
 // (n_obs + 1) × 8 bytes, ~80 MB at 10M cells, dominant resident cost
 // at census-100M scale.
-//
-// See `STREAMING-CONVERSION.md` for the broader design; this file is
-// only the reader side. Phase 4 will wrap it in the streaming writer
-// pipeline.
 
 use hdf5::types::{IntSize, TypeDescriptor, VarLenUnicode};
 use ndarray::s;

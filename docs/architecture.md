@@ -586,9 +586,7 @@ The conversion code lives in the **`scx-convert`** crate (workspace
 member 15, opt-in `hdf5` feature). Both `scx-cli` and `pyscx` depend on
 it; the previous in-line `scx-cli/src/convert/` module was extracted
 when streaming conversion landed so `pyscx` could share the pipeline
-without depending on the binary-only `scx-cli`. See
-[STREAMING-CONVERSION.md](../STREAMING-CONVERSION.md) for the full
-design.
+without depending on the binary-only `scx-cli`.
 
 **Streaming variant** (`scx convert --stream`, `pyscx.from_h5ad`,
 auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`

@@ -134,11 +134,27 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// (`int64` / `int32` / `float32`) may allocate fresh numpy arrays — those
 /// allocations never alias or mutate the caller's data.
 ///
+/// **Backed AnnData auto-routes to streaming.** When `adata.isbacked` is
+/// true and `adata.filename` (or `adata.file.filename`) resolves to a
+/// readable h5ad path, the call dispatches to the streaming pipeline
+/// instead of materialising `X`. Peak memory becomes bounded by one
+/// shard's worth of CSR plus encode buffers, matching `from_h5ad`.
+/// In-Python mutations to `obs` / `var` / `uns` / `obsm` / `varm` /
+/// `obsp` / `varp` are preserved verbatim — the on-disk values are
+/// overridden by the caller's. Layers are streamed directly from disk;
+/// if the in-memory AnnData has layer mutations, a `UserWarning` fires
+/// (use `from_h5ad` after rewriting an h5ad if you need them
+/// preserved). Backed AnnDatas without a resolvable filename (e.g.
+/// zarr-backed) raise `NotImplementedError`.
+///
 /// Example:
 ///     pyscx.from_anndata(adata, "output.scx")
 ///     pyscx.from_anndata(adata, "output.scx", codec="scx1", shard_size=8192)
 ///     pyscx.from_anndata(adata, "output.scx", in_place=True)
 ///     pyscx.from_anndata(adata, "output.scx", csc="always")
+///     # Backed AnnData (auto-streams):
+///     backed = sc.read_h5ad("big.h5ad", backed="r")
+///     pyscx.from_anndata(backed, "big.scx")
 ///
 /// `csc`: when `"always"`, also writes a CSC (column-major) sidecar.
 ///   `"off"` (default) emits CSR shards only. No `"auto"` mode — CSC is
@@ -177,12 +193,11 @@ fn from_anndata(
 /// X matrix in Python or Rust.
 ///
 /// `pyscx.from_h5ad(path, out)` reads `path` from disk through the
-/// `scx-convert` streaming pipeline (see Phase 4 of
-/// `STREAMING-CONVERSION.md`) and writes `out` shard-by-shard. Peak
-/// memory is bounded by one shard's worth of CSR plus encode buffers
-/// (plus the always-resident `indptr`, ~80 MB at 10M cells), so this
-/// is the recommended entry point for h5ad files larger than node
-/// RAM. For files that comfortably fit in memory, `from_anndata`
+/// `scx-convert` streaming pipeline and writes `out` shard-by-shard.
+/// Peak memory is bounded by one shard's worth of CSR plus encode
+/// buffers (plus the always-resident `indptr`, ~80 MB at 10M cells),
+/// so this is the recommended entry point for h5ad files larger than
+/// node RAM. For files that comfortably fit in memory, `from_anndata`
 /// remains a touch faster.
 ///
 /// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
@@ -197,7 +212,7 @@ fn from_anndata(
 /// the CSC sidecar over the just-written file. Peak disk briefly
 /// reaches ~2× the output size during the rebuild.
 ///
-/// Limitations (Phase 4 MVP):
+/// Limitations:
 ///   * CSC-on-disk h5ad and dense X are rejected with a clear error.
 ///   * `varm` is preserved; `obsp` / `varp` are silently skipped (same
 ///     gap the non-streaming CLI converter has).

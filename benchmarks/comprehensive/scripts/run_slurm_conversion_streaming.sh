@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Streaming h5ad → SCX conversion benchmark (Phase 10 of
-# STREAMING-CONVERSION.md). Submits one SLURM job per dataset; the
-# memory rule pinned in
+# Streaming h5ad → SCX conversion benchmark. Submits one SLURM job per
+# dataset; the memory rule pinned in
 # ~/.claude/projects/-home-nickyoungblut-dev-rust-scx/memory/feedback_lambda_hpc_jobs.md
 # forbids inline benchmark runs.
 #

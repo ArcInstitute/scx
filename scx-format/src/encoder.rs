@@ -1,10 +1,7 @@
-// Per-shard encode helper.
-//
-// Lifted from the inner closure of
-// `pyscx::anndata::parallel_encode_csr_shards` in Phase 3 of
-// STREAMING-CONVERSION.md so the streaming writer pipeline
-// (scx-convert Phase 4) and the existing in-memory pyscx path
-// share the same encode logic with bit-identical output.
+// Per-shard encode helper shared by the in-memory pyscx converter
+// and the `scx-convert` streaming writer. Both paths route through
+// `encode_one_shard` so output is bit-identical regardless of how
+// the (indptr, indices, values) slice was assembled upstream.
 
 use blake3;
 

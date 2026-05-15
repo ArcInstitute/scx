@@ -2,13 +2,12 @@
 # =============================================================================
 # Streaming conversion benchmark — smoke-test submission for Lambda HPC.
 #
-# Phase 10 of STREAMING-CONVERSION.md called for SLURM jobs against
-# census_1m / census_5m / census_10m. Those fixtures are not yet
-# provisioned in this environment. This submission validates the
-# end-to-end harness (build pyscx with hdf5, generate a small
-# synthetic h5ad, run conversion_streaming, write results) so the
-# wiring is exercised; production runs against the census fixtures
-# only need the operator to swap the dataset name and supply the
+# Validates the end-to-end harness (build pyscx with hdf5, generate a
+# small synthetic h5ad, run conversion_streaming, write results)
+# against a tiny synthetic fixture so the wiring is exercised even
+# when canonical census_*m fixtures aren't provisioned locally.
+# Production runs against the census fixtures use
+# `run_slurm_conversion_streaming.sh` with the dataset name and a
 # real h5ad on disk.
 #
 # Differences from run_slurm_conversion_streaming.sh:

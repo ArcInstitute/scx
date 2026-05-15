@@ -1,7 +1,6 @@
 //! Integration tests for `scx convert --stream` and
-//! `scx convert --stream --csc always` (Phase 5 of
-//! STREAMING-CONVERSION.md). Spawn the `scx` binary against a
-//! synthetic h5ad fixture built with the `hdf5` crate.
+//! `scx convert --stream --csc always`. Spawn the `scx` binary
+//! against a synthetic h5ad fixture built with the `hdf5` crate.
 //!
 //! Lives in `scx-cli/tests/` because it exercises the CLI surface;
 //! the underlying streaming pipeline is tested separately in

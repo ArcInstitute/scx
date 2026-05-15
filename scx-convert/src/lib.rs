@@ -1,7 +1,7 @@
 // External format <-> SCX conversion.
-// Extracted from scx-cli so pyscx can call into the same code (see
-// STREAMING-CONVERSION.md). Behaviour is unchanged from the prior
-// scx-cli/src/convert/ module.
+// Shared by scx-cli and pyscx; the `hdf5` feature gates the h5ad /
+// h5mu / 10x readers and writers so consumers that don't need them
+// can build without libhdf5.
 
 mod direction;
 pub use direction::determine_convert_direction;

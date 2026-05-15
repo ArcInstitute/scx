@@ -314,38 +314,14 @@ pub fn scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), ConvertError
     write_scx_to_h5ad(scx_path, h5ad_path)
 }
 
-/// Streaming h5ad → SCX conversion. Reads the input one shard's worth
-/// of rows at a time via [`super::h5ad_stream::XStreamReader`] so peak
-/// memory is bounded by `shard_target_rows × n_vars × density × ~16
-/// bytes` plus the always-resident indptr (`(n_obs + 1) × 8 bytes`).
+/// Override hooks for [`h5ad_to_scx_streaming`]. Each `Some(...)`
+/// field skips the corresponding on-disk read and uses the provided
+/// value instead.
 ///
-/// Behaviour notes (Phase 4 MVP):
-/// - **Sequential**: one shard read → sort → drop-zeros → encode →
-///   write per iteration. No concurrent encoder pool yet. Worker
-///   parallelism is a planned follow-on if benchmarks show I/O
-///   starvation.
-/// - **CSC sidecar (`opts.csc == true`)**: not yet supported via
-///   streaming. The two-pass design (`rebuild_csc_inplace` on the
-///   finished file) requires that helper to be reachable from
-///   `scx-convert`; it currently lives in `scx-cli`. Returns
-///   [`ConvertError::StreamingUnsupported`] until the move lands.
-///   Users can still run `scx build-csc` on the streamed output.
-/// - **`varm`** is read and written via [`read_varm`]; `obsp`/`varp`
-///   readers are still missing and any present sections on the input
-///   will be silently skipped (same gap the non-streaming CLI
-///   converter had before Phase 4).
-/// - **CSC-on-disk and dense X** are rejected by
-///   `open_x_streaming` with [`ConvertError::StreamingUnsupported`].
-/// Override hooks for `h5ad_to_scx_streaming`. Each `Some(...)` field
-/// skips the corresponding on-disk read and uses the provided value
-/// instead.
-///
-/// Phase 7 of `STREAMING-CONVERSION.md` introduced this for the
-/// backed-AnnData routing path in `pyscx.from_anndata`: when a caller
-/// has already mutated `obs` / `var` / `uns` / `obsm` / `varm` /
-/// `obsp` / `varp` in Python, those edits would be silently lost if
-/// the streaming pipeline re-read them from disk. Pass the mutated
-/// values here to preserve them.
+/// The pyscx backed-AnnData routing path in `from_anndata` uses this
+/// to preserve in-Python mutations to `obs` / `var` / `uns` / `obsm` /
+/// `varm` / `obsp` / `varp` that would otherwise be silently lost
+/// when the streaming pipeline re-reads them from disk.
 ///
 /// Layers are intentionally not overridable — they're streamed
 /// directly from disk per shard, and the pyscx backed-mode path
@@ -362,6 +338,23 @@ pub struct StreamingOverrides {
     pub varp: Option<Vec<(String, arrow::record_batch::RecordBatch)>>,
 }
 
+/// Streaming h5ad → SCX conversion. Reads the input one shard's worth
+/// of rows at a time via [`super::h5ad_stream::XStreamReader`] so peak
+/// memory is bounded by `shard_target_rows × n_vars × density × ~16
+/// bytes` plus the always-resident indptr (`(n_obs + 1) × 8 bytes`).
+///
+/// The pipeline is currently sequential: one shard read → sort →
+/// drop-zeros → encode → write per iteration. A concurrent encoder
+/// pool is a planned follow-on if benchmarks show I/O starvation.
+///
+/// `opts.csc == true` runs a post-`finish()`
+/// [`scx_ops::rebuild_csc_inplace`] pass over the just-written file;
+/// peak disk briefly reaches ~2× the output size during the rebuild.
+///
+/// `varm` is read and written; `obsp` / `varp` are silently skipped
+/// unless caller-supplied via [`StreamingOverrides`] (same gap the
+/// non-streaming CLI converter has). CSC-on-disk and dense `X` are
+/// rejected up front with [`ConvertError::StreamingUnsupported`].
 pub fn h5ad_to_scx_streaming(
     input: &Path,
     output: &Path,
