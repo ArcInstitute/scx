@@ -2509,17 +2509,18 @@ fn parallel_encode_csr_shards(
     result.map_err(PyRuntimeError::new_err)
 }
 
-/// Phase 7: route a backed AnnData object through the streaming
-/// converter. Extracts in-memory `obs` / `var` / `uns` / `obsm` /
-/// `varm` / `obsp` / `varp` into Rust types so any caller mutations
-/// are preserved, then invokes
-/// `scx_convert::h5ad_to_scx_streaming` on the backing h5ad file.
+/// Route a backed AnnData object through the streaming converter.
+/// Extracts in-memory `obs` / `var` / `uns` / `obsm` / `varm` /
+/// `obsp` / `varp` into Rust types so any caller mutations are
+/// preserved, then invokes `scx_convert::h5ad_to_scx_streaming` on
+/// the backing h5ad file.
 ///
 /// X and layers always come from disk via streaming — there's no
 /// override hook for those (they're potentially too large to extract
 /// from a backed AnnData into memory). Emits a `UserWarning` when
 /// the backed AnnData has any layers, because the streaming reads
 /// will overwrite any in-memory layer mutations.
+#[cfg(feature = "hdf5")]
 #[allow(clippy::too_many_arguments)]
 fn route_backed_anndata_to_streaming(
     py: Python<'_>,
@@ -2612,6 +2613,7 @@ fn route_backed_anndata_to_streaming(
 /// Helper for the backed-routing path. Reads a dense mapping
 /// (`obsm` / `varm`) from a Python AnnData and returns
 /// `Vec<(name, RecordBatch)>`. Missing groups → empty Vec.
+#[cfg(feature = "hdf5")]
 fn extract_dense_mapping(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -2639,6 +2641,7 @@ fn extract_dense_mapping(
 /// Helper for the backed-routing path. Reads a sparse pairwise
 /// mapping (`obsp` / `varp`) as COO RecordBatches. Missing groups →
 /// empty Vec.
+#[cfg(feature = "hdf5")]
 fn extract_coo_mapping(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -2665,6 +2668,7 @@ fn extract_coo_mapping(
 /// AnnData into an optional `serde_json::Value`. Returns `None` if
 /// `uns` is empty (no `__scx_uns__` section written), matching the
 /// non-backed path.
+#[cfg(feature = "hdf5")]
 fn extract_uns_value(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -2713,30 +2717,45 @@ pub fn from_anndata_impl(
     };
     let uns_format_parsed = parse_uns_format(uns_format)?;
 
-    // Phase 7: backed AnnData → route through the streaming converter
+    // Backed AnnData → route through the streaming converter
     // (`scx_convert::h5ad_to_scx_streaming`) instead of the in-memory
     // path, which would fail at the `ensure_csr` step (backed `X` is
     // an `_CSRDataset`, not a scipy sparse matrix). In-memory
     // mutations on `obs` / `var` / `uns` / `obsm` / `varm` / `obsp` /
     // `varp` are extracted to Rust and passed as `StreamingOverrides`
     // so user edits aren't silently overwritten by the on-disk
-    // version.
+    // version. Available only when pyscx was built with the `hdf5`
+    // feature; without it the call falls through to the in-memory
+    // path which raises a clear error on the backed `_CSRDataset`.
     let is_backed: bool = adata
         .getattr("isbacked")
         .ok()
         .and_then(|v| v.extract::<bool>().ok())
         .unwrap_or(false);
     if is_backed {
-        return route_backed_anndata_to_streaming(
-            py,
-            adata,
-            path,
-            explicit_codec,
-            shard_target_rows,
-            csc_always,
-            csc_cols_per_shard,
-            uns_format_parsed,
-        );
+        #[cfg(feature = "hdf5")]
+        {
+            return route_backed_anndata_to_streaming(
+                py,
+                adata,
+                path,
+                explicit_codec,
+                shard_target_rows,
+                csc_always,
+                csc_cols_per_shard,
+                uns_format_parsed,
+            );
+        }
+        #[cfg(not(feature = "hdf5"))]
+        {
+            let _ = (explicit_codec, csc_always, csc_cols_per_shard, uns_format_parsed);
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "pyscx was built without the `hdf5` feature; backed AnnData \
+                 routing requires libhdf5. Rebuild with \
+                 `maturin develop --features hdf5` or convert the AnnData \
+                 to a non-backed form first.",
+            ));
+        }
     }
 
     // Extract X as CSR. By default we do not mutate caller-owned CSR

@@ -92,7 +92,7 @@ echo ""
 rm -rf "\${REPO_ROOT}/target/maturin"
 echo "--- Building pyscx (--features hdf5, release) ---"
 cd "\${REPO_ROOT}/pyscx"
-"\${CONDA_PREFIX}/bin/maturin" develop --release 2>&1 | tail -10
+"\${CONDA_PREFIX}/bin/maturin" develop --release --features hdf5 2>&1 | tail -10
 cd "\${REPO_ROOT}"
 echo ""
 

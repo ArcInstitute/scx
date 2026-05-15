@@ -220,6 +220,7 @@ fn from_anndata(
 /// Example:
 ///     pyscx.from_h5ad("big.h5ad", "big.scx")
 ///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
+#[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
 #[allow(clippy::too_many_arguments)]
@@ -405,6 +406,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
+    #[cfg(feature = "hdf5")]
     m.add_function(wrap_pyfunction!(from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
