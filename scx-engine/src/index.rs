@@ -639,7 +639,13 @@ pub fn build_obs_predicate_index_bytes(
     outcomes: &mut Vec<BuildOutcome>,
     indexed_column_names: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>> {
-    build_predicate_index_bytes_inner(obs, shard_row_ranges, options, outcomes, indexed_column_names)
+    build_predicate_index_bytes_inner(
+        obs,
+        shard_row_ranges,
+        options,
+        outcomes,
+        indexed_column_names,
+    )
 }
 
 /// Build serialized predicate-index bytes for a var RecordBatch. The
@@ -653,7 +659,13 @@ pub fn build_var_predicate_index_bytes(
     outcomes: &mut Vec<BuildOutcome>,
     indexed_column_names: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>> {
-    build_predicate_index_bytes_inner(var, shard_row_ranges, options, outcomes, indexed_column_names)
+    build_predicate_index_bytes_inner(
+        var,
+        shard_row_ranges,
+        options,
+        outcomes,
+        indexed_column_names,
+    )
 }
 
 /// Build a categorical index for a column.
@@ -1399,9 +1411,14 @@ mod tests {
         };
         let mut outcomes = Vec::new();
         let mut names = Vec::new();
-        let bytes =
-            build_obs_predicate_index_bytes(&batch, &shard_ranges, &opts, &mut outcomes, &mut names)
-                .unwrap();
+        let bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_ranges,
+            &opts,
+            &mut outcomes,
+            &mut names,
+        )
+        .unwrap();
         assert!(bytes.is_none());
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
@@ -1424,15 +1441,20 @@ mod tests {
         };
         let mut outcomes = Vec::new();
         let mut names = Vec::new();
-        let bytes =
-            build_obs_predicate_index_bytes(&batch, &shard_ranges, &opts, &mut outcomes, &mut names)
-                .unwrap();
+        let bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_ranges,
+            &opts,
+            &mut outcomes,
+            &mut names,
+        )
+        .unwrap();
         // cell_type exists in the fixture so an index is produced.
         assert!(bytes.is_some());
         assert_eq!(names, vec!["cell_type".to_string()]);
         // tissue is missing → preset skip
-        assert!(outcomes
-            .iter()
-            .any(|o| matches!(o, BuildOutcome::PresetSkipped { column, .. } if column == "tissue")));
+        assert!(outcomes.iter().any(
+            |o| matches!(o, BuildOutcome::PresetSkipped { column, .. } if column == "tissue")
+        ));
     }
 }

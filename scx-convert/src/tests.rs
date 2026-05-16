@@ -3512,9 +3512,7 @@ fn create_test_h5ad_with_cell_type(path: &Path, n_obs: usize, n_vars: usize) {
     let file = hdf5::File::append(path).unwrap();
     let obs = file.group("obs").unwrap();
     let labels = ["A", "B", "A", "B", "A"]; // small palette
-    let col: Vec<VarLenUnicode> = (0..n_obs)
-        .map(|i| vlu(labels[i % labels.len()]))
-        .collect();
+    let col: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(labels[i % labels.len()])).collect();
     obs.new_dataset::<VarLenUnicode>()
         .shape([n_obs])
         .create("cell_type")
@@ -3587,7 +3585,10 @@ fn convert_with_preset_missing_column_warns() {
     let counter = std::sync::Arc::new(std::sync::Mutex::new(0u64));
     let counter_clone = counter.clone();
     let mut sink = WarningSink::with_handler(move |w| {
-        if matches!(w, super::warnings::ConvertWarning::MissingPresetIndexColumn { .. }) {
+        if matches!(
+            w,
+            super::warnings::ConvertWarning::MissingPresetIndexColumn { .. }
+        ) {
             *counter_clone.lock().unwrap() += 1;
         }
     });

@@ -15,8 +15,7 @@ pub use fused_ops::{
 };
 pub use index::{
     build_indexes, build_obs_predicate_index_bytes, build_var_predicate_index_bytes,
-    index_preset_columns, BuildOutcome, IndexPreset, PredicateIndex,
-    PredicateIndexBuildOptions,
+    index_preset_columns, BuildOutcome, IndexPreset, PredicateIndex, PredicateIndexBuildOptions,
 };
 pub use pipeline::{NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};
