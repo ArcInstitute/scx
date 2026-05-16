@@ -26,7 +26,8 @@ pub use backed::{
 };
 #[cfg(feature = "deletion-vectors")]
 pub use bitmap::{
-    BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC, BITMAP_SHARD_VERSION,
+    BitmapPolicy, BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC,
+    BITMAP_SHARD_VERSION,
 };
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;

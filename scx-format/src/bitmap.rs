@@ -28,6 +28,41 @@ use std::io::{Read, Write};
 
 use crate::error::{validate_allocation, Result, ScxError};
 
+/// Phase 5b: detection-bitmap generation policy. Mirrors the
+/// `--bitmap off|auto|always` CLI flag and the `bitmap="..."` pyscx
+/// kwarg. Lives in `scx-format` (next to [`BitmapShard`]) rather than
+/// `scx-convert` so the CPU-only pyscx build — where `scx-convert` is
+/// behind the `hdf5` feature — can still drive the policy from its
+/// in-memory write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BitmapPolicy {
+    /// Never emit bitmap sidecars.
+    #[default]
+    Off,
+    /// Emit bitmap sidecars when the shard passes the auto policy
+    /// (sparse X, `n_vars <= 1_000_000`, estimated bitmap size ≤ 15 %
+    /// of encoded CSR size; ATAC modalities are always-on under Auto).
+    Auto,
+    /// Always emit bitmap sidecars regardless of cost.
+    Always,
+}
+
+impl BitmapPolicy {
+    /// Parse the CLI / Python form (`"off" | "auto" | "always"`).
+    /// Unknown values return an `Err(reason)` for the caller to wrap
+    /// in `ConvertError::Other` / `PyValueError` as appropriate.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            other => Err(format!(
+                "invalid bitmap value '{other}'; expected off|auto|always"
+            )),
+        }
+    }
+}
+
 /// Magic bytes at the start of every bitmap shard section.
 pub const BITMAP_SHARD_MAGIC: [u8; 4] = *b"SCXB";
 /// Wire-format version. Increment only when an existing field

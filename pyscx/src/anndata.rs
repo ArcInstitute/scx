@@ -44,10 +44,10 @@ fn build_and_write_bitmap_for_shard_python(
     n_rows: u32,
     n_vars: u32,
     encoded_csr_size: usize,
-    policy: scx_convert::BitmapPolicy,
+    policy: scx_format::BitmapPolicy,
 ) -> PyResult<()> {
-    use scx_convert::BitmapPolicy;
     use scx_format::bitmap::BitmapShard;
+    use scx_format::BitmapPolicy;
     const DENSITY_THRESHOLD: f32 = 0.30;
     const N_VARS_CAP: u32 = 1_000_000;
     const SIZE_PERCENT: usize = 15;
@@ -2730,7 +2730,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     index_auto_threshold: usize,
     bitmap: &str,
 ) -> PyResult<()> {
-    let bitmap_policy = scx_convert::BitmapPolicy::parse(bitmap)
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older
@@ -3229,13 +3229,13 @@ pub fn from_anndata_impl(
         "X",
     )?;
     // Phase 5b: parse bitmap policy once.
-    let bitmap_policy = scx_convert::BitmapPolicy::parse(bitmap)
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     for (boundary, section) in boundaries.iter().zip(pre_encoded) {
         let encoded_csr_size = section.section_length as usize;
         writer.write_preencoded_shard(section).map_err(to_pyerr)?;
-        if !matches!(bitmap_policy, scx_convert::BitmapPolicy::Off) {
+        if !matches!(bitmap_policy, scx_format::BitmapPolicy::Off) {
             // Build the bitmap from the original CSR slice. boundary
             // values are bounded to the (already-validated) slice
             // lengths; the i64→u64 / i32→u32 casts mirror the

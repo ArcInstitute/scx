@@ -201,7 +201,7 @@ pub fn from_h5mu_impl(
             )));
         }
     };
-    let bitmap_policy = scx_convert::BitmapPolicy::parse(bitmap)
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = crate::anndata::parse_memory_budget(memory_budget.as_ref())?;

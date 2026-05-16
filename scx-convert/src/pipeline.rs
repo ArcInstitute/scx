@@ -222,34 +222,15 @@ fn build_and_write_bitmap_for_shard(
     Ok(true)
 }
 
-/// Phase 5b: detection-bitmap generation policy. Mirrors the
-/// `--bitmap off|auto|always` CLI flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BitmapPolicy {
-    /// Never emit bitmap sidecars.
-    #[default]
-    Off,
-    /// Emit bitmap sidecars when the shard passes the auto policy
-    /// (sparse X, `n_vars <= 1_000_000`, estimated bitmap size ≤ 15 %
-    /// of encoded CSR size; ATAC modalities are always-on under Auto).
-    Auto,
-    /// Always emit bitmap sidecars regardless of cost.
-    Always,
-}
-
-impl BitmapPolicy {
-    /// Parse the CLI / Python form (`"off" | "auto" | "always"`).
-    pub fn parse(s: &str) -> Result<Self, ConvertError> {
-        match s {
-            "off" => Ok(Self::Off),
-            "auto" => Ok(Self::Auto),
-            "always" => Ok(Self::Always),
-            other => Err(ConvertError::Other(format!(
-                "invalid bitmap value '{other}'; expected off|auto|always"
-            ))),
-        }
-    }
-}
+/// Phase 5b: detection-bitmap generation policy.
+///
+/// Re-exported from [`scx_format::BitmapPolicy`] so callers that depend
+/// on `scx-convert` (CLI, pyscx with hdf5) can name it without an
+/// extra `scx_format` import. The actual definition lives in
+/// `scx-format` so the CPU-only pyscx build (which doesn't pull in
+/// `scx-convert`) can still drive bitmap generation from its in-memory
+/// write path.
+pub use scx_format::BitmapPolicy;
 
 impl Default for ConvertOptions {
     fn default() -> Self {
