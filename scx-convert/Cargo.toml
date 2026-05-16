@@ -25,6 +25,11 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-mtx = { path = "../scx-mtx" }
 scx-ops = { path = "../scx-ops" }
+# Phase 2 external CSC → CSR transpose writes intermediate
+# `(row, col, value)` triples to a session temp directory. `TempDir`
+# is auto-deleted on drop — the cleanest "scoped resource" pattern
+# for that path.
+tempfile = { workspace = true }
 
 hdf5 = { workspace = true, optional = true }
 # Renamed: the 0.9.x line of `hdf5-rust` ships the `hdf5-sys` companion
@@ -35,5 +40,4 @@ libz-sys = { version = "1", optional = true, default-features = false }
 ndarray = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 flate2 = "1"

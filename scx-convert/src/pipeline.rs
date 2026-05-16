@@ -11,6 +11,7 @@ use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 use scx_sparse::{drop_explicit_zeros_inplace, sort_csr_rows_in_place};
 
+use super::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
 use super::dense_stream::{open_dense_layer_streaming, open_dense_streaming};
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
 use super::dtype::{detect_value_encoding, values_to_raw_bytes};
@@ -90,6 +91,13 @@ pub struct ConvertOptions {
     /// equality-to-zero filtering that `scx_sparse::dense_to_csr`
     /// already does (matches scipy `csr_matrix(dense)`).
     pub dense_zero_epsilon: f32,
+    /// Directory under which the Phase 2 external CSC → CSR transpose
+    /// writes its session temp directory
+    /// (`<temp_dir>/scx-transpose-<pid>-<random>/`). `None` falls back
+    /// to [`std::env::temp_dir`]. Used only when the budget arithmetic
+    /// forces the external path; the in-memory CSC route never
+    /// touches disk.
+    pub temp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ConvertOptions {
@@ -104,6 +112,7 @@ impl Default for ConvertOptions {
             stream: true,
             strict_uns: false,
             dense_zero_epsilon: 0.0,
+            temp_dir: None,
         }
     }
 }
@@ -436,17 +445,12 @@ pub fn h5ad_to_scx_streaming(
     // Open the X reader first — it surfaces shape via `n_obs` /
     // `n_vars`, both of which the file header needs before any section
     // write. CSR uses the indptr-eager reader; Dense slabs rows on
-    // demand; CSC is rejected (Phase 2 owns external-memory transpose).
+    // demand; CSC routes through the Phase 2 dispatcher which picks
+    // in-memory vs. external-memory transpose based on the budget.
     let mut x_reader: Box<dyn CsrShardStream> = match matrix_format {
         MatrixFormat::Csr => Box::new(open_x_streaming(&file, "X", matrix_format, sink)?),
         MatrixFormat::Dense => Box::new(open_dense_streaming(&file, "X", opts, sink)?),
-        MatrixFormat::Csc => {
-            return Err(ConvertError::StreamingUnsupported(
-                "CSC-on-disk h5ad cannot stream; pass --stream=false or \
-                 pre-convert to CSR"
-                    .into(),
-            ));
-        }
+        MatrixFormat::Csc => open_csc_streaming(&file, "X", opts, sink)?,
     };
     let n_obs = x_reader.n_obs() as usize;
     let n_vars = x_reader.n_vars() as usize;
@@ -618,11 +622,16 @@ pub fn h5ad_to_scx_streaming(
                     }
                 }
                 MatrixFormat::Csc => {
-                    sink.emit(ConvertWarning::LayerSkipped {
-                        name: layer_name.clone(),
-                        reason: "CSC layer; pass --stream=false or pre-convert to CSR".into(),
-                    });
-                    continue;
+                    match open_csc_layer_streaming(&file, layer_name, opts, sink) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            sink.emit(ConvertWarning::LayerSkipped {
+                                name: layer_name.clone(),
+                                reason: format!("{e}"),
+                            });
+                            continue;
+                        }
+                    }
                 }
             };
             let l_n_obs = layer_reader.n_obs() as usize;
@@ -664,6 +673,11 @@ pub fn h5ad_to_scx_streaming(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let source_format_str = match matrix_format {
+        MatrixFormat::Csr => "csr_matrix",
+        MatrixFormat::Csc => "csc_matrix",
+        MatrixFormat::Dense => "array",
+    };
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
@@ -672,6 +686,7 @@ pub fn h5ad_to_scx_streaming(
             "input": input.display().to_string(),
             "format": "h5ad",
             "stream": true,
+            "source_matrix_format": source_format_str,
             "warnings": sink.summary_json(),
         })
         .to_string(),
@@ -718,11 +733,21 @@ pub fn streaming_writer_coordinator(
     n_vars_u32: u32,
     section_type: SectionType,
     section_name_prefix: &str,
-    _sink: &mut WarningSink,
+    sink: &mut WarningSink,
 ) -> Result<u32, ConvertError> {
     let target_rows = opts.shard_target_rows as usize;
     let mut shard_idx: u32 = 0;
     while let Some(mut shard) = reader.next_csr_shard(target_rows)? {
+        // Surface upstream duplicate-coordinate canonicalisation
+        // (Phase 2 CSC external transpose) as a typed warning. Other
+        // readers always set `duplicates_merged = 0` so this is a
+        // no-op for them.
+        if shard.duplicates_merged > 0 {
+            sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
+                count: shard.duplicates_merged,
+                policy: "sum".to_string(),
+            });
+        }
         drop_explicit_zeros_inplace(&mut shard.indptr, &mut shard.indices, &mut shard.values);
         sort_csr_rows_in_place(&shard.indptr, &mut shard.indices, &mut shard.values);
         let pre = encode_one_shard(

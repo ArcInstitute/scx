@@ -220,6 +220,7 @@ impl CsrShardStream for DenseXStreamReader {
             indices,
             values,
             source_name: Some(self.source_name.clone()),
+            duplicates_merged: 0,
         }))
     }
 }

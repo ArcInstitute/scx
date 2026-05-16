@@ -272,6 +272,7 @@ impl CsrShardStream for XStreamReader {
                     indices: slice.indices,
                     values: slice.values,
                     source_name: Some(self.source_name.clone()),
+                    duplicates_merged: 0,
                 }))
             }
         }
@@ -281,7 +282,11 @@ impl CsrShardStream for XStreamReader {
 /// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.
 /// Dispatches on the on-disk dtype (i32 / i64 / u32 supported) and
 /// applies the same range-validation checks per element.
-fn read_slice_i32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<i32>, ConvertError> {
+pub(crate) fn read_slice_i32(
+    ds: &hdf5::Dataset,
+    start: usize,
+    end: usize,
+) -> Result<Vec<i32>, ConvertError> {
     let desc = ds.dtype()?.to_descriptor()?;
     let sel = s![start..end];
     match desc {
@@ -317,7 +322,11 @@ fn read_slice_i32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<i3
 }
 
 /// Slice-read variant of `read_f32_dataset` from `h5ad_read.rs`.
-fn read_slice_f32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<f32>, ConvertError> {
+pub(crate) fn read_slice_f32(
+    ds: &hdf5::Dataset,
+    start: usize,
+    end: usize,
+) -> Result<Vec<f32>, ConvertError> {
     let desc = ds.dtype()?.to_descriptor()?;
     let sel = s![start..end];
     match desc {

@@ -1888,30 +1888,28 @@ fn streaming_sets_index_dtype_1_when_n_vars_above_u16() {
 }
 
 #[test]
-fn streaming_csc_on_disk_errors_at_pipeline_level() {
+fn streaming_csc_on_disk_routes_through_phase2_dispatcher() {
+    // Pre-Phase 2 this used to reject CSC at the pipeline level.
+    // Phase 2 lights up `open_csc_streaming`, so the same fixture
+    // should now convert successfully via the in-memory CSC route
+    // (no `memory_budget` set → MaterializedCsrStream).
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("csc.h5ad");
     create_test_h5ad(&h5ad, 6, 5, "csc", false);
 
     let scx = dir.path().join("csc.scx");
     let opts = streaming_opts(16);
-    let err = h5ad_to_scx_streaming(
+    h5ad_to_scx_streaming(
         &h5ad,
         &scx,
         &opts,
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
-    .expect_err("CSC-on-disk h5ad must be rejected by the streaming pipeline");
-    match err {
-        ConvertError::StreamingUnsupported(msg) => {
-            assert!(
-                msg.contains("CSC"),
-                "expected CSC-on-disk error message; got: {msg}"
-            );
-        }
-        other => panic!("expected StreamingUnsupported, got {other:?}"),
-    }
+    .expect("Phase 2 should route CSC through open_csc_streaming");
+    let reader = ScxReader::open(&scx).unwrap();
+    assert_eq!(reader.header().n_obs, 6);
+    assert_eq!(reader.header().n_vars, 5);
 }
 
 #[test]
@@ -2598,6 +2596,388 @@ fn write_dense_h5ad(path: &Path, n_obs: usize, n_vars: usize, dense: &[f32]) {
         .unwrap()
         .write_scalar(&vlu("_index"))
         .unwrap();
+}
+
+/// Write a CSC-encoded h5ad with hand-supplied indptr/indices/data
+/// (no obs/var extras). Used by the unsorted-rows, duplicate, and
+/// explicit-zero CSC tests.
+#[cfg(test)]
+fn write_csc_h5ad(
+    path: &Path,
+    n_obs: usize,
+    n_vars: usize,
+    col_indptr: &[i64],
+    row_indices: &[i32],
+    data: &[f32],
+) {
+    let file = hdf5::File::create(path).unwrap();
+    let x = file.create_group("X").unwrap();
+    x.new_dataset::<i64>()
+        .shape([col_indptr.len()])
+        .create("indptr")
+        .unwrap()
+        .write(col_indptr)
+        .unwrap();
+    x.new_dataset::<i32>()
+        .shape([row_indices.len()])
+        .create("indices")
+        .unwrap()
+        .write(row_indices)
+        .unwrap();
+    x.new_dataset::<f32>()
+        .shape([data.len()])
+        .create("data")
+        .unwrap()
+        .write(data)
+        .unwrap();
+    x.new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("csc_matrix"))
+        .unwrap();
+    x.new_attr::<i64>()
+        .shape([2])
+        .create("shape")
+        .unwrap()
+        .write(&[n_obs as i64, n_vars as i64])
+        .unwrap();
+
+    let obs = file.create_group("obs").unwrap();
+    let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("c_{i}"))).collect();
+    obs.new_dataset::<VarLenUnicode>()
+        .shape([n_obs])
+        .create("_index")
+        .unwrap()
+        .write(&obs_index)
+        .unwrap();
+    obs.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+
+    let var = file.create_group("var").unwrap();
+    let var_index: Vec<VarLenUnicode> = (0..n_vars).map(|i| vlu(&format!("g_{i}"))).collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([n_vars])
+        .create("_index")
+        .unwrap()
+        .write(&var_index)
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Phase 2 — CSC-on-disk h5ad streaming.
+// -----------------------------------------------------------------------
+
+#[test]
+fn phase2_streaming_csc_matches_in_memory_csr() {
+    // Default budget (None) → in-memory CSC route via
+    // MaterializedCsrStream. Output must match the non-streaming
+    // `h5ad_to_scx` path which uses the same csc_to_csr scatter.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_small.h5ad");
+    create_test_h5ad(&h5ad, 41, 13, "csc", false);
+
+    let scx_stream = dir.path().join("stream.scx");
+    let scx_bulk = dir.path().join("bulk.scx");
+    let opts = streaming_opts(16);
+
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_stream,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &opts, &mut WarningSink::log()).unwrap();
+
+    let a = ScxReader::open(&scx_stream).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+    assert_eq!(a.header().n_obs, b.header().n_obs);
+    assert_eq!(a.header().n_vars, b.header().n_vars);
+    assert_eq!(a.header().nnz, b.header().nnz);
+    let csr_a = a.read_all_csr_shards().unwrap();
+    let csr_b = b.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+}
+
+#[test]
+fn phase2_streaming_csc_external_transpose_matches_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_ext.h5ad");
+    create_test_h5ad(&h5ad, 41, 13, "csc", false);
+
+    let scx_ext = dir.path().join("ext.scx");
+    let scx_bulk = dir.path().join("bulk.scx");
+    let bulk_opts = streaming_opts(16);
+
+    // 2 KiB budget — well below the in-memory threshold of
+    // `16 × nnz + 16 × n_obs`, so the external route is forced.
+    let ext_opts = ConvertOptions {
+        shard_target_rows: 16,
+        memory_budget: Some(2048),
+        ..ConvertOptions::default()
+    };
+
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_ext,
+        &ext_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    h5ad_to_scx(&h5ad, &scx_bulk, &bulk_opts, &mut WarningSink::log()).unwrap();
+
+    let a = ScxReader::open(&scx_ext).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+    let csr_a = a.read_all_csr_shards().unwrap();
+    let csr_b = b.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+}
+
+#[test]
+fn phase2_streaming_csc_unsorted_rows_per_col() {
+    // CSC where per-column row indices are NOT sorted. scipy allows
+    // this; the streaming pipeline's downstream `sort_csr_rows_in_place`
+    // keeps the output canonical.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_unsorted.h5ad");
+    // 3 rows, 2 cols. Col 0 has rows in order [2, 0] (unsorted)
+    // with values 5.0, 3.0. Col 1 has row [1] with value 7.0.
+    write_csc_h5ad(
+        &h5ad,
+        3,
+        2,
+        &[0i64, 2, 3],
+        &[2i32, 0, 1],
+        &[5.0f32, 3.0, 7.0],
+    );
+
+    let scx = dir.path().join("out.scx");
+    let opts = streaming_opts(8);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    let reader = ScxReader::open(&scx).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    // Row 0: col 0, val 3.0; Row 1: col 1, val 7.0; Row 2: col 0, val 5.0
+    assert_eq!(csr.indptr, vec![0, 1, 2, 3]);
+    assert_eq!(csr.indices, vec![0, 1, 0]);
+    assert_eq!(csr.data, vec![3.0, 7.0, 5.0]);
+}
+
+#[test]
+fn phase2_streaming_csc_external_unsorted_rows_per_col() {
+    // Same fixture, but force the external transposer to exercise
+    // the sort+coalesce path.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_unsorted_ext.h5ad");
+    write_csc_h5ad(
+        &h5ad,
+        3,
+        2,
+        &[0i64, 2, 3],
+        &[2i32, 0, 1],
+        &[5.0f32, 3.0, 7.0],
+    );
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 8,
+        memory_budget: Some(1024),
+        ..ConvertOptions::default()
+    };
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    let reader = ScxReader::open(&scx).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.indptr, vec![0, 1, 2, 3]);
+    assert_eq!(csr.indices, vec![0, 1, 0]);
+    assert_eq!(csr.data, vec![3.0, 7.0, 5.0]);
+}
+
+#[test]
+fn phase2_streaming_csc_duplicate_coords_sum() {
+    // CSC with two entries at the SAME (row, col). The external
+    // transposer's coalesce step sums them; the writer coordinator
+    // emits one `DuplicateCoordinatesMerged` warning per non-zero
+    // shard.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_dup.h5ad");
+    // 2 rows × 2 cols. Col 0 has TWO entries at row 0 (vals 1.0, 2.5),
+    // plus one at row 1 (val 4.0). Col 1 has one entry at row 0 (val 0.5).
+    write_csc_h5ad(
+        &h5ad,
+        2,
+        2,
+        &[0i64, 3, 4],
+        &[0i32, 0, 1, 0],
+        &[1.0f32, 2.5, 4.0, 0.5],
+    );
+
+    let scx = dir.path().join("out.scx");
+    // Budget below the in-memory threshold (16*nnz + 16*n_obs = 96 B
+    // here) but above the 4-record minimum (64 B) — forces the
+    // external transposer which is the path that coalesces
+    // duplicates.
+    let opts = ConvertOptions {
+        shard_target_rows: 8,
+        memory_budget: Some(80),
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut sink,
+    )
+    .unwrap();
+    let dup = sink
+        .counts()
+        .get("duplicate_coordinates_merged")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        dup >= 1,
+        "expected ≥1 DuplicateCoordinatesMerged warning, got {dup}"
+    );
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    // Row 0: col 0 → 1.0 + 2.5 = 3.5; col 1 → 0.5
+    // Row 1: col 0 → 4.0
+    assert_eq!(csr.indptr, vec![0, 2, 3]);
+    assert_eq!(csr.indices, vec![0, 1, 0]);
+    assert_eq!(csr.data, vec![3.5, 0.5, 4.0]);
+}
+
+#[test]
+fn phase2_streaming_csc_explicit_zeros_dropped() {
+    // CSC with explicit 0.0 entries in `data` must round-trip
+    // without those zeros (`drop_explicit_zeros_inplace` applies
+    // after each shard).
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_zero.h5ad");
+    // 2 rows × 2 cols. Each column has one zero entry and one
+    // nonzero entry.
+    write_csc_h5ad(
+        &h5ad,
+        2,
+        2,
+        &[0i64, 2, 4],
+        &[0i32, 1, 0, 1],
+        &[0.0f32, 7.0, 3.0, 0.0],
+    );
+
+    let scx = dir.path().join("out.scx");
+    let opts = streaming_opts(8);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    let reader = ScxReader::open(&scx).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    // After zero-drop: row 0 has col 1 (3.0); row 1 has col 0 (7.0)
+    assert_eq!(csr.indptr, vec![0, 1, 2]);
+    assert_eq!(csr.indices, vec![1, 0]);
+    assert_eq!(csr.data, vec![3.0, 7.0]);
+}
+
+#[test]
+fn phase2_streaming_csc_external_temp_cleanup_on_success() {
+    // Open + drive the external transposer to completion, then
+    // assert no `scx-transpose-*` directories remain under the
+    // configured temp_dir.
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+
+    let h5ad = dir.path().join("csc.h5ad");
+    create_test_h5ad(&h5ad, 12, 4, "csc", false);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        memory_budget: Some(1024),
+        temp_dir: Some(scratch.clone()),
+        ..ConvertOptions::default()
+    };
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    // After the transposer's `TempDir` drops, the session
+    // directory under `scratch` should be gone.
+    let leftover: Vec<_> = std::fs::read_dir(&scratch).unwrap().collect();
+    assert!(
+        leftover.is_empty(),
+        "expected scratch to be empty after success; found {} entries",
+        leftover.len()
+    );
+}
+
+#[test]
+fn phase2_streaming_csc_budget_too_small_actionable_error() {
+    // memory_budget so small the external transposer can't fit even
+    // 4 temp records. Must return an actionable error mentioning
+    // "memory_budget".
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_tiny_budget.h5ad");
+    create_test_h5ad(&h5ad, 6, 3, "csc", false);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        memory_budget: Some(1),
+        ..ConvertOptions::default()
+    };
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect_err("budget=1 byte must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("memory_budget"),
+        "error message should mention memory_budget; got: {msg}"
+    );
 }
 
 /// Write a CSR `/X` group with `indptr`/`indices`/`data` children

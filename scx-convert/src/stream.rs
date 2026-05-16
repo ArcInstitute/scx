@@ -32,6 +32,12 @@ pub struct StreamedCsrShard {
     /// writer coordinator only for diagnostics; carrying it on the
     /// shard avoids a parallel side-channel.
     pub source_name: Option<String>,
+    /// Number of `(row, col)` duplicates that were merged into this
+    /// shard's values during canonicalisation (Phase 2 CSC external
+    /// transpose). Zero for any reader that doesn't canonicalise.
+    /// The writer coordinator surfaces a single
+    /// `DuplicateCoordinatesMerged` warning per non-zero shard.
+    pub duplicates_merged: u64,
 }
 
 /// Cursor over the rows of a single sparse matrix. Drained by the

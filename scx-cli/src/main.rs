@@ -98,6 +98,13 @@ enum Commands {
         /// filtering that matches scipy `csr_matrix(dense)`.
         #[arg(long, value_name = "EPSILON", default_value_t = 0.0)]
         dense_zero_epsilon: f32,
+        /// Directory for the Phase 2 external CSC → CSR transpose
+        /// session (`<DIR>/scx-transpose-<pid>-<random>/`). Used
+        /// only when `--memory-budget` forces the external path;
+        /// the in-memory CSC route never touches disk. Defaults to
+        /// the platform temp dir.
+        #[arg(long, value_name = "DIR")]
+        temp_dir: Option<std::path::PathBuf>,
     },
     /// Display SCX file information
     Info {
@@ -398,6 +405,7 @@ fn main() {
             memory_budget,
             strict_uns,
             dense_zero_epsilon,
+            temp_dir,
         } => run_convert(
             &input,
             &output,
@@ -412,6 +420,7 @@ fn main() {
             memory_budget.as_deref(),
             strict_uns,
             dense_zero_epsilon,
+            temp_dir,
         ),
         Commands::Info {
             file,
@@ -579,6 +588,7 @@ fn run_convert(
     memory_budget: Option<&str>,
     strict_uns: bool,
     dense_zero_epsilon: f32,
+    temp_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -651,6 +661,7 @@ fn run_convert(
         memory_budget_bytes,
         strict_uns,
         dense_zero_epsilon,
+        temp_dir,
     )
 }
 
@@ -669,6 +680,7 @@ fn dispatch_convert(
     memory_budget: Option<u64>,
     strict_uns: bool,
     dense_zero_epsilon: f32,
+    temp_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -700,6 +712,7 @@ fn dispatch_convert(
         stream,
         strict_uns,
         dense_zero_epsilon,
+        temp_dir,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -799,6 +812,7 @@ fn dispatch_convert(
     _memory_budget: Option<u64>,
     _strict_uns: bool,
     _dense_zero_epsilon: f32,
+    _temp_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

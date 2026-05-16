@@ -231,7 +231,7 @@ fn from_anndata(
 #[pyo3(signature = (
     path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
     uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
-    memory_budget=None,
+    memory_budget=None, temp_dir=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -247,6 +247,7 @@ fn from_h5ad(
     strict_uns: bool,
     dense_zero_epsilon: f32,
     memory_budget: Option<Bound<'_, PyAny>>,
+    temp_dir: Option<&str>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -286,6 +287,7 @@ fn from_h5ad(
         strict_uns,
         dense_zero_epsilon,
         memory_budget_bytes,
+        temp_dir,
     )
 }
 

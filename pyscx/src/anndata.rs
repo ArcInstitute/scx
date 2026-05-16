@@ -2584,6 +2584,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     strict_uns: bool,
     dense_zero_epsilon: f32,
     memory_budget: Option<u64>,
+    temp_dir: Option<&str>,
 ) -> PyResult<()> {
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older
@@ -2674,6 +2675,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
         stream,
         strict_uns,
         dense_zero_epsilon,
+        temp_dir: temp_dir.map(std::path::PathBuf::from),
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);
@@ -2838,6 +2840,7 @@ pub fn from_anndata_impl(
                 false, // strict_uns
                 0.0,   // dense_zero_epsilon
                 None,  // memory_budget
+                None,  // temp_dir
             );
         }
         #[cfg(not(feature = "hdf5"))]
