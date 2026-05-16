@@ -167,6 +167,7 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
     adata, path, codec=None, shard_size=None, in_place=false, csc="off",
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
+    bitmap="off",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -183,6 +184,7 @@ fn from_anndata(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
     anndata::from_anndata_impl(
         py,
@@ -198,6 +200,7 @@ fn from_anndata(
         index_var.unwrap_or_default(),
         index_preset,
         index_auto_threshold,
+        bitmap,
     )
 }
 
@@ -245,6 +248,7 @@ fn from_anndata(
     uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
     memory_budget=None, temp_dir=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
+    bitmap="off",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -265,6 +269,7 @@ fn from_h5ad(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -309,6 +314,7 @@ fn from_h5ad(
         index_var.unwrap_or_default(),
         index_preset,
         index_auto_threshold,
+        bitmap,
     )
 }
 
@@ -326,6 +332,7 @@ fn from_h5ad(
     h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off",
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
+    bitmap="off",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_10x(
@@ -342,6 +349,7 @@ fn from_10x(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy").map_err(|e| {
         // Only rewrite when scanpy itself is the missing module — if scanpy
@@ -377,6 +385,7 @@ fn from_10x(
         index_var.unwrap_or_default(),
         index_preset,
         index_auto_threshold,
+        bitmap,
     )
 }
 
@@ -411,6 +420,7 @@ fn from_10x(
     stream=true, strict_uns=false, memory_budget=None, temp_dir=None,
     modalities=None, modality_types=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
+    bitmap="off",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5mu(
@@ -431,6 +441,7 @@ fn from_h5mu(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
     mudata::from_h5mu_impl(
         py,
@@ -450,6 +461,7 @@ fn from_h5mu(
         index_var.unwrap_or_default(),
         index_preset,
         index_auto_threshold,
+        bitmap,
     )
 }
 

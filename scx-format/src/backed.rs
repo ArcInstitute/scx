@@ -1038,6 +1038,111 @@ impl BackedCsrReader {
         }
     }
 
+    /// Phase 5b: which modality this backed reader is scoped to. Used
+    /// by [`Self::gene_detection_counts`] / [`Self::cells_expressing_gene`]
+    /// to look up the matching bitmap sidecar shards.
+    ///
+    /// Returns `0` for unimodal files and for the global X path on
+    /// multimodal files; `for_modality(reader, id, ...)` returns `id`.
+    pub fn modality_id(&self) -> u8 {
+        self.x_sorted_entries
+            .first()
+            .map(|e| e.modality_id)
+            .unwrap_or(0)
+    }
+
+    /// Phase 5b: are per-modality detection bitmap shards present on
+    /// disk for every CSR shard? Fast path predicate for
+    /// [`Self::gene_detection_counts`] — if `false`, the helpers fall
+    /// back to a CSR scan.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn has_full_bitmap_coverage(&self) -> bool {
+        if !self.reader.header().has_bitmap() {
+            return false;
+        }
+        let modality_id = self.modality_id();
+        self.reader.bitmap_shard_count(modality_id) == self.x_sorted_entries.len()
+            && !self.x_sorted_entries.is_empty()
+    }
+
+    /// Phase 5b: per-gene detection counts across the entire shard
+    /// range this reader covers. Length is `self.n_vars()`.
+    ///
+    /// Fast path: when every CSR shard has a matching bitmap sidecar,
+    /// sum `RoaringBitmap::len()` per gene. Otherwise falls back to a
+    /// CSR scan via `read_all().to_dense()` — the slow path is the
+    /// reason the auto-policy / `--bitmap=always` flag exists.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn gene_detection_counts(&self) -> Result<Vec<u64>> {
+        let n_vars = self.n_vars;
+        let mut out = vec![0u64; n_vars];
+        if self.has_full_bitmap_coverage() {
+            let modality_id = self.modality_id();
+            for shard_idx in 0..self.x_sorted_entries.len() {
+                let shard = self.reader.read_bitmap_shard_for(modality_id, shard_idx)?;
+                for (&gene_id, bm) in &shard.genes {
+                    let g = gene_id as usize;
+                    if g < n_vars {
+                        out[g] = out[g].saturating_add(bm.len());
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // Fallback: scan CSR. Counts the distinct rows per column.
+        let csr = self.read_all()?;
+        for row in 0..csr.indptr.len().saturating_sub(1) {
+            let lo = csr.indptr[row] as usize;
+            let hi = csr.indptr[row + 1] as usize;
+            for &col in &csr.indices[lo..hi] {
+                let c = col as usize;
+                if c < n_vars {
+                    out[c] = out[c].saturating_add(1);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Phase 5b: global row indices of cells with `gene_idx > 0`.
+    /// Uses bitmap sidecars when present; otherwise scans CSR.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn cells_expressing_gene(&self, gene_idx: u32) -> Result<Vec<u32>> {
+        if (gene_idx as usize) >= self.n_vars {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "gene_idx {gene_idx} out of range (n_vars = {})",
+                    self.n_vars
+                ),
+            )));
+        }
+        let mut out: Vec<u32> = Vec::new();
+        if self.has_full_bitmap_coverage() {
+            let modality_id = self.modality_id();
+            for shard_idx in 0..self.x_sorted_entries.len() {
+                let shard = self.reader.read_bitmap_shard_for(modality_id, shard_idx)?;
+                if let Some(bm) = shard.cells_expressing(gene_idx) {
+                    let row_start = shard.row_start as u32;
+                    for local in bm {
+                        out.push(row_start.saturating_add(local));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // Fallback: scan CSR for the gene column.
+        let csr = self.read_all()?;
+        for row in 0..csr.indptr.len().saturating_sub(1) {
+            let lo = csr.indptr[row] as usize;
+            let hi = csr.indptr[row + 1] as usize;
+            if csr.indices[lo..hi].iter().any(|&c| c == gene_idx as i32) {
+                out.push(row as u32);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read a single decoded shard without caching.
     ///
     /// Use this for sequential streaming workloads (aggregation, col_sums,

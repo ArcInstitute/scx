@@ -1,5 +1,7 @@
 pub mod arrow_compat;
 pub mod backed;
+#[cfg(feature = "deletion-vectors")]
+pub mod bitmap;
 pub mod catalog;
 pub mod catalog_view;
 pub mod checksum;
@@ -33,6 +35,10 @@ pub use catalog_view::{CatalogView, CatalogViewEntry, ShardStatsLite};
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::{
     select_codec, select_codec_for_modality, select_codec_with_profile, CodecProfile,
+};
+#[cfg(feature = "deletion-vectors")]
+pub use bitmap::{
+    BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC, BITMAP_SHARD_VERSION,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};

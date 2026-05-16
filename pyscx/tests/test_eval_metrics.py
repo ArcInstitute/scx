@@ -454,6 +454,64 @@ class TestPerturbationMetrics:
                     err_msg=f"Backed vs mem mismatch: {metric}[{pert}]"
                 )
 
+    def test_embed_key_uses_obsm(self):
+        """``embed_key`` routes per-perturbation means through adata.obsm
+        rather than X — the score must depend on the embedding, not X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+
+        # Random embeddings independent of X. Two different embeddings on
+        # the same X+pert assignment must produce two different metric
+        # outputs, proving the kernel read from obsm and not X.
+        rng = np.random.default_rng(7)
+        n_obs = adata_real.n_obs
+        adata_real.obsm["X_emb_a"] = rng.standard_normal((n_obs, 8)).astype(
+            np.float32
+        )
+        adata_pred.obsm["X_emb_a"] = rng.standard_normal((n_obs, 8)).astype(
+            np.float32
+        )
+        adata_real.obsm["X_emb_b"] = rng.standard_normal((n_obs, 8)).astype(
+            np.float32
+        )
+        adata_pred.obsm["X_emb_b"] = rng.standard_normal((n_obs, 8)).astype(
+            np.float32
+        )
+
+        results_x = pyscx.accel.perturbation_metrics(
+            adata_real, adata_pred, metrics=["mse", "pearson_delta"]
+        )
+        results_a = pyscx.accel.perturbation_metrics(
+            adata_real, adata_pred, metrics=["mse", "pearson_delta"],
+            embed_key="X_emb_a",
+        )
+        results_b = pyscx.accel.perturbation_metrics(
+            adata_real, adata_pred, metrics=["mse", "pearson_delta"],
+            embed_key="X_emb_b",
+        )
+
+        # Structure preserved (same perturbation keys).
+        assert set(results_a["mse"]) == set(results_x["mse"])
+        # Output must change vs. X-based and across embeddings.
+        assert any(
+            results_a["mse"][p] != results_x["mse"][p] for p in results_x["mse"]
+        )
+        assert any(
+            results_a["mse"][p] != results_b["mse"][p] for p in results_a["mse"]
+        )
+
+    def test_embed_key_missing_raises(self):
+        """``embed_key`` pointing at a non-existent obsm key surfaces a
+        ValueError rather than silently falling back to X."""
+        import pyscx
+
+        adata_real, adata_pred, _ = self._make_paired_adata()
+        with pytest.raises(ValueError, match="embed_key"):
+            pyscx.accel.perturbation_metrics(
+                adata_real, adata_pred, embed_key="not_there"
+            )
+
     def test_all_zero_expression(self):
         """Edge case: all-zero expression matrix."""
         import pyscx
