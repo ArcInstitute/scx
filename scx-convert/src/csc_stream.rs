@@ -1,7 +1,6 @@
 // Streaming CSC-on-disk h5ad → CSR shard reader.
 //
-// Phase 2 of REAL-WORLD-UX-FEATS. Two routes share the
-// [`open_csc_streaming`] dispatcher:
+// Two routes share the [`open_csc_streaming`] dispatcher:
 //
 // 1. **In-memory** ([`MaterializedCsrStream`]): when the budget arithmetic
 //    allows, load the full CSC, run the existing

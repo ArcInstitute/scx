@@ -1,9 +1,8 @@
 // Memory-budget parser shared across the conversion pipelines.
 //
-// Phase 0.4 of REAL-WORLD-UX-FEATS. Phases 1 (dense slab sizing),
-// 2 (CSC transpose buffers), 7 (cloud in-flight bytes), and 8c
-// (worker derate) all reference `ConvertOptions::memory_budget`, so
-// the same parser must accept `K`/`M`/`G`/`T` (powers of two by
+// Dense slab sizing, CSC transpose buffers, cloud in-flight bytes,
+// and worker derate all reference `ConvertOptions::memory_budget`,
+// so the same parser must accept `K`/`M`/`G`/`T` (powers of two by
 // convention), explicit `KiB`/`MiB`/`GiB`/`TiB`, and bare byte
 // counts. Decimal suffixes (`KB`, `MB`) are rejected to avoid the
 // usual 1000 vs 1024 ambiguity — users who want decimal magnitudes

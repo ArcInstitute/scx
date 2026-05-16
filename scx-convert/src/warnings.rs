@@ -1,13 +1,13 @@
 // Structured warning channel for conversion pipelines.
 //
-// Phase 0.3 of REAL-WORLD-UX-FEATS. Replaces ad-hoc `eprintln!` /
-// `log::warn!` calls scattered across `h5ad_to_scx`,
-// `h5ad_to_scx_streaming`, `h5mu_to_scx`, and `scx_to_h5ad` with a
-// typed channel. CLI summarises per-category counts at the end of
-// the command; pyscx forwards each warning to `warnings.warn(...)`
-// as `UserWarning`. A per-category count summary is folded into the
-// provenance entry so the recipient of the .scx file can see which
-// classes of issue were tolerated during conversion.
+// Replaces ad-hoc `eprintln!` / `log::warn!` calls across
+// `h5ad_to_scx`, `h5ad_to_scx_streaming`, `h5mu_to_scx`, and
+// `scx_to_h5ad` with a typed channel. CLI summarises per-category
+// counts at the end of the command; pyscx forwards each warning to
+// `warnings.warn(...)` as `UserWarning`. A per-category count summary
+// is folded into the provenance entry so the recipient of the .scx
+// file can see which classes of issue were tolerated during
+// conversion.
 
 use std::collections::BTreeMap;
 

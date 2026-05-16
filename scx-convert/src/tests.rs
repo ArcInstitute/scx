@@ -1046,6 +1046,130 @@ fn create_test_h5mu(path: &Path, n_obs: usize, rna_n_vars: usize, adt_n_vars: us
     write_modality(&adt, adt_n_vars);
 }
 
+/// Like [`create_test_h5mu`] but writes a second modality
+/// `dense_adt` whose `/X` is a 2D dense **f64** dataset with
+/// `encoding-type="array"`. Exercises the dense-non-f32 sampling
+/// path in `mudata_pipeline::sample_modality_values`.
+#[cfg(test)]
+fn create_test_h5mu_with_dense_f64_modality(
+    path: &Path,
+    n_obs: usize,
+    rna_n_vars: usize,
+    dense_n_vars: usize,
+) {
+    let file = hdf5::File::create(path).unwrap();
+
+    let obs = file.create_group("obs").unwrap();
+    let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+    obs.new_dataset::<VarLenUnicode>()
+        .shape([n_obs])
+        .create("_index")
+        .unwrap()
+        .write(&obs_index)
+        .unwrap();
+    obs.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+
+    let mod_group = file.create_group("mod").unwrap();
+
+    // Sparse `rna` modality (existing layout).
+    let rna = mod_group.create_group("rna").unwrap();
+    {
+        let mut indptr = vec![0i64];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for row in 0..n_obs {
+            indices.push((row % rna_n_vars) as i32);
+            data.push((row + 1) as f32);
+            indptr.push(data.len() as i64);
+        }
+        let x = rna.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, rna_n_vars as i64])
+            .unwrap();
+
+        let var = rna.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> =
+            (0..rna_n_vars).map(|i| vlu(&format!("rna_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([rna_n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    // Dense f64 `dense_adt` modality.
+    let dense = mod_group.create_group("dense_adt").unwrap();
+    {
+        let dense_values: Vec<f64> = (0..n_obs * dense_n_vars)
+            .map(|i| if i % 3 == 0 { 0.0 } else { (i as f64) * 0.5 })
+            .collect();
+        let nd = ndarray::Array2::from_shape_vec((n_obs, dense_n_vars), dense_values).unwrap();
+        let x_ds = dense
+            .new_dataset::<f64>()
+            .shape([n_obs, dense_n_vars])
+            .create("X")
+            .unwrap();
+        x_ds.write(&nd).unwrap();
+        x_ds.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("array"))
+            .unwrap();
+
+        let var = dense.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> = (0..dense_n_vars)
+            .map(|i| vlu(&format!("adt_{i}")))
+            .collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([dense_n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+}
+
 /// Round-trip: create an h5mu fixture → h5mu_to_scx → ScxReader
 /// reports two modalities with the right names, var counts, and
 /// CSR shard counts. Per-modality reads return non-empty data.
@@ -2552,6 +2676,47 @@ fn phase1_streaming_dense_memory_budget_caps_slab() {
     assert!(shard.n_rows >= 1);
 }
 
+#[test]
+fn phase1_streaming_dense_budget_too_small_actionable_error() {
+    // `memory_budget` smaller than a single dense row must be
+    // rejected with a clear error rather than silently disabling the
+    // slab cap (and risking OOM). Mirrors
+    // `phase2_streaming_csc_budget_too_small_actionable_error` but
+    // exercises the dense path.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense_tiny_budget.h5ad");
+    let n_obs = 4usize;
+    let n_vars = 1000usize;
+    let dense = vec![1.0f32; n_obs * n_vars];
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 2,
+        // `n_vars * 4` is 4000 bytes per row; budget = 1 byte cannot
+        // fit anything.
+        memory_budget: Some(1),
+        ..ConvertOptions::default()
+    };
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect_err("budget=1 byte must be rejected for a dense matrix");
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("memory_budget"),
+        "error should mention memory_budget; got: {msg}"
+    );
+    assert!(
+        msg.contains("dense"),
+        "error should mention dense path; got: {msg}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Phase 1 fixture helpers
 // -----------------------------------------------------------------------
@@ -3059,6 +3224,37 @@ fn phase3_streaming_h5mu_per_modality_codec_routing() {
             sa.name
         );
     }
+}
+
+#[test]
+fn phase3_streaming_h5mu_dense_modality_non_f32_dtype() {
+    // The streaming h5mu sampler reads the leading slab of any dense
+    // modality `/X` to feed codec auto-selection. Before the fix it
+    // hardcoded `read_slice_2d::<f32>`, which rejects non-f32 source
+    // dtypes that the actual streaming reader supports. Write a
+    // two-modality h5mu where the second modality's X is dense f64
+    // (`encoding-type=array`) and confirm the streaming pipeline
+    // converts it without erroring on the sample step.
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("dense_f64.h5mu");
+    create_test_h5mu_with_dense_f64_modality(&h5mu, 6, 4, 3);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        ..ConvertOptions::default()
+    };
+    h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log()).unwrap();
+    let reader = ScxReader::open(&scx).unwrap();
+    assert_eq!(reader.n_modalities(), 2);
+    let dense_id = reader
+        .modality_id("dense_adt")
+        .expect("dense modality registered");
+    let info = reader.modality_info(dense_id).unwrap();
+    assert_eq!(info.n_vars, 3);
+    let csr = reader.read_all_csr_shards_for(dense_id).unwrap();
+    assert_eq!(csr.shape, (6, 3));
 }
 
 #[test]

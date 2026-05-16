@@ -1,9 +1,8 @@
 // Streaming-matrix abstraction shared across conversion readers.
 //
-// Phase 0.1 of REAL-WORLD-UX-FEATS. Dense h5ad (Phase 1), CSC
-// external-memory transpose (Phase 2), h5mu per-modality (Phase 3),
-// and Zarr-backed readers (Phase 4) all implement `CsrShardStream`
-// so the writer-side coordinator can drive any of them uniformly.
+// Dense h5ad, CSC external-memory transpose, h5mu per-modality, and
+// (future) Zarr-backed readers all implement `CsrShardStream` so the
+// writer-side coordinator can drive any of them uniformly.
 
 use super::pipeline::ConvertError;
 

@@ -34,7 +34,7 @@ use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 
 use super::csc_stream::open_csc_streaming;
-use super::dense_stream::open_dense_streaming;
+use super::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
 use super::detect::{detect_matrix_format_at, MatrixFormat};
 use super::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
 use super::h5ad_read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
@@ -769,9 +769,8 @@ fn sample_modality_values(
             let rows = (SAMPLE_VALUES / (n_vars as usize).max(1))
                 .max(1)
                 .min(n_obs_total);
-            let nd: ndarray::Array2<f32> = ds.read_slice_2d::<f32, _>(ndarray::s![0..rows, ..])?;
-            let (flat, _) = nd.into_raw_vec_and_offset();
-            Ok(flat)
+            let dtype = DenseDtype::from_descriptor(&ds.dtype()?.to_descriptor()?)?;
+            read_dense_slab_f32(&ds, dtype, 0, rows)
         }
     }
 }

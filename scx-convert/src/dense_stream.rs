@@ -1,14 +1,16 @@
 // Streaming reader for dense h5ad `/X` (or `/layers/<name>`) datasets.
 //
-// Phase 1 of REAL-WORLD-UX-FEATS. Implements [`CsrShardStream`] over
-// a 2D HDF5 dataset by slab-reading `target_rows` rows at a time and
-// sparsifying each slab into a [`StreamedCsrShard`].
+// Implements [`CsrShardStream`] over a 2D HDF5 dataset by slab-reading
+// `target_rows` rows at a time and sparsifying each slab into a
+// [`StreamedCsrShard`].
 //
 // Peak memory per shard is bounded by
 // `slab_rows × n_vars × sizeof(source_dtype)` for the dense buffer,
 // plus the sparsified CSR working set. `ConvertOptions::memory_budget`
 // caps `slab_rows` independently of `shard_target_rows` so dense
-// inputs with very large `n_vars` don't exceed the budget.
+// inputs with very large `n_vars` don't exceed the budget. When the
+// budget is smaller than a single dense row, `open_dense_streaming`
+// returns an actionable error rather than silently disabling the cap.
 
 use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
 use ndarray::s;
@@ -40,8 +42,10 @@ pub struct DenseXStreamReader {
     max_slab_rows: usize,
 }
 
+/// On-disk numeric dtype for a 2D dense HDF5 dataset. Drives the
+/// per-slab cast to `f32` in [`read_dense_slab_f32`].
 #[derive(Debug, Clone, Copy)]
-enum DenseDtype {
+pub(crate) enum DenseDtype {
     F32,
     F64,
     I64,
@@ -55,7 +59,7 @@ enum DenseDtype {
 }
 
 impl DenseDtype {
-    fn from_descriptor(desc: &TypeDescriptor) -> Result<Self, ConvertError> {
+    pub(crate) fn from_descriptor(desc: &TypeDescriptor) -> Result<Self, ConvertError> {
         Ok(match desc {
             TypeDescriptor::Float(FloatSize::U4) => Self::F32,
             TypeDescriptor::Float(FloatSize::U8) => Self::F64,
@@ -75,7 +79,7 @@ impl DenseDtype {
         })
     }
 
-    fn size_bytes(&self) -> usize {
+    pub(crate) fn size_bytes(&self) -> usize {
         match self {
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F64 | Self::I64 | Self::U64 => 8,
@@ -83,6 +87,42 @@ impl DenseDtype {
             Self::I8 | Self::U8 => 1,
         }
     }
+}
+
+/// Read rows `[row_start, row_end)` of a 2D dense HDF5 dataset as a
+/// row-major `Vec<f32>` of length `(row_end - row_start) * n_vars`.
+/// Dispatches on `dtype` and casts non-`f32` source values to `f32`.
+/// Used by [`DenseXStreamReader::read_slab_f32`] and the codec-sampling
+/// path for dense h5mu modalities.
+pub(crate) fn read_dense_slab_f32(
+    ds: &hdf5::Dataset,
+    dtype: DenseDtype,
+    row_start: usize,
+    row_end: usize,
+) -> Result<Vec<f32>, ConvertError> {
+    let sel = s![row_start..row_end, ..];
+    macro_rules! read_and_cast {
+        ($t:ty) => {{
+            let (data, _) = ds.read_slice_2d::<$t, _>(sel)?.into_raw_vec_and_offset();
+            data.into_iter().map(|v| v as f32).collect()
+        }};
+    }
+    let slab: Vec<f32> = match dtype {
+        DenseDtype::F32 => {
+            let (data, _) = ds.read_slice_2d::<f32, _>(sel)?.into_raw_vec_and_offset();
+            data
+        }
+        DenseDtype::F64 => read_and_cast!(f64),
+        DenseDtype::I64 => read_and_cast!(i64),
+        DenseDtype::I32 => read_and_cast!(i32),
+        DenseDtype::I16 => read_and_cast!(i16),
+        DenseDtype::I8 => read_and_cast!(i8),
+        DenseDtype::U64 => read_and_cast!(u64),
+        DenseDtype::U32 => read_and_cast!(u32),
+        DenseDtype::U16 => read_and_cast!(u16),
+        DenseDtype::U8 => read_and_cast!(u8),
+    };
+    Ok(slab)
 }
 
 /// Open a dense matrix dataset for streaming row-range reads.
@@ -112,13 +152,23 @@ pub fn open_dense_streaming(
 
     // `memory_budget / (n_vars * sizeof(dtype)) / 4` — the `/4`
     // reserves headroom for the sparsified output, the encoder queue,
-    // and per-shard sort scratch.
+    // and per-shard sort scratch. A budget too small to fit one
+    // 4×-reserved row would silently lose the cap and risk OOM —
+    // reject with an actionable error instead, mirroring the
+    // `csc_stream::open_csc_streaming` precedent.
     let max_slab_rows = match opts.memory_budget {
         None => usize::MAX,
         Some(budget) => {
             let row_bytes = (n_vars as usize).saturating_mul(dtype.size_bytes());
+            let min_required = row_bytes.saturating_mul(4);
             match (budget as usize).checked_div(row_bytes) {
-                None | Some(0) => usize::MAX,
+                None | Some(0) => {
+                    return Err(ConvertError::Other(format!(
+                        "memory_budget {budget} bytes too small for dense streaming of \
+                         {n_vars} vars × {dtype:?}; need at least {min_required} bytes \
+                         (≈ 4 × row_bytes for slab + sparsified output + encoder headroom)"
+                    )));
+                }
                 Some(rows) => (rows / 4).max(1),
             }
         }
@@ -238,50 +288,7 @@ impl DenseXStreamReader {
         row_end: usize,
         n_vars: usize,
     ) -> Result<Vec<f32>, ConvertError> {
-        let sel = s![row_start..row_end, ..];
-        let ds = &self.dataset;
-        let slab: Vec<f32> = match self.dtype {
-            DenseDtype::F32 => {
-                let (data, _) = ds.read_slice_2d::<f32, _>(sel)?.into_raw_vec_and_offset();
-                data
-            }
-            DenseDtype::F64 => {
-                let (data, _) = ds.read_slice_2d::<f64, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::I64 => {
-                let (data, _) = ds.read_slice_2d::<i64, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::I32 => {
-                let (data, _) = ds.read_slice_2d::<i32, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::I16 => {
-                let (data, _) = ds.read_slice_2d::<i16, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::I8 => {
-                let (data, _) = ds.read_slice_2d::<i8, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::U64 => {
-                let (data, _) = ds.read_slice_2d::<u64, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::U32 => {
-                let (data, _) = ds.read_slice_2d::<u32, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::U16 => {
-                let (data, _) = ds.read_slice_2d::<u16, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-            DenseDtype::U8 => {
-                let (data, _) = ds.read_slice_2d::<u8, _>(sel)?.into_raw_vec_and_offset();
-                data.into_iter().map(|v| v as f32).collect()
-            }
-        };
+        let slab = read_dense_slab_f32(&self.dataset, self.dtype, row_start, row_end)?;
         let expected = (row_end - row_start) * n_vars;
         if slab.len() != expected {
             return Err(ConvertError::Other(format!(
