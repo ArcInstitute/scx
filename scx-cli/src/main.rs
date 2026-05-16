@@ -39,6 +39,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Convert between h5ad/h5mu/10x/mtx and SCX formats
     Convert {
@@ -117,6 +118,25 @@ enum Commands {
         /// custom.
         #[arg(long, value_name = "NAME:TYPE,...")]
         modality_types: Option<String>,
+        /// Phase 5a: comma-separated obs columns to force-index at
+        /// conversion time. Missing or unsupported columns fail the
+        /// convert.
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Phase 5a: comma-separated var columns to force-index at
+        /// conversion time. Missing or unsupported columns fail the
+        /// convert.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Phase 5a: named column preset
+        /// (`cellxgene` | `perturbseq` | `training`). Missing preset
+        /// columns warn but don't fail.
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Phase 5a: cardinality cap for auto-detected index columns
+        /// when no explicit columns or preset are supplied.
+        #[arg(long, default_value_t = 1000)]
+        index_auto_threshold: usize,
     },
     /// Display SCX file information
     Info {
@@ -420,6 +440,10 @@ fn main() {
             temp_dir,
             modalities,
             modality_types,
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
         } => run_convert(
             &input,
             &output,
@@ -437,6 +461,10 @@ fn main() {
             temp_dir,
             modalities.as_deref(),
             modality_types.as_deref(),
+            index_obs.as_deref(),
+            index_var.as_deref(),
+            index_preset,
+            index_auto_threshold,
         ),
         Commands::Info {
             file,
@@ -607,6 +635,10 @@ fn run_convert(
     temp_dir: Option<std::path::PathBuf>,
     modalities: Option<&str>,
     modality_types: Option<&str>,
+    index_obs: Option<&str>,
+    index_var: Option<&str>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -691,6 +723,12 @@ fn run_convert(
             Some(s) => parse_modality_types(s)?,
         };
 
+    // Phase 5a: split CSV --index-obs / --index-var into Vec<String>;
+    // empty / whitespace-only inputs are treated as no override.
+    let index_obs_list = parse_index_columns(index_obs);
+    let index_var_list = parse_index_columns(index_var);
+    let index_preset_value = index_preset.filter(|s| !s.trim().is_empty());
+
     dispatch_convert(
         direction,
         input,
@@ -707,7 +745,25 @@ fn run_convert(
         temp_dir,
         modalities_list,
         modality_types_list,
+        index_obs_list,
+        index_var_list,
+        index_preset_value,
+        index_auto_threshold,
     )
+}
+
+/// Parse a comma-separated CLI argument into a `Vec<String>`. Whitespace
+/// is trimmed and empty segments are dropped (so trailing commas behave
+/// as users expect). Returns an empty vec when the input is `None`.
+fn parse_index_columns(value: Option<&str>) -> Vec<String> {
+    value
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse `--modality-types name:Type,name:Type` into a typed list.
@@ -761,6 +817,10 @@ fn dispatch_convert(
     temp_dir: Option<std::path::PathBuf>,
     modalities: Option<Vec<String>>,
     modality_types: Vec<(String, scx_format::modality::ModalityType)>,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -795,6 +855,10 @@ fn dispatch_convert(
         temp_dir,
         modalities,
         modality_types,
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -834,7 +898,7 @@ fn dispatch_convert(
                 convert::h5mu_to_scx(input, output, &opts, &mut sink)
             }
         }
-        "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts),
+        "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts, &mut sink),
         "scx_to_h5ad" => match modality {
             Some(name) => convert::scx_modality_to_h5ad(input, output, name),
             None => {
@@ -903,6 +967,10 @@ fn dispatch_convert(
     _temp_dir: Option<std::path::PathBuf>,
     _modalities: Option<Vec<String>>,
     _modality_types: Vec<(String, scx_format::modality::ModalityType)>,
+    _index_obs: Vec<String>,
+    _index_var: Vec<String>,
+    _index_preset: Option<String>,
+    _index_auto_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

@@ -48,6 +48,26 @@ pub fn is_h5mu_file(file: &hdf5::File) -> bool {
     file.group("mod").is_ok()
 }
 
+/// Phase 5a: emit a `PredicateIndexSkippedMultimodal` warning when the
+/// caller passed predicate-index flags on multimodal input. The engine
+/// read-side is unimodal-only today (`scx-format/src/reader.rs`
+/// `read_obs_predicate_index_bytes` ignores `modality_id`), so writing
+/// per-modality sections at conversion time would produce on-disk
+/// artefacts that `QueryPipeline` cannot consume. Drop them with a
+/// typed warning instead; users get a clear signal at convert time.
+fn emit_multimodal_index_skip_warning(opts: &ConvertOptions, sink: &mut WarningSink) {
+    if opts.index_obs.is_empty() && opts.index_var.is_empty() && opts.index_preset.is_none() {
+        return;
+    }
+    let mut columns: Vec<String> = Vec::new();
+    columns.extend(opts.index_obs.iter().cloned());
+    columns.extend(opts.index_var.iter().cloned());
+    if let Some(name) = opts.index_preset.as_deref() {
+        columns.push(format!("preset:{name}"));
+    }
+    sink.emit(ConvertWarning::PredicateIndexSkippedMultimodal { columns });
+}
+
 /// Resolve the modality type for `name`: prefer
 /// `opts.modality_types` if the caller supplied an explicit
 /// override; otherwise fall back to
@@ -113,6 +133,8 @@ pub fn h5mu_to_scx(
             got: "unknown HDF5 layout".to_string(),
         });
     }
+
+    emit_multimodal_index_skip_warning(opts, sink);
 
     // List modalities under /mod, in member-name order. h5mu stores
     // modalities under `/mod/{name}` — the names are case-sensitive
@@ -368,6 +390,8 @@ pub fn h5mu_to_scx_streaming(
             got: "unknown HDF5 layout".to_string(),
         });
     }
+
+    emit_multimodal_index_skip_warning(opts, sink);
 
     let mod_group = file.group("mod")?;
     let modality_names_all = mod_group.member_names()?;

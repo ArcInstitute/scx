@@ -3422,6 +3422,7 @@ dependencies = [
  "log",
  "ndarray",
  "scx-codec",
+ "scx-engine",
  "scx-format",
  "scx-mtx",
  "scx-ops",

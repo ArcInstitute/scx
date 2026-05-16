@@ -13,7 +13,11 @@ pub use fused_ops::{
     apply_fused_ops, fused_normalize_log1p, log1p_row, normalize_row, streaming_preprocess,
     streaming_save_layer, PreprocessConfig,
 };
-pub use index::{build_indexes, PredicateIndex};
+pub use index::{
+    build_indexes, build_obs_predicate_index_bytes, build_var_predicate_index_bytes,
+    index_preset_columns, BuildOutcome, IndexPreset, PredicateIndex,
+    PredicateIndexBuildOptions,
+};
 pub use pipeline::{NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var};

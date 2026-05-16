@@ -23,6 +23,11 @@ use super::h5ad_write::write_scx_to_h5ad;
 use super::stream::CsrShardStream;
 use super::tenx_read::read_tenx_h5;
 use super::warnings::{ConvertWarning, WarningSink};
+use arrow::record_batch::RecordBatch;
+use scx_engine::{
+    build_obs_predicate_index_bytes, build_var_predicate_index_bytes, index_preset_columns,
+    BuildOutcome, PredicateIndexBuildOptions,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
@@ -107,6 +112,20 @@ pub struct ConvertOptions {
     /// [`crate::infer_modality_type_from_name`] and emit
     /// [`crate::ConvertWarning::ModalityTypeInferred`].
     pub modality_types: Vec<(String, ModalityType)>,
+    /// Phase 5a: force-index these obs columns at conversion time.
+    /// Missing or unsupported columns fail the convert.
+    pub index_obs: Vec<String>,
+    /// Phase 5a: force-index these var columns at conversion time.
+    /// Missing or unsupported columns fail the convert.
+    pub index_var: Vec<String>,
+    /// Phase 5a: named column preset
+    /// (`cellxgene` / `perturbseq` / `training`). Missing preset
+    /// columns warn but don't fail.
+    pub index_preset: Option<String>,
+    /// Phase 5a: cardinality cap for auto-detected index columns
+    /// when neither `index_obs`/`index_var` nor `index_preset` is set.
+    /// Default 1000.
+    pub index_auto_threshold: usize,
 }
 
 impl Default for ConvertOptions {
@@ -124,8 +143,143 @@ impl Default for ConvertOptions {
             temp_dir: None,
             modalities: None,
             modality_types: Vec::new(),
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 1000,
         }
     }
+}
+
+/// Phase 5a — build and write obs/var predicate indexes from the
+/// currently configured conversion options, then return the list of
+/// columns that ended up indexed so the caller can stamp provenance.
+///
+/// Three sources of column names are combined:
+///   1. `opts.index_obs` / `opts.index_var` (forced; missing/unsupported
+///      columns produce a hard `ConvertError`),
+///   2. `opts.index_preset` (skipped + warned via the sink on
+///      missing/unsupported columns),
+///   3. auto-detection on cardinality `< opts.index_auto_threshold` when
+///      neither forced nor preset columns are supplied.
+///
+/// `csr_row_ranges` must reflect the actual on-disk shard boundaries
+/// produced by the writer (the engine uses local row indices within
+/// each shard, so any drift between assumed and actual ranges produces
+/// silently wrong pruning).
+fn build_and_write_predicate_indexes(
+    writer: &mut ScxWriter,
+    obs: &RecordBatch,
+    var: &RecordBatch,
+    csr_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    opts: &ConvertOptions,
+    sink: &mut WarningSink,
+) -> Result<(Vec<String>, Vec<String>), ConvertError> {
+    // Resolve preset columns up front so an unknown preset name fails
+    // before we touch the writer.
+    let preset = if let Some(name) = opts.index_preset.as_deref() {
+        let p = index_preset_columns(name).ok_or_else(|| {
+            ConvertError::Other(format!(
+                "unknown --index-preset '{name}'; expected one of cellxgene, perturbseq, training"
+            ))
+        })?;
+        Some(p)
+    } else {
+        None
+    };
+
+    let preset_obs: Vec<String> = preset
+        .as_ref()
+        .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
+        .unwrap_or_default();
+    let preset_var: Vec<String> = preset
+        .as_ref()
+        .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
+        .unwrap_or_default();
+
+    // ---- obs ----
+    let obs_options = PredicateIndexBuildOptions {
+        forced_columns: opts.index_obs.clone(),
+        preset_columns: preset_obs,
+        auto_threshold: opts.index_auto_threshold,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut obs_outcomes: Vec<BuildOutcome> = Vec::new();
+    let mut obs_indexed_names: Vec<String> = Vec::new();
+    let obs_bytes = build_obs_predicate_index_bytes(
+        obs,
+        csr_row_ranges,
+        &obs_options,
+        &mut obs_outcomes,
+        &mut obs_indexed_names,
+    )
+    .map_err(|e| ConvertError::Other(format!("build_obs_predicate_index: {e}")))?;
+    for outcome in obs_outcomes {
+        match outcome {
+            BuildOutcome::ForcedColumnError { column, reason } => {
+                return Err(ConvertError::Other(format!(
+                    "forced obs index column '{column}': {reason}"
+                )));
+            }
+            BuildOutcome::PresetSkipped { column, reason } => {
+                if reason == "missing column" {
+                    sink.emit(ConvertWarning::MissingPresetIndexColumn { column });
+                } else {
+                    sink.emit(ConvertWarning::UnsupportedIndexColumn { column, reason });
+                }
+            }
+        }
+    }
+    if let Some(bytes) = obs_bytes {
+        writer
+            .write_obs_predicate_index(&bytes)
+            .map_err(ConvertError::from)?;
+    }
+
+    // ---- var ----
+    // The engine treats var as a single "shard" for index purposes —
+    // matches the test fixture at scx-engine/tests/integration_tests.rs.
+    let var_row_ranges: Vec<(u64, u64)> = vec![(0, n_vars as u64)];
+    let var_options = PredicateIndexBuildOptions {
+        forced_columns: opts.index_var.clone(),
+        preset_columns: preset_var,
+        auto_threshold: opts.index_auto_threshold,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut var_outcomes: Vec<BuildOutcome> = Vec::new();
+    let mut var_indexed_names: Vec<String> = Vec::new();
+    let var_bytes = build_var_predicate_index_bytes(
+        var,
+        &var_row_ranges,
+        &var_options,
+        &mut var_outcomes,
+        &mut var_indexed_names,
+    )
+    .map_err(|e| ConvertError::Other(format!("build_var_predicate_index: {e}")))?;
+    for outcome in var_outcomes {
+        match outcome {
+            BuildOutcome::ForcedColumnError { column, reason } => {
+                return Err(ConvertError::Other(format!(
+                    "forced var index column '{column}': {reason}"
+                )));
+            }
+            BuildOutcome::PresetSkipped { column, reason } => {
+                if reason == "missing column" {
+                    sink.emit(ConvertWarning::MissingPresetIndexColumn { column });
+                } else {
+                    sink.emit(ConvertWarning::UnsupportedIndexColumn { column, reason });
+                }
+            }
+        }
+    }
+    if let Some(bytes) = var_bytes {
+        writer
+            .write_var_predicate_index(&bytes)
+            .map_err(ConvertError::from)?;
+    }
+
+    Ok((obs_indexed_names, var_indexed_names))
 }
 
 pub fn h5ad_to_scx(
@@ -195,7 +349,7 @@ pub fn h5ad_to_scx(
     writer.write_var(&var)?;
 
     // Write CSR shards
-    write_csr_shards(
+    let csr_row_ranges = write_csr_shards(
         &mut writer,
         &indptr,
         &indices,
@@ -259,6 +413,18 @@ pub fn h5ad_to_scx(
         }
     }
 
+    // Phase 5a: predicate indexes built from the obs/var we just wrote,
+    // using the actual on-disk shard boundaries.
+    let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
+        &mut writer,
+        &obs,
+        &var,
+        &csr_row_ranges,
+        n_vars,
+        opts,
+        sink,
+    )?;
+
     // Write provenance
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -272,6 +438,11 @@ pub fn h5ad_to_scx(
             "input": input.display().to_string(),
             "format": "h5ad",
             "warnings": sink.summary_json(),
+            "predicate_index": {
+                "obs_columns": obs_indexed,
+                "var_columns": var_indexed,
+                "preset": opts.index_preset,
+            },
         })
         .to_string(),
         input_checksums: vec![],
@@ -281,7 +452,12 @@ pub fn h5ad_to_scx(
     Ok(())
 }
 
-pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<(), ConvertError> {
+pub fn tenx_to_scx(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
 
     let format = detect_input_format(&file)?;
@@ -332,7 +508,7 @@ pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     writer.write_obs(&tenx.obs)?;
     writer.write_var(&tenx.var)?;
 
-    write_csr_shards(
+    let csr_row_ranges = write_csr_shards(
         &mut writer,
         &tenx.indptr,
         &tenx.indices,
@@ -360,6 +536,19 @@ pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         )?;
     }
 
+    // Phase 5a: predicate indexes from 10x obs/var. 10x obs is usually
+    // just barcodes; var has gene_name / feature_type. Auto-detection
+    // is the common path here.
+    let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
+        &mut writer,
+        &tenx.obs,
+        &tenx.var,
+        &csr_row_ranges,
+        tenx.n_genes,
+        opts,
+        sink,
+    )?;
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -371,6 +560,12 @@ pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         params_json: serde_json::json!({
             "input": input.display().to_string(),
             "format": "10x",
+            "warnings": sink.summary_json(),
+            "predicate_index": {
+                "obs_columns": obs_indexed,
+                "var_columns": var_indexed,
+                "preset": opts.index_preset,
+            },
         })
         .to_string(),
         input_checksums: vec![],
@@ -521,7 +716,7 @@ pub fn h5ad_to_scx_streaming(
     // X shards (streaming). The coordinator drives the reader
     // through `&mut dyn CsrShardStream`; Phase 8c will swap in a
     // parallel reader fan-out without touching this call site.
-    streaming_writer_coordinator(
+    let (_csr_shard_count, csr_row_ranges) = streaming_writer_coordinator(
         x_reader.as_mut(),
         &mut writer,
         opts,
@@ -666,7 +861,7 @@ pub fn h5ad_to_scx_streaming(
                 }
             };
             let l_index_dtype: u8 = if l_n_vars <= 65535 { 0 } else { 1 };
-            streaming_writer_coordinator(
+            let (_, _) = streaming_writer_coordinator(
                 layer_reader.as_mut(),
                 &mut writer,
                 opts,
@@ -679,6 +874,18 @@ pub fn h5ad_to_scx_streaming(
             )?;
         }
     }
+
+    // Phase 5a: predicate indexes from the obs/var we just wrote and
+    // the actual shard boundaries reported by `streaming_writer_coordinator`.
+    let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
+        &mut writer,
+        &obs,
+        &var,
+        &csr_row_ranges,
+        n_vars,
+        opts,
+        sink,
+    )?;
 
     // Provenance carries the streaming flag so consumers can tell at
     // a glance how the file was produced.
@@ -701,6 +908,11 @@ pub fn h5ad_to_scx_streaming(
             "stream": true,
             "source_matrix_format": source_format_str,
             "warnings": sink.summary_json(),
+            "predicate_index": {
+                "obs_columns": obs_indexed,
+                "var_columns": var_indexed,
+                "preset": opts.index_preset,
+            },
         })
         .to_string(),
         input_checksums: vec![],
@@ -748,9 +960,10 @@ pub fn streaming_writer_coordinator(
     modality_type: ModalityType,
     section_name_prefix: &str,
     sink: &mut WarningSink,
-) -> Result<u32, ConvertError> {
+) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
     let target_rows = opts.shard_target_rows as usize;
     let mut shard_idx: u32 = 0;
+    let mut row_ranges: Vec<(u64, u64)> = Vec::new();
     while let Some(mut shard) = reader.next_csr_shard(target_rows)? {
         // Surface upstream duplicate-coordinate canonicalisation
         // (Phase 2 CSC external transpose) as a typed warning. Other
@@ -764,6 +977,8 @@ pub fn streaming_writer_coordinator(
         }
         drop_explicit_zeros_inplace(&mut shard.indptr, &mut shard.indices, &mut shard.values);
         sort_csr_rows_in_place(&shard.indptr, &mut shard.indices, &mut shard.values);
+        let row_start = shard.row_start;
+        let n_rows = shard.n_rows as u64;
         let pre = encode_one_shard(
             &shard.indptr,
             &shard.indices,
@@ -771,15 +986,16 @@ pub fn streaming_writer_coordinator(
             opts.codec,
             index_dtype,
             n_vars_u32,
-            shard.row_start,
+            row_start,
             section_type,
             modality_type,
             format!("{section_name_prefix}_{shard_idx}"),
         )?;
         writer.write_preencoded_shard(pre)?;
+        row_ranges.push((row_start, row_start + n_rows));
         shard_idx += 1;
     }
-    Ok(shard_idx)
+    Ok((shard_idx, row_ranges))
 }
 
 /// Memory budget for the streaming CSR→CSC transpose at convert time.
@@ -867,9 +1083,10 @@ fn write_csr_shards(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     index_dtype: u8,
-) -> Result<(), ConvertError> {
+) -> Result<Vec<(u64, u64)>, ConvertError> {
     let _ = index_dtype; // index dtype is set in the file header; writer reads it from there
 
+    let mut row_ranges: Vec<(u64, u64)> = Vec::new();
     let mut row_start: usize = 0;
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
@@ -920,9 +1137,10 @@ fn write_csr_shards(
             row_start as u64,
         )?;
 
+        row_ranges.push((row_start as u64, row_end as u64));
         row_start = row_end;
     }
-    Ok(())
+    Ok(row_ranges)
 }
 
 #[allow(clippy::too_many_arguments)]

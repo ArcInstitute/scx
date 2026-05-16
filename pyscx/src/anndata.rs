@@ -26,6 +26,125 @@ use crate::to_pyerr;
 /// transpose working set.
 const PYSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Phase 5a: build and write obs / var predicate indexes from a Python
+/// in-memory AnnData write path. Mirrors
+/// `scx_convert::pipeline::build_and_write_predicate_indexes` but
+/// surfaces outcomes through Python (`PyValueError` for forced
+/// errors, `warnings.warn` for preset skips / unsupported columns).
+#[allow(clippy::too_many_arguments)]
+fn build_and_write_predicate_indexes_inline(
+    py: Python<'_>,
+    writer: &mut ScxWriter,
+    obs: &RecordBatch,
+    var: &RecordBatch,
+    csr_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    index_obs: &[String],
+    index_var: &[String],
+    index_preset: Option<&str>,
+    index_auto_threshold: usize,
+) -> PyResult<()> {
+    use scx_engine::{
+        build_obs_predicate_index_bytes, build_var_predicate_index_bytes, index_preset_columns,
+        BuildOutcome, PredicateIndexBuildOptions,
+    };
+
+    let preset = match index_preset {
+        Some(name) => Some(index_preset_columns(name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown index_preset '{name}'; expected one of cellxgene, perturbseq, training"
+            ))
+        })?),
+        None => None,
+    };
+    let preset_obs: Vec<String> = preset
+        .as_ref()
+        .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
+        .unwrap_or_default();
+    let preset_var: Vec<String> = preset
+        .as_ref()
+        .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
+        .unwrap_or_default();
+
+    let emit_warning = |msg: String| -> PyResult<()> {
+        py.import("warnings")?.call_method1("warn", (msg,))?;
+        Ok(())
+    };
+
+    // ---- obs ----
+    let obs_options = PredicateIndexBuildOptions {
+        forced_columns: index_obs.to_vec(),
+        preset_columns: preset_obs,
+        auto_threshold: index_auto_threshold,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut obs_outcomes: Vec<BuildOutcome> = Vec::new();
+    let mut obs_indexed: Vec<String> = Vec::new();
+    let obs_bytes = build_obs_predicate_index_bytes(
+        obs,
+        csr_row_ranges,
+        &obs_options,
+        &mut obs_outcomes,
+        &mut obs_indexed,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("build_obs_predicate_index: {e}")))?;
+    for outcome in obs_outcomes {
+        match outcome {
+            BuildOutcome::ForcedColumnError { column, reason } => {
+                return Err(PyValueError::new_err(format!(
+                    "forced obs index column '{column}': {reason}"
+                )));
+            }
+            BuildOutcome::PresetSkipped { column, reason } => {
+                emit_warning(format!(
+                    "predicate index skipped for obs column '{column}': {reason}"
+                ))?;
+            }
+        }
+    }
+    if let Some(bytes) = obs_bytes {
+        writer.write_obs_predicate_index(&bytes).map_err(to_pyerr)?;
+    }
+
+    // ---- var ----
+    let var_row_ranges: Vec<(u64, u64)> = vec![(0, n_vars as u64)];
+    let var_options = PredicateIndexBuildOptions {
+        forced_columns: index_var.to_vec(),
+        preset_columns: preset_var,
+        auto_threshold: index_auto_threshold,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut var_outcomes: Vec<BuildOutcome> = Vec::new();
+    let mut var_indexed: Vec<String> = Vec::new();
+    let var_bytes = build_var_predicate_index_bytes(
+        var,
+        &var_row_ranges,
+        &var_options,
+        &mut var_outcomes,
+        &mut var_indexed,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("build_var_predicate_index: {e}")))?;
+    for outcome in var_outcomes {
+        match outcome {
+            BuildOutcome::ForcedColumnError { column, reason } => {
+                return Err(PyValueError::new_err(format!(
+                    "forced var index column '{column}': {reason}"
+                )));
+            }
+            BuildOutcome::PresetSkipped { column, reason } => {
+                emit_warning(format!(
+                    "predicate index skipped for var column '{column}': {reason}"
+                ))?;
+            }
+        }
+    }
+    if let Some(bytes) = var_bytes {
+        writer.write_var_predicate_index(&bytes).map_err(to_pyerr)?;
+    }
+
+    Ok(())
+}
+
 /// Streaming CSR → CSC transpose over the in-memory `(indptr, indices,
 /// data)` arrays, writing each emitted chunk as one CSC shard.
 ///
@@ -2585,6 +2704,10 @@ pub(crate) fn route_backed_anndata_to_streaming(
     dense_zero_epsilon: f32,
     memory_budget: Option<u64>,
     temp_dir: Option<&str>,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older
@@ -2678,6 +2801,10 @@ pub(crate) fn route_backed_anndata_to_streaming(
         temp_dir: temp_dir.map(std::path::PathBuf::from),
         modalities: None,
         modality_types: Vec::new(),
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);
@@ -2794,6 +2921,10 @@ pub fn from_anndata_impl(
     csc: &str,
     csc_cols_per_shard: usize,
     uns_format: &str,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
@@ -2843,6 +2974,10 @@ pub fn from_anndata_impl(
                 0.0,   // dense_zero_epsilon
                 None,  // memory_budget
                 None,  // temp_dir
+                index_obs,
+                index_var,
+                index_preset,
+                index_auto_threshold,
             );
         }
         #[cfg(not(feature = "hdf5"))]
@@ -2852,6 +2987,10 @@ pub fn from_anndata_impl(
                 csc_always,
                 csc_cols_per_shard,
                 uns_format_parsed,
+                &index_obs,
+                &index_var,
+                &index_preset,
+                index_auto_threshold,
             );
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "pyscx was built without the `hdf5` feature; backed AnnData \
@@ -3298,6 +3437,26 @@ pub fn from_anndata_impl(
         })
         .map_err(to_pyerr)?;
     }
+
+    // Phase 5a: predicate indexes. Row ranges come from the boundaries
+    // we already computed for the CSR shards — guaranteed to match
+    // what's on disk because they drove the write itself.
+    let csr_row_ranges: Vec<(u64, u64)> = boundaries
+        .iter()
+        .map(|b| (b.row_start as u64, b.row_end as u64))
+        .collect();
+    build_and_write_predicate_indexes_inline(
+        py,
+        &mut writer,
+        &obs_batch,
+        &var_batch,
+        &csr_row_ranges,
+        n_vars as usize,
+        &index_obs,
+        &index_var,
+        index_preset.as_deref(),
+        index_auto_threshold,
+    )?;
 
     // Write provenance
     writer
