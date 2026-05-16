@@ -3232,7 +3232,7 @@ pub fn from_anndata_impl(
     let bitmap_policy = scx_convert::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    for (boundary, section) in boundaries.iter().zip(pre_encoded.into_iter()) {
+    for (boundary, section) in boundaries.iter().zip(pre_encoded) {
         let encoded_csr_size = section.section_length as usize;
         writer.write_preencoded_shard(section).map_err(to_pyerr)?;
         if !matches!(bitmap_policy, scx_convert::BitmapPolicy::Off) {

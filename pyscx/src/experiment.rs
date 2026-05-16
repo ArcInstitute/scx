@@ -60,11 +60,7 @@ fn open_backed_csr(path: &PathBuf, modality: Option<&str>) -> PyResult<BackedCsr
 }
 
 /// Resolve a gene name against the appropriate modality's `var`.
-fn resolve_gene_name(
-    reader: &ScxReader,
-    modality: Option<&str>,
-    name: &str,
-) -> PyResult<u32> {
+fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> PyResult<u32> {
     use scx_format::SectionType;
     let modality_id = if reader.is_multimodal() {
         match modality {
@@ -112,9 +108,7 @@ fn resolve_gene_name(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let batch = arrow_reader
         .next()
-        .ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("var record batch is empty")
-        })?
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("var record batch is empty"))?
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     // The pandas index column is conventionally named "_index" or
     // tagged via Arrow schema metadata; try the most common keys
@@ -130,7 +124,10 @@ fn resolve_gene_name(
                     }
                 }
             }
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+            if let Some(arr) = col
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+            {
                 for i in 0..arr.len() {
                     if !arr.is_null(i) && arr.value(i) == name {
                         return Ok(i as u32);
@@ -143,7 +140,6 @@ fn resolve_gene_name(
         "gene name '{name}' not found in var index"
     )))
 }
-
 
 #[pymethods]
 impl PyExperiment {

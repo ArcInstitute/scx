@@ -1136,7 +1136,7 @@ impl BackedCsrReader {
         for row in 0..csr.indptr.len().saturating_sub(1) {
             let lo = csr.indptr[row] as usize;
             let hi = csr.indptr[row + 1] as usize;
-            if csr.indices[lo..hi].iter().any(|&c| c == gene_idx as i32) {
+            if csr.indices[lo..hi].contains(&(gene_idx as i32)) {
                 out.push(row as u32);
             }
         }

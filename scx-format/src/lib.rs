@@ -24,6 +24,10 @@ pub use backed::{
     concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
     BackedCsrReader, CacheMetrics,
 };
+#[cfg(feature = "deletion-vectors")]
+pub use bitmap::{
+    BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC, BITMAP_SHARD_VERSION,
+};
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;
 pub use catalog::{
@@ -35,10 +39,6 @@ pub use catalog_view::{CatalogView, CatalogViewEntry, ShardStatsLite};
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::{
     select_codec, select_codec_for_modality, select_codec_with_profile, CodecProfile,
-};
-#[cfg(feature = "deletion-vectors")]
-pub use bitmap::{
-    BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC, BITMAP_SHARD_VERSION,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};

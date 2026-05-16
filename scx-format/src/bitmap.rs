@@ -362,6 +362,10 @@ mod tests {
         shard.write_to(&mut buf).unwrap();
         // Estimate is an upper bound (roaring serialized_size is exact).
         // Allow ±10% slack on either side just in case roaring internals shift.
-        assert!(estimate >= buf.len(), "estimate {estimate} < actual {}", buf.len());
+        assert!(
+            estimate >= buf.len(),
+            "estimate {estimate} < actual {}",
+            buf.len()
+        );
     }
 }

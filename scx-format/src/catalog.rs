@@ -908,9 +908,7 @@ impl FullCatalog {
         let mut shards: Vec<_> = self
             .entries
             .iter()
-            .filter(|e| {
-                e.section_type == SectionType::BitmapShard && e.modality_id == modality_id
-            })
+            .filter(|e| e.section_type == SectionType::BitmapShard && e.modality_id == modality_id)
             .collect();
         shards.sort_by_key(|e| {
             e.stats

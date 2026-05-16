@@ -153,6 +153,7 @@ const BITMAP_AUTO_SIZE_PERCENT: usize = 15;
 ///
 /// Returns whether a bitmap section was actually written so callers
 /// can stamp provenance.
+#[allow(clippy::too_many_arguments)]
 fn build_and_write_bitmap_for_shard(
     writer: &mut ScxWriter,
     indptr: &[u64],
@@ -202,7 +203,9 @@ fn build_and_write_bitmap_for_shard(
     if matches!(policy, BitmapPolicy::Auto) && !matches!(modality_type, ModalityType::Atac) {
         let est = shard.estimated_encoded_size();
         // est <= 15% * encoded_csr_size  ⇔  est * 100 <= encoded_csr_size * 15
-        if encoded_csr_size > 0 && est.saturating_mul(100) > encoded_csr_size.saturating_mul(BITMAP_AUTO_SIZE_PERCENT) {
+        if encoded_csr_size > 0
+            && est.saturating_mul(100) > encoded_csr_size.saturating_mul(BITMAP_AUTO_SIZE_PERCENT)
+        {
             sink.emit(ConvertWarning::BitmapSkipped {
                 modality: modality_name.map(String::from),
                 reason: format!(
@@ -213,15 +216,18 @@ fn build_and_write_bitmap_for_shard(
         }
     }
 
-    writer.write_bitmap_shard(&shard).map_err(ConvertError::from)?;
+    writer
+        .write_bitmap_shard(&shard)
+        .map_err(ConvertError::from)?;
     Ok(true)
 }
 
 /// Phase 5b: detection-bitmap generation policy. Mirrors the
 /// `--bitmap off|auto|always` CLI flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BitmapPolicy {
     /// Never emit bitmap sidecars.
+    #[default]
     Off,
     /// Emit bitmap sidecars when the shard passes the auto policy
     /// (sparse X, `n_vars <= 1_000_000`, estimated bitmap size ≤ 15 %
@@ -229,12 +235,6 @@ pub enum BitmapPolicy {
     Auto,
     /// Always emit bitmap sidecars regardless of cost.
     Always,
-}
-
-impl Default for BitmapPolicy {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 impl BitmapPolicy {
@@ -1249,11 +1249,14 @@ fn write_csr_shards(
         // never strands a half-written file. Estimated CSR size is the
         // raw indptr + indices + values byte footprint pre-compression
         // — accurate enough for the 15% threshold.
-        let estimated_csr_size = raw_values.len()
-            + shard_indices.len() * 4
-            + shard_indptr.len() * 8;
-        let n_rows_u32 = u32::try_from(row_end - row_start)
-            .map_err(|_| ConvertError::Other(format!("shard rows {} exceeds u32::MAX", row_end - row_start)))?;
+        let estimated_csr_size =
+            raw_values.len() + shard_indices.len() * 4 + shard_indptr.len() * 8;
+        let n_rows_u32 = u32::try_from(row_end - row_start).map_err(|_| {
+            ConvertError::Other(format!(
+                "shard rows {} exceeds u32::MAX",
+                row_end - row_start
+            ))
+        })?;
         build_and_write_bitmap_for_shard(
             writer,
             &shard_indptr,

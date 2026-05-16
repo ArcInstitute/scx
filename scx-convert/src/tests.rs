@@ -3789,7 +3789,10 @@ fn convert_with_bitmap_always_emits_section() {
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
-    assert!(reader.header().has_bitmap(), "has_bitmap flag should be set");
+    assert!(
+        reader.header().has_bitmap(),
+        "has_bitmap flag should be set"
+    );
     let bm_entries: Vec<_> = reader
         .catalog()
         .entries

@@ -1465,9 +1465,7 @@ impl ScxWriter {
         // Phase 5b: header `has_bitmap` flag is set if ≥1 bitmap shard
         // landed (unimodal or any modality).
         #[cfg(feature = "deletion-vectors")]
-        if self.bitmap_shard_count > 0
-            || self.modality_bitmap_counts.iter().any(|&n| n > 0)
-        {
+        if self.bitmap_shard_count > 0 || self.modality_bitmap_counts.iter().any(|&n| n > 0) {
             self.header.set_bitmap();
         }
 
@@ -1636,11 +1634,7 @@ impl ScxWriter {
         let idx = (modality_id as usize)
             .checked_sub(1)
             .ok_or_else(|| ScxError::InvalidCatalog("modality_id must be >= 1".to_string()))?;
-        let shard_idx = self
-            .modality_bitmap_counts
-            .get(idx)
-            .copied()
-            .unwrap_or(0);
+        let shard_idx = self.modality_bitmap_counts.get(idx).copied().unwrap_or(0);
         let name = format!("X/bitmap/{mname}/shard_{shard_idx}");
         let mut data = Vec::new();
         shard.write_to(&mut data)?;

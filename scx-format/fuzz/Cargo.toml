@@ -36,3 +36,9 @@ name = "fuzz_csc_shard"
 path = "fuzz_targets/fuzz_csc_shard.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_bitmap"
+path = "fuzz_targets/fuzz_bitmap.rs"
+test = false
+doc = false
