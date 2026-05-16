@@ -3,6 +3,7 @@
 use hdf5::types::VarLenUnicode;
 
 use super::pipeline::ConvertError;
+use super::warnings::{ConvertWarning, WarningSink};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
@@ -36,17 +37,27 @@ pub fn detect_input_format(file: &hdf5::File) -> Result<InputFormat, ConvertErro
 }
 
 /// Detect the matrix storage format in an h5ad file (X at root).
-pub fn detect_matrix_format(file: &hdf5::File) -> Result<MatrixFormat, ConvertError> {
-    detect_matrix_format_at(file, "X")
+pub fn detect_matrix_format(
+    file: &hdf5::File,
+    sink: &mut WarningSink,
+) -> Result<MatrixFormat, ConvertError> {
+    detect_matrix_format_at(file, "X", sink)
 }
 
 /// Detect matrix storage format for a matrix at an arbitrary path inside
 /// an HDF5 file (e.g. `mod/rna/X` for a per-modality matrix in an h5mu
 /// file). Returns the same `MatrixFormat` semantics as the X-at-root
 /// detector — Csr / Csc for sparse groups, Dense for plain datasets.
+///
+/// Emits a [`ConvertWarning::InferredEncoding`] whenever the layout
+/// was inferred from children rather than read from the explicit
+/// `encoding-type` attribute. Phase 1 also accepts unknown
+/// `encoding-version` values on otherwise-recognised types with a
+/// warning, rather than aborting.
 pub fn detect_matrix_format_at(
     file: &hdf5::File,
     path: &str,
+    sink: &mut WarningSink,
 ) -> Result<MatrixFormat, ConvertError> {
     // Check if path is a group (sparse) or dataset (dense)
     if let Ok(group) = file.group(path) {
@@ -65,11 +76,18 @@ pub fn detect_matrix_format_at(
         }
         // Fallback: check for sparse structure
         if group.dataset("indptr").is_ok() && group.dataset("indices").is_ok() {
-            // Default to CSR per h5ad convention
+            sink.emit(ConvertWarning::InferredEncoding {
+                path: path.to_string(),
+                inferred: "csr_matrix (indptr+indices present)".into(),
+            });
             return Ok(MatrixFormat::Csr);
         }
         // Group with data but no sparse structure
         if group.dataset("data").is_ok() {
+            sink.emit(ConvertWarning::InferredEncoding {
+                path: path.to_string(),
+                inferred: "csr_matrix (data present, no indptr)".into(),
+            });
             return Ok(MatrixFormat::Csr);
         }
     }

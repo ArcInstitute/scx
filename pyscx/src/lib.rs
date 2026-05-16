@@ -228,7 +228,11 @@ fn from_anndata(
 ///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
 #[cfg(feature = "hdf5")]
 #[pyfunction]
-#[pyo3(signature = (path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
+#[pyo3(signature = (
+    path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
+    uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
+    memory_budget=None, temp_dir=None,
+))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
     py: Python<'_>,
@@ -239,6 +243,11 @@ fn from_h5ad(
     csc: &str,
     csc_cols_per_shard: usize,
     uns_format: &str,
+    stream: bool,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    temp_dir: Option<&str>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -252,6 +261,7 @@ fn from_h5ad(
     };
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
+    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
 
     // Open the h5ad in backed mode so obs / var / obsm / varm / uns
     // are extractable as Python objects but X stays on disk. The
@@ -273,6 +283,11 @@ fn from_h5ad(
         csc_always,
         csc_cols_per_shard,
         uns_format_parsed,
+        stream,
+        strict_uns,
+        dense_zero_epsilon,
+        memory_budget_bytes,
+        temp_dir,
     )
 }
 
@@ -329,6 +344,70 @@ fn from_10x(
         csc,
         csc_cols_per_shard,
         uns_format,
+    )
+}
+
+/// Convert an h5mu file to a multimodal SCX v2 file (path-based,
+/// streaming by default).
+///
+/// Mirrors `pyscx.from_h5ad` for h5mu inputs. When `stream=True`
+/// (default) this calls `scx_convert::h5mu_to_scx_streaming`, which
+/// processes one shard at a time per modality. Peak memory is
+/// bounded by `shard_target_rows × max_n_vars × density × ~16`
+/// bytes plus the always-resident outer obs.
+///
+/// `modalities`: optional list of modality names to include
+/// (case-sensitive match against `/mod/{name}`). Unknown names
+/// raise `ValueError` with the available list. `None` (default)
+/// keeps every modality.
+///
+/// `modality_types`: optional dict mapping modality name → type
+/// string (`"rna"`, `"protein"`, `"atac"`, `"spatial"`,
+/// `"methylation"`, `"custom"`). Modalities not listed fall back
+/// to inference and trigger a `UserWarning` per modality.
+///
+/// Example:
+///     pyscx.from_h5mu("cite_seq.h5mu", "out.scx")
+///     pyscx.from_h5mu("multiome.h5mu", "out.scx",
+///                     modalities=["rna", "atac"],
+///                     modality_types={"adt": "protein"})
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (
+    path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
+    stream=true, strict_uns=false, memory_budget=None, temp_dir=None,
+    modalities=None, modality_types=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn from_h5mu(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    codec: Option<&str>,
+    shard_size: Option<u32>,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    stream: bool,
+    strict_uns: bool,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    temp_dir: Option<&str>,
+    modalities: Option<Vec<String>>,
+    modality_types: Option<std::collections::HashMap<String, String>>,
+) -> PyResult<()> {
+    mudata::from_h5mu_impl(
+        py,
+        path,
+        out,
+        codec,
+        shard_size,
+        csc,
+        csc_cols_per_shard,
+        stream,
+        strict_uns,
+        memory_budget,
+        temp_dir,
+        modalities,
+        modality_types,
     )
 }
 
@@ -425,6 +504,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
     m.add_function(wrap_pyfunction!(to_mtx, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(from_h5mu, m)?)?;
     m.add_function(wrap_pyfunction!(from_mudata, m)?)?;
 
     // Preprocessing pipeline
@@ -571,6 +652,7 @@ fn register_clustering(m: &Bound<'_, PyModule>) -> PyResult<()> {
 fn register_de(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::de::rank_genes_groups, m)?)?;
     m.add_function(wrap_pyfunction!(accel::de::rank_genes_groups_df, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::de::pdex_ref, m)?)?;
     Ok(())
 }
 

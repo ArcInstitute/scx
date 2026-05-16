@@ -82,6 +82,41 @@ enum Commands {
         /// streaming write completes.
         #[arg(long)]
         stream: bool,
+        /// Memory budget for slab-sizing heuristics (Phase 1 dense
+        /// streaming, Phase 2 transpose buffers, Phase 8c worker
+        /// derate). Accepts bare bytes, `K`/`M`/`G`/`T`, or
+        /// `KiB`/`MiB`/`GiB`/`TiB`. Decimal suffixes (`KB`, `MB`)
+        /// are rejected as ambiguous. None = each phase's default.
+        #[arg(long, value_name = "SIZE")]
+        memory_budget: Option<String>,
+        /// Fail conversion on the first unsupported `uns` key
+        /// instead of skipping it with a warning.
+        #[arg(long)]
+        strict_uns: bool,
+        /// Drop dense values with `|v| <= EPSILON` during
+        /// sparsification. Default `0.0` keeps the equality-to-zero
+        /// filtering that matches scipy `csr_matrix(dense)`.
+        #[arg(long, value_name = "EPSILON", default_value_t = 0.0)]
+        dense_zero_epsilon: f32,
+        /// Directory for the Phase 2 external CSC → CSR transpose
+        /// session (`<DIR>/scx-transpose-<pid>-<random>/`). Used
+        /// only when `--memory-budget` forces the external path;
+        /// the in-memory CSC route never touches disk. Defaults to
+        /// the platform temp dir.
+        #[arg(long, value_name = "DIR")]
+        temp_dir: Option<std::path::PathBuf>,
+        /// Phase 3 h5mu filter: comma-separated list of modality
+        /// names to include. Unknown names fail with the available
+        /// modality list. Default: include every modality.
+        #[arg(long, value_name = "CSV")]
+        modalities: Option<String>,
+        /// Phase 3 h5mu type overrides: comma-separated
+        /// `name:Type` pairs (e.g. `adt:Protein,peaks:ATAC`). Names
+        /// not listed fall back to inference + a typed warning.
+        /// Valid types: rna, protein, atac, spatial, methylation,
+        /// custom.
+        #[arg(long, value_name = "NAME:TYPE,...")]
+        modality_types: Option<String>,
     },
     /// Display SCX file information
     Info {
@@ -379,6 +414,12 @@ fn main() {
             csc_cols_per_shard,
             modality,
             stream,
+            memory_budget,
+            strict_uns,
+            dense_zero_epsilon,
+            temp_dir,
+            modalities,
+            modality_types,
         } => run_convert(
             &input,
             &output,
@@ -390,6 +431,12 @@ fn main() {
             csc_cols_per_shard,
             modality.as_deref(),
             stream,
+            memory_budget.as_deref(),
+            strict_uns,
+            dense_zero_epsilon,
+            temp_dir,
+            modalities.as_deref(),
+            modality_types.as_deref(),
         ),
         Commands::Info {
             file,
@@ -554,6 +601,12 @@ fn run_convert(
     csc_cols_per_shard: usize,
     modality: Option<&str>,
     stream: bool,
+    memory_budget: Option<&str>,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
+    temp_dir: Option<std::path::PathBuf>,
+    modalities: Option<&str>,
+    modality_types: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -568,14 +621,19 @@ fn run_convert(
         other => return Err(format!("invalid --csc value: {other}").into()),
     };
 
-    // `--stream` is only valid for h5ad → scx. Reject other directions
-    // up front so the user gets a clear error rather than a confusing
-    // downstream failure. h5mu streaming is explicitly out of scope
-    // (single-modality streaming only).
-    if stream && direction != "h5ad_to_scx" {
+    // `--stream` is supported for h5ad → scx (Phase 0/1/2) and
+    // h5mu → scx (Phase 3). Reject for other directions so the user
+    // gets a clear error rather than a confusing downstream failure.
+    if stream && direction != "h5ad_to_scx" && direction != "h5mu_to_scx" {
         return Err(format!(
-            "--stream is only supported for h5ad → scx; got direction '{direction}'. \
-             For h5mu, drop --stream (multimodal streaming is not yet implemented)."
+            "--stream is only supported for h5ad → scx and h5mu → scx; \
+             got direction '{direction}'."
+        )
+        .into());
+    }
+    if (modalities.is_some() || modality_types.is_some()) && direction != "h5mu_to_scx" {
+        return Err(format!(
+            "--modalities / --modality-types only apply to h5mu → scx; got direction '{direction}'."
         )
         .into());
     }
@@ -596,6 +654,43 @@ fn run_convert(
         _ => {}
     }
 
+    // Parse `--memory-budget` once here so an invalid value fails the
+    // command before we touch the file. Empty string and `None` both
+    // mean "use default heuristics" (= `ConvertOptions::memory_budget = None`).
+    // The parser lives behind scx-convert's `hdf5` feature gate; the
+    // non-hdf5 CLI stub never reaches the dispatch, so silently drop
+    // the budget there (it would be unused anyway).
+    #[cfg(feature = "hdf5")]
+    let memory_budget_bytes: Option<u64> = match memory_budget {
+        None => None,
+        Some(s) => Some(convert::MemoryBudget::parse(s)?),
+    };
+    #[cfg(not(feature = "hdf5"))]
+    let memory_budget_bytes: Option<u64> = {
+        let _ = memory_budget;
+        None
+    };
+
+    // Parse Phase 3 h5mu filters / type overrides. The empty-string
+    // case is treated as no filter; non-empty strings are split on
+    // commas and validated.
+    let modalities_list: Option<Vec<String>> = match modalities {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect(),
+        ),
+    };
+    let modality_types_list: Vec<(String, scx_format::modality::ModalityType)> =
+        match modality_types {
+            None => Vec::new(),
+            Some(s) if s.trim().is_empty() => Vec::new(),
+            Some(s) => parse_modality_types(s)?,
+        };
+
     dispatch_convert(
         direction,
         input,
@@ -606,7 +701,46 @@ fn run_convert(
         csc_cols_per_shard,
         modality,
         stream,
+        memory_budget_bytes,
+        strict_uns,
+        dense_zero_epsilon,
+        temp_dir,
+        modalities_list,
+        modality_types_list,
     )
+}
+
+/// Parse `--modality-types name:Type,name:Type` into a typed list.
+/// Case-insensitive on the right side; case-sensitive modality
+/// names match `/mod/{name}` keys verbatim.
+fn parse_modality_types(
+    s: &str,
+) -> Result<Vec<(String, scx_format::modality::ModalityType)>, Box<dyn std::error::Error>> {
+    use scx_format::modality::ModalityType;
+    s.split(',')
+        .map(|kv| {
+            let trimmed = kv.trim();
+            let (k, v) = trimmed
+                .split_once(':')
+                .ok_or_else(|| format!("expected 'name:Type', got '{trimmed}'"))?;
+            let mt = match v.trim().to_lowercase().as_str() {
+                "rna" => ModalityType::Rna,
+                "protein" | "adt" => ModalityType::Protein,
+                "atac" => ModalityType::Atac,
+                "spatial" => ModalityType::Spatial,
+                "methylation" | "methyl" => ModalityType::Methylation,
+                "custom" => ModalityType::Custom,
+                other => {
+                    return Err(format!(
+                        "unknown modality type '{other}'; valid: \
+                         rna, protein, atac, spatial, methylation, custom"
+                    )
+                    .into());
+                }
+            };
+            Ok((k.trim().to_string(), mt))
+        })
+        .collect()
 }
 
 #[cfg(feature = "hdf5")]
@@ -621,6 +755,12 @@ fn dispatch_convert(
     csc_cols_per_shard: usize,
     modality: Option<&str>,
     stream: bool,
+    memory_budget: Option<u64>,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
+    temp_dir: Option<std::path::PathBuf>,
+    modalities: Option<Vec<String>>,
+    modality_types: Vec<(String, scx_format::modality::ModalityType)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -648,6 +788,13 @@ fn dispatch_convert(
         csc: csc_always,
         csc_cols_per_shard,
         tool: "scx-cli".into(),
+        memory_budget,
+        stream,
+        strict_uns,
+        dense_zero_epsilon,
+        temp_dir,
+        modalities,
+        modality_types,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -657,6 +804,11 @@ fn dispatch_convert(
             .expect("valid template"),
     );
     pb.set_message(format!("Converting {}...", input.display()));
+
+    // Structured warning channel (Phase 0.3). Default backend forwards
+    // each emission to `log::warn!`; we also print a per-category
+    // summary at the end of the command.
+    let mut sink = convert::WarningSink::log();
 
     // Special-case scx_to_h5ad on multimodal input: gate on the
     // `--modality` flag and route through `scx_modality_to_h5ad` when
@@ -669,12 +821,19 @@ fn dispatch_convert(
                     output,
                     &opts,
                     &convert::StreamingOverrides::default(),
+                    &mut sink,
                 )
             } else {
-                convert::h5ad_to_scx(input, output, &opts)
+                convert::h5ad_to_scx(input, output, &opts, &mut sink)
             }
         }
-        "h5mu_to_scx" => convert::h5mu_to_scx(input, output, &opts),
+        "h5mu_to_scx" => {
+            if stream {
+                convert::h5mu_to_scx_streaming(input, output, &opts, &mut sink)
+            } else {
+                convert::h5mu_to_scx(input, output, &opts, &mut sink)
+            }
+        }
         "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts),
         "scx_to_h5ad" => match modality {
             Some(name) => convert::scx_modality_to_h5ad(input, output, name),
@@ -699,7 +858,7 @@ fn dispatch_convert(
                     .into());
                 }
                 drop(reader);
-                convert::scx_to_h5ad(input, output)
+                convert::scx_to_h5ad(input, output, &mut sink)
             }
         },
         "scx_to_h5mu" => convert::scx_to_h5mu(input, output),
@@ -707,6 +866,15 @@ fn dispatch_convert(
     };
 
     pb.finish_and_clear();
+
+    if sink.total() > 0 {
+        let parts: Vec<String> = sink
+            .counts()
+            .iter()
+            .map(|(cat, n)| format!("{cat}={n}"))
+            .collect();
+        eprintln!("{} conversion warnings: {}", sink.total(), parts.join(", "));
+    }
 
     match result {
         Ok(()) => {
@@ -729,6 +897,12 @@ fn dispatch_convert(
     _csc_cols_per_shard: usize,
     _modality: Option<&str>,
     _stream: bool,
+    _memory_budget: Option<u64>,
+    _strict_uns: bool,
+    _dense_zero_epsilon: f32,
+    _temp_dir: Option<std::path::PathBuf>,
+    _modalities: Option<Vec<String>>,
+    _modality_types: Vec<(String, scx_format::modality::ModalityType)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

@@ -27,8 +27,8 @@ pub use csc::{
     wilcoxon_rank_sum_streaming_csc, PreferFormat,
 };
 pub use diffexp::{
-    merge_diff_exp_results, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse,
-    wilcoxon_rank_sum_streaming, DiffExpResult,
+    merge_diff_exp_results, pdex_ref, pdex_ref_sparse, pdex_ref_streaming, wilcoxon_rank_sum,
+    wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming, DiffExpResult, PdexRefResult,
 };
 pub use error::{AccelError, Result};
 pub use eval_metrics::{
@@ -58,7 +58,7 @@ pub use pca::{
 pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
     pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,
-    PseudobulkResult,
+    GeomMeanMode, PseudobulkResult,
 };
 pub use umap::{compute_umap, UmapResult};
 

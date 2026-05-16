@@ -808,22 +808,28 @@ impl ScxWriter {
     }
 
     /// Run `body` with `current_modality_id` temporarily set to `id`.
+    /// Public so external pipelines (e.g. the Phase 3 h5mu streaming
+    /// coordinator) can stamp per-modality shards without going
+    /// through the per-method `_for` wrappers.
     /// Used internally by every `*_for` method to stamp the right
     /// modality id on catalog entries created by `body`.
-    fn with_modality<F, R>(&mut self, id: u8, body: F) -> Result<R>
+    pub fn with_modality<F, R, E>(&mut self, id: u8, body: F) -> std::result::Result<R, E>
     where
-        F: FnOnce(&mut Self) -> Result<R>,
+        E: From<ScxError>,
+        F: FnOnce(&mut Self) -> std::result::Result<R, E>,
     {
         if id == 0 {
             return Err(ScxError::InvalidCatalog(
                 "modality_id 0 is reserved for global entries".to_string(),
-            ));
+            )
+            .into());
         }
         if id as usize > self.modalities.len() {
             return Err(ScxError::InvalidCatalog(format!(
                 "modality_id {id} out of range (registered: {})",
                 self.modalities.len()
-            )));
+            ))
+            .into());
         }
         let prev = self.current_modality_id;
         self.current_modality_id = id;

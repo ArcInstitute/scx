@@ -331,31 +331,44 @@ fn wilcoxon_from_ranks(
     n_total: usize,
     tie_correction: f64,
 ) -> (f64, f64) {
+    let (_u, z, p) = wilcoxon_full_from_ranks(ranks, group_cells, n_total, tie_correction);
+    (z, p)
+}
+
+/// Full Wilcoxon stats from pre-computed ranks: `(u1, z, two_sided_p)`.
+///
+/// `u1` is the Mann-Whitney U statistic for the test group (the convention
+/// matched by `pdex` / `numba_mwu`'s `.statistic`).  `z` is the
+/// tie-corrected signed z-score used by the existing scanpy-parity path.
+/// All callers within this crate use one or the other; the unified helper
+/// avoids recomputing the rank sum twice when both are needed.
+fn wilcoxon_full_from_ranks(
+    ranks: &[f64],
+    group_cells: &[usize],
+    n_total: usize,
+    tie_correction: f64,
+) -> (f64, f64, f64) {
     let n1 = group_cells.len() as f64;
     let n2 = n_total as f64 - n1;
     let n = n_total as f64;
 
     if n1 == 0.0 || n2 == 0.0 {
-        return (0.0, 1.0);
+        return (0.0, 0.0, 1.0);
     }
 
-    // Rank sum for the group.
     let rank_sum: f64 = group_cells.iter().map(|&i| ranks[i]).sum();
-
-    // U-statistic.
     let u1 = rank_sum - n1 * (n1 + 1.0) / 2.0;
 
-    // Expected U and variance under H0.
     let mu = n1 * n2 / 2.0;
     let sigma_sq = (n1 * n2 / 12.0) * ((n + 1.0) - tie_correction / (n * (n - 1.0)));
 
     if sigma_sq <= 0.0 {
-        return (0.0, 1.0);
+        return (u1, 0.0, 1.0);
     }
 
     let z = (u1 - mu) / sigma_sq.sqrt();
     let p = 2.0 * normal_sf(z.abs());
-    (z, p)
+    (u1, z, p)
 }
 
 /// Wilcoxon rank-sum (Mann–Whitney U) test with normal approximation and tie correction.
@@ -786,6 +799,526 @@ pub fn merge_diff_exp_results(
     })
 }
 
+// ---------------------------------------------------------------------------
+// pdex `mode="ref"` accelerator
+// ---------------------------------------------------------------------------
+
+/// Result of a pdex `mode="ref"` differential expression analysis.
+///
+/// Mirrors the row-per-(group, feature) frame returned by
+/// `pdex.pdex(adata, groupby, mode="ref")`. Inner vectors are indexed
+/// `[test_group_idx][gene_idx]`, with `feature_names` in input (var_names)
+/// order — there is no per-group sorting (pdex returns input order).
+///
+/// The reference group is excluded from `group_names`.
+#[derive(Debug, Clone)]
+pub struct PdexRefResult {
+    /// Names of test groups, in the input `group_names` order (reference excluded).
+    pub group_names: Vec<String>,
+    /// Gene names in input order. Length = `n_vars`.
+    pub feature_names: Vec<String>,
+    /// `target_mean[group_idx][gene_idx]` in natural (count) space.
+    pub target_means: Vec<Vec<f64>>,
+    /// `ref_mean[gene_idx]` in natural (count) space.
+    pub ref_means: Vec<f64>,
+    /// Cell count per test group.
+    pub target_memberships: Vec<usize>,
+    /// Cell count for the reference group.
+    pub ref_membership: usize,
+    /// `log2((target_mean + epsilon) / (ref_mean + epsilon))`.
+    pub log2_fold_changes: Vec<Vec<f64>>,
+    /// `(target_mean - ref_mean) / (ref_mean + epsilon)`.
+    pub percent_changes: Vec<Vec<f64>>,
+    /// Mann-Whitney U statistic for the test group vs the reference.
+    pub statistics: Vec<Vec<f64>>,
+    /// Two-sided MWU p-values.
+    pub p_values: Vec<Vec<f64>>,
+    /// Benjamini-Hochberg adjusted p-values per group across genes.
+    pub fdrs: Vec<Vec<f64>>,
+}
+
+/// Per-cell value transform `f(x)` applied before averaging for pdex pseudobulk.
+#[inline]
+fn pdex_pre(mode: crate::pseudobulk::GeomMeanMode, x: f64) -> f64 {
+    mode.pre(x)
+}
+
+/// Per-(group, gene) mean transform `g(y)` applied after dividing by cell count.
+#[inline]
+fn pdex_post(mode: crate::pseudobulk::GeomMeanMode, y: f64) -> f64 {
+    mode.post(y)
+}
+
+/// Per-(test group, gene) pdex stats from a dense column buffer with a
+/// pre-computed `ref_mean`.
+///
+/// `values` has length `n_obs`, holding the column for one gene.
+/// `group_cells` and `ref_cells` are disjoint cell-index arrays into `values`.
+/// Returns `(target_mean, log2_fc, percent_change, u_stat, p_value)`.
+///
+/// Rank computation runs over only the combined `(group ∪ ref)` cells —
+/// matching pdex's `mwu(group_matrix, ref_data)` which does not include
+/// other groups in the rank pool.
+#[allow(clippy::too_many_arguments)]
+fn pdex_gene_target_stats(
+    values: &[f64],
+    group_cells: &[usize],
+    ref_cells: &[usize],
+    ref_mean: f64,
+    mode: crate::pseudobulk::GeomMeanMode,
+    epsilon: f64,
+    values_buf: &mut Vec<f64>,
+    index_buf: &mut Vec<usize>,
+    ranks_buf: &mut Vec<f64>,
+    group_buf_indices: &mut Vec<usize>,
+) -> (f64, f64, f64, f64, f64) {
+    let n1 = group_cells.len();
+    let n2 = ref_cells.len();
+
+    let target_mean = if n1 == 0 {
+        f64::NAN
+    } else {
+        let s: f64 = group_cells.iter().map(|&c| pdex_pre(mode, values[c])).sum();
+        pdex_post(mode, s / n1 as f64)
+    };
+
+    let log2_fc = ((target_mean + epsilon) / (ref_mean + epsilon)).log2();
+    let percent_change = (target_mean - ref_mean) / (ref_mean + epsilon);
+
+    if n1 == 0 || n2 == 0 {
+        return (target_mean, log2_fc, percent_change, f64::NAN, 1.0);
+    }
+
+    // Gather (group, ref) into a contiguous buffer; rank within that pool.
+    let n_total = n1 + n2;
+    values_buf.clear();
+    values_buf.reserve(n_total);
+    for &c in group_cells {
+        values_buf.push(values[c]);
+    }
+    for &c in ref_cells {
+        values_buf.push(values[c]);
+    }
+
+    let tc = rank_with_ties(&values_buf[..n_total], index_buf, ranks_buf);
+    group_buf_indices.clear();
+    group_buf_indices.extend(0..n1);
+    let (u_stat, _z, p) = wilcoxon_full_from_ranks(ranks_buf, group_buf_indices, n_total, tc);
+
+    (target_mean, log2_fc, percent_change, u_stat, p)
+}
+
+/// pdex `mode="ref"` accelerator over a dense `[n_obs × n_vars]` row-major buffer.
+///
+/// For each non-reference group `g`, compute per (group, gene):
+/// * `target_mean` and `ref_mean` in natural (count) space using `mode`.
+/// * `log2((target_mean + epsilon) / (ref_mean + epsilon))`.
+/// * `(target_mean - ref_mean) / (ref_mean + epsilon)`.
+/// * Mann-Whitney U statistic and two-sided p-value vs the reference cells.
+/// * Benjamini-Hochberg FDR across genes (per group).
+///
+/// Parallelised over genes. Returns rows in input `group_names` and `gene_names`
+/// order — the reference group is excluded from output.
+#[allow(clippy::too_many_arguments)]
+pub fn pdex_ref(
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    mode: crate::pseudobulk::GeomMeanMode,
+    epsilon: f64,
+) -> Result<PdexRefResult> {
+    if data.len() != n_obs * n_vars {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "data length {} != n_obs {} × n_vars {}",
+            data.len(),
+            n_obs,
+            n_vars
+        )));
+    }
+    if gene_names.len() != n_vars {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "gene_names length {} != n_vars {}",
+            gene_names.len(),
+            n_vars
+        )));
+    }
+    if groups.len() != n_obs {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "groups length {} != n_obs {}",
+            groups.len(),
+            n_obs
+        )));
+    }
+    let n_groups = group_names.len();
+    if reference >= n_groups {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "reference index {} out of range (n_groups = {})",
+            reference, n_groups
+        )));
+    }
+    if epsilon < 0.0 || !epsilon.is_finite() {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "epsilon must be non-negative and finite (got {epsilon})"
+        )));
+    }
+
+    // Bucket cell indices by group. Cells with `group >= n_groups` are
+    // silently dropped (matches pdex's NaN/empty-string handling, which the
+    // caller is expected to encode upstream as out-of-range group ids).
+    let mut group_indices: Vec<Vec<usize>> = vec![vec![]; n_groups];
+    for (i, &g) in groups.iter().enumerate() {
+        if g < n_groups {
+            group_indices[g].push(i);
+        }
+    }
+
+    let ref_cells = group_indices[reference].clone();
+    let ref_membership = ref_cells.len();
+    if ref_membership == 0 {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "reference group '{}' has zero cells",
+            group_names[reference]
+        )));
+    }
+
+    // Test groups in input order, reference excluded.
+    let test_groups: Vec<usize> = (0..n_groups).filter(|&g| g != reference).collect();
+    let n_test = test_groups.len();
+    let target_memberships: Vec<usize> = test_groups
+        .iter()
+        .map(|&g| group_indices[g].len())
+        .collect();
+
+    // Per-gene parallel kernel: compute ref_mean once, then per test-group stats.
+    // gene_results[var_idx] = (ref_mean, Vec<(t_mean, lfc, pct, u, p)> of len n_test).
+    type PerGroupStats = (f64, f64, f64, f64, f64);
+    let gene_results: Vec<(f64, Vec<PerGroupStats>)> = (0..n_vars)
+        .into_par_iter()
+        .map_init(
+            || {
+                (
+                    vec![0.0f64; n_obs], // column-value buffer
+                    Vec::<f64>::with_capacity(n_obs),
+                    Vec::<usize>::with_capacity(n_obs),
+                    Vec::<f64>::with_capacity(n_obs),
+                    Vec::<usize>::with_capacity(n_obs),
+                )
+            },
+            |(col_buf, values_buf, index_buf, ranks_buf, group_buf_indices), var_idx| {
+                for cell in 0..n_obs {
+                    col_buf[cell] = data[cell * n_vars + var_idx] as f64;
+                }
+
+                // ref_mean is shared across all test groups for this gene.
+                let ref_sum: f64 = ref_cells.iter().map(|&c| pdex_pre(mode, col_buf[c])).sum();
+                let ref_mean = pdex_post(mode, ref_sum / ref_membership as f64);
+
+                let per_group: Vec<PerGroupStats> = test_groups
+                    .iter()
+                    .map(|&g| {
+                        pdex_gene_target_stats(
+                            &col_buf[..n_obs],
+                            &group_indices[g],
+                            &ref_cells,
+                            ref_mean,
+                            mode,
+                            epsilon,
+                            values_buf,
+                            index_buf,
+                            ranks_buf,
+                            group_buf_indices,
+                        )
+                    })
+                    .collect();
+
+                (ref_mean, per_group)
+            },
+        )
+        .collect();
+
+    // Transpose into per-group flat arrays in gene-input order.
+    let mut target_means: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut ref_means: Vec<f64> = Vec::with_capacity(n_vars);
+    let mut log2_fold_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut percent_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+
+    for (ref_mean, per_group) in gene_results {
+        ref_means.push(ref_mean);
+        for (tg, s) in per_group.into_iter().enumerate() {
+            target_means[tg].push(s.0);
+            log2_fold_changes[tg].push(s.1);
+            percent_changes[tg].push(s.2);
+            statistics[tg].push(s.3);
+            p_values[tg].push(s.4);
+        }
+    }
+
+    // BH per group across genes. pdex emits p-values clipped to [0, 1] before
+    // BH — mirror that to match its FDR output bit-for-bit.
+    let fdrs: Vec<Vec<f64>> = p_values
+        .iter()
+        .map(|pv| {
+            let clipped: Vec<f64> = pv.iter().map(|&p| p.clamp(0.0, 1.0)).collect();
+            benjamini_hochberg(&clipped)
+        })
+        .collect();
+
+    // Also clip the reported p_values to [0, 1] (pdex does this too).
+    for pv in p_values.iter_mut() {
+        for p in pv.iter_mut() {
+            *p = p.clamp(0.0, 1.0);
+        }
+    }
+
+    Ok(PdexRefResult {
+        group_names: test_groups
+            .iter()
+            .map(|&g| group_names[g].clone())
+            .collect(),
+        feature_names: gene_names.to_vec(),
+        target_means,
+        ref_means,
+        target_memberships,
+        ref_membership,
+        log2_fold_changes,
+        percent_changes,
+        statistics,
+        p_values,
+        fdrs,
+    })
+}
+
+/// Gene-chunked pdex `mode="ref"` over an in-memory `ScxCsr` matrix.
+///
+/// Materializes one gene chunk at a time into a dense `[n_obs × chunk_size]`
+/// buffer and calls `pdex_ref` on the chunk. Avoids `O(n_obs × n_vars)`
+/// dense expansion while preserving exact-pdex semantics. BH FDR is applied
+/// per group across the full gene set after all chunks complete.
+#[allow(clippy::too_many_arguments)]
+pub fn pdex_ref_sparse(
+    csr: &scx_sparse::ScxCsr,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    gene_chunk_size: usize,
+    mode: crate::pseudobulk::GeomMeanMode,
+    epsilon: f64,
+) -> Result<PdexRefResult> {
+    let (n_obs, n_vars) = csr.shape;
+    if gene_names.len() != n_vars {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "gene_names length {} != n_vars {}",
+            gene_names.len(),
+            n_vars
+        )));
+    }
+    if groups.len() != n_obs {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "groups length {} != n_obs {}",
+            groups.len(),
+            n_obs
+        )));
+    }
+    if gene_chunk_size == 0 {
+        return Err(crate::AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+
+    let mut combined: Option<PdexRefResult> = None;
+
+    for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
+        let chunk_end = (chunk_start + gene_chunk_size).min(n_vars);
+        let chunk_size = chunk_end - chunk_start;
+        let col_indices: Vec<u32> = (chunk_start as u32..chunk_end as u32).collect();
+
+        // Project to the chunk's columns and densify (zero-init).
+        let projected = scx_engine::project_csr(csr, &col_indices);
+        let mut dense = vec![0.0f32; n_obs * chunk_size];
+        for row in 0..projected.n_rows() {
+            let s = projected.indptr[row] as usize;
+            let e = projected.indptr[row + 1] as usize;
+            for j in s..e {
+                let col = projected.indices[j] as usize;
+                dense[row * chunk_size + col] = projected.data[j];
+            }
+        }
+
+        let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
+        let chunk_result = pdex_ref(
+            &dense,
+            n_obs,
+            chunk_size,
+            &chunk_genes,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+        )?;
+
+        combined = Some(match combined.take() {
+            None => chunk_result,
+            Some(mut acc) => {
+                merge_pdex_chunk_into(&mut acc, chunk_result);
+                acc
+            }
+        });
+    }
+
+    let mut result = combined.unwrap_or_else(|| empty_pdex_result(group_names, reference));
+    recompute_pdex_fdrs(&mut result);
+    Ok(result)
+}
+
+/// Gene-chunked pdex `mode="ref"` streaming from `BackedCsrReader`.
+///
+/// Mirrors `wilcoxon_rank_sum_streaming`: walks every shard once per gene
+/// chunk through the cached shard API. Size the reader's cache to
+/// `>= n_shards` to keep the inner loop cache-resident across chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn pdex_ref_streaming(
+    reader: &scx_format::backed::BackedCsrReader,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    gene_chunk_size: usize,
+    mode: crate::pseudobulk::GeomMeanMode,
+    epsilon: f64,
+) -> Result<PdexRefResult> {
+    let n_obs = reader.n_obs();
+    let n_vars = gene_names.len();
+    if groups.len() != n_obs {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "groups length {} != n_obs {}",
+            groups.len(),
+            n_obs
+        )));
+    }
+    if gene_chunk_size == 0 {
+        return Err(crate::AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+
+    let n_shards = reader.index().n_shards();
+    let cache_cap = reader.cache_capacity();
+    let n_chunks = n_vars.div_ceil(gene_chunk_size);
+    if n_chunks > 1 && cache_cap < n_shards {
+        log::warn!(
+            "pdex_ref_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
+             the cached read path will evict and re-decode every shard on each chunk. \
+             Size the BackedCsrReader cache to >= n_shards for the documented speedup.",
+            cache_cap,
+            n_shards,
+            n_chunks,
+        );
+    }
+
+    let mut combined: Option<PdexRefResult> = None;
+
+    for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
+        let chunk_end = (chunk_start + gene_chunk_size).min(n_vars);
+        let chunk_size = chunk_end - chunk_start;
+        let col_indices: Vec<u32> = (chunk_start as u32..chunk_end as u32).collect();
+
+        let mut dense = vec![0.0f32; n_obs * chunk_size];
+        let mut global_row = 0usize;
+        for shard_idx in 0..n_shards {
+            let shard_csr = reader
+                .read_shard_cached_arc(shard_idx)
+                .map_err(crate::AccelError::Scx)?;
+            let projected = scx_engine::project_csr(&shard_csr, &col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    let col = projected.indices[j] as usize;
+                    dense[(global_row + row) * chunk_size + col] = projected.data[j];
+                }
+            }
+            global_row += projected.n_rows();
+        }
+
+        let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
+        let chunk_result = pdex_ref(
+            &dense,
+            n_obs,
+            chunk_size,
+            &chunk_genes,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+        )?;
+
+        combined = Some(match combined.take() {
+            None => chunk_result,
+            Some(mut acc) => {
+                merge_pdex_chunk_into(&mut acc, chunk_result);
+                acc
+            }
+        });
+    }
+
+    let mut result = combined.unwrap_or_else(|| empty_pdex_result(group_names, reference));
+    recompute_pdex_fdrs(&mut result);
+    Ok(result)
+}
+
+fn empty_pdex_result(group_names: &[String], reference: usize) -> PdexRefResult {
+    let group_names_out: Vec<String> = (0..group_names.len())
+        .filter(|&g| g != reference)
+        .map(|g| group_names[g].clone())
+        .collect();
+    let n_test = group_names_out.len();
+    PdexRefResult {
+        group_names: group_names_out,
+        feature_names: vec![],
+        target_means: vec![vec![]; n_test],
+        ref_means: vec![],
+        target_memberships: vec![0; n_test],
+        ref_membership: 0,
+        log2_fold_changes: vec![vec![]; n_test],
+        percent_changes: vec![vec![]; n_test],
+        statistics: vec![vec![]; n_test],
+        p_values: vec![vec![]; n_test],
+        fdrs: vec![vec![]; n_test],
+    }
+}
+
+fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResult) {
+    // The first chunk already initialised the membership counts.
+    acc.feature_names.extend(chunk.feature_names);
+    acc.ref_means.extend(chunk.ref_means);
+    debug_assert_eq!(acc.target_means.len(), chunk.target_means.len());
+    for tg in 0..acc.target_means.len() {
+        acc.target_means[tg].extend(&chunk.target_means[tg]);
+        acc.log2_fold_changes[tg].extend(&chunk.log2_fold_changes[tg]);
+        acc.percent_changes[tg].extend(&chunk.percent_changes[tg]);
+        acc.statistics[tg].extend(&chunk.statistics[tg]);
+        acc.p_values[tg].extend(&chunk.p_values[tg]);
+    }
+    // Discard chunk.fdrs — we recompute globally after all chunks merge.
+}
+
+fn recompute_pdex_fdrs(result: &mut PdexRefResult) {
+    result.fdrs = result
+        .p_values
+        .iter()
+        .map(|pv| benjamini_hochberg(pv))
+        .collect();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,7 +1476,7 @@ mod tests {
     fn test_pairwise_reference() {
         let n_obs = 30;
         let n_vars = 2;
-        let mut data = vec![5.0f32; n_obs * n_vars];
+        let data = vec![5.0f32; n_obs * n_vars];
         let groups: Vec<usize> = (0..n_obs)
             .map(|i| {
                 if i < 10 {
@@ -1547,5 +2080,392 @@ mod tests {
         .unwrap();
 
         assert_diffexp_results_match(&uncached_res, &reference, 1e-5, 1e-5);
+    }
+
+    // ── pdex `mode="ref"` accelerator tests ──────────────────────────────────
+
+    use crate::pseudobulk::GeomMeanMode;
+
+    fn build_pdex_fixture(n_obs: usize, n_vars: usize) -> (Vec<f32>, Vec<usize>, Vec<String>) {
+        // Three groups: 0=ref, 1=test_a, 2=test_b. Each gets a third of cells.
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let mut groups = vec![0usize; n_obs];
+        let third = n_obs / 3;
+        for cell in 0..n_obs {
+            let g = if cell < third {
+                0
+            } else if cell < 2 * third {
+                1
+            } else {
+                2
+            };
+            groups[cell] = g;
+            for gene in 0..n_vars {
+                // Deterministic, non-trivial pattern: each gene gets a shifted
+                // sequence by group, plus a per-cell perturbation.
+                let base = (g as f32) * 2.0 + (gene as f32) * 0.5;
+                let pert = ((cell + gene * 7) % 11) as f32 * 0.1;
+                data[cell * n_vars + gene] = base + pert;
+            }
+        }
+        let group_names = vec!["ref".to_string(), "ta".to_string(), "tb".to_string()];
+        (data, groups, group_names)
+    }
+
+    #[test]
+    fn test_pdex_ref_smoke_dense() {
+        let n_obs = 60;
+        let n_vars = 4;
+        let (data, groups, group_names) = build_pdex_fixture(n_obs, n_vars);
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+
+        let result = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0, // reference = "ref"
+            GeomMeanMode::ArithRaw,
+            0.0,
+        )
+        .unwrap();
+
+        // Reference is excluded; two test groups remain.
+        assert_eq!(result.group_names, vec!["ta", "tb"]);
+        assert_eq!(result.feature_names.len(), n_vars);
+        assert_eq!(result.ref_means.len(), n_vars);
+        assert_eq!(result.ref_membership, n_obs / 3);
+        assert_eq!(result.target_memberships, vec![n_obs / 3, n_obs / 3]);
+
+        // Shapes per test group.
+        for tg in 0..2 {
+            assert_eq!(result.target_means[tg].len(), n_vars);
+            assert_eq!(result.log2_fold_changes[tg].len(), n_vars);
+            assert_eq!(result.percent_changes[tg].len(), n_vars);
+            assert_eq!(result.statistics[tg].len(), n_vars);
+            assert_eq!(result.p_values[tg].len(), n_vars);
+            assert_eq!(result.fdrs[tg].len(), n_vars);
+        }
+
+        // Sanity: ref/test means should be positive in this fixture, and the
+        // test groups have a strictly larger group-shift than the reference,
+        // so log2_fc should be positive for every gene.
+        for tg in 0..2 {
+            for gene in 0..n_vars {
+                assert!(
+                    result.target_means[tg][gene] > result.ref_means[gene],
+                    "test group {} gene {} expected larger mean than ref",
+                    tg,
+                    gene
+                );
+                assert!(
+                    result.log2_fold_changes[tg][gene] > 0.0,
+                    "log2_fc should be positive for tg={} gene={}",
+                    tg,
+                    gene
+                );
+                // FDR is BH-adjusted, must be in [0, 1] and >= raw p.
+                let p = result.p_values[tg][gene];
+                let fdr = result.fdrs[tg][gene];
+                assert!((0.0..=1.0).contains(&p));
+                assert!((0.0..=1.0).contains(&fdr));
+                assert!(fdr + 1e-12 >= p, "FDR must be >= raw p");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pdex_ref_four_geom_modes() {
+        // Verify that all four GeomMeanMode variants run end-to-end and produce
+        // finite means / log2_fcs. Compare ArithRaw and GeomLog1p (the two
+        // "no transform per cell" modes) on raw vs log1p inputs.
+        let n_obs = 30;
+        let n_vars = 3;
+        let (mut data, groups, group_names) = build_pdex_fixture(n_obs, n_vars);
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+
+        let modes = [
+            GeomMeanMode::ArithRaw,
+            GeomMeanMode::ArithLog1pExpand,
+            GeomMeanMode::GeomRaw,
+            GeomMeanMode::GeomLog1p,
+        ];
+
+        for mode in modes {
+            let raw_result = pdex_ref(
+                &data,
+                n_obs,
+                n_vars,
+                &gene_names,
+                &groups,
+                &group_names,
+                0,
+                mode,
+                0.0,
+            )
+            .unwrap();
+
+            for tg in 0..2 {
+                for gene in 0..n_vars {
+                    assert!(
+                        raw_result.target_means[tg][gene].is_finite(),
+                        "mode {:?}: target_mean must be finite",
+                        mode
+                    );
+                    assert!(
+                        raw_result.ref_means[gene].is_finite(),
+                        "mode {:?}: ref_mean must be finite",
+                        mode
+                    );
+                    assert!(
+                        raw_result.log2_fold_changes[tg][gene].is_finite(),
+                        "mode {:?}: log2_fc must be finite",
+                        mode
+                    );
+                }
+            }
+        }
+
+        // For GeomLog1p: the input is treated as log1p already, so the natural
+        // mean is expm1(arithmetic_mean). Verify by applying log1p to data and
+        // checking that GeomRaw on log1p(data) ≈ GeomLog1p on log1p(data).
+        for v in data.iter_mut() {
+            *v = v.ln_1p();
+        }
+        let geom_raw = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::GeomRaw,
+            0.0,
+        )
+        .unwrap();
+        let geom_log1p = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::GeomLog1p,
+            0.0,
+        )
+        .unwrap();
+        for gene in 0..n_vars {
+            // GeomRaw on log1p input applies log1p again → expm1(mean(log1p^2(x))).
+            // That is NOT equal to GeomLog1p on log1p input (expm1(mean(log1p(x)))).
+            // So we only check that both are finite and positive, not that they
+            // match. The four-mode parity is enforced by the Python parity test
+            // against pdex (pyscx/tests/test_pdex_ref_parity.py).
+            assert!(geom_raw.ref_means[gene] >= 0.0);
+            assert!(geom_log1p.ref_means[gene] >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_pdex_ref_epsilon_stabilises_zero_ref() {
+        // When ref_mean = 0, epsilon avoids division-by-zero in
+        // log2_fold_change and percent_change.
+        let n_obs = 12;
+        let n_vars = 1;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let groups = vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+        // Group 0 (ref) is all zeros. Group 1 has positive values.
+        for cell in 4..8 {
+            data[cell] = 3.0;
+        }
+        for cell in 8..12 {
+            data[cell] = 5.0;
+        }
+        let group_names = vec!["ref".to_string(), "ta".to_string(), "tb".to_string()];
+        let gene_names = vec!["g0".to_string()];
+
+        // epsilon=0 → log2_fc = log2(target / 0) = +inf for non-zero target.
+        let r0 = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::ArithRaw,
+            0.0,
+        )
+        .unwrap();
+        assert!(
+            r0.log2_fold_changes[0][0].is_infinite(),
+            "log2_fc with eps=0 and ref_mean=0 should be +inf"
+        );
+
+        // epsilon=0.5 → log2_fc is finite.
+        let r1 = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::ArithRaw,
+            0.5,
+        )
+        .unwrap();
+        for tg in 0..2 {
+            assert!(
+                r1.log2_fold_changes[tg][0].is_finite(),
+                "log2_fc with eps=0.5 should be finite"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pdex_ref_sparse_matches_dense() {
+        // Build a sparse CSR mirroring the fixture and verify pdex_ref_sparse
+        // produces the same outputs as pdex_ref (with gene chunking forcing
+        // the merge path).
+        let n_obs = 30;
+        let n_vars = 5;
+        let (dense, groups, group_names) = build_pdex_fixture(n_obs, n_vars);
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = dense[r * n_vars + c];
+                if v != 0.0 {
+                    indices.push(c as i32);
+                    data.push(v);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, data);
+
+        let dense_res = pdex_ref(
+            &dense,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::ArithRaw,
+            0.0,
+        )
+        .unwrap();
+
+        // chunk_size=2 → forces three chunks across 5 genes, exercising merge.
+        let sparse_res = pdex_ref_sparse(
+            &csr,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            2,
+            GeomMeanMode::ArithRaw,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(dense_res.group_names, sparse_res.group_names);
+        assert_eq!(dense_res.feature_names, sparse_res.feature_names);
+        assert_eq!(dense_res.ref_membership, sparse_res.ref_membership);
+        assert_eq!(dense_res.target_memberships, sparse_res.target_memberships);
+
+        for gene in 0..n_vars {
+            assert!((dense_res.ref_means[gene] - sparse_res.ref_means[gene]).abs() < 1e-9);
+        }
+        for tg in 0..dense_res.group_names.len() {
+            for gene in 0..n_vars {
+                assert!(
+                    (dense_res.target_means[tg][gene] - sparse_res.target_means[tg][gene]).abs()
+                        < 1e-9
+                );
+                assert!(
+                    (dense_res.log2_fold_changes[tg][gene]
+                        - sparse_res.log2_fold_changes[tg][gene])
+                        .abs()
+                        < 1e-9
+                );
+                assert!(
+                    (dense_res.percent_changes[tg][gene] - sparse_res.percent_changes[tg][gene])
+                        .abs()
+                        < 1e-9
+                );
+                assert!(
+                    (dense_res.statistics[tg][gene] - sparse_res.statistics[tg][gene]).abs() < 1e-9
+                );
+                assert!(
+                    (dense_res.p_values[tg][gene] - sparse_res.p_values[tg][gene]).abs() < 1e-9
+                );
+                assert!((dense_res.fdrs[tg][gene] - sparse_res.fdrs[tg][gene]).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pdex_ref_rejects_invalid_inputs() {
+        let n_obs = 9;
+        let n_vars = 2;
+        let (data, mut groups, mut group_names) = build_pdex_fixture(n_obs, n_vars);
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+
+        // Reference index out of range.
+        assert!(pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            99,
+            GeomMeanMode::ArithRaw,
+            0.0,
+        )
+        .is_err());
+
+        // Negative epsilon.
+        assert!(pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::ArithRaw,
+            -0.1,
+        )
+        .is_err());
+
+        // Reference group has zero cells (assign no cell to group 99).
+        groups.iter_mut().for_each(|g| {
+            if *g == 0 {
+                *g = 1;
+            }
+        });
+        group_names.push("empty_ref".to_string());
+        assert!(pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            group_names.len() - 1,
+            GeomMeanMode::ArithRaw,
+            0.0,
+        )
+        .is_err());
     }
 }

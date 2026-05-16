@@ -12,6 +12,8 @@ use ndarray::s;
 use super::detect::MatrixFormat;
 use super::h5ad_read::read_i64_dataset;
 use super::pipeline::ConvertError;
+use super::stream::{CsrShardStream, StreamedCsrShard};
+use super::warnings::{ConvertWarning, WarningSink};
 
 /// A single shard's worth of CSR rows read from an h5ad file.
 ///
@@ -30,9 +32,14 @@ pub struct CsrShardSlice {
 /// `/layers/{name}`). Open once via [`open_x_streaming`] /
 /// [`open_layer_streaming`], then call [`XStreamReader::next_shard`]
 /// in a loop until it yields `None`.
+#[derive(Debug)]
 pub struct XStreamReader {
     pub n_obs: usize,
     pub n_vars: usize,
+    /// Source matrix label used by [`CsrShardStream::source_matrix_name`]
+    /// and propagated onto each emitted [`StreamedCsrShard`]. Examples:
+    /// `"X"`, `"layers/spliced"`.
+    pub source_name: String,
     /// Eagerly loaded — `(n_obs + 1) × 8` bytes.
     indptr: Vec<i64>,
     /// Open HDF5 dataset handles; sliced per-shard, never read whole.
@@ -51,6 +58,7 @@ pub fn open_x_streaming(
     file: &hdf5::File,
     group_path: &str,
     format: MatrixFormat,
+    sink: &mut WarningSink,
 ) -> Result<XStreamReader, ConvertError> {
     if matches!(format, MatrixFormat::Dense) {
         return Err(ConvertError::StreamingUnsupported(
@@ -79,22 +87,31 @@ pub fn open_x_streaming(
 
     // Best-effort encoding-type sanity check. Newer h5ad files set
     // this attribute; older files omit it — in that case we trust the
-    // caller's `format` argument.
-    if let Ok(attr) = group.attr("encoding-type") {
-        if let Ok(enc) = attr.read_scalar::<VarLenUnicode>() {
-            let enc_s = enc.as_str();
-            if enc_s == "csc_matrix" {
-                return Err(ConvertError::StreamingUnsupported(
-                    "CSC-on-disk h5ad cannot stream; pass --stream=false or \
-                     pre-convert to CSR"
-                        .into(),
-                ));
+    // caller's `format` argument and emit a warning so the conversion
+    // record reflects the inference.
+    match group.attr("encoding-type") {
+        Ok(attr) => {
+            if let Ok(enc) = attr.read_scalar::<VarLenUnicode>() {
+                let enc_s = enc.as_str();
+                if enc_s == "csc_matrix" {
+                    return Err(ConvertError::StreamingUnsupported(
+                        "CSC-on-disk h5ad cannot stream; pass --stream=false or \
+                         pre-convert to CSR"
+                            .into(),
+                    ));
+                }
+                if enc_s != "csr_matrix" {
+                    return Err(ConvertError::StreamingUnsupported(format!(
+                        "unsupported encoding-type '{enc_s}' for streaming"
+                    )));
+                }
             }
-            if enc_s != "csr_matrix" {
-                return Err(ConvertError::StreamingUnsupported(format!(
-                    "unsupported encoding-type '{enc_s}' for streaming"
-                )));
-            }
+        }
+        Err(_) => {
+            sink.emit(ConvertWarning::InferredEncoding {
+                path: group_path.to_string(),
+                inferred: "csr_matrix (no encoding-type attr)".into(),
+            });
         }
     }
 
@@ -114,6 +131,7 @@ pub fn open_x_streaming(
     Ok(XStreamReader {
         n_obs,
         n_vars,
+        source_name: group_path.to_string(),
         indptr,
         indices_ds,
         data_ds,
@@ -126,8 +144,14 @@ pub fn open_x_streaming(
 pub fn open_layer_streaming(
     file: &hdf5::File,
     layer_name: &str,
+    sink: &mut WarningSink,
 ) -> Result<XStreamReader, ConvertError> {
-    open_x_streaming(file, &format!("layers/{layer_name}"), MatrixFormat::Csr)
+    open_x_streaming(
+        file,
+        &format!("layers/{layer_name}"),
+        MatrixFormat::Csr,
+        sink,
+    )
 }
 
 impl XStreamReader {
@@ -207,10 +231,62 @@ impl XStreamReader {
     }
 }
 
+impl CsrShardStream for XStreamReader {
+    fn n_obs(&self) -> u64 {
+        self.n_obs as u64
+    }
+
+    fn n_vars(&self) -> u64 {
+        self.n_vars as u64
+    }
+
+    fn source_matrix_name(&self) -> &str {
+        &self.source_name
+    }
+
+    fn next_csr_shard(
+        &mut self,
+        target_rows: usize,
+    ) -> Result<Option<StreamedCsrShard>, ConvertError> {
+        match self.next_shard(target_rows) {
+            None => Ok(None),
+            Some(Err(e)) => Err(e),
+            Some(Ok(slice)) => {
+                // Inherent `next_shard` already validated row counts
+                // against `n_obs`; the casts to u32 are bounded by the
+                // `n_vars` u32-fit check in the writer coordinator.
+                let n_rows = u32::try_from(slice.n_rows).map_err(|_| {
+                    ConvertError::Other(format!(
+                        "shard row count {} exceeds u32::MAX",
+                        slice.n_rows
+                    ))
+                })?;
+                let n_cols = u32::try_from(self.n_vars).map_err(|_| {
+                    ConvertError::Other(format!("n_vars {} exceeds u32::MAX", self.n_vars))
+                })?;
+                Ok(Some(StreamedCsrShard {
+                    row_start: slice.row_start as u64,
+                    n_rows,
+                    n_cols,
+                    indptr: slice.indptr,
+                    indices: slice.indices,
+                    values: slice.values,
+                    source_name: Some(self.source_name.clone()),
+                    duplicates_merged: 0,
+                }))
+            }
+        }
+    }
+}
+
 /// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.
 /// Dispatches on the on-disk dtype (i32 / i64 / u32 supported) and
 /// applies the same range-validation checks per element.
-fn read_slice_i32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<i32>, ConvertError> {
+pub(crate) fn read_slice_i32(
+    ds: &hdf5::Dataset,
+    start: usize,
+    end: usize,
+) -> Result<Vec<i32>, ConvertError> {
     let desc = ds.dtype()?.to_descriptor()?;
     let sel = s![start..end];
     match desc {
@@ -246,7 +322,11 @@ fn read_slice_i32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<i3
 }
 
 /// Slice-read variant of `read_f32_dataset` from `h5ad_read.rs`.
-fn read_slice_f32(ds: &hdf5::Dataset, start: usize, end: usize) -> Result<Vec<f32>, ConvertError> {
+pub(crate) fn read_slice_f32(
+    ds: &hdf5::Dataset,
+    start: usize,
+    end: usize,
+) -> Result<Vec<f32>, ConvertError> {
     let desc = ds.dtype()?.to_descriptor()?;
     let sel = s![start..end];
     match desc {

@@ -7,7 +7,11 @@ mod direction;
 pub use direction::determine_convert_direction;
 
 #[cfg(feature = "hdf5")]
+mod csc_stream;
+#[cfg(feature = "hdf5")]
 mod csc_transpose;
+#[cfg(feature = "hdf5")]
+mod dense_stream;
 #[cfg(feature = "hdf5")]
 mod detect;
 #[cfg(feature = "hdf5")]
@@ -26,19 +30,37 @@ mod mudata_write;
 mod tenx_read;
 
 #[cfg(feature = "hdf5")]
+mod mem;
+#[cfg(feature = "hdf5")]
+mod stream;
+#[cfg(feature = "hdf5")]
+mod warnings;
+
+#[cfg(feature = "hdf5")]
+pub use csc_stream::{open_csc_layer_streaming, open_csc_streaming};
+#[cfg(feature = "hdf5")]
+pub use dense_stream::{open_dense_layer_streaming, open_dense_streaming, DenseXStreamReader};
+#[cfg(feature = "hdf5")]
 pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
+
+#[cfg(feature = "hdf5")]
+pub use mem::MemoryBudget;
+#[cfg(feature = "hdf5")]
+pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
+#[cfg(feature = "hdf5")]
+pub use warnings::{ConvertWarning, WarningSink};
 
 #[cfg(feature = "hdf5")]
 pub mod pipeline;
 
 #[cfg(feature = "hdf5")]
 pub use pipeline::{
-    h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions,
-    StreamingOverrides,
+    h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, streaming_writer_coordinator, tenx_to_scx,
+    ConvertError, ConvertOptions, StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]
-pub use mudata_pipeline::{h5mu_to_scx, is_h5mu_file};
+pub use mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming, is_h5mu_file};
 
 #[cfg(feature = "hdf5")]
 pub use mudata_write::{scx_modality_to_h5ad, scx_to_h5mu};

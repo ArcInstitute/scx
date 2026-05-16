@@ -67,6 +67,18 @@ def pseudobulk_dex(
 ) -> Any: ...
 
 
+def pdex_ref(
+    adata: Any,
+    groupby: str,
+    *,
+    reference: str = "non-targeting",
+    is_log1p: bool | None = None,
+    geometric_mean: bool = True,
+    epsilon: float = 0.0,
+    gene_chunk_size: int | None = None,
+) -> Any: ...
+
+
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------

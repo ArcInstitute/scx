@@ -11,14 +11,18 @@ use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 use scx_sparse::{drop_explicit_zeros_inplace, sort_csr_rows_in_place};
 
-use super::detect::{detect_input_format, detect_matrix_format, InputFormat};
+use super::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
+use super::dense_stream::{open_dense_layer_streaming, open_dense_streaming};
+use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
 use super::dtype::{detect_value_encoding, values_to_raw_bytes};
 use super::h5ad_read::{
     read_dataframe_group, read_layers, read_obsm, read_uns, read_varm, read_x_matrix,
 };
 use super::h5ad_stream::{open_layer_streaming, open_x_streaming};
 use super::h5ad_write::write_scx_to_h5ad;
+use super::stream::CsrShardStream;
 use super::tenx_read::read_tenx_h5;
+use super::warnings::{ConvertWarning, WarningSink};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
@@ -66,6 +70,43 @@ pub struct ConvertOptions {
     /// `"scx-cli"`; `pyscx` overrides this to `"pyscx"` so the
     /// recorded provenance reflects the actual caller.
     pub tool: String,
+    /// Phase-0.4 budget shared by dense slab sizing (Phase 1), CSC
+    /// transpose buffers (Phase 2), cloud in-flight bytes (Phase 7),
+    /// and worker derate (Phase 8c). `None` keeps each phase's own
+    /// sizing heuristic. Parse user-facing strings with
+    /// [`crate::MemoryBudget::parse`].
+    pub memory_budget: Option<u64>,
+    /// Prefer streaming I/O over full materialisation when the input
+    /// supports it (CSR and dense `/X`). When `false`, `h5ad_to_scx`
+    /// keeps the legacy in-memory path. When `true` (default), CSR
+    /// and dense routes go through `h5ad_to_scx_streaming`; CSC-on-
+    /// disk still errors with the Phase 2 message.
+    pub stream: bool,
+    /// Fail conversion on the first unsupported `uns` key instead of
+    /// skipping it with a warning. Default `false` keeps the existing
+    /// lenient behaviour.
+    pub strict_uns: bool,
+    /// Treat dense values with absolute magnitude `<= dense_zero_epsilon`
+    /// as zeros during sparsification. Default `0.0` keeps the
+    /// equality-to-zero filtering that `scx_sparse::dense_to_csr`
+    /// already does (matches scipy `csr_matrix(dense)`).
+    pub dense_zero_epsilon: f32,
+    /// Directory under which the Phase 2 external CSC → CSR transpose
+    /// writes its session temp directory
+    /// (`<temp_dir>/scx-transpose-<pid>-<random>/`). `None` falls back
+    /// to [`std::env::temp_dir`]. Used only when the budget arithmetic
+    /// forces the external path; the in-memory CSC route never
+    /// touches disk.
+    pub temp_dir: Option<std::path::PathBuf>,
+    /// Phase 3: Filter h5mu input to only the named modalities.
+    /// `None` (default) keeps every modality. Unknown names error
+    /// with the full list of available modalities.
+    pub modalities: Option<Vec<String>>,
+    /// Phase 3: Explicit modality-type overrides keyed by modality
+    /// name. Modalities not listed get
+    /// [`crate::infer_modality_type_from_name`] and emit
+    /// [`crate::ConvertWarning::ModalityTypeInferred`].
+    pub modality_types: Vec<(String, ModalityType)>,
 }
 
 impl Default for ConvertOptions {
@@ -76,11 +117,23 @@ impl Default for ConvertOptions {
             csc: false,
             csc_cols_per_shard: 5000,
             tool: "scx-cli".into(),
+            memory_budget: None,
+            stream: true,
+            strict_uns: false,
+            dense_zero_epsilon: 0.0,
+            temp_dir: None,
+            modalities: None,
+            modality_types: Vec::new(),
         }
     }
 }
 
-pub fn h5ad_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<(), ConvertError> {
+pub fn h5ad_to_scx(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
 
     // Validate format
@@ -93,7 +146,7 @@ pub fn h5ad_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     }
 
     // Read X matrix
-    let matrix_format = detect_matrix_format(&file)?;
+    let matrix_format = detect_matrix_format(&file, sink)?;
     let (indptr, indices, data, n_obs, n_vars) = read_x_matrix(&file, matrix_format)?;
     let nnz = *indptr.last().unwrap_or(&0) as u64;
 
@@ -178,7 +231,10 @@ pub fn h5ad_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         }
     }
 
-    if let Ok(uns) = read_uns(&file) {
+    // Read /uns only when the group exists; key-level failures route
+    // through the sink (lenient) or propagate (strict).
+    if file.group("uns").is_ok() {
+        let uns = read_uns(&file, opts.strict_uns, sink)?;
         writer.write_uns(&uns)?;
     }
 
@@ -215,6 +271,7 @@ pub fn h5ad_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         params_json: serde_json::json!({
             "input": input.display().to_string(),
             "format": "h5ad",
+            "warnings": sink.summary_json(),
         })
         .to_string(),
         input_checksums: vec![],
@@ -323,7 +380,14 @@ pub fn tenx_to_scx(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     Ok(())
 }
 
-pub fn scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), ConvertError> {
+pub fn scx_to_h5ad(
+    scx_path: &Path,
+    h5ad_path: &Path,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    let _ = sink; // Phase 8 reverse-conversion will emit through this sink
+                  // (e.g. unsupported uns shape, dropped predicate indexes);
+                  // Phase 0 only threads the parameter.
     write_scx_to_h5ad(scx_path, h5ad_path)
 }
 
@@ -373,6 +437,7 @@ pub fn h5ad_to_scx_streaming(
     output: &Path,
     opts: &ConvertOptions,
     overrides: &StreamingOverrides,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
 
@@ -386,14 +451,20 @@ pub fn h5ad_to_scx_streaming(
             got: "10x".to_string(),
         });
     }
-    let matrix_format = detect_matrix_format(&file)?;
+    let matrix_format = detect_matrix_format(&file, sink)?;
 
-    // Open the X reader first — it loads the full indptr and surfaces
-    // shape via `n_obs` / `n_vars`, both of which the file header
-    // needs before any section write.
-    let mut x_reader = open_x_streaming(&file, "X", matrix_format)?;
-    let n_obs = x_reader.n_obs;
-    let n_vars = x_reader.n_vars;
+    // Open the X reader first — it surfaces shape via `n_obs` /
+    // `n_vars`, both of which the file header needs before any section
+    // write. CSR uses the indptr-eager reader; Dense slabs rows on
+    // demand; CSC routes through the Phase 2 dispatcher which picks
+    // in-memory vs. external-memory transpose based on the budget.
+    let mut x_reader: Box<dyn CsrShardStream> = match matrix_format {
+        MatrixFormat::Csr => Box::new(open_x_streaming(&file, "X", matrix_format, sink)?),
+        MatrixFormat::Dense => Box::new(open_dense_streaming(&file, "X", opts, sink)?),
+        MatrixFormat::Csc => open_csc_streaming(&file, "X", opts, sink)?,
+    };
+    let n_obs = x_reader.n_obs() as usize;
+    let n_vars = x_reader.n_vars() as usize;
     let n_vars_u32: u32 = u32::try_from(n_vars)
         .map_err(|_| ConvertError::Other(format!("n_vars {n_vars} exceeds u32::MAX")))?;
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
@@ -447,28 +518,20 @@ pub fn h5ad_to_scx_streaming(
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
-    // X shards (streaming).
-    let target_rows = opts.shard_target_rows as usize;
-    let mut shard_idx: u32 = 0;
-    while let Some(slice_result) = x_reader.next_shard(target_rows) {
-        let mut slice = slice_result?;
-        drop_explicit_zeros_inplace(&mut slice.indptr, &mut slice.indices, &mut slice.values);
-        sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
-        let pre = encode_one_shard(
-            &slice.indptr,
-            &slice.indices,
-            &slice.values,
-            opts.codec,
-            index_dtype,
-            n_vars_u32,
-            slice.row_start as u64,
-            SectionType::CsrShard,
-            ModalityType::Rna,
-            format!("x_shard_{shard_idx}"),
-        )?;
-        writer.write_preencoded_shard(pre)?;
-        shard_idx += 1;
-    }
+    // X shards (streaming). The coordinator drives the reader
+    // through `&mut dyn CsrShardStream`; Phase 8c will swap in a
+    // parallel reader fan-out without touching this call site.
+    streaming_writer_coordinator(
+        x_reader.as_mut(),
+        &mut writer,
+        opts,
+        index_dtype,
+        n_vars_u32,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "x_shard",
+        sink,
+    )?;
     drop(x_reader);
 
     // obsm / varm / uns. Small dense sections — non-streaming reads,
@@ -516,7 +579,8 @@ pub fn h5ad_to_scx_streaming(
     match overrides.uns.as_ref() {
         Some(json) => writer.write_uns(json)?,
         None => {
-            if let Ok(uns) = read_uns(&file) {
+            if file.group("uns").is_ok() {
+                let uns = read_uns(&file, opts.strict_uns, sink)?;
                 writer.write_uns(&uns)?;
             }
         }
@@ -534,55 +598,85 @@ pub fn h5ad_to_scx_streaming(
     if let Ok(layers_group) = file.group("layers") {
         let layer_names = layers_group.member_names()?;
         for layer_name in &layer_names {
-            let mut layer_reader = match open_layer_streaming(&file, layer_name) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("warning: skipping streaming layer '{layer_name}': {e}");
-                    continue;
+            let layer_path = format!("layers/{layer_name}");
+            let layer_format =
+                match super::detect::detect_matrix_format_at(&file, &layer_path, sink) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        sink.emit(ConvertWarning::LayerSkipped {
+                            name: layer_name.clone(),
+                            reason: format!("{e}"),
+                        });
+                        continue;
+                    }
+                };
+            let mut layer_reader: Box<dyn CsrShardStream> = match layer_format {
+                MatrixFormat::Csr => match open_layer_streaming(&file, layer_name, sink) {
+                    Ok(r) => Box::new(r),
+                    Err(e) => {
+                        sink.emit(ConvertWarning::LayerSkipped {
+                            name: layer_name.clone(),
+                            reason: format!("{e}"),
+                        });
+                        continue;
+                    }
+                },
+                MatrixFormat::Dense => {
+                    match open_dense_layer_streaming(&file, layer_name, opts, sink) {
+                        Ok(r) => Box::new(r),
+                        Err(e) => {
+                            sink.emit(ConvertWarning::LayerSkipped {
+                                name: layer_name.clone(),
+                                reason: format!("{e}"),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                MatrixFormat::Csc => {
+                    match open_csc_layer_streaming(&file, layer_name, opts, sink) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            sink.emit(ConvertWarning::LayerSkipped {
+                                name: layer_name.clone(),
+                                reason: format!("{e}"),
+                            });
+                            continue;
+                        }
+                    }
                 }
             };
-            if layer_reader.n_obs != n_obs {
-                eprintln!(
-                    "warning: skipping streaming layer '{layer_name}': n_obs {} does not match X n_obs {}",
-                    layer_reader.n_obs, n_obs
-                );
+            let l_n_obs = layer_reader.n_obs() as usize;
+            if l_n_obs != n_obs {
+                sink.emit(ConvertWarning::LayerSkipped {
+                    name: layer_name.clone(),
+                    reason: format!("n_obs {l_n_obs} does not match X n_obs {n_obs}"),
+                });
                 continue;
             }
-            let l_n_vars = layer_reader.n_vars;
+            let l_n_vars = layer_reader.n_vars() as usize;
             let l_n_vars_u32 = match u32::try_from(l_n_vars) {
                 Ok(v) => v,
                 Err(_) => {
-                    eprintln!(
-                        "warning: skipping streaming layer '{layer_name}': n_vars {l_n_vars} exceeds u32::MAX"
-                    );
+                    sink.emit(ConvertWarning::LayerSkipped {
+                        name: layer_name.clone(),
+                        reason: format!("n_vars {l_n_vars} exceeds u32::MAX"),
+                    });
                     continue;
                 }
             };
             let l_index_dtype: u8 = if l_n_vars <= 65535 { 0 } else { 1 };
-            let mut layer_shard_idx: u32 = 0;
-            while let Some(slice_result) = layer_reader.next_shard(target_rows) {
-                let mut slice = slice_result?;
-                drop_explicit_zeros_inplace(
-                    &mut slice.indptr,
-                    &mut slice.indices,
-                    &mut slice.values,
-                );
-                sort_csr_rows_in_place(&slice.indptr, &mut slice.indices, &mut slice.values);
-                let pre = encode_one_shard(
-                    &slice.indptr,
-                    &slice.indices,
-                    &slice.values,
-                    opts.codec,
-                    l_index_dtype,
-                    l_n_vars_u32,
-                    slice.row_start as u64,
-                    SectionType::LayerCsrShard,
-                    ModalityType::Rna,
-                    format!("{layer_name}_shard_{layer_shard_idx}"),
-                )?;
-                writer.write_preencoded_shard(pre)?;
-                layer_shard_idx += 1;
-            }
+            streaming_writer_coordinator(
+                layer_reader.as_mut(),
+                &mut writer,
+                opts,
+                l_index_dtype,
+                l_n_vars_u32,
+                SectionType::LayerCsrShard,
+                ModalityType::Rna,
+                &format!("{layer_name}_shard"),
+                sink,
+            )?;
         }
     }
 
@@ -592,6 +686,11 @@ pub fn h5ad_to_scx_streaming(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let source_format_str = match matrix_format {
+        MatrixFormat::Csr => "csr_matrix",
+        MatrixFormat::Csc => "csc_matrix",
+        MatrixFormat::Dense => "array",
+    };
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
@@ -600,6 +699,8 @@ pub fn h5ad_to_scx_streaming(
             "input": input.display().to_string(),
             "format": "h5ad",
             "stream": true,
+            "source_matrix_format": source_format_str,
+            "warnings": sink.summary_json(),
         })
         .to_string(),
         input_checksums: vec![],
@@ -618,6 +719,67 @@ pub fn h5ad_to_scx_streaming(
     }
 
     Ok(())
+}
+
+/// Drain a [`CsrShardStream`] into an [`ScxWriter`] one shard at a
+/// time, encoding each shard through [`encode_one_shard`].
+///
+/// Phase 0.2 seam. The initial implementation is sequential — one
+/// shard read → drop-zeros → sort → encode → write per iteration —
+/// matching the behaviour of the original inline loop in
+/// `h5ad_to_scx_streaming`. Phase 8c will replace the body with a
+/// bounded shard queue plus an ordered writer stage, but the
+/// signature is the same: every entry point that drives a
+/// `CsrShardStream` (X, layers, h5mu modalities, Zarr) goes through
+/// this helper.
+///
+/// `section_name_prefix` is appended with `_{shard_idx}` to produce
+/// the per-shard section name. Returns the number of shards
+/// written, useful for callers that need to track per-source shard
+/// counts (e.g. the layer loop).
+#[allow(clippy::too_many_arguments)]
+pub fn streaming_writer_coordinator(
+    reader: &mut dyn CsrShardStream,
+    writer: &mut ScxWriter,
+    opts: &ConvertOptions,
+    index_dtype: u8,
+    n_vars_u32: u32,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    section_name_prefix: &str,
+    sink: &mut WarningSink,
+) -> Result<u32, ConvertError> {
+    let target_rows = opts.shard_target_rows as usize;
+    let mut shard_idx: u32 = 0;
+    while let Some(mut shard) = reader.next_csr_shard(target_rows)? {
+        // Surface upstream duplicate-coordinate canonicalisation
+        // (Phase 2 CSC external transpose) as a typed warning. Other
+        // readers always set `duplicates_merged = 0` so this is a
+        // no-op for them.
+        if shard.duplicates_merged > 0 {
+            sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
+                count: shard.duplicates_merged,
+                policy: "sum".to_string(),
+            });
+        }
+        drop_explicit_zeros_inplace(&mut shard.indptr, &mut shard.indices, &mut shard.values);
+        sort_csr_rows_in_place(&shard.indptr, &mut shard.indices, &mut shard.values);
+        let pre = encode_one_shard(
+            &shard.indptr,
+            &shard.indices,
+            &shard.values,
+            opts.codec,
+            index_dtype,
+            n_vars_u32,
+            shard.row_start,
+            section_type,
+            modality_type,
+            format!("{section_name_prefix}_{shard_idx}"),
+        )?;
+        writer.write_preencoded_shard(pre)?;
+        shard_idx += 1;
+    }
+    Ok(shard_idx)
 }
 
 /// Memory budget for the streaming CSR→CSC transpose at convert time.

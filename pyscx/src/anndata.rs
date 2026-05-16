@@ -1385,6 +1385,29 @@ pub(crate) fn parse_uns_format(s: &str) -> PyResult<UnsFormat> {
     }
 }
 
+/// Accept `memory_budget` as either an int (raw bytes), a string
+/// parsed via [`scx_convert::MemoryBudget::parse`] (`"2GiB"`,
+/// `"512M"`), or `None` for "use default heuristics". Anything else
+/// returns a `TypeError`.
+#[cfg(feature = "hdf5")]
+pub(crate) fn parse_memory_budget(v: Option<&Bound<'_, PyAny>>) -> PyResult<Option<u64>> {
+    let Some(obj) = v else { return Ok(None) };
+    if obj.is_none() {
+        return Ok(None);
+    }
+    if let Ok(n) = obj.extract::<u64>() {
+        return Ok(Some(n));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        let bytes = scx_convert::MemoryBudget::parse(&s)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        return Ok(Some(bytes));
+    }
+    Err(PyValueError::new_err(
+        "memory_budget must be None, an int (bytes), or a string like '2GiB' / '512M'",
+    ))
+}
+
 /// Sentinel key marking a tagged envelope in the on-disk JSON.
 const SCX_TYPE_KEY: &str = "__scx_type__";
 
@@ -2509,6 +2532,32 @@ fn parallel_encode_csr_shards(
     result.map_err(PyRuntimeError::new_err)
 }
 
+/// Forward each non-empty category in `sink` as a single
+/// `warnings.warn(..., UserWarning)` call on the Python side.
+///
+/// The conversion itself runs under `py.allow_threads`, so emission
+/// happens after the GIL is reacquired. One Python-side warning per
+/// category (with its aggregate count) is enough for Phase 0; per-
+/// emission forwarding would require holding the GIL across the
+/// whole conversion.
+#[cfg(feature = "hdf5")]
+pub(crate) fn emit_python_warnings(
+    py: Python<'_>,
+    sink: &scx_convert::WarningSink,
+) -> PyResult<()> {
+    if sink.total() == 0 {
+        return Ok(());
+    }
+    let warnings_mod = py.import("warnings")?;
+    let warn = warnings_mod.getattr("warn")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    for (cat, count) in sink.counts() {
+        let msg = format!("scx conversion: {count} warning(s) of type '{cat}'");
+        warn.call1((msg, user_warning.clone()))?;
+    }
+    Ok(())
+}
+
 /// Route a backed AnnData object through the streaming converter.
 /// Extracts in-memory `obs` / `var` / `uns` / `obsm` / `varm` /
 /// `obsp` / `varp` into Rust types so any caller mutations are
@@ -2531,6 +2580,11 @@ pub(crate) fn route_backed_anndata_to_streaming(
     csc_always: bool,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
+    stream: bool,
+    strict_uns: bool,
+    dense_zero_epsilon: f32,
+    memory_budget: Option<u64>,
+    temp_dir: Option<&str>,
 ) -> PyResult<()> {
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older
@@ -2617,12 +2671,34 @@ pub(crate) fn route_backed_anndata_to_streaming(
         csc: csc_always,
         csc_cols_per_shard,
         tool: "pyscx".into(),
+        memory_budget,
+        stream,
+        strict_uns,
+        dense_zero_epsilon,
+        temp_dir: temp_dir.map(std::path::PathBuf::from),
+        modalities: None,
+        modality_types: Vec::new(),
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);
 
-    py.allow_threads(|| scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    // Honour `stream=false` by routing to the non-streaming
+    // `h5ad_to_scx` path. The backed-AnnData overrides for obs / var /
+    // uns / obsm / varm / obsp / varp are dropped on this path —
+    // `from_anndata` (non-streaming) is the canonical caller when
+    // those mutations need preserving.
+    let mut sink = scx_convert::WarningSink::log();
+    if stream {
+        py.allow_threads(|| {
+            scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    } else {
+        py.allow_threads(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+    emit_python_warnings(py, &sink)?;
+    Ok(())
 }
 
 /// Helper for the backed-routing path. Reads a dense mapping
@@ -2750,6 +2826,9 @@ pub fn from_anndata_impl(
     if is_backed {
         #[cfg(feature = "hdf5")]
         {
+            // `from_anndata(adata)` doesn't take Phase 1 kwargs yet —
+            // it always asks for streaming with default policy. Phase
+            // 1 kwarg surface lives on `pyscx.from_h5ad(path, ...)`.
             return route_backed_anndata_to_streaming(
                 py,
                 adata,
@@ -2759,6 +2838,11 @@ pub fn from_anndata_impl(
                 csc_always,
                 csc_cols_per_shard,
                 uns_format_parsed,
+                true,  // stream
+                false, // strict_uns
+                0.0,   // dense_zero_epsilon
+                None,  // memory_budget
+                None,  // temp_dir
             );
         }
         #[cfg(not(feature = "hdf5"))]
