@@ -93,10 +93,7 @@ fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> 
         .catalog()
         .entries
         .iter()
-        .find(|e| {
-            e.section_type == SectionType::VarMetadata
-                && (e.name == var_section_name || (modality_id == 0 && e.name == "var"))
-        })
+        .find(|e| e.section_type == SectionType::VarMetadata && e.name == var_section_name)
         .ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!(
                 "var section '{var_section_name}' not found"
@@ -110,35 +107,93 @@ fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> 
         .next()
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("var record batch is empty"))?
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    // The pandas index column is conventionally named "_index" or
-    // tagged via Arrow schema metadata; try the most common keys
-    // before failing.
-    let candidate_columns = ["_index", "gene_name", "feature_name", "gene_id", "name"];
-    for col_name in candidate_columns {
-        if let Some((idx, _)) = batch.schema().column_with_name(col_name) {
-            let col = batch.column(idx);
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) && arr.value(i) == name {
-                        return Ok(i as u32);
-                    }
-                }
-            }
-            if let Some(arr) = col
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-            {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) && arr.value(i) == name {
-                        return Ok(i as u32);
-                    }
-                }
-            }
+
+    // Probe column order:
+    //   1. Columns named in the Arrow IPC `pandas` schema metadata's
+    //      `index_columns` array (the authoritative source from
+    //      `Table.from_pandas`, including named indexes like
+    //      `var.index.name = "gene_symbols"`).
+    //   2. `__index_level_0__` — the canonical pyarrow name for an
+    //      unnamed pandas index.
+    //   3. The original heuristic list, kept so any files that pre-date
+    //      pandas-metadata-aware writes still resolve.
+    let pandas_index_cols = pandas_index_columns(batch.schema().as_ref());
+    let fallback_columns = [
+        "__index_level_0__",
+        "_index",
+        "gene_name",
+        "feature_name",
+        "gene_id",
+        "name",
+    ];
+    let probe = pandas_index_cols
+        .iter()
+        .map(String::as_str)
+        .chain(fallback_columns.iter().copied());
+    for col_name in probe {
+        if let Some(idx) = lookup_string_in_column(&batch, col_name, name) {
+            return Ok(idx);
         }
     }
     Err(pyo3::exceptions::PyKeyError::new_err(format!(
         "gene name '{name}' not found in var index"
     )))
+}
+
+/// Decode `index_columns` from the Arrow IPC schema's `pandas`
+/// metadata key. `Table.from_pandas(df)` stamps this with a JSON
+/// envelope of the form `{"index_columns": ["gene_symbols", ...], ...}`
+/// (string for named indexes; a dict envelope for `RangeIndex`, which
+/// we skip — those never name a gene). Returns an empty vec when the
+/// key is absent or malformed; callers fall through to the next probe.
+fn pandas_index_columns(schema: &arrow::datatypes::Schema) -> Vec<String> {
+    let Some(raw) = schema.metadata().get("pandas") else {
+        return Vec::new();
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get("index_columns")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Scan a single string column of a `RecordBatch` for an exact match
+/// and return the row index. Handles both `Utf8` (`StringArray`) and
+/// `LargeUtf8` (`LargeStringArray`). Returns `None` when the column
+/// is absent, has a non-string dtype, or contains no match.
+fn lookup_string_in_column(
+    batch: &arrow::record_batch::RecordBatch,
+    col_name: &str,
+    target: &str,
+) -> Option<u32> {
+    let (idx, _) = batch.schema().column_with_name(col_name)?;
+    let col = batch.column(idx);
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) && arr.value(i) == target {
+                return Some(i as u32);
+            }
+        }
+    }
+    if let Some(arr) = col
+        .as_any()
+        .downcast_ref::<arrow::array::LargeStringArray>()
+    {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) && arr.value(i) == target {
+                return Some(i as u32);
+            }
+        }
+    }
+    None
 }
 
 #[pymethods]

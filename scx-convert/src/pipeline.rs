@@ -417,7 +417,6 @@ pub fn h5ad_to_scx(
         n_obs,
         n_vars,
         opts.shard_target_rows as usize,
-        value_encoding,
         codec_id,
         index_dtype,
         opts.bitmap,
@@ -579,7 +578,6 @@ pub fn tenx_to_scx(
         tenx.n_cells,
         tenx.n_genes,
         opts.shard_target_rows as usize,
-        value_encoding,
         codec_id,
         index_dtype,
         opts.bitmap,
@@ -1164,19 +1162,18 @@ fn write_csr_shards(
     n_obs: usize,
     n_vars: usize,
     shard_target_rows: usize,
-    value_encoding: ValueEncoding,
     codec_id: CodecId,
     index_dtype: u8,
     bitmap_policy: BitmapPolicy,
     modality_type: ModalityType,
     sink: &mut WarningSink,
 ) -> Result<Vec<(u64, u64)>, ConvertError> {
-    let _ = index_dtype; // index dtype is set in the file header; writer reads it from there
     let n_vars_u32 = u32::try_from(n_vars)
         .map_err(|_| ConvertError::Other(format!("n_vars {n_vars} exceeds u32::MAX")))?;
 
     let mut row_ranges: Vec<(u64, u64)> = Vec::new();
     let mut row_start: usize = 0;
+    let mut shard_idx: u32 = 0;
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
@@ -1215,23 +1212,28 @@ fn write_csr_shards(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
-        writer.write_csr_shard(
+        // Pre-encode so the bitmap auto-policy can compare against the
+        // post-codec section length (matches streaming + python in-memory
+        // paths). Section name `X_shard_{idx}` mirrors the name that
+        // `ScxWriter::write_csr_shard` constructs internally.
+        let pre = encode_one_shard(
             &shard_indptr,
             &shard_indices,
-            &raw_values,
-            codec_id,
-            value_encoding,
+            shard_data,
+            Some(codec_id),
+            index_dtype,
+            n_vars_u32,
             row_start as u64,
+            SectionType::CsrShard,
+            modality_type,
+            format!("X_shard_{shard_idx}"),
         )?;
+        let encoded_csr_size = pre.section_length as usize;
+        writer.write_preencoded_shard(pre)?;
 
         // Phase 5b: detection bitmap, post-CSR-write so a failed bitmap
-        // never strands a half-written file. Estimated CSR size is the
-        // raw indptr + indices + values byte footprint pre-compression
-        // — accurate enough for the 15% threshold.
-        let estimated_csr_size =
-            raw_values.len() + shard_indices.len() * 4 + shard_indptr.len() * 8;
+        // never strands a half-written file.
         let n_rows_u32 = u32::try_from(row_end - row_start).map_err(|_| {
             ConvertError::Other(format!(
                 "shard rows {} exceeds u32::MAX",
@@ -1245,7 +1247,7 @@ fn write_csr_shards(
             row_start as u64,
             n_rows_u32,
             n_vars_u32,
-            estimated_csr_size,
+            encoded_csr_size,
             bitmap_policy,
             modality_type,
             None,
@@ -1254,6 +1256,7 @@ fn write_csr_shards(
 
         row_ranges.push((row_start as u64, row_end as u64));
         row_start = row_end;
+        shard_idx += 1;
     }
     Ok(row_ranges)
 }
