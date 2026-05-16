@@ -801,3 +801,362 @@ pub fn rank_genes_groups_df(
     let df = de_result_to_cell_eval_dataframe(py, &result, n_genes)?;
     Ok(df.unbind())
 }
+
+// ---------------------------------------------------------------------------
+// pdex `mode="ref"` accelerator binding
+// ---------------------------------------------------------------------------
+
+/// Auto-detect whether `adata.X` looks log1p-transformed.
+///
+/// Mirrors `pdex._utils._detect_is_log1p` and the existing
+/// `adata.uns["log1p"]` probe used by `rank_genes_groups`.  Prefers the
+/// explicit annotation when present.
+fn detect_is_log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if let Ok(uns) = adata.getattr("uns") {
+        if let Ok(v) = uns.call_method1("get", ("log1p",)) {
+            if !v.is_none() {
+                return Ok(true);
+            }
+        }
+    }
+    // Fall back to a max-value heuristic on adata.X, matching pdex's default.
+    // Skip the probe for backed datasets — touching X here would force a load.
+    let x = adata.getattr("X")?;
+    if x.extract::<PyRef<ScxBackedSparseDataset>>().is_ok() {
+        return Ok(false);
+    }
+    let np = py.import("numpy")?;
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let is_sparse = scipy_sparse
+        .call_method1("issparse", (&x,))?
+        .extract::<bool>()
+        .unwrap_or(false);
+    let max_val: f64 = if is_sparse {
+        let data = x.getattr("data")?;
+        let m = np.call_method1("max", (data,))?;
+        m.extract::<f64>().unwrap_or(f64::NAN)
+    } else {
+        let m = np.call_method1("max", (x,))?;
+        m.extract::<f64>().unwrap_or(f64::NAN)
+    };
+    // pdex's heuristic: log1p-transformed counts rarely exceed ~30.
+    Ok(max_val.is_finite() && max_val < 30.0)
+}
+
+/// Resolve group encoding and reference index, mirroring
+/// `run_rank_genes_groups_inner`.
+fn resolve_groups_and_reference(
+    adata: &Bound<'_, PyAny>,
+    groupby: &str,
+    reference: &str,
+) -> PyResult<(Vec<usize>, Vec<String>, usize)> {
+    let obs = adata.getattr("obs")?;
+    let group_col = obs.get_item(groupby)?;
+    let group_labels: Vec<String> = group_col
+        .call_method1("astype", ("str",))?
+        .call_method0("tolist")?
+        .extract()?;
+
+    let cat_attr = group_col.getattr("cat");
+    let unique_groups: Vec<String> = if let Ok(cat) = cat_attr {
+        cat.getattr("categories")?
+            .call_method0("tolist")?
+            .extract()?
+    } else {
+        let mut unique: Vec<String> = group_labels.to_vec();
+        unique.sort();
+        unique.dedup();
+        unique
+    };
+
+    let group_name_to_idx: std::collections::HashMap<&str, usize> = unique_groups
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+
+    let ref_idx = *group_name_to_idx.get(reference).ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "reference group '{reference}' not found in adata.obs['{groupby}']"
+        ))
+    })?;
+
+    // Unknown groups (NaN / empty strings after astype("str") become "nan" /
+    // "") get mapped to a sentinel that exceeds n_groups, so pdex_ref drops
+    // them. Use `unique_groups.len()` as the out-of-range marker.
+    let oor = unique_groups.len();
+    let groups: Vec<usize> = group_labels
+        .iter()
+        .map(|label| {
+            if label.is_empty() || label == "nan" {
+                oor
+            } else {
+                *group_name_to_idx.get(label.as_str()).unwrap_or(&oor)
+            }
+        })
+        .collect();
+
+    Ok((groups, unique_groups, ref_idx))
+}
+
+/// Run pdex `mode="ref"` against an AnnData, dispatching to the SCX-backed
+/// streaming, in-memory-CSR, or dense kernel based on `adata.X`.
+#[allow(clippy::too_many_arguments)]
+fn run_pdex_ref_inner(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    groupby: &str,
+    reference: &str,
+    geometric_mean: bool,
+    is_log1p: Option<bool>,
+    epsilon: f64,
+    gene_chunk_size: Option<usize>,
+) -> PyResult<scx_accel::PdexRefResult> {
+    let numpy = py.import("numpy")?;
+    let scipy_sparse = py.import("scipy.sparse")?;
+
+    let (groups, unique_groups, ref_idx) = resolve_groups_and_reference(adata, groupby, reference)?;
+
+    let var = adata.getattr("var")?;
+    let var_names = var.getattr("index")?;
+    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+
+    let resolved_log1p = match is_log1p {
+        Some(v) => v,
+        None => detect_is_log1p(py, adata)?,
+    };
+    let mode = scx_accel::GeomMeanMode::from_flags(geometric_mean, resolved_log1p);
+
+    let x = adata.getattr("X")?;
+
+    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        let chunk_size = gene_chunk_size.unwrap_or(500);
+        let reader = std::sync::Arc::clone(&backed.backed);
+        drop(backed);
+        return py
+            .allow_threads(|| {
+                scx_accel::pdex_ref_streaming(
+                    &reader,
+                    &gene_names,
+                    &groups,
+                    &unique_groups,
+                    ref_idx,
+                    chunk_size,
+                    mode,
+                    epsilon,
+                )
+            })
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+    }
+
+    let is_sparse = scipy_sparse
+        .call_method1("issparse", (&x,))?
+        .extract::<bool>()?;
+
+    if is_sparse {
+        let csr_obj = scipy_sparse.call_method1("csr_matrix", (&x,))?;
+        let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
+        let np = py.import("numpy")?;
+        let indptr: Vec<i64> = np
+            .call_method1("asarray", (csr_obj.getattr("indptr")?,))?
+            .call_method1("astype", ("int64",))?
+            .extract::<Vec<i64>>()?;
+        let indices: Vec<i32> = np
+            .call_method1("asarray", (csr_obj.getattr("indices")?,))?
+            .call_method1("astype", ("int32",))?
+            .extract::<Vec<i32>>()?;
+        let data: Vec<f32> = np
+            .call_method1("asarray", (csr_obj.getattr("data")?,))?
+            .call_method1("astype", ("float32",))?
+            .extract::<Vec<f32>>()?;
+
+        let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
+        let chunk_size = gene_chunk_size.unwrap_or(500);
+        py.allow_threads(|| {
+            scx_accel::pdex_ref_sparse(
+                &csr,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                chunk_size,
+                mode,
+                epsilon,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    } else {
+        let dense = numpy
+            .call_method1("asarray", (&x,))?
+            .call_method1("astype", ("float32",))?;
+        let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
+        let (n_obs, n_vars) = shape;
+        let flat = dense.call_method0("ravel")?;
+        let data: Vec<f32> = flat.extract()?;
+
+        py.allow_threads(|| {
+            scx_accel::pdex_ref(
+                &data,
+                n_obs,
+                n_vars,
+                &gene_names,
+                &groups,
+                &unique_groups,
+                ref_idx,
+                mode,
+                epsilon,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+/// Convert a `PdexRefResult` to a polars DataFrame matching pdex's row schema.
+///
+/// Columns: `target`, `feature`, `target_mean`, `ref_mean`,
+/// `target_membership`, `ref_membership`, `fold_change` (=log2_fold_change,
+/// deprecated alias for migration), `log2_fold_change`, `percent_change`,
+/// `p_value`, `statistic`, `fdr`.
+fn pdex_ref_result_to_dataframe<'py>(
+    py: Python<'py>,
+    result: &scx_accel::PdexRefResult,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pl = py.import("polars").map_err(|_| {
+        PyRuntimeError::new_err(
+            "polars is required for pdex_ref(). Install it: \
+             pip install 'pyscx[eval]'  (or: pip install polars)",
+        )
+    })?;
+
+    let n_genes = result.feature_names.len();
+    let n_test = result.group_names.len();
+    let total_rows = n_genes * n_test;
+
+    let mut targets: Vec<String> = Vec::with_capacity(total_rows);
+    let mut features: Vec<String> = Vec::with_capacity(total_rows);
+    let mut target_means: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut ref_means: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut target_memberships: Vec<u64> = Vec::with_capacity(total_rows);
+    let mut ref_memberships: Vec<u64> = Vec::with_capacity(total_rows);
+    let mut log2_fcs: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut percent_changes: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut p_values: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut statistics: Vec<f64> = Vec::with_capacity(total_rows);
+    let mut fdrs: Vec<f64> = Vec::with_capacity(total_rows);
+
+    for (tg, group_name) in result.group_names.iter().enumerate() {
+        targets.extend(std::iter::repeat_n(group_name.clone(), n_genes));
+        features.extend(result.feature_names.iter().cloned());
+        target_means.extend(result.target_means[tg].iter().copied());
+        ref_means.extend(result.ref_means.iter().copied());
+        target_memberships.extend(std::iter::repeat_n(
+            result.target_memberships[tg] as u64,
+            n_genes,
+        ));
+        ref_memberships.extend(std::iter::repeat_n(result.ref_membership as u64, n_genes));
+        log2_fcs.extend(result.log2_fold_changes[tg].iter().copied());
+        percent_changes.extend(result.percent_changes[tg].iter().copied());
+        p_values.extend(result.p_values[tg].iter().copied());
+        statistics.extend(result.statistics[tg].iter().copied());
+        fdrs.extend(result.fdrs[tg].iter().copied());
+    }
+
+    // pdex emits `fold_change` as a duplicate of `log2_fold_change` (a
+    // deprecated alias retained for one release). Mirror that exactly so
+    // downstream `DEResults` finds both columns.
+    let fold_changes = log2_fcs.clone();
+
+    let dict = PyDict::new(py);
+    dict.set_item("target", targets)?;
+    dict.set_item("feature", features)?;
+    dict.set_item("target_mean", target_means)?;
+    dict.set_item("ref_mean", ref_means)?;
+    dict.set_item("target_membership", target_memberships)?;
+    dict.set_item("ref_membership", ref_memberships)?;
+    dict.set_item("fold_change", fold_changes)?;
+    dict.set_item("log2_fold_change", log2_fcs)?;
+    dict.set_item("percent_change", percent_changes)?;
+    dict.set_item("p_value", p_values)?;
+    dict.set_item("statistic", statistics)?;
+    dict.set_item("fdr", fdrs)?;
+
+    let df = pl.call_method1("DataFrame", (dict,))?;
+    let column_order = pyo3::types::PyList::new(
+        py,
+        [
+            "target",
+            "feature",
+            "target_mean",
+            "ref_mean",
+            "target_membership",
+            "ref_membership",
+            "fold_change",
+            "log2_fold_change",
+            "percent_change",
+            "p_value",
+            "statistic",
+            "fdr",
+        ],
+    )?;
+    let df = df.call_method1("select", (column_order,))?;
+    Ok(df)
+}
+
+/// pdex `mode="ref"` differential expression on an SCX-backed or in-memory
+/// AnnData, returned as a polars DataFrame matching pdex's row schema.
+///
+/// This is the SCX-native equivalent of `pdex.pdex(adata, groupby, mode="ref")`:
+/// per (group, gene), reports pseudobulk means in natural (count) space, log2
+/// fold change, percent change, Mann-Whitney U statistic, two-sided p-value,
+/// and BH-adjusted FDR. The reference group is excluded from output.
+///
+/// Output columns: `target`, `feature`, `target_mean`, `ref_mean`,
+/// `target_membership`, `ref_membership`, `fold_change` (=log2_fold_change,
+/// deprecated alias retained for migration), `log2_fold_change`,
+/// `percent_change`, `p_value`, `statistic`, `fdr`.
+///
+/// Args:
+///     adata: AnnData object with X and obs[groupby]
+///     groupby: Column in adata.obs to group cells by
+///     reference: Reference group name (default: "non-targeting")
+///     is_log1p: Whether adata.X contains log1p-transformed values. None
+///         (default) auto-detects via adata.uns["log1p"] and a max-value
+///         heuristic, matching pdex.
+///     geometric_mean: If True (default), pseudobulk summary is the geometric
+///         mean of expression values back-transformed to count space (matches
+///         pdex's `geometric_mean=True`). If False, arithmetic mean is used.
+///     epsilon: Pseudocount added to target_mean and ref_mean before computing
+///         fold_change and percent_change. Default 0.0.
+///     gene_chunk_size: Genes per chunk for sparse/backed streaming
+///         (default: 500). Ignored for dense input.
+#[pyfunction]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn pdex_ref(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    groupby: &str,
+    reference: &str,
+    is_log1p: Option<bool>,
+    geometric_mean: bool,
+    epsilon: f64,
+    gene_chunk_size: Option<usize>,
+) -> PyResult<PyObject> {
+    if epsilon < 0.0 || !epsilon.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "epsilon must be non-negative and finite (got {epsilon})"
+        )));
+    }
+    let result = run_pdex_ref_inner(
+        py,
+        adata,
+        groupby,
+        reference,
+        geometric_mean,
+        is_log1p,
+        epsilon,
+        gene_chunk_size,
+    )?;
+    let df = pdex_ref_result_to_dataframe(py, &result)?;
+    Ok(df.unbind())
+}

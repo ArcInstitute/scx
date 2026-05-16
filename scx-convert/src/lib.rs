@@ -60,7 +60,7 @@ pub use pipeline::{
 };
 
 #[cfg(feature = "hdf5")]
-pub use mudata_pipeline::{h5mu_to_scx, is_h5mu_file};
+pub use mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming, is_h5mu_file};
 
 #[cfg(feature = "hdf5")]
 pub use mudata_write::{scx_modality_to_h5ad, scx_to_h5mu};

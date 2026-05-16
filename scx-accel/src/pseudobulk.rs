@@ -21,6 +21,69 @@ pub enum AggregationMethod {
     Mean,
 }
 
+/// pdex-style pseudobulk mode controlling per-cell and per-group-mean transforms.
+///
+/// Encodes the four `(geometric_mean × is_log1p)` combinations from
+/// `pdex._math.pseudobulk`. The per-cell transform `f(x)` is applied to each
+/// cell's expression value before averaging; the per-group-mean transform
+/// `g(y)` is applied to the resulting mean. Both `f(0) = 0` and `g(0) = 0`
+/// hold for all four modes, so CSR aggregation only visits non-zero entries.
+///
+/// | mode             | `geometric_mean` | `is_log1p` | `f(x)`    | `g(y)`     |
+/// |------------------|------------------|------------|-----------|------------|
+/// | `ArithRaw`       | false            | false      | `x`       | `y`        |
+/// | `ArithLog1pExpand` | false          | true       | `expm1(x)`| `y`        |
+/// | `GeomRaw`        | true             | false      | `log1p(x)`| `expm1(y)` |
+/// | `GeomLog1p`      | true             | true       | `x`       | `expm1(y)` |
+///
+/// The output mean is always in **natural (count) space**, matching pdex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeomMeanMode {
+    /// `geometric_mean=False, is_log1p=False`: arithmetic mean of raw counts.
+    ArithRaw,
+    /// `geometric_mean=False, is_log1p=True`: arithmetic mean of `expm1(X)`.
+    ArithLog1pExpand,
+    /// `geometric_mean=True, is_log1p=False`: `expm1(mean(log1p(X)))`.
+    GeomRaw,
+    /// `geometric_mean=True, is_log1p=True`: `expm1(mean(X))`.
+    GeomLog1p,
+}
+
+impl GeomMeanMode {
+    /// Per-cell-value transform `f(x)`. All four modes satisfy `f(0) = 0`,
+    /// so sparse-aggregation paths can skip explicit zeros.
+    #[inline]
+    pub fn pre(self, x: f64) -> f64 {
+        match self {
+            Self::ArithRaw | Self::GeomLog1p => x,
+            Self::ArithLog1pExpand => x.exp_m1(),
+            Self::GeomRaw => x.ln_1p(),
+        }
+    }
+
+    /// Per-(group, gene) mean transform `g(y)`. Applied after dividing the
+    /// sum of `f(x_i)` by the group's cell count.
+    #[inline]
+    pub fn post(self, y: f64) -> f64 {
+        match self {
+            Self::ArithRaw | Self::ArithLog1pExpand => y,
+            Self::GeomRaw | Self::GeomLog1p => y.exp_m1(),
+        }
+    }
+
+    /// Convenience constructor from the `(geometric_mean, is_log1p)` pair
+    /// pdex's Python API exposes.
+    #[inline]
+    pub fn from_flags(geometric_mean: bool, is_log1p: bool) -> Self {
+        match (geometric_mean, is_log1p) {
+            (false, false) => Self::ArithRaw,
+            (false, true) => Self::ArithLog1pExpand,
+            (true, false) => Self::GeomRaw,
+            (true, true) => Self::GeomLog1p,
+        }
+    }
+}
+
 /// Result of pseudobulk aggregation.
 #[derive(Debug, Clone)]
 pub struct PseudobulkResult {
@@ -776,6 +839,62 @@ mod tests {
             0,
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_geom_mean_mode_transforms() {
+        // Each row: (mode, x, expected_pre, mean (sum/2), expected_post(mean))
+        let cases: &[(GeomMeanMode, f64)] = &[
+            (GeomMeanMode::ArithRaw, 2.5),
+            (GeomMeanMode::ArithLog1pExpand, 1.5),
+            (GeomMeanMode::GeomRaw, 1.5),
+            (GeomMeanMode::GeomLog1p, 0.5),
+        ];
+
+        for &(mode, x) in cases {
+            // f(0) == 0 invariant — required for CSR aggregation correctness.
+            assert!(
+                mode.pre(0.0).abs() < 1e-15,
+                "{:?}.pre(0.0) must equal 0 (got {})",
+                mode,
+                mode.pre(0.0)
+            );
+
+            // Match pdex's _math.pseudobulk reference behavior on a single value.
+            let pre = mode.pre(x);
+            let post = mode.post(pre);
+            let expected = match mode {
+                GeomMeanMode::ArithRaw => x,
+                GeomMeanMode::ArithLog1pExpand => x.exp_m1(),
+                GeomMeanMode::GeomRaw => x.ln_1p().exp_m1(), // = x for x > -1
+                GeomMeanMode::GeomLog1p => x.exp_m1(),
+            };
+            assert!(
+                (post - expected).abs() < 1e-12,
+                "{:?} round-trip: post(pre({})) = {} != {}",
+                mode,
+                x,
+                post,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_geom_mean_mode_from_flags() {
+        assert_eq!(
+            GeomMeanMode::from_flags(false, false),
+            GeomMeanMode::ArithRaw
+        );
+        assert_eq!(
+            GeomMeanMode::from_flags(false, true),
+            GeomMeanMode::ArithLog1pExpand
+        );
+        assert_eq!(GeomMeanMode::from_flags(true, false), GeomMeanMode::GeomRaw);
+        assert_eq!(
+            GeomMeanMode::from_flags(true, true),
+            GeomMeanMode::GeomLog1p
+        );
     }
 
     #[test]

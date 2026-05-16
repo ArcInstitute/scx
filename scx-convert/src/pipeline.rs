@@ -98,6 +98,15 @@ pub struct ConvertOptions {
     /// forces the external path; the in-memory CSC route never
     /// touches disk.
     pub temp_dir: Option<std::path::PathBuf>,
+    /// Phase 3: Filter h5mu input to only the named modalities.
+    /// `None` (default) keeps every modality. Unknown names error
+    /// with the full list of available modalities.
+    pub modalities: Option<Vec<String>>,
+    /// Phase 3: Explicit modality-type overrides keyed by modality
+    /// name. Modalities not listed get
+    /// [`crate::infer_modality_type_from_name`] and emit
+    /// [`crate::ConvertWarning::ModalityTypeInferred`].
+    pub modality_types: Vec<(String, ModalityType)>,
 }
 
 impl Default for ConvertOptions {
@@ -113,6 +122,8 @@ impl Default for ConvertOptions {
             strict_uns: false,
             dense_zero_epsilon: 0.0,
             temp_dir: None,
+            modalities: None,
+            modality_types: Vec::new(),
         }
     }
 }
@@ -517,6 +528,7 @@ pub fn h5ad_to_scx_streaming(
         index_dtype,
         n_vars_u32,
         SectionType::CsrShard,
+        ModalityType::Rna,
         "x_shard",
         sink,
     )?;
@@ -661,6 +673,7 @@ pub fn h5ad_to_scx_streaming(
                 l_index_dtype,
                 l_n_vars_u32,
                 SectionType::LayerCsrShard,
+                ModalityType::Rna,
                 &format!("{layer_name}_shard"),
                 sink,
             )?;
@@ -732,6 +745,7 @@ pub fn streaming_writer_coordinator(
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
+    modality_type: ModalityType,
     section_name_prefix: &str,
     sink: &mut WarningSink,
 ) -> Result<u32, ConvertError> {
@@ -759,7 +773,7 @@ pub fn streaming_writer_coordinator(
             n_vars_u32,
             shard.row_start,
             section_type,
-            ModalityType::Rna,
+            modality_type,
             format!("{section_name_prefix}_{shard_idx}"),
         )?;
         writer.write_preencoded_shard(pre)?;

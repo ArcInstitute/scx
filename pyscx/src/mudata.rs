@@ -161,6 +161,98 @@ pub fn to_mudata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py
     Ok(mu)
 }
 
+/// Implementation of `pyscx.from_h5mu(path, out, ...)` — path-based
+/// streaming entry that delegates to
+/// `scx_convert::h5mu_to_scx_streaming` (Phase 3). When
+/// `stream=false`, falls back to the non-streaming `h5mu_to_scx`.
+///
+/// `modality_types`: dict mapping name → type string (`"rna"`,
+/// `"protein"`, `"atac"`, `"spatial"`, `"methylation"`, `"custom"`).
+#[cfg(feature = "hdf5")]
+#[allow(clippy::too_many_arguments)]
+pub fn from_h5mu_impl(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    codec: Option<&str>,
+    shard_size: Option<u32>,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    stream: bool,
+    strict_uns: bool,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    temp_dir: Option<&str>,
+    modalities: Option<Vec<String>>,
+    modality_types: Option<HashMap<String, String>>,
+) -> PyResult<()> {
+    use pyo3::exceptions::PyValueError;
+    let explicit_codec = crate::anndata::parse_codec(codec)?;
+    let csc_always = match csc {
+        "off" => false,
+        "always" => true,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "invalid csc value '{other}'; expected 'off' or 'always'"
+            )));
+        }
+    };
+    let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
+    let memory_budget_bytes = crate::anndata::parse_memory_budget(memory_budget.as_ref())?;
+
+    // Translate the Python dict form into ConvertOptions::modality_types.
+    let modality_types_vec: Vec<(String, ModalityType)> = match modality_types {
+        None => Vec::new(),
+        Some(map) => map
+            .into_iter()
+            .map(|(k, v)| {
+                let mt = match v.to_lowercase().as_str() {
+                    "rna" => ModalityType::Rna,
+                    "protein" | "adt" => ModalityType::Protein,
+                    "atac" => ModalityType::Atac,
+                    "spatial" => ModalityType::Spatial,
+                    "methylation" | "methyl" => ModalityType::Methylation,
+                    "custom" => ModalityType::Custom,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown modality type '{other}' for '{k}'; \
+                             valid: rna, protein, atac, spatial, methylation, custom"
+                        )));
+                    }
+                };
+                Ok((k, mt))
+            })
+            .collect::<PyResult<Vec<_>>>()?,
+    };
+
+    let opts = scx_convert::ConvertOptions {
+        shard_target_rows,
+        codec: explicit_codec,
+        csc: csc_always,
+        csc_cols_per_shard,
+        tool: "pyscx".into(),
+        memory_budget: memory_budget_bytes,
+        stream,
+        strict_uns,
+        dense_zero_epsilon: 0.0,
+        temp_dir: temp_dir.map(std::path::PathBuf::from),
+        modalities,
+        modality_types: modality_types_vec,
+    };
+
+    let input = std::path::PathBuf::from(path);
+    let output = std::path::PathBuf::from(out);
+    let mut sink = scx_convert::WarningSink::log();
+    if stream {
+        py.allow_threads(|| scx_convert::h5mu_to_scx_streaming(&input, &output, &opts, &mut sink))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    } else {
+        py.allow_threads(|| scx_convert::h5mu_to_scx(&input, &output, &opts, &mut sink))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+    crate::anndata::emit_python_warnings(py, &sink)?;
+    Ok(())
+}
+
 /// Implementation of `pyscx.from_mudata(mu, path, ...)`. Mirrors
 /// `from_anndata_impl` but iterates `mu.mod` and emits one modality
 /// per AnnData.

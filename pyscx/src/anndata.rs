@@ -2676,6 +2676,8 @@ pub(crate) fn route_backed_anndata_to_streaming(
         strict_uns,
         dense_zero_epsilon,
         temp_dir: temp_dir.map(std::path::PathBuf::from),
+        modalities: None,
+        modality_types: Vec::new(),
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);

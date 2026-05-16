@@ -2980,6 +2980,258 @@ fn phase2_streaming_csc_budget_too_small_actionable_error() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Phase 3 — streaming h5mu / MuData conversion.
+// -----------------------------------------------------------------------
+
+#[test]
+fn phase3_streaming_h5mu_round_trip_matches_bulk() {
+    use super::mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("phase3.h5mu");
+    create_test_h5mu(&h5mu, 20, 8, 4);
+
+    let scx_stream = dir.path().join("stream.scx");
+    let scx_bulk = dir.path().join("bulk.scx");
+    let opts = streaming_opts(8);
+
+    h5mu_to_scx_streaming(&h5mu, &scx_stream, &opts, &mut WarningSink::log()).unwrap();
+    h5mu_to_scx(&h5mu, &scx_bulk, &opts, &mut WarningSink::log()).unwrap();
+
+    let a = ScxReader::open(&scx_stream).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+    assert_eq!(a.header().n_obs, b.header().n_obs);
+    assert_eq!(a.n_modalities(), b.n_modalities());
+    assert_eq!(a.n_modalities(), 2);
+    // Per-modality CSR shard payloads must match exactly.
+    let n = a.n_modalities() as u8;
+    for mid in 1u8..=n {
+        let csr_a = a.read_all_csr_shards_for(mid).unwrap();
+        let csr_b = b.read_all_csr_shards_for(mid).unwrap();
+        assert_eq!(
+            csr_a.indptr, csr_b.indptr,
+            "modality {mid} indptr divergence"
+        );
+        assert_eq!(
+            csr_a.indices, csr_b.indices,
+            "modality {mid} indices divergence"
+        );
+        assert_eq!(csr_a.data, csr_b.data, "modality {mid} data divergence");
+    }
+}
+
+#[test]
+fn phase3_streaming_h5mu_per_modality_codec_routing() {
+    // Per-modality codec choices made by `select_codec_for_modality`
+    // must match between the bulk and streaming paths. The streaming
+    // path samples up to 16 KiB of values per modality before picking
+    // — enough for any fixture small enough to fit in the bulk path
+    // for comparison.
+    use super::mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("codec.h5mu");
+    create_test_h5mu(&h5mu, 20, 8, 4);
+
+    let scx_stream = dir.path().join("stream.scx");
+    let scx_bulk = dir.path().join("bulk.scx");
+    let opts = streaming_opts(8);
+    h5mu_to_scx_streaming(&h5mu, &scx_stream, &opts, &mut WarningSink::log()).unwrap();
+    h5mu_to_scx(&h5mu, &scx_bulk, &opts, &mut WarningSink::log()).unwrap();
+
+    let a = ScxReader::open(&scx_stream).unwrap();
+    let b = ScxReader::open(&scx_bulk).unwrap();
+    let ta = a.modality_table().expect("modality table present");
+    let tb = b.modality_table().expect("modality table present");
+    assert_eq!(ta.entries.len(), tb.entries.len());
+    for (sa, sb) in ta.entries.iter().zip(tb.entries.iter()) {
+        assert_eq!(
+            sa.name, sb.name,
+            "modality name divergence between streaming and bulk"
+        );
+        assert_eq!(
+            sa.default_codec_id, sb.default_codec_id,
+            "modality '{}' codec divergence: streaming={}, bulk={}",
+            sa.name, sa.default_codec_id, sb.default_codec_id
+        );
+        assert_eq!(
+            sa.default_value_encoding, sb.default_value_encoding,
+            "modality '{}' value-encoding divergence",
+            sa.name
+        );
+    }
+}
+
+#[test]
+fn phase3_streaming_h5mu_modality_filter() {
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("filter.h5mu");
+    create_test_h5mu(&h5mu, 8, 5, 3);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        modalities: Some(vec!["rna".to_string()]),
+        ..ConvertOptions::default()
+    };
+    h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log()).unwrap();
+    let reader = ScxReader::open(&scx).unwrap();
+    assert_eq!(reader.n_modalities(), 1, "expected only 'rna' modality");
+    let table = reader.modality_table().expect("modality table present");
+    let names: Vec<&str> = table.entries.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["rna"]);
+}
+
+#[test]
+fn phase3_streaming_h5mu_modality_filter_unknown_errors() {
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("unknown.h5mu");
+    create_test_h5mu(&h5mu, 6, 3, 2);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        modalities: Some(vec!["zzz".to_string()]),
+        ..ConvertOptions::default()
+    };
+    let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
+        .expect_err("unknown modality must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("zzz") && msg.contains("available"),
+        "expected message to name 'zzz' and 'available'; got: {msg}"
+    );
+}
+
+#[test]
+fn phase3_streaming_h5mu_modality_types_override() {
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("types.h5mu");
+    create_test_h5mu(&h5mu, 8, 4, 2);
+
+    let scx = dir.path().join("out.scx");
+    // Override adt → Atac (a deliberately surprising mapping so we
+    // can tell override actually took effect). The default heuristic
+    // would map "adt" → Protein. No override for rna → inference +
+    // ModalityTypeInferred warning emitted for rna only.
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        modality_types: vec![("adt".to_string(), scx_format::modality::ModalityType::Atac)],
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut sink).unwrap();
+    let reader = ScxReader::open(&scx).unwrap();
+    let table = reader.modality_table().expect("modality table present");
+    let adt = table.entries.iter().find(|m| m.name == "adt").unwrap();
+    assert_eq!(adt.modality_type, scx_format::modality::ModalityType::Atac);
+    let rna = table.entries.iter().find(|m| m.name == "rna").unwrap();
+    assert_eq!(rna.modality_type, scx_format::modality::ModalityType::Rna);
+    // rna had no override → one inferred-type warning. adt was
+    // explicitly overridden → no inferred warning for it.
+    let inferred = sink
+        .counts()
+        .get("modality_type_inferred")
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        inferred, 1,
+        "expected exactly one ModalityTypeInferred (rna), got {inferred}"
+    );
+}
+
+#[test]
+fn phase3_streaming_h5mu_non_aligned_obs_errors() {
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("misaligned.h5mu");
+    // Build an h5mu by hand where outer obs has n_obs=8 but
+    // /mod/rna/X.shape[0] = 12.
+    {
+        let file = hdf5::File::create(&h5mu).unwrap();
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = (0..8).map(|i| vlu(&format!("cell_{i}"))).collect();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([8])
+            .create("_index")
+            .unwrap()
+            .write(&obs_index)
+            .unwrap();
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+        let mod_group = file.create_group("mod").unwrap();
+        let rna = mod_group.create_group("rna").unwrap();
+        let n_obs = 12usize;
+        let n_vars = 3usize;
+        let mut indptr = vec![0i64];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for row in 0..n_obs {
+            indices.push((row % n_vars) as i32);
+            data.push((row + 1) as f32);
+            indptr.push(data.len() as i64);
+        }
+        let x = rna.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+        let var = rna.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> = (0..n_vars).map(|i| vlu(&format!("g_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let scx = dir.path().join("out.scx");
+    let opts = streaming_opts(4);
+    let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
+        .expect_err("non-aligned modality obs must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("rna") && msg.contains("12") && msg.contains("8"),
+        "expected message to name 'rna' and the offending counts; got: {msg}"
+    );
+}
+
 /// Write a CSR `/X` group with `indptr`/`indices`/`data` children
 /// AND a `shape` attribute, but deliberately omit `encoding-type`.
 /// Used to test the inference path.
