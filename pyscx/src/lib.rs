@@ -163,7 +163,11 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
 ///   Pass `0` to disable the cap (single CSC shard, memory permitting).
 #[pyfunction]
-#[pyo3(signature = (adata, path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
+#[pyo3(signature = (
+    adata, path, codec=None, shard_size=None, in_place=false, csc="off",
+    csc_cols_per_shard=5000, uns_format="tagged",
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
+))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
     py: Python<'_>,
@@ -175,6 +179,10 @@ fn from_anndata(
     csc: &str,
     csc_cols_per_shard: usize,
     uns_format: &str,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     anndata::from_anndata_impl(
         py,
@@ -186,6 +194,10 @@ fn from_anndata(
         csc,
         csc_cols_per_shard,
         uns_format,
+        index_obs.unwrap_or_default(),
+        index_var.unwrap_or_default(),
+        index_preset,
+        index_auto_threshold,
     )
 }
 
@@ -232,6 +244,7 @@ fn from_anndata(
     path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
     uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
     memory_budget=None, temp_dir=None,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -248,6 +261,10 @@ fn from_h5ad(
     dense_zero_epsilon: f32,
     memory_budget: Option<Bound<'_, PyAny>>,
     temp_dir: Option<&str>,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -288,6 +305,10 @@ fn from_h5ad(
         dense_zero_epsilon,
         memory_budget_bytes,
         temp_dir,
+        index_obs.unwrap_or_default(),
+        index_var.unwrap_or_default(),
+        index_preset,
+        index_auto_threshold,
     )
 }
 
@@ -301,7 +322,11 @@ fn from_h5ad(
 /// `csc`, `csc_cols_per_shard`, and `uns_format` mirror `from_anndata`
 /// — see those docs.
 #[pyfunction]
-#[pyo3(signature = (h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off", csc_cols_per_shard=5000, uns_format="tagged"))]
+#[pyo3(signature = (
+    h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off",
+    csc_cols_per_shard=5000, uns_format="tagged",
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
+))]
 #[allow(clippy::too_many_arguments)]
 fn from_10x(
     py: Python<'_>,
@@ -313,6 +338,10 @@ fn from_10x(
     csc: &str,
     csc_cols_per_shard: usize,
     uns_format: &str,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy").map_err(|e| {
         // Only rewrite when scanpy itself is the missing module — if scanpy
@@ -344,6 +373,10 @@ fn from_10x(
         csc,
         csc_cols_per_shard,
         uns_format,
+        index_obs.unwrap_or_default(),
+        index_var.unwrap_or_default(),
+        index_preset,
+        index_auto_threshold,
     )
 }
 
@@ -377,6 +410,7 @@ fn from_10x(
     path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
     stream=true, strict_uns=false, memory_budget=None, temp_dir=None,
     modalities=None, modality_types=None,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5mu(
@@ -393,6 +427,10 @@ fn from_h5mu(
     temp_dir: Option<&str>,
     modalities: Option<Vec<String>>,
     modality_types: Option<std::collections::HashMap<String, String>>,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     mudata::from_h5mu_impl(
         py,
@@ -408,6 +446,10 @@ fn from_h5mu(
         temp_dir,
         modalities,
         modality_types,
+        index_obs.unwrap_or_default(),
+        index_var.unwrap_or_default(),
+        index_preset,
+        index_auto_threshold,
     )
 }
 

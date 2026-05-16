@@ -184,6 +184,10 @@ pub fn from_h5mu_impl(
     temp_dir: Option<&str>,
     modalities: Option<Vec<String>>,
     modality_types: Option<HashMap<String, String>>,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> PyResult<()> {
     use pyo3::exceptions::PyValueError;
     let explicit_codec = crate::anndata::parse_codec(codec)?;
@@ -237,6 +241,12 @@ pub fn from_h5mu_impl(
         temp_dir: temp_dir.map(std::path::PathBuf::from),
         modalities,
         modality_types: modality_types_vec,
+        // h5mu paths emit PredicateIndexSkippedMultimodal when these are
+        // set — the engine read-side is unimodal-only today.
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
     };
 
     let input = std::path::PathBuf::from(path);

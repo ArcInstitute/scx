@@ -25,6 +25,10 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-mtx = { path = "../scx-mtx" }
 scx-ops = { path = "../scx-ops" }
+# Phase 5a: build_obs_predicate_index_bytes / build_var_predicate_index_bytes
+# live in scx-engine alongside the read-side IndexLookup / QueryPipeline,
+# so conversion-time index building reuses the same encoder.
+scx-engine = { path = "../scx-engine" }
 # Phase 2 external CSC → CSR transpose writes intermediate
 # `(row, col, value)` triples to a session temp directory. `TempDir`
 # is auto-deleted on drop — the cleanest "scoped resource" pattern

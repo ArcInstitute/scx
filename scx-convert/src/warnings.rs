@@ -45,6 +45,11 @@ pub enum ConvertWarning {
     /// A layer was skipped during streaming (open failed, shape
     /// mismatch, or width exceeds u32::MAX).
     LayerSkipped { name: String, reason: String },
+    /// Predicate index flags were passed on a multimodal input but the
+    /// engine read-side is unimodal-only today — the indexes were
+    /// skipped. Lifted once `QueryPipeline` grows per-modality
+    /// predicate-index lookup (Phase 6 / follow-on).
+    PredicateIndexSkippedMultimodal { columns: Vec<String> },
 }
 
 impl ConvertWarning {
@@ -62,6 +67,7 @@ impl ConvertWarning {
             Self::DenseSparsified { .. } => "dense_sparsified",
             Self::DuplicateCoordinatesMerged { .. } => "duplicate_coordinates_merged",
             Self::LayerSkipped { .. } => "layer_skipped",
+            Self::PredicateIndexSkippedMultimodal { .. } => "predicate_index_skipped_multimodal",
         }
     }
 }
