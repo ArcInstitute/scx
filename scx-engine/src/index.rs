@@ -387,14 +387,46 @@ pub struct PredicateIndexBuildOptions {
     pub high_cardinality_threshold: usize,
 }
 
+/// Why a named column couldn't be indexed. Carried by both
+/// [`BuildOutcome::ForcedColumnError`] and
+/// [`BuildOutcome::PresetSkipped`] so callers can route policy
+/// (e.g. `MissingPresetIndexColumn` vs `UnsupportedIndexColumn`)
+/// without parsing a free-form `String`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipReason {
+    /// Column name was not found in the metadata schema.
+    MissingColumn,
+    /// Column exists but its dtype is neither categorical nor numeric.
+    UnsupportedDtype(String),
+    /// Cardinality exceeds the caller-supplied
+    /// `high_cardinality_threshold`.
+    HighCardinality { n_unique: usize, threshold: usize },
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingColumn => write!(f, "missing column"),
+            Self::UnsupportedDtype(dt) => write!(f, "unsupported dtype {dt}"),
+            Self::HighCardinality {
+                n_unique,
+                threshold,
+            } => write!(
+                f,
+                "cardinality {n_unique} exceeds high_cardinality_threshold {threshold}"
+            ),
+        }
+    }
+}
+
 /// Per-column build outcome surfaced to the caller so policy decisions
 /// (hard error vs. typed warning) stay in the conversion layer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuildOutcome {
     /// Forced column couldn't be indexed.
-    ForcedColumnError { column: String, reason: String },
+    ForcedColumnError { column: String, reason: SkipReason },
     /// Preset column couldn't be indexed.
-    PresetSkipped { column: String, reason: String },
+    PresetSkipped { column: String, reason: SkipReason },
 }
 
 /// Named column preset (e.g. `cellxgene`, `perturbseq`, `training`).
@@ -547,56 +579,47 @@ fn build_predicate_index_bytes_inner(
     }
 
     let mut indexed: Vec<IndexedColumn> = Vec::new();
-    for (col_name, is_forced) in &named {
-        let Some((idx, field)) = schema.column_with_name(col_name) else {
-            let reason = "missing column".to_string();
-            outcomes.push(if *is_forced {
+    let push_outcome =
+        |outcomes: &mut Vec<BuildOutcome>, col_name: &str, is_forced: bool, reason: SkipReason| {
+            outcomes.push(if is_forced {
                 BuildOutcome::ForcedColumnError {
-                    column: col_name.clone(),
+                    column: col_name.to_string(),
                     reason,
                 }
             } else {
                 BuildOutcome::PresetSkipped {
-                    column: col_name.clone(),
+                    column: col_name.to_string(),
                     reason,
                 }
             });
+        };
+    for (col_name, is_forced) in &named {
+        let Some((idx, field)) = schema.column_with_name(col_name) else {
+            push_outcome(outcomes, col_name, *is_forced, SkipReason::MissingColumn);
             continue;
         };
         let col = metadata.column(idx);
         let dt = field.data_type();
         if !is_categorical_type(dt) && !is_numeric_type(dt) {
-            let reason = format!("unsupported dtype {dt:?}");
-            outcomes.push(if *is_forced {
-                BuildOutcome::ForcedColumnError {
-                    column: col_name.clone(),
-                    reason,
-                }
-            } else {
-                BuildOutcome::PresetSkipped {
-                    column: col_name.clone(),
-                    reason,
-                }
-            });
+            push_outcome(
+                outcomes,
+                col_name,
+                *is_forced,
+                SkipReason::UnsupportedDtype(format!("{dt:?}")),
+            );
             continue;
         }
         let n_unique = estimate_unique_values(col);
         if n_unique > options.high_cardinality_threshold {
-            let reason = format!(
-                "cardinality {n_unique} exceeds high_cardinality_threshold {}",
-                options.high_cardinality_threshold
+            push_outcome(
+                outcomes,
+                col_name,
+                *is_forced,
+                SkipReason::HighCardinality {
+                    n_unique,
+                    threshold: options.high_cardinality_threshold,
+                },
             );
-            outcomes.push(if *is_forced {
-                BuildOutcome::ForcedColumnError {
-                    column: col_name.clone(),
-                    reason,
-                }
-            } else {
-                BuildOutcome::PresetSkipped {
-                    column: col_name.clone(),
-                    reason,
-                }
-            });
             continue;
         }
         if is_categorical_type(dt) {
@@ -666,6 +689,122 @@ pub fn build_var_predicate_index_bytes(
         outcomes,
         indexed_column_names,
     )
+}
+
+/// CLI / Python conversion-time inputs for the predicate-index builder.
+/// Mirrors the four `--index-*` CLI flags and the matching pyscx kwargs.
+#[derive(Debug, Clone, Default)]
+pub struct ConversionPredicateIndexOptions {
+    /// Force-index these obs columns. Missing/unsupported columns
+    /// produce a [`BuildOutcome::ForcedColumnError`] in the result.
+    pub index_obs: Vec<String>,
+    /// Force-index these var columns.
+    pub index_var: Vec<String>,
+    /// Named preset (`cellxgene` | `perturbseq` | `training`). Unknown
+    /// names return an [`EngineError::UnknownIndexPreset`].
+    pub index_preset: Option<String>,
+    /// Cardinality cap for auto-detection when no forced/preset columns
+    /// are supplied.
+    pub index_auto_threshold: usize,
+}
+
+/// Result of [`build_and_write_conversion_predicate_indexes`]. Callers
+/// walk the outcomes to demote preset skips to typed warnings and to
+/// short-circuit on forced errors; `indexed_columns` is useful for
+/// stamping provenance.
+#[derive(Debug, Default)]
+pub struct ConversionPredicateIndexResult {
+    pub obs_outcomes: Vec<BuildOutcome>,
+    pub obs_indexed_columns: Vec<String>,
+    pub var_outcomes: Vec<BuildOutcome>,
+    pub var_indexed_columns: Vec<String>,
+}
+
+/// Build both the obs and var predicate indexes for a conversion and
+/// write them to `writer`. Returns the per-axis outcomes + indexed
+/// column names; the caller maps outcomes to its own
+/// warning/error types (see `scx-convert::pipeline` and
+/// `pyscx::anndata` for examples).
+///
+/// `obs_row_ranges` must reflect the actual on-disk CSR shard
+/// boundaries. `var` is treated as a single shard `[(0, n_vars)]`
+/// internally (matches `scx-engine/tests/integration_tests.rs`).
+///
+/// `high_cardinality_threshold` is fixed at 100_000 here — the cap
+/// exists to keep a forced/preset column from blowing up the index;
+/// auto-detect uses `options.index_auto_threshold` (default 1000).
+pub fn build_and_write_conversion_predicate_indexes(
+    writer: &mut scx_format::ScxWriter,
+    obs: &arrow::array::RecordBatch,
+    var: &arrow::array::RecordBatch,
+    obs_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    options: &ConversionPredicateIndexOptions,
+) -> Result<ConversionPredicateIndexResult> {
+    const HIGH_CARDINALITY_THRESHOLD: usize = 100_000;
+
+    // Resolve preset up front so an unknown name fails before any
+    // writer state changes.
+    let (preset_obs, preset_var) = match options.index_preset.as_deref() {
+        Some(name) => {
+            let preset = index_preset_columns(name)
+                .ok_or_else(|| EngineError::UnknownIndexPreset(name.to_string()))?;
+            (
+                preset
+                    .obs_columns
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+                preset
+                    .var_columns
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
+    let mut result = ConversionPredicateIndexResult::default();
+
+    // obs
+    let obs_build_opts = PredicateIndexBuildOptions {
+        forced_columns: options.index_obs.clone(),
+        preset_columns: preset_obs,
+        auto_threshold: options.index_auto_threshold,
+        high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
+    };
+    let obs_bytes = build_obs_predicate_index_bytes(
+        obs,
+        obs_row_ranges,
+        &obs_build_opts,
+        &mut result.obs_outcomes,
+        &mut result.obs_indexed_columns,
+    )?;
+    if let Some(bytes) = obs_bytes {
+        writer.write_obs_predicate_index(&bytes)?;
+    }
+
+    // var (single shard)
+    let var_row_ranges: [(u64, u64); 1] = [(0, n_vars as u64)];
+    let var_build_opts = PredicateIndexBuildOptions {
+        forced_columns: options.index_var.clone(),
+        preset_columns: preset_var,
+        auto_threshold: options.index_auto_threshold,
+        high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
+    };
+    let var_bytes = build_var_predicate_index_bytes(
+        var,
+        &var_row_ranges,
+        &var_build_opts,
+        &mut result.var_outcomes,
+        &mut result.var_indexed_columns,
+    )?;
+    if let Some(bytes) = var_bytes {
+        writer.write_var_predicate_index(&bytes)?;
+    }
+
+    Ok(result)
 }
 
 /// Build a categorical index for a column.
@@ -1422,8 +1561,9 @@ mod tests {
         assert!(bytes.is_none());
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
-            BuildOutcome::ForcedColumnError { column, .. } => {
+            BuildOutcome::ForcedColumnError { column, reason } => {
                 assert_eq!(column, "does_not_exist");
+                assert_eq!(reason, &SkipReason::MissingColumn);
             }
             _ => panic!("expected ForcedColumnError"),
         }
@@ -1452,9 +1592,69 @@ mod tests {
         // cell_type exists in the fixture so an index is produced.
         assert!(bytes.is_some());
         assert_eq!(names, vec!["cell_type".to_string()]);
-        // tissue is missing → preset skip
-        assert!(outcomes.iter().any(
-            |o| matches!(o, BuildOutcome::PresetSkipped { column, .. } if column == "tissue")
-        ));
+        // tissue is missing → preset skip with typed MissingColumn reason
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            BuildOutcome::PresetSkipped { column, reason }
+                if column == "tissue" && *reason == SkipReason::MissingColumn
+        )));
+    }
+
+    /// Forced column whose cardinality exceeds `high_cardinality_threshold`
+    /// must surface as a `ForcedColumnError` with the typed
+    /// `SkipReason::HighCardinality` discriminant. The Display impl is
+    /// also exercised so callers re-using it for free-form messages
+    /// stay stable.
+    #[test]
+    fn build_obs_predicate_index_bytes_forced_high_cardinality_errors() {
+        // 100 rows, 100 unique values in `cell_id`. Setting
+        // `high_cardinality_threshold = 10` is enough to reject it.
+        let n_rows: usize = 100;
+        let schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let ids: Vec<String> = (0..n_rows).map(|i| format!("cell_{i}")).collect();
+        let id_array = StringArray::from(ids);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(id_array)]).unwrap();
+        let shard_ranges = vec![(0u64, n_rows as u64)];
+        let opts = PredicateIndexBuildOptions {
+            forced_columns: vec!["cell_id".to_string()],
+            preset_columns: vec![],
+            auto_threshold: 1000,
+            high_cardinality_threshold: 10,
+        };
+        let mut outcomes = Vec::new();
+        let mut names = Vec::new();
+        let bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_ranges,
+            &opts,
+            &mut outcomes,
+            &mut names,
+        )
+        .unwrap();
+        // No column ended up indexed (the only forced one was rejected).
+        assert!(bytes.is_none());
+        assert!(names.is_empty());
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            BuildOutcome::ForcedColumnError { column, reason } => {
+                assert_eq!(column, "cell_id");
+                match reason {
+                    SkipReason::HighCardinality {
+                        n_unique,
+                        threshold,
+                    } => {
+                        assert_eq!(*n_unique, n_rows);
+                        assert_eq!(*threshold, 10);
+                    }
+                    other => panic!("expected HighCardinality reason, got {other:?}"),
+                }
+                // Display impl should mention both numbers so callers
+                // that stringify for warnings get useful output.
+                let s = reason.to_string();
+                assert!(s.contains("100"), "expected '100' in {s}");
+                assert!(s.contains("10"), "expected '10' in {s}");
+            }
+            _ => panic!("expected ForcedColumnError"),
+        }
     }
 }

@@ -25,8 +25,8 @@ use super::tenx_read::read_tenx_h5;
 use super::warnings::{ConvertWarning, WarningSink};
 use arrow::record_batch::RecordBatch;
 use scx_engine::{
-    build_obs_predicate_index_bytes, build_var_predicate_index_bytes, index_preset_columns,
-    BuildOutcome, PredicateIndexBuildOptions,
+    build_and_write_conversion_predicate_indexes, BuildOutcome, ConversionPredicateIndexOptions,
+    SkipReason,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -167,6 +167,14 @@ impl Default for ConvertOptions {
 /// produced by the writer (the engine uses local row indices within
 /// each shard, so any drift between assumed and actual ranges produces
 /// silently wrong pruning).
+///
+/// All of the build orchestration (preset resolution, encoding, writer
+/// calls) lives in
+/// [`scx_engine::build_and_write_conversion_predicate_indexes`]; this
+/// wrapper only maps the engine's typed outcomes into `ConvertError` /
+/// `ConvertWarning::{MissingPresetIndexColumn, UnsupportedIndexColumn}`.
+/// `pyscx::anndata::build_and_write_predicate_indexes_inline` is the
+/// Python-side mirror — keep their outcome handling shapes in sync.
 fn build_and_write_predicate_indexes(
     writer: &mut ScxWriter,
     obs: &RecordBatch,
@@ -176,110 +184,57 @@ fn build_and_write_predicate_indexes(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(Vec<String>, Vec<String>), ConvertError> {
-    // Resolve preset columns up front so an unknown preset name fails
-    // before we touch the writer.
-    let preset = if let Some(name) = opts.index_preset.as_deref() {
-        let p = index_preset_columns(name).ok_or_else(|| {
-            ConvertError::Other(format!(
-                "unknown --index-preset '{name}'; expected one of cellxgene, perturbseq, training"
-            ))
-        })?;
-        Some(p)
-    } else {
-        None
+    let engine_opts = ConversionPredicateIndexOptions {
+        index_obs: opts.index_obs.clone(),
+        index_var: opts.index_var.clone(),
+        index_preset: opts.index_preset.clone(),
+        index_auto_threshold: opts.index_auto_threshold,
     };
-
-    let preset_obs: Vec<String> = preset
-        .as_ref()
-        .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
-        .unwrap_or_default();
-    let preset_var: Vec<String> = preset
-        .as_ref()
-        .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-        .unwrap_or_default();
-
-    // ---- obs ----
-    let obs_options = PredicateIndexBuildOptions {
-        forced_columns: opts.index_obs.clone(),
-        preset_columns: preset_obs,
-        auto_threshold: opts.index_auto_threshold,
-        high_cardinality_threshold: 100_000,
-    };
-    let mut obs_outcomes: Vec<BuildOutcome> = Vec::new();
-    let mut obs_indexed_names: Vec<String> = Vec::new();
-    let obs_bytes = build_obs_predicate_index_bytes(
+    let result = build_and_write_conversion_predicate_indexes(
+        writer,
         obs,
-        csr_row_ranges,
-        &obs_options,
-        &mut obs_outcomes,
-        &mut obs_indexed_names,
-    )
-    .map_err(|e| ConvertError::Other(format!("build_obs_predicate_index: {e}")))?;
-    for outcome in obs_outcomes {
-        match outcome {
-            BuildOutcome::ForcedColumnError { column, reason } => {
-                return Err(ConvertError::Other(format!(
-                    "forced obs index column '{column}': {reason}"
-                )));
-            }
-            BuildOutcome::PresetSkipped { column, reason } => {
-                if reason == "missing column" {
-                    sink.emit(ConvertWarning::MissingPresetIndexColumn { column });
-                } else {
-                    sink.emit(ConvertWarning::UnsupportedIndexColumn { column, reason });
-                }
-            }
-        }
-    }
-    if let Some(bytes) = obs_bytes {
-        writer
-            .write_obs_predicate_index(&bytes)
-            .map_err(ConvertError::from)?;
-    }
-
-    // ---- var ----
-    // The engine treats var as a single "shard" for index purposes —
-    // matches the test fixture at scx-engine/tests/integration_tests.rs.
-    let var_row_ranges: Vec<(u64, u64)> = vec![(0, n_vars as u64)];
-    let var_options = PredicateIndexBuildOptions {
-        forced_columns: opts.index_var.clone(),
-        preset_columns: preset_var,
-        auto_threshold: opts.index_auto_threshold,
-        high_cardinality_threshold: 100_000,
-    };
-    let mut var_outcomes: Vec<BuildOutcome> = Vec::new();
-    let mut var_indexed_names: Vec<String> = Vec::new();
-    let var_bytes = build_var_predicate_index_bytes(
         var,
-        &var_row_ranges,
-        &var_options,
-        &mut var_outcomes,
-        &mut var_indexed_names,
+        csr_row_ranges,
+        n_vars,
+        &engine_opts,
     )
-    .map_err(|e| ConvertError::Other(format!("build_var_predicate_index: {e}")))?;
-    for outcome in var_outcomes {
+    .map_err(|e| ConvertError::Other(format!("build predicate index: {e}")))?;
+
+    process_predicate_index_outcomes(result.obs_outcomes, "obs", sink)?;
+    process_predicate_index_outcomes(result.var_outcomes, "var", sink)?;
+
+    Ok((result.obs_indexed_columns, result.var_indexed_columns))
+}
+
+/// Demote per-column outcomes from
+/// `scx_engine::build_and_write_conversion_predicate_indexes` into the
+/// convert layer's policy: forced errors abort the convert; preset
+/// skips emit a typed warning whose variant is chosen by the
+/// `SkipReason` discriminant.
+fn process_predicate_index_outcomes(
+    outcomes: Vec<BuildOutcome>,
+    axis: &str,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    for outcome in outcomes {
         match outcome {
             BuildOutcome::ForcedColumnError { column, reason } => {
                 return Err(ConvertError::Other(format!(
-                    "forced var index column '{column}': {reason}"
+                    "forced {axis} index column '{column}': {reason}"
                 )));
             }
-            BuildOutcome::PresetSkipped { column, reason } => {
-                if reason == "missing column" {
+            BuildOutcome::PresetSkipped { column, reason } => match reason {
+                SkipReason::MissingColumn => {
                     sink.emit(ConvertWarning::MissingPresetIndexColumn { column });
-                } else {
-                    sink.emit(ConvertWarning::UnsupportedIndexColumn { column, reason });
                 }
-            }
+                other => sink.emit(ConvertWarning::UnsupportedIndexColumn {
+                    column,
+                    reason: other.to_string(),
+                }),
+            },
         }
     }
-    if let Some(bytes) = var_bytes {
-        writer
-            .write_var_predicate_index(&bytes)
-            .map_err(ConvertError::from)?;
-    }
-
-    Ok((obs_indexed_names, var_indexed_names))
+    Ok(())
 }
 
 pub fn h5ad_to_scx(

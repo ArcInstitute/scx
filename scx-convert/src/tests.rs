@@ -3504,9 +3504,10 @@ fn write_csr_h5ad_without_encoding_type(path: &Path, n_obs: usize, n_vars: usize
 // -----------------------------------------------------------------------
 
 /// Build a minimal h5ad fixture that includes a low-cardinality
-/// categorical obs column ("cell_type") so we can exercise forced-
-/// index + preset paths without relying on the existing fixture's
-/// `_index` / `n_counts` columns.
+/// categorical obs column ("cell_type") and a low-cardinality
+/// categorical var column ("feature_type") so we can exercise both
+/// the obs and var force-index paths without relying on the existing
+/// fixture's `_index` / `n_counts` columns.
 fn create_test_h5ad_with_cell_type(path: &Path, n_obs: usize, n_vars: usize) {
     create_test_h5ad(path, n_obs, n_vars, "csr", false);
     let file = hdf5::File::append(path).unwrap();
@@ -3518,6 +3519,18 @@ fn create_test_h5ad_with_cell_type(path: &Path, n_obs: usize, n_vars: usize) {
         .create("cell_type")
         .unwrap()
         .write(&col)
+        .unwrap();
+
+    let var = file.group("var").unwrap();
+    let feature_types = ["Gene Expression", "Antibody Capture"];
+    let var_col: Vec<VarLenUnicode> = (0..n_vars)
+        .map(|i| vlu(feature_types[i % feature_types.len()]))
+        .collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([n_vars])
+        .create("feature_type")
+        .unwrap()
+        .write(&var_col)
         .unwrap();
 }
 
@@ -3633,4 +3646,124 @@ fn unknown_index_preset_name_errors() {
     let mut sink = WarningSink::log();
     let err = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap_err();
     assert!(format!("{err}").contains("does_not_exist"));
+}
+
+/// Symmetry with `convert_with_index_obs_writes_predicate_index`: a
+/// forced var column should round-trip into the var predicate index
+/// section. Without this test the var branch of the new engine helper
+/// is exercised only via auto-detect.
+#[test]
+fn convert_with_index_var_writes_predicate_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("output.scx");
+    create_test_h5ad_with_cell_type(&h5ad_path, 8, 6);
+
+    let opts = ConvertOptions {
+        index_var: vec!["feature_type".to_string()],
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let bytes = reader
+        .read_var_predicate_index_bytes()
+        .unwrap()
+        .expect("var predicate index should be present");
+    let index = scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+    assert!(
+        index.columns.iter().any(|c| matches!(
+            c,
+            scx_engine::index::IndexedColumn::Categorical(cat)
+                if cat.column_name == "feature_type"
+        )),
+        "expected feature_type to be indexed in var; got {:?}",
+        index
+            .columns
+            .iter()
+            .map(|c| match c {
+                scx_engine::index::IndexedColumn::Categorical(c) => c.column_name.clone(),
+                scx_engine::index::IndexedColumn::Numeric(n) => n.column_name.clone(),
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Forced var column that doesn't exist in the schema must surface
+/// as a `ConvertError` (mirrors
+/// `convert_with_unknown_forced_index_column_errors` for the var
+/// axis). The high-cardinality rejection path is covered by the
+/// engine unit test
+/// `build_obs_predicate_index_bytes_forced_high_cardinality_errors`
+/// — `high_cardinality_threshold` is not user-tunable from the
+/// convert layer today (Phase 5a), so the missing-column branch is
+/// the only forced-error shape reachable through the CLI flag
+/// surface here.
+#[test]
+fn convert_with_forced_missing_var_column_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("output.scx");
+    create_test_h5ad_with_cell_type(&h5ad_path, 4, 3);
+
+    let opts = ConvertOptions {
+        index_var: vec!["no_such_var_column".to_string()],
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    let err = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no_such_var_column"),
+        "expected error to mention forced var column name; got: {msg}"
+    );
+    assert!(
+        msg.contains("missing column"),
+        "expected error to mention the typed SkipReason; got: {msg}"
+    );
+}
+
+/// Phase 5a multimodal: predicate index flags on an h5mu input must
+/// emit `PredicateIndexSkippedMultimodal` (engine read-side is
+/// unimodal-only today). This pins down the typed warning so a
+/// future read-side per-modality lookup change can flip the
+/// behaviour without breaking expectations silently.
+#[test]
+fn convert_h5mu_with_index_obs_emits_skip_warning() {
+    use super::mudata_pipeline::h5mu_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("input.h5mu");
+    let scx_path = dir.path().join("output.scx");
+    create_test_h5mu(&h5mu_path, 6, 4, 3);
+
+    let opts = ConvertOptions {
+        index_obs: vec!["cell_type".to_string()],
+        ..ConvertOptions::default()
+    };
+    let saw_skip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_skip_clone = saw_skip.clone();
+    let mut sink = WarningSink::with_handler(move |w| {
+        if matches!(
+            w,
+            super::warnings::ConvertWarning::PredicateIndexSkippedMultimodal { .. }
+        ) {
+            saw_skip_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut sink).unwrap();
+    assert!(
+        saw_skip.load(std::sync::atomic::Ordering::Relaxed),
+        "expected PredicateIndexSkippedMultimodal warning when --index-obs is set on h5mu input"
+    );
+
+    // And the on-disk file must NOT have an obs predicate index section
+    // — otherwise the engine read-side (unimodal-only) would silently
+    // see an orphan.
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(
+        reader.read_obs_predicate_index_bytes().unwrap().is_none(),
+        "h5mu output must not carry an obs predicate index until per-modality lookup lands"
+    );
 }

@@ -27,10 +27,12 @@ use crate::to_pyerr;
 const PYSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Phase 5a: build and write obs / var predicate indexes from a Python
-/// in-memory AnnData write path. Mirrors
-/// `scx_convert::pipeline::build_and_write_predicate_indexes` but
-/// surfaces outcomes through Python (`PyValueError` for forced
-/// errors, `warnings.warn` for preset skips / unsupported columns).
+/// in-memory AnnData write path. Thin wrapper over
+/// `scx_engine::build_and_write_conversion_predicate_indexes`; only the
+/// outcome-to-Python mapping differs from the convert-side wrapper in
+/// `scx_convert::pipeline::build_and_write_predicate_indexes`
+/// (`PyValueError` for forced errors, `warnings.warn(...)` for preset
+/// skips). Keep those two outcome maps in sync.
 #[allow(clippy::too_many_arguments)]
 fn build_and_write_predicate_indexes_inline(
     py: Python<'_>,
@@ -45,102 +47,54 @@ fn build_and_write_predicate_indexes_inline(
     index_auto_threshold: usize,
 ) -> PyResult<()> {
     use scx_engine::{
-        build_obs_predicate_index_bytes, build_var_predicate_index_bytes, index_preset_columns,
-        BuildOutcome, PredicateIndexBuildOptions,
+        build_and_write_conversion_predicate_indexes, BuildOutcome,
+        ConversionPredicateIndexOptions, EngineError,
     };
 
-    let preset = match index_preset {
-        Some(name) => Some(index_preset_columns(name).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "unknown index_preset '{name}'; expected one of cellxgene, perturbseq, training"
-            ))
-        })?),
-        None => None,
+    let engine_opts = ConversionPredicateIndexOptions {
+        index_obs: index_obs.to_vec(),
+        index_var: index_var.to_vec(),
+        index_preset: index_preset.map(|s| s.to_string()),
+        index_auto_threshold,
     };
-    let preset_obs: Vec<String> = preset
-        .as_ref()
-        .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
-        .unwrap_or_default();
-    let preset_var: Vec<String> = preset
-        .as_ref()
-        .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-        .unwrap_or_default();
+    let result = build_and_write_conversion_predicate_indexes(
+        writer,
+        obs,
+        var,
+        csr_row_ranges,
+        n_vars,
+        &engine_opts,
+    )
+    .map_err(|e| match e {
+        // Unknown preset is user-facing — surface as PyValueError so it
+        // shows up as a clean `ValueError` in Python.
+        EngineError::UnknownIndexPreset(_) => PyValueError::new_err(e.to_string()),
+        other => PyRuntimeError::new_err(format!("build predicate index: {other}")),
+    })?;
 
     let emit_warning = |msg: String| -> PyResult<()> {
         py.import("warnings")?.call_method1("warn", (msg,))?;
         Ok(())
     };
-
-    // ---- obs ----
-    let obs_options = PredicateIndexBuildOptions {
-        forced_columns: index_obs.to_vec(),
-        preset_columns: preset_obs,
-        auto_threshold: index_auto_threshold,
-        high_cardinality_threshold: 100_000,
-    };
-    let mut obs_outcomes: Vec<BuildOutcome> = Vec::new();
-    let mut obs_indexed: Vec<String> = Vec::new();
-    let obs_bytes = build_obs_predicate_index_bytes(
-        obs,
-        csr_row_ranges,
-        &obs_options,
-        &mut obs_outcomes,
-        &mut obs_indexed,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("build_obs_predicate_index: {e}")))?;
-    for outcome in obs_outcomes {
-        match outcome {
-            BuildOutcome::ForcedColumnError { column, reason } => {
-                return Err(PyValueError::new_err(format!(
-                    "forced obs index column '{column}': {reason}"
-                )));
-            }
-            BuildOutcome::PresetSkipped { column, reason } => {
-                emit_warning(format!(
-                    "predicate index skipped for obs column '{column}': {reason}"
-                ))?;
+    let process = |outcomes: Vec<BuildOutcome>, axis: &str| -> PyResult<()> {
+        for outcome in outcomes {
+            match outcome {
+                BuildOutcome::ForcedColumnError { column, reason } => {
+                    return Err(PyValueError::new_err(format!(
+                        "forced {axis} index column '{column}': {reason}"
+                    )));
+                }
+                BuildOutcome::PresetSkipped { column, reason } => {
+                    emit_warning(format!(
+                        "predicate index skipped for {axis} column '{column}': {reason}"
+                    ))?;
+                }
             }
         }
-    }
-    if let Some(bytes) = obs_bytes {
-        writer.write_obs_predicate_index(&bytes).map_err(to_pyerr)?;
-    }
-
-    // ---- var ----
-    let var_row_ranges: Vec<(u64, u64)> = vec![(0, n_vars as u64)];
-    let var_options = PredicateIndexBuildOptions {
-        forced_columns: index_var.to_vec(),
-        preset_columns: preset_var,
-        auto_threshold: index_auto_threshold,
-        high_cardinality_threshold: 100_000,
+        Ok(())
     };
-    let mut var_outcomes: Vec<BuildOutcome> = Vec::new();
-    let mut var_indexed: Vec<String> = Vec::new();
-    let var_bytes = build_var_predicate_index_bytes(
-        var,
-        &var_row_ranges,
-        &var_options,
-        &mut var_outcomes,
-        &mut var_indexed,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("build_var_predicate_index: {e}")))?;
-    for outcome in var_outcomes {
-        match outcome {
-            BuildOutcome::ForcedColumnError { column, reason } => {
-                return Err(PyValueError::new_err(format!(
-                    "forced var index column '{column}': {reason}"
-                )));
-            }
-            BuildOutcome::PresetSkipped { column, reason } => {
-                emit_warning(format!(
-                    "predicate index skipped for var column '{column}': {reason}"
-                ))?;
-            }
-        }
-    }
-    if let Some(bytes) = var_bytes {
-        writer.write_var_predicate_index(&bytes).map_err(to_pyerr)?;
-    }
+    process(result.obs_outcomes, "obs")?;
+    process(result.var_outcomes, "var")?;
 
     Ok(())
 }

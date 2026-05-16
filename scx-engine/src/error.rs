@@ -12,6 +12,9 @@ pub enum EngineError {
     #[error("collect() called on empty pipeline (no file opened)")]
     EmptyPipeline,
 
+    #[error("unknown index preset '{0}'; expected one of cellxgene, perturbseq, training")]
+    UnknownIndexPreset(String),
+
     #[error(transparent)]
     FormatError(#[from] scx_format::ScxError),
 

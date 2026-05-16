@@ -14,8 +14,10 @@ pub use fused_ops::{
     streaming_save_layer, PreprocessConfig,
 };
 pub use index::{
-    build_indexes, build_obs_predicate_index_bytes, build_var_predicate_index_bytes,
-    index_preset_columns, BuildOutcome, IndexPreset, PredicateIndex, PredicateIndexBuildOptions,
+    build_and_write_conversion_predicate_indexes, build_indexes, build_obs_predicate_index_bytes,
+    build_var_predicate_index_bytes, index_preset_columns, BuildOutcome,
+    ConversionPredicateIndexOptions, ConversionPredicateIndexResult, IndexPreset, PredicateIndex,
+    PredicateIndexBuildOptions, SkipReason,
 };
 pub use pipeline::{NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};
