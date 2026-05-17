@@ -341,10 +341,14 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 }
 
 /// Phase 6: merge multimodal SCX files with matching modality
-/// structure. Per-modality CSR shards are concatenated in input order
-/// with `row_start` adjusted for the cumulative global obs offset;
-/// per-modality var is preserved from the first input (already
-/// validated identical by the modality-table check). Per-modality CSC
+/// structure. Per-modality CSR shards and per-modality layers are
+/// concatenated in input order with `row_start` adjusted for the
+/// cumulative global obs offset; global `obsm` and per-modality
+/// `obsm` are concatenated row-wise (any key missing in any input is
+/// dropped, matching single-modality semantics); per-modality var
+/// and per-modality / global `uns` are copied from the first input
+/// (var is already validated identical by the modality-table check;
+/// uns is treated as a single source of truth). Per-modality CSC
 /// sidecars are dropped (caller can `--rebuild-csc`).
 fn merge_multimodal(
     readers: &[ScxReader],
@@ -427,6 +431,22 @@ fn merge_multimodal(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
     writer.write_obs(&merged_obs)?;
+
+    // Global obsm: concatenate across inputs row-wise. Drop a key if
+    // any input is missing it (consistent with single-modality merge).
+    let first_obsm = readers[0].read_all_obsm()?;
+    for name in first_obsm.keys() {
+        let mut batches = Vec::new();
+        for reader in readers {
+            if let Ok(batch) = reader.read_obsm(name) {
+                batches.push(batch);
+            }
+        }
+        if batches.len() == readers.len() {
+            let merged = concat_batches(&batches[0].schema(), &batches)?;
+            writer.write_obsm(name, &merged)?;
+        }
+    }
 
     // Register modalities in input order.
     for info in &table.entries {
@@ -519,6 +539,131 @@ fn merge_multimodal(
             if all_present && !batches.is_empty() {
                 let merged = concat_batches(&batches[0].schema(), &batches)?;
                 writer.write_obsm_for(modality_id, &key, &merged)?;
+            }
+        }
+    }
+
+    // Per-modality layers: concatenate per-modality `layer/{mod}/{layer}/...`
+    // shards across inputs with cumulative emitted-rows as row_start.
+    // Layer names are unioned across all readers (matching single-modality
+    // merge); any reader missing a layer that another input has fails fast
+    // with `LayerMissing`.
+    let shard_target = first_header.shard_target_rows;
+    for (idx, info) in table.entries.iter().enumerate() {
+        let modality_id = (idx + 1) as u8;
+        let layer_prefix = format!("layer/{}/", info.name);
+        let mut layer_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for reader in readers {
+            for entry in &reader.catalog().entries {
+                if entry.section_type == SectionType::LayerCsrShard
+                    && entry.modality_id == modality_id
+                    && entry.name.starts_with(&layer_prefix)
+                {
+                    if let Some(remainder) = entry.name.strip_prefix(&layer_prefix) {
+                        if let Some(pos) = remainder.find("/shard_") {
+                            layer_names.insert(remainder[..pos].to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        for layer_name in &layer_names {
+            // Probe value_encoding from the first input that has a shard for
+            // this (modality, layer); fall back to the modality default.
+            let layer_value_encoding = {
+                let mut enc: Option<ValueEncoding> = None;
+                for reader in readers {
+                    let shards = reader
+                        .catalog()
+                        .layer_csr_shards_for_modality(modality_id, layer_name);
+                    if let Some(first) = shards.first() {
+                        let section = reader.section_bytes(first)?;
+                        let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
+                            &section[..SHARD_HEADER_SIZE],
+                        ))?;
+                        enc = Some(
+                            ValueEncoding::from_u8(sh.value_encoding)
+                                .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?,
+                        );
+                        break;
+                    }
+                }
+                enc.unwrap_or_else(|| {
+                    ValueEncoding::from_u8(info.default_value_encoding)
+                        .unwrap_or(ValueEncoding::Uint8)
+                })
+            };
+
+            let mut l_indptr: Vec<u64> = vec![0];
+            let mut l_indices: Vec<u32> = Vec::new();
+            let mut l_values: Vec<u8> = Vec::new();
+            let mut l_rows = 0u64;
+            let mut l_shard_idx = 0u32;
+            let mut l_emitted = 0u64;
+
+            for (file_idx, reader) in readers.iter().enumerate() {
+                let shards = reader
+                    .catalog()
+                    .layer_csr_shards_for_modality(modality_id, layer_name);
+                if shards.is_empty() {
+                    return Err(OpsError::LayerMissing {
+                        name: format!("{}/{}", info.name, layer_name),
+                        file_index: file_idx,
+                    });
+                }
+                for shard_entry in shards {
+                    let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+                    let n_rows = indptr.len() - 1;
+                    for local_row in 0..n_rows {
+                        let s = indptr[local_row] as usize;
+                        let e = indptr[local_row + 1] as usize;
+                        for j in s..e {
+                            l_indices.push(indices[j] as u32);
+                            encode_value(&mut l_values, data[j], layer_value_encoding)?;
+                        }
+                        let prev = *l_indptr.last().unwrap();
+                        l_indptr.push(prev + (e - s) as u64);
+                        l_rows += 1;
+
+                        if l_rows >= shard_target as u64 {
+                            let codec = select_codec(&l_values, layer_value_encoding);
+                            writer.write_layer_csr_shard_for(
+                                modality_id,
+                                layer_name,
+                                l_shard_idx,
+                                &l_indptr,
+                                &l_indices,
+                                &l_values,
+                                codec,
+                                layer_value_encoding,
+                                l_emitted,
+                            )?;
+                            l_emitted += l_rows;
+                            l_indptr = vec![0];
+                            l_indices.clear();
+                            l_values.clear();
+                            l_rows = 0;
+                            l_shard_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            if l_rows > 0 {
+                let codec = select_codec(&l_values, layer_value_encoding);
+                writer.write_layer_csr_shard_for(
+                    modality_id,
+                    layer_name,
+                    l_shard_idx,
+                    &l_indptr,
+                    &l_indices,
+                    &l_values,
+                    codec,
+                    layer_value_encoding,
+                    l_emitted,
+                )?;
             }
         }
     }
