@@ -570,7 +570,6 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
         }
 
         for layer_name in layer_names {
-            let csr = reader.read_layer_for(in_modality_id, &layer_name)?;
             let layer_value_encoding = {
                 let shards = reader
                     .catalog()
@@ -595,40 +594,54 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             let mut l_emitted = 0u64;
             let mut l_shard_idx = 0u32;
 
-            for row_idx in 0..csr.shape.0 {
-                let deleted = keep_mask.as_ref().is_some_and(|mask| !mask[row_idx]);
-                if deleted {
-                    continue;
-                }
-                let row_start = csr.indptr[row_idx] as usize;
-                let row_end = csr.indptr[row_idx + 1] as usize;
-                for j in row_start..row_end {
-                    l_indices.push(csr.indices[j] as u32);
-                    encode_value(&mut l_values, csr.data[j], layer_value_encoding)?;
-                }
-                let prev = *l_indptr.last().unwrap();
-                l_indptr.push(prev + (row_end - row_start) as u64);
-                l_rows += 1;
+            // Stream layer shards one at a time (peak memory: one shard,
+            // not the whole layer) — mirrors the X-stream pattern above.
+            for shard_entry in reader
+                .catalog()
+                .layer_csr_shards_for_modality(in_modality_id, &layer_name)
+            {
+                let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+                let shard_row_start =
+                    shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+                let shard_n_rows = indptr.len() - 1;
+                for local_row in 0..shard_n_rows {
+                    let global_idx = shard_row_start + local_row as u64;
+                    let deleted = keep_mask
+                        .as_ref()
+                        .is_some_and(|mask| !mask[global_idx as usize]);
+                    if deleted {
+                        continue;
+                    }
+                    let row_start = indptr[local_row] as usize;
+                    let row_end = indptr[local_row + 1] as usize;
+                    for j in row_start..row_end {
+                        l_indices.push(indices[j] as u32);
+                        encode_value(&mut l_values, data[j], layer_value_encoding)?;
+                    }
+                    let prev = *l_indptr.last().unwrap();
+                    l_indptr.push(prev + (row_end - row_start) as u64);
+                    l_rows += 1;
 
-                if l_rows >= shard_target as u64 {
-                    let codec = select_codec(&l_values, layer_value_encoding);
-                    writer.write_layer_csr_shard_for(
-                        out_modality_id,
-                        &layer_name,
-                        l_shard_idx,
-                        &l_indptr,
-                        &l_indices,
-                        &l_values,
-                        codec,
-                        layer_value_encoding,
-                        l_emitted,
-                    )?;
-                    l_emitted += l_rows;
-                    l_indptr = vec![0];
-                    l_indices.clear();
-                    l_values.clear();
-                    l_rows = 0;
-                    l_shard_idx += 1;
+                    if l_rows >= shard_target as u64 {
+                        let codec = select_codec(&l_values, layer_value_encoding);
+                        writer.write_layer_csr_shard_for(
+                            out_modality_id,
+                            &layer_name,
+                            l_shard_idx,
+                            &l_indptr,
+                            &l_indices,
+                            &l_values,
+                            codec,
+                            layer_value_encoding,
+                            l_emitted,
+                        )?;
+                        l_emitted += l_rows;
+                        l_indptr = vec![0];
+                        l_indices.clear();
+                        l_values.clear();
+                        l_rows = 0;
+                        l_shard_idx += 1;
+                    }
                 }
             }
             if l_rows > 0 {
