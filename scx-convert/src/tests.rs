@@ -3767,3 +3767,110 @@ fn convert_h5mu_with_index_obs_emits_skip_warning() {
         "h5mu output must not carry an obs predicate index until per-modality lookup lands"
     );
 }
+
+// -----------------------------------------------------------------------
+// Phase 5b: detection bitmaps
+// -----------------------------------------------------------------------
+
+#[test]
+fn convert_with_bitmap_always_emits_section() {
+    use scx_format::section::SectionType;
+    use scx_format::BitmapShard;
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("output.scx");
+    create_test_h5ad(&h5ad_path, 8, 4, "csr", false);
+
+    let opts = ConvertOptions {
+        bitmap: super::pipeline::BitmapPolicy::Always,
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(
+        reader.header().has_bitmap(),
+        "has_bitmap flag should be set"
+    );
+    let bm_entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::BitmapShard)
+        .collect();
+    assert_eq!(
+        bm_entries.len(),
+        reader.header().n_csr_shards as usize,
+        "one bitmap shard per CSR shard under always policy",
+    );
+    // Decode shard 0 and sanity-check against a CSR scan.
+    let bm0 = reader.read_bitmap_shard(0).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    let dense = csr.to_dense().unwrap();
+    let n_vars = bm0.n_vars as usize;
+    // shard 0 spans rows [bm0.row_start, bm0.row_start + bm0.n_rows).
+    let row_start = bm0.row_start as usize;
+    let row_end = row_start + bm0.n_rows as usize;
+    for col in 0..bm0.n_vars as usize {
+        let mut expected = 0u64;
+        for row in row_start..row_end {
+            if dense[row * n_vars + col] != 0.0 {
+                expected += 1;
+            }
+        }
+        assert_eq!(
+            bm0.gene_detection_count(col as u32),
+            expected,
+            "gene {col} count mismatch in shard 0",
+        );
+    }
+    let _ = BitmapShard::build_from_csr(0, 0, 1, &[0], &[]); // sanity: type is callable from test crate
+}
+
+#[test]
+fn convert_with_bitmap_auto_dense_skips() {
+    // Fixture has density ~ 50% (2-3 nnz per row in 4-col matrix) which
+    // is above the 30% auto-density threshold.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("output.scx");
+    create_test_h5ad(&h5ad_path, 8, 4, "csr", false);
+
+    let opts = ConvertOptions {
+        bitmap: super::pipeline::BitmapPolicy::Auto,
+        ..ConvertOptions::default()
+    };
+    let counter = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let counter_clone = counter.clone();
+    let mut sink = WarningSink::with_handler(move |w| {
+        if matches!(w, super::warnings::ConvertWarning::BitmapSkipped { .. }) {
+            *counter_clone.lock().unwrap() += 1;
+        }
+    });
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(
+        !reader.header().has_bitmap(),
+        "auto+dense fixture should not write bitmaps"
+    );
+    assert!(
+        *counter.lock().unwrap() > 0,
+        "expected at least one BitmapSkipped warning under auto on a dense fixture"
+    );
+}
+
+#[test]
+fn bitmap_off_default_no_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let scx_path = dir.path().join("output.scx");
+    create_test_h5ad(&h5ad_path, 6, 4, "csr", false);
+
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(!reader.header().has_bitmap());
+}

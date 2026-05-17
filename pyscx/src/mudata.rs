@@ -188,6 +188,7 @@ pub fn from_h5mu_impl(
     index_var: Vec<String>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
     use pyo3::exceptions::PyValueError;
     let explicit_codec = crate::anndata::parse_codec(codec)?;
@@ -200,6 +201,8 @@ pub fn from_h5mu_impl(
             )));
         }
     };
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = crate::anndata::parse_memory_budget(memory_budget.as_ref())?;
 
@@ -247,6 +250,7 @@ pub fn from_h5mu_impl(
         index_var,
         index_preset,
         index_auto_threshold,
+        bitmap: bitmap_policy,
     };
 
     let input = std::path::PathBuf::from(path);

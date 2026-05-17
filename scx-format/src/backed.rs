@@ -1038,6 +1038,134 @@ impl BackedCsrReader {
         }
     }
 
+    /// Phase 5b: modality-scoped X read for bitmap fallbacks. Mirrors
+    /// `read_all()` for the X path but honours `self.modality_id()` so
+    /// per-modality `BackedCsrReader`s on multimodal files do not fold
+    /// in rows from other modalities. Layer readers route through the
+    /// global layer path (bitmaps are X-only, so this method is never
+    /// called on layer readers in practice).
+    #[cfg(feature = "deletion-vectors")]
+    fn read_all_modality_scoped(&self) -> Result<ScxCsr> {
+        if let Some(name) = &self.layer_name {
+            return self.reader.read_layer(name);
+        }
+        let modality_id = self.modality_id();
+        if modality_id == 0 {
+            self.reader.read_all_csr_shards()
+        } else {
+            self.reader.read_all_csr_shards_for(modality_id)
+        }
+    }
+
+    /// Phase 5b: which modality this backed reader is scoped to. Used
+    /// by [`Self::gene_detection_counts`] / [`Self::cells_expressing_gene`]
+    /// to look up the matching bitmap sidecar shards.
+    ///
+    /// Returns `0` for unimodal files and for the global X path on
+    /// multimodal files; `for_modality(reader, id, ...)` returns `id`.
+    pub fn modality_id(&self) -> u8 {
+        self.x_sorted_entries
+            .first()
+            .map(|e| e.modality_id)
+            .unwrap_or(0)
+    }
+
+    /// Phase 5b: are per-modality detection bitmap shards present on
+    /// disk for every CSR shard? Fast path predicate for
+    /// [`Self::gene_detection_counts`] — if `false`, the helpers fall
+    /// back to a CSR scan.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn has_full_bitmap_coverage(&self) -> bool {
+        if !self.reader.header().has_bitmap() {
+            return false;
+        }
+        let modality_id = self.modality_id();
+        self.reader.bitmap_shard_count(modality_id) == self.x_sorted_entries.len()
+            && !self.x_sorted_entries.is_empty()
+    }
+
+    /// Phase 5b: per-gene detection counts across the entire shard
+    /// range this reader covers. Length is `self.n_vars()`.
+    ///
+    /// Fast path: when every CSR shard has a matching bitmap sidecar,
+    /// sum `RoaringBitmap::len()` per gene. Otherwise falls back to a
+    /// CSR scan via `read_all().to_dense()` — the slow path is the
+    /// reason the auto-policy / `--bitmap=always` flag exists.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn gene_detection_counts(&self) -> Result<Vec<u64>> {
+        let n_vars = self.n_vars;
+        let mut out = vec![0u64; n_vars];
+        if self.has_full_bitmap_coverage() {
+            let modality_id = self.modality_id();
+            for shard_idx in 0..self.x_sorted_entries.len() {
+                let shard = self.reader.read_bitmap_shard_for(modality_id, shard_idx)?;
+                for (&gene_id, bm) in &shard.genes {
+                    let g = gene_id as usize;
+                    if g < n_vars {
+                        out[g] = out[g].saturating_add(bm.len());
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // Fallback: scan CSR. Counts the distinct rows per column.
+        // Modality-scoped so per-modality readers don't fold in rows
+        // from other modalities on multimodal files.
+        let csr = self.read_all_modality_scoped()?;
+        for row in 0..csr.indptr.len().saturating_sub(1) {
+            let lo = csr.indptr[row] as usize;
+            let hi = csr.indptr[row + 1] as usize;
+            for &col in &csr.indices[lo..hi] {
+                let c = col as usize;
+                if c < n_vars {
+                    out[c] = out[c].saturating_add(1);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Phase 5b: global row indices of cells with `gene_idx > 0`.
+    /// Uses bitmap sidecars when present; otherwise scans CSR.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn cells_expressing_gene(&self, gene_idx: u32) -> Result<Vec<u32>> {
+        if (gene_idx as usize) >= self.n_vars {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "gene_idx {gene_idx} out of range (n_vars = {})",
+                    self.n_vars
+                ),
+            )));
+        }
+        let mut out: Vec<u32> = Vec::new();
+        if self.has_full_bitmap_coverage() {
+            let modality_id = self.modality_id();
+            for shard_idx in 0..self.x_sorted_entries.len() {
+                let shard = self.reader.read_bitmap_shard_for(modality_id, shard_idx)?;
+                if let Some(bm) = shard.cells_expressing(gene_idx) {
+                    let row_start = shard.row_start as u32;
+                    for local in bm {
+                        out.push(row_start.saturating_add(local));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // Fallback: scan CSR for the gene column. Modality-scoped so
+        // per-modality readers don't pick up rows from other modalities
+        // on multimodal files.
+        let csr = self.read_all_modality_scoped()?;
+        for row in 0..csr.indptr.len().saturating_sub(1) {
+            let lo = csr.indptr[row] as usize;
+            let hi = csr.indptr[row + 1] as usize;
+            if csr.indices[lo..hi].contains(&(gene_idx as i32)) {
+                out.push(row as u32);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read a single decoded shard without caching.
     ///
     /// Use this for sequential streaming workloads (aggregation, col_sums,
@@ -3402,5 +3530,116 @@ mod tests {
         assert_eq!(trait_obj.csc_shard_col_range(99), None);
         let s0 = trait_obj.read_csc_shard(0).unwrap();
         assert_eq!(s0.n_cols(), 4);
+    }
+
+    /// Phase 5b regression: when bitmaps are missing on a multimodal
+    /// file, the CSR fallback in `gene_detection_counts` /
+    /// `cells_expressing_gene` must read only the requested modality's
+    /// shards. Pre-fix this called `read_all()` (global) and folded in
+    /// rows from every modality.
+    #[cfg(feature = "deletion-vectors")]
+    #[test]
+    fn multimodal_fallback_does_not_mix_modalities() {
+        use crate::modality::ModalityType;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multimodal.scx");
+        let n_obs: u64 = 4;
+        // Both modalities use the same n_vars (4) but distribute their
+        // nonzeros differently, so a global merge would visibly inflate
+        // the per-gene counts.
+        let n_vars: u64 = 4;
+        let header = sample_header(n_obs, n_vars, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(4)).unwrap();
+        writer.write_var_for(atac_id, &sample_var(4)).unwrap();
+        writer.set_modality_n_vars(rna_id, 4).unwrap();
+        writer.set_modality_n_vars(atac_id, 4).unwrap();
+
+        // RNA: cells 0..4 all express only gene 0.
+        let rna_indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
+        let rna_indices: Vec<u32> = vec![0, 0, 0, 0];
+        let rna_values: Vec<u8> = vec![1, 1, 1, 1];
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &rna_indptr,
+                &rna_indices,
+                &rna_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        // ATAC: cells 0..4 all express only gene 3.
+        let atac_indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
+        let atac_indices: Vec<u32> = vec![3, 3, 3, 3];
+        let atac_values: Vec<u8> = vec![1, 1, 1, 1];
+        writer
+            .write_csr_shard_for(
+                atac_id,
+                &atac_indptr,
+                &atac_indices,
+                &atac_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        // No bitmap shards were written → both methods hit the
+        // CSR fallback path. Without the modality-scoped read, the
+        // global path folds in ATAC's gene 3 rows when asked about
+        // RNA (and vice versa).
+        let rna_reader = ScxReader::open(&path).unwrap();
+        let rna_backed = BackedCsrReader::for_modality(rna_reader, rna_id, 0);
+        assert!(
+            !rna_backed.has_full_bitmap_coverage(),
+            "no bitmaps were written; expected fallback path"
+        );
+        let rna_counts = rna_backed.gene_detection_counts().unwrap();
+        assert_eq!(
+            rna_counts,
+            vec![4, 0, 0, 0],
+            "RNA-only counts must not include ATAC's gene 3"
+        );
+
+        let atac_reader = ScxReader::open(&path).unwrap();
+        let atac_backed = BackedCsrReader::for_modality(atac_reader, atac_id, 0);
+        let atac_counts = atac_backed.gene_detection_counts().unwrap();
+        assert_eq!(
+            atac_counts,
+            vec![0, 0, 0, 4],
+            "ATAC-only counts must not include RNA's gene 0"
+        );
+
+        // cells_expressing_gene must follow the same scoping. RNA's
+        // gene 3 has no hits; pre-fix this would return ATAC's rows.
+        let rna_reader = ScxReader::open(&path).unwrap();
+        let rna_backed = BackedCsrReader::for_modality(rna_reader, rna_id, 0);
+        let rna_gene3 = rna_backed.cells_expressing_gene(3).unwrap();
+        assert!(
+            rna_gene3.is_empty(),
+            "RNA modality has no cells expressing gene 3; got {rna_gene3:?}"
+        );
     }
 }

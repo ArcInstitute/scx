@@ -93,6 +93,8 @@ impl ModalityFlags {
     pub const HAS_LAYERS: u8 = 1 << 3;
     /// Modality has uns metadata.
     pub const HAS_UNS: u8 = 1 << 4;
+    /// Phase 5b: modality has at least one detection-bitmap sidecar shard.
+    pub const HAS_BITMAP: u8 = 1 << 5;
 
     pub const fn bits(self) -> u8 {
         self.0
@@ -117,6 +119,9 @@ impl ModalityFlags {
     pub fn has_uns(self) -> bool {
         self.0 & Self::HAS_UNS != 0
     }
+    pub fn has_bitmap(self) -> bool {
+        self.0 & Self::HAS_BITMAP != 0
+    }
 
     pub fn set_csc(&mut self) {
         self.0 |= Self::HAS_CSC;
@@ -132,6 +137,9 @@ impl ModalityFlags {
     }
     pub fn set_uns(&mut self) {
         self.0 |= Self::HAS_UNS;
+    }
+    pub fn set_bitmap(&mut self) {
+        self.0 |= Self::HAS_BITMAP;
     }
 }
 

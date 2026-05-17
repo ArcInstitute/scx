@@ -1243,6 +1243,40 @@ impl ScxReader {
 
     /// Read deletion vectors if present. Returns `Ok(None)` if the file has no DV flag set.
     #[cfg(feature = "deletion-vectors")]
+    /// Phase 5b: read a single detection-bitmap shard by index, scoped
+    /// to a modality (`modality_id == 0` for unimodal files). Shards
+    /// are ordered by `row_start`, matching the CSR shard order.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_bitmap_shard_for(
+        &self,
+        modality_id: u8,
+        shard_idx: usize,
+    ) -> Result<crate::bitmap::BitmapShard> {
+        let entries = self.full_catalog.bitmap_shards_for_modality(modality_id);
+        let entry = entries.get(shard_idx).ok_or_else(|| {
+            ScxError::SectionNotFound(format!(
+                "X/bitmap/shard_{shard_idx} (modality_id={modality_id})"
+            ))
+        })?;
+        let slice = self.section_bytes(entry)?;
+        crate::bitmap::BitmapShard::read_from(&mut Cursor::new(slice), slice.len())
+    }
+
+    /// Phase 5b: unimodal helper — equivalent to
+    /// `read_bitmap_shard_for(0, shard_idx)`.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_bitmap_shard(&self, shard_idx: usize) -> Result<crate::bitmap::BitmapShard> {
+        self.read_bitmap_shard_for(0, shard_idx)
+    }
+
+    /// Number of bitmap shards available for a modality (0 if none).
+    #[cfg(feature = "deletion-vectors")]
+    pub fn bitmap_shard_count(&self, modality_id: u8) -> usize {
+        self.full_catalog
+            .bitmap_shards_for_modality(modality_id)
+            .len()
+    }
+
     pub fn read_deletion_vectors(
         &self,
     ) -> Result<Option<crate::deletion_vectors::DeletionVectors>> {

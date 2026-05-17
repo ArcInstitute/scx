@@ -2,9 +2,11 @@
 
 use std::path::PathBuf;
 
-use numpy::PyReadonlyArray1;
+use arrow::array::Array;
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use scx_engine::QueryPipeline;
+use scx_format::backed::BackedCsrReader;
 use scx_format::ScxReader;
 
 use crate::anndata;
@@ -25,6 +27,173 @@ impl PyExperiment {
     pub fn new(reader: ScxReader, path: PathBuf) -> Self {
         Self { reader, path }
     }
+}
+
+/// Phase 5b: open a fresh `BackedCsrReader` for the requested modality
+/// from a file path. `modality = None` → modality_id 0 (the unimodal /
+/// global X) on non-multimodal files; on multimodal files we require an
+/// explicit modality unless there is exactly one.
+fn open_backed_csr(path: &PathBuf, modality: Option<&str>) -> PyResult<BackedCsrReader> {
+    let opened = ScxReader::open(path).map_err(to_pyerr)?;
+    if !opened.is_multimodal() {
+        return Ok(BackedCsrReader::new(opened, 4));
+    }
+    let modality_id = match modality {
+        Some(name) => opened.modality_id(name).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{name}'"))
+        })?,
+        None => {
+            let names = opened.modality_names();
+            if names.len() == 1 {
+                opened.modality_id(names[0]).unwrap_or(1)
+            } else {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "file is multimodal with {} modalities; pass modality=... \
+                     (one of {:?})",
+                    names.len(),
+                    names
+                )));
+            }
+        }
+    };
+    Ok(BackedCsrReader::for_modality(opened, modality_id, 4))
+}
+
+/// Resolve a gene name against the appropriate modality's `var`.
+fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> PyResult<u32> {
+    use scx_format::SectionType;
+    let modality_id = if reader.is_multimodal() {
+        match modality {
+            Some(m) => reader.modality_id(m).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{m}'"))
+            })?,
+            None => {
+                let names = reader.modality_names();
+                if names.len() == 1 {
+                    reader.modality_id(names[0]).unwrap_or(1)
+                } else {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "file is multimodal; pass modality=... to resolve gene name",
+                    ));
+                }
+            }
+        }
+    } else {
+        0
+    };
+    let var_section_name = if modality_id == 0 {
+        "var".to_string()
+    } else {
+        match reader.modality_info(modality_id) {
+            Some(info) => format!("var/{}", info.name),
+            None => "var".to_string(),
+        }
+    };
+    let entry = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::VarMetadata && e.name == var_section_name)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!(
+                "var section '{var_section_name}' not found"
+            ))
+        })?;
+    let bytes = reader.section_bytes(entry).map_err(to_pyerr)?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut arrow_reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let batch = arrow_reader
+        .next()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("var record batch is empty"))?
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    // Probe column order:
+    //   1. Columns named in the Arrow IPC `pandas` schema metadata's
+    //      `index_columns` array (the authoritative source from
+    //      `Table.from_pandas`, including named indexes like
+    //      `var.index.name = "gene_symbols"`).
+    //   2. `__index_level_0__` — the canonical pyarrow name for an
+    //      unnamed pandas index.
+    //   3. The original heuristic list, kept so any files that pre-date
+    //      pandas-metadata-aware writes still resolve.
+    let pandas_index_cols = pandas_index_columns(batch.schema().as_ref());
+    let fallback_columns = [
+        "__index_level_0__",
+        "_index",
+        "gene_name",
+        "feature_name",
+        "gene_id",
+        "name",
+    ];
+    let probe = pandas_index_cols
+        .iter()
+        .map(String::as_str)
+        .chain(fallback_columns.iter().copied());
+    for col_name in probe {
+        if let Some(idx) = lookup_string_in_column(&batch, col_name, name) {
+            return Ok(idx);
+        }
+    }
+    Err(pyo3::exceptions::PyKeyError::new_err(format!(
+        "gene name '{name}' not found in var index"
+    )))
+}
+
+/// Decode `index_columns` from the Arrow IPC schema's `pandas`
+/// metadata key. `Table.from_pandas(df)` stamps this with a JSON
+/// envelope of the form `{"index_columns": ["gene_symbols", ...], ...}`
+/// (string for named indexes; a dict envelope for `RangeIndex`, which
+/// we skip — those never name a gene). Returns an empty vec when the
+/// key is absent or malformed; callers fall through to the next probe.
+fn pandas_index_columns(schema: &arrow::datatypes::Schema) -> Vec<String> {
+    let Some(raw) = schema.metadata().get("pandas") else {
+        return Vec::new();
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get("index_columns")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Scan a single string column of a `RecordBatch` for an exact match
+/// and return the row index. Handles both `Utf8` (`StringArray`) and
+/// `LargeUtf8` (`LargeStringArray`). Returns `None` when the column
+/// is absent, has a non-string dtype, or contains no match.
+fn lookup_string_in_column(
+    batch: &arrow::record_batch::RecordBatch,
+    col_name: &str,
+    target: &str,
+) -> Option<u32> {
+    let (idx, _) = batch.schema().column_with_name(col_name)?;
+    let col = batch.column(idx);
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) && arr.value(i) == target {
+                return Some(i as u32);
+            }
+        }
+    }
+    if let Some(arr) = col
+        .as_any()
+        .downcast_ref::<arrow::array::LargeStringArray>()
+    {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) && arr.value(i) == target {
+                return Some(i as u32);
+            }
+        }
+    }
+    None
 }
 
 #[pymethods]
@@ -264,6 +433,72 @@ impl PyExperiment {
     /// `to_anndata()`.
     fn to_mudata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         crate::mudata::to_mudata(py, &self.reader)
+    }
+
+    /// Phase 5b: per-gene detection counts (number of cells where
+    /// each gene is expressed).
+    ///
+    /// Only `axis="var"` is supported in the first cut (per-cell
+    /// detection counts would require a transpose). On multimodal
+    /// files, pass `modality=` to select a specific modality;
+    /// otherwise the global X (modality_id = 0) is used.
+    ///
+    /// Fast path: when bitmap sidecars are present for every CSR
+    /// shard, this is O(roaring-cardinality). Otherwise the call
+    /// falls back to a full CSR scan.
+    ///
+    /// Returns a numpy `int64` array of length `n_vars`.
+    #[pyo3(signature = (axis = "var", modality = None))]
+    fn detection_counts<'py>(
+        &self,
+        py: Python<'py>,
+        axis: &str,
+        modality: Option<&str>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        if axis != "var" {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "detection_counts: only axis='var' is supported (got '{axis}')"
+            )));
+        }
+        let backed = open_backed_csr(&self.path, modality)?;
+        let counts: Vec<i64> = py
+            .allow_threads(|| backed.gene_detection_counts())
+            .map_err(to_pyerr)?
+            .into_iter()
+            .map(|c| c as i64)
+            .collect();
+        Ok(PyArray1::from_vec(py, counts))
+    }
+
+    /// Phase 5b: global row indices of cells expressing the given gene.
+    ///
+    /// `gene` may be either an integer gene index (`0..n_vars`) or a
+    /// string name (looked up against the modality's `var.index`).
+    /// Returns a numpy `uint32` array of global row ids.
+    #[pyo3(signature = (gene, modality = None))]
+    fn cells_expressing<'py>(
+        &self,
+        py: Python<'py>,
+        gene: &Bound<'_, PyAny>,
+        modality: Option<&str>,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let backed = open_backed_csr(&self.path, modality)?;
+        // Resolve gene → gene_idx. Integer fast path; string falls
+        // through to a var.index lookup.
+        let gene_idx: u32 = if let Ok(idx) = gene.extract::<u32>() {
+            idx
+        } else {
+            let name: String = gene.extract().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "gene must be an integer index or a string name",
+                )
+            })?;
+            resolve_gene_name(&self.reader, modality, &name)?
+        };
+        let rows = py
+            .allow_threads(|| backed.cells_expressing_gene(gene_idx))
+            .map_err(to_pyerr)?;
+        Ok(PyArray1::from_vec(py, rows))
     }
 
     fn __repr__(&self) -> String {

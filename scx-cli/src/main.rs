@@ -137,6 +137,16 @@ enum Commands {
         /// when no explicit columns or preset are supplied.
         #[arg(long, default_value_t = 1000)]
         index_auto_threshold: usize,
+        /// Phase 5b: detection-bitmap shard generation.
+        ///
+        /// `off` (default) emits CSR only. `always` writes a bitmap
+        /// sidecar for every CSR shard. `auto` writes a sidecar when
+        /// the shard is sparse, `n_vars ≤ 1_000_000`, and the
+        /// estimated bitmap size ≤ 15 % of the encoded CSR shard
+        /// (ATAC modalities are always-on under `auto`). See
+        /// `pyscx.detection_counts` / `cells_expressing`.
+        #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
+        bitmap: String,
     },
     /// Display SCX file information
     Info {
@@ -444,6 +454,7 @@ fn main() {
             index_var,
             index_preset,
             index_auto_threshold,
+            bitmap,
         } => run_convert(
             &input,
             &output,
@@ -465,6 +476,7 @@ fn main() {
             index_var.as_deref(),
             index_preset,
             index_auto_threshold,
+            &bitmap,
         ),
         Commands::Info {
             file,
@@ -639,6 +651,7 @@ fn run_convert(
     index_var: Option<&str>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -749,6 +762,7 @@ fn run_convert(
         index_var_list,
         index_preset_value,
         index_auto_threshold,
+        bitmap,
     )
 }
 
@@ -821,10 +835,12 @@ fn dispatch_convert(
     index_var: Vec<String>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use convert::{ConvertError, ConvertOptions};
+    use convert::{BitmapPolicy, ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
     use scx_codec::CodecId;
+    let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
 
     let explicit_codec = match codec {
         "auto" => None,
@@ -859,6 +875,7 @@ fn dispatch_convert(
         index_var,
         index_preset,
         index_auto_threshold,
+        bitmap: bitmap_policy,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -971,6 +988,7 @@ fn dispatch_convert(
     _index_var: Vec<String>,
     _index_preset: Option<String>,
     _index_auto_threshold: usize,
+    _bitmap: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

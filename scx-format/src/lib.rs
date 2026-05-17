@@ -1,5 +1,7 @@
 pub mod arrow_compat;
 pub mod backed;
+#[cfg(feature = "deletion-vectors")]
+pub mod bitmap;
 pub mod catalog;
 pub mod catalog_view;
 pub mod checksum;
@@ -21,6 +23,11 @@ pub use arrow_compat::{downcast_large_types, upcast_to_large_types};
 pub use backed::{
     concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
     BackedCsrReader, CacheMetrics,
+};
+#[cfg(feature = "deletion-vectors")]
+pub use bitmap::{
+    BitmapPolicy, BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC,
+    BITMAP_SHARD_VERSION,
 };
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;

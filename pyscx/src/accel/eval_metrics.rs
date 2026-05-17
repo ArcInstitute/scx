@@ -631,6 +631,10 @@ fn extract_obs_column<'py>(
 ///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
 ///     control: Label for control perturbation (default: "control")
 ///     metrics: List of metric names to compute (default: all five)
+///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None).
+///         When set, the per-perturbation means are computed in embedding space
+///         rather than gene space. Both adatas must expose obsm[embed_key] with
+///         the same trailing dimension.
 ///     min_cells_per_group: Skip groups with fewer cells (default: 1)
 ///
 /// Returns:
@@ -641,7 +645,7 @@ fn extract_obs_column<'py>(
 ///     # results["pearson_delta"]["drug_A"] == 0.95
 ///     # results["mse"]["drug_A"] == 0.12
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, embed_key=None, min_cells_per_group=1))]
 #[allow(clippy::too_many_arguments)]
 pub fn perturbation_metrics<'py>(
     py: Python<'py>,
@@ -650,6 +654,7 @@ pub fn perturbation_metrics<'py>(
     pert_col: &str,
     control: &str,
     metrics: Option<Vec<String>>,
+    embed_key: Option<&str>,
     min_cells_per_group: usize,
 ) -> PyResult<PyObject> {
     // Determine which metrics to compute.
@@ -682,7 +687,7 @@ pub fn perturbation_metrics<'py>(
             adata_pred,
             pert_col,
             control,
-            None, // no embed_key for perturbation_metrics
+            embed_key,
             min_cells_per_group,
         )?;
 

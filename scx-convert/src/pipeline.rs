@@ -28,6 +28,7 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes, BuildOutcome, ConversionPredicateIndexOptions,
     SkipReason,
 };
+use scx_format::bitmap::BitmapShard;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
@@ -126,7 +127,110 @@ pub struct ConvertOptions {
     /// when neither `index_obs`/`index_var` nor `index_preset` is set.
     /// Default 1000.
     pub index_auto_threshold: usize,
+    /// Phase 5b: detection-bitmap shard generation policy. Default
+    /// `Off` (explicit opt-in, matches `--csc` ergonomics).
+    pub bitmap: BitmapPolicy,
 }
+
+/// Phase 5b: density threshold below which `--bitmap=auto` considers a
+/// shard "sparse enough" for bitmaps. Above this, the CSR storage is
+/// already dense-ish (>30% nonzero) and bitmaps offer little win.
+const BITMAP_AUTO_DENSITY_THRESHOLD: f32 = 0.30;
+/// Phase 5b: `n_vars` cap for `--bitmap=auto`. Tied to the per-row
+/// allocator cost on extremely wide matrices.
+const BITMAP_AUTO_N_VARS_CAP: u32 = 1_000_000;
+/// Phase 5b: bitmap size budget under `--bitmap=auto`, expressed as a
+/// percentage of the encoded CSR shard size. Roaring sizes vary enough
+/// that this is checked *after* the build, not before.
+const BITMAP_AUTO_SIZE_PERCENT: usize = 15;
+
+/// Phase 5b: build (and conditionally write) a detection bitmap for
+/// one CSR shard.
+///
+/// `modality_type` and `modality_name` drive the auto policy
+/// (ATAC modalities are eager; everything else compares estimated
+/// bitmap size against `encoded_csr_size`).
+///
+/// Returns whether a bitmap section was actually written so callers
+/// can stamp provenance.
+#[allow(clippy::too_many_arguments)]
+fn build_and_write_bitmap_for_shard(
+    writer: &mut ScxWriter,
+    indptr: &[u64],
+    indices: &[u32],
+    row_start: u64,
+    n_rows: u32,
+    n_vars: u32,
+    encoded_csr_size: usize,
+    policy: BitmapPolicy,
+    modality_type: ModalityType,
+    modality_name: Option<&str>,
+    sink: &mut WarningSink,
+) -> Result<bool, ConvertError> {
+    if matches!(policy, BitmapPolicy::Off) {
+        return Ok(false);
+    }
+    if n_vars > BITMAP_AUTO_N_VARS_CAP && !matches!(policy, BitmapPolicy::Always) {
+        sink.emit(ConvertWarning::BitmapSkipped {
+            modality: modality_name.map(String::from),
+            reason: format!("n_vars {n_vars} exceeds auto cap {BITMAP_AUTO_N_VARS_CAP}"),
+        });
+        return Ok(false);
+    }
+
+    let nnz = *indptr.last().unwrap_or(&0);
+    let cells = n_rows as u64;
+    let density = if cells == 0 || n_vars == 0 {
+        0.0_f32
+    } else {
+        nnz as f32 / (cells as f32 * n_vars as f32)
+    };
+    if matches!(policy, BitmapPolicy::Auto)
+        && density > BITMAP_AUTO_DENSITY_THRESHOLD
+        && !matches!(modality_type, ModalityType::Atac)
+    {
+        sink.emit(ConvertWarning::BitmapSkipped {
+            modality: modality_name.map(String::from),
+            reason: format!(
+                "density {density:.3} above auto threshold {BITMAP_AUTO_DENSITY_THRESHOLD}"
+            ),
+        });
+        return Ok(false);
+    }
+
+    let shard = BitmapShard::build_from_csr(row_start, n_rows, n_vars, indptr, indices);
+
+    if matches!(policy, BitmapPolicy::Auto) && !matches!(modality_type, ModalityType::Atac) {
+        let est = shard.estimated_encoded_size();
+        // est <= 15% * encoded_csr_size  ⇔  est * 100 <= encoded_csr_size * 15
+        if encoded_csr_size > 0
+            && est.saturating_mul(100) > encoded_csr_size.saturating_mul(BITMAP_AUTO_SIZE_PERCENT)
+        {
+            sink.emit(ConvertWarning::BitmapSkipped {
+                modality: modality_name.map(String::from),
+                reason: format!(
+                    "estimated {est} bytes > {BITMAP_AUTO_SIZE_PERCENT}% of CSR shard ({encoded_csr_size})"
+                ),
+            });
+            return Ok(false);
+        }
+    }
+
+    writer
+        .write_bitmap_shard(&shard)
+        .map_err(ConvertError::from)?;
+    Ok(true)
+}
+
+/// Phase 5b: detection-bitmap generation policy.
+///
+/// Re-exported from [`scx_format::BitmapPolicy`] so callers that depend
+/// on `scx-convert` (CLI, pyscx with hdf5) can name it without an
+/// extra `scx_format` import. The actual definition lives in
+/// `scx-format` so the CPU-only pyscx build (which doesn't pull in
+/// `scx-convert`) can still drive bitmap generation from its in-memory
+/// write path.
+pub use scx_format::BitmapPolicy;
 
 impl Default for ConvertOptions {
     fn default() -> Self {
@@ -147,6 +251,7 @@ impl Default for ConvertOptions {
             index_var: Vec::new(),
             index_preset: None,
             index_auto_threshold: 1000,
+            bitmap: BitmapPolicy::Off,
         }
     }
 }
@@ -312,9 +417,11 @@ pub fn h5ad_to_scx(
         n_obs,
         n_vars,
         opts.shard_target_rows as usize,
-        value_encoding,
         codec_id,
         index_dtype,
+        opts.bitmap,
+        ModalityType::Rna,
+        sink,
     )?;
 
     // Optional CSC sidecar — streaming transpose over the in-memory
@@ -471,9 +578,11 @@ pub fn tenx_to_scx(
         tenx.n_cells,
         tenx.n_genes,
         opts.shard_target_rows as usize,
-        value_encoding,
         codec_id,
         index_dtype,
+        opts.bitmap,
+        ModalityType::Rna,
+        sink,
     )?;
 
     // Optional CSC sidecar — same streaming transpose as h5ad.
@@ -946,7 +1055,25 @@ pub fn streaming_writer_coordinator(
             modality_type,
             format!("{section_name_prefix}_{shard_idx}"),
         )?;
+        let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;
+        // Phase 5b: detection bitmap (only for primary X shards; layer
+        // shards are skipped — bitmaps are per X-axis presence today).
+        if section_type == SectionType::CsrShard {
+            build_and_write_bitmap_for_shard(
+                writer,
+                &shard.indptr,
+                &shard.indices,
+                row_start,
+                shard.n_rows,
+                n_vars_u32,
+                encoded_csr_size,
+                opts.bitmap,
+                modality_type,
+                None,
+                sink,
+            )?;
+        }
         row_ranges.push((row_start, row_start + n_rows));
         shard_idx += 1;
     }
@@ -1033,16 +1160,20 @@ fn write_csr_shards(
     indices: &[i32],
     data: &[f32],
     n_obs: usize,
-    _n_vars: usize,
+    n_vars: usize,
     shard_target_rows: usize,
-    value_encoding: ValueEncoding,
     codec_id: CodecId,
     index_dtype: u8,
+    bitmap_policy: BitmapPolicy,
+    modality_type: ModalityType,
+    sink: &mut WarningSink,
 ) -> Result<Vec<(u64, u64)>, ConvertError> {
-    let _ = index_dtype; // index dtype is set in the file header; writer reads it from there
+    let n_vars_u32 = u32::try_from(n_vars)
+        .map_err(|_| ConvertError::Other(format!("n_vars {n_vars} exceeds u32::MAX")))?;
 
     let mut row_ranges: Vec<(u64, u64)> = Vec::new();
     let mut row_start: usize = 0;
+    let mut shard_idx: u32 = 0;
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
@@ -1081,19 +1212,51 @@ fn write_csr_shards(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 
-        writer.write_csr_shard(
+        // Pre-encode so the bitmap auto-policy can compare against the
+        // post-codec section length (matches streaming + python in-memory
+        // paths). Section name `X_shard_{idx}` mirrors the name that
+        // `ScxWriter::write_csr_shard` constructs internally.
+        let pre = encode_one_shard(
             &shard_indptr,
             &shard_indices,
-            &raw_values,
-            codec_id,
-            value_encoding,
+            shard_data,
+            Some(codec_id),
+            index_dtype,
+            n_vars_u32,
             row_start as u64,
+            SectionType::CsrShard,
+            modality_type,
+            format!("X_shard_{shard_idx}"),
+        )?;
+        let encoded_csr_size = pre.section_length as usize;
+        writer.write_preencoded_shard(pre)?;
+
+        // Phase 5b: detection bitmap, post-CSR-write so a failed bitmap
+        // never strands a half-written file.
+        let n_rows_u32 = u32::try_from(row_end - row_start).map_err(|_| {
+            ConvertError::Other(format!(
+                "shard rows {} exceeds u32::MAX",
+                row_end - row_start
+            ))
+        })?;
+        build_and_write_bitmap_for_shard(
+            writer,
+            &shard_indptr,
+            &shard_indices,
+            row_start as u64,
+            n_rows_u32,
+            n_vars_u32,
+            encoded_csr_size,
+            bitmap_policy,
+            modality_type,
+            None,
+            sink,
         )?;
 
         row_ranges.push((row_start as u64, row_end as u64));
         row_start = row_end;
+        shard_idx += 1;
     }
     Ok(row_ranges)
 }

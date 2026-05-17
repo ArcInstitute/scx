@@ -26,6 +26,72 @@ use crate::to_pyerr;
 /// transpose working set.
 const PYSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Phase 5b: build and (conditionally) write a detection-bitmap shard
+/// for the in-memory `from_anndata` write path. Mirrors
+/// `scx_convert::pipeline::build_and_write_bitmap_for_shard` but emits
+/// a Python `UserWarning` instead of `ConvertWarning::BitmapSkipped`.
+///
+/// Only the unimodal RNA case is exercised here (multimodal MuData
+/// converts go through `scx-convert::h5mu_to_scx[_streaming]`); the
+/// auto policy is therefore conservative — no ATAC eagerness branch.
+#[allow(clippy::too_many_arguments)]
+fn build_and_write_bitmap_for_shard_python(
+    py: Python<'_>,
+    writer: &mut ScxWriter,
+    indptr: &[u64],
+    indices: &[u32],
+    row_start: u64,
+    n_rows: u32,
+    n_vars: u32,
+    encoded_csr_size: usize,
+    policy: scx_format::BitmapPolicy,
+) -> PyResult<()> {
+    use scx_format::bitmap::BitmapShard;
+    use scx_format::BitmapPolicy;
+    const DENSITY_THRESHOLD: f32 = 0.30;
+    const N_VARS_CAP: u32 = 1_000_000;
+    const SIZE_PERCENT: usize = 15;
+
+    let emit_warning = |msg: String| -> PyResult<()> {
+        py.import("warnings")?.call_method1("warn", (msg,))?;
+        Ok(())
+    };
+
+    if matches!(policy, BitmapPolicy::Off) {
+        return Ok(());
+    }
+    if n_vars > N_VARS_CAP && !matches!(policy, BitmapPolicy::Always) {
+        return emit_warning(format!(
+            "bitmap skipped: n_vars {n_vars} exceeds auto cap {N_VARS_CAP}"
+        ));
+    }
+    let nnz = *indptr.last().unwrap_or(&0);
+    let cells = n_rows as u64;
+    let density = if cells == 0 || n_vars == 0 {
+        0.0_f32
+    } else {
+        nnz as f32 / (cells as f32 * n_vars as f32)
+    };
+    if matches!(policy, BitmapPolicy::Auto) && density > DENSITY_THRESHOLD {
+        return emit_warning(format!(
+            "bitmap skipped: density {density:.3} above auto threshold {DENSITY_THRESHOLD}"
+        ));
+    }
+    let shard = BitmapShard::build_from_csr(row_start, n_rows, n_vars, indptr, indices);
+    if matches!(policy, BitmapPolicy::Auto) {
+        let est = shard.estimated_encoded_size();
+        if encoded_csr_size > 0
+            && est.saturating_mul(100) > encoded_csr_size.saturating_mul(SIZE_PERCENT)
+        {
+            return emit_warning(format!(
+                "bitmap skipped: estimated {est} bytes > {SIZE_PERCENT}% of CSR shard ({encoded_csr_size})"
+            ));
+        }
+    }
+    writer.write_bitmap_shard(&shard).map_err(to_pyerr)?;
+    Ok(())
+}
+
 /// Phase 5a: build and write obs / var predicate indexes from a Python
 /// in-memory AnnData write path. Thin wrapper over
 /// `scx_engine::build_and_write_conversion_predicate_indexes`; only the
@@ -2662,7 +2728,10 @@ pub(crate) fn route_backed_anndata_to_streaming(
     index_var: Vec<String>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older
     // name); we try both. Recent anndata returns `pathlib.PosixPath`
@@ -2759,6 +2828,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
         index_var,
         index_preset,
         index_auto_threshold,
+        bitmap: bitmap_policy,
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);
@@ -2879,6 +2949,7 @@ pub fn from_anndata_impl(
     index_var: Vec<String>,
     index_preset: Option<String>,
     index_auto_threshold: usize,
+    bitmap: &str,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
@@ -2932,6 +3003,7 @@ pub fn from_anndata_impl(
                 index_var,
                 index_preset,
                 index_auto_threshold,
+                bitmap,
             );
         }
         #[cfg(not(feature = "hdf5"))]
@@ -2945,6 +3017,7 @@ pub fn from_anndata_impl(
                 &index_var,
                 &index_preset,
                 index_auto_threshold,
+                bitmap,
             );
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "pyscx was built without the `hdf5` feature; backed AnnData \
@@ -3155,8 +3228,43 @@ pub fn from_anndata_impl(
         SectionType::CsrShard,
         "X",
     )?;
-    for section in pre_encoded {
+    // Phase 5b: parse bitmap policy once.
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    for (boundary, section) in boundaries.iter().zip(pre_encoded) {
+        let encoded_csr_size = section.section_length as usize;
         writer.write_preencoded_shard(section).map_err(to_pyerr)?;
+        if !matches!(bitmap_policy, scx_format::BitmapPolicy::Off) {
+            // Build the bitmap from the original CSR slice. boundary
+            // values are bounded to the (already-validated) slice
+            // lengths; the i64→u64 / i32→u32 casts mirror the
+            // `parallel_encode_csr_shards` contract.
+            let lo = boundary.row_start;
+            let hi = boundary.row_end;
+            let nnz_lo = boundary.nnz_start;
+            let nnz_hi = boundary.nnz_end;
+            let local_indptr: Vec<u64> = indptr_slice[lo..=hi]
+                .iter()
+                .map(|&v| (v - boundary.indptr_base) as u64)
+                .collect();
+            let local_indices: Vec<u32> = indices_slice[nnz_lo..nnz_hi]
+                .iter()
+                .map(|&v| v as u32)
+                .collect();
+            let n_rows = (hi - lo) as u32;
+            build_and_write_bitmap_for_shard_python(
+                py,
+                &mut writer,
+                &local_indptr,
+                &local_indices,
+                lo as u64,
+                n_rows,
+                n_vars as u32,
+                encoded_csr_size,
+                bitmap_policy,
+            )?;
+        }
     }
 
     // 1E.2: Collect obsm RecordBatches under GIL

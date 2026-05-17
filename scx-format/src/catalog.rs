@@ -900,6 +900,24 @@ impl FullCatalog {
         shards
     }
 
+    /// Phase 5b: return detection-bitmap shards belonging to a given
+    /// modality, sorted by `row_start`. Mirrors
+    /// [`Self::csr_shards_for_modality`] but filters on
+    /// `SectionType::BitmapShard`.
+    pub fn bitmap_shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::BitmapShard && e.modality_id == modality_id)
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(SectionType::BitmapShard))
+        });
+        shards
+    }
+
     /// Return CSC shards belonging to a given modality, sorted by
     /// `col_start`.
     pub fn csc_shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {

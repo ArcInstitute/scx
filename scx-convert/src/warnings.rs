@@ -50,6 +50,14 @@ pub enum ConvertWarning {
     /// skipped. Lifted once `QueryPipeline` grows per-modality
     /// predicate-index lookup (Phase 6 / follow-on).
     PredicateIndexSkippedMultimodal { columns: Vec<String> },
+    /// Phase 5b: detection bitmap was skipped on a shard because the
+    /// `--bitmap=auto` policy rejected it (density not sparse,
+    /// `n_vars` exceeds the cap, or estimated bitmap size > 15 % of
+    /// the CSR shard).
+    BitmapSkipped {
+        modality: Option<String>,
+        reason: String,
+    },
 }
 
 impl ConvertWarning {
@@ -68,6 +76,7 @@ impl ConvertWarning {
             Self::DuplicateCoordinatesMerged { .. } => "duplicate_coordinates_merged",
             Self::LayerSkipped { .. } => "layer_skipped",
             Self::PredicateIndexSkippedMultimodal { .. } => "predicate_index_skipped_multimodal",
+            Self::BitmapSkipped { .. } => "bitmap_skipped",
         }
     }
 }

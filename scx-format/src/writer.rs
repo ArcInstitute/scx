@@ -62,6 +62,18 @@ pub struct ScxWriter {
     entries: Vec<FullCatalogEntry>,
     csr_shard_count: u32,
     csc_shard_count: u32,
+    /// Phase 5b: count of bitmap sidecar shards written so far. Used by
+    /// `finish()` to flip `FileHeader::set_bitmap()` and (in the
+    /// unimodal case) by `write_bitmap_shard` to derive the next
+    /// shard's index.
+    #[cfg(feature = "deletion-vectors")]
+    bitmap_shard_count: u32,
+    /// Phase 5b: per-modality bitmap shard counter. Indexed by
+    /// `modality_id - 1`. Writer-only state (mirrors
+    /// [`Self::modality_build_csc`]) — the actual count is reconstructed
+    /// at read time from `FullCatalog::bitmap_shards_for_modality`.
+    #[cfg(feature = "deletion-vectors")]
+    modality_bitmap_counts: Vec<u32>,
     total_nnz: u64,
     has_obsm: bool,
     has_obsp: bool,
@@ -146,6 +158,10 @@ impl ScxWriter {
             entries: Vec::new(),
             csr_shard_count: 0,
             csc_shard_count: 0,
+            #[cfg(feature = "deletion-vectors")]
+            bitmap_shard_count: 0,
+            #[cfg(feature = "deletion-vectors")]
+            modality_bitmap_counts: Vec::new(),
             total_nnz: 0,
             has_obsm: false,
             has_obsp: false,
@@ -790,6 +806,8 @@ impl ScxWriter {
         };
         self.modalities.push(info);
         self.modality_build_csc.push(build_csc);
+        #[cfg(feature = "deletion-vectors")]
+        self.modality_bitmap_counts.push(0);
         Ok(self.modalities.len() as u8)
     }
 
@@ -1444,6 +1462,12 @@ impl ScxWriter {
         if self.has_obsp {
             self.header.set_obsp();
         }
+        // Phase 5b: header `has_bitmap` flag is set if ≥1 bitmap shard
+        // landed (unimodal or any modality).
+        #[cfg(feature = "deletion-vectors")]
+        if self.bitmap_shard_count > 0 || self.modality_bitmap_counts.iter().any(|&n| n > 0) {
+            self.header.set_bitmap();
+        }
 
         // 4. Compute file checksum: hash header + root catalog from memory,
         //    re-read only section bytes from file, hash full catalog from memory.
@@ -1528,6 +1552,112 @@ impl ScxWriter {
             data,
             None,
         )
+    }
+
+    /// Phase 5b: write a detection-bitmap shard.
+    ///
+    /// Modality-aware: if [`Self::with_modality`] has set
+    /// `current_modality_id` to a non-zero value, the section name is
+    /// `X/bitmap/{modality_name}/shard_{idx}` and the per-modality
+    /// counter is incremented (`ModalityFlags::HAS_BITMAP` is flipped).
+    /// Otherwise the unimodal naming `X/bitmap/shard_{idx}` is used
+    /// and the global counter is incremented.
+    ///
+    /// Auto-derives the next shard index from the writer's own
+    /// counter (mirrors `write_csr_shard`); callers don't need to
+    /// track it.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn write_bitmap_shard(&mut self, shard: &crate::bitmap::BitmapShard) -> Result<()> {
+        if self.current_modality_id > 0 {
+            // We're inside a `with_modality(id, ...)` scope — defer to
+            // the per-modality path so the section name + counter match
+            // the multimodal naming convention.
+            let modality_id = self.current_modality_id;
+            return self.write_bitmap_shard_for_inner(modality_id, shard);
+        }
+        let shard_idx = self.bitmap_shard_count;
+        let name = format!("X/bitmap/shard_{shard_idx}");
+        let mut data = Vec::new();
+        shard.write_to(&mut data)?;
+        let stats = ShardStats {
+            row_start: shard.row_start,
+            row_end: shard.row_start + shard.n_rows as u64,
+            col_start: 0,
+            col_end: shard.n_vars as u64,
+            nnz: 0,
+            value_min: 0,
+            value_max: 0,
+            value_sum: 0,
+            n_indexed_columns: 0,
+            column_stats: Vec::new(),
+        };
+        self.write_section_bytes(name, SectionType::BitmapShard, &data, Some(stats))?;
+        self.bitmap_shard_count += 1;
+        Ok(())
+    }
+
+    /// Phase 5b: per-modality bitmap shard. Section name
+    /// `X/bitmap/{modality_name}/shard_{idx}`.
+    ///
+    /// Auto-derives the per-modality shard index from
+    /// `modality_bitmap_counts`. Also flips
+    /// [`ModalityFlags::HAS_BITMAP`] on the modality's flags.
+    ///
+    /// Wraps the body in [`Self::with_modality`] so the catalog entry
+    /// is stamped with the right `modality_id`. Callers that are
+    /// already inside `with_modality` should call [`Self::write_bitmap_shard`]
+    /// instead — it dispatches to the same per-modality path
+    /// automatically via `current_modality_id`.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn write_bitmap_shard_for(
+        &mut self,
+        modality_id: u8,
+        shard: &crate::bitmap::BitmapShard,
+    ) -> Result<()> {
+        // Re-enter `with_modality` even if we're already in scope:
+        // it stacks correctly (saves/restores `current_modality_id`).
+        self.with_modality(modality_id, |this| {
+            this.write_bitmap_shard_for_inner(modality_id, shard)
+        })
+    }
+
+    /// Internal: the actual write. Assumes `current_modality_id` is
+    /// already set to `modality_id` (either via [`Self::with_modality`]
+    /// wrapper above or via the dispatcher in [`Self::write_bitmap_shard`]).
+    #[cfg(feature = "deletion-vectors")]
+    fn write_bitmap_shard_for_inner(
+        &mut self,
+        modality_id: u8,
+        shard: &crate::bitmap::BitmapShard,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let idx = (modality_id as usize)
+            .checked_sub(1)
+            .ok_or_else(|| ScxError::InvalidCatalog("modality_id must be >= 1".to_string()))?;
+        let shard_idx = self.modality_bitmap_counts.get(idx).copied().unwrap_or(0);
+        let name = format!("X/bitmap/{mname}/shard_{shard_idx}");
+        let mut data = Vec::new();
+        shard.write_to(&mut data)?;
+        let stats = ShardStats {
+            row_start: shard.row_start,
+            row_end: shard.row_start + shard.n_rows as u64,
+            col_start: 0,
+            col_end: shard.n_vars as u64,
+            nnz: 0,
+            value_min: 0,
+            value_max: 0,
+            value_sum: 0,
+            n_indexed_columns: 0,
+            column_stats: Vec::new(),
+        };
+        self.write_section_bytes(name, SectionType::BitmapShard, &data, Some(stats))?;
+        if let Some(slot) = self.modality_bitmap_counts.get_mut(idx) {
+            *slot += 1;
+        }
+        if let Some(info) = self.modalities.get_mut(idx) {
+            info.flags.set_bitmap();
+        }
+        Ok(())
     }
 
     /// Write the deletion vectors section.
