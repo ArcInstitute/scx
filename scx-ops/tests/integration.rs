@@ -2323,3 +2323,329 @@ fn test_streaming_append_multimodal() {
         "streaming-appended shard ShardHeader.n_minor should equal adt.n_vars"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: multimodal lifecycle parity
+// ---------------------------------------------------------------------------
+
+/// Build a multimodal file with `rna` and `adt` modalities, returning
+/// the path. Each modality has a CSR shard with a single row of nnz=2.
+fn write_multimodal_with_csc(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+    adt_n_vars: u64,
+    with_adt_csc: bool,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_n_vars);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer
+        .write_var_for(adt_id, &sample_var(adt_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+    let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            adt_id,
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    if with_adt_csc {
+        // Build a single CSC shard for adt covering all its columns.
+        let mut csc_indptr = vec![0u64];
+        let mut csc_indices: Vec<u32> = Vec::new();
+        let mut csc_values: Vec<u8> = Vec::new();
+        // Reconstruct dense per-row from adt CSR data and build CSC.
+        let mut dense = vec![0u8; n_obs * adt_n_vars as usize];
+        for r in 0..n_obs {
+            let s = adt_indptr[r] as usize;
+            let e = adt_indptr[r + 1] as usize;
+            for k in s..e {
+                dense[r * adt_n_vars as usize + adt_indices[k] as usize] = adt_values[k];
+            }
+        }
+        for c in 0..adt_n_vars as usize {
+            for r in 0..n_obs {
+                let v = dense[r * adt_n_vars as usize + c];
+                if v != 0 {
+                    csc_indices.push(r as u32);
+                    csc_values.push(v);
+                }
+            }
+            csc_indptr.push(csc_indices.len() as u64);
+        }
+        writer
+            .write_csc_shard_for(
+                adt_id,
+                &csc_indptr,
+                &csc_indices,
+                &csc_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    writer.finish().unwrap();
+    path
+}
+
+/// Phase 6: appending into RNA preserves ADT's CSC sidecar.
+#[test]
+fn test_append_partial_csc_preserves_other_modality() {
+    use scx_format::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multimodal_with_csc(&dir, "partial_csc.scx", 4, 30, 10, true);
+
+    // Verify the seed file has CSC on adt only.
+    {
+        let reader = ScxReader::open(&path).unwrap();
+        let n_csc_entries = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+            .count();
+        let header_n_csc = reader.header().n_csc_shards;
+        assert!(
+            reader.header().has_csc(),
+            "seed file should advertise has_csc; n_csc_entries={n_csc_entries} header.n_csc_shards={header_n_csc}"
+        );
+        let adt_info = reader.modality_info(2).unwrap();
+        let rna_info = reader.modality_info(1).unwrap();
+        assert!(adt_info.flags.has_csc(), "adt should have CSC");
+        assert!(!rna_info.flags.has_csc(), "rna should not have CSC");
+    }
+
+    // Append two new rows into rna.
+    let new_obs = sample_obs(2);
+    let (new_indptr, new_indices, new_values) = sample_shard_data(2, 30);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &new_indptr,
+        &new_indices,
+        &new_values,
+        ValueEncoding::Uint8,
+        &AppendOptions {
+            modality_id: 1, // rna
+            ..AppendOptions::default()
+        },
+    )
+    .unwrap();
+
+    // ADT CSC must survive; RNA must still have no CSC; header.has_csc
+    // must remain true because ADT's CSC is still present.
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.header().has_csc(),
+        "header.has_csc should remain set when another modality still owns CSC"
+    );
+    let adt_info = reader.modality_info(2).unwrap();
+    let rna_info = reader.modality_info(1).unwrap();
+    assert!(
+        adt_info.flags.has_csc(),
+        "appending to rna must NOT clear adt's HAS_CSC flag"
+    );
+    assert!(!rna_info.flags.has_csc(), "rna must still have no CSC");
+
+    let adt_csc_shards: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == 2)
+        .collect();
+    assert!(
+        !adt_csc_shards.is_empty(),
+        "adt CSC catalog entries must be preserved after appending to rna"
+    );
+    let rna_csc_shards: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == 1)
+        .collect();
+    assert!(rna_csc_shards.is_empty(), "rna should still own no CSC");
+}
+
+/// Phase 6: appending into a modality that DOES own CSC drops only
+/// that modality's CSC, leaves others untouched.
+#[test]
+fn test_append_partial_csc_invalidates_target_only() {
+    use scx_format::section::SectionType;
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multimodal_with_csc(&dir, "partial_csc_target.scx", 4, 30, 10, true);
+
+    // Append two rows into adt — should invalidate adt CSC only.
+    let new_obs = sample_obs(2);
+    let (new_indptr, new_indices, new_values) = sample_shard_data(2, 10);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &new_indptr,
+        &new_indices,
+        &new_values,
+        ValueEncoding::Uint8,
+        &AppendOptions {
+            modality_id: 2, // adt
+            ..AppendOptions::default()
+        },
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let adt_info = reader.modality_info(2).unwrap();
+    assert!(
+        !adt_info.flags.has_csc(),
+        "appending to adt should clear adt's HAS_CSC"
+    );
+    let adt_csc_shards: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == 2)
+        .collect();
+    assert!(
+        adt_csc_shards.is_empty(),
+        "appending to adt should drop adt's CSC catalog entries"
+    );
+
+    // No other modality owned CSC, so the header should be cleared.
+    assert!(
+        !reader.header().has_csc(),
+        "no remaining CSC anywhere => header should clear has_csc"
+    );
+}
+
+/// Phase 6: multimodal compact applies the global delete mask to all
+/// modalities and preserves the modality table.
+#[test]
+fn test_compact_multimodal_applies_to_all_modalities() {
+    use scx_format::section::SectionType;
+    let dir = tempfile::tempdir().unwrap();
+    let n_obs = 6;
+    let path = write_multimodal_with_csc(&dir, "compact_mm.scx", n_obs, 30, 10, false);
+
+    // Delete the first two cells globally.
+    scx_ops::mark_deleted(&path, &[0, 1]).unwrap();
+
+    let output = dir.path().join("compact_mm_out.scx");
+    scx_ops::compact(&path, &output).unwrap();
+
+    let reader = ScxReader::open(&output).unwrap();
+    assert_eq!(reader.header().n_obs, (n_obs - 2) as u64);
+    let table = reader.modality_table().expect("modality table preserved");
+    assert_eq!(table.entries.len(), 2);
+    assert_eq!(table.entries[0].name, "rna");
+    assert_eq!(table.entries[1].name, "adt");
+
+    // Each modality should still have at least one CSR shard.
+    for modality_id in 1u8..=2u8 {
+        let shards: Vec<_> = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
+            .collect();
+        assert!(
+            !shards.is_empty(),
+            "modality {modality_id} should have CSR shards after compact"
+        );
+    }
+
+    // Compacted CSR should have (n_obs - 2) rows per modality.
+    for modality_id in 1u8..=2u8 {
+        let csr = reader.read_all_csr_shards_for(modality_id).unwrap();
+        assert_eq!(
+            csr.shape.0,
+            n_obs - 2,
+            "modality {modality_id} row count after compact"
+        );
+    }
+}
+
+/// Phase 6: multimodal merge concatenates rows from both inputs for
+/// every shared modality. Final obs is the row union; per-modality
+/// CSR row count matches the new global n_obs.
+#[test]
+fn test_merge_multimodal_concatenates_per_modality() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_multimodal_with_csc(&dir, "merge_a.scx", 4, 30, 10, false);
+    let b = write_multimodal_with_csc(&dir, "merge_b.scx", 3, 30, 10, false);
+    let out = dir.path().join("merge_out.scx");
+
+    scx_ops::merge(&[&a, &b], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 7, "merged obs is sum of inputs");
+    let table = reader.modality_table().expect("modality table preserved");
+    assert_eq!(table.entries.len(), 2);
+    for modality_id in 1u8..=2u8 {
+        let csr = reader.read_all_csr_shards_for(modality_id).unwrap();
+        assert_eq!(
+            csr.shape.0, 7,
+            "modality {modality_id} should span the merged obs"
+        );
+    }
+}
+
+/// Phase 6: merge rejects inputs with mismatched modality structure.
+#[test]
+fn test_merge_multimodal_rejects_var_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_multimodal_with_csc(&dir, "mm_a.scx", 4, 30, 10, false);
+    // b has a different adt n_vars — should error.
+    let b = write_multimodal_with_csc(&dir, "mm_b.scx", 4, 30, 12, false);
+    let out = dir.path().join("merge_mismatch.scx");
+
+    let result = scx_ops::merge(&[&a, &b], &out);
+    assert!(result.is_err(), "merge should reject modality mismatch");
+}

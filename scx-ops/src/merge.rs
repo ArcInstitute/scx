@@ -4,7 +4,7 @@ use std::path::Path;
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
-use scx_codec::ValueEncoding;
+use scx_codec::{CodecId, ValueEncoding};
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -51,7 +51,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         }
     }
 
-    // Phase F.4: validate modality structure consistency. Multimodal
+    // Phase 6: validate modality structure consistency. Multimodal
     // merge requires every input to expose the same set of
     // modalities (name + type + n_vars). On mismatch, raise with a
     // clear error directing to extract-then-merge.
@@ -71,12 +71,10 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
                 });
             }
         }
-        // All inputs have matching modality structure, but full
-        // multimodal merge (concatenating per-modality shards) is
-        // not yet implemented — the existing merge logic below
-        // assumes single-modality and would silently flatten the
-        // file. Refuse rather than corrupt.
-        return Err(OpsError::MultimodalUnsupported { op: "scx merge" });
+        // Phase 6: dispatch to multimodal merge — concatenate the
+        // global obs row axis and per-modality CSR shards in input
+        // order, preserving each modality's var.
+        return merge_multimodal(&readers, input_paths, output_path);
     }
 
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
@@ -338,6 +336,231 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     });
     writer.write_provenance(all_prov_entries)?;
 
+    writer.finish()?;
+    Ok(())
+}
+
+/// Phase 6: merge multimodal SCX files with matching modality
+/// structure. Per-modality CSR shards are concatenated in input order
+/// with `row_start` adjusted for the cumulative global obs offset;
+/// per-modality var is preserved from the first input (already
+/// validated identical by the modality-table check). Per-modality CSC
+/// sidecars are dropped (caller can `--rebuild-csc`).
+fn merge_multimodal(
+    readers: &[ScxReader],
+    input_paths: &[&Path],
+    output_path: &Path,
+) -> Result<()> {
+    let table = readers[0]
+        .modality_table()
+        .ok_or_else(|| {
+            scx_format::ScxError::InvalidCatalog(
+                "merge_multimodal: input has no modality table".to_string(),
+            )
+        })?
+        .clone();
+
+    let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
+    let first_header = readers[0].header();
+
+    let any_input_had_csc = readers.iter().any(|r| {
+        r.modality_table()
+            .map(|t| t.entries.iter().any(|info| info.flags.has_csc()))
+            .unwrap_or(false)
+    });
+    if any_input_had_csc {
+        let inputs_str = input_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!(
+            "merge dropped per-modality CSC shards from at least one input ({inputs_str}): \
+             rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
+             column-major sidecar on the merged output"
+        );
+    }
+
+    let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
+
+    let out_header = FileHeader {
+        magic: MAGIC,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs: total_n_obs,
+        n_vars: max_n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: first_header.shard_target_rows,
+        codec_id: 0,
+        index_dtype: first_header.index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 0,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    };
+
+    let mut writer = ScxWriter::new(output_path, out_header)?;
+
+    // Global obs: concatenate with dict unification (same path as
+    // single-modality merge).
+    let obs_batches: Vec<RecordBatch> = readers
+        .iter()
+        .map(|r| r.read_obs())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let unified_batches: Vec<RecordBatch> = obs_batches
+        .iter()
+        .map(unify_dict_columns)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
+    writer.write_obs(&merged_obs)?;
+
+    // Register modalities in input order.
+    for info in &table.entries {
+        let codec = CodecId::from_u8(info.default_codec_id)
+            .ok_or(OpsError::UnknownCodec(info.default_codec_id))?;
+        let value_encoding = ValueEncoding::from_u8(info.default_value_encoding)
+            .ok_or(OpsError::UnknownValueEncoding(info.default_value_encoding))?;
+        writer.add_modality(&info.name, info.modality_type, codec, value_encoding, false)?;
+        writer.set_modality_n_vars(writer.n_modalities() as u8, info.n_vars)?;
+    }
+
+    // Per-modality var (from first input — already validated identical).
+    for (idx, info) in table.entries.iter().enumerate() {
+        let modality_id = (idx + 1) as u8;
+        let var = readers[0].read_var_for(modality_id)?;
+        writer.write_var_for(modality_id, &var)?;
+        let _ = info; // suppress unused if no other field needed
+    }
+
+    // Per-modality CSR shards: concatenate across inputs with row_start
+    // adjusted for the cumulative global obs offset. Within an input,
+    // the modality's shards collectively cover the input's n_obs rows;
+    // after one input we advance the offset by that input's n_obs so
+    // the next input's shards line up against the merged obs.
+    for (idx, _info) in table.entries.iter().enumerate() {
+        let modality_id = (idx + 1) as u8;
+        let mut input_offset: u64 = 0;
+        for reader in readers {
+            let entries = reader.catalog().csr_shards_for_modality(modality_id);
+            for shard_entry in entries {
+                let section = reader.section_bytes(shard_entry)?;
+                let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
+                    &section[..SHARD_HEADER_SIZE],
+                ))?;
+                let shard_value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+                    .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
+                let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+                let shard_local_row_start =
+                    shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+
+                let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+                let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
+                let mut values_bytes = Vec::new();
+                for &v in &data {
+                    encode_value(&mut values_bytes, v, shard_value_encoding)?;
+                }
+                let shard_codec = select_codec(&values_bytes, shard_value_encoding);
+                writer.write_csr_shard_for(
+                    modality_id,
+                    &indptr_u64,
+                    &indices_u32,
+                    &values_bytes,
+                    shard_codec,
+                    shard_value_encoding,
+                    input_offset + shard_local_row_start,
+                )?;
+            }
+            input_offset += reader.n_obs();
+        }
+    }
+
+    // Per-modality obsm: concatenate across inputs row-wise. Drop if
+    // any input is missing it (consistent with single-modality merge).
+    for (idx, info) in table.entries.iter().enumerate() {
+        let modality_id = (idx + 1) as u8;
+        let prefix = format!("obsm/{}/", info.name);
+        let mut obsm_keys = std::collections::BTreeSet::new();
+        for entry in &readers[0].catalog().entries {
+            if entry.section_type == SectionType::ObsmEmbedding
+                && entry.modality_id == modality_id
+                && entry.name.starts_with(&prefix)
+            {
+                if let Some(k) = entry.name.strip_prefix(&prefix) {
+                    obsm_keys.insert(k.to_string());
+                }
+            }
+        }
+        for key in obsm_keys {
+            let mut batches = Vec::new();
+            let mut all_present = true;
+            for reader in readers {
+                match reader.read_obsm_for(modality_id, &key) {
+                    Ok(b) => batches.push(b),
+                    Err(_) => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if all_present && !batches.is_empty() {
+                let merged = concat_batches(&batches[0].schema(), &batches)?;
+                writer.write_obsm_for(modality_id, &key, &merged)?;
+            }
+        }
+    }
+
+    // Per-modality uns: copy from first input (single source of truth).
+    for (idx, _info) in table.entries.iter().enumerate() {
+        let modality_id = (idx + 1) as u8;
+        if let Ok(uns) = readers[0].read_uns_for(modality_id) {
+            writer.write_uns_for(modality_id, &uns)?;
+        }
+    }
+
+    // Global uns from first input.
+    if let Ok(uns) = readers[0].read_uns() {
+        writer.write_uns(&uns)?;
+    }
+
+    // Provenance: concatenate input chains, then stamp merge op.
+    let mut all_prov = Vec::new();
+    for reader in readers {
+        if let Ok(prov) = reader.read_provenance() {
+            all_prov.extend(prov.operations);
+        }
+    }
+    all_prov.push(ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: "merge".to_string(),
+        tool: "scx-ops 0.1.0".to_string(),
+        params_json: format!("{{\"n_inputs\":{}}}", input_paths.len()),
+        input_checksums: readers
+            .iter()
+            .map(|r| {
+                let mut cs = [0u8; 32];
+                cs[..8].copy_from_slice(&r.header().file_checksum.to_le_bytes());
+                cs
+            })
+            .collect(),
+    });
+    writer.write_provenance(all_prov)?;
     writer.finish()?;
     Ok(())
 }

@@ -935,28 +935,48 @@ fn finalize_append(
     let prov_checksum = blake3_hash(&prov_bytes);
     write_offset += prov_length;
 
-    // Build new catalog
-    let had_csc = prep.header.has_csc();
+    // Build new catalog.
+    //
+    // Phase 6: per-modality CSC invalidation. When appending to a
+    // specific modality on a multimodal file, only that modality's
+    // CSC sidecar is invalidated by the new rows; other modalities'
+    // CSC entries are preserved verbatim (their `indices` arrays still
+    // reference valid global row indices because we only added rows to
+    // ONE modality's CSR shards). When `modality_id == 0` (legacy
+    // single-modality / global append) the old all-or-nothing
+    // behaviour is preserved.
+    let target_modality_id = prep.modality_id;
+    let is_multimodal_target = prep.modality_table.is_some() && target_modality_id != 0;
     let n_dropped_csc = prep
         .old_catalog
         .entries
         .iter()
-        .filter(|e| e.section_type == SectionType::CscShard)
+        .filter(|e| {
+            e.section_type == SectionType::CscShard
+                && (!is_multimodal_target || e.modality_id == target_modality_id)
+        })
         .count();
+    let had_target_csc = n_dropped_csc > 0;
     let n_new_csr_shards = new_shard_entries.len() as u32;
     let mut new_entries: Vec<FullCatalogEntry> = prep
         .old_catalog
         .entries
         .into_iter()
         .filter(|e| {
+            let is_csc_to_drop = e.section_type == SectionType::CscShard
+                && (!is_multimodal_target || e.modality_id == target_modality_id);
             e.section_type != SectionType::ObsMetadata
                 && e.section_type != SectionType::Provenance
-                && e.section_type != SectionType::CscShard
+                && !is_csc_to_drop
         })
         .collect();
-    if had_csc {
+    if had_target_csc {
+        let target_label = match prep.modality_name.as_deref() {
+            Some(name) => format!(" for modality '{name}'"),
+            None => String::new(),
+        };
         log::warn!(
-            "append dropped {n_dropped_csc} CSC shards from {target}: \
+            "append dropped {n_dropped_csc} CSC shards{target_label} from {target}: \
              rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
              column-major sidecar",
             target = target_path.display()
@@ -1000,11 +1020,19 @@ fn finalize_append(
                     info.nnz += total_new_nnz;
                 }
             }
-            for info in table.entries.iter_mut() {
-                info.n_csc_shards = 0;
-                info.flags = scx_format::ModalityFlags::from_bits_truncate(
-                    info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
-                );
+            // Phase 6: clear HAS_CSC and n_csc_shards only on the
+            // target modality. Other modalities keep their CSC state
+            // because their CSC `indices` arrays still reference
+            // valid global row indices.
+            for (idx, info) in table.entries.iter_mut().enumerate() {
+                let this_modality_id = (idx + 1) as u8;
+                let clear_csc = prep.modality_id == 0 || this_modality_id == prep.modality_id;
+                if clear_csc {
+                    info.n_csc_shards = 0;
+                    info.flags = scx_format::ModalityFlags::from_bits_truncate(
+                        info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
+                    );
+                }
             }
 
             let pad = write_alignment_padding(&mut *lock, write_offset)?;
@@ -1059,8 +1087,21 @@ fn finalize_append(
         .iter()
         .filter(|e| e.section_type == SectionType::CsrShard)
         .count() as u32;
-    prep.header.n_csc_shards = 0;
-    prep.header.clear_csc();
+    // Phase 6: count CSC shards remaining after per-modality
+    // invalidation. Header `has_csc` still means "at least one CSC
+    // sidecar exists" — preserved when other modalities still own
+    // valid CSC entries on a per-modality append.
+    let remaining_csc = new_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard)
+        .count() as u32;
+    prep.header.n_csc_shards = remaining_csc;
+    if remaining_csc > 0 {
+        prep.header.set_csc();
+    } else {
+        prep.header.clear_csc();
+    }
     prep.header.full_catalog_offset = new_catalog_offset;
     prep.header.full_catalog_length = new_catalog_length;
     prep.header.modality_table_offset = modality_table_offset;

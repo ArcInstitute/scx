@@ -105,7 +105,7 @@ pub fn run_info(
         if !table.entries.is_empty() {
             println!();
             println!(
-                "Modalities ({}):  {:<14} {:<10} {:>10} {:>14} {:>6} {:>6} {:<10}",
+                "Modalities ({}):  {:<14} {:<10} {:>10} {:>14} {:>6} {:>6} {:<6} {:<10}",
                 table.entries.len(),
                 "name",
                 "type",
@@ -113,19 +113,22 @@ pub fn run_info(
                 "nnz",
                 "csr",
                 "csc",
+                "has_csc",
                 "codec",
             );
             for info in &table.entries {
                 let type_name = modality_type_name(info.modality_type);
                 let codec_name = codec_id_name(info.default_codec_id);
+                let has_csc = if info.flags.has_csc() { "yes" } else { "no" };
                 println!(
-                    "                  {:<14} {:<10} {:>10} {:>14} {:>6} {:>6} {:<10}",
+                    "                  {:<14} {:<10} {:>10} {:>14} {:>6} {:>6} {:<6} {:<10}",
                     info.name,
                     type_name,
                     fmt_num(info.n_vars),
                     fmt_num(info.nnz),
                     info.n_csr_shards,
                     info.n_csc_shards,
+                    has_csc,
                     codec_name,
                 );
             }
@@ -296,6 +299,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
                         "nnz": info.nnz,
                         "n_csr_shards": info.n_csr_shards,
                         "n_csc_shards": info.n_csc_shards,
+                        "has_csc": info.flags.has_csc(),
                         "default_codec": codec_id_name(info.default_codec_id),
                         "flags": info.flags.bits(),
                     })

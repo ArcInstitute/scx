@@ -24,9 +24,9 @@ pub fn run_subset(
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Phase F.4: pure modality extraction (no filter / no genes).
-    // The output is a single-modality v2 file containing just the
-    // chosen modality's CSR + var, with the file's global obs.
+    // Pure modality extraction (no filter / no genes). The output is a
+    // single-modality v2 file containing just the chosen modality's
+    // CSR + var, with the file's global obs.
     if let Some(name) = modality {
         if filter.is_none() && gene_file.is_none() {
             if dry_run {
@@ -35,14 +35,24 @@ pub fn run_subset(
             let out_path = output.ok_or("--output is required for `--modality NAME` extraction")?;
             return extract_modality(input, out_path, name, shard_size, codec);
         }
-        // Filter/genes scoping for a specific modality is a Phase F+
-        // follow-on: the QueryPipeline below is single-modality and
-        // would need per-modality plumbing to honour `--modality`.
-        return Err(
-            "`--modality NAME` combined with `--filter` / `--genes` is not yet supported; \
-             extract the modality first via `scx subset --modality NAME --output …`, then \
-             rerun the filter on the extracted single-modality file"
-                .into(),
+        // Phase 6: --modality combined with --filter / --genes. Extract
+        // the modality, apply the row predicate against the global
+        // obs, apply optional gene selection, then write a
+        // single-modality v2 SCX.
+        if !dry_run && output.is_none() {
+            return Err("--output is required (or use --dry-run)".into());
+        }
+        return extract_modality_with_filter(
+            input,
+            output,
+            name,
+            filter,
+            gene_file,
+            dry_run,
+            shard_size,
+            codec,
+            rebuild_csc,
+            csc_cols_per_shard,
         );
     }
 
@@ -517,6 +527,370 @@ fn extract_modality(
         input.display(),
         output.display()
     );
+    Ok(())
+}
+
+/// Phase 6: `scx subset --modality NAME --filter ... --genes ...`.
+/// Extract one modality from a multimodal SCX file and apply the row
+/// predicate / gene projection in a single pass.  Output is a
+/// single-modality v2 SCX whose obs is the modality-aligned (global)
+/// obs filtered by the predicate.
+#[allow(clippy::too_many_arguments)]
+fn extract_modality_with_filter(
+    input: &Path,
+    output: Option<&Path>,
+    modality_name: &str,
+    filter: Option<&str>,
+    gene_file: Option<&Path>,
+    dry_run: bool,
+    shard_size: u32,
+    codec: &str,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::Array;
+    use scx_format::section::SectionType;
+
+    let reader = ScxReader::open(input)?;
+    if !reader.is_multimodal() {
+        return Err(format!(
+            "input file is single-modality; `--modality {modality_name}` is not applicable"
+        )
+        .into());
+    }
+    let modality_id = reader.modality_id(modality_name).ok_or_else(|| {
+        format!(
+            "input file does not have a modality named '{modality_name}'; \
+             run `scx info {}` to list modalities",
+            input.display()
+        )
+    })?;
+    let info = reader
+        .modality_info(modality_id)
+        .expect("modality_id resolved above");
+    let modality_type = info.modality_type;
+    let n_vars = info.n_vars;
+
+    // Read the global obs and apply the optional filter.
+    let obs = reader.read_obs()?;
+    let n_obs_global = reader.header().n_obs as usize;
+    let row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
+        let schema = obs.schema();
+        let pred = scx_engine::parse_predicate(expr, &schema)?;
+        let bool_arr = scx_engine::evaluate(&pred, &obs)?;
+        let mut mask = vec![false; n_obs_global];
+        for (i, slot) in mask.iter_mut().enumerate() {
+            if bool_arr.is_valid(i) && bool_arr.value(i) {
+                *slot = true;
+            }
+        }
+        Some(mask)
+    } else {
+        None
+    };
+
+    // Parse the optional gene list (resolved against the modality var).
+    let var = reader.read_var_for(modality_id)?;
+    let gene_indices: Option<Vec<u32>> = if let Some(gene_path) = gene_file {
+        let mut entries = Vec::new();
+        for line in
+            std::io::BufRead::lines(std::io::BufReader::new(std::fs::File::open(gene_path)?))
+        {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            entries.push(trimmed.to_string());
+        }
+        let all_numeric: Option<Vec<u32>> = entries.iter().map(|e| e.parse::<u32>().ok()).collect();
+        let mut indices = if let Some(num) = all_numeric {
+            num
+        } else {
+            // Resolve names against the modality's var first string column.
+            let (col_name, col_idx) = var
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, f)| {
+                    matches!(
+                        f.data_type(),
+                        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8
+                    )
+                })
+                .map(|(i, f)| (f.name().clone(), i))
+                .ok_or("modality var has no string column for gene name resolution")?;
+            let col = var.column(col_idx);
+            let map: std::collections::HashMap<&str, u32> = col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| {
+                    format!(
+                        "var column '{}' is not a StringArray (type: {:?})",
+                        col_name,
+                        col.data_type()
+                    )
+                })?
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| v.map(|s| (s, i as u32)))
+                .collect();
+            let mut missing = Vec::new();
+            let mut idx = Vec::new();
+            for name in &entries {
+                match map.get(name.as_str()) {
+                    Some(&i) => idx.push(i),
+                    None => missing.push(name.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                return Err(format!(
+                    "{} gene name(s) not found in modality '{}' var column '{}': {}",
+                    missing.len(),
+                    modality_name,
+                    col_name,
+                    missing
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            idx
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    } else {
+        None
+    };
+
+    // Read the modality's CSR (full assembly — simple and correct).
+    // For very large modalities we could stream shards instead, but
+    // subset compositions are typically targeted enough that this is
+    // fine.
+    let csr = reader.read_all_csr_shards_for(modality_id)?;
+    let n_modality_rows = csr.shape.0;
+    if n_modality_rows != n_obs_global {
+        return Err(format!(
+            "modality '{modality_name}' has {n_modality_rows} rows but global n_obs={n_obs_global}; \
+             cannot subset"
+        )
+        .into());
+    }
+
+    // Apply row mask and gene projection.
+    let filtered_csr = if let Some(ref mask) = row_mask {
+        let kept: Vec<usize> = (0..n_obs_global).filter(|&i| mask[i]).collect();
+        let mut new_indptr: Vec<i64> = Vec::with_capacity(kept.len() + 1);
+        new_indptr.push(0);
+        let mut new_indices: Vec<i32> = Vec::new();
+        let mut new_data: Vec<f32> = Vec::new();
+        for &row in &kept {
+            let s = csr.indptr[row] as usize;
+            let e = csr.indptr[row + 1] as usize;
+            new_indices.extend_from_slice(&csr.indices[s..e]);
+            new_data.extend_from_slice(&csr.data[s..e]);
+            new_indptr.push(*new_indptr.last().unwrap() + (e - s) as i64);
+        }
+        scx_sparse::ScxCsr::new_unchecked(
+            (kept.len(), csr.shape.1),
+            new_indptr,
+            new_indices,
+            new_data,
+        )
+    } else {
+        csr
+    };
+
+    let projected_csr = if let Some(ref idx) = gene_indices {
+        scx_engine::project_csr(&filtered_csr, idx)
+    } else {
+        filtered_csr
+    };
+
+    // Build the filtered obs and projected var record batches.
+    let filtered_obs = if let Some(ref mask) = row_mask {
+        let bool_arr = arrow::array::BooleanArray::from(mask.clone());
+        arrow::compute::filter_record_batch(&obs, &bool_arr)?
+    } else {
+        obs
+    };
+    let projected_var = if let Some(ref idx) = gene_indices {
+        scx_engine::project_var(&var, idx)?
+    } else {
+        var
+    };
+
+    println!(
+        "Subset (modality '{}'): {}/{} cells, {}/{} genes, {} nnz",
+        modality_name,
+        projected_csr.n_rows(),
+        n_obs_global,
+        projected_csr.n_cols(),
+        n_vars,
+        projected_csr.indptr.last().copied().unwrap_or(0),
+    );
+
+    if dry_run {
+        println!("(dry run — no output written)");
+        return Ok(());
+    }
+
+    let value_encoding = {
+        let entries: Vec<&scx_format::FullCatalogEntry> = reader
+            .catalog()
+            .shards(SectionType::CsrShard)
+            .into_iter()
+            .filter(|e| e.modality_id == modality_id)
+            .collect();
+        if let Some(first) = entries.first() {
+            let bytes = reader.section_bytes(first)?;
+            if bytes.len() >= SHARD_HEADER_SIZE {
+                let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+                    &bytes[..SHARD_HEADER_SIZE],
+                ))?;
+                ValueEncoding::from_u8(sh.value_encoding).ok_or_else(|| {
+                    format!(
+                        "unknown value encoding {} on modality '{modality_name}'",
+                        sh.value_encoding
+                    )
+                })?
+            } else {
+                ValueEncoding::Uint16
+            }
+        } else {
+            ValueEncoding::Uint16
+        }
+    };
+
+    let explicit_codec = match codec {
+        "auto" => None,
+        "none" => Some(scx_codec::CodecId::None),
+        "scx1" => Some(scx_codec::CodecId::Scx1),
+        "zstd" => Some(scx_codec::CodecId::Zstd),
+        "lz4" => Some(scx_codec::CodecId::Lz4Shuffle),
+        "pcodec" => Some(scx_codec::CodecId::Pcodec),
+        other => {
+            return Err(format!(
+                "unknown codec: '{other}'. Use auto, none, scx1, zstd, lz4, or pcodec."
+            )
+            .into())
+        }
+    };
+
+    let output = output.unwrap();
+    let n_obs_out = projected_csr.n_rows() as u64;
+    let n_vars_out = projected_csr.n_cols() as u64;
+    let index_dtype = if n_vars_out <= 65535 { 0u8 } else { 1u8 };
+    let header = FileHeader {
+        magic: scx_format::MAGIC,
+        format_version: CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs: n_obs_out,
+        n_vars: n_vars_out,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows: shard_size,
+        codec_id: 0,
+        index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    };
+
+    let mut writer = ScxWriter::new(output, header)?;
+    writer.write_obs(&filtered_obs)?;
+    writer.write_var(&projected_var)?;
+
+    let indptr: Vec<u64> = projected_csr.indptr.iter().map(|&v| v as u64).collect();
+    let indices: Vec<u32> = projected_csr.indices.iter().map(|&v| v as u32).collect();
+    let raw_values = value_encoding.encode_f32_batch(&projected_csr.data)?;
+
+    let shard_target = shard_size as usize;
+    let total_rows = indptr.len().saturating_sub(1);
+    let mut row_offset = 0usize;
+    while row_offset < total_rows {
+        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
+        let shard_indptr_start = indptr[row_offset];
+        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
+            .iter()
+            .map(|&v| v - shard_indptr_start)
+            .collect();
+        let shard_nnz = *shard_indptr.last().unwrap();
+        let idx_start = shard_indptr_start as usize;
+        let idx_end = (shard_indptr_start + shard_nnz) as usize;
+        let shard_indices = &indices[idx_start..idx_end];
+        let value_byte_size = value_encoding.byte_width();
+        let val_start = idx_start * value_byte_size;
+        let val_end = idx_end * value_byte_size;
+        let shard_values = &raw_values[val_start..val_end];
+        let codec_id = match explicit_codec {
+            Some(c) => c,
+            None => {
+                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
+            }
+        };
+        writer.write_csr_shard(
+            &shard_indptr,
+            shard_indices,
+            shard_values,
+            codec_id,
+            value_encoding,
+            row_offset as u64,
+        )?;
+        row_offset += shard_rows;
+    }
+
+    // Preserve uns: prefer per-modality, fall back to global.
+    let uns = reader
+        .read_uns_for(modality_id)
+        .ok()
+        .or_else(|| reader.read_uns().ok());
+    if let Some(u) = &uns {
+        writer.write_uns(u)?;
+    }
+
+    let params = serde_json::json!({
+        "modality": modality_name,
+        "filter": filter,
+        "n_genes": gene_indices.as_ref().map(|g| g.len()),
+    });
+    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        action: "subset".to_string(),
+        tool: format!("scx-cli {}", env!("CARGO_PKG_VERSION")),
+        params_json: params.to_string(),
+        input_checksums: vec![],
+    }])?;
+
+    writer.finish()?;
+    println!("Wrote {}", output.display());
+
+    if rebuild_csc {
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        println!("Rebuilt CSC sidecar on {}", output.display());
+    }
     Ok(())
 }
 
@@ -1096,6 +1470,71 @@ mod tests {
         let roundtrip = reader.read_uns().unwrap();
         assert_eq!(roundtrip["source"], "global");
         assert_eq!(roundtrip["version"], 7);
+    }
+
+    /// Phase 6: `scx subset --modality NAME --filter ...` extracts the
+    /// chosen modality and applies the row predicate against the
+    /// global obs. The output is a single-modality v2 SCX whose
+    /// n_obs matches the number of cells the filter matched, and
+    /// whose var matches the modality's var.
+    #[test]
+    fn test_subset_modality_with_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, None, None);
+
+        // sample_obs assigns cell_type cyclically T/B/NK over 3 cells:
+        // index 0 → T cell, 1 → B cell, 2 → NK cell. Filter matches
+        // exactly one row.
+        let output = dir.path().join("subset_modality_filtered.scx");
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            Some("rna"),
+            false,
+            10000,
+            "none",
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        let header = reader.header();
+        assert_eq!(header.n_obs, 1, "filter should keep exactly one cell");
+        assert_eq!(header.n_vars, 5, "rna has 5 vars in the fixture");
+        assert!(!reader.is_multimodal(), "output is single-modality v2");
+    }
+
+    /// Phase 6: `scx subset --modality NAME --genes ...` extracts the
+    /// chosen modality and projects to the named gene indices.
+    #[test]
+    fn test_subset_modality_with_genes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, None, None);
+        let gene_file = dir.path().join("genes.txt");
+        std::fs::write(&gene_file, "0\n2\n").unwrap();
+
+        let output = dir.path().join("subset_modality_genes.scx");
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            None,
+            Some(gene_file.as_path()),
+            Some("rna"),
+            false,
+            10000,
+            "none",
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        let header = reader.header();
+        assert_eq!(header.n_obs, 3, "no filter → all cells preserved");
+        assert_eq!(header.n_vars, 2, "two genes selected");
     }
 
     #[test]
