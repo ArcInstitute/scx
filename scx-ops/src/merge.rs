@@ -552,8 +552,7 @@ fn merge_multimodal(
     for (idx, info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
         let layer_prefix = format!("layer/{}/", info.name);
-        let mut layer_names: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut layer_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for reader in readers {
             for entry in &reader.catalog().entries {
                 if entry.section_type == SectionType::LayerCsrShard

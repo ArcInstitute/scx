@@ -238,17 +238,16 @@ fn parse_gene_list(
     Ok(indices)
 }
 
-/// Resolve gene names to column indices using the var metadata.
+/// Resolve gene names to column indices against a pre-fetched var batch.
 ///
-/// Looks up each name in the first string column of the var RecordBatch
-/// (typically `gene_id`). Returns an error if any name is not found.
-fn resolve_gene_names(
+/// Looks up each name in the first string column of `var` (typically
+/// `gene_id`). `context` is interpolated into error messages (e.g. `"var"`
+/// or `"modality 'rna' var"`).
+fn resolve_gene_names_from_var(
     names: &[String],
-    reader: &ScxReader,
+    var: &arrow::array::RecordBatch,
+    context: &str,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let var = reader.read_var()?;
-
-    // Find the first string column to use as the gene name column
     let (col_name, col_idx) = var
         .schema()
         .fields()
@@ -261,7 +260,7 @@ fn resolve_gene_names(
             )
         })
         .map(|(i, f)| (f.name().clone(), i))
-        .ok_or("var metadata has no string column for gene name resolution")?;
+        .ok_or_else(|| format!("{context} has no string column for gene name resolution"))?;
 
     let col = var.column(col_idx);
     let string_array = col
@@ -269,13 +268,12 @@ fn resolve_gene_names(
         .downcast_ref::<arrow::array::StringArray>()
         .ok_or_else(|| {
             format!(
-                "var column '{}' is not a StringArray (type: {:?})",
+                "{context} column '{}' is not a StringArray (type: {:?})",
                 col_name,
                 col.data_type()
             )
         })?;
 
-    // Build name → index map
     let name_to_idx: std::collections::HashMap<&str, u32> = string_array
         .iter()
         .enumerate()
@@ -284,7 +282,6 @@ fn resolve_gene_names(
 
     let mut indices = Vec::with_capacity(names.len());
     let mut missing = Vec::new();
-
     for name in names {
         match name_to_idx.get(name.as_str()) {
             Some(&idx) => indices.push(idx),
@@ -300,7 +297,7 @@ fn resolve_gene_names(
             String::new()
         };
         return Err(format!(
-            "{} gene name(s) not found in var '{}': {}{}",
+            "{} gene name(s) not found in {context} column '{}': {}{}",
             missing.len(),
             col_name,
             shown.join(", "),
@@ -310,6 +307,16 @@ fn resolve_gene_names(
     }
 
     Ok(indices)
+}
+
+/// Resolve gene names against the global var (`modality_id == 0` /
+/// single-modality). Thin wrapper around [`resolve_gene_names_from_var`].
+fn resolve_gene_names(
+    names: &[String],
+    reader: &ScxReader,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let var = reader.read_var()?;
+    resolve_gene_names_from_var(names, &var, "var")
 }
 
 /// Detect the ValueEncoding from the first CSR shard using an existing reader.
@@ -607,59 +614,7 @@ fn extract_modality_with_filter(
         let mut indices = if let Some(num) = all_numeric {
             num
         } else {
-            // Resolve names against the modality's var first string column.
-            let (col_name, col_idx) = var
-                .schema()
-                .fields()
-                .iter()
-                .enumerate()
-                .find(|(_, f)| {
-                    matches!(
-                        f.data_type(),
-                        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8
-                    )
-                })
-                .map(|(i, f)| (f.name().clone(), i))
-                .ok_or("modality var has no string column for gene name resolution")?;
-            let col = var.column(col_idx);
-            let map: std::collections::HashMap<&str, u32> = col
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| {
-                    format!(
-                        "var column '{}' is not a StringArray (type: {:?})",
-                        col_name,
-                        col.data_type()
-                    )
-                })?
-                .iter()
-                .enumerate()
-                .filter_map(|(i, v)| v.map(|s| (s, i as u32)))
-                .collect();
-            let mut missing = Vec::new();
-            let mut idx = Vec::new();
-            for name in &entries {
-                match map.get(name.as_str()) {
-                    Some(&i) => idx.push(i),
-                    None => missing.push(name.clone()),
-                }
-            }
-            if !missing.is_empty() {
-                return Err(format!(
-                    "{} gene name(s) not found in modality '{}' var column '{}': {}",
-                    missing.len(),
-                    modality_name,
-                    col_name,
-                    missing
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-                .into());
-            }
-            idx
+            resolve_gene_names_from_var(&entries, &var, &format!("modality '{modality_name}' var"))?
         };
         indices.sort_unstable();
         indices.dedup();

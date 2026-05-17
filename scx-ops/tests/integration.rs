@@ -2437,9 +2437,14 @@ fn write_multimodal_with_csc(
     path
 }
 
-/// Phase 6: appending into RNA preserves ADT's CSC sidecar.
+/// Appending into RNA on a multimodal file drops ADT's CSC sidecar too.
+/// Per-modality CSC preservation is a Phase F+ follow-on (see
+/// docs/multimodal.md § append) — CSC `n_minor` is stamped from the
+/// file-wide `header.n_obs` so any preserved sidecar would become stale
+/// when global n_obs bumps. Regression guard against re-introducing the
+/// premature preservation.
 #[test]
-fn test_append_partial_csc_preserves_other_modality() {
+fn test_append_into_rna_drops_adt_csc() {
     use scx_format::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2448,16 +2453,9 @@ fn test_append_partial_csc_preserves_other_modality() {
     // Verify the seed file has CSC on adt only.
     {
         let reader = ScxReader::open(&path).unwrap();
-        let n_csc_entries = reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
-            .count();
-        let header_n_csc = reader.header().n_csc_shards;
         assert!(
             reader.header().has_csc(),
-            "seed file should advertise has_csc; n_csc_entries={n_csc_entries} header.n_csc_shards={header_n_csc}"
+            "seed file should advertise has_csc"
         );
         let adt_info = reader.modality_info(2).unwrap();
         let rna_info = reader.modality_info(1).unwrap();
@@ -2482,49 +2480,43 @@ fn test_append_partial_csc_preserves_other_modality() {
     )
     .unwrap();
 
-    // ADT CSC must survive; RNA must still have no CSC; header.has_csc
-    // must remain true because ADT's CSC is still present.
+    // After append, every modality's CSC is dropped and the file-wide
+    // has_csc flag clears.
     let reader = ScxReader::open(&path).unwrap();
     assert!(
-        reader.header().has_csc(),
-        "header.has_csc should remain set when another modality still owns CSC"
+        !reader.header().has_csc(),
+        "header.has_csc should clear when every modality's CSC is dropped"
     );
     let adt_info = reader.modality_info(2).unwrap();
     let rna_info = reader.modality_info(1).unwrap();
     assert!(
-        adt_info.flags.has_csc(),
-        "appending to rna must NOT clear adt's HAS_CSC flag"
+        !adt_info.flags.has_csc(),
+        "append must clear adt's HAS_CSC flag even when appending to rna"
     );
     assert!(!rna_info.flags.has_csc(), "rna must still have no CSC");
 
-    let adt_csc_shards: Vec<_> = reader
+    let csc_shards: Vec<_> = reader
         .catalog()
         .entries
         .iter()
-        .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == 2)
+        .filter(|e| e.section_type == SectionType::CscShard)
         .collect();
     assert!(
-        !adt_csc_shards.is_empty(),
-        "adt CSC catalog entries must be preserved after appending to rna"
+        csc_shards.is_empty(),
+        "all CSC catalog entries must be dropped after append, found {}",
+        csc_shards.len()
     );
-    let rna_csc_shards: Vec<_> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == 1)
-        .collect();
-    assert!(rna_csc_shards.is_empty(), "rna should still own no CSC");
 }
 
-/// Phase 6: appending into a modality that DOES own CSC drops only
-/// that modality's CSC, leaves others untouched.
+/// Appending into a modality that owns the only CSC drops it and
+/// clears the file-wide HAS_CSC flag.
 #[test]
-fn test_append_partial_csc_invalidates_target_only() {
+fn test_append_into_adt_drops_csc() {
     use scx_format::section::SectionType;
     let dir = tempfile::tempdir().unwrap();
     let path = write_multimodal_with_csc(&dir, "partial_csc_target.scx", 4, 30, 10, true);
 
-    // Append two rows into adt — should invalidate adt CSC only.
+    // Append two rows into adt — drops adt CSC (the only CSC present).
     let new_obs = sample_obs(2);
     let (new_indptr, new_indices, new_values) = sample_shard_data(2, 10);
     scx_ops::append(
@@ -2648,4 +2640,200 @@ fn test_merge_multimodal_rejects_var_mismatch() {
 
     let result = scx_ops::merge(&[&a, &b], &out);
     assert!(result.is_err(), "merge should reject modality mismatch");
+}
+
+/// Fixture for the merge/compact tests that exercise global obsm and
+/// per-modality layers: same shape as `write_multimodal_with_csc` plus
+/// a `counts` layer on rna, a `centered` layer on adt, and an `X_pca`
+/// global obsm.
+fn write_multimodal_with_layers_and_obsm(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+    adt_n_vars: u64,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_n_vars);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    // Global obsm.
+    let pca: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.25).collect();
+    let pca_schema = Schema::new(vec![
+        Field::new("PC1", DataType::Float64, false),
+        Field::new("PC2", DataType::Float64, false),
+    ]);
+    let pca_batch = arrow::array::RecordBatch::try_new(
+        Arc::new(pca_schema),
+        vec![
+            Arc::new(Float64Array::from(pca[..n_obs].to_vec())),
+            Arc::new(Float64Array::from(pca[n_obs..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer.write_obsm("X_pca", &pca_batch).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer
+        .write_var_for(adt_id, &sample_var(adt_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+    let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            adt_id,
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // RNA `counts` layer: Float32, value = csr_value * 1.5.
+    let mut rna_layer_values = Vec::new();
+    for &v in &rna_values {
+        rna_layer_values.extend_from_slice(&(v as f32 * 1.5_f32).to_le_bytes());
+    }
+    writer
+        .write_layer_csr_shard_for(
+            rna_id,
+            "counts",
+            0,
+            &rna_indptr,
+            &rna_indices,
+            &rna_layer_values,
+            CodecId::None,
+            ValueEncoding::Float32,
+            0,
+        )
+        .unwrap();
+
+    // ADT `centered` layer: Float32, value = csr_value - 1.0.
+    let mut adt_layer_values = Vec::new();
+    for &v in &adt_values {
+        adt_layer_values.extend_from_slice(&(v as f32 - 1.0_f32).to_le_bytes());
+    }
+    writer
+        .write_layer_csr_shard_for(
+            adt_id,
+            "centered",
+            0,
+            &adt_indptr,
+            &adt_indices,
+            &adt_layer_values,
+            CodecId::None,
+            ValueEncoding::Float32,
+            0,
+        )
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// Phase 6 follow-up: multimodal merge must concatenate the global obsm
+/// row-wise across inputs (single-modality merge already does this; the
+/// initial multimodal path silently dropped it).
+#[test]
+fn test_merge_multimodal_preserves_global_obsm() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_multimodal_with_layers_and_obsm(&dir, "obsm_a.scx", 4, 30, 10);
+    let b = write_multimodal_with_layers_and_obsm(&dir, "obsm_b.scx", 3, 30, 10);
+    let out = dir.path().join("merge_obsm_out.scx");
+
+    scx_ops::merge(&[&a, &b], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let pca = reader
+        .read_obsm("X_pca")
+        .expect("merged file should preserve global X_pca obsm");
+    assert_eq!(pca.num_rows(), 7, "obsm rows = n_obs_a + n_obs_b");
+    assert_eq!(pca.num_columns(), 2);
+    let schema = pca.schema();
+    assert_eq!(schema.field(0).name(), "PC1");
+    assert_eq!(schema.field(1).name(), "PC2");
+}
+
+/// Phase 6 follow-up: multimodal merge must copy per-modality layers
+/// across inputs. The initial multimodal path skipped layers entirely.
+#[test]
+fn test_merge_multimodal_preserves_per_modality_layers() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_multimodal_with_layers_and_obsm(&dir, "lay_a.scx", 4, 30, 10);
+    let b = write_multimodal_with_layers_and_obsm(&dir, "lay_b.scx", 3, 30, 10);
+    let out = dir.path().join("merge_layers_out.scx");
+
+    scx_ops::merge(&[&a, &b], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let rna_counts = reader
+        .read_layer_for(1, "counts")
+        .expect("rna 'counts' layer must survive merge");
+    assert_eq!(rna_counts.shape.0, 7, "rna counts row count = merged n_obs");
+    let adt_centered = reader
+        .read_layer_for(2, "centered")
+        .expect("adt 'centered' layer must survive merge");
+    assert_eq!(
+        adt_centered.shape.0, 7,
+        "adt centered row count = merged n_obs"
+    );
+}
+
+/// Phase 6 follow-up: per-shard streaming refactor of `compact_multimodal`
+/// must preserve correctness on per-modality layers.
+#[test]
+fn test_compact_multimodal_layers_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let n_obs = 6;
+    let path = write_multimodal_with_layers_and_obsm(&dir, "compact_lay.scx", n_obs, 30, 10);
+
+    // Drop two cells globally.
+    scx_ops::mark_deleted(&path, &[0, 3]).unwrap();
+    let out = dir.path().join("compact_lay_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, (n_obs - 2) as u64);
+    let rna_counts = reader.read_layer_for(1, "counts").unwrap();
+    assert_eq!(rna_counts.shape.0, n_obs - 2);
+    let adt_centered = reader.read_layer_for(2, "centered").unwrap();
+    assert_eq!(adt_centered.shape.0, n_obs - 2);
 }

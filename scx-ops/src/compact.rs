@@ -601,8 +601,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
                 .layer_csr_shards_for_modality(in_modality_id, &layer_name)
             {
                 let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
-                let shard_row_start =
-                    shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+                let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
                 let shard_n_rows = indptr.len() - 1;
                 for local_row in 0..shard_n_rows {
                     let global_idx = shard_row_start + local_row as u64;
