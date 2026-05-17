@@ -958,6 +958,12 @@ impl ScxWriter {
                 SectionType::CscShard,
             )
         })?;
+        // Phase 6: increment the file-wide CSC counter so `finish()`
+        // sets the header `has_csc` flag and `n_csc_shards` field.
+        // `write_shard_inner` itself does not touch these counters; the
+        // single-modality `write_csc_shard` increments them after the
+        // inner call, so mirror that here for the multimodal path.
+        self.csc_shard_count += 1;
         if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
             info.n_csc_shards += 1;
             info.flags.set_csc();

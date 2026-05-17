@@ -935,14 +935,19 @@ fn finalize_append(
     let prov_checksum = blake3_hash(&prov_bytes);
     write_offset += prov_length;
 
-    // Build new catalog
-    let had_csc = prep.header.has_csc();
+    // Build new catalog. Append always drops every CSC sidecar
+    // (single- and multi-modality alike): CSC shard headers stamp
+    // `n_minor` from the file-wide `header.n_obs`, so any preserved
+    // sidecar becomes stale the moment global `n_obs` bumps. Per-
+    // modality CSC preservation is a Phase F+ follow-on (see
+    // docs/multimodal.md § append).
     let n_dropped_csc = prep
         .old_catalog
         .entries
         .iter()
         .filter(|e| e.section_type == SectionType::CscShard)
         .count();
+    let had_csc = n_dropped_csc > 0;
     let n_new_csr_shards = new_shard_entries.len() as u32;
     let mut new_entries: Vec<FullCatalogEntry> = prep
         .old_catalog
@@ -1000,6 +1005,9 @@ fn finalize_append(
                     info.nnz += total_new_nnz;
                 }
             }
+            // Clear HAS_CSC and n_csc_shards on every modality —
+            // append always drops the file-wide sidecar (see catalog
+            // comment above).
             for info in table.entries.iter_mut() {
                 info.n_csc_shards = 0;
                 info.flags = scx_format::ModalityFlags::from_bits_truncate(
@@ -1059,8 +1067,20 @@ fn finalize_append(
         .iter()
         .filter(|e| e.section_type == SectionType::CsrShard)
         .count() as u32;
-    prep.header.n_csc_shards = 0;
-    prep.header.clear_csc();
+    // Append drops every CSC sidecar, so n_csc_shards collapses to 0
+    // and HAS_CSC clears. Kept as a count to defend against any future
+    // partial-preservation logic re-introduction.
+    let remaining_csc = new_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard)
+        .count() as u32;
+    prep.header.n_csc_shards = remaining_csc;
+    if remaining_csc > 0 {
+        prep.header.set_csc();
+    } else {
+        prep.header.clear_csc();
+    }
     prep.header.full_catalog_offset = new_catalog_offset;
     prep.header.full_catalog_length = new_catalog_length;
     prep.header.modality_table_offset = modality_table_offset;
