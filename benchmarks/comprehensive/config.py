@@ -700,6 +700,11 @@ N_WARMUP_RUNS = 1     # Discarded warm-up iterations
 # Row-slice query: number of random cells to select
 QUERY_N_CELLS = 1_000
 
+# Streaming-vs-in-memory benchmark: row-chunk width for the iteration
+# loop. 65 536 rows matches the canonical SCX shard target so backed
+# iteration usually decodes one shard per chunk on default configs.
+STREAMING_CHUNK_ROWS = 65_536
+
 # Column projection: number of HVGs to project onto
 QUERY_N_HVGS = 2_000
 

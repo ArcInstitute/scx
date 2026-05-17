@@ -66,6 +66,75 @@ fn infer_modality_type(name: &str) -> ModalityType {
     }
 }
 
+/// Materialise an SCX file as a `mudata.MuData` whose
+/// per-modality `AnnData` objects are backed (X is
+/// `ScxBackedSparseDataset`, not a materialised scipy CSR). All
+/// modalities share the same global `obs` DataFrame.
+///
+/// Single-modality files (v1 or single-modality v2) are wrapped in a
+/// one-modality `MuData({name_or_X: adata})` rather than raising — so
+/// `reader.to_mudata(backed=True)` works uniformly across layouts.
+pub fn to_mudata_backed<'py>(
+    py: Python<'py>,
+    path: &Path,
+    reader: &ScxReader,
+    cache_shards: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let mudata_mod = import_mudata(py)?;
+
+    // Build the global obs once.
+    let global_obs = match reader.read_obs() {
+        Ok(batch) => {
+            let table = record_batch_to_pyarrow(py, &batch)?;
+            Some(pyarrow_table_to_pandas(&table)?)
+        }
+        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(e) => return Err(to_pyerr(e)),
+    };
+
+    let mod_dict = PyDict::new(py);
+
+    if reader.is_multimodal() {
+        let shared_catalog = reader.catalog_arc();
+        for modality_id in 1..=reader.n_modalities() as u8 {
+            let info = reader.modality_info(modality_id).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "modality_info({modality_id}) returned None — modality table is corrupt"
+                ))
+            })?;
+            let mname = info.name.clone();
+            let adata = crate::anndata::build_backed_anndata_for_modality(
+                py,
+                path,
+                &shared_catalog,
+                modality_id,
+                &mname,
+                cache_shards,
+                global_obs.as_ref(),
+            )?;
+            mod_dict.set_item(&mname, adata)?;
+        }
+    } else {
+        // Single-modality (v1 or single-modality v2): wrap the existing
+        // single-AnnData backed factory in a one-modality MuData. Use the
+        // sole modality name when present, else "X" for v1.
+        let modality_key = if reader.n_modalities() >= 1 {
+            reader.modality_names()[0].to_string()
+        } else {
+            "X".to_string()
+        };
+        let adata = crate::anndata::to_anndata_backed(py, path, cache_shards, None, None, None)?;
+        mod_dict.set_item(&modality_key, adata)?;
+    }
+
+    let mu_kwargs = PyDict::new(py);
+    if let Some(obs) = global_obs {
+        mu_kwargs.set_item("obs", obs)?;
+    }
+    let mu = mudata_mod.call_method("MuData", (mod_dict,), Some(&mu_kwargs))?;
+    Ok(mu)
+}
+
 /// Materialise an `ScxReader` as a `mudata.MuData` object. Iterates
 /// `modality_names()`, builds an AnnData per modality via the
 /// existing zero-copy CSR path, and attaches them to a `MuData(...)`

@@ -76,6 +76,7 @@ benchmarks/
 │   ├── benchmarks/                      # Benchmark modules (one per dimension)
 │   │   ├── compression.py, write.py, read_full.py, read_selective.py
 │   │   ├── parallel_scaling.py, parallel_write_scaling.py, memory.py, ml_loader.py
+│   │   ├── read_streaming_vs_inmemory.py            # Backed iteration vs eager materialise (Phase 6b)
 │   │   ├── fragment_ops.py, correctness.py
 │   │   ├── accel_{pca,knn,umap,leiden,preprocess,hvg}.py   # Accelerator surface
 │   │   ├── cloud_{push,pull,read,metadata,filtered,large_atlas,reader_vs_pull}.py, cost_model.py
@@ -183,6 +184,8 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 | **Parallel Scaling** (3.5) | `parallel_scaling.py`, `parallel_write_scaling.py` | Read/write throughput vs thread count (1, 2, 4, 8, 16, 32) |
 | **ML Loader** (3.6) | `ml_loader.py` | Batched iteration throughput (batches/sec, TTFB, peak RSS) |
 | **Memory** (3.7) | `memory.py` | Peak RSS during common operations |
+| **Streaming vs in-memory** (3.7b) | `read_streaming_vs_inmemory.py` | Backed row-chunk iteration vs eager-materialise-then-iterate. Wall time and peak RSS for both modes; gated on `"backed_mode"` capability — SCX-only today |
+| **Multimodal streaming vs in-memory** (3.7c) | `multimodal_read_streaming_vs_inmemory.py` | Phase 6b — `to_mudata(backed=True)` per-modality chunked iteration vs eager `to_mudata()`. Gated on `dataset.multimodal == True` AND multimodal-SCX format keys |
 | **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval / arc-bench reference, on synthetic perturbation datasets at 100K–1M cells |
 
 ### Measurement Protocol
@@ -568,6 +571,29 @@ The launcher submits one SLURM job per (benchmark × format × dataset)
 triple via submitit, sized per-job by `estimate_memory_gb` /
 `estimate_time_minutes` (`comprehensive/config.py`), with
 `partition_for_memory` auto-routing to `cpu_high_mem` past 200 GB.
+
+#### Phase 6b — streaming vs in-memory sweep
+
+A thin pre-canned wrapper submits both
+`read_streaming_vs_inmemory` (on `census_500k` / `census_1m` /
+`census_5m`) and `multimodal_read_streaming_vs_inmemory` (on
+`cite_seq_pbmc` / `multiome_pbmc`) with the right per-partition
+sizing for Lambda HPC:
+
+```bash
+sbatch benchmarks/comprehensive/scripts/slurm_read_streaming_vs_inmemory.sh
+```
+
+The wrapper sets `SCX_BENCH_HIGH_MEM_PARTITION=large_batch` so jobs
+sized above the `MEM_HIGH_MEM_THRESHOLD_GB` floor (the census_5m
+conversion lands at ~864 GB) auto-route to Lambda's `large_batch`
+partition instead of the missing `cpu_high_mem`. Pass-through
+overrides go after `--`:
+
+```bash
+sbatch slurm_read_streaming_vs_inmemory.sh -- --datasets census_1m
+sbatch slurm_read_streaming_vs_inmemory.sh -- --partition standard
+```
 
 ### Correctness Validation
 

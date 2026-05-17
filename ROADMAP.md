@@ -327,6 +327,21 @@ scGPT train end-to-end on atlas-scale SCX data.
   invalidates ADT's CSC).
 - [ ] Spatial transcriptomics R-tree index — **DEFERRED** (separate
   spec; spatial coordinates already work via standard `obs`/`obsm`).
+- [x] Multimodal backed / out-of-core reads (Phase 6b). `to_anndata`
+  takes `modality=` and routes `backed=True` through
+  `BackedCsrReader::for_modality`. `to_mudata(backed=True)` assembles
+  a `mudata.MuData` of per-modality backed `AnnData` sharing one
+  global obs DataFrame. Modality scoping flows transparently through
+  the wrapper's `Arc<BackedCsrReader>`, so `pp.normalize_total →
+  pp.log1p` produces a modality-scoped `ScxLazyTransformedDataset`
+  with no new field on the lazy wrapper. A latent bug in
+  `BackedCsrReader::read_shard_uncached` / `decode_and_cache` (X path
+  dispatched by global CSR index rather than the per-instance
+  filtered table) was fixed en route — required for the per-modality
+  path to return the right shard. Cloud
+  `open_cloud(...).to_mudata(backed=True)` and multimodal predicate
+  pushdown (`var_names` / `obs_filter` with `modality=`) remain
+  follow-ons.
 
 **Status**: shipped end-to-end via Phases A–I. CITE-seq /
 10x Multiome / TEA-seq round-trip through `pyscx.from_mudata` /

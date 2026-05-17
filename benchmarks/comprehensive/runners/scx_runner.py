@@ -298,6 +298,227 @@ class ScxRunner(FormatRunner):
         timing.extra = {"mode": "backed_slice", "start": start, "count": count}
         return timing
 
+    def iterate_streaming(
+        self,
+        path: str | Path,
+        chunk_size: int,
+    ) -> TimingResult:
+        self._check_pyscx()
+        from benchmarks.comprehensive.rss import current_rss_mb
+
+        def _stream() -> tuple[int, float, float]:
+            ds = pyscx.open(str(path))
+            adata = ds.to_anndata(backed=True)
+            n_obs = adata.shape[0]
+            in_iter_peak = current_rss_mb()
+            n_chunks = 0
+            # Trivial reduction so the chunk actually gets decoded; we
+            # discard the value but keep an accumulator to prevent the
+            # JIT/Python optimiser from elliding the work.
+            total = 0.0
+            for start in range(0, n_obs, chunk_size):
+                end = min(start + chunk_size, n_obs)
+                chunk = adata.X[start:end]
+                total += float(chunk.sum())
+                in_iter_peak = max(in_iter_peak, current_rss_mb())
+                n_chunks += 1
+            return n_chunks, total, in_iter_peak
+
+        self._gc_collect()
+        rss_before = current_rss_mb()
+        u0, s0 = self._get_cpu_times()
+        t0 = time.perf_counter()
+        n_chunks, total, in_iter_peak = _stream()
+        wall = time.perf_counter() - t0
+        u1, s1 = self._get_cpu_times()
+        rss_after = current_rss_mb()
+
+        return TimingResult(
+            wall_s=wall,
+            user_s=u1 - u0,
+            sys_s=s1 - s0,
+            peak_rss_mb=max(rss_before, rss_after, in_iter_peak),
+            extra={
+                "mode": "streaming",
+                "chunk_size": chunk_size,
+                "n_chunks": n_chunks,
+                "matrix_sum": total,
+            },
+        )
+
+    def iterate_in_memory(
+        self,
+        path: str | Path,
+        chunk_size: int,
+    ) -> TimingResult:
+        self._check_pyscx()
+        from benchmarks.comprehensive.rss import current_rss_mb
+
+        def _eager() -> tuple[int, float, float]:
+            ds = pyscx.open(str(path))
+            adata = ds.to_anndata()
+            X = adata.X  # already materialised (scipy CSR)
+            n_obs = X.shape[0]
+            in_iter_peak = current_rss_mb()
+            n_chunks = 0
+            total = 0.0
+            for start in range(0, n_obs, chunk_size):
+                end = min(start + chunk_size, n_obs)
+                total += float(X[start:end].sum())
+                in_iter_peak = max(in_iter_peak, current_rss_mb())
+                n_chunks += 1
+            return n_chunks, total, in_iter_peak
+
+        self._gc_collect()
+        rss_before = current_rss_mb()
+        u0, s0 = self._get_cpu_times()
+        t0 = time.perf_counter()
+        n_chunks, total, in_iter_peak = _eager()
+        wall = time.perf_counter() - t0
+        u1, s1 = self._get_cpu_times()
+        rss_after = current_rss_mb()
+
+        return TimingResult(
+            wall_s=wall,
+            user_s=u1 - u0,
+            sys_s=s1 - s0,
+            peak_rss_mb=max(rss_before, rss_after, in_iter_peak),
+            extra={
+                "mode": "in_memory",
+                "chunk_size": chunk_size,
+                "n_chunks": n_chunks,
+                "matrix_sum": total,
+            },
+        )
+
+    def iterate_streaming_multimodal(
+        self,
+        path: str | Path,
+        chunk_size: int,
+        modality_names: tuple[str, ...] | None = None,
+    ) -> TimingResult:
+        """Phase 6b streaming multimodal walk. Opens
+        ``to_mudata(backed=True)`` and iterates each modality's X in
+        ``chunk_size`` row chunks. The total matrix sum and per-modality
+        chunk count are recorded so the in-memory counterpart can
+        validate correctness."""
+        self._check_pyscx()
+        from benchmarks.comprehensive.rss import current_rss_mb
+
+        def _stream() -> tuple[int, float, dict, float]:
+            ds = pyscx.open(str(path))
+            mu = ds.to_mudata(backed=True)
+            names = (
+                list(modality_names)
+                if modality_names is not None
+                else list(mu.mod.keys())
+            )
+            in_iter_peak = current_rss_mb()
+            total_chunks = 0
+            total_sum = 0.0
+            per_modality: dict[str, dict[str, float]] = {}
+            for mname in names:
+                adata = mu.mod[mname]
+                n_obs = adata.shape[0]
+                m_chunks = 0
+                m_sum = 0.0
+                for start in range(0, n_obs, chunk_size):
+                    end = min(start + chunk_size, n_obs)
+                    m_sum += float(adata.X[start:end].sum())
+                    in_iter_peak = max(in_iter_peak, current_rss_mb())
+                    m_chunks += 1
+                per_modality[mname] = {"n_chunks": m_chunks, "matrix_sum": m_sum}
+                total_chunks += m_chunks
+                total_sum += m_sum
+            return total_chunks, total_sum, per_modality, in_iter_peak
+
+        self._gc_collect()
+        rss_before = current_rss_mb()
+        u0, s0 = self._get_cpu_times()
+        t0 = time.perf_counter()
+        total_chunks, total_sum, per_modality, in_iter_peak = _stream()
+        wall = time.perf_counter() - t0
+        u1, s1 = self._get_cpu_times()
+        rss_after = current_rss_mb()
+
+        return TimingResult(
+            wall_s=wall,
+            user_s=u1 - u0,
+            sys_s=s1 - s0,
+            peak_rss_mb=max(rss_before, rss_after, in_iter_peak),
+            extra={
+                "mode": "streaming",
+                "chunk_size": chunk_size,
+                "n_modalities": len(per_modality),
+                "total_chunks": total_chunks,
+                "matrix_sum": total_sum,
+                "per_modality": per_modality,
+            },
+        )
+
+    def iterate_in_memory_multimodal(
+        self,
+        path: str | Path,
+        chunk_size: int,
+        modality_names: tuple[str, ...] | None = None,
+    ) -> TimingResult:
+        """Eager counterpart: ``to_mudata()`` materialises every
+        modality, then we iterate each modality's X in chunks of the
+        same size as the streaming path."""
+        self._check_pyscx()
+        from benchmarks.comprehensive.rss import current_rss_mb
+
+        def _eager() -> tuple[int, float, dict, float]:
+            ds = pyscx.open(str(path))
+            mu = ds.to_mudata()
+            names = (
+                list(modality_names)
+                if modality_names is not None
+                else list(mu.mod.keys())
+            )
+            in_iter_peak = current_rss_mb()
+            total_chunks = 0
+            total_sum = 0.0
+            per_modality: dict[str, dict[str, float]] = {}
+            for mname in names:
+                X = mu.mod[mname].X
+                n_obs = X.shape[0]
+                m_chunks = 0
+                m_sum = 0.0
+                for start in range(0, n_obs, chunk_size):
+                    end = min(start + chunk_size, n_obs)
+                    m_sum += float(X[start:end].sum())
+                    in_iter_peak = max(in_iter_peak, current_rss_mb())
+                    m_chunks += 1
+                per_modality[mname] = {"n_chunks": m_chunks, "matrix_sum": m_sum}
+                total_chunks += m_chunks
+                total_sum += m_sum
+            return total_chunks, total_sum, per_modality, in_iter_peak
+
+        self._gc_collect()
+        rss_before = current_rss_mb()
+        u0, s0 = self._get_cpu_times()
+        t0 = time.perf_counter()
+        total_chunks, total_sum, per_modality, in_iter_peak = _eager()
+        wall = time.perf_counter() - t0
+        u1, s1 = self._get_cpu_times()
+        rss_after = current_rss_mb()
+
+        return TimingResult(
+            wall_s=wall,
+            user_s=u1 - u0,
+            sys_s=s1 - s0,
+            peak_rss_mb=max(rss_before, rss_after, in_iter_peak),
+            extra={
+                "mode": "in_memory",
+                "chunk_size": chunk_size,
+                "n_modalities": len(per_modality),
+                "total_chunks": total_chunks,
+                "matrix_sum": total_sum,
+                "per_modality": per_modality,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Filtered query via SCX catalog pushdown
     # ------------------------------------------------------------------

@@ -558,3 +558,153 @@ def test_phase_k2_python_to_r_cross_language(cite_seq_mudata, tmp_path):
     assert n_obs == cite_seq_mudata.n_obs
     assert n_rna == cite_seq_mudata.mod["rna"].n_vars
     assert n_adt == cite_seq_mudata.mod["adt"].n_vars
+
+
+# --- multimodal backed / out-of-core reads ----------------------
+
+
+def test_to_mudata_backed_lazy_x(cite_seq_mudata, tmp_path):
+    """Phase 6b: `reader.to_mudata(backed=True)` wraps each modality's X
+    in `ScxBackedSparseDataset` (not a materialised scipy CSR). Shapes
+    track the per-modality `n_vars` (not the file-wide max), and the
+    global obs is the same length across modalities."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+
+    mu = reader.to_mudata(backed=True)
+    assert sorted(mu.mod.keys()) == ["adt", "rna"]
+    for name in ("rna", "adt"):
+        x = mu.mod[name].X
+        assert isinstance(x, pyscx.ScxBackedSparseDataset), (
+            f"{name!r}.X should be ScxBackedSparseDataset, got {type(x).__name__}"
+        )
+        mod_n_vars = cite_seq_mudata.mod[name].n_vars
+        assert x.shape == (cite_seq_mudata.n_obs, mod_n_vars)
+
+
+def test_to_anndata_modality_backed_row_equality(cite_seq_mudata, tmp_path):
+    """Phase 6b: `to_anndata(modality=name, backed=True)` is row-wise
+    bit-identical to the eager `to_mudata().mod[name]` over a random
+    row sample."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+
+    mu_eager = reader.to_mudata()
+    rng = np.random.default_rng(0)
+    rows = np.sort(rng.choice(cite_seq_mudata.n_obs, 16, replace=False))
+
+    for name in ("rna", "adt"):
+        adata = reader.to_anndata(modality=name, backed=True)
+        mod_n_vars = cite_seq_mudata.mod[name].n_vars
+        assert adata.shape == (cite_seq_mudata.n_obs, mod_n_vars)
+
+        backed_rows = np.asarray(adata.X[rows, :].toarray())
+        eager_rows = np.asarray(mu_eager.mod[name].X[rows, :].toarray())
+        np.testing.assert_array_equal(
+            backed_rows, eager_rows,
+            err_msg=f"row-sample mismatch on modality {name!r}",
+        )
+
+
+def test_to_anndata_backed_rejects_filter_kwargs_with_modality(cite_seq_mudata, tmp_path):
+    """Phase 6b: filter kwargs are unsupported on the modality-backed
+    path — they raise with a directing message to
+    `scx subset --modality NAME --filter`."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+
+    with pytest.raises(ValueError, match="scx subset"):
+        reader.to_anndata(modality="rna", backed=True, var_names=["g0"])
+    with pytest.raises(ValueError, match="scx subset"):
+        reader.to_anndata(modality="rna", backed=True, obs_filter="cell_id == 'cell_0'")
+    with pytest.raises(ValueError, match="scx subset"):
+        reader.to_anndata(modality="rna", backed=True, layers=["raw"])
+
+    # modality= without backed=True is also rejected.
+    with pytest.raises(ValueError, match="requires backed=True"):
+        reader.to_anndata(modality="rna")
+
+
+def test_to_anndata_backed_multimodal_requires_modality(cite_seq_mudata, tmp_path):
+    """Phase 6b: the per-modality flow is the supported way to get a
+    backed AnnData from a multimodal file. Verify the modality= flow
+    works end-to-end."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+    rna = reader.to_anndata(modality="rna", backed=True)
+    assert rna.shape[1] == cite_seq_mudata.mod["rna"].n_vars
+
+
+def test_to_mudata_backed_single_modality_wraps(tmp_path):
+    """Phase 6b: `to_mudata(backed=True)` on a single-modality v1 file
+    wraps the result in a one-modality `MuData` rather than raising
+    (today's eager `to_mudata` raises with a directing error)."""
+    pytest.importorskip("mudata")
+    pytest.importorskip("anndata")
+    import anndata
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.3, size=(24, 18)).astype(np.float32))
+    )
+    adata.var_names = [f"g{i}" for i in range(18)]
+    adata.obs_names = [f"c{i}" for i in range(24)]
+    path = str(tmp_path / "single.scx")
+    pyscx.from_anndata(adata, path)
+
+    reader = pyscx.open(path)
+    mu = reader.to_mudata(backed=True)
+    assert len(mu.mod) == 1
+    only = next(iter(mu.mod.values()))
+    assert isinstance(only.X, pyscx.ScxBackedSparseDataset)
+    assert only.X.shape == (24, 18)
+
+
+def test_to_mudata_backed_lazy_normalize_log1p_parity(cite_seq_mudata, tmp_path):
+    """Phase 6b spec test bullet — modality-scoped lazy transforms produce
+    row-by-row output bit-identical to materialising one modality first
+    and applying the same transforms."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+
+    # Path A: backed-modality + lazy normalize + log1p.
+    mu_backed = reader.to_mudata(backed=True)
+    rna_backed = mu_backed.mod["rna"]
+    pyscx.accel.normalize_total(rna_backed)
+    pyscx.accel.log1p(rna_backed)
+    # adata.X should now be a lazy transformed wrapper.
+    assert isinstance(rna_backed.X, pyscx.ScxLazyTransformedDataset)
+    out_backed = np.asarray(rna_backed.X[:, :].toarray())
+
+    # Path B: eager materialise, then normalize + log1p on scipy CSR
+    # via scanpy.pp (which is what pyscx.accel falls back to once X
+    # is a scipy sparse matrix).
+    mu_eager = reader.to_mudata()
+    rna_eager = mu_eager.mod["rna"]
+    pyscx.accel.normalize_total(rna_eager)
+    pyscx.accel.log1p(rna_eager)
+    out_eager = np.asarray(rna_eager.X.toarray())
+
+    np.testing.assert_allclose(out_backed, out_eager, atol=1e-6, rtol=1e-6)
