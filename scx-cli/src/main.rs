@@ -932,9 +932,7 @@ fn dispatch_convert(
         "scx_to_h5ad" => match modality {
             Some(name) => {
                 if opts.stream {
-                    convert::scx_modality_to_h5ad_streaming(
-                        input, output, name, &opts, &mut sink,
-                    )
+                    convert::scx_modality_to_h5ad_streaming(input, output, name, &opts, &mut sink)
                 } else {
                     convert::scx_modality_to_h5ad(input, output, name)
                 }

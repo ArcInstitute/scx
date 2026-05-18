@@ -432,9 +432,7 @@ fn write_column_to_hdf5(
             let values: Vec<bool> = (0..arr.len())
                 .map(|i| arr.is_valid(i) && arr.value(i))
                 .collect();
-            let mask: Vec<bool> = (0..arr.len())
-                .map(|i| !arr.is_valid(i))
-                .collect();
+            let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
 
             bool_group
                 .new_dataset::<bool>()

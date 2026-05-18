@@ -232,9 +232,7 @@ fn write_h5mu_per_modality_non_x_blocks(
         .catalog()
         .entries
         .iter()
-        .filter(|e| {
-            e.section_type == SectionType::ObsmEmbedding && e.modality_id == modality_id
-        })
+        .filter(|e| e.section_type == SectionType::ObsmEmbedding && e.modality_id == modality_id)
         .collect();
     if !mod_obsm.is_empty() {
         let obsm_group = modality_root.create_group("obsm")?;

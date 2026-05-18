@@ -4089,8 +4089,14 @@ fn test_h5ad_streaming_multi_shard_round_trip() {
         .read_1d()
         .unwrap()
         .to_vec();
-    assert_eq!(orig_data, out_data, "multi-shard streaming /X/data mismatch");
-    assert_eq!(orig_indptr, out_indptr, "multi-shard streaming /X/indptr mismatch");
+    assert_eq!(
+        orig_data, out_data,
+        "multi-shard streaming /X/data mismatch"
+    );
+    assert_eq!(
+        orig_indptr, out_indptr,
+        "multi-shard streaming /X/indptr mismatch"
+    );
 }
 
 /// Streaming export with active deletion vectors: only kept rows
@@ -4331,7 +4337,10 @@ fn test_categorical_wide_round_trip() {
     // containing codes + categories.
     let file = hdf5::File::open(&h5ad_out).unwrap();
     let wide = file.group("obs/wide_cat").unwrap();
-    assert!(wide.dataset("codes").is_ok(), "expected /obs/wide_cat/codes dataset");
+    assert!(
+        wide.dataset("codes").is_ok(),
+        "expected /obs/wide_cat/codes dataset"
+    );
     assert!(
         wide.dataset("categories").is_ok(),
         "expected /obs/wide_cat/categories dataset"

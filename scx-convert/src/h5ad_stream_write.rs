@@ -28,9 +28,7 @@ use scx_format::catalog::FullCatalogEntry;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 
-use super::h5ad_write::{
-    write_dataframe_group_at, write_obsm_entry_at, write_uns_entries_at,
-};
+use super::h5ad_write::{write_dataframe_group_at, write_obsm_entry_at, write_uns_entries_at};
 use super::pipeline::{ConvertError, ConvertOptions};
 use super::warnings::WarningSink;
 
@@ -165,12 +163,7 @@ pub(super) fn stream_csr_to_group_at(
     let total_nnz = precompute_total_nnz(reader, &shards, keep_mask_opt, layer_name, modality_id)?;
 
     let group = parent.create_group(name)?;
-    create_csr_triplet(
-        &group,
-        n_obs_kept as usize,
-        n_vars,
-        total_nnz as usize,
-    )?;
+    create_csr_triplet(&group, n_obs_kept as usize, n_vars, total_nnz as usize)?;
 
     // Re-open the three datasets just created so we can hyperslab into them.
     let indptr_ds = group.dataset("indptr")?;
@@ -178,10 +171,7 @@ pub(super) fn stream_csr_to_group_at(
     let data_ds = group.dataset("data")?;
 
     // indptr[0] = 0; written once before the loop.
-    indptr_ds.write_slice(
-        ArrayView1::from(&[0i64][..]),
-        ndarray::s![0..1],
-    )?;
+    indptr_ds.write_slice(ArrayView1::from(&[0i64][..]), ndarray::s![0..1])?;
 
     let mut nnz_offset: u64 = 0;
     let mut row_offset_kept: u64 = 0;
@@ -210,15 +200,11 @@ pub(super) fn stream_csr_to_group_at(
         if !kept_indices_i32.is_empty() {
             indices_ds.write_slice(
                 ArrayView1::from(kept_indices_i32.as_slice()),
-                ndarray::s![
-                    nnz_offset as usize..nnz_offset as usize + kept_indices_i32.len()
-                ],
+                ndarray::s![nnz_offset as usize..nnz_offset as usize + kept_indices_i32.len()],
             )?;
             data_ds.write_slice(
                 ArrayView1::from(kept_data_f32.as_slice()),
-                ndarray::s![
-                    nnz_offset as usize..nnz_offset as usize + kept_data_f32.len()
-                ],
+                ndarray::s![nnz_offset as usize..nnz_offset as usize + kept_data_f32.len()],
             )?;
         }
         if !kept_indptr_tail.is_empty() {
@@ -512,7 +498,11 @@ fn filter_shard(
             // existing read paths already return owned `Vec`s, so we
             // just hand the buffers back as-is rather than playing
             // lifetime games.
-            (kept_indptr_tail, indices_local.to_vec(), data_local.to_vec())
+            (
+                kept_indptr_tail,
+                indices_local.to_vec(),
+                data_local.to_vec(),
+            )
         }
         Some(mask) => {
             let n_rows = indptr_local.len().saturating_sub(1);
