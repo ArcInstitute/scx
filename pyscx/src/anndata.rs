@@ -1087,6 +1087,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed), cache_shards),
     };
     x_dataset.with_csc_reader(x_backed_csc);
+    x_dataset.with_source_path(path);
     if let Some(ref indices) = col_indices {
         x_dataset.set_col_projection(indices.clone());
     }
@@ -2900,10 +2901,617 @@ pub(crate) fn route_backed_anndata_to_streaming(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Phase 8b: SCX → SCX streaming writer (backed and lazy `X`).
+// ---------------------------------------------------------------------------
+
+/// Extracted metadata + uns JSON for an AnnData object that wraps an
+/// SCX-backed or lazy `X`. Returned by `extract_scx_overrides` so the
+/// route functions below can interleave metadata writes with shard
+/// reads.
+struct ScxOverrides {
+    obs: RecordBatch,
+    var: RecordBatch,
+    obsm: Vec<(String, RecordBatch)>,
+    varm: Vec<(String, RecordBatch)>,
+    obsp: Vec<(String, RecordBatch)>,
+    varp: Vec<(String, RecordBatch)>,
+    uns: Option<serde_json::Value>,
+}
+
+fn extract_scx_overrides(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    uns_format_parsed: UnsFormat,
+) -> PyResult<ScxOverrides> {
+    let obs = pandas_to_record_batch(py, &adata.getattr("obs")?)?;
+    let var = pandas_to_record_batch(py, &adata.getattr("var")?)?;
+    let obsm = extract_dense_mapping(py, adata, "obsm")?;
+    let varm = extract_dense_mapping(py, adata, "varm")?;
+    let obsp = extract_coo_mapping(py, adata, "obsp")?;
+    let varp = extract_coo_mapping(py, adata, "varp")?;
+    let uns = extract_uns_value(py, adata, uns_format_parsed)?;
+    Ok(ScxOverrides {
+        obs,
+        var,
+        obsm,
+        varm,
+        obsp,
+        varp,
+        uns,
+    })
+}
+
+/// Warn (Python `UserWarning`) that a CSC sidecar on the source is
+/// being dropped on rewrite. Matches the convention documented in
+/// `AGENTS.md`'s "CSC storage" bullet — mutating ops drop the
+/// sidecar by default; callers opt into a rebuild via `csc="always"`.
+fn warn_csc_dropped(py: Python<'_>) {
+    let msg = "source SCX has a CSC sidecar; the rewrite drops it. \
+               Pass csc=\"always\" to rebuild a fresh CSC sidecar over the new CSR shards.";
+    let _ = py
+        .import("warnings")
+        .and_then(|w| w.call_method1("warn", (msg,)));
+}
+
+/// Decompose a scipy CSR matrix into owned `(indptr_u64, indices_u32,
+/// data_f32)` vectors suitable for `encode_one_shard`. Mirrors the
+/// extraction inside the in-memory `from_anndata_impl` path but pulls
+/// from a Python object rather than slicing a pre-validated buffer.
+fn decompose_scipy_csr(
+    py: Python<'_>,
+    csr: &Bound<'_, PyAny>,
+) -> PyResult<(Vec<u64>, Vec<u32>, Vec<f32>)> {
+    let np = py.import("numpy")?;
+
+    let indptr_obj = csr.getattr("indptr")?;
+    let indptr_arr = astype_if_needed(&indptr_obj, &np, "int64")?;
+    let indptr: PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
+    let indptr_slice = indptr
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let indptr_u64: Vec<u64> = indptr_slice
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative indptr value {v} from wrapper.__getitem__"
+                )))
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect::<PyResult<Vec<u64>>>()?;
+
+    let indices_obj = csr.getattr("indices")?;
+    let indices_arr = astype_if_needed(&indices_obj, &np, "int32")?;
+    let indices: PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
+    let indices_slice = indices
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let indices_u32: Vec<u32> = indices_slice
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "negative column index {v} from wrapper.__getitem__"
+                )))
+            } else {
+                Ok(v as u32)
+            }
+        })
+        .collect::<PyResult<Vec<u32>>>()?;
+
+    let data_obj = csr.getattr("data")?;
+    let data_arr = astype_if_needed(&data_obj, &np, "float32")?;
+    let data: PyReadonlyArray1<'_, f32> = data_arr.extract()?;
+    let data_slice = data
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let data_f32: Vec<f32> = data_slice.to_vec();
+
+    Ok((indptr_u64, indices_u32, data_f32))
+}
+
+/// Build a fresh `FileHeader` template for an SCX → SCX rewrite.
+/// Catalog offsets, shard counts, and `nnz` are written by
+/// `ScxWriter::finish()`.
+fn build_output_header(
+    n_obs: u64,
+    n_vars: u64,
+    shard_target_rows: u32,
+    codec: CodecId,
+    index_dtype: u8,
+) -> FileHeader {
+    FileHeader {
+        magic: MAGIC,
+        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        header_length: 256,
+        flags: 0,
+        n_obs,
+        n_vars,
+        nnz: 0,
+        n_csr_shards: 0,
+        n_csc_shards: 0,
+        shard_target_rows,
+        codec_id: codec as u8,
+        index_dtype,
+        endian: 0,
+        reserved_padding: 0,
+        root_catalog_offset: 0,
+        root_catalog_length: 0,
+        full_catalog_offset: 0,
+        full_catalog_length: 0,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        file_checksum: 0,
+        front_catalog_offset: 0,
+        front_catalog_length: 0,
+        n_modalities: 0,
+        modality_table_offset: 0,
+        modality_table_length: 0,
+        reserved: [0u8; 112],
+    }
+}
+
+/// Route an AnnData with `adata.X = ScxBackedSparseDataset` through
+/// an SCX → SCX streaming writer.
+///
+/// Two modes:
+///
+/// * **Byte-passthrough**: when the source and target shard layouts
+///   agree (same `shard_target_rows`, same codec, no row deletions,
+///   no column projection, source is built from a single modality
+///   with `modality_id == None`), pre-encoded CSR shards are copied
+///   from the source file into the target writer via
+///   [`ScxWriter::copy_section_verbatim`]. No decode + re-encode.
+/// * **Decode + encode**: otherwise the writer iterates the
+///   wrapper's user-visible shard boundaries, calls
+///   `wrapper[start:end]` to materialise each shard as a scipy CSR
+///   (deletions and column projection already applied by the
+///   wrapper), then hands it to [`scx_format::encode_one_shard`]
+///   plus [`ScxWriter::write_preencoded_shard`].
+///
+/// `shard_size_overridden` reflects whether the caller passed
+/// `shard_size=…`. When `explicit_codec` is `None` and `shard_size`
+/// was not overridden *and* every other precondition holds, the
+/// rewrite is byte-faithful; otherwise it falls back to
+/// decode + encode.
+#[allow(clippy::too_many_arguments)]
+fn route_scx_backed_to_scx(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    backed: &crate::backed::ScxBackedSparseDataset,
+    out_path: &str,
+    explicit_codec: Option<CodecId>,
+    shard_target_rows: u32,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
+    uns_format_parsed: UnsFormat,
+    shard_size_overridden: bool,
+) -> PyResult<()> {
+    let src_path = backed.source_path().ok_or_else(|| {
+        pyo3::exceptions::PyNotImplementedError::new_err(
+            "ScxBackedSparseDataset has no known source path; the SCX → SCX writer needs a \
+             path-backed wrapper (constructed via pyscx.open(path).to_anndata(backed=True)).",
+        )
+    })?;
+    let src_path_owned = src_path.to_path_buf();
+
+    let src_reader = ScxReader::open(&src_path_owned).map_err(to_pyerr)?;
+    let src_header = src_reader.header().clone();
+    let src_n_obs = src_header.n_obs;
+    let src_n_vars = src_header.n_vars;
+    let src_codec_id = src_header.codec_id;
+    let src_shard_rows = src_header.shard_target_rows;
+    let src_has_csc = src_header.has_csc();
+    let modality_id = backed.modality_id;
+
+    // User-visible dimensions after any row deletions / column
+    // projection. Used by the decode-encode path's output header so
+    // the new file's shape matches what the AnnData wrapper exposes.
+    let (out_n_obs_visible, out_n_vars_visible) =
+        (backed.shape_val.0 as u64, backed.shape_val.1 as u64);
+
+    // Passthrough preconditions. Any false → fall through to
+    // decode-encode.
+    let target_codec_for_passthrough = match explicit_codec {
+        Some(c) => c as u8 == src_codec_id,
+        None => true,
+    };
+    let target_shard_rows_matches = if shard_size_overridden {
+        shard_target_rows == src_shard_rows
+    } else {
+        true
+    };
+    let no_deletions = backed.kept_to_global.is_none();
+    let no_projection = backed.col_projection().is_none();
+    let single_modality_source = modality_id.is_none();
+    let passthrough_ok = target_codec_for_passthrough
+        && target_shard_rows_matches
+        && no_deletions
+        && no_projection
+        && single_modality_source;
+
+    // Output header / writer setup. For passthrough, mirror the
+    // source's codec / shard_target_rows / index_dtype so the
+    // catalog and per-shard headers stay self-consistent.
+    let out_codec_id: u8 = if passthrough_ok {
+        src_codec_id
+    } else {
+        match explicit_codec {
+            Some(c) => c as u8,
+            None => CodecId::Zstd as u8,
+        }
+    };
+    let out_shard_rows = if passthrough_ok {
+        src_shard_rows
+    } else {
+        shard_target_rows
+    };
+    let out_index_dtype = if passthrough_ok {
+        src_header.index_dtype
+    } else if src_n_vars <= 65535 {
+        0
+    } else {
+        1
+    };
+
+    let codec_for_header = match out_codec_id {
+        0 => CodecId::None,
+        1 => CodecId::Scx1,
+        2 => CodecId::Zstd,
+        3 => CodecId::Lz4Shuffle,
+        _ => CodecId::Zstd,
+    };
+    // Output dimensions: passthrough mirrors the source header
+    // (preconditions guarantee no deletions / projection). The
+    // decode-encode path uses the wrapper's user-visible shape so
+    // the rewrite drops any deleted rows and respects column
+    // projection.
+    let (out_n_obs, out_n_vars) = if passthrough_ok {
+        (src_n_obs, src_n_vars)
+    } else {
+        (out_n_obs_visible, out_n_vars_visible)
+    };
+    let header = build_output_header(
+        out_n_obs,
+        out_n_vars,
+        out_shard_rows,
+        codec_for_header,
+        out_index_dtype,
+    );
+
+    let mut writer = ScxWriter::new(out_path, header).map_err(to_pyerr)?;
+
+    // Extract metadata overrides up front so the writer can interleave
+    // metadata writes with shard I/O in the canonical order.
+    let ov = extract_scx_overrides(py, adata, uns_format_parsed)?;
+
+    // CSC sidecar policy.
+    let csc_dropped = src_has_csc && !csc_always;
+    if csc_dropped {
+        warn_csc_dropped(py);
+    }
+
+    // Write obs/var first.
+    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        writer.write_obs(&ov.obs)?;
+        writer.write_var(&ov.var)?;
+        Ok(())
+    })
+    .map_err(to_pyerr)?;
+
+    let n_vars_u32 = u32::try_from(out_n_vars)
+        .map_err(|_| PyRuntimeError::new_err(format!("n_vars {out_n_vars} exceeds u32::MAX")))?;
+    let codec_for_encode = explicit_codec;
+
+    if passthrough_ok {
+        // Byte-passthrough. Iterate source CSR shards in row order;
+        // copy each verbatim. `modality_id == None` is already
+        // enforced above, so we can write at the global modality
+        // (current_modality_id == 0).
+        let csr_shards = src_reader.catalog().csr_shards_sorted();
+        py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+            for entry in csr_shards {
+                let bytes = src_reader.read_raw_shard_bytes(entry)?;
+                writer.copy_section_verbatim(entry, bytes)?;
+            }
+            Ok(())
+        })
+        .map_err(to_pyerr)?;
+    } else {
+        // Decode + encode. Drive iteration over user-visible shard
+        // boundaries so deletions / column projection already apply
+        // via the wrapper's `__getitem__`.
+        let bounds = compute_wrapper_boundaries_backed(backed, out_shard_rows);
+        for (i, (start, end)) in bounds.iter().enumerate() {
+            let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
+            // Use the Python-visible wrapper to honour deletion /
+            // projection semantics. Calling through PyAny gives us
+            // the wrapper's __getitem__ (returns scipy CSR).
+            let adata_x = adata.getattr("X")?;
+            let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
+            let (indptr_u64, indices_u32, data_f32) = decompose_scipy_csr(py, &shard_obj)?;
+            let pre = py.allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
+                scx_format::encode_one_shard(
+                    &indptr_u64,
+                    &indices_u32,
+                    &data_f32,
+                    codec_for_encode,
+                    out_index_dtype,
+                    n_vars_u32,
+                    *start as u64,
+                    SectionType::CsrShard,
+                    ModalityType::Rna,
+                    format!("X_shard_{i}"),
+                )
+            })
+            .map_err(to_pyerr)?;
+            py.allow_threads(|| writer.write_preencoded_shard(pre))
+                .map_err(to_pyerr)?;
+        }
+    }
+
+    // Write remaining metadata (obsm / varm / obsp / varp / uns) after
+    // the X shards, matching the canonical layout.
+    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        for (k, b) in &ov.obsm {
+            writer.write_obsm(k, b)?;
+        }
+        for (k, b) in &ov.varm {
+            writer.write_varm(k, b)?;
+        }
+        for (k, b) in &ov.obsp {
+            writer.write_obsp(k, b)?;
+        }
+        for (k, b) in &ov.varp {
+            writer.write_varp(k, b)?;
+        }
+        if let Some(ref uns_json) = ov.uns {
+            writer.write_uns(uns_json)?;
+        }
+        Ok(())
+    })
+    .map_err(to_pyerr)?;
+
+    // Provenance: x_source / passthrough / source_path / csc_dropped.
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let params_json = serde_json::json!({
+        "x_source": "backed",
+        "passthrough": passthrough_ok,
+        "source_path": src_path_owned.display().to_string(),
+        "csc_dropped": csc_dropped,
+    });
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp,
+            action: "from_anndata".to_string(),
+            tool: format!("pyscx {}", env!("CARGO_PKG_VERSION")),
+            params_json: params_json.to_string(),
+            input_checksums: vec![],
+        }])
+        .map_err(to_pyerr)?;
+
+    writer.finish().map_err(to_pyerr)?;
+
+    // Optional CSC sidecar rebuild over the just-written file.
+    if csc_always {
+        py.allow_threads(|| {
+            scx_ops::rebuild_csc_inplace(
+                std::path::Path::new(out_path),
+                csc_cols_per_shard,
+                "4G",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Route an AnnData with `adata.X = ScxLazyTransformedDataset`
+/// through an SCX → SCX streaming writer.
+///
+/// Always decode + encode. The wrapper's `__getitem__` returns the
+/// transformed scipy CSR for the requested row slice; the writer
+/// hands it to `encode_one_shard` and `write_preencoded_shard`.
+/// Any source CSC sidecar is invalidated by the transforms and is
+/// dropped with a `UserWarning` unless `csc="always"` is passed (in
+/// which case it is rebuilt post-finalise).
+#[allow(clippy::too_many_arguments)]
+fn route_scx_lazy_to_scx(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    lazy: &crate::lazy_transform::ScxLazyTransformedDataset,
+    out_path: &str,
+    explicit_codec: Option<CodecId>,
+    shard_target_rows: u32,
+    csc_always: bool,
+    csc_cols_per_shard: usize,
+    uns_format_parsed: UnsFormat,
+) -> PyResult<()> {
+    let (n_obs_usize, n_vars_usize) = lazy.shape_val;
+    let n_obs = n_obs_usize as u64;
+    let n_vars = n_vars_usize as u64;
+
+    let out_codec = explicit_codec.unwrap_or(CodecId::Zstd);
+    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
+    let n_vars_u32 = u32::try_from(n_vars)
+        .map_err(|_| PyRuntimeError::new_err(format!("n_vars {n_vars} exceeds u32::MAX")))?;
+
+    let header = build_output_header(n_obs, n_vars, shard_target_rows, out_codec, index_dtype);
+    let mut writer = ScxWriter::new(out_path, header).map_err(to_pyerr)?;
+
+    // Source CSC sidecar (if any) is always invalidated by the
+    // transform chain. Warn unless the user opted into a rebuild.
+    let src_has_csc = lazy.backed_csc.is_some();
+    let csc_dropped = src_has_csc && !csc_always;
+    if csc_dropped {
+        warn_csc_dropped(py);
+    }
+
+    let ov = extract_scx_overrides(py, adata, uns_format_parsed)?;
+
+    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        writer.write_obs(&ov.obs)?;
+        writer.write_var(&ov.var)?;
+        Ok(())
+    })
+    .map_err(to_pyerr)?;
+
+    // Lazy transforms always force decode + encode. Iterate the
+    // wrapper's user-visible shard boundaries so any deletion vector
+    // already applies.
+    let bounds = compute_wrapper_boundaries_lazy(lazy, shard_target_rows);
+    let adata_x = adata.getattr("X")?;
+    for (i, (start, end)) in bounds.iter().enumerate() {
+        let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
+        let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
+        let (indptr_u64, indices_u32, data_f32) = decompose_scipy_csr(py, &shard_obj)?;
+        let pre = py.allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
+            scx_format::encode_one_shard(
+                &indptr_u64,
+                &indices_u32,
+                &data_f32,
+                explicit_codec,
+                index_dtype,
+                n_vars_u32,
+                *start as u64,
+                SectionType::CsrShard,
+                ModalityType::Rna,
+                format!("X_shard_{i}"),
+            )
+        })
+        .map_err(to_pyerr)?;
+        py.allow_threads(|| writer.write_preencoded_shard(pre))
+            .map_err(to_pyerr)?;
+    }
+
+    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        for (k, b) in &ov.obsm {
+            writer.write_obsm(k, b)?;
+        }
+        for (k, b) in &ov.varm {
+            writer.write_varm(k, b)?;
+        }
+        for (k, b) in &ov.obsp {
+            writer.write_obsp(k, b)?;
+        }
+        for (k, b) in &ov.varp {
+            writer.write_varp(k, b)?;
+        }
+        if let Some(ref uns_json) = ov.uns {
+            writer.write_uns(uns_json)?;
+        }
+        Ok(())
+    })
+    .map_err(to_pyerr)?;
+
+    // Provenance: lazy_transforms summary.
+    let transforms_repr: Vec<serde_json::Value> = lazy
+        .transforms()
+        .iter()
+        .map(|t| match t {
+            crate::lazy_transform::Transform::NormalizeTotal {
+                row_sums,
+                target_sum,
+            } => serde_json::json!({
+                "name": "normalize_total",
+                "params": { "row_sums_len": row_sums.len(), "target_sum": target_sum },
+            }),
+            crate::lazy_transform::Transform::Log1p => serde_json::json!({
+                "name": "log1p",
+                "params": {},
+            }),
+            crate::lazy_transform::Transform::RowScale { factors } => serde_json::json!({
+                "name": "row_scale",
+                "params": { "factors_len": factors.len() },
+            }),
+        })
+        .collect();
+    let source_path_json: serde_json::Value = lazy
+        .source_path()
+        .map(|p| serde_json::Value::String(p.display().to_string()))
+        .unwrap_or(serde_json::Value::Null);
+    let params_json = serde_json::json!({
+        "x_source": "lazy",
+        "passthrough": false,
+        "source_path": source_path_json,
+        "lazy_transforms": transforms_repr,
+        "csc_dropped": csc_dropped,
+    });
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp,
+            action: "from_anndata".to_string(),
+            tool: format!("pyscx {}", env!("CARGO_PKG_VERSION")),
+            params_json: params_json.to_string(),
+            input_checksums: vec![],
+        }])
+        .map_err(to_pyerr)?;
+
+    writer.finish().map_err(to_pyerr)?;
+
+    if csc_always {
+        py.allow_threads(|| {
+            scx_ops::rebuild_csc_inplace(
+                std::path::Path::new(out_path),
+                csc_cols_per_shard,
+                "4G",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Compute output shard boundaries for the backed decode-encode
+/// path. Sized by the **target** `shard_target_rows` (not the
+/// source's), since the user may have asked for a different chunk
+/// size — and that's the only reason we're on the decode-encode path
+/// instead of byte-passthrough.
+fn compute_wrapper_boundaries_backed(
+    backed: &crate::backed::ScxBackedSparseDataset,
+    target_shard_rows: u32,
+) -> Vec<(usize, usize)> {
+    let n_obs = backed.shape_val.0;
+    chunk_boundaries(n_obs, target_shard_rows as usize)
+}
+
+fn compute_wrapper_boundaries_lazy(
+    lazy: &crate::lazy_transform::ScxLazyTransformedDataset,
+    target_shard_rows: u32,
+) -> Vec<(usize, usize)> {
+    let n_obs = lazy.shape_val.0;
+    chunk_boundaries(n_obs, target_shard_rows as usize)
+}
+
+fn chunk_boundaries(n_obs: usize, target_rows: usize) -> Vec<(usize, usize)> {
+    if n_obs == 0 || target_rows == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n_obs.div_ceil(target_rows));
+    let mut start = 0usize;
+    while start < n_obs {
+        let end = (start + target_rows).min(n_obs);
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
 /// Helper for the backed-routing path. Reads a dense mapping
 /// (`obsm` / `varm`) from a Python AnnData and returns
 /// `Vec<(name, RecordBatch)>`. Missing groups → empty Vec.
-#[cfg(feature = "hdf5")]
 fn extract_dense_mapping(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -2931,7 +3539,6 @@ fn extract_dense_mapping(
 /// Helper for the backed-routing path. Reads a sparse pairwise
 /// mapping (`obsp` / `varp`) as COO RecordBatches. Missing groups →
 /// empty Vec.
-#[cfg(feature = "hdf5")]
 fn extract_coo_mapping(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -2958,7 +3565,6 @@ fn extract_coo_mapping(
 /// AnnData into an optional `serde_json::Value`. Returns `None` if
 /// `uns` is empty (no `__scx_uns__` section written), matching the
 /// non-backed path.
-#[cfg(feature = "hdf5")]
 fn extract_uns_value(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -3080,6 +3686,40 @@ pub fn from_anndata_impl(
     // matrices; pass `in_place=true` to opt into the original in-place
     // sort behavior for speed/memory.
     let x = adata.getattr("X")?;
+
+    // Phase 8b: SCX-backed or lazy `X` → stream from the source SCX
+    // file without materialising X into a scipy CSR. Falls through
+    // to the existing in-memory path for scipy / numpy input. The
+    // `extract::<PyRef<…>>()` calls are no-ops on non-matching
+    // types (fail-fast, no Python call overhead).
+    if let Ok(backed) = x.extract::<PyRef<crate::backed::ScxBackedSparseDataset>>() {
+        return route_scx_backed_to_scx(
+            py,
+            adata,
+            &backed,
+            path,
+            explicit_codec,
+            shard_target_rows,
+            csc_always,
+            csc_cols_per_shard,
+            uns_format_parsed,
+            shard_size.is_some(),
+        );
+    }
+    if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+        return route_scx_lazy_to_scx(
+            py,
+            adata,
+            &lazy,
+            path,
+            explicit_codec,
+            shard_target_rows,
+            csc_always,
+            csc_cols_per_shard,
+            uns_format_parsed,
+        );
+    }
+
     let (x_csr, csr_validated) = ensure_csr(py, &x, in_place)?;
 
     // Get shape
@@ -3655,6 +4295,7 @@ pub fn build_backed_anndata_for_modality<'py>(
     let mut x_dataset = ScxBackedSparseDataset::from_reader(Arc::clone(&backed_csr), cache_shards);
     x_dataset.with_csc_reader(backed_csc);
     x_dataset.with_modality_id(modality_id);
+    x_dataset.with_source_path(path);
 
     // Per-modality var.
     let var_batch = meta.read_var_for(modality_id).map_err(to_pyerr)?;

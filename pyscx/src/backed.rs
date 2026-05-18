@@ -2,6 +2,7 @@
 //
 // Implements the anndata.abc.CSRDataset interface for backed mode.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyIndexError, PyRuntimeError};
@@ -59,6 +60,14 @@ pub struct ScxBackedSparseDataset {
     /// used internally for routing (the readers are already pinned
     /// at construction time).
     pub(crate) modality_id: Option<u8>,
+    /// On-disk source SCX file path, when the wrapper was constructed
+    /// from `pyscx.open(path)`. Read by the Phase 8b SCX → SCX writer
+    /// (`pyscx.from_anndata` dispatch) so it can open a fresh
+    /// `ScxReader` for catalog introspection and byte-passthrough
+    /// shard copies. `None` for wrappers built without a known path
+    /// (e.g. ad-hoc readers in tests) — in that case the writer falls
+    /// back to decode-encode.
+    pub(crate) source_path: Option<PathBuf>,
 }
 
 impl ScxBackedSparseDataset {
@@ -76,6 +85,7 @@ impl ScxBackedSparseDataset {
             col_projection: None,
             non_negative: true,
             modality_id: None,
+            source_path: None,
         }
     }
 
@@ -101,7 +111,25 @@ impl ScxBackedSparseDataset {
             col_projection: None,
             non_negative: true,
             modality_id: None,
+            source_path: None,
         }
+    }
+
+    /// Builder-style setter for the on-disk source path. Populated by
+    /// `pyscx.open(path).to_anndata(backed=True)` (and the
+    /// per-modality variant) so the Phase 8b `from_anndata` writer
+    /// can recover the source path for byte-passthrough copies.
+    pub fn with_source_path(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.source_path = Some(path.into());
+        self
+    }
+
+    /// Returns the on-disk source path that this wrapper was built
+    /// from, if known. `None` when the wrapper was constructed without
+    /// a path (e.g. ad-hoc readers in tests) — callers should fall
+    /// back to decode-encode in that case.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
     }
 
     /// Phase B.5: builder-style setter for the `modality_id` tag.
@@ -439,7 +467,8 @@ impl ScxBackedSparseDataset {
                 }],
                 self.non_negative,
             )
-            .with_csc_reader(self.backed_csc.clone());
+            .with_csc_reader(self.backed_csc.clone())
+            .with_source_path(self.source_path.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -480,7 +509,8 @@ impl ScxBackedSparseDataset {
                 }],
                 self.non_negative,
             )
-            .with_csc_reader(self.backed_csc.clone());
+            .with_csc_reader(self.backed_csc.clone())
+            .with_source_path(self.source_path.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -1303,6 +1333,7 @@ impl ScxBackedSparseDataset {
                     col_projection: Some(Arc::new(composed)),
                     non_negative: self.non_negative,
                     modality_id: self.modality_id,
+                    source_path: self.source_path.clone(),
                 };
                 return Ok(new_ds.into_pyobject(py)?.into_any().unbind().into_bound(py));
             }
@@ -2136,7 +2167,6 @@ pub(crate) fn expand_to_global(
 // ─── Phase D.4: ScxBackedMuDataset ──────────────────────────────────────────
 
 use scx_format::ScxReader;
-use std::path::Path;
 use std::sync::Mutex as StdMutex;
 
 /// Phase D.4: backed wrapper for multimodal SCX files. Holds an
@@ -2360,6 +2390,7 @@ impl ScxBackedMuModality {
 
         let mut ds = ScxBackedSparseDataset::from_reader(backed_csr, self.cache_shards);
         ds.with_csc_reader(backed_csc).with_modality_id(modality_id);
+        ds.with_source_path(&self.path);
         Py::new(py, ds)
     }
 

@@ -735,6 +735,78 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Copy a pre-encoded section verbatim from another SCX file into
+    /// this writer.
+    ///
+    /// Used by the Phase 8b SCX → SCX byte-passthrough path
+    /// (`pyscx.from_anndata` with `ScxBackedSparseDataset` input):
+    /// when the source and target shard layouts agree (same
+    /// `shard_target_rows`, same codec, same value encoding), the
+    /// source shard bytes — header, indptr, indices, values,
+    /// block-index — can be written into the new file without
+    /// decode + re-encode.
+    ///
+    /// `src_entry` carries the source section's name, length,
+    /// checksum, `section_type`, modality routing key, and shard
+    /// stats. This method writes `raw_bytes` (the full section
+    /// payload as returned by [`ScxReader::read_raw_shard_bytes`]),
+    /// pushes a new [`FullCatalogEntry`] with the file offset
+    /// adjusted to the writer's current cursor (every other field
+    /// cloned from `src_entry`), and updates the writer's shard
+    /// counters and `total_nnz` accumulator to mirror
+    /// [`Self::write_preencoded_shard`]'s bookkeeping.
+    ///
+    /// `raw_bytes.len()` must equal `src_entry.length`.
+    pub fn copy_section_verbatim(
+        &mut self,
+        src_entry: &FullCatalogEntry,
+        raw_bytes: &[u8],
+    ) -> Result<()> {
+        if raw_bytes.len() as u64 != src_entry.length {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "copy_section_verbatim: raw_bytes length {} does not match catalog entry length {}",
+                    raw_bytes.len(),
+                    src_entry.length,
+                ),
+            )));
+        }
+
+        self.write_padding()?;
+
+        let shard_global_offset = self.current_offset;
+        self.writer()?.write_all(raw_bytes)?;
+        self.current_offset += src_entry.length;
+
+        let nnz = src_entry.stats.as_ref().map(|s| s.nnz).unwrap_or(0);
+
+        self.entries.push(FullCatalogEntry {
+            name: src_entry.name.clone(),
+            offset: shard_global_offset,
+            length: src_entry.length,
+            section_type: src_entry.section_type,
+            checksum: src_entry.checksum,
+            modality_id: self.current_modality_id,
+            stats: src_entry.stats.clone(),
+        });
+
+        match src_entry.section_type {
+            SectionType::CsrShard => {
+                self.csr_shard_count += 1;
+                self.total_nnz += nnz;
+            }
+            SectionType::CscShard => {
+                self.csc_shard_count += 1;
+                // Don't double-count nnz — CSC mirrors CSR (see
+                // `write_preencoded_shard`).
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     /// Set per-column statistics on the last written shard entry.
     ///
     /// This must be called immediately after `write_csr_shard()` (or its

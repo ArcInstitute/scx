@@ -363,6 +363,63 @@ encoded CSR; ATAC modalities are always-on under `auto`. Consumed by
 falls back to a CSR scan when sidecars are absent. The wire format is
 specified in [docs/format.md § Detection Bitmap](format.md#12-detection-bitmap-optional).
 
+## `pyscx.from_anndata` — backed and lazy `X`
+
+`pyscx.from_anndata(adata, out)` accepts `adata.X` in three shapes:
+
+1. **scipy / numpy** — the existing in-memory path; extracts CSR
+   arrays, partitions into shards, writes.
+2. **`ScxBackedSparseDataset`** (returned by
+   `pyscx.open(p).to_anndata(backed=True)`) — streams the source SCX
+   file shard-by-shard without materialising `X`.
+3. **`ScxLazyTransformedDataset`** (after
+   `pyscx.accel.normalize_total` / `pyscx.accel.log1p` / row scaling
+   are stacked on a backed source) — same streaming write, with
+   transforms applied per shard.
+
+For shape 2 the writer chooses between two modes:
+
+- **Byte-passthrough**: when the source and target shard layouts
+  agree (matching `shard_size`, matching `codec`, source built from a
+  single modality with no row deletions and no column projection),
+  pre-encoded CSR shards are copied verbatim via
+  `ScxWriter::copy_section_verbatim`. Provenance records
+  `passthrough=true`.
+- **Decode + encode**: any precondition mismatch (e.g.
+  `shard_size=` override, `codec=` override, a deletion vector marked
+  via `mark_deleted`, a `[:, gene_subset]` column projection) falls
+  back to iterating the wrapper's user-visible shard boundaries,
+  materialising each shard via `wrapper[start:end]` (which already
+  applies deletions / projection), and re-encoding through
+  `encode_one_shard` + `write_preencoded_shard`. The output `n_obs`
+  / `n_vars` reflect the user-visible shape.
+
+For shape 3 the rewrite is always decode + encode; transforms are
+applied per shard inside `wrapper[start:end]`. The same
+`csc="always"` two-pass rebuild is honoured (matches `from_h5ad`).
+Any source CSC sidecar that would be invalidated by the rewrite is
+dropped with a `UserWarning` unless `csc="always"` opts into a
+fresh rebuild.
+
+Each rewrite emits a `from_anndata` provenance entry with the
+following `params_json` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `x_source` | `"scipy" \| "backed" \| "lazy"` | source of `X` |
+| `passthrough` | `bool` | `true` only on the byte-passthrough fast path |
+| `source_path` | `str \| null` | source SCX path (when the wrapper carried one) |
+| `lazy_transforms` | `list[{"name","params"}]` | only for `x_source="lazy"`; per-row factor / row-sum vectors are summarised by length |
+| `csc_dropped` | `bool` | source had a CSC sidecar that was dropped |
+
+Read the chain via `PyExperiment.provenance()` — each entry is a
+dict with `params_json` as a raw JSON string (parse with
+`json.loads`).
+
+The full transform list is also surfaced on the wrapper itself via
+`ScxLazyTransformedDataset.transforms_repr() → list[{"name","params"}]`,
+which the writer uses to build the `lazy_transforms` payload.
+
 ## BackedCsrReader (`scx-format/src/backed.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
