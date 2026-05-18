@@ -9,9 +9,40 @@ use scx_format::header::FileHeader;
 use scx_format::reader::ScxReader;
 use scx_format::writer::ScxWriter;
 
+/// Return true if `source` should be opened via `scx_cloud::open_cloud`.
+///
+/// Routes to the cloud path when:
+///   - `source` carries a recognised URL scheme (`s3`, `gs`, `az`,
+///     `azure`, `http`, `https`, `file`), or
+///   - `source` is an existing local **directory** (typically an
+///     exploded `.scxd/`), which `scx_cloud::open_cloud` handles via
+///     the `LocalFileSystem` backend.
+///
+/// Plain regular files fall through to the local mmap path.
+fn is_cloud_url(source: &str) -> bool {
+    has_cloud_scheme(source) || Path::new(source).is_dir()
+}
+
+/// Return true if `source` carries a recognised remote URL scheme.
+///
+/// Narrower than [`is_cloud_url`]: this returns `false` for local
+/// directories, which are routed through `LocalFileSystem` but are not
+/// actually remote. Callers that need to gate behaviour on "round-trip
+/// cost" (e.g. whether peeking a shard header is cheap) want this
+/// helper, not `is_cloud_url`.
+fn has_cloud_scheme(source: &str) -> bool {
+    source.split_once("://").is_some_and(|(scheme, rest)| {
+        !rest.is_empty()
+            && matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "s3" | "gs" | "az" | "azure" | "http" | "https" | "file"
+            )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_query(
-    file: &Path,
+    source: &str,
     filter: &str,
     count: bool,
     output: Option<&Path>,
@@ -21,8 +52,14 @@ pub fn run_query(
     limit: Option<usize>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Build pipeline
-    let mut pipeline = QueryPipeline::open(file)?.filter_obs(filter)?;
+    // Cloud URLs require the tokio runtime to outlive the pipeline
+    // (the `CloudSectionReader` stores a `Handle` into it). Hold the
+    // runtime in a guard binding tied to the function's lifetime.
+    let opened = open_pipeline_for(source)?;
+    let mut pipeline = opened.pipeline;
+    #[cfg(feature = "cloud")]
+    let _rt_guard = opened.runtime; // kept alive for the pipeline's lifetime
+    pipeline = pipeline.filter_obs(filter)?;
 
     if let Some(gene_file) = select_genes {
         let indices = parse_gene_indices(gene_file)?;
@@ -68,12 +105,20 @@ pub fn run_query(
     }
 
     if let Some(out_path) = output {
-        // Determine value encoding: if normalize/log1p was applied, use Float32;
-        // otherwise detect from original file.
-        let value_encoding = if normalize.is_some() || log1p {
+        // Default to Float32 when normalize/log1p was applied (the
+        // result is no longer integer-valued) or when the source is a
+        // true remote URL (no easy way to peek a shard header without
+        // a second round-trip). Local files AND local exploded
+        // directories peek the first shard header.
+        let value_encoding = if normalize.is_some() || log1p || has_cloud_scheme(source) {
             ValueEncoding::Float32
         } else {
-            detect_value_encoding(file)?
+            let path = Path::new(source);
+            if path.is_dir() {
+                detect_value_encoding_from_dir(path)?
+            } else {
+                detect_value_encoding(path)?
+            }
         };
 
         write_query_result(&result, out_path, value_encoding)?;
@@ -93,6 +138,64 @@ pub fn run_query(
     );
 
     Ok(())
+}
+
+/// Pipeline plus the tokio runtime that owns its I/O thread pool.
+///
+/// The `runtime` slot is present only under `--features cloud`: it's
+/// `Some` for cloud-backed pipelines (the runtime owns the threads
+/// the pipeline's `block_on` calls land on) and `None` for local
+/// pipelines. Outside the cloud feature, every pipeline is local, so
+/// the field is omitted entirely.
+struct OpenedPipeline {
+    pipeline: QueryPipeline,
+    #[cfg(feature = "cloud")]
+    runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+}
+
+#[cfg(feature = "cloud")]
+fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
+    if is_cloud_url(source) {
+        // Multi-threaded runtime sized to match rayon's default pool
+        // so that rayon-parallel shard decodes (each calling
+        // `block_on`) can't starve the runtime they're waiting on.
+        let worker_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
+        let rt = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .thread_name("scx-cloud-io")
+                .build()?,
+        );
+        let reader = rt.block_on(scx_cloud::open_cloud(source))?;
+        let adapter = scx_cloud::CloudSectionReader::new(
+            std::sync::Arc::new(reader),
+            std::sync::Arc::clone(&rt),
+        );
+        let pipeline = QueryPipeline::from_reader(Box::new(adapter))?;
+        Ok(OpenedPipeline {
+            pipeline,
+            runtime: Some(rt),
+        })
+    } else {
+        Ok(OpenedPipeline {
+            pipeline: QueryPipeline::open(Path::new(source))?,
+            runtime: None,
+        })
+    }
+}
+
+#[cfg(not(feature = "cloud"))]
+fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
+    if is_cloud_url(source) {
+        return Err("cloud URLs require `scx-cli` to be built with `--features cloud`".into());
+    }
+    Ok(OpenedPipeline {
+        pipeline: QueryPipeline::open(Path::new(source))?,
+    })
 }
 
 /// Parse a gene index file: one u32 index per line, skip comments (#) and blank lines.
@@ -154,6 +257,61 @@ fn detect_value_encoding(path: &Path) -> Result<ValueEncoding, Box<dyn std::erro
         // Default for files with no shards
         Ok(ValueEncoding::Uint16)
     }
+}
+
+/// Detect the ValueEncoding from the first CSR shard of a local
+/// exploded `.scxd/` directory. Reads only the 76-byte shard header.
+///
+/// The exploded layout (see `scx_cloud::explode::section_name_to_path`)
+/// places single-modality shards at `X/{idx:06}.shard` and
+/// per-modality shards at `X/{modality}/{idx:06}.shard`. We probe the
+/// canonical first shard `X/000000.shard`, and if absent, walk one
+/// level deep to find any `*.shard` file under `X/`.
+fn detect_value_encoding_from_dir(dir: &Path) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
+    use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+    use std::fs::File;
+    use std::io::Read;
+
+    let canonical = dir.join("X").join("000000.shard");
+    let shard_path: std::path::PathBuf = if canonical.is_file() {
+        canonical
+    } else {
+        // Walk one level deep under X/ looking for any *.shard file.
+        let x_dir = dir.join("X");
+        let mut found: Option<std::path::PathBuf> = None;
+        if x_dir.is_dir() {
+            'outer: for entry in std::fs::read_dir(&x_dir)? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("shard") {
+                    found = Some(p);
+                    break;
+                }
+                if p.is_dir() {
+                    for sub in std::fs::read_dir(&p)? {
+                        let sub = sub?;
+                        let sp = sub.path();
+                        if sp.is_file() && sp.extension().and_then(|e| e.to_str()) == Some("shard")
+                        {
+                            found = Some(sp);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return Ok(ValueEncoding::Uint16), // empty / no shards
+        }
+    };
+
+    let mut f = File::open(&shard_path)?;
+    let mut buf = [0u8; SHARD_HEADER_SIZE];
+    f.read_exact(&mut buf)?;
+    let sh = ShardHeader::read_from(&mut std::io::Cursor::new(&buf[..]))?;
+    ValueEncoding::from_u8(sh.value_encoding)
+        .ok_or_else(|| format!("unknown value encoding: {}", sh.value_encoding).into())
 }
 
 /// Write a QueryResult to a new SCX file.
@@ -312,5 +470,87 @@ fn f32_to_raw_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
             }
             bytes
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_cloud_scheme_matches_known_schemes() {
+        assert!(has_cloud_scheme("gs://bucket/path"));
+        assert!(has_cloud_scheme("s3://bucket/path"));
+        assert!(has_cloud_scheme("az://acct/container"));
+        assert!(has_cloud_scheme("azure://acct/container"));
+        assert!(has_cloud_scheme("http://example.com/data.scx"));
+        assert!(has_cloud_scheme("https://example.com/data.scx"));
+        assert!(has_cloud_scheme("file:///tmp/data.scx"));
+        assert!(has_cloud_scheme("GS://Bucket/Path")); // case-insensitive
+    }
+
+    #[test]
+    fn has_cloud_scheme_rejects_local_paths_and_dirs() {
+        assert!(!has_cloud_scheme("/tmp/data.scx"));
+        assert!(!has_cloud_scheme("./local.scxd"));
+        assert!(!has_cloud_scheme("relative/path"));
+        // Local directory paths must NOT trigger the cloud-scheme branch
+        // (this is the Fix 1 regression: previously is_cloud_url returned
+        // true for any local directory, forcing Float32 output even when
+        // the source shards were integer-encoded).
+        assert!(!has_cloud_scheme("/var/data/atlas.scxd"));
+        // Empty / scheme-only inputs.
+        assert!(!has_cloud_scheme("gs://"));
+        assert!(!has_cloud_scheme("://"));
+    }
+
+    #[test]
+    fn detect_value_encoding_from_dir_reads_first_shard_header() {
+        use scx_codec::CodecId;
+        use scx_format::shard::SHARD_HEADER_SIZE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let x_dir = dir.path().join("X");
+        std::fs::create_dir_all(&x_dir).unwrap();
+        let shard_path = x_dir.join("000000.shard");
+
+        // Synthesize a minimal valid ShardHeader with Uint8 encoding.
+        let sh = scx_format::shard::ShardHeader {
+            magic: scx_format::shard::SHARD_MAGIC,
+            shard_format_version: 1,
+            shard_type: 0,
+            codec_id: CodecId::None as u8,
+            value_encoding: ValueEncoding::Uint8 as u8,
+            index_dtype: 1,
+            reserved_flags: [0u8; 3],
+            n_major: 1,
+            n_minor: 1,
+            nnz: 0,
+            global_offset: 0,
+            indptr_rel_offset: SHARD_HEADER_SIZE as u32,
+            indptr_length: 0,
+            indices_rel_offset: SHARD_HEADER_SIZE as u32,
+            indices_length: 0,
+            values_rel_offset: SHARD_HEADER_SIZE as u32,
+            values_length: 0,
+            block_index_rel_offset: SHARD_HEADER_SIZE as u32,
+            block_index_length: 0,
+            checksum: [0u8; 8],
+        };
+        let mut buf = Vec::with_capacity(SHARD_HEADER_SIZE);
+        sh.write_to(&mut buf).unwrap();
+        std::fs::write(&shard_path, &buf).unwrap();
+
+        let encoding = detect_value_encoding_from_dir(dir.path()).unwrap();
+        assert_eq!(encoding, ValueEncoding::Uint8);
+    }
+
+    #[test]
+    fn detect_value_encoding_from_dir_handles_empty_dir() {
+        // No shards present → conservative Uint16 default (matches the
+        // local detect_value_encoding behaviour for shard-less files).
+        let dir = tempfile::tempdir().unwrap();
+        let encoding = detect_value_encoding_from_dir(dir.path()).unwrap();
+        assert_eq!(encoding, ValueEncoding::Uint16);
     }
 }

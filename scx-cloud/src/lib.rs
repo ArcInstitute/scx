@@ -7,6 +7,7 @@ pub mod explode;
 pub mod pack;
 pub mod pull;
 pub mod push;
+pub mod section_reader;
 
 pub use backend::{create_backend, parse_location, CloudLocation};
 pub use cloud_optimize::cloud_optimize;
@@ -19,3 +20,4 @@ pub use pull::{
     pull, pull_filtered, FilterMode, PullFilteredStats, PullOptions, PullStats, RetryConfig,
 };
 pub use push::{push, PushOptions, PushStats};
+pub use section_reader::CloudSectionReader;

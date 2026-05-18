@@ -8,8 +8,13 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use memmap2::Mmap;
-use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
 use scx_sparse::{ScxCsc, ScxCsr};
+
+// `CodecId` / `ValueEncoding` are only referenced from the in-module
+// `#[cfg(test)]` block + the test-only `values_to_f32` helper; gating
+// the imports keeps the release build warning-clean.
+#[cfg(test)]
+use scx_codec::{CodecId, ValueEncoding};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -1529,66 +1534,12 @@ impl ScxReader {
         verify_checksum: bool,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
         let section = self.section_bytes(entry)?;
-
-        // Parse shard header
-        let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
-
-        // v2 strict shard_type validation: a v2 catalog must not carry
-        // CSC entries with shard_type != 1. v1 catalogs preserve the
-        // legacy catalog-wins tolerance (the writer hardcoded
-        // shard_type = 0 for CSC pre-CSC-SUPPORT).
-        if self.full_catalog.catalog_version >= 2 {
-            sh.validate_csc_strict(entry.section_type)?;
-        }
-
-        // Extract encoded byte slices
-        let indptr_bytes = &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
-        let indices_bytes =
-            &section[sh.indices_rel_offset as usize..][..sh.indices_length as usize];
-        let values_bytes = &section[sh.values_rel_offset as usize..][..sh.values_length as usize];
-        let block_index_bytes =
-            &section[sh.block_index_rel_offset as usize..][..sh.block_index_length as usize];
-
-        if verify_checksum {
-            // Verify shard checksum via streaming hasher (no payload Vec allocation)
-            let mut shard_hasher = blake3::Hasher::new();
-            shard_hasher.update(indptr_bytes);
-            shard_hasher.update(indices_bytes);
-            shard_hasher.update(values_bytes);
-            shard_hasher.update(block_index_bytes);
-            let hash = shard_hasher.finalize();
-            let mut computed = [0u8; 8];
-            computed.copy_from_slice(&hash.as_bytes()[..8]);
-            if computed != sh.checksum {
-                return Err(ScxError::ChecksumMismatch {
-                    section: format!("shard '{}'", entry.name),
-                });
-            }
-        }
-
-        // Resolve codec and encoding from shard header (NOT file header)
-        let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
-        let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
-        let index_dtype_u16 = sh.index_dtype == 0;
-
-        // Build EncodedShardRef (zero-copy from mmap) and decode directly to scipy types
-        let encoded = EncodedShardRef {
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
-        };
-
-        let (indptr, indices, data) = scx_codec::decode_shard_scipy(
-            &encoded,
-            codec_id,
-            value_encoding,
-            sh.n_major as usize,
-            sh.nnz as usize,
-            index_dtype_u16,
-        )?;
-
-        Ok((indptr, indices, data))
+        crate::shard_decode::decode_shard_bytes(
+            section,
+            entry,
+            self.full_catalog.catalog_version,
+            verify_checksum,
+        )
     }
 
     /// Assemble multiple shard entries into a single ScxCsr using parallel decode.

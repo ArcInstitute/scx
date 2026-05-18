@@ -6,6 +6,7 @@ pub mod pipeline;
 pub mod predicate;
 pub mod projection;
 pub mod pushdown;
+pub mod reader;
 
 pub use collect::filter_csr_rows;
 pub use error::{EngineError, Result};
@@ -26,3 +27,4 @@ pub use pushdown::{
     prune_rows_by_index, prune_shards_by_catalog, prune_shards_by_catalog_with_dict,
     CategoryDictionaries, ShardCandidate,
 };
+pub use reader::{BoxedSectionReader, SectionReader};

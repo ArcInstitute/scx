@@ -45,6 +45,44 @@ pub fn downcast_large_types(batch: &RecordBatch) -> Result<RecordBatch> {
     convert(batch, false)
 }
 
+/// Schema-only counterpart to [`downcast_large_types`].
+///
+/// Eagerly rewrites `LargeUtf8 → Utf8` and `LargeBinary → Binary`
+/// (including `Dictionary(_, LargeUtf8|LargeBinary)` value types) at
+/// the schema level. Unlike the batch-level helper, this version is
+/// **unconditional**: there are no column offsets to inspect, so it
+/// always narrows. Preserves field-level and schema-level metadata.
+///
+/// Used by callers (e.g. `scx-cloud::CloudReader::read_obs_schema`)
+/// that need a schema for predicate parsing without paying to decode
+/// the full IPC batch. The local `ScxReader::read_obs_schema` already
+/// achieves the same effect by routing through its fast/slow path
+/// (see `scx-format/src/reader.rs`).
+pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let new_dt = match f.data_type() {
+                DataType::LargeUtf8 => DataType::Utf8,
+                DataType::LargeBinary => DataType::Binary,
+                DataType::Dictionary(k, v) => match v.as_ref() {
+                    DataType::LargeUtf8 => {
+                        DataType::Dictionary(k.clone(), Box::new(DataType::Utf8))
+                    }
+                    DataType::LargeBinary => {
+                        DataType::Dictionary(k.clone(), Box::new(DataType::Binary))
+                    }
+                    _ => f.data_type().clone(),
+                },
+                other => other.clone(),
+            };
+            Field::new(f.name(), new_dt, f.is_nullable()).with_metadata(f.metadata().clone())
+        })
+        .collect();
+    Schema::new(new_fields).with_metadata(schema.metadata().clone())
+}
+
 /// True if `col`'s value-offsets buffer can be re-expressed as `i32`
 /// (i.e. last offset ≤ `i32::MAX`). Returns `true` for any non-wide
 /// type. Used by the downcast path to decide between narrowing and

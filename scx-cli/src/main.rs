@@ -255,8 +255,8 @@ enum Commands {
     },
     /// Query cells by predicate
     Query {
-        /// SCX file to query
-        file: PathBuf,
+        /// SCX file path or cloud URL (e.g. `gs://bucket/atlas.scxd/`)
+        source: String,
         /// Obs predicate expression
         filter: String,
         /// Print matching cell count only
@@ -530,7 +530,7 @@ fn main() {
             csc_cols_per_shard,
         } => merge::run_merge(&inputs, &output, rebuild_csc, csc_cols_per_shard),
         Commands::Query {
-            file,
+            source,
             filter,
             count,
             output,
@@ -540,7 +540,7 @@ fn main() {
             limit,
             json,
         } => query::run_query(
-            &file,
+            &source,
             &filter,
             count,
             output.as_deref(),

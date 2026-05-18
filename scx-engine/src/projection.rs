@@ -6,10 +6,10 @@
 use arrow::array::{RecordBatch, UInt32Array};
 use arrow::compute;
 use scx_format::catalog::FullCatalogEntry;
-use scx_format::ScxReader;
 use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::error::Result;
+use crate::reader::SectionReader;
 
 /// Project a single CSR row, keeping only entries whose column index
 /// appears in `gene_set`.
@@ -112,7 +112,7 @@ pub fn project_var(var: &RecordBatch, gene_indices: &[u32]) -> Result<RecordBatc
 /// post-decode projection; optimize into the codec layer if benchmarks
 /// show it matters.
 pub fn decode_shard_projected(
-    reader: &ScxReader,
+    reader: &dyn SectionReader,
     entry: &FullCatalogEntry,
     gene_indices: &[u32],
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
@@ -223,6 +223,7 @@ mod tests {
     use scx_codec::{CodecId, ValueEncoding};
     use scx_format::header::FileHeader;
     use scx_format::writer::ScxWriter;
+    use scx_format::ScxReader;
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------

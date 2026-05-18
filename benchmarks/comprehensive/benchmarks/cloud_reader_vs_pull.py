@@ -9,11 +9,17 @@ GET-count proxy:
     Captures the magnitude of "don't-download-the-whole-dataset" for
     metadata-only workloads (``scx info``).
 
-  * ``selective_*`` at ``~5%``, ``~20%``, ``~80%`` cell selectivity —
-    ``pyscx.pull_filtered`` (predicate-pushdown cloud pull that downloads
-    only the matching shards) compared against a full ``pyscx.pull``
-    followed by a local filter. Scores the break-even selectivity where a
-    full pull starts winning over selective range reads.
+  * ``selective_*`` at ``~5%``, ``~20%``, ``~80%`` cell selectivity.
+    Three methods at each selectivity:
+      - ``pull_full`` — full ``pyscx.pull`` followed by a local filter
+        (the baseline cost of downloading everything).
+      - ``pull_filtered`` — ``pyscx.pull`` with ``filter=`` (downloads
+        only matching shards, writes them to local disk).
+      - ``open_cloud_query`` — Phase 7's selective query path:
+        ``pyscx.open_cloud(url).query().filter_obs(filter).collect()``
+        — no local materialisation, results land directly in memory.
+    Scores the break-even selectivity where a full pull starts winning
+    and isolates query-vs-pull overhead at the same selectivity.
 
 The predicate for the selectivity sweep is synthesized from the dataset's
 obs table: we sort by ``n_counts`` (when present) and pick a threshold
@@ -256,6 +262,55 @@ def run(
                     wall, counters.bytes_downloaded,
                     int(stats.get("matching_cells", 0)),
                 )
+
+            # open_cloud_query — Phase 7 selective query path. No local
+            # materialisation; matching cells land in memory as a
+            # QueryResult / AnnData. Bytes downloaded telemetry is not
+            # surfaced on this path yet (deferred with the rest of
+            # CloudQueryOptions); we record the cell / shard accounting
+            # the QueryResult exposes (matching_cells, skipped_shards).
+            logger.info(
+                "  open_cloud_query run %d/%d (target=%.2f)",
+                i + 1, n_runs, target,
+            )
+            try:
+                def _run_query():
+                    exp = pyscx.open_cloud(cloud_url)
+                    return exp.query().filter_obs(filter_expr).collect()
+
+                qresult, wall, rss = _time_call(_run_query)
+            except Exception as exc:  # noqa: BLE001 — report & skip
+                logger.warning(
+                    "open_cloud_query failed for predicate %r: %s",
+                    filter_expr, exc,
+                )
+                continue
+            matching_cells = int(qresult.n_obs)
+            skipped_shards = int(qresult.skipped_shards)
+            total_shards = int(qresult.total_shards)
+            result.add_run(
+                wall_s=wall, peak_rss_mb=rss,
+                scenario=scenario_name,
+                method="open_cloud_query",
+                predicate=describe,
+                target_fraction=target,
+                matching_cells=matching_cells,
+                downloaded_shards=total_shards - skipped_shards,
+                skipped_shards=skipped_shards,
+                bytes_downloaded=0,
+                bytes_saved=0,
+                get_count_proxy=0,
+                telemetry="phase_f_deferred",
+            )
+            logger.info(
+                "    open_cloud_query wall=%.3fs matching_cells=%d "
+                "skipped_shards=%d/%d",
+                wall, matching_cells, skipped_shards, total_shards,
+            )
+            # Drop the in-memory result before the next iteration so
+            # peak RSS comparisons stay clean.
+            del qresult
+            gc.collect()
 
     # -----------------------------------------------------------------
     # Per-scenario / per-method medians so reports can pivot without
