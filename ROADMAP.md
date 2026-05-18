@@ -64,7 +64,7 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
 ### 1.4 scx-cli (minimal)
 - [x] `scx convert --from h5ad input.h5ad output.scx`
 - [x] `scx convert --from 10x matrix.h5 output.scx`
-- [x] `scx convert --to h5ad input.scx output.h5ad`
+- [x] `scx convert --to h5ad input.scx output.h5ad` (Phase 8: streams by default; `--stream=false` for the legacy materialising path; `--to h5mu` and `--modality NAME` for multimodal export)
 - [x] `scx info experiment.scx` (header summary, shard count, manifest history)
 - [x] `scx validate experiment.scx` (BLAKE3 verification of all sections)
 

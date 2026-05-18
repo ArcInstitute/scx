@@ -229,7 +229,8 @@ sampleMap directly — pre-align.
 ## 5. CLI
 
 ```bash
-# Conversion
+# Conversion (Phase 8: SCX → h5ad / h5mu also streams by default;
+# pass `--stream=false` for the legacy materialising path)
 scx convert --from h5mu citeseq.h5mu --to scx citeseq.scx
 scx convert --from scx citeseq.scx --to h5mu out.h5mu
 scx convert --from scx citeseq.scx --to h5ad rna.h5ad --modality rna
@@ -241,6 +242,13 @@ scx validate citeseq.scx    # ModalityTable checksum + cross-check
 # Mutating ops (per-modality routing)
 scx append citeseq.scx --input new_rna_cells.scx --modality rna
 scx subset citeseq.scx --modality rna --output rna_only.scx
+```
+
+Python equivalent for the export direction:
+
+```python
+pyscx.to_h5mu("citeseq.scx", "out.h5mu")                       # streams per-modality X + layers
+pyscx.to_h5ad("citeseq.scx", "rna.h5ad", modality="rna")       # single-modality extract
 ```
 
 Multimodal `scx merge` and `scx compact` are explicitly rejected with a

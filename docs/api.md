@@ -232,10 +232,12 @@ LRU thrashing across modalities.
 ### CLI surface
 
 ```
-scx info path.scx               # Modalities (N): name, type, n_vars, nnz, csr/csc, codec
-scx validate path.scx           # ModalityTable checksum + n_modalities cross-check
-scx convert --from h5mu in.h5mu --to scx out.scx
-scx convert --to h5ad out.scx out.h5ad --modality rna
+scx info path.scx                 # Modalities (N): name, type, n_vars, nnz, csr/csc, codec
+scx validate path.scx             # ModalityTable checksum + n_modalities cross-check
+scx convert --from h5mu in.h5mu --to scx out.scx          # h5mu → SCX (streaming by default)
+scx convert --to h5ad out.scx out.h5ad --modality rna     # SCX → h5ad (streaming by default)
+scx convert --to h5mu out.scx out.h5mu                    # SCX → h5mu (streaming by default)
+scx convert --to h5ad out.scx out.h5ad --stream=false     # opt-out: materialising path
 scx append target.scx --input new.scx --modality rna
 scx subset in.scx --modality rna --output rna_only.scx
 ```
@@ -552,6 +554,24 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
+- `pyscx.to_h5ad(path, out, stream=True, modality=None)` — Stream SCX → h5ad
+  without materialising `X` in memory. Mirror of `pyscx.from_h5ad` in the
+  opposite direction. Bounded peak memory: one shard's worth of CSR
+  plus encode buffers per matrix written, plus the always-resident
+  `indptr` (`(n_obs + 1) × 8` bytes). When deletion vectors are
+  present, only kept rows appear in the output (`shape[0] = n_obs -
+  n_deleted`); a single pre-scan pass computes the filtered nnz before
+  pre-allocating the HDF5 triplet so the on-disk layout is
+  deterministic. For multimodal SCX files, pass `modality="rna"` to
+  extract a single modality as h5ad; otherwise the call raises (use
+  `pyscx.to_h5mu`). `stream=False` falls back to the materialising
+  path (kept for parity / debugging).
+- `pyscx.to_h5mu(path, out, stream=True)` — Stream a multimodal SCX
+  file to h5mu. Iterates each modality and writes
+  `/mod/{name}/X` and any `/mod/{name}/layers/{layer}` shard-by-shard;
+  global `/obs`, per-modality `/var` / `/obsm`, and `/uns` reuse the
+  in-memory metadata writers. Requires `reader.is_multimodal()`;
+  single-modality files raise (use `to_h5ad`).
 - `pyscx.iter_chunks(adata, chunk_size="shard")` — Shard-aligned or fixed-size chunk iterator
 - `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
@@ -1004,7 +1024,7 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x] [--to h5ad] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream] [--csc off|always] [--csc-cols-per-shard N]` — `--stream` reads the h5ad one shard at a time so peak memory is bounded by `shard_size × n_vars × density` plus the resident `indptr`. h5ad → SCX only; combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output).
+- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
 - `scx info <file> [--json] [--history]`
 - `scx validate <file> [--verbose]`
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`

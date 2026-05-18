@@ -59,6 +59,7 @@ File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX
 - **Lazy preprocessing**: `ScxLazyTransformedDataset` chains `normalize_total → log1p → row_scale` without materialization; `ShardSource` enables streaming PCA. Supports a full out-of-core pipeline (open → QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden). See [docs/performance.md](docs/performance.md) for memory and throughput figures.
 - **ML training loader**: Triple-buffered Rust pipeline (tokio I/O → rayon decode → Python consumer). Zero Python on the hot path. See `TrainingPipeline` in [docs/api.md](docs/api.md).
 - **Multimodal**: CITE-seq / 10x Multiome / TEA-seq via the v2 format. See [docs/multimodal.md](docs/multimodal.md).
+- **Streaming export** (Phase 8, `scx-convert/src/h5ad_stream_write.rs`): SCX → h5ad / h5mu via pre-allocated HDF5 hyperslab writes. CLI `scx convert --to h5ad/h5mu` and `pyscx.to_h5ad` / `pyscx.to_h5mu` stream by default; peak RSS bounded by one shard's worth of CSR per matrix written. Deletion vectors handled via a single-pass pre-scan so on-disk layout stays deterministic. `--stream=false` / `stream=False` falls back to the legacy materialising path.
 
 ## Coding Conventions
 

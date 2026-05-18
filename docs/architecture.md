@@ -588,7 +588,7 @@ it; the previous in-line `scx-cli/src/convert/` module was extracted
 when streaming conversion landed so `pyscx` could share the pipeline
 without depending on the binary-only `scx-cli`.
 
-**Streaming variant** (`scx convert --stream`, `pyscx.from_h5ad`,
+**Streaming ingestion** (`scx convert --stream`, `pyscx.from_h5ad`,
 auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`
 loads the full `indptr` then iterates `XStreamReader::next_shard`,
 running `sort_csr_rows_in_place` + `drop_explicit_zeros_inplace` per
@@ -597,6 +597,21 @@ Peak memory is bounded by one shard's worth of CSR plus the resident
 indptr, independent of total dataset size. `csc="always"` triggers a
 post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
 ~2× the output size during the rebuild).
+
+**Streaming export** (`scx convert --to h5ad/h5mu`, `pyscx.to_h5ad`,
+`pyscx.to_h5mu` — Phase 8): the inverse path. `scx_convert::
+scx_to_h5ad_streaming` (and `scx_to_h5mu_streaming` / `scx_modality_to_h5ad_streaming`)
+iterate SCX CSR shards in row order
+via `ScxReader::read_csr_shard_for` / `read_layer_csr_shard*` and
+write hyperslab slices into pre-allocated `/X/{indptr,indices,data}`
+HDF5 datasets. The total `nnz` is computed up front from catalog
+`ShardStats` (single pre-scan decode when deletion vectors are
+active) so the on-disk layout is deterministic — no extendable HDF5
+datasets. Metadata writers (`obs` / `var` / `obsm` / `uns` / etc.) are
+reused verbatim from the non-streaming path. Peak memory is bounded
+by one shard's worth of CSR per matrix written. `--stream=false`
+falls back to the legacy materialising `scx_to_h5ad` /
+`scx_to_h5mu` / `scx_modality_to_h5ad` paths.
 
 ### Conversion: MTX ↔ SCX
 

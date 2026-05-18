@@ -615,10 +615,20 @@ For an end-to-end walkthrough, see the [scanpy tutorial notebook](notebooks/scx_
 SCX supports **roundtrip conversion** with h5ad, 10x HDF5, and Cell Ranger MTX formats —
 convert in, work with SCX, convert back out.
 
+All ingestion and export paths **stream by default** — peak RSS is
+bounded by one shard's worth of CSR per matrix regardless of total
+file size. Pass `--stream=false` (CLI) or `stream=False` (Python) to
+opt into the legacy materialising paths.
+
 ```bash
-# h5ad ↔ SCX (roundtrip)
+# h5ad ↔ SCX (roundtrip, streaming by default)
 scx convert experiment.h5ad experiment.scx
 scx convert --to h5ad experiment.scx experiment.h5ad
+
+# h5mu ↔ SCX (multimodal, streaming by default)
+scx convert experiment.h5mu experiment.scx
+scx convert --to h5mu experiment.scx experiment.h5mu
+scx convert --to h5ad experiment.scx rna.h5ad --modality rna  # extract one modality
 
 # Cell Ranger MTX ↔ SCX (roundtrip)
 scx convert /path/to/filtered_feature_bc_matrix/ experiment.scx
@@ -639,6 +649,11 @@ pyscx.from_10x("filtered_feature_bc_matrix.h5", "experiment.scx")
 
 # From Cell Ranger MTX directory
 pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "experiment.scx")
+
+# Streaming export back to h5ad / h5mu
+pyscx.to_h5ad("experiment.scx", "experiment.h5ad")
+pyscx.to_h5mu("experiment.scx", "experiment.h5mu")
+pyscx.to_h5ad("experiment.scx", "rna.h5ad", modality="rna")  # extract one modality
 
 # Export back to MTX
 pyscx.to_mtx("experiment.scx", "/path/to/output_dir")
