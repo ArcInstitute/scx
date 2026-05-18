@@ -177,6 +177,17 @@ sc.pl.umap(adata, color="leiden")
 
 ### From AnnData / h5ad
 
+> [!NOTE]
+> **All h5ad / h5mu ingestion and export entry points stream by default.**
+> `pyscx.from_h5ad`, `pyscx.from_h5mu`, `pyscx.to_h5ad`, and
+> `pyscx.to_h5mu` all default to `stream=True`; `pyscx.from_anndata`
+> auto-routes to the streaming pipeline when given a backed AnnData.
+> Peak RSS is bounded by one shard's worth of CSR per matrix regardless
+> of total file size. Pass `stream=False` to opt into the legacy
+> materialising paths (only useful when you specifically need the
+> in-memory shape, e.g. for AnnData mutations the streaming path
+> doesn't forward).
+
 ```python
 import scanpy as sc
 import pyscx
@@ -268,6 +279,32 @@ pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "dataset.scx")
 
 ```python
 pyscx.to_mtx("dataset.scx", "/path/to/output_dir")
+```
+
+### Exporting back to h5ad / h5mu (`to_h5ad`, `to_h5mu`)
+
+Symmetric to `from_h5ad` / `from_h5mu`. Both default to `stream=True`
+— peak RSS is bounded by one shard's worth of CSR per matrix
+written, regardless of total file size. Deletion vectors are
+respected (only kept rows appear in the output); for high-cardinality
+categorical obs columns the writer emits the modern `categorical`
+group form so `anndata.read_h5ad` reads them cleanly at census scale.
+
+```python
+import pyscx
+
+# Single-modality export.
+pyscx.to_h5ad("dataset.scx", "dataset.h5ad")
+
+# Multimodal export (per-modality X + layers).
+pyscx.to_h5mu("citeseq.scx", "citeseq.h5mu")
+
+# Extract one modality from a multimodal SCX file as an h5ad.
+pyscx.to_h5ad("citeseq.scx", "rna.h5ad", modality="rna")
+
+# Opt out of streaming if you specifically want the legacy
+# materialising path.
+pyscx.to_h5ad("dataset.scx", "dataset.h5ad", stream=False)
 ```
 
 ## Validating files after write or transfer
