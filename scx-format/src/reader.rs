@@ -10,6 +10,12 @@ use arrow::array::RecordBatch;
 use memmap2::Mmap;
 use scx_sparse::{ScxCsc, ScxCsr};
 
+// `CodecId` / `ValueEncoding` are only referenced from the in-module
+// `#[cfg(test)]` block + the test-only `values_to_f32` helper; gating
+// the imports keeps the release build warning-clean.
+#[cfg(test)]
+use scx_codec::{CodecId, ValueEncoding};
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
