@@ -930,6 +930,35 @@ pub fn to_anndata_backed<'py>(
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    to_anndata_backed_with_options(
+        py,
+        path,
+        cache_shards,
+        var_names,
+        obs_filter,
+        layer_filter,
+        true,
+    )
+}
+
+/// Internal entrypoint for the backed AnnData builder.
+///
+/// `apply_deletion_vectors`: when `true` (the default for the public
+/// `to_anndata_backed`), the X / obs / obsm / obsp paths are filtered through
+/// the file's global deletion vectors. When `false`, the function returns the
+/// unfiltered axes — used by `mudata::to_mudata_backed` so that the inner
+/// AnnData's `obs` row count matches the outer MuData's global `obs` (which
+/// is also unfiltered, matching the eager `to_mudata` path's behaviour).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn to_anndata_backed_with_options<'py>(
+    py: Python<'py>,
+    path: &std::path::Path,
+    cache_shards: usize,
+    var_names: Option<&[String]>,
+    obs_filter: Option<&str>,
+    layer_filter: Option<&[String]>,
+    apply_deletion_vectors: bool,
+) -> PyResult<Bound<'py, PyAny>> {
     use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
     use scx_format::BackedCsrReader;
     use std::sync::Arc;
@@ -950,13 +979,24 @@ pub fn to_anndata_backed<'py>(
     // --- Compute kept_to_global from deletion vectors (if present) ---
     // Cache the deletion-vector-only mapping; obs_filter may mutate kept_to_global
     // further, but obsm filtering needs the original DV-only version.
-    let dv_kept_to_global = compute_kept_to_global(&reader)?;
+    // Skipped when `apply_deletion_vectors` is false (e.g. `to_mudata_backed`
+    // single-modality wrap, where DVs are intentionally not applied to keep
+    // inner-AnnData obs in lockstep with the unfiltered outer MuData obs).
+    let dv_kept_to_global = if apply_deletion_vectors {
+        compute_kept_to_global(&reader)?
+    } else {
+        None
+    };
     let mut kept_to_global = dv_kept_to_global.clone();
 
-    // --- obs (eager, filtered by deletion vectors) ---
+    // --- obs (eager, optionally filtered by deletion vectors) ---
     let obs = match reader.read_obs() {
         Ok(batch) => {
-            let filtered_batch = filter_obs_by_deletion_vectors(&reader, batch)?;
+            let filtered_batch = if apply_deletion_vectors {
+                filter_obs_by_deletion_vectors(&reader, batch)?
+            } else {
+                batch
+            };
             let table = record_batch_to_pyarrow(py, &filtered_batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
@@ -1101,8 +1141,12 @@ pub fn to_anndata_backed<'py>(
             };
 
             for (name, batch) in &obsm_map {
-                // First filter by deletion vectors
-                let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
+                // First filter by deletion vectors (skipped when DVs are disabled).
+                let filtered = if apply_deletion_vectors {
+                    filter_obs_by_deletion_vectors(&reader, batch.clone())?
+                } else {
+                    batch.clone()
+                };
                 let np_arr = obsm_batch_to_numpy(py, &filtered)?;
                 // Slice to the obs_filter rows using pre-computed positions
                 let idx_arr = numpy::PyArray1::from_slice(py, &positions);
@@ -1112,7 +1156,11 @@ pub fn to_anndata_backed<'py>(
         }
     } else {
         for (name, batch) in &obsm_map {
-            let filtered = filter_obs_by_deletion_vectors(&reader, batch.clone())?;
+            let filtered = if apply_deletion_vectors {
+                filter_obs_by_deletion_vectors(&reader, batch.clone())?
+            } else {
+                batch.clone()
+            };
             let np_arr = obsm_batch_to_numpy(py, &filtered)?;
             obsm_dict.set_item(name, np_arr)?;
         }
@@ -3615,6 +3663,7 @@ pub fn build_backed_anndata_for_modality<'py>(
 
     // Per-modality obsm: catalog entries with this modality_id.
     let obsm_dict = pyo3::types::PyDict::new(py);
+    let prefix = format!("obsm/{modality_name}/");
     for entry in &meta.catalog().entries {
         if entry.section_type != SectionType::ObsmEmbedding {
             continue;
@@ -3622,7 +3671,6 @@ pub fn build_backed_anndata_for_modality<'py>(
         if entry.modality_id != modality_id {
             continue;
         }
-        let prefix = format!("obsm/{modality_name}/");
         let key = entry
             .name
             .strip_prefix(&prefix)

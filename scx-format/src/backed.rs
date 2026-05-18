@@ -2831,6 +2831,42 @@ mod tests {
         assert_eq!(result.data, expected.data);
     }
 
+    /// Locks the post-unification X-path dispatch: `read_shard_uncached(i)`
+    /// (which now always routes through `shard_entry → read_shard_from_entry`)
+    /// must produce per-shard `(indptr, indices, data)` triples that are
+    /// byte-equal to `ScxReader::read_csr_shard(i)` on a single-modality file.
+    ///
+    /// Pre-fix the X branch took the direct `reader.read_csr_shard(shard_idx)`
+    /// path; post-fix it goes via `x_sorted_entries`. The two paths should
+    /// resolve to the same shard at the same catalog offset on non-multimodal
+    /// files (multimodal-only callers rely on the new path for correctness),
+    /// so this test pins the invariant.
+    #[test]
+    fn test_read_shard_uncached_byte_equal_to_reader_read_csr_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let n_obs = 24;
+        let n_vars = 10;
+        let n_shards = 4;
+        let (backed, _) = write_test_file_and_open(&dir, n_obs, n_vars, n_shards, 0);
+
+        // Reopen the file via `ScxReader` to call `read_csr_shard` directly.
+        // We compare against this canonical per-shard decoder.
+        let path = dir.path().join("test.scx");
+        let reader = ScxReader::open(&path).unwrap();
+
+        assert_eq!(backed.shard_count(), n_shards);
+        for i in 0..n_shards {
+            let backed_shard = backed.read_shard_uncached(i).unwrap();
+            let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+            assert_eq!(backed_shard.indptr, indptr, "indptr mismatch at shard {i}");
+            assert_eq!(
+                backed_shard.indices, indices,
+                "indices mismatch at shard {i}"
+            );
+            assert_eq!(backed_shard.data, data, "data mismatch at shard {i}");
+        }
+    }
+
     #[test]
     fn test_read_rows_every_contiguous_range() {
         let dir = tempfile::tempdir().unwrap();

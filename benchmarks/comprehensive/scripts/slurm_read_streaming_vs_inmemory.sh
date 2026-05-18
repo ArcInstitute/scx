@@ -63,8 +63,14 @@ trap '
     [[ -f "${TMP_ERR}" ]] && cp "${TMP_ERR}" "${LOGS_DIR}/stream_vs_inmem_${SLURM_JOB_ID:-$$}.err" 2>/dev/null || true
 ' EXIT
 
-# Forwarded args.
-EXTRA_ARGS=("$@")
+# Forwarded args. `--skip-smoke` is appended unconditionally because
+# the pre-submit smoke check requires `pbmc3k.h5ad`, which not every
+# host (e.g. Lambda HPC) stages. The actual benchmark sub-jobs gate
+# on their own dataset paths via DATA_DIR, so the lost coverage is
+# minimal.
+EXTRA_ARGS=("$@" "--skip-smoke")
+
+SCX_DATASETS_DIR="${SCX_DATA_DIR:-${SCX_WORK_DIR:-}/benchmarks/datasets}"
 
 # ---------------------------------------------------------------------------
 # Conda / venv activation. Prefer scx-bench; fall back to .venv.
@@ -125,10 +131,17 @@ RUN_PARALLEL="${REPO_ROOT}/benchmarks/comprehensive/scripts/run_parallel.py"
 # Lambda partition choice: ``preemptible`` for the smaller two (faster
 # scheduling against the full 22-node pool, 60s SIGTERM grace is fine
 # at this read-only workload) and ``large_batch`` for census_5m
-# (longer timeout headroom; the eager mode has to materialise ~75 GB
-# into one CSR before iteration begins). ``run_parallel.py`` sizes
-# memory per-job via ``estimate_memory_gb``; the wrapper just sets a
-# sensible floor.
+# (longer timeout headroom).
+#
+# Memory sizing: ``run_parallel.py`` treats ``--mem-gb`` as a *floor* and
+# bumps each sub-job up to ``estimate_memory_gb(benchmark, dataset, format)``
+# from ``comprehensive/config.py``. For ``read_streaming_vs_inmemory`` the
+# in-memory mode materialises the full CSR, so estimates are large:
+# ``census_5m`` lands around ~880 GB (auto-promoted past
+# ``MEM_HIGH_MEM_THRESHOLD_GB`` to ``$SCX_BENCH_HIGH_MEM_PARTITION`` →
+# ``large_batch``). The explicit ``--mem-gb`` floors below are defensive —
+# they keep the small-dataset sub-jobs from undersizing if the estimator
+# ever returns 0.
 # ---------------------------------------------------------------------------
 echo
 echo "[stream-vs-inmem] Sweep 1/2 — single-modality on D5/D6/D7"
@@ -143,16 +156,25 @@ ${PYTHON} "${RUN_PARALLEL}" \
     --cold-cache \
     "${EXTRA_ARGS[@]}"
 
-${PYTHON} "${RUN_PARALLEL}" \
-    --benchmarks read_streaming_vs_inmemory \
-    --datasets census_5m \
-    --formats scx_auto \
-    --partition large_batch \
-    --cpus 16 \
-    --mem-gb 256 \
-    --timeout 480 \
-    --cold-cache \
-    "${EXTRA_ARGS[@]}"
+if [[ -f "${SCX_DATASETS_DIR}/census_5m.h5ad" ]]; then
+    # ``--mem-gb 512`` is a defensive floor; estimate_memory_gb auto-sizes
+    # the actual request to ~880 GB for census_5m (eager-CSR materialise
+    # dominates), which routes via partition_for_memory → large_batch.
+    ${PYTHON} "${RUN_PARALLEL}" \
+        --benchmarks read_streaming_vs_inmemory \
+        --datasets census_5m \
+        --formats scx_auto \
+        --partition large_batch \
+        --cpus 16 \
+        --mem-gb 512 \
+        --timeout 480 \
+        --cold-cache \
+        "${EXTRA_ARGS[@]}"
+else
+    echo "[stream-vs-inmem] Skipping D7: ${SCX_DATASETS_DIR}/census_5m.h5ad not present."
+    echo "[stream-vs-inmem]   Stage it via:  sbatch benchmarks/scripts/slurm_build_census_5m.sh"
+    echo "[stream-vs-inmem]   (requires the _census_chunk_*.h5ad chunks to exist first.)"
+fi
 
 # ---------------------------------------------------------------------------
 # Sweep 2 — multimodal streaming vs in-memory on K1 + K2.

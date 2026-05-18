@@ -85,7 +85,11 @@ _NO_CONVERSION = {"write", "parallel_write_scaling", "cell_eval_parity_perf"}
 # Benchmarks that operate on multimodal h5mu sources. They expect
 # `dataset.multimodal=True` and a multimodal-aware format runner; pairing
 # them with single-modality datasets / formats is wasted scheduling.
-_MULTIMODAL_BENCHMARKS = {"multimodal_compression", "multimodal_training"}
+_MULTIMODAL_BENCHMARKS = {
+    "multimodal_compression",
+    "multimodal_training",
+    "multimodal_read_streaming_vs_inmemory",
+}
 
 # Format keys that consume `.h5mu` (or write the multimodal SCX layout).
 # Non-multimodal benchmarks can't read these; multimodal benchmarks can't

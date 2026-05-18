@@ -118,12 +118,26 @@ pub fn to_mudata_backed<'py>(
         // Single-modality (v1 or single-modality v2): wrap the existing
         // single-AnnData backed factory in a one-modality MuData. Use the
         // sole modality name when present, else "X" for v1.
+        //
+        // Skip deletion-vector filtering on the inner AnnData so its `obs`
+        // row count stays in lockstep with the unfiltered outer `global_obs`
+        // attached to the MuData below — the multimodal branch above and the
+        // eager `to_mudata` path both skip DVs, so this keeps every backed-
+        // mudata path symmetric.
         let modality_key = if reader.n_modalities() >= 1 {
             reader.modality_names()[0].to_string()
         } else {
             "X".to_string()
         };
-        let adata = crate::anndata::to_anndata_backed(py, path, cache_shards, None, None, None)?;
+        let adata = crate::anndata::to_anndata_backed_with_options(
+            py,
+            path,
+            cache_shards,
+            None,
+            None,
+            None,
+            false,
+        )?;
         mod_dict.set_item(&modality_key, adata)?;
     }
 

@@ -708,3 +708,50 @@ def test_to_mudata_backed_lazy_normalize_log1p_parity(cite_seq_mudata, tmp_path)
     out_eager = np.asarray(rna_eager.X.toarray())
 
     np.testing.assert_allclose(out_backed, out_eager, atol=1e-6, rtol=1e-6)
+
+
+def test_to_mudata_backed_single_modality_preserves_dv_unfiltered_obs(tmp_path):
+    """Phase 6b regression — on a single-modality file with deletion vectors,
+    `to_mudata(backed=True)` must NOT apply DVs to the inner AnnData, so the
+    inner `obs` row count matches the unfiltered outer MuData `obs`.
+
+    Prior to the fix, the single-modality branch routed through
+    `to_anndata_backed` (which DV-filters obs) while the outer MuData obs
+    stayed unfiltered — producing `mu.obs.shape[0] != mu.mod[name].obs.shape[0]`.
+    """
+    pytest.importorskip("mudata")
+    pytest.importorskip("anndata")
+    import anndata
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, n_vars = 24, 18
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.3, size=(n_obs, n_vars)).astype(np.float32))
+    )
+    adata.var_names = [f"g{i}" for i in range(n_vars)]
+    adata.obs_names = [f"c{i}" for i in range(n_obs)]
+    path = str(tmp_path / "single_dv.scx")
+    pyscx.from_anndata(adata, path)
+
+    # Mark a handful of rows deleted. The DVs are global; both the inner
+    # AnnData's obs and the outer MuData's obs should keep them visible on
+    # the backed path so the axes stay aligned.
+    delete_mask = np.zeros(n_obs, dtype=bool)
+    delete_mask[[0, 5, n_obs - 1]] = True
+    pyscx.open(path).mark_deleted(delete_mask)
+
+    mu = pyscx.open(path).to_mudata(backed=True)
+    only = next(iter(mu.mod.values()))
+    # Both axes must show all original rows (DVs not applied on the
+    # backed-mudata path; symmetric with the eager `to_mudata` path).
+    assert mu.n_obs == n_obs, (
+        f"outer MuData obs unexpectedly DV-filtered: {mu.n_obs} != {n_obs}"
+    )
+    assert only.n_obs == n_obs, (
+        f"inner AnnData obs unexpectedly DV-filtered: {only.n_obs} != {n_obs}"
+    )
+    assert only.X.shape[0] == n_obs
+    # Cross-check: outer and inner must be in lockstep on this path.
+    assert mu.n_obs == only.n_obs
