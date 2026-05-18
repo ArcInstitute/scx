@@ -212,6 +212,96 @@ class FormatRunner(ABC):
         """
         raise NotImplementedError(f"{self.name} does not support backed row slices")
 
+    def iterate_streaming(
+        self,
+        path: str | Path,
+        chunk_size: int,
+    ) -> TimingResult:
+        """Open `path` in backed mode and walk the matrix row-by-row in
+        ``chunk_size`` blocks, reducing each chunk to a scalar so the
+        decoder actually runs. The point is to measure peak RSS and
+        wall time when X is *never* materialised in full — the
+        "streaming" half of the streaming-vs-in-memory comparison.
+
+        A runner that advertises ``"backed_mode"`` in its
+        ``capabilities`` set must override this method.
+
+        Returns
+        -------
+        TimingResult
+            ``extra`` should include ``"mode": "streaming"``,
+            ``"chunk_size"``, and ``"n_chunks"`` so reports can group
+            apples-to-apples.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support iterate_streaming"
+        )
+
+    def iterate_in_memory(
+        self,
+        path: str | Path,
+        chunk_size: int,
+    ) -> TimingResult:
+        """Eagerly materialise X, then walk it row-by-row in
+        ``chunk_size`` blocks with the same per-chunk reduction as
+        :meth:`iterate_streaming`. The "in-memory" half of the
+        streaming-vs-in-memory comparison.
+
+        A runner that advertises ``"backed_mode"`` in its
+        ``capabilities`` set must override this method.
+
+        Returns
+        -------
+        TimingResult
+            ``extra`` should include ``"mode": "in_memory"``,
+            ``"chunk_size"``, and ``"n_chunks"``.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support iterate_in_memory"
+        )
+
+    def iterate_streaming_multimodal(
+        self,
+        path: str | Path,
+        chunk_size: int,
+        modality_names: tuple[str, ...] | None = None,
+    ) -> TimingResult:
+        """Phase 6b: open a multimodal file in backed mode and walk every
+        modality's X in ``chunk_size`` row chunks. Aggregates wall time,
+        CPU, and peak RSS across all modalities so one call yields one
+        TimingResult per file.
+
+        Default implementation raises ``NotImplementedError``. Runners
+        that advertise both ``"backed_mode"`` and multimodal support
+        (i.e. ``convert_from_h5mu`` works) should override this.
+
+        Returns
+        -------
+        TimingResult
+            ``extra`` should include ``"mode": "streaming"``,
+            ``"chunk_size"``, ``"n_modalities"``, ``"total_chunks"``,
+            and a ``"per_modality"`` dict mapping name → (n_chunks,
+            matrix_sum) so a follow-on correctness check can assert
+            sums match between streaming and in-memory.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support iterate_streaming_multimodal"
+        )
+
+    def iterate_in_memory_multimodal(
+        self,
+        path: str | Path,
+        chunk_size: int,
+        modality_names: tuple[str, ...] | None = None,
+    ) -> TimingResult:
+        """Eager counterpart to :meth:`iterate_streaming_multimodal` —
+        materialise the entire multimodal X via ``to_mudata()`` then
+        iterate each modality's X in ``chunk_size`` row chunks.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support iterate_in_memory_multimodal"
+        )
+
     # ------------------------------------------------------------------
     # Cloud operations (Phase 5 — GCP only)
     # ------------------------------------------------------------------

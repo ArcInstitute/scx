@@ -103,6 +103,45 @@ rna_only = reader.to_anndata()      # raises on multimodal — use to_mudata
 record (`{name, modality_type, default_codec_id, n_vars, nnz, …}`)
 useful for introspection and writer-symmetry checks.
 
+#### Backed multimodal access
+
+CITE-seq / Multiome / TEA-seq files at census scale don't fit in RAM.
+For ad-hoc analysis (QC, exploratory plots, notebook work) on those
+files, both `to_mudata` and `to_anndata` now expose an out-of-core path.
+
+```python
+import pyscx
+
+reader = pyscx.open("citeseq.scx")
+
+# All-modalities backed: returns mudata.MuData of backed AnnData,
+# all sharing the same global obs Arrow table.
+mu = reader.to_mudata(backed=True)
+mu.mod["rna"].X      # ScxBackedSparseDataset — reads shards on demand
+mu.mod["adt"].X      # ScxBackedSparseDataset — reads shards on demand
+
+# Per-modality backed, without extracting to a new file:
+rna = reader.to_anndata(modality="rna", backed=True)
+
+# Per-modality lazy transforms — modality scope flows through the
+# wrapped BackedCsrReader automatically:
+import pyscx.accel as pp
+pp.normalize_total(rna)
+pp.log1p(rna)
+rna.X                # ScxLazyTransformedDataset (modality-scoped)
+```
+
+`to_mudata(backed=True)` on a single-modality v1 or v2 file is supported
+too — the result is a one-modality `MuData` rather than an error, so the
+same code paths work uniformly across file layouts.
+
+Filter kwargs (`var_names`, `obs_filter`, `layers`) are **not** supported
+together with `modality=...` in this PR. Use
+`scx subset --modality NAME --filter '<expr>'` to materialise a filtered
+single-modality file first, then `to_anndata(backed=True)` on the
+result. Cloud-backed `open_cloud(...).to_mudata(backed=True)` depends on
+the Phase 7 `SectionReader` abstraction and is not yet wired.
+
 ### 3.3 Training — `pyscx.MultimodalTrainingDataset`
 
 ```python
@@ -217,6 +256,9 @@ operate, then merge back). This is a Phase F+ follow-on.
 | Operation | Status | Workaround |
 |---|---|---|
 | `pyscx.from_mudata` / `PyExperiment.to_mudata` | Supported | — |
+| `to_mudata(backed=True)` | Supported (Phase 6b) | — |
+| `to_anndata(modality=…, backed=True)` | Supported (Phase 6b) | — |
+| Modality-scoped lazy transforms | Supported (Phase 6b) | — |
 | `scx convert --from/--to h5mu` | Supported | — |
 | `pyscx.MultimodalTrainingDataset` | Supported | — |
 | `scx subset --modality NAME` | Supported | — |
@@ -224,6 +266,8 @@ operate, then merge back). This is a Phase F+ follow-on.
 | `scx merge` on multimodal inputs | Rejected with friendly error | `scx subset --modality NAME` per modality, then merge per-modality, re-compose |
 | `scx compact` on multimodal inputs | Rejected with friendly error | Same workaround |
 | Per-modality CSC sidecar on `scx append` | Drops file-wide sidecar | `scx build-csc` after append |
+| `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | `scx subset --modality NAME --filter` |
+| `open_cloud(...).to_mudata(backed=True)` | Not supported | Depends on Phase 7 `SectionReader` |
 
 ### Detail
 

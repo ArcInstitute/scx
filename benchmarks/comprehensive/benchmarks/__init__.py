@@ -24,6 +24,11 @@ ALL_BENCHMARKS: list[str] = [
     "parallel_scaling",
     "parallel_write_scaling",
     "memory",
+    # Streaming vs in-memory row-iteration head-to-head (Phase 6b).
+    # Gated on `"backed_mode"` capability inside the module; only
+    # formats with a true streaming path (SCX today) record runs —
+    # others skip via NotImplementedError → None.
+    "read_streaming_vs_inmemory",
     "ml_loader",
     # Correctness validation — scanpy / backed / preprocessing parity.
     # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
@@ -70,6 +75,10 @@ ALL_BENCHMARKS: list[str] = [
     # error so the orchestrator never silently skips them.
     "multimodal_compression",
     "multimodal_training",
+    # Phase 6b — multimodal streaming vs in-memory row iteration.
+    # Gated on `dataset.multimodal == True` AND
+    # `format_variant.key in scx_multimodal_*` inside the module.
+    "multimodal_read_streaming_vs_inmemory",
 ]
 
 

@@ -223,6 +223,59 @@ The lazy preprocessing peak (~3.5 GB) covers QC through streaming PCA; kNN graph
 construction and UMAP dominate the remaining RSS in the full pipeline (~10.9 GB).
 Source: `BENCHMARK_REPORT.md` §12 (Lazy Preprocessing & Out-of-Core Pipeline).
 
+### Read iteration: streaming vs in-memory (Phase 6b)
+
+`pyscx.open(path).to_anndata(backed=True)` and `to_mudata(backed=True)` walk
+shards on demand; the eager `to_anndata()` / `to_mudata()` materialise the
+full X up front. Direct head-to-head on a row-by-row iteration workload
+(``read_streaming_vs_inmemory`` benchmark, 65 536-row chunks, ``chunk.sum()``
+per chunk, **cold cache** via ``posix_fadvise(POSIX_FADV_DONTNEED)`` between
+runs; Lambda HPC ``preemptible`` partition, single-modality SCX (auto)):
+
+| Dataset | SCX on disk | Streaming wall | In-memory wall | Streaming peak RSS | In-memory peak RSS | Wall ratio | RSS savings |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| census_500k (500K × 61K) | 1.56 GB | 48.5 s | 50.5 s | 3.2 GB | 7.9 GB | **0.96× (streaming faster)** | **2.4×** |
+| census_1m (1M × 61K) | 3.13 GB | 94.4 s | 99.0 s | 5.2 GB | 15.6 GB | **0.95× (streaming faster)** | **3.0×** |
+
+Two takeaways:
+
+- Under cold cache, streaming actually edges out in-memory by ~4-5 % on
+  wall time. Streaming interleaves shard I/O with decode; the in-memory
+  path reads everything before iteration begins, and at cold cache that
+  serialise-then-iterate pattern doesn't amortise. (Warm-cache repeats —
+  pre-`POSIX_FADV_DONTNEED` — invert the ratio to ~1.23× *slower* for
+  streaming, since the in-memory path can re-read from RAM. Production
+  workloads on census-scale files don't fit in RAM, so cold cache is the
+  load-bearing regime.)
+- Streaming peak RSS scales with one shard's footprint
+  (``chunk_size × n_vars × ~16`` bytes plus indptr); in-memory scales
+  with the full CSR. Both modes produce identical per-chunk matrix sums
+  (correctness gate in the benchmark module). The RSS ratio grows
+  linearly with dataset size — extrapolating from these two points,
+  ``census_5m`` (5M cells × 61K vars) lands at roughly 6-10× and
+  ``census_10m`` pushes the in-memory path past the headroom of typical
+  workstation hardware.
+
+**Multimodal** counterpart (``multimodal_read_streaming_vs_inmemory``)
+routes through ``to_mudata(backed=True)`` and iterates each modality. On
+the available real fixtures the in-memory ceiling fits comfortably in
+node RAM, so RSS is baseline-bound and the two modes look identical;
+the Phase 6b read path is verified correct via matching per-modality
+matrix sums across both modes:
+
+| Dataset | Modalities | SCX size | Streaming wall | In-memory wall | Streaming peak RSS | In-memory peak RSS |
+|---|---|---:|---:|---:|---:|---:|
+| cite_seq_pbmc_5k (5.2K × 33K + 32) | rna + adt | 16 MB | 0.61 s | 0.59 s | 312 MB | 315 MB |
+| multiome_pbmc_10k (11.9K × 36K + 144K) | rna + atac | 228 MB | 25.4 s | 24.5 s | 1.58 GB | 1.59 GB |
+
+The RSS-saving regime activates at census-scale CITE-seq / Multiome
+(not staged on the current Lambda fleet); the pattern at single-modality
+``census_500k`` / ``census_1m`` is the load-bearing extrapolation.
+
+Source: ``benchmarks/comprehensive/results/raw/read_streaming_vs_inmemory__scx_auto__{census_500k,census_1m}.json``
+and ``benchmarks/comprehensive/results/raw/multimodal_read_streaming_vs_inmemory__scx_multimodal_per_modality_auto__{cite_seq_pbmc_5k,multiome_pbmc_10k}.json``.
+SLURM wrapper: ``benchmarks/comprehensive/scripts/slurm_read_streaming_vs_inmemory.sh``.
+
 ## Analysis Accelerators (CPU)
 
 Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):

@@ -319,10 +319,18 @@ impl PyExperiment {
     ///                     instead of the SCX predicate engine, so syntax must be
     ///                     pandas-compatible. No effect when obs_filter is None or
     ///                     when backed=True (backed mode already preserves slots).
+    ///     modality: Select a single modality of a multimodal file
+    ///                     and return a backed AnnData scoped to that modality
+    ///                     (per-modality X, var, and obsm; the global obs is
+    ///                     shared). Currently requires `backed=True`. The
+    ///                     filter kwargs (`var_names`, `obs_filter`, `layers`)
+    ///                     are not supported in this mode — use
+    ///                     `scx subset --modality NAME --filter ...` to
+    ///                     materialise a filtered single-modality file first.
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -333,7 +341,25 @@ impl PyExperiment {
         obs_filter: Option<&str>,
         layers: Option<Vec<String>>,
         preserve_slots: bool,
+        modality: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(name) = modality.as_deref() {
+            if !backed {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "to_anndata(modality=...) currently requires backed=True; \
+                     use to_mudata() for eager multimodal extraction",
+                ));
+            }
+            if var_names.is_some() || obs_filter.is_some() || layers.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "to_anndata(modality=..., backed=True) does not support \
+                     var_names / obs_filter / layers; use \
+                     `scx subset --modality NAME --filter ...` to materialise \
+                     a filtered single-modality file first",
+                ));
+            }
+            return anndata::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
+        }
         if backed {
             anndata::to_anndata_backed(
                 py,
@@ -426,13 +452,27 @@ impl PyExperiment {
 
     /// Materialise this file as a `mudata.MuData` object.
     ///
-    /// Iterates the registered modalities, builds an AnnData per
-    /// modality via the existing zero-copy CSR path, and attaches
-    /// them to a `MuData(...)` with the shared global obs.
-    /// Single-modality files raise `RuntimeError` directing to
-    /// `to_anndata()`.
-    fn to_mudata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        crate::mudata::to_mudata(py, &self.reader)
+    /// Eager mode (default): iterates registered modalities, builds a
+    /// scipy-CSR-backed AnnData per modality, and attaches them to a
+    /// `MuData(...)` with the shared global obs. Single-modality files
+    /// raise `RuntimeError` directing to `to_anndata()`.
+    ///
+    /// Backed mode (`backed=True`, Phase 6b): each modality's X is wrapped
+    /// in `ScxBackedSparseDataset` (per-modality `BackedCsrReader` + CSC
+    /// sidecar if present). Single-modality files are wrapped in a
+    /// one-modality `MuData` rather than raising.
+    #[pyo3(signature = (backed=false, cache_shards=4))]
+    fn to_mudata<'py>(
+        &self,
+        py: Python<'py>,
+        backed: bool,
+        cache_shards: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if backed {
+            crate::mudata::to_mudata_backed(py, &self.path, &self.reader, cache_shards)
+        } else {
+            crate::mudata::to_mudata(py, &self.reader)
+        }
     }
 
     /// Phase 5b: per-gene detection counts (number of cells where

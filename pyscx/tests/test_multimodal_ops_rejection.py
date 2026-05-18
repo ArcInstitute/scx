@@ -1,8 +1,9 @@
-"""Multimodal inputs are rejected by `pyscx.merge` and `pyscx.compact`.
+"""Multimodal `pyscx.merge` / `pyscx.compact` integration tests.
 
-The Rust core (`scx_ops::merge` / `scx_ops::compact`) returns
-`OpsError::MultimodalUnsupported`, which the pyscx error mapper routes
-to `RuntimeError`. These tests pin the user-visible behaviour.
+Lifted the old `OpsError::MultimodalUnsupported`
+rejection that gated these ops on multimodal inputs. These tests pin
+the new user-visible behaviour: both ops succeed and produce a
+multimodal output that round-trips.
 """
 
 from __future__ import annotations
@@ -39,19 +40,31 @@ def multimodal_scx_path():
         yield path, tmp
 
 
-def test_compact_rejects_multimodal(multimodal_scx_path):
+def test_compact_supports_multimodal(multimodal_scx_path):
+    """Phase 6: `pyscx.compact` round-trips a multimodal file."""
     import pyscx
 
     path, tmp = multimodal_scx_path
     out = os.path.join(tmp, "compacted.scx")
-    with pytest.raises(RuntimeError, match="not yet supported for multimodal"):
-        pyscx.compact(path, out)
+    pyscx.compact(path, out)
+
+    reader = pyscx.open(out)
+    assert reader.is_multimodal is True
+    assert sorted(reader.modality_names) == ["adt", "rna"]
 
 
-def test_merge_rejects_multimodal(multimodal_scx_path):
+def test_merge_supports_multimodal(multimodal_scx_path):
+    """Phase 6: `pyscx.merge` concatenates two multimodal files along
+    the obs axis."""
     import pyscx
 
     path, tmp = multimodal_scx_path
     out = os.path.join(tmp, "merged.scx")
-    with pytest.raises(RuntimeError, match="not yet supported for multimodal"):
-        pyscx.merge([path, path], out)
+    pyscx.merge([path, path], out)
+
+    src = pyscx.open(path)
+    merged = pyscx.open(out)
+    assert merged.is_multimodal is True
+    assert sorted(merged.modality_names) == sorted(src.modality_names)
+    # Doubled obs axis; modalities preserved.
+    assert merged.n_obs == 2 * src.n_obs

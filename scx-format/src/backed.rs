@@ -1173,20 +1173,21 @@ impl BackedCsrReader {
     /// the ~640 MB-per-shard LRU cache overhead that is dead weight during
     /// sequential access.
     pub fn read_shard_uncached(&self, shard_idx: usize) -> Result<ScxCsr> {
-        let (indptr, indices, data) = match &self.layer_name {
-            None => self.reader.read_csr_shard(shard_idx)?,
-            Some(_) => {
-                let lite =
-                    self.sorted_entries
-                        .get(shard_idx)
-                        .ok_or(ScxError::ShardIndexOutOfBounds {
-                            index: shard_idx,
-                            count: self.sorted_entries.len(),
-                        })?;
-                self.reader
-                    .read_shard_from_entry(&lite.into_transient_full_entry())?
-            }
-        };
+        // Resolve the shard via the lite-entry table (X or layer) rather
+        // than `reader.read_csr_shard(shard_idx)`, which is keyed on the
+        // global CSR shard index. For `BackedCsrReader::for_modality(...)`
+        // the local `shard_idx` maps to a filtered subset of the catalog,
+        // so the lite-entry path correctly addresses the per-modality
+        // shard at its real catalog offset.
+        let lite = self
+            .shard_entry(shard_idx)
+            .ok_or(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: self.shard_count(),
+            })?;
+        let (indptr, indices, data) = self
+            .reader
+            .read_shard_from_entry(&lite.into_transient_full_entry())?;
 
         // Release page cache for the just-decoded shard. This is safe because
         // the mmap is read-only and the data has been copied into owned Vecs.
@@ -1318,20 +1319,18 @@ impl BackedCsrReader {
     /// upcoming sequential shards. Caller is responsible for singleflight /
     /// metrics bookkeeping around this call.
     fn decode_and_cache(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
-        let (indptr, indices, data) = match &self.layer_name {
-            None => self.reader.read_csr_shard(shard_idx)?,
-            Some(_) => {
-                let lite =
-                    self.sorted_entries
-                        .get(shard_idx)
-                        .ok_or(ScxError::ShardIndexOutOfBounds {
-                            index: shard_idx,
-                            count: self.sorted_entries.len(),
-                        })?;
-                self.reader
-                    .read_shard_from_entry(&lite.into_transient_full_entry())?
-            }
-        };
+        // Same per-modality-correct dispatch as `read_shard_uncached`:
+        // address shards by their catalog offset via `shard_entry`, not by
+        // global CSR index.
+        let lite = self
+            .shard_entry(shard_idx)
+            .ok_or(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: self.shard_count(),
+            })?;
+        let (indptr, indices, data) = self
+            .reader
+            .read_shard_from_entry(&lite.into_transient_full_entry())?;
         let n_rows = indptr.len().saturating_sub(1);
         let csr = Arc::new(ScxCsr::new_unchecked(
             (n_rows, self.n_vars),
@@ -2830,6 +2829,42 @@ mod tests {
         assert_eq!(result.indptr, expected.indptr);
         assert_eq!(result.indices, expected.indices);
         assert_eq!(result.data, expected.data);
+    }
+
+    /// Locks the post-unification X-path dispatch: `read_shard_uncached(i)`
+    /// (which now always routes through `shard_entry → read_shard_from_entry`)
+    /// must produce per-shard `(indptr, indices, data)` triples that are
+    /// byte-equal to `ScxReader::read_csr_shard(i)` on a single-modality file.
+    ///
+    /// Pre-fix the X branch took the direct `reader.read_csr_shard(shard_idx)`
+    /// path; post-fix it goes via `x_sorted_entries`. The two paths should
+    /// resolve to the same shard at the same catalog offset on non-multimodal
+    /// files (multimodal-only callers rely on the new path for correctness),
+    /// so this test pins the invariant.
+    #[test]
+    fn test_read_shard_uncached_byte_equal_to_reader_read_csr_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let n_obs = 24;
+        let n_vars = 10;
+        let n_shards = 4;
+        let (backed, _) = write_test_file_and_open(&dir, n_obs, n_vars, n_shards, 0);
+
+        // Reopen the file via `ScxReader` to call `read_csr_shard` directly.
+        // We compare against this canonical per-shard decoder.
+        let path = dir.path().join("test.scx");
+        let reader = ScxReader::open(&path).unwrap();
+
+        assert_eq!(backed.shard_count(), n_shards);
+        for i in 0..n_shards {
+            let backed_shard = backed.read_shard_uncached(i).unwrap();
+            let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+            assert_eq!(backed_shard.indptr, indptr, "indptr mismatch at shard {i}");
+            assert_eq!(
+                backed_shard.indices, indices,
+                "indices mismatch at shard {i}"
+            );
+            assert_eq!(backed_shard.data, data, "data mismatch at shard {i}");
+        }
     }
 
     #[test]
