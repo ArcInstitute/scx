@@ -688,9 +688,14 @@ fn test_integer_dtype_detection() {
     assert_eq!(enc, ValueEncoding::Uint32);
     assert_eq!(codec, CodecId::Scx1);
 
+    // Float data auto-routes to Pcodec (see select_codec at
+    // scx-format/src/codec_select.rs:50). Older versions selected
+    // Zstd for floats — Pcodec landed as the float-data default
+    // because it compresses log-normalised / PCA-style data ~4-7%
+    // better than Zstd.
     let (enc, codec) = detect_value_encoding(&[0.5, 1.5], None).unwrap();
     assert_eq!(enc, ValueEncoding::Float32);
-    assert_eq!(codec, CodecId::Zstd);
+    assert_eq!(codec, CodecId::Pcodec);
 }
 
 #[test]
@@ -828,8 +833,11 @@ fn test_float_data_uses_zstd() {
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
-    // Should use Zstd for float data
-    assert_eq!(reader.header().codec_id, CodecId::Zstd as u8);
+    // Float data auto-routes to Pcodec (see `select_codec` at
+    // scx-format/src/codec_select.rs:50). Pcodec landed as the
+    // float-data default after this test was written; the test
+    // name is now historical.
+    assert_eq!(reader.header().codec_id, CodecId::Pcodec as u8);
 }
 
 /// convert h5ad → scx with `csc=always`, verify the output
@@ -1408,10 +1416,12 @@ fn test_merge_multimodal_mismatch_raises() {
     );
 }
 
-/// Phase F.4: `scx merge` of two multimodal files that match in
-/// every modality is also explicitly rejected (multimodal merge is
-/// not yet implemented). Refusing is safer than silently producing
-/// a flattened output.
+/// Phase 6: `scx merge` of two multimodal files that match in
+/// every modality concatenates rows per-modality and preserves the
+/// modality table. Previously this case was rejected (the test
+/// name retains the historical `still_unsupported` prefix); merge
+/// has since been implemented for matching multimodal structures
+/// — assert the positive path.
 #[test]
 fn test_merge_multimodal_match_still_unsupported() {
     use super::mudata_pipeline::h5mu_to_scx;
@@ -1429,16 +1439,25 @@ fn test_merge_multimodal_match_still_unsupported() {
     h5mu_to_scx(&h5mu_a, &scx_a, &opts, &mut WarningSink::log()).unwrap();
     h5mu_to_scx(&h5mu_b, &scx_b, &opts, &mut WarningSink::log()).unwrap();
 
-    let err = scx_ops::merge(&[&scx_a, &scx_b], &merged).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("multimodal") || msg.contains("modality"),
-        "merge error should mention multimodal limitation; got: {msg}"
+    scx_ops::merge(&[&scx_a, &scx_b], &merged).unwrap();
+    let reader = ScxReader::open(&merged).unwrap();
+    assert!(reader.is_multimodal(), "merged file should be multimodal");
+    assert_eq!(reader.n_obs(), 12, "merge should concatenate the 6+6 rows");
+    let mod_names: Vec<&str> = reader.modality_names();
+    let mut sorted = mod_names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec!["adt", "rna"],
+        "both modalities should survive merge"
     );
 }
 
-/// Phase F.4: `scx compact` on a multimodal file is rejected with a
-/// clear error directing to subset-then-compact.
+/// Phase 6: `scx compact` on a multimodal file now succeeds —
+/// `compact_multimodal` applies the global keep-mask across every
+/// modality and preserves the modality table. Previously this case
+/// was rejected (the test name retains the historical
+/// `_unsupported` suffix); assert the positive path.
 #[test]
 fn test_compact_multimodal_unsupported() {
     use super::mudata_pipeline::h5mu_to_scx;
@@ -1452,11 +1471,16 @@ fn test_compact_multimodal_unsupported() {
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_in, &opts, &mut WarningSink::log()).unwrap();
 
-    let err = scx_ops::compact(&scx_in, &scx_out).unwrap_err();
-    let msg = err.to_string();
+    scx_ops::compact(&scx_in, &scx_out).unwrap();
+    let reader = ScxReader::open(&scx_out).unwrap();
     assert!(
-        msg.contains("multimodal"),
-        "compact error should mention multimodal limitation; got: {msg}"
+        reader.is_multimodal(),
+        "compacted multimodal file should remain multimodal"
+    );
+    assert_eq!(
+        reader.n_obs(),
+        6,
+        "no deletion vectors → all rows preserved"
     );
 }
 
