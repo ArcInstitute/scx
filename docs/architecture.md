@@ -312,6 +312,32 @@ normalize(target_sum=1e4)          ← fused with log1p when possible
 - **Parallel collection:** Qualifying shards are decoded and filtered in parallel
   via rayon (`scx-engine/src/collect.rs`).
 
+### `SectionReader` — local + cloud unification
+
+`QueryPipeline` is generic over a `SectionReader` trait that abstracts
+how catalog sections are fetched. Two implementations ship today:
+
+| Reader | Section fetch | Construction |
+| --- | --- | --- |
+| `ScxReader` (`scx-format`) | mmap / `pread` over a local `.scx` file | `QueryPipeline::open(path)` |
+| `CloudSectionReader` (`scx-cloud`) | `object_store` range reads over `gs://` / `s3://` / `az://` / exploded `.scxd/` directories | `QueryPipeline::from_reader(reader)` |
+
+`PyExperiment.query()` opens a local mmap-backed pipeline;
+`PyCloudExperiment.query()` opens a cloud-backed pipeline (see
+[docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query)).
+Both share the same predicate planning, shard pruning, gene
+projection, and decoding code paths — only the bytes-by-section
+implementation differs.
+
+The CLI surface mirrors this: `scx query <input> "<predicate>"`
+auto-detects the input as a local file, an exploded `.scxd/`
+directory, or a cloud URL and constructs the matching `SectionReader`.
+
+Cloud reads on the engine path currently issue per-shard
+`block_on(read)` calls from rayon workers. A batched async
+section-fetch stage is deferred to a follow-on (tracked alongside
+`CloudQueryOptions`).
+
 ---
 
 ## ML Training Loader (scx-loader)
@@ -588,7 +614,7 @@ it; the previous in-line `scx-cli/src/convert/` module was extracted
 when streaming conversion landed so `pyscx` could share the pipeline
 without depending on the binary-only `scx-cli`.
 
-**Streaming variant** (`scx convert --stream`, `pyscx.from_h5ad`,
+**Streaming ingestion** (`scx convert --stream`, `pyscx.from_h5ad`,
 auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`
 loads the full `indptr` then iterates `XStreamReader::next_shard`,
 running `sort_csr_rows_in_place` + `drop_explicit_zeros_inplace` per
@@ -597,6 +623,21 @@ Peak memory is bounded by one shard's worth of CSR plus the resident
 indptr, independent of total dataset size. `csc="always"` triggers a
 post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
 ~2× the output size during the rebuild).
+
+**Streaming export** (`scx convert --to h5ad/h5mu`, `pyscx.to_h5ad`,
+`pyscx.to_h5mu`): the inverse path. `scx_convert::
+scx_to_h5ad_streaming` (and `scx_to_h5mu_streaming` / `scx_modality_to_h5ad_streaming`)
+iterate SCX CSR shards in row order
+via `ScxReader::read_csr_shard_for` / `read_layer_csr_shard*` and
+write hyperslab slices into pre-allocated `/X/{indptr,indices,data}`
+HDF5 datasets. The total `nnz` is computed up front from catalog
+`ShardStats` (single pre-scan decode when deletion vectors are
+active) so the on-disk layout is deterministic — no extendable HDF5
+datasets. Metadata writers (`obs` / `var` / `obsm` / `uns` / etc.) are
+reused verbatim from the non-streaming path. Peak memory is bounded
+by one shard's worth of CSR per matrix written. `--stream=false`
+falls back to the legacy materialising `scx_to_h5ad` /
+`scx_to_h5mu` / `scx_modality_to_h5ad` paths.
 
 ### Conversion: MTX ↔ SCX
 

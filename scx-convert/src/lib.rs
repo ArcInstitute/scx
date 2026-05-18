@@ -21,6 +21,8 @@ mod h5ad_read;
 #[cfg(feature = "hdf5")]
 mod h5ad_stream;
 #[cfg(feature = "hdf5")]
+mod h5ad_stream_write;
+#[cfg(feature = "hdf5")]
 mod h5ad_write;
 #[cfg(feature = "hdf5")]
 mod mudata_pipeline;
@@ -55,15 +57,18 @@ pub mod pipeline;
 
 #[cfg(feature = "hdf5")]
 pub use pipeline::{
-    h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, streaming_writer_coordinator, tenx_to_scx,
-    BitmapPolicy, ConvertError, ConvertOptions, StreamingOverrides,
+    h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, scx_to_h5ad_streaming,
+    streaming_writer_coordinator, tenx_to_scx, BitmapPolicy, ConvertError, ConvertOptions,
+    StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]
 pub use mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming, is_h5mu_file};
 
 #[cfg(feature = "hdf5")]
-pub use mudata_write::{scx_modality_to_h5ad, scx_to_h5mu};
+pub use mudata_write::{
+    scx_modality_to_h5ad, scx_modality_to_h5ad_streaming, scx_to_h5mu, scx_to_h5mu_streaming,
+};
 
 pub mod mtx_pipeline;
 

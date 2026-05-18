@@ -650,6 +650,21 @@ pub fn scx_to_h5ad(
     write_scx_to_h5ad(scx_path, h5ad_path)
 }
 
+/// Streaming SCX → h5ad. Walks SCX CSR shards in row order and writes
+/// `/X/{indptr,indices,data}` (and `/layers/{name}/…`) via pre-
+/// allocated HDF5 hyperslab slices, so peak RSS is bounded by one
+/// shard's worth of CSR plus encode buffers regardless of file size.
+/// Single-modality only; multimodal SCX files must use
+/// [`scx_to_h5mu_streaming`] or [`scx_modality_to_h5ad_streaming`].
+pub fn scx_to_h5ad_streaming(
+    scx_path: &Path,
+    h5ad_path: &Path,
+    opts: &ConvertOptions,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    crate::h5ad_stream_write::write_scx_to_h5ad_streaming(scx_path, h5ad_path, opts, sink)
+}
+
 /// Override hooks for [`h5ad_to_scx_streaming`]. Each `Some(...)`
 /// field skips the corresponding on-disk read and uses the provided
 /// value instead.

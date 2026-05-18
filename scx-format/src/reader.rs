@@ -634,6 +634,20 @@ impl ScxReader {
         self.read_shard_from_entry(shards[shard_idx])
     }
 
+    /// Indptr-only variant of [`Self::read_csr_shard_for`]. Decodes only
+    /// the row-pointer region; cheap path for callers that need just
+    /// per-row nnz counts.
+    pub fn read_csr_shard_indptr_for(&self, modality_id: u8, shard_idx: usize) -> Result<Vec<i64>> {
+        let shards = self.full_catalog.csr_shards_for_modality(modality_id);
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_shard_indptr_from_entry(shards[shard_idx])
+    }
+
     /// Read a single CSC shard for the given modality.
     pub fn read_csc_shard_for(&self, modality_id: u8, shard_idx: usize) -> Result<ScxCsc> {
         let shards = self.full_catalog.csc_shards_for_modality(modality_id);
@@ -1158,13 +1172,7 @@ impl ScxReader {
 
     /// Read a named layer, assembling all its shards into a ScxCsr.
     pub fn read_layer(&self, name: &str) -> Result<ScxCsr> {
-        let prefix = format!("{name}_shard_");
-        let mut shards: Vec<&FullCatalogEntry> = self
-            .full_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix))
-            .collect();
+        let mut shards = self.legacy_layer_shards(name);
 
         if shards.is_empty() {
             return Err(ScxError::SectionNotFound(format!("layer '{name}'")));
@@ -1180,6 +1188,155 @@ impl ScxReader {
         {
             self.assemble_shards(&shards)
         }
+    }
+
+    fn legacy_layer_shards(&self, name: &str) -> Vec<&FullCatalogEntry> {
+        let prefix = format!("{name}_shard_");
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Read a single LayerCsrShard by `(layer_name, shard_idx)` for the
+    /// legacy single-modality naming pattern `{layer_name}_shard_{idx}`.
+    /// Shards are sorted by `row_start` before indexing so the caller
+    /// can walk them in row order.
+    pub fn read_layer_csr_shard(
+        &self,
+        layer_name: &str,
+        shard_idx: usize,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        let mut shards = self.legacy_layer_shards(layer_name);
+        if shards.is_empty() {
+            return Err(ScxError::SectionNotFound(format!("layer '{layer_name}'")));
+        }
+        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_shard_from_entry(shards[shard_idx])
+    }
+
+    /// Per-modality variant of [`Self::read_layer_csr_shard`]: read a
+    /// single LayerCsrShard for `(modality_id, layer_name, shard_idx)`
+    /// using the multimodal naming pattern
+    /// `layer/{mname}/{layer_name}/shard_{idx}`. Shards are returned in
+    /// `row_start` order (matching the catalog accessor's sort).
+    pub fn read_layer_csr_shard_for(
+        &self,
+        modality_id: u8,
+        layer_name: &str,
+        shard_idx: usize,
+    ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        let shards = self
+            .full_catalog
+            .layer_csr_shards_for_modality(modality_id, layer_name);
+        if shards.is_empty() {
+            return Err(ScxError::SectionNotFound(format!(
+                "layer '{layer_name}' for modality_id {modality_id}"
+            )));
+        }
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_shard_from_entry(shards[shard_idx])
+    }
+
+    /// Indptr-only variant of [`Self::read_layer_csr_shard`].
+    pub fn read_layer_csr_shard_indptr(
+        &self,
+        layer_name: &str,
+        shard_idx: usize,
+    ) -> Result<Vec<i64>> {
+        let mut shards = self.legacy_layer_shards(layer_name);
+        if shards.is_empty() {
+            return Err(ScxError::SectionNotFound(format!("layer '{layer_name}'")));
+        }
+        shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_shard_indptr_from_entry(shards[shard_idx])
+    }
+
+    /// Indptr-only variant of [`Self::read_layer_csr_shard_for`].
+    pub fn read_layer_csr_shard_indptr_for(
+        &self,
+        modality_id: u8,
+        layer_name: &str,
+        shard_idx: usize,
+    ) -> Result<Vec<i64>> {
+        let shards = self
+            .full_catalog
+            .layer_csr_shards_for_modality(modality_id, layer_name);
+        if shards.is_empty() {
+            return Err(ScxError::SectionNotFound(format!(
+                "layer '{layer_name}' for modality_id {modality_id}"
+            )));
+        }
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_shard_indptr_from_entry(shards[shard_idx])
+    }
+
+    /// Number of legacy single-modality LayerCsrShard entries for
+    /// `layer_name` (`{layer_name}_shard_{idx}`).
+    pub fn layer_csr_shard_count(&self, layer_name: &str) -> usize {
+        self.legacy_layer_shards(layer_name).len()
+    }
+
+    /// Number of per-modality LayerCsrShard entries for
+    /// `(modality_id, layer_name)` (`layer/{mname}/{layer_name}/shard_{idx}`).
+    pub fn layer_csr_shard_count_for(&self, modality_id: u8, layer_name: &str) -> usize {
+        self.full_catalog
+            .layer_csr_shards_for_modality(modality_id, layer_name)
+            .len()
+    }
+
+    /// Per-modality layer names. For `modality_id == 0`, equivalent to
+    /// [`Self::layer_names`] (legacy single-modality pattern). For
+    /// `modality_id > 0`, returns the deduplicated layer names parsed
+    /// from `layer/{mname}/{layer_name}/shard_{idx}` entries belonging
+    /// to that modality.
+    pub fn layer_names_for(&self, modality_id: u8) -> Vec<String> {
+        if modality_id == 0 {
+            return self.layer_names();
+        }
+        let mut names: Vec<String> = self
+            .full_catalog
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id
+            })
+            .filter_map(|e| {
+                // `layer/{mname}/{layer_name}/shard_{idx}` —
+                // the `{layer_name}` segment lives between the second
+                // `/` and the trailing `/shard_{idx}`.
+                let after_first = e.name.strip_prefix("layer/")?;
+                let (_mname, rest) = after_first.split_once('/')?;
+                let pos = rest.rfind("/shard_")?;
+                Some(rest[..pos].to_string())
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     // -----------------------------------------------------------------------
@@ -1539,6 +1696,19 @@ impl ScxReader {
             entry,
             self.full_catalog.catalog_version,
             verify_checksum,
+        )
+    }
+
+    /// Read only the indptr (row-pointer) array of a shard, skipping
+    /// indices/data decode entirely. For callers that need just the
+    /// per-row nnz counts (e.g. the streaming SCX → h5ad export's
+    /// `precompute_total_nnz` when a deletion vector is active).
+    pub fn read_shard_indptr_from_entry(&self, entry: &FullCatalogEntry) -> Result<Vec<i64>> {
+        let section = self.section_bytes(entry)?;
+        crate::shard_decode::decode_shard_indptr_bytes(
+            section,
+            entry,
+            self.full_catalog.catalog_version,
         )
     }
 

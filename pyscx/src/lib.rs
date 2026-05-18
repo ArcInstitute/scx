@@ -232,15 +232,49 @@ fn from_anndata(
 /// the CSC sidecar over the just-written file. Peak disk briefly
 /// reaches ~2× the output size during the rebuild.
 ///
-/// Limitations:
-///   * CSC-on-disk h5ad and dense X are rejected with a clear error.
+/// Source-layout handling:
+///   * CSR-on-disk h5ad: native streaming path.
+///   * Dense-on-disk h5ad: row-slab streaming with per-shard
+///     sparsification (zero-drop). Use `dense_zero_epsilon` to
+///     threshold near-zero values; default `0.0` matches
+///     scipy's `csr_matrix(dense)` behaviour.
+///   * CSC-on-disk h5ad: in-memory transpose when the file fits the
+///     `memory_budget`; otherwise an external bucketed transpose to
+///     `temp_dir` (`scipy.sum_duplicates` semantics on duplicate
+///     coordinates).
 ///   * `varm` is preserved; `obsp` / `varp` come through only when
 ///     the on-disk h5ad has them in a form anndata exposes (matches
 ///     the non-streaming CLI converter).
 ///
+/// Hardening / index kwargs:
+///   * `strict_uns`: when `True`, the first unrepresentable `uns`
+///     entry raises; default `False` emits a `UserWarning` per
+///     skipped key (`SkippedUnsKey`).
+///   * `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
+///     dense slabs and the CSC external-transpose buffers. Binary
+///     prefixes only (`K/M/G/T`, `KiB/MiB/GiB/TiB`); decimal
+///     `KB/MB/GB/TB` is rejected to avoid ambiguity.
+///   * `temp_dir`: directory for CSC external transpose runs.
+///     Cleaned on success and on drop; defaults to the system temp.
+///   * `index_obs` / `index_var` / `index_preset`
+///     (`cellxgene` | `perturbseq` | `training`) /
+///     `index_auto_threshold`: materialise predicate indexes at
+///     conversion time so `pyscx.open(...).query()` and
+///     `scx pull --filter` can pushdown. Forced missing/unsupported
+///     columns hard-error; preset misses emit
+///     `MissingPresetIndexColumn`. Skipped for multimodal inputs.
+///   * `bitmap`: `"off"` | `"auto"` | `"always"`. Writes per-shard
+///     gene→local-row roaring bitmap sidecars (`SCXB`). `auto`
+///     opts in for sparse X with `n_vars <= 1_000_000` and bitmap
+///     size <= 15% of encoded CSR; ATAC modalities are eager under
+///     `auto`.
+///
 /// Example:
 ///     pyscx.from_h5ad("big.h5ad", "big.scx")
 ///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
+///     pyscx.from_h5ad("big.h5ad", "big.scx",
+///                     memory_budget="4G", temp_dir="/scratch",
+///                     index_preset="cellxgene", bitmap="auto")
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
@@ -465,6 +499,95 @@ fn from_h5mu(
     )
 }
 
+/// Convert an SCX file to h5ad.
+///
+/// Mirrors `pyscx.from_h5ad` in the opposite direction. Streams by
+/// default — peak RSS is bounded by one shard's worth of CSR plus
+/// encode buffers, matching the ingestion direction. For multimodal
+/// SCX files, pass `modality="rna"` to extract a single modality as
+/// h5ad; otherwise multimodal inputs raise (use `pyscx.to_h5mu`).
+///
+/// Args:
+///     path: Source SCX file.
+///     out: Destination h5ad file.
+///     stream: Stream the conversion (default True). Set False for
+///         the legacy materializing path.
+///     modality: Modality name to extract (only valid on multimodal
+///         SCX inputs).
+///
+/// Example:
+///     pyscx.to_h5ad("data.scx", "data.h5ad")
+///     pyscx.to_h5ad("cite.scx", "rna.h5ad", modality="rna")
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (path, out, stream=true, modality=None))]
+fn to_h5ad(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    stream: bool,
+    modality: Option<&str>,
+) -> PyResult<()> {
+    use std::path::Path;
+    let opts = scx_convert::ConvertOptions {
+        stream,
+        tool: "pyscx".into(),
+        ..Default::default()
+    };
+    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+        let mut sink = scx_convert::WarningSink::log();
+        match (modality, stream) {
+            (Some(name), true) => scx_convert::scx_modality_to_h5ad_streaming(
+                Path::new(path),
+                Path::new(out),
+                name,
+                &opts,
+                &mut sink,
+            ),
+            (Some(name), false) => {
+                scx_convert::scx_modality_to_h5ad(Path::new(path), Path::new(out), name)
+            }
+            (None, true) => scx_convert::scx_to_h5ad_streaming(
+                Path::new(path),
+                Path::new(out),
+                &opts,
+                &mut sink,
+            ),
+            (None, false) => scx_convert::scx_to_h5ad(Path::new(path), Path::new(out), &mut sink),
+        }
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Convert an SCX file to h5mu.
+///
+/// Mirrors `pyscx.from_h5mu` in the opposite direction. Streams by
+/// default; per-modality `/mod/{name}/X` and any layers are written
+/// shard-by-shard. Requires a multimodal SCX file.
+///
+/// Example:
+///     pyscx.to_h5mu("cite.scx", "cite.h5mu")
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (path, out, stream=true))]
+fn to_h5mu(py: Python<'_>, path: &str, out: &str, stream: bool) -> PyResult<()> {
+    use std::path::Path;
+    let opts = scx_convert::ConvertOptions {
+        stream,
+        tool: "pyscx".into(),
+        ..Default::default()
+    };
+    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+        let mut sink = scx_convert::WarningSink::log();
+        if stream {
+            scx_convert::scx_to_h5mu_streaming(Path::new(path), Path::new(out), &opts, &mut sink)
+        } else {
+            scx_convert::scx_to_h5mu(Path::new(path), Path::new(out))
+        }
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 /// Convert a `mudata.MuData` object to a multimodal SCX v2 file.
 ///
 /// Mirrors `from_anndata` for multi-modality inputs. The MuData's
@@ -561,6 +684,10 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "hdf5")]
     m.add_function(wrap_pyfunction!(from_h5mu, m)?)?;
     m.add_function(wrap_pyfunction!(from_mudata, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(to_h5ad, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(to_h5mu, m)?)?;
 
     // Preprocessing pipeline
     m.add_function(wrap_pyfunction!(preprocess::preprocess, m)?)?;

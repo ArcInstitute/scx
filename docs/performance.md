@@ -163,6 +163,40 @@ Source data:
 (absolute floor: `streaming_peak_rss_mb max: 2048` on `census_1m`,
 declared in `benchmarks/comprehensive/thresholds.yaml`).
 
+### Streaming export (SCX → h5ad / h5mu)
+
+Phase 8 closes the asymmetry with the ingestion path. `scx convert
+--to h5ad` / `--to h5mu` (default `--stream=true`) and
+`pyscx.to_h5ad` / `pyscx.to_h5mu` (default `stream=True`) walk SCX
+CSR shards in row order via
+`scx_convert::scx_to_h5ad_streaming` /
+`scx_to_h5mu_streaming` / `scx_modality_to_h5ad_streaming` and write
+hyperslab slices into pre-allocated `/X/{indptr,indices,data}` HDF5
+datasets. Total `nnz` is summed from catalog `ShardStats` up front
+(or computed via a single pre-scan decode when deletion vectors are
+active) so the on-disk layout is deterministic — no extendable HDF5
+datasets.
+
+Peak RSS bound: one shard's worth of CSR per matrix written
+(~`stats.nnz × 16` bytes for indices + data), plus the
+always-resident kept-row indptr (`(n_obs_kept + 1) × 8` bytes — same
+floor the ingestion side carries). Multimodal h5mu export reuses
+the same writer per modality so the bound applies per-modality, not
+cumulatively. Pass `--stream=false` / `stream=False` to opt into
+the legacy materialising path (`scx_to_h5ad` /
+`scx_to_h5mu`).
+
+For regression coverage, see
+`benchmarks/comprehensive/benchmarks/export_streaming.py` (paired
+`pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs
+`stream=False`, run via
+`benchmarks/comprehensive/scripts/run_slurm_export_streaming.sh`).
+The streaming row's `streaming_peak_rss_mb` is gated on `census_1m`
+in `benchmarks/comprehensive/thresholds.yaml` at the same `2048 MB`
+ceiling as the ingestion floor; a cross-shard accumulator leak in
+`scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor
+without needing a wall-clock signal.
+
 ## Column Projection (2000 HVGs)
 
 | Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA | SLAF |

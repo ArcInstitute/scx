@@ -76,12 +76,19 @@ enum Commands {
         /// a multimodal SCX input; ignored otherwise.
         #[arg(long)]
         modality: Option<String>,
-        /// Stream h5ad → SCX without materializing the full X matrix
-        /// in memory. Required for files larger than RAM. Only
-        /// supported on `h5ad → scx`; combine with `--csc always` to
-        /// emit a CSC sidecar via a two-pass rebuild after the
-        /// streaming write completes.
-        #[arg(long)]
+        /// Stream the conversion without materializing the full X
+        /// matrix in memory. Defaults to true — pass `--stream=false`
+        /// to opt into the legacy materializing path. Supported for
+        /// h5ad ↔ SCX and h5mu ↔ SCX; combine with `--csc always` on
+        /// h5ad → SCX to emit a CSC sidecar via a two-pass rebuild
+        /// after the streaming write completes.
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set,
+        )]
         stream: bool,
         /// Memory budget for slab-sizing heuristics (Phase 1 dense
         /// streaming, Phase 2 transpose buffers, Phase 8c worker
@@ -666,13 +673,19 @@ fn run_convert(
         other => return Err(format!("invalid --csc value: {other}").into()),
     };
 
-    // `--stream` is supported for h5ad → scx (Phase 0/1/2) and
-    // h5mu → scx (Phase 3). Reject for other directions so the user
-    // gets a clear error rather than a confusing downstream failure.
-    if stream && direction != "h5ad_to_scx" && direction != "h5mu_to_scx" {
+    // `--stream` is supported for h5ad → scx (Phase 0/1/2), h5mu →
+    // scx (Phase 3), and scx → h5ad / h5mu (Phase 8). Reject for
+    // other directions so the user gets a clear error rather than a
+    // confusing downstream failure.
+    if stream
+        && !matches!(
+            direction,
+            "h5ad_to_scx" | "h5mu_to_scx" | "scx_to_h5ad" | "scx_to_h5mu"
+        )
+    {
         return Err(format!(
-            "--stream is only supported for h5ad → scx and h5mu → scx; \
-             got direction '{direction}'."
+            "--stream is only supported for h5ad → scx, h5mu → scx, scx → h5ad, and \
+             scx → h5mu; got direction '{direction}'."
         )
         .into());
     }
@@ -917,32 +930,44 @@ fn dispatch_convert(
         }
         "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts, &mut sink),
         "scx_to_h5ad" => match modality {
-            Some(name) => convert::scx_modality_to_h5ad(input, output, name),
+            Some(name) => {
+                if opts.stream {
+                    convert::scx_modality_to_h5ad_streaming(input, output, name, &opts, &mut sink)
+                } else {
+                    convert::scx_modality_to_h5ad(input, output, name)
+                }
+            }
             None => {
                 // If the file is multimodal, raise with a clear
                 // message; if single-modality, fall through to the
-                // legacy h5ad writer.
+                // h5ad writer (streaming by default).
                 let reader = scx_format::reader::ScxReader::open(input)?;
-                if reader.is_multimodal() {
-                    drop(reader);
+                let is_multimodal = reader.is_multimodal();
+                let n_modalities = reader.n_modalities();
+                drop(reader);
+                if is_multimodal {
                     return Err(format!(
                         "SCX file '{}' has {} modalities; use --to h5mu, or use \
                          --modality NAME to extract a single modality as h5ad",
                         input.display(),
-                        {
-                            let r = scx_format::reader::ScxReader::open(input)?;
-                            let n = r.n_modalities();
-                            drop(r);
-                            n
-                        }
+                        n_modalities,
                     )
                     .into());
                 }
-                drop(reader);
-                convert::scx_to_h5ad(input, output, &mut sink)
+                if opts.stream {
+                    convert::scx_to_h5ad_streaming(input, output, &opts, &mut sink)
+                } else {
+                    convert::scx_to_h5ad(input, output, &mut sink)
+                }
             }
         },
-        "scx_to_h5mu" => convert::scx_to_h5mu(input, output),
+        "scx_to_h5mu" => {
+            if opts.stream {
+                convert::scx_to_h5mu_streaming(input, output, &opts, &mut sink)
+            } else {
+                convert::scx_to_h5mu(input, output)
+            }
+        }
         _ => unreachable!(),
     };
 

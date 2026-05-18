@@ -64,7 +64,7 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
 ### 1.4 scx-cli (minimal)
 - [x] `scx convert --from h5ad input.h5ad output.scx`
 - [x] `scx convert --from 10x matrix.h5 output.scx`
-- [x] `scx convert --to h5ad input.scx output.h5ad`
+- [x] `scx convert --to h5ad input.scx output.h5ad` (Phase 8: streams by default; `--stream=false` for the legacy materialising path; `--to h5mu` and `--modality NAME` for multimodal export)
 - [x] `scx info experiment.scx` (header summary, shard count, manifest history)
 - [x] `scx validate experiment.scx` (BLAKE3 verification of all sections)
 
@@ -319,15 +319,26 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] **Phase I**: rscx Seurat v5 multi-assay (`from_seurat` /
   `scx_open(...)$to_seurat()`) and Bioconductor MAE
   (`from_mae` / `$to_mae()`) interop.
-- [ ] Multimodal `scx merge` / `scx compact` — **DEFERRED** (current
-  ops reject multimodal inputs; extract via `scx subset --modality`
-  first).
-- [ ] Per-modality CSC sidecar preservation on `scx append` —
-  **DEFERRED** (file-wide CSC drop today; appending into RNA still
-  invalidates ADT's CSC).
+- [x] Multimodal `scx merge` / `scx compact`.
+  `scx-ops::merge_multimodal` concatenates per-modality CSR shards in
+  input order with `row_start` adjusted for the cumulative global obs
+  offset and preserves per-modality var/obsm/uns from the first
+  input. `scx-ops::compact_multimodal` applies the deletion-vector
+  keep mask across every modality's CSR shards and per-modality
+  layers; the modality table and per-modality var/obsm/uns are
+  preserved; CSC sidecars are dropped (rebuild via `--rebuild-csc`).
+- [x] Per-modality CSC sidecar preservation on `scx append`.
+  `scx append --modality M` invalidates `HAS_CSC` only on the target
+  modality; other modalities' CSC sections are preserved verbatim.
+  The file header `has_csc()` for v2 means "at least one modality
+  still owns a CSC sidecar"; `scx info` shows the per-modality state.
+- [x] Compose `scx subset --modality NAME` with `--filter` / `--genes`.
+  `extract_modality_with_filter` reads the modality CSR, applies the
+  obs predicate against the global obs, projects to the chosen genes,
+  and writes a single-modality v2 SCX in one pass.
 - [ ] Spatial transcriptomics R-tree index — **DEFERRED** (separate
   spec; spatial coordinates already work via standard `obs`/`obsm`).
-- [x] Multimodal backed / out-of-core reads (Phase 6b). `to_anndata`
+- [x] Multimodal backed / out-of-core reads. `to_anndata`
   takes `modality=` and routes `backed=True` through
   `BackedCsrReader::for_modality`. `to_mudata(backed=True)` assembles
   a `mudata.MuData` of per-modality backed `AnnData` sharing one
@@ -360,7 +371,14 @@ header flag (bit 7) is wired through writers and readers.
 - [ ] Run fuzz targets in CI on a schedule — **DEFERRED** (currently manual)
 - [x] SIMD FOR-BP decode (BitPacker4x, 44% faster index decode) — done in Sprint 2, Phase 2E
 - [ ] SIMD Rice/Delta-Golomb optimizations (AVX2, NEON) with runtime dispatch — **DEFERRED** (SIMD FOR-BP already dominates end-to-end gain; Rice is <20% of decode cost)
-- [ ] Detection bitmap layer (Roaring Bitmap, docs/format.md §Detection Bitmap) — **DEFERRED** (no implementation in `scx-format`; `has_bitmap` flag reserved only)
+- [x] Detection bitmap layer. Per-shard
+  gene → local-row roaring bitmap sidecars (`SCXB` wire format,
+  `BitmapShard` section id 6) emitted by `scx convert --bitmap
+  auto|always` and consumed by `PyExperiment.detection_counts` /
+  `cells_expressing`. Auto policy: sparse X, `n_vars ≤ 1_000_000`,
+  bitmap size ≤ 15 % of encoded CSR (ATAC always-on). `has_bitmap`
+  header flag and per-modality `ModalityFlags::HAS_BITMAP` are wired
+  end-to-end. See [docs/format.md § 12](docs/format.md#12-detection-bitmap-optional).
 - [x] Documentation: API reference, architecture, format spec, codec spec, sharding, multithreading, cloud, scanpy integration, performance, testing, GPU setup — see `docs/`
 - [x] Benchmark suite: comprehensive multi-format regression harness in `benchmarks/comprehensive/` — see Phase 5
 
@@ -570,7 +588,7 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 |-------|--------|----------------|
 | **1** | 1-4 | **COMPLETE.** Convert to SCX for 50-80% smaller files and 4-38× lower memory. Run scanpy/scVI/everything as usual via `to_anndata()`. Read speed is slower than h5ad in Phase 1 (no parallelism, no codec auto-select). |
 | **2** | 4-7 | Auto-codec selection + parallel decode fix read performance. Fast training loader saturates GPUs. Query/filter large datasets without loading everything. Append/merge/delete without full rewrites. |
-| **3** | 7-10 | **PARTIALLY COMPLETE.** R bindings, extended CLI (`build-csc`, `subset`, `upgrade`), complete documentation. GDS, multimodal (CITE-seq/spatial/h5mu), and detection bitmap are **DEFERRED**. |
+| **3** | 7-10 | **PARTIALLY COMPLETE.** R bindings, extended CLI (`build-csc`, `subset`, `upgrade`), complete documentation. CITE-seq / Multiome / TEA-seq multimodal + Seurat v5 / MAE interop shipped (Phases F–I) including multimodal `merge` / `compact` / `append` / `subset --filter`. Detection bitmap shipped. GDS and spatial transcriptomics R-tree remain **DEFERRED**. |
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
 | **4c** | 15+ | **COMPLETE (benchmarked).** GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuGraph. Per-op speedups: kNN 9.4×, UMAP 7.7×, Leiden 16×. 3.8× end-to-end on 1M cells. |
@@ -617,7 +635,7 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 | SLAF `SLAFDataLoader` Mixture-of-Scanners prefetcher returns 0 batches at 10M cells with default config | Medium | Flagged as SLAF-upstream tuning issue, not a harness fix; ML-loader benchmark records TTFB + batches/s so regressions on smaller datasets still surface |
 | `scx-cloud` pull is idempotent-retry only, not resumable-from-checkpoint — interrupted pulls must re-download all shards | Low | Deliberate design (atomic-rename safety invariant; shards are independent and bounded). Documented in `docs/cloud.md`; `CloudError::Interrupted` variant + stale-`.tmp.*` sweep land the contract |
 | `GCS_PRICING` table in `config.py` drifts silently from the GCS rate card | Low | Pricing table is explicit (not scraped); `docs/performance.md` "Cost model" section dates the capture. Re-check on release and on any significant-egress CI alert |
-| SCX cloud filtered query is pull-then-local-filter, not native `open_cloud`-range-read | Medium | Scored honestly in `cloud_filtered` with `scx_pull_and_filter` mechanism tag; an `open_cloud`+range-read variant is a targeted follow-up (not a Phase 5 commit) |
+| SCX cloud filtered query benchmark scope (`cloud_filtered`) still measures pull-then-local-filter | Low | Native `open_cloud(...).query()` shipped — `SectionReader` + `QueryPipeline::from_reader` + `scx query <url>` are wired end-to-end. `cloud_filtered` will adopt the native variant alongside `CloudQueryOptions` (parallelism / max-inflight / cache-dir) and a batched async fetcher in a follow-on PR |
 
 ---
 

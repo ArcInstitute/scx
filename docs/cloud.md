@@ -368,6 +368,61 @@ packed) and returns a `PyCloudExperiment` whose metadata accessors require only
 the header + catalog. Use this to decide what to pull before paying for the
 bytes.
 
+### Cloud-native query
+
+`PyCloudExperiment.query()` now returns a `PyQueryPipeline` wired
+over the cloud `SectionReader`, so a selective read can resolve
+without `scx pull`-ing the whole file first:
+
+```python
+exp = pyscx.open_cloud("gs://bucket/atlas.scxd/")
+adata = (
+    exp.query()
+       .filter_obs("cell_type == 'T cell' and tissue == 'lung'")
+       .select_genes(hvg)
+       .collect()
+       .to_anndata()
+)
+```
+
+The CLI mirrors this via `scx query` — `<input>` accepts a local
+`.scx` path, an exploded `.scxd/` directory, or a cloud URL:
+
+```bash
+scx query gs://bucket/atlas.scxd/ "cell_type == 'T cell'" \
+    --output tcells.scx
+scx query gs://bucket/atlas.scxd/ "cell_type == 'T cell'" \
+    --count --json
+```
+
+Predicate evaluation uses, in order:
+
+1. predicate-index sections when present
+   (`scx convert --index-obs cell_type,…` or
+   `--index-preset cellxgene` at write time — see
+   [docs/api.md § Conversion-time predicate indexes and detection bitmaps](api.md#conversion-time-predicate-indexes-and-detection-bitmaps)),
+2. catalog shard statistics otherwise,
+3. a full obs scan as a fallback.
+
+The planner then issues parallel range reads (cloud-optimized packed)
+or independent shard-object GETs (exploded `.scxd/`) for only the
+matching sections; decode reuses the local engine code path.
+
+Plain packed `.scx` (no front catalog) also works — `open_cloud`
+range-reads the EOF catalog on open, with one extra round-trip
+relative to a cloud-optimized layout.
+
+**Deferred to follow-on PRs:**
+
+- `CloudQueryOptions` (parallelism, max-inflight bytes, cache-dir,
+  retry policy) — today's cloud reads inherit the same retry layering
+  documented under [Tuning throughput](#tuning-throughput) but are
+  not yet individually configurable for the query path.
+- `pyscx.read_cloud(url, obs_filter=..., var_names=...)` flat helper.
+- A batched async section fetcher; today each cloud read uses
+  `block_on` from a rayon worker, so cloud bandwidth is bounded by
+  the rayon thread pool rather than fully saturated.
+
 ### `explode` / `pack` — convert layouts locally
 
 ```bash

@@ -6,7 +6,10 @@ use arrow::array::{
     Array, AsArray, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
     Int64Array, RecordBatch,
 };
-use arrow::datatypes::{DataType, Int32Type};
+use arrow::datatypes::{
+    DataType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type,
+    UInt8Type,
+};
 use hdf5::types::VarLenUnicode;
 
 /// Convert &str to VarLenUnicode, validating no NUL bytes are present.
@@ -139,6 +142,17 @@ pub(super) fn write_dataframe_group_at(
         .new_attr::<VarLenUnicode>()
         .create("encoding-version")?
         .write_scalar(&vlu("0.2.0"))?;
+
+    // `_index` attribute names the column that holds the row index.
+    // anndata.read_h5ad requires this; without it the `/obs` group
+    // fails to read.
+    if !schema.fields().is_empty() {
+        let index_name = vlu(schema.field(0).name());
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("_index")?
+            .write_scalar(&index_name)?;
+    }
 
     let mut col_order: Vec<VarLenUnicode> = Vec::with_capacity(batch.num_columns());
     for (col_idx, field) in schema.fields().iter().enumerate() {
@@ -274,6 +288,60 @@ fn downcast_err(name: &str, expected: &str) -> ConvertError {
     ))
 }
 
+/// Extract codes (promoted to i32, -1 for null) and string
+/// categories from a categorical column. Handles all integer key
+/// widths Arrow / pandas uses (Int8/16/32/64, UInt8/16/32/64). The
+/// SCX → h5ad writer emits i32 codes uniformly so anndata's reader
+/// doesn't need to dispatch on key width.
+fn dict_codes_and_categories_i32(
+    array: &dyn Array,
+    name: &str,
+) -> Result<(Vec<i32>, Vec<VarLenUnicode>), ConvertError> {
+    macro_rules! extract {
+        ($t:ty, $label:literal) => {{
+            let dict = array
+                .as_any()
+                .downcast_ref::<DictionaryArray<$t>>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            let codes: Vec<i32> = dict
+                .keys()
+                .iter()
+                .map(|v| match v {
+                    Some(k) => k as i32,
+                    None => -1,
+                })
+                .collect();
+            let values_arr = dict.values().as_string::<i32>();
+            let cats: Vec<VarLenUnicode> = (0..values_arr.len())
+                .map(|i| vlu(values_arr.value(i)))
+                .collect();
+            Ok::<_, ConvertError>((codes, cats))
+        }};
+    }
+    let key_type = match array.data_type() {
+        DataType::Dictionary(k, _) => k.as_ref(),
+        _ => {
+            return Err(ConvertError::Other(format!(
+                "column '{name}': expected Dictionary, got {:?}",
+                array.data_type()
+            )))
+        }
+    };
+    match key_type {
+        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, Utf8>"),
+        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, Utf8>"),
+        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, Utf8>"),
+        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, Utf8>"),
+        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, Utf8>"),
+        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, Utf8>"),
+        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, Utf8>"),
+        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, Utf8>"),
+        other => Err(ConvertError::Other(format!(
+            "column '{name}': unsupported categorical key type {other:?}"
+        ))),
+    }
+}
+
 fn write_column_to_hdf5(
     group: &hdf5::Group,
     name: &str,
@@ -346,52 +414,91 @@ fn write_column_to_hdf5(
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| downcast_err(name, "Boolean"))?;
-            let values: Vec<u8> = arr
-                .iter()
-                .map(|v| if v.unwrap_or(false) { 1u8 } else { 0u8 })
-                .collect();
-            let ds = group
-                .new_dataset::<u8>()
-                .shape([values.len()])
-                .create(name)?;
-            ds.write(&values)?;
-            let enc = vlu("boolean");
-            ds.new_attr::<VarLenUnicode>()
-                .create("encoding-type")?
-                .write_scalar(&enc)?;
-        }
-        DataType::Dictionary(key_type, value_type)
-            if **key_type == DataType::Int32 && **value_type == DataType::Utf8 =>
-        {
-            let dict = array
-                .as_any()
-                .downcast_ref::<DictionaryArray<Int32Type>>()
-                .ok_or_else(|| downcast_err(name, "Dictionary<Int32, Utf8>"))?;
 
-            // Write codes
-            let keys = dict.keys();
-            let codes: Vec<i32> = keys.iter().map(|v| v.unwrap_or(-1)).collect();
-            let ds = group
+            // anndata's only registered IOSpec for h5py boolean
+            // columns is `nullable-boolean` v0.1.0 — a *group* with
+            // `values` and `mask` datasets. The legacy
+            // flat-u8-with-encoding-type-boolean shape isn't
+            // registered at all, so `anndata.read_h5ad` raises on
+            // it. The group form additionally preserves Arrow's
+            // per-element validity bits in the mask
+            // (`mask[i] == 1` ⇔ row is null).
+            let bool_group = group.create_group(name)?;
+
+            // anndata + pandas's BooleanArray reader is strict: the
+            // values dataset must have native HDF5 boolean dtype,
+            // not u8. Plain u8 trips
+            // `TypeError: values should be boolean numpy array`.
+            let values: Vec<bool> = (0..arr.len())
+                .map(|i| arr.is_valid(i) && arr.value(i))
+                .collect();
+            let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
+
+            bool_group
+                .new_dataset::<bool>()
+                .shape([values.len()])
+                .create("values")?
+                .write(&values)?;
+            bool_group
+                .new_dataset::<bool>()
+                .shape([mask.len()])
+                .create("mask")?
+                .write(&mask)?;
+
+            bool_group
+                .new_attr::<VarLenUnicode>()
+                .create("encoding-type")?
+                .write_scalar(&vlu("nullable-boolean"))?;
+            bool_group
+                .new_attr::<VarLenUnicode>()
+                .create("encoding-version")?
+                .write_scalar(&vlu("0.1.0"))?;
+        }
+        DataType::Dictionary(_key_type, value_type) if **value_type == DataType::Utf8 => {
+            // Modern anndata categorical (encoding-version 0.2.0):
+            // write as a group with `codes` + `categories` as
+            // separate datasets, NOT as a `categories` attribute on
+            // the codes dataset. The legacy attribute form overflows
+            // HDF5's ~64 KB object-header limit on high-cardinality
+            // categoricals (census-scale `cell_type` / `donor_id`):
+            // `H5Acreate2(): object header message is too large`.
+            //
+            // Key types: pandas/Arrow picks the narrowest integer
+            // type that fits the cardinality (Int8 for <128
+            // categories, Int16 for <32K, Int32 above). We promote
+            // every input to i32 on disk so the SCX → h5ad output
+            // is uniform; anndata reads any width on the round-trip.
+            let (codes, cats) = dict_codes_and_categories_i32(array, name)?;
+
+            let cat_group = group.create_group(name)?;
+            cat_group
                 .new_dataset::<i32>()
                 .shape([codes.len()])
-                .create(name)?;
-            ds.write(&codes)?;
-
-            // Set encoding-type
-            let enc = vlu("categorical");
-            ds.new_attr::<VarLenUnicode>()
-                .create("encoding-type")?
-                .write_scalar(&enc)?;
-
-            // Write categories as attribute
-            let values_arr = dict.values().as_string::<i32>();
-            let cats: Vec<VarLenUnicode> = (0..values_arr.len())
-                .map(|i| vlu(values_arr.value(i)))
-                .collect();
-            ds.new_attr::<VarLenUnicode>()
+                .create("codes")?
+                .write(&codes)?;
+            cat_group
+                .new_dataset::<VarLenUnicode>()
                 .shape([cats.len()])
                 .create("categories")?
                 .write(&cats)?;
+
+            cat_group
+                .new_attr::<VarLenUnicode>()
+                .create("encoding-type")?
+                .write_scalar(&vlu("categorical"))?;
+            cat_group
+                .new_attr::<VarLenUnicode>()
+                .create("encoding-version")?
+                .write_scalar(&vlu("0.2.0"))?;
+            // `ordered=false` matches scipy / pandas default. Arrow's
+            // DictionaryArray doesn't carry an `ordered` bit so we
+            // never have richer information to forward. Native HDF5
+            // bool — anndata's categorical reader expects
+            // `H5T_NATIVE_HBOOL_8`, not u8.
+            cat_group
+                .new_attr::<bool>()
+                .create("ordered")?
+                .write_scalar(&false)?;
         }
         _ => {
             eprintln!("warning: skipping column '{name}' with unsupported type {dtype:?}");
@@ -480,12 +587,11 @@ fn write_uns_value(
                 .write_scalar(&v)?;
         }
         serde_json::Value::Bool(b) => {
-            let v = if *b { 1u8 } else { 0u8 };
             group
-                .new_dataset::<u8>()
+                .new_dataset::<bool>()
                 .shape(())
                 .create(name)?
-                .write_scalar(&v)?;
+                .write_scalar(b)?;
         }
         serde_json::Value::Array(arr) => {
             // Try as array of numbers

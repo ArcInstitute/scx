@@ -728,8 +728,13 @@ including graceful `flock()` fallback on NFS/Lustre/GPFS.
 
 ## 12. Detection Bitmap (Optional)
 
-Bit-packed presence/absence stored as Roaring Bitmap sections (`bitmap_shard`,
-type 6). Written when `has_bitmap` is set.
+Per-shard gene-detection sidecars stored as Roaring Bitmap sections
+(`bitmap_shard`, type 6). Written by `scx convert --bitmap auto|always`
+(and the pyscx `bitmap="..."` kwarg) and consumed by
+`PyExperiment.detection_counts` / `cells_expressing`. The file header
+flag bit 1 `has_bitmap` is flipped on `ScxWriter::finish()` whenever any
+`bitmap_shard` was emitted; per-modality `ModalityFlags::HAS_BITMAP`
+mirrors it for v2 files.
 
 - **Storage**: 30K × 500K at 5% density → ~100–200 MB compressed.
 - **Use cases**:
@@ -738,8 +743,61 @@ type 6). Written when `has_bitmap` is set.
   - Fast approximate filtering ("which cells express gene X?").
 
 For publication-quality analyses (DE, trajectory inference, regression),
-count-based methods on the full CSR data are required. The bitmap does not
-replace counts.
+count-based methods on the full CSR data are required. The bitmap does
+not replace counts.
+
+### 12.1 Section naming
+
+| Single-modality | Multimodal (v2) |
+| --- | --- |
+| `X/bitmap/shard_{idx}` | `X/bitmap/{modality_name}/shard_{idx}` |
+
+`{idx}` is the zero-padded CSR shard index; `{modality_name}` matches the
+`ModalityTable` entry's UTF-8 name. Layers do not yet emit bitmap
+sidecars.
+
+### 12.2 BitmapShard wire format
+
+Each `BitmapShard` section is a 76-byte header followed by per-gene
+roaring blobs and trailing checksum bytes. All values little-endian.
+
+```
+u32 magic = b"SCXB"
+u16 version = 1
+u8  orientation = 0          (0 = gene → local row ids; reserved for future)
+u8  index_dtype              (gene id width: 1 = u8, 2 = u16, 4 = u32)
+u64 row_start                (global row id of the shard's first row)
+u32 n_rows                   (rows in this shard)
+u32 n_vars                   (variables in the file / modality)
+u32 n_genes_with_hits        (count of (gene_id, bitmap) pairs that follow)
+repeated × n_genes_with_hits:
+  uN  gene_id                (width = index_dtype; local var id)
+  u32 roaring_len            (length in bytes of the following roaring blob)
+  u8  roaring_bytes[roaring_len]
+u8  checksum[32]             (BLAKE3-256 over the preceding header + payload)
+```
+
+Local row ids inside each roaring bitmap are zero-based relative to
+`row_start`. Global row ids reconstruct as `row_start + local_row`.
+
+### 12.3 Auto policy
+
+`--bitmap auto` writes the sidecar when **all** of the following hold:
+
+- `X` is sparse (CSR / CSC).
+- `n_vars ≤ 1_000_000`.
+- Estimated bitmap size ≤ 15 % of the encoded CSR size.
+
+ATAC modalities are always eager under `auto` because presence is the
+primary signal for chromatin accessibility. The writer emits a
+`BitmapSkipped { reason }` warning when the policy rejects emission.
+
+### 12.4 Reader fallback
+
+When sidecars are absent, `detection_counts` and `cells_expressing`
+fall back to a per-shard CSR scan. The fast path therefore lights up
+incrementally as users opt into `--bitmap` on freshly-converted files
+without breaking older files.
 
 ## 13. Multimodal Extension (Optional)
 

@@ -6,8 +6,9 @@
 //! cloud implementations drive async object-store I/O via `block_on`
 //! inside their methods.
 //!
-//! See `docs/architecture.md` for the dependency graph and Phase 7 of
-//! `REAL-WORLD-UX-FEATS.md` for the motivating cloud-native query path.
+//! See `docs/architecture.md` § `SectionReader` for the dependency
+//! graph and `docs/cloud.md` § Cloud-native query for the motivating
+//! cloud-native query path.
 
 use std::any::Any;
 

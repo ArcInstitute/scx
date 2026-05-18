@@ -94,3 +94,29 @@ pub fn decode_shard_bytes(
 
     Ok((indptr, indices, data))
 }
+
+/// Decode **only** the indptr region of a shard.
+///
+/// Parses the [`ShardHeader`], slices out `indptr_bytes`, and dispatches
+/// to [`scx_codec::decode_indptr_only`]. No checksum verification — the
+/// catalog already authenticates section offsets/lengths, and indptr-only
+/// callers (e.g. the streaming SCX → h5ad export's `precompute_total_nnz`)
+/// are followed by a full shard decode that will surface any corruption.
+pub fn decode_shard_indptr_bytes(
+    section: &[u8],
+    entry: &FullCatalogEntry,
+    catalog_version: u16,
+) -> Result<Vec<i64>> {
+    let sh = ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+
+    if catalog_version >= 2 {
+        sh.validate_csc_strict(entry.section_type)?;
+    }
+
+    let indptr_bytes = &section[sh.indptr_rel_offset as usize..][..sh.indptr_length as usize];
+
+    let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
+
+    let indptr = scx_codec::decode_indptr_only(indptr_bytes, codec_id, sh.n_major as usize)?;
+    Ok(indptr)
+}
