@@ -14,6 +14,7 @@ use scx_format::DeletionVectors;
 
 use crate::error::Result;
 use crate::predicate::{parse_predicate, Predicate};
+use crate::reader::SectionReader;
 
 /// Configuration for normalize-total operation.
 #[derive(Debug, Clone)]
@@ -52,7 +53,7 @@ impl std::fmt::Debug for QueryResult {
 /// Stores configuration but performs no I/O until `.collect()` is called.
 /// Schema errors (unknown columns, type mismatches) are raised immediately.
 pub struct QueryPipeline {
-    reader: ScxReader,
+    reader: Box<dyn SectionReader>,
     obs_schema: Schema,
     var_schema: Schema,
     obs_predicates: Vec<Predicate>,
@@ -80,13 +81,22 @@ impl std::fmt::Debug for QueryPipeline {
 }
 
 impl QueryPipeline {
-    /// Open an SCX file and create a new query pipeline.
+    /// Open a local SCX file and create a new query pipeline.
     ///
     /// Reads and caches the obs and var schemas for eager validation.
     /// If deletion vectors are present, they are loaded automatically.
+    /// Convenience wrapper around [`from_reader`](Self::from_reader)
+    /// for the local-file case.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let reader = ScxReader::open(path)?;
+        Self::from_reader(Box::new(ScxReader::open(path)?))
+    }
 
+    /// Create a new query pipeline from any `SectionReader`.
+    ///
+    /// This is the entry point for cloud-backed pipelines: hand it a
+    /// `scx_cloud::CloudSectionReader` (or any other backend) to drive
+    /// the same query engine against remote storage.
+    pub fn from_reader(reader: Box<dyn SectionReader>) -> Result<Self> {
         // Cache schemas for eager validation
         let obs_schema = reader.read_obs_schema()?;
         let var_schema = reader.read_var_schema()?;
@@ -185,9 +195,16 @@ impl QueryPipeline {
         &self.var_predicates
     }
 
-    /// Access the underlying reader.
-    pub fn reader(&self) -> &ScxReader {
-        &self.reader
+    /// Access the underlying reader as a `SectionReader` trait object.
+    pub fn reader(&self) -> &dyn SectionReader {
+        self.reader.as_ref()
+    }
+
+    /// Downcast accessor for callers that need the local `ScxReader`
+    /// API (`scx subset` reads `uns`, layer names, value encoding,
+    /// etc.). Returns `None` for cloud-backed pipelines.
+    pub fn local_reader(&self) -> Option<&ScxReader> {
+        self.reader.as_any().downcast_ref::<ScxReader>()
     }
 
     /// Access the gene indices for projection.

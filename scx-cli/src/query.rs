@@ -9,9 +9,35 @@ use scx_format::header::FileHeader;
 use scx_format::reader::ScxReader;
 use scx_format::writer::ScxWriter;
 
+/// Return true if `source` should be opened via `scx_cloud::open_cloud`.
+///
+/// Routes to the cloud path when:
+///   - `source` carries a recognised URL scheme (`s3`, `gs`, `az`,
+///     `azure`, `http`, `https`, `file`), or
+///   - `source` is an existing local **directory** (typically an
+///     exploded `.scxd/`), which `scx_cloud::open_cloud` handles via
+///     the `LocalFileSystem` backend.
+///
+/// Plain regular files fall through to the local mmap path.
+fn is_cloud_url(source: &str) -> bool {
+    if let Some((scheme, rest)) = source.split_once("://") {
+        if !rest.is_empty()
+            && matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "s3" | "gs" | "az" | "azure" | "http" | "https" | "file"
+            )
+        {
+            return true;
+        }
+    }
+    // Local directory (e.g. an exploded `.scxd/`) → cloud reader via
+    // LocalFileSystem.
+    Path::new(source).is_dir()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_query(
-    file: &Path,
+    source: &str,
     filter: &str,
     count: bool,
     output: Option<&Path>,
@@ -21,8 +47,13 @@ pub fn run_query(
     limit: Option<usize>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Build pipeline
-    let mut pipeline = QueryPipeline::open(file)?.filter_obs(filter)?;
+    // Cloud URLs require the tokio runtime to outlive the pipeline
+    // (the `CloudSectionReader` stores a `Handle` into it). Hold the
+    // runtime in a `Option` here and tie its lifetime to the function.
+    let cloud_rt = open_pipeline_for(source)?;
+    let mut pipeline = cloud_rt.pipeline;
+    let _rt_guard = cloud_rt.runtime; // kept alive for the pipeline's lifetime
+    pipeline = pipeline.filter_obs(filter)?;
 
     if let Some(gene_file) = select_genes {
         let indices = parse_gene_indices(gene_file)?;
@@ -68,12 +99,14 @@ pub fn run_query(
     }
 
     if let Some(out_path) = output {
-        // Determine value encoding: if normalize/log1p was applied, use Float32;
-        // otherwise detect from original file.
-        let value_encoding = if normalize.is_some() || log1p {
+        // Default to Float32 when normalize/log1p was applied (the
+        // result is no longer integer-valued) or when the source is
+        // remote (no easy way to peek a shard header without a second
+        // round-trip). Local plain files: detect from the first shard.
+        let value_encoding = if normalize.is_some() || log1p || is_cloud_url(source) {
             ValueEncoding::Float32
         } else {
-            detect_value_encoding(file)?
+            detect_value_encoding(Path::new(source))?
         };
 
         write_query_result(&result, out_path, value_encoding)?;
@@ -93,6 +126,51 @@ pub fn run_query(
     );
 
     Ok(())
+}
+
+/// Pipeline + (optional) tokio runtime that must outlive it.
+struct OpenedPipeline {
+    pipeline: QueryPipeline,
+    /// `Some` for cloud-backed pipelines (the runtime owns the I/O
+    /// threads the pipeline's `block_on` calls land on); `None` for
+    /// local pipelines.
+    #[cfg(feature = "cloud")]
+    runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+    #[cfg(not(feature = "cloud"))]
+    runtime: Option<()>,
+}
+
+#[cfg(feature = "cloud")]
+fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
+    if is_cloud_url(source) {
+        let rt = std::sync::Arc::new(tokio::runtime::Runtime::new()?);
+        let reader = rt.block_on(scx_cloud::open_cloud(source))?;
+        let adapter = scx_cloud::CloudSectionReader::new(
+            std::sync::Arc::new(reader),
+            std::sync::Arc::clone(&rt),
+        );
+        let pipeline = QueryPipeline::from_reader(Box::new(adapter))?;
+        Ok(OpenedPipeline {
+            pipeline,
+            runtime: Some(rt),
+        })
+    } else {
+        Ok(OpenedPipeline {
+            pipeline: QueryPipeline::open(Path::new(source))?,
+            runtime: None,
+        })
+    }
+}
+
+#[cfg(not(feature = "cloud"))]
+fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
+    if is_cloud_url(source) {
+        return Err("cloud URLs require `scx-cli` to be built with `--features cloud`".into());
+    }
+    Ok(OpenedPipeline {
+        pipeline: QueryPipeline::open(Path::new(source))?,
+        runtime: None,
+    })
 }
 
 /// Parse a gene index file: one u32 index per line, skip comments (#) and blank lines.

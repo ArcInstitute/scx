@@ -73,9 +73,16 @@ pub fn run_subset(
         pipeline = pipeline.filter_obs(expr)?;
     }
 
+    // `scx subset` operates on local files only — it pulls metadata
+    // that lives outside `SectionReader` (uns, layer names, on-disk
+    // value encoding) from the underlying `ScxReader`.
+    let local_reader = pipeline
+        .local_reader()
+        .ok_or("scx subset requires a local SCX file")?;
+
     // 4. Parse gene file if provided — supports both names and numeric indices
     let gene_indices = if let Some(gene_path) = gene_file {
-        let indices = parse_gene_list(gene_path, pipeline.reader())?;
+        let indices = parse_gene_list(gene_path, local_reader)?;
         pipeline = pipeline.select_genes(indices.clone());
         Some(indices)
     } else {
@@ -83,26 +90,27 @@ pub fn run_subset(
     };
 
     // 5. Extract info from reader BEFORE collect() consumes the pipeline
-    let in_header = pipeline.reader().header().clone();
-    let value_encoding = detect_value_encoding_from_reader(pipeline.reader())?;
+    let local_reader = pipeline
+        .local_reader()
+        .ok_or("scx subset requires a local SCX file")?;
+    let in_header = local_reader.header().clone();
+    let value_encoding = detect_value_encoding_from_reader(local_reader)?;
 
     // Check for sections that will be dropped and warn
-    let dropped_layers = pipeline.reader().layer_names();
+    let dropped_layers = local_reader.layer_names();
     let has_obsm = in_header.has_obsm();
-    let has_obs_pred_idx = pipeline
-        .reader()
+    let has_obs_pred_idx = local_reader
         .read_obs_predicate_index_bytes()
         .ok()
         .flatten()
         .is_some();
-    let has_var_pred_idx = pipeline
-        .reader()
+    let has_var_pred_idx = local_reader
         .read_var_predicate_index_bytes()
         .ok()
         .flatten()
         .is_some();
     // Read uns before collect consumes the reader
-    let uns = pipeline.reader().read_uns().ok();
+    let uns = local_reader.read_uns().ok();
 
     // 6. Execute query (consumes pipeline)
     let result = pipeline.collect()?;

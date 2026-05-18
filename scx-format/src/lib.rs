@@ -16,6 +16,7 @@ pub mod provenance;
 pub mod reader;
 pub mod section;
 pub mod shard;
+pub mod shard_decode;
 pub mod shard_source;
 pub mod writer;
 
@@ -57,6 +58,7 @@ pub use shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE,
     SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
+pub use shard_decode::decode_shard_bytes;
 pub use shard_source::{ColumnShardSource, ShardSource};
 pub use writer::{
     chmod_to_umask, compute_shard_stats, fsync_parent_dir, make_sibling_tempfile, MajorAxis,

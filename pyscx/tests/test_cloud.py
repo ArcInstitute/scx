@@ -252,3 +252,136 @@ class TestCloudReader:
             assert exp_exploded.n_obs == exp_packed.n_obs
             assert exp_exploded.n_vars == exp_packed.n_vars
             assert exp_exploded.shard_count == exp_packed.shard_count
+
+
+class TestCloudQuery:
+    """Phase 7: pyscx.open_cloud(...).query().filter_obs(...).collect()
+    must produce the same AnnData (X, obs, var) as the local
+    pyscx.open(...).query().filter_obs(...).collect() pipeline on
+    equivalent files. Verifies the SectionReader unification."""
+
+    def test_query_filter_obs_matches_local_exploded(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path, n_obs=120, n_vars=40)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local_adata = (
+                pyscx.open(scx_path)
+                .query()
+                .filter_obs("cell_type == 'T_cell'")
+                .collect()
+                .to_anndata()
+            )
+            cloud_adata = (
+                pyscx.open_cloud(exploded_dir)
+                .query()
+                .filter_obs("cell_type == 'T_cell'")
+                .collect()
+                .to_anndata()
+            )
+
+            assert cloud_adata.n_obs == local_adata.n_obs
+            assert cloud_adata.n_vars == local_adata.n_vars
+            assert cloud_adata.n_obs > 0
+            # X matrices: same shape and nonzero structure
+            np.testing.assert_array_equal(
+                cloud_adata.X.toarray(), local_adata.X.toarray()
+            )
+            # obs cell_id column matches row-for-row
+            assert list(cloud_adata.obs["cell_id"]) == list(local_adata.obs["cell_id"])
+
+    def test_query_select_genes_matches_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path, n_obs=80, n_vars=30)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            genes = [0, 3, 7, 15, 22]
+            local_adata = (
+                pyscx.open(scx_path)
+                .query()
+                .filter_obs("cell_type == 'B_cell'")
+                .select_genes(genes)
+                .collect()
+                .to_anndata()
+            )
+            cloud_adata = (
+                pyscx.open_cloud(exploded_dir)
+                .query()
+                .filter_obs("cell_type == 'B_cell'")
+                .select_genes(genes)
+                .collect()
+                .to_anndata()
+            )
+
+            assert cloud_adata.n_vars == 5
+            assert cloud_adata.n_obs == local_adata.n_obs
+            np.testing.assert_array_equal(
+                cloud_adata.X.toarray(), local_adata.X.toarray()
+            )
+            assert list(cloud_adata.var["gene_id"]) == list(local_adata.var["gene_id"])
+
+    def test_query_against_packed_cloud_ready_file(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path, n_obs=100, n_vars=50)
+
+            optimized_path = os.path.join(tmpdir, "optimized.scx")
+            pyscx.cloud_optimize(scx_path, optimized_path)
+
+            local_adata = (
+                pyscx.open(scx_path)
+                .query()
+                .filter_obs("cell_type == 'Monocyte'")
+                .collect()
+                .to_anndata()
+            )
+            cloud_adata = (
+                pyscx.open_cloud(optimized_path)
+                .query()
+                .filter_obs("cell_type == 'Monocyte'")
+                .collect()
+                .to_anndata()
+            )
+
+            assert cloud_adata.n_obs == local_adata.n_obs
+            np.testing.assert_array_equal(
+                cloud_adata.X.toarray(), local_adata.X.toarray()
+            )
+
+    def test_query_reports_total_shards(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path, n_obs=120, n_vars=30)
+
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local_result = (
+                pyscx.open(scx_path)
+                .query()
+                .filter_obs("cell_type == 'T_cell'")
+                .collect()
+            )
+            cloud_result = (
+                pyscx.open_cloud(exploded_dir)
+                .query()
+                .filter_obs("cell_type == 'T_cell'")
+                .collect()
+            )
+
+            assert cloud_result.total_shards == local_result.total_shards
+            assert cloud_result.skipped_shards == local_result.skipped_shards

@@ -3,9 +3,15 @@
 //! Provides PyO3 wrappers for pull, push, cloud_optimize, explode, and pack.
 //! All async operations create a tokio runtime internally.
 
-use pyo3::exceptions::PyRuntimeError;
+use std::sync::Arc;
+
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
+use scx_engine::QueryPipeline;
+
+use crate::query::PyQueryPipeline;
 
 /// Pull from cloud/local exploded .scxd into a local .scx file.
 ///
@@ -212,9 +218,11 @@ pub fn pack(input: &str, output: &str) -> PyResult<()> {
 /// and read methods for obs/var metadata.
 #[pyclass]
 pub struct PyCloudExperiment {
-    reader: scx_cloud::CloudReader,
-    #[allow(dead_code)] // Kept alive to own the tokio runtime for the reader's lifetime.
-    rt: tokio::runtime::Runtime,
+    reader: Arc<scx_cloud::CloudReader>,
+    // Kept alive so the runtime handle stored inside any
+    // `CloudSectionReader` constructed from `.query()` stays valid for
+    // as long as that pipeline lives.
+    rt: Arc<tokio::runtime::Runtime>,
 }
 
 #[pymethods]
@@ -258,6 +266,28 @@ impl PyCloudExperiment {
             self.reader.n_shards(),
         )
     }
+
+    /// Open a lazy query pipeline backed by this cloud experiment.
+    ///
+    /// The returned pipeline supports the same chain as the local
+    /// `pyscx.open(path).query()` pipeline (`filter_obs`,
+    /// `filter_var`, `select_genes`, `with_normalize`, `with_log1p`,
+    /// `limit`, `collect`). I/O happens lazily on `.collect()` and
+    /// downloads only the catalog sections, obs metadata, var
+    /// metadata, predicate indexes (if present), and CSR shards that
+    /// match the predicate / projection — no `scx pull` to local disk
+    /// is required first.
+    fn query(&self, py: Python<'_>) -> PyResult<PyQueryPipeline> {
+        let reader = Arc::clone(&self.reader);
+        let rt = Arc::clone(&self.rt);
+        let pipeline = py
+            .allow_threads(|| {
+                let adapter = scx_cloud::CloudSectionReader::new(reader, rt);
+                QueryPipeline::from_reader(Box::new(adapter))
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyQueryPipeline::from_pipeline(pipeline))
+    }
 }
 
 /// Open an SCX file or exploded directory from cloud/local storage.
@@ -281,5 +311,8 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
         .allow_threads(|| rt.block_on(scx_cloud::open_cloud(&url)))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    Ok(PyCloudExperiment { reader, rt })
+    Ok(PyCloudExperiment {
+        reader: Arc::new(reader),
+        rt: Arc::new(rt),
+    })
 }
