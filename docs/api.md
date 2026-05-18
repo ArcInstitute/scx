@@ -289,25 +289,26 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 
 | Variant | Emitted by | Meaning |
 | --- | --- | --- |
-| `InferredEncoding { path, inferred }` | Phase 1 detect / open | h5ad `encoding-type` was missing or ambiguous; layout was inferred from group children or dataset shape. |
-| `SkippedUnsKey { key, reason }` | Phase 1 `read_uns` | `uns` entry was unrepresentable; skipped under default `strict_uns=false`. `strict_uns=true` turns this into an error on the first occurrence. |
-| `DenseSparsified { path, density }` | Phase 1 dense path | Dense `/X` slab was sparsified during streaming. Reports density to help users decide whether dense storage is worth keeping. |
-| `DuplicateCoordinatesMerged { count, policy }` | Phase 2 CSC streaming | CSC input contained duplicate `(row, col)` coordinates; values were summed (scipy `sum_duplicates` semantics). |
-| `ModalityTypeInferred { name, modality_type }` | Phase 3 h5mu | Modality name → `ModalityType` was inferred by name; override via `--modality-types NAME:TYPE` / `modality_types={...}`. |
-| `MissingPresetIndexColumn { column }` | Phase 5a | A preset (`cellxgene` / `perturbseq` / `training`) referenced an obs/var column not present in the source; preset misses warn, conversion continues. |
-| `UnsupportedIndexColumn { column, reason }` | Phase 5a | A user-forced (`--index-obs` / `--index-var`) or preset column has an unsupported dtype; forced columns hard-error, preset columns warn and skip. |
-| `PredicateIndexSkippedMultimodal` | Phase 5a | Predicate indexes are unimodal-only on the read side today; emitted (and indexes skipped) when conversion input is multimodal. |
-| `BitmapSkipped { reason }` | Phase 5b `--bitmap auto` | Auto policy rejected bitmap emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
-| `DroppedObsp { name, reason }` | Phase 6 merge | `obsp` could not be merged (axis semantics don't compose); default-dropped with a warning. |
-| `ThreadsafeHdf5Unavailable` | Phase 8c fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
+| `InferredEncoding { path, inferred }` | h5ad layout detection (`detect_matrix_format_at`, `open_x_streaming`) | h5ad `encoding-type` was missing or ambiguous; layout was inferred from group children or dataset shape. |
+| `SkippedUnsKey { key, reason }` | `read_uns` / `read_uns_entry` | `uns` entry was unrepresentable; skipped under default `strict_uns=false`. `strict_uns=true` turns this into an error on the first occurrence. |
+| `DenseSparsified { path, density }` | Dense h5ad streaming reader | Dense `/X` slab was sparsified during streaming. Reports density to help users decide whether dense storage is worth keeping. |
+| `DuplicateCoordinatesMerged { count, policy }` | CSC h5ad streaming reader | CSC input contained duplicate `(row, col)` coordinates; values were summed (scipy `sum_duplicates` semantics). |
+| `ModalityTypeInferred { name, modality_type }` | h5mu streaming reader | Modality name → `ModalityType` was inferred by name; override via `--modality-types NAME:TYPE` / `modality_types={...}`. |
+| `MissingPresetIndexColumn { column }` | Predicate-index builder | A preset (`cellxgene` / `perturbseq` / `training`) referenced an obs/var column not present in the source; preset misses warn, conversion continues. |
+| `UnsupportedIndexColumn { column, reason }` | Predicate-index builder | A user-forced (`--index-obs` / `--index-var`) or preset column has an unsupported dtype; forced columns hard-error, preset columns warn and skip. |
+| `PredicateIndexSkippedMultimodal` | Predicate-index builder | Predicate indexes are unimodal-only on the read side today; emitted (and indexes skipped) when conversion input is multimodal. |
+| `BitmapSkipped { reason }` | Detection bitmap auto policy | `--bitmap auto` rejected emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
+| `DroppedObsp { name, reason }` | `scx merge` (multimodal) | `obsp` could not be merged (axis semantics don't compose); default-dropped with a warning. |
+| `ThreadsafeHdf5Unavailable` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
 
 ## Memory budgets
 
 `MemoryBudget::parse(s)` (`scx-convert/src/mem.rs`) is the shared parser
 behind `--memory-budget` (CLI) and the `memory_budget=` kwarg on
-`from_h5ad` / `from_h5mu`. It caps dense row slabs (Phase 1), CSC
-external-transpose buffers (Phase 2), and the parallel streaming
-reader's worker derate (Phase 8c).
+`from_h5ad` / `from_h5mu`. It caps dense row slabs in the h5ad
+streaming reader, CSC external-transpose buffers when CSC-on-disk
+exceeds the budget, and the parallel streaming reader's worker
+derate.
 
 Accepted forms:
 
@@ -718,7 +719,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
   - `layers`: list of layer names to load (default: all)
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
-  - `modality` (Phase 6b): select one modality of a multimodal file and
+  - `modality`: select one modality of a multimodal file and
     return a backed AnnData scoped to that modality (per-modality X /
     var / obsm; global obs shared). Currently requires `backed=True`;
     incompatible with `var_names` / `obs_filter` / `layers` (use
@@ -732,19 +733,19 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `to_mudata(backed=False, cache_shards=4)` — Materialise a multimodal file as `mudata.MuData`
   - Eager (`backed=False`): per-modality scipy CSR AnnData sharing the
     global obs (existing behaviour). Raises on single-modality files.
-  - **Backed (`backed=True`)** (Phase 6b): per-modality
+  - **Backed (`backed=True`)**: per-modality
     `ScxBackedSparseDataset` AnnData sharing the global obs.
     Single-modality files are wrapped in a one-modality MuData rather
     than raising, so the call works uniformly across layouts.
 - `query() -> PyQueryPipeline` — Start lazy query pipeline
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`
-- `detection_counts(axis="var", modality=None) -> np.ndarray` (Phase 5b)
+- `detection_counts(axis="var", modality=None) -> np.ndarray`
   — Per-gene non-zero counts. Reads `BitmapShard` sidecars when
   present (one roaring decode per shard); falls back to a CSR scan
   otherwise. `axis="obs"` returns per-cell gene counts. For
   multimodal v2 files, pass `modality="rna"` to scope the result.
-- `cells_expressing(gene, modality=None) -> np.ndarray` (Phase 5b) —
+- `cells_expressing(gene, modality=None) -> np.ndarray` —
   Indices of cells with non-zero expression for `gene` (name or
   integer). Bitmap fast path when sidecars exist; CSR fallback
   otherwise.
@@ -804,9 +805,9 @@ any JSON tool. Example for a `float32` array:
 ### PyCloudExperiment
 
 Returned by `pyscx.open_cloud()`. Cloud-hosted SCX handle. Supports
-metadata accessors plus the cloud-native query path landed in Phase 7;
-full `to_anndata()` and `validate()` still require `pyscx.pull()` to
-materialise the file locally.
+metadata accessors plus a cloud-native query path served over
+`object_store` range reads; full `to_anndata()` and `validate()` still
+require `pyscx.pull()` to materialise the file locally.
 
 - `n_obs` `→ int` — Number of observations (cells)
 - `n_vars` `→ int` — Number of variables (genes)
@@ -831,7 +832,7 @@ materialise the file locally.
   )
   ```
 
-  Deferred (Phase 7 follow-on): `CloudQueryOptions` (parallelism,
+  Deferred follow-ons: `CloudQueryOptions` (parallelism,
   max-inflight bytes, cache-dir, retry policy), the
   `pyscx.read_cloud(...)` flat helper, and a batched async section
   fetcher (current cloud reads block per shard from the rayon worker).
@@ -1176,19 +1177,19 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 ### Core
 - `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
 
-  Wild-h5ad hardening (Phase 1): `--memory-budget 4G` caps dense
-  row slabs and CSC external-transpose buffers (binary prefixes only;
-  see [Memory budgets](#memory-budgets)). `--strict-uns` aborts on the
-  first unrepresentable `uns` entry rather than warning. `--dense-zero-epsilon F`
-  thresholds near-zero values during dense→CSR sparsification (default
-  `0.0`). `--temp-dir DIR` selects the scratch directory for CSC
-  external-transpose runs.
+  Wild-h5ad hardening: `--memory-budget 4G` caps dense row slabs and
+  CSC external-transpose buffers (binary prefixes only; see
+  [Memory budgets](#memory-budgets)). `--strict-uns` aborts on the
+  first unrepresentable `uns` entry rather than warning.
+  `--dense-zero-epsilon F` thresholds near-zero values during
+  dense→CSR sparsification (default `0.0`). `--temp-dir DIR` selects
+  the scratch directory for CSC external-transpose runs.
 
-  h5mu (Phase 3): `--modalities rna,adt` restricts to a subset of
+  h5mu inputs: `--modalities rna,adt` restricts to a subset of
   modalities; `--modality-types adt:Protein,peaks:ATAC` overrides
   inferred types.
 
-  Query-readiness (Phase 5): `--index-obs cell_type,donor` and
+  Query-readiness: `--index-obs cell_type,donor` and
   `--index-var gene_name` force predicate indexes; `--index-preset
   cellxgene|perturbseq|training` expands curated column lists;
   `--index-auto-threshold N` controls automatic categorical indexing.
@@ -1214,7 +1215,7 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 - `scx compact <input> --output <path> [--force]`
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path>`
-- `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path (Phase 7) with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query-phase-7).
+- `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
 - `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version

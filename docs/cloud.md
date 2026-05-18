@@ -368,7 +368,7 @@ packed) and returns a `PyCloudExperiment` whose metadata accessors require only
 the header + catalog. Use this to decide what to pull before paying for the
 bytes.
 
-### Cloud-native query (Phase 7)
+### Cloud-native query
 
 `PyCloudExperiment.query()` now returns a `PyQueryPipeline` wired
 over the cloud `SectionReader`, so a selective read can resolve
@@ -412,7 +412,7 @@ Plain packed `.scx` (no front catalog) also works — `open_cloud`
 range-reads the EOF catalog on open, with one extra round-trip
 relative to a cloud-optimized layout.
 
-Phase 7 shipped Core+CLI scope. **Deferred to follow-on PRs:**
+**Deferred to follow-on PRs:**
 
 - `CloudQueryOptions` (parallelism, max-inflight bytes, cache-dir,
   retry policy) — today's cloud reads inherit the same retry layering

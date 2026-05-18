@@ -312,7 +312,7 @@ normalize(target_sum=1e4)          ← fused with log1p when possible
 - **Parallel collection:** Qualifying shards are decoded and filtered in parallel
   via rayon (`scx-engine/src/collect.rs`).
 
-### `SectionReader` — local + cloud unification (Phase 7)
+### `SectionReader` — local + cloud unification
 
 `QueryPipeline` is generic over a `SectionReader` trait that abstracts
 how catalog sections are fetched. Two implementations ship today:
@@ -324,7 +324,7 @@ how catalog sections are fetched. Two implementations ship today:
 
 `PyExperiment.query()` opens a local mmap-backed pipeline;
 `PyCloudExperiment.query()` opens a cloud-backed pipeline (see
-[docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query-phase-7)).
+[docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query)).
 Both share the same predicate planning, shard pruning, gene
 projection, and decoding code paths — only the bytes-by-section
 implementation differs.
@@ -625,7 +625,7 @@ post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
 ~2× the output size during the rebuild).
 
 **Streaming export** (`scx convert --to h5ad/h5mu`, `pyscx.to_h5ad`,
-`pyscx.to_h5mu` — Phase 8): the inverse path. `scx_convert::
+`pyscx.to_h5mu`): the inverse path. `scx_convert::
 scx_to_h5ad_streaming` (and `scx_to_h5mu_streaming` / `scx_modality_to_h5ad_streaming`)
 iterate SCX CSR shards in row order
 via `ScxReader::read_csr_shard_for` / `read_layer_csr_shard*` and
