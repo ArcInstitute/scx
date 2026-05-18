@@ -3874,3 +3874,312 @@ fn bitmap_off_default_no_section() {
     let reader = ScxReader::open(&scx_path).unwrap();
     assert!(!reader.header().has_bitmap());
 }
+
+// -----------------------------------------------------------------------
+// Phase 8: streaming SCX → h5ad / h5mu
+// -----------------------------------------------------------------------
+
+/// Streaming variant of `test_h5ad_csr_to_scx_to_h5ad_round_trip`.
+/// Goes through `scx_to_h5ad_streaming` and checks that `/X/{data,
+/// indices, indptr}` and the auxiliary `/layers/raw/*` group match
+/// the source h5ad bit-for-bit.
+#[test]
+fn test_h5ad_csr_to_scx_to_h5ad_streaming_round_trip() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("test.h5ad");
+    let scx_path = dir.path().join("test.scx");
+    let h5ad_out = dir.path().join("out.h5ad");
+
+    let n_obs = 20;
+    let n_vars = 15;
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+    let orig_file = hdf5::File::open(&h5ad_path).unwrap();
+    let out_file = hdf5::File::open(&h5ad_out).unwrap();
+
+    let orig_data: Vec<f32> = orig_file
+        .dataset("X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let orig_indices: Vec<i32> = orig_file
+        .dataset("X/indices")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let orig_indptr: Vec<i64> = orig_file
+        .dataset("X/indptr")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+
+    let out_data: Vec<f32> = out_file
+        .dataset("X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let out_indices: Vec<i32> = out_file
+        .dataset("X/indices")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let out_indptr: Vec<i64> = out_file
+        .dataset("X/indptr")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(orig_data, out_data, "/X/data mismatch after streaming");
+    assert_eq!(orig_indices, out_indices, "/X/indices mismatch");
+    assert_eq!(orig_indptr, out_indptr, "/X/indptr mismatch");
+
+    // Layer round-trip (the fixture writes `layers/raw` mirroring X).
+    let orig_layer_data: Vec<f32> = orig_file
+        .dataset("layers/raw/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let out_layer_data: Vec<f32> = out_file
+        .dataset("layers/raw/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        orig_layer_data, out_layer_data,
+        "streaming layer round-trip mismatch"
+    );
+
+    // Streaming and materialising writers must produce equivalent
+    // CSR triplets; reuse `scx_to_h5ad` for the cross-check.
+    let h5ad_mat = dir.path().join("out_mat.h5ad");
+    scx_to_h5ad(&scx_path, &h5ad_mat, &mut WarningSink::log()).unwrap();
+    let mat_file = hdf5::File::open(&h5ad_mat).unwrap();
+    let mat_data: Vec<f32> = mat_file
+        .dataset("X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        mat_data, out_data,
+        "streaming and materialising writers diverged on /X/data"
+    );
+}
+
+/// `scx_to_h5mu_streaming` round-trip: ensures the multimodal h5mu
+/// export streams per-modality `/X` and produces a valid output.
+#[test]
+fn test_scx_to_h5mu_streaming_round_trip() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use super::mudata_write::scx_to_h5mu_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_path = dir.path().join("mid.scx");
+    let h5mu_out = dir.path().join("out.h5mu");
+    create_test_h5mu(&h5mu_in, 8, 30, 5);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5mu_streaming(&scx_path, &h5mu_out, &opts, &mut WarningSink::log()).unwrap();
+
+    let file = hdf5::File::open(&h5mu_out).unwrap();
+    assert!(file.group("mod").is_ok());
+    assert!(file.group("mod/rna").is_ok());
+    assert!(file.group("mod/adt").is_ok());
+    assert!(file.group("mod/rna/X").is_ok());
+    assert!(file.group("mod/adt/X").is_ok());
+    assert!(file.group("obs").is_ok());
+    let rna_var = file.group("mod/rna/var").unwrap();
+    assert!(rna_var.dataset("_index").is_ok());
+
+    // Cross-check streaming vs. materialising writer on the same SCX.
+    let h5mu_mat = dir.path().join("out_mat.h5mu");
+    super::mudata_write::scx_to_h5mu(&scx_path, &h5mu_mat).unwrap();
+    let mat_file = hdf5::File::open(&h5mu_mat).unwrap();
+    let stream_rna_data: Vec<f32> = file
+        .dataset("mod/rna/X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let mat_rna_data: Vec<f32> = mat_file
+        .dataset("mod/rna/X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        stream_rna_data, mat_rna_data,
+        "h5mu streaming and materialising writers diverged on /mod/rna/X/data"
+    );
+}
+
+/// Multi-shard streaming export: force a small `shard_target_rows` so
+/// the streaming writer must walk several shards and write multiple
+/// hyperslab slices. Exercises the `nnz_offset` / `row_offset_kept`
+/// accumulators and the indptr/indices/data write loop more than the
+/// single-shard happy path.
+#[test]
+fn test_h5ad_streaming_multi_shard_round_trip() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("test.h5ad");
+    let scx_path = dir.path().join("test.scx");
+    let h5ad_out = dir.path().join("out.h5ad");
+
+    let n_obs = 32;
+    let n_vars = 12;
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+
+    let mut opts = ConvertOptions::default();
+    opts.shard_target_rows = 7; // 5 shards for 32 rows
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    assert!(
+        ScxReader::open(&scx_path)
+            .unwrap()
+            .catalog()
+            .csr_shards_for_modality(0)
+            .len()
+            > 1,
+        "fixture should produce multiple shards to exercise the streaming loop"
+    );
+
+    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+    let orig_file = hdf5::File::open(&h5ad_path).unwrap();
+    let out_file = hdf5::File::open(&h5ad_out).unwrap();
+    let orig_data: Vec<f32> = orig_file
+        .dataset("X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let out_data: Vec<f32> = out_file
+        .dataset("X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let orig_indptr: Vec<i64> = orig_file
+        .dataset("X/indptr")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let out_indptr: Vec<i64> = out_file
+        .dataset("X/indptr")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(orig_data, out_data, "multi-shard streaming /X/data mismatch");
+    assert_eq!(orig_indptr, out_indptr, "multi-shard streaming /X/indptr mismatch");
+}
+
+/// Streaming export with active deletion vectors: only kept rows
+/// must appear in the output `/X/{indptr,indices,data}` and the
+/// `shape[0]` attribute must reflect `n_obs - n_deleted`.
+#[test]
+fn test_h5ad_streaming_with_deletion_vectors() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("in.scx");
+    let h5ad_out = dir.path().join("out.h5ad");
+
+    let n_obs: usize = 10;
+    let n_vars: usize = 8;
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    // Mark rows 1, 3, 7 deleted; 7 kept rows remain.
+    let deleted: Vec<u64> = vec![1, 3, 7];
+    scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
+
+    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+    let out_file = hdf5::File::open(&h5ad_out).unwrap();
+    let shape: Vec<i64> = out_file
+        .group("X")
+        .unwrap()
+        .attr("shape")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let n_obs_kept = (n_obs - deleted.len()) as i64;
+    assert_eq!(shape[0], n_obs_kept, "kept-row count in shape attr");
+    assert_eq!(shape[1], n_vars as i64);
+
+    let out_indptr: Vec<i64> = out_file
+        .dataset("X/indptr")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(out_indptr.len() as i64, n_obs_kept + 1, "indptr length");
+
+    // Materialising path applied by `read_all_csr_shards_filtered`
+    // must produce the same indices/data as the streamed export.
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let expected = reader.read_all_csr_shards_filtered().unwrap();
+    let out_indices: Vec<i32> = out_file
+        .dataset("X/indices")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let out_data: Vec<f32> = out_file
+        .dataset("X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(expected.indices, out_indices, "indices after DV streaming");
+    assert_eq!(expected.data, out_data, "data after DV streaming");
+}
+
+/// Streaming variant of `test_modality_extract_to_h5ad`.
+#[test]
+fn test_modality_extract_to_h5ad_streaming() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use super::mudata_write::scx_modality_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_path = dir.path().join("mid.scx");
+    let h5ad_out = dir.path().join("rna.h5ad");
+    create_test_h5mu(&h5mu_in, 6, 40, 7);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_modality_to_h5ad_streaming(&scx_path, &h5ad_out, "rna", &opts, &mut WarningSink::log())
+        .unwrap();
+
+    let file = hdf5::File::open(&h5ad_out).unwrap();
+    assert!(file.group("X").is_ok());
+    assert!(file.group("obs").is_ok());
+    assert!(file.group("var").is_ok());
+    let var_idx = file.dataset("var/_index").unwrap();
+    assert_eq!(var_idx.shape()[0], 40);
+}

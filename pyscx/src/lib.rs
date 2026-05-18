@@ -465,6 +465,95 @@ fn from_h5mu(
     )
 }
 
+/// Convert an SCX file to h5ad (Phase 8).
+///
+/// Mirrors `pyscx.from_h5ad` in the opposite direction. Streams by
+/// default — peak RSS is bounded by one shard's worth of CSR plus
+/// encode buffers, matching the ingestion direction. For multimodal
+/// SCX files, pass `modality="rna"` to extract a single modality as
+/// h5ad; otherwise multimodal inputs raise (use `pyscx.to_h5mu`).
+///
+/// Args:
+///     path: Source SCX file.
+///     out: Destination h5ad file.
+///     stream: Stream the conversion (default True). Set False for
+///         the legacy materializing path.
+///     modality: Modality name to extract (only valid on multimodal
+///         SCX inputs).
+///
+/// Example:
+///     pyscx.to_h5ad("data.scx", "data.h5ad")
+///     pyscx.to_h5ad("cite.scx", "rna.h5ad", modality="rna")
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (path, out, stream=true, modality=None))]
+fn to_h5ad(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    stream: bool,
+    modality: Option<&str>,
+) -> PyResult<()> {
+    use std::path::Path;
+    let opts = scx_convert::ConvertOptions {
+        stream,
+        tool: "pyscx".into(),
+        ..Default::default()
+    };
+    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+        let mut sink = scx_convert::WarningSink::log();
+        match (modality, stream) {
+            (Some(name), true) => scx_convert::scx_modality_to_h5ad_streaming(
+                Path::new(path),
+                Path::new(out),
+                name,
+                &opts,
+                &mut sink,
+            ),
+            (Some(name), false) => {
+                scx_convert::scx_modality_to_h5ad(Path::new(path), Path::new(out), name)
+            }
+            (None, true) => scx_convert::scx_to_h5ad_streaming(
+                Path::new(path),
+                Path::new(out),
+                &opts,
+                &mut sink,
+            ),
+            (None, false) => scx_convert::scx_to_h5ad(Path::new(path), Path::new(out), &mut sink),
+        }
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Convert an SCX file to h5mu (Phase 8).
+///
+/// Mirrors `pyscx.from_h5mu` in the opposite direction. Streams by
+/// default; per-modality `/mod/{name}/X` and any layers are written
+/// shard-by-shard. Requires a multimodal SCX file.
+///
+/// Example:
+///     pyscx.to_h5mu("cite.scx", "cite.h5mu")
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (path, out, stream=true))]
+fn to_h5mu(py: Python<'_>, path: &str, out: &str, stream: bool) -> PyResult<()> {
+    use std::path::Path;
+    let opts = scx_convert::ConvertOptions {
+        stream,
+        tool: "pyscx".into(),
+        ..Default::default()
+    };
+    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+        let mut sink = scx_convert::WarningSink::log();
+        if stream {
+            scx_convert::scx_to_h5mu_streaming(Path::new(path), Path::new(out), &opts, &mut sink)
+        } else {
+            scx_convert::scx_to_h5mu(Path::new(path), Path::new(out))
+        }
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 /// Convert a `mudata.MuData` object to a multimodal SCX v2 file.
 ///
 /// Mirrors `from_anndata` for multi-modality inputs. The MuData's
@@ -561,6 +650,10 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "hdf5")]
     m.add_function(wrap_pyfunction!(from_h5mu, m)?)?;
     m.add_function(wrap_pyfunction!(from_mudata, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(to_h5ad, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(to_h5mu, m)?)?;
 
     // Preprocessing pipeline
     m.add_function(wrap_pyfunction!(preprocess::preprocess, m)?)?;

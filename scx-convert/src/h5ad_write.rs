@@ -140,6 +140,17 @@ pub(super) fn write_dataframe_group_at(
         .create("encoding-version")?
         .write_scalar(&vlu("0.2.0"))?;
 
+    // `_index` attribute names the column that holds the row index.
+    // anndata.read_h5ad requires this; without it the `/obs` group
+    // fails to read.
+    if !schema.fields().is_empty() {
+        let index_name = vlu(schema.field(0).name());
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("_index")?
+            .write_scalar(&index_name)?;
+    }
+
     let mut col_order: Vec<VarLenUnicode> = Vec::with_capacity(batch.num_columns());
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let col = batch.column(col_idx);
