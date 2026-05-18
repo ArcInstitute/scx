@@ -239,6 +239,13 @@ impl PyExperiment {
         self.reader.header().codec_id
     }
 
+    /// File-header index dtype (`0=u16`, `1=u32`). Used for testing the
+    /// SCX → SCX writer's projection-aware index-dtype selection.
+    #[getter]
+    fn index_dtype(&self) -> u8 {
+        self.reader.header().index_dtype
+    }
+
     /// List of layer names in the file.
     #[getter]
     fn layer_names(&self) -> Vec<String> {

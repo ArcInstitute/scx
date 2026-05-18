@@ -37,42 +37,17 @@ def src_scx(synthetic_adata, tmp_dir):
     return path
 
 
-def _read_csr_shard_bytes(path):
-    """Read raw CSR-shard payloads from an SCX file via `scx info` (or a
-    minimal mmap + catalog peek if `scx info` is unavailable).
-
-    Returns a list of `bytes`, one per CSR shard, sorted by row_start.
-    """
-    # Fall back to opening the file as bytes and slicing per catalog
-    # entry. The Rust side exposes `read_raw_shard_bytes` but not a
-    # Python accessor, so we use a small helper: open through pyscx,
-    # walk catalog via the public reader, and extract raw bytes by
-    # offset.
-    exp = pyscx.open(path)
-    # `exp.shard_count` is the only public hint at #shards; raw bytes
-    # come from the on-disk file at known offsets. The simplest
-    # cross-implementation check is BLAKE3 of each CSR shard payload
-    # via the experiment-level catalog accessor exposed for testing.
-    # In lieu of that accessor, hash the whole file contents up to but
-    # excluding the catalog/header so passthrough byte-equality is
-    # observable as "decoded shards match the source per-element".
-    del exp
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def _shard_payload_hashes(path):
-    """Return BLAKE3 hashes of each CSR shard payload in `path`.
-
-    Implementation note: we read back `X` from both files and compare
-    via `np.array_equal` instead of hashing raw bytes, because the
-    catalog offset / file-checksum metadata differs between writes
-    even on a byte-faithful passthrough (catalog offsets are computed
-    fresh by `ScxWriter::finish`). The decoded shard *values* are
-    what byte-passthrough preserves.
-    """
-    exp = pyscx.open(path)
-    return exp.to_anndata().X
+def _adata_with_layers(n_obs=80, n_vars=30, n_layers=2, seed=11):
+    """Build a small AnnData with N CSR layers for round-trip tests."""
+    rng = np.random.RandomState(seed)
+    dense = rng.randint(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+    dense[rng.random((n_obs, n_vars)) > 0.3] = 0
+    layers = {}
+    for k in range(n_layers):
+        layer_dense = rng.randint(0, 50, size=(n_obs, n_vars)).astype(np.float32)
+        layer_dense[rng.random((n_obs, n_vars)) > 0.4] = 0
+        layers[f"layer_{k}"] = sp.csr_matrix(layer_dense)
+    return anndata.AnnData(X=sp.csr_matrix(dense), layers=layers)
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +278,138 @@ def test_csc_sidecar_drop_warning(synthetic_adata, tmp_dir):
 
     # Output should not have a CSC sidecar.
     assert not pyscx.open(dst).has_csc
+
+
+# ---------------------------------------------------------------------------
+# Layers round-trip through the streaming rewrite
+# ---------------------------------------------------------------------------
+
+
+def test_layers_round_trip_through_streaming_rewrite(tmp_dir):
+    """Layers on a backed AnnData must be preserved through the SCX → SCX
+    rewrite. Regression test for the bug where both route functions
+    returned before the layer-writing block."""
+    adata = _adata_with_layers(n_obs=64, n_vars=20, n_layers=2)
+    src = str(tmp_dir / "src_layers.scx")
+    pyscx.from_anndata(adata, src)
+    assert sorted(pyscx.open(src).layer_names) == ["layer_0", "layer_1"]
+
+    backed = pyscx.open(src).to_anndata(backed=True)
+    dst = str(tmp_dir / "dst_layers.scx")
+    pyscx.from_anndata(backed, dst)
+
+    out = pyscx.open(dst)
+    assert sorted(out.layer_names) == ["layer_0", "layer_1"]
+    out_ad = out.to_anndata()
+    src_ad = pyscx.open(src).to_anndata()
+    for name in ["layer_0", "layer_1"]:
+        np.testing.assert_array_equal(
+            out_ad.layers[name].toarray(),
+            src_ad.layers[name].toarray(),
+        )
+
+
+def test_layers_round_trip_after_lazy_transforms(tmp_dir):
+    """Lazy transforms (normalize_total + log1p) are applied to X only —
+    layers must round-trip untransformed."""
+    adata = _adata_with_layers(n_obs=64, n_vars=20, n_layers=1)
+    src = str(tmp_dir / "src_layers_lazy.scx")
+    pyscx.from_anndata(adata, src)
+
+    backed = pyscx.open(src).to_anndata(backed=True)
+    pyscx.accel.normalize_total(backed, target_sum=1e4)
+    pyscx.accel.log1p(backed)
+
+    dst = str(tmp_dir / "dst_layers_lazy.scx")
+    pyscx.from_anndata(backed, dst)
+
+    out = pyscx.open(dst).to_anndata()
+    src_layer = pyscx.open(src).to_anndata().layers["layer_0"]
+    np.testing.assert_array_equal(
+        out.layers["layer_0"].toarray(),
+        src_layer.toarray(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codec / index_dtype header faithfulness
+# ---------------------------------------------------------------------------
+
+
+def test_default_codec_preserves_source_choice(synthetic_adata, tmp_dir):
+    """A backed rewrite without an explicit `codec=` should preserve
+    the source codec. A `shard_size=` override forces decode-encode
+    but the codec choice still comes from the source header."""
+    src = str(tmp_dir / "src_scx1.scx")
+    pyscx.from_anndata(synthetic_adata, src, codec="scx1")
+    src_codec = pyscx.open(src).codec_id
+    assert src_codec == 1, f"expected Scx1 (1), got {src_codec}"
+
+    backed = pyscx.open(src).to_anndata(backed=True)
+    dst = str(tmp_dir / "dst_default_codec.scx")
+    pyscx.from_anndata(backed, dst, shard_size=32)
+
+    out = pyscx.open(dst)
+    assert out.codec_id == src_codec, (
+        f"default codec should preserve source ({src_codec}); got {out.codec_id}"
+    )
+
+
+def test_pcodec_round_trip_preserves_header_codec(synthetic_adata, tmp_dir):
+    """Source written with `codec='pcodec'` (id 4) must round-trip
+    through the streaming rewrite with the header codec preserved.
+    Regression test for the hardcoded `match` that mapped Pcodec to
+    Zstd in the header."""
+    src = str(tmp_dir / "src_pcodec.scx")
+    pyscx.from_anndata(synthetic_adata, src, codec="pcodec")
+    assert pyscx.open(src).codec_id == 4
+
+    backed = pyscx.open(src).to_anndata(backed=True)
+    dst = str(tmp_dir / "dst_pcodec.scx")
+    pyscx.from_anndata(backed, dst, shard_size=32)
+
+    out = pyscx.open(dst)
+    assert out.codec_id == 4, f"expected Pcodec (4) in header, got {out.codec_id}"
+
+
+def test_column_projection_uses_visible_n_vars(tmp_dir):
+    """A backed rewrite with column projection should compute
+    `index_dtype` from the user-visible (projected) n_vars, not the
+    source's. The visible-shape invariant is what makes the writer
+    parity-equal with the in-memory path.
+
+    Projection on a backed AnnData is wired through
+    `to_anndata(backed=True, var_names=[...])`, which sets a
+    `col_projection` on the X wrapper. `pyscx.from_anndata` then
+    sees the projected shape and routes through decode-encode."""
+    rng = np.random.RandomState(7)
+    n_obs, n_vars = 80, 100
+    dense = rng.randint(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+    dense[rng.random((n_obs, n_vars)) > 0.3] = 0
+    gene_names = [f"gene_{i}" for i in range(n_vars)]
+    var = pd.DataFrame({"gene_id": gene_names}, index=gene_names)
+    adata = anndata.AnnData(X=sp.csr_matrix(dense), var=var)
+
+    src = str(tmp_dir / "src_proj.scx")
+    pyscx.from_anndata(adata, src)
+    assert pyscx.open(src).index_dtype == 0  # u16 (n_vars=100)
+
+    keep = ["gene_0", "gene_3", "gene_7", "gene_12", "gene_18"]
+    backed = pyscx.open(src).to_anndata(backed=True, var_names=keep)
+    assert backed.n_vars == 5
+    dst = str(tmp_dir / "dst_proj.scx")
+    pyscx.from_anndata(backed, dst)
+
+    out = pyscx.open(dst)
+    assert out.n_vars == 5
+    assert out.index_dtype == 0, (
+        f"projected output should use u16 indices (0); got {out.index_dtype}"
+    )
+
+    # Numerical sanity: projected X matches the manual numpy projection.
+    src_x = pyscx.open(src).to_anndata().X.toarray()
+    keep_idx = np.array([0, 3, 7, 12, 18])
+    np.testing.assert_array_equal(
+        out.to_anndata().X.toarray(),
+        src_x[:, keep_idx],
+    )

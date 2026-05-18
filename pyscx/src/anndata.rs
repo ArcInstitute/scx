@@ -2954,14 +2954,15 @@ fn warn_csc_dropped(py: Python<'_>) {
         .and_then(|w| w.call_method1("warn", (msg,)));
 }
 
-/// Decompose a scipy CSR matrix into owned `(indptr_u64, indices_u32,
-/// data_f32)` vectors suitable for `encode_one_shard`. Mirrors the
-/// extraction inside the in-memory `from_anndata_impl` path but pulls
-/// from a Python object rather than slicing a pre-validated buffer.
-fn decompose_scipy_csr(
-    py: Python<'_>,
-    csr: &Bound<'_, PyAny>,
-) -> PyResult<(Vec<u64>, Vec<u32>, Vec<f32>)> {
+/// Decompose a scipy CSR matrix and invoke `f` with borrowed slices
+/// suitable for `encode_one_shard`. `indptr` and `indices` are owned
+/// `Vec`s because they require an i64→u64 / i32→u32 cast; `data` is
+/// borrowed directly from the underlying numpy buffer to avoid an
+/// f32 copy. The borrow lives only for the duration of `f`.
+fn decompose_scipy_csr_with<F, R>(py: Python<'_>, csr: &Bound<'_, PyAny>, f: F) -> PyResult<R>
+where
+    F: FnOnce(&[u64], &[u32], &[f32]) -> PyResult<R>,
+{
     let np = py.import("numpy")?;
 
     let indptr_obj = csr.getattr("indptr")?;
@@ -3008,9 +3009,8 @@ fn decompose_scipy_csr(
     let data_slice = data
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let data_f32: Vec<f32> = data_slice.to_vec();
 
-    Ok((indptr_u64, indices_u32, data_f32))
+    f(&indptr_u64, &indices_u32, data_slice)
 }
 
 /// Build a fresh `FileHeader` template for an SCX → SCX rewrite.
@@ -3135,13 +3135,16 @@ fn route_scx_backed_to_scx(
 
     // Output header / writer setup. For passthrough, mirror the
     // source's codec / shard_target_rows / index_dtype so the
-    // catalog and per-shard headers stay self-consistent.
+    // catalog and per-shard headers stay self-consistent. On the
+    // decode-encode fallback, default to the source's codec choice
+    // (preserves Scx1/Pcodec/etc — only override when the caller
+    // passes `codec=`).
     let out_codec_id: u8 = if passthrough_ok {
         src_codec_id
     } else {
         match explicit_codec {
             Some(c) => c as u8,
-            None => CodecId::Zstd as u8,
+            None => src_codec_id,
         }
     };
     let out_shard_rows = if passthrough_ok {
@@ -3149,21 +3152,23 @@ fn route_scx_backed_to_scx(
     } else {
         shard_target_rows
     };
+    // Key index_dtype off the user-visible n_vars (after any column
+    // projection), not the source's. Allows u16 when projecting a
+    // large source down to a small gene subset, and matches the
+    // in-memory path which sees only the visible shape.
     let out_index_dtype = if passthrough_ok {
         src_header.index_dtype
-    } else if src_n_vars <= 65535 {
+    } else if out_n_vars_visible <= 65535 {
         0
     } else {
         1
     };
 
-    let codec_for_header = match out_codec_id {
-        0 => CodecId::None,
-        1 => CodecId::Scx1,
-        2 => CodecId::Zstd,
-        3 => CodecId::Lz4Shuffle,
-        _ => CodecId::Zstd,
-    };
+    let codec_for_header = CodecId::from_u8(out_codec_id).ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "unknown codec id {out_codec_id} from source SCX header"
+        ))
+    })?;
     // Output dimensions: passthrough mirrors the source header
     // (preconditions guarantee no deletions / projection). The
     // decode-encode path uses the wrapper's user-visible shape so
@@ -3204,7 +3209,12 @@ fn route_scx_backed_to_scx(
 
     let n_vars_u32 = u32::try_from(out_n_vars)
         .map_err(|_| PyRuntimeError::new_err(format!("n_vars {out_n_vars} exceeds u32::MAX")))?;
-    let codec_for_encode = explicit_codec;
+    // Pin the per-shard encode codec to the header's codec so the
+    // recorded `codec_id` and the actual shard encodings stay
+    // consistent. When the user passed an explicit codec we use it;
+    // otherwise we use the source's codec (which `out_codec_id` now
+    // mirrors).
+    let codec_for_encode = Some(codec_for_header);
 
     if passthrough_ok {
         // Byte-passthrough. Iterate source CSR shards in row order;
@@ -3225,20 +3235,19 @@ fn route_scx_backed_to_scx(
         // boundaries so deletions / column projection already apply
         // via the wrapper's `__getitem__`.
         let bounds = compute_wrapper_boundaries_backed(backed, out_shard_rows);
+        let adata_x = adata.getattr("X")?;
         for (i, (start, end)) in bounds.iter().enumerate() {
             let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
             // Use the Python-visible wrapper to honour deletion /
             // projection semantics. Calling through PyAny gives us
             // the wrapper's __getitem__ (returns scipy CSR).
-            let adata_x = adata.getattr("X")?;
             let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
-            let (indptr_u64, indices_u32, data_f32) = decompose_scipy_csr(py, &shard_obj)?;
-            let pre = py
-                .allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
+            let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
+                py.allow_threads(|| {
                     scx_format::encode_one_shard(
-                        &indptr_u64,
-                        &indices_u32,
-                        &data_f32,
+                        indptr,
+                        indices,
+                        data,
                         codec_for_encode,
                         out_index_dtype,
                         n_vars_u32,
@@ -3248,11 +3257,27 @@ fn route_scx_backed_to_scx(
                         format!("X_shard_{i}"),
                     )
                 })
-                .map_err(to_pyerr)?;
+                .map_err(to_pyerr)
+            })?;
             py.allow_threads(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;
         }
     }
+
+    // Layers (decode-encode, never passthrough — keeps the byte
+    // path bounded to X). `adata.layers` from a backed AnnData
+    // contains `ScxBackedLayerDataset` instances which slice-via-
+    // `__getitem__` exactly like X.
+    stream_write_layers(
+        py,
+        adata,
+        &mut writer,
+        out_n_obs,
+        out_n_vars,
+        out_shard_rows,
+        codec_for_encode,
+        out_index_dtype,
+    )?;
 
     // Write remaining metadata (obsm / varm / obsp / varp / uns) after
     // the X shards, matching the canonical layout.
@@ -3335,7 +3360,16 @@ fn route_scx_lazy_to_scx(
     let n_obs = n_obs_usize as u64;
     let n_vars = n_vars_usize as u64;
 
-    let out_codec = explicit_codec.unwrap_or(CodecId::Zstd);
+    // Default codec to the source SCX's choice when known (preserves
+    // Scx1 / Pcodec / etc through the rewrite). Falls back to Zstd
+    // when no source path is recorded (the lazy wrapper can in
+    // principle be built without one).
+    let src_codec: Option<CodecId> = lazy.source_path().and_then(|p| {
+        ScxReader::open(p)
+            .ok()
+            .and_then(|r| CodecId::from_u8(r.header().codec_id))
+    });
+    let out_codec = explicit_codec.or(src_codec).unwrap_or(CodecId::Zstd);
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
     let n_vars_u32 = u32::try_from(n_vars)
         .map_err(|_| PyRuntimeError::new_err(format!("n_vars {n_vars} exceeds u32::MAX")))?;
@@ -3362,20 +3396,22 @@ fn route_scx_lazy_to_scx(
 
     // Lazy transforms always force decode + encode. Iterate the
     // wrapper's user-visible shard boundaries so any deletion vector
-    // already applies.
+    // already applies. Pin per-shard encode codec to the header
+    // codec so the recorded `codec_id` and the actual encodings
+    // stay consistent.
+    let codec_for_encode = Some(out_codec);
     let bounds = compute_wrapper_boundaries_lazy(lazy, shard_target_rows);
     let adata_x = adata.getattr("X")?;
     for (i, (start, end)) in bounds.iter().enumerate() {
         let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
         let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
-        let (indptr_u64, indices_u32, data_f32) = decompose_scipy_csr(py, &shard_obj)?;
-        let pre = py
-            .allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
+        let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
+            py.allow_threads(|| {
                 scx_format::encode_one_shard(
-                    &indptr_u64,
-                    &indices_u32,
-                    &data_f32,
-                    explicit_codec,
+                    indptr,
+                    indices,
+                    data,
+                    codec_for_encode,
                     index_dtype,
                     n_vars_u32,
                     *start as u64,
@@ -3384,10 +3420,24 @@ fn route_scx_lazy_to_scx(
                     format!("X_shard_{i}"),
                 )
             })
-            .map_err(to_pyerr)?;
+            .map_err(to_pyerr)
+        })?;
         py.allow_threads(|| writer.write_preencoded_shard(pre))
             .map_err(to_pyerr)?;
     }
+
+    // Layers — never transformed by the lazy X chain, so we just
+    // stream them through the same decode-encode pipeline as X.
+    stream_write_layers(
+        py,
+        adata,
+        &mut writer,
+        n_obs,
+        n_vars,
+        shard_target_rows,
+        codec_for_encode,
+        index_dtype,
+    )?;
 
     py.allow_threads(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
@@ -3501,6 +3551,79 @@ fn chunk_boundaries(n_obs: usize, target_rows: usize) -> Vec<(usize, usize)> {
         start = end;
     }
     out
+}
+
+/// Stream `adata.layers` shard-by-shard into the writer using the
+/// same decode-encode pattern as the X path. Shared by both the
+/// backed and lazy SCX → SCX routes — neither transforms layers,
+/// so the logic is identical.
+///
+/// Each layer wrapper (`ScxBackedLayerDataset` or a scipy CSR) must
+/// support `__getitem__(slice)` and report `(n_obs, n_vars)` via
+/// `.shape`. The shape must match the output X dims; otherwise we
+/// raise a `ValueError` matching the in-memory path's contract.
+#[allow(clippy::too_many_arguments)]
+fn stream_write_layers(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    writer: &mut ScxWriter,
+    out_n_obs: u64,
+    out_n_vars: u64,
+    out_shard_rows: u32,
+    codec_for_encode: Option<CodecId>,
+    index_dtype: u8,
+) -> PyResult<()> {
+    let layers = match adata.getattr("layers") {
+        Ok(l) => l,
+        Err(_) => return Ok(()),
+    };
+    let keys: Vec<String> = py
+        .import("builtins")?
+        .call_method1("list", (layers.call_method0("keys")?,))?
+        .extract()?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let n_vars_u32 = u32::try_from(out_n_vars)
+        .map_err(|_| PyRuntimeError::new_err(format!("n_vars {out_n_vars} exceeds u32::MAX")))?;
+    let bounds = chunk_boundaries(out_n_obs as usize, out_shard_rows as usize);
+
+    for layer_name in &keys {
+        let layer = layers.call_method1("__getitem__", (layer_name,))?;
+        let l_shape: (u64, u64) = layer.getattr("shape")?.extract()?;
+        if l_shape != (out_n_obs, out_n_vars) {
+            return Err(PyValueError::new_err(format!(
+                "Layer '{layer_name}' has shape ({}, {}), expected ({}, {})",
+                l_shape.0, l_shape.1, out_n_obs, out_n_vars
+            )));
+        }
+
+        for (i, (start, end)) in bounds.iter().enumerate() {
+            let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
+            let shard_obj = layer.call_method1("__getitem__", (py_slice,))?;
+            let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
+                py.allow_threads(|| {
+                    scx_format::encode_one_shard(
+                        indptr,
+                        indices,
+                        data,
+                        codec_for_encode,
+                        index_dtype,
+                        n_vars_u32,
+                        *start as u64,
+                        SectionType::LayerCsrShard,
+                        ModalityType::Rna,
+                        format!("{layer_name}_shard_{i}"),
+                    )
+                })
+                .map_err(to_pyerr)
+            })?;
+            py.allow_threads(|| writer.write_preencoded_shard(pre))
+                .map_err(to_pyerr)?;
+        }
+    }
+    Ok(())
 }
 
 /// Helper for the backed-routing path. Reads a dense mapping
