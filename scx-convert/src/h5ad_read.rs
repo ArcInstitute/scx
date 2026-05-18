@@ -249,19 +249,69 @@ pub fn read_dataframe_group(
             continue;
         }
 
-        // Try reading as dataset
-        let ds = match group.dataset(name) {
-            Ok(ds) => ds,
-            Err(_) => continue, // Skip non-dataset members (subgroups)
-        };
-
-        match read_column_to_arrow(&group, &ds, name) {
-            Ok((field, array)) => {
-                fields.push(field);
-                arrays.push(array);
+        // Dataset form: covers numeric columns, strings, booleans,
+        // and the legacy attribute-form categorical (codes dataset
+        // + `categories` attribute) handled by
+        // [`read_categorical_column`].
+        if let Ok(ds) = group.dataset(name) {
+            match read_column_to_arrow(&group, &ds, name) {
+                Ok((field, array)) => {
+                    fields.push(field);
+                    arrays.push(array);
+                }
+                Err(e) => {
+                    eprintln!("warning: skipping column '{name}' in {group_name}: {e}");
+                }
             }
-            Err(e) => {
-                eprintln!("warning: skipping column '{name}' in {group_name}: {e}");
+            continue;
+        }
+
+        // Group form: modern anndata column encodings — categorical
+        // (encoding-version 0.2.0, `codes` + `categories` datasets)
+        // or nullable-boolean (encoding-version 0.1.0, `values` +
+        // `mask` datasets). Both bypass HDF5's 64 KB attribute /
+        // header limits and are anndata's canonical reading shape.
+        if let Ok(subgroup) = group.group(name) {
+            let enc = subgroup
+                .attr("encoding-type")
+                .ok()
+                .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            match enc.as_str() {
+                "categorical" => {
+                    match read_categorical_group(&subgroup, name) {
+                        Ok((field, array)) => {
+                            fields.push(field);
+                            arrays.push(array);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: skipping categorical group '{name}' in {group_name}: {e}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                "nullable-boolean" => {
+                    match read_nullable_boolean_group(&subgroup, name) {
+                        Ok((field, array)) => {
+                            fields.push(field);
+                            arrays.push(array);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: skipping nullable-boolean group '{name}' in {group_name}: {e}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                _ => {
+                    // Non-categorical / non-nullable-boolean subgroups
+                    // (nested uns dicts, etc.) are not dataframe
+                    // columns — leave them out silently.
+                }
             }
         }
     }
@@ -404,6 +454,83 @@ fn read_column_to_arrow(
             "column '{name}': unsupported HDF5 type: {other:?}"
         ))),
     }
+}
+
+/// Read a modern anndata categorical (encoding-version 0.2.0):
+/// a subgroup containing `codes` and `categories` as separate
+/// datasets plus an `ordered` attribute. The dataset form lets the
+/// categories payload grow past HDF5's 64 KB object-header limit,
+/// which the legacy attribute form (read by
+/// [`read_categorical_column`]) cannot.
+fn read_categorical_group(
+    cat_group: &hdf5::Group,
+    name: &str,
+) -> Result<(Field, ArrayRef), ConvertError> {
+    let codes_ds = cat_group.dataset("codes")?;
+    let codes: Vec<i32> = read_i32_dataset(&codes_ds)?;
+
+    let cats_ds = cat_group.dataset("categories")?;
+    let cats_raw: Vec<hdf5::types::VarLenUnicode> = cats_ds.read_1d()?.to_vec();
+    let categories: Vec<String> = cats_raw.iter().map(|s| s.to_string()).collect();
+
+    let keys = Int32Array::from(
+        codes
+            .iter()
+            .map(|&c| if c < 0 { None } else { Some(c) })
+            .collect::<Vec<Option<i32>>>(),
+    );
+    let values = StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))?;
+
+    let field = Field::new(
+        name,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        true,
+    );
+    Ok((field, Arc::new(dict)))
+}
+
+/// Read anndata's `nullable-boolean` group form (encoding-version
+/// 0.1.0): a subgroup with `values` (u8) and `mask` (u8) datasets.
+/// `mask[i] == 1` marks the row as null; the resulting Arrow
+/// `BooleanArray` carries the corresponding validity bit.
+fn read_nullable_boolean_group(
+    bool_group: &hdf5::Group,
+    name: &str,
+) -> Result<(Field, ArrayRef), ConvertError> {
+    // anndata writes `values` and `mask` as native HDF5 boolean
+    // dtype. hdf5-rust exposes the same via `bool` (truthful read +
+    // write with H5T_NATIVE_HBOOL_8). Accept either bool or u8 on
+    // read so older files written with the legacy u8 shape still
+    // round-trip.
+    let values: Vec<bool> = read_bool_or_u8(&bool_group.dataset("values")?)?;
+    let mask: Vec<bool> = read_bool_or_u8(&bool_group.dataset("mask")?)?;
+    if mask.len() != values.len() {
+        return Err(ConvertError::Other(format!(
+            "nullable-boolean '{name}': values len {} != mask len {}",
+            values.len(),
+            mask.len()
+        )));
+    }
+    let arr = BooleanArray::from(
+        values
+            .iter()
+            .zip(mask.iter())
+            .map(|(v, m)| if *m { None } else { Some(*v) })
+            .collect::<Vec<_>>(),
+    );
+    Ok((Field::new(name, DataType::Boolean, true), Arc::new(arr)))
+}
+
+/// Read a 1D dataset that may be encoded as native HDF5 boolean
+/// (`H5T_NATIVE_HBOOL_8`) or as u8. Used for `nullable-boolean`
+/// values/mask datasets which different writers encode differently.
+fn read_bool_or_u8(ds: &hdf5::Dataset) -> Result<Vec<bool>, ConvertError> {
+    if let Ok(v) = ds.read_1d::<bool>() {
+        return Ok(v.to_vec());
+    }
+    let v: Vec<u8> = ds.read_1d::<u8>()?.to_vec();
+    Ok(v.into_iter().map(|x| x != 0).collect())
 }
 
 /// Read a categorical column (integer codes + string categories).

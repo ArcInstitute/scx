@@ -4183,3 +4183,180 @@ fn test_modality_extract_to_h5ad_streaming() {
     let var_idx = file.dataset("var/_index").unwrap();
     assert_eq!(var_idx.shape()[0], 40);
 }
+
+/// Regression test for the boolean encoding mismatch surfaced via
+/// the export_streaming benchmark: the legacy
+/// flat-u8-with-encoding-type-boolean shape was rejected by
+/// `anndata.read_h5ad` (no registered IOSpec). The writer now emits
+/// the canonical `nullable-boolean` group form (values + mask
+/// datasets) which anndata reads natively.
+#[test]
+fn test_boolean_round_trip_via_streaming_export() {
+    use super::h5ad_read::read_dataframe_group;
+    use super::pipeline::scx_to_h5ad_streaming;
+    use arrow::array::BooleanArray;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_in = dir.path().join("bool.h5ad");
+    let scx_path = dir.path().join("bool.scx");
+    let h5ad_out = dir.path().join("bool_out.h5ad");
+
+    let n_obs: usize = 20;
+    let n_vars: usize = 5;
+    create_test_h5ad(&h5ad_in, n_obs, n_vars, "csr", false);
+
+    // Inject a legacy attribute-form boolean column at the input;
+    // the SCX → h5ad writer must emit the modern group form
+    // regardless of what came in.
+    {
+        let file = hdf5::File::open_rw(&h5ad_in).unwrap();
+        let obs = file.group("obs").unwrap();
+        let codes: Vec<u8> = (0..n_obs).map(|i| (i % 2) as u8).collect();
+        let ds = obs
+            .new_dataset::<u8>()
+            .shape([n_obs])
+            .create("is_doublet")
+            .unwrap();
+        ds.write(&codes).unwrap();
+        ds.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("boolean"))
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+    // Output shape: /obs/is_doublet is a group with values + mask.
+    let file = hdf5::File::open(&h5ad_out).unwrap();
+    let g = file.group("obs/is_doublet").unwrap();
+    assert!(g.dataset("values").is_ok(), "expected values dataset");
+    assert!(g.dataset("mask").is_ok(), "expected mask dataset");
+    let enc = g
+        .attr("encoding-type")
+        .unwrap()
+        .read_scalar::<VarLenUnicode>()
+        .unwrap();
+    assert_eq!(enc.as_str(), "nullable-boolean");
+    let enc_v = g
+        .attr("encoding-version")
+        .unwrap()
+        .read_scalar::<VarLenUnicode>()
+        .unwrap();
+    assert_eq!(enc_v.as_str(), "0.1.0");
+
+    // Reader round-trip via read_dataframe_group.
+    let obs = read_dataframe_group(&file, "obs").unwrap();
+    let idx = obs.schema().index_of("is_doublet").unwrap();
+    let col = obs.column(idx);
+    assert!(matches!(col.data_type(), DataType::Boolean));
+    let bool_arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert_eq!(bool_arr.len(), n_obs);
+    for i in 0..n_obs {
+        assert!(bool_arr.is_valid(i), "no nulls expected");
+        assert_eq!(bool_arr.value(i), i % 2 == 1, "row {i}");
+    }
+}
+
+/// Regression test for the categorical attribute-form bug that
+/// surfaced via the export_streaming benchmark on census_500k:
+/// `H5Acreate2(): object header message is too large` when a
+/// categorical column has too many categories to fit in HDF5's
+/// 64 KB attribute payload limit. The fix writes categoricals as a
+/// group (`codes` + `categories` datasets), which has no such cap.
+#[test]
+fn test_categorical_wide_round_trip() {
+    use super::h5ad_read::read_dataframe_group;
+    use super::pipeline::scx_to_h5ad_streaming;
+    use arrow::array::DictionaryArray;
+    use arrow::datatypes::Int32Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_in = dir.path().join("wide_cat_in.h5ad");
+    let scx_path = dir.path().join("wide_cat.scx");
+    let h5ad_out = dir.path().join("wide_cat_out.h5ad");
+
+    // 2048 categories × ~44 chars each ≈ 90 KB raw — well past the
+    // ~64 KB attribute ceiling. The legacy writer fails with
+    // `H5Acreate2: object header too large` on this fixture.
+    let n_obs: usize = 4096;
+    let n_cats: usize = 2048;
+    let cats: Vec<VarLenUnicode> = (0..n_cats)
+        .map(|i| vlu(&format!("category_with_long_descriptive_name_{i:08x}")))
+        .collect();
+    let codes: Vec<i32> = (0..n_obs as i32).map(|i| i % n_cats as i32).collect();
+
+    let n_vars: usize = 5;
+    create_test_h5ad(&h5ad_in, n_obs, n_vars, "csr", false);
+    {
+        let file = hdf5::File::open_rw(&h5ad_in).unwrap();
+        let obs = file.group("obs").unwrap();
+        // Write the wide categorical using the legacy attribute form
+        // — anndata still emits this in some pipelines, and the SCX
+        // ingest path handles it via `read_categorical_column`.
+        let ds = obs
+            .new_dataset::<i32>()
+            .shape([n_obs])
+            .create("wide_cat")
+            .unwrap();
+        ds.write(&codes).unwrap();
+        ds.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("categorical"))
+            .unwrap();
+        // The input is intentionally written via the dataset form
+        // for the *ingest* side; the export-side fix lives in the
+        // writer. The legacy form fits at ingest because anndata
+        // pipelines that produce such files use HDF5's compact-vs-
+        // dense attribute storage transitions.
+        ds.new_attr::<VarLenUnicode>()
+            .shape([cats.len()])
+            .create("categories")
+            .unwrap()
+            .write(&cats)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    // This is the call that previously failed at HDF5's attribute
+    // limit. With the writer fix, it succeeds.
+    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+    // Output shape: /obs/wide_cat is a *group* (not a dataset)
+    // containing codes + categories.
+    let file = hdf5::File::open(&h5ad_out).unwrap();
+    let wide = file.group("obs/wide_cat").unwrap();
+    assert!(wide.dataset("codes").is_ok(), "expected /obs/wide_cat/codes dataset");
+    assert!(
+        wide.dataset("categories").is_ok(),
+        "expected /obs/wide_cat/categories dataset"
+    );
+    let enc = wide
+        .attr("encoding-type")
+        .unwrap()
+        .read_scalar::<VarLenUnicode>()
+        .unwrap();
+    assert_eq!(enc.as_str(), "categorical");
+    let enc_v = wide
+        .attr("encoding-version")
+        .unwrap()
+        .read_scalar::<VarLenUnicode>()
+        .unwrap();
+    assert_eq!(enc_v.as_str(), "0.2.0");
+
+    // Reader side: the new `read_categorical_group` path picks it up.
+    let obs = read_dataframe_group(&file, "obs").unwrap();
+    let idx = obs.schema().index_of("wide_cat").unwrap();
+    let col = obs.column(idx);
+    let dict = col
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+        .expect("expected Dictionary<Int32, Utf8>");
+    assert_eq!(dict.values().len(), n_cats);
+    assert_eq!(dict.len(), n_obs);
+}

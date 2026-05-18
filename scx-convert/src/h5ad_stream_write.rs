@@ -1,4 +1,4 @@
-// Streaming SCX → h5ad writer (Phase 8).
+// Streaming SCX → h5ad writer.
 //
 // Symmetrical to `h5ad_stream.rs` on the read side: walks SCX CSR
 // shards in row order and writes hyperslab slices into pre-allocated
@@ -11,10 +11,11 @@
 // * Pre-allocate the `indptr` / `indices` / `data` triplet by walking
 //   the catalog stats once (`stats.nnz` over CSR shards). This avoids
 //   HDF5 extendable datasets and keeps the on-disk layout
-//   deterministic (`REAL-WORLD-UX-FEATS.md:1287-1294`).
+//   deterministic.
 // * Deletion vectors: when present, the pre-scan decodes each shard
 //   once to count kept nnz, then the write loop decodes again. The
-//   spec at `:1294` explicitly accepts the second decode for export.
+//   second decode is acceptable for export — deterministic on-disk
+//   layout is worth one extra pass over the CSR shards.
 // * Metadata writes (`obs`, `var`, `obsm`, `varm`, `obsp`, `varp`,
 //   `uns`) reuse the non-streaming helpers in `h5ad_write.rs`. Only
 //   `/X` and `/layers/{name}` change.

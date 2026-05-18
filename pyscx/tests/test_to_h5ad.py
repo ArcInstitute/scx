@@ -92,6 +92,87 @@ def test_to_h5ad_round_trip_materialising(tmp_dir):
     )
 
 
+def test_to_h5ad_preserves_numeric_and_string_obs_columns(tmp_dir):
+    """Int / Float / Utf8 obs columns are written as untagged HDF5
+    datasets; anndata's empty-IOSpec auto-detect path must round
+    them back to the right pandas dtype + values."""
+    import anndata
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(7)
+    n_obs, n_vars = 30, 8
+    x = sp.csr_matrix(rng.integers(0, 20, (n_obs, n_vars)).astype(np.float32))
+    obs = pd.DataFrame(
+        {
+            "n_counts": np.arange(n_obs, dtype=np.int32),
+            "total_umi": np.arange(n_obs, dtype=np.int64),
+            "f32_metric": np.linspace(0.0, 1.0, n_obs, dtype=np.float32),
+            "f64_metric": np.linspace(-1.0, 1.0, n_obs, dtype=np.float64),
+            "sample_id": [f"sample_{i % 4}" for i in range(n_obs)],
+        },
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_vars)])
+    src = anndata.AnnData(X=x, obs=obs, var=var)
+
+    scx_path = str(tmp_dir / "numeric.scx")
+    out_path = str(tmp_dir / "numeric.h5ad")
+    pyscx.from_anndata(src, scx_path)
+    pyscx.to_h5ad(scx_path, out_path, stream=True)
+
+    out = anndata.read_h5ad(out_path)
+    for col in ("n_counts", "total_umi", "f32_metric", "f64_metric", "sample_id"):
+        assert col in out.obs.columns, f"column {col} missing"
+        # Compare values regardless of exact dtype (string columns may
+        # come back as object/categorical depending on anndata version).
+        np.testing.assert_array_equal(
+            np.asarray(src.obs[col]),
+            np.asarray(out.obs[col]),
+            err_msg=f"column {col} drifted",
+        )
+
+
+def test_to_h5ad_preserves_boolean_obs_column(tmp_dir):
+    """Boolean obs columns must survive the streaming export and
+    read back through `anndata.read_h5ad`. The writer's
+    `nullable-boolean` group form is the only h5py shape anndata
+    has a registered IOSpec for."""
+    import anndata
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    n_obs = 30
+    n_vars = 8
+    rng = np.random.default_rng(0)
+    x = sp.csr_matrix(
+        rng.integers(0, 20, size=(n_obs, n_vars)).astype(np.float32)
+    )
+    obs = pd.DataFrame(
+        {
+            "is_doublet": pd.array(
+                [bool(i % 3 != 0) for i in range(n_obs)], dtype="boolean"
+            )
+        },
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_vars)])
+    src = anndata.AnnData(X=x, obs=obs, var=var)
+
+    scx_path = str(tmp_dir / "bool.scx")
+    h5ad_out = str(tmp_dir / "bool.h5ad")
+    pyscx.from_anndata(src, scx_path)
+    pyscx.to_h5ad(scx_path, h5ad_out, stream=True)
+
+    out = anndata.read_h5ad(h5ad_out)
+    assert "is_doublet" in out.obs.columns, "boolean column lost"
+    src_vals = src.obs["is_doublet"].to_numpy(dtype=bool)
+    out_vals = out.obs["is_doublet"].to_numpy(dtype=bool)
+    np.testing.assert_array_equal(src_vals, out_vals)
+
+
 def test_to_h5ad_multimodal_without_modality_raises(tmp_dir):
     """Plain `to_h5ad` on a multimodal SCX file must raise; the
     user should pass `modality=...` or call `to_h5mu`."""

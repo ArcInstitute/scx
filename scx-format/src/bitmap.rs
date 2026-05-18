@@ -1,11 +1,12 @@
-// Detection bitmap shards (Phase 5b of REAL-WORLD-UX-FEATS.md).
+// Detection bitmap shards. See docs/format.md § 12 for the
+// user-facing description.
 //
 // One section per CSR shard. Each section stores a roaring bitmap
 // per gene whose nonzero presence in that shard is recorded. Drives
 // O(roaring-cardinality) detection-count and "cells expressing gene X"
 // queries without scanning the CSR payload.
 //
-// On-disk wire format (mirrors REAL-WORLD-UX-FEATS.md "Wire format proposal"):
+// On-disk wire format:
 //
 //   magic            : [u8; 4]   = b"SCXB"
 //   version          : u16 LE    = 1
@@ -28,7 +29,7 @@ use std::io::{Read, Write};
 
 use crate::error::{validate_allocation, Result, ScxError};
 
-/// Phase 5b: detection-bitmap generation policy. Mirrors the
+/// Detection-bitmap generation policy. Mirrors the
 /// `--bitmap off|auto|always` CLI flag and the `bitmap="..."` pyscx
 /// kwarg. Lives in `scx-format` (next to [`BitmapShard`]) rather than
 /// `scx-convert` so the CPU-only pyscx build — where `scx-convert` is

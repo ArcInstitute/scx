@@ -809,6 +809,21 @@ absolute_floors:
     metric: streaming_peak_rss_mb     # only streaming runs carry this key
     max: 2048.0       # ~10× the design ceiling; trips on accumulator leaks.
 
+  # ─── Streaming SCX → h5ad / h5mu export (Phase 8) ──────────────────
+  # Mirror of the ingestion floor above. Streaming export's contract
+  # is the same: peak RSS bounded by one shard's worth of CSR per
+  # matrix written, regardless of total file size. Same regression
+  # mode (cross-shard accumulator leak in
+  # ``scx_to_h5ad_streaming`` / ``scx_to_h5mu_streaming``) trips
+  # this floor. Wall-clock is intentionally not gated — materialise
+  # naturally wins on datasets that fit in RAM, and a streaming wall
+  # regression doesn't change the bounded-memory contract.
+  - benchmark: export_streaming
+    format: scx_streaming_vs_materialize
+    dataset: census_1m
+    metric: streaming_peak_rss_mb     # only streaming runs carry this key
+    max: 2048.0       # ~10× the design ceiling; mirrors the ingestion floor.
+
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
 # missing and why. Add entries above this block once the blockers below

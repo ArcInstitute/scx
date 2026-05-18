@@ -232,7 +232,7 @@ fn from_anndata(
 /// the CSC sidecar over the just-written file. Peak disk briefly
 /// reaches ~2× the output size during the rebuild.
 ///
-/// Source-layout handling (Phases 1 & 2):
+/// Source-layout handling:
 ///   * CSR-on-disk h5ad: native streaming path.
 ///   * Dense-on-disk h5ad: row-slab streaming with per-shard
 ///     sparsification (zero-drop). Use `dense_zero_epsilon` to
@@ -246,7 +246,7 @@ fn from_anndata(
 ///     the on-disk h5ad has them in a form anndata exposes (matches
 ///     the non-streaming CLI converter).
 ///
-/// Hardening / index kwargs (Phases 1 & 5):
+/// Hardening / index kwargs:
 ///   * `strict_uns`: when `True`, the first unrepresentable `uns`
 ///     entry raises; default `False` emits a `UserWarning` per
 ///     skipped key (`SkippedUnsKey`).
@@ -499,7 +499,7 @@ fn from_h5mu(
     )
 }
 
-/// Convert an SCX file to h5ad (Phase 8).
+/// Convert an SCX file to h5ad.
 ///
 /// Mirrors `pyscx.from_h5ad` in the opposite direction. Streams by
 /// default — peak RSS is bounded by one shard's worth of CSR plus
@@ -559,7 +559,7 @@ fn to_h5ad(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-/// Convert an SCX file to h5mu (Phase 8).
+/// Convert an SCX file to h5mu.
 ///
 /// Mirrors `pyscx.from_h5mu` in the opposite direction. Streams by
 /// default; per-modality `/mod/{name}/X` and any layers are written

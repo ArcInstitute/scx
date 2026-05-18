@@ -51,11 +51,35 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from benchmarks.comprehensive.config import (  # noqa: E402
     ALL_FORMATS,
     DATASETS,
+    MULTIMODAL_FORMATS,
     PRIMARY_FORMATS,
     RAW_RESULTS_DIR,
     FormatVariant,
     n_runs_for_dataset,
 )
+
+# Format keys that consume `.h5mu` (or write the multimodal SCX
+# layout). Single-modality datasets can't read these, and
+# multimodal datasets can't read non-multimodal formats. Mirrors
+# the convention used by `run_parallel.py::_is_multimodal_format`.
+_MULTIMODAL_FORMAT_PREFIXES = ("h5mu_", "zarr_mudata_", "scx_multimodal_")
+
+
+def _is_multimodal_format(format_key: str) -> bool:
+    return any(format_key.startswith(p) for p in _MULTIMODAL_FORMAT_PREFIXES)
+
+
+def filter_formats_for_dataset(
+    cfg, formats: list[FormatVariant]
+) -> list[FormatVariant]:
+    """Pair multimodal datasets with multimodal formats and
+    single-modality datasets with non-multimodal formats. The
+    benchmark module's own gating (return None for unmatched) catches
+    anything that slips through, but pre-filtering keeps the
+    per-format log lines from cluttering the orchestrator output."""
+    if cfg.multimodal:
+        return [f for f in formats if _is_multimodal_format(f.key)]
+    return [f for f in formats if not _is_multimodal_format(f.key)]
 from benchmarks.comprehensive.results import BenchmarkResult, write_result
 from benchmarks.comprehensive.sysinfo import collect_system_info
 
@@ -82,6 +106,7 @@ AVAILABLE_BENCHMARKS = [
     "correctness",         # Correctness validation suite
     "cell_eval_parity_perf",  # cell-eval / arc-bench parity perf
     "conversion_streaming",   # Streaming vs materialising h5ad → SCX (Phase 10)
+    "export_streaming",       # Streaming vs materialising SCX → h5ad / h5mu (Phase 8)
 ]
 
 # Benchmarks appropriate for smoke testing
@@ -96,13 +121,19 @@ SMOKE_DATASETS = ["pbmc3k"]
 def discover_available_datasets() -> list[str]:
     """Return names of datasets that are ready to benchmark.
 
-    Non-synthetic datasets must have their h5ad file present on disk.
-    Synthetic datasets are always considered available — they're generated
-    on demand by the benchmark module that uses them.
+    Non-synthetic single-modality datasets must have their h5ad file
+    on disk; multimodal datasets must have their h5mu file on disk
+    instead. Synthetic datasets are always considered available —
+    they're generated on demand by the benchmark module that uses
+    them.
     """
     available = []
     for name, cfg in DATASETS.items():
-        if cfg.synthetic or cfg.h5ad_path.exists():
+        if cfg.synthetic:
+            available.append(name)
+        elif cfg.multimodal and cfg.h5mu_path.exists():
+            available.append(name)
+        elif not cfg.multimodal and cfg.h5ad_path.exists():
             available.append(name)
     return available
 
@@ -137,11 +168,27 @@ def run_benchmark(
         print(f"  SKIP: Unknown dataset '{dataset_name}'")
         return []
 
-    # Synthetic datasets are materialized on demand by the benchmark module
-    # (see benchmarks/comprehensive/benchmarks/_pert_synth.py) — skip the
-    # existence gate so the benchmark gets a chance to generate the data.
-    if not cfg.synthetic and not cfg.h5ad_path.exists():
-        print(f"  SKIP: {dataset_name} h5ad not found at {cfg.h5ad_path}")
+    # Synthetic datasets are materialized on demand by the benchmark
+    # module (see benchmarks/comprehensive/benchmarks/_pert_synth.py)
+    # — skip the existence gate so the benchmark gets a chance to
+    # generate the data. Multimodal datasets gate on h5mu_path, not
+    # h5ad_path (their source is `.h5mu`).
+    if not cfg.synthetic:
+        if cfg.multimodal:
+            if not cfg.h5mu_path.exists():
+                print(f"  SKIP: {dataset_name} h5mu not found at {cfg.h5mu_path}")
+                return []
+        elif not cfg.h5ad_path.exists():
+            print(f"  SKIP: {dataset_name} h5ad not found at {cfg.h5ad_path}")
+            return []
+
+    # Modality-aware format filter: single-modality datasets can't
+    # read `scx_multimodal_*` / `h5mu_*` / `zarr_mudata_*` formats,
+    # and multimodal datasets can't read non-multimodal formats.
+    formats = filter_formats_for_dataset(cfg, formats)
+    if not formats:
+        modality = "multimodal" if cfg.multimodal else "single-modality"
+        print(f"  SKIP: no {modality}-compatible formats in scope for '{dataset_name}'")
         return []
 
     n_runs = n_runs_for_dataset(dataset_name)
@@ -281,13 +328,17 @@ def main() -> None:
         benchmarks = args.benchmarks or AVAILABLE_BENCHMARKS
         datasets = args.datasets or discover_available_datasets()
 
-    # Resolve formats
+    # Resolve formats. PRIMARY_FORMATS covers single-modality
+    # datasets; MULTIMODAL_FORMATS is always merged in so multimodal
+    # datasets find their format variants. `run_benchmark()` filters
+    # the merged list per-dataset modality (see
+    # `filter_formats_for_dataset`).
     if args.formats:
         formats = get_formats_by_keys(args.formats)
     elif args.include_additional:
         formats = list(ALL_FORMATS)
     else:
-        formats = list(PRIMARY_FORMATS)
+        formats = list(PRIMARY_FORMATS) + list(MULTIMODAL_FORMATS)
 
     # Header
     sysinfo = collect_system_info()
