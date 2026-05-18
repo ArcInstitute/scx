@@ -14,9 +14,13 @@ CscShard (5)           — Column-major (gene-major) sparse shard. Used
                          for column-axis analytical workloads (DE, HVG,
                          per-gene QC). Optional sidecar; written via
                          `scx convert --csc=always` or `scx build-csc`.
-BitmapShard (6)        — Reserved; not produced by the current writer.
-                         Detection-presence bitmap was deferred to a
-                         future release.
+BitmapShard (6)        — Per-shard detection bitmap sidecar (gene →
+                         local-row roaring bitmaps; `SCXB` magic).
+                         Written by `scx convert --bitmap auto|always`
+                         and the pyscx `bitmap="..."` kwarg; consumed
+                         by `PyExperiment.detection_counts` /
+                         `cells_expressing`. See
+                         [docs/format.md § Detection Bitmap](format.md#12-detection-bitmap-optional).
 LayerCsrShard (7)      — Alternative expression layers
 ObsmEmbedding (8)      — Embeddings (obsm)
 ObspCsrShard (9)       — Reserved (legacy); current obsp persistence uses
@@ -269,6 +273,94 @@ For raw count data (integer-valued), `auto` selects Scx1 or Zstd — Pcodec fall
 - Auto-populated on `ScxWriter::finish()` with operation info
 - `scx info` displays full provenance history
 - Read/write via `ScxReader::read_provenance()` / `ScxWriter::write_provenance()`
+- Conversion runs include a `params_json.warnings` summary (per-category
+  counts emitted via [`WarningSink::summary_json`](#conversion-warnings-convertwarning)),
+  along with `stream`, `source_format`, `source_matrix_format`,
+  `indexed_obs`, `indexed_var`, `bitmap`, `memory_budget_mb`,
+  `modalities`, and modality-type overrides where applicable.
+
+## Conversion warnings (`ConvertWarning`)
+
+Conversion paths surface structured warnings via a `WarningSink`
+(`scx-convert/src/warnings.rs`). The CLI prints a per-category summary
+at the end of `scx convert`; `pyscx` aggregates them and emits one
+Python `UserWarning` per category. The full count + sample is also
+recorded under `ProvenanceEntry.params_json.warnings`.
+
+| Variant | Emitted by | Meaning |
+| --- | --- | --- |
+| `InferredEncoding { path, inferred }` | Phase 1 detect / open | h5ad `encoding-type` was missing or ambiguous; layout was inferred from group children or dataset shape. |
+| `SkippedUnsKey { key, reason }` | Phase 1 `read_uns` | `uns` entry was unrepresentable; skipped under default `strict_uns=false`. `strict_uns=true` turns this into an error on the first occurrence. |
+| `DenseSparsified { path, density }` | Phase 1 dense path | Dense `/X` slab was sparsified during streaming. Reports density to help users decide whether dense storage is worth keeping. |
+| `DuplicateCoordinatesMerged { count, policy }` | Phase 2 CSC streaming | CSC input contained duplicate `(row, col)` coordinates; values were summed (scipy `sum_duplicates` semantics). |
+| `ModalityTypeInferred { name, modality_type }` | Phase 3 h5mu | Modality name → `ModalityType` was inferred by name; override via `--modality-types NAME:TYPE` / `modality_types={...}`. |
+| `MissingPresetIndexColumn { column }` | Phase 5a | A preset (`cellxgene` / `perturbseq` / `training`) referenced an obs/var column not present in the source; preset misses warn, conversion continues. |
+| `UnsupportedIndexColumn { column, reason }` | Phase 5a | A user-forced (`--index-obs` / `--index-var`) or preset column has an unsupported dtype; forced columns hard-error, preset columns warn and skip. |
+| `PredicateIndexSkippedMultimodal` | Phase 5a | Predicate indexes are unimodal-only on the read side today; emitted (and indexes skipped) when conversion input is multimodal. |
+| `BitmapSkipped { reason }` | Phase 5b `--bitmap auto` | Auto policy rejected bitmap emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
+| `DroppedObsp { name, reason }` | Phase 6 merge | `obsp` could not be merged (axis semantics don't compose); default-dropped with a warning. |
+| `ThreadsafeHdf5Unavailable` | Phase 8c fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
+
+## Memory budgets
+
+`MemoryBudget::parse(s)` (`scx-convert/src/mem.rs`) is the shared parser
+behind `--memory-budget` (CLI) and the `memory_budget=` kwarg on
+`from_h5ad` / `from_h5mu`. It caps dense row slabs (Phase 1), CSC
+external-transpose buffers (Phase 2), and the parallel streaming
+reader's worker derate (Phase 8c).
+
+Accepted forms:
+
+- bare byte counts (`"1048576"`, `1048576`),
+- binary-prefix shorthand `K` / `M` / `G` / `T` (= `KiB` / `MiB` / …),
+- explicit binary prefixes `KiB` / `MiB` / `GiB` / `TiB`.
+
+Decimal prefixes (`KB`, `MB`, `GB`, `TB`) are **rejected** to avoid
+1000-vs-1024 ambiguity. When the requested budget cannot fit even one
+shard's metadata plus one worker, conversion refuses to start with
+an actionable error rather than OOMing partway through.
+
+## Conversion-time predicate indexes and detection bitmaps
+
+CLI flags `--index-obs`, `--index-var`, `--index-preset`,
+`--index-auto-threshold` (plus the equivalent
+`index_obs=` / `index_var=` / `index_preset=` /
+`index_auto_threshold=` kwargs on `from_anndata` / `from_h5ad` /
+`from_10x` / `from_h5mu`) materialise `ObsPredicateIndex` /
+`VarPredicateIndex` sections at write time so subsequent
+`pyscx.open(...).query()` and `scx pull --filter` calls can push
+predicates down without an obs scan.
+
+Behaviour:
+
+- Force-listed columns (`--index-obs`/`--index-var`) **hard-error** if
+  the column is missing or has an unsupported dtype.
+- Preset columns warn (`MissingPresetIndexColumn` /
+  `UnsupportedIndexColumn`) and are skipped without aborting the
+  conversion.
+- Auto-indexing picks up categorical-like columns with cardinality
+  `≤ index_auto_threshold` (default `1000`).
+- Multimodal inputs emit `PredicateIndexSkippedMultimodal` and skip
+  predicate-index emission entirely — the read path is unimodal-only
+  today.
+
+Index presets:
+
+| Preset | Expanded obs columns |
+| --- | --- |
+| `cellxgene` | `cell_type`, `cell_type_ontology_term_id`, `tissue`, `tissue_ontology_term_id`, `disease`, `assay`, `donor_id`, `development_stage`, `sex`, `suspension_type` |
+| `perturbseq` | `cell_type`, `donor`, `batch`, `condition`, `perturbation`, `guide_id`, `target_gene`, `control`, `split` |
+| `training` | `cell_type`, `donor`, `batch`, `dataset_id`, `split`, `organism`, `tissue` |
+
+`--bitmap off|auto|always` (and the `bitmap=` kwarg) write
+`BitmapShard` (section id 6) sidecars carrying per-shard
+gene → local-row roaring bitmaps. Auto policy requires sparse X,
+`n_vars ≤ 1_000_000`, and an estimated bitmap size ≤ 15 % of the
+encoded CSR; ATAC modalities are always-on under `auto`. Consumed by
+`PyExperiment.detection_counts(axis="var", modality=...)` and
+`PyExperiment.cells_expressing(gene, modality=...)`; the backed reader
+falls back to a CSR scan when sidecars are absent. The wire format is
+specified in [docs/format.md § Detection Bitmap](format.md#12-detection-bitmap-optional).
 
 ## BackedCsrReader (`scx-format/src/backed.rs`)
 
@@ -532,15 +624,17 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ### Module-level functions
 
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged")` — Write AnnData to SCX.
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Write AnnData to SCX.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
   Arrow IPC; higher-precision inputs are downcast on write. `uns_format`
   selects how `adata.uns` is serialized — see [`uns` serialization](#uns-serialization).
   Accepts backed AnnData (`sc.read_h5ad(path, backed='r')`) and auto-routes
   to the streaming converter — see `pyscx.from_h5ad` below for the
-  underlying mechanics.
-- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged")` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+  underlying mechanics. `index_*` / `bitmap` materialise query
+  predicate indexes and detection bitmaps at conversion time — see
+  [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   plus the always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
   entry point for files larger than RAM. `csc="always"` performs a
@@ -548,10 +642,35 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   finished file) — peak disk briefly reaches ~2× the output size during
   the rebuild. `uns_format` is accepted for API parity with
   `from_anndata` but is a no-op here (streaming reads `uns` from the
-  h5ad file directly, not from Python). Rejects CSC-on-disk and dense
-  `X` with `RuntimeError`; `obsp` / `varp` on the input are silently
-  skipped.
-- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None)` — 10x HDF5 to SCX
+  h5ad file directly, not from Python).
+  - Source layout (Phases 1 & 2): CSR streams natively. Dense `/X`
+    streams via row-slab sparsification — set `dense_zero_epsilon` to
+    threshold near-zero values (default `0.0` matches scipy's
+    `csr_matrix(dense)`). CSC-on-disk uses an in-memory transpose
+    when the file fits `memory_budget`, otherwise an external
+    bucketed transpose to `temp_dir` (scipy `sum_duplicates` semantics
+    on duplicate coordinates).
+  - `strict_uns=True`: raise on the first unrepresentable `uns`
+    entry; default `False` emits a `UserWarning` per skipped key
+    (`SkippedUnsKey`). Other structured warnings: `InferredEncoding`
+    (h5ad encoding-type missing/ambiguous), `DenseSparsified`,
+    `DuplicateCoordinatesMerged`. See
+    [Conversion warnings](#conversion-warnings-convertwarning).
+  - `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
+    dense slabs and the CSC external-transpose buffers. Binary
+    prefixes only — `KB/MB/GB/TB` is rejected to avoid ambiguity
+    (see [Memory budgets](#memory-budgets)).
+  - `stream=False` falls back to the materialising path (kept for
+    parity / debugging).
+  - `obsp` / `varp` on the input are silently skipped.
+- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation.
+  - `modalities`: optional list of modality names to keep
+    (case-sensitive). Unknown names raise `ValueError` with the
+    available list.
+  - `modality_types`: optional dict `{name: "rna" | "protein" | "atac"
+    | "spatial" | "methylation" | "custom"}`. Modalities not listed
+    fall back to name inference and emit `ModalityTypeInferred`.
+- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — 10x HDF5 to SCX.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
 - `pyscx.to_h5ad(path, out, stream=True, modality=None)` — Stream SCX → h5ad
@@ -620,6 +739,15 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `query() -> PyQueryPipeline` — Start lazy query pipeline
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`
+- `detection_counts(axis="var", modality=None) -> np.ndarray` (Phase 5b)
+  — Per-gene non-zero counts. Reads `BitmapShard` sidecars when
+  present (one roaring decode per shard); falls back to a CSR scan
+  otherwise. `axis="obs"` returns per-cell gene counts. For
+  multimodal v2 files, pass `modality="rna"` to scope the result.
+- `cells_expressing(gene, modality=None) -> np.ndarray` (Phase 5b) —
+  Indices of cells with non-zero expression for `gene` (name or
+  integer). Bitmap fast path when sidecars exist; CSR fallback
+  otherwise.
 - Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `layer_names`
 
 ### `uns` serialization
@@ -675,9 +803,10 @@ any JSON tool. Example for a `float32` array:
 
 ### PyCloudExperiment
 
-Returned by `pyscx.open_cloud()`. Metadata-only handle for cloud-hosted SCX files.
-Does **not** support `to_anndata()`, `query()`, or `validate()` — use `pyscx.pull()` to
-download the file first for full data access.
+Returned by `pyscx.open_cloud()`. Cloud-hosted SCX handle. Supports
+metadata accessors plus the cloud-native query path landed in Phase 7;
+full `to_anndata()` and `validate()` still require `pyscx.pull()` to
+materialise the file locally.
 
 - `n_obs` `→ int` — Number of observations (cells)
 - `n_vars` `→ int` — Number of variables (genes)
@@ -685,6 +814,27 @@ download the file first for full data access.
 - `shard_count` `→ int` — Number of CSR shards in the file
 - `format_version` `→ int` — SCX format version
 - `codec_id` `→ int` — Default codec ID
+- `query() → PyQueryPipeline` — Start a lazy cloud query. Backed by
+  the same `QueryPipeline` as `pyscx.open(...).query()`, wired over a
+  `CloudReader`-backed `SectionReader`. Predicate pushdown uses the
+  catalog (and predicate indexes when present); only matching shards
+  are range-read from object storage. Example:
+
+  ```python
+  adata = (
+      pyscx.open_cloud("gs://bucket/atlas.scxd/")
+            .query()
+            .filter_obs("cell_type == 'T cell'")
+            .select_genes(hvg)
+            .collect()
+            .to_anndata()
+  )
+  ```
+
+  Deferred (Phase 7 follow-on): `CloudQueryOptions` (parallelism,
+  max-inflight bytes, cache-dir, retry policy), the
+  `pyscx.read_cloud(...)` flat helper, and a batched async section
+  fetcher (current cloud reads block per shard from the rayon worker).
 
 ### pyscx.accel — Rust-Native Accelerators
 
@@ -1024,9 +1174,38 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
-- `scx info <file> [--json] [--history]`
-- `scx validate <file> [--verbose]`
+- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
+
+  Wild-h5ad hardening (Phase 1): `--memory-budget 4G` caps dense
+  row slabs and CSC external-transpose buffers (binary prefixes only;
+  see [Memory budgets](#memory-budgets)). `--strict-uns` aborts on the
+  first unrepresentable `uns` entry rather than warning. `--dense-zero-epsilon F`
+  thresholds near-zero values during dense→CSR sparsification (default
+  `0.0`). `--temp-dir DIR` selects the scratch directory for CSC
+  external-transpose runs.
+
+  h5mu (Phase 3): `--modalities rna,adt` restricts to a subset of
+  modalities; `--modality-types adt:Protein,peaks:ATAC` overrides
+  inferred types.
+
+  Query-readiness (Phase 5): `--index-obs cell_type,donor` and
+  `--index-var gene_name` force predicate indexes; `--index-preset
+  cellxgene|perturbseq|training` expands curated column lists;
+  `--index-auto-threshold N` controls automatic categorical indexing.
+  `--bitmap auto|always` writes per-shard detection bitmap sidecars
+  consumed by `detection_counts` / `cells_expressing`. See
+  [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
+
+- `scx info <file> [--json] [--history]` — Pretty-prints file
+  metadata. Multimodal v2 files show a per-modality table including
+  a `has_csc` column (`✓` / `—`) and the underlying boolean lands in
+  the `--json` payload under each modality's entry. The file-level
+  header `has_csc` flag means "at least one CSC sidecar exists" for
+  v2 multimodal files; the per-modality column resolves which
+  modalities own one (relevant after a partial-CSC `scx append`).
+- `scx validate <file> [--verbose]` — Walks the catalog and verifies
+  BLAKE3 checksums section-by-section. Partial per-modality CSC
+  sidecars are accepted naturally.
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`
 
 ### File operations
@@ -1035,7 +1214,7 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 - `scx compact <input> --output <path> [--force]`
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path>`
-- `scx query <file> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]`
+- `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path (Phase 7) with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query-phase-7).
 - `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version

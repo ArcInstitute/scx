@@ -312,6 +312,32 @@ normalize(target_sum=1e4)          ← fused with log1p when possible
 - **Parallel collection:** Qualifying shards are decoded and filtered in parallel
   via rayon (`scx-engine/src/collect.rs`).
 
+### `SectionReader` — local + cloud unification (Phase 7)
+
+`QueryPipeline` is generic over a `SectionReader` trait that abstracts
+how catalog sections are fetched. Two implementations ship today:
+
+| Reader | Section fetch | Construction |
+| --- | --- | --- |
+| `ScxReader` (`scx-format`) | mmap / `pread` over a local `.scx` file | `QueryPipeline::open(path)` |
+| `CloudSectionReader` (`scx-cloud`) | `object_store` range reads over `gs://` / `s3://` / `az://` / exploded `.scxd/` directories | `QueryPipeline::from_reader(reader)` |
+
+`PyExperiment.query()` opens a local mmap-backed pipeline;
+`PyCloudExperiment.query()` opens a cloud-backed pipeline (see
+[docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query-phase-7)).
+Both share the same predicate planning, shard pruning, gene
+projection, and decoding code paths — only the bytes-by-section
+implementation differs.
+
+The CLI surface mirrors this: `scx query <input> "<predicate>"`
+auto-detects the input as a local file, an exploded `.scxd/`
+directory, or a cloud URL and constructs the matching `SectionReader`.
+
+Cloud reads on the engine path currently issue per-shard
+`block_on(read)` calls from rayon workers. A batched async
+section-fetch stage is deferred to a follow-on (tracked alongside
+`CloudQueryOptions`).
+
 ---
 
 ## ML Training Loader (scx-loader)

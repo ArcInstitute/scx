@@ -186,6 +186,7 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 | **Memory** (3.7) | `memory.py` | Peak RSS during common operations |
 | **Streaming vs in-memory** (3.7b) | `read_streaming_vs_inmemory.py` | Backed row-chunk iteration vs eager-materialise-then-iterate. Wall time and peak RSS for both modes; gated on `"backed_mode"` capability — SCX-only today |
 | **Multimodal streaming vs in-memory** (3.7c) | `multimodal_read_streaming_vs_inmemory.py` | Phase 6b — `to_mudata(backed=True)` per-modality chunked iteration vs eager `to_mudata()`. Gated on `dataset.multimodal == True` AND multimodal-SCX format keys |
+| **Streaming export** (3.7d) | `export_streaming.py` | Phase 8 — paired `pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs `stream=False`. Wall time and peak RSS for both paths; gates on the streaming row's `streaming_peak_rss_mb` floor at `census_1m`. Multimodal datasets auto-dispatch to `to_h5mu`. SCX-only |
 | **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval / arc-bench reference, on synthetic perturbation datasets at 100K–1M cells |
 
 ### Measurement Protocol

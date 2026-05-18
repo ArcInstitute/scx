@@ -232,15 +232,49 @@ fn from_anndata(
 /// the CSC sidecar over the just-written file. Peak disk briefly
 /// reaches ~2× the output size during the rebuild.
 ///
-/// Limitations:
-///   * CSC-on-disk h5ad and dense X are rejected with a clear error.
+/// Source-layout handling (Phases 1 & 2):
+///   * CSR-on-disk h5ad: native streaming path.
+///   * Dense-on-disk h5ad: row-slab streaming with per-shard
+///     sparsification (zero-drop). Use `dense_zero_epsilon` to
+///     threshold near-zero values; default `0.0` matches
+///     scipy's `csr_matrix(dense)` behaviour.
+///   * CSC-on-disk h5ad: in-memory transpose when the file fits the
+///     `memory_budget`; otherwise an external bucketed transpose to
+///     `temp_dir` (`scipy.sum_duplicates` semantics on duplicate
+///     coordinates).
 ///   * `varm` is preserved; `obsp` / `varp` come through only when
 ///     the on-disk h5ad has them in a form anndata exposes (matches
 ///     the non-streaming CLI converter).
 ///
+/// Hardening / index kwargs (Phases 1 & 5):
+///   * `strict_uns`: when `True`, the first unrepresentable `uns`
+///     entry raises; default `False` emits a `UserWarning` per
+///     skipped key (`SkippedUnsKey`).
+///   * `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
+///     dense slabs and the CSC external-transpose buffers. Binary
+///     prefixes only (`K/M/G/T`, `KiB/MiB/GiB/TiB`); decimal
+///     `KB/MB/GB/TB` is rejected to avoid ambiguity.
+///   * `temp_dir`: directory for CSC external transpose runs.
+///     Cleaned on success and on drop; defaults to the system temp.
+///   * `index_obs` / `index_var` / `index_preset`
+///     (`cellxgene` | `perturbseq` | `training`) /
+///     `index_auto_threshold`: materialise predicate indexes at
+///     conversion time so `pyscx.open(...).query()` and
+///     `scx pull --filter` can pushdown. Forced missing/unsupported
+///     columns hard-error; preset misses emit
+///     `MissingPresetIndexColumn`. Skipped for multimodal inputs.
+///   * `bitmap`: `"off"` | `"auto"` | `"always"`. Writes per-shard
+///     gene→local-row roaring bitmap sidecars (`SCXB`). `auto`
+///     opts in for sparse X with `n_vars <= 1_000_000` and bitmap
+///     size <= 15% of encoded CSR; ATAC modalities are eager under
+///     `auto`.
+///
 /// Example:
 ///     pyscx.from_h5ad("big.h5ad", "big.scx")
 ///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
+///     pyscx.from_h5ad("big.h5ad", "big.scx",
+///                     memory_budget="4G", temp_dir="/scratch",
+///                     index_preset="cellxgene", bitmap="auto")
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (

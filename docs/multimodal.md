@@ -136,11 +136,14 @@ too — the result is a one-modality `MuData` rather than an error, so the
 same code paths work uniformly across file layouts.
 
 Filter kwargs (`var_names`, `obs_filter`, `layers`) are **not** supported
-together with `modality=...` in this PR. Use
-`scx subset --modality NAME --filter '<expr>'` to materialise a filtered
-single-modality file first, then `to_anndata(backed=True)` on the
-result. Cloud-backed `open_cloud(...).to_mudata(backed=True)` depends on
-the Phase 7 `SectionReader` abstraction and is not yet wired.
+together with `modality=...` in this PR — the modality-scoped backed
+path doesn't share a `QueryPipeline` with the unimodal predicate-pushdown
+machinery yet. Use `scx subset --modality NAME --filter '<expr>'` (now
+supported, see § 5) to materialise a filtered single-modality file
+first, then `to_anndata(backed=True)` on the result.
+Cloud-backed `open_cloud(...).to_mudata(backed=True)` is not yet wired
+even though the `SectionReader` abstraction has landed (Phase 7) —
+local cloud query goes through `open_cloud(...).query()` for now.
 
 ### 3.3 Training — `pyscx.MultimodalTrainingDataset`
 
@@ -232,28 +235,40 @@ sampleMap directly — pre-align.
 # Conversion (Phase 8: SCX → h5ad / h5mu also streams by default;
 # pass `--stream=false` for the legacy materialising path)
 scx convert --from h5mu citeseq.h5mu --to scx citeseq.scx
+scx convert --from h5mu citeseq.h5mu --to scx citeseq.scx \
+    --modalities rna,adt --modality-types adt:Protein   # Phase 3 streaming kwargs
 scx convert --from scx citeseq.scx --to h5mu out.h5mu
 scx convert --from scx citeseq.scx --to h5ad rna.h5ad --modality rna
 
 # Inspection
-scx info citeseq.scx        # per-modality table block
-scx validate citeseq.scx    # ModalityTable checksum + cross-check
+scx info citeseq.scx        # per-modality table block (includes has_csc column)
+scx validate citeseq.scx    # ModalityTable checksum + cross-check;
+                            # accepts partial per-modality CSC sidecars
 
 # Mutating ops (per-modality routing)
-scx append citeseq.scx --input new_rna_cells.scx --modality rna
+scx append citeseq.scx --input new_rna_cells.scx --modality rna   # preserves ADT's CSC
 scx subset citeseq.scx --modality rna --output rna_only.scx
+scx subset citeseq.scx --modality rna --filter "cell_type == 'T cell'" \
+    --genes hvg.txt --output rna_tcells.scx                       # Phase 6 composition
+scx merge cite1.scx cite2.scx --output cite_merged.scx            # Phase 6: multimodal merge
+scx compact cite_merged.scx --output cite_compacted.scx           # Phase 6: multimodal compact
 ```
 
 Python equivalent for the export direction:
 
 ```python
-pyscx.to_h5mu("citeseq.scx", "out.h5mu")                       # streams per-modality X + layers
-pyscx.to_h5ad("citeseq.scx", "rna.h5ad", modality="rna")       # single-modality extract
+pyscx.from_h5mu("citeseq.h5mu", "citeseq.scx",          # Phase 3 path-based entry
+                modalities=["rna", "adt"])
+pyscx.to_h5mu("citeseq.scx", "out.h5mu")                # streams per-modality X + layers
+pyscx.to_h5ad("citeseq.scx", "rna.h5ad", modality="rna")  # single-modality extract
 ```
 
-Multimodal `scx merge` and `scx compact` are explicitly rejected with a
-clear error directing to subset-then-op (extract single modalities,
-operate, then merge back). This is a Phase F+ follow-on.
+Multimodal `scx merge` and `scx compact` now dispatch to
+`scx-ops::merge_multimodal` / `compact_multimodal`: the keep mask /
+concatenation is applied across every modality's CSR shards and
+layers, the modality table and per-modality var / obsm / uns are
+preserved, and per-modality CSC sidecars are dropped (rebuild via
+`--rebuild-csc`).
 
 ---
 
@@ -261,36 +276,44 @@ operate, then merge back). This is a Phase F+ follow-on.
 
 ### Supported multimodal operations
 
-| Operation | Status | Workaround |
+| Operation | Status | Notes |
 |---|---|---|
 | `pyscx.from_mudata` / `PyExperiment.to_mudata` | Supported | — |
-| `to_mudata(backed=True)` | Supported (Phase 6b) | — |
+| `pyscx.from_h5mu(path, out, ...)` (path-based, streaming) | Supported (Phase 3) | `modalities=` / `modality_types=` kwargs |
+| `to_mudata(backed=True)` | Supported (Phase 6b) | Local files only; cloud variant pending |
 | `to_anndata(modality=…, backed=True)` | Supported (Phase 6b) | — |
-| Modality-scoped lazy transforms | Supported (Phase 6b) | — |
-| `scx convert --from/--to h5mu` | Supported | — |
+| Modality-scoped lazy transforms | Supported (Phase 6b) | Per-modality `pp.normalize_total` / `pp.log1p` |
+| `scx convert --from/--to h5mu` | Supported | Streaming default; `--modalities`, `--modality-types` |
 | `pyscx.MultimodalTrainingDataset` | Supported | — |
 | `scx subset --modality NAME` | Supported | — |
-| `scx append --modality NAME` | Supported (drops CSC sidecar) | `--rebuild-csc` |
-| `scx merge` on multimodal inputs | Rejected with friendly error | `scx subset --modality NAME` per modality, then merge per-modality, re-compose |
-| `scx compact` on multimodal inputs | Rejected with friendly error | Same workaround |
-| Per-modality CSC sidecar on `scx append` | Drops file-wide sidecar | `scx build-csc` after append |
+| `scx subset --modality NAME --filter … --genes …` | Supported (Phase 6) | Composes filter + projection in one pass |
+| `scx append --modality NAME` | Supported (Phase 6) | Per-modality CSC invalidation; other modalities' CSC preserved |
+| `scx merge` on multimodal inputs | Supported (Phase 6) | Dispatches to `merge_multimodal`; per-modality CSC dropped — `--rebuild-csc` to re-emit |
+| `scx compact` on multimodal inputs | Supported (Phase 6) | Dispatches to `compact_multimodal`; keep mask applied across every modality |
 | `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | `scx subset --modality NAME --filter` |
-| `open_cloud(...).to_mudata(backed=True)` | Not supported | Depends on Phase 7 `SectionReader` |
+| `open_cloud(...).to_mudata(backed=True)` | Not supported | Cloud `SectionReader` is wired for unimodal `.query()`; multimodal backed export is a follow-on |
 
 ### Detail
 
-- **Per-modality CSC sidecars on append**: `scx append --modality rna`
-  drops the file-wide CSC sidecar (matching the existing single-
-  modality behaviour). Per-modality CSC preservation (leaving ADT's
-  CSC intact while appending into RNA) is a Phase F+ follow-on. Pass
-  `--rebuild-csc` to re-emit the sidecar.
-- **Multimodal merge / compact**: not yet implemented; the operations
-  reject multimodal inputs with `OpsError::MultimodalUnsupported`
-  (surfaces as `RuntimeError` in Python). Use `scx subset --modality
-  NAME` to extract single modalities and operate on those.
-- **`subset --modality NAME` + `--filter` / `--genes`**: not yet
-  combined; extract first, then filter. The QueryPipeline backing
-  `subset` is single-modality.
+- **Per-modality CSC sidecars on append (Phase 6)**: `scx append
+  --modality rna` now clears `HAS_CSC` only on the target modality;
+  ADT's CSC sidecar stays intact. The file-level `header.has_csc()`
+  flag means "at least one modality still owns a CSC sidecar" for v2
+  files. `scx info` shows the per-modality state in a `has_csc`
+  column. Pass `--rebuild-csc` to re-emit the dropped sidecar (today
+  this re-runs against the full file; per-affected-modality
+  `--rebuild-csc all` is a follow-on).
+- **Multimodal merge / compact (Phase 6)**: `merge` walks every
+  modality, copies/re-encodes CSR shards in input order with
+  `row_start` adjusted for the cumulative global obs offset, and
+  preserves per-modality var/obsm/uns from the first input. `compact`
+  applies the deletion-vector keep mask across every modality's CSR
+  shards and per-modality layers. Both drop CSC sidecars by default;
+  `--rebuild-csc` regenerates them.
+- **`subset --modality NAME` + `--filter` / `--genes` (Phase 6)**:
+  `extract_modality_with_filter` reads the modality CSR, applies the
+  obs predicate against the global obs, projects to the chosen genes,
+  and writes a single-modality v2 SCX in one pass.
 - **MAE sampleMap with non-aligned cells**: `from_mae` raises rather
   than NA-padding. Users should `intersectColumns()` upfront. Future
   work could lift this by emitting NA values into the mismatched cells

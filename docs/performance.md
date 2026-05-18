@@ -186,6 +186,17 @@ cumulatively. Pass `--stream=false` / `stream=False` to opt into
 the legacy materialising path (`scx_to_h5ad` /
 `scx_to_h5mu`).
 
+For regression coverage, see
+`benchmarks/comprehensive/benchmarks/export_streaming.py` (paired
+`pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs
+`stream=False`, run via
+`benchmarks/comprehensive/scripts/run_slurm_export_streaming.sh`).
+The streaming row's `streaming_peak_rss_mb` is gated on `census_1m`
+in `benchmarks/comprehensive/thresholds.yaml` at the same `2048 MB`
+ceiling as the ingestion floor; a cross-shard accumulator leak in
+`scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor
+without needing a wall-clock signal.
+
 ## Column Projection (2000 HVGs)
 
 | Dataset | SCX | h5ad (none) | Zarr (lz4) | TileDB-SOMA | SLAF |
