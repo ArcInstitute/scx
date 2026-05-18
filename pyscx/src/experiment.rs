@@ -239,10 +239,54 @@ impl PyExperiment {
         self.reader.header().codec_id
     }
 
+    /// File-header index dtype (`0=u16`, `1=u32`). Used for testing the
+    /// SCX → SCX writer's projection-aware index-dtype selection.
+    #[getter]
+    fn index_dtype(&self) -> u8 {
+        self.reader.header().index_dtype
+    }
+
     /// List of layer names in the file.
     #[getter]
     fn layer_names(&self) -> Vec<String> {
         self.reader.layer_names()
+    }
+
+    /// `True` when the file has a CSC sidecar (gene-major shards).
+    #[getter]
+    fn has_csc(&self) -> bool {
+        self.reader.header().has_csc()
+    }
+
+    /// Read the provenance chain as a list of dicts:
+    /// `[{"timestamp": int, "action": str, "tool": str,
+    ///   "params_json": str, "input_checksums": list[bytes]}]`.
+    ///
+    /// `params_json` is the raw JSON string written by the producer.
+    /// Use `json.loads(entry["params_json"])` to decode. Returns an
+    /// empty list when the file has no `provenance` section.
+    fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::{PyDict, PyList};
+        let list = PyList::empty(py);
+        let prov = match self.reader.read_provenance() {
+            Ok(p) => p,
+            Err(scx_format::ScxError::SectionNotFound(_)) => return Ok(list),
+            Err(e) => return Err(to_pyerr(e)),
+        };
+        for entry in prov.operations {
+            let d = PyDict::new(py);
+            d.set_item("timestamp", entry.timestamp)?;
+            d.set_item("action", entry.action)?;
+            d.set_item("tool", entry.tool)?;
+            d.set_item("params_json", entry.params_json)?;
+            let checksums = PyList::empty(py);
+            for c in &entry.input_checksums {
+                checksums.append(pyo3::types::PyBytes::new(py, c))?;
+            }
+            d.set_item("input_checksums", checksums)?;
+            list.append(d)?;
+        }
+        Ok(list)
     }
 
     /// Create a new query pipeline for this file.

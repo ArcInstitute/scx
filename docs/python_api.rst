@@ -22,10 +22,14 @@ I/O & file lifecycle
    open
    validate
    from_anndata
+   from_h5ad
    from_10x
    from_mtx
    from_mudata
+   from_h5mu
    to_mtx
+   to_h5ad
+   to_h5mu
 
 Mutating operations
 -------------------
@@ -62,6 +66,7 @@ Cloud operations (requires ``--features cloud``)
    explode
    pack
    open_cloud
+   PyCloudExperiment
 
 Datasets & readers
 ------------------
@@ -73,7 +78,10 @@ Datasets & readers
    PyExperiment
    ScxBackedSparseDataset
    ScxBackedLayerDataset
+   ScxBackedMuDataset
+   ScxBackedMuModality
    ScxLazyTransformedDataset
+   ScxComparisonResult
 
 ML training datasets
 --------------------
@@ -150,6 +158,19 @@ Preprocessing
    filter_genes
    subset_obs
    calculate_qc_metrics
+
+Column aggregates
+~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   col_sums
+   col_nnz
+   col_min
+   col_max
+   col_var
 
 Differential expression & pseudobulk
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

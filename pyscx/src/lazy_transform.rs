@@ -6,11 +6,12 @@
 //
 // Peak memory = O(shard_size) — one decoded shard at a time, never the full matrix.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PySlice, PyTuple};
+use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 
 use scx_format::{BackedCscReader, BackedCsrReader};
 use scx_sparse::{ScxCsc, ScxCsr};
@@ -86,6 +87,12 @@ pub struct ScxLazyTransformedDataset {
     /// Whether the data is known to be non-negative after transforms.
     /// NormalizeTotal and Log1p preserve non-negativity.
     pub(crate) non_negative: bool,
+    /// On-disk source SCX file path, propagated from the originating
+    /// `ScxBackedSparseDataset` through every transform-chain
+    /// extension. Read by the Phase 8b SCX → SCX writer for
+    /// catalog introspection (the lazy path never does byte
+    /// passthrough — transforms always force a re-encode).
+    pub(crate) source_path: Option<PathBuf>,
 }
 
 impl ScxLazyTransformedDataset {
@@ -106,7 +113,31 @@ impl ScxLazyTransformedDataset {
             kept_to_global,
             col_projection,
             non_negative,
+            source_path: None,
         }
+    }
+
+    /// Builder-style setter for the on-disk source path. Used when
+    /// the lazy dataset is built from a backed source with a known
+    /// path so the Phase 8b SCX → SCX writer can recover it.
+    pub fn with_source_path(mut self, path: Option<PathBuf>) -> Self {
+        self.source_path = path;
+        self
+    }
+
+    /// Returns the on-disk source path that this wrapper was built
+    /// from, if known. `None` when the originating
+    /// `ScxBackedSparseDataset` had no source path.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    /// Returns the ordered list of transforms stacked on this
+    /// dataset. Read by the Phase 8b SCX → SCX writer for
+    /// provenance JSON; full per-row factor / row-sum vectors are
+    /// summarised by length in the provenance entry.
+    pub fn transforms(&self) -> &[Transform] {
+        &self.transforms
     }
 
     /// Builder method: attach a CSC sidecar reader. Mirrors
@@ -647,6 +678,39 @@ impl ScxLazyTransformedDataset {
         )
     }
 
+    /// Returns the stacked transforms as a JSON-serialisable Python
+    /// list of `{"name": str, "params": dict}` entries.
+    ///
+    /// Per-row factor / row-sum vectors are summarised by length
+    /// (`{"factors_len": n}` / `{"row_sums_len": n}`) so provenance
+    /// payloads stay small.
+    fn transforms_repr<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for t in &self.transforms {
+            let entry = PyDict::new(py);
+            let params = PyDict::new(py);
+            let name = match t {
+                Transform::NormalizeTotal {
+                    row_sums,
+                    target_sum,
+                } => {
+                    params.set_item("row_sums_len", row_sums.len())?;
+                    params.set_item("target_sum", *target_sum)?;
+                    "normalize_total"
+                }
+                Transform::Log1p => "log1p",
+                Transform::RowScale { factors } => {
+                    params.set_item("factors_len", factors.len())?;
+                    "row_scale"
+                }
+            };
+            entry.set_item("name", name)?;
+            entry.set_item("params", params)?;
+            list.append(entry)?;
+        }
+        Ok(list)
+    }
+
     /// Load a slice from disk, apply transforms, return scipy CSR.
     fn __getitem__<'py>(
         &self,
@@ -807,7 +871,8 @@ impl ScxLazyTransformedDataset {
                 new_transforms,
                 self.non_negative,
             )
-            .with_csc_reader(self.backed_csc.clone());
+            .with_csc_reader(self.backed_csc.clone())
+            .with_source_path(self.source_path.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -848,7 +913,8 @@ impl ScxLazyTransformedDataset {
                 new_transforms,
                 self.non_negative,
             )
-            .with_csc_reader(self.backed_csc.clone());
+            .with_csc_reader(self.backed_csc.clone())
+            .with_source_path(self.source_path.clone());
             return Ok(Bound::new(py, lazy)?.into_any());
         }
 
@@ -1379,7 +1445,8 @@ impl ScxLazyTransformedDataset {
                     self.transforms.clone(),
                     self.non_negative,
                 )
-                .with_csc_reader(self.backed_csc.clone());
+                .with_csc_reader(self.backed_csc.clone())
+                .with_source_path(self.source_path.clone());
                 return Ok(new_ds.into_pyobject(py)?.into_any().unbind().into_bound(py));
             }
         }

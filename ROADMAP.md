@@ -71,7 +71,7 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
 ### 1.5 pyscx (AnnData bridge)
 - [x] `scx.open("experiment.scx")` → lazy handle
 - [x] `exp.to_anndata()` → AnnData (zero-copy CSR, Arrow→pandas obs/var)
-- [x] `scx.from_anndata(adata, "output.scx")`
+- [x] `scx.from_anndata(adata, "output.scx")` (also accepts a backed AnnData over an SCX file or a `ScxLazyTransformedDataset`; streams shard-by-shard with byte-passthrough when source and target shard layouts agree)
 - [x] `scx.from_10x("matrix.h5", "output.scx")`
 - [x] PyO3 bindings with maturin build
 - [x] Layers, obsm, obsp, uns round-trip through AnnData
