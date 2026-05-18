@@ -7,6 +7,10 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
+# `mudata` is an optional dependency. CI's CPU-only Python lane does not
+# install it; skip the entire module rather than error on collect.
+pytest.importorskip("mudata")
+
 
 def _dense(x):
     if hasattr(x, "toarray"):

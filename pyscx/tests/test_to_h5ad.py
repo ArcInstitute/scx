@@ -176,8 +176,8 @@ def test_to_h5ad_preserves_boolean_obs_column(tmp_dir):
 def test_to_h5ad_multimodal_without_modality_raises(tmp_dir):
     """Plain `to_h5ad` on a multimodal SCX file must raise; the
     user should pass `modality=...` or call `to_h5mu`."""
+    mudata = pytest.importorskip("mudata")
     import anndata
-    import mudata
     import pandas as pd
     import pyscx
     import scipy.sparse as sp
@@ -204,8 +204,8 @@ def test_to_h5ad_multimodal_without_modality_raises(tmp_dir):
 
 def test_to_h5ad_modality_extract(tmp_dir):
     """Multimodal SCX → single-modality h5ad via `modality='rna'`."""
+    mudata = pytest.importorskip("mudata")
     import anndata
-    import mudata
     import pandas as pd
     import pyscx
     import scipy.sparse as sp
