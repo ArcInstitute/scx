@@ -942,22 +942,18 @@ fn dispatch_convert(
                 // message; if single-modality, fall through to the
                 // h5ad writer (streaming by default).
                 let reader = scx_format::reader::ScxReader::open(input)?;
-                if reader.is_multimodal() {
-                    drop(reader);
+                let is_multimodal = reader.is_multimodal();
+                let n_modalities = reader.n_modalities();
+                drop(reader);
+                if is_multimodal {
                     return Err(format!(
                         "SCX file '{}' has {} modalities; use --to h5mu, or use \
                          --modality NAME to extract a single modality as h5ad",
                         input.display(),
-                        {
-                            let r = scx_format::reader::ScxReader::open(input)?;
-                            let n = r.n_modalities();
-                            drop(r);
-                            n
-                        }
+                        n_modalities,
                     )
                     .into());
                 }
-                drop(reader);
                 if opts.stream {
                     convert::scx_to_h5ad_streaming(input, output, &opts, &mut sink)
                 } else {

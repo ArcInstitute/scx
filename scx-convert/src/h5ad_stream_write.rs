@@ -24,7 +24,7 @@ use std::path::Path;
 
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
-use scx_format::catalog::FullCatalogEntry;
+use scx_format::catalog::{FullCatalogEntry, ShardStats};
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 
@@ -148,14 +148,16 @@ pub(super) fn stream_csr_to_group_at(
     let n_obs_kept = match keep_mask_opt {
         Some(mask) => {
             // Mask length must cover the union of shard row ranges. We
-            // index by global row, so any out-of-range mask is a bug in
-            // the caller.
-            assert!(
-                mask.len() >= n_obs_total as usize,
-                "keep_mask length {} < n_obs_total {}",
-                mask.len(),
-                n_obs_total
-            );
+            // index by global row, so any short mask is a catalog /
+            // header drift — surface as a real error rather than a
+            // panic (callers may be in Python).
+            if mask.len() < n_obs_total as usize {
+                return Err(ConvertError::Other(format!(
+                    "keep_mask length {} < n_obs_total {} (catalog/header drift)",
+                    mask.len(),
+                    n_obs_total
+                )));
+            }
             count_kept_rows_in_shards(&shards, mask) as u64
         }
         None => n_obs_total,
@@ -177,21 +179,16 @@ pub(super) fn stream_csr_to_group_at(
     let mut row_offset_kept: u64 = 0;
 
     for (shard_idx, entry) in shards.iter().enumerate() {
-        let stats = entry.stats.as_ref().ok_or_else(|| {
-            ConvertError::Other(format!(
-                "shard '{}' missing stats (catalog v1?)",
-                entry.name
-            ))
-        })?;
+        let stats = require_stats(entry)?;
         let shard_row_start = stats.row_start as usize;
 
         let (indptr_local_i64, indices_local_i32, data_local_f32) =
             read_shard_payload(reader, modality_id, section_type, layer_name, shard_idx)?;
 
         let (kept_indptr_tail, kept_indices_i32, kept_data_f32) = filter_shard(
-            &indptr_local_i64,
-            &indices_local_i32,
-            &data_local_f32,
+            indptr_local_i64,
+            indices_local_i32,
+            data_local_f32,
             keep_mask_opt,
             shard_row_start,
             nnz_offset,
@@ -222,7 +219,6 @@ pub(super) fn stream_csr_to_group_at(
     debug_assert_eq!(nnz_offset, total_nnz);
     debug_assert_eq!(row_offset_kept, n_obs_kept);
 
-    let _ = n_obs_total; // suppress unused warning when both branches return identical value
     Ok(())
 }
 
@@ -327,6 +323,45 @@ fn read_shard_payload(
     Ok((ip, ix, dv))
 }
 
+/// Indptr-only counterpart of [`read_shard_payload`]. Decodes just the
+/// row-pointer array, skipping indices/data — used by precompute paths
+/// that only need per-row nnz counts.
+fn read_shard_indptr(
+    reader: &ScxReader,
+    modality_id: u8,
+    section_type: SectionType,
+    layer_name: Option<&str>,
+    shard_idx: usize,
+) -> Result<Vec<i64>, ConvertError> {
+    let ip = match (section_type, layer_name) {
+        (SectionType::CsrShard, _) => reader.read_csr_shard_indptr_for(modality_id, shard_idx)?,
+        (SectionType::LayerCsrShard, Some(name)) if modality_id == 0 => {
+            reader.read_layer_csr_shard_indptr(name, shard_idx)?
+        }
+        (SectionType::LayerCsrShard, Some(name)) => {
+            reader.read_layer_csr_shard_indptr_for(modality_id, name, shard_idx)?
+        }
+        _ => {
+            return Err(ConvertError::Other(format!(
+                "unsupported shard read: section_type={section_type:?}, layer_name={layer_name:?}"
+            )));
+        }
+    };
+    Ok(ip)
+}
+
+/// `entry.stats` must be present on every shard in v2 catalogs (the
+/// writer auto-upgrades v1 → v2 on serialise). Missing stats here
+/// means the file is corrupt or truncated.
+fn require_stats(entry: &FullCatalogEntry) -> Result<&ShardStats, ConvertError> {
+    entry.stats.as_ref().ok_or_else(|| {
+        ConvertError::Other(format!(
+            "shard '{}' has no catalog stats — file may be corrupt or truncated",
+            entry.name
+        ))
+    })
+}
+
 fn total_rows_in_shards(shards: &[&FullCatalogEntry]) -> u64 {
     shards
         .iter()
@@ -360,18 +395,15 @@ fn precompute_total_nnz(
             // Fast path: sum stats.nnz across shards (zero decode).
             let mut nnz = 0u64;
             for entry in shards {
-                let stats = entry.stats.as_ref().ok_or_else(|| {
-                    ConvertError::Other(format!(
-                        "shard '{}' missing stats (catalog v1?)",
-                        entry.name
-                    ))
-                })?;
+                let stats = require_stats(entry)?;
                 nnz = nnz.saturating_add(stats.nnz);
             }
             Ok(nnz)
         }
         Some(mask) => {
-            // DV active: decode each shard once to count kept nnz.
+            // DV active: decode each shard's indptr once to count
+            // kept nnz. Indices/data stay encoded — they're not
+            // touched until the main write loop's full-shard read.
             let section_type = if layer_name.is_some() {
                 SectionType::LayerCsrShard
             } else {
@@ -379,15 +411,10 @@ fn precompute_total_nnz(
             };
             let mut nnz = 0u64;
             for (shard_idx, entry) in shards.iter().enumerate() {
-                let stats = entry.stats.as_ref().ok_or_else(|| {
-                    ConvertError::Other(format!(
-                        "shard '{}' missing stats (catalog v1?)",
-                        entry.name
-                    ))
-                })?;
+                let stats = require_stats(entry)?;
                 let row_start = stats.row_start as usize;
-                let (indptr_local, _, _) =
-                    read_shard_payload(reader, modality_id, section_type, layer_name, shard_idx)?;
+                let indptr_local =
+                    read_shard_indptr(reader, modality_id, section_type, layer_name, shard_idx)?;
                 let n_rows = indptr_local.len().saturating_sub(1);
                 for r in 0..n_rows {
                     let global = row_start + r;
@@ -475,12 +502,14 @@ fn create_csr_triplet(
 /// `indptr[i+1]`). Returns `(kept_indptr_tail, kept_indices,
 /// kept_data)`.
 ///
-/// Fast path: `keep_mask_opt.is_none()` — pass indices/data through;
-/// the rebased indptr is `indptr_local[1..] + nnz_offset`.
+/// Fast path: `keep_mask_opt.is_none()` — the input `indices` / `data`
+/// vectors are returned unchanged (no allocation, no copy). Takes the
+/// three Vecs by value so the fast path can transfer ownership
+/// directly.
 fn filter_shard(
-    indptr_local: &[i64],
-    indices_local: &[i32],
-    data_local: &[f32],
+    indptr_local: Vec<i64>,
+    indices_local: Vec<i32>,
+    data_local: Vec<f32>,
     keep_mask_opt: Option<&[bool]>,
     shard_row_start: usize,
     nnz_offset: u64,
@@ -492,17 +521,7 @@ fn filter_shard(
                 .skip(1)
                 .map(|v| *v + nnz_offset as i64)
                 .collect();
-            // The hot path doesn't need to copy indices/data; the
-            // caller writes them via a slice view. But hdf5-metno's
-            // `write_slice` accepts `ArrayView1::from(&[T])` and the
-            // existing read paths already return owned `Vec`s, so we
-            // just hand the buffers back as-is rather than playing
-            // lifetime games.
-            (
-                kept_indptr_tail,
-                indices_local.to_vec(),
-                data_local.to_vec(),
-            )
+            (kept_indptr_tail, indices_local, data_local)
         }
         Some(mask) => {
             let n_rows = indptr_local.len().saturating_sub(1);

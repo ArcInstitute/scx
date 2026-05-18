@@ -492,12 +492,13 @@ fn write_column_to_hdf5(
                 .write_scalar(&vlu("0.2.0"))?;
             // `ordered=false` matches scipy / pandas default. Arrow's
             // DictionaryArray doesn't carry an `ordered` bit so we
-            // never have richer information to forward. Encoded as
-            // u8 0/1 to match the Boolean-column convention above.
+            // never have richer information to forward. Native HDF5
+            // bool — anndata's categorical reader expects
+            // `H5T_NATIVE_HBOOL_8`, not u8.
             cat_group
-                .new_attr::<u8>()
+                .new_attr::<bool>()
                 .create("ordered")?
-                .write_scalar(&0u8)?;
+                .write_scalar(&false)?;
         }
         _ => {
             eprintln!("warning: skipping column '{name}' with unsupported type {dtype:?}");
@@ -586,12 +587,11 @@ fn write_uns_value(
                 .write_scalar(&v)?;
         }
         serde_json::Value::Bool(b) => {
-            let v = if *b { 1u8 } else { 0u8 };
             group
-                .new_dataset::<u8>()
+                .new_dataset::<bool>()
                 .shape(())
                 .create(name)?
-                .write_scalar(&v)?;
+                .write_scalar(b)?;
         }
         serde_json::Value::Array(arr) => {
             // Try as array of numbers

@@ -315,6 +315,34 @@ pub fn decode_shard_scipy(
     Ok((indptr, indices, data))
 }
 
+/// Decode **only** the indptr region of a shard, skipping indices/data.
+///
+/// Used by callers that need just the row-pointer array — e.g. the
+/// streaming SCX → h5ad export's `precompute_total_nnz` when a
+/// deletion vector is active and only nnz-per-row counts matter.
+/// Mirrors the indptr sub-path of [`decode_shard_scipy`] but does no
+/// work on `indices_bytes` or `values_bytes`.
+pub fn decode_indptr_only(
+    indptr_bytes: &[u8],
+    codec_id: CodecId,
+    n_rows: usize,
+) -> Result<Vec<i64>, CodecError> {
+    let indptr_u64: Vec<u64> = match codec_id {
+        CodecId::None => le_bytes_to_u64(indptr_bytes, n_rows + 1)?,
+        CodecId::Scx1 => delta_golomb_decode(indptr_bytes, n_rows + 1)?,
+        CodecId::Zstd | CodecId::Pcodec => {
+            let raw = zstd_decode_bounded(indptr_bytes, (n_rows + 1) * 8)?;
+            le_bytes_to_u64(&raw, n_rows + 1)?
+        }
+        CodecId::Lz4Shuffle => {
+            let shuffled = lz4_frame_decompress(indptr_bytes)?;
+            let raw = byte_unshuffle(&shuffled, 8)?;
+            le_bytes_to_u64(&raw, n_rows + 1)?
+        }
+    };
+    u64_vec_to_i64(indptr_u64)
+}
+
 /// Convert Vec<u64> to Vec<i64> via zero-copy reinterpretation.
 /// CSR indptr values are always non-negative and well below i64::MAX,
 /// so the bit patterns are identical. Uses bytemuck for safe transmute.
