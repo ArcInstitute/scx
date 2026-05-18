@@ -574,16 +574,29 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### PyExperiment
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
   - `layers`: list of layer names to load (default: all)
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
+  - `modality` (Phase 6b): select one modality of a multimodal file and
+    return a backed AnnData scoped to that modality (per-modality X /
+    var / obsm; global obs shared). Currently requires `backed=True`;
+    incompatible with `var_names` / `obs_filter` / `layers` (use
+    `scx subset --modality NAME --filter` to pre-materialise a
+    filtered single-modality file).
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are
     logically deleted, the pairwise matrices still cover the full
     original axis; `compact` resolves this by rebuilding from scratch.
+- `to_mudata(backed=False, cache_shards=4)` — Materialise a multimodal file as `mudata.MuData`
+  - Eager (`backed=False`): per-modality scipy CSR AnnData sharing the
+    global obs (existing behaviour). Raises on single-modality files.
+  - **Backed (`backed=True`)** (Phase 6b): per-modality
+    `ScxBackedSparseDataset` AnnData sharing the global obs.
+    Single-modality files are wrapped in a one-modality MuData rather
+    than raising, so the call works uniformly across layouts.
 - `query() -> PyQueryPipeline` — Start lazy query pipeline
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`
