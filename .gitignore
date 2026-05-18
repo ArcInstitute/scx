@@ -11,7 +11,7 @@ archive/
 tasks/
 tmp/
 learn/
-.claude/skills/scx-dev/
+.claude/*.lock
 data/*.h5ad
 *.proptest-regressions
 external-repos/

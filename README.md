@@ -32,6 +32,7 @@ sce <- exp$to_sce()              # SingleCellExperiment
 - **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline (open → QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) runs at **~11 GB peak RSS** vs ~22 GB materialised (51% less; lazy preprocessing alone peaks at ~3.5 GB). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
 - **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression, pseudobulk, and [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1). Same scanpy-shaped API, 3–40× faster; every op has a `device="auto"` switch that picks GPU when available.
 - **Mutable without rewriting** — append new cells, mark-delete doublets, compact, merge, or roll back in milliseconds. Append writes new matrix shards in O(new cells); obs metadata is rewritten as a merged Arrow IPC covering all cells (see [docs/operations.md](docs/operations.md)). Delete is a logical mask, not a data rewrite.
+- **Multimodal native** — CITE-seq, 10x Multiome, and TEA-seq carried in a single v2 file on a shared cell axis. Per-modality codec selection (Scx1 for RNA UMI, Zstd for ADT, Lz4Shuffle/Zstd for ATAC), per-modality `scx merge`/`compact`/`subset --modality`, CSC sidecars preserved through `scx append`, and a `MultimodalTrainingDataset` that yields cell-aligned RNA+ADT+ATAC batches. Round-trips with `mudata.MuData` (Python), Seurat v5 multi-assay, and Bioconductor `MultiAssayExperiment` (R). See [docs/multimodal.md](docs/multimodal.md).
 - **Lazy query engine** — predicate pushdown skips ~55% of shards on realistic queries; selective reads land in under **5 ms**. Filter by cell type, tissue, donor, etc. before paying to read.
 - **Drop-in for scverse and Seurat** — works with AnnData, scanpy, and scVI (Python), and Seurat v5 + SingleCellExperiment (R). Round-trips cleanly with h5ad, 10x HDF5, and Cell Ranger MTX.
 - **Cloud-native** — streaming push/pull to S3, GCS, and Azure with selective download (only the shards you need) and a direct `open_cloud()` path that skips the full download.
@@ -123,59 +124,12 @@ shard prefetch lookahead. Plan-driven access is intentionally random — at
 `ScxBackedSparseDataset` Python-loop baseline. See
 [`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
 
-#### Fork safety under PyTorch `DataLoader(num_workers > 0)`
-
-`pyscx.TrainingDataset` and `pyscx.IndexPlanDataset` are fork-safe under
-`torch.utils.data.DataLoader(num_workers > 0, start_method="fork")` —
-the Linux PyTorch default — when the dataset is **constructed lazily
-inside the worker's `__iter__`** (the pattern `cell-load-scx` and
-`state-scx` already use). Both the per-pipeline tokio runtime (current-
-thread, per-epoch) and per-pipeline `rayon::ThreadPool` (lazily built on
-first iteration) are constructed inside the worker process, so a forked
-child inherits no fork-hostile state from the parent.
-
-```python
-# Recommended IterableDataset wrapper for DataLoader(num_workers=2)
-import torch.utils.data as data
-
-class TrainingShim(data.IterableDataset):
-    def __init__(self, scx_path):
-        self.scx_path = scx_path  # paths only — no inner dataset yet
-
-    def __iter__(self):
-        # Construct the inner dataset HERE (in the worker process, post-fork).
-        ds = pyscx.TrainingDataset(self.scx_path, batch_size=1024, hvg_indices=...)
-        try:
-            yield from ds
-        finally:
-            ds.close()  # release the per-pipeline rayon pool / tokio runtime
-
-loader = torch.utils.data.DataLoader(
-    TrainingShim("atlas.scx"),
-    batch_size=None,
-    num_workers=2,
-    persistent_workers=False,
-)
-```
-
-**Do**: construct lazily inside `__iter__`; call `dataset.close()` (or
-register `weakref.finalize(dataset, dataset.close)`) before process exit;
-prefer `multiprocessing.set_start_method("spawn")` if your workload
-allows — spawn re-execs Python in the child and is genuinely fork-safe
-because there is no fork.
-
-**Don't**: construct a `TrainingDataset` / `IndexPlanDataset` in the
-parent and share it across forked workers — the PID check in `__next__`
-raises `RuntimeError`. Don't pickle a constructed dataset across
-processes either; it owns thread handles that don't survive transfer.
-
-> [!IMPORTANT]
-> Calling **any** `rayon::par_*`-using pyscx API in the parent before
-> fork (e.g., `pyscx.from_anndata(...)` to write the fixture) initialises
-> rayon's process-global pool. Pre-fix this prerequisite was sufficient
-> to wedge `DataLoader(num_workers=2)` indefinitely; the per-pipeline
-> rayon pool in `scx-loader` removed that hazard. See
-> `pyscx/tests/test_fork_safety.py` for the durable regression test.
+Fork-safe under `DataLoader(num_workers > 0)` when the dataset is
+constructed lazily inside the worker's `__iter__` — see
+[`docs/api.md` § Fork safety under PyTorch DataLoader](docs/api.md#fork-safety-under-pytorch-dataloadernum_workers--0)
+for the recommended `IterableDataset` wrapper, do/don't list, and the
+rayon-pool gotcha (the durable regression lives in
+`pyscx/tests/test_fork_safety.py`).
 
 ### You want to query without loading everything
 
@@ -215,6 +169,45 @@ pyscx.compact("atlas.scx", "atlas_clean.scx")
 # Oops? Roll back to the previous version (header-only update)
 pyscx.rollback("atlas.scx")
 ```
+
+### Your data is multimodal (CITE-seq, 10x Multiome, TEA-seq)
+
+A single SCX v2 file carries multiple modalities (RNA + ADT + ATAC + …) on a
+shared cell axis. Each modality picks its own codec — Scx1 for RNA UMI counts,
+Zstd for ADT, Lz4Shuffle/Zstd for ATAC peaks — instead of forcing one
+compression scheme across feature spaces with very different statistics.
+
+```python
+import mudata
+import pyscx
+
+# CITE-seq: write a MuData(rna, adt) into one .scx file
+mu = mudata.read_h5mu("citeseq.h5mu")
+pyscx.from_mudata(mu, "citeseq.scx")          # codec="auto" picks per modality
+
+# Read back as MuData, or extract one modality as AnnData
+reader = pyscx.open("citeseq.scx")
+mu = reader.to_mudata()                       # full MuData
+rna = reader.to_anndata(modality="rna")       # single modality
+
+# Train cell-aligned RNA+ADT batches in one pass
+ds = pyscx.MultimodalTrainingDataset(
+    "citeseq.scx", modalities=["rna", "adt"], batch_size=1024,
+)
+```
+
+All file-mutation ops route per modality: `scx merge`, `scx compact`,
+`scx subset --modality NAME --filter "..."`, and `scx append` (which
+preserves per-modality CSC sidecars). Streaming h5mu ↔ SCX conversion is
+the default in both directions — `pyscx.from_h5mu` / `pyscx.to_h5mu` and
+`scx convert --from h5mu` / `--to h5mu` all bound peak RSS to one shard
+per matrix. R support covers Seurat v5 multi-assay (`exp$to_seurat()`)
+and Bioconductor `MultiAssayExperiment` round-trips.
+
+See [docs/multimodal.md](docs/multimodal.md) for the full Python / R /
+CLI surface, the format model ([format.md § 13](docs/format.md#13-multimodal-extension)),
+and per-modality codec defaults
+([codec.md § Per-modality codec defaults](docs/codec.md#per-modality-codec-defaults)).
 
 ### Your data lives in the cloud
 
