@@ -435,6 +435,69 @@ fn test_query_output_writes_valid_file() {
 }
 
 // ---------------------------------------------------------------------------
+// Fix 1 regression: `scx query <local.scxd>/ ... --output` must preserve the
+// source value encoding. Before the fix, `is_cloud_url` returned true for any
+// local directory, so this path forced ValueEncoding::Float32 even though the
+// shard files on disk were Uint8.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cloud")]
+#[test]
+fn test_query_local_exploded_preserves_value_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = write_test_file(&dir, "src.scx", 12, 10);
+    let exploded_dir = dir.path().join("src.scxd");
+
+    // Explode the .scx into an .scxd/ directory.
+    let out = scx_cli()
+        .args([
+            "explode",
+            scx_path.to_str().unwrap(),
+            exploded_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "explode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Run `scx query <local.scxd>/ ... --output out.scx`.
+    let out_path = dir.path().join("subset.scx");
+    let out = scx_cli()
+        .args([
+            "query",
+            exploded_dir.to_str().unwrap(),
+            "cell_type == 'T cell'",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "query failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Inspect the first CSR shard of the output and assert encoding is Uint8
+    // (the source encoding), NOT Float32 (the pre-fix fallback).
+    let reader = ScxReader::open(&out_path).unwrap();
+    let shards = reader.catalog().shards(SectionType::CsrShard);
+    let first = shards.first().expect("output must have at least one shard");
+    let bytes = reader.section_bytes(first).unwrap();
+    let sh =
+        ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
+    assert_eq!(
+        ValueEncoding::from_u8(sh.value_encoding).unwrap(),
+        ValueEncoding::Uint8,
+        "output should preserve source's Uint8 encoding, got {:?}",
+        ValueEncoding::from_u8(sh.value_encoding)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Error cases
 // ---------------------------------------------------------------------------
 

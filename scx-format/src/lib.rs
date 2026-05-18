@@ -20,7 +20,7 @@ pub mod shard_decode;
 pub mod shard_source;
 pub mod writer;
 
-pub use arrow_compat::{downcast_large_types, upcast_to_large_types};
+pub use arrow_compat::{downcast_large_types, downcast_large_types_schema, upcast_to_large_types};
 pub use backed::{
     concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
     BackedCsrReader, CacheMetrics,

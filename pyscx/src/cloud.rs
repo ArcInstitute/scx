@@ -13,6 +13,26 @@ use scx_engine::QueryPipeline;
 
 use crate::query::PyQueryPipeline;
 
+/// Build the tokio runtime that backs a long-lived `CloudReader`.
+///
+/// The runtime services `block_on` calls from rayon worker threads
+/// inside `scx_engine::collect`'s parallel shard decode (each cloud
+/// shard fetch ends up on a different rayon worker, each blocking on
+/// async I/O). Sizing tokio's worker pool to match what rayon would
+/// use prevents a starvation case where all rayon workers are blocked
+/// on tokio tasks that have no executor.
+fn build_cloud_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("scx-cloud-io")
+        .build()
+}
+
 /// Pull from cloud/local exploded .scxd into a local .scx file.
 ///
 /// Args:
@@ -302,7 +322,7 @@ impl PyCloudExperiment {
 ///     PyCloudExperiment handle with metadata accessors
 #[pyfunction]
 pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
-    let rt = tokio::runtime::Runtime::new()
+    let rt = build_cloud_runtime()
         .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
 
     // Release the GIL during blocking cloud I/O (finding 9.3).

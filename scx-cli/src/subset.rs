@@ -75,44 +75,53 @@ pub fn run_subset(
 
     // `scx subset` operates on local files only — it pulls metadata
     // that lives outside `SectionReader` (uns, layer names, on-disk
-    // value encoding) from the underlying `ScxReader`.
-    let local_reader = pipeline
-        .local_reader()
-        .ok_or("scx subset requires a local SCX file")?;
+    // value encoding) from the underlying `ScxReader`. Collect
+    // everything in one borrow scope; `pipeline.select_genes()` below
+    // consumes `pipeline`, so the borrow must end before that point.
+    let (
+        in_header,
+        value_encoding,
+        dropped_layers,
+        has_obs_pred_idx,
+        has_var_pred_idx,
+        uns,
+        gene_indices_opt,
+    ) = {
+        let local_reader = pipeline
+            .local_reader()
+            .ok_or("scx subset requires a local SCX file")?;
+        let gi = gene_file
+            .map(|p| parse_gene_list(p, local_reader))
+            .transpose()?;
+        (
+            local_reader.header().clone(),
+            detect_value_encoding_from_reader(local_reader)?,
+            local_reader.layer_names(),
+            local_reader
+                .read_obs_predicate_index_bytes()
+                .ok()
+                .flatten()
+                .is_some(),
+            local_reader
+                .read_var_predicate_index_bytes()
+                .ok()
+                .flatten()
+                .is_some(),
+            local_reader.read_uns().ok(),
+            gi,
+        )
+    };
+    let has_obsm = in_header.has_obsm();
 
-    // 4. Parse gene file if provided — supports both names and numeric indices
-    let gene_indices = if let Some(gene_path) = gene_file {
-        let indices = parse_gene_list(gene_path, local_reader)?;
+    // 4. Apply gene projection (consumes & rebuilds pipeline)
+    let gene_indices = if let Some(indices) = gene_indices_opt {
         pipeline = pipeline.select_genes(indices.clone());
         Some(indices)
     } else {
         None
     };
 
-    // 5. Extract info from reader BEFORE collect() consumes the pipeline
-    let local_reader = pipeline
-        .local_reader()
-        .ok_or("scx subset requires a local SCX file")?;
-    let in_header = local_reader.header().clone();
-    let value_encoding = detect_value_encoding_from_reader(local_reader)?;
-
-    // Check for sections that will be dropped and warn
-    let dropped_layers = local_reader.layer_names();
-    let has_obsm = in_header.has_obsm();
-    let has_obs_pred_idx = local_reader
-        .read_obs_predicate_index_bytes()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_var_pred_idx = local_reader
-        .read_var_predicate_index_bytes()
-        .ok()
-        .flatten()
-        .is_some();
-    // Read uns before collect consumes the reader
-    let uns = local_reader.read_uns().ok();
-
-    // 6. Execute query (consumes pipeline)
+    // 5. Execute query (consumes pipeline)
     let result = pipeline.collect()?;
 
     // 7. Report stats

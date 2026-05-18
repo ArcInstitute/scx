@@ -38,6 +38,15 @@ pub struct CloudReader {
     layout: ReaderLayout,
     header: FileHeader,
     catalog: FullCatalog,
+    /// One-shot caches for the obs and var section bytes. These
+    /// sections are read twice per `QueryPipeline`: once for schema
+    /// (eager validation in `from_reader`) and once for the batch
+    /// itself (`collect`). On census-scale data each is O(100 MB);
+    /// caching elides the duplicate range read. Other sections
+    /// (predicate indexes, shards, catalog) are single-fetch per
+    /// query and are not cached.
+    obs_bytes_cache: tokio::sync::OnceCell<Vec<u8>>,
+    var_bytes_cache: tokio::sync::OnceCell<Vec<u8>>,
 }
 
 impl CloudReader {
@@ -71,6 +80,23 @@ impl CloudReader {
         &self.catalog
     }
 
+    /// Read the obs/var section bytes, caching the first fetch.
+    ///
+    /// Routes through `read_section(name)` on first call and stores
+    /// the result in the per-section `OnceCell`. Subsequent calls
+    /// return the cached bytes without touching the network. Used for
+    /// obs/var only; other sections call `read_section` directly.
+    async fn read_metadata_section(&self, name: &str) -> Result<Vec<u8>> {
+        let cell = match name {
+            "obs" => &self.obs_bytes_cache,
+            "var" => &self.var_bytes_cache,
+            _ => return self.read_section(name).await,
+        };
+        cell.get_or_try_init(|| async { self.read_section(name).await })
+            .await
+            .cloned()
+    }
+
     /// Read a specific section by name.
     pub async fn read_section(&self, name: &str) -> Result<Vec<u8>> {
         let entry = self
@@ -98,10 +124,10 @@ impl CloudReader {
             }
             ReaderLayout::Packed(file_path) => {
                 let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
-                    CloudError::SliceBoundsExceeded {
-                        offset: entry.offset as usize,
-                        length: entry.length as usize,
-                        data_len: 0, // remote file; actual size unknown
+                    CloudError::CatalogOffsetOverflow {
+                        name: entry.name.clone(),
+                        offset: entry.offset,
+                        length: entry.length,
                     }
                 })?;
                 let data = self.backend.get_range(file_path, entry.offset..end).await?;
@@ -117,7 +143,7 @@ impl CloudReader {
     /// canonical narrow `Utf8` / `Binary` types regardless of the
     /// on-disk encoding.
     pub async fn read_obs(&self) -> Result<RecordBatch> {
-        let obs_data = self.read_section("obs").await?;
+        let obs_data = self.read_metadata_section("obs").await?;
         let cursor = Cursor::new(&obs_data);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
@@ -141,7 +167,7 @@ impl CloudReader {
     /// canonical narrow `Utf8` / `Binary` types regardless of the
     /// on-disk encoding.
     pub async fn read_var(&self) -> Result<RecordBatch> {
-        let var_data = self.read_section("var").await?;
+        let var_data = self.read_metadata_section("var").await?;
         let cursor = Cursor::new(&var_data);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
@@ -184,10 +210,10 @@ impl CloudReader {
             }
             ReaderLayout::Packed(file_path) => {
                 let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
-                    CloudError::SliceBoundsExceeded {
-                        offset: entry.offset as usize,
-                        length: entry.length as usize,
-                        data_len: 0,
+                    CloudError::CatalogOffsetOverflow {
+                        name: entry.name.clone(),
+                        offset: entry.offset,
+                        length: entry.length,
                     }
                 })?;
                 let data = self.backend.get_range(file_path, entry.offset..end).await?;
@@ -200,13 +226,13 @@ impl CloudReader {
     ///
     /// Decodes only the Arrow IPC footer from the obs section bytes.
     pub async fn read_obs_schema(&self) -> Result<Schema> {
-        let data = self.read_section("obs").await?;
+        let data = self.read_metadata_section("obs").await?;
         decode_arrow_ipc_schema(&data)
     }
 
     /// Read the var schema without materialising the full RecordBatch.
     pub async fn read_var_schema(&self) -> Result<Schema> {
-        let data = self.read_section("var").await?;
+        let data = self.read_metadata_section("var").await?;
         decode_arrow_ipc_schema(&data)
     }
 
@@ -259,30 +285,19 @@ impl CloudReader {
 
 /// Decode just the schema from an Arrow IPC file's footer.
 ///
-/// Applies `scx_format::downcast_large_types` semantics so the schema
-/// matches what `ScxReader::read_obs_schema` returns even when the
-/// on-disk Arrow IPC encodes `LargeUtf8` / `LargeBinary`.
+/// Delegates to [`scx_format::downcast_large_types_schema`] so the
+/// schema matches what `ScxReader::read_obs_schema` returns even when
+/// the on-disk Arrow IPC encodes `LargeUtf8` / `LargeBinary` or
+/// `Dictionary(_, Large*)`. (Local fast path preserves narrow types as
+/// data fits; cloud schemas are eagerly narrowed since we don't have
+/// the offsets to inspect.)
 fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<Schema> {
     let cursor = Cursor::new(bytes);
     let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let schema = reader.schema();
-    // Downcast LargeUtf8 → Utf8 (etc.) so cloud schemas match the
-    // local `ScxReader::read_obs_schema` shape used by the query
-    // engine's predicate parser.
-    let downcast_fields: Vec<arrow::datatypes::Field> = schema
-        .fields()
-        .iter()
-        .map(|f| {
-            let dt = match f.data_type() {
-                arrow::datatypes::DataType::LargeUtf8 => arrow::datatypes::DataType::Utf8,
-                arrow::datatypes::DataType::LargeBinary => arrow::datatypes::DataType::Binary,
-                other => other.clone(),
-            };
-            arrow::datatypes::Field::new(f.name(), dt, f.is_nullable())
-        })
-        .collect();
-    Ok(Schema::new(downcast_fields))
+    Ok(scx_format::downcast_large_types_schema(
+        reader.schema().as_ref(),
+    ))
 }
 
 /// Open an SCX file or directory from cloud/local storage.
@@ -322,6 +337,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 layout: ReaderLayout::Exploded(location),
                 header,
                 catalog,
+                obs_bytes_cache: tokio::sync::OnceCell::new(),
+                var_bytes_cache: tokio::sync::OnceCell::new(),
             })
         }
         Err(e) => {
@@ -369,10 +386,10 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 let fc_offset = header.front_catalog_offset;
                 let fc_end = fc_offset
                     .checked_add(header.front_catalog_length)
-                    .ok_or_else(|| CloudError::SliceBoundsExceeded {
-                        offset: fc_offset as usize,
-                        length: header.front_catalog_length as usize,
-                        data_len: 0,
+                    .ok_or_else(|| CloudError::CatalogOffsetOverflow {
+                        name: "front_catalog".into(),
+                        offset: fc_offset,
+                        length: header.front_catalog_length,
                     })?;
 
                 let fc_bytes = if (fc_end as usize) <= first_bytes.len() {
@@ -392,16 +409,18 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     layout: ReaderLayout::Packed(file_path),
                     header,
                     catalog,
+                    obs_bytes_cache: tokio::sync::OnceCell::new(),
+                    var_bytes_cache: tokio::sync::OnceCell::new(),
                 })
             } else {
                 // Not cloud-ready: read full catalog at EOF
                 let fc_offset = header.full_catalog_offset;
                 let fc_end = fc_offset
                     .checked_add(header.full_catalog_length)
-                    .ok_or_else(|| CloudError::SliceBoundsExceeded {
-                        offset: fc_offset as usize,
-                        length: header.full_catalog_length as usize,
-                        data_len: 0,
+                    .ok_or_else(|| CloudError::CatalogOffsetOverflow {
+                        name: "full_catalog".into(),
+                        offset: fc_offset,
+                        length: header.full_catalog_length,
                     })?;
 
                 let fc_bytes = backend
@@ -417,6 +436,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     layout: ReaderLayout::Packed(file_path),
                     header,
                     catalog,
+                    obs_bytes_cache: tokio::sync::OnceCell::new(),
+                    var_bytes_cache: tokio::sync::OnceCell::new(),
                 })
             }
         }

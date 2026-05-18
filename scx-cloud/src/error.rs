@@ -53,6 +53,13 @@ pub enum CloudError {
         data_len: usize,
     },
 
+    #[error("catalog entry {name}: offset {offset} + length {length} overflows u64")]
+    CatalogOffsetOverflow {
+        name: String,
+        offset: u64,
+        length: u64,
+    },
+
     #[error(
         "section length mismatch for {name}: declared {declared} bytes, downloaded {downloaded} bytes"
     )]

@@ -15,13 +15,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{DictionaryArray, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use scx_cloud::{cloud_optimize, explode, CloudSectionReader};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_engine::QueryPipeline;
+use scx_engine::{QueryPipeline, SectionReader};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::writer::ScxWriter;
+use scx_format::ScxReader;
 
 fn test_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
@@ -305,4 +306,121 @@ fn cloud_query_reports_total_shards() {
     assert_eq!(cloud.total_shards, local.total_shards);
     assert_eq!(cloud.skipped_shards, local.skipped_shards);
     assert_eq!(cloud.total_shards, 4); // 200 cells / 50 per shard
+}
+
+// ---------------------------------------------------------------------------
+// Fix 3 regression: cloud `read_obs_schema` must narrow
+// `Dictionary(Int32, LargeUtf8)` to `Dictionary(Int32, Utf8)` so the schema
+// matches what the local `ScxReader::read_obs_schema` returns. Before the
+// fix the cloud decoder only narrowed top-level `LargeUtf8` / `LargeBinary`,
+// not the value type inside a Dictionary, causing divergence for any
+// categorical column in obs.
+// ---------------------------------------------------------------------------
+
+/// Write a test SCX file whose obs contains a `Dictionary(Int32, Utf8)`
+/// `cell_type` column. The writer upcasts narrow Utf8 → LargeUtf8 (including
+/// inside dictionaries) before serialising, so the on-disk obs is
+/// `Dictionary(Int32, LargeUtf8)` — exactly the case Fix 3 targets.
+fn write_test_scx_with_dictionary_obs(
+    dir: &tempfile::TempDir,
+    n_obs: usize,
+    n_vars: usize,
+) -> PathBuf {
+    let path = dir.path().join("test_dict.scx");
+    let header = test_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let type_strings: Vec<&str> = (0..n_obs)
+        .map(|i| match i % 3 {
+            0 => "T_cell",
+            1 => "B_cell",
+            _ => "NK_cell",
+        })
+        .collect();
+    let dict: DictionaryArray<Int32Type> = type_strings.iter().copied().collect();
+    let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", dict_dt, false),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(dict),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Local and cloud obs schemas must agree for a file whose obs holds a
+/// `Dictionary(Int32, Utf8)` column (which the writer widens to
+/// `Dictionary(Int32, LargeUtf8)` on disk). Pre-fix the cloud reader
+/// returned `Dictionary(Int32, LargeUtf8)` while the local reader
+/// returned `Dictionary(Int32, Utf8)`.
+#[test]
+fn cloud_read_obs_schema_narrows_dictionary_large_utf8() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = write_test_scx_with_dictionary_obs(&dir, 60, 20);
+
+    // Local schema via ScxReader.
+    let local_reader = ScxReader::open(&scx_path).unwrap();
+    let local_schema = local_reader.read_obs_schema().unwrap();
+
+    // Cloud schema via CloudReader through CloudSectionReader.
+    let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let cloud_reader = rt
+        .block_on(scx_cloud::open_cloud(&scx_path.to_string_lossy()))
+        .unwrap();
+    let cloud_adapter = CloudSectionReader::new(Arc::new(cloud_reader), Arc::clone(&rt));
+    let cloud_schema = cloud_adapter.read_obs_schema().unwrap();
+
+    let expected_dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+
+    // Both schemas must narrow LargeUtf8 → Utf8 inside the dict.
+    let local_cell_type_dt = local_schema
+        .field_with_name("cell_type")
+        .unwrap()
+        .data_type();
+    let cloud_cell_type_dt = cloud_schema
+        .field_with_name("cell_type")
+        .unwrap()
+        .data_type();
+    assert_eq!(
+        local_cell_type_dt, &expected_dict,
+        "local schema should narrow dict to Utf8 value type"
+    );
+    assert_eq!(
+        cloud_cell_type_dt, &expected_dict,
+        "cloud schema must narrow dict to Utf8 value type (Fix 3)"
+    );
+    // Field-for-field equality across the rest of the schema.
+    assert_eq!(local_schema.fields().len(), cloud_schema.fields().len());
+    for (lf, cf) in local_schema
+        .fields()
+        .iter()
+        .zip(cloud_schema.fields().iter())
+    {
+        assert_eq!(lf.name(), cf.name());
+        assert_eq!(lf.data_type(), cf.data_type());
+    }
 }
