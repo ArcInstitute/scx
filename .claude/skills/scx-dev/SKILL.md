@@ -115,8 +115,37 @@ Full details live in `docs/development.md`. The bits that come up often:
 - **GPU:** `scx-gpu` compiles without CUDA installed; runtime falls back to CPU when no GPU is present. CI's `build-cpu-only` job pins this contract.
 - **GDS** (GPUDirect Storage) needs local NVMe + nvidia-fs + ext4/XFS; always has a CPU fallback.
 
-For the full crate dependency graph and feature flag rules, see [docs/architecture.md § Crate Dependency Graph](../../../docs/architecture.md#crate-dependency-graph). Coding conventions live in [docs/conventions.md](../../../docs/conventions.md). Test matrix is in [docs/testing.md](../../../docs/testing.md).
+For the full crate dependency graph and feature flag rules, see [docs/architecture.md § Crate Dependency Graph](../../../docs/architecture.md#crate-dependency-graph). Test matrix is in [docs/testing.md](../../../docs/testing.md).
 
 ## Benchmarks workflow
 
 Submit **parallel SLURM jobs** — one per benchmark × dataset pair. Practical guide and the regression-gate workflow are in [benchmarks/README.md](../../../benchmarks/README.md). Local `gate_candidate.py` against `results/baselines/LATEST` is the canonical signal; there is no CI-side gate.
+
+## Coding conventions
+
+Coding conventions live in [docs/conventions.md](../../../docs/conventions.md).
+
+### Documentation in tracked files
+
+Tracked files (code, tests, docs, configs, READMEs) MUST NOT reference
+gitignored markdown documents. In this repo those live at the workspace
+root and under `tasks/` — typically ALL-CAPS or date-prefixed names like
+`*_CODE-REVIEW.md`, `Phase*.md`, `SPEC*.md`, `GPU-ACC-SPEED-UP.md`,
+`HARMONY2.md`, `DEADLOCK-ISSUE.md`, `PER-CELL-CONTROL-PAIRING.md`,
+`SCX-EVAL-METRIC-IMPROVE.md`, `2026-*_REGRESSIONS.md`, etc. They are
+scratch/working specs and do not ship with the repository.
+
+Concretely, in any tracked file, do not:
+
+- Link to a gitignored doc (`[X.md](X.md)`, `see X.md §3`, `(per X.md)`).
+- Cite a "review §1.4" / "Phase 7.2 of X.md" / "spec target (X.md:1037)".
+- Carry inline `// TODO: see X.md` markers pointing at gitignored specs.
+
+Tracked documentation must stand alone. When the gitignored doc carried
+load-bearing context, **inline the substance** (a sentence or two of the
+why / how) into the tracked file instead of citing. When the citation
+was decorative, just delete it.
+
+Cross-references between tracked files (`docs/*.md`, `benchmarks/README.md`,
+`ROADMAP.md`, `AGENTS.md`/`CLAUDE.md`, generated reports under
+`benchmarks/comprehensive/results/reports/`) are fine — they ship together.

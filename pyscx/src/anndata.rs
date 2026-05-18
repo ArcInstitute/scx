@@ -3233,21 +3233,22 @@ fn route_scx_backed_to_scx(
             let adata_x = adata.getattr("X")?;
             let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
             let (indptr_u64, indices_u32, data_f32) = decompose_scipy_csr(py, &shard_obj)?;
-            let pre = py.allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
-                scx_format::encode_one_shard(
-                    &indptr_u64,
-                    &indices_u32,
-                    &data_f32,
-                    codec_for_encode,
-                    out_index_dtype,
-                    n_vars_u32,
-                    *start as u64,
-                    SectionType::CsrShard,
-                    ModalityType::Rna,
-                    format!("X_shard_{i}"),
-                )
-            })
-            .map_err(to_pyerr)?;
+            let pre = py
+                .allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
+                    scx_format::encode_one_shard(
+                        &indptr_u64,
+                        &indices_u32,
+                        &data_f32,
+                        codec_for_encode,
+                        out_index_dtype,
+                        n_vars_u32,
+                        *start as u64,
+                        SectionType::CsrShard,
+                        ModalityType::Rna,
+                        format!("X_shard_{i}"),
+                    )
+                })
+                .map_err(to_pyerr)?;
             py.allow_threads(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;
         }
@@ -3301,12 +3302,8 @@ fn route_scx_backed_to_scx(
     // Optional CSC sidecar rebuild over the just-written file.
     if csc_always {
         py.allow_threads(|| {
-            scx_ops::rebuild_csc_inplace(
-                std::path::Path::new(out_path),
-                csc_cols_per_shard,
-                "4G",
-            )
-            .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
+                .map_err(|e| e.to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
     }
@@ -3372,21 +3369,22 @@ fn route_scx_lazy_to_scx(
         let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
         let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
         let (indptr_u64, indices_u32, data_f32) = decompose_scipy_csr(py, &shard_obj)?;
-        let pre = py.allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
-            scx_format::encode_one_shard(
-                &indptr_u64,
-                &indices_u32,
-                &data_f32,
-                explicit_codec,
-                index_dtype,
-                n_vars_u32,
-                *start as u64,
-                SectionType::CsrShard,
-                ModalityType::Rna,
-                format!("X_shard_{i}"),
-            )
-        })
-        .map_err(to_pyerr)?;
+        let pre = py
+            .allow_threads(|| -> Result<PreEncodedSection, scx_format::ScxError> {
+                scx_format::encode_one_shard(
+                    &indptr_u64,
+                    &indices_u32,
+                    &data_f32,
+                    explicit_codec,
+                    index_dtype,
+                    n_vars_u32,
+                    *start as u64,
+                    SectionType::CsrShard,
+                    ModalityType::Rna,
+                    format!("X_shard_{i}"),
+                )
+            })
+            .map_err(to_pyerr)?;
         py.allow_threads(|| writer.write_preencoded_shard(pre))
             .map_err(to_pyerr)?;
     }
@@ -3462,12 +3460,8 @@ fn route_scx_lazy_to_scx(
 
     if csc_always {
         py.allow_threads(|| {
-            scx_ops::rebuild_csc_inplace(
-                std::path::Path::new(out_path),
-                csc_cols_per_shard,
-                "4G",
-            )
-            .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
+                .map_err(|e| e.to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
     }
