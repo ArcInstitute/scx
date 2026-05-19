@@ -49,6 +49,12 @@ Run from the bumped commit before tagging.
 - [ ] `cargo test --workspace --features cloud` passes if cloud changes
 - [ ] `cargo check` on default-members compiles. **`cargo check --workspace` may fail in `extendr-api`** (the R-bindings dep needs an R toolchain); rscx is intentionally excluded from default-members for this reason — that failure is *not* a release blocker.
 
+**Fuzzing** (run before any release that touches `scx-codec`, `scx-format`, or `scx-engine` parsers; recommended on every synchronized minor regardless):
+
+- [ ] CI's `Fuzz / fuzz-build` job ran green on the release commit. This job is automatic on every PR and push to `main` and verifies all 12 targets across `scx-codec/fuzz`, `scx-format/fuzz`, and `scx-engine/fuzz` still compile on nightly — catches bitrot from a parser refactor that would otherwise go unnoticed (the fuzz crates are separate cargo workspaces, so the main CI's `cargo --workspace` walks past them).
+- [ ] Manually trigger the `Fuzz / fuzz-run` workflow against the release commit via the Actions tab → Fuzz → "Run workflow". Use `duration_seconds=600` (10 min / target, ~2 h matrix wall clock) and leave `target` empty to fan out across all 12 targets. Any crash input is uploaded as a workflow artifact named `fuzz-<crate>-<target>-crashes`; investigate before tagging. Full target list and local invocation in [docs/development.md § Fuzzing](../../../docs/development.md#fuzzing).
+- [ ] For an urgent / targeted release, instead run a single target locally: `cd <crate>/fuzz && cargo +nightly fuzz run <target> -- -max_total_time=600`. Requires `cargo install cargo-fuzz` and the nightly toolchain.
+
 **Python bindings** (always via `../.venv/bin/`, never system Python):
 
 - [ ] `cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v`

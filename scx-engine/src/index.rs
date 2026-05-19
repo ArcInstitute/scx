@@ -103,6 +103,40 @@ pub struct HashIndex {
 // C2. Serialization — docs/format.md (Predicate Indexes) binary layout
 // ============================================================================
 
+/// Upper bound on per-column categorical entries the reader will accept
+/// from an on-disk u32 length prefix. Above this the input is treated
+/// as malformed and rejected as `InvalidData`. A real-world categorical
+/// column (cell_type, donor_id, …) has <100k unique values; 10M is
+/// already pathological.
+const MAX_CATEGORICAL_ENTRIES: usize = 10_000_000;
+
+/// Upper bound on B+ tree internal/leaf pages per numeric index.
+const MAX_NUMERIC_PAGES: usize = 10_000_000;
+
+/// Upper bound on leaf entries per single numeric leaf page.
+const MAX_NUMERIC_LEAF_ENTRIES_PER_PAGE: usize = 1_000_000;
+
+/// Cap the `Vec::with_capacity` allocation hint for an untrusted count,
+/// so that a single crafted u32 cannot trigger a multi-GB up-front
+/// allocation. The vec will grow organically beyond the hint as
+/// elements are pushed.
+fn capacity_hint(requested: usize) -> usize {
+    requested.min(1024)
+}
+
+/// Reject a count read from an on-disk length prefix if it exceeds a
+/// declared upper bound. Returns `InvalidData` with a `descriptor`
+/// naming the field for diagnosability.
+fn check_count_bound(count: usize, max: usize, descriptor: &str) -> Result<()> {
+    if count > max {
+        return Err(EngineError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("PredicateIndex {descriptor} count {count} exceeds maximum {max}"),
+        )));
+    }
+    Ok(())
+}
+
 impl PredicateIndex {
     /// Serialize the predicate index per docs/format.md (Predicate Indexes).
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
@@ -177,6 +211,13 @@ impl PredicateIndex {
     }
 
     /// Deserialize a predicate index from a reader.
+    ///
+    /// Defends against malformed input: the u32 length-prefix fields are
+    /// each capped, both via a hard upper bound (`InvalidData` error if
+    /// exceeded) and via a capped `Vec::with_capacity` hint so a single
+    /// crafted u32 cannot trigger a multi-GB allocation before the inner
+    /// `read_exact` calls EOF. Plausible legitimate inputs stay well
+    /// below the caps.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
         let version = r.read_u8()?;
         let n_columns = r.read_u16::<LittleEndian>()?;
@@ -197,8 +238,13 @@ impl PredicateIndex {
             match column_type {
                 0 => {
                     // Categorical
-                    let n_cat_entries = _n_entries;
-                    let mut entries = Vec::with_capacity(n_cat_entries as usize);
+                    let n_cat_entries = _n_entries as usize;
+                    check_count_bound(
+                        n_cat_entries,
+                        MAX_CATEGORICAL_ENTRIES,
+                        "categorical entries",
+                    )?;
+                    let mut entries = Vec::with_capacity(capacity_hint(n_cat_entries));
                     for _ in 0..n_cat_entries {
                         let val_len = r.read_u16::<LittleEndian>()? as usize;
                         let mut val_bytes = vec![0u8; val_len];
@@ -233,8 +279,10 @@ impl PredicateIndex {
                     let fanout = r.read_u16::<LittleEndian>()?;
                     let n_leaf_pages = r.read_u32::<LittleEndian>()? as usize;
                     let n_internal_pages = r.read_u32::<LittleEndian>()? as usize;
+                    check_count_bound(n_leaf_pages, MAX_NUMERIC_PAGES, "leaf pages")?;
+                    check_count_bound(n_internal_pages, MAX_NUMERIC_PAGES, "internal pages")?;
 
-                    let mut internal_pages = Vec::with_capacity(n_internal_pages);
+                    let mut internal_pages = Vec::with_capacity(capacity_hint(n_internal_pages));
                     for _ in 0..n_internal_pages {
                         let n_keys = r.read_u16::<LittleEndian>()?;
                         let mut keys = Vec::with_capacity(n_keys as usize);
@@ -252,10 +300,15 @@ impl PredicateIndex {
                         });
                     }
 
-                    let mut leaf_pages = Vec::with_capacity(n_leaf_pages);
+                    let mut leaf_pages = Vec::with_capacity(capacity_hint(n_leaf_pages));
                     for _ in 0..n_leaf_pages {
                         let n_leaf_entries = r.read_u32::<LittleEndian>()? as usize;
-                        let mut entries = Vec::with_capacity(n_leaf_entries);
+                        check_count_bound(
+                            n_leaf_entries,
+                            MAX_NUMERIC_LEAF_ENTRIES_PER_PAGE,
+                            "leaf entries",
+                        )?;
+                        let mut entries = Vec::with_capacity(capacity_hint(n_leaf_entries));
                         for _ in 0..n_leaf_entries {
                             entries.push(NumericLeafEntry {
                                 min_value: r.read_f64::<LittleEndian>()?,
@@ -1237,6 +1290,26 @@ mod tests {
 
         let decoded = PredicateIndex::read_from(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, index);
+    }
+
+    /// Regression: a 10-byte malformed input that declared
+    /// `n_cat_entries = 0x2d000000` (~755 million) used to trigger a
+    /// ~36 GB `Vec::with_capacity` and OOM the process. Found by the
+    /// Phase 9 `fuzz_predicate_index` libfuzzer target on its first
+    /// 10-second run. The reader now rejects the input with
+    /// `InvalidData` via [`MAX_CATEGORICAL_ENTRIES`].
+    #[test]
+    fn read_from_rejects_oversized_categorical_count() {
+        // version | n_columns(LE) | name_len(LE) | column_type | n_entries(LE)
+        //   0xfb  |   0x000a      |   0x0000     |    0x00     |  0x2d000000
+        let crash_input: [u8; 10] = [0xfb, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2d];
+        let err = PredicateIndex::read_from(&mut Cursor::new(&crash_input[..]))
+            .expect_err("oversized n_entries must be rejected, not allocated");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("categorical entries") && msg.contains("exceeds maximum"),
+            "expected 'categorical entries ... exceeds maximum' error, got: {msg}"
+        );
     }
 
     #[test]

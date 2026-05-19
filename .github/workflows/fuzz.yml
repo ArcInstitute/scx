@@ -1,0 +1,97 @@
+name: Fuzz
+
+# Build-check every PR + push to main so the fuzz crates can't bitrot
+# (they live in separate cargo workspaces under <crate>/fuzz/, so the
+# main `cargo build/test/clippy --workspace` walks past them).
+#
+# Run-on-demand only via workflow_dispatch — no cron schedule. Trigger
+# from the Actions tab before a release or after touching a parser.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz duration in seconds"
+        required: false
+        default: "120"
+      target:
+        description: "Run only this target name (omit to run all)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-build:
+    name: Fuzz build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            scx-codec/fuzz
+            scx-format/fuzz
+            scx-engine/fuzz
+      # `cargo check` (not `cargo fuzz build`) is enough to catch the
+      # bitrot we care about: if `scx_format` / `scx_engine` rename or
+      # change the signature of a function a fuzz target calls, the
+      # check fails. Skips the release-mode sanitizer-instrumented codegen
+      # + linking that `cargo fuzz build` does, which is the bulk of the
+      # 10-minute run on a cold cache. Sanitizer codegen is exercised by
+      # the workflow_dispatch fuzz-run job; this PR-time job only needs
+      # to typecheck.
+      - name: Check scx-codec fuzz targets
+        run: cargo +nightly check --manifest-path scx-codec/fuzz/Cargo.toml
+      - name: Check scx-format fuzz targets
+        run: cargo +nightly check --manifest-path scx-format/fuzz/Cargo.toml
+      - name: Check scx-engine fuzz targets
+        run: cargo +nightly check --manifest-path scx-engine/fuzz/Cargo.toml
+
+  fuzz-run:
+    name: Fuzz ${{ matrix.crate }}/${{ matrix.target }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { crate: scx-codec,  target: fuzz_bitstream }
+          - { crate: scx-codec,  target: fuzz_delta_golomb }
+          - { crate: scx-codec,  target: fuzz_forbp }
+          - { crate: scx-codec,  target: fuzz_rice }
+          - { crate: scx-format, target: fuzz_header }
+          - { crate: scx-format, target: fuzz_shard }
+          - { crate: scx-format, target: fuzz_catalog }
+          - { crate: scx-format, target: fuzz_csc_shard }
+          - { crate: scx-format, target: fuzz_bitmap }
+          - { crate: scx-format, target: fuzz_modality_table }
+          - { crate: scx-format, target: fuzz_provenance }
+          - { crate: scx-engine, target: fuzz_predicate_index }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}/fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Run ${{ matrix.target }}
+        if: github.event.inputs.target == '' || github.event.inputs.target == matrix.target
+        working-directory: ${{ matrix.crate }}/fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=${{ github.event.inputs.duration_seconds }}
+      - name: Upload crash inputs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.crate }}-${{ matrix.target }}-crashes
+          path: ${{ matrix.crate }}/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
