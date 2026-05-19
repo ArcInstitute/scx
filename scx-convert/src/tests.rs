@@ -4905,3 +4905,352 @@ fn dense_max_slab_rows_clamps_partition() {
     let total: u64 = ranges.iter().map(|(_, n)| *n as u64).sum();
     assert_eq!(total, 100);
 }
+
+// -----------------------------------------------------------------------
+// Phase 8d — parallel streaming reader on the SCX → h5ad/h5mu export
+// path. Mirrors the ingest tests above: sequential vs parallel must
+// produce identical output, deletion vectors must round-trip, the
+// memory budget derate must fire, and oversized shards must refuse.
+// -----------------------------------------------------------------------
+
+/// Read /X/{indptr,indices,data} from an h5ad file at `path`. Helper
+/// for the export-parallel byte-equality tests.
+fn read_h5ad_x_triplet(path: &Path) -> (Vec<i64>, Vec<i32>, Vec<f32>, Vec<i64>) {
+    let f = hdf5::File::open(path).unwrap();
+    let g = f.group("X").unwrap();
+    let indptr: Vec<i64> = g.dataset("indptr").unwrap().read_1d().unwrap().to_vec();
+    let indices: Vec<i32> = g.dataset("indices").unwrap().read_1d().unwrap().to_vec();
+    let data: Vec<f32> = g.dataset("data").unwrap().read_1d().unwrap().to_vec();
+    let shape: Vec<i64> = g.attr("shape").unwrap().read_1d().unwrap().to_vec();
+    (indptr, indices, data, shape)
+}
+
+/// Convert h5ad → SCX with a small shard_size so the SCX file has
+/// many shards (the export-parallel path needs ≥ a handful of shards
+/// to exercise the rolling-window).
+fn make_multishard_scx(scx_path: &Path, n_obs: usize, n_vars: usize, shard_size: u32) {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("src.h5ad");
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", false);
+    let opts = ConvertOptions {
+        shard_target_rows: shard_size,
+        ..ConvertOptions::default()
+    };
+    h5ad_to_scx(&h5ad, scx_path, &opts, &mut WarningSink::log()).unwrap();
+}
+
+#[test]
+fn parallel_export_byte_identical_to_sequential() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx = dir.path().join("src.scx");
+    let h5ad_seq = dir.path().join("seq.h5ad");
+    let h5ad_par = dir.path().join("par.h5ad");
+
+    // 80 rows / shard_size 10 → 8 shards.
+    make_multishard_scx(&scx, 80, 11, 10);
+    let reader = ScxReader::open(&scx).unwrap();
+    assert!(reader.catalog().shards_sorted().len() >= 4);
+    drop(reader);
+
+    let seq_opts = ConvertOptions {
+        reader_threads: Some(1),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
+
+    let par_opts = ConvertOptions {
+        reader_threads: Some(4),
+        writer_queue_depth: 4,
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
+
+    let (a_indptr, a_indices, a_data, a_shape) = read_h5ad_x_triplet(&h5ad_seq);
+    let (b_indptr, b_indices, b_data, b_shape) = read_h5ad_x_triplet(&h5ad_par);
+    assert_eq!(a_shape, b_shape, "shape diverges between paths");
+    assert_eq!(a_indptr, b_indptr, "indptr diverges between paths");
+    assert_eq!(a_indices, b_indices, "indices diverges between paths");
+    assert_eq!(a_data, b_data, "data diverges between paths");
+}
+
+#[test]
+fn parallel_export_with_layers_byte_identical() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("src.h5ad");
+    let scx = dir.path().join("src.scx");
+    let h5ad_seq = dir.path().join("seq.h5ad");
+    let h5ad_par = dir.path().join("par.h5ad");
+
+    // `include_extras = true` adds a layer alongside the main X.
+    create_test_h5ad(&h5ad, 64, 9, "csr", true);
+    let import_opts = ConvertOptions {
+        shard_target_rows: 8,
+        ..ConvertOptions::default()
+    };
+    h5ad_to_scx(&h5ad, &scx, &import_opts, &mut WarningSink::log()).unwrap();
+
+    let seq_opts = ConvertOptions {
+        reader_threads: Some(1),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
+
+    let par_opts = ConvertOptions {
+        reader_threads: Some(4),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
+
+    // Compare /X
+    let (a_indptr, a_indices, a_data, _) = read_h5ad_x_triplet(&h5ad_seq);
+    let (b_indptr, b_indices, b_data, _) = read_h5ad_x_triplet(&h5ad_par);
+    assert_eq!(a_indptr, b_indptr);
+    assert_eq!(a_indices, b_indices);
+    assert_eq!(a_data, b_data);
+
+    // Compare each layer.
+    let a_file = hdf5::File::open(&h5ad_seq).unwrap();
+    let b_file = hdf5::File::open(&h5ad_par).unwrap();
+    let layer_names = a_file.group("layers").unwrap().member_names().unwrap();
+    assert!(
+        !layer_names.is_empty(),
+        "fixture must have at least one layer"
+    );
+    for layer in &layer_names {
+        let a_grp = a_file.group(&format!("layers/{layer}")).unwrap();
+        let b_grp = b_file.group(&format!("layers/{layer}")).unwrap();
+        let a_data: Vec<f32> = a_grp.dataset("data").unwrap().read_1d().unwrap().to_vec();
+        let b_data: Vec<f32> = b_grp.dataset("data").unwrap().read_1d().unwrap().to_vec();
+        let a_indices: Vec<i32> = a_grp
+            .dataset("indices")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        let b_indices: Vec<i32> = b_grp
+            .dataset("indices")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        let a_indptr: Vec<i64> = a_grp.dataset("indptr").unwrap().read_1d().unwrap().to_vec();
+        let b_indptr: Vec<i64> = b_grp.dataset("indptr").unwrap().read_1d().unwrap().to_vec();
+        assert_eq!(a_indptr, b_indptr, "layer {layer} indptr diverges");
+        assert_eq!(a_indices, b_indices, "layer {layer} indices diverges");
+        assert_eq!(a_data, b_data, "layer {layer} data diverges");
+    }
+}
+
+#[test]
+fn parallel_export_with_deletion_vectors_byte_identical() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx = dir.path().join("src.scx");
+    let h5ad_seq = dir.path().join("seq.h5ad");
+    let h5ad_par = dir.path().join("par.h5ad");
+
+    make_multishard_scx(&scx, 80, 11, 10);
+    // Delete rows scattered across multiple shards so the writer
+    // thread's `nnz_offset` + `row_offset_kept` accumulators have
+    // to reorder across shard boundaries.
+    let deleted: Vec<u64> = vec![1, 9, 12, 25, 41, 67];
+    scx_ops::mark_deleted(&scx, &deleted).unwrap();
+
+    let seq_opts = ConvertOptions {
+        reader_threads: Some(1),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
+
+    let par_opts = ConvertOptions {
+        reader_threads: Some(4),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
+
+    let (a_indptr, a_indices, a_data, a_shape) = read_h5ad_x_triplet(&h5ad_seq);
+    let (b_indptr, b_indices, b_data, b_shape) = read_h5ad_x_triplet(&h5ad_par);
+    assert_eq!(a_shape, b_shape);
+    assert_eq!(
+        a_indptr, b_indptr,
+        "indptr diverges after DV-applied parallel export"
+    );
+    assert_eq!(
+        a_indices, b_indices,
+        "indices diverges after DV-applied parallel export"
+    );
+    assert_eq!(
+        a_data, b_data,
+        "data diverges after DV-applied parallel export"
+    );
+    assert_eq!(
+        a_shape[0],
+        (80 - deleted.len()) as i64,
+        "kept-row count in shape attr"
+    );
+}
+
+#[test]
+fn parallel_export_h5mu_byte_identical() {
+    use super::mudata_pipeline::h5mu_to_scx;
+    use super::mudata_write::scx_to_h5mu_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx = dir.path().join("mid.scx");
+    let h5mu_seq = dir.path().join("seq.h5mu");
+    let h5mu_par = dir.path().join("par.h5mu");
+
+    // Two modalities (rna 40 × 7, adt 40 × 5); shard_size 8 → 5 shards each.
+    create_test_h5mu(&h5mu_in, 40, 7, 5);
+    let import_opts = ConvertOptions {
+        shard_target_rows: 8,
+        ..ConvertOptions::default()
+    };
+    h5mu_to_scx(&h5mu_in, &scx, &import_opts, &mut WarningSink::log()).unwrap();
+
+    let seq_opts = ConvertOptions {
+        reader_threads: Some(1),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5mu_streaming(&scx, &h5mu_seq, &seq_opts, &mut WarningSink::log()).unwrap();
+
+    let par_opts = ConvertOptions {
+        reader_threads: Some(4),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5mu_streaming(&scx, &h5mu_par, &par_opts, &mut WarningSink::log()).unwrap();
+
+    let a_file = hdf5::File::open(&h5mu_seq).unwrap();
+    let b_file = hdf5::File::open(&h5mu_par).unwrap();
+    let mod_names = a_file.group("mod").unwrap().member_names().unwrap();
+    assert!(mod_names.len() >= 2);
+    for m in &mod_names {
+        let a_grp = a_file.group(&format!("mod/{m}/X")).unwrap();
+        let b_grp = b_file.group(&format!("mod/{m}/X")).unwrap();
+        let a_indices: Vec<i32> = a_grp
+            .dataset("indices")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        let b_indices: Vec<i32> = b_grp
+            .dataset("indices")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        let a_data: Vec<f32> = a_grp.dataset("data").unwrap().read_1d().unwrap().to_vec();
+        let b_data: Vec<f32> = b_grp.dataset("data").unwrap().read_1d().unwrap().to_vec();
+        let a_indptr: Vec<i64> = a_grp.dataset("indptr").unwrap().read_1d().unwrap().to_vec();
+        let b_indptr: Vec<i64> = b_grp.dataset("indptr").unwrap().read_1d().unwrap().to_vec();
+        assert_eq!(a_indptr, b_indptr, "modality {m} indptr diverges");
+        assert_eq!(a_indices, b_indices, "modality {m} indices diverges");
+        assert_eq!(a_data, b_data, "modality {m} data diverges");
+    }
+}
+
+#[test]
+fn parallel_export_memory_budget_refuses_oversized_shard() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx = dir.path().join("src.scx");
+    let h5ad = dir.path().join("out.h5ad");
+
+    make_multishard_scx(&scx, 80, 64, 16);
+    let opts = ConvertOptions {
+        reader_threads: Some(4),
+        memory_budget: Some(1), // 1 byte — well below any shard's working set
+        ..ConvertOptions::default()
+    };
+    let err = scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut WarningSink::log())
+        .expect_err("expected refusal");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("memory_budget"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[test]
+fn parallel_export_memory_budget_derates_workers() {
+    use super::pipeline::scx_to_h5ad_streaming;
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx = dir.path().join("src.scx");
+    let h5ad = dir.path().join("out.h5ad");
+
+    // Many shards but each tiny. per_shard_export_bytes ≈
+    //   nnz × 8 + (n_rows + 1) × 8 + nnz × 8 (scratch)
+    // For 8 rows × 9 vars at the fixture's 2-3 nnz/row ≈ 20 nnz:
+    //   20×16 + 9×8 ≈ 392 bytes per shard.
+    // Budget = 1500 → outstanding_max = 1500/392 = 3 → granted
+    // threads + depth = 3; with requested 8 → derate fires.
+    make_multishard_scx(&scx, 64, 9, 8);
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = Arc::clone(&log);
+    let mut sink = WarningSink::with_handler(move |w| {
+        log_clone.lock().unwrap().push(format!("{:?}", w));
+    });
+
+    let opts = ConvertOptions {
+        reader_threads: Some(8),
+        writer_queue_depth: 4,
+        memory_budget: Some(1500),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut sink).unwrap();
+
+    let warnings = log.lock().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("ReaderThreadsDerated")),
+        "expected ReaderThreadsDerated; got: {:?}",
+        *warnings
+    );
+
+    // Output must still match the sequential path.
+    let h5ad_seq = dir.path().join("seq.h5ad");
+    let seq_opts = ConvertOptions {
+        reader_threads: Some(1),
+        ..ConvertOptions::default()
+    };
+    scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
+    let (a_indptr, a_indices, a_data, _) = read_h5ad_x_triplet(&h5ad);
+    let (b_indptr, b_indices, b_data, _) = read_h5ad_x_triplet(&h5ad_seq);
+    assert_eq!(a_indptr, b_indptr);
+    assert_eq!(a_indices, b_indices);
+    assert_eq!(a_data, b_data);
+}
+
+#[test]
+fn per_shard_export_bytes_matches_payload_layout() {
+    // Sanity: the helper computes exactly what the dispatcher
+    // documents — payload (nnz×8) + indptr ((n_rows+1)×8) +
+    // scratch (nnz×8). Anchors the budget arithmetic against
+    // accidental regressions.
+    use super::h5ad_stream_write::per_shard_export_bytes_for_test;
+    use scx_format::catalog::ShardStats;
+    let stats = ShardStats {
+        row_start: 0,
+        row_end: 100,
+        col_start: 0,
+        col_end: 0,
+        nnz: 50,
+        value_min: 0,
+        value_max: 0,
+        value_sum: 0,
+        n_indexed_columns: 0,
+        column_stats: Vec::new(),
+    };
+    let bytes = per_shard_export_bytes_for_test(&stats);
+    // 50×8 + 101×8 + 50×8 = 400 + 808 + 400 = 1608
+    assert_eq!(bytes, 1608);
+}

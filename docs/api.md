@@ -754,7 +754,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — 10x HDF5 to SCX.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
-- `pyscx.to_h5ad(path, out, stream=True, modality=None)` — Stream SCX → h5ad
+- `pyscx.to_h5ad(path, out, stream=True, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None)` — Stream SCX → h5ad
   without materialising `X` in memory. Mirror of `pyscx.from_h5ad` in the
   opposite direction. Bounded peak memory: one shard's worth of CSR
   plus encode buffers per matrix written, plus the always-resident
@@ -766,12 +766,34 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   extract a single modality as h5ad; otherwise the call raises (use
   `pyscx.to_h5mu`). `stream=False` falls back to the materialising
   path (kept for parity / debugging).
-- `pyscx.to_h5mu(path, out, stream=True)` — Stream a multimodal SCX
+  - `reader_threads`: parallel shard decoder pool. `None` (default)
+    auto-resolves to `RAYON_NUM_THREADS` if set, else
+    `os.cpu_count()`. `1` forces the sequential coordinator.
+    `> 1` requests rayon workers; output is byte-identical to
+    sequential. HDF5 writes stay on the calling thread, so this
+    knob does **not** require a thread-safe libhdf5 build (unlike
+    the ingest direction).
+  - `writer_queue_depth`: bounded reorder buffer depth between the
+    parallel decoder pool and the ordered HDF5 writer. Default 4.
+    Outstanding decoded shards are capped at `reader_threads +
+    writer_queue_depth` so a slow shard 0 can't let the buffer
+    accumulate the rest of the file.
+  - `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes — same
+    parser as `from_h5ad`. Derates the granted `reader_threads`
+    against `max_shard_bytes` (computed exactly from
+    `FullCatalogEntry::stats.nnz` and row count, no density
+    heuristic). A single shard exceeding the budget raises with an
+    actionable message; smaller mismatches emit
+    `ReaderThreadsDerated` and proceed with fewer workers.
+- `pyscx.to_h5mu(path, out, stream=True, reader_threads=None, writer_queue_depth=4, memory_budget=None)` — Stream a multimodal SCX
   file to h5mu. Iterates each modality and writes
   `/mod/{name}/X` and any `/mod/{name}/layers/{layer}` shard-by-shard;
   global `/obs`, per-modality `/var` / `/obsm`, and `/uns` reuse the
   in-memory metadata writers. Requires `reader.is_multimodal()`;
-  single-modality files raise (use `to_h5ad`).
+  single-modality files raise (use `to_h5ad`). `reader_threads`,
+  `writer_queue_depth`, and `memory_budget` carry the same
+  semantics as `to_h5ad`; each modality runs through the same
+  dispatcher independently.
 - `pyscx.iter_chunks(adata, chunk_size="shard")` — Shard-aligned or fixed-size chunk iterator
 - `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer

@@ -137,3 +137,40 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   threadsafe libhdf5 build or a probe-injection seam, neither of which
   is in scope. The `OnceLock` guard is exercised indirectly by any
   multimodal h5mu run on a non-threadsafe host.
+
+## Parallel streaming reader — export direction (scx-convert)
+
+The SCX → h5ad / h5mu export path
+(`h5ad_stream_write::stream_csr_to_group_at`) mirrors the ingest
+dispatcher but with a simpler precondition set:
+
+- **No libhdf5 thread-safety probe.** Workers only read SCX shards
+  (mmap + scx-codec decode); the HDF5 writes (`indices_ds.write_slice`,
+  `data_ds.write_slice`, `indptr_ds.write_slice`) stay on the calling
+  thread. There is no concurrent HDF5 access on this path, so
+  non-threadsafe libhdf5 builds work just as well as threadsafe ones.
+- **Exact per-shard memory budget.** Every CSR shard records its
+  `nnz` and row range in `FullCatalogEntry::stats` at convert time.
+  `per_shard_export_bytes(stats)` computes the working set
+  precisely — `nnz × 8` (indices + data) + `(n_rows + 1) × 8`
+  (indptr) + `nnz × 8` (codec scratch). No density heuristic, no
+  modality-type branching. The memory-budget derate constrains
+  `reader_threads + writer_queue_depth` against `max_shard_bytes` so
+  the rolling-window cap matches the budget directly.
+- **No `max_slab_rows` clamp.** SCX shards are random-access via
+  `ScxReader::read_csr_shard_for(modality_id, shard_idx)`; the
+  source isn't gated by a slab budget the way an HDF5 dense reader
+  is on the ingest side.
+- **Rolling-window spawn carries over.** The reorder buffer
+  (`BTreeMap<u32, DecodedShard>`) on the writer thread is bounded
+  by the same `reader_threads + writer_queue_depth` window so a
+  slow shard 0 can't accumulate the rest of the file in memory.
+- **Filtering stays on the writer thread.** Deletion-vector
+  filtering (`filter_shard`) reads the running `nnz_offset` /
+  `row_offset_kept` accumulators, which must be sequential to keep
+  the on-disk layout deterministic. Workers produce raw decoded
+  triplets only.
+- **No new public API.** `pyscx.to_h5ad` / `pyscx.to_h5mu` gain
+  `reader_threads=`, `writer_queue_depth=`, `memory_budget=` kwargs
+  symmetric with the ingest wrappers, plus the existing CLI flags
+  already flow through `ConvertOptions`.
