@@ -171,7 +171,7 @@ post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
 run cleanly end-to-end. 
 See `comprehensive/results/baselines/LATEST/summary.json` for the canonical
 `ml_loader` floors once the next baseline is promoted (the Lambda-side
-Phase-5 calibration sets `pyscx_training_dataset_workers2{,_persistent}`
+calibration sets `pyscx_training_dataset_workers2{,_persistent}`
 floors to 0.5× the post-fix median per the gate's convention).
 
 ### Why three runtimes?

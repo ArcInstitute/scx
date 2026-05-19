@@ -282,7 +282,7 @@ fn from_anndata(
     uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
     memory_budget=None, temp_dir=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
-    bitmap="off",
+    bitmap="off", reader_threads=None, writer_queue_depth=4,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -304,6 +304,8 @@ fn from_h5ad(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -349,6 +351,8 @@ fn from_h5ad(
         index_preset,
         index_auto_threshold,
         bitmap,
+        reader_threads,
+        writer_queue_depth,
     )
 }
 
@@ -454,7 +458,7 @@ fn from_10x(
     stream=true, strict_uns=false, memory_budget=None, temp_dir=None,
     modalities=None, modality_types=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
-    bitmap="off",
+    bitmap="off", reader_threads=None, writer_queue_depth=4,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5mu(
@@ -476,6 +480,8 @@ fn from_h5mu(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
 ) -> PyResult<()> {
     mudata::from_h5mu_impl(
         py,
@@ -496,6 +502,8 @@ fn from_h5mu(
         index_preset,
         index_auto_threshold,
         bitmap,
+        reader_threads,
+        writer_queue_depth,
     )
 }
 

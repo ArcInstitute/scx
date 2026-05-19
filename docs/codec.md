@@ -214,7 +214,7 @@ Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
 
 ## 8. Automatic Codec Selection
 
-Writers SHOULD choose per-shard codecs automatically. Phase 1 benchmarks found
+Writers SHOULD choose per-shard codecs automatically. Benchmarks found
 that Rice (Scx1) **increases** file size for non-UMI data (Smart-seq2: 0.852×
 h5ad vs 0.746× uncompressed), while Zstd achieves 0.345×.
 
@@ -264,8 +264,8 @@ Rationale:
 
 Single-modality writers (`pyscx.from_anndata`, `scx convert --from h5ad`,
 `scx-mtx`, `rscx`) implicitly default to `ModalityType::Rna`, which
-delegates to the §8 heuristic — output is bit-identical to v1 / pre-Phase-E
-files. Multimodal-aware ops in `scx-ops` (`scx append`, `compact`,
+delegates to the §8 heuristic — output is bit-identical to v1 / earlier
+files written before per-modality routing. Multimodal-aware ops in `scx-ops` (`scx append`, `compact`,
 `merge` working on already-written SCX files) currently still use the
 modality-blind `select_codec`; modality-aware routing through ops is
 a follow-on (modality-aware routing through ops is not yet implemented).

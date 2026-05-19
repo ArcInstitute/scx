@@ -1,4 +1,4 @@
-// pyscx mudata bindings (Phase D.3 / D.4 of MULTIMODAL-SUPPORT.md).
+// pyscx mudata bindings.
 //
 // Mirrors the existing `from_anndata` / `to_anndata` API:
 //   - `pyscx.from_mudata(mu, path, ...)` writes a v2 multimodal SCX
@@ -272,6 +272,8 @@ pub fn from_h5mu_impl(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
 ) -> PyResult<()> {
     use pyo3::exceptions::PyValueError;
     let explicit_codec = crate::anndata::parse_codec(codec)?;
@@ -334,6 +336,8 @@ pub fn from_h5mu_impl(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        reader_threads,
+        writer_queue_depth,
     };
 
     let input = std::path::PathBuf::from(path);

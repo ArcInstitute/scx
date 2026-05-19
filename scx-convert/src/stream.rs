@@ -4,6 +4,8 @@
 // (future) Zarr-backed readers all implement `CsrShardStream` so the
 // writer-side coordinator can drive any of them uniformly.
 
+use scx_format::modality::ModalityType;
+
 use super::pipeline::ConvertError;
 
 /// Major axis of the source matrix. Streaming readers always emit
@@ -54,4 +56,72 @@ pub trait CsrShardStream {
         &mut self,
         target_rows: usize,
     ) -> Result<Option<StreamedCsrShard>, ConvertError>;
+
+    /// If this reader supports parallel row-range reads,
+    /// return a `&dyn IndexedCsrShardStream` view of `self`. Default
+    /// implementation returns `None`, which routes the writer
+    /// coordinator to the sequential path. Readers that can safely
+    /// be driven from multiple worker threads (CSR h5ad, dense h5ad,
+    /// in-memory CSC) override this to return `Some(self)`.
+    fn as_indexed(&self) -> Option<&dyn IndexedCsrShardStream> {
+        None
+    }
+}
+
+/// Sibling of [`CsrShardStream`] for readers that can serve
+/// independent row-range reads concurrently from multiple worker
+/// threads.
+///
+/// Implementers must be `Send + Sync` and stateless across calls
+/// (no internal cursor). The streaming writer coordinator partitions
+/// the matrix into `[(row_start, n_rows)]` ranges via
+/// [`crate::pipeline::compute_shard_row_ranges`] and fans them out
+/// across a rayon worker pool. The encoded shards funnel through a
+/// bounded reorder buffer and are written in shard-index order so
+/// the output `.scx` file is byte-identical to the sequential path.
+///
+/// The CSC external-memory bucket transposer (Phase 2) does not
+/// implement this trait — its bucket pipeline is inherently
+/// sequential.
+pub trait IndexedCsrShardStream: Send + Sync {
+    fn n_obs(&self) -> u64;
+    fn n_vars(&self) -> u64;
+    fn source_matrix_name(&self) -> &str;
+    /// Read rows `[row_start, row_start + n_rows)` and return them
+    /// as a `StreamedCsrShard`. `row_start + n_rows` must not exceed
+    /// `self.n_obs()`; callers (the parallel coordinator) compute
+    /// ranges from `compute_shard_row_ranges` so this invariant is
+    /// enforced by construction.
+    fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError>;
+
+    /// Hard upper bound on rows the reader can serve in a single
+    /// [`read_range`](Self::read_range) call. `None` means no cap
+    /// (CSR and in-memory CSC readers). `Some(n)` clamps the
+    /// parallel coordinator's partition so the shard-row ranges it
+    /// emits never exceed what the reader can handle. The dense
+    /// reader returns `Some(max_slab_rows)` when `memory_budget`
+    /// is set, matching the sequential `next_csr_shard` clamp.
+    fn max_slab_rows(&self) -> Option<u32> {
+        None
+    }
+
+    /// Conservative per-worker working-set estimate in bytes used
+    /// by the memory-budget derate in the parallel-coordinator
+    /// dispatcher. Default impl assumes the sparsified output is
+    /// the binding bound and picks density by modality
+    /// (`Atac` → 10 %, everything else → 5 %), with ~16 B/nnz
+    /// (`i32` indices + `f32` values + amortised `indptr`). Dense
+    /// readers override this to size the dense slab buffer
+    /// instead.
+    fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
+        let density_den: u64 = match modality_type {
+            ModalityType::Atac => crate::pipeline::PARALLEL_DENSITY_ATAC_DEN,
+            _ => crate::pipeline::PARALLEL_DENSITY_DEFAULT_DEN,
+        };
+        let est = (shard_target_rows as u64)
+            .saturating_mul(self.n_vars())
+            .saturating_mul(16)
+            / density_den;
+        est.max(1)
+    }
 }

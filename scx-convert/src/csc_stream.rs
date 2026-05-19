@@ -21,7 +21,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use super::h5ad_read::{read_i64_dataset, read_x_matrix_at};
 use super::h5ad_stream::{read_slice_f32, read_slice_i32};
 use super::pipeline::{ConvertError, ConvertOptions};
-use super::stream::{CsrShardStream, StreamedCsrShard};
+use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
 use super::warnings::WarningSink;
 
 /// Open a CSC-on-disk matrix as a [`CsrShardStream`]. Picks the
@@ -151,6 +151,54 @@ impl MaterializedCsrStream {
     }
 }
 
+impl MaterializedCsrStream {
+    /// Slice rows `[row_start, row_start + n_rows)` from
+    /// the resident `(indptr, indices, data)` buffers. Stateless;
+    /// safe to call from worker threads.
+    fn read_range_inner(
+        &self,
+        row_start: u64,
+        n_rows: u32,
+    ) -> Result<StreamedCsrShard, ConvertError> {
+        if row_start.saturating_add(n_rows as u64) > self.n_obs {
+            return Err(ConvertError::Other(format!(
+                "materialised CSR read_range out of bounds: row_start={row_start}, n_rows={n_rows}, n_obs={}",
+                self.n_obs
+            )));
+        }
+        let row_start_usize = row_start as usize;
+        let row_end = row_start_usize + n_rows as usize;
+
+        let base = self.indptr[row_start_usize];
+        let end_val = self.indptr[row_end];
+        let nnz_start = usize::try_from(base)
+            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
+        let nnz_end = usize::try_from(end_val)
+            .map_err(|_| ConvertError::Other(format!("negative indptr end {end_val}")))?;
+
+        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows as usize + 1);
+        for &v in &self.indptr[row_start_usize..=row_end] {
+            shard_indptr.push((v - base) as u64);
+        }
+        let shard_indices: Vec<u32> = self.indices[nnz_start..nnz_end]
+            .iter()
+            .map(|&v| v as u32)
+            .collect();
+        let shard_values: Vec<f32> = self.data[nnz_start..nnz_end].to_vec();
+
+        Ok(StreamedCsrShard {
+            row_start,
+            n_rows,
+            n_cols: self.n_vars as u32,
+            indptr: shard_indptr,
+            indices: shard_indices,
+            values: shard_values,
+            source_name: Some(self.source_name.clone()),
+            duplicates_merged: 0,
+        })
+    }
+}
+
 impl CsrShardStream for MaterializedCsrStream {
     fn n_obs(&self) -> u64 {
         self.n_obs
@@ -172,40 +220,30 @@ impl CsrShardStream for MaterializedCsrStream {
         if target_rows == 0 {
             return Err(ConvertError::Other("target_rows must be > 0".into()));
         }
-        let row_start = self.cursor as usize;
-        let row_end = (row_start + target_rows).min(self.n_obs as usize);
-        let n_rows = row_end - row_start;
+        let remaining = (self.n_obs - self.cursor) as u32;
+        let slab_rows = (target_rows as u32).min(remaining);
+        let shard = self.read_range_inner(self.cursor, slab_rows)?;
+        self.cursor += slab_rows as u64;
+        Ok(Some(shard))
+    }
 
-        let base = self.indptr[row_start];
-        let end_val = self.indptr[row_end];
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(end_val)
-            .map_err(|_| ConvertError::Other(format!("negative indptr end {end_val}")))?;
+    fn as_indexed(&self) -> Option<&dyn IndexedCsrShardStream> {
+        Some(self)
+    }
+}
 
-        // Rebase the local indptr to start at zero (StreamedCsrShard
-        // contract — first element always 0).
-        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows + 1);
-        for &v in &self.indptr[row_start..=row_end] {
-            shard_indptr.push((v - base) as u64);
-        }
-        let shard_indices: Vec<u32> = self.indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| v as u32)
-            .collect();
-        let shard_values: Vec<f32> = self.data[nnz_start..nnz_end].to_vec();
-
-        self.cursor = row_end as u64;
-        Ok(Some(StreamedCsrShard {
-            row_start: row_start as u64,
-            n_rows: n_rows as u32,
-            n_cols: self.n_vars as u32,
-            indptr: shard_indptr,
-            indices: shard_indices,
-            values: shard_values,
-            source_name: Some(self.source_name.clone()),
-            duplicates_merged: 0,
-        }))
+impl IndexedCsrShardStream for MaterializedCsrStream {
+    fn n_obs(&self) -> u64 {
+        self.n_obs
+    }
+    fn n_vars(&self) -> u64 {
+        self.n_vars
+    }
+    fn source_matrix_name(&self) -> &str {
+        &self.source_name
+    }
+    fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError> {
+        self.read_range_inner(row_start, n_rows)
     }
 }
 

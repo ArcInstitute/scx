@@ -330,7 +330,7 @@ discriminator; the in-shard `shard_type` byte exists for self-contained
 shard validation (e.g. exploded `.scxd` files where the catalog and
 shard live in separate files). Going forward writers emit `shard_type
 = 1`; readers also accept `shard_type = 0` for files written before
-the Phase A `derive_shard_type()` fix landed.
+the `derive_shard_type()` fix landed.
 
 ### `ShardStats.row_start` / `row_end` axis overload
 
@@ -368,7 +368,7 @@ post-decode. See `docs/sharding.md` § CSC sharding.
 
 ### `scx upgrade` preserves CSC
 
-`scx upgrade` (Phase B) re-emits the file through the current writer
+`scx upgrade` re-emits the file through the current writer
 while preserving CSC sidecars: the CSR rewrite loop calls
 `writer.write_csr_shard()`, then the CSC entries are walked via
 `catalog.csc_shards_sorted()` and re-emitted via

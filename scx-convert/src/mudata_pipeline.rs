@@ -596,7 +596,7 @@ pub fn h5mu_to_scx_streaming(
         let modality_id_for_closure = modality_id;
         let section_prefix = format!("{mname}_x_shard");
         writer.with_modality::<_, _, ConvertError>(modality_id_for_closure, |w| {
-            super::pipeline::streaming_writer_coordinator(
+            super::pipeline::run_streaming_writer_coordinator(
                 x_reader.as_mut(),
                 w,
                 opts,
@@ -687,7 +687,7 @@ pub fn h5mu_to_scx_streaming(
                 let layer_index_dtype: u8 = if layer_n_vars <= 65535 { 0 } else { 1 };
                 let prefix = format!("{mname}_{layer_name}_shard");
                 writer.with_modality::<_, _, ConvertError>(modality_id_for_closure, |w| {
-                    super::pipeline::streaming_writer_coordinator(
+                    super::pipeline::run_streaming_writer_coordinator(
                         layer_reader.as_mut(),
                         w,
                         opts,
@@ -720,6 +720,7 @@ pub fn h5mu_to_scx_streaming(
         .as_secs() as i64;
     let modality_names_for_json: Vec<&String> =
         modality_meta.iter().map(|(name, _, _)| name).collect();
+    let resolved_reader_threads = super::pipeline::resolve_reader_threads(opts);
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
@@ -730,6 +731,8 @@ pub fn h5mu_to_scx_streaming(
             "stream": true,
             "modalities": modality_names_for_json,
             "warnings": sink.summary_json(),
+            "reader_threads": resolved_reader_threads,
+            "writer_queue_depth": opts.writer_queue_depth,
         })
         .to_string(),
         input_checksums: vec![],

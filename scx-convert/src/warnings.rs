@@ -58,6 +58,22 @@ pub enum ConvertWarning {
         modality: Option<String>,
         reason: String,
     },
+    /// libhdf5 was built without `--enable-threadsafe`, so
+    /// the parallel streaming reader fell back to the sequential
+    /// coordinator. Functional output is unchanged. Emitted at most
+    /// once per process (see
+    /// [`crate::hdf5_threadsafe::try_emit_not_threadsafe_warning`]) —
+    /// the threadsafe flag is a build-time property of libhdf5 and
+    /// cannot change within a process, so repeating the warning per
+    /// matrix / per modality is pure noise.
+    Hdf5NotThreadsafe,
+    /// The requested `reader_threads` was derated to fit
+    /// within `memory_budget`. Functional output is unchanged.
+    ReaderThreadsDerated {
+        requested: usize,
+        granted: usize,
+        reason: String,
+    },
 }
 
 impl ConvertWarning {
@@ -77,6 +93,8 @@ impl ConvertWarning {
             Self::LayerSkipped { .. } => "layer_skipped",
             Self::PredicateIndexSkippedMultimodal { .. } => "predicate_index_skipped_multimodal",
             Self::BitmapSkipped { .. } => "bitmap_skipped",
+            Self::Hdf5NotThreadsafe => "hdf5_not_threadsafe",
+            Self::ReaderThreadsDerated { .. } => "reader_threads_derated",
         }
     }
 }

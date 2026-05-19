@@ -186,7 +186,7 @@ pub struct ModalityInfo {
 ### Codec selection — `select_codec_for_modality`
 
 `select_codec_for_modality(raw_values, value_encoding, modality_type)`
-extends `select_codec` with per-modality routing (Phase E):
+extends `select_codec` with per-modality routing:
 RNA / Custom / Methylation / Spatial → delegate to `select_codec`;
 Protein/ADT → Zstd for integers, Pcodec for floats; ATAC → Zstd for
 binary peak presence (sample max ≤ 1) else Lz4Shuffle, Pcodec for
@@ -692,7 +692,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   underlying mechanics. `index_*` / `bitmap` materialise query
   predicate indexes and detection bitmaps at conversion time — see
   [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
-- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   plus the always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
   entry point for files larger than RAM. `csc="always"` performs a
@@ -701,7 +701,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   the rebuild. `uns_format` is accepted for API parity with
   `from_anndata` but is a no-op here (streaming reads `uns` from the
   h5ad file directly, not from Python).
-  - Source layout (Phases 1 & 2): CSR streams natively. Dense `/X`
+  - Source layout: CSR streams natively. Dense `/X`
     streams via row-slab sparsification — set `dense_zero_epsilon` to
     threshold near-zero values (default `0.0` matches scipy's
     `csr_matrix(dense)`). CSC-on-disk uses an in-memory transpose
@@ -721,7 +721,30 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `stream=False` falls back to the materialising path (kept for
     parity / debugging).
   - `obsp` / `varp` on the input are silently skipped.
-- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation.
+  - `reader_threads`: streaming reader worker count.
+    `None` (default) resolves to `RAYON_NUM_THREADS` if set, else
+    `os.cpu_count()`. `1` forces the sequential coordinator. `> 1`
+    requests rayon workers; output is byte-identical to sequential.
+    Requires a thread-safe libhdf5 build (conda-forge default); falls
+    back to sequential with a `Hdf5NotThreadsafe` warning emitted at
+    most once per process otherwise. `--memory-budget` derates the
+    granted count to fit a per-worker estimate; the estimate is
+    delegated to the reader: sparse readers assume density 5 % (RNA
+    and general) or 10 % (ATAC), times `n_vars × 16 B/nnz`; the
+    dense reader sizes the dense slab buffer
+    (`shard_target_rows × n_vars × sizeof(dtype) × 2`). When the
+    dense reader's `memory_budget`-derived slab cap is tighter than
+    `shard_target_rows`, the parallel coordinator silently clamps
+    its partition to that cap (matching the sequential path).
+  - `writer_queue_depth`: backpressure window between the parallel
+    encoder pool and the ordered writer. Default 4. The parallel
+    coordinator caps outstanding shards (encoding + in channel + in
+    reorder buffer) at `reader_threads + writer_queue_depth` via a
+    rolling-window spawn, so peak RSS scales with that sum, not with
+    the total shard count. Larger values give a slow shard a deeper
+    look-ahead buffer; smaller values risk starving encoders when
+    one shard takes much longer than its siblings.
+- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
   - `modalities`: optional list of modality names to keep
     (case-sensitive). Unknown names raise `ValueError` with the
     available list.
@@ -917,7 +940,7 @@ for the full dispatch rules and requirements.
 - `pyscx.accel.energy_distance_details(...)` — Same signature (including `backend` / `dtype`) as `energy_distance` but returns `{"correlation": float, "d_real": {pert: float}, "d_pred": {pert: float}, "pert_names": [...]}`.
 - `pyscx.accel.discrimination_score(adata_real, adata_pred, pert_col="perturbation", control="control", metric="l1", exclude_target_gene=True, embed_key=None, min_cells_per_group=1) → dict[str, float]` — Per-perturbation normalized rank of the predicted perturbation effect's distance to the correct real effect. `metric ∈ {"l1", "l2"/"euclidean", "cosine"}`. `exclude_target_gene=True` drops the gene matching each perturbation's name from the distance (matches cell-eval's default).
 - `pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation", control="control", eps=1e-8)` — Per-cell knockdown efficiency + log-fold change vs control baseline. Input must be normalized (NOT log1p'd); log1p is applied internally. Writes `adata.obs["KnockDownEfficiency"]` and `adata.obs["KnockDownGeneFC"]` (both float32, NaN for control cells and cells whose perturbation name isn't in `var_names`). Matches `arc_bench.tools.normalize_transform.core` within atol=1e-6.
-- `pyscx.accel.clustering_agreement(adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1) → float` — Builds perturbation-centroid kNN graphs, sweeps Leiden resolutions, scores best real-vs-pred agreement via AMI / NMI / ARI. **All-native-Rust** post-Phase-3 — no scanpy / anndata / igraph dispatch; uses `scx_accel::neighbors::build_knn_graph` (HNSW via `instant-distance`, `ef_construction=200, ef_search=50, seed=0`) plus `scx_accel::leiden` sequential mode (`max_iterations=2, parallel=false, seed=0` — matches scanpy's `flavor="igraph", n_iterations=2`). Pred-side kNN graph built once and reused across the resolution sweep; whole hot path runs under `py.allow_threads`. Matches cell-eval's `ClusteringAgreement` within `atol=0.15` aggregate (stochastic Leiden; exact score match not expected — algorithms agree exactly on graphs with `n_perts ≥ 16`).
+- `pyscx.accel.clustering_agreement(adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1) → float` — Builds perturbation-centroid kNN graphs, sweeps Leiden resolutions, scores best real-vs-pred agreement via AMI / NMI / ARI. **All-native-Rust** — no scanpy / anndata / igraph dispatch; uses `scx_accel::neighbors::build_knn_graph` (HNSW via `instant-distance`, `ef_construction=200, ef_search=50, seed=0`) plus `scx_accel::leiden` sequential mode (`max_iterations=2, parallel=false, seed=0` — matches scanpy's `flavor="igraph", n_iterations=2`). Pred-side kNN graph built once and reused across the resolution sweep; whole hot path runs under `py.allow_threads`. Matches cell-eval's `ClusteringAgreement` within `atol=0.15` aggregate (stochastic Leiden; exact score match not expected — algorithms agree exactly on graphs with `n_perts ≥ 16`).
 - `pyscx.accel.adjusted_mutual_info(labels_a, labels_b) → float` — AMI on integer label arrays (arithmetic-mean convention). Matches `sklearn.metrics.adjusted_mutual_info_score` within atol=1e-10.
 - `pyscx.accel.normalized_mutual_info(labels_a, labels_b) → float` — NMI (arithmetic-mean). Matches `sklearn.metrics.normalized_mutual_info_score` within atol=1e-10.
 - `pyscx.accel.adjusted_rand_index(labels_a, labels_b) → float` — ARI rescaled to `[0, 1]` via `(ARI + 1) / 2` (cell-eval convention). For the raw sklearn ARI (in `[-0.5, 1]`), compute `2 * adjusted_rand_index(a, b) - 1`.
@@ -1286,7 +1309,7 @@ processes either; it owns thread handles that don't survive transfer.
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
+- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always] [--reader-threads N] [--writer-queue-depth N]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
 
   Wild-h5ad hardening: `--memory-budget 4G` caps dense row slabs and
   CSC external-transpose buffers (binary prefixes only; see

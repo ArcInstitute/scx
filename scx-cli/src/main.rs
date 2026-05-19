@@ -144,7 +144,7 @@ enum Commands {
         /// when no explicit columns or preset are supplied.
         #[arg(long, default_value_t = 1000)]
         index_auto_threshold: usize,
-        /// Phase 5b: detection-bitmap shard generation.
+        /// Detection-bitmap shard generation.
         ///
         /// `off` (default) emits CSR only. `always` writes a bitmap
         /// sidecar for every CSR shard. `auto` writes a sidecar when
@@ -154,6 +154,19 @@ enum Commands {
         /// `pyscx.detection_counts` / `cells_expressing`.
         #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
         bitmap: String,
+        /// Streaming reader worker threads. Default: auto —
+        /// `RAYON_NUM_THREADS` if set, else CPU count. `1` forces the
+        /// sequential coordinator. Output is byte-identical regardless
+        /// of thread count; the parallel path requires a thread-safe
+        /// libhdf5 build (conda-forge default) and falls back to
+        /// sequential with a warning otherwise.
+        #[arg(long, value_name = "N")]
+        reader_threads: Option<usize>,
+        /// Reorder buffer depth between the parallel encoder
+        /// pool and the ordered writer. Default 4. Larger values raise
+        /// peak RSS linearly; smaller values can starve encoders.
+        #[arg(long, value_name = "N", default_value_t = 4)]
+        writer_queue_depth: usize,
     },
     /// Display SCX file information
     Info {
@@ -462,6 +475,8 @@ fn main() {
             index_preset,
             index_auto_threshold,
             bitmap,
+            reader_threads,
+            writer_queue_depth,
         } => run_convert(
             &input,
             &output,
@@ -484,6 +499,8 @@ fn main() {
             index_preset,
             index_auto_threshold,
             &bitmap,
+            reader_threads,
+            writer_queue_depth,
         ),
         Commands::Info {
             file,
@@ -659,6 +676,8 @@ fn run_convert(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
 
@@ -776,6 +795,8 @@ fn run_convert(
         index_preset_value,
         index_auto_threshold,
         bitmap,
+        reader_threads,
+        writer_queue_depth,
     )
 }
 
@@ -849,6 +870,8 @@ fn dispatch_convert(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{BitmapPolicy, ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -889,6 +912,8 @@ fn dispatch_convert(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        reader_threads,
+        writer_queue_depth,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1014,6 +1039,8 @@ fn dispatch_convert(
     _index_preset: Option<String>,
     _index_auto_threshold: usize,
     _bitmap: &str,
+    _reader_threads: Option<usize>,
+    _writer_queue_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

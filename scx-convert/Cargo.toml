@@ -34,6 +34,10 @@ scx-engine = { path = "../scx-engine" }
 # is auto-deleted on drop — the cleanest "scoped resource" pattern
 # for that path.
 tempfile = { workspace = true }
+# Parallel streaming reader. `rayon` for the encoder worker
+# pool; `crossbeam-channel` for the bounded producer→writer queue.
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 hdf5 = { workspace = true, optional = true }
 # Renamed: the 0.9.x line of `hdf5-rust` ships the `hdf5-sys` companion

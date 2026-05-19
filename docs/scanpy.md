@@ -1612,7 +1612,7 @@ SCX's pairwise kernel runs in two backend modes:
   L1 has no gemm formulation and `backend="gemm"` with `metric="l1"`
   raises `RuntimeError`.
 - **`backend="scalar"`**: row-by-row `point_distance` reduction. Always
-  valid; matches the pre-Phase-1 implementation and serves as the legacy
+  valid; matches the original implementation and serves as the legacy
   back-compat path for callers that need bit-stable historical numbers.
 
 The `dtype` kwarg controls the matmul / per-pair arithmetic precision —
@@ -1662,7 +1662,7 @@ calls. The kNN graph uses `scx_accel::neighbors::build_knn_graph`, which
 auto-dispatches between two backends based on `n_obs` (the perturbation
 count after filtering control):
 
-- **`n_obs ≤ 5,000` (Phase 6 default)** — exact kNN via a faer matmul of
+- **`n_obs ≤ 5,000` (default)** — exact kNN via a faer matmul of
   `Centroids · Centroidsᵀ`, per-row partial top-k sort. Wins at small
   `n_obs` because the matmul runs at AVX-GEMM throughput while HNSW's
   inner loops are scalar. This is the active path on every realistic

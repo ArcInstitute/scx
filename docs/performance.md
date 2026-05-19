@@ -165,7 +165,7 @@ declared in `benchmarks/comprehensive/thresholds.yaml`).
 
 ### Streaming export (SCX → h5ad / h5mu)
 
-Phase 8 closes the asymmetry with the ingestion path. `scx convert
+Streaming export closes the asymmetry with the ingestion path. `scx convert
 --to h5ad` / `--to h5mu` (default `--stream=true`) and
 `pyscx.to_h5ad` / `pyscx.to_h5mu` (default `stream=True`) walk SCX
 CSR shards in row order via
@@ -257,7 +257,7 @@ The lazy preprocessing peak (~3.5 GB) covers QC through streaming PCA; kNN graph
 construction and UMAP dominate the remaining RSS in the full pipeline (~10.9 GB).
 Source: `BENCHMARK_REPORT.md` §12 (Lazy Preprocessing & Out-of-Core Pipeline).
 
-### Read iteration: streaming vs in-memory (Phase 6b)
+### Read iteration: streaming vs in-memory
 
 `pyscx.open(path).to_anndata(backed=True)` and `to_mudata(backed=True)` walk
 shards on demand; the eager `to_anndata()` / `to_mudata()` materialise the
@@ -294,7 +294,7 @@ Two takeaways:
 routes through ``to_mudata(backed=True)`` and iterates each modality. On
 the available real fixtures the in-memory ceiling fits comfortably in
 node RAM, so RSS is baseline-bound and the two modes look identical;
-the Phase 6b read path is verified correct via matching per-modality
+the streaming read path is verified correct via matching per-modality
 matrix sums across both modes:
 
 | Dataset | Modalities | SCX size | Streaming wall | In-memory wall | Streaming peak RSS | In-memory peak RSS |
@@ -443,7 +443,7 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuBLAS, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB (driver 535.161.08, CUDA 12.2, scx-gpu conda env).
 
-Numbers below are from the Phase 8 cluster run on 2026-04-23 (SLURM job 2211369). Pipeline end-to-end row is marked _pending bench_ until the census_1m pipeline completes.
+Numbers below are from the cluster run on 2026-04-23 (SLURM job 2211369). Pipeline end-to-end row is marked _pending bench_ until the census_1m pipeline completes.
 
 #### Per-operation timing
 
@@ -461,7 +461,7 @@ Numbers below are from the Phase 8 cluster run on 2026-04-23 (SLURM job 2211369)
 | UMAP trustworthiness | pbmc3k | 0.9238 | 0.9233 | — | vs PCA space |
 | Leiden (`device="cpu"`) | census_1m | 55.0 | 56.9 | **1.0×** | Rust-native (`scx_accel::leiden`) |
 | Leiden (`device="gpu"`) | census_1m | 55.0 | ~3.5 | **~16×** | cuGraph (reached directly post-spec — see "Choosing a Leiden backend" below) |
-| **End-to-end pipeline** | **census_1m** | **837.9** | **120.6** | **6.9×** | all above — **up from 3.8× pre-Phase-1** |
+| **End-to-end pipeline** | **census_1m** | **837.9** | **120.6** | **6.9×** | all above |
 
 The pipeline 6.9× speedup is headlined by UMAP (18.8×, up from 7.7×) and kNN (5.4× in-pipeline, up from 2.3×). PCA at 2K HVGs × 1M cells shows 1.0× because CPU covariance PCA already takes ~3 s — there's no headroom for a speedup. At `n_vars = 100 K` (tabula_sapiens_100k without HVG subsetting) PCA lands at 1.7×.
 
@@ -480,7 +480,7 @@ cuGraph's Leiden uses a different refinement step and seed-handling scheme from 
 
 `device="gpu:N"` pins the cuGraph call to CUDA device `N` via `cupy.cuda.Device(N)`. Bare `"gpu"` is `"gpu:0"`. Out-of-range indices are rejected by `resolve_device`'s validation against `cudarc::GpuDevice::count()`. The Python `leidenalg` shim has been removed — callers who want it run `scanpy.tl.leiden(flavor="leidenalg")` directly.
 
-#### Preprocessing device dispatch (Phase 5)
+#### Preprocessing device dispatch
 
 `pyscx.accel.{normalize_total, log1p, highly_variable_genes}` now accept `device="cpu|gpu|auto"`. The GPU path is eager (materializes to scipy CSR). **`log1p(device="gpu")` on a materialised scipy/dense X warns and falls back to CPU** — the H→D + kernel + D→H round-trip dominates log1p's trivial math. The pre-fallback measurement (retained as motivation):
 
@@ -508,7 +508,7 @@ baseline as the format benchmarks. The LATEST baseline covers a full
 
 | Dataset | accel cells | Source |
 |---|---:|---|
-| pbmc3k (2.7K cells) | 20 | post-Phase-9 Tier 1 / 3 |
+| pbmc3k (2.7K cells) | 20 | Tier 1 / 3 |
 | tabula_sapiens_100k (100K cells) | 20 | Tier 2 / 3 |
 | census_1m (1M cells) | 20 | Tier 3 + CPU-reference retry |
 
@@ -529,7 +529,7 @@ python benchmarks/comprehensive/scripts/gate_candidate.py
 
 The pbmc3k-only `v0.6.0-gpu-phase1-7` baseline (the smoke snapshot
 that briefly held LATEST in late April) remains in-tree for historical
-diff comparison but is no longer the gate target. The Phase-8 stop-gap
+diff comparison but is no longer the gate target. The earlier stop-gap
 wrappers (`benchmarks/scripts/gpu_regression_{diff,driver}.py` and
 `slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py`
 for accelerator regression runs. See
@@ -537,12 +537,11 @@ for accelerator regression runs. See
 
 #### Changes vs previous version
 
-- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) implemented. On tabula_sapiens_100k (HVG-shaped input) GPU PCA now runs 1.7× vs CPU, up from 0.9× in the pre-Phase-1 baseline. On census_1m at the same n_vars, the speedup remained 0.9× — the covariance-PCA's Gram-matrix cost on 1M cells doesn't currently outperform CPU's block-partitioned outer-product accumulation. Tracked as a follow-up optimization (streaming Gram into a sparse intermediate rather than densifying per shard).
+- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) implemented. On tabula_sapiens_100k (HVG-shaped input) GPU PCA now runs 1.7× vs CPU, up from 0.9× in the earlier baseline. On census_1m at the same n_vars, the speedup remained 0.9× — the covariance-PCA's Gram-matrix cost on 1M cells doesn't currently outperform CPU's block-partitioned outer-product accumulation. Tracked as a follow-up optimization (streaming Gram into a sparse intermediate rather than densifying per shard).
 - **Randomized PCA's critical path** now fully GPU-resident — the prior `Q → host → f64` SVD tail and per-iteration `d_m` download round-trip are gone (cuBLAS `sgemv` + `sgemm`). Correctness preserved (cosine ≥ 0.9999 on real data).
 - **Opt-in CholeskyQR2** (`qr_method="cholesky"`) for the randomized path; benchmark-suite variants `gpu_randomized_pca_chol` vs `gpu_randomized_pca_householder` pending from the current cluster run.
 - **Standalone GPU preprocessing ops** (`normalize_total`, `log1p`, `highly_variable_genes`) gain a `device` kwarg. In isolation they are slower than the CPU path (see table above — `log1p` is ~40× slower on tabula due to H2D/D2H round-trips); the `normalize_total → log1p` fusion marker is the only fast path.
 - **cuGraph Leiden** exposes the `theta` knob via `pyscx.accel.leiden(theta=...)`.
-- **Frozen pre-Phase-1 baseline** committed at `benchmarks/results/pre_phases_1_7_baseline_2026_03/` with BLAKE-equivalent integrity (`MANIFEST.sha256`). Historical bisects can diff against this reference via `compare_against_baseline.py --baseline benchmarks/results/pre_phases_1_7_baseline_2026_03/`.
 
 ### Go/No-Go Status
 
@@ -602,18 +601,18 @@ flexibility.
 
 | Lever | Delta | Notes |
 |---|---|---|
-| Phase 2 — shard sort | 0.96× | break-even (fixture fits in 1.4 TB RAM, page-cache hot) |
-| Phase 3 — vectorised pair scatter | 1.07–1.08× | CPU-bound microbench, scale-independent |
-| Phase 4 — lookahead 0→4 | **1.04×** | small but consistent at 1M scale |
-| Phase 4 — lookahead 4→8 | 0.98× | beyond 4 doesn't help on this fixture |
-| Phase 5 — zero-allocation dense gather | **1.36×** | tabula_sapiens_100k A/B, see below |
+| Shard sort | 0.96× | break-even (fixture fits in 1.4 TB RAM, page-cache hot) |
+| Vectorised pair scatter | 1.07–1.08× | CPU-bound microbench, scale-independent |
+| Lookahead 0→4 | **1.04×** | small but consistent at 1M scale |
+| Lookahead 4→8 | 0.98× | beyond 4 doesn't help on this fixture |
+| Zero-allocation dense gather | **1.36×** | tabula_sapiens_100k A/B, see below |
 
-Phase 2 and Phase 4 deltas are scale-dependent — they should grow once the
+The shard-sort and lookahead deltas are scale-dependent — they should grow once the
 fixture exceeds RAM and shard-cache misses start dominating wall time. The
 default `lookahead=4` is justified by the 1M result; `cache_shards=128` is
 the more important lever.
 
-**Phase 5 — zero-allocation dense gather** (tabula_sapiens_100k, HVG=2000,
+**Zero-allocation dense gather** (tabula_sapiens_100k, HVG=2000,
 1024 pairs/batch × 300 batches, page-cache warm; A/B on Chimera CPU node).
 Replaces the `read_row_indices` → per-row `ScxCsr` → `concatenate_csr`
 pipeline with `BackedCsrReader::read_rows_with`, which scatters directly
@@ -660,9 +659,9 @@ fixtures grow beyond memory.
 
 ---
 
-## Phase 5
+## Comprehensive Benchmarking + Cloud Validation
 
-Phase 5 closes SLAF parity, cloud validation on GCS, fragment-ops
+Closes SLAF parity, cloud validation on GCS, fragment-ops
 throughput, and the regression gate. Numbers below come from live
 benchmark runs on a Chimera CPU node against
 `gs://arc-ctc-nextflow/scx-test/` across all four primary cloud

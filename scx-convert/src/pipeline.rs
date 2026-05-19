@@ -8,7 +8,7 @@ use scx_format::header::{FileHeader, MAGIC};
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
+use scx_format::writer::{PreEncodedSection, ScxWriter};
 use scx_sparse::{drop_explicit_zeros_inplace, sort_csr_rows_in_place};
 
 use super::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
@@ -55,6 +55,22 @@ pub enum ConvertError {
 
     #[error("streaming unsupported: {0}")]
     StreamingUnsupported(String),
+
+    /// A per-shard read or encode failed on one of the
+    /// parallel reader workers. The wrapper carries the row range and
+    /// source-matrix name so the user knows exactly which shard
+    /// produced the error.
+    #[error(
+        "shard read failed at rows [{row_start}, {}) of '{source}': {inner}",
+        row_start + *n_rows as u64
+    )]
+    ShardRead {
+        row_start: u64,
+        n_rows: u32,
+        source: String,
+        #[source]
+        inner: Box<ConvertError>,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -130,6 +146,25 @@ pub struct ConvertOptions {
     /// Phase 5b: detection-bitmap shard generation policy. Default
     /// `Off` (explicit opt-in, matches `--csc` ergonomics).
     pub bitmap: BitmapPolicy,
+    /// Streaming reader worker thread count.
+    /// `None` (default) = auto: use `RAYON_NUM_THREADS` if set, else
+    /// [`std::thread::available_parallelism`]. `Some(1)` forces the
+    /// sequential coordinator. `Some(N>1)` requests N rayon workers;
+    /// the coordinator falls back to sequential when (a) libhdf5
+    /// isn't built threadsafe, (b) the reader doesn't implement
+    /// [`crate::stream::IndexedCsrShardStream`], or (c) the
+    /// `memory_budget` derate forces it. The parallel path is
+    /// byte-identical to the sequential path.
+    pub reader_threads: Option<usize>,
+    /// Backpressure window between the parallel encoder pool and the
+    /// ordered writer. Default 4. The parallel coordinator caps
+    /// outstanding shards (encoding + in channel + in reorder buffer)
+    /// at `reader_threads + writer_queue_depth` via a rolling-window
+    /// spawn, so peak RSS scales with that sum, not with the total
+    /// shard count. Larger values give the slow shard a deeper
+    /// look-ahead buffer; smaller values risk starving encoders when
+    /// one shard takes much longer than its siblings.
+    pub writer_queue_depth: usize,
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -144,7 +179,87 @@ const BITMAP_AUTO_N_VARS_CAP: u32 = 1_000_000;
 /// that this is checked *after* the build, not before.
 const BITMAP_AUTO_SIZE_PERCENT: usize = 15;
 
-/// Phase 5b: build (and conditionally write) a detection bitmap for
+/// Per-modality density assumptions used by the
+/// `IndexedCsrShardStream::per_worker_bytes` default impl. The
+/// dispatcher uses this estimate to derate workers under
+/// `memory_budget`. Over-estimating routes the convert to the
+/// sequential coordinator (safe failure mode), so values err
+/// conservative. The dense reader overrides `per_worker_bytes`
+/// entirely; these constants only affect sparse readers.
+pub(crate) const PARALLEL_DENSITY_DEFAULT_DEN: u64 = 20; // ≈ 5 % RNA/general
+pub(crate) const PARALLEL_DENSITY_ATAC_DEN: u64 = 10; // ≈ 10 % ATAC peak matrices
+
+/// Outcome of [`maybe_build_bitmap_shard`]. Either a built shard
+/// (ready to write) or a structured reason for skipping that the
+/// caller forwards to the warning sink.
+pub(crate) enum BitmapBuildOutcome {
+    Skip { reason: String },
+    Built(BitmapShard),
+}
+
+/// Pure (no I/O, no sink) bitmap-build helper. Applies
+/// the same `--bitmap=auto` density / size gates as the sequential
+/// path but returns an outcome instead of writing. The parallel
+/// coordinator runs this in a worker thread and the sequential
+/// wrapper (`build_and_write_bitmap_for_shard`) routes the outcome
+/// through the writer + sink.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maybe_build_bitmap_shard(
+    indptr: &[u64],
+    indices: &[u32],
+    row_start: u64,
+    n_rows: u32,
+    n_vars: u32,
+    encoded_csr_size: usize,
+    policy: BitmapPolicy,
+    modality_type: ModalityType,
+) -> Option<BitmapBuildOutcome> {
+    if matches!(policy, BitmapPolicy::Off) {
+        return None;
+    }
+    if n_vars > BITMAP_AUTO_N_VARS_CAP && !matches!(policy, BitmapPolicy::Always) {
+        return Some(BitmapBuildOutcome::Skip {
+            reason: format!("n_vars {n_vars} exceeds auto cap {BITMAP_AUTO_N_VARS_CAP}"),
+        });
+    }
+
+    let nnz = *indptr.last().unwrap_or(&0);
+    let cells = n_rows as u64;
+    let density = if cells == 0 || n_vars == 0 {
+        0.0_f32
+    } else {
+        nnz as f32 / (cells as f32 * n_vars as f32)
+    };
+    if matches!(policy, BitmapPolicy::Auto)
+        && density > BITMAP_AUTO_DENSITY_THRESHOLD
+        && !matches!(modality_type, ModalityType::Atac)
+    {
+        return Some(BitmapBuildOutcome::Skip {
+            reason: format!(
+                "density {density:.3} above auto threshold {BITMAP_AUTO_DENSITY_THRESHOLD}"
+            ),
+        });
+    }
+
+    let shard = BitmapShard::build_from_csr(row_start, n_rows, n_vars, indptr, indices);
+
+    if matches!(policy, BitmapPolicy::Auto) && !matches!(modality_type, ModalityType::Atac) {
+        let est = shard.estimated_encoded_size();
+        if encoded_csr_size > 0
+            && est.saturating_mul(100) > encoded_csr_size.saturating_mul(BITMAP_AUTO_SIZE_PERCENT)
+        {
+            return Some(BitmapBuildOutcome::Skip {
+                reason: format!(
+                    "estimated {est} bytes > {BITMAP_AUTO_SIZE_PERCENT}% of CSR shard ({encoded_csr_size})"
+                ),
+            });
+        }
+    }
+
+    Some(BitmapBuildOutcome::Built(shard))
+}
+
+/// Build (and conditionally write) a detection bitmap for
 /// one CSR shard.
 ///
 /// `modality_type` and `modality_name` drive the auto policy
@@ -167,62 +282,35 @@ fn build_and_write_bitmap_for_shard(
     modality_name: Option<&str>,
     sink: &mut WarningSink,
 ) -> Result<bool, ConvertError> {
-    if matches!(policy, BitmapPolicy::Off) {
-        return Ok(false);
-    }
-    if n_vars > BITMAP_AUTO_N_VARS_CAP && !matches!(policy, BitmapPolicy::Always) {
-        sink.emit(ConvertWarning::BitmapSkipped {
-            modality: modality_name.map(String::from),
-            reason: format!("n_vars {n_vars} exceeds auto cap {BITMAP_AUTO_N_VARS_CAP}"),
-        });
-        return Ok(false);
-    }
-
-    let nnz = *indptr.last().unwrap_or(&0);
-    let cells = n_rows as u64;
-    let density = if cells == 0 || n_vars == 0 {
-        0.0_f32
-    } else {
-        nnz as f32 / (cells as f32 * n_vars as f32)
-    };
-    if matches!(policy, BitmapPolicy::Auto)
-        && density > BITMAP_AUTO_DENSITY_THRESHOLD
-        && !matches!(modality_type, ModalityType::Atac)
-    {
-        sink.emit(ConvertWarning::BitmapSkipped {
-            modality: modality_name.map(String::from),
-            reason: format!(
-                "density {density:.3} above auto threshold {BITMAP_AUTO_DENSITY_THRESHOLD}"
-            ),
-        });
-        return Ok(false);
-    }
-
-    let shard = BitmapShard::build_from_csr(row_start, n_rows, n_vars, indptr, indices);
-
-    if matches!(policy, BitmapPolicy::Auto) && !matches!(modality_type, ModalityType::Atac) {
-        let est = shard.estimated_encoded_size();
-        // est <= 15% * encoded_csr_size  ⇔  est * 100 <= encoded_csr_size * 15
-        if encoded_csr_size > 0
-            && est.saturating_mul(100) > encoded_csr_size.saturating_mul(BITMAP_AUTO_SIZE_PERCENT)
-        {
+    let outcome = maybe_build_bitmap_shard(
+        indptr,
+        indices,
+        row_start,
+        n_rows,
+        n_vars,
+        encoded_csr_size,
+        policy,
+        modality_type,
+    );
+    match outcome {
+        None => Ok(false),
+        Some(BitmapBuildOutcome::Skip { reason }) => {
             sink.emit(ConvertWarning::BitmapSkipped {
                 modality: modality_name.map(String::from),
-                reason: format!(
-                    "estimated {est} bytes > {BITMAP_AUTO_SIZE_PERCENT}% of CSR shard ({encoded_csr_size})"
-                ),
+                reason,
             });
-            return Ok(false);
+            Ok(false)
+        }
+        Some(BitmapBuildOutcome::Built(shard)) => {
+            writer
+                .write_bitmap_shard(&shard)
+                .map_err(ConvertError::from)?;
+            Ok(true)
         }
     }
-
-    writer
-        .write_bitmap_shard(&shard)
-        .map_err(ConvertError::from)?;
-    Ok(true)
 }
 
-/// Phase 5b: detection-bitmap generation policy.
+/// Detection-bitmap generation policy.
 ///
 /// Re-exported from [`scx_format::BitmapPolicy`] so callers that depend
 /// on `scx-convert` (CLI, pyscx with hdf5) can name it without an
@@ -252,11 +340,30 @@ impl Default for ConvertOptions {
             index_preset: None,
             index_auto_threshold: 1000,
             bitmap: BitmapPolicy::Off,
+            reader_threads: None,
+            writer_queue_depth: 4,
         }
     }
 }
 
-/// Phase 5a — build and write obs/var predicate indexes from the
+/// Resolve [`ConvertOptions::reader_threads`] to a concrete
+/// worker count. `None` (auto) reads `RAYON_NUM_THREADS` if set, else
+/// falls back to [`std::thread::available_parallelism`].
+pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
+    if let Some(n) = opts.reader_threads {
+        return n.max(1);
+    }
+    if let Ok(s) = std::env::var("RAYON_NUM_THREADS") {
+        if let Ok(n) = s.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Build and write obs/var predicate indexes from the
 /// currently configured conversion options, then return the list of
 /// columns that ended up indexed so the caller can stamp provenance.
 ///
@@ -792,10 +899,12 @@ pub fn h5ad_to_scx_streaming(
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
-    // X shards (streaming). The coordinator drives the reader
-    // through `&mut dyn CsrShardStream`; Phase 8c will swap in a
-    // parallel reader fan-out without touching this call site.
-    let (_csr_shard_count, csr_row_ranges) = streaming_writer_coordinator(
+    // X shards (streaming). `run_streaming_writer_coordinator`
+    // dispatches to the parallel encoder pool when the reader is
+    // indexable + libhdf5 is thread-safe + the resolved thread count
+    // is > 1; otherwise it falls back to the sequential path. Output
+    // is byte-identical regardless of route.
+    let (_csr_shard_count, csr_row_ranges) = run_streaming_writer_coordinator(
         x_reader.as_mut(),
         &mut writer,
         opts,
@@ -940,7 +1049,7 @@ pub fn h5ad_to_scx_streaming(
                 }
             };
             let l_index_dtype: u8 = if l_n_vars <= 65535 { 0 } else { 1 };
-            let (_, _) = streaming_writer_coordinator(
+            let (_, _) = run_streaming_writer_coordinator(
                 layer_reader.as_mut(),
                 &mut writer,
                 opts,
@@ -977,6 +1086,7 @@ pub fn h5ad_to_scx_streaming(
         MatrixFormat::Csc => "csc_matrix",
         MatrixFormat::Dense => "array",
     };
+    let resolved_reader_threads = resolve_reader_threads(opts);
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
@@ -992,6 +1102,8 @@ pub fn h5ad_to_scx_streaming(
                 "var_columns": var_indexed,
                 "preset": opts.index_preset,
             },
+            "reader_threads": resolved_reader_threads,
+            "writer_queue_depth": opts.writer_queue_depth,
         })
         .to_string(),
         input_checksums: vec![],
@@ -1072,7 +1184,7 @@ pub fn streaming_writer_coordinator(
         )?;
         let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;
-        // Phase 5b: detection bitmap (only for primary X shards; layer
+        // Detection bitmap (only for primary X shards; layer
         // shards are skipped — bitmaps are per X-axis presence today).
         if section_type == SectionType::CsrShard {
             build_and_write_bitmap_for_shard(
@@ -1093,6 +1205,493 @@ pub fn streaming_writer_coordinator(
         shard_idx += 1;
     }
     Ok((shard_idx, row_ranges))
+}
+
+/// Split the matrix into `[(row_start, n_rows)]` shard
+/// ranges. The sequential coordinator's `while next_csr_shard(...)`
+/// loop produces the same partition implicitly; the parallel
+/// coordinator hoists it so workers can claim ranges without
+/// coordination.
+pub(crate) fn compute_shard_row_ranges(n_obs: u64, target_rows: u32) -> Vec<(u64, u32)> {
+    if target_rows == 0 || n_obs == 0 {
+        return Vec::new();
+    }
+    let target = target_rows as u64;
+    let cap = (n_obs / target + 1) as usize;
+    let mut out = Vec::with_capacity(cap);
+    let mut row = 0u64;
+    while row < n_obs {
+        let n = (n_obs - row).min(target) as u32;
+        out.push((row, n));
+        row += n as u64;
+    }
+    out
+}
+
+/// Payload from a worker thread to the ordered writer.
+struct EncodedShardOutput {
+    pre: PreEncodedSection,
+    /// For sequential `BitmapShard` write after the CSR shard.
+    /// Built by the worker; the writer just calls `write_bitmap_shard`.
+    bitmap: Option<BitmapBuildOutcome>,
+    duplicates_merged: u64,
+}
+
+/// Parallel sibling of [`streaming_writer_coordinator`].
+///
+/// Partitions the reader into `[(row_start, n_rows)]` ranges, fans
+/// them out across a rayon worker pool, and writes encoded shards in
+/// shard-index order via a bounded reorder buffer. Output is
+/// byte-identical to the sequential coordinator.
+///
+/// Requires `reader.as_indexed()` to return `Some(_)`; callers must
+/// verify that and the libhdf5 thread-safety check before routing
+/// here. The top-level [`run_streaming_writer_coordinator`] handles
+/// the fallback to sequential when those preconditions fail.
+#[allow(clippy::too_many_arguments)]
+fn streaming_writer_coordinator_parallel(
+    reader: &dyn crate::stream::IndexedCsrShardStream,
+    writer: &mut ScxWriter,
+    opts: &ConvertOptions,
+    index_dtype: u8,
+    n_vars_u32: u32,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    section_name_prefix: &str,
+    sink: &mut WarningSink,
+    reader_threads: usize,
+    queue_depth: usize,
+    effective_target_rows: u32,
+) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
+    use crossbeam_channel::bounded;
+    use rayon::ThreadPoolBuilder;
+
+    let n_obs = reader.n_obs();
+    let ranges = compute_shard_row_ranges(n_obs, effective_target_rows);
+    if ranges.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let row_ranges: Vec<(u64, u64)> = ranges
+        .iter()
+        .map(|&(rs, nr)| (rs, rs + nr as u64))
+        .collect();
+
+    let n_ranges = ranges.len();
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(reader_threads)
+        .thread_name(|i| format!("scx-stream-{i}"))
+        .build()
+        .map_err(|e| {
+            ConvertError::Other(format!(
+                "failed to build rayon pool with {reader_threads} threads: {e}"
+            ))
+        })?;
+
+    let queue_depth = queue_depth.max(1);
+    let (tx, rx) = bounded::<(usize, Result<EncodedShardOutput, ConvertError>)>(queue_depth);
+
+    let source_name: String = reader.source_matrix_name().to_string();
+    let opts_codec = opts.codec;
+    let opts_bitmap = opts.bitmap;
+    let want_bitmap = section_type == SectionType::CsrShard;
+    let name_prefix = section_name_prefix.to_string();
+
+    // Cap outstanding shards (encoding + in channel + in BTreeMap) at
+    // `reader_threads + queue_depth`. Rolling-window spawn: prime the
+    // pool with `in_flight_cap` tasks, then spawn one new task each
+    // time a shard is received. This bounds the reorder buffer; the
+    // previous up-front spawn loop let the BTreeMap grow to ~n_ranges
+    // when shard 0 was slow (Gemini code review feedback).
+    let in_flight_cap = reader_threads.saturating_add(queue_depth);
+
+    // Serialize parallel coordinator runs across the test binary so
+    // the cfg(test) in-flight counter is observable race-free. Held
+    // for the entire parallel scope; no effect in production.
+    #[cfg(test)]
+    let _serial = {
+        let lock = test_hooks::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        test_hooks::reset_in_flight();
+        lock
+    };
+
+    // Macro-style local spawn: must inline because extracting a
+    // closure would re-borrow `reader` from a nested closure scope
+    // and rayon's `'scope` lifetime can't be reconciled with that
+    // shape. Each spawn clones `tx` + `source_name` for the worker.
+    pool.in_place_scope(|s| -> Result<(), ConvertError> {
+        macro_rules! spawn_shard {
+            ($scope:expr, $idx:expr) => {{
+                let idx_ = $idx;
+                let (row_start, n_rows) = ranges[idx_];
+                let tx = tx.clone();
+                let source_name = source_name.clone();
+                let name = format!("{name_prefix}_{idx_}");
+                $scope.spawn(move |_| {
+                    #[cfg(test)]
+                    let _guard = crate::pipeline::test_hooks::InFlightGuard::new();
+                    let result = encode_one_shard_worker(
+                        reader,
+                        row_start,
+                        n_rows,
+                        opts_codec,
+                        index_dtype,
+                        n_vars_u32,
+                        section_type,
+                        modality_type,
+                        name,
+                        opts_bitmap,
+                        want_bitmap,
+                    );
+                    let wrapped = result.map_err(|inner| ConvertError::ShardRead {
+                        row_start,
+                        n_rows,
+                        source: source_name,
+                        inner: Box::new(inner),
+                    });
+                    let _ = tx.send((idx_, wrapped));
+                });
+            }};
+        }
+
+        // Prime the pump with up to `in_flight_cap` tasks.
+        let mut next_to_spawn: usize = 0;
+        let prime = in_flight_cap.min(n_ranges);
+        while next_to_spawn < prime {
+            spawn_shard!(s, next_to_spawn);
+            next_to_spawn += 1;
+        }
+
+        // Drain in the calling thread, reordering by shard_idx and
+        // spawning one new task per received shard. The BTreeMap can
+        // hold at most `in_flight_cap - 1` out-of-order shards.
+        let mut buffer: std::collections::BTreeMap<usize, EncodedShardOutput> =
+            std::collections::BTreeMap::new();
+        let mut next_idx: usize = 0;
+        let mut received: usize = 0;
+        while received < n_ranges {
+            let (idx, r) = rx.recv().map_err(|_| {
+                ConvertError::Other(
+                    "parallel streaming worker channel closed before all shards arrived".into(),
+                )
+            })?;
+            received += 1;
+            if next_to_spawn < n_ranges {
+                spawn_shard!(s, next_to_spawn);
+                next_to_spawn += 1;
+            }
+            match r {
+                Err(e) => return Err(e),
+                Ok(out) => {
+                    buffer.insert(idx, out);
+                }
+            }
+            while let Some(out) = buffer.remove(&next_idx) {
+                if out.duplicates_merged > 0 {
+                    sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
+                        count: out.duplicates_merged,
+                        policy: "sum".to_string(),
+                    });
+                }
+                let bitmap = out.bitmap;
+                writer.write_preencoded_shard(out.pre)?;
+                if want_bitmap {
+                    match bitmap {
+                        None => { /* policy was Off — nothing to do */ }
+                        Some(BitmapBuildOutcome::Skip { reason }) => {
+                            sink.emit(ConvertWarning::BitmapSkipped {
+                                modality: None,
+                                reason,
+                            });
+                        }
+                        Some(BitmapBuildOutcome::Built(shard)) => {
+                            writer
+                                .write_bitmap_shard(&shard)
+                                .map_err(ConvertError::from)?;
+                        }
+                    }
+                }
+                next_idx += 1;
+            }
+        }
+        Ok(())
+    })?;
+
+    // Capture the in-flight peak into the calling thread's
+    // thread-local *before* releasing `_serial`, so tests reading
+    // `LAST_RUN_PEAK` after `h5ad_to_scx_streaming` returns see the
+    // peak from this run without interference from any subsequent
+    // parallel coordinator invocation. No-op in production.
+    #[cfg(test)]
+    {
+        let peak = test_hooks::IN_FLIGHT_PEAK.load(std::sync::atomic::Ordering::SeqCst);
+        test_hooks::set_last_run_peak(peak);
+        drop(_serial);
+    }
+
+    Ok((n_ranges as u32, row_ranges))
+}
+
+/// Worker body: read + canonicalise + encode one shard and (if
+/// requested) build the bitmap for it. Pure with respect to the
+/// writer — output is funnelled back through a channel to the
+/// ordered writer thread.
+#[allow(clippy::too_many_arguments)]
+fn encode_one_shard_worker(
+    reader: &dyn crate::stream::IndexedCsrShardStream,
+    row_start: u64,
+    n_rows: u32,
+    codec: Option<CodecId>,
+    index_dtype: u8,
+    n_vars_u32: u32,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    name: String,
+    bitmap_policy: BitmapPolicy,
+    want_bitmap: bool,
+) -> Result<EncodedShardOutput, ConvertError> {
+    let mut shard = reader.read_range(row_start, n_rows)?;
+    let duplicates_merged = shard.duplicates_merged;
+    drop_explicit_zeros_inplace(&mut shard.indptr, &mut shard.indices, &mut shard.values);
+    sort_csr_rows_in_place(&shard.indptr, &mut shard.indices, &mut shard.values);
+
+    let pre = encode_one_shard(
+        &shard.indptr,
+        &shard.indices,
+        &shard.values,
+        codec,
+        index_dtype,
+        n_vars_u32,
+        shard.row_start,
+        section_type,
+        modality_type,
+        name,
+    )?;
+    let encoded_csr_size = pre.section_length as usize;
+
+    let bitmap = if want_bitmap {
+        maybe_build_bitmap_shard(
+            &shard.indptr,
+            &shard.indices,
+            shard.row_start,
+            shard.n_rows,
+            n_vars_u32,
+            encoded_csr_size,
+            bitmap_policy,
+            modality_type,
+        )
+    } else {
+        None
+    };
+
+    Ok(EncodedShardOutput {
+        pre,
+        bitmap,
+        duplicates_merged,
+    })
+}
+
+/// Top-level dispatcher: pick parallel vs sequential
+/// coordinator based on `opts.reader_threads`, libhdf5 thread-safety,
+/// reader trait support, and memory-budget derate.
+///
+/// Always returns `(shard_count, row_ranges)` matching the sequential
+/// coordinator's contract. Output is byte-identical regardless of
+/// path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_streaming_writer_coordinator(
+    reader: &mut dyn CsrShardStream,
+    writer: &mut ScxWriter,
+    opts: &ConvertOptions,
+    index_dtype: u8,
+    n_vars_u32: u32,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    section_name_prefix: &str,
+    sink: &mut WarningSink,
+) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
+    let requested = resolve_reader_threads(opts);
+    if requested <= 1 {
+        return streaming_writer_coordinator(
+            reader,
+            writer,
+            opts,
+            index_dtype,
+            n_vars_u32,
+            section_type,
+            modality_type,
+            section_name_prefix,
+            sink,
+        );
+    }
+
+    // Reader must expose row-range reads.
+    let Some(indexed) = reader.as_indexed() else {
+        return streaming_writer_coordinator(
+            reader,
+            writer,
+            opts,
+            index_dtype,
+            n_vars_u32,
+            section_type,
+            modality_type,
+            section_name_prefix,
+            sink,
+        );
+    };
+
+    // libhdf5 must be threadsafe (only when we hit the HDF5-backed
+    // readers — for in-memory MaterializedCsrStream the check is
+    // harmless but we still gate to keep behaviour uniform).
+    if !crate::hdf5_threadsafe::hdf5_is_threadsafe() {
+        crate::hdf5_threadsafe::try_emit_not_threadsafe_warning(sink);
+        return streaming_writer_coordinator(
+            reader,
+            writer,
+            opts,
+            index_dtype,
+            n_vars_u32,
+            section_type,
+            modality_type,
+            section_name_prefix,
+            sink,
+        );
+    }
+
+    // Clamp the partition's shard size by the reader's hard slab cap.
+    // Only `DenseXStreamReader` returns `Some(_)` today (when
+    // `memory_budget` shrinks `max_slab_rows` below
+    // `shard_target_rows`). Sequential `DenseXStreamReader::
+    // next_csr_shard` already clamps the same way, so byte-identity
+    // with the sequential path holds.
+    let effective_target = indexed
+        .max_slab_rows()
+        .map_or(opts.shard_target_rows, |cap| {
+            opts.shard_target_rows.min(cap)
+        });
+
+    // Memory-budget derate: cap workers so per-worker working set
+    // fits under `memory_budget`. Estimate is delegated to the reader
+    // via `IndexedCsrShardStream::per_worker_bytes`: the default impl
+    // assumes the sparsified output is the binding bound and picks
+    // density by modality (RNA/default 5 %, ATAC 10 %); the dense
+    // reader override sizes the dense slab buffer instead. Pass
+    // `effective_target` so the estimate matches the shard size we
+    // are actually about to drive workers at.
+    let per_worker_bytes = indexed
+        .per_worker_bytes(effective_target, modality_type)
+        .max(1);
+    let granted = match opts.memory_budget {
+        Some(b) if per_worker_bytes > b => {
+            return Err(ConvertError::Other(format!(
+                "single parallel-streaming shard requires \u{2248} {per_worker_bytes} bytes \
+                 but memory_budget is {b}; lower --shard-size or raise --memory-budget"
+            )));
+        }
+        Some(b) => {
+            let max_workers = (b / per_worker_bytes).max(1) as usize;
+            max_workers.min(requested)
+        }
+        None => requested,
+    };
+    if granted < requested {
+        sink.emit(ConvertWarning::ReaderThreadsDerated {
+            requested,
+            granted,
+            reason: format!(
+                "memory_budget caps per-worker working set to {per_worker_bytes} bytes"
+            ),
+        });
+    }
+
+    if granted <= 1 {
+        return streaming_writer_coordinator(
+            reader,
+            writer,
+            opts,
+            index_dtype,
+            n_vars_u32,
+            section_type,
+            modality_type,
+            section_name_prefix,
+            sink,
+        );
+    }
+
+    streaming_writer_coordinator_parallel(
+        indexed,
+        writer,
+        opts,
+        index_dtype,
+        n_vars_u32,
+        section_type,
+        modality_type,
+        section_name_prefix,
+        sink,
+        granted,
+        opts.writer_queue_depth.max(1),
+        effective_target,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+pub(crate) mod test_hooks {
+    //! Test-only instrumentation for the parallel coordinator.
+    //!
+    //! `IN_FLIGHT_NOW` tracks worker tasks currently executing (one
+    //! entry per running `encode_one_shard_worker`); `IN_FLIGHT_PEAK`
+    //! is the running maximum across the most recent run. The
+    //! coordinator acquires `SERIALIZE` for the duration of the
+    //! parallel scope to ensure exactly one parallel coordinator run
+    //! is in flight at a time across all tests in the binary, then
+    //! captures `IN_FLIGHT_PEAK` into the calling thread's
+    //! `LAST_RUN_PEAK` before releasing the lock. Tests read
+    //! `LAST_RUN_PEAK` after the streaming call returns; the
+    //! thread-local pin makes the read race-free without requiring
+    //! tests themselves to hold the global lock.
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    pub static IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
+    pub static IN_FLIGHT_PEAK: AtomicUsize = AtomicUsize::new(0);
+    pub static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        pub static LAST_RUN_PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn reset_in_flight() {
+        IN_FLIGHT_NOW.store(0, Ordering::SeqCst);
+        IN_FLIGHT_PEAK.store(0, Ordering::SeqCst);
+    }
+
+    pub fn last_run_peak() -> usize {
+        LAST_RUN_PEAK.with(|c| c.get())
+    }
+
+    pub fn set_last_run_peak(v: usize) {
+        LAST_RUN_PEAK.with(|c| c.set(v));
+    }
+
+    pub struct InFlightGuard;
+
+    impl InFlightGuard {
+        pub fn new() -> Self {
+            let now = IN_FLIGHT_NOW.fetch_add(1, Ordering::SeqCst) + 1;
+            IN_FLIGHT_PEAK.fetch_max(now, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            IN_FLIGHT_NOW.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Memory budget for the streaming CSR→CSC transpose at convert time.
