@@ -133,6 +133,20 @@ pub(super) fn write_dataframe_group_at(
     batch: &arrow::array::RecordBatch,
 ) -> Result<(), ConvertError> {
     let group = parent.group(name).or_else(|_| parent.create_group(name))?;
+    write_dataframe_body(&group, batch)
+}
+
+/// Shared body for `write_dataframe_group{,_at}`. Caller is responsible
+/// for opening or creating `group`. Resolves the pandas index from
+/// schema metadata, renames pyarrow's `__index_level_0__` to anndata's
+/// `_index` literal on disk (named indexes keep their original name),
+/// excludes the index column from `column-order`, and always writes
+/// `column-order` (length-0 OK) since anndata.read_h5ad requires the
+/// attribute to be present.
+fn write_dataframe_body(
+    group: &hdf5::Group,
+    batch: &arrow::array::RecordBatch,
+) -> Result<(), ConvertError> {
     let schema = batch.schema();
     group
         .new_attr::<VarLenUnicode>()
@@ -179,9 +193,9 @@ pub(super) fn write_dataframe_group_at(
         if Some(field.name()) == index_field_name.as_ref() {
             // Index column → write under the anndata on-disk name and
             // exclude from `column-order` (matches anndata convention).
-            write_column_to_hdf5(&group, on_disk_index, col, field.data_type())?;
+            write_column_to_hdf5(group, on_disk_index, col, field.data_type())?;
         } else {
-            write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
+            write_column_to_hdf5(group, field.name(), col, field.data_type())?;
             col_order.push(vlu(field.name()));
         }
     }
@@ -191,7 +205,8 @@ pub(super) fn write_dataframe_group_at(
     // (it will raise `KeyError: "...can't locate attribute:
     // 'column-order'"` otherwise). Write it unconditionally — a
     // length-0 array for the no-columns case matches anndata's own
-    // emission.
+    // emission. SCX's own reader handles the empty-attr case in
+    // `read_dataframe_group`'s fallback branch.
     group
         .new_attr::<VarLenUnicode>()
         .shape(col_order.len())
@@ -270,63 +285,7 @@ fn write_dataframe_group(
     batch: &RecordBatch,
 ) -> Result<(), ConvertError> {
     let group = file.create_group(name)?;
-    let schema = batch.schema();
-
-    // Probe order (matches `write_dataframe_group_at`): pandas
-    // `index_columns` metadata first, then `schema.field(0)`. Rename
-    // pyarrow's `__index_level_0__` to anndata's `_index` literal on
-    // disk; named indexes keep their original name. The index column
-    // is excluded from `column-order` to match anndata's convention.
-    let pandas_idx_cols = scx_format::pandas_index_columns(schema.as_ref());
-    let index_field_name: Option<String> = pandas_idx_cols
-        .into_iter()
-        .find(|n| schema.field_with_name(n).is_ok())
-        .or_else(|| schema.fields().first().map(|f| f.name().clone()));
-    let on_disk_index: &str = match index_field_name.as_deref() {
-        Some("__index_level_0__") => "_index",
-        Some(n) => n,
-        None => "_index",
-    };
-
-    if !schema.fields().is_empty() {
-        group
-            .new_attr::<VarLenUnicode>()
-            .create("_index")?
-            .write_scalar(&vlu(on_disk_index))?;
-    }
-
-    let encoding_type = vlu("dataframe");
-    group
-        .new_attr::<VarLenUnicode>()
-        .create("encoding-type")?
-        .write_scalar(&encoding_type)?;
-
-    let encoding_version = vlu("0.2.0");
-    group
-        .new_attr::<VarLenUnicode>()
-        .create("encoding-version")?
-        .write_scalar(&encoding_version)?;
-
-    let mut col_order: Vec<VarLenUnicode> =
-        Vec::with_capacity(batch.num_columns().saturating_sub(1));
-    for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        if Some(field.name()) == index_field_name.as_ref() {
-            write_column_to_hdf5(&group, on_disk_index, col, field.data_type())?;
-        } else {
-            write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
-            col_order.push(vlu(field.name()));
-        }
-    }
-
-    // Always write `column-order` (anndata requires it; length-0 OK).
-    group
-        .new_attr::<VarLenUnicode>()
-        .shape([col_order.len()])
-        .create("column-order")?
-        .write_raw(&col_order)?;
-
-    Ok(())
+    write_dataframe_body(&group, batch)
 }
 
 fn downcast_err(name: &str, expected: &str) -> ConvertError {

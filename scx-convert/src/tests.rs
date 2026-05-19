@@ -5877,3 +5877,78 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
         "the index column must be excluded from column-order"
     );
 }
+
+#[test]
+fn read_dataframe_group_index_only_recovers_values() {
+    // Codex P1 (SCX-USER-REPORT-2026-05-19 § B2 follow-up): when a
+    // dataframe group has an empty `column-order` attribute (the
+    // canonical anndata emission for an index-only frame, and what
+    // `write_dataframe_body` now emits when all schema fields are the
+    // pandas index), `read_dataframe_group` must still read the real
+    // values from the `_index` dataset — not synthesise blank
+    // strings, which is what the pre-fix fallback did.
+    use super::h5ad_read::read_dataframe_group;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("idx_only.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let var = file.create_group("var").unwrap();
+
+    // Encoding metadata that anndata expects.
+    var.new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("dataframe"))
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("encoding-version")
+        .unwrap()
+        .write_scalar(&vlu("0.2.0"))
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+    // Length-0 column-order — matches our writer's emission for
+    // index-only frames.
+    let empty: Vec<VarLenUnicode> = Vec::new();
+    var.new_attr::<VarLenUnicode>()
+        .shape(0_usize)
+        .create("column-order")
+        .unwrap()
+        .write_raw(&empty)
+        .unwrap();
+
+    // Actual index dataset — gene symbols on disk.
+    let symbols: Vec<VarLenUnicode> = ["MIR1302-2HG", "FAM138A", "OR4F5"]
+        .iter()
+        .map(|s| vlu(s))
+        .collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([symbols.len()])
+        .create("_index")
+        .unwrap()
+        .write(&symbols)
+        .unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let batch = read_dataframe_group(&file, "var").unwrap();
+
+    assert_eq!(batch.num_columns(), 1, "expected single _index column");
+    assert_eq!(batch.schema().field(0).name(), "_index");
+    assert_eq!(batch.num_rows(), 3);
+
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("index column must be Utf8/StringArray");
+    let values: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(
+        values,
+        vec!["MIR1302-2HG", "FAM138A", "OR4F5"],
+        "fallback must read real values from the _index dataset, not blanks"
+    );
+}

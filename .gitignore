@@ -7,6 +7,7 @@ docs/_autosummary/
 .venv-docs/
 
 # Misc
+.nfs*
 archive/
 tasks/
 tmp/

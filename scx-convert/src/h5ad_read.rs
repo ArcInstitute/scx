@@ -347,18 +347,24 @@ pub fn read_dataframe_group(
     }
 
     if fields.is_empty() {
-        // Create an empty batch with a dummy index if needed
-        let n_rows = if let Some(ref idx_name) = index_col_name {
+        // Index-only frame: `column-order` was absent or length-0
+        // (anndata's own emission for a dataframe with no columns,
+        // and this crate's writer does the same — see
+        // `h5ad_write::write_dataframe_body`). The normal loop above
+        // never visited the index dataset because `column-order`
+        // excludes it by convention. Read the dataset named by the
+        // `_index` HDF5 attribute directly so obs_names / var_names
+        // survive the round-trip instead of being silently replaced
+        // with empty strings.
+        if let Some(ref idx_name) = index_col_name {
             if let Ok(ds) = group.dataset(idx_name) {
-                ds.shape()[0]
-            } else {
-                0
+                let (field, array) = read_column_to_arrow(&group, &ds, "_index")?;
+                let schema = Schema::new(vec![field]);
+                return Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?);
             }
-        } else {
-            0
-        };
+        }
         let schema = Schema::new(vec![Field::new("_index", DataType::Utf8, true)]);
-        let empty_arr: ArrayRef = Arc::new(StringArray::from(vec![""; n_rows]));
+        let empty_arr: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
         return Ok(RecordBatch::try_new(Arc::new(schema), vec![empty_arr])?);
     }
 

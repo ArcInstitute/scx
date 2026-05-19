@@ -321,3 +321,53 @@ def test_pyscx_h5ad_roundtrip_preserves_named_var_index(tmp_dir):
     )
     assert list(rt.var.columns) == ["gene_ids"]
     assert "__index_level_0__" not in rt.var.columns
+
+
+def test_pyscx_h5ad_roundtrip_preserves_index_only_var(tmp_dir):
+    """Codex P1 (B2 follow-up): an AnnData with non-trivial var_names
+    but zero var columns must survive a full
+    `from_h5ad → to_h5ad → from_h5ad → to_anndata` loop without
+    `var_names`/`obs_names` getting replaced by empty strings.
+
+    Triggers the SCX-internal re-read path that hits
+    `read_dataframe_group`'s empty-`column-order` fallback — the
+    branch that pre-fix synthesised `vec![""; n_rows]` for the index.
+    """
+    import anndata as ad
+    import pandas as pd
+    import pyscx
+
+    n_obs, n_vars = 6, 4
+    x = sp.csr_matrix(
+        np.arange(n_obs * n_vars, dtype=np.float32).reshape(n_obs, n_vars)
+    )
+    src = ad.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=pd.Index([f"CELL_{i}" for i in range(n_obs)])),
+        var=pd.DataFrame(index=pd.Index([f"GENE_{i}" for i in range(n_vars)])),
+    )
+    assert src.var.shape[1] == 0 and src.obs.shape[1] == 0
+
+    src_h5ad = tmp_dir / "idx_only.h5ad"
+    src_scx = tmp_dir / "idx_only.scx"
+    rt_h5ad = tmp_dir / "idx_only_rt.h5ad"
+    rt_scx = tmp_dir / "idx_only_rt.scx"
+    src.write_h5ad(src_h5ad)
+
+    # First leg: h5ad → scx → h5ad (exercises the writer fix from B2).
+    pyscx.from_h5ad(str(src_h5ad), str(src_scx))
+    pyscx.to_h5ad(str(src_scx), str(rt_h5ad))
+
+    # Second leg: h5ad → scx via the CLI-style path that goes through
+    # `read_dataframe_group`. This is the branch Codex flagged.
+    pyscx.from_h5ad(str(rt_h5ad), str(rt_scx))
+    rt = pyscx.open(str(rt_scx)).to_anndata()
+
+    assert list(rt.var_names) == list(src.var_names), (
+        f"var_names lost on round-trip: got {list(rt.var_names)}, "
+        f"expected {list(src.var_names)}"
+    )
+    assert list(rt.obs_names) == list(src.obs_names), (
+        f"obs_names lost on round-trip: got {list(rt.obs_names)}, "
+        f"expected {list(src.obs_names)}"
+    )
