@@ -245,7 +245,7 @@ All feature flags are opt-in:
 
 ## Fuzzing
 
-Two fuzz target suites exist, both using `cargo-fuzz` + `libfuzzer-sys`:
+Three fuzz target suites exist, all using `cargo-fuzz` + `libfuzzer-sys`. Each lives in its own cargo workspace under `<crate>/fuzz/` (the standard `cargo-fuzz` layout), so the top-level `cargo build/test --workspace` walks past them.
 
 ### scx-codec fuzzing
 
@@ -253,10 +253,9 @@ Targets malformed codec bitstreams:
 
 ```bash
 # Install cargo-fuzz (one-time)
-cargo install cargo-fuzz
+cargo install --locked cargo-fuzz
 
-# List available targets
-cd scx-codec
+cd scx-codec/fuzz
 cargo fuzz list
 
 # Run a specific target (runs indefinitely; Ctrl-C to stop)
@@ -268,22 +267,47 @@ cargo +nightly fuzz run fuzz_delta_golomb
 
 ### scx-format fuzzing
 
-Targets malformed file structures (headers, catalogs, shards):
+Targets malformed file structures (headers, catalogs, shards, sidecars):
 
 ```bash
-cd scx-format
+cd scx-format/fuzz
 cargo fuzz list
 
 cargo +nightly fuzz run fuzz_header
 cargo +nightly fuzz run fuzz_shard
 cargo +nightly fuzz run fuzz_catalog
 cargo +nightly fuzz run fuzz_csc_shard
+cargo +nightly fuzz run fuzz_bitmap            # Phase 5b BitmapShard
+cargo +nightly fuzz run fuzz_modality_table    # Phase 9: ModalityTable
+cargo +nightly fuzz run fuzz_provenance        # Phase 9: Provenance.params_json
 ```
 
-> **Note**: `cargo fuzz` requires the nightly toolchain. Install with
-> `rustup toolchain install nightly`. Corpus files accumulate in
-> `fuzz/corpus/<target>/`; check in interesting specimens as regression
-> fixtures.
+### scx-engine fuzzing
+
+Predicate-index deserialisation lives in `scx_engine::PredicateIndex::read_from`, not `scx-format`, so it gets its own fuzz crate:
+
+```bash
+cd scx-engine/fuzz
+cargo fuzz list
+
+cargo +nightly fuzz run fuzz_predicate_index   # Phase 9: categorical + numeric
+```
+
+### Bounded runs and CI
+
+For a fixed-duration smoke test (e.g. 2 minutes) rather than indefinite fuzzing:
+
+```bash
+cd scx-format/fuzz
+cargo +nightly fuzz run fuzz_modality_table -- -max_total_time=120
+```
+
+The `.github/workflows/fuzz.yml` workflow exposes both modes:
+
+- **Build check** runs on every PR and push to `main`: `cargo +nightly fuzz build` in each of the three fuzz crates. This catches API bitrot — if a refactor breaks a fuzz target's call site, the PR fails before merging.
+- **Run on demand** runs only via `workflow_dispatch`. Trigger from the GitHub Actions tab → Fuzz → Run workflow, with inputs `duration_seconds` (default 120) and an optional `target` filter (e.g. `fuzz_modality_table` to run a single target). Crash inputs are uploaded as workflow artifacts when a target fails.
+
+> **Note**: `cargo fuzz` requires the nightly toolchain. Install with `rustup toolchain install nightly`. Corpus files accumulate in `fuzz/corpus/<target>/`; check in interesting specimens as regression fixtures.
 
 ## Benchmarks
 
