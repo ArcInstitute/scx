@@ -32,8 +32,8 @@ with a `device="gpu"` parameter.
 Operations without their required dependencies fall back to CPU automatically
 with a warning — no crashes.
 
-**Note on cuBLAS:** Phase 2+ (covariance PCA, GPU-resident final-embedding
-multiply, CholeskyQR2, preprocessing Gram correction) depend on **cuBLAS**.
+**Note on cuBLAS:** covariance PCA, GPU-resident final-embedding
+multiply, CholeskyQR2, and preprocessing Gram correction depend on **cuBLAS**.
 `libcublas.so` ships alongside `libcusparse.so` / `libcusolver.so` inside
 every CUDA Toolkit 12.x install, so no new runtime library path or env-var
 setup is required — any working `scx-gpu` env from prior releases continues

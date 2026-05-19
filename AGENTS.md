@@ -6,7 +6,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 
 ## Key Documents
 
-- **[ROADMAP.md](ROADMAP.md)** — Capability tiers and phase status.
+- **[ROADMAP.md](ROADMAP.md)** — Capability tiers and status.
 - **[docs/architecture.md](docs/architecture.md)** — Crate graph, feature flags, file format overview, codec system, data model, reader/writer architecture.
 - **[docs/format.md](docs/format.md)** — Binary format reference: file header, catalogs, CSR shard layout, fragment/manifest model, checksums.
 - **[docs/codec.md](docs/codec.md)** — Bit-level codec spec: Delta-Golomb-Rice, FOR-BP, Rice, LZ4+shuffle, auto-selection.

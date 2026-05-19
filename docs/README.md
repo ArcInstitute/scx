@@ -51,6 +51,6 @@ big picture, then [api.md](api.md) (Rust/CLI/Python APIs) or
 ## Related top-level docs
 
 - [../README.md](../README.md) — Project README.
-- [../ROADMAP.md](../ROADMAP.md) — Capability tiers and phase status.
+- [../ROADMAP.md](../ROADMAP.md) — Capability tiers and status.
 - [../CLAUDE.md](../CLAUDE.md) — Agent-facing project overview with links into the docs above.
 - [../benchmarks/README.md](../benchmarks/README.md) — Practical benchmark guide: SLURM submission, dataset prep, regression gating.

@@ -186,7 +186,7 @@ pub struct ModalityInfo {
 ### Codec selection — `select_codec_for_modality`
 
 `select_codec_for_modality(raw_values, value_encoding, modality_type)`
-extends `select_codec` with per-modality routing (Phase E):
+extends `select_codec` with per-modality routing:
 RNA / Custom / Methylation / Spatial → delegate to `select_codec`;
 Protein/ADT → Zstd for integers, Pcodec for floats; ATAC → Zstd for
 binary peak presence (sample max ≤ 1) else Lz4Shuffle, Pcodec for
@@ -701,7 +701,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   the rebuild. `uns_format` is accepted for API parity with
   `from_anndata` but is a no-op here (streaming reads `uns` from the
   h5ad file directly, not from Python).
-  - Source layout (Phases 1 & 2): CSR streams natively. Dense `/X`
+  - Source layout: CSR streams natively. Dense `/X`
     streams via row-slab sparsification — set `dense_zero_epsilon` to
     threshold near-zero values (default `0.0` matches scipy's
     `csr_matrix(dense)`). CSC-on-disk uses an in-memory transpose
@@ -929,7 +929,7 @@ for the full dispatch rules and requirements.
 - `pyscx.accel.energy_distance_details(...)` — Same signature (including `backend` / `dtype`) as `energy_distance` but returns `{"correlation": float, "d_real": {pert: float}, "d_pred": {pert: float}, "pert_names": [...]}`.
 - `pyscx.accel.discrimination_score(adata_real, adata_pred, pert_col="perturbation", control="control", metric="l1", exclude_target_gene=True, embed_key=None, min_cells_per_group=1) → dict[str, float]` — Per-perturbation normalized rank of the predicted perturbation effect's distance to the correct real effect. `metric ∈ {"l1", "l2"/"euclidean", "cosine"}`. `exclude_target_gene=True` drops the gene matching each perturbation's name from the distance (matches cell-eval's default).
 - `pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation", control="control", eps=1e-8)` — Per-cell knockdown efficiency + log-fold change vs control baseline. Input must be normalized (NOT log1p'd); log1p is applied internally. Writes `adata.obs["KnockDownEfficiency"]` and `adata.obs["KnockDownGeneFC"]` (both float32, NaN for control cells and cells whose perturbation name isn't in `var_names`). Matches `arc_bench.tools.normalize_transform.core` within atol=1e-6.
-- `pyscx.accel.clustering_agreement(adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1) → float` — Builds perturbation-centroid kNN graphs, sweeps Leiden resolutions, scores best real-vs-pred agreement via AMI / NMI / ARI. **All-native-Rust** post-Phase-3 — no scanpy / anndata / igraph dispatch; uses `scx_accel::neighbors::build_knn_graph` (HNSW via `instant-distance`, `ef_construction=200, ef_search=50, seed=0`) plus `scx_accel::leiden` sequential mode (`max_iterations=2, parallel=false, seed=0` — matches scanpy's `flavor="igraph", n_iterations=2`). Pred-side kNN graph built once and reused across the resolution sweep; whole hot path runs under `py.allow_threads`. Matches cell-eval's `ClusteringAgreement` within `atol=0.15` aggregate (stochastic Leiden; exact score match not expected — algorithms agree exactly on graphs with `n_perts ≥ 16`).
+- `pyscx.accel.clustering_agreement(adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1) → float` — Builds perturbation-centroid kNN graphs, sweeps Leiden resolutions, scores best real-vs-pred agreement via AMI / NMI / ARI. **All-native-Rust** — no scanpy / anndata / igraph dispatch; uses `scx_accel::neighbors::build_knn_graph` (HNSW via `instant-distance`, `ef_construction=200, ef_search=50, seed=0`) plus `scx_accel::leiden` sequential mode (`max_iterations=2, parallel=false, seed=0` — matches scanpy's `flavor="igraph", n_iterations=2`). Pred-side kNN graph built once and reused across the resolution sweep; whole hot path runs under `py.allow_threads`. Matches cell-eval's `ClusteringAgreement` within `atol=0.15` aggregate (stochastic Leiden; exact score match not expected — algorithms agree exactly on graphs with `n_perts ≥ 16`).
 - `pyscx.accel.adjusted_mutual_info(labels_a, labels_b) → float` — AMI on integer label arrays (arithmetic-mean convention). Matches `sklearn.metrics.adjusted_mutual_info_score` within atol=1e-10.
 - `pyscx.accel.normalized_mutual_info(labels_a, labels_b) → float` — NMI (arithmetic-mean). Matches `sklearn.metrics.normalized_mutual_info_score` within atol=1e-10.
 - `pyscx.accel.adjusted_rand_index(labels_a, labels_b) → float` — ARI rescaled to `[0, 1]` via `(ARI + 1) / 2` (cell-eval convention). For the raw sklearn ARI (in `[-0.5, 1]`), compute `2 * adjusted_rand_index(a, b) - 1`.

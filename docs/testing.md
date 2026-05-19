@@ -179,7 +179,7 @@ Helper utilities in `validation_helpers.py`: `max_abs_error`, `max_rel_error`, `
 
 | Script | Purpose |
 |--------|---------|
-| `benchmark_all.py` | Runs all Phase 1 benchmarks together |
+| `benchmark_all.py` | Runs all baseline benchmarks together |
 | `benchmark_compression.py` | Compression ratio vs h5ad (target: < 60%) |
 | `benchmark_read.py` | Read performance (scx vs h5ad) |
 | `benchmark_write.py` | h5ad → scx conversion speed (MB/s) |
@@ -199,7 +199,6 @@ Helper utilities in `validation_helpers.py`: `max_abs_error`, `max_rel_error`, `
 | `submit_benchmarks.py` | Submit and manage benchmark SLURM jobs |
 | `benchmark_madvise_rss.py` | MADV_DONTNEED RSS impact: peak RSS during streaming aggregation (orchestrator) |
 | `benchmark_madvise_rss_worker.py` | Subprocess worker for RSS measurement (samples /proc/self/statm) |
-| `slurm_phase2g_exit.sh` | Sprint 2 exit benchmark: parallel SLURM submission for D1–D7 |
 
 ### Running Benchmarks
 

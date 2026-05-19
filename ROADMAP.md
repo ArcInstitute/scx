@@ -28,7 +28,7 @@ faster than scanpy. These are optimizations, not prerequisites.
 
 ---
 
-## Phase 1: Format + Codec + AnnData Bridge (Months 1-4) — COMPLETE
+## 1. Format + Codec + AnnData Bridge (Months 1-4) — COMPLETE
 
 **Status**: All tasks complete. Go/No-Go gate passed 2026-03-17.
 **Benchmark results**: [benchmarks/results/benchmark_results.md](benchmarks/results/benchmark_results.md)
@@ -64,7 +64,7 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
 ### 1.4 scx-cli (minimal)
 - [x] `scx convert --from h5ad input.h5ad output.scx` (parallel streaming reader; `--reader-threads N`/`--writer-queue-depth N` opt-in tunables, auto-derived from `RAYON_NUM_THREADS`/CPU count by default, byte-identical to sequential output)
 - [x] `scx convert --from 10x matrix.h5 output.scx`
-- [x] `scx convert --to h5ad input.scx output.h5ad` (Phase 8: streams by default; `--stream=false` for the legacy materialising path; `--to h5mu` and `--modality NAME` for multimodal export)
+- [x] `scx convert --to h5ad input.scx output.h5ad` (streams by default; `--stream=false` for the legacy materialising path; `--to h5mu` and `--modality NAME` for multimodal export)
 - [x] `scx info experiment.scx` (header summary, shard count, manifest history)
 - [x] `scx validate experiment.scx` (BLAKE3 verification of all sections)
 
@@ -101,7 +101,7 @@ are smaller than h5ad with dramatically lower memory usage.
   - With Scx1 codec: 0.207, 0.270 respectively
 - [x] `scx.open().to_anndata()` → full scanpy pipeline (QC → PCA → Leiden → DE) works
 
-### Phase 1 Benchmark Summary
+### Benchmark Summary
 
 | Dataset | Cells | h5ad | SCX (None) | SCX/h5ad | SCX (Scx1) | SCX (Zstd) |
 |---------|-------|------|-----------|----------|-----------|-----------|
@@ -109,23 +109,22 @@ are smaller than h5ad with dramatically lower memory usage.
 | Smart-seq2 | 50,000 | 1.07 GB | 799 MB | 0.746 | 912 MB* | 370 MB |
 | Lung 100K | 100,000 | 1.59 GB | 795 MB | 0.501 | 428 MB | 322 MB |
 
-*Rice codec increases size for non-UMI data — auto-codec selection needed (Phase 2).
+*Rice codec increases size for non-UMI data — auto-codec selection needed.
 
 **Key finding**: Default codec=None gives good compression via integer dtype detection
-alone (float32→uint8/uint16). With codecs enabled, ratios reach 20-35%. Phase 1 SCX reads
+alone (float32→uint8/uint16). With codecs enabled, ratios reach 20-35%. Original SCX reads
 were 7-23× slower than h5ad (sequential decode, no parallelism) but used 4-38× less memory
 (mmap + zero-copy). **Sprint 2–3 resolved the read gap and then some**: SCX is now 1.15–1.38× faster
 than Zarr lz4 on census-scale datasets (500K–5M cells), achieves up to 7× parallel scaling
 at 32 threads, and dominates column projection (4–8× faster than all competitors).
-See `benchmarks/comprehensive/reporting/phase3_report.md` for the full Phase 3 benchmark report.
 
-**Lessons for Phase 2** (all addressed in Sprint 2):
-1. Auto-codec selection is critical (Rice hurts non-UMI data) → Phase 2D added LZ4+shuffle
-2. Parallel shard decode is the highest-impact read performance fix → Phase 2A (rayon par_iter)
+**Lessons learned** (all addressed in Sprint 2):
+1. Auto-codec selection is critical (Rice hurts non-UMI data) → added LZ4+shuffle
+2. Parallel shard decode is the highest-impact read performance fix → rayon par_iter
 3. Memory efficiency (4-38× less than h5ad) is a major selling point
 4. Training loader bypasses to_anndata() entirely — read perf is less relevant there
 
-### Phase 1 Pitfalls and Risks
+### Pitfalls and Risks
 
 - **HDF5 crate (`hdf5-rust`) is unmaintained.** Last release November 2021. It wraps
   the C HDF5 library and still works, but receives no bug fixes. Mitigation: HDF5 is
@@ -148,13 +147,13 @@ See `benchmarks/comprehensive/reporting/phase3_report.md` for the full Phase 3 b
 
 ---
 
-## Phase 2: Training Loader + Query Engine (Months 4-7)
+## 2. Training Loader + Query Engine (Months 4-7)
 
 **Goal**: The ML training data loader (the primary performance thesis) and
 the lazy query engine for efficient subsetting. Also: auto-codec selection
-and parallel shard decode (highest-impact fixes from Phase 1 benchmarks).
+and parallel shard decode (highest-impact fixes from earlier benchmarks).
 
-### 2.0 Phase 1 Fixes (immediate, before new features)
+### 2.0 Fixes from earlier work (immediate, before new features)
 - [x] Auto-codec selection: choose Scx1 vs Zstd based on value distribution
 - [x] Parallel shard decode via rayon (addressed 7-23× read slowdown → now 1.5× faster than competitors)
 - [x] Default `from_anndata()` codec from None to "auto"
@@ -232,11 +231,11 @@ scGPT train end-to-end on atlas-scale SCX data.
 - Training throughput >2x TileDB-SOMA-ML on same hardware and data
 - Predicate pushdown skips >50% of shards on filtered queries
 
-### Phase 2 Pitfalls and Risks
+### Pitfalls and Risks
 
 - **TileDB-SOMA-ML is a moving target.** The `tiledbsoma-ml` package (alpha, March
   2025) has a 4-stage pipeline with eager prefetching and DDP support. By the time
-  SCX Phase 2 ships, SOMA-ML may be stable with C++ acceleration. The >2× throughput
+  the training loader work ships, SOMA-ML may be stable with C++ acceleration. The >2× throughput
   target must be validated against the latest release, not an old version. If SOMA-ML
   closes the gap, SCX's value proposition shifts from "faster loader" to "better
   compression + single file + operation fusion."
@@ -257,7 +256,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 
 ---
 
-## Phase 3: GPU Path + Ecosystem (Months 7-10) — PARTIALLY COMPLETE
+## 3. GPU Path + Ecosystem (Months 7-10) — PARTIALLY COMPLETE
 
 **Goal**: GPU-accelerated I/O, GDS, R bindings, and production polish.
 
@@ -281,16 +280,16 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] SingleCellExperiment interop
 - [x] Harmony batch correction in R (see `rscx/R/harmony.R`)
 
-### 3.4 Multimodal Support — SHIPPED (Phases A–I)
-- [x] **Phase A**: format v2 bump; carve `n_modalities` /
+### 3.4 Multimodal Support — SHIPPED
+- [x] Format v2 bump; carve `n_modalities` /
   `modality_table_offset` / `modality_table_length` out of the header
   reserved tail; add `has_modalities` flag (bit 7); add explicit
   `col_start` / `col_end` to `ShardStats` (catalog v2); v2-strict
   CSC `shard_type=1` validation with `ScxError::InvalidShardType`.
-- [x] **Phase B**: `ModalityTable` section (id 15), `LayerCscShard`
+- [x] `ModalityTable` section (id 15), `LayerCscShard`
   (id 16), per-modality reader / writer methods, `BackedCscReader`
   per-modality scoping.
-- [x] **Phase C**: catalog `modality_id: u8` field, per-modality
+- [x] Catalog `modality_id: u8` field, per-modality
   filtering helpers (`csr_shards_for_modality`, etc.), bumped
   `catalog_version = 2`. `FullCatalog::write_to` auto-upgrades
   `catalog_version` to ≥2 on serialise so the on-disk header matches
@@ -299,24 +298,24 @@ scGPT train end-to-end on atlas-scale SCX data.
   of a v1 catalog produced "v1 header / v2 stats" hybrids unreadable
   by any code path (regression test
   `catalog::tests::write_upgrades_v1_catalog_to_v2`).
-- [x] **Phase D**: CITE-seq / 10x Multiome / TEA-seq layout via
+- [x] CITE-seq / 10x Multiome / TEA-seq layout via
   `pyscx.from_mudata` / `to_mudata` and `scx convert --from h5mu`.
-- [x] **Phase E**: per-modality auto-codec via
+- [x] Per-modality auto-codec via
   `select_codec_for_modality` (RNA→Scx1/Zstd, ADT→Zstd, ATAC→Zstd
   or Lz4Shuffle).
-- [x] **Phase F**: `scx info` per-modality table, `scx validate`
+- [x] `scx info` per-modality table, `scx validate`
   modality cross-checks, `scx append --modality`, `scx subset
   --modality NAME` extract.
-- [x] **Phase G**: cloud header preservation (`cloud_optimize` /
+- [x] Cloud header preservation (`cloud_optimize` /
   `pack` / `pull` rewrite the modality table at the new layout
   offset; `pull_filtered` recomputes per-modality counts from the
   filtered catalog), exploded `_modality_table.bin` + per-modality
   `X/{name}/` directories.
-- [x] **Phase H**: `pyscx.MultimodalTrainingDataset` with
+- [x] `pyscx.MultimodalTrainingDataset` with
   triple-buffered per-modality pipelines and aligned `cell_indices`
   validation; `TrainingDataset(path)` backward-compat warning on
   multimodal files.
-- [x] **Phase I**: rscx Seurat v5 multi-assay (`from_seurat` /
+- [x] rscx Seurat v5 multi-assay (`from_seurat` /
   `scx_open(...)$to_seurat()`) and Bioconductor MAE
   (`from_mae` / `$to_mae()`) interop.
 - [x] Multimodal `scx merge` / `scx compact`.
@@ -354,7 +353,7 @@ scGPT train end-to-end on atlas-scale SCX data.
   pushdown (`var_names` / `obs_filter` with `modality=`) remain
   follow-ons.
 
-**Status**: shipped end-to-end via Phases A–I. CITE-seq /
+**Status**: shipped end-to-end. CITE-seq /
 10x Multiome / TEA-seq round-trip through `pyscx.from_mudata` /
 `pyscx.MultimodalTrainingDataset` and Seurat v5 / MAE via rscx. See
 [docs/multimodal.md](docs/multimodal.md) for the user-facing guide
@@ -369,7 +368,7 @@ header flag (bit 7) is wired through writers and readers.
 - [ ] Full conformance test suite with reference .scx files — **PARTIAL**: round-trip and per-codec correctness tests run in CI; no frozen reference-file vectors yet.
 - [x] Fuzz targets for codec decoders — `scx-codec/fuzz/fuzz_targets/` covers bitstream, Rice, FOR-BP, Delta-Golomb. Scaffolded `scx-format/fuzz/` exists but has no targets yet.
 - [ ] Run fuzz targets in CI on a schedule — **DEFERRED** (currently manual)
-- [x] SIMD FOR-BP decode (BitPacker4x, 44% faster index decode) — done in Sprint 2, Phase 2E
+- [x] SIMD FOR-BP decode (BitPacker4x, 44% faster index decode) — done in Sprint 2
 - [ ] SIMD Rice/Delta-Golomb optimizations (AVX2, NEON) with runtime dispatch — **DEFERRED** (SIMD FOR-BP already dominates end-to-end gain; Rice is <20% of decode cost)
 - [x] Detection bitmap layer. Per-shard
   gene → local-row roaring bitmap sidecars (`SCXB` wire format,
@@ -380,7 +379,7 @@ header flag (bit 7) is wired through writers and readers.
   header flag and per-modality `ModalityFlags::HAS_BITMAP` are wired
   end-to-end. See [docs/format.md § 12](docs/format.md#12-detection-bitmap-optional).
 - [x] Documentation: API reference, architecture, format spec, codec spec, sharding, multithreading, cloud, scanpy integration, performance, testing, GPU setup — see `docs/`
-- [x] Benchmark suite: comprehensive multi-format regression harness in `benchmarks/comprehensive/` — see Phase 5
+- [x] Benchmark suite: comprehensive multi-format regression harness in `benchmarks/comprehensive/` — see §5
 
 ### Deliverable
 Production-ready v1.0 release. GPU-accelerated training loader (CPU path;
@@ -391,7 +390,7 @@ GDS deferred). R bindings. Full documentation. Multimodal deferred.
 - [x] R and Python bindings both pass functional test suites
 - [ ] GDS path benchmarked: >2x CPU path throughput on NVMe — **GATE DROPPED** (GDS deferred; CPU path is the v1 shipping configuration)
 
-### Phase 3 Pitfalls and Risks
+### Pitfalls and Risks
 
 - **GDS has strict deployment prerequisites.** GPUDirect Storage requires local NVMe
   (not network-attached), nvidia-fs drivers, and a compatible filesystem (ext4, XFS —
@@ -418,20 +417,20 @@ GDS deferred). R bindings. Full documentation. Multimodal deferred.
 
 ---
 
-## Phase 4: Rust-Native Analysis Accelerators — 4a/4b COMPLETE
+## 4. Rust-Native Analysis Accelerators — 4a/4b COMPLETE
 
 **Goal**: For operations where scanpy is a bottleneck at scale, provide
 faster Rust implementations. These are **optional optimizations** — the
-full scverse pipeline works via AnnData from Phase 1.
+full scverse pipeline works via AnnData from the format / codec / bridge work.
 
-### Phase 4a: Scanpy Integration — COMPLETE
+### 4a. Scanpy Integration — COMPLETE
 - [x] Remaining backed mode aggregation ops (`var`, `max`, `min` per axis with deletion vectors)
 - [x] Comparison optimization (`(X > 0).sum()` → `getnnz()` short-circuit)
 - [x] Streaming preprocessing pipeline (`pyscx.preprocess`, `pyscx.save_layer`)
 - [x] Chunk iterator (`pyscx.iter_chunks`)
 - [x] Selective loading (`var_names`, `obs_filter`, `layers` parameters)
 
-### Phase 4b: Rust-Native Accelerators — COMPLETE
+### 4b. Rust-Native Accelerators — COMPLETE
 - [x] **PCA** (randomized SVD): streaming SpMM from backed mode, `faer` for QR/SVD
 - [x] **kNN graph**: HNSW via `instant-distance`, UMAP-style connectivities
 - [x] **UMAP**: SGD embedding with spectral initialization
@@ -439,7 +438,7 @@ full scverse pipeline works via AnnData from Phase 1.
 - [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + `pydeseq2`
 - [x] **Stratified DE**: per-stratum execution for both Wilcoxon and pseudobulk
 
-### Phase 4c: GPU Accelerators — COMPLETE (benchmarked, 3/4 Go/No-Go gates pass)
+### 4c. GPU Accelerators — COMPLETE (benchmarked, 3/4 Go/No-Go gates pass)
 - [x] GPU SpMM for PCA (cuSPARSE + cuSOLVER QR + cuRAND)
 - [x] GPU kNN via CAGRA (cuVS) — 9.4× on 1M cells
 - [x] GPU UMAP via native CUDA SGD kernel — 7.7× on 1M cells
@@ -449,7 +448,7 @@ full scverse pipeline works via AnnData from Phase 1.
 
 See [docs/gpu-setup.md](docs/gpu-setup.md) and [docs/performance.md](docs/performance.md) for setup and benchmark results.
 
-### Phase 4d: Eliminating Materialization — COMPLETE
+### 4d. Eliminating Materialization — COMPLETE
 - [x] Column-projected streaming aggregation (`sum`, `var`, `nnz`, `max`, `min` with gene subsets)
 - [x] Lazy transform wrappers (`ScxLazyTransformedDataset` for normalize_total + log1p)
 - [x] `pyscx.accel.normalize_total()` — lazy, no materialization
@@ -463,15 +462,15 @@ See [docs/gpu-setup.md](docs/gpu-setup.md) and [docs/performance.md](docs/perfor
 
 ---
 
-## Phase 5: Comprehensive Benchmarking + Cloud Validation
+## 5. Comprehensive Benchmarking + Cloud Validation
 
 **Goal**: Establish a reproducible, multi-format benchmark harness that
 validates SCX's performance claims on representative single-cell workloads
 across local HPC (Chimera) and cloud (GCP) environments, then keep it
 running as a regression gate.
 
-**Why this is its own phase**: Phases 1–4 built features and shipped
-ad-hoc benchmarks per feature. Phase 5 consolidates everything into a single
+**Why this is its own workstream**: §1–§4 built features and shipped
+ad-hoc benchmarks per feature. This effort consolidates everything into a single
 harness, adds cross-format competitors (h5ad, Zarr v3, TileDB-SOMA, BPCells,
 Parquet, [SLAF](https://github.com/slaf-project/slaf)), and extends
 coverage to cloud object storage. This is what the public performance
@@ -480,7 +479,7 @@ claims in `docs/performance.md` cite.
 **Location**: [`benchmarks/comprehensive/`](benchmarks/comprehensive/) (the
 gated suite). [`benchmarks/scripts/`](benchmarks/scripts/) holds dataset
 prep, the standalone ML training loader, and active-development GPU /
-Harmony benches; the legacy phase wrappers and one-off
+Harmony benches; the legacy wrappers and one-off
 `benchmark_*.py` entrypoints have been deleted.
 Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 
@@ -518,13 +517,13 @@ Practical operator guide: [`benchmarks/README.md`](benchmarks/README.md).
 - [x] CELLxGENE Census 500K, 1M, 5M subsets (large)
 - [x] 10M-cell synthetic build for training loader (`build_census_*.py`)
 - [x] Smart-seq2 50K (non-UMI protocol — validates codec selection heuristic)
-- [ ] CITE-seq reference dataset — Phase 3.4 multimodal landed (`pyscx.from_mudata` + `MultimodalTrainingDataset` ship) and multimodal compression benchmarks are live (`benchmarks/comprehensive/benchmarks/multimodal_compression.py`). Still TODO: extend the comprehensive suite with multimodal training loader throughput rows.
+- [ ] CITE-seq reference dataset — multimodal support (§3.4) landed (`pyscx.from_mudata` + `MultimodalTrainingDataset` ship) and multimodal compression benchmarks are live (`benchmarks/comprehensive/benchmarks/multimodal_compression.py`). Still TODO: extend the comprehensive suite with multimodal training loader throughput rows.
 
 ### 5.4 Local HPC Benchmarking (Chimera SLURM) — COMPLETE
 - [x] Parallel SLURM submission via `benchmarks/scripts/submit_benchmarks.py`
 - [x] GPU benchmarks on H100 / A100 nodes (PCA, kNN, UMAP, Leiden, fused preprocess)
 - [x] R / BPCells benchmarks via isolated conda env (`scx-bench-r.yml`)
-- [x] Published Phase 3 report: `benchmarks/comprehensive/reporting/phase3_report.md`
+- [x] Published benchmark report: `benchmarks/comprehensive/reporting/phase3_report.md`
 - [x] Results snapshot archived (`benchmarks/comprehensive/results/raw_archive_*/`)
 
 ### 5.5 Cloud Benchmarking (GCP) — COMPLETE (S3/Azure deferred)
@@ -552,7 +551,7 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 - [x] **Cloud competitor parity** — Zarr v3 (consolidated metadata + `anndata_zarr_backed` variant), TileDB-SOMA (native GCS + `AxisQuery(value_filter=…)`), and SLAF (cloud-backed DuckDB). `cloud_filtered.py` iterates the canonical predicate set and pivots `(dataset, query, format)` with median + p95 over ≥3 reps.
 - [x] **CloudReader vs pull** — `cloud_reader_vs_pull.py` compares `pyscx.open_cloud` (metadata-only) vs full `pyscx.pull`, and `pyscx.pull(filter=…)` vs full `pull` at ~5%/20%/80% selectivity with bytes-downloaded + GET-count proxies.
 - [x] **Request-cost accounting** — `GCS_PRICING` pinned in `config.py`; `CloudIOCounters` helper in `cloud_fixtures.py`; `cost_model.py` records `usd_per_million_cells_queried` per `(layout, scenario)`. Reporting pivots as "Cost Model (GCS pricing)".
-- [ ] **S3 + Azure parity** — DEFERRED indefinitely. GCP is the only validated cloud target for Phase 5. The `provider="gcs"` ValueError gate across every cloud benchmark module keeps the provider-parameterization in place for a future un-defer without rewrites.
+- [ ] **S3 + Azure parity** — DEFERRED indefinitely. GCP is the only validated cloud target. The `provider="gcs"` ValueError gate across every cloud benchmark module keeps the provider-parameterization in place for a future un-defer without rewrites.
 - [x] **Resumable pull regression test** — idempotent-retry contract documented in `docs/cloud.md`; `CloudError::Interrupted` variant + `cleanup_stale_tmp_files` orphan sweep in `scx-cloud/src/pull.rs`. Three Rust unit tests + four Python tests at `pyscx/tests/test_resumable_pull.py`.
 - [x] **Large atlas (50 GB+) streaming pull** — `cloud_large_atlas.py` runs `pyscx.pull` with a background RSS sampler (100 ms cadence); asserts `peak_rss_mb <= 240` per the `docs/cloud.md` performance model. Fails loudly on violation.
 
@@ -566,13 +565,13 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 - [x] **Cloud preflight** — `gate_candidate.py --probe-cloud` (opt-in) does one `fsspec.filesystem('gs').ls(<bucket>)` + one `pyscx.open_cloud(<probe_url>)` in <30 s before any sbatch. Catches missing/mismatched `gcsfs` and catalog-format bugs (the two recurring pre-run failure modes from the 2026-05 firefight: 24 zarr cloud FAST_FAILs and 158 SCX cloud FAST_FAILs respectively) before they cascade into the live gate.
 - [x] **Fixture re-conversion workflow** — `benchmarks/scripts/reconvert_fixtures.py` is the canonical entry point for rebuilding derived SCX / Zarr / TileDB local files (and their cloud-pushed copies) after a source h5ad fixture change. Default matrix: all datasets × `{scx_auto, tiledb_soma, zarr_zstd}`. `--cloud-push` invalidates the prior `.blake3` completion sidecar before re-uploading so `ensure_cloud_fixture`'s short-circuit doesn't skip fresh data. Replaces the ad-hoc `/tmp/reconvert_stale.py` from the 2026-05 campaign.
 
-### Go/No-Go Gate — Phase 5
+### Go/No-Go Gate
 - [x] Comprehensive cloud benchmark suite runs to completion on GCS via the unified launcher (`run_parallel.py --benchmarks cloud_*`).
 - [x] Cross-format cloud comparison (SCX vs Zarr v3 vs TileDB-SOMA vs SLAF) published with reproducible scripts (`cloud_read`, `cloud_filtered`, `cloud_metadata`; launched via the documented entry points in `benchmarks/README.md` and `docs/cloud.md`).
 - [x] Published cost model ($/1M cells read) — `cost_model.py` benchmark + `GCS_PRICING` rate-card pin. ±20% on three GCP instance sizes requires live `submit_gcp_matrix.py --yes-spend` runs — infrastructure is in place, numbers land when operators spend the budget.
 - [x] Regression gate catches a synthetic 15% slowdown before release — enforced by `tests/test_gate_self_test.py` (5 hermetic pytest cases, all passing).
 
-### Phase 5 Pitfalls and Risks
+### Pitfalls and Risks
 - **Cloud benchmark drift is expensive.** Every GCS / S3 read / write is billed. Cache aggressively, keep a shared test bucket (`gs://arc-ctc-nextflow/scx-test`), and never re-upload benchmark fixtures per-run.
 - **Network noise.** Cloud throughput is inherently variable (shared tenancy). Run ≥3 repetitions, report median and p95, and always pin the GCP region to the bucket's region to avoid silent cross-region egress.
 - **Credentials in CI.** Never embed service-account keys in scripts or commits. Use workload identity or short-lived tokens for automated runs; the existing scripts expect `GOOGLE_APPLICATION_CREDENTIALS` to be set out-of-band.
@@ -582,18 +581,18 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 
 ---
 
-## What Users Get at Each Phase
+## What Users Get at Each Tier
 
-| Phase | Months | User Experience |
+| Tier | Months | User Experience |
 |-------|--------|----------------|
-| **1** | 1-4 | **COMPLETE.** Convert to SCX for 50-80% smaller files and 4-38× lower memory. Run scanpy/scVI/everything as usual via `to_anndata()`. Read speed is slower than h5ad in Phase 1 (no parallelism, no codec auto-select). |
+| **1** | 1-4 | **COMPLETE.** Convert to SCX for 50-80% smaller files and 4-38× lower memory. Run scanpy/scVI/everything as usual via `to_anndata()`. Read speed is slower than h5ad in Tier 1 (no parallelism, no codec auto-select). |
 | **2** | 4-7 | Auto-codec selection + parallel decode fix read performance. Fast training loader saturates GPUs. Query/filter large datasets without loading everything. Append/merge/delete without full rewrites. |
-| **3** | 7-10 | **PARTIALLY COMPLETE.** R bindings, extended CLI (`build-csc`, `subset`, `upgrade`), complete documentation. CITE-seq / Multiome / TEA-seq multimodal + Seurat v5 / MAE interop shipped (Phases F–I) including multimodal `merge` / `compact` / `append` / `subset --filter`. Detection bitmap shipped. GDS and spatial transcriptomics R-tree remain **DEFERRED**. |
+| **3** | 7-10 | **PARTIALLY COMPLETE.** R bindings, extended CLI (`build-csc`, `subset`, `upgrade`), complete documentation. CITE-seq / Multiome / TEA-seq multimodal + Seurat v5 / MAE interop shipped, including multimodal `merge` / `compact` / `append` / `subset --filter`. Detection bitmap shipped. GDS and spatial transcriptomics R-tree remain **DEFERRED**. |
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
 | **4c** | 15+ | **COMPLETE (benchmarked).** GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuGraph. Per-op speedups: kNN 9.4×, UMAP 7.7×, Leiden 16×. 3.8× end-to-end on 1M cells. |
 | **4d** | 16+ | **COMPLETE.** Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation, streaming PCA through transforms via `ShardSource` trait, non-materializing `filter_cells`/`filter_genes`. Full out-of-core pipeline from open → QC → preprocess → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS at 1M cells (vs ~22 GB materialized; 51% reduction). |
-| **5** | ongoing | **COMPLETE** (S3/Azure deferred; CITE-seq multimodal depends on Phase 3.4). Comprehensive multi-format benchmark harness validated on Chimera HPC + GCS, including SLAF parity across compression / read / selective / ML / memory, fragment-ops throughput, cloud push/pull/read/metadata/filtered-query + cost model + GCP instance matrix, on-demand regression gate with justification workflow + rolling HTML dashboard, and honest idempotent-retry contract for interrupted pulls. |
+| **5** | ongoing | **COMPLETE** (S3/Azure deferred; CITE-seq multimodal depends on §3.4). Comprehensive multi-format benchmark harness validated on Chimera HPC + GCS, including SLAF parity across compression / read / selective / ML / memory, fragment-ops throughput, cloud push/pull/read/metadata/filtered-query + cost model + GCP instance matrix, on-demand regression gate with justification workflow + rolling HTML dashboard, and honest idempotent-retry contract for interrupted pulls. |
 
 ---
 
@@ -624,7 +623,7 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 | GPU driver/GDS compatibility | Medium | CPU path always functional; GDS is opt-in and currently deferred |
 | AnnData zero-copy edge cases | Medium | Extensive round-trip testing; fallback to copy for problematic dtypes |
 | HDF5 crate stability | Low | Only needed for conversion; SCX native path takes over |
-| Scope creep into analysis tools | Medium | AnnData bridge means users keep their existing tools; Phase 4 is optional |
+| Scope creep into analysis tools | Medium | AnnData bridge means users keep their existing tools; the analysis accelerators (§4) are optional |
 | Incumbents improve faster than expected | High | If AnnData Zarr v3 + SOMA-ML close the gap, pivot: contribute codec/loader back into existing formats rather than pushing a new format |
 | Compression claims don't generalize | Medium | Benchmark on diverse datasets (10x, Smart-seq2, CITE-seq, spatial) before publishing claims; be honest about where Rice underperforms |
 | PyO3 breaking changes | Low | Pin pyo3 + numpy crate versions; budget time for migration if needed |
@@ -654,9 +653,9 @@ Key developments to monitor that affect SCX's value proposition:
 | **SLAF** ([slaf-project/slaf](https://github.com/slaf-project/slaf)) | SQL-native sparse lazy format: DuckDB + Polars backend, Scanpy-compatible lazy API, PyTorch tokenizers/dataloaders for foundation models, `slafdb` on PyPI | Overlaps directly with SCX across lazy AnnData, selective queries (SQL pushdown), and ML training loader. A SQL-first approach sidesteps a binary-format learning curve; if SLAF matches SCX on throughput, the pitch shifts to "binary format + domain codec + single-file portability" |
 
 **Strategic implication**: SCX's highest-risk scenario is not that it fails technically,
-but that incumbents improve fast enough to close the gaps SCX targets. The phased
-roadmap mitigates this — Phase 1 validates the format thesis before committing to
-the full ecosystem. If Phase 1 benchmarks show only modest improvements over improving
-incumbents, the honest response is to contribute the codec and loader innovations to
-existing tools (e.g., a Rice codec plugin for Zarr, a Rust training loader for
-AnnData/h5ad) rather than pushing full format adoption.
+but that incumbents improve fast enough to close the gaps SCX targets. The tiered
+roadmap mitigates this — the format / codec / bridge tier validates the format thesis
+before committing to the full ecosystem. If those benchmarks show only modest improvements
+over improving incumbents, the honest response is to contribute the codec and loader
+innovations to existing tools (e.g., a Rice codec plugin for Zarr, a Rust training loader
+for AnnData/h5ad) rather than pushing full format adoption.
