@@ -40,7 +40,9 @@ jobs:
             scx-format/fuzz
             scx-engine/fuzz
       - name: Install cargo-fuzz
-        run: cargo install --locked cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Build scx-codec fuzz targets
         working-directory: scx-codec/fuzz
         run: cargo +nightly fuzz build
@@ -78,7 +80,9 @@ jobs:
         with:
           workspaces: ${{ matrix.crate }}/fuzz
       - name: Install cargo-fuzz
-        run: cargo install --locked cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Run ${{ matrix.target }}
         if: github.event.inputs.target == '' || github.event.inputs.target == matrix.target
         working-directory: ${{ matrix.crate }}/fuzz
