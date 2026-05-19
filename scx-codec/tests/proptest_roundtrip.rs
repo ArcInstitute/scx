@@ -301,6 +301,44 @@ proptest! {
         prop_assert_eq!(&d_v, &values);
     }
 
+    /// Phase 9: float32 roundtrip for the non-integer codecs. Closes
+    /// the codec × encoding matrix for the canonical-matrix property.
+    #[test]
+    fn dispatch_lz4shuffle_f32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Float32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Float32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Float32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_zstd_f32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Float32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Float32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Zstd, ValueEncoding::Float32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_none_f32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Float32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Float32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::None, ValueEncoding::Float32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
     #[test]
     fn dispatch_pcodec_u8_roundtrip(
         data in arb_csr(50, 20, ValueEncoding::Uint8)

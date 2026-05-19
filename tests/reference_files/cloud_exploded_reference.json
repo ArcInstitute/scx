@@ -1,0 +1,34 @@
+{
+  "fixture_name": "cloud_exploded_reference",
+  "header": {
+    "format_version": 2,
+    "n_obs": 40,
+    "n_vars": 25,
+    "nnz": 257,
+    "n_csr_shards": 1,
+    "n_csc_shards": 0,
+    "n_modalities": 0,
+    "has_deletion_vectors": false
+  },
+  "catalog_summary": [
+    {
+      "section_type": "ObsMetadata",
+      "name": "obs",
+      "modality_id": 0,
+      "length": 2402
+    },
+    {
+      "section_type": "VarMetadata",
+      "name": "var",
+      "modality_id": 0,
+      "length": 1538
+    },
+    {
+      "section_type": "CsrShard",
+      "name": "X_shard_0",
+      "modality_id": 0,
+      "length": 950
+    }
+  ],
+  "compatibility_notes": "v1_minimal passed through scx_cloud::explode: one file per section, byte-identical."
+}

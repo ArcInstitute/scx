@@ -1,0 +1,58 @@
+{
+  "fixture_name": "v2_multimodal_partial_csc",
+  "header": {
+    "format_version": 2,
+    "n_obs": 30,
+    "n_vars": 0,
+    "nnz": 0,
+    "n_csr_shards": 0,
+    "n_csc_shards": 1,
+    "n_modalities": 2,
+    "has_deletion_vectors": false
+  },
+  "catalog_summary": [
+    {
+      "section_type": "ObsMetadata",
+      "name": "obs",
+      "modality_id": 0,
+      "length": 1954
+    },
+    {
+      "section_type": "VarMetadata",
+      "name": "var/rna",
+      "modality_id": 1,
+      "length": 1538
+    },
+    {
+      "section_type": "VarMetadata",
+      "name": "var/adt",
+      "modality_id": 2,
+      "length": 1218
+    },
+    {
+      "section_type": "CsrShard",
+      "name": "X/rna/shard_0",
+      "modality_id": 1,
+      "length": 815
+    },
+    {
+      "section_type": "CsrShard",
+      "name": "X/adt/shard_0",
+      "modality_id": 2,
+      "length": 461
+    },
+    {
+      "section_type": "CscShard",
+      "name": "X_csc/adt/shard_0",
+      "modality_id": 2,
+      "length": 381
+    },
+    {
+      "section_type": "ModalityTable",
+      "name": "modality_table",
+      "modality_id": 0,
+      "length": 92
+    }
+  ],
+  "compatibility_notes": "v2 multimodal where only the ADT modality carries a CSC sidecar (Phase 6 prerequisite)."
+}
