@@ -143,31 +143,60 @@ pub(super) fn write_dataframe_group_at(
         .create("encoding-version")?
         .write_scalar(&vlu("0.2.0"))?;
 
-    // `_index` attribute names the column that holds the row index.
-    // anndata.read_h5ad requires this; without it the `/obs` group
-    // fails to read.
+    // Resolve the schema field that holds the pandas index. Probe order:
+    //   1. The `pandas` schema metadata's `index_columns` (the
+    //      authoritative source — `pyarrow.Table.from_pandas` stamps
+    //      this; covers both named and unnamed indexes).
+    //   2. Fallback: `schema.field(0)` — preserves the CLI path's
+    //      behaviour where obs/var come from disk without pandas
+    //      metadata, and the first field already IS the index dataset.
+    let pandas_idx_cols = scx_format::pandas_index_columns(schema.as_ref());
+    let index_field_name: Option<String> = pandas_idx_cols
+        .into_iter()
+        .find(|n| schema.field_with_name(n).is_ok())
+        .or_else(|| schema.fields().first().map(|f| f.name().clone()));
+
+    // Rename pyarrow's canonical `__index_level_0__` (unnamed pandas
+    // index) to anndata's `_index` literal on disk. Named indexes keep
+    // their original name.
+    let on_disk_index: &str = match index_field_name.as_deref() {
+        Some("__index_level_0__") => "_index",
+        Some(n) => n,
+        None => "_index",
+    };
+
     if !schema.fields().is_empty() {
-        let index_name = vlu(schema.field(0).name());
         group
             .new_attr::<VarLenUnicode>()
             .create("_index")?
-            .write_scalar(&index_name)?;
+            .write_scalar(&vlu(on_disk_index))?;
     }
 
-    let mut col_order: Vec<VarLenUnicode> = Vec::with_capacity(batch.num_columns());
+    let mut col_order: Vec<VarLenUnicode> =
+        Vec::with_capacity(batch.num_columns().saturating_sub(1));
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let col = batch.column(col_idx);
-        write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
-        col_order.push(vlu(field.name()));
+        if Some(field.name()) == index_field_name.as_ref() {
+            // Index column → write under the anndata on-disk name and
+            // exclude from `column-order` (matches anndata convention).
+            write_column_to_hdf5(&group, on_disk_index, col, field.data_type())?;
+        } else {
+            write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
+            col_order.push(vlu(field.name()));
+        }
     }
 
-    if !col_order.is_empty() {
-        group
-            .new_attr::<VarLenUnicode>()
-            .shape(col_order.len())
-            .create("column-order")?
-            .write_raw(&col_order)?;
-    }
+    // anndata.read_h5ad requires `column-order` to be present on every
+    // dataframe group, even when the dataframe has no non-index columns
+    // (it will raise `KeyError: "...can't locate attribute:
+    // 'column-order'"` otherwise). Write it unconditionally — a
+    // length-0 array for the no-columns case matches anndata's own
+    // emission.
+    group
+        .new_attr::<VarLenUnicode>()
+        .shape(col_order.len())
+        .create("column-order")?
+        .write_raw(&col_order)?;
 
     Ok(())
 }
@@ -241,19 +270,31 @@ fn write_dataframe_group(
     batch: &RecordBatch,
 ) -> Result<(), ConvertError> {
     let group = file.create_group(name)?;
-
     let schema = batch.schema();
 
-    // Write _index attribute (use first column name)
+    // Probe order (matches `write_dataframe_group_at`): pandas
+    // `index_columns` metadata first, then `schema.field(0)`. Rename
+    // pyarrow's `__index_level_0__` to anndata's `_index` literal on
+    // disk; named indexes keep their original name. The index column
+    // is excluded from `column-order` to match anndata's convention.
+    let pandas_idx_cols = scx_format::pandas_index_columns(schema.as_ref());
+    let index_field_name: Option<String> = pandas_idx_cols
+        .into_iter()
+        .find(|n| schema.field_with_name(n).is_ok())
+        .or_else(|| schema.fields().first().map(|f| f.name().clone()));
+    let on_disk_index: &str = match index_field_name.as_deref() {
+        Some("__index_level_0__") => "_index",
+        Some(n) => n,
+        None => "_index",
+    };
+
     if !schema.fields().is_empty() {
-        let index_name = vlu(schema.field(0).name());
         group
             .new_attr::<VarLenUnicode>()
             .create("_index")?
-            .write_scalar(&index_name)?;
+            .write_scalar(&vlu(on_disk_index))?;
     }
 
-    // Write column-categories group attribute
     let encoding_type = vlu("dataframe");
     group
         .new_attr::<VarLenUnicode>()
@@ -266,18 +307,24 @@ fn write_dataframe_group(
         .create("encoding-version")?
         .write_scalar(&encoding_version)?;
 
-    // Write column-order attribute
-    let col_names: Vec<VarLenUnicode> = schema.fields().iter().map(|f| vlu(f.name())).collect();
-    group
-        .new_attr::<VarLenUnicode>()
-        .shape([col_names.len()])
-        .create("column-order")?
-        .write(&col_names)?;
-
+    let mut col_order: Vec<VarLenUnicode> =
+        Vec::with_capacity(batch.num_columns().saturating_sub(1));
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
-        write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
+        if Some(field.name()) == index_field_name.as_ref() {
+            write_column_to_hdf5(&group, on_disk_index, col, field.data_type())?;
+        } else {
+            write_column_to_hdf5(&group, field.name(), col, field.data_type())?;
+            col_order.push(vlu(field.name()));
+        }
     }
+
+    // Always write `column-order` (anndata requires it; length-0 OK).
+    group
+        .new_attr::<VarLenUnicode>()
+        .shape([col_order.len()])
+        .create("column-order")?
+        .write_raw(&col_order)?;
 
     Ok(())
 }

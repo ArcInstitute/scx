@@ -5695,3 +5695,185 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
         "expected Err from injected ingest shard failure; got Ok"
     );
 }
+
+// -----------------------------------------------------------------------
+// B2: `write_dataframe_group_at` must honour the pandas `index_columns`
+// schema metadata so that `pyscx.from_h5ad → pyscx.to_h5ad` preserves
+// `var_names` / `obs_names` instead of silently swapping them with the
+// first non-index column. See SCX-USER-REPORT-2026-05-19.md § B2.
+// -----------------------------------------------------------------------
+
+fn build_var_batch_with_pandas_metadata(
+    index_columns: &[&str],
+    index_field_name: &str,
+    index_values: &[&str],
+) -> arrow::record_batch::RecordBatch {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let mut md = HashMap::new();
+    md.insert(
+        "pandas".to_string(),
+        format!(
+            "{{\"index_columns\":[{}]}}",
+            index_columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    let schema = Arc::new(
+        Schema::new(vec![
+            Field::new("gene_ids", DataType::Utf8, false),
+            Field::new(index_field_name, DataType::Utf8, false),
+        ])
+        .with_metadata(md),
+    );
+    let gene_ids = Arc::new(StringArray::from(vec!["ENSG1", "ENSG2"]));
+    let symbols = Arc::new(StringArray::from(index_values.to_vec()));
+    arrow::record_batch::RecordBatch::try_new(schema, vec![gene_ids, symbols]).unwrap()
+}
+
+#[test]
+fn write_dataframe_group_honors_pandas_index_metadata_unnamed() {
+    // pyarrow.Table.from_pandas on a var DataFrame with var.index.name = None
+    // emits the index as `__index_level_0__`. Writer must rename it to
+    // `_index` on disk and exclude it from `column-order`.
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("var.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let root = file.as_group().unwrap();
+
+    let batch = build_var_batch_with_pandas_metadata(
+        &["__index_level_0__"],
+        "__index_level_0__",
+        &["MIR1302-2HG", "FAM138A"],
+    );
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let var = file.group("var").unwrap();
+
+    let idx_name: VarLenUnicode = var.attr("_index").unwrap().read_scalar().unwrap();
+    assert_eq!(idx_name.as_str(), "_index");
+
+    let col_order: Vec<VarLenUnicode> = var
+        .attr("column-order")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let names: Vec<String> = col_order.iter().map(|s| s.to_string()).collect();
+    assert_eq!(names, vec!["gene_ids".to_string()]);
+
+    let symbols: Vec<VarLenUnicode> = var.dataset("_index").unwrap().read_1d().unwrap().to_vec();
+    let symbols: Vec<String> = symbols.iter().map(|s| s.to_string()).collect();
+    assert_eq!(symbols, vec!["MIR1302-2HG", "FAM138A"]);
+
+    assert!(
+        var.dataset("__index_level_0__").is_err(),
+        "phantom __index_level_0__ dataset must not exist on disk"
+    );
+}
+
+#[test]
+fn write_dataframe_group_honors_pandas_index_metadata_named() {
+    // Named pandas index (`var.index.name = "gene_symbols"`): the column
+    // is named gene_symbols in the schema; pyarrow lists it under
+    // `index_columns`. Writer must use "gene_symbols" as both the
+    // on-disk dataset name AND the `_index` attribute, and exclude it
+    // from `column-order`.
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("var.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let root = file.as_group().unwrap();
+
+    let batch = build_var_batch_with_pandas_metadata(
+        &["gene_symbols"],
+        "gene_symbols",
+        &["MIR1302-2HG", "FAM138A"],
+    );
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let var = file.group("var").unwrap();
+
+    let idx_name: VarLenUnicode = var.attr("_index").unwrap().read_scalar().unwrap();
+    assert_eq!(idx_name.as_str(), "gene_symbols");
+
+    let col_order: Vec<VarLenUnicode> = var
+        .attr("column-order")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let names: Vec<String> = col_order.iter().map(|s| s.to_string()).collect();
+    assert_eq!(names, vec!["gene_ids".to_string()]);
+
+    let symbols: Vec<VarLenUnicode> = var
+        .dataset("gene_symbols")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let symbols: Vec<String> = symbols.iter().map(|s| s.to_string()).collect();
+    assert_eq!(symbols, vec!["MIR1302-2HG", "FAM138A"]);
+
+    assert!(
+        var.dataset("_index").is_err(),
+        "for a named pandas index, the on-disk dataset must be the named one, \
+         not a renamed `_index`"
+    );
+}
+
+#[test]
+fn write_dataframe_group_no_pandas_metadata_fallback() {
+    // CLI path: obs/var came from `read_dataframe_group` which doesn't
+    // carry pandas metadata. The first schema field is already the
+    // index dataset name (e.g. "_index" or "gene_symbols" from the
+    // source h5ad). Writer must use field(0) as the index AND exclude
+    // it from `column-order` — matches anndata's convention.
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("var.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let root = file.as_group().unwrap();
+
+    // No pandas metadata; first field is "_index" (anndata default).
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_index", DataType::Utf8, false),
+        Field::new("gene_ids", DataType::Utf8, false),
+    ]));
+    let symbols = Arc::new(StringArray::from(vec!["GENE_A", "GENE_B"]));
+    let gene_ids = Arc::new(StringArray::from(vec!["ENSG1", "ENSG2"]));
+    let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![symbols, gene_ids]).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let var = file.group("var").unwrap();
+
+    let idx_name: VarLenUnicode = var.attr("_index").unwrap().read_scalar().unwrap();
+    assert_eq!(idx_name.as_str(), "_index");
+
+    let col_order: Vec<VarLenUnicode> = var
+        .attr("column-order")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    let names: Vec<String> = col_order.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["gene_ids".to_string()],
+        "the index column must be excluded from column-order"
+    );
+}
