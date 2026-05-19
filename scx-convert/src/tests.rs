@@ -821,8 +821,16 @@ macro_rules! unsigned_dataframe_column_test {
     };
 }
 
-unsigned_dataframe_column_test!(h5ad_with_u16_dataframe_column_converts, u16, DataType::Int32);
-unsigned_dataframe_column_test!(h5ad_with_u64_dataframe_column_converts, u64, DataType::Int64);
+unsigned_dataframe_column_test!(
+    h5ad_with_u16_dataframe_column_converts,
+    u16,
+    DataType::Int32
+);
+unsigned_dataframe_column_test!(
+    h5ad_with_u64_dataframe_column_converts,
+    u64,
+    DataType::Int64
+);
 
 /// Companion regression test for the user-visible
 /// `scx-cli convert pbmc10k.h5ad` crash. pandas / anndata write an

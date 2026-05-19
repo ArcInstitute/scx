@@ -411,9 +411,7 @@ fn read_column_to_arrow(
     }
 
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
-        ConvertError::UnsupportedDtype(format!(
-            "column '{name}': unsupported HDF5 type: {desc:?}"
-        ))
+        ConvertError::UnsupportedDtype(format!("column '{name}': unsupported HDF5 type: {desc:?}"))
     })?;
 
     match dt {
