@@ -692,7 +692,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   underlying mechanics. `index_*` / `bitmap` materialise query
   predicate indexes and detection bitmaps at conversion time — see
   [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
-- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   plus the always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
   entry point for files larger than RAM. `csc="always"` performs a
@@ -721,7 +721,19 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `stream=False` falls back to the materialising path (kept for
     parity / debugging).
   - `obsp` / `varp` on the input are silently skipped.
-- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation.
+  - `reader_threads`: streaming reader worker count.
+    `None` (default) resolves to `RAYON_NUM_THREADS` if set, else
+    `os.cpu_count()`. `1` forces the sequential coordinator. `> 1`
+    requests rayon workers; output is byte-identical to sequential.
+    Requires a thread-safe libhdf5 build (conda-forge default); falls
+    back to sequential with a one-shot `Hdf5NotThreadsafe` warning
+    otherwise. `--memory-budget` derates the granted count to fit a
+    per-worker estimate (`shard_target_rows × n_vars × density × 16`).
+  - `writer_queue_depth`: bounded reorder buffer depth between the
+    parallel encoder pool and the ordered writer. Default 4. Larger
+    values raise peak RSS linearly; smaller values can starve
+    encoders.
+- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
   - `modalities`: optional list of modality names to keep
     (case-sensitive). Unknown names raise `ValueError` with the
     available list.
@@ -1286,7 +1298,7 @@ processes either; it owns thread handles that don't survive transfer.
 ## CLI (`scx-cli`)
 
 ### Core
-- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
+- `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always] [--reader-threads N] [--writer-queue-depth N]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
 
   Wild-h5ad hardening: `--memory-budget 4G` caps dense row slabs and
   CSC external-transpose buffers (binary prefixes only; see

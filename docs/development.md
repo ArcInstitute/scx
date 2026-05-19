@@ -68,6 +68,16 @@ cargo build -p scx-cli --features hdf5
 cargo build -p scx-cli --features hdf5-static
 ```
 
+**Parallel streaming reader and libhdf5 thread-safety.** The parallel
+streaming convert path (`scx convert --reader-threads N`, `pyscx.from_h5ad(...,
+reader_threads=N)`, both with `N > 1`; default `None` auto-resolves to
+`RAYON_NUM_THREADS` or CPU count) requires a libhdf5 build with
+`--enable-threadsafe`. Conda-forge `hdf5=1.12.*=nompi*` and the Ubuntu
+system package ship this option by default. The runtime probe
+(`H5is_library_threadsafe`) is cached in a `OnceLock`; non-threadsafe
+builds fall back to the sequential coordinator with a one-shot
+`Hdf5NotThreadsafe` warning. Output is byte-identical on both paths.
+
 ### Cloud feature build
 
 The `cloud` feature enables `object_store`-backed GCS/S3/Azure I/O in

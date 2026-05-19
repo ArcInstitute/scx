@@ -12,7 +12,7 @@ use ndarray::s;
 use super::detect::MatrixFormat;
 use super::h5ad_read::read_i64_dataset;
 use super::pipeline::ConvertError;
-use super::stream::{CsrShardStream, StreamedCsrShard};
+use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
 use super::warnings::{ConvertWarning, WarningSink};
 
 /// A single shard's worth of CSR rows read from an h5ad file.
@@ -231,6 +231,74 @@ impl XStreamReader {
     }
 }
 
+impl XStreamReader {
+    /// Read rows `[row_start, row_start + n_rows)` without
+    /// mutating internal state. Used by the parallel coordinator from
+    /// worker threads (libhdf5 serialises overlapping reads internally
+    /// under `--enable-threadsafe`; the runtime check in
+    /// `crate::pipeline::hdf5_is_threadsafe` gates the parallel path).
+    fn read_range_inner(
+        &self,
+        row_start: u64,
+        n_rows: u32,
+    ) -> Result<StreamedCsrShard, ConvertError> {
+        let n_obs_u64 = self.n_obs as u64;
+        if row_start.saturating_add(n_rows as u64) > n_obs_u64 {
+            return Err(ConvertError::Other(format!(
+                "read_range out of bounds: row_start={row_start}, n_rows={n_rows}, n_obs={n_obs_u64}"
+            )));
+        }
+        let row_start_usize = row_start as usize;
+        let row_end = row_start_usize + n_rows as usize;
+
+        let base = self.indptr[row_start_usize];
+        let end_val = self.indptr[row_end];
+        let nnz_start = usize::try_from(base)
+            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
+        let nnz_end = usize::try_from(end_val)
+            .map_err(|_| ConvertError::Other(format!("negative indptr end {end_val}")))?;
+        if nnz_end < nnz_start {
+            return Err(ConvertError::Other(format!(
+                "indptr non-monotonic across shard: base={base}, end={end_val}"
+            )));
+        }
+
+        let (shard_indices_i32, shard_values) = if nnz_start == nnz_end {
+            (Vec::<i32>::new(), Vec::<f32>::new())
+        } else {
+            let i = read_slice_i32(&self.indices_ds, nnz_start, nnz_end)?;
+            let v = read_slice_f32(&self.data_ds, nnz_start, nnz_end)?;
+            (i, v)
+        };
+
+        scx_sparse::validate_csr_arrays(
+            &self.indptr[row_start_usize..=row_end],
+            &shard_indices_i32,
+            self.n_vars as u64,
+        )
+        .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
+
+        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows as usize + 1);
+        for &v in &self.indptr[row_start_usize..=row_end] {
+            shard_indptr.push((v - base) as u64);
+        }
+        let shard_indices: Vec<u32> = shard_indices_i32.into_iter().map(|v| v as u32).collect();
+
+        let n_cols = u32::try_from(self.n_vars)
+            .map_err(|_| ConvertError::Other(format!("n_vars {} exceeds u32::MAX", self.n_vars)))?;
+        Ok(StreamedCsrShard {
+            row_start,
+            n_rows,
+            n_cols,
+            indptr: shard_indptr,
+            indices: shard_indices,
+            values: shard_values,
+            source_name: Some(self.source_name.clone()),
+            duplicates_merged: 0,
+        })
+    }
+}
+
 impl CsrShardStream for XStreamReader {
     fn n_obs(&self) -> u64 {
         self.n_obs as u64
@@ -276,6 +344,28 @@ impl CsrShardStream for XStreamReader {
                 }))
             }
         }
+    }
+
+    fn as_indexed(&self) -> Option<&dyn IndexedCsrShardStream> {
+        Some(self)
+    }
+}
+
+impl IndexedCsrShardStream for XStreamReader {
+    fn n_obs(&self) -> u64 {
+        self.n_obs as u64
+    }
+
+    fn n_vars(&self) -> u64 {
+        self.n_vars as u64
+    }
+
+    fn source_matrix_name(&self) -> &str {
+        &self.source_name
+    }
+
+    fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError> {
+        self.read_range_inner(row_start, n_rows)
     }
 }
 

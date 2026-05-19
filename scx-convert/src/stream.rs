@@ -54,4 +54,41 @@ pub trait CsrShardStream {
         &mut self,
         target_rows: usize,
     ) -> Result<Option<StreamedCsrShard>, ConvertError>;
+
+    /// If this reader supports parallel row-range reads,
+    /// return a `&dyn IndexedCsrShardStream` view of `self`. Default
+    /// implementation returns `None`, which routes the writer
+    /// coordinator to the sequential path. Readers that can safely
+    /// be driven from multiple worker threads (CSR h5ad, dense h5ad,
+    /// in-memory CSC) override this to return `Some(self)`.
+    fn as_indexed(&self) -> Option<&dyn IndexedCsrShardStream> {
+        None
+    }
+}
+
+/// Sibling of [`CsrShardStream`] for readers that can serve
+/// independent row-range reads concurrently from multiple worker
+/// threads.
+///
+/// Implementers must be `Send + Sync` and stateless across calls
+/// (no internal cursor). The streaming writer coordinator partitions
+/// the matrix into `[(row_start, n_rows)]` ranges via
+/// [`crate::pipeline::compute_shard_row_ranges`] and fans them out
+/// across a rayon worker pool. The encoded shards funnel through a
+/// bounded reorder buffer and are written in shard-index order so
+/// the output `.scx` file is byte-identical to the sequential path.
+///
+/// The CSC external-memory bucket transposer (Phase 2) does not
+/// implement this trait — its bucket pipeline is inherently
+/// sequential.
+pub trait IndexedCsrShardStream: Send + Sync {
+    fn n_obs(&self) -> u64;
+    fn n_vars(&self) -> u64;
+    fn source_matrix_name(&self) -> &str;
+    /// Read rows `[row_start, row_start + n_rows)` and return them
+    /// as a `StreamedCsrShard`. `row_start + n_rows` must not exceed
+    /// `self.n_obs()`; callers (the parallel coordinator) compute
+    /// ranges from `compute_shard_row_ranges` so this invariant is
+    /// enforced by construction.
+    fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError>;
 }

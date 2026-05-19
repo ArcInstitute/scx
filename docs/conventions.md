@@ -75,3 +75,38 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   Linux to return freed arenas to the OS after large reductions.
 - Pseudobulk aggregation streams via `BackedCsrReader`; statistical
   testing delegated to `pydeseq2`.
+
+## Parallel streaming reader (scx-convert)
+
+- `run_streaming_writer_coordinator` is the entry point that dispatches
+  every streaming convert (h5ad CSR, h5ad dense, in-memory CSC, h5mu
+  per-modality, h5ad layers). It picks between the sequential
+  `streaming_writer_coordinator` and the rayon-parallel
+  `streaming_writer_coordinator_parallel` based on three preconditions:
+  (1) the reader exposes `IndexedCsrShardStream::read_range` via the
+  `as_indexed` trait override, (2) `H5is_library_threadsafe` reports
+  the libhdf5 build is thread-safe (cached in `OnceLock`), and (3)
+  `ConvertOptions::reader_threads` resolves to `> 1`. Any precondition
+  failing falls back to the sequential path; a `Hdf5NotThreadsafe`
+  warning fires once when (2) is the missing piece.
+- Workers funnel encoded shards through a bounded `crossbeam-channel`
+  sized by `writer_queue_depth` and drain through a `BTreeMap` reorder
+  buffer keyed by shard index. The writer thread (the calling thread)
+  preserves shard-index order so the on-disk file layout, catalog
+  offsets, and BLAKE3 checksums match the sequential output
+  byte-for-byte.
+- Memory derate: per-worker working-set estimate is
+  `shard_target_rows × n_vars × 4 / 5` (matches the documented
+  `× density × 16 bytes` ceiling at density = 5 % using integer math
+  to avoid float→u64 truncation). When `--memory-budget` is set,
+  worker count is clamped to fit; a single shard exceeding the budget
+  fails the convert with an actionable message rather than risking
+  OOM.
+- CSC external-memory transpose stays sequential (the bucket pipeline
+  serialises by construction). h5mu cross-modality is sequential
+  across modalities; each modality's X / layers go through the
+  same dispatcher independently.
+- `IndexedCsrShardStream` requires `Send + Sync`. HDF5-backed readers
+  inherit thread-safety from libhdf5 (verified by the runtime probe).
+  In-memory readers (e.g. `MaterializedCsrStream`) own all their state
+  in `Vec`s and slice deterministically — safe by construction.

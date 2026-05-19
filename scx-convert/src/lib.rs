@@ -32,6 +32,8 @@ mod mudata_write;
 mod tenx_read;
 
 #[cfg(feature = "hdf5")]
+mod hdf5_threadsafe;
+#[cfg(feature = "hdf5")]
 mod mem;
 #[cfg(feature = "hdf5")]
 mod stream;
@@ -57,9 +59,9 @@ pub mod pipeline;
 
 #[cfg(feature = "hdf5")]
 pub use pipeline::{
-    h5ad_to_scx, h5ad_to_scx_streaming, scx_to_h5ad, scx_to_h5ad_streaming,
-    streaming_writer_coordinator, tenx_to_scx, BitmapPolicy, ConvertError, ConvertOptions,
-    StreamingOverrides,
+    h5ad_to_scx, h5ad_to_scx_streaming, run_streaming_writer_coordinator, scx_to_h5ad,
+    scx_to_h5ad_streaming, streaming_writer_coordinator, tenx_to_scx, BitmapPolicy, ConvertError,
+    ConvertOptions, StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]

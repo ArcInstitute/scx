@@ -2778,6 +2778,8 @@ pub(crate) fn route_backed_anndata_to_streaming(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
 ) -> PyResult<()> {
     let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -2878,6 +2880,8 @@ pub(crate) fn route_backed_anndata_to_streaming(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        reader_threads,
+        writer_queue_depth,
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);
@@ -3775,6 +3779,8 @@ pub fn from_anndata_impl(
                 index_preset,
                 index_auto_threshold,
                 bitmap,
+                None, // reader_threads (auto)
+                4,    // writer_queue_depth (default)
             );
         }
         #[cfg(not(feature = "hdf5"))]

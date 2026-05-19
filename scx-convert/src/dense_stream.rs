@@ -16,7 +16,7 @@ use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
 use ndarray::s;
 
 use super::pipeline::{ConvertError, ConvertOptions};
-use super::stream::{CsrShardStream, StreamedCsrShard};
+use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
 use super::warnings::WarningSink;
 
 /// Streaming reader over an h5ad dense matrix dataset. Open via
@@ -197,35 +197,36 @@ pub fn open_dense_layer_streaming(
     open_dense_streaming(file, &format!("layers/{layer_name}"), opts, sink)
 }
 
-impl CsrShardStream for DenseXStreamReader {
-    fn n_obs(&self) -> u64 {
-        self.n_obs
-    }
-    fn n_vars(&self) -> u64 {
-        self.n_vars
-    }
-    fn source_matrix_name(&self) -> &str {
-        &self.source_name
-    }
-
-    fn next_csr_shard(
-        &mut self,
-        target_rows: usize,
-    ) -> Result<Option<StreamedCsrShard>, ConvertError> {
-        if self.cursor >= self.n_obs {
-            return Ok(None);
+impl DenseXStreamReader {
+    /// Read rows `[row_start, row_start + n_rows)` and
+    /// sparsify into a `StreamedCsrShard` without mutating internal
+    /// state. Subject to the same `max_slab_rows` budget cap as
+    /// `next_csr_shard`; callers (the parallel coordinator) must size
+    /// their ranges accordingly via [`crate::pipeline::compute_shard_row_ranges`]
+    /// with `target_rows ≤ max_slab_rows`.
+    fn read_range_inner(
+        &self,
+        row_start: u64,
+        n_rows: u32,
+    ) -> Result<StreamedCsrShard, ConvertError> {
+        if row_start.saturating_add(n_rows as u64) > self.n_obs {
+            return Err(ConvertError::Other(format!(
+                "dense read_range out of bounds: row_start={row_start}, n_rows={n_rows}, n_obs={}",
+                self.n_obs
+            )));
         }
-        if target_rows == 0 {
-            return Err(ConvertError::Other("target_rows must be > 0".into()));
+        if (n_rows as usize) > self.max_slab_rows {
+            return Err(ConvertError::Other(format!(
+                "dense read_range slab_rows={n_rows} exceeds max_slab_rows={} (lower --shard-size or raise --memory-budget)",
+                self.max_slab_rows
+            )));
         }
-
-        let remaining = (self.n_obs - self.cursor) as usize;
-        let slab_rows = target_rows.min(self.max_slab_rows).min(remaining);
-        let row_start = self.cursor as usize;
-        let row_end = row_start + slab_rows;
-
+        let row_start_usize = row_start as usize;
+        let row_end = row_start_usize + n_rows as usize;
         let n_vars = self.n_vars as usize;
-        let flat = self.read_slab_f32(row_start, row_end, n_vars)?;
+        let slab_rows = n_rows as usize;
+
+        let flat = self.read_slab_f32(row_start_usize, row_end, n_vars)?;
 
         let mut indptr: Vec<u64> = Vec::with_capacity(slab_rows + 1);
         let mut indices: Vec<u32> = Vec::with_capacity(slab_rows * n_vars / 32 + 1);
@@ -234,8 +235,6 @@ impl CsrShardStream for DenseXStreamReader {
         indptr.push(0);
         let eps = self.zero_eps;
         if eps == 0.0 {
-            // Match scipy `csr_matrix(dense)`: keep `val != 0.0`,
-            // which preserves NaN (NaN != 0.0).
             for row in 0..slab_rows {
                 let base = row * n_vars;
                 for col in 0..n_vars {
@@ -261,17 +260,65 @@ impl CsrShardStream for DenseXStreamReader {
             }
         }
 
-        self.cursor += slab_rows as u64;
-        Ok(Some(StreamedCsrShard {
-            row_start: row_start as u64,
-            n_rows: slab_rows as u32,
+        Ok(StreamedCsrShard {
+            row_start,
+            n_rows,
             n_cols: self.n_vars as u32,
             indptr,
             indices,
             values,
             source_name: Some(self.source_name.clone()),
             duplicates_merged: 0,
-        }))
+        })
+    }
+}
+
+impl CsrShardStream for DenseXStreamReader {
+    fn n_obs(&self) -> u64 {
+        self.n_obs
+    }
+    fn n_vars(&self) -> u64 {
+        self.n_vars
+    }
+    fn source_matrix_name(&self) -> &str {
+        &self.source_name
+    }
+
+    fn next_csr_shard(
+        &mut self,
+        target_rows: usize,
+    ) -> Result<Option<StreamedCsrShard>, ConvertError> {
+        if self.cursor >= self.n_obs {
+            return Ok(None);
+        }
+        if target_rows == 0 {
+            return Err(ConvertError::Other("target_rows must be > 0".into()));
+        }
+
+        let remaining = (self.n_obs - self.cursor) as usize;
+        let slab_rows = target_rows.min(self.max_slab_rows).min(remaining);
+        let shard = self.read_range_inner(self.cursor, slab_rows as u32)?;
+        self.cursor += slab_rows as u64;
+        Ok(Some(shard))
+    }
+
+    fn as_indexed(&self) -> Option<&dyn IndexedCsrShardStream> {
+        Some(self)
+    }
+}
+
+impl IndexedCsrShardStream for DenseXStreamReader {
+    fn n_obs(&self) -> u64 {
+        self.n_obs
+    }
+    fn n_vars(&self) -> u64 {
+        self.n_vars
+    }
+    fn source_matrix_name(&self) -> &str {
+        &self.source_name
+    }
+    fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError> {
+        self.read_range_inner(row_start, n_rows)
     }
 }
 
