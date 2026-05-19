@@ -528,18 +528,26 @@ fn from_h5mu(
 ///     pyscx.to_h5ad("cite.scx", "rna.h5ad", modality="rna")
 #[cfg(feature = "hdf5")]
 #[pyfunction]
-#[pyo3(signature = (path, out, stream=true, modality=None))]
+#[pyo3(signature = (path, out, stream=true, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None))]
+#[allow(clippy::too_many_arguments)]
 fn to_h5ad(
     py: Python<'_>,
     path: &str,
     out: &str,
     stream: bool,
     modality: Option<&str>,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
+    memory_budget: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     use std::path::Path;
+    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
     let opts = scx_convert::ConvertOptions {
         stream,
         tool: "pyscx".into(),
+        reader_threads,
+        writer_queue_depth,
+        memory_budget: memory_budget_bytes,
         ..Default::default()
     };
     py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
@@ -577,12 +585,25 @@ fn to_h5ad(
 ///     pyscx.to_h5mu("cite.scx", "cite.h5mu")
 #[cfg(feature = "hdf5")]
 #[pyfunction]
-#[pyo3(signature = (path, out, stream=true))]
-fn to_h5mu(py: Python<'_>, path: &str, out: &str, stream: bool) -> PyResult<()> {
+#[pyo3(signature = (path, out, stream=true, reader_threads=None, writer_queue_depth=4, memory_budget=None))]
+#[allow(clippy::too_many_arguments)]
+fn to_h5mu(
+    py: Python<'_>,
+    path: &str,
+    out: &str,
+    stream: bool,
+    reader_threads: Option<usize>,
+    writer_queue_depth: usize,
+    memory_budget: Option<Bound<'_, PyAny>>,
+) -> PyResult<()> {
     use std::path::Path;
+    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
     let opts = scx_convert::ConvertOptions {
         stream,
         tool: "pyscx".into(),
+        reader_threads,
+        writer_queue_depth,
+        memory_budget: memory_budget_bytes,
         ..Default::default()
     };
     py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {

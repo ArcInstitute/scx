@@ -1317,11 +1317,26 @@ fn streaming_writer_coordinator_parallel(
         lock
     };
 
+    // Capture the fault-injection setting on the calling thread (the
+    // caller's `FailIngestShardGuard` lives in this thread's
+    // thread-local). The captured `Option<usize>` is `Copy` and
+    // propagates into rayon workers via the spawn closure capture, so
+    // each coordinator invocation carries its own fault config —
+    // concurrent non-fault tests on other threads see `None`.
+    #[cfg(test)]
+    let captured_fault_shard = test_hooks::current_ingest_fault_shard();
+
     // Macro-style local spawn: must inline because extracting a
     // closure would re-borrow `reader` from a nested closure scope
     // and rayon's `'scope` lifetime can't be reconciled with that
     // shape. Each spawn clones `tx` + `source_name` for the worker.
-    pool.in_place_scope(|s| -> Result<(), ConvertError> {
+    //
+    // `move` is load-bearing: it moves `rx` into the closure so an
+    // early `return Err(...)` from the drain loop drops `rx` on
+    // unwind, unblocking workers parked in `tx.send(...)` on the
+    // bounded channel. Without `move` `rx` lives in the parent frame
+    // and the scope can never join those workers.
+    pool.in_place_scope(move |s| -> Result<(), ConvertError> {
         macro_rules! spawn_shard {
             ($scope:expr, $idx:expr) => {{
                 let idx_ = $idx;
@@ -1332,6 +1347,20 @@ fn streaming_writer_coordinator_parallel(
                 $scope.spawn(move |_| {
                     #[cfg(test)]
                     let _guard = crate::pipeline::test_hooks::InFlightGuard::new();
+                    #[cfg(test)]
+                    if Some(idx_) == captured_fault_shard {
+                        let inner = ConvertError::Other(format!(
+                            "test_hooks: injected failure at shard {idx_}"
+                        ));
+                        let wrapped = ConvertError::ShardRead {
+                            row_start,
+                            n_rows,
+                            source: source_name,
+                            inner: Box::new(inner),
+                        };
+                        let _ = tx.send((idx_, Err(wrapped)));
+                        return;
+                    }
                     let result = encode_one_shard_worker(
                         reader,
                         row_start,
@@ -1659,6 +1688,58 @@ pub(crate) mod test_hooks {
     pub static IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
     pub static IN_FLIGHT_PEAK: AtomicUsize = AtomicUsize::new(0);
     pub static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// Per-thread fault-injection switch read by the parallel
+        /// ingest coordinator (`streaming_writer_coordinator_parallel`)
+        /// at entry. Workers fail synthetically on the configured shard
+        /// index instead of running the real shard worker. Used by the
+        /// deadlock regression test to force a mid-stream worker failure
+        /// without corrupting the source h5ad on disk.
+        ///
+        /// Thread-local (not a global atomic) so a concurrently
+        /// scheduled non-fault test running on a different thread never
+        /// observes another test's fault config. The coordinator copies
+        /// the value at entry on its calling thread and propagates it
+        /// to the spawned rayon workers; each coordinator invocation
+        /// captures its own value.
+        ///
+        /// Mutate only via [`FailIngestShardGuard`]; the guard restores
+        /// the previous value on drop so the hook can't leak across
+        /// tests, even on panic mid-flight.
+        pub static FAIL_INGEST_SHARD_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Read the current thread's ingest fault-injection setting.
+    /// Coordinator captures this at entry on its calling thread, then
+    /// propagates to spawned workers via the closure capture.
+    pub fn current_ingest_fault_shard() -> Option<usize> {
+        FAIL_INGEST_SHARD_AT.with(|c| c.get())
+    }
+
+    /// RAII guard that arms the ingest fault injector for the
+    /// current thread. Drop restores the previous value — keeps the
+    /// hook from leaking when the test panics mid-flight. The fault is
+    /// thread-scoped, so tests that spawn the convert call onto a
+    /// helper thread must create the guard *on that helper thread*
+    /// (typically inside the `std::thread::spawn` closure body).
+    pub struct FailIngestShardGuard {
+        prev: Option<usize>,
+    }
+
+    impl FailIngestShardGuard {
+        pub fn new(shard_idx: usize) -> Self {
+            let prev = FAIL_INGEST_SHARD_AT.with(|c| c.replace(Some(shard_idx)));
+            Self { prev }
+        }
+    }
+
+    impl Drop for FailIngestShardGuard {
+        fn drop(&mut self) {
+            let prev = self.prev;
+            FAIL_INGEST_SHARD_AT.with(|c| c.set(prev));
+        }
+    }
 
     thread_local! {
         pub static LAST_RUN_PEAK: Cell<usize> = const { Cell::new(0) };
