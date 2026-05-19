@@ -43,15 +43,18 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # Explicit --target overrides the cargo-fuzz prebuilt binary's
+      # default of x86_64-unknown-linux-musl, which would require
+      # x86_64-linux-musl-gcc (not present on ubuntu-latest).
       - name: Build scx-codec fuzz targets
         working-directory: scx-codec/fuzz
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: Build scx-format fuzz targets
         working-directory: scx-format/fuzz
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: Build scx-engine fuzz targets
         working-directory: scx-engine/fuzz
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
 
   fuzz-run:
     name: Fuzz ${{ matrix.crate }}/${{ matrix.target }}
@@ -86,7 +89,7 @@ jobs:
       - name: Run ${{ matrix.target }}
         if: github.event.inputs.target == '' || github.event.inputs.target == matrix.target
         working-directory: ${{ matrix.crate }}/fuzz
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event.inputs.duration_seconds }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=${{ github.event.inputs.duration_seconds }}
       - name: Upload crash inputs on failure
         if: failure()
         uses: actions/upload-artifact@v4
