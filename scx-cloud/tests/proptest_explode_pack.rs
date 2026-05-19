@@ -213,8 +213,8 @@ fn assert_section_payloads_byte_identical(orig_bytes: &[u8], packed_bytes: &[u8]
             orig_entry.section_type, orig_entry.name
         );
 
-        let orig_payload =
-            &orig_bytes[orig_entry.offset as usize..(orig_entry.offset + orig_entry.length) as usize];
+        let orig_payload = &orig_bytes
+            [orig_entry.offset as usize..(orig_entry.offset + orig_entry.length) as usize];
         let packed_payload =
             &packed_bytes[matched.offset as usize..(matched.offset + matched.length) as usize];
 

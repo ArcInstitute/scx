@@ -23,9 +23,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use proptest::prelude::*;
-use scx_engine::{
-    build_indexes, prune_rows_by_index, Predicate, PredicateIndex, ScalarValue,
-};
+use scx_engine::{build_indexes, prune_rows_by_index, Predicate, PredicateIndex, ScalarValue};
 
 const CATEGORIES: &[&str] = &["T cell", "B cell", "NK cell", "monocyte"];
 
@@ -40,7 +38,8 @@ fn arb_records(min_rows: usize, max_rows: usize) -> impl Strategy<Value = Record
                 let strs: Vec<&str> = categories.iter().map(|&i| CATEGORIES[i]).collect();
                 StringArray::from(strs)
             });
-        let num_strat = prop::collection::vec(-100.0f32..100.0, n_rows).prop_map(Float32Array::from);
+        let num_strat =
+            prop::collection::vec(-100.0f32..100.0, n_rows).prop_map(Float32Array::from);
         (Just(n_rows), cat_strat, num_strat).prop_map(|(n_rows, cat, num)| {
             let schema = Schema::new(vec![
                 Field::new("cell_type", DataType::Utf8, false),

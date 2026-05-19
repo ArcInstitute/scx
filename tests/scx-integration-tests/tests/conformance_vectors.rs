@@ -207,19 +207,13 @@ fn make_var(n: usize) -> RecordBatch {
 }
 
 /// Generate sparse CSR with ~30% density, u16 values.
-fn make_csr(
-    n_rows: usize,
-    n_vars: usize,
-    seed_offset: u64,
-) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+fn make_csr(n_rows: usize, n_vars: usize, seed_offset: u64) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
     let mut rng = Xorshift64::new(SEED.wrapping_add(seed_offset));
     let mut indptr = vec![0u64];
     let mut indices = Vec::new();
     let mut data = Vec::new();
     for _ in 0..n_rows {
-        let mut row_cols: Vec<u32> = (0..n_vars as u32)
-            .filter(|_| rng.next() % 10 < 3)
-            .collect();
+        let mut row_cols: Vec<u32> = (0..n_vars as u32).filter(|_| rng.next() % 10 < 3).collect();
         row_cols.sort_unstable();
         for &c in &row_cols {
             indices.push(c);
@@ -634,13 +628,8 @@ fn generate_v2_bitmap(out: &Path) {
         .unwrap();
 
     // Derive the bitmap directly from the shard.
-    let bitmap_shard = BitmapShard::build_from_csr(
-        0,
-        n_obs as u32,
-        n_vars as u32,
-        &indptr,
-        &indices,
-    );
+    let bitmap_shard =
+        BitmapShard::build_from_csr(0, n_obs as u32, n_vars as u32, &indptr, &indices);
     writer.write_bitmap_shard(&bitmap_shard).unwrap();
 
     writer.finish().unwrap();
@@ -654,8 +643,7 @@ fn extract_catalog_summary(path: &Path) -> Vec<CatalogSummaryEntry> {
     use scx_format::catalog::FullCatalog;
     use scx_format::header::HEADER_SIZE;
     let bytes = fs::read(path).unwrap();
-    let header =
-        FileHeader::read_from(&mut std::io::Cursor::new(&bytes[..HEADER_SIZE])).unwrap();
+    let header = FileHeader::read_from(&mut std::io::Cursor::new(&bytes[..HEADER_SIZE])).unwrap();
     let fc_off = header.full_catalog_offset as usize;
     let fc_len = header.full_catalog_length as usize;
     let cat = FullCatalog::read_from(
@@ -719,7 +707,11 @@ fn hash_directory(dir: &Path, prefix: &Path) -> Vec<(String, String)> {
     let mut hashes = Vec::new();
     for entry in entries {
         let path = entry.path();
-        let rel = path.strip_prefix(prefix).unwrap().to_string_lossy().to_string();
+        let rel = path
+            .strip_prefix(prefix)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let ft = entry.file_type().unwrap();
         if ft.is_dir() {
             hashes.extend(hash_directory(&path, prefix));
@@ -859,10 +851,9 @@ fn write_sidecar(fixture: &Fixture, dir: &Path) {
             use scx_format::catalog::FullCatalog;
             use scx_format::header::HEADER_SIZE;
             let header_bytes = fs::read(scx_path.join("_header.bin")).unwrap();
-            let header = FileHeader::read_from(&mut std::io::Cursor::new(
-                &header_bytes[..HEADER_SIZE],
-            ))
-            .unwrap();
+            let header =
+                FileHeader::read_from(&mut std::io::Cursor::new(&header_bytes[..HEADER_SIZE]))
+                    .unwrap();
             let catalog_bytes = fs::read(scx_path.join("_catalog.bin")).unwrap();
             let cat = FullCatalog::read_from(
                 &mut std::io::Cursor::new(&catalog_bytes),
@@ -1058,10 +1049,9 @@ fn test_conformance_files_header_summary() {
             FixtureKind::Directory => {
                 use scx_format::header::HEADER_SIZE;
                 let header_bytes = fs::read(path.join("_header.bin")).unwrap();
-                let header = FileHeader::read_from(&mut std::io::Cursor::new(
-                    &header_bytes[..HEADER_SIZE],
-                ))
-                .unwrap();
+                let header =
+                    FileHeader::read_from(&mut std::io::Cursor::new(&header_bytes[..HEADER_SIZE]))
+                        .unwrap();
                 HeaderSummary {
                     format_version: header.format_version as u32,
                     n_obs: header.n_obs,
@@ -1220,13 +1210,14 @@ fn test_unknown_future_section_type_skipped() {
     // brittle in theory but the catalog layout puts the section_type
     // byte right after the name in each entry. We patch all occurrences
     // of byte 4 followed by zeros to be safe.
-    let header =
-        FileHeader::read_from(&mut std::io::Cursor::new(&bytes[..256])).unwrap();
+    let header = FileHeader::read_from(&mut std::io::Cursor::new(&bytes[..256])).unwrap();
     let fc_off = header.full_catalog_offset as usize;
     let fc_end = fc_off + header.full_catalog_length as usize;
     let mut patched = false;
     for byte in bytes.iter_mut().take(fc_end).skip(fc_off) {
-        if *byte == 4 /* CsrShard */ {
+        if *byte == 4
+        /* CsrShard */
+        {
             *byte = 254;
             patched = true;
             break;
