@@ -770,6 +770,60 @@ categorical_codes_dtype_test!(h5ad_with_int16_categorical_codes_converts, i16);
 categorical_codes_dtype_test!(h5ad_with_uint8_categorical_codes_converts, u8);
 categorical_codes_dtype_test!(h5ad_with_uint16_categorical_codes_converts, u16);
 
+/// Regression test for the second class of bug fixed by the
+/// `HdfNumericDtype` migration in `read_column_to_arrow`. The pre-
+/// refactor function fell through to `let data: Vec<i32> = ds.read_1d()?`
+/// for any `Unsigned` width other than `U1` / `U4`, which hdf5-rust
+/// rejects with the opaque `HDF5 error: no conversion paths found`
+/// for `uint16` and `uint64` source dtypes. anndata writers do produce
+/// such columns (e.g. integer count columns saved as uint16 to halve
+/// disk footprint).
+macro_rules! unsigned_dataframe_column_test {
+    ($name:ident, $rust_ty:ty, $arrow_dtype:expr) => {
+        #[test]
+        fn $name() {
+            use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+
+            let dir = tempfile::tempdir().unwrap();
+            let h5ad_path = dir.path().join(concat!(stringify!($name), ".h5ad"));
+            let n_obs = 8;
+            let n_vars = 4;
+            create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+            {
+                let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+                let var = file.group("var").unwrap();
+                let col: Vec<$rust_ty> = (0..n_vars).map(|i| i as $rust_ty).collect();
+                let ds = var
+                    .new_dataset::<$rust_ty>()
+                    .shape([n_vars])
+                    .create("n_counts")
+                    .unwrap();
+                ds.write(&col).unwrap();
+            }
+            let scx = dir.path().join("out.scx");
+            h5ad_to_scx_streaming(
+                &h5ad_path,
+                &scx,
+                &ConvertOptions::default(),
+                &StreamingOverrides::default(),
+                &mut WarningSink::log(),
+            )
+            .expect(concat!(
+                "convert must accept ",
+                stringify!($rust_ty),
+                " dataframe columns"
+            ));
+            let reader = ScxReader::open(&scx).unwrap();
+            let var = reader.read_var().unwrap();
+            let idx = var.schema().index_of("n_counts").unwrap();
+            assert_eq!(var.column(idx).data_type(), &$arrow_dtype);
+        }
+    };
+}
+
+unsigned_dataframe_column_test!(h5ad_with_u16_dataframe_column_converts, u16, DataType::Int32);
+unsigned_dataframe_column_test!(h5ad_with_u64_dataframe_column_converts, u64, DataType::Int64);
+
 /// Companion regression test for the user-visible
 /// `scx-cli convert pbmc10k.h5ad` crash. pandas / anndata write an
 /// *empty* `obs/@column-order` as a length-0 `float64` array (numpy's

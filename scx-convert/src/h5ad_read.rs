@@ -372,6 +372,8 @@ fn read_column_to_arrow(
     ds: &hdf5::Dataset,
     name: &str,
 ) -> Result<(Field, ArrayRef), ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+
     // Check for categorical encoding
     let is_categorical = ds
         .attr("encoding-type")
@@ -385,104 +387,132 @@ fn read_column_to_arrow(
     }
 
     let desc = ds.dtype()?.to_descriptor()?;
-    match desc {
-        TypeDescriptor::Integer(sz) => match sz {
-            hdf5::types::IntSize::U1 => {
-                // Could be boolean encoding
-                let data: Vec<i8> = ds.read_1d()?.to_vec();
-                let array: ArrayRef = Arc::new(Int32Array::from(
-                    data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
-                ));
-                Ok((Field::new(name, DataType::Int32, true), array))
-            }
-            hdf5::types::IntSize::U2 => {
-                let data: Vec<i16> = ds.read_1d()?.to_vec();
-                let array: ArrayRef = Arc::new(Int32Array::from(
-                    data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
-                ));
-                Ok((Field::new(name, DataType::Int32, true), array))
-            }
-            hdf5::types::IntSize::U4 => {
-                let data: Vec<i32> = ds.read_1d()?.to_vec();
-                let array: ArrayRef = Arc::new(Int32Array::from(data));
-                Ok((Field::new(name, DataType::Int32, true), array))
-            }
-            hdf5::types::IntSize::U8 => {
-                let data: Vec<i64> = ds.read_1d()?.to_vec();
-                let array: ArrayRef = Arc::new(Int64Array::from(data));
-                Ok((Field::new(name, DataType::Int64, true), array))
-            }
-        },
-        TypeDescriptor::Unsigned(sz) => match sz {
-            hdf5::types::IntSize::U1 => {
-                // Check if this is actually a boolean
-                let is_bool = ds
-                    .attr("encoding-type")
-                    .ok()
-                    .and_then(|attr| attr.read_scalar::<hdf5::types::VarLenUnicode>().ok())
-                    .map(|v| v.as_str() == "boolean")
-                    .unwrap_or(false);
-                if is_bool {
-                    let data: Vec<u8> = ds.read_1d()?.to_vec();
-                    let array: ArrayRef = Arc::new(BooleanArray::from(
-                        data.iter().map(|&v| v != 0).collect::<Vec<_>>(),
-                    ));
-                    Ok((Field::new(name, DataType::Boolean, true), array))
-                } else {
-                    let data: Vec<u8> = ds.read_1d()?.to_vec();
-                    let array: ArrayRef = Arc::new(Int32Array::from(
-                        data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
-                    ));
-                    Ok((Field::new(name, DataType::Int32, true), array))
-                }
-            }
-            hdf5::types::IntSize::U4 => {
-                let data: Vec<u32> = ds.read_1d()?.to_vec();
-                let array: ArrayRef = Arc::new(Int64Array::from(
-                    data.iter().map(|&v| v as i64).collect::<Vec<_>>(),
-                ));
-                Ok((Field::new(name, DataType::Int64, true), array))
-            }
-            _ => {
-                let data: Vec<i32> = ds.read_1d()?.to_vec();
-                let array: ArrayRef = Arc::new(Int32Array::from(data));
-                Ok((Field::new(name, DataType::Int32, true), array))
-            }
-        },
-        TypeDescriptor::Float(hdf5::types::FloatSize::U8) => {
-            let data: Vec<f64> = ds.read_1d()?.to_vec();
-            let array: ArrayRef = Arc::new(Float64Array::from(data));
-            Ok((Field::new(name, DataType::Float64, true), array))
-        }
-        TypeDescriptor::Float(_) => {
-            let data: Vec<f32> = ds.read_1d()?.to_vec();
-            let array: ArrayRef = Arc::new(Float32Array::from(data));
-            Ok((Field::new(name, DataType::Float32, true), array))
-        }
+
+    // Non-numeric descriptors first — `HdfNumericDtype` only covers
+    // integer / float widths. Boolean and string columns route here.
+    match &desc {
         TypeDescriptor::Boolean => {
             let data: Vec<bool> = ds.read_1d()?.to_vec();
             let array: ArrayRef = Arc::new(BooleanArray::from(data));
-            Ok((Field::new(name, DataType::Boolean, true), array))
+            return Ok((Field::new(name, DataType::Boolean, true), array));
         }
-        TypeDescriptor::VarLenUnicode | TypeDescriptor::VarLenAscii => {
+        TypeDescriptor::VarLenUnicode
+        | TypeDescriptor::VarLenAscii
+        | TypeDescriptor::FixedUnicode(_)
+        | TypeDescriptor::FixedAscii(_) => {
             let data: Vec<hdf5::types::VarLenUnicode> = ds.read_1d()?.to_vec();
             let strings: Vec<String> = data.iter().map(|s| s.to_string()).collect();
             let array: ArrayRef = Arc::new(StringArray::from(
                 strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             ));
-            Ok((Field::new(name, DataType::Utf8, true), array))
+            return Ok((Field::new(name, DataType::Utf8, true), array));
         }
-        TypeDescriptor::FixedUnicode(_) | TypeDescriptor::FixedAscii(_) => {
-            let data: Vec<hdf5::types::VarLenUnicode> = ds.read_1d()?.to_vec();
-            let strings: Vec<String> = data.iter().map(|s| s.to_string()).collect();
-            let array: ArrayRef = Arc::new(StringArray::from(
-                strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        _ => {}
+    }
+
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "column '{name}': unsupported HDF5 type: {desc:?}"
+        ))
+    })?;
+
+    match dt {
+        HdfNumericDtype::I8 => {
+            let data: Vec<i8> = ds.read_1d()?.to_vec();
+            let array: ArrayRef = Arc::new(Int32Array::from(
+                data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
             ));
-            Ok((Field::new(name, DataType::Utf8, true), array))
+            Ok((Field::new(name, DataType::Int32, true), array))
         }
-        other => Err(ConvertError::UnsupportedDtype(format!(
-            "column '{name}': unsupported HDF5 type: {other:?}"
-        ))),
+        HdfNumericDtype::I16 => {
+            let data: Vec<i16> = ds.read_1d()?.to_vec();
+            let array: ArrayRef = Arc::new(Int32Array::from(
+                data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            ));
+            Ok((Field::new(name, DataType::Int32, true), array))
+        }
+        HdfNumericDtype::I32 => {
+            let data: Vec<i32> = ds.read_1d()?.to_vec();
+            Ok((
+                Field::new(name, DataType::Int32, true),
+                Arc::new(Int32Array::from(data)),
+            ))
+        }
+        HdfNumericDtype::I64 => {
+            let data: Vec<i64> = ds.read_1d()?.to_vec();
+            Ok((
+                Field::new(name, DataType::Int64, true),
+                Arc::new(Int64Array::from(data)),
+            ))
+        }
+        // u8 columns may carry the anndata `boolean` encoding-type
+        // attribute — preserved from the pre-refactor path.
+        HdfNumericDtype::U8 => {
+            let is_bool = ds
+                .attr("encoding-type")
+                .ok()
+                .and_then(|attr| attr.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+                .map(|v| v.as_str() == "boolean")
+                .unwrap_or(false);
+            let data: Vec<u8> = ds.read_1d()?.to_vec();
+            if is_bool {
+                let array: ArrayRef = Arc::new(BooleanArray::from(
+                    data.iter().map(|&v| v != 0).collect::<Vec<_>>(),
+                ));
+                Ok((Field::new(name, DataType::Boolean, true), array))
+            } else {
+                let array: ArrayRef = Arc::new(Int32Array::from(
+                    data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+                ));
+                Ok((Field::new(name, DataType::Int32, true), array))
+            }
+        }
+        HdfNumericDtype::U16 => {
+            let data: Vec<u16> = ds.read_1d()?.to_vec();
+            let array: ArrayRef = Arc::new(Int32Array::from(
+                data.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            ));
+            Ok((Field::new(name, DataType::Int32, true), array))
+        }
+        HdfNumericDtype::U32 => {
+            let data: Vec<u32> = ds.read_1d()?.to_vec();
+            let array: ArrayRef = Arc::new(Int64Array::from(
+                data.iter().map(|&v| v as i64).collect::<Vec<_>>(),
+            ));
+            Ok((Field::new(name, DataType::Int64, true), array))
+        }
+        // u64 → i64 may overflow. Range-check loudly instead of
+        // silently truncating — same precedent as `read_i64_dataset`
+        // for CSR indptr.
+        HdfNumericDtype::U64 => {
+            let data: Vec<u64> = ds.read_1d()?.to_vec();
+            if let Some(&v) = data.iter().find(|&&v| v > i64::MAX as u64) {
+                return Err(ConvertError::IndexOverflow {
+                    path: ds.name(),
+                    source_dtype: dt.name(),
+                    target: "i64",
+                    value: v.to_string(),
+                });
+            }
+            let array: ArrayRef = Arc::new(Int64Array::from(
+                data.iter().map(|&v| v as i64).collect::<Vec<_>>(),
+            ));
+            Ok((Field::new(name, DataType::Int64, true), array))
+        }
+        HdfNumericDtype::F32 => {
+            let data: Vec<f32> = ds.read_1d()?.to_vec();
+            Ok((
+                Field::new(name, DataType::Float32, true),
+                Arc::new(Float32Array::from(data)),
+            ))
+        }
+        HdfNumericDtype::F64 => {
+            let data: Vec<f64> = ds.read_1d()?.to_vec();
+            Ok((
+                Field::new(name, DataType::Float64, true),
+                Arc::new(Float64Array::from(data)),
+            ))
+        }
     }
 }
 

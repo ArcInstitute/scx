@@ -11,7 +11,7 @@
 use crate::pipeline::ConvertError;
 use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HdfNumericDtype {
     F32,
     F64,
@@ -57,7 +57,6 @@ impl HdfNumericDtype {
 
     // Used by the readers in `h5ad_read.rs` and `h5ad_stream.rs` to
     // attach a source-dtype tag to `ConvertError::IndexOverflow`.
-    #[allow(dead_code)]
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::F32 => "f32",
@@ -147,11 +146,7 @@ mod tests {
             let got = HdfNumericDtype::from_descriptor(&desc).unwrap_or_else(|e| {
                 panic!("from_descriptor({desc:?}) returned Err: {e}");
             });
-            assert_eq!(
-                std::mem::discriminant(&got),
-                std::mem::discriminant(&want),
-                "variant mismatch for {desc:?}: got {got:?}, want {want:?}"
-            );
+            assert_eq!(got, want, "variant mismatch for {desc:?}");
             assert_eq!(got.name(), want_name);
             assert_eq!(got.size_bytes(), want_bytes);
         }
