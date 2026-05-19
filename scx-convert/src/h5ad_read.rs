@@ -103,119 +103,137 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
     Ok((csr.indptr, csr.indices, csr.data, n_obs, n_vars))
 }
 
-/// Read a dataset as Vec<i64>, handling i32 or i64 source dtypes.
+/// Read a dataset as `Vec<i64>`. Accepts every integer width; widens
+/// signed and unsigned source values to `i64`. `u64` values exceeding
+/// `i64::MAX` fail with [`ConvertError::IndexOverflow`] — silent
+/// truncation of CSR `indptr` would corrupt the on-disk sparse layout.
+/// Float source dtypes are rejected.
 pub(super) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
-    match desc {
-        TypeDescriptor::Integer(sz) => match sz {
-            hdf5::types::IntSize::U4 => {
-                let data: Vec<i32> = ds.read_1d()?.to_vec();
-                Ok(data.iter().map(|&v| v as i64).collect())
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as i64"
+        ))
+    })?;
+    match dt {
+        HdfNumericDtype::I8 => Ok(ds.read_1d::<i8>()?.into_iter().map(i64::from).collect()),
+        HdfNumericDtype::I16 => Ok(ds.read_1d::<i16>()?.into_iter().map(i64::from).collect()),
+        HdfNumericDtype::I32 => Ok(ds.read_1d::<i32>()?.into_iter().map(i64::from).collect()),
+        HdfNumericDtype::I64 => Ok(ds.read_1d::<i64>()?.to_vec()),
+        HdfNumericDtype::U8 => Ok(ds.read_1d::<u8>()?.into_iter().map(i64::from).collect()),
+        HdfNumericDtype::U16 => Ok(ds.read_1d::<u16>()?.into_iter().map(i64::from).collect()),
+        HdfNumericDtype::U32 => Ok(ds.read_1d::<u32>()?.into_iter().map(i64::from).collect()),
+        HdfNumericDtype::U64 => {
+            let data: Vec<u64> = ds.read_1d()?.to_vec();
+            if let Some(&v) = data.iter().find(|&&v| v > i64::MAX as u64) {
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i64",
+                    value: v.to_string(),
+                });
             }
-            hdf5::types::IntSize::U8 => {
-                let data: Vec<i64> = ds.read_1d()?.to_vec();
-                Ok(data)
-            }
-            _ => {
-                // Try reading as i64 for other sizes
-                let data: Vec<i64> = ds.read_1d()?.to_vec();
-                Ok(data)
-            }
-        },
-        TypeDescriptor::Unsigned(sz) => match sz {
-            hdf5::types::IntSize::U4 => {
-                let data: Vec<u32> = ds.read_1d()?.to_vec();
-                Ok(data.iter().map(|&v| v as i64).collect())
-            }
-            hdf5::types::IntSize::U8 => {
-                let data: Vec<u64> = ds.read_1d()?.to_vec();
-                // Validate no values exceed i64::MAX (finding 8.4).
-                if let Some(&v) = data.iter().find(|&&v| v > i64::MAX as u64) {
-                    return Err(ConvertError::Other(format!(
-                        "u64 indptr value {v} exceeds i64::MAX"
-                    )));
-                }
-                Ok(data.iter().map(|&v| v as i64).collect())
-            }
-            _ => {
-                let data: Vec<i64> = ds.read_1d()?.to_vec();
-                Ok(data)
-            }
-        },
-        _ => {
-            // Fallback
-            let data: Vec<i64> = ds.read_1d()?.to_vec();
-            Ok(data)
+            Ok(data.into_iter().map(|v| v as i64).collect())
         }
+        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
+            format!("dataset '{path}': float dtype {desc:?} cannot be read as i64"),
+        )),
     }
 }
 
-/// Read a dataset as Vec<i32>, handling various integer dtypes.
+/// Read a dataset as `Vec<i32>`. Accepts every integer width; widens
+/// narrow source values (`i8` / `i16` / `u8` / `u16`) via lossless
+/// cast, and range-checks narrowing casts (`i64` / `u32` / `u64`)
+/// against the i32 range — overflow returns
+/// [`ConvertError::IndexOverflow`] so CSR `indices` corruption is
+/// surfaced loudly. Float source dtypes are rejected.
 pub(super) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
-    match desc {
-        TypeDescriptor::Integer(sz) => match sz {
-            hdf5::types::IntSize::U4 => {
-                let data: Vec<i32> = ds.read_1d()?.to_vec();
-                Ok(data)
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as i32"
+        ))
+    })?;
+    match dt {
+        HdfNumericDtype::I8 => Ok(ds.read_1d::<i8>()?.into_iter().map(i32::from).collect()),
+        HdfNumericDtype::I16 => Ok(ds.read_1d::<i16>()?.into_iter().map(i32::from).collect()),
+        HdfNumericDtype::I32 => Ok(ds.read_1d::<i32>()?.to_vec()),
+        HdfNumericDtype::I64 => {
+            let data: Vec<i64> = ds.read_1d()?.to_vec();
+            if let Some(&v) = data
+                .iter()
+                .find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64)
+            {
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
             }
-            hdf5::types::IntSize::U8 => {
-                let data: Vec<i64> = ds.read_1d()?.to_vec();
-                // Validate no values overflow i32 (finding 8.3).
-                if let Some(&v) = data
-                    .iter()
-                    .find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64)
-                {
-                    return Err(ConvertError::Other(format!(
-                        "i64 index value {v} out of i32 range"
-                    )));
-                }
-                Ok(data.iter().map(|&v| v as i32).collect())
-            }
-            _ => {
-                let data: Vec<i32> = ds.read_1d()?.to_vec();
-                Ok(data)
-            }
-        },
-        TypeDescriptor::Unsigned(hdf5::types::IntSize::U4) => {
+            Ok(data.into_iter().map(|v| v as i32).collect())
+        }
+        HdfNumericDtype::U8 => Ok(ds.read_1d::<u8>()?.into_iter().map(i32::from).collect()),
+        HdfNumericDtype::U16 => Ok(ds.read_1d::<u16>()?.into_iter().map(i32::from).collect()),
+        HdfNumericDtype::U32 => {
             let data: Vec<u32> = ds.read_1d()?.to_vec();
-            // Validate no values exceed i32::MAX (finding 8.3).
             if let Some(&v) = data.iter().find(|&&v| v > i32::MAX as u32) {
-                return Err(ConvertError::Other(format!(
-                    "u32 index value {v} exceeds i32::MAX"
-                )));
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
             }
-            Ok(data.iter().map(|&v| v as i32).collect())
+            Ok(data.into_iter().map(|v| v as i32).collect())
         }
-        _ => {
-            let data: Vec<i32> = ds.read_1d()?.to_vec();
-            Ok(data)
+        HdfNumericDtype::U64 => {
+            let data: Vec<u64> = ds.read_1d()?.to_vec();
+            if let Some(&v) = data.iter().find(|&&v| v > i32::MAX as u64) {
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
+            }
+            Ok(data.into_iter().map(|v| v as i32).collect())
         }
+        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
+            format!("dataset '{path}': float dtype {desc:?} cannot be read as i32"),
+        )),
     }
 }
 
-/// Read a dataset as Vec<f32>, handling f32, f64, i32, u32 source dtypes.
+/// Read a dataset as `Vec<f32>`. Accepts every numeric width; casts
+/// signed and unsigned integers and `f64` to `f32`. Casts from `i64`
+/// and `u64` may lose precision for values above 2^24 — documented
+/// behaviour, not a regression.
 pub(super) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
-    match desc {
-        TypeDescriptor::Float(hdf5::types::FloatSize::U8) => {
-            let data: Vec<f64> = ds.read_1d()?.to_vec();
-            Ok(data.iter().map(|&v| v as f32).collect())
-        }
-        TypeDescriptor::Integer(hdf5::types::IntSize::U4) => {
-            let data: Vec<i32> = ds.read_1d()?.to_vec();
-            Ok(data.iter().map(|&v| v as f32).collect())
-        }
-        TypeDescriptor::Unsigned(hdf5::types::IntSize::U4) => {
-            let data: Vec<u32> = ds.read_1d()?.to_vec();
-            Ok(data.iter().map(|&v| v as f32).collect())
-        }
-        _ => {
-            // Fallback: try reading as f32 (HDF5 may auto-convert)
-            let data: Vec<f32> = ds.read_1d()?.to_vec();
-            Ok(data)
-        }
-    }
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as f32"
+        ))
+    })?;
+    Ok(match dt {
+        HdfNumericDtype::F32 => ds.read_1d::<f32>()?.to_vec(),
+        HdfNumericDtype::F64 => ds.read_1d::<f64>()?.into_iter().map(|v| v as f32).collect(),
+        HdfNumericDtype::I8 => ds.read_1d::<i8>()?.into_iter().map(f32::from).collect(),
+        HdfNumericDtype::I16 => ds.read_1d::<i16>()?.into_iter().map(f32::from).collect(),
+        HdfNumericDtype::I32 => ds.read_1d::<i32>()?.into_iter().map(|v| v as f32).collect(),
+        HdfNumericDtype::I64 => ds.read_1d::<i64>()?.into_iter().map(|v| v as f32).collect(),
+        HdfNumericDtype::U8 => ds.read_1d::<u8>()?.into_iter().map(f32::from).collect(),
+        HdfNumericDtype::U16 => ds.read_1d::<u16>()?.into_iter().map(f32::from).collect(),
+        HdfNumericDtype::U32 => ds.read_1d::<u32>()?.into_iter().map(|v| v as f32).collect(),
+        HdfNumericDtype::U64 => ds.read_1d::<u64>()?.into_iter().map(|v| v as f32).collect(),
+    })
 }
 
 /// Read a DataFrame group (obs or var) from an h5ad file as an Arrow RecordBatch.
@@ -232,10 +250,22 @@ pub fn read_dataframe_group(
         .and_then(|attr| attr.read_scalar::<hdf5::types::VarLenUnicode>().ok())
         .map(|v| v.to_string());
 
-    // Use column-order attribute if present (h5ad spec), otherwise fall back to member_names
+    // Use column-order attribute if present (h5ad spec), otherwise fall back to member_names.
+    //
+    // pandas / anndata write an *empty* `column-order` for dataframes
+    // with no columns (only the index) as a length-0 `float64` array
+    // (numpy's default empty-array dtype) — see e.g. pbmc10k.h5ad's
+    // `/obs/@column-order`. hdf5-rust has no f64 → VarLenUnicode
+    // conversion kernel, so reading the typed payload would crash with
+    // the opaque `HDF5 error: no conversion paths found`. Short-circuit
+    // the empty case before the typed read.
     let member_names: Vec<String> = if let Ok(attr) = group.attr("column-order") {
-        let ordered: Vec<hdf5::types::VarLenUnicode> = attr.read_1d()?.to_vec();
-        ordered.iter().map(|s| s.to_string()).collect()
+        if attr.shape().iter().product::<usize>() == 0 {
+            Vec::new()
+        } else {
+            let ordered: Vec<hdf5::types::VarLenUnicode> = attr.read_1d()?.to_vec();
+            ordered.iter().map(|s| s.to_string()).collect()
+        }
     } else {
         group.member_names()?
     };

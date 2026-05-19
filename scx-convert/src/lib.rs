@@ -25,6 +25,8 @@ mod h5ad_stream_write;
 #[cfg(feature = "hdf5")]
 mod h5ad_write;
 #[cfg(feature = "hdf5")]
+mod hdf_dtype;
+#[cfg(feature = "hdf5")]
 mod mudata_pipeline;
 #[cfg(feature = "hdf5")]
 mod mudata_write;

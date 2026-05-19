@@ -50,6 +50,19 @@ pub enum ConvertError {
     #[error("unsupported dtype: {0}")]
     UnsupportedDtype(String),
 
+    /// Narrowing an HDF5 source value to the target Rust type would
+    /// truncate. Used by `read_*_dataset` / `read_slice_*` when a
+    /// source `i64` / `u32` / `u64` value falls outside the target
+    /// range. Silent truncation of CSR indptr / indices would corrupt
+    /// the on-disk sparse layout, so the conversion fails loudly.
+    #[error("value {value} from {source_dtype} dataset '{path}' overflows {target} target range")]
+    IndexOverflow {
+        path: String,
+        source_dtype: &'static str,
+        target: &'static str,
+        value: String,
+    },
+
     #[error("format mismatch: expected {expected}, got {got}")]
     FormatMismatch { expected: String, got: String },
 
