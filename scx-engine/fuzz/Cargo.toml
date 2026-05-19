@@ -1,0 +1,20 @@
+[package]
+name = "scx-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+scx-engine = { path = ".." }
+
+[[bin]]
+name = "fuzz_predicate_index"
+path = "fuzz_targets/fuzz_predicate_index.rs"
+test = false
+doc = false

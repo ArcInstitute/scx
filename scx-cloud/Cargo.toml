@@ -29,3 +29,4 @@ roaring = { workspace = true }
 # injectors. object_store itself uses `#[async_trait]` on the trait
 # declaration, so wrappers must do the same.
 async-trait = "0.1"
+proptest = { workspace = true }

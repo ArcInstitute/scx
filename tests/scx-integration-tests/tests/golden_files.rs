@@ -506,12 +506,18 @@ fn test_manifest_hashes() {
         );
     }
 
-    // Verify manifest has the expected number of entries
-    assert_eq!(
-        manifest.files.len(),
-        golden_combinations().len(),
-        "Manifest entry count mismatch"
-    );
+    // Verify the manifest contains an entry for every codec-compat
+    // golden fixture. Added conformance vectors that share
+    // this MANIFEST.json (also validated via `conformance_vectors.rs`),
+    // so the total entry count may exceed `golden_combinations()`.
+    for (codec, encoding) in golden_combinations() {
+        let basename = golden_basename(codec, encoding);
+        let key = format!("{basename}.scx");
+        assert!(
+            manifest.files.contains_key(&key),
+            "Manifest missing golden entry: {key}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

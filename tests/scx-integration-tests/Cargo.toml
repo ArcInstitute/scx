@@ -11,6 +11,8 @@ scx-ops = { path = "../../scx-ops" }
 scx-engine = { path = "../../scx-engine" }
 scx-sparse = { path = "../../scx-sparse" }
 scx-accel = { path = "../../scx-accel" }
+scx-cloud = { path = "../../scx-cloud" }
+roaring = { workspace = true }
 rand = { workspace = true }
 rand_chacha = "0.3"
 tempfile = { workspace = true }

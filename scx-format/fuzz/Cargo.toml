@@ -42,3 +42,15 @@ name = "fuzz_bitmap"
 path = "fuzz_targets/fuzz_bitmap.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_modality_table"
+path = "fuzz_targets/fuzz_modality_table.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_provenance"
+path = "fuzz_targets/fuzz_provenance.rs"
+test = false
+doc = false
