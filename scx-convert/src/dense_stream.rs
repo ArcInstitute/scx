@@ -12,7 +12,6 @@
 // budget is smaller than a single dense row, `open_dense_streaming`
 // returns an actionable error rather than silently disabling the cap.
 
-use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
 use ndarray::s;
 
 use super::pipeline::{ConvertError, ConvertOptions};
@@ -42,52 +41,11 @@ pub struct DenseXStreamReader {
     max_slab_rows: usize,
 }
 
-/// On-disk numeric dtype for a 2D dense HDF5 dataset. Drives the
-/// per-slab cast to `f32` in [`read_dense_slab_f32`].
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum DenseDtype {
-    F32,
-    F64,
-    I64,
-    I32,
-    I16,
-    I8,
-    U64,
-    U32,
-    U16,
-    U8,
-}
-
-impl DenseDtype {
-    pub(crate) fn from_descriptor(desc: &TypeDescriptor) -> Result<Self, ConvertError> {
-        Ok(match desc {
-            TypeDescriptor::Float(FloatSize::U4) => Self::F32,
-            TypeDescriptor::Float(FloatSize::U8) => Self::F64,
-            TypeDescriptor::Integer(IntSize::U8) => Self::I64,
-            TypeDescriptor::Integer(IntSize::U4) => Self::I32,
-            TypeDescriptor::Integer(IntSize::U2) => Self::I16,
-            TypeDescriptor::Integer(IntSize::U1) => Self::I8,
-            TypeDescriptor::Unsigned(IntSize::U8) => Self::U64,
-            TypeDescriptor::Unsigned(IntSize::U4) => Self::U32,
-            TypeDescriptor::Unsigned(IntSize::U2) => Self::U16,
-            TypeDescriptor::Unsigned(IntSize::U1) => Self::U8,
-            other => {
-                return Err(ConvertError::UnsupportedDtype(format!(
-                    "dense /X dtype {other:?} not supported by streaming reader"
-                )));
-            }
-        })
-    }
-
-    pub(crate) fn size_bytes(&self) -> usize {
-        match self {
-            Self::F32 | Self::I32 | Self::U32 => 4,
-            Self::F64 | Self::I64 | Self::U64 => 8,
-            Self::I16 | Self::U16 => 2,
-            Self::I8 | Self::U8 => 1,
-        }
-    }
-}
+/// On-disk numeric dtype for a 2D dense HDF5 dataset. Aliased to the
+/// shared `HdfNumericDtype` so the sparse readers and slice readers
+/// dispatch on the same surface. The `read_dense_slab_f32` macro below
+/// still matches every variant exhaustively.
+pub(crate) use crate::hdf_dtype::HdfNumericDtype as DenseDtype;
 
 /// Read rows `[row_start, row_end)` of a 2D dense HDF5 dataset as a
 /// row-major `Vec<f32>` of length `(row_end - row_start) * n_vars`.
@@ -148,7 +106,12 @@ pub fn open_dense_streaming(
     let n_obs = shape[0] as u64;
     let n_vars = shape[1] as u64;
 
-    let dtype = DenseDtype::from_descriptor(&dataset.dtype()?.to_descriptor()?)?;
+    let desc = dataset.dtype()?.to_descriptor()?;
+    let dtype = DenseDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dense /X dtype {desc:?} not supported by streaming reader"
+        ))
+    })?;
 
     // `memory_budget / (n_vars * sizeof(dtype)) / 4` — the `/4`
     // reserves headroom for the sparsified output, the encoder queue,

@@ -6,7 +6,7 @@
 // (n_obs + 1) × 8 bytes, ~80 MB at 10M cells, dominant resident cost
 // at census-100M scale.
 
-use hdf5::types::{IntSize, TypeDescriptor, VarLenUnicode};
+use hdf5::types::VarLenUnicode;
 use ndarray::s;
 
 use super::detect::MatrixFormat;
@@ -370,74 +370,128 @@ impl IndexedCsrShardStream for XStreamReader {
 }
 
 /// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.
-/// Dispatches on the on-disk dtype (i32 / i64 / u32 supported) and
-/// applies the same range-validation checks per element.
+/// Accepts every integer width; widens narrow source values and
+/// range-checks narrowing casts (`i64` / `u32` / `u64`). Overflow
+/// returns [`ConvertError::IndexOverflow`] — silent truncation of CSR
+/// `indices` would corrupt the on-disk sparse layout. Float source
+/// dtypes are rejected.
 pub(crate) fn read_slice_i32(
     ds: &hdf5::Dataset,
     start: usize,
     end: usize,
 ) -> Result<Vec<i32>, ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as i32"
+        ))
+    })?;
     let sel = s![start..end];
-    match desc {
-        TypeDescriptor::Integer(IntSize::U4) => {
+    match dt {
+        HdfNumericDtype::I8 => {
+            let (data, _) = ds.read_slice_1d::<i8, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(i32::from).collect())
+        }
+        HdfNumericDtype::I16 => {
+            let (data, _) = ds.read_slice_1d::<i16, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(i32::from).collect())
+        }
+        HdfNumericDtype::I32 => {
             let (data, _) = ds.read_slice_1d::<i32, _>(sel)?.into_raw_vec_and_offset();
             Ok(data)
         }
-        TypeDescriptor::Integer(IntSize::U8) => {
+        HdfNumericDtype::I64 => {
             let (data, _) = ds.read_slice_1d::<i64, _>(sel)?.into_raw_vec_and_offset();
             if let Some(&v) = data
                 .iter()
                 .find(|&&v| v < i32::MIN as i64 || v > i32::MAX as i64)
             {
-                return Err(ConvertError::Other(format!(
-                    "i64 index value {v} out of i32 range"
-                )));
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
             }
             Ok(data.into_iter().map(|v| v as i32).collect())
         }
-        TypeDescriptor::Unsigned(IntSize::U4) => {
+        HdfNumericDtype::U8 => {
+            let (data, _) = ds.read_slice_1d::<u8, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(i32::from).collect())
+        }
+        HdfNumericDtype::U16 => {
+            let (data, _) = ds.read_slice_1d::<u16, _>(sel)?.into_raw_vec_and_offset();
+            Ok(data.into_iter().map(i32::from).collect())
+        }
+        HdfNumericDtype::U32 => {
             let (data, _) = ds.read_slice_1d::<u32, _>(sel)?.into_raw_vec_and_offset();
             if let Some(&v) = data.iter().find(|&&v| v > i32::MAX as u32) {
-                return Err(ConvertError::Other(format!(
-                    "u32 index value {v} exceeds i32::MAX"
-                )));
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
             }
             Ok(data.into_iter().map(|v| v as i32).collect())
         }
-        other => Err(ConvertError::UnsupportedDtype(format!(
-            "indices dtype {other:?} not supported by streaming reader"
-        ))),
+        HdfNumericDtype::U64 => {
+            let (data, _) = ds.read_slice_1d::<u64, _>(sel)?.into_raw_vec_and_offset();
+            if let Some(&v) = data.iter().find(|&&v| v > i32::MAX as u64) {
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
+            }
+            Ok(data.into_iter().map(|v| v as i32).collect())
+        }
+        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
+            format!("dataset '{path}': float dtype {desc:?} cannot be read as i32"),
+        )),
     }
 }
 
 /// Slice-read variant of `read_f32_dataset` from `h5ad_read.rs`.
+/// Accepts every numeric width; casts signed and unsigned integers
+/// and `f64` to `f32`. Casts from `i64` / `u64` may lose precision
+/// for values above 2^24 — documented behaviour.
 pub(crate) fn read_slice_f32(
     ds: &hdf5::Dataset,
     start: usize,
     end: usize,
 ) -> Result<Vec<f32>, ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as f32"
+        ))
+    })?;
     let sel = s![start..end];
-    match desc {
-        TypeDescriptor::Float(hdf5::types::FloatSize::U4) => {
-            let (data, _) = ds.read_slice_1d::<f32, _>(sel)?.into_raw_vec_and_offset();
-            Ok(data)
-        }
-        TypeDescriptor::Float(hdf5::types::FloatSize::U8) => {
-            let (data, _) = ds.read_slice_1d::<f64, _>(sel)?.into_raw_vec_and_offset();
-            Ok(data.into_iter().map(|v| v as f32).collect())
-        }
-        TypeDescriptor::Integer(IntSize::U4) => {
-            let (data, _) = ds.read_slice_1d::<i32, _>(sel)?.into_raw_vec_and_offset();
-            Ok(data.into_iter().map(|v| v as f32).collect())
-        }
-        TypeDescriptor::Unsigned(IntSize::U4) => {
-            let (data, _) = ds.read_slice_1d::<u32, _>(sel)?.into_raw_vec_and_offset();
-            Ok(data.into_iter().map(|v| v as f32).collect())
-        }
-        other => Err(ConvertError::UnsupportedDtype(format!(
-            "data dtype {other:?} not supported by streaming reader"
-        ))),
+    macro_rules! read_cast {
+        ($t:ty) => {{
+            let (data, _) = ds.read_slice_1d::<$t, _>(sel)?.into_raw_vec_and_offset();
+            data.into_iter().map(|v| v as f32).collect()
+        }};
     }
+    Ok(match dt {
+        HdfNumericDtype::F32 => {
+            let (data, _) = ds.read_slice_1d::<f32, _>(sel)?.into_raw_vec_and_offset();
+            data
+        }
+        HdfNumericDtype::F64 => read_cast!(f64),
+        HdfNumericDtype::I8 => read_cast!(i8),
+        HdfNumericDtype::I16 => read_cast!(i16),
+        HdfNumericDtype::I32 => read_cast!(i32),
+        HdfNumericDtype::I64 => read_cast!(i64),
+        HdfNumericDtype::U8 => read_cast!(u8),
+        HdfNumericDtype::U16 => read_cast!(u16),
+        HdfNumericDtype::U32 => read_cast!(u32),
+        HdfNumericDtype::U64 => read_cast!(u64),
+    })
 }
