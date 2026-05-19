@@ -4,6 +4,8 @@
 // (future) Zarr-backed readers all implement `CsrShardStream` so the
 // writer-side coordinator can drive any of them uniformly.
 
+use scx_format::modality::ModalityType;
+
 use super::pipeline::ConvertError;
 
 /// Major axis of the source matrix. Streaming readers always emit
@@ -91,4 +93,35 @@ pub trait IndexedCsrShardStream: Send + Sync {
     /// ranges from `compute_shard_row_ranges` so this invariant is
     /// enforced by construction.
     fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError>;
+
+    /// Hard upper bound on rows the reader can serve in a single
+    /// [`read_range`](Self::read_range) call. `None` means no cap
+    /// (CSR and in-memory CSC readers). `Some(n)` clamps the
+    /// parallel coordinator's partition so the shard-row ranges it
+    /// emits never exceed what the reader can handle. The dense
+    /// reader returns `Some(max_slab_rows)` when `memory_budget`
+    /// is set, matching the sequential `next_csr_shard` clamp.
+    fn max_slab_rows(&self) -> Option<u32> {
+        None
+    }
+
+    /// Conservative per-worker working-set estimate in bytes used
+    /// by the memory-budget derate in the parallel-coordinator
+    /// dispatcher. Default impl assumes the sparsified output is
+    /// the binding bound and picks density by modality
+    /// (`Atac` → 10 %, everything else → 5 %), with ~16 B/nnz
+    /// (`i32` indices + `f32` values + amortised `indptr`). Dense
+    /// readers override this to size the dense slab buffer
+    /// instead.
+    fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
+        let density_den: u64 = match modality_type {
+            ModalityType::Atac => crate::pipeline::PARALLEL_DENSITY_ATAC_DEN,
+            _ => crate::pipeline::PARALLEL_DENSITY_DEFAULT_DEN,
+        };
+        let est = (shard_target_rows as u64)
+            .saturating_mul(self.n_vars())
+            .saturating_mul(16)
+            / density_den;
+        est.max(1)
+    }
 }

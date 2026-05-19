@@ -726,13 +726,24 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     `os.cpu_count()`. `1` forces the sequential coordinator. `> 1`
     requests rayon workers; output is byte-identical to sequential.
     Requires a thread-safe libhdf5 build (conda-forge default); falls
-    back to sequential with a one-shot `Hdf5NotThreadsafe` warning
-    otherwise. `--memory-budget` derates the granted count to fit a
-    per-worker estimate (`shard_target_rows × n_vars × density × 16`).
-  - `writer_queue_depth`: bounded reorder buffer depth between the
-    parallel encoder pool and the ordered writer. Default 4. Larger
-    values raise peak RSS linearly; smaller values can starve
-    encoders.
+    back to sequential with a `Hdf5NotThreadsafe` warning emitted at
+    most once per process otherwise. `--memory-budget` derates the
+    granted count to fit a per-worker estimate; the estimate is
+    delegated to the reader: sparse readers assume density 5 % (RNA
+    and general) or 10 % (ATAC), times `n_vars × 16 B/nnz`; the
+    dense reader sizes the dense slab buffer
+    (`shard_target_rows × n_vars × sizeof(dtype) × 2`). When the
+    dense reader's `memory_budget`-derived slab cap is tighter than
+    `shard_target_rows`, the parallel coordinator silently clamps
+    its partition to that cap (matching the sequential path).
+  - `writer_queue_depth`: backpressure window between the parallel
+    encoder pool and the ordered writer. Default 4. The parallel
+    coordinator caps outstanding shards (encoding + in channel + in
+    reorder buffer) at `reader_threads + writer_queue_depth` via a
+    rolling-window spawn, so peak RSS scales with that sum, not with
+    the total shard count. Larger values give a slow shard a deeper
+    look-ahead buffer; smaller values risk starving encoders when
+    one shard takes much longer than its siblings.
 - `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
   - `modalities`: optional list of modality names to keep
     (case-sensitive). Unknown names raise `ValueError` with the

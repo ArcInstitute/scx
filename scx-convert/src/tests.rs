@@ -4664,3 +4664,244 @@ fn compute_shard_row_ranges_partition_invariants() {
     assert!(compute_shard_row_ranges(0, 10).is_empty());
     assert!(compute_shard_row_ranges(10, 0).is_empty());
 }
+
+// -----------------------------------------------------------------------
+// Regression tests for the four follow-up defects to PR #104.
+// -----------------------------------------------------------------------
+
+/// Fix 1: dense h5ad + `memory_budget` used to abort because the
+/// parallel coordinator partitioned by `shard_target_rows` while
+/// `DenseXStreamReader::read_range_inner` rejected `n_rows >
+/// max_slab_rows`. The dispatcher now clamps the partition by
+/// `IndexedCsrShardStream::max_slab_rows`, matching the sequential
+/// path's slab clamp. Verifies the run completes and CSR bytes match
+/// the sequential path.
+#[test]
+fn dense_parallel_with_memory_budget_byte_identical() {
+    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
+        eprintln!("skipping: libhdf5 not built thread-safe");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense.h5ad");
+    // 100 rows × 50 vars dense, f32 → row_bytes = 200.
+    create_test_h5ad(&h5ad, 100, 50, "dense", false);
+
+    // budget = 8192 → max_slab_rows = (8192 / 200) / 4 = 10
+    // shard_target = 32 → parallel must clamp the partition to 10.
+    // Per-worker dense bytes = 10 × 50 × 4 × 2 = 4000 ≤ 8192.
+    let scx_seq = dir.path().join("seq.scx");
+    let scx_par = dir.path().join("par.scx");
+
+    let mut seq_opts = streaming_opts(32);
+    seq_opts.reader_threads = Some(1);
+    seq_opts.memory_budget = Some(8192);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_seq,
+        &seq_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("sequential dense convert under memory_budget");
+
+    let mut par_opts = streaming_opts(32);
+    par_opts.reader_threads = Some(4);
+    par_opts.memory_budget = Some(8192);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_par,
+        &par_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("parallel dense convert under memory_budget must not abort");
+
+    let a = ScxReader::open(&scx_seq).unwrap();
+    let b = ScxReader::open(&scx_par).unwrap();
+    assert_eq!(a.header().n_obs, b.header().n_obs);
+    assert_eq!(a.header().n_vars, b.header().n_vars);
+    assert_eq!(a.header().nnz, b.header().nnz);
+    let csr_a = a.read_all_csr_shards().unwrap();
+    let csr_b = b.read_all_csr_shards().unwrap();
+    assert_eq!(csr_a.indptr, csr_b.indptr);
+    assert_eq!(csr_a.indices, csr_b.indices);
+    assert_eq!(csr_a.data, csr_b.data);
+}
+
+/// Fix 2: the BTreeMap reorder buffer used to be unbounded — a slow
+/// shard 0 let the caller drain the channel into the map until it
+/// held ~`n_ranges` shards. The rolling-window spawn caps outstanding
+/// shards (encoding + in channel + in buffer) at `reader_threads +
+/// writer_queue_depth`. Asserts the in-flight peak observed during
+/// the coordinator stays within that bound.
+#[test]
+fn parallel_in_flight_bounded_by_window() {
+    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
+        eprintln!("skipping: libhdf5 not built thread-safe");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("many.h5ad");
+    // Many small shards exercise the rolling-window spawn — without
+    // the cap, a delayed shard 0 would let the BTreeMap accumulate
+    // dozens of out-of-order shards.
+    create_test_h5ad(&h5ad, 400, 13, "csr", false);
+
+    let mut opts = streaming_opts(8);
+    opts.reader_threads = Some(4);
+    opts.writer_queue_depth = 2;
+
+    let scx = dir.path().join("out.scx");
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let peak = super::pipeline::test_hooks::last_run_peak();
+    let cap = 4 + 2; // reader_threads + writer_queue_depth
+    assert!(
+        peak > 0,
+        "expected the in-flight counter to record activity"
+    );
+    assert!(
+        peak <= cap,
+        "in-flight peak {peak} exceeds rolling-window cap {cap}"
+    );
+}
+
+/// Fix 3 (default impl): non-ATAC density is 5 %, ATAC density is
+/// 10 %, so the per-worker bytes estimate for ATAC is exactly 2× the
+/// default. A hand-rolled stub `IndexedCsrShardStream` avoids any
+/// libhdf5 dependency.
+#[test]
+fn parallel_per_worker_bytes_atac_higher_density() {
+    use super::stream::{IndexedCsrShardStream, StreamedCsrShard};
+    use scx_format::modality::ModalityType;
+
+    struct StubReader {
+        n_obs: u64,
+        n_vars: u64,
+    }
+    impl IndexedCsrShardStream for StubReader {
+        fn n_obs(&self) -> u64 {
+            self.n_obs
+        }
+        fn n_vars(&self) -> u64 {
+            self.n_vars
+        }
+        fn source_matrix_name(&self) -> &str {
+            "stub"
+        }
+        fn read_range(
+            &self,
+            _row_start: u64,
+            _n_rows: u32,
+        ) -> Result<StreamedCsrShard, ConvertError> {
+            unreachable!("not used by this test")
+        }
+    }
+
+    let r = StubReader {
+        n_obs: 1_000,
+        n_vars: 30_000,
+    };
+    let rna = r.per_worker_bytes(1024, ModalityType::Rna);
+    let atac = r.per_worker_bytes(1024, ModalityType::Atac);
+    // 1024 × 30000 × 16 = 491_520_000.
+    // RNA: / 20 = 24_576_000. ATAC: / 10 = 49_152_000.
+    assert_eq!(rna, 24_576_000);
+    assert_eq!(atac, 49_152_000);
+    assert_eq!(atac, rna * 2);
+}
+
+/// Fix 3 (dense override): dense reader sizes the dense slab buffer
+/// (`shard_target_rows × n_vars × sizeof(dtype) × 2`) rather than
+/// applying a density assumption. Verifies the override returns the
+/// expected formula and does not depend on `modality_type`.
+#[test]
+fn parallel_per_worker_bytes_dense_uses_dense_formula() {
+    use super::dense_stream::open_dense_streaming;
+    use super::stream::IndexedCsrShardStream;
+    use scx_format::modality::ModalityType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense.h5ad");
+    create_test_h5ad(&h5ad, 64, 40, "dense", false);
+    let file = hdf5::File::open(&h5ad).unwrap();
+
+    let opts = ConvertOptions {
+        shard_target_rows: 32,
+        memory_budget: None,
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    let reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
+    let indexed: &dyn IndexedCsrShardStream = &reader;
+
+    // f32 = 4 bytes. Expected: 32 × 40 × 4 × 2 = 10_240.
+    let bytes_rna = indexed.per_worker_bytes(32, ModalityType::Rna);
+    let bytes_atac = indexed.per_worker_bytes(32, ModalityType::Atac);
+    assert_eq!(bytes_rna, 10_240);
+    // Dense override ignores modality — same formula regardless.
+    assert_eq!(bytes_rna, bytes_atac);
+    // And it's never zero.
+    assert!(bytes_rna >= 1);
+}
+
+/// Fix 1 (wiring): dispatcher's slab-cap clamp produces partition
+/// shapes consistent with the sequential path. `DenseXStreamReader::
+/// max_slab_rows` returns `Some(n)` only when `memory_budget` shrinks
+/// the cap below `usize::MAX`. Verifies the trait method is hooked
+/// up — `compute_shard_row_ranges` with the clamped value matches the
+/// sequential `next_csr_shard` partition.
+#[test]
+fn dense_max_slab_rows_clamps_partition() {
+    use super::dense_stream::open_dense_streaming;
+    use super::pipeline::compute_shard_row_ranges;
+    use super::stream::IndexedCsrShardStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense.h5ad");
+    create_test_h5ad(&h5ad, 100, 50, "dense", false);
+    let file = hdf5::File::open(&h5ad).unwrap();
+
+    // No budget → no cap.
+    let opts_nocap = ConvertOptions {
+        shard_target_rows: 32,
+        memory_budget: None,
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    let r_nocap = open_dense_streaming(&file, "X", &opts_nocap, &mut sink).unwrap();
+    let indexed_nocap: &dyn IndexedCsrShardStream = &r_nocap;
+    assert_eq!(indexed_nocap.max_slab_rows(), None);
+
+    // Tight budget → cap fires.
+    let opts_capped = ConvertOptions {
+        shard_target_rows: 32,
+        memory_budget: Some(8192),
+        ..ConvertOptions::default()
+    };
+    let r_capped = open_dense_streaming(&file, "X", &opts_capped, &mut sink).unwrap();
+    let indexed_capped: &dyn IndexedCsrShardStream = &r_capped;
+    let cap = indexed_capped.max_slab_rows().expect("expected slab cap");
+    assert!(cap < 32, "cap {cap} expected < shard_target_rows 32");
+
+    // Partition must use the clamped value, not the requested 32.
+    let effective_target = (opts_capped.shard_target_rows).min(cap);
+    let ranges = compute_shard_row_ranges(100, effective_target);
+    for &(_, n_rows) in &ranges {
+        assert!(
+            n_rows <= cap,
+            "partition emits shard of {n_rows} rows exceeding cap {cap}"
+        );
+    }
+    // And it covers the matrix.
+    let total: u64 = ranges.iter().map(|(_, n)| *n as u64).sum();
+    assert_eq!(total, 100);
+}

@@ -14,7 +14,10 @@
 
 use std::sync::OnceLock;
 
+use crate::warnings::{ConvertWarning, WarningSink};
+
 static IS_THREADSAFE: OnceLock<bool> = OnceLock::new();
+static EMITTED_NOT_THREADSAFE: OnceLock<()> = OnceLock::new();
 
 /// Returns `true` iff libhdf5 was built with `--enable-threadsafe`.
 ///
@@ -30,6 +33,18 @@ fn probe() -> bool {
     // the call has no preconditions.
     let rc = unsafe { hdf5_sys::h5::H5is_library_threadsafe(&mut is_ts) };
     rc >= 0 && is_ts != 0
+}
+
+/// Emit [`ConvertWarning::Hdf5NotThreadsafe`] at most once per
+/// process. Subsequent calls are no-ops. The condition is a build-time
+/// property of libhdf5 and cannot change within a process, so per-
+/// process scope is correct — without this guard the dispatcher would
+/// fire the warning on every matrix and every modality-layer of a
+/// multimodal h5mu conversion.
+pub fn try_emit_not_threadsafe_warning(sink: &mut WarningSink) {
+    if EMITTED_NOT_THREADSAFE.set(()).is_ok() {
+        sink.emit(ConvertWarning::Hdf5NotThreadsafe);
+    }
 }
 
 #[cfg(test)]

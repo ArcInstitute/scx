@@ -320,6 +320,32 @@ impl IndexedCsrShardStream for DenseXStreamReader {
     fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError> {
         self.read_range_inner(row_start, n_rows)
     }
+
+    fn max_slab_rows(&self) -> Option<u32> {
+        if self.max_slab_rows == usize::MAX {
+            None
+        } else {
+            Some(u32::try_from(self.max_slab_rows).unwrap_or(u32::MAX))
+        }
+    }
+
+    fn per_worker_bytes(
+        &self,
+        shard_target_rows: u32,
+        _modality_type: scx_format::modality::ModalityType,
+    ) -> u64 {
+        // Dense slab buffer is the binding bound (the sparsified
+        // output is bounded by it). Match the sequential reservation
+        // philosophy at `open_dense_streaming` (× 4 row_bytes for slab
+        // + sparsified output + encoder headroom) with × 2 here — the
+        // dispatcher only needs to know "fits or doesn't" rather than
+        // exact peak.
+        let row_bytes = (self.n_vars).saturating_mul(self.dtype.size_bytes() as u64);
+        (shard_target_rows as u64)
+            .saturating_mul(row_bytes)
+            .saturating_mul(2)
+            .max(1)
+    }
 }
 
 impl DenseXStreamReader {
