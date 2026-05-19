@@ -36,7 +36,7 @@ use scx_engine::{
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
 use scx_format::reader::ScxReader;
 use scx_format::writer::ScxWriter;
-use scx_format::{BitmapShard, DeletionVectors, ModalityType};
+use scx_format::{BitmapShard, DeletionVectors, FullCatalog, ModalityType, SectionType};
 use serde::{Deserialize, Serialize};
 
 const SEED: u64 = 0xDEAD_BEEF_CAFE_1234;
@@ -1114,16 +1114,34 @@ fn test_conformance_files_manifest_hashes() {
     }
     let manifest: Manifest = serde_json::from_str(&fs::read_to_string(&mp).unwrap()).unwrap();
     let dir = reference_dir();
+
+    // If the entire reference corpus is absent (fresh checkout before
+    // generation), skip the whole test rather than running zero
+    // assertions. Otherwise every fixture in FIXTURES must be present
+    // AND must have a manifest entry — silent-skip would defeat the
+    // frozen-reference guarantee.
+    let any_present = FIXTURES.iter().any(|f| dir.join(f.rel_path).exists());
+    if !any_present {
+        eprintln!("no conformance fixtures present; skipping (run generate_conformance_vectors).");
+        return;
+    }
+
     for fixture in FIXTURES {
         let target = dir.join(fixture.rel_path);
-        if !target.exists() {
-            continue;
-        }
+        assert!(
+            target.exists(),
+            "{}: fixture file missing — regenerate via `cargo test -p scx-integration-tests \
+             --test conformance_vectors generate_conformance_vectors -- --ignored`",
+            fixture.rel_path
+        );
         match fixture.kind {
             FixtureKind::File => {
-                let Some(expected_hash) = manifest.files.get(fixture.rel_path) else {
-                    continue;
-                };
+                let expected_hash = manifest.files.get(fixture.rel_path).unwrap_or_else(|| {
+                    panic!(
+                        "{}: missing from MANIFEST.json — regenerate the corpus",
+                        fixture.rel_path
+                    )
+                });
                 let actual_hash = hash_file(&target);
                 assert_eq!(
                     &actual_hash, expected_hash,
@@ -1134,9 +1152,9 @@ fn test_conformance_files_manifest_hashes() {
             FixtureKind::Directory => {
                 for (rel, actual_hash) in hash_directory(&target, &target) {
                     let key = format!("{}/{rel}", fixture.rel_path);
-                    let Some(expected_hash) = manifest.files.get(&key) else {
-                        continue;
-                    };
+                    let expected_hash = manifest.files.get(&key).unwrap_or_else(|| {
+                        panic!("{key}: missing from MANIFEST.json — regenerate the corpus")
+                    });
                     assert_eq!(
                         &actual_hash, expected_hash,
                         "{}: blake3 hash diverged from MANIFEST.json",
@@ -1187,61 +1205,103 @@ fn test_conformance_files_catalog_summary() {
 }
 
 /// Unknown future section-type IDs must be skipped with a warning
-/// rather than failing the read. Reuses the unknown-codec patching
-/// trick from `golden_files.rs::test_unknown_codec_rejected_gracefully`
-/// but at the catalog-entry level: rewrite one `section_type` byte to
-/// 254 (unused) and ensure the reader still opens the file.
+/// rather than failing the read. This is the catalog-level analogue of
+/// `golden_files.rs::test_unknown_codec_rejected_gracefully`: rewrite
+/// one catalog entry's `section_type` byte to 254 (an unused
+/// discriminant — `SectionType::from_u8(254)` returns `None`), recompute
+/// the catalog BLAKE3 checksum, and assert the reader opens the file
+/// (per the warn-and-continue path at
+/// `scx-format/src/catalog.rs::FullCatalog::read_from`).
 #[test]
 fn test_unknown_future_section_type_skipped() {
-    // Use a fresh tempfile so we don't perturb the frozen fixture.
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("unknown_section_type.scx");
     generate_v1_minimal(&path);
 
+    let n_obs_expected = 40u64;
+    let n_vars_expected = 25u64;
+
     let mut bytes = fs::read(&path).unwrap();
-    // Walk catalog entries looking for an `Obsm`-style optional entry
-    // we can corrupt safely. v1_minimal has only obs/var/X_shard — the
-    // CSR shard is the only entry safe to rebrand to 254 since the
-    // header doesn't position the reader for it before the catalog
-    // walk. The reader must not crash on unknown section ids.
-    //
-    // For simplicity: scan the catalog area for SectionType bytes (the
-    // value 4 == CsrShard) and overwrite the first occurrence. This is
-    // brittle in theory but the catalog layout puts the section_type
-    // byte right after the name in each entry. We patch all occurrences
-    // of byte 4 followed by zeros to be safe.
     let header = FileHeader::read_from(&mut std::io::Cursor::new(&bytes[..256])).unwrap();
     let fc_off = header.full_catalog_offset as usize;
-    let fc_end = fc_off + header.full_catalog_length as usize;
-    let mut patched = false;
-    for byte in bytes.iter_mut().take(fc_end).skip(fc_off) {
-        if *byte == 4
-        /* CsrShard */
-        {
-            *byte = 254;
-            patched = true;
-            break;
+    let fc_len = header.full_catalog_length as usize;
+    let fc_end = fc_off + fc_len;
+
+    // Parse the catalog (skip checksum since we're about to mutate).
+    let catalog = FullCatalog::read_from(
+        &mut std::io::Cursor::new(&bytes[fc_off..fc_end]),
+        fc_len,
+        false,
+    )
+    .expect("catalog must parse");
+
+    // Target the CsrShard entry: rebranding it leaves obs/var (the
+    // sections the reader actually needs to report shape) untouched,
+    // and `n_obs`/`n_vars` come from the file header, not the catalog.
+    let target_idx = catalog
+        .entries
+        .iter()
+        .position(|e| e.section_type == SectionType::CsrShard)
+        .expect("v1_minimal must contain a CsrShard entry");
+
+    // Walk the v2 payload to locate the target entry's section_type
+    // byte. Catalog payload layout (see `FullCatalog::write_to`):
+    //   header (30 bytes): u16 catalog_version + u64 manifest_sequence
+    //     + u64 prev_catalog_offset + u64 n_obs + u32 n_entries
+    //   per v2 entry: u16 name_len + name + u64 offset + u64 length
+    //     + u8 section_type + 32 checksum + u8 modality_id
+    //     + u16 stats_len + stats
+    let payload_end = fc_end - 32; // strip trailing BLAKE3 checksum
+    let abs_section_type_offset = {
+        let payload = &bytes[fc_off..payload_end];
+        let mut cursor: usize = 30; // skip catalog header
+        let mut found: Option<usize> = None;
+        for entry_idx in 0..catalog.entries.len() {
+            let name_len =
+                u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+            cursor += 2 + name_len;
+            cursor += 8 + 8; // offset + length
+            let section_type_pos = cursor;
+            cursor += 1; // section_type
+            cursor += 32; // checksum
+            cursor += 1; // modality_id
+            let stats_len =
+                u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+            cursor += 2 + stats_len;
+
+            if entry_idx == target_idx {
+                found = Some(fc_off + section_type_pos);
+                break;
+            }
         }
-    }
-    if !patched {
-        // No CSR shard byte found in catalog window — bail without
-        // asserting, since the fixture must still validate.
-        return;
-    }
+        found.expect("walked target entry in catalog payload")
+    };
+
+    // Sanity: the byte we're about to patch must currently hold the
+    // CsrShard discriminant. If this fails the layout walk drifted.
+    assert_eq!(
+        bytes[abs_section_type_offset],
+        SectionType::CsrShard as u8,
+        "section_type byte offset walk landed on the wrong byte"
+    );
+
+    bytes[abs_section_type_offset] = 254;
+
+    // Recompute the catalog's trailing BLAKE3 checksum over the patched
+    // payload — the reader rejects mismatched checksums before it ever
+    // reaches the per-entry SectionType match.
+    let new_checksum = blake3::hash(&bytes[fc_off..payload_end]);
+    bytes[payload_end..fc_end].copy_from_slice(new_checksum.as_bytes());
 
     let patched_path = tmp.path().join("unknown_section_type_patched.scx");
     fs::write(&patched_path, &bytes).unwrap();
 
-    // The reader should open the patched file. Validate may complain
-    // about the per-section checksum (we corrupted catalog bytes), so
-    // we only assert that `open` doesn't panic and produces some
-    // header back.
-    match ScxReader::open(&patched_path) {
-        Ok(_) => { /* reader survived — expected non-fatal */ }
-        Err(e) => {
-            // Acceptable: reader rejected via a typed error rather than
-            // a panic. The key invariant is "no panic, no SIGSEGV."
-            eprintln!("reader rejected patched file with typed error: {e}");
-        }
-    }
+    // The reader must open the file; the unknown discriminant entry is
+    // logged and skipped per the warn-and-continue path.
+    let reader = ScxReader::open(&patched_path)
+        .expect("reader must skip unknown section types (warn-and-continue invariant)");
+
+    // obs/var sections are intact, and the file header is unchanged.
+    assert_eq!(reader.n_obs(), n_obs_expected);
+    assert_eq!(reader.n_vars(), n_vars_expected);
 }

@@ -2,7 +2,8 @@
 //!
 //! Locks the invariant that the streaming + in-memory converters share:
 //! after `sort_csr_rows_in_place` and `drop_explicit_zeros_inplace`,
-//! every row's column indices are strictly ascending and no entry has
+//! every row's column indices are sorted (non-decreasing; duplicates
+//! within a row are preserved as separate entries) and no entry has
 //! `value == 0.0`. Idempotency: a second pass changes nothing.
 //!
 //! Strategy: generate random CSR triplets with deliberately unsorted
@@ -62,8 +63,8 @@ fn arb_csr_unsorted_with_zeros() -> impl Strategy<
     })
 }
 
-/// Assert canonical post-conditions: every row's indices are strictly
-/// ascending, no value is exactly 0.0, indptr ends at indices.len().
+/// Assert canonical post-conditions: every row's indices are
+/// non-decreasing, no value is exactly 0.0, indptr ends at indices.len().
 fn assert_canonical(indptr: &[u64], indices: &[u32], values: &[f32]) {
     assert_eq!(indptr[indptr.len() - 1] as usize, indices.len());
     assert_eq!(indices.len(), values.len());
@@ -74,10 +75,9 @@ fn assert_canonical(indptr: &[u64], indices: &[u32], values: &[f32]) {
     for row in 0..n_rows {
         let start = indptr[row] as usize;
         let end = indptr[row + 1] as usize;
-        // Strictly ascending — we don't dedupe, but the generator may
-        // produce duplicates; the canonical pipeline only sorts. So
-        // assert *non-decreasing* and separately count duplicate-column
-        // rows for visibility.
+        // Canonical pipeline sorts but does not dedup — duplicates within
+        // a row are preserved as separate entries, so the contract is
+        // non-decreasing, not strictly ascending.
         for w in indices[start..end].windows(2) {
             assert!(
                 w[0] <= w[1],
@@ -92,8 +92,8 @@ fn assert_canonical(indptr: &[u64], indices: &[u32], values: &[f32]) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// After sort + drop_zeros, every row is sorted ascending and no
-    /// explicit zero remains.
+    /// After sort + drop_zeros, every row is sorted (non-decreasing)
+    /// and no explicit zero remains.
     #[test]
     fn canonicalisation_post_conditions(
         triplet in arb_csr_unsorted_with_zeros()

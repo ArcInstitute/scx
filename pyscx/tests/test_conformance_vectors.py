@@ -146,13 +146,28 @@ def test_conformance_manifest_hashes():
     assert manifest["algorithm"] == "blake3"
 
     conformance_names = SINGLE_MODALITY_FIXTURES + MULTIMODAL_FIXTURES
+
+    # Skip the whole test if the corpus hasn't been generated yet — but
+    # once any fixture is present, every named fixture must be both on
+    # disk AND in the manifest. Silent-skip would defeat the
+    # frozen-reference guarantee.
+    any_present = any((REF_DIR / f"{n}.scx").exists() for n in conformance_names)
+    if not any_present:
+        pytest.skip(
+            "no conformance fixtures present; run "
+            "`cargo test -p scx-integration-tests --test conformance_vectors "
+            "generate_conformance_vectors -- --ignored`"
+        )
+
     for fixture_name in conformance_names:
         rel_path = f"{fixture_name}.scx"
-        if rel_path not in manifest["files"]:
-            continue
         file_path = REF_DIR / rel_path
-        if not file_path.exists():
-            continue
+        assert file_path.exists(), (
+            f"{rel_path}: fixture file missing — regenerate the corpus"
+        )
+        assert rel_path in manifest["files"], (
+            f"{rel_path}: missing from MANIFEST.json — regenerate the corpus"
+        )
         expected_hash = manifest["files"][rel_path]
         actual_hash = b3.blake3(file_path.read_bytes()).hexdigest()
         assert actual_hash == expected_hash, (

@@ -8,9 +8,10 @@
 //! snapshot recorded for that sequence.
 //!
 //! Invariants:
-//! - After every op, the file is readable and `manifest_sequence`
-//!   monotonically increases (or stays the same — `mark_deleted` of an
-//!   already-deleted row is a no-op in some paths).
+//! - After every op (in-bounds append or in-bounds delete), the file is
+//!   readable and `manifest_sequence` strictly advances. `mark_deleted`
+//!   always writes a new manifest entry, even when re-deleting an
+//!   already-deleted row.
 //! - After every op, the `prev_catalog_offset` chain is well-formed:
 //!   walking it from the header back must reach `manifest_sequence = 1`.
 //! - `rollback_to(seq)` returns the file to exactly the state recorded
@@ -168,7 +169,11 @@ enum Op {
     Delete { row_idx: u64 },
 }
 
-fn arb_op(_n_obs: usize) -> impl Strategy<Value = Op> {
+// Note: proptest strategies are evaluated once per case, before the op
+// sequence runs, so we can't bound `row_idx` by the post-op `n_obs`
+// (which changes between ops). The runtime modulo at the execution
+// site (`row_idx % current_n_obs`) handles bounding instead.
+fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         2 => (1usize..=4).prop_map(|n_rows| Op::Append { n_rows }),
         1 => (0u64..1024).prop_map(|row_idx| Op::Delete { row_idx }),
@@ -176,7 +181,7 @@ fn arb_op(_n_obs: usize) -> impl Strategy<Value = Op> {
 }
 
 fn arb_op_sequence() -> impl Strategy<Value = Vec<Op>> {
-    prop::collection::vec(arb_op(10), 1..=6)
+    prop::collection::vec(arb_op(), 1..=6)
 }
 
 // =========================================================================
@@ -221,14 +226,12 @@ proptest! {
                     current_n_obs += n_rows;
                 }
                 Op::Delete { row_idx } => {
-                    // Cap to current n_obs so we don't hit OOB.
+                    // Modulo keeps idx in bounds, so mark_deleted must
+                    // succeed. Re-deleting an already-deleted row still
+                    // writes a new manifest entry (no no-op path).
                     let idx = row_idx % (current_n_obs as u64);
-                    let result = scx_ops::mark_deleted(&path, &[idx]);
-                    if result.is_err() {
-                        // OOB or other error — skip; the proptest is
-                        // about valid op outcomes, not error paths.
-                        continue;
-                    }
+                    scx_ops::mark_deleted(&path, &[idx])
+                        .expect("in-bounds mark_deleted must not fail");
                 }
             }
 
