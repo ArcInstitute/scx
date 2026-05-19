@@ -82,33 +82,75 @@ mod tests {
     #[test]
     fn from_descriptor_round_trips_every_supported_width() {
         let cases = [
-            (TypeDescriptor::Float(FloatSize::U4), HdfNumericDtype::F32, "f32", 4),
-            (TypeDescriptor::Float(FloatSize::U8), HdfNumericDtype::F64, "f64", 8),
-            (TypeDescriptor::Integer(IntSize::U1), HdfNumericDtype::I8, "i8", 1),
-            (TypeDescriptor::Integer(IntSize::U2), HdfNumericDtype::I16, "i16", 2),
-            (TypeDescriptor::Integer(IntSize::U4), HdfNumericDtype::I32, "i32", 4),
-            (TypeDescriptor::Integer(IntSize::U8), HdfNumericDtype::I64, "i64", 8),
-            (TypeDescriptor::Unsigned(IntSize::U1), HdfNumericDtype::U8, "u8", 1),
-            (TypeDescriptor::Unsigned(IntSize::U2), HdfNumericDtype::U16, "u16", 2),
-            (TypeDescriptor::Unsigned(IntSize::U4), HdfNumericDtype::U32, "u32", 4),
-            (TypeDescriptor::Unsigned(IntSize::U8), HdfNumericDtype::U64, "u64", 8),
+            (
+                TypeDescriptor::Float(FloatSize::U4),
+                HdfNumericDtype::F32,
+                "f32",
+                4,
+            ),
+            (
+                TypeDescriptor::Float(FloatSize::U8),
+                HdfNumericDtype::F64,
+                "f64",
+                8,
+            ),
+            (
+                TypeDescriptor::Integer(IntSize::U1),
+                HdfNumericDtype::I8,
+                "i8",
+                1,
+            ),
+            (
+                TypeDescriptor::Integer(IntSize::U2),
+                HdfNumericDtype::I16,
+                "i16",
+                2,
+            ),
+            (
+                TypeDescriptor::Integer(IntSize::U4),
+                HdfNumericDtype::I32,
+                "i32",
+                4,
+            ),
+            (
+                TypeDescriptor::Integer(IntSize::U8),
+                HdfNumericDtype::I64,
+                "i64",
+                8,
+            ),
+            (
+                TypeDescriptor::Unsigned(IntSize::U1),
+                HdfNumericDtype::U8,
+                "u8",
+                1,
+            ),
+            (
+                TypeDescriptor::Unsigned(IntSize::U2),
+                HdfNumericDtype::U16,
+                "u16",
+                2,
+            ),
+            (
+                TypeDescriptor::Unsigned(IntSize::U4),
+                HdfNumericDtype::U32,
+                "u32",
+                4,
+            ),
+            (
+                TypeDescriptor::Unsigned(IntSize::U8),
+                HdfNumericDtype::U64,
+                "u64",
+                8,
+            ),
         ];
         for (desc, want, want_name, want_bytes) in cases {
             let got = HdfNumericDtype::from_descriptor(&desc).unwrap_or_else(|e| {
                 panic!("from_descriptor({desc:?}) returned Err: {e}");
             });
-            assert!(
-                matches!((got, want), |(HdfNumericDtype::F32, HdfNumericDtype::F32)|
-                    (HdfNumericDtype::F64, HdfNumericDtype::F64) |
-                    (HdfNumericDtype::I8, HdfNumericDtype::I8) |
-                    (HdfNumericDtype::I16, HdfNumericDtype::I16) |
-                    (HdfNumericDtype::I32, HdfNumericDtype::I32) |
-                    (HdfNumericDtype::I64, HdfNumericDtype::I64) |
-                    (HdfNumericDtype::U8, HdfNumericDtype::U8) |
-                    (HdfNumericDtype::U16, HdfNumericDtype::U16) |
-                    (HdfNumericDtype::U32, HdfNumericDtype::U32) |
-                    (HdfNumericDtype::U64, HdfNumericDtype::U64)),
-                "mismatch for {desc:?}: got {got:?}, want {want:?}"
+            assert_eq!(
+                std::mem::discriminant(&got),
+                std::mem::discriminant(&want),
+                "variant mismatch for {desc:?}: got {got:?}, want {want:?}"
             );
             assert_eq!(got.name(), want_name);
             assert_eq!(got.size_bytes(), want_bytes);
