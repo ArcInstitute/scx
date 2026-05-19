@@ -39,22 +39,20 @@ jobs:
             scx-codec/fuzz
             scx-format/fuzz
             scx-engine/fuzz
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-      # Explicit --target overrides the cargo-fuzz prebuilt binary's
-      # default of x86_64-unknown-linux-musl, which would require
-      # x86_64-linux-musl-gcc (not present on ubuntu-latest).
-      - name: Build scx-codec fuzz targets
-        working-directory: scx-codec/fuzz
-        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
-      - name: Build scx-format fuzz targets
-        working-directory: scx-format/fuzz
-        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
-      - name: Build scx-engine fuzz targets
-        working-directory: scx-engine/fuzz
-        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+      # `cargo check` (not `cargo fuzz build`) is enough to catch the
+      # bitrot we care about: if `scx_format` / `scx_engine` rename or
+      # change the signature of a function a fuzz target calls, the
+      # check fails. Skips the release-mode sanitizer-instrumented codegen
+      # + linking that `cargo fuzz build` does, which is the bulk of the
+      # 10-minute run on a cold cache. Sanitizer codegen is exercised by
+      # the workflow_dispatch fuzz-run job; this PR-time job only needs
+      # to typecheck.
+      - name: Check scx-codec fuzz targets
+        run: cargo +nightly check --manifest-path scx-codec/fuzz/Cargo.toml
+      - name: Check scx-format fuzz targets
+        run: cargo +nightly check --manifest-path scx-format/fuzz/Cargo.toml
+      - name: Check scx-engine fuzz targets
+        run: cargo +nightly check --manifest-path scx-engine/fuzz/Cargo.toml
 
   fuzz-run:
     name: Fuzz ${{ matrix.crate }}/${{ matrix.target }}
