@@ -342,7 +342,13 @@ fn stream_csr_into_prealloc_parallel(
     // would re-borrow `reader` / `shards` / `layer_name` shorter
     // than `'scope`. Inlining the spawn body via a macro keeps the
     // borrows on the scope's lifetime directly.
-    pool.in_place_scope(|s| -> Result<(), ConvertError> {
+    //
+    // `move` is load-bearing: it moves `rx` into the closure so that
+    // an early `return Err(...)` from the drain loop drops `rx` on
+    // unwind, unblocking workers parked in `tx.send(...)` on the
+    // bounded channel. Without `move` `rx` lives in the parent frame
+    // and the scope can never join those workers.
+    pool.in_place_scope(move |s| -> Result<(), ConvertError> {
         macro_rules! spawn_shard {
             ($scope:expr, $idx:expr) => {{
                 let idx_ = $idx;
@@ -570,9 +576,11 @@ pub(crate) fn per_shard_export_bytes_for_test(stats: &ShardStats) -> u64 {
 ///
 /// The constraint is `(granted_threads + granted_depth) ×
 /// max_shard_bytes ≤ budget`. The derate prefers shrinking
-/// `granted_threads` over `granted_depth` because reducing queue
-/// depth below 1 starves the writer; we keep a minimum queue of 1
-/// and trim threads down to a floor of 1.
+/// `granted_depth` over `granted_threads` so the dispatcher stays
+/// on the parallel route under tight budgets — falling back to
+/// `granted_threads = 1` would route through the sequential
+/// coordinator and lose parallelism entirely. Both have a floor of 1
+/// (a queue depth of zero would starve the writer).
 fn derate_export_for_budget(
     memory_budget: Option<u64>,
     max_shard_bytes: u64,
@@ -601,14 +609,20 @@ fn derate_export_for_budget(
     if requested_outstanding <= outstanding_max {
         return Ok((requested_threads, requested_depth));
     }
-    // Shrink threads first (keep at least 1), depth floor 1.
-    let granted_depth = requested_depth
-        .min(outstanding_max.saturating_sub(1))
-        .max(1);
+    // Preserve parallelism: shrink depth first (floor 1), then
+    // shrink threads only if necessary (floor 1). Reserving one slot
+    // for depth and giving the rest to threads keeps `granted_threads
+    // > 1` whenever `outstanding_max >= 2`, so the dispatcher stays
+    // on the parallel route under tight budgets instead of falling
+    // back to sequential.
     let granted_threads = outstanding_max
-        .saturating_sub(granted_depth)
-        .max(1)
-        .min(requested_threads);
+        .saturating_sub(1)
+        .min(requested_threads)
+        .max(1);
+    let granted_depth = outstanding_max
+        .saturating_sub(granted_threads)
+        .min(requested_depth)
+        .max(1);
     sink.emit(ConvertWarning::ReaderThreadsDerated {
         requested: requested_threads,
         granted: granted_threads,

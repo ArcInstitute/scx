@@ -5215,6 +5215,17 @@ fn parallel_export_memory_budget_derates_workers() {
         "expected ReaderThreadsDerated; got: {:?}",
         *warnings
     );
+    // Fix 2 (PR 105 follow-up): the derate now shrinks depth first
+    // so the parallel route is preserved at threads=2 / depth=1
+    // rather than collapsing to threads=1 (which would fall back to
+    // the sequential coordinator and lose parallelism).
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("writer_queue_depth granted = 1")),
+        "expected derate to shrink depth before threads (writer_queue_depth granted = 1); got: {:?}",
+        *warnings
+    );
 
     // Output must still match the sequential path.
     let h5ad_seq = dir.path().join("seq.h5ad");
@@ -5253,4 +5264,164 @@ fn per_shard_export_bytes_matches_payload_layout() {
     let bytes = per_shard_export_bytes_for_test(&stats);
     // 50×8 + 101×8 + 50×8 = 400 + 808 + 400 = 1608
     assert_eq!(bytes, 1608);
+}
+
+/// Regression test for the deadlock fixed by routing the export parallel
+/// coordinator's `in_place_scope` closure through `move` semantics.
+///
+/// Before the fix, when a worker reported an error mid-stream
+/// (`return Err(e)` in the drain loop), `rx` lived in the parent function
+/// frame and stayed alive across the rayon scope's join. Other workers
+/// parked on `tx.send(...)` against the bounded channel never unblocked,
+/// so `pool.in_place_scope(...)` hung forever. With `move`, `rx` drops on
+/// closure exit and the senders complete with `SendError`.
+///
+/// The test forces a shard read error by zeroing the `SCXS` magic of a
+/// mid-stream CSR shard so `ShardHeader::read_from` rejects it. The convert
+/// runs on a worker thread and is polled with a 30s timeout — a missing
+/// `move` keyword (or a regression in the drain logic) will hang the thread
+/// and trip the `panic!` below.
+#[test]
+fn parallel_export_worker_error_does_not_deadlock() {
+    use super::pipeline::scx_to_h5ad_streaming;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = dir.path().join("src.scx");
+    let h5ad_out = dir.path().join("out.h5ad");
+
+    // 80 rows / shard 10 → 8 CSR shards. With the default
+    // ConvertOptions, no bitmap shards are emitted, so every `SCXS`
+    // magic in the file is a CSR shard header.
+    make_multishard_scx(&scx_path, 80, 11, 10);
+
+    // Zero the 4th `SCXS` magic. Shards 0-2 decode OK; shard 3 fails
+    // at the magic check in `scx-format::shard::ShardHeader::read_from`.
+    let target_offset = {
+        let mut buf = Vec::new();
+        std::fs::File::open(&scx_path)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        let magic = b"SCXS";
+        let mut hits = Vec::new();
+        let mut i = 0;
+        while i + 4 <= buf.len() {
+            if &buf[i..i + 4] == magic {
+                hits.push(i);
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(
+            hits.len() >= 4,
+            "expected ≥4 SCXS occurrences (one per CSR shard); got {}",
+            hits.len()
+        );
+        hits[3]
+    };
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&scx_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(target_offset as u64)).unwrap();
+        f.write_all(&[0u8; 4]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // reader_threads=4 + writer_queue_depth=1 forces the bounded channel
+    // to fill quickly: with 5 outstanding workers and a 1-slot channel,
+    // at least 4 workers will be parked on `tx.send(...)` when shard 3
+    // reports its error.
+    let scx = scx_path.clone();
+    let handle = std::thread::spawn(move || {
+        let opts = ConvertOptions {
+            reader_threads: Some(4),
+            writer_queue_depth: 1,
+            ..ConvertOptions::default()
+        };
+        scx_to_h5ad_streaming(&scx, &h5ad_out, &opts, &mut WarningSink::log())
+    });
+
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() > timeout {
+            panic!(
+                "parallel export deadlocked: convert thread did not finish \
+                 within {timeout:?}; the `move` keyword on the in_place_scope \
+                 closure may be missing or regressed"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let result = handle.join().expect("convert thread panicked");
+    assert!(
+        result.is_err(),
+        "expected Err from corrupted SCX shard; got Ok"
+    );
+}
+
+/// Symmetric regression test for the ingest direction: the same
+/// `move` closure fix was applied in
+/// `pipeline::streaming_writer_coordinator_parallel`. Forces a worker
+/// error via the `FailIngestShardGuard` hook in
+/// `pipeline::test_hooks` — corrupting an h5ad file in a way that
+/// fails HDF5 reads selectively per shard is impractical, so we use a
+/// purpose-built fault-injection seam instead. Production code is
+/// unaffected: the injection check is `#[cfg(test)]`-gated.
+#[test]
+fn parallel_ingest_worker_error_does_not_deadlock() {
+    use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("src.h5ad");
+    let scx_out = dir.path().join("out.scx");
+
+    // 80 rows × 11 vars, shard_size 10 → 8 ingest shards. Shard index
+    // 3 is in the initial prime spawn (outstanding_cap = threads +
+    // depth = 5) so several workers are guaranteed to be parked on
+    // `tx.send(...)` against the depth-1 channel when this one fires.
+    create_test_h5ad(&h5ad, 80, 11, "csr", false);
+
+    let h5ad_owned = h5ad.clone();
+    let scx_out_owned = scx_out.clone();
+    let handle = std::thread::spawn(move || {
+        // Guard lives for the whole convert; Drop clears the atomic
+        // on normal return *and* on panic, so it can't leak into a
+        // concurrently scheduled test in the same binary.
+        let _fault = test_hooks::FailIngestShardGuard::new(3);
+        let mut opts = streaming_opts(10);
+        opts.reader_threads = Some(4);
+        opts.writer_queue_depth = 1;
+        h5ad_to_scx_streaming(
+            &h5ad_owned,
+            &scx_out_owned,
+            &opts,
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+    });
+
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() > timeout {
+            panic!(
+                "parallel ingest deadlocked: convert thread did not finish \
+                 within {timeout:?}; the `move` keyword on the in_place_scope \
+                 closure may be missing or regressed"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let result = handle.join().expect("convert thread panicked");
+    assert!(
+        result.is_err(),
+        "expected Err from injected ingest shard failure; got Ok"
+    );
 }
