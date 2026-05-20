@@ -270,63 +270,74 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 
 /// Convert a pyarrow Table to a pandas DataFrame.
 ///
-/// Honours scx's minimal `{"index_columns": [...]}` pandas-metadata
-/// envelope: if the table's schema carries one (stamped either by
-/// `scx-convert/src/h5ad_read.rs::read_dataframe_group` on the CLI
-/// convert path, by `scx_format::ensure_pandas_index_metadata` as
-/// the B2-2026-05-20 defensive belt, or by any other producer), we
-/// extract the index column name, strip the `pandas` key from the
-/// schema metadata so `Table.to_pandas()` doesn't choke on the
-/// missing `columns` field of pyarrow's full envelope, and then set
-/// the DataFrame index manually. The `"__index_level_0__"` column
-/// (pyarrow's canonical unnamed-index name) results in
-/// `df.index.name = None`, matching the source AnnData semantics.
+/// Branches on the schema's `pandas` metadata envelope shape:
+///
+/// - **No envelope** → plain `Table.to_pandas()`.
+/// - **Full envelope** (from `pyarrow.Table.from_pandas`, preserved
+///   verbatim through the SCX on-disk round-trip) → plain
+///   `Table.to_pandas()`. pyarrow natively restores the index name,
+///   multi-level indexes, and pandas-extension dtypes (`Int64`,
+///   `boolean`, `Categorical`, …) from the envelope.
+/// - **Minimal envelope** `{"index_columns": [...]}` (stamped by
+///   `scx-convert/src/h5ad_read.rs::read_dataframe_group` and
+///   `scx_format::ensure_pandas_index_metadata`) → `Table.to_pandas()`
+///   KeyErrors on the missing `columns` field, so strip the `pandas`
+///   key first, then `set_index(drop=True, inplace=True)` manually.
+///   The `__index_level_0__` sentinel becomes `df.index.name = None`
+///   to match anndata semantics for an unnamed index.
 pub(crate) fn pyarrow_table_to_pandas<'py>(
     table: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let py = table.py();
-
-    let index_col_name: Option<String> = extract_scx_index_column(table)?;
-
-    let working_table: Bound<'py, PyAny> = if index_col_name.is_some() {
-        // Strip the `pandas` schema metadata so pyarrow's to_pandas
-        // doesn't try to parse our minimal envelope and KeyError on the
-        // missing `columns` array.
-        strip_pandas_metadata(table)?
-    } else {
-        table.clone()
-    };
-
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("self_destruct", true)?;
-    let df = working_table.call_method("to_pandas", (), Some(&kwargs))?;
 
-    if let Some(idx) = index_col_name {
-        // set_index(idx, drop=True): the column becomes the index and
-        // is removed from `df.columns`.
-        let set_idx_kwargs = pyo3::types::PyDict::new(py);
-        set_idx_kwargs.set_item("drop", true)?;
-        set_idx_kwargs.set_item("inplace", true)?;
-        df.call_method("set_index", (idx.as_str(),), Some(&set_idx_kwargs))?;
-        // anndata convention: the unnamed pandas-index sentinel
-        // `__index_level_0__` must become `df.index.name = None` so
-        // downstream `adata.write_h5ad` produces canonical h5ad.
-        // Named pandas indexes (e.g. `gene_symbols`) keep their name.
-        if idx == "__index_level_0__" {
-            let index = df.getattr("index")?;
-            index.setattr("name", py.None())?;
-        }
+    let Some(info) = extract_scx_envelope_info(table)? else {
+        return table.call_method("to_pandas", (), Some(&kwargs));
+    };
+    if !info.is_minimal {
+        // Full pyarrow envelope: let to_pandas() restore dtypes and
+        // index natively.
+        return table.call_method("to_pandas", (), Some(&kwargs));
     }
 
+    // Minimal envelope: strip + manual set_index.
+    let stripped = strip_pandas_metadata(table)?;
+    let df = stripped.call_method("to_pandas", (), Some(&kwargs))?;
+    let set_idx_kwargs = pyo3::types::PyDict::new(py);
+    set_idx_kwargs.set_item("drop", true)?;
+    set_idx_kwargs.set_item("inplace", true)?;
+    df.call_method(
+        "set_index",
+        (info.index_col.as_str(),),
+        Some(&set_idx_kwargs),
+    )?;
+    if info.index_col == "__index_level_0__" {
+        df.getattr("index")?.setattr("name", py.None())?;
+    }
     Ok(df)
 }
 
-/// Return the first entry of the `pandas.index_columns` array stamped
-/// on `table.schema.metadata`, if any. Mirrors
-/// `scx_format::pandas_index_columns` on the Python side because the
-/// Rust schema view of the Arrow IPC has already been moved into
-/// pyarrow's address space by the time we get here.
-fn extract_scx_index_column<'py>(table: &Bound<'py, PyAny>) -> PyResult<Option<String>> {
+/// Shape of the pandas-metadata envelope on a pyarrow Table's schema,
+/// as it concerns `pyarrow_table_to_pandas`.
+struct EnvelopeInfo {
+    /// First string entry from `index_columns` — the column to use as
+    /// the DataFrame index on the minimal-envelope branch.
+    index_col: String,
+    /// `true` when the envelope is the bare `{"index_columns": [...]}`
+    /// shape stamped by `scx-convert/src/h5ad_read.rs` and
+    /// `scx_format::ensure_pandas_index_metadata`. `false` when the
+    /// envelope is the full pyarrow shape stamped by
+    /// `pyarrow.Table.from_pandas` (carries `columns`,
+    /// `column_indexes`, `pandas_version`, `creator`).
+    is_minimal: bool,
+}
+
+/// Parse the schema's `pandas` metadata envelope, if any. Distinguishes
+/// the minimal envelope (KeyError-on-`to_pandas`, must be stripped) from
+/// the full envelope (carries dtype hints, must be preserved so
+/// pandas-extension dtypes and multi-level indexes round-trip).
+fn extract_scx_envelope_info<'py>(table: &Bound<'py, PyAny>) -> PyResult<Option<EnvelopeInfo>> {
     let schema = table.getattr("schema")?;
     let metadata = schema.getattr("metadata")?;
     if metadata.is_none() {
@@ -355,7 +366,18 @@ fn extract_scx_index_column<'py>(table: &Bound<'py, PyAny>) -> PyResult<Option<S
         .get("index_columns")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.iter().find_map(|v| v.as_str().map(String::from)));
-    Ok(idx)
+    let Some(index_col) = idx else {
+        return Ok(None);
+    };
+    // pyarrow's full envelope (from `Table.from_pandas`) always carries
+    // a `columns` array alongside `index_columns`. The minimal envelope
+    // stamped by `read_dataframe_group` /
+    // `ensure_pandas_index_metadata` has only `index_columns`.
+    let is_minimal = !parsed.get("columns").is_some_and(|v| v.is_array());
+    Ok(Some(EnvelopeInfo {
+        index_col,
+        is_minimal,
+    }))
 }
 
 /// Drop the `pandas` key from `table.schema.metadata`, returning a
