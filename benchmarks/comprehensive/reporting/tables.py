@@ -1601,7 +1601,18 @@ def correctness_detail_table(dataset: str = "pbmc3k") -> TableBlock | TextBlock:
         elif status == "Fail" and error:
             notes = error
 
-        # Pick the most representative metric
+        # Pick the most representative metric.
+        # CAVEAT: this picks the first metric by dict-insertion order, which
+        # may not be the metric that triggered a failure. e.g. on
+        # tabula_sapiens_100k, `rank_genes_groups` reports both
+        # `min_top100_overlap_pct` (passes at 100%) and `min_pval_spearman_r`
+        # (the brittle per-cluster check that actually fails near 0.80) — and
+        # the table currently shows the passing one. The `rank_genes_groups`
+        # spearman check itself is also fragile: it correlates p-values at
+        # the same RANK between methods (not the same gene) and has zero
+        # margin against the 0.80 threshold, so any numerical jitter in BH
+        # tie structure for a single noisy cluster can flip the test.
+        # TODO: prefer the failing metric when status == "Fail".
         if metrics:
             metric_name = next(iter(metrics))
             metric_val = metrics[metric_name]

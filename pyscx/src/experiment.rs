@@ -355,10 +355,21 @@ impl PyExperiment {
     ///                     are not supported in this mode — use
     ///                     `scx subset --modality NAME --filter ...` to
     ///                     materialise a filtered single-modality file first.
+    ///     eager: When False (default), `obsp`, `varp`, `varm`, and (in the
+    ///            non-backed path) `layers` are returned as lazy bridges
+    ///            that decode each entry on first access. Keeps peak
+    ///            RSS of `to_anndata()` itself bounded for files that
+    ///            carry large kNN graphs / embeddings; downstream code
+    ///            that touches these slots pays the same one-time
+    ///            decode cost it would otherwise pay at construction
+    ///            time. Pass `eager=True` to materialize everything up
+    ///            front and detach the returned AnnData from the SCX
+    ///            file handle (e.g., before closing the experiment or
+    ///            handing the AnnData to a subprocess).
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -370,6 +381,7 @@ impl PyExperiment {
         layers: Option<Vec<String>>,
         preserve_slots: bool,
         modality: Option<String>,
+        eager: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if let Some(name) = modality.as_deref() {
             if !backed {
@@ -396,6 +408,7 @@ impl PyExperiment {
                 var_names.as_deref(),
                 obs_filter,
                 layers.as_deref(),
+                eager,
             )
         } else {
             anndata::to_anndata_filtered(
@@ -406,6 +419,7 @@ impl PyExperiment {
                 obs_filter,
                 layers.as_deref(),
                 preserve_slots,
+                eager,
             )
         }
     }

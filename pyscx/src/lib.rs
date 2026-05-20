@@ -2,6 +2,7 @@ mod accel;
 mod anndata;
 pub(crate) mod backed;
 mod experiment;
+pub(crate) mod lazy_mapping;
 pub(crate) mod lazy_transform;
 pub(crate) mod mudata;
 mod ops;
@@ -759,6 +760,11 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<backed::ScxBackedMuModality>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
     m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
+    m.add_class::<lazy_mapping::ScxLazyPairwiseMapping>()?;
+    m.add_class::<lazy_mapping::ScxLazyVarmMapping>()?;
+    m.add_class::<lazy_mapping::ScxLazyLayersMapping>()?;
+    m.add_class::<lazy_mapping::ScxLazyValueIterator>()?;
+    m.add_class::<lazy_mapping::ScxLazyItemIterator>()?;
 
     // Accelerators submodule.  Functions are grouped by domain into
     // `register_*` helpers so adding a new accelerator only touches one

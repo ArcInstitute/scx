@@ -137,6 +137,7 @@ pub fn to_mudata_backed<'py>(
             None,
             None,
             false,
+            false,
         )?;
         mod_dict.set_item(&modality_key, adata)?;
     }
