@@ -162,9 +162,7 @@ fn build_and_write_predicate_indexes_inline(
                     // columns + did-you-mean suggestion. Use the shared
                     // helper so CLI and pyscx surfaces stay in sync.
                     let msg = if matches!(reason, scx_engine::index::SkipReason::MissingColumn) {
-                        scx_convert::pipeline::forced_column_missing_message(
-                            axis, &column, available,
-                        )
+                        scx_engine::index::forced_column_missing_message(axis, &column, available)
                     } else {
                         format!("forced {axis} index column '{column}': {reason}")
                     };

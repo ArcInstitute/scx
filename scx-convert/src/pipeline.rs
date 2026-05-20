@@ -479,41 +479,6 @@ fn build_and_write_predicate_indexes(
 /// pointing the user at the fix instead of emitting one
 /// `MissingPresetIndexColumn` per column. Partial mismatch keeps the
 /// per-column shape — that's a real schema drift worth surfacing.
-/// Render an actionable error message for a forced obs/var index
-/// column that doesn't exist in the source DataFrame. Adds the
-/// available column list and, when one is close enough, a single
-/// `Did you mean '<col>'?` suggestion (Levenshtein-normalised
-/// threshold ≥ 0.6). Shared by `scx-convert/src/pipeline.rs` (CLI
-/// path) and `pyscx/src/anndata.rs` (Python path) so both surfaces
-/// emit the same message.
-pub fn forced_column_missing_message(axis: &str, column: &str, available: &[String]) -> String {
-    let mut msg = format!("forced {axis} index column '{column}': missing column.");
-    if available.is_empty() {
-        msg.push_str(&format!(
-            " Available {axis} columns: [] (this h5ad has no {axis} metadata)."
-        ));
-        return msg;
-    }
-    let preview_n = available.len().min(8);
-    let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
-    let suffix = if available.len() > preview_n {
-        ", ..."
-    } else {
-        ""
-    };
-    msg.push_str(&format!(" Available {axis} columns: {preview:?}{suffix}."));
-    if let Some(suggestion) = available
-        .iter()
-        .map(|n| (n, strsim::normalized_levenshtein(column, n)))
-        .filter(|(_, s)| *s >= 0.6)
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(n, _)| n.clone())
-    {
-        msg.push_str(&format!(" Did you mean '{suggestion}'?"));
-    }
-    msg
-}
-
 pub(crate) fn process_predicate_index_outcomes(
     outcomes: Vec<BuildOutcome>,
     axis: &str,
@@ -536,7 +501,11 @@ pub(crate) fn process_predicate_index_outcomes(
                 // pass through with the engine's text since the column
                 // *does* exist.
                 let msg = if matches!(reason, SkipReason::MissingColumn) {
-                    forced_column_missing_message(axis, &column, available_columns)
+                    scx_engine::index::forced_column_missing_message(
+                        axis,
+                        &column,
+                        available_columns,
+                    )
                 } else {
                     format!("forced {axis} index column '{column}': {reason}")
                 };

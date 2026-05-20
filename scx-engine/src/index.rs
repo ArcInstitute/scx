@@ -482,6 +482,107 @@ pub enum BuildOutcome {
     PresetSkipped { column: String, reason: SkipReason },
 }
 
+/// Render an actionable error message for a forced obs/var index
+/// column that doesn't exist in the source DataFrame. Adds the
+/// available column list and, when one is close enough, a single
+/// `Did you mean '<col>'?` suggestion (Levenshtein-normalised
+/// threshold ≥ 0.6). Shared by `scx-convert/src/pipeline.rs` (CLI
+/// path) and `pyscx/src/anndata.rs` (Python path) so both surfaces
+/// emit the same message. — E2-2026-05-20.
+///
+/// Lives in `scx-engine` rather than `scx-convert` because pyscx
+/// depends on `scx-engine` unconditionally but only pulls in
+/// `scx-convert` under the `hdf5` feature; the helper must remain
+/// callable from `pyscx::anndata::build_and_write_predicate_indexes_inline`
+/// (which is reachable from CPU-only `pyscx.from_anndata` paths).
+pub fn forced_column_missing_message(axis: &str, column: &str, available: &[String]) -> String {
+    let mut msg = format!("forced {axis} index column '{column}': missing column.");
+    if available.is_empty() {
+        msg.push_str(&format!(
+            " Available {axis} columns: [] (this h5ad has no {axis} metadata)."
+        ));
+        return msg;
+    }
+    let preview_n = available.len().min(8);
+    let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
+    let suffix = if available.len() > preview_n {
+        ", ..."
+    } else {
+        ""
+    };
+    msg.push_str(&format!(" Available {axis} columns: {preview:?}{suffix}."));
+    if let Some(suggestion) = available
+        .iter()
+        .map(|n| (n, strsim::normalized_levenshtein(column, n)))
+        .filter(|(_, s)| *s >= 0.6)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(n, _)| n.clone())
+    {
+        msg.push_str(&format!(" Did you mean '{suggestion}'?"));
+    }
+    msg
+}
+
+#[cfg(test)]
+mod forced_column_missing_message_tests {
+    use super::forced_column_missing_message;
+
+    #[test]
+    fn lists_available_columns() {
+        let avail = vec![
+            "total_counts".to_string(),
+            "n_genes_by_counts".to_string(),
+            "pct_counts_mt".to_string(),
+        ];
+        let msg = forced_column_missing_message("obs", "nonexistent_column", &avail);
+        assert!(
+            msg.contains("forced obs index column 'nonexistent_column'"),
+            "{msg}"
+        );
+        assert!(msg.contains("missing column."), "{msg}");
+        assert!(msg.contains("total_counts"), "{msg}");
+        assert!(msg.contains("n_genes_by_counts"), "{msg}");
+        assert!(!msg.contains("Did you mean"), "{msg}");
+    }
+
+    #[test]
+    fn suggests_typo() {
+        let avail = vec!["total_counts".to_string(), "n_genes_by_counts".to_string()];
+        let msg = forced_column_missing_message("obs", "totl_counts", &avail);
+        assert!(msg.contains("Did you mean 'total_counts'?"), "{msg}");
+    }
+
+    #[test]
+    fn no_suggestion_when_far() {
+        let avail = vec!["foo".to_string(), "bar".to_string()];
+        let msg = forced_column_missing_message("obs", "cell_type", &avail);
+        assert!(!msg.contains("Did you mean"), "{msg}");
+        assert!(msg.contains("foo") && msg.contains("bar"), "{msg}");
+    }
+
+    #[test]
+    fn handles_empty_available() {
+        let msg = forced_column_missing_message("obs", "total_counts", &[]);
+        assert!(
+            msg.contains("Available obs columns: [] (this h5ad has no obs metadata)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("Did you mean"), "{msg}");
+    }
+
+    #[test]
+    fn truncates_long_available_lists() {
+        let avail: Vec<String> = (0..20).map(|i| format!("col_{i}")).collect();
+        let msg = forced_column_missing_message("var", "missing", &avail);
+        assert!(msg.contains(", ..."), "should signal truncation: {msg}");
+        assert!(msg.contains("col_0") && msg.contains("col_7"), "{msg}");
+        assert!(
+            !msg.contains("col_15"),
+            "should not list past index 7: {msg}"
+        );
+    }
+}
+
 /// Named column preset (e.g. `cellxgene`, `perturbseq`, `training`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexPreset {
