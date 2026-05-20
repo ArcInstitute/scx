@@ -11,6 +11,9 @@ the scverse ecosystem and Seurat v5.
 This site bundles the architecture and design references that ship in the
 repo with an auto-generated reference for the `pyscx` Python package.
 
+For a runnable end-to-end example (install → convert → analyze), see the
+[Quickstart](quickstart.md).
+
 ::::{grid} 1 2 2 2
 :gutter: 3
 
@@ -50,6 +53,7 @@ Benchmarks, operational semantics (append/delete/compact), and test infrastructu
 :maxdepth: 2
 :hidden:
 
+quickstart
 scanpy
 gpu-setup
 cloud

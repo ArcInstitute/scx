@@ -25,6 +25,9 @@ seurat_obj <- exp$to_seurat()    # Seurat v5 assay
 sce <- exp$to_sce()              # SingleCellExperiment
 ```
 
+See [`docs/quickstart.md`](docs/quickstart.md) for a runnable end-to-end pipeline
+(install → convert → QC → normalize → HVG → PCA → neighbors → UMAP → leiden → markers).
+
 ## Main features
 
 - **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.4× faster than Zarr, and produces a file ~1.2–1.7× smaller than gzipped h5ad (4–5× smaller than anndata's default uncompressed h5ad). Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
