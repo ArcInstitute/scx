@@ -232,3 +232,142 @@ def test_empty_obs_var_columns(tmp_dir):
     assert adata2.n_obs == 5
     assert adata2.n_vars == 5
     np.testing.assert_array_equal(adata.X.toarray(), adata2.X.toarray())
+
+
+# ---------------------------------------------------------------------------
+# B2 (SCX-USER-REPORT-2026-05-19): `pyscx.from_h5ad → pyscx.to_h5ad` must
+# preserve `var_names` / `obs_names` rather than silently swapping the
+# pandas index with the first non-index column. The bug was in
+# `scx-convert/src/h5ad_write.rs::write_dataframe_group_at`, which used
+# `schema.field(0).name()` as the `_index` attribute instead of
+# consulting the pandas `index_columns` schema metadata.
+# ---------------------------------------------------------------------------
+
+
+def test_pyscx_h5ad_roundtrip_preserves_unnamed_var_index(tmp_dir):
+    """The pbmc10k-shaped case: `var.index.name = None`, multiple var
+    columns. Round-trip must keep var_names as the gene symbols and must
+    NOT introduce a `__index_level_0__` column."""
+    import anndata as ad
+    import pandas as pd
+    import pyscx
+
+    n_obs, n_vars = 6, 4
+    x = sp.csr_matrix(
+        np.arange(n_obs * n_vars, dtype=np.float32).reshape(n_obs, n_vars)
+    )
+    var = pd.DataFrame(
+        {
+            "gene_ids": [f"ENSG{i:07d}" for i in range(n_vars)],
+            "feature_types": pd.Categorical(["Gene Expression"] * n_vars),
+        },
+        index=pd.Index([f"GENE_{i}" for i in range(n_vars)]),  # unnamed
+    )
+    obs = pd.DataFrame(index=pd.Index([f"CELL_{i}" for i in range(n_obs)]))
+    src = ad.AnnData(X=x, obs=obs, var=var)
+
+    src_path = tmp_dir / "src.h5ad"
+    scx_path = tmp_dir / "src.scx"
+    rt_path = tmp_dir / "rt.h5ad"
+    src.write_h5ad(src_path)
+
+    pyscx.from_h5ad(str(src_path), str(scx_path))
+    pyscx.to_h5ad(str(scx_path), str(rt_path))
+
+    rt = ad.read_h5ad(rt_path)
+    assert list(rt.var_names) == list(src.var_names), (
+        f"var_names corrupted: got {list(rt.var_names)[:3]}, expected "
+        f"{list(src.var_names)[:3]}"
+    )
+    assert list(rt.var.columns) == ["gene_ids", "feature_types"], (
+        f"var.columns drifted: {rt.var.columns.tolist()}"
+    )
+    assert rt.var.index.name is None
+    assert "__index_level_0__" not in rt.var.columns
+
+
+def test_pyscx_h5ad_roundtrip_preserves_named_var_index(tmp_dir):
+    """Named pandas index (`var.index.name = 'gene_symbols'`): the
+    round-trip must keep the index NAME as well as the values."""
+    import anndata as ad
+    import pandas as pd
+    import pyscx
+
+    n_obs, n_vars = 6, 4
+    x = sp.csr_matrix(
+        np.arange(n_obs * n_vars, dtype=np.float32).reshape(n_obs, n_vars)
+    )
+    var = pd.DataFrame(
+        {"gene_ids": [f"ENSG{i:07d}" for i in range(n_vars)]},
+        index=pd.Index(
+            [f"SYMBOL_{i}" for i in range(n_vars)], name="gene_symbols"
+        ),
+    )
+    obs = pd.DataFrame(index=pd.Index([f"CELL_{i}" for i in range(n_obs)]))
+    src = ad.AnnData(X=x, obs=obs, var=var)
+
+    src_path = tmp_dir / "src_named.h5ad"
+    scx_path = tmp_dir / "src_named.scx"
+    rt_path = tmp_dir / "rt_named.h5ad"
+    src.write_h5ad(src_path)
+
+    pyscx.from_h5ad(str(src_path), str(scx_path))
+    pyscx.to_h5ad(str(scx_path), str(rt_path))
+
+    rt = ad.read_h5ad(rt_path)
+    assert list(rt.var_names) == list(src.var_names)
+    assert rt.var.index.name == "gene_symbols", (
+        f"named index lost: got {rt.var.index.name!r}"
+    )
+    assert list(rt.var.columns) == ["gene_ids"]
+    assert "__index_level_0__" not in rt.var.columns
+
+
+def test_pyscx_h5ad_roundtrip_preserves_index_only_var(tmp_dir):
+    """Codex P1 (B2 follow-up): an AnnData with non-trivial var_names
+    but zero var columns must survive a full
+    `from_h5ad → to_h5ad → from_h5ad → to_anndata` loop without
+    `var_names`/`obs_names` getting replaced by empty strings.
+
+    Triggers the SCX-internal re-read path that hits
+    `read_dataframe_group`'s empty-`column-order` fallback — the
+    branch that pre-fix synthesised `vec![""; n_rows]` for the index.
+    """
+    import anndata as ad
+    import pandas as pd
+    import pyscx
+
+    n_obs, n_vars = 6, 4
+    x = sp.csr_matrix(
+        np.arange(n_obs * n_vars, dtype=np.float32).reshape(n_obs, n_vars)
+    )
+    src = ad.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=pd.Index([f"CELL_{i}" for i in range(n_obs)])),
+        var=pd.DataFrame(index=pd.Index([f"GENE_{i}" for i in range(n_vars)])),
+    )
+    assert src.var.shape[1] == 0 and src.obs.shape[1] == 0
+
+    src_h5ad = tmp_dir / "idx_only.h5ad"
+    src_scx = tmp_dir / "idx_only.scx"
+    rt_h5ad = tmp_dir / "idx_only_rt.h5ad"
+    rt_scx = tmp_dir / "idx_only_rt.scx"
+    src.write_h5ad(src_h5ad)
+
+    # First leg: h5ad → scx → h5ad (exercises the writer fix from B2).
+    pyscx.from_h5ad(str(src_h5ad), str(src_scx))
+    pyscx.to_h5ad(str(src_scx), str(rt_h5ad))
+
+    # Second leg: h5ad → scx via the CLI-style path that goes through
+    # `read_dataframe_group`. This is the branch Codex flagged.
+    pyscx.from_h5ad(str(rt_h5ad), str(rt_scx))
+    rt = pyscx.open(str(rt_scx)).to_anndata()
+
+    assert list(rt.var_names) == list(src.var_names), (
+        f"var_names lost on round-trip: got {list(rt.var_names)}, "
+        f"expected {list(src.var_names)}"
+    )
+    assert list(rt.obs_names) == list(src.obs_names), (
+        f"obs_names lost on round-trip: got {list(rt.obs_names)}, "
+        f"expected {list(src.obs_names)}"
+    )

@@ -184,6 +184,34 @@ fn convert(batch: &RecordBatch, widen: bool) -> Result<RecordBatch> {
     )?)
 }
 
+/// Parse the `index_columns` array from the Arrow IPC schema's
+/// `pandas` metadata key. `pyarrow.Table.from_pandas(df)` stamps this
+/// with a JSON envelope of the form
+/// `{"index_columns": ["gene_symbols", ...], ...}` for string-named
+/// indexes (and `__index_level_0__` for unnamed indexes). For
+/// `RangeIndex`, pyarrow emits a dict envelope instead of a string;
+/// we filter to string entries since `RangeIndex` never names a row.
+/// Returns an empty vec when the key is absent, malformed, or holds
+/// only dict envelopes.
+pub fn pandas_index_columns(schema: &Schema) -> Vec<String> {
+    let Some(raw) = schema.metadata().get("pandas") else {
+        return Vec::new();
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get("index_columns")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

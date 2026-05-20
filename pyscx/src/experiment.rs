@@ -117,7 +117,7 @@ fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> 
     //      unnamed pandas index.
     //   3. The original heuristic list, kept so any files that pre-date
     //      pandas-metadata-aware writes still resolve.
-    let pandas_index_cols = pandas_index_columns(batch.schema().as_ref());
+    let pandas_index_cols = scx_format::pandas_index_columns(batch.schema().as_ref());
     let fallback_columns = [
         "__index_level_0__",
         "_index",
@@ -138,31 +138,6 @@ fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> 
     Err(pyo3::exceptions::PyKeyError::new_err(format!(
         "gene name '{name}' not found in var index"
     )))
-}
-
-/// Decode `index_columns` from the Arrow IPC schema's `pandas`
-/// metadata key. `Table.from_pandas(df)` stamps this with a JSON
-/// envelope of the form `{"index_columns": ["gene_symbols", ...], ...}`
-/// (string for named indexes; a dict envelope for `RangeIndex`, which
-/// we skip — those never name a gene). Returns an empty vec when the
-/// key is absent or malformed; callers fall through to the next probe.
-fn pandas_index_columns(schema: &arrow::datatypes::Schema) -> Vec<String> {
-    let Some(raw) = schema.metadata().get("pandas") else {
-        return Vec::new();
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    parsed
-        .get("index_columns")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Scan a single string column of a `RecordBatch` for an exact match
