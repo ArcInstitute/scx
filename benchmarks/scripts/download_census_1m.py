@@ -17,13 +17,18 @@ The flow here:
 """
 import os
 import sys
+from pathlib import Path
+
 import numpy as np
 
 import cellxgene_census
 import anndata as ad
 import scipy.sparse as sp
 
-from bench_env import DATA_DIR
+# Make the comprehensive/bench_env shim resolvable regardless of CWD.
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent / "comprehensive"))
+from bench_env import DATA_DIR  # noqa: E402
 
 OUTPUT_DIR = str(DATA_DIR)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "census_1m.h5ad")

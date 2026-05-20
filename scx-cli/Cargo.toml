@@ -6,6 +6,14 @@ description = "CLI tool for SCX: convert, info, validate"
 license.workspace = true
 authors.workspace = true
 
+# Binary is named `scx` (matches `clap::command(name = "scx", ...)` in
+# src/main.rs and every docs / SKILL invocation). The crate name stays
+# `scx-cli` so `cargo install scx-cli` and release tag prefix
+# `scx-cli-v*` remain stable.
+[[bin]]
+name = "scx"
+path = "src/main.rs"
+
 [features]
 default = []
 # Conversion paths that need libhdf5: h5ad, h5mu, 10x. The actual code
@@ -16,6 +24,11 @@ hdf5 = ["scx-convert/hdf5", "dep:hdf5"]
 # runtime requirement. Pulls in CMake at build time.
 hdf5-static = ["hdf5", "scx-convert/hdf5-static"]
 cloud = ["dep:scx-cloud", "dep:tokio"]
+# End-user install bundle for `cargo install --features default-bin scx-cli`.
+# Enables h5ad/h5mu/10x conversion out of the box. Kept separate from
+# `default = []` so contributor builds (`cargo build/test` from a workspace
+# checkout) don't drag in libhdf5 unnecessarily.
+default-bin = ["hdf5"]
 
 [dependencies]
 clap = { workspace = true }

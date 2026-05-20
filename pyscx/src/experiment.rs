@@ -203,6 +203,15 @@ impl PyExperiment {
         self.reader.header().format_version
     }
 
+    /// Filesystem path the experiment was opened from. Returned as a
+    /// plain string so it can be passed straight back to converters
+    /// like `pyscx.to_h5ad(exp, out)` (the Python wrapper picks this
+    /// up via `getattr(source, "path", None)`).
+    #[getter]
+    fn path(&self) -> String {
+        self.path.display().to_string()
+    }
+
     /// File-header codec ID
     /// (`0=None`, `1=Scx1`, `2=Zstd`, `3=Lz4Shuffle`, `4=Pcodec`).
     ///

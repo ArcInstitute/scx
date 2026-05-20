@@ -49,6 +49,7 @@ def highly_variable_genes(
     n_bins: int = 20,
     device: str = "auto",
     prefer_format: PreferFormat = "csr",
+    layer: str | None = None,
 ) -> None: ...
 
 

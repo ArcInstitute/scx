@@ -1328,7 +1328,10 @@ processes either; it owns thread handles that don't survive transfer.
 > rayon pool in `scx-loader` removed that hazard. See
 > `pyscx/tests/test_fork_safety.py` for the durable regression test.
 
-## CLI (`scx-cli`)
+## CLI (`scx`)
+
+The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -p scx-cli`).
+
 
 ### Core
 - `scx convert <input> <output> [--from h5ad|10x|h5mu|scx] [--to h5ad|h5mu|scx] [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N] [--modality NAME] [--memory-budget SIZE] [--strict-uns] [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV] [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N] [--bitmap off|auto|always] [--reader-threads N] [--writer-queue-depth N]` — `--stream` (default `true`) bounds peak memory to one shard's worth of CSR plus encode buffers; supported on h5ad ↔ SCX and h5mu ↔ SCX in both directions. On ingestion (h5ad/h5mu → SCX), combine with `--csc always` for a two-pass CSR-then-`rebuild_csc_inplace` write (transient disk ~2× the output). On export (SCX → h5ad/h5mu), the streaming writer pre-allocates the `/X/{indptr,indices,data}` HDF5 triplet from catalog stats (or a single pre-scan when deletion vectors are active) so the on-disk layout is deterministic. Pass `--stream=false` to opt into the legacy materialising path on either side. For multimodal SCX → h5ad, combine `--to h5ad --modality NAME` to extract a single modality.
@@ -1383,4 +1386,4 @@ processes either; it owns thread handles that don't survive transfer.
 - `scx pull <source-url> <dest> [--parallelism N] [--no-cloud-ready] [--filter <expr>]`
 - `scx push <source> <dest-url> [--parallelism N]`
 
-Note: `scx-cli` has optional `hdf5` and `cloud` feature flags. HDF5 support is opt-in (`--features hdf5`). Cloud operations are opt-in (`--features cloud`).
+Note: the `scx-cli` crate has optional `hdf5` and `cloud` feature flags. HDF5 support is opt-in (`--features hdf5`). Cloud operations are opt-in (`--features cloud`). End-users installing via `cargo install` can pass `--features default-bin` to get an h5ad-capable build in one command.

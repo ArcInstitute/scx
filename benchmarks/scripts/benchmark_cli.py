@@ -11,7 +11,7 @@ End-to-end benchmarks for the scx CLI binary, measuring:
 
 Requires:
 - tabula_sapiens_100k.scx (and .h5ad) in $SCX_WORK_DIR
-- Release-built scx-cli binary
+- Release-built scx binary (built from the `scx-cli` crate)
 
 Usage:
     python benchmarks/scripts/benchmark_cli.py
@@ -39,16 +39,17 @@ CELL_TYPE_DELETE = "ciliated cell"  # ~18% — used for delete benchmark
 
 
 def find_scx_binary():
-    """Find the release-built scx-cli binary."""
+    """Find the release-built scx binary (built from the `scx-cli` crate)."""
     candidates = [
-        REPO_ROOT / "target" / "release" / "scx-cli",
         REPO_ROOT / "target" / "release" / "scx",
+        # Legacy: pre-rename layouts may still have `scx-cli` from older builds.
+        REPO_ROOT / "target" / "release" / "scx-cli",
     ]
     for path in candidates:
         if path.exists():
             return str(path)
     # Try building it
-    print("Building scx-cli in release mode...")
+    print("Building scx (release, from the `scx-cli` crate)...")
     result = subprocess.run(
         ["cargo", "build", "-p", "scx-cli", "--release"],
         capture_output=True, text=True, cwd=REPO_ROOT,
@@ -59,7 +60,7 @@ def find_scx_binary():
     for path in candidates:
         if path.exists():
             return str(path)
-    print("ERROR: could not find scx-cli binary after build", file=sys.stderr)
+    print("ERROR: could not find scx binary after build", file=sys.stderr)
     sys.exit(1)
 
 

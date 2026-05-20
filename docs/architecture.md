@@ -535,10 +535,11 @@ Relies on `object_store`'s built-in credential chains:
 
 ---
 
-## CLI (scx-cli)
+## CLI (scx)
 
-The CLI binary provides format conversion, inspection, validation, query, file
-operations, and cloud access:
+The CLI binary is named `scx` (built from the `scx-cli` crate). It provides
+format conversion, inspection, validation, query, file operations, and cloud
+access:
 
 ```bash
 # Convert h5ad/10x to SCX (requires --features hdf5)

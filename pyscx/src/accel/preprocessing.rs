@@ -298,6 +298,42 @@ pub fn calculate_qc_metrics<'py>(
     let x = adata.getattr("X")?;
     let qc_vars = qc_vars.unwrap_or_default();
 
+    // F2: warn if `qc_vars` is empty AND the var_names look like they
+    // contain mitochondrial genes (human "MT-" or mouse "mt-"). Without
+    // qc_vars, `pct_counts_mt` is never computed — silently — and the
+    // canonical scanpy filter `adata.obs["pct_counts_mt"] < 20` then
+    // raises `KeyError: 'pct_counts_mt'`. The threshold of 5 avoids
+    // noisy warnings on synthetic datasets where a couple of gene
+    // symbols coincidentally start with "MT-".
+    if qc_vars.is_empty() {
+        if let Ok(var_names) = adata.getattr("var_names") {
+            // pd.Index doesn't implement Iterator over &PyAny cheaply
+            // in pyo3; convert to a Python list once, then count
+            // string prefixes in a tight Rust loop.
+            if let Ok(names_list) = var_names.call_method0("tolist") {
+                if let Ok(names) = names_list.extract::<Vec<String>>() {
+                    let n_mt = names
+                        .iter()
+                        .filter(|s| s.starts_with("MT-") || s.starts_with("mt-"))
+                        .count();
+                    if n_mt >= 5 {
+                        let warnings = py.import("warnings")?;
+                        let builtins = py.import("builtins")?;
+                        let user_warning = builtins.getattr("UserWarning")?;
+                        let msg = format!(
+                            "calculate_qc_metrics: found {n_mt} MT-/mt- prefixed gene \
+                             symbols in adata.var_names but `qc_vars` is None, so \
+                             `pct_counts_mt` will NOT be computed. To compute it, run:\n  \
+                             adata.var['mt'] = adata.var_names.str.startswith('MT-')\n  \
+                             pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
+                        );
+                        warnings.call_method1("warn", (msg, user_warning))?;
+                    }
+                }
+            }
+        }
+    }
+
     // Detect backed or lazy-transformed SCX dataset
     let is_backed = x.downcast::<ScxBackedSparseDataset>().is_ok();
     let is_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();

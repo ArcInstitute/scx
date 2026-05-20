@@ -1,0 +1,86 @@
+"""F3 regression: `pyscx.accel.highly_variable_genes(layer=name)` reads
+from `adata.layers[name]` instead of `adata.X`. Closes F3 from
+SCX-USER-REPORT-2026-05-19.md.
+
+The original bug was that the scanpy idiom
+``adata.layers["counts"] = adata.X.copy(); normalize_total; log1p;
+highly_variable_genes(flavor="seurat_v3", layer="counts")`` did not
+work because pyscx didn't forward `layer=` through the binding —
+forcing users to reorder the pipeline (run HVG BEFORE normalize/log1p).
+"""
+import warnings
+
+import anndata as ad
+import numpy as np
+import pandas as pd
+import pytest
+import scipy.sparse as sp
+
+
+def _make_counts_adata(n_obs=200, n_vars=80, seed=0):
+    rng = np.random.default_rng(seed)
+    x = sp.csr_matrix(rng.integers(0, 50, size=(n_obs, n_vars)).astype(np.float32))
+    return ad.AnnData(X=x)
+
+
+def test_layer_kwarg_avoids_seurat_v3_warning():
+    """With `layer="counts"` pointing at raw counts, seurat_v3's
+    "expects raw count data but non-integers were found" warning must
+    not fire even though X has been normalized + log1p'd."""
+    from pyscx import accel
+    adata = _make_counts_adata()
+    adata.layers["counts"] = adata.X.copy()
+    accel.normalize_total(adata, target_sum=1e4)
+    accel.log1p(adata)
+    with warnings.catch_warnings(record=True) as ws:
+        warnings.simplefilter("always")
+        accel.highly_variable_genes(
+            adata, n_top_genes=20, flavor="seurat_v3", layer="counts"
+        )
+    msgs = [str(w.message) for w in ws]
+    non_integer_warnings = [m for m in msgs if "non-integers" in m or "raw count" in m]
+    assert not non_integer_warnings, (
+        "seurat_v3 should not warn when reading from a raw-counts layer; "
+        f"got warnings: {non_integer_warnings}"
+    )
+    assert "highly_variable" in adata.var.columns
+    assert int(adata.var["highly_variable"].sum()) == 20
+
+
+def test_layer_kwarg_matches_running_before_normalize():
+    """Sanity: running HVG with `layer="counts"` on the post-normalize
+    AnnData should select the SAME genes as running HVG on a sibling
+    AnnData BEFORE normalize_total / log1p (since both compute on the
+    same raw counts)."""
+    from pyscx import accel
+    adata = _make_counts_adata()
+    adata.layers["counts"] = adata.X.copy()
+
+    # Sibling: HVG before normalize/log1p — the "old" idiom.
+    sibling = adata.copy()
+    accel.highly_variable_genes(sibling, n_top_genes=15, flavor="seurat_v3")
+    expected = set(sibling.var_names[sibling.var["highly_variable"]])
+
+    # Original: normalize+log1p, then HVG with layer=.
+    accel.normalize_total(adata, target_sum=1e4)
+    accel.log1p(adata)
+    accel.highly_variable_genes(
+        adata, n_top_genes=15, flavor="seurat_v3", layer="counts"
+    )
+    got = set(adata.var_names[adata.var["highly_variable"]])
+
+    assert got == expected, (
+        f"HVG selection drifted when using layer= on normalized X; "
+        f"missing from layer-result: {expected - got}; "
+        f"extra in layer-result: {got - expected}"
+    )
+
+
+def test_layer_default_none_still_uses_X():
+    """Control: without `layer=`, the function still reads from adata.X."""
+    from pyscx import accel
+    adata = _make_counts_adata()
+    # X holds raw counts; no layer. The seurat_v3 flavor should work fine.
+    accel.highly_variable_genes(adata, n_top_genes=10, flavor="seurat_v3")
+    assert "highly_variable" in adata.var.columns
+    assert int(adata.var["highly_variable"].sum()) == 10

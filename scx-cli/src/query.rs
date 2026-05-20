@@ -429,7 +429,7 @@ fn write_query_result(
             .unwrap_or_default()
             .as_secs() as i64,
         action: "query".to_string(),
-        tool: "scx-cli 0.1.0".to_string(),
+        tool: format!("scx {}", env!("CARGO_PKG_VERSION")),
         params_json: "{}".to_string(),
         input_checksums: vec![],
     }])?;

@@ -6,14 +6,18 @@ Downloads the filtered feature-barcode matrix in HDF5 format,
 reads with scanpy, and saves as h5ad.
 """
 import os
+import shutil
 import sys
 import urllib.request
-import tempfile
+from pathlib import Path
 
 import scanpy as sc
 import anndata as ad
 
-from bench_env import DATA_DIR
+# Make the comprehensive/bench_env shim resolvable regardless of CWD.
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent / "comprehensive"))
+from bench_env import DATA_DIR  # noqa: E402
 
 OUTPUT_DIR = str(DATA_DIR)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "pbmc10k.h5ad")
@@ -31,12 +35,19 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Download to temp file
+    # Download to temp file. cf.10xgenomics.com returns HTTP 403 for the
+    # default `Python-urllib/x.y` User-Agent; supply a UA so the fetch
+    # succeeds across all 10x dataset CDNs.
     h5_path = os.path.join(OUTPUT_DIR, "pbmc_10k_v3_filtered_feature_bc_matrix.h5")
     if not os.path.exists(h5_path):
         print(f"Downloading PBMC 10k dataset from 10x Genomics...")
         print(f"  URL: {URL}")
-        urllib.request.urlretrieve(URL, h5_path)
+        req = urllib.request.Request(
+            URL,
+            headers={"User-Agent": "scx-benchmarks/0.4.0 (research use)"},
+        )
+        with urllib.request.urlopen(req) as resp, open(h5_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
         print(f"  Downloaded to: {h5_path}")
         print(f"  Size: {os.path.getsize(h5_path) / 1e6:.1f} MB")
     else:

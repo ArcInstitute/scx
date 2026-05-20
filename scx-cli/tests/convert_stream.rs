@@ -121,7 +121,7 @@ fn convert_stream_h5ad_to_scx() {
             "h5ad",
             "--to",
             "scx",
-            "--stream",
+            "--stream=true",
             h5ad.to_str().unwrap(),
             scx_path.to_str().unwrap(),
         ])
@@ -230,7 +230,7 @@ fn convert_stream_skips_unreadable_layer() {
             "h5ad",
             "--to",
             "scx",
-            "--stream",
+            "--stream=true",
             h5ad.to_str().unwrap(),
             scx_path.to_str().unwrap(),
         ])
