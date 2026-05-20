@@ -416,8 +416,15 @@ The returned `anndata.AnnData` is fully populated:
 > intend to close the experiment, hand the AnnData to a subprocess,
 > or otherwise outlive the underlying mmap. See
 > [`docs/api.md` § `PyExperiment`](api.md#pyexperiment) for the kwarg
-> table and the regression context in `Cluster 1 — peak-RSS` of the
-> 2026-05-20 benchmark report.
+> table.
+>
+> The lazy default bounds the peak RSS of `to_anndata()` itself for
+> files that carry large kNN graphs (`obsp["distances"]` /
+> `obsp["connectivities"]`) or embeddings (`varm["PCs"]`): the
+> sections are not decoded until consumer code touches the slot. User
+> code that does access them pays the same one-time decode cost it
+> would have paid at construction time. Repeat accesses of the same
+> key return the cached object.
 
 > **`uns` round-trip fidelity:** `from_anndata()` defaults to
 > `uns_format="tagged"`, which preserves NumPy `dtype` and `shape`,

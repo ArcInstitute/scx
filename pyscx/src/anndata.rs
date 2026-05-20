@@ -694,10 +694,12 @@ pub fn to_anndata<'py>(
 /// `ScxLazyVarmMapping` / `ScxLazyLayersMapping` and attached to the
 /// AnnData's private `_obsp` / `_varp` / `_varm` / `_layers` storage,
 /// deferring each section's decode until the consumer first accesses
-/// `ad.obsp[…]` etc. When `true`, every section is decoded up front
-/// and a plain `dict` is passed through the AnnData constructor —
-/// matches pre-fix behaviour. See [`crate::lazy_mapping`] and
-/// `2026-05-20_BENCHMARK-REGRESSIONS.md` cluster 1 for background.
+/// `ad.obsp[…]` etc. Keeps peak RSS of `to_anndata()` bounded for
+/// files that carry large kNN graphs / embeddings. When `true`, every
+/// section is decoded up front and a plain `dict` is passed through
+/// the AnnData constructor — matches pre-fix behaviour and detaches
+/// the returned AnnData from the SCX file handle. See
+/// [`crate::lazy_mapping`].
 fn to_anndata_with_layers<'py>(
     py: Python<'py>,
     path: &std::path::Path,
