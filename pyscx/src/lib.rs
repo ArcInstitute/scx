@@ -701,6 +701,23 @@ fn to_mtx(scx_path: &str, output_dir: &str) -> PyResult<()> {
 
 #[pymodule]
 fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Eagerly build the rayon global threadpool and force worker-thread
+    // spawn at module import time. Without this, the first parallel accel
+    // call (e.g. `calculate_qc_metrics`) pays a ~13 s cold-init tax that
+    // scares users into thinking the op is slow.
+    //
+    // `build_global()` is idempotent — Err on already-initialised is harmless.
+    // A trivial `par_iter` forces the worker threads to actually spawn
+    // (rayon's pool is otherwise lazy on first use).
+    let _ = rayon::ThreadPoolBuilder::new().build_global();
+    {
+        use rayon::prelude::*;
+        let _ = (0..rayon::current_num_threads().max(1))
+            .into_par_iter()
+            .map(|_| 0u64)
+            .sum::<u64>();
+    }
+
     // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
