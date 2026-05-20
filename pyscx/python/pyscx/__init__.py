@@ -71,8 +71,17 @@ def _coerce_path(p, *, allow_experiment: bool = True):
                 "not an already-converted SCX file."
             )
         return path_attr
-    # Last resort: let os.fspath raise its canonical TypeError.
-    fspath = _os.fspath(p)
+    # Last resort: re-raise os.fspath's TypeError with a scx-specific
+    # message naming the expected types, so users hitting the boundary
+    # see "pyscx expects ..." instead of the generic "expected str, bytes
+    # or os.PathLike object, not list".
+    try:
+        fspath = _os.fspath(p)
+    except TypeError:
+        expected = "str | os.PathLike | pyscx.Experiment" if allow_experiment else "str | os.PathLike"
+        raise TypeError(
+            f"pyscx expects {expected}; got {type(p).__name__}"
+        ) from None
     return fspath.decode() if isinstance(fspath, bytes) else fspath
 
 
