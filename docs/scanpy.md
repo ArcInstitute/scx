@@ -1029,8 +1029,7 @@ All accelerators that support GPU expose a `device` parameter:
 
 ¹ GPU Leiden has a documented label-stability divergence vs `leidenalg` —
 pin `device="cpu"` to preserve label stability for downstream DE / annotation
-transfer. See [docs/architecture.md § GPU Leiden caveat](architecture.md) and
-CLAUDE.md § Known Limitations.
+transfer. See `CLAUDE.md § Known Limitations`.
 
 ### `prefer_format="csr"|"csc"`: explicit column-major dispatch
 

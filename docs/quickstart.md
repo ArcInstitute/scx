@@ -67,8 +67,11 @@ accel.umap(adata)
 accel.leiden(adata, resolution=1.0, device="cpu")   # pin CPU for label stability
 accel.rank_genes_groups(adata, groupby="leiden")
 
-# Persist results
-pyscx.to_h5ad(exp, "pbmc10k_processed.h5ad")
+# Persist processed results. `pyscx.to_h5ad(exp, ...)` re-exports the
+# unmodified on-disk SCX file — to save the analysis you just ran, write
+# `adata` directly. Use `pyscx.from_anndata(adata, "out.scx")` instead to
+# round-trip the processed AnnData back to SCX.
+adata.write_h5ad("pbmc10k_processed.h5ad")
 ```
 
 ## What's different from scanpy
