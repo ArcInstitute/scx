@@ -15,6 +15,7 @@ hdf5-static = ["hdf5", "hdf5-sys/static", "hdf5-sys/zlib", "libz-sys/static"]
 [dependencies]
 arrow = { workspace = true }
 serde_json = { workspace = true }
+strsim = { workspace = true }
 byteorder = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

@@ -3441,6 +3441,7 @@ dependencies = [
  "scx-ops",
  "scx-sparse",
  "serde_json",
+ "strsim",
  "tempfile",
  "thiserror 2.0.18",
 ]

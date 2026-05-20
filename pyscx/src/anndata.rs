@@ -142,13 +142,33 @@ fn build_and_write_predicate_indexes_inline(
         py.import("warnings")?.call_method1("warn", (msg,))?;
         Ok(())
     };
-    let process = |outcomes: Vec<BuildOutcome>, axis: &str| -> PyResult<()> {
+    let obs_available: Vec<String> = obs
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let var_available: Vec<String> = var
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let process = |outcomes: Vec<BuildOutcome>, axis: &str, available: &[String]| -> PyResult<()> {
         for outcome in outcomes {
             match outcome {
                 BuildOutcome::ForcedColumnError { column, reason } => {
-                    return Err(PyValueError::new_err(format!(
-                        "forced {axis} index column '{column}': {reason}"
-                    )));
+                    // E2-2026-05-20: enrich the message with available
+                    // columns + did-you-mean suggestion. Use the shared
+                    // helper so CLI and pyscx surfaces stay in sync.
+                    let msg = if matches!(reason, scx_engine::index::SkipReason::MissingColumn) {
+                        scx_convert::pipeline::forced_column_missing_message(
+                            axis, &column, available,
+                        )
+                    } else {
+                        format!("forced {axis} index column '{column}': {reason}")
+                    };
+                    return Err(PyValueError::new_err(msg));
                 }
                 BuildOutcome::PresetSkipped { column, reason } => {
                     emit_warning(format!(
@@ -159,8 +179,8 @@ fn build_and_write_predicate_indexes_inline(
         }
         Ok(())
     };
-    process(result.obs_outcomes, "obs")?;
-    process(result.var_outcomes, "var")?;
+    process(result.obs_outcomes, "obs", &obs_available)?;
+    process(result.var_outcomes, "var", &var_available)?;
 
     Ok(())
 }

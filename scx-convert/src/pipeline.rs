@@ -425,8 +425,44 @@ fn build_and_write_predicate_indexes(
     )
     .map_err(|e| ConvertError::Other(format!("build predicate index: {e}")))?;
 
-    process_predicate_index_outcomes(result.obs_outcomes, "obs", sink)?;
-    process_predicate_index_outcomes(result.var_outcomes, "var", sink)?;
+    // Preset name + per-axis expected count flow into the outcome
+    // processor so it can batch a fully-missing preset into a single
+    // actionable warning. Unknown preset names resolve
+    // to (0, 0); engine surfaces those as `ConvertError`.
+    let (preset_obs_expected, preset_var_expected) = opts
+        .index_preset
+        .as_deref()
+        .and_then(scx_engine::index::index_preset_columns)
+        .map(|p| (p.obs_columns.len(), p.var_columns.len()))
+        .unwrap_or((0, 0));
+    let obs_available: Vec<String> = obs
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let var_available: Vec<String> = var
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    process_predicate_index_outcomes(
+        result.obs_outcomes,
+        "obs",
+        opts.index_preset.as_deref(),
+        preset_obs_expected,
+        &obs_available,
+        sink,
+    )?;
+    process_predicate_index_outcomes(
+        result.var_outcomes,
+        "var",
+        opts.index_preset.as_deref(),
+        preset_var_expected,
+        &var_available,
+        sink,
+    )?;
 
     Ok((result.obs_indexed_columns, result.var_indexed_columns))
 }
@@ -436,28 +472,103 @@ fn build_and_write_predicate_indexes(
 /// convert layer's policy: forced errors abort the convert; preset
 /// skips emit a typed warning whose variant is chosen by the
 /// `SkipReason` discriminant.
-fn process_predicate_index_outcomes(
+///
+/// When `preset` is `Some` and EVERY preset column on this axis came
+/// back `SkipReason::MissingColumn` (preset/file format mismatch),
+/// collapse the burst into a single `PresetNoColumnsMatched` warning
+/// pointing the user at the fix instead of emitting one
+/// `MissingPresetIndexColumn` per column. Partial mismatch keeps the
+/// per-column shape — that's a real schema drift worth surfacing.
+/// Render an actionable error message for a forced obs/var index
+/// column that doesn't exist in the source DataFrame. Adds the
+/// available column list and, when one is close enough, a single
+/// `Did you mean '<col>'?` suggestion (Levenshtein-normalised
+/// threshold ≥ 0.6). Shared by `scx-convert/src/pipeline.rs` (CLI
+/// path) and `pyscx/src/anndata.rs` (Python path) so both surfaces
+/// emit the same message.
+pub fn forced_column_missing_message(axis: &str, column: &str, available: &[String]) -> String {
+    let mut msg = format!("forced {axis} index column '{column}': missing column.");
+    if available.is_empty() {
+        msg.push_str(&format!(
+            " Available {axis} columns: [] (this h5ad has no {axis} metadata)."
+        ));
+        return msg;
+    }
+    let preview_n = available.len().min(8);
+    let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
+    let suffix = if available.len() > preview_n {
+        ", ..."
+    } else {
+        ""
+    };
+    msg.push_str(&format!(" Available {axis} columns: {preview:?}{suffix}."));
+    if let Some(suggestion) = available
+        .iter()
+        .map(|n| (n, strsim::normalized_levenshtein(column, n)))
+        .filter(|(_, s)| *s >= 0.6)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(n, _)| n.clone())
+    {
+        msg.push_str(&format!(" Did you mean '{suggestion}'?"));
+    }
+    msg
+}
+
+pub(crate) fn process_predicate_index_outcomes(
     outcomes: Vec<BuildOutcome>,
     axis: &str,
+    preset: Option<&str>,
+    preset_expected: usize,
+    available_columns: &[String],
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    let mut missing: Vec<String> = Vec::new();
+    let mut deferred: Vec<ConvertWarning> = Vec::new();
+
     for outcome in outcomes {
         match outcome {
             BuildOutcome::ForcedColumnError { column, reason } => {
-                return Err(ConvertError::Other(format!(
-                    "forced {axis} index column '{column}': {reason}"
-                )));
+                // E2-2026-05-20: the `reason` from the engine is the
+                // raw `missing column` / `unsupported_dtype` discriminant.
+                // When it's `MissingColumn`, our renderer adds the
+                // available-columns list + did-you-mean suggestion;
+                // other reasons (unsupported dtype, high cardinality)
+                // pass through with the engine's text since the column
+                // *does* exist.
+                let msg = if matches!(reason, SkipReason::MissingColumn) {
+                    forced_column_missing_message(axis, &column, available_columns)
+                } else {
+                    format!("forced {axis} index column '{column}': {reason}")
+                };
+                return Err(ConvertError::Other(msg));
             }
             BuildOutcome::PresetSkipped { column, reason } => match reason {
-                SkipReason::MissingColumn => {
-                    sink.emit(ConvertWarning::MissingPresetIndexColumn { column });
-                }
-                other => sink.emit(ConvertWarning::UnsupportedIndexColumn {
+                SkipReason::MissingColumn => missing.push(column),
+                other => deferred.push(ConvertWarning::UnsupportedIndexColumn {
                     column,
                     reason: other.to_string(),
                 }),
             },
         }
+    }
+
+    let aggregate = preset.is_some_and(|_| {
+        !missing.is_empty() && preset_expected > 0 && missing.len() == preset_expected
+    });
+
+    if aggregate {
+        sink.emit(ConvertWarning::PresetNoColumnsMatched {
+            preset: preset.expect("aggregate => preset.is_some()").to_string(),
+            axis: axis.to_string(),
+            missing,
+        });
+    } else {
+        for column in missing {
+            sink.emit(ConvertWarning::MissingPresetIndexColumn { column });
+        }
+    }
+    for w in deferred {
+        sink.emit(w);
     }
     Ok(())
 }

@@ -6204,3 +6204,168 @@ fn h5ad_to_scx_streaming_preserves_obs_var_names() {
     let expected_var: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
     assert_eq!(var_values, expected_var, "var_names must round-trip");
 }
+
+// -----------------------------------------------------------------------
+// Process_predicate_index_outcomes batches a fully-missing
+// preset into a single PresetNoColumnsMatched warning.
+// -----------------------------------------------------------------------
+
+#[test]
+fn process_outcomes_emits_aggregate_when_preset_fully_missing() {
+    use super::pipeline::process_predicate_index_outcomes;
+    use super::warnings::WarningSink;
+    use scx_engine::index::{BuildOutcome, SkipReason};
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured);
+    let mut sink = WarningSink::with_handler(move |w| {
+        captured_clone
+            .lock()
+            .unwrap()
+            .push(w.category().to_string());
+    });
+
+    let outcomes = vec![
+        BuildOutcome::PresetSkipped {
+            column: "cell_type".into(),
+            reason: SkipReason::MissingColumn,
+        },
+        BuildOutcome::PresetSkipped {
+            column: "tissue".into(),
+            reason: SkipReason::MissingColumn,
+        },
+        BuildOutcome::PresetSkipped {
+            column: "disease".into(),
+            reason: SkipReason::MissingColumn,
+        },
+    ];
+    process_predicate_index_outcomes(outcomes, "obs", Some("cellxgene"), 3, &[], &mut sink)
+        .unwrap();
+
+    let cats = captured.lock().unwrap();
+    assert_eq!(*cats, vec!["preset_no_columns_matched".to_string()]);
+    assert_eq!(
+        sink.counts().get("missing_preset_index_column"),
+        None,
+        "no per-column warnings expected when preset fully missing"
+    );
+    assert_eq!(sink.counts().get("preset_no_columns_matched"), Some(&1));
+}
+
+#[test]
+fn process_outcomes_falls_back_to_per_column_on_partial_mismatch() {
+    use super::pipeline::process_predicate_index_outcomes;
+    use super::warnings::WarningSink;
+    use scx_engine::index::{BuildOutcome, SkipReason};
+
+    let mut sink = WarningSink::log();
+    let outcomes = vec![
+        BuildOutcome::PresetSkipped {
+            column: "cell_type".into(),
+            reason: SkipReason::MissingColumn,
+        },
+        BuildOutcome::PresetSkipped {
+            column: "tissue".into(),
+            reason: SkipReason::MissingColumn,
+        },
+        // 1 of 3 expected columns is *not* missing → preset is real,
+        // and the per-column warnings remain useful signal.
+    ];
+    process_predicate_index_outcomes(outcomes, "obs", Some("cellxgene"), 3, &[], &mut sink)
+        .unwrap();
+
+    assert_eq!(
+        sink.counts().get("missing_preset_index_column"),
+        Some(&2),
+        "partial mismatch must surface per-column warnings"
+    );
+    assert_eq!(sink.counts().get("preset_no_columns_matched"), None);
+}
+
+#[test]
+fn process_outcomes_keeps_per_column_when_no_preset() {
+    use super::pipeline::process_predicate_index_outcomes;
+    use super::warnings::WarningSink;
+    use scx_engine::index::{BuildOutcome, SkipReason};
+
+    // Caller passed user-explicit `--index-obs <col>` (no preset). The
+    // engine still surfaces these as `PresetSkipped` because they were
+    // resolved via the preset code path — but `preset = None` means
+    // there's no aggregate to collapse to.
+    let mut sink = WarningSink::log();
+    let outcomes = vec![BuildOutcome::PresetSkipped {
+        column: "ghost_column".into(),
+        reason: SkipReason::MissingColumn,
+    }];
+    process_predicate_index_outcomes(outcomes, "obs", None, 0, &[], &mut sink).unwrap();
+    assert_eq!(sink.counts().get("missing_preset_index_column"), Some(&1));
+    assert_eq!(sink.counts().get("preset_no_columns_matched"), None);
+}
+
+// -----------------------------------------------------------------------
+// E2-2026-05-20: forced_column_missing_message renders an actionable
+// "available columns" list and an optional did-you-mean suggestion.
+// -----------------------------------------------------------------------
+
+#[test]
+fn forced_column_missing_message_lists_available_columns() {
+    use super::pipeline::forced_column_missing_message;
+    let avail = vec![
+        "total_counts".to_string(),
+        "n_genes_by_counts".to_string(),
+        "pct_counts_mt".to_string(),
+    ];
+    let msg = forced_column_missing_message("obs", "nonexistent_column", &avail);
+    assert!(
+        msg.contains("forced obs index column 'nonexistent_column'"),
+        "{msg}"
+    );
+    assert!(msg.contains("missing column."), "{msg}");
+    assert!(msg.contains("total_counts"), "{msg}");
+    assert!(msg.contains("n_genes_by_counts"), "{msg}");
+    // No did-you-mean — none of the available columns are close.
+    assert!(!msg.contains("Did you mean"), "{msg}");
+}
+
+#[test]
+fn forced_column_missing_message_suggests_typo() {
+    use super::pipeline::forced_column_missing_message;
+    let avail = vec!["total_counts".to_string(), "n_genes_by_counts".to_string()];
+    let msg = forced_column_missing_message("obs", "totl_counts", &avail);
+    assert!(msg.contains("Did you mean 'total_counts'?"), "{msg}");
+}
+
+#[test]
+fn forced_column_missing_message_no_suggestion_when_far() {
+    use super::pipeline::forced_column_missing_message;
+    let avail = vec!["foo".to_string(), "bar".to_string()];
+    // 'cell_type' is far from both → no suggestion.
+    let msg = forced_column_missing_message("obs", "cell_type", &avail);
+    assert!(!msg.contains("Did you mean"), "{msg}");
+    assert!(msg.contains("foo") && msg.contains("bar"), "{msg}");
+}
+
+#[test]
+fn forced_column_missing_message_handles_empty_available() {
+    use super::pipeline::forced_column_missing_message;
+    let msg = forced_column_missing_message("obs", "total_counts", &[]);
+    assert!(
+        msg.contains("Available obs columns: [] (this h5ad has no obs metadata)"),
+        "{msg}"
+    );
+    assert!(!msg.contains("Did you mean"), "{msg}");
+}
+
+#[test]
+fn forced_column_missing_message_truncates_long_available_lists() {
+    use super::pipeline::forced_column_missing_message;
+    let avail: Vec<String> = (0..20).map(|i| format!("col_{i}")).collect();
+    let msg = forced_column_missing_message("var", "missing", &avail);
+    assert!(msg.contains(", ..."), "should signal truncation: {msg}");
+    assert!(msg.contains("col_0") && msg.contains("col_7"), "{msg}");
+    assert!(
+        !msg.contains("col_15"),
+        "should not list past index 7: {msg}"
+    );
+}
