@@ -570,3 +570,67 @@ def test_to_anndata_backed_aligned_slots_lazy(tmp_dir):
     np.testing.assert_allclose(
         backed.varm["PCs"], adata.varm["PCs"], atol=1e-6
     )
+
+
+def test_to_anndata_values_items_are_lazy(tmp_dir):
+    """`values()` and `items()` on the lazy bridges return per-entry
+    iterators (not pre-materialised lists). Each `next()` step pulls
+    exactly one entry through the cache."""
+    import pyscx
+
+    rng = np.random.default_rng(606)
+    adata = _make_adata_with_aligned_slots(rng)
+    path = str(tmp_dir / "iter.scx")
+    pyscx.from_anndata(adata, path)
+
+    obsp = pyscx.open(path).to_anndata()._obsp
+    assert type(obsp).__name__ == "ScxLazyPairwiseMapping"
+    # 2 obsp keys present, 0 materialised at construction time
+    assert "0 materialized" in repr(obsp)
+
+    vit = obsp.values()
+    assert type(vit).__name__ == "ScxLazyValueIterator"
+    assert iter(vit) is vit  # __iter__ returns self
+    next(vit)
+    assert "1 materialized" in repr(obsp)
+    next(vit)
+    assert "2 materialized" in repr(obsp)
+
+    # items() yields (key, value) tuples lazily on a fresh bridge.
+    obsp2 = pyscx.open(path).to_anndata()._obsp
+    iit = obsp2.items()
+    assert type(iit).__name__ == "ScxLazyItemIterator"
+    assert "0 materialized" in repr(obsp2)
+    k, v = next(iit)
+    assert isinstance(k, str)
+    assert v is not None
+    assert "1 materialized" in repr(obsp2)
+
+    # list() drains the iterator and matches len()
+    obsp3 = pyscx.open(path).to_anndata()._obsp
+    drained = list(obsp3.values())
+    assert len(drained) == len(obsp3)
+
+
+def test_to_anndata_get_propagates_non_keyerror(tmp_dir):
+    """`get()` returns `default` only for missing keys; real keys still
+    return the decoded value. (Decode-failure propagation is hard to
+    reproduce without a corrupted fixture, so the present-key + missing-
+    key paths are the testable contract.)"""
+    import pyscx
+
+    rng = np.random.default_rng(707)
+    adata = _make_adata_with_aligned_slots(rng)
+    path = str(tmp_dir / "get.scx")
+    pyscx.from_anndata(adata, path)
+    lazy = pyscx.open(path).to_anndata()
+
+    # Missing key → default sentinel
+    sentinel = object()
+    assert lazy._obsp.get("does_not_exist", sentinel) is sentinel
+    # Missing key, no default → None
+    assert lazy._obsp.get("also_missing") is None
+    # Present key → real value (not the default)
+    v = lazy._obsp.get("connectivities", sentinel)
+    assert v is not sentinel
+    assert v is not None

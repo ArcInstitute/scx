@@ -122,10 +122,15 @@ impl ScxLazyPairwiseMapping {
             _ => coo_record_batch_to_scipy(py, &batch)?,
         };
         let obj: PyObject = bound.unbind();
-        self.state
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), Some(obj.clone_ref(py)));
+        let mut state = self.state.lock().unwrap();
+        // Re-check: a concurrent fetch may have populated the slot while
+        // we were decoding. Return whatever's already there so callers
+        // converge on the same PyObject identity (the `a is b` invariant
+        // asserted by `test_to_anndata_obsp_is_lazy`).
+        if let Some(Some(cached)) = state.get(key) {
+            return Ok(cached.clone_ref(py));
+        }
+        state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
     }
 }
@@ -168,31 +173,40 @@ impl ScxLazyPairwiseMapping {
         PyList::new(py, &keys)
     }
 
-    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
-        let list = PyList::empty(py);
-        for k in keys {
-            list.append(self.fetch(py, &k)?)?;
-        }
-        Ok(list)
+    fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyValueIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
     }
 
-    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
-        let list = PyList::empty(py);
-        for k in keys {
-            let v = self.fetch(py, &k)?;
-            let tuple = PyTuple::new(py, &[k.into_pyobject(py)?.into_any(), v.into_bound(py)])?;
-            list.append(tuple)?;
-        }
-        Ok(list)
+    fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyItemIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyObject {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
         match self.fetch(py, key) {
-            Ok(v) => v,
-            Err(_) => default.unwrap_or_else(|| py.None()),
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<PyKeyError>(py) => {
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -250,10 +264,12 @@ impl ScxLazyVarmMapping {
         let batch = self.reader.read_varm(key).map_err(to_pyerr)?;
         let bound = obsm_batch_to_numpy(py, &batch)?;
         let obj: PyObject = bound.unbind();
-        self.state
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), Some(obj.clone_ref(py)));
+        let mut state = self.state.lock().unwrap();
+        // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
+        if let Some(Some(cached)) = state.get(key) {
+            return Ok(cached.clone_ref(py));
+        }
+        state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
     }
 }
@@ -296,31 +312,40 @@ impl ScxLazyVarmMapping {
         PyList::new(py, &keys)
     }
 
-    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
-        let list = PyList::empty(py);
-        for k in keys {
-            list.append(self.fetch(py, &k)?)?;
-        }
-        Ok(list)
+    fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyValueIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
     }
 
-    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
-        let list = PyList::empty(py);
-        for k in keys {
-            let v = self.fetch(py, &k)?;
-            let tuple = PyTuple::new(py, &[k.into_pyobject(py)?.into_any(), v.into_bound(py)])?;
-            list.append(tuple)?;
-        }
-        Ok(list)
+    fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyItemIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyObject {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
         match self.fetch(py, key) {
-            Ok(v) => v,
-            Err(_) => default.unwrap_or_else(|| py.None()),
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<PyKeyError>(py) => {
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -386,10 +411,12 @@ impl ScxLazyLayersMapping {
         let csr = self.reader.read_layer_filtered(key).map_err(to_pyerr)?;
         let bound = csr_to_scipy(py, csr)?;
         let obj: PyObject = bound.unbind();
-        self.state
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), Some(obj.clone_ref(py)));
+        let mut state = self.state.lock().unwrap();
+        // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
+        if let Some(Some(cached)) = state.get(key) {
+            return Ok(cached.clone_ref(py));
+        }
+        state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
     }
 }
@@ -432,31 +459,40 @@ impl ScxLazyLayersMapping {
         PyList::new(py, &keys)
     }
 
-    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
-        let list = PyList::empty(py);
-        for k in keys {
-            list.append(self.fetch(py, &k)?)?;
-        }
-        Ok(list)
+    fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyValueIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
     }
 
-    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
-        let list = PyList::empty(py);
-        for k in keys {
-            let v = self.fetch(py, &k)?;
-            let tuple = PyTuple::new(py, &[k.into_pyobject(py)?.into_any(), v.into_bound(py)])?;
-            list.append(tuple)?;
-        }
-        Ok(list)
+    fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyItemIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyObject {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
         match self.fetch(py, key) {
-            Ok(v) => v,
-            Err(_) => default.unwrap_or_else(|| py.None()),
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<PyKeyError>(py) => {
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -468,5 +504,58 @@ impl ScxLazyLayersMapping {
             "ScxLazyLayersMapping({} keys, {} materialized)",
             n_keys, n_cached
         )
+    }
+}
+
+/// Lazy iterator over the values of an `ScxLazy*Mapping`. Each
+/// `__next__` call delegates to the parent's `__getitem__` (which
+/// routes through the parent's `fetch`, so it picks up the same caching
+/// + double-checked-insert behaviour). Holds the parent as
+/// `Py<PyAny>` rather than a typed handle so a single iterator class
+/// works for all three mapping kinds.
+#[pyclass(name = "ScxLazyValueIterator")]
+pub struct ScxLazyValueIterator {
+    parent: Py<PyAny>,
+    keys: std::vec::IntoIter<String>,
+}
+
+#[pymethods]
+impl ScxLazyValueIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+        let py = slf.py();
+        let Some(k) = slf.keys.next() else {
+            return Ok(None);
+        };
+        let v = slf.parent.bind(py).get_item(&k)?;
+        Ok(Some(v.unbind()))
+    }
+}
+
+/// Lazy iterator over `(key, value)` pairs of an `ScxLazy*Mapping`.
+/// See [`ScxLazyValueIterator`].
+#[pyclass(name = "ScxLazyItemIterator")]
+pub struct ScxLazyItemIterator {
+    parent: Py<PyAny>,
+    keys: std::vec::IntoIter<String>,
+}
+
+#[pymethods]
+impl ScxLazyItemIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+        let py = slf.py();
+        let Some(k) = slf.keys.next() else {
+            return Ok(None);
+        };
+        let v = slf.parent.bind(py).get_item(&k)?;
+        let tup = PyTuple::new(py, &[k.into_pyobject(py)?.into_any(), v])?;
+        Ok(Some(tup.into_any().unbind()))
     }
 }
