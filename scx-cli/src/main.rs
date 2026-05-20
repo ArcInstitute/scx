@@ -32,7 +32,7 @@ mod pull;
 mod push;
 
 #[derive(Parser)]
-#[command(name = "scx", about = "SCX file format tool")]
+#[command(name = "scx", about = "SCX file format tool", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

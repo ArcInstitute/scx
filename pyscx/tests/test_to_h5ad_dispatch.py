@@ -131,3 +131,15 @@ def test_from_h5mu_rejects_experiment_handle(src_h5ad, tmp_path):
     exp = pyscx.open(scx_path)
     with pytest.raises(TypeError, match="SCX Experiment"):
         pyscx.from_h5mu(exp, tmp_path / "should_not_exist.scx")
+
+
+def test_to_h5ad_bad_type_raises_scx_specific(tmp_path):
+    """E2 regression: when callers pass something that isn't a
+    str / os.PathLike / pyscx.Experiment, the wrapper must raise a
+    scx-named TypeError naming the expected types and the actual one,
+    instead of the bare `os.fspath` message."""
+    import pyscx
+    with pytest.raises(TypeError, match=r"pyscx expects .* got list"):
+        pyscx.to_h5ad([], tmp_path / "x.h5ad")
+    with pytest.raises(TypeError, match=r"pyscx expects .* got dict"):
+        pyscx.from_h5ad({}, tmp_path / "x.scx")

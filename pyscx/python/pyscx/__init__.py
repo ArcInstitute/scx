@@ -4,10 +4,23 @@ This module re-exports everything from the native Rust extension module
 and provides pure-Python integration packages (e.g., scx_integrations).
 """
 
+from importlib.metadata import (
+    PackageNotFoundError as _PkgNotFound,
+    version as _pkg_version,
+)
+
+try:
+    __version__ = _pkg_version("pyscx")
+except _PkgNotFound:
+    # Editable install before `maturin develop` has materialised
+    # distribution metadata — keep a sentinel rather than raising.
+    __version__ = "0.0.0+dev"
+del _pkg_version, _PkgNotFound
+
 # Re-export everything from the native Rust extension module.
 # The compiled .so/.pyd is named "pyscx.pyscx" internally by maturin.
-from .pyscx import *  # noqa: F401, F403
-from .pyscx import ScxBackedSparseDataset, ScxBackedLayerDataset
+from .pyscx import *  # noqa: F401, F403, E402
+from .pyscx import ScxBackedSparseDataset, ScxBackedLayerDataset  # noqa: E402
 
 # Thin Python wrappers around the native entry points so they accept
 # `os.PathLike` (e.g. `pathlib.Path`) and — for the SCX-side
@@ -58,8 +71,17 @@ def _coerce_path(p, *, allow_experiment: bool = True):
                 "not an already-converted SCX file."
             )
         return path_attr
-    # Last resort: let os.fspath raise its canonical TypeError.
-    fspath = _os.fspath(p)
+    # Last resort: re-raise os.fspath's TypeError with a scx-specific
+    # message naming the expected types, so users hitting the boundary
+    # see "pyscx expects ..." instead of the generic "expected str, bytes
+    # or os.PathLike object, not list".
+    try:
+        fspath = _os.fspath(p)
+    except TypeError:
+        expected = "str | os.PathLike | pyscx.Experiment" if allow_experiment else "str | os.PathLike"
+        raise TypeError(
+            f"pyscx expects {expected}; got {type(p).__name__}"
+        ) from None
     return fspath.decode() if isinstance(fspath, bytes) else fspath
 
 
