@@ -240,6 +240,13 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let batch = scx_format::upcast_to_large_types(batch)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // Defensive: stamp pandas `index_columns` metadata if the schema
+    // carries a literal `__index_level_0__` / `_index` column without
+    // it. anndata 0.10+ hard-rejects `_index` as a regular DataFrame
+    // column on `write_h5ad`, so this prevents `_index` from leaking
+    // into `df.columns` regardless of how the underlying SCX was
+    // written. See `scx_format::ensure_pandas_index_metadata` doc.
+    let batch = scx_format::ensure_pandas_index_metadata(&batch);
     // Serialize to Arrow IPC file format
     let mut buf = Vec::new();
     {
@@ -262,12 +269,148 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 }
 
 /// Convert a pyarrow Table to a pandas DataFrame.
+///
+/// Branches on the schema's `pandas` metadata envelope shape:
+///
+/// - **No envelope** → plain `Table.to_pandas()`.
+/// - **Full envelope** (from `pyarrow.Table.from_pandas`, preserved
+///   verbatim through the SCX on-disk round-trip) → plain
+///   `Table.to_pandas()`. pyarrow natively restores the index name,
+///   multi-level indexes, and pandas-extension dtypes (`Int64`,
+///   `boolean`, `Categorical`, …) from the envelope.
+/// - **Minimal envelope** `{"index_columns": [...]}` (stamped by
+///   `scx-convert/src/h5ad_read.rs::read_dataframe_group` and
+///   `scx_format::ensure_pandas_index_metadata`) → `Table.to_pandas()`
+///   KeyErrors on the missing `columns` field, so strip the `pandas`
+///   key first, then `set_index(drop=True, inplace=True)` manually.
+///   The `__index_level_0__` sentinel becomes `df.index.name = None`
+///   to match anndata semantics for an unnamed index.
 pub(crate) fn pyarrow_table_to_pandas<'py>(
     table: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let kwargs = pyo3::types::PyDict::new(table.py());
+    let py = table.py();
+    let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("self_destruct", true)?;
-    table.call_method("to_pandas", (), Some(&kwargs))
+
+    let Some(info) = extract_scx_envelope_info(table)? else {
+        return table.call_method("to_pandas", (), Some(&kwargs));
+    };
+    if !info.is_minimal {
+        // Full pyarrow envelope: let to_pandas() restore dtypes and
+        // index natively.
+        return table.call_method("to_pandas", (), Some(&kwargs));
+    }
+
+    // Minimal envelope: strip + manual set_index.
+    let stripped = strip_pandas_metadata(table)?;
+    let df = stripped.call_method("to_pandas", (), Some(&kwargs))?;
+    let set_idx_kwargs = pyo3::types::PyDict::new(py);
+    set_idx_kwargs.set_item("drop", true)?;
+    set_idx_kwargs.set_item("inplace", true)?;
+    df.call_method(
+        "set_index",
+        (info.index_col.as_str(),),
+        Some(&set_idx_kwargs),
+    )?;
+    if info.index_col == "__index_level_0__" {
+        df.getattr("index")?.setattr("name", py.None())?;
+    }
+    Ok(df)
+}
+
+/// Shape of the pandas-metadata envelope on a pyarrow Table's schema,
+/// as it concerns `pyarrow_table_to_pandas`.
+struct EnvelopeInfo {
+    /// First string entry from `index_columns` — the column to use as
+    /// the DataFrame index on the minimal-envelope branch.
+    index_col: String,
+    /// `true` when the envelope is the bare `{"index_columns": [...]}`
+    /// shape stamped by `scx-convert/src/h5ad_read.rs` and
+    /// `scx_format::ensure_pandas_index_metadata`. `false` when the
+    /// envelope is the full pyarrow shape stamped by
+    /// `pyarrow.Table.from_pandas` (carries `columns`,
+    /// `column_indexes`, `pandas_version`, `creator`).
+    is_minimal: bool,
+}
+
+/// Parse the schema's `pandas` metadata envelope, if any. Distinguishes
+/// the minimal envelope (KeyError-on-`to_pandas`, must be stripped) from
+/// the full envelope (carries dtype hints, must be preserved so
+/// pandas-extension dtypes and multi-level indexes round-trip).
+fn extract_scx_envelope_info<'py>(table: &Bound<'py, PyAny>) -> PyResult<Option<EnvelopeInfo>> {
+    let schema = table.getattr("schema")?;
+    let metadata = schema.getattr("metadata")?;
+    if metadata.is_none() {
+        return Ok(None);
+    }
+    // metadata behaves like a dict {bytes: bytes}.
+    let raw = match metadata.get_item("pandas") {
+        Ok(v) => v,
+        Err(_) => match metadata.get_item(pyo3::types::PyBytes::new(table.py(), b"pandas")) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        },
+    };
+    let raw_bytes: &[u8] = if let Ok(b) = raw.downcast::<pyo3::types::PyBytes>() {
+        b.as_bytes()
+    } else if let Ok(s) = raw.extract::<&str>() {
+        s.as_bytes()
+    } else {
+        return Ok(None);
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(raw_bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let idx = parsed
+        .get("index_columns")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.iter().find_map(|v| v.as_str().map(String::from)));
+    let Some(index_col) = idx else {
+        return Ok(None);
+    };
+    // pyarrow's full envelope (from `Table.from_pandas`) always carries
+    // a `columns` array alongside `index_columns`. The minimal envelope
+    // stamped by `read_dataframe_group` /
+    // `ensure_pandas_index_metadata` has only `index_columns`.
+    let is_minimal = !parsed.get("columns").is_some_and(|v| v.is_array());
+    Ok(Some(EnvelopeInfo {
+        index_col,
+        is_minimal,
+    }))
+}
+
+/// Drop the `pandas` key from `table.schema.metadata`, returning a
+/// new pyarrow Table with the rest of the schema metadata preserved.
+fn strip_pandas_metadata<'py>(table: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = table.py();
+    let schema = table.getattr("schema")?;
+    let metadata = schema.getattr("metadata")?;
+    if metadata.is_none() {
+        return Ok(table.clone());
+    }
+    let dict = pyo3::types::PyDict::new(py);
+    let items = metadata.call_method0("items")?;
+    let iter = items.try_iter()?;
+    for item in iter {
+        let item = item?;
+        let key = item.get_item(0)?;
+        let value = item.get_item(1)?;
+        let key_bytes: &[u8] = if let Ok(b) = key.downcast::<pyo3::types::PyBytes>() {
+            b.as_bytes()
+        } else if let Ok(s) = key.extract::<&str>() {
+            s.as_bytes()
+        } else {
+            // Pass unknown key shapes through unchanged.
+            dict.set_item(key, value)?;
+            continue;
+        };
+        if key_bytes == b"pandas" {
+            continue;
+        }
+        dict.set_item(key, value)?;
+    }
+    table.call_method1("replace_schema_metadata", (dict,))
 }
 
 /// Convert an ScxCsr to a scipy.sparse.csr_matrix via zero-copy numpy arrays.

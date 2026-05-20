@@ -346,29 +346,96 @@ pub fn read_dataframe_group(
         }
     }
 
-    if fields.is_empty() {
-        // Index-only frame: `column-order` was absent or length-0
-        // (anndata's own emission for a dataframe with no columns,
-        // and this crate's writer does the same — see
-        // `h5ad_write::write_dataframe_body`). The normal loop above
-        // never visited the index dataset because `column-order`
-        // excludes it by convention. Read the dataset named by the
-        // `_index` HDF5 attribute directly so obs_names / var_names
-        // survive the round-trip instead of being silently replaced
-        // with empty strings.
-        if let Some(ref idx_name) = index_col_name {
-            if let Ok(ds) = group.dataset(idx_name) {
-                let (field, array) = read_column_to_arrow(&group, &ds, "_index")?;
-                let schema = Schema::new(vec![field]);
-                return Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?);
+    // Inject the pandas index column (referenced by the `_index` HDF5
+    // attribute) into the RecordBatch. `column-order` excludes it by
+    // anndata convention, so the loop above never visited it — yet
+    // downstream consumers (`scx_format::pandas_index_columns`, used
+    // by `pyscx.open(...).to_anndata()` and by
+    // `scx-convert/src/h5ad_write.rs::write_dataframe_body`) rely on
+    // the resulting schema's `pandas` metadata envelope to identify
+    // which column is the index. Without this block, obs_names /
+    // var_names silently default to integer-positional strings.
+    //
+    // Rename the literal `_index` (anndata's on-disk sentinel for an
+    // unnamed pandas index) to `__index_level_0__` (pyarrow's
+    // canonical name). The inverse rename lives in
+    // `scx-convert/src/h5ad_write.rs::write_dataframe_body`'s
+    // `Some("__index_level_0__") => "_index"` arm — together they
+    // round-trip an unnamed pandas index byte-equivalent through SCX.
+    let mut injected_index_field_name: Option<String> = None;
+    if let Some(ref idx_name) = index_col_name {
+        let on_arrow_name = if idx_name == "_index" {
+            "__index_level_0__".to_string()
+        } else {
+            idx_name.clone()
+        };
+        if let Some(existing_pos) = fields.iter().position(|f| f.name() == idx_name) {
+            // The index dataset already got picked up by the main loop
+            // (e.g. when `column-order` is absent and we fell back to
+            // `member_names`, which includes the `_index` dataset).
+            // Rename it in-place so downstream consumers see the
+            // canonical `__index_level_0__` instead of the on-disk
+            // `_index` sentinel.
+            if &on_arrow_name != idx_name {
+                let old = fields[existing_pos].clone();
+                fields[existing_pos] = Field::new(
+                    on_arrow_name.clone(),
+                    old.data_type().clone(),
+                    old.is_nullable(),
+                )
+                .with_metadata(old.metadata().clone());
+            }
+            injected_index_field_name = Some(on_arrow_name);
+        } else {
+            let read_result: Option<Result<(Field, ArrayRef), ConvertError>> =
+                if let Ok(ds) = group.dataset(idx_name) {
+                    Some(read_column_to_arrow(&group, &ds, &on_arrow_name))
+                } else if let Ok(subgroup) = group.group(idx_name) {
+                    // The pandas index is unusual-but-legal as a
+                    // categorical / nullable-boolean subgroup; preserve
+                    // it the same way regular columns are handled.
+                    let enc = subgroup
+                        .attr("encoding-type")
+                        .ok()
+                        .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    match enc.as_str() {
+                        "categorical" => Some(read_categorical_group(&subgroup, &on_arrow_name)),
+                        "nullable-boolean" => {
+                            Some(read_nullable_boolean_group(&subgroup, &on_arrow_name))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            if let Some(res) = read_result {
+                let (field, array) = res?;
+                fields.push(field);
+                arrays.push(array);
+                injected_index_field_name = Some(on_arrow_name);
             }
         }
+    }
+
+    if fields.is_empty() {
+        // Truly empty dataframe — no columns and no readable index.
+        // Preserve the historic single-column-of-utf8 shape so
+        // downstream consumers that expect *something* don't crash.
         let schema = Schema::new(vec![Field::new("_index", DataType::Utf8, true)]);
         let empty_arr: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
         return Ok(RecordBatch::try_new(Arc::new(schema), vec![empty_arr])?);
     }
 
-    let schema = Schema::new(fields);
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    if let Some(ref idx_field_name) = injected_index_field_name {
+        metadata.insert(
+            "pandas".to_string(),
+            serde_json::json!({"index_columns": [idx_field_name]}).to_string(),
+        );
+    }
+    let schema = Schema::new(fields).with_metadata(metadata);
     Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
 }
 

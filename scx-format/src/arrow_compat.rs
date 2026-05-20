@@ -212,6 +212,55 @@ pub fn pandas_index_columns(schema: &Schema) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Defensive: ensure the schema's `pandas` metadata envelope identifies
+/// the index column when the batch carries a literal `__index_level_0__`
+/// or `_index` field but no metadata. anndata 0.10+ hard-rejects any
+/// DataFrame column called `_index` on `write_h5ad`, so a missing
+/// envelope here means downstream `pyarrow.Table.to_pandas()` will leak
+/// `_index` into `df.columns` and the user's first `adata.write_h5ad`
+/// crashes. The B1 reader-side fix stamps this envelope on every
+/// CLI-produced SCX; this helper is the belt-and-braces for any other
+/// path (legacy files, third-party writers, future regressions).
+///
+/// Behaviour:
+/// - If `pandas_index_columns` already returns a non-empty list →
+///   return `batch.clone()` (no-op).
+/// - Else scan `schema.fields()` for the first match of
+///   `"__index_level_0__"`, then `"_index"`. pyarrow's name wins so a
+///   round-tripped envelope stays canonical.
+/// - If neither is present → return `batch.clone()` (no spurious
+///   metadata for files that legitimately have no index column).
+pub fn ensure_pandas_index_metadata(batch: &RecordBatch) -> RecordBatch {
+    if !pandas_index_columns(batch.schema_ref()).is_empty() {
+        return batch.clone();
+    }
+    let candidates = ["__index_level_0__", "_index"];
+    let schema = batch.schema();
+    let idx_name: Option<String> = candidates
+        .iter()
+        .find(|name| schema.field_with_name(name).is_ok())
+        .map(|s| s.to_string());
+    let Some(idx_name) = idx_name else {
+        return batch.clone();
+    };
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(
+        "pandas".to_string(),
+        serde_json::json!({"index_columns": [idx_name]}).to_string(),
+    );
+    let new_schema = Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+    )
+    .with_metadata(metadata);
+    // Safe: same arrays, same field count, same dtypes.
+    RecordBatch::try_new(std::sync::Arc::new(new_schema), batch.columns().to_vec())
+        .expect("ensure_pandas_index_metadata: schema/columns mismatch")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +462,82 @@ mod tests {
         assert_eq!(downcast.schema().metadata(), &schema_md);
         assert_eq!(downcast.schema().field(0).metadata(), &field_md);
         assert_eq!(downcast.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    // -------------------------------------------------------------
+    // B2-2026-05-20: ensure_pandas_index_metadata defensive helper
+    // -------------------------------------------------------------
+
+    #[test]
+    fn ensure_pandas_index_metadata_noop_when_already_set() {
+        use std::collections::HashMap;
+        let mut schema_md = HashMap::new();
+        schema_md.insert(
+            "pandas".to_string(),
+            r#"{"index_columns":["__index_level_0__"]}"#.to_string(),
+        );
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("__index_level_0__", DataType::Utf8, true)])
+                .with_metadata(schema_md.clone()),
+        );
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let out = ensure_pandas_index_metadata(&batch);
+        assert_eq!(out.schema().metadata(), &schema_md);
+        assert_eq!(
+            pandas_index_columns(out.schema_ref()),
+            vec!["__index_level_0__".to_string()]
+        );
+    }
+
+    #[test]
+    fn ensure_pandas_index_metadata_promotes_double_underscore() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let batch = batch_from(vec![("__index_level_0__", DataType::Utf8, arr)]);
+        assert!(pandas_index_columns(batch.schema_ref()).is_empty());
+        let out = ensure_pandas_index_metadata(&batch);
+        assert_eq!(
+            pandas_index_columns(out.schema_ref()),
+            vec!["__index_level_0__".to_string()]
+        );
+    }
+
+    #[test]
+    fn ensure_pandas_index_metadata_promotes_single_underscore() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let batch = batch_from(vec![("_index", DataType::Utf8, arr)]);
+        assert!(pandas_index_columns(batch.schema_ref()).is_empty());
+        let out = ensure_pandas_index_metadata(&batch);
+        assert_eq!(
+            pandas_index_columns(out.schema_ref()),
+            vec!["_index".to_string()]
+        );
+    }
+
+    #[test]
+    fn ensure_pandas_index_metadata_double_underscore_wins_over_single() {
+        // Both `__index_level_0__` and `_index` are present (pathological
+        // but legal). pyarrow's canonical name wins.
+        let a1: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let a2: ArrayRef = Arc::new(StringArray::from(vec!["c", "d"]));
+        let batch = batch_from(vec![
+            ("_index", DataType::Utf8, a1),
+            ("__index_level_0__", DataType::Utf8, a2),
+        ]);
+        let out = ensure_pandas_index_metadata(&batch);
+        assert_eq!(
+            pandas_index_columns(out.schema_ref()),
+            vec!["__index_level_0__".to_string()]
+        );
+    }
+
+    #[test]
+    fn ensure_pandas_index_metadata_noop_when_neither_present() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let batch = batch_from(vec![("cell_id", DataType::Utf8, arr)]);
+        let out = ensure_pandas_index_metadata(&batch);
+        assert!(out.schema().metadata().get("pandas").is_none());
+        assert!(pandas_index_columns(out.schema_ref()).is_empty());
     }
 
     #[test]
