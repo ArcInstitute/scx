@@ -77,9 +77,10 @@ pyscx.from_h5ad(
     f"{data}/pbmc10k.h5ad",
     f"{data}/pbmc10k_v2.scx",
     stream=True,
-    index_obs=["total_counts", "n_genes_by_counts"],
 )
 ```
+
+(Tier 1 doesn't run any `pyscx.open(...).query().filter_obs(...)` against the resulting SCX, so there's nothing for `index_obs=...` to accelerate. The raw pbmc10k file also has no obs columns yet — QC metrics like `total_counts` / `n_genes_by_counts` are added later by `accel.calculate_qc_metrics`. Tier 2's `index_obs` example is the right place to see this kwarg in action.)
 
 **Analyze in Python** (the realistic scientist surface):
 

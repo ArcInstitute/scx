@@ -10,6 +10,7 @@
 // conversion.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use scx_format::modality::ModalityType;
 
@@ -24,8 +25,20 @@ pub enum ConvertWarning {
     /// An `uns` entry could not be represented and was skipped.
     SkippedUnsKey { key: String, reason: String },
     /// A column requested via `--index-preset` was missing from the
-    /// source DataFrame.
+    /// source DataFrame. Emitted for partial preset/file mismatch only —
+    /// when EVERY preset column is missing, the convert layer batches
+    /// the burst into a single `PresetNoColumnsMatched` warning with
+    /// actionable copy.
     MissingPresetIndexColumn { column: String },
+    /// `--index-preset <preset>` matched **none** of the source obs/var
+    /// columns. The user almost certainly picked the wrong preset for
+    /// the input format, so we collapse the 10+ per-column warnings
+    /// into a single actionable diagnosis pointing at the fix.
+    PresetNoColumnsMatched {
+        preset: String,
+        axis: String,
+        missing: Vec<String>,
+    },
     /// A column was eligible for indexing by name but unsupported by
     /// dtype, cardinality, or null density.
     UnsupportedIndexColumn { column: String, reason: String },
@@ -85,6 +98,7 @@ impl ConvertWarning {
             Self::InferredEncoding { .. } => "inferred_encoding",
             Self::SkippedUnsKey { .. } => "skipped_uns_key",
             Self::MissingPresetIndexColumn { .. } => "missing_preset_index_column",
+            Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
             Self::UnsupportedIndexColumn { .. } => "unsupported_index_column",
             Self::DroppedObsp { .. } => "dropped_obsp",
             Self::ModalityTypeInferred { .. } => "modality_type_inferred",
@@ -95,6 +109,38 @@ impl ConvertWarning {
             Self::BitmapSkipped { .. } => "bitmap_skipped",
             Self::Hdf5NotThreadsafe => "hdf5_not_threadsafe",
             Self::ReaderThreadsDerated { .. } => "reader_threads_derated",
+        }
+    }
+}
+
+impl fmt::Display for ConvertWarning {
+    /// Human-readable rendering used by `WarningSink::log()`. The
+    /// special-cased variant is `PresetNoColumnsMatched`, which earns a
+    /// single actionable sentence; every other variant falls back to
+    /// the derived `Debug` shape (preserves the prior log format).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PresetNoColumnsMatched {
+                preset,
+                axis,
+                missing,
+            } => {
+                let preview_count = missing.len().min(3);
+                let preview = missing[..preview_count].join(", ");
+                let suffix = if missing.len() > preview_count {
+                    ", ..."
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "--index-preset {preset} expects {n} {axis} columns ({preview}{suffix}) \
+                     but the input file has none of them. Drop --index-preset, or use \
+                     --index-{axis} <col>,... to pick existing columns.",
+                    n = missing.len(),
+                )
+            }
+            other => write!(f, "{other:?}"),
         }
     }
 }
@@ -111,9 +157,13 @@ pub struct WarningSink {
 
 impl WarningSink {
     /// Build a sink that forwards each warning to `log::warn!`.
+    /// Uses `Display`, which gives `PresetNoColumnsMatched` its
+    /// actionable single-sentence rendering; every other variant
+    /// falls through to the derived `Debug` shape via
+    /// [`ConvertWarning`]'s `Display` impl.
     pub fn log() -> Self {
         Self {
-            on_warning: Box::new(|w| log::warn!("{:?}", w)),
+            on_warning: Box::new(|w| log::warn!("{w}")),
             counts: BTreeMap::new(),
         }
     }
@@ -201,6 +251,38 @@ mod tests {
         });
         let s = sink.summary_json();
         assert_eq!(s["inferred_encoding"], serde_json::Value::from(1u64));
+    }
+
+    #[test]
+    fn preset_no_columns_matched_display_includes_actionable_text() {
+        let w = ConvertWarning::PresetNoColumnsMatched {
+            preset: "cellxgene".into(),
+            axis: "obs".into(),
+            missing: vec![
+                "cell_type".into(),
+                "cell_type_ontology_term_id".into(),
+                "tissue".into(),
+                "tissue_ontology_term_id".into(),
+            ],
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("--index-preset cellxgene"), "{rendered}");
+        assert!(rendered.contains("4 obs columns"), "{rendered}");
+        assert!(
+            rendered.contains("cell_type, cell_type_ontology_term_id, tissue"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(", ..."), "{rendered}");
+        assert!(rendered.contains("Drop --index-preset"), "{rendered}");
+        assert!(rendered.contains("--index-obs"), "{rendered}");
+    }
+
+    #[test]
+    fn other_variants_display_falls_back_to_debug() {
+        let w = ConvertWarning::MissingPresetIndexColumn {
+            column: "feature_name".into(),
+        };
+        assert_eq!(format!("{w}"), format!("{w:?}"));
     }
 
     #[test]

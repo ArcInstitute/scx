@@ -16,6 +16,9 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 roaring = { workspace = true }
 byteorder = { workspace = true }
+# E2-2026-05-20: `did you mean ...?` suggestion rendered by
+# `index::forced_column_missing_message` for forced-column errors.
+strsim = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
