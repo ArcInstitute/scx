@@ -41,7 +41,7 @@ jobs:
             --strip
             --out dist
             --interpreter python${{ matrix.python-version }}
-            --features cloud
+            --features hdf5-static,cloud
 
       - name: List built wheels
         run: ls -lh pyscx/dist
