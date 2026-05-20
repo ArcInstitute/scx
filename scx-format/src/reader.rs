@@ -499,6 +499,21 @@ impl ScxReader {
         Ok(result)
     }
 
+    /// Read a named obsp pairwise sparse matrix (COO format).
+    ///
+    /// Lazy counterpart to [`Self::read_all_obsp`]: used by
+    /// `pyscx::lazy_mapping::ScxLazyPairwiseMapping` so `to_anndata()`
+    /// can defer obsp materialization until the consumer actually
+    /// accesses `ad.obsp[name]`.
+    pub fn read_obsp(&self, name: &str) -> Result<RecordBatch> {
+        let key = format!("obsp/{name}");
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or_else(|| ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc(entry)
+    }
+
     /// Read all obsp pairwise sparse matrices (COO format), keyed by name.
     pub fn read_all_obsp(&self) -> Result<HashMap<String, RecordBatch>> {
         let mut result = HashMap::new();
@@ -516,6 +531,18 @@ impl ScxReader {
         Ok(result)
     }
 
+    /// Read a named varp pairwise sparse matrix (COO format).
+    ///
+    /// Lazy counterpart to [`Self::read_all_varp`]; see [`Self::read_obsp`].
+    pub fn read_varp(&self, name: &str) -> Result<RecordBatch> {
+        let key = format!("varp/{name}");
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or_else(|| ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc(entry)
+    }
+
     /// Read all varp pairwise sparse matrices (COO format), keyed by name.
     pub fn read_all_varp(&self) -> Result<HashMap<String, RecordBatch>> {
         let mut result = HashMap::new();
@@ -531,6 +558,39 @@ impl ScxReader {
             }
         }
         Ok(result)
+    }
+
+    /// List the keys (entry names with their section prefix stripped) of
+    /// every `obsp/*` catalog entry. Pure catalog scan — no section
+    /// bytes are read. Used by `pyscx::lazy_mapping` to pre-populate the
+    /// key set of the lazy obsp wrapper at `to_anndata()` time.
+    pub fn list_obsp(&self) -> Vec<String> {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObspEmbedding)
+            .map(|e| e.name.strip_prefix("obsp/").unwrap_or(&e.name).to_string())
+            .collect()
+    }
+
+    /// List the keys of every `varp/*` catalog entry. See [`Self::list_obsp`].
+    pub fn list_varp(&self) -> Vec<String> {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::VarpEmbedding)
+            .map(|e| e.name.strip_prefix("varp/").unwrap_or(&e.name).to_string())
+            .collect()
+    }
+
+    /// List the keys of every `varm/*` catalog entry. See [`Self::list_obsp`].
+    pub fn list_varm(&self) -> Vec<String> {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::VarmEmbedding)
+            .map(|e| e.name.strip_prefix("varm/").unwrap_or(&e.name).to_string())
+            .collect()
     }
 
     // -----------------------------------------------------------------------

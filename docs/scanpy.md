@@ -348,6 +348,10 @@ exp.to_anndata(
     obs_filter=None,      # Predicate string to filter cells (e.g. "cell_type == 'T cell'")
     layers=None,          # None = load all layers; pass a list to select specific layers
                           # (e.g. ["raw_counts"]), or [] to skip loading layers entirely
+    eager=False,          # False (default): obsp/varp/varm and non-backed layers are
+                          # wrapped in lazy bridges that decode each entry on first
+                          # access. True: materialise everything up front so the
+                          # AnnData is fully detached from the SCX file handle.
 )
 ```
 
@@ -368,7 +372,9 @@ exactly what happens:
    `scipy.sparse.csr_matrix` wraps them without conversion.
 4. **Reads obs/var metadata** as Arrow RecordBatches, converts to pandas
    DataFrames via `pyarrow.to_pandas()`.
-5. **Reads obsm, varm, obsp, varp, uns, and layers** if present in the file.
+5. **Reads obsm and uns eagerly**, and **wires lazy bridges for obsp,
+   varp, varm, and (non-backed) layers** — each entry is decoded on
+   first access rather than during `to_anndata()` itself.
 
 The returned `anndata.AnnData` is fully populated:
 
@@ -378,22 +384,40 @@ The returned `anndata.AnnData` is fully populated:
 | `obs` | Obs metadata section | pandas DataFrame |
 | `var` | Var metadata section | pandas DataFrame |
 | `obsm` | Obsm sections | dict of numpy arrays (e.g. `X_pca`, `X_umap`) |
-| `varm` | Varm sections | dict of numpy arrays (e.g. `PCs` from `pyscx.accel.pca`) |
-| `obsp` | Obsp sections (COO Arrow IPC) | dict of `scipy.sparse.csr_matrix` (float32) |
-| `varp` | Varp sections (COO Arrow IPC) | dict of `scipy.sparse.csr_matrix` (float32) |
+| `varm` | Varm sections | `ScxLazyVarmMapping` (lazy) / dict of numpy arrays (`eager=True`) |
+| `obsp` | Obsp sections (COO Arrow IPC) | `ScxLazyPairwiseMapping` (lazy) / dict of `scipy.sparse.csr_matrix` (`eager=True`) |
+| `varp` | Varp sections (COO Arrow IPC) | `ScxLazyPairwiseMapping` (lazy) / dict of `scipy.sparse.csr_matrix` (`eager=True`) |
 | `uns` | Uns section | dict (tagged-JSON round-tripped; see below) |
-| `layers` | Layer shards | dict of `scipy.sparse.csr_matrix` |
+| `layers` | Layer shards | `ScxLazyLayersMapping` (lazy, non-backed) / `ScxBackedLayerDataset` per entry (backed) / dict (`eager=True`) |
 
 > Scanpy workflows that produce `obsp` / `varp` / `varm` (`sc.pp.neighbors`
 > writes `obsp["distances"]` + `obsp["connectivities"]`; `pyscx.accel.pca`
-> writes `varm["PCs"]`) survive `pyscx.from_anndata` → `to_anndata` since
-> Patch 7. Sparse pairwise matrices are stored as float32 COO; higher
+> writes `varm["PCs"]`) survive `pyscx.from_anndata` → `to_anndata`
+> verbatim. Sparse pairwise matrices are stored as float32 COO; higher
 > precision is downcast on write. When cells are logically deleted via
 > `mark_deleted` (or excluded by `obs_filter` in backed mode), `obsp` is
-> subset to the kept rows and columns at read time so the in-memory
-> AnnData stays shape-consistent. The on-disk section keeps its original
-> axis until `compact` rebuilds the file. `varp` and `varm` are unaffected
-> by the deletion vector (var axis).
+> subset to the kept rows and columns when the entry is decoded so the
+> in-memory AnnData stays shape-consistent. The on-disk section keeps
+> its original axis until `compact` rebuilds the file. `varp` and `varm`
+> are unaffected by the deletion vector (var axis).
+
+> **Lazy `obsp` / `varp` / `varm` / `layers`** (default `eager=False`):
+> the four slots above are `MutableMapping`-compatible bridges
+> (`ScxLazyPairwiseMapping`, `ScxLazyVarmMapping`,
+> `ScxLazyLayersMapping`) that decode each entry from the SCX file
+> only on first access — `ad.obsp["distances"]`,
+> `for k, v in ad.varm.items():`, `dict(ad.layers)`, etc. — and cache
+> the materialised value. Lookups via `__contains__` and key iteration
+> stay catalog-only (no I/O). Mutations are in-memory and never write
+> back to disk. The bridges keep a sibling `Arc<ScxReader>` alive so
+> the returned AnnData stays usable after the source `PyExperiment`
+> drops. Pass `eager=True` to substitute a plain `dict` and fully
+> detach the AnnData from the SCX file handle — required when you
+> intend to close the experiment, hand the AnnData to a subprocess,
+> or otherwise outlive the underlying mmap. See
+> [`docs/api.md` § `PyExperiment`](api.md#pyexperiment) for the kwarg
+> table and the regression context in `Cluster 1 — peak-RSS` of the
+> 2026-05-20 benchmark report.
 
 > **`uns` round-trip fidelity:** `from_anndata()` defaults to
 > `uns_format="tagged"`, which preserves NumPy `dtype` and `shape`,

@@ -677,16 +677,39 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
 ///
 /// When deletion vectors are present, deleted cells are excluded from
 /// both the CSR matrix and the obs metadata.
-pub fn to_anndata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py, PyAny>> {
-    to_anndata_with_layers(py, reader, None)
+pub fn to_anndata<'py>(
+    py: Python<'py>,
+    path: &std::path::Path,
+    reader: &ScxReader,
+    eager: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    to_anndata_with_layers(py, path, reader, None, eager)
 }
 
 /// Build an AnnData object from an ScxReader with optional layer filtering.
+///
+/// `eager` controls how `obsp` / `varp` / `varm` / `layers` are
+/// populated. When `false` (default for `pyscx.open(...).to_anndata()`),
+/// these slots are wrapped in `ScxLazyPairwiseMapping` /
+/// `ScxLazyVarmMapping` / `ScxLazyLayersMapping` and attached to the
+/// AnnData's private `_obsp` / `_varp` / `_varm` / `_layers` storage,
+/// deferring each section's decode until the consumer first accesses
+/// `ad.obsp[…]` etc. When `true`, every section is decoded up front
+/// and a plain `dict` is passed through the AnnData constructor —
+/// matches pre-fix behaviour. See [`crate::lazy_mapping`] and
+/// `2026-05-20_BENCHMARK-REGRESSIONS.md` cluster 1 for background.
 fn to_anndata_with_layers<'py>(
     py: Python<'py>,
+    path: &std::path::Path,
     reader: &ScxReader,
     layer_filter: Option<&[String]>,
+    eager: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    use crate::lazy_mapping::{
+        PairwiseAxis, ScxLazyLayersMapping, ScxLazyPairwiseMapping, ScxLazyVarmMapping,
+    };
+    use std::sync::Arc;
+
     let anndata_mod = py.import("anndata")?;
 
     // X — assemble all CSR shards (with deletion vector filtering)
@@ -714,7 +737,8 @@ fn to_anndata_with_layers<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // obsm embeddings
+    // obsm embeddings (eager: dense numpy, filtered by deletion vectors).
+    // Kept eager because obsm tends to be small relative to obsp/varp/varm.
     let obsm_map = match reader.read_all_obsm() {
         Ok(map) => map,
         Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
@@ -727,74 +751,57 @@ fn to_anndata_with_layers<'py>(
         obsm_dict.set_item(name, np_arr)?;
     }
 
-    // varm (dense, var × components — no deletion vector filtering needed)
-    let varm_map = match reader.read_all_varm() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
-    let varm_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &varm_map {
-        let np_arr = obsm_batch_to_numpy(py, batch)?;
-        varm_dict.set_item(name, np_arr)?;
-    }
-
-    // obsp (obs × obs sparse — subset to kept rows when a deletion vector is active)
-    let obsp_kept = compute_kept_to_global(reader)?;
-    let obsp_map = match reader.read_all_obsp() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
-    let obsp_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &obsp_map {
-        let scipy_mat = if let Some(ref kept) = obsp_kept {
-            let filtered = filter_coo_obsp_by_kept_rows(batch, kept)?;
-            coo_record_batch_to_scipy(py, &filtered)?
-        } else {
-            coo_record_batch_to_scipy(py, batch)?
-        };
-        obsp_dict.set_item(name, scipy_mat)?;
-    }
-
-    // varp (var × var sparse — no deletion vector applies to the var axis)
-    let varp_map = match reader.read_all_varp() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
-    let varp_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &varp_map {
-        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
-        varp_dict.set_item(name, scipy_mat)?;
-    }
-
     // uns — reconstruct any `__scx_type__` envelopes back into NumPy
     // ndarrays / scalars / tuples / pandas Index/Series/Categorical /
     // structured recarrays. Plain JSON passes through unchanged.
     let uns_dict = read_uns_as_pyobject(py, reader)?;
 
-    // layers (with optional filtering)
-    let all_layer_names = reader.layer_names();
-    let layers_dict = pyo3::types::PyDict::new(py);
-    for name in &all_layer_names {
-        // Skip layers not in the filter list (if specified)
-        if let Some(filter) = layer_filter {
-            if !filter.iter().any(|f| f == name) {
-                continue;
-            }
-        }
-        match reader.read_layer_filtered(name) {
-            Ok(layer_csr) => {
-                let scipy_mat = csr_to_scipy(py, layer_csr)?;
-                layers_dict.set_item(name, scipy_mat)?;
-            }
-            Err(scx_format::ScxError::SectionNotFound(_)) => {}
-            Err(e) => return Err(to_pyerr(e)),
-        }
-    }
+    // Sibling reader for the lazy bridges (`_obsp`/`_varp`/`_varm`/
+    // `_layers`). Independent mmap so the returned AnnData stays valid
+    // after the caller's `ScxReader` drops. Skipped when no lazy slot
+    // is needed.
+    let has_obsp = !reader.list_obsp().is_empty();
+    let has_varp = !reader.list_varp().is_empty();
+    let has_varm = !reader.list_varm().is_empty();
+    let layer_names = reader.layer_names();
+    let has_layers = if let Some(filter) = layer_filter {
+        layer_names.iter().any(|n| filter.iter().any(|f| f == n))
+    } else {
+        !layer_names.is_empty()
+    };
+    let need_lazy = has_obsp || has_varp || has_varm || has_layers;
 
-    // Build AnnData kwargs
+    let obsp_kept = if has_obsp {
+        compute_kept_to_global(reader)?.map(Arc::new)
+    } else {
+        None
+    };
+
+    let lazy_reader: Option<Arc<ScxReader>> = if need_lazy {
+        Some(Arc::new(
+            ScxReader::open_with_shared_catalog(path, reader.catalog_arc()).map_err(to_pyerr)?,
+        ))
+    } else {
+        None
+    };
+    let lazy_obsp = lazy_reader
+        .as_ref()
+        .filter(|_| has_obsp)
+        .map(|r| ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Obsp, obsp_kept.clone()));
+    let lazy_varp = lazy_reader
+        .as_ref()
+        .filter(|_| has_varp)
+        .map(|r| ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None));
+    let lazy_varm = lazy_reader
+        .as_ref()
+        .filter(|_| has_varm)
+        .map(|r| ScxLazyVarmMapping::new(Arc::clone(r)));
+    let lazy_layers = lazy_reader
+        .as_ref()
+        .filter(|_| has_layers)
+        .map(|r| ScxLazyLayersMapping::new(Arc::clone(r), layer_filter));
+
+    // Build AnnData kwargs.
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("X", x)?;
     if let Some(obs) = obs {
@@ -806,23 +813,52 @@ fn to_anndata_with_layers<'py>(
     if !obsm_dict.is_empty() {
         kwargs.set_item("obsm", obsm_dict)?;
     }
-    if !varm_dict.is_empty() {
-        kwargs.set_item("varm", varm_dict)?;
-    }
-    if !obsp_dict.is_empty() {
-        kwargs.set_item("obsp", obsp_dict)?;
-    }
-    if !varp_dict.is_empty() {
-        kwargs.set_item("varp", varp_dict)?;
-    }
     if let Some(uns) = uns_dict {
         kwargs.set_item("uns", uns)?;
     }
-    if !layers_dict.is_empty() {
-        kwargs.set_item("layers", layers_dict)?;
+    if eager {
+        // Materialize each lazy bridge up front; AnnData's __init__
+        // receives plain dicts (same shape as pre-fix). Returned AnnData
+        // is fully detached from the SCX file handle.
+        if let Some(m) = &lazy_obsp {
+            kwargs.set_item("obsp", m.materialize_all(py)?)?;
+        }
+        if let Some(m) = &lazy_varp {
+            kwargs.set_item("varp", m.materialize_all(py)?)?;
+        }
+        if let Some(m) = &lazy_varm {
+            kwargs.set_item("varm", m.materialize_all(py)?)?;
+        }
+        if let Some(m) = &lazy_layers {
+            kwargs.set_item("layers", m.materialize_all(py)?)?;
+        }
     }
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
+
+    if !eager {
+        // Lazy mode: attach each bridge to AnnData's private `_obsp` /
+        // `_varp` / `_varm` / `_layers` storage. AnnData's
+        // `AlignedMappingProperty` descriptor reads from these on
+        // every public `.obsp` (etc.) access — the first access drives
+        // the bridge's per-key materialization through AnnData's
+        // validation loop; subsequent accesses hit the bridge's cache.
+        // We bypass the property setter (which would otherwise iterate
+        // and validate every entry up front, defeating the lazy point).
+        if let Some(m) = lazy_obsp {
+            adata.setattr("_obsp", m.into_pyobject(py)?)?;
+        }
+        if let Some(m) = lazy_varp {
+            adata.setattr("_varp", m.into_pyobject(py)?)?;
+        }
+        if let Some(m) = lazy_varm {
+            adata.setattr("_varm", m.into_pyobject(py)?)?;
+        }
+        if let Some(m) = lazy_layers {
+            adata.setattr("_layers", m.into_pyobject(py)?)?;
+        }
+    }
+
     Ok(adata)
 }
 
@@ -839,6 +875,7 @@ fn to_anndata_with_layers<'py>(
 /// engine's predicate-pushdown shard skipping. When `preserve_slots=false`
 /// (default), the query-engine path runs and emits a warning if obsm or
 /// layers exist on disk (since they are dropped from the result).
+#[allow(clippy::too_many_arguments)]
 pub fn to_anndata_filtered<'py>(
     py: Python<'py>,
     path: &std::path::Path,
@@ -847,17 +884,21 @@ pub fn to_anndata_filtered<'py>(
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
     preserve_slots: bool,
+    eager: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Fast path: no filtering → use existing implementation
     if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
-        return to_anndata(py, reader);
+        return to_anndata(py, path, reader, eager);
     }
 
     // preserve_slots=true with obs_filter: load full AnnData, then filter
     // rows via pandas.eval. Keeps obsm / layers / uns intact at the cost
-    // of skipping query-engine predicate pushdown.
+    // of skipping query-engine predicate pushdown. Force eager so the
+    // pandas-side __getitem__ slicing operates on real arrays rather
+    // than lazy bridges (which AnnData iterates / validates during
+    // `.copy()` anyway).
     if let (Some(expr), true) = (obs_filter, preserve_slots) {
-        let full = to_anndata_with_layers(py, reader, layer_filter)?;
+        let full = to_anndata_with_layers(py, path, reader, layer_filter, true)?;
 
         let obs_attr = full.getattr("obs")?;
         let mask = obs_attr.call_method1("eval", (expr,)).map_err(|e| {
@@ -996,8 +1037,12 @@ pub fn to_anndata_filtered<'py>(
     }
 
     // No obs_filter but var_names and/or layers specified
-    // Load normally, then apply var_names column projection
-    let adata = to_anndata_with_layers(py, reader, layer_filter)?;
+    // Load normally, then apply var_names column projection. Force eager
+    // because slicing the AnnData by var_names triggers AlignedMapping
+    // validation across all aligned slots (obsp / varp / varm), which
+    // would materialize through the lazy bridges anyway — doing it up
+    // front avoids fragmenting the cost across implicit slicing.
+    let adata = to_anndata_with_layers(py, path, reader, layer_filter, true)?;
 
     if let Some(names) = var_names {
         // Resolve via the same path as backed / query-engine: scans all string
@@ -1083,6 +1128,7 @@ fn resolve_var_names_to_indices(reader: &ScxReader, names: &[String]) -> PyResul
 /// When deletion vectors are present, a `kept_to_global` mapping is
 /// computed and passed to `ScxBackedSparseDataset` so that user-visible
 /// row indices exclude deleted rows (matching non-backed behavior).
+#[allow(clippy::too_many_arguments)]
 pub fn to_anndata_backed<'py>(
     py: Python<'py>,
     path: &std::path::Path,
@@ -1090,6 +1136,7 @@ pub fn to_anndata_backed<'py>(
     var_names: Option<&[String]>,
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
+    eager: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     to_anndata_backed_with_options(
         py,
@@ -1099,6 +1146,7 @@ pub fn to_anndata_backed<'py>(
         obs_filter,
         layer_filter,
         true,
+        eager,
     )
 }
 
@@ -1119,8 +1167,10 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
     apply_deletion_vectors: bool,
+    eager: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
+    use crate::lazy_mapping::{PairwiseAxis, ScxLazyPairwiseMapping, ScxLazyVarmMapping};
     use scx_format::BackedCsrReader;
     use std::sync::Arc;
 
@@ -1328,48 +1378,47 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         }
     }
 
-    // --- varm (eager, dense — no deletion vector filtering needed) ---
-    let varm_map = match reader.read_all_varm() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
+    // --- obsp / varp / varm — lazy bridges by default ---
+    //
+    // Same `Arc<ScxReader>` (sibling of the main one, sharing the
+    // parsed catalog) backs all three bridges; refcount-only clones
+    // when handing it to each `ScxLazyPairwiseMapping` /
+    // `ScxLazyVarmMapping`. Each bridge decodes its sections on the
+    // consumer's first `ad.obsp[…]` / `.varp[…]` / `.varm[…]` access.
+    // See `to_anndata_with_layers` for the contract between
+    // `eager=true/false` and AnnData's private `_obsp` / `_varp` /
+    // `_varm` storage.
+    let has_obsp = !reader.list_obsp().is_empty();
+    let has_varp = !reader.list_varp().is_empty();
+    let has_varm = !reader.list_varm().is_empty();
+    let need_lazy_aligned = has_obsp || has_varp || has_varm;
+    let lazy_reader: Option<Arc<ScxReader>> = if need_lazy_aligned {
+        Some(Arc::new(
+            ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+                .map_err(to_pyerr)?,
+        ))
+    } else {
+        None
     };
-    let varm_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &varm_map {
-        let np_arr = obsm_batch_to_numpy(py, batch)?;
-        varm_dict.set_item(name, np_arr)?;
-    }
-
-    // --- obsp (eager, obs × obs sparse — subset by the same kept_to_global ---
-    // --- mapping that was applied to X and obs above, composing deletion ---
-    // --- vector + obs_filter) ---
-    let obsp_map = match reader.read_all_obsp() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
-    let obsp_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &obsp_map {
-        let scipy_mat = if let Some(ref kept) = kept_to_global {
-            let filtered = filter_coo_obsp_by_kept_rows(batch, kept)?;
-            coo_record_batch_to_scipy(py, &filtered)?
-        } else {
-            coo_record_batch_to_scipy(py, batch)?
-        };
-        obsp_dict.set_item(name, scipy_mat)?;
-    }
-
-    // --- varp (eager, var × var sparse) ---
-    let varp_map = match reader.read_all_varp() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
-    let varp_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &varp_map {
-        let scipy_mat = coo_record_batch_to_scipy(py, batch)?;
-        varp_dict.set_item(name, scipy_mat)?;
-    }
+    // Backed-path obsp filter mirrors the eager pre-fix logic at
+    // anndata.rs (kept_to_global composes deletion vectors with
+    // obs_filter); shared by Arc so the bridge holds its own ref.
+    let kept_to_global_arc = kept_to_global.as_ref().map(|k| Arc::new(k.clone()));
+    let lazy_obsp = lazy_reader.as_ref().filter(|_| has_obsp).map(|r| {
+        ScxLazyPairwiseMapping::new(
+            Arc::clone(r),
+            PairwiseAxis::Obsp,
+            kept_to_global_arc.clone(),
+        )
+    });
+    let lazy_varp = lazy_reader
+        .as_ref()
+        .filter(|_| has_varp)
+        .map(|r| ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None));
+    let lazy_varm = lazy_reader
+        .as_ref()
+        .filter(|_| has_varm)
+        .map(|r| ScxLazyVarmMapping::new(Arc::clone(r)));
 
     // --- uns (eager; tagged envelopes reconstructed) ---
     let uns_dict = read_uns_as_pyobject(py, &reader)?;
@@ -1416,23 +1465,44 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     if !obsm_dict.is_empty() {
         kwargs.set_item("obsm", obsm_dict)?;
     }
-    if !varm_dict.is_empty() {
-        kwargs.set_item("varm", varm_dict)?;
-    }
-    if !obsp_dict.is_empty() {
-        kwargs.set_item("obsp", obsp_dict)?;
-    }
-    if !varp_dict.is_empty() {
-        kwargs.set_item("varp", varp_dict)?;
-    }
     if let Some(uns) = uns_dict {
         kwargs.set_item("uns", uns)?;
     }
     if !layers_dict.is_empty() {
         kwargs.set_item("layers", layers_dict)?;
     }
+    if eager {
+        // Eager mode: materialize lazy bridges up front and pass
+        // through normal kwargs path. Caller receives an AnnData
+        // detached from the SCX file handle.
+        if let Some(m) = &lazy_obsp {
+            kwargs.set_item("obsp", m.materialize_all(py)?)?;
+        }
+        if let Some(m) = &lazy_varp {
+            kwargs.set_item("varp", m.materialize_all(py)?)?;
+        }
+        if let Some(m) = &lazy_varm {
+            kwargs.set_item("varm", m.materialize_all(py)?)?;
+        }
+    }
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
+
+    if !eager {
+        // Lazy mode: attach bridges directly to AnnData's private
+        // storage to bypass `AlignedMappingProperty.__set__`'s eager
+        // validation. See [`to_anndata_with_layers`].
+        if let Some(m) = lazy_obsp {
+            adata.setattr("_obsp", m.into_pyobject(py)?)?;
+        }
+        if let Some(m) = lazy_varp {
+            adata.setattr("_varp", m.into_pyobject(py)?)?;
+        }
+        if let Some(m) = lazy_varm {
+            adata.setattr("_varm", m.into_pyobject(py)?)?;
+        }
+    }
+
     Ok(adata)
 }
 

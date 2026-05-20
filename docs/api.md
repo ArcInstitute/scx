@@ -816,7 +816,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### PyExperiment
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
   - `layers`: list of layer names to load (default: all)
@@ -827,6 +827,22 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     incompatible with `var_names` / `obs_filter` / `layers` (use
     `scx subset --modality NAME --filter` to pre-materialise a
     filtered single-modality file).
+  - `eager` (default `False`): when `False`, the `obsp` / `varp` /
+    `varm` slots (plus `layers` in non-backed mode) are returned as
+    lazy bridges — `ScxLazyPairwiseMapping` / `ScxLazyVarmMapping` /
+    `ScxLazyLayersMapping` — that decode each entry on first
+    access. Keeps the peak RSS of `to_anndata()` itself bounded for
+    files that carry large kNN graphs or embeddings; user code that
+    accesses these slots pays the same one-time decode cost it would
+    otherwise pay at construction time. Bridges expose the full
+    `MutableMapping` protocol (`__getitem__` / `__contains__` /
+    `__iter__` / `__len__` / `keys` / `items` / `values` / `get` /
+    `__setitem__` / `__delitem__`); mutations stay in memory and are
+    not written back. Pass `eager=True` to materialise everything up
+    front and detach the returned AnnData from the SCX file handle
+    (use this before closing the experiment or shipping the AnnData
+    to a subprocess). `obsm` and `uns` are always eager regardless of
+    this flag.
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are

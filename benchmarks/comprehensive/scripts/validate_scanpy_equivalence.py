@@ -356,6 +356,13 @@ def check_rank_genes_groups(adata_prepped) -> ValidationCheck:
     # The Wilcoxon test implementation differs in tie-breaking and exact-test
     # heuristics, so per-group overlap can be lower for small clusters.
     # Use mean overlap (not min) since small clusters can have high variance.
+    # CAVEAT: `min_spearman` is the worst-of-N-clusters of a brittle check —
+    # it correlates pvals_adj at the same RANK between scanpy/pyscx (not the
+    # same gene), so the value is driven by tie structure at the BH boundary
+    # (many top-100 entries clip to 1.0). A single noisy cluster can swing
+    # min_spearman by 0.1+ from numerical jitter while top-100 gene SETS
+    # still match 100% — see tabula_sapiens_100k regression 0.899 → 0.799
+    # between 2026-04-15 and 2026-05-14 with no change in selected genes.
     mean_overlap_threshold = 60.0
     spearman_threshold = 0.80
     return ValidationCheck(
