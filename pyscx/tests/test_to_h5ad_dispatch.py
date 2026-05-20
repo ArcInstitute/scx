@@ -84,3 +84,50 @@ def test_experiment_exposes_path_getter(src_h5ad, tmp_path):
     exp = pyscx.open(scx_path)
     assert isinstance(exp.path, str)
     assert Path(exp.path) == scx_path
+
+
+def test_coerce_path_uses_fspath_not_str(src_h5ad, tmp_path):
+    """`_coerce_path` must invoke `__fspath__` (via `os.fspath`), not
+    `str()`. A PathLike whose `__str__` returns the default object
+    repr would silently corrupt the path otherwise."""
+    import os
+
+    import pyscx
+
+    class FsOnlyPath(os.PathLike):
+        def __init__(self, p):
+            self._p = str(p)
+
+        def __fspath__(self):
+            return self._p
+        # Deliberately NO __str__ override — str(self) returns the
+        # default "<...FsOnlyPath object at 0x...>" repr.
+
+    out = tmp_path / "out_fspath.scx"
+    pyscx.from_h5ad(FsOnlyPath(src_h5ad), FsOnlyPath(out))
+    assert out.exists()
+
+
+def test_from_h5ad_rejects_experiment_handle(src_h5ad, tmp_path):
+    """`from_h5ad` converts an h5ad file to SCX, so passing an open
+    SCX Experiment as the source is semantically wrong. The wrapper
+    must refuse it with a clear TypeError rather than silently
+    extracting `.path` and feeding an SCX file to the h5ad reader."""
+    import pyscx
+
+    scx_path = tmp_path / "src.scx"
+    pyscx.from_h5ad(src_h5ad, scx_path)
+    exp = pyscx.open(scx_path)
+    with pytest.raises(TypeError, match="SCX Experiment"):
+        pyscx.from_h5ad(exp, tmp_path / "should_not_exist.scx")
+
+
+def test_from_h5mu_rejects_experiment_handle(src_h5ad, tmp_path):
+    """Same contract as `from_h5ad`: source must be a file path."""
+    import pyscx
+
+    scx_path = tmp_path / "src.scx"
+    pyscx.from_h5ad(src_h5ad, scx_path)
+    exp = pyscx.open(scx_path)
+    with pytest.raises(TypeError, match="SCX Experiment"):
+        pyscx.from_h5mu(exp, tmp_path / "should_not_exist.scx")

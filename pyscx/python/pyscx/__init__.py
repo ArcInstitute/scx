@@ -11,10 +11,13 @@ from .pyscx import ScxBackedSparseDataset, ScxBackedLayerDataset
 
 # Thin Python wrappers around the native entry points so they accept
 # `os.PathLike` (e.g. `pathlib.Path`) and — for the SCX-side
-# converters — a `PyExperiment` handle. The Rust bindings still want
-# plain `str`; the wrappers coerce on the way in. Source can be either
-# an SCX path or a `pyscx.open(...).path` handle on `to_h5ad` /
-# `to_h5mu`.
+# converters (`to_h5ad` / `to_h5mu`) — a `PyExperiment` handle. The
+# Rust bindings still want plain `str`; the wrappers coerce on the
+# way in. `from_h5ad` / `from_h5mu` deliberately reject Experiment
+# handles because their source must be an h5ad/h5mu file, not an
+# already-open SCX file.
+import os as _os                                   # noqa: E402
+
 from .pyscx import open as _open_native            # noqa: E402
 from .pyscx import validate as _validate_native    # noqa: E402
 from .pyscx import from_h5ad as _from_h5ad_native  # noqa: E402
@@ -23,24 +26,41 @@ from .pyscx import from_h5mu as _from_h5mu_native  # noqa: E402
 from .pyscx import to_h5mu as _to_h5mu_native      # noqa: E402
 
 
-def _coerce_path(p):
-    """Accept str, os.PathLike, or a pyscx Experiment handle (uses
-    its `.path` attribute). Returns a plain str for the Rust bindings.
+def _coerce_path(p, *, allow_experiment: bool = True):
+    """Coerce a path-like input to a plain str for the Rust bindings.
 
-    Strings are returned as-is. `pathlib.Path` and other PathLike
-    objects are stringified via `str()`, which invokes `__fspath__`.
-    A `pyscx.Experiment` exposes its on-disk path via a `.path`
-    getter (added on the Rust side); the wrapper unwraps it here so
-    `pyscx.to_h5ad(exp, "/tmp/out.h5ad")` works idiomatically.
+    Accepts:
+      - `str` (returned as-is)
+      - `os.PathLike` (e.g. `pathlib.Path`) — uses `__fspath__` via
+        `os.fspath`, so subclasses whose `__str__` isn't overridden
+        still resolve correctly.
+      - a `pyscx.Experiment` handle, via its `.path` getter — only
+        when `allow_experiment=True`. The `from_h5ad` / `from_h5mu`
+        wrappers pass `allow_experiment=False` because their source
+        must be an h5ad/h5mu file, not an open SCX Experiment.
     """
-    if isinstance(p, (str, bytes)):
-        return p if isinstance(p, str) else p.decode()
+    if isinstance(p, str):
+        return p
+    # Real PathLike (pathlib.Path, etc.) takes priority over the
+    # Experiment duck-type check so a path-like whose subclass happens
+    # to expose `.path` for unrelated reasons still resolves via
+    # __fspath__.
+    if hasattr(p, "__fspath__"):
+        fspath = _os.fspath(p)
+        return fspath.decode() if isinstance(fspath, bytes) else fspath
     # PyExperiment exposes a `.path` getter returning str.
     path_attr = getattr(p, "path", None)
     if isinstance(path_attr, str):
+        if not allow_experiment:
+            raise TypeError(
+                f"{type(p).__name__} (open SCX Experiment) is not a valid "
+                "source here — the source must be an h5ad/h5mu file path, "
+                "not an already-converted SCX file."
+            )
         return path_attr
-    # os.PathLike or anything else — let str() handle it.
-    return str(p)
+    # Last resort: let os.fspath raise its canonical TypeError.
+    fspath = _os.fspath(p)
+    return fspath.decode() if isinstance(fspath, bytes) else fspath
 
 
 def open(path, verify=True):  # noqa: A001 — intentional shadowing of builtins.open within the pyscx namespace
@@ -56,9 +76,14 @@ def validate(path):
 
 
 def from_h5ad(path, out, **kwargs):
-    """Convert an h5ad file to SCX. Accepts str, `os.PathLike`, or a
-    pyscx Experiment for `path`; str or `os.PathLike` for `out`."""
-    return _from_h5ad_native(_coerce_path(path), _coerce_path(out), **kwargs)
+    """Convert an h5ad file to SCX. Accepts str or `os.PathLike` for
+    `path` and `out`. (Source must be an h5ad file, not an open SCX
+    Experiment.)"""
+    return _from_h5ad_native(
+        _coerce_path(path, allow_experiment=False),
+        _coerce_path(out),
+        **kwargs,
+    )
 
 
 def to_h5ad(path, out, **kwargs):
@@ -68,9 +93,14 @@ def to_h5ad(path, out, **kwargs):
 
 
 def from_h5mu(path, out, **kwargs):
-    """Convert an h5mu file to SCX. Accepts str, `os.PathLike`, or a
-    pyscx Experiment for `path`; str or `os.PathLike` for `out`."""
-    return _from_h5mu_native(_coerce_path(path), _coerce_path(out), **kwargs)
+    """Convert an h5mu file to SCX. Accepts str or `os.PathLike` for
+    `path` and `out`. (Source must be an h5mu file, not an open SCX
+    Experiment.)"""
+    return _from_h5mu_native(
+        _coerce_path(path, allow_experiment=False),
+        _coerce_path(out),
+        **kwargs,
+    )
 
 
 def to_h5mu(path, out, **kwargs):
