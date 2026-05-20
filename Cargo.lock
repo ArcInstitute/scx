@@ -452,6 +452,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-print"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a2128d00b7061b82b72844a351e80acd29e05afc60e9261e2ac90dca9ecc2ac"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -995,9 +1001,9 @@ dependencies = [
 
 [[package]]
 name = "extendr-api"
-version = "0.8.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea54977c6e37236839ffcbc20b5dcea58aa32ae43fbef54a81e1011dc6b19061"
+checksum = "cae12193370e4f00f4a54b64f40dabc753ad755f15229c367e4b5851ed206954"
 dependencies = [
  "extendr-ffi",
  "extendr-macros",
@@ -1007,9 +1013,12 @@ dependencies = [
 
 [[package]]
 name = "extendr-ffi"
-version = "0.8.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c76777174a82bdb3e66872f580687d3d0143eed1df9b9cd72b321b9596a23ca7"
+checksum = "b48f96b7a4a2ff009ad9087f22a6de2312731a4096b520e3eb1c483df476ae95"
+dependencies = [
+ "build-print",
+]
 
 [[package]]
 name = "extendr-macros"
@@ -3152,6 +3161,7 @@ version = "0.4.0"
 dependencies = [
  "arrow",
  "extendr-api",
+ "extendr-ffi",
  "half",
  "scx-accel",
  "scx-codec",
