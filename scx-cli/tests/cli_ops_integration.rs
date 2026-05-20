@@ -145,7 +145,7 @@ fn write_test_file(
 }
 
 fn scx_cli() -> std::process::Command {
-    std::process::Command::new(env!("CARGO_BIN_EXE_scx-cli"))
+    std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
 }
 
 // ---------------------------------------------------------------------------

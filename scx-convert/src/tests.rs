@@ -617,7 +617,7 @@ fn test_categorical_columns() {
     assert!(matches!(ct_col.data_type(), DataType::Dictionary(_, _)));
 }
 
-/// Regression test for the `scx-cli convert` blocker: real-world h5ad
+/// Regression test for the `scx convert` blocker: real-world h5ad
 /// files (e.g. `sc.read_10x_h5(...).write_h5ad(...)`,
 /// `sc.datasets.pbmc3k().write_h5ad(...)`) store categorical codes as
 /// **int8** whenever `len(categories) < 128`. The previous
@@ -665,7 +665,7 @@ fn h5ad_with_int8_categorical_codes_converts() {
             .unwrap();
     }
 
-    // Streaming path — the one `scx-cli convert` uses by default.
+    // Streaming path — the one `scx convert` uses by default.
     let scx_stream = dir.path().join("stream.scx");
     h5ad_to_scx_streaming(
         &h5ad_path,
@@ -833,7 +833,7 @@ unsigned_dataframe_column_test!(
 );
 
 /// Companion regression test for the user-visible
-/// `scx-cli convert pbmc10k.h5ad` crash. pandas / anndata write an
+/// `scx convert pbmc10k.h5ad` crash. pandas / anndata write an
 /// *empty* `obs/@column-order` as a length-0 `float64` array (numpy's
 /// default empty-array dtype). The old `read_dataframe_group`
 /// unconditionally read the attribute as `Vec<VarLenUnicode>`, which
@@ -2083,7 +2083,7 @@ fn streaming_opts(shard_size: u32) -> ConvertOptions {
         codec: None,
         csc: false,
         csc_cols_per_shard: 5000,
-        tool: "scx-cli".into(),
+        tool: "scx".into(),
         ..ConvertOptions::default()
     }
 }
@@ -2343,7 +2343,7 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
         codec: None,
         csc: true,
         csc_cols_per_shard: 5,
-        tool: "scx-cli".into(),
+        tool: "scx".into(),
         ..ConvertOptions::default()
     };
     h5ad_to_scx_streaming(
@@ -2567,7 +2567,7 @@ fn streaming_provenance_escapes_path_quotes() {
     assert_eq!(prov.operations.len(), 1);
     let entry = &prov.operations[0];
     assert_eq!(entry.action, "convert");
-    assert_eq!(entry.tool, "scx-cli");
+    assert_eq!(entry.tool, "scx");
     // `params_json` must round-trip through serde_json::from_str —
     // proves the path was escaped correctly.
     let parsed: serde_json::Value =

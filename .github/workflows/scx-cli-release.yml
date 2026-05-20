@@ -68,15 +68,16 @@ jobs:
       - name: Build (release, hdf5-static + cloud)
         run: cargo build -p scx-cli --release --locked --features hdf5-static,cloud --target ${{ matrix.target }}
 
-      # Cargo emits the binary as `scx-cli` (package name). We rename to `scx`
-      # in the staging directory so the tarball matches the user-facing CLI
-      # name documented in the README and used throughout the project.
+      # Cargo emits the binary as `scx` (via the `[[bin]]` stanza in
+      # scx-cli/Cargo.toml). The package/crate name stays `scx-cli` so
+      # `cargo install scx-cli` and the release tag prefix `scx-cli-v*`
+      # remain stable — only the on-disk binary file is `scx`.
       - name: Strip binary
-        run: strip "target/${{ matrix.target }}/release/scx-cli"
+        run: strip "target/${{ matrix.target }}/release/scx"
 
       - name: Verify static linkage of libhdf5
         run: |
-          bin="target/${{ matrix.target }}/release/scx-cli"
+          bin="target/${{ matrix.target }}/release/scx"
           if ldd "$bin" | grep -i hdf5; then
             echo "ERROR: libhdf5 is dynamically linked; static feature did not take effect" >&2
             exit 1
@@ -91,7 +92,7 @@ jobs:
           name="scx-cli-${version}-${target}"
           staging="${RUNNER_TEMP}/${name}"
           mkdir -p "$staging"
-          cp "target/${target}/release/scx-cli" "$staging/scx"
+          cp "target/${target}/release/scx" "$staging/scx"
           cp README.md "$staging/"
           tar -czvf "${name}.tar.gz" -C "${RUNNER_TEMP}" "$name"
           echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"

@@ -17,7 +17,7 @@ use crate::error::MtxError;
 /// Reads the MTX directory (matrix.mtx[.gz], barcodes.tsv[.gz], features.tsv[.gz])
 /// and writes an SCX file with the specified codec and shard size.
 ///
-/// `tool_name` is recorded in provenance (e.g. `"pyscx"` or `"scx-cli"`).
+/// `tool_name` is recorded in provenance (e.g. `"pyscx"` or `"scx"`).
 pub fn mtx_to_scx(
     input_dir: &Path,
     output: &Path,

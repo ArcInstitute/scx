@@ -40,8 +40,13 @@ use super::filtering::update_layers_col_projection;
 ///         CSC sidecar (`from_anndata(csc="always")`). Single-batch
 ///         seurat_v3 only — multi-batch and seurat flavor raise on
 ///         CSC. Mutually exclusive with `device != "cpu"`.
+///     layer: Read counts from `adata.layers[layer]` instead of
+///         `adata.X`. Mirrors `scanpy.pp.highly_variable_genes(layer=)`
+///         and is the canonical way to compute `flavor="seurat_v3"`
+///         on a raw-counts layer after the main X has been
+///         log-normalized.
 #[pyfunction]
-#[pyo3(signature = (adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=false, n_bins=20, device="auto", prefer_format="csr"))]
+#[pyo3(signature = (adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=false, n_bins=20, device="auto", prefer_format="csr", layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn highly_variable_genes<'py>(
     py: Python<'py>,
@@ -54,6 +59,7 @@ pub fn highly_variable_genes<'py>(
     n_bins: usize,
     device: &str,
     prefer_format: &str,
+    layer: Option<&str>,
 ) -> PyResult<()> {
     // Validate prefer_format up front (matches the constraint applied
     // across all `pyscx.accel.*` entry points).
@@ -119,7 +125,17 @@ pub fn highly_variable_genes<'py>(
         None
     };
 
-    let x = adata.getattr("X")?;
+    // F3: read the source matrix from `adata.layers[layer]` when a
+    // layer is named (scanpy parity); otherwise from `adata.X`. The
+    // downstream dispatch on `ScxBackedSparseDataset` /
+    // `ScxLazyTransformedDataset` works identically — if the layer is
+    // itself an SCX-backed dataset (e.g. set via
+    // `adata.layers["counts"] = adata.X.copy()`), the streaming path
+    // applies; otherwise we fall through to scanpy with `layer=`.
+    let x = match layer {
+        Some(name) => adata.getattr("layers")?.get_item(name)?,
+        None => adata.getattr("X")?,
+    };
 
     // ── Try SCX backed dataset ──────────────────────────────────────────
     if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
@@ -192,6 +208,9 @@ pub fn highly_variable_genes<'py>(
     kwargs.set_item("n_bins", n_bins)?;
     if let Some(bk) = batch_key {
         kwargs.set_item("batch_key", bk)?;
+    }
+    if let Some(layer_name) = layer {
+        kwargs.set_item("layer", layer_name)?;
     }
     sc.getattr("pp")?
         .call_method("highly_variable_genes", (adata,), Some(&kwargs))?;

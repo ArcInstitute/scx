@@ -102,7 +102,7 @@ pub struct ConvertOptions {
     /// cap (single CSC shard, memory permitting).
     pub csc_cols_per_shard: usize,
     /// Tool name recorded in the provenance entry. Defaults to
-    /// `"scx-cli"`; `pyscx` overrides this to `"pyscx"` so the
+    /// `"scx"`; `pyscx` overrides this to `"pyscx"` so the
     /// recorded provenance reflects the actual caller.
     pub tool: String,
     /// Phase-0.4 budget shared by dense slab sizing (Phase 1), CSC
@@ -340,7 +340,7 @@ impl Default for ConvertOptions {
             codec: None,
             csc: false,
             csc_cols_per_shard: 5000,
-            tool: "scx-cli".into(),
+            tool: "scx".into(),
             memory_budget: None,
             stream: true,
             strict_uns: false,

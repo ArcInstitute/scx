@@ -920,16 +920,23 @@ capture run picks it up automatically.
 >     print(sorted(keys))"
 > ```
 >
-> The current `LATEST` symlink points at `v0.6.1-multimodal`, which
-> covers **format + accel + multimodal** rows captured at the small
-> tier (60 accel cells from the prior baseline plus the new
-> `multimodal_compression` / `multimodal_training` rows on
-> `cite_seq_pbmc` + `multiome_pbmc`). Format / cloud / `ml_loader` / `index_plan` /
-> `correctness` / `roundtrip` / `cell_eval_parity_perf` benchmarks
-> capture cleanly but produce no gate signal against this baseline. The
-> earlier `v0.6.0-gpu-phase1-7` baseline (577 rows) covers format +
-> cloud + `ml_loader` + accel — pin it via `--baseline` for full-surface
-> gating until the next multi-surface baseline is promoted as `LATEST`.
+> The current `LATEST` symlink points at `v0.6.2-n_counts-augmentation`
+> (captured 2026-05-11 from `b1629ea`, tier `full`, 806 rows across all
+> 8 datasets — `pbmc3k`, `pbmc10k`, `smartseq2`, `tabula_sapiens_100k`,
+> `census_500k`, `census_1m`, `cite_seq_pbmc_5k`, `multiome_pbmc_10k`).
+> It gates **format** (`compression`, `read_full`, `read_selective`,
+> `write`, `memory`, `parallel_scaling`, `parallel_write_scaling`,
+> `roundtrip`), **cloud** (`cloud_metadata`, `cloud_read`,
+> `cloud_filtered`, `cloud_pull`, `cloud_push`, `cloud_large_atlas`,
+> `cloud_reader_vs_pull`, `cost_model`), **`ml_loader`**, **multimodal**
+> (`multimodal_compression`, `multimodal_training`), `index_plan`,
+> `fragment_ops`, and `correctness`. The remaining gap is the `accel_*`
+> family (`accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`,
+> `accel_preprocess`, `accel_hvg`) — those benchmarks capture cleanly
+> but produce no gate signal against `LATEST`. Pin
+> `--baseline benchmarks/comprehensive/results/baselines/v0.6.0-gpu-phase1-7`
+> when you need accelerator gating, until the next multi-surface
+> baseline that re-includes `accel_*` is promoted as `LATEST`.
 
 **`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
 peer of `gate_candidate.py`. It exclusively drives

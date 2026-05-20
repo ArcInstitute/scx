@@ -569,8 +569,11 @@ curl -L "https://github.com/ArcInstitute/scx/releases/download/scx-cli-v${VERSIO
 **Build from source** — for macOS, Windows, musl, or custom feature sets:
 
 ```bash
-# Build the CLI tool
+# Build the CLI tool (binary is named `scx`; crate is `scx-cli`).
 cargo build -p scx-cli --release
+
+# End-user install in one command — bundles h5ad/h5mu/10x conversion:
+cargo install --features default-bin scx-cli
 
 # With h5ad conversion support (requires libhdf5-dev):
 cargo build -p scx-cli --release --features hdf5

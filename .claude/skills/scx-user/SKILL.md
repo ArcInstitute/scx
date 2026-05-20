@@ -62,10 +62,10 @@ cd "$SCX_USER_DIR"
 
 ```bash
 ( cd "$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
-"$SCX_REPO/target/release/scx-cli" convert \
+"$SCX_REPO/target/release/scx" convert \
   "$SCX_DATA_DIR/pbmc10k.h5ad" "$SCX_DATA_DIR/pbmc10k.scx" \
   --stream --index-preset cellxgene
-"$SCX_REPO/target/release/scx-cli" info "$SCX_DATA_DIR/pbmc10k.scx"
+"$SCX_REPO/target/release/scx" info "$SCX_DATA_DIR/pbmc10k.scx"
 ```
 
 **Convert the same h5ad via pyscx** (so the same session touches both surfaces — intentionally reuses pbmc10k.h5ad rather than introducing a second download):
@@ -165,12 +165,12 @@ export SCX_DATA_DIR=$SCX_DATA_DIR
 
 ( cd "\$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
 
-"\$SCX_REPO/target/release/scx-cli" convert \\
+"\$SCX_REPO/target/release/scx" convert \\
   "\$SCX_DATA_DIR/census_500k.h5ad" "\$SCX_DATA_DIR/census_500k.scx" \\
   --stream --memory-budget 64G --reader-threads 16 \\
   --index-preset cellxgene
 
-"\$SCX_REPO/target/release/scx-cli" info "\$SCX_DATA_DIR/census_500k.scx"
+"\$SCX_REPO/target/release/scx" info "\$SCX_DATA_DIR/census_500k.scx"
 
 "\$SCX_REPO/.venv/bin/python" - <<'PY'
 import os, time
@@ -250,7 +250,7 @@ export SCX_DATA_DIR=$SCX_DATA_DIR
 ( cd "\$SCX_REPO/pyscx" && ../.venv/bin/maturin develop --release --features gpu )
 
 ( cd "\$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
-"\$SCX_REPO/target/release/scx-cli" convert \\
+"\$SCX_REPO/target/release/scx" convert \\
   "\$SCX_DATA_DIR/census_1m.h5ad" "\$SCX_DATA_DIR/census_1m.scx" \\
   --stream --memory-budget 128G --reader-threads 24 \\
   --index-preset cellxgene

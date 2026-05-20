@@ -256,7 +256,7 @@ fn test_info_minimal_file() {
 /// Test the binary runs and shows help.
 #[test]
 fn test_cli_help() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx-cli"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
         .arg("--help")
         .output()
         .expect("failed to run scx-cli");
@@ -281,7 +281,7 @@ fn test_cli_info_subcommand() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "cli_info.scx", 6, 10, 2, true);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx-cli"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
         .args(["info", path.to_str().unwrap()])
         .output()
         .expect("failed to run scx-cli info");
@@ -302,7 +302,7 @@ fn test_cli_validate_subcommand() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "cli_valid.scx", 6, 10, 2, true);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx-cli"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
         .args(["validate", path.to_str().unwrap()])
         .output()
         .expect("failed to run scx-cli validate");
@@ -332,7 +332,7 @@ fn test_cli_validate_fails_on_corruption() {
     data[corrupt_pos] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx-cli"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
         .args(["validate", path.to_str().unwrap()])
         .output()
         .expect("failed to run scx-cli validate");
@@ -350,7 +350,7 @@ fn test_cli_validate_verbose() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "cli_verbose.scx", 4, 8, 1, false);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx-cli"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
         .args(["validate", "--verbose", path.to_str().unwrap()])
         .output()
         .expect("failed to run scx-cli validate");

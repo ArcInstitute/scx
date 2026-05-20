@@ -610,7 +610,7 @@ PROVENANCE SECTION:
                                     "delete", "compact", "rollback",
                                     "add_layer", "add_csc", "add_obsm", …)
     tool_length: u16
-    tool: [u8]                   (UTF-8: "scx-cli 0.1.0", "pyscx 0.1.0", …)
+    tool: [u8]                   (UTF-8: "scx 0.4.0", "pyscx 0.4.0", …)
     params_json_length: u32
     params_json: [u8]            (UTF-8 JSON, tool-specific)
     input_checksums_count: u8

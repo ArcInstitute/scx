@@ -899,7 +899,7 @@ fn dispatch_convert(
         codec: explicit_codec,
         csc: csc_always,
         csc_cols_per_shard,
-        tool: "scx-cli".into(),
+        tool: "scx".into(),
         memory_budget,
         stream,
         strict_uns,
