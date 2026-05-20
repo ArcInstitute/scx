@@ -1004,11 +1004,33 @@ via `pyscx.accel`. These accelerators are 2–40× faster than their scanpy
 equivalents at scale (>100K cells) while writing results to the same AnnData
 slots — so downstream scanpy functions (plotting, etc.) work identically.
 
-All accelerators support a `device` parameter for GPU acceleration:
+All accelerators that support GPU expose a `device` parameter:
 - `device="auto"` (default) — use GPU if available, fall back to CPU
 - `device="cpu"` — force CPU
 - `device="gpu"` — force GPU (raises error if unavailable)
 - `device="gpu:1"` — select a specific GPU on multi-GPU systems
+
+### Compatibility matrix
+
+| Op                       | CPU | GPU | Scanpy-parity kwargs                                                  | scx-only kwargs                                |
+|--------------------------|:---:|:---:|-----------------------------------------------------------------------|------------------------------------------------|
+| `normalize_total`        | ✓   | ✓   | `target_sum`                                                          | `device`                                       |
+| `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
+| `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
+| `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
+| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `prefer_format`            |
+| `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
+| `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
+| `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
+| `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
+| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`                           | —                                              |
+| `rank_genes_groups`      | ✓   | —   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format` |
+| `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format` |
+
+¹ GPU Leiden has a documented label-stability divergence vs `leidenalg` —
+pin `device="cpu"` to preserve label stability for downstream DE / annotation
+transfer. See [docs/architecture.md § GPU Leiden caveat](architecture.md) and
+CLAUDE.md § Known Limitations.
 
 ### `prefer_format="csr"|"csc"`: explicit column-major dispatch
 
