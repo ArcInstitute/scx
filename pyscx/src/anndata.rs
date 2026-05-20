@@ -240,6 +240,13 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let batch = scx_format::upcast_to_large_types(batch)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // Defensive: stamp pandas `index_columns` metadata if the schema
+    // carries a literal `__index_level_0__` / `_index` column without
+    // it. anndata 0.10+ hard-rejects `_index` as a regular DataFrame
+    // column on `write_h5ad`, so this prevents `_index` from leaking
+    // into `df.columns` regardless of how the underlying SCX was
+    // written. See `scx_format::ensure_pandas_index_metadata` doc.
+    let batch = scx_format::ensure_pandas_index_metadata(&batch);
     // Serialize to Arrow IPC file format
     let mut buf = Vec::new();
     {
@@ -262,12 +269,126 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 }
 
 /// Convert a pyarrow Table to a pandas DataFrame.
+///
+/// Honours scx's minimal `{"index_columns": [...]}` pandas-metadata
+/// envelope: if the table's schema carries one (stamped either by
+/// `scx-convert/src/h5ad_read.rs::read_dataframe_group` on the CLI
+/// convert path, by `scx_format::ensure_pandas_index_metadata` as
+/// the B2-2026-05-20 defensive belt, or by any other producer), we
+/// extract the index column name, strip the `pandas` key from the
+/// schema metadata so `Table.to_pandas()` doesn't choke on the
+/// missing `columns` field of pyarrow's full envelope, and then set
+/// the DataFrame index manually. The `"__index_level_0__"` column
+/// (pyarrow's canonical unnamed-index name) results in
+/// `df.index.name = None`, matching the source AnnData semantics.
 pub(crate) fn pyarrow_table_to_pandas<'py>(
     table: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let kwargs = pyo3::types::PyDict::new(table.py());
+    let py = table.py();
+
+    let index_col_name: Option<String> = extract_scx_index_column(table)?;
+
+    let working_table: Bound<'py, PyAny> = if index_col_name.is_some() {
+        // Strip the `pandas` schema metadata so pyarrow's to_pandas
+        // doesn't try to parse our minimal envelope and KeyError on the
+        // missing `columns` array.
+        strip_pandas_metadata(table)?
+    } else {
+        table.clone()
+    };
+
+    let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("self_destruct", true)?;
-    table.call_method("to_pandas", (), Some(&kwargs))
+    let df = working_table.call_method("to_pandas", (), Some(&kwargs))?;
+
+    if let Some(idx) = index_col_name {
+        // set_index(idx, drop=True): the column becomes the index and
+        // is removed from `df.columns`.
+        let set_idx_kwargs = pyo3::types::PyDict::new(py);
+        set_idx_kwargs.set_item("drop", true)?;
+        set_idx_kwargs.set_item("inplace", true)?;
+        df.call_method("set_index", (idx.as_str(),), Some(&set_idx_kwargs))?;
+        // anndata convention: the unnamed pandas-index sentinel
+        // `__index_level_0__` must become `df.index.name = None` so
+        // downstream `adata.write_h5ad` produces canonical h5ad.
+        // Named pandas indexes (e.g. `gene_symbols`) keep their name.
+        if idx == "__index_level_0__" {
+            let index = df.getattr("index")?;
+            index.setattr("name", py.None())?;
+        }
+    }
+
+    Ok(df)
+}
+
+/// Return the first entry of the `pandas.index_columns` array stamped
+/// on `table.schema.metadata`, if any. Mirrors
+/// `scx_format::pandas_index_columns` on the Python side because the
+/// Rust schema view of the Arrow IPC has already been moved into
+/// pyarrow's address space by the time we get here.
+fn extract_scx_index_column<'py>(table: &Bound<'py, PyAny>) -> PyResult<Option<String>> {
+    let schema = table.getattr("schema")?;
+    let metadata = schema.getattr("metadata")?;
+    if metadata.is_none() {
+        return Ok(None);
+    }
+    // metadata behaves like a dict {bytes: bytes}.
+    let raw = match metadata.get_item("pandas") {
+        Ok(v) => v,
+        Err(_) => match metadata.get_item(pyo3::types::PyBytes::new(table.py(), b"pandas")) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        },
+    };
+    let raw_bytes: &[u8] = if let Ok(b) = raw.downcast::<pyo3::types::PyBytes>() {
+        b.as_bytes()
+    } else if let Ok(s) = raw.extract::<&str>() {
+        s.as_bytes()
+    } else {
+        return Ok(None);
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(raw_bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let idx = parsed
+        .get("index_columns")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.iter().find_map(|v| v.as_str().map(String::from)));
+    Ok(idx)
+}
+
+/// Drop the `pandas` key from `table.schema.metadata`, returning a
+/// new pyarrow Table with the rest of the schema metadata preserved.
+fn strip_pandas_metadata<'py>(table: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = table.py();
+    let schema = table.getattr("schema")?;
+    let metadata = schema.getattr("metadata")?;
+    if metadata.is_none() {
+        return Ok(table.clone());
+    }
+    let dict = pyo3::types::PyDict::new(py);
+    let items = metadata.call_method0("items")?;
+    let iter = items.try_iter()?;
+    for item in iter {
+        let item = item?;
+        let key = item.get_item(0)?;
+        let value = item.get_item(1)?;
+        let key_bytes: &[u8] = if let Ok(b) = key.downcast::<pyo3::types::PyBytes>() {
+            b.as_bytes()
+        } else if let Ok(s) = key.extract::<&str>() {
+            s.as_bytes()
+        } else {
+            // Pass unknown key shapes through unchanged.
+            dict.set_item(key, value)?;
+            continue;
+        };
+        if key_bytes == b"pandas" {
+            continue;
+        }
+        dict.set_item(key, value)?;
+    }
+    table.call_method1("replace_schema_metadata", (dict,))
 }
 
 /// Convert an ScxCsr to a scipy.sparse.csr_matrix via zero-copy numpy arrays.

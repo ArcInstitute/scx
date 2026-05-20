@@ -5936,8 +5936,20 @@ fn read_dataframe_group_index_only_recovers_values() {
     let file = hdf5::File::open(&h5_path).unwrap();
     let batch = read_dataframe_group(&file, "var").unwrap();
 
-    assert_eq!(batch.num_columns(), 1, "expected single _index column");
-    assert_eq!(batch.schema().field(0).name(), "_index");
+    // anndata's `_index = "_index"` sentinel
+    // (unnamed pandas index) is renamed to pyarrow's canonical
+    // `__index_level_0__` in the Arrow schema, and the schema gains a
+    // `pandas` metadata envelope so consumers like
+    // `pyscx.open(...).to_anndata()` and
+    // `scx-convert/src/h5ad_write.rs::write_dataframe_body` identify
+    // the index automatically.
+    assert_eq!(batch.num_columns(), 1, "expected single index column");
+    assert_eq!(batch.schema().field(0).name(), "__index_level_0__");
+    assert_eq!(
+        scx_format::pandas_index_columns(batch.schema_ref()),
+        vec!["__index_level_0__".to_string()],
+        "schema must carry pandas metadata pointing at the index column"
+    );
     assert_eq!(batch.num_rows(), 3);
 
     let col = batch
@@ -5951,4 +5963,244 @@ fn read_dataframe_group_index_only_recovers_values() {
         vec!["MIR1302-2HG", "FAM138A", "OR4F5"],
         "fallback must read real values from the _index dataset, not blanks"
     );
+}
+
+#[test]
+fn read_dataframe_group_attaches_pandas_index_metadata_unnamed() {
+    // var with `_index = "_index"`
+    // (unnamed pandas index) PLUS non-empty `column-order`. Pre-fix,
+    // `read_dataframe_group` silently dropped the index. Post-fix, the
+    // schema must include `__index_level_0__` AND stamp the pandas
+    // metadata envelope so consumers find the index.
+    use super::h5ad_read::read_dataframe_group;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("var_unnamed.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let var = file.create_group("var").unwrap();
+
+    var.new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("dataframe"))
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("encoding-version")
+        .unwrap()
+        .write_scalar(&vlu("0.2.0"))
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+    // column-order = ["gene_ids", "feature_types"] — the index is
+    // excluded by anndata convention.
+    let col_order: Vec<VarLenUnicode> = ["gene_ids", "feature_types"]
+        .iter()
+        .map(|s| vlu(s))
+        .collect();
+    var.new_attr::<VarLenUnicode>()
+        .shape([col_order.len()])
+        .create("column-order")
+        .unwrap()
+        .write(&col_order)
+        .unwrap();
+
+    let symbols: Vec<VarLenUnicode> = ["MIR1302-2HG", "FAM138A", "OR4F5"]
+        .iter()
+        .map(|s| vlu(s))
+        .collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([symbols.len()])
+        .create("_index")
+        .unwrap()
+        .write(&symbols)
+        .unwrap();
+    let gene_ids: Vec<VarLenUnicode> = ["ENSG1", "ENSG2", "ENSG3"].iter().map(|s| vlu(s)).collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([gene_ids.len()])
+        .create("gene_ids")
+        .unwrap()
+        .write(&gene_ids)
+        .unwrap();
+    let feature_types: Vec<VarLenUnicode> = ["Gene Expression"; 3].iter().map(|s| vlu(s)).collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([feature_types.len()])
+        .create("feature_types")
+        .unwrap()
+        .write(&feature_types)
+        .unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let batch = read_dataframe_group(&file, "var").unwrap();
+
+    let schema = batch.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(field_names.contains(&"gene_ids"), "fields={field_names:?}");
+    assert!(
+        field_names.contains(&"feature_types"),
+        "fields={field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"__index_level_0__"),
+        "fields={field_names:?} — B1 reader must inject the index column"
+    );
+    assert_eq!(
+        scx_format::pandas_index_columns(batch.schema_ref()),
+        vec!["__index_level_0__".to_string()],
+        "schema must carry pandas metadata pointing at the index column"
+    );
+
+    // Values in the index column round-trip.
+    let idx_pos = field_names
+        .iter()
+        .position(|n| *n == "__index_level_0__")
+        .unwrap();
+    let col = batch
+        .column(idx_pos)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("index column must be Utf8/StringArray");
+    let values: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(values, vec!["MIR1302-2HG", "FAM138A", "OR4F5"]);
+}
+
+#[test]
+fn read_dataframe_group_attaches_pandas_index_metadata_named() {
+    // B1-2026-05-20 named-index shape: `_index = "gene_symbols"`. The
+    // reader must NOT rename to `__index_level_0__`; the field keeps
+    // its original name and the pandas metadata points at it.
+    use super::h5ad_read::read_dataframe_group;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("var_named.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let var = file.create_group("var").unwrap();
+
+    var.new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("dataframe"))
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("encoding-version")
+        .unwrap()
+        .write_scalar(&vlu("0.2.0"))
+        .unwrap();
+    var.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("gene_symbols"))
+        .unwrap();
+    let col_order: Vec<VarLenUnicode> = ["gene_ids"].iter().map(|s| vlu(s)).collect();
+    var.new_attr::<VarLenUnicode>()
+        .shape([col_order.len()])
+        .create("column-order")
+        .unwrap()
+        .write(&col_order)
+        .unwrap();
+
+    let symbols: Vec<VarLenUnicode> = ["MIR1302-2HG", "FAM138A", "OR4F5"]
+        .iter()
+        .map(|s| vlu(s))
+        .collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([symbols.len()])
+        .create("gene_symbols")
+        .unwrap()
+        .write(&symbols)
+        .unwrap();
+    let gene_ids: Vec<VarLenUnicode> = ["ENSG1", "ENSG2", "ENSG3"].iter().map(|s| vlu(s)).collect();
+    var.new_dataset::<VarLenUnicode>()
+        .shape([gene_ids.len()])
+        .create("gene_ids")
+        .unwrap()
+        .write(&gene_ids)
+        .unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let batch = read_dataframe_group(&file, "var").unwrap();
+
+    let schema = batch.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(field_names.contains(&"gene_ids"), "fields={field_names:?}");
+    assert!(
+        field_names.contains(&"gene_symbols"),
+        "named index keeps its source name: {field_names:?}"
+    );
+    assert!(
+        !field_names.contains(&"__index_level_0__"),
+        "named index must NOT be renamed: {field_names:?}"
+    );
+    assert_eq!(
+        scx_format::pandas_index_columns(batch.schema_ref()),
+        vec!["gene_symbols".to_string()],
+        "pandas metadata must point at the named index"
+    );
+}
+
+#[test]
+fn h5ad_to_scx_streaming_preserves_obs_var_names() {
+    // B1-2026-05-20 end-to-end: the streaming path that `scx convert`
+    // uses by default must produce an SCX whose obs/var carry the
+    // pandas index metadata, so `pyscx.open(...).to_anndata()` sees
+    // `cell_<i>` / `gene_<i>` as obs_names / var_names and NOT as
+    // integer-positional defaults.
+    use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("input.h5ad");
+    let n_obs = 6;
+    let n_vars = 4;
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+
+    let scx_path = dir.path().join("out.scx");
+    h5ad_to_scx_streaming(
+        &h5ad_path,
+        &scx_path,
+        &ConvertOptions::default(),
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("streaming convert must succeed");
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(
+        scx_format::pandas_index_columns(obs.schema_ref()),
+        vec!["__index_level_0__".to_string()],
+        "obs schema must identify the index column"
+    );
+    let obs_idx = obs.schema().index_of("__index_level_0__").unwrap();
+    let obs_col = obs
+        .column(obs_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("obs index must be Utf8/StringArray");
+    let obs_values: Vec<String> = (0..obs_col.len())
+        .map(|i| obs_col.value(i).to_string())
+        .collect();
+    let expected_obs: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    assert_eq!(obs_values, expected_obs, "obs_names must round-trip");
+
+    let var = reader.read_var().unwrap();
+    assert_eq!(
+        scx_format::pandas_index_columns(var.schema_ref()),
+        vec!["__index_level_0__".to_string()],
+        "var schema must identify the index column"
+    );
+    let var_idx = var.schema().index_of("__index_level_0__").unwrap();
+    let var_col = var
+        .column(var_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("var index must be Utf8/StringArray");
+    let var_values: Vec<String> = (0..var_col.len())
+        .map(|i| var_col.value(i).to_string())
+        .collect();
+    let expected_var: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    assert_eq!(var_values, expected_var, "var_names must round-trip");
 }
