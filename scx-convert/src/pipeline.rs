@@ -435,17 +435,26 @@ fn build_and_write_predicate_indexes(
         .and_then(scx_engine::index::index_preset_columns)
         .map(|p| (p.obs_columns.len(), p.var_columns.len()))
         .unwrap_or((0, 0));
+    // `__index_level_0__` (pyarrow's canonical
+    // name for an unnamed pandas index) survives into the arrow schema
+    // for round-trip purposes but should never be suggested as a
+    // user-facing column name in a "did you mean" / "available columns"
+    // preview. Drop any `__`-prefixed entries.
     let obs_available: Vec<String> = obs
         .schema()
         .fields()
         .iter()
-        .map(|f| f.name().clone())
+        .map(|f| f.name())
+        .filter(|n| !n.starts_with("__"))
+        .cloned()
         .collect();
     let var_available: Vec<String> = var
         .schema()
         .fields()
         .iter()
-        .map(|f| f.name().clone())
+        .map(|f| f.name())
+        .filter(|n| !n.starts_with("__"))
+        .cloned()
         .collect();
     process_predicate_index_outcomes(
         result.obs_outcomes,

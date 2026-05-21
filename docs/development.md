@@ -127,8 +127,16 @@ uv venv .venv
 uv pip install maturin pytest numpy scipy pyarrow anndata scanpy \
     scikit-learn leidenalg python-dotenv
 
-# Build and install pyscx in development mode
+# Build and install pyscx in development mode. The pyscx `[tool.maturin]`
+# default feature set includes `hdf5`, so `pyscx.from_h5ad` / `to_h5ad`
+# / `from_h5mu` / `to_h5mu` are available out of the box (requires
+# `libhdf5-dev` system headers).
 cd pyscx && ../.venv/bin/maturin develop && cd ..
+
+# CPU-only / no-libhdf5 build (the four h5ad/h5mu wrappers still import
+# but raise `NotImplementedError` at call time).
+cd pyscx && ../.venv/bin/maturin develop --no-default-features \
+    --features pyo3/extension-module && cd ..
 
 # With cloud support
 cd pyscx && ../.venv/bin/maturin develop --features cloud && cd ..
@@ -231,7 +239,10 @@ compiles without CUDA installed. This ensures that:
 
 ### Feature flags
 
-All feature flags are opt-in:
+All feature flags are opt-in, with one exception: `pyscx/hdf5` is in the
+default `[tool.maturin] features` set so a bare `maturin develop`
+matches the published PyPI wheel. Opt out with
+`maturin develop --no-default-features --features pyo3/extension-module`.
 
 | Crate | Feature | What it enables |
 |-------|---------|----------------|
@@ -240,6 +251,8 @@ All feature flags are opt-in:
 | `scx-cli` | `cloud` | GCS/S3/Azure cloud I/O |
 | `scx-gpu` | `gds` | GPUDirect Storage (requires nvidia-fs drivers) |
 | `scx-accel` | `gpu` | GPU-accelerated PCA/kNN/UMAP/Leiden/preprocessing |
+| `pyscx` | `hdf5` | `pyscx.from_h5ad` / `to_h5ad` / `from_h5mu` / `to_h5mu` (default-on; see above) |
+| `pyscx` | `hdf5-static` | Bundles libhdf5 + zlib statically (wheel builds) |
 | `pyscx` | `cloud` | Python cloud operations |
 | `pyscx` | `gpu` | Python GPU accelerators |
 
