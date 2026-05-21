@@ -223,20 +223,28 @@ absolute_floors:
   #   * < 1.0 iff a component direction is genuinely missing or rotated
   #     out of plane — the failure mode that per-PC cosine cannot detect
   #
-  # 2026-05-20: switched randomized variants from `subspace_cos_min` to
-  # `subspace_cos_mean`. Empirical calibration (pbmc3k + tabula_sapiens_100k
-  # on cuda-version=12.6 / libcusparse=12.5.4.2):
+  # 2026-05-20: randomized variants now use a **layered** gate:
+  #   * `subspace_cos_mean ≥ 0.70/0.85` — main correctness floor.
+  #   * `subspace_cos_min  ≥ 0.01/0.02` — loose orthogonal-component guard.
+  # Empirical calibration (pbmc3k + tabula_sapiens_100k + census_1m on
+  # cuda-version=12.6 / libcusparse=12.5.4.2):
   #   randomized PCA at default params (n_oversamples=10, n_power_iterations=2)
   #   at n_comps=50 produces well-resolved top PCs (top-10 cos ≥ 0.99)
   #   but degrades at the tail of the spectrum — pbmc3k PC50 cos ≈ 0.05.
   #   This is textbook randomized-SVD behavior, not a code regression;
   #   CPU randomized produces the same tail-PC drift on the same fixtures.
-  # `subspace_cos_mean` averages the full principal-cosine vector and
-  # remains a strict regression signal: a broken implementation (e.g.
-  # buggy SpMM or QR) collapses both metrics toward 0; a correct one
-  # holds mean ≳ 0.8 at small n_obs and ≳ 0.92 at large n_obs.
-  # Floors set 0.05 below the calibrated value so noise doesn't trip.
-  # Covariance PCA (exact) keeps the original `subspace_cos_min ≥ 0.95`
+  # `subspace_cos_mean` is the main correctness signal: a broken
+  # implementation (e.g. buggy SpMM or QR) collapses it toward 0; a
+  # correct one holds mean ≳ 0.8 at small n_obs and ≳ 0.92 at large n_obs.
+  # Mean floors sit ~0.05 below the calibrated value so noise doesn't trip.
+  # The mean alone is insensitive to a *single* PC going orthogonal
+  # (cos_mean stays at (k-1)/k ≈ 0.98 for k=50), which is the failure mode
+  # `test_subspace_regression_drops_min_cosine` documents. To preserve
+  # that coverage we keep a loose `subspace_cos_min` floor — set well
+  # under the empirical tail (pbmc3k 0.032, tabula 0.041, census_1m
+  # 0.185) so randomized-SVD tail drift passes, but a true component-loss
+  # regression (cos_min → 0) still fails.
+  # Covariance PCA (exact) keeps a strict `subspace_cos_min ≥ 0.95`
   # floor — it doesn't have the randomized-tail problem.
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_cov
@@ -254,30 +262,60 @@ absolute_floors:
     metric: subspace_cos_mean
     min: 0.70
   - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.01
+  - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_chol
     dataset: pbmc3k
     metric: subspace_cos_mean
     min: 0.70
   - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.01
+  - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: tabula_sapiens_100k
     metric: subspace_cos_mean
     min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.01
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_chol
     dataset: tabula_sapiens_100k
     metric: subspace_cos_mean
     min: 0.85
   - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.01
+  - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
+    dataset: census_1m
+    metric: subspace_cos_mean
+    min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: census_1m
+    metric: subspace_cos_min
+    min: 0.02
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_chol
     dataset: census_1m
     metric: subspace_cos_mean
     min: 0.85
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_chol
     dataset: census_1m
-    metric: subspace_cos_mean
-    min: 0.85
+    metric: subspace_cos_min
+    min: 0.02
   # Covariance path at census_1m — f32 GPU vs f64 CPU tail-PC drift is real
   # but bounded; observed 0.9999+. Keep 0.90 floor for safety headroom.
   - benchmark: accel_pca
