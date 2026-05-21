@@ -516,14 +516,38 @@ pub fn column_not_found_message(axis: &str, column: &str, available: &[String]) 
     )
 }
 
-/// Shared suffix builder for [`forced_column_missing_message`] and
-/// [`column_not_found_message`]. Emits either the empty-axis fallback
-/// (`Available obs columns: [] (this h5ad has no obs metadata).`) or the
-/// `Available {axis} columns: [\"a\", \"b\", ...], ...` preview + the
-/// strsim-based `Did you mean '{best}'?` suggestion (threshold 0.6).
-fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> String {
+/// Find the closest match for `column` in `available` using normalized
+/// Levenshtein distance with a 0.6 acceptance threshold. Returns `None`
+/// when no candidate clears the threshold (i.e. the user's input isn't
+/// a near-typo of any existing column).
+fn best_match(column: &str, available: &[String]) -> Option<String> {
+    available
+        .iter()
+        .map(|n| (n, strsim::normalized_levenshtein(column, n)))
+        .filter(|(_, s)| *s >= 0.6)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(n, _)| n.clone())
+}
+
+/// Render the `"Available {axis} columns: [...]."` footer.
+///
+/// When `show_all` is true and `available.len() <= 64`, lists every
+/// column when strsim has a near-match the user
+/// is "on the right page" and benefits from seeing the full list). The
+/// 64-column cap keeps the worst-case message bounded for atlases with
+/// hundreds of obs columns. Otherwise falls back to the historical
+/// first-8 preview with `", ..."` truncation marker.
+///
+/// Empty `available` yields the empty-axis fallback that hints at no
+/// obs/var metadata being present in the file.
+fn render_available_columns(axis: &str, available: &[String], show_all: bool) -> String {
     if available.is_empty() {
         return format!("Available {axis} columns: [] (this h5ad has no {axis} metadata).");
+    }
+    let show_all = show_all && available.len() <= 64;
+    if show_all {
+        let items: Vec<&str> = available.iter().map(String::as_str).collect();
+        return format!("Available {axis} columns: {items:?}.");
     }
     let preview_n = available.len().min(8);
     let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
@@ -532,15 +556,19 @@ fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> S
     } else {
         ""
     };
-    let mut msg = format!("Available {axis} columns: {preview:?}{suffix}.");
-    if let Some(suggestion) = available
-        .iter()
-        .map(|n| (n, strsim::normalized_levenshtein(column, n)))
-        .filter(|(_, s)| *s >= 0.6)
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(n, _)| n.clone())
-    {
-        msg.push_str(&format!(" Did you mean '{suggestion}'?"));
+    format!("Available {axis} columns: {preview:?}{suffix}.")
+}
+
+/// Shared suffix builder for [`forced_column_missing_message`] and
+/// [`column_not_found_message`]. Computes the strsim suggestion first
+/// so the available-columns renderer can decide whether to show all
+/// (suggestion present → user is on the right page)
+/// or fall back to the 8-column preview.
+fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> String {
+    let suggestion = best_match(column, available);
+    let mut msg = render_available_columns(axis, available, suggestion.is_some());
+    if let Some(s) = suggestion {
+        msg.push_str(&format!(" Did you mean '{s}'?"));
     }
     msg
 }
@@ -576,32 +604,23 @@ pub fn forced_columns_missing_message(
         "{n} forced {axis} index columns are missing:",
         n = missing.len()
     );
+    // If ANY missing column has a strsim near-match
+    // in `available`, the user is "on the right page" — show the full
+    // available-columns list (capped at 64) instead of the 8-column
+    // preview so they can scan and pick the right name.
+    let mut any_suggestion = false;
     for column in missing {
-        let suggestion = available
-            .iter()
-            .map(|n| (n, strsim::normalized_levenshtein(column, n)))
-            .filter(|(_, s)| *s >= 0.6)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(n, _)| n.clone());
+        let suggestion = best_match(column, available);
+        if suggestion.is_some() {
+            any_suggestion = true;
+        }
         match suggestion {
             Some(s) => msg.push_str(&format!("\n  - '{column}': did you mean '{s}'?")),
             None => msg.push_str(&format!("\n  - '{column}'")),
         }
     }
-    if available.is_empty() {
-        msg.push_str(&format!(
-            "\nAvailable {axis} columns: [] (this h5ad has no {axis} metadata)."
-        ));
-    } else {
-        let preview_n = available.len().min(8);
-        let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
-        let suffix = if available.len() > preview_n {
-            ", ..."
-        } else {
-            ""
-        };
-        msg.push_str(&format!("\nAvailable {axis} columns: {preview:?}{suffix}."));
-    }
+    msg.push('\n');
+    msg.push_str(&render_available_columns(axis, available, any_suggestion));
     msg
 }
 
@@ -661,6 +680,69 @@ mod forced_column_missing_message_tests {
         assert!(
             !msg.contains("col_15"),
             "should not list past index 7: {msg}"
+        );
+    }
+
+    // E1-2026-05-20-Tier2: when the typo has a near-match in available,
+    // the user is on the right page — show ALL columns (up to the 64-col
+    // cap) instead of truncating to 8 so they can scan past index 7.
+    #[test]
+    fn shows_all_columns_when_strsim_suggestion_present() {
+        // 28 obs columns mirroring the census_500k.scx layout; `raw_sum`
+        // is at index 11 (past the 8-column cutoff). The strsim match
+        // for `raw_summ` should be `raw_sum`, which triggers show-all.
+        let mut avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
+        avail[11] = "raw_sum".to_string();
+        let msg = forced_column_missing_message("obs", "raw_summ", &avail);
+        assert!(
+            msg.contains("Did you mean 'raw_sum'?"),
+            "suggestion gate: {msg}"
+        );
+        assert!(
+            !msg.contains(", ..."),
+            "show-all path should NOT emit the truncation marker: {msg}"
+        );
+        assert!(msg.contains("col_00"), "should show first column: {msg}");
+        assert!(
+            msg.contains("col_27"),
+            "should show LAST column (past 8-col preview): {msg}"
+        );
+        assert!(msg.contains("raw_sum"), "{msg}");
+    }
+
+    // E1 corner: empty-suggestion case keeps the 8-column preview to
+    // avoid overwhelming a "fishing" user with hundreds of column names.
+    #[test]
+    fn keeps_preview_when_no_strsim_suggestion() {
+        let avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
+        let msg = forced_column_missing_message("obs", "totally_unrelated", &avail);
+        assert!(
+            !msg.contains("Did you mean"),
+            "no suggestion expected: {msg}"
+        );
+        assert!(msg.contains(", ..."), "should keep truncation: {msg}");
+        assert!(
+            !msg.contains("col_27"),
+            "should NOT show past index 7: {msg}"
+        );
+    }
+
+    // The 64-column cap guards the worst-case payload size: an atlas
+    // with > 64 obs columns falls back to the 8-column preview even
+    // when a suggestion is present.
+    #[test]
+    fn cap_at_64_columns_falls_back_to_preview() {
+        let mut avail: Vec<String> = (0..70).map(|i| format!("col_{i:03}")).collect();
+        avail[50] = "raw_sum".to_string();
+        let msg = forced_column_missing_message("obs", "raw_summ", &avail);
+        assert!(msg.contains("Did you mean 'raw_sum'?"), "{msg}");
+        assert!(
+            msg.contains(", ..."),
+            "should truncate past the 64-col cap: {msg}"
+        );
+        assert!(
+            !msg.contains("col_050"),
+            "the suggested column lives at index 50 — past the 8-col preview: {msg}"
         );
     }
 }
@@ -754,6 +836,30 @@ mod forced_columns_missing_message_tests {
         assert!(
             msg.contains("[] (this h5ad has no obs metadata)"),
             "should render the empty-axis footer: {msg}"
+        );
+    }
+
+    // E1-2026-05-20-Tier2: aggregate path inherits the show-all-when-
+    // strsim-matches behaviour from `render_available_columns`. If ANY
+    // of the misses has a near-match, the full column list (≤ 64) shows.
+    #[test]
+    fn aggregate_shows_all_columns_when_any_miss_has_suggestion() {
+        let mut avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
+        avail[11] = "raw_sum".to_string();
+        avail[14] = "cell_type".to_string();
+        let missing = vec!["raw_summ".to_string(), "cell_typ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &avail);
+        assert!(
+            msg.contains("did you mean 'raw_sum'?") && msg.contains("did you mean 'cell_type'?"),
+            "both suggestions should render: {msg}"
+        );
+        assert!(
+            !msg.contains(", ..."),
+            "show-all path should NOT truncate: {msg}"
+        );
+        assert!(
+            msg.contains("col_27"),
+            "should show LAST column (past 8-col preview): {msg}"
         );
     }
 }
