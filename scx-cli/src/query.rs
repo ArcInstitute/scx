@@ -92,10 +92,17 @@ pub fn run_query(
     // every shard had at least one matching row (Level 1 skipped zero)
     // even though Level 2 was doing all the work.
     let candidate_shards = result.total_shards - result.skipped_shards;
+    // matched_rows is the pre-limit
+    // Level-2 match count; n_cells (= result.x.n_rows()) reflects post-
+    // limit truncation, so reporting that as "matched" would underreport
+    // whenever --limit truncates.
     eprintln!(
         "Pushdown: {}/{} shards eliminated by catalog stats (Level 1); \
          {} of {} candidate-shard rows matched (Level 2 index/row-eval)",
-        result.skipped_shards, result.total_shards, n_cells, result.candidate_shard_rows,
+        result.skipped_shards,
+        result.total_shards,
+        result.matched_rows,
+        result.candidate_shard_rows,
     );
 
     // F3-2026-05-20-Tier2: minimal --explain block. Prints the parsed
@@ -115,7 +122,10 @@ pub fn run_query(
             "  Level 2 candidate shards: {}, candidate rows: {}",
             candidate_shards, result.candidate_shard_rows
         );
-        eprintln!("  matched rows: {n_cells}");
+        eprintln!("  matched rows (pre-limit): {}", result.matched_rows);
+        if result.matched_rows != n_cells {
+            eprintln!("  returned rows (post-limit): {n_cells}");
+        }
     }
 
     if count {
@@ -125,6 +135,7 @@ pub fn run_query(
                 "skipped_shards": result.skipped_shards,
                 "total_shards": result.total_shards,
                 "candidate_shard_rows": result.candidate_shard_rows,
+                "matched_rows": result.matched_rows,
             });
             println!("{}", serde_json::to_string_pretty(&json_out)?);
         } else {

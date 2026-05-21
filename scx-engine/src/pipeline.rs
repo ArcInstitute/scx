@@ -38,6 +38,11 @@ pub struct QueryResult {
     /// before Level 2 (PredicateIndex / row-evaluator) narrowing. Compare
     /// against `result.x.n_rows()` to see how much Level 2 trimmed.
     pub candidate_shard_rows: usize,
+    /// Number of rows that matched the obs predicate, *before* `--limit`
+    /// truncation. `result.x.n_rows()` is the post-limit returned count;
+    /// `matched_rows` is the true Level 2 match count. They're equal when
+    /// no limit was applied (or the limit exceeded the match count).
+    pub matched_rows: usize,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -49,6 +54,7 @@ impl std::fmt::Debug for QueryResult {
             .field("skipped_shards", &self.skipped_shards)
             .field("total_shards", &self.total_shards)
             .field("candidate_shard_rows", &self.candidate_shard_rows)
+            .field("matched_rows", &self.matched_rows)
             .finish()
     }
 }

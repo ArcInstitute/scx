@@ -383,6 +383,11 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     // Step 9: Apply fused normalize+log1p
     apply_fused_ops(&mut csr, plan.normalize, plan.log1p);
 
+    // Capture the pre-limit Level-2 match
+    // count so the CLI's pushdown / --explain output isn't confused by
+    // `--limit N` (which truncates `csr` below).
+    let matched_rows = csr.n_rows();
+
     // Step 10: Apply limit
     if let Some(limit) = plan.limit {
         if limit < csr.n_rows() {
@@ -431,6 +436,7 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         skipped_shards,
         total_shards,
         candidate_shard_rows,
+        matched_rows,
     })
 }
 
@@ -721,6 +727,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.x.n_rows(), 3);
         assert_eq!(result.obs.num_rows(), 3);
+        // matched_rows must reflect the
+        // pre-limit Level-2 match count (12 rows match the no-predicate
+        // pipeline), not the post-limit returned count.
+        assert_eq!(result.matched_rows, 12);
     }
 
     #[test]
@@ -734,6 +744,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.x.n_rows(), 6);
         assert_eq!(result.obs.num_rows(), 6);
+        // No truncation occurred — matched_rows must equal returned rows.
+        assert_eq!(result.matched_rows, result.x.n_rows());
     }
 
     #[test]

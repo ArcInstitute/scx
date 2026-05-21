@@ -857,22 +857,29 @@ fn emit_qc_advisories(
     let builtins = py.import("builtins")?;
     let user_warning = builtins.getattr("UserWarning")?;
 
-    let n_mt_var_names = count_mt_prefix_in_var_names(adata);
-    let n_mt_feature_name = count_mt_prefix_in_feature_name(adata);
+    // The MT-prefix counts cost a pandas
+    // `.str.startswith(...).sum()` scan each — small but non-trivial on
+    // 60k+ genes. Compute lazily and memoize so the common path (valid
+    // non-empty `qc_vars=["mt"]` mask) does zero scans, and the warning
+    // paths do at most one scan per axis.
+    let mut n_mt_var_names: Option<usize> = None;
+    let mut n_mt_feature_name: Option<usize> = None;
 
     // F2-2026-05-19: qc_vars=None + MT genes visible in var_names.
-    if qc_vars.is_empty() && n_mt_var_names >= 5 {
-        let msg = format!(
-            "calculate_qc_metrics: found {n_mt_var_names} MT-/mt- prefixed gene \
-             symbols in adata.var_names but `qc_vars` is None, so \
-             `pct_counts_mt` will NOT be computed. To compute it, run:\n  \
-             adata.var['mt'] = adata.var_names.str.startswith('MT-')\n  \
-             pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
-        );
-        warnings.call_method1("warn", (msg, &user_warning))?;
+    if qc_vars.is_empty() {
+        let n = *n_mt_var_names.get_or_insert_with(|| count_mt_prefix_in_var_names(adata));
+        if n >= 5 {
+            let msg = format!(
+                "calculate_qc_metrics: found {n} MT-/mt- prefixed gene \
+                 symbols in adata.var_names but `qc_vars` is None, so \
+                 `pct_counts_mt` will NOT be computed. To compute it, run:\n  \
+                 adata.var['mt'] = adata.var_names.str.upper().str.startswith('MT-')\n  \
+                 pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
+            );
+            warnings.call_method1("warn", (msg, &user_warning))?;
+        }
     }
 
-    // B1-2026-05-20-Tier2 options 1+2: per-qc_var empty-mask check.
     // `qc_var_mask_has_true` returns None when the column is absent or
     // not introspectable — in either case we let the downstream code
     // raise its own error rather than guessing.
@@ -881,28 +888,43 @@ fn emit_qc_advisories(
             continue;
         }
         let is_mt = qc_var.eq_ignore_ascii_case("mt");
-        let msg = if is_mt && n_mt_var_names < 5 && n_mt_feature_name >= 5 {
-            format!(
-                "calculate_qc_metrics: adata.var['mt'] mask matches 0 \
-                 genes, but adata.var['feature_name'] has \
-                 {n_mt_feature_name} MT-/mt- prefixed symbols — the \
-                 CELLxGENE Census layout (integer-string var_names, \
-                 gene symbols in var['feature_name']). \
-                 pct_counts_mt will be 0 for every cell. Tag mt from \
-                 feature_name instead:\n  \
-                 adata.var['mt'] = adata.var['feature_name'].str.startswith('MT-')\n  \
-                 pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
-            )
+        // CELLxGENE-shape branch only reachable when `is_mt` — gate the
+        // count materialisation on that so non-mt qc_vars don't pay the
+        // scan cost.
+        let msg = if is_mt {
+            let n_vn = *n_mt_var_names.get_or_insert_with(|| count_mt_prefix_in_var_names(adata));
+            let n_fn =
+                *n_mt_feature_name.get_or_insert_with(|| count_mt_prefix_in_feature_name(adata));
+            if n_vn < 5 && n_fn >= 5 {
+                format!(
+                    "calculate_qc_metrics: adata.var['mt'] mask matches 0 \
+                     genes, but adata.var['feature_name'] has \
+                     {n_fn} MT-/mt- prefixed symbols — the \
+                     CELLxGENE Census layout (integer-string var_names, \
+                     gene symbols in var['feature_name']). \
+                     pct_counts_mt will be 0 for every cell. Tag mt from \
+                     feature_name instead:\n  \
+                     adata.var['mt'] = adata.var['feature_name'].str.upper().str.startswith('MT-')\n  \
+                     pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
+                )
+            } else {
+                format!(
+                    "calculate_qc_metrics: qc_var '{qc_var}' mask matches 0 \
+                     genes in adata.var['{qc_var}']; total_counts_{qc_var} \
+                     and pct_counts_{qc_var} will be 0 for every cell. \
+                     Check that adata.var['{qc_var}'] is populated correctly \
+                     — e.g. for CELLxGENE Census data, gene symbols live in \
+                     adata.var['feature_name'], not in adata.var_names, so \
+                     tag as `adata.var['{qc_var}'] = \
+                     adata.var['feature_name'].str.upper().str.startswith('MT-')`."
+                )
+            }
         } else {
             format!(
                 "calculate_qc_metrics: qc_var '{qc_var}' mask matches 0 \
                  genes in adata.var['{qc_var}']; total_counts_{qc_var} \
                  and pct_counts_{qc_var} will be 0 for every cell. \
-                 Check that adata.var['{qc_var}'] is populated correctly \
-                 — e.g. for CELLxGENE Census data, gene symbols live in \
-                 adata.var['feature_name'], not in adata.var_names, so \
-                 tag as `adata.var['{qc_var}'] = \
-                 adata.var['feature_name'].str.startswith('MT-')`."
+                 Check that adata.var['{qc_var}'] is populated correctly."
             )
         };
         warnings.call_method1("warn", (msg, &user_warning))?;
@@ -912,28 +934,32 @@ fn emit_qc_advisories(
 }
 
 /// Count gene symbols starting with `MT-` or `mt-` in `adata.var_names`.
-/// Returns 0 on any access error (var_names missing, non-string values,
-/// etc.) so the caller can treat a 0 result as "no MT-tagged genes".
+/// Returns 0 on any access error (var_names missing, accessor failure,
+/// etc.) so the caller can treat 0 as "no MT-tagged genes".
+///
+/// Uses the pandas `.str.startswith(...).sum()` vectorised accessor so
+/// no per-name Python→Rust string copy is needed — the prefix scan runs
+/// in C inside pandas, returning a `numpy.int64` scalar.
 fn count_mt_prefix_in_var_names(adata: &Bound<'_, PyAny>) -> usize {
     let Ok(var_names) = adata.getattr("var_names") else {
         return 0;
     };
-    let Ok(names_list) = var_names.call_method0("tolist") else {
-        return 0;
-    };
-    let Ok(names) = names_list.extract::<Vec<String>>() else {
-        return 0;
-    };
-    names
-        .iter()
-        .filter(|s| s.starts_with("MT-") || s.starts_with("mt-"))
-        .count()
+    var_names
+        .getattr("str")
+        .and_then(|s| s.call_method1("startswith", (("MT-", "mt-"),)))
+        .and_then(|m| m.call_method0("sum"))
+        .and_then(|v| v.extract::<usize>())
+        .unwrap_or(0)
 }
 
 /// Count gene symbols starting with `MT-` or `mt-` in
 /// `adata.var['feature_name']`. Used to detect the CELLxGENE Census layout
 /// (integer-string var_names, real symbols under `feature_name`). Returns
-/// 0 when `feature_name` is absent or values are not strings.
+/// 0 when `feature_name` is absent or the accessor chain fails.
+///
+/// pandas `.str.startswith` works directly on Categorical columns
+/// (Census stores `feature_name` as Categorical) — no `.astype(str)` /
+/// `Vec<String>` materialisation needed.
 fn count_mt_prefix_in_feature_name(adata: &Bound<'_, PyAny>) -> usize {
     let Ok(var) = adata.getattr("var") else {
         return 0;
@@ -950,23 +976,11 @@ fn count_mt_prefix_in_feature_name(adata: &Bound<'_, PyAny>) -> usize {
     let Ok(col) = var.get_item("feature_name") else {
         return 0;
     };
-    // Cast categorical → str via .astype(str) so we don't depend on
-    // pandas internals — CELLxGENE Census stores feature_name as a
-    // pandas Categorical, which extract::<Vec<String>>() handles via
-    // tolist() but cheap defensive astype is safer.
-    let Ok(as_str) = col.call_method1("astype", ("str",)) else {
-        return 0;
-    };
-    let Ok(values_list) = as_str.call_method0("tolist") else {
-        return 0;
-    };
-    let Ok(values) = values_list.extract::<Vec<String>>() else {
-        return 0;
-    };
-    values
-        .iter()
-        .filter(|s| s.starts_with("MT-") || s.starts_with("mt-"))
-        .count()
+    col.getattr("str")
+        .and_then(|s| s.call_method1("startswith", (("MT-", "mt-"),)))
+        .and_then(|m| m.call_method0("sum"))
+        .and_then(|v| v.extract::<usize>())
+        .unwrap_or(0)
 }
 
 /// Compute per-gene `(total_counts, n_cells_by_counts)` via the CSC

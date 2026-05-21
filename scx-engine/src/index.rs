@@ -536,7 +536,7 @@ fn best_match(column: &str, available: &[String]) -> Option<String> {
 /// is "on the right page" and benefits from seeing the full list). The
 /// 64-column cap keeps the worst-case message bounded for atlases with
 /// hundreds of obs columns. Otherwise falls back to the historical
-/// first-8 preview with `", ..."` truncation marker.
+/// first-8 preview with `", \u{2026}"` (Unicode ellipsis) truncation marker.
 ///
 /// Empty `available` yields the empty-axis fallback that hints at no
 /// obs/var metadata being present in the file.
@@ -551,8 +551,12 @@ fn render_available_columns(axis: &str, available: &[String], show_all: bool) ->
     }
     let preview_n = available.len().min(8);
     let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
+    // Unicode ellipsis (single char) avoids
+    // the historical `, ....` 4-dot artifact when concatenated with the
+    // trailing sentence terminator. Reads as `, ….` — visually
+    // unambiguous.
     let suffix = if available.len() > preview_n {
-        ", ..."
+        ", \u{2026}"
     } else {
         ""
     };
@@ -675,7 +679,10 @@ mod forced_column_missing_message_tests {
     fn truncates_long_available_lists() {
         let avail: Vec<String> = (0..20).map(|i| format!("col_{i}")).collect();
         let msg = forced_column_missing_message("var", "missing", &avail);
-        assert!(msg.contains(", ..."), "should signal truncation: {msg}");
+        assert!(
+            msg.contains(", \u{2026}"),
+            "should signal truncation: {msg}"
+        );
         assert!(msg.contains("col_0") && msg.contains("col_7"), "{msg}");
         assert!(
             !msg.contains("col_15"),
@@ -699,7 +706,7 @@ mod forced_column_missing_message_tests {
             "suggestion gate: {msg}"
         );
         assert!(
-            !msg.contains(", ..."),
+            !msg.contains(", \u{2026}"),
             "show-all path should NOT emit the truncation marker: {msg}"
         );
         assert!(msg.contains("col_00"), "should show first column: {msg}");
@@ -720,7 +727,7 @@ mod forced_column_missing_message_tests {
             !msg.contains("Did you mean"),
             "no suggestion expected: {msg}"
         );
-        assert!(msg.contains(", ..."), "should keep truncation: {msg}");
+        assert!(msg.contains(", \u{2026}"), "should keep truncation: {msg}");
         assert!(
             !msg.contains("col_27"),
             "should NOT show past index 7: {msg}"
@@ -737,7 +744,7 @@ mod forced_column_missing_message_tests {
         let msg = forced_column_missing_message("obs", "raw_summ", &avail);
         assert!(msg.contains("Did you mean 'raw_sum'?"), "{msg}");
         assert!(
-            msg.contains(", ..."),
+            msg.contains(", \u{2026}"),
             "should truncate past the 64-col cap: {msg}"
         );
         assert!(
@@ -854,7 +861,7 @@ mod forced_columns_missing_message_tests {
             "both suggestions should render: {msg}"
         );
         assert!(
-            !msg.contains(", ..."),
+            !msg.contains(", \u{2026}"),
             "show-all path should NOT truncate: {msg}"
         );
         assert!(
