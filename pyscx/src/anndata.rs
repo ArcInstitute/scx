@@ -155,18 +155,23 @@ fn build_and_write_predicate_indexes_inline(
         .map(|f| f.name().clone())
         .collect();
     let process = |outcomes: Vec<BuildOutcome>, axis: &str, available: &[String]| -> PyResult<()> {
+        // Aggregate forced missing-column errors
+        // into a single error so users see ALL typos in one shot,
+        // matching the CLI's `process_predicate_index_outcomes` policy.
+        // Non-missing forced errors (unsupported dtype, high
+        // cardinality) stay fail-fast — the column exists, the message
+        // is per-column.
+        let mut forced_missing: Vec<String> = Vec::new();
         for outcome in outcomes {
             match outcome {
                 BuildOutcome::ForcedColumnError { column, reason } => {
-                    // E2-2026-05-20: enrich the message with available
-                    // columns + did-you-mean suggestion. Use the shared
-                    // helper so CLI and pyscx surfaces stay in sync.
-                    let msg = if matches!(reason, scx_engine::index::SkipReason::MissingColumn) {
-                        scx_engine::index::forced_column_missing_message(axis, &column, available)
+                    if matches!(reason, scx_engine::index::SkipReason::MissingColumn) {
+                        forced_missing.push(column);
                     } else {
-                        format!("forced {axis} index column '{column}': {reason}")
-                    };
-                    return Err(PyValueError::new_err(msg));
+                        return Err(PyValueError::new_err(format!(
+                            "forced {axis} index column '{column}': {reason}"
+                        )));
+                    }
                 }
                 BuildOutcome::PresetSkipped { column, reason } => {
                     emit_warning(format!(
@@ -174,6 +179,11 @@ fn build_and_write_predicate_indexes_inline(
                     ))?;
                 }
             }
+        }
+        if !forced_missing.is_empty() {
+            let msg =
+                scx_engine::index::forced_columns_missing_message(axis, &forced_missing, available);
+            return Err(PyValueError::new_err(msg));
         }
         Ok(())
     };

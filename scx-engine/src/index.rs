@@ -545,6 +545,66 @@ fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> S
     msg
 }
 
+/// Aggregate-form of [`forced_column_missing_message`] for callers that
+/// processed multiple `BuildOutcome::ForcedColumnError` entries with
+/// `SkipReason::MissingColumn`. Used by `scx convert --index-obs/--index-var`
+/// (and the parallel `pyscx.from_anndata` path) so the user sees ALL
+/// typos in a single error rather than fixing them one per run.
+///
+/// `missing` is the list of forced columns that came back missing, in
+/// the order they were requested. Each entry gets its own line with a
+/// strsim suggestion (if any); the available-columns preview is shared
+/// across them via the same `column_suggestion_suffix` helper so the
+/// rendered format stays consistent with the single-column message.
+///
+/// For a single missing column, prefer [`forced_column_missing_message`]
+/// — the singular form keeps the existing single-line wording.
+pub fn forced_columns_missing_message(
+    axis: &str,
+    missing: &[String],
+    available: &[String],
+) -> String {
+    if missing.is_empty() {
+        // Degenerate guard. Should not happen in practice — the caller
+        // is supposed to gate on `!missing.is_empty()` before calling.
+        return format!("0 forced {axis} index columns are missing.");
+    }
+    if missing.len() == 1 {
+        return forced_column_missing_message(axis, &missing[0], available);
+    }
+    let mut msg = format!(
+        "{n} forced {axis} index columns are missing:",
+        n = missing.len()
+    );
+    for column in missing {
+        let suggestion = available
+            .iter()
+            .map(|n| (n, strsim::normalized_levenshtein(column, n)))
+            .filter(|(_, s)| *s >= 0.6)
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(n, _)| n.clone());
+        match suggestion {
+            Some(s) => msg.push_str(&format!("\n  - '{column}': did you mean '{s}'?")),
+            None => msg.push_str(&format!("\n  - '{column}'")),
+        }
+    }
+    if available.is_empty() {
+        msg.push_str(&format!(
+            "\nAvailable {axis} columns: [] (this h5ad has no {axis} metadata)."
+        ));
+    } else {
+        let preview_n = available.len().min(8);
+        let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
+        let suffix = if available.len() > preview_n {
+            ", ..."
+        } else {
+            ""
+        };
+        msg.push_str(&format!("\nAvailable {axis} columns: {preview:?}{suffix}."));
+    }
+    msg
+}
+
 #[cfg(test)]
 mod forced_column_missing_message_tests {
     use super::forced_column_missing_message;
@@ -601,6 +661,99 @@ mod forced_column_missing_message_tests {
         assert!(
             !msg.contains("col_15"),
             "should not list past index 7: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forced_columns_missing_message_tests {
+    use super::forced_columns_missing_message;
+
+    fn census_obs_columns() -> Vec<String> {
+        vec![
+            "soma_joinid".to_string(),
+            "dataset_id".to_string(),
+            "cell_type".to_string(),
+            "raw_sum".to_string(),
+            "tissue".to_string(),
+            "disease".to_string(),
+        ]
+    }
+
+    #[test]
+    fn aggregates_multiple_misses_with_suggestions() {
+        // F6-2026-05-20-Tier2: both `raw_summ` and `cell_typ` should be
+        // surfaced in a single error, each with its own strsim hint.
+        let missing = vec!["raw_summ".to_string(), "cell_typ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &census_obs_columns());
+        assert!(
+            msg.contains("2 forced obs index columns are missing"),
+            "should aggregate count + axis: {msg}"
+        );
+        assert!(
+            msg.contains("- 'raw_summ': did you mean 'raw_sum'?"),
+            "should include first typo + suggestion: {msg}"
+        );
+        assert!(
+            msg.contains("- 'cell_typ': did you mean 'cell_type'?"),
+            "should include second typo + suggestion: {msg}"
+        );
+        assert!(
+            msg.contains("Available obs columns"),
+            "should include available-columns footer: {msg}"
+        );
+    }
+
+    #[test]
+    fn aggregates_misses_without_near_suggestion() {
+        let missing = vec![
+            "totally_unrelated".to_string(),
+            "another_unrelated".to_string(),
+        ];
+        let msg = forced_columns_missing_message("obs", &missing, &census_obs_columns());
+        assert!(
+            msg.contains("2 forced obs index columns are missing"),
+            "{msg}"
+        );
+        // Both names without suggestions should appear on their own bullets.
+        assert!(msg.contains("- 'totally_unrelated'"), "{msg}");
+        assert!(msg.contains("- 'another_unrelated'"), "{msg}");
+        assert!(
+            !msg.contains("Did you mean") && !msg.contains("did you mean"),
+            "no near match in either case: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_miss_delegates_to_singular_helper() {
+        // The singular path keeps the historical wording so we don't
+        // gratuitously change byte-for-byte output of the single-miss
+        // surface (the most common one in practice).
+        let missing = vec!["raw_summ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &census_obs_columns());
+        assert!(
+            msg.contains("forced obs index column 'raw_summ': missing column."),
+            "should use the singular wording: {msg}"
+        );
+        assert!(msg.contains("Did you mean 'raw_sum'?"), "{msg}");
+        // The aggregate header MUST NOT appear when N == 1.
+        assert!(
+            !msg.contains("forced obs index columns are missing"),
+            "should not emit the aggregate header for single miss: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_available_columns_is_handled() {
+        let missing = vec!["raw_summ".to_string(), "cell_typ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &[]);
+        assert!(
+            msg.contains("2 forced obs index columns are missing"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("[] (this h5ad has no obs metadata)"),
+            "should render the empty-axis footer: {msg}"
         );
     }
 }

@@ -6309,3 +6309,115 @@ fn process_outcomes_keeps_per_column_when_no_preset() {
 // unconditionally; `scx-convert` is `hdf5`-gated) can call it from
 // CPU-only builds. The previous duplicate tests here were removed in
 // the CI fix-up for PR #113.
+
+// -----------------------------------------------------------------------
+// Process_predicate_index_outcomes aggregates
+// multiple ForcedColumnError(MissingColumn) into a single error so the
+// user can see ALL typos in a single run, instead of fixing one per
+// invocation.
+// -----------------------------------------------------------------------
+
+#[test]
+fn process_outcomes_aggregates_forced_missing_columns_into_single_error() {
+    use super::pipeline::process_predicate_index_outcomes;
+    use super::warnings::WarningSink;
+    use scx_engine::index::{BuildOutcome, SkipReason};
+
+    let mut sink = WarningSink::log();
+    let outcomes = vec![
+        BuildOutcome::ForcedColumnError {
+            column: "raw_summ".into(),
+            reason: SkipReason::MissingColumn,
+        },
+        BuildOutcome::ForcedColumnError {
+            column: "cell_typ".into(),
+            reason: SkipReason::MissingColumn,
+        },
+    ];
+    let available: Vec<String> = vec![
+        "soma_joinid".into(),
+        "dataset_id".into(),
+        "cell_type".into(),
+        "raw_sum".into(),
+    ];
+    let err = process_predicate_index_outcomes(outcomes, "obs", None, 0, &available, &mut sink)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("2 forced obs index columns are missing"),
+        "should aggregate: {msg}"
+    );
+    assert!(
+        msg.contains("'raw_summ': did you mean 'raw_sum'?"),
+        "first typo + suggestion: {msg}"
+    );
+    assert!(
+        msg.contains("'cell_typ': did you mean 'cell_type'?"),
+        "second typo + suggestion: {msg}"
+    );
+}
+
+#[test]
+fn process_outcomes_single_forced_miss_uses_singular_wording() {
+    // Sanity: the single-miss path must keep the existing singular
+    // wording so PR #113's user-visible message is byte-identical when
+    // only one column is typo'd (the common case).
+    use super::pipeline::process_predicate_index_outcomes;
+    use super::warnings::WarningSink;
+    use scx_engine::index::{BuildOutcome, SkipReason};
+
+    let mut sink = WarningSink::log();
+    let outcomes = vec![BuildOutcome::ForcedColumnError {
+        column: "raw_summ".into(),
+        reason: SkipReason::MissingColumn,
+    }];
+    let available: Vec<String> = vec!["soma_joinid".into(), "raw_sum".into()];
+    let err = process_predicate_index_outcomes(outcomes, "obs", None, 0, &available, &mut sink)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forced obs index column 'raw_summ': missing column."),
+        "should use singular wording: {msg}"
+    );
+    assert!(msg.contains("Did you mean 'raw_sum'?"), "{msg}");
+    assert!(
+        !msg.contains("forced obs index columns are missing"),
+        "should NOT emit plural header for single miss: {msg}"
+    );
+}
+
+#[test]
+fn process_outcomes_non_missing_forced_error_stays_fail_fast() {
+    // Forced errors with non-MissingColumn reasons (unsupported dtype,
+    // high cardinality) describe a real per-column condition — they
+    // should still abort on the first hit rather than aggregating.
+    use super::pipeline::process_predicate_index_outcomes;
+    use super::warnings::WarningSink;
+    use scx_engine::index::{BuildOutcome, SkipReason};
+
+    let mut sink = WarningSink::log();
+    let outcomes = vec![BuildOutcome::ForcedColumnError {
+        column: "donor_id".into(),
+        reason: SkipReason::HighCardinality {
+            n_unique: 10_000,
+            threshold: 1_024,
+        },
+    }];
+    let err =
+        process_predicate_index_outcomes(outcomes, "obs", None, 0, &[], &mut sink).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forced obs index column 'donor_id'"),
+        "should name the column: {msg}"
+    );
+    // The fail-fast (non-aggregated) path should NOT emit the plural
+    // header or the strsim treatment — the column exists.
+    assert!(
+        !msg.contains("forced obs index columns are missing"),
+        "non-missing reason should not aggregate: {msg}"
+    );
+    assert!(
+        !msg.contains("Did you mean"),
+        "non-missing reason should not strsim: {msg}"
+    );
+}

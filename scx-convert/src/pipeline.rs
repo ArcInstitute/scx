@@ -489,27 +489,26 @@ pub(crate) fn process_predicate_index_outcomes(
 ) -> Result<(), ConvertError> {
     let mut missing: Vec<String> = Vec::new();
     let mut deferred: Vec<ConvertWarning> = Vec::new();
-
+    // Forced-column errors used to be fail-fast on
+    // the first miss, so users had to iterate one typo per run. Collect
+    // them all and surface as a single aggregated error after the loop,
+    // matching the `missing` / `deferred` pattern below for PresetSkipped.
+    let mut forced_missing: Vec<String> = Vec::new();
+    // Non-missing forced errors (unsupported dtype, high cardinality)
+    // can't reuse the strsim renderer — the column DOES exist; the
+    // engine's text already describes the real reason. Preserve fail-
+    // fast on those: they're per-column type/cardinality problems that
+    // aren't related to typo'd column names.
     for outcome in outcomes {
         match outcome {
             BuildOutcome::ForcedColumnError { column, reason } => {
-                // E2-2026-05-20: the `reason` from the engine is the
-                // raw `missing column` / `unsupported_dtype` discriminant.
-                // When it's `MissingColumn`, our renderer adds the
-                // available-columns list + did-you-mean suggestion;
-                // other reasons (unsupported dtype, high cardinality)
-                // pass through with the engine's text since the column
-                // *does* exist.
-                let msg = if matches!(reason, SkipReason::MissingColumn) {
-                    scx_engine::index::forced_column_missing_message(
-                        axis,
-                        &column,
-                        available_columns,
-                    )
+                if matches!(reason, SkipReason::MissingColumn) {
+                    forced_missing.push(column);
                 } else {
-                    format!("forced {axis} index column '{column}': {reason}")
-                };
-                return Err(ConvertError::Other(msg));
+                    return Err(ConvertError::Other(format!(
+                        "forced {axis} index column '{column}': {reason}"
+                    )));
+                }
             }
             BuildOutcome::PresetSkipped { column, reason } => match reason {
                 SkipReason::MissingColumn => missing.push(column),
@@ -519,6 +518,15 @@ pub(crate) fn process_predicate_index_outcomes(
                 }),
             },
         }
+    }
+
+    if !forced_missing.is_empty() {
+        let msg = scx_engine::index::forced_columns_missing_message(
+            axis,
+            &forced_missing,
+            available_columns,
+        );
+        return Err(ConvertError::Other(msg));
     }
 
     let aggregate = preset.is_some_and(|_| {
