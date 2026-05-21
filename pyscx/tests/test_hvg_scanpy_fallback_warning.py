@@ -110,10 +110,45 @@ def test_warning_mentions_the_scx_native_workaround():
 
 
 def test_warning_text_calls_out_known_fragility():
-    """The warning should mention the scanpy fragility the user is most
-    likely to hit on real Census data: seurat_v3 LOESS singularity and
-    cell_ranger pd.cut bin-edge collisions — together with the cheap
-    workarounds (filter_genes / flavor='seurat')."""
+    """The fragility paragraph (LOESS / pd.cut)
+    should appear when the user calls a flavor that actually traverses
+    those code paths — `seurat_v3` / `seurat_v3_paper` / `cell_ranger`.
+    Verified here on `seurat_v3` (the failure mode the Tier 2 user
+    actually hit). Pre-N4 this test ran with `flavor="seurat"` and
+    incorrectly asserted the fragility text appeared there too — the
+    warning re-fired its own recommended workaround at the user."""
+    from pyscx import accel
+    adata = _adata_seurat_compatible()
+    # seurat_v3 expects raw counts (not log-normalised), so do NOT
+    # normalize_total/log1p first. The scanpy call may then fail on
+    # this tiny synthetic data — we only care about the warning, which
+    # fires BEFORE the scanpy call attempts the LOESS fit.
+    with warnings.catch_warnings(record=True) as ws:
+        warnings.simplefilter("always")
+        try:
+            accel.highly_variable_genes(adata, n_top_genes=50, flavor="seurat_v3")
+        except Exception:
+            pass
+    matches = [
+        w for w in ws
+        if "scanpy.pp.highly_variable_genes" in str(w.message)
+    ]
+    assert matches
+    text = str(matches[0].message)
+    assert "seurat_v3" in text and "cell_ranger" in text, (
+        f"Warning should reference both fragile flavors. Got: {text!r}"
+    )
+    assert "filter_genes" in text or "flavor=\"seurat\"" in text, (
+        f"Warning should reference the recommended workaround. Got: {text!r}"
+    )
+
+
+def test_warning_text_omits_fragility_for_seurat_flavor():
+    """The warning text MUST NOT mention the LOESS
+    / pd.cut fragility when the user is already on `flavor="seurat"`
+    (the flavor that the fragility paragraph itself recommends as a
+    workaround). The core delegation message still fires — silent
+    fallback is still a finding — but the irrelevant tail is suppressed."""
     from pyscx import accel
     adata = _adata_seurat_compatible()
     import scanpy as sc
@@ -127,11 +162,24 @@ def test_warning_text_calls_out_known_fragility():
         w for w in ws
         if "scanpy.pp.highly_variable_genes" in str(w.message)
     ]
-    assert matches
+    assert matches, (
+        "Core delegation warning must still fire for seurat flavor — "
+        "silent-fallback observability is the design intent. "
+        f"Got: {[str(w.message) for w in ws]}"
+    )
     text = str(matches[0].message)
-    assert "seurat_v3" in text and "cell_ranger" in text, (
-        f"Warning should reference both fragile flavors. Got: {text!r}"
+    # Substrings unique to the fragility tail. `cell_ranger` is the
+    # tightest signal because it appears nowhere else in the message.
+    assert "cell_ranger" not in text, (
+        f"Fragility paragraph (LOESS / pd.cut) should be suppressed for "
+        f"flavor='seurat'. Got: {text!r}"
     )
-    assert "filter_genes" in text or "flavor=\"seurat\"" in text, (
-        f"Warning should reference the recommended workaround. Got: {text!r}"
+    assert "LOESS" not in text and "pd.cut" not in text, (
+        f"Fragility paragraph should be suppressed for flavor='seurat'. "
+        f"Got: {text!r}"
     )
+    # The user still sees the scx-native workaround (this is what
+    # `test_warning_mentions_the_scx_native_workaround` also asserts —
+    # repeated here so a future re-refactor that breaks both fails
+    # both, not silently one).
+    assert "backed=True" in text or "ScxLazyTransformedDataset" in text

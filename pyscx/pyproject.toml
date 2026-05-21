@@ -50,7 +50,13 @@ cloud = [
     "scanpy>=1.10",
 ]
 
+# `hdf5` is included by default so a bare
+# `maturin develop` produces a working venv where `pyscx.from_h5ad`
+# is callable. Opt out with `maturin develop --no-default-features
+# --features pyo3/extension-module` when libhdf5 is unavailable;
+# `pyscx/__init__.py` gates the wrapper imports so `import pyscx`
+# still succeeds in that mode.
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "hdf5"]
 python-source = "python"
 include = [{ path = "python/pyscx/py.typed", format = "sdist" }]

@@ -355,11 +355,16 @@ impl<'a> Parser<'a> {
         match self.schema.column_with_name(col) {
             Some((_, field)) => Ok(field.data_type()),
             None => {
+                // Drop pyarrow-internal `__*`
+                // columns (notably `__index_level_0__`) from the
+                // user-facing available-columns preview.
                 let available: Vec<String> = self
                     .schema
                     .fields()
                     .iter()
-                    .map(|f| f.name().to_string())
+                    .map(|f| f.name())
+                    .filter(|n| !n.starts_with("__"))
+                    .map(|n| n.to_string())
                     .collect();
                 Err(EngineError::SchemaError {
                     column: col.to_string(),

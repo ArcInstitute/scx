@@ -531,47 +531,41 @@ fn best_match(column: &str, available: &[String]) -> Option<String> {
 
 /// Render the `"Available {axis} columns: [...]."` footer.
 ///
-/// When `show_all` is true and `available.len() <= 64`, lists every
-/// column when strsim has a near-match the user
-/// is "on the right page" and benefits from seeing the full list). The
-/// 64-column cap keeps the worst-case message bounded for atlases with
-/// hundreds of obs columns. Otherwise falls back to the historical
-/// first-8 preview with `", \u{2026}"` (Unicode ellipsis) truncation marker.
+/// Lists every column when `available.len() <= 64`; the 64-column cap
+/// keeps the worst-case message bounded for atlases with hundreds of
+/// obs columns. Falls back to the first-8 preview with `", \u{2026}"`
+/// (Unicode ellipsis — avoids the `, ....` 4-dot artifact) when there
+/// are more than 64 columns.
+///
+/// N2-2026-05-21-Tier2: gating is purely on `available.len()` now.
+/// PR #116's E1 fix originally gated show-all on "strsim has a winner",
+/// but scanpy-vocab inputs (`total_counts`, `pct_counts_mt`, …) have
+/// no near-match in the Census obs schema, so the user couldn't see
+/// `raw_sum` in the truncated preview. Length is the only meaningful
+/// concern; the strsim suggestion is rendered separately.
 ///
 /// Empty `available` yields the empty-axis fallback that hints at no
 /// obs/var metadata being present in the file.
-fn render_available_columns(axis: &str, available: &[String], show_all: bool) -> String {
+fn render_available_columns(axis: &str, available: &[String]) -> String {
     if available.is_empty() {
         return format!("Available {axis} columns: [] (this h5ad has no {axis} metadata).");
     }
-    let show_all = show_all && available.len() <= 64;
-    if show_all {
+    if available.len() <= 64 {
         let items: Vec<&str> = available.iter().map(String::as_str).collect();
         return format!("Available {axis} columns: {items:?}.");
     }
-    let preview_n = available.len().min(8);
+    let preview_n = 8;
     let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
-    // Unicode ellipsis (single char) avoids
-    // the historical `, ....` 4-dot artifact when concatenated with the
-    // trailing sentence terminator. Reads as `, ….` — visually
-    // unambiguous.
-    let suffix = if available.len() > preview_n {
-        ", \u{2026}"
-    } else {
-        ""
-    };
-    format!("Available {axis} columns: {preview:?}{suffix}.")
+    format!("Available {axis} columns: {preview:?}, \u{2026}.")
 }
 
 /// Shared suffix builder for [`forced_column_missing_message`] and
-/// [`column_not_found_message`]. Computes the strsim suggestion first
-/// so the available-columns renderer can decide whether to show all
-/// (suggestion present → user is on the right page)
-/// or fall back to the 8-column preview.
+/// [`column_not_found_message`]. Renders the available-columns footer
+/// (capped at 64) and appends a strsim "Did you mean ...?" hint when
+/// there's a near-match.
 fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> String {
-    let suggestion = best_match(column, available);
-    let mut msg = render_available_columns(axis, available, suggestion.is_some());
-    if let Some(s) = suggestion {
+    let mut msg = render_available_columns(axis, available);
+    if let Some(s) = best_match(column, available) {
         msg.push_str(&format!(" Did you mean '{s}'?"));
     }
     msg
@@ -608,23 +602,14 @@ pub fn forced_columns_missing_message(
         "{n} forced {axis} index columns are missing:",
         n = missing.len()
     );
-    // If ANY missing column has a strsim near-match
-    // in `available`, the user is "on the right page" — show the full
-    // available-columns list (capped at 64) instead of the 8-column
-    // preview so they can scan and pick the right name.
-    let mut any_suggestion = false;
     for column in missing {
-        let suggestion = best_match(column, available);
-        if suggestion.is_some() {
-            any_suggestion = true;
-        }
-        match suggestion {
+        match best_match(column, available) {
             Some(s) => msg.push_str(&format!("\n  - '{column}': did you mean '{s}'?")),
             None => msg.push_str(&format!("\n  - '{column}'")),
         }
     }
     msg.push('\n');
-    msg.push_str(&render_available_columns(axis, available, any_suggestion));
+    msg.push_str(&render_available_columns(axis, available));
     msg
 }
 
@@ -675,24 +660,25 @@ mod forced_column_missing_message_tests {
         assert!(!msg.contains("Did you mean"), "{msg}");
     }
 
+    // N2-2026-05-21-Tier2: under the 64-column cap, lists with ≤ 64
+    // columns show in full regardless of strsim — so users who type
+    // scanpy-vocab columns (e.g. `total_counts`) on a Census atlas can
+    // still see `raw_sum` in the rendered list. Pre-N2 this test
+    // asserted `, ….` truncation; that gate moved to the > 64 path.
     #[test]
-    fn truncates_long_available_lists() {
+    fn shows_all_columns_when_under_cap() {
         let avail: Vec<String> = (0..20).map(|i| format!("col_{i}")).collect();
         let msg = forced_column_missing_message("var", "missing", &avail);
         assert!(
-            msg.contains(", \u{2026}"),
-            "should signal truncation: {msg}"
+            !msg.contains(", \u{2026}"),
+            "20 cols ≤ 64 cap should show all, not truncate: {msg}"
         );
-        assert!(msg.contains("col_0") && msg.contains("col_7"), "{msg}");
-        assert!(
-            !msg.contains("col_15"),
-            "should not list past index 7: {msg}"
-        );
+        assert!(msg.contains("col_0") && msg.contains("col_19"), "{msg}");
     }
 
-    // E1-2026-05-20-Tier2: when the typo has a near-match in available,
-    // the user is on the right page — show ALL columns (up to the 64-col
-    // cap) instead of truncating to 8 so they can scan past index 7.
+    // E1-2026-05-20-Tier2: with a strsim near-match the full list still
+    // renders (no behavioural change from N2 — only the gating logic
+    // changed, this case continues to show all).
     #[test]
     fn shows_all_columns_when_strsim_suggestion_present() {
         // 28 obs columns mirroring the census_500k.scx layout; `raw_sum`
@@ -717,20 +703,25 @@ mod forced_column_missing_message_tests {
         assert!(msg.contains("raw_sum"), "{msg}");
     }
 
-    // E1 corner: empty-suggestion case keeps the 8-column preview to
-    // avoid overwhelming a "fishing" user with hundreds of column names.
+    // N2-2026-05-21-Tier2: even without a strsim suggestion, lists ≤ 64
+    // columns show in full. This is the scanpy-vocab failure mode the
+    // pre-N2 logic produced: `total_counts` on a Census schema has no
+    // near-match, so `raw_sum` was hidden in the 8-column preview.
     #[test]
-    fn keeps_preview_when_no_strsim_suggestion() {
+    fn previews_all_when_under_cap_regardless_of_strsim() {
         let avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
         let msg = forced_column_missing_message("obs", "totally_unrelated", &avail);
         assert!(
             !msg.contains("Did you mean"),
             "no suggestion expected: {msg}"
         );
-        assert!(msg.contains(", \u{2026}"), "should keep truncation: {msg}");
         assert!(
-            !msg.contains("col_27"),
-            "should NOT show past index 7: {msg}"
+            !msg.contains(", \u{2026}"),
+            "28 cols ≤ 64 cap should show all, not truncate: {msg}"
+        );
+        assert!(
+            msg.contains("col_27"),
+            "should show LAST column even with no strsim winner: {msg}"
         );
     }
 
@@ -846,9 +837,10 @@ mod forced_columns_missing_message_tests {
         );
     }
 
-    // E1-2026-05-20-Tier2: aggregate path inherits the show-all-when-
-    // strsim-matches behaviour from `render_available_columns`. If ANY
-    // of the misses has a near-match, the full column list (≤ 64) shows.
+    // E1-2026-05-20-Tier2 + N2-2026-05-21-Tier2: aggregate path renders
+    // the full column list when ≤ 64 columns regardless of strsim. This
+    // case kept its assertion identical post-N2; only the rationale
+    // narrowed (length cap, not strsim winner, is the gate).
     #[test]
     fn aggregate_shows_all_columns_when_any_miss_has_suggestion() {
         let mut avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
@@ -867,6 +859,71 @@ mod forced_columns_missing_message_tests {
         assert!(
             msg.contains("col_27"),
             "should show LAST column (past 8-col preview): {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod column_not_found_message_tests {
+    use super::column_not_found_message;
+
+    // N2-2026-05-21-Tier2: a runtime `filter_obs("total_counts >= 500")`
+    // on a CELLxGENE Census `.scx` must surface `raw_sum` even though
+    // normalized Levenshtein("total_counts", "raw_sum") ≈ 0.083 — well
+    // below the 0.6 strsim threshold. Pre-N2 the 29-column list was
+    // truncated to 8 and the user never saw `raw_sum`.
+    #[test]
+    fn shows_full_list_when_no_strsim_winner_under_cap() {
+        // 29 obs columns mirroring `census_500k_0521.scx`. `raw_sum` is
+        // at index 23 (way past the 8-column preview), and no Census
+        // column is within 0.6 normalized-Levenshtein of `total_counts`.
+        let avail: Vec<String> = vec![
+            "soma_joinid",
+            "dataset_id",
+            "assay",
+            "assay_ontology_term_id",
+            "cell_type",
+            "cell_type_ontology_term_id",
+            "development_stage",
+            "development_stage_ontology_term_id",
+            "disease",
+            "disease_ontology_term_id",
+            "donor_id",
+            "is_primary_data",
+            "observation_joinid",
+            "self_reported_ethnicity",
+            "self_reported_ethnicity_ontology_term_id",
+            "sex",
+            "sex_ontology_term_id",
+            "suspension_type",
+            "tissue",
+            "tissue_ontology_term_id",
+            "tissue_type",
+            "tissue_general",
+            "tissue_general_ontology_term_id",
+            "raw_sum",
+            "nnz",
+            "raw_mean_nnz",
+            "raw_variance_nnz",
+            "n_measured_vars",
+            "__index_level_0__",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let msg = column_not_found_message("obs", "total_counts", &avail);
+        assert!(
+            !msg.contains("Did you mean"),
+            "no strsim winner expected for total_counts on Census schema: {msg}"
+        );
+        assert!(
+            msg.contains("raw_sum"),
+            "user must be able to see `raw_sum` to recover from the \
+             scanpy-vocab mismatch: {msg}"
+        );
+        assert!(
+            !msg.contains(", \u{2026}"),
+            "29 cols ≤ 64 cap should show all, not truncate: {msg}"
         );
     }
 }

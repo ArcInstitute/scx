@@ -142,17 +142,25 @@ fn build_and_write_predicate_indexes_inline(
         py.import("warnings")?.call_method1("warn", (msg,))?;
         Ok(())
     };
+    // Drop pyarrow-internal `__*` columns
+    // (notably `__index_level_0__`) before passing to the error
+    // renderer — they live in the arrow schema for round-trip but
+    // are never the right user-facing suggestion.
     let obs_available: Vec<String> = obs
         .schema()
         .fields()
         .iter()
-        .map(|f| f.name().clone())
+        .map(|f| f.name())
+        .filter(|n| !n.starts_with("__"))
+        .cloned()
         .collect();
     let var_available: Vec<String> = var
         .schema()
         .fields()
         .iter()
-        .map(|f| f.name().clone())
+        .map(|f| f.name())
+        .filter(|n| !n.starts_with("__"))
+        .cloned()
         .collect();
     let process = |outcomes: Vec<BuildOutcome>, axis: &str, available: &[String]| -> PyResult<()> {
         // Aggregate forced missing-column errors

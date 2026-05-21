@@ -40,6 +40,29 @@ fn has_cloud_scheme(source: &str) -> bool {
     })
 }
 
+/// Format the `--explain` "Level 2 row eliminations" line, or `None`
+/// when the inputs aren't interpretable as an elimination count.
+///
+/// Returns `None` when:
+///   * `candidate_shard_rows == 0` — Level 1 took every shard, so the
+///     line would divide by zero and carry no information.
+///   * `matched_rows > candidate_shard_rows` — reachable when some
+///     candidate shards lack catalog `stats`. `candidate_shard_rows`
+///     drops those via `filter_map`
+///     (`scx-engine::collect::candidate_shard_rows`) but `matched_rows`
+///     still counts the rows they contributed, so the difference would
+///     underflow `usize` (panic in debug, >100% in release).
+fn format_level2_eliminations(candidate_shard_rows: usize, matched_rows: usize) -> Option<String> {
+    if candidate_shard_rows == 0 {
+        return None;
+    }
+    let eliminated = candidate_shard_rows.checked_sub(matched_rows)?;
+    let pct = 100.0 * eliminated as f64 / candidate_shard_rows as f64;
+    Some(format!(
+        "  Level 2 row eliminations: {eliminated} ({pct:.1}% of candidate rows)"
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_query(
     source: &str,
@@ -123,6 +146,16 @@ pub fn run_query(
             candidate_shards, result.candidate_shard_rows
         );
         eprintln!("  matched rows (pre-limit): {}", result.matched_rows);
+        // F1-2026-05-21-Tier2: surface the Level-2 row-mask
+        // elimination count directly rather than making the user
+        // compute `candidate_rows - matched_rows` mentally. Skipped
+        // when the numbers can't be interpreted as elimination — see
+        // `format_level2_eliminations` for the guards.
+        if let Some(line) =
+            format_level2_eliminations(result.candidate_shard_rows, result.matched_rows)
+        {
+            eprintln!("{line}");
+        }
         if result.matched_rows != n_cells {
             eprintln!("  returned rows (post-limit): {n_cells}");
         }
@@ -588,5 +621,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let encoding = detect_value_encoding_from_dir(dir.path()).unwrap();
         assert_eq!(encoding, ValueEncoding::Uint16);
+    }
+
+    #[test]
+    fn level2_eliminations_formats_when_candidate_exceeds_matched() {
+        let line = format_level2_eliminations(100, 30).expect("should format");
+        assert!(line.contains("70"), "{line}");
+        assert!(line.contains("70.0%"), "{line}");
+    }
+
+    #[test]
+    fn level2_eliminations_skips_when_no_candidates() {
+        assert!(format_level2_eliminations(0, 0).is_none());
+    }
+
+    #[test]
+    fn level2_eliminations_skips_when_matched_exceeds_candidates() {
+        // Mixed-catalog case: candidate_shard_rows drops stats-less
+        // shards via filter_map, but matched_rows still counts their
+        // rows. The naive subtraction would underflow usize.
+        assert!(format_level2_eliminations(30, 100).is_none());
+    }
+
+    #[test]
+    fn level2_eliminations_formats_zero_when_matched_equals_candidates() {
+        let line = format_level2_eliminations(50, 50).expect("should format");
+        assert!(line.contains(" 0 "), "{line}");
+        assert!(line.contains("0.0%"), "{line}");
     }
 }
