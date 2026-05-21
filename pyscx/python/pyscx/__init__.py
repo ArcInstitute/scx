@@ -33,10 +33,35 @@ import os as _os                                   # noqa: E402
 
 from .pyscx import open as _open_native            # noqa: E402
 from .pyscx import validate as _validate_native    # noqa: E402
-from .pyscx import from_h5ad as _from_h5ad_native  # noqa: E402
-from .pyscx import to_h5ad as _to_h5ad_native      # noqa: E402
-from .pyscx import from_h5mu as _from_h5mu_native  # noqa: E402
-from .pyscx import to_h5mu as _to_h5mu_native      # noqa: E402
+
+# N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
+# these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
+# `[tool.maturin] features` defaults `hdf5` on, so the common case is
+# `_HAS_HDF5 = True`. The try/except guard keeps `import pyscx` working
+# in `--no-default-features` builds; calls into the wrappers below then
+# raise a clean `NotImplementedError` via `_require_hdf5` instead of an
+# `ImportError` on the very first `import pyscx`.
+try:
+    from .pyscx import from_h5ad as _from_h5ad_native  # noqa: E402
+    from .pyscx import to_h5ad as _to_h5ad_native      # noqa: E402
+    from .pyscx import from_h5mu as _from_h5mu_native  # noqa: E402
+    from .pyscx import to_h5mu as _to_h5mu_native      # noqa: E402
+    _HAS_HDF5 = True
+except ImportError:
+    _from_h5ad_native = None
+    _to_h5ad_native = None
+    _from_h5mu_native = None
+    _to_h5mu_native = None
+    _HAS_HDF5 = False
+
+
+def _require_hdf5(fn_name):
+    if not _HAS_HDF5:
+        raise NotImplementedError(
+            f"pyscx.{fn_name} requires the `hdf5` feature; rebuild via "
+            "`cd pyscx && maturin develop --features hdf5` or install "
+            "the prebuilt wheel from PyPI (bundles libhdf5)."
+        )
 
 
 def _coerce_path(p, *, allow_experiment: bool = True):
@@ -101,6 +126,7 @@ def from_h5ad(path, out, **kwargs):
     """Convert an h5ad file to SCX. Accepts str or `os.PathLike` for
     `path` and `out`. (Source must be an h5ad file, not an open SCX
     Experiment.)"""
+    _require_hdf5("from_h5ad")
     return _from_h5ad_native(
         _coerce_path(path, allow_experiment=False),
         _coerce_path(out),
@@ -111,6 +137,7 @@ def from_h5ad(path, out, **kwargs):
 def to_h5ad(path, out, **kwargs):
     """Convert an SCX file to h5ad. Accepts str, `os.PathLike`, or a
     pyscx Experiment for `path`; str or `os.PathLike` for `out`."""
+    _require_hdf5("to_h5ad")
     return _to_h5ad_native(_coerce_path(path), _coerce_path(out), **kwargs)
 
 
@@ -118,6 +145,7 @@ def from_h5mu(path, out, **kwargs):
     """Convert an h5mu file to SCX. Accepts str or `os.PathLike` for
     `path` and `out`. (Source must be an h5mu file, not an open SCX
     Experiment.)"""
+    _require_hdf5("from_h5mu")
     return _from_h5mu_native(
         _coerce_path(path, allow_experiment=False),
         _coerce_path(out),
@@ -128,6 +156,7 @@ def from_h5mu(path, out, **kwargs):
 def to_h5mu(path, out, **kwargs):
     """Convert an SCX file to h5mu. Accepts str, `os.PathLike`, or a
     pyscx Experiment for `path`; str or `os.PathLike` for `out`."""
+    _require_hdf5("to_h5mu")
     return _to_h5mu_native(_coerce_path(path), _coerce_path(out), **kwargs)
 
 
