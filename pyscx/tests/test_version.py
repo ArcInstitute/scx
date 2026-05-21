@@ -1,5 +1,4 @@
-"""F4 regression: `pyscx.__version__` exists and matches the installed
-package version. Closes F4 from SCX-USER-REPORT-2026-05-19.md."""
+"""`pyscx.__version__` exists and matches the installed package version."""
 import re
 
 import pyscx

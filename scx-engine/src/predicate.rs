@@ -302,15 +302,20 @@ struct Parser<'a> {
     pos: usize,
     schema: &'a Schema,
     expr: String,
+    /// "obs" or "var" — used by [`validate_column`] to render the
+    /// strsim-augmented "Available {axis} columns: ..." reason on
+    /// `EngineError::SchemaError`
+    axis: &'a str,
 }
 
 impl<'a> Parser<'a> {
-    fn new(tokens: Vec<Token>, schema: &'a Schema, expr: &str) -> Self {
+    fn new(tokens: Vec<Token>, schema: &'a Schema, expr: &str, axis: &'a str) -> Self {
         Self {
             tokens,
             pos: 0,
             schema,
             expr: expr.to_string(),
+            axis,
         }
     }
 
@@ -349,10 +354,18 @@ impl<'a> Parser<'a> {
     fn validate_column(&self, col: &str) -> Result<&DataType> {
         match self.schema.column_with_name(col) {
             Some((_, field)) => Ok(field.data_type()),
-            None => Err(EngineError::SchemaError {
-                column: col.to_string(),
-                reason: "column not found in schema".to_string(),
-            }),
+            None => {
+                let available: Vec<String> = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().to_string())
+                    .collect();
+                Err(EngineError::SchemaError {
+                    column: col.to_string(),
+                    reason: crate::index::column_not_found_message(self.axis, col, &available),
+                })
+            }
         }
     }
 
@@ -527,7 +540,9 @@ impl<'a> Parser<'a> {
 ///
 /// Column names are validated against the schema immediately.
 /// Returns `Err(SchemaError)` for unknown columns or type mismatches.
-pub fn parse_predicate(expr: &str, schema: &Schema) -> Result<Predicate> {
+/// `axis` is `"obs"` or `"var"` — used in the strsim-augmented
+/// `SchemaError` reason on unknown-column errors (F5-2026-05-20-Tier2).
+pub fn parse_predicate(expr: &str, schema: &Schema, axis: &str) -> Result<Predicate> {
     if expr.trim().is_empty() {
         return Err(EngineError::PredicateParseError {
             expr: expr.to_string(),
@@ -536,7 +551,7 @@ pub fn parse_predicate(expr: &str, schema: &Schema) -> Result<Predicate> {
     }
 
     let tokens = tokenize(expr)?;
-    let mut parser = Parser::new(tokens, schema, expr);
+    let mut parser = Parser::new(tokens, schema, expr, axis);
     let pred = parser.parse_expr()?;
 
     // Ensure all tokens were consumed
@@ -1049,7 +1064,7 @@ mod tests {
     #[test]
     fn parse_equality() {
         let schema = test_schema();
-        let pred = parse_predicate("cell_type == 'T cell'", &schema).unwrap();
+        let pred = parse_predicate("cell_type == 'T cell'", &schema, "obs").unwrap();
         assert_eq!(
             pred,
             Predicate::Eq("cell_type".into(), ScalarValue::Utf8("T cell".into()))
@@ -1059,7 +1074,7 @@ mod tests {
     #[test]
     fn parse_double_quoted_string() {
         let schema = test_schema();
-        let pred = parse_predicate("cell_type == \"T cell\"", &schema).unwrap();
+        let pred = parse_predicate("cell_type == \"T cell\"", &schema, "obs").unwrap();
         assert_eq!(
             pred,
             Predicate::Eq("cell_type".into(), ScalarValue::Utf8("T cell".into()))
@@ -1069,7 +1084,7 @@ mod tests {
     #[test]
     fn parse_and_comparison() {
         let schema = test_schema();
-        let pred = parse_predicate("n_genes > 200 and n_counts < 5000", &schema).unwrap();
+        let pred = parse_predicate("n_genes > 200 and n_counts < 5000", &schema, "obs").unwrap();
         assert_eq!(
             pred,
             Predicate::And(
@@ -1082,8 +1097,12 @@ mod tests {
     #[test]
     fn parse_in_expr() {
         let schema = test_schema();
-        let pred =
-            parse_predicate("cell_type in ['T cell', 'B cell', 'NK cell']", &schema).unwrap();
+        let pred = parse_predicate(
+            "cell_type in ['T cell', 'B cell', 'NK cell']",
+            &schema,
+            "obs",
+        )
+        .unwrap();
         assert_eq!(
             pred,
             Predicate::In(
@@ -1100,7 +1119,7 @@ mod tests {
     #[test]
     fn parse_not() {
         let schema = test_schema();
-        let pred = parse_predicate("not is_doublet == true", &schema).unwrap();
+        let pred = parse_predicate("not is_doublet == true", &schema, "obs").unwrap();
         assert_eq!(
             pred,
             Predicate::Not(Box::new(Predicate::Eq(
@@ -1116,6 +1135,7 @@ mod tests {
         let pred = parse_predicate(
             "(tissue == 'lung' or tissue == 'heart') and disease == 'healthy'",
             &schema,
+            "obs",
         )
         .unwrap();
         assert_eq!(
@@ -1146,6 +1166,7 @@ mod tests {
         let pred = parse_predicate(
             "tissue == 'lung' or tissue == 'heart' and disease == 'healthy'",
             &schema,
+            "obs",
         )
         .unwrap();
         // tissue == 'lung' OR (tissue == 'heart' AND disease == 'healthy')
@@ -1173,35 +1194,101 @@ mod tests {
     #[test]
     fn parse_nonexistent_column_error() {
         let schema = test_schema();
-        let err = parse_predicate("nonexistent_column == 'x'", &schema).unwrap_err();
+        let err = parse_predicate("nonexistent_column == 'x'", &schema, "obs").unwrap_err();
         assert!(matches!(err, EngineError::SchemaError { .. }));
+    }
+
+    // F5-2026-05-20-Tier2: runtime predicate path should produce the
+    // same strsim-augmented "Available / Did you mean" suffix that
+    // convert-time forced-index errors got from PR #113.
+    #[test]
+    fn parse_unknown_column_includes_available_and_suggestion() {
+        let schema = test_schema();
+        let err = parse_predicate("celltype == 'T cell'", &schema, "obs").unwrap_err();
+        match err {
+            EngineError::SchemaError { column, reason } => {
+                assert_eq!(column, "celltype");
+                assert!(
+                    reason.contains("column not found"),
+                    "reason should start with 'column not found': {reason}"
+                );
+                assert!(
+                    reason.contains("Available obs columns"),
+                    "reason should list available columns: {reason}"
+                );
+                assert!(
+                    reason.contains("Did you mean 'cell_type'?"),
+                    "reason should propose 'cell_type' (strsim ≥ 0.6): {reason}"
+                );
+            }
+            other => panic!("expected SchemaError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_column_no_suggestion_when_far() {
+        let schema = test_schema();
+        let err = parse_predicate("xyz_completely_unrelated == 1", &schema, "obs").unwrap_err();
+        match err {
+            EngineError::SchemaError { reason, .. } => {
+                assert!(
+                    reason.contains("column not found"),
+                    "reason should start with 'column not found': {reason}"
+                );
+                assert!(
+                    reason.contains("Available obs columns"),
+                    "reason should list available columns: {reason}"
+                );
+                assert!(
+                    !reason.contains("Did you mean"),
+                    "no near match should appear: {reason}"
+                );
+            }
+            other => panic!("expected SchemaError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_var_column_uses_var_axis_label() {
+        // Verify the axis label flows through from filter_var-style calls.
+        let schema = test_schema();
+        let err = parse_predicate("nonsense_col == 'x'", &schema, "var").unwrap_err();
+        match err {
+            EngineError::SchemaError { reason, .. } => {
+                assert!(
+                    reason.contains("Available var columns"),
+                    "reason should label axis as 'var': {reason}"
+                );
+            }
+            other => panic!("expected SchemaError, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_type_mismatch_string_vs_int() {
         let schema = test_schema();
-        let err = parse_predicate("cell_type > 5", &schema).unwrap_err();
+        let err = parse_predicate("cell_type > 5", &schema, "obs").unwrap_err();
         assert!(matches!(err, EngineError::SchemaError { .. }));
     }
 
     #[test]
     fn parse_empty_string_error() {
         let schema = test_schema();
-        let err = parse_predicate("", &schema).unwrap_err();
+        let err = parse_predicate("", &schema, "obs").unwrap_err();
         assert!(matches!(err, EngineError::PredicateParseError { .. }));
     }
 
     #[test]
     fn parse_malformed_error() {
         let schema = test_schema();
-        let err = parse_predicate("cell_type ==", &schema).unwrap_err();
+        let err = parse_predicate("cell_type ==", &schema, "obs").unwrap_err();
         assert!(matches!(err, EngineError::PredicateParseError { .. }));
     }
 
     #[test]
     fn parse_float_value() {
         let schema = test_schema();
-        let pred = parse_predicate("score > 0.5", &schema).unwrap();
+        let pred = parse_predicate("score > 0.5", &schema, "obs").unwrap();
         assert_eq!(
             pred,
             Predicate::Gt("score".into(), ScalarValue::Float64(0.5))
@@ -1211,7 +1298,7 @@ mod tests {
     #[test]
     fn parse_le_ge() {
         let schema = test_schema();
-        let pred = parse_predicate("n_genes >= 100 and n_genes <= 5000", &schema).unwrap();
+        let pred = parse_predicate("n_genes >= 100 and n_genes <= 5000", &schema, "obs").unwrap();
         assert_eq!(
             pred,
             Predicate::And(

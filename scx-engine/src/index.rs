@@ -496,30 +496,135 @@ pub enum BuildOutcome {
 /// callable from `pyscx::anndata::build_and_write_predicate_indexes_inline`
 /// (which is reachable from CPU-only `pyscx.from_anndata` paths).
 pub fn forced_column_missing_message(axis: &str, column: &str, available: &[String]) -> String {
-    let mut msg = format!("forced {axis} index column '{column}': missing column.");
-    if available.is_empty() {
-        msg.push_str(&format!(
-            " Available {axis} columns: [] (this h5ad has no {axis} metadata)."
-        ));
-        return msg;
-    }
-    let preview_n = available.len().min(8);
-    let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
-    let suffix = if available.len() > preview_n {
-        ", ..."
-    } else {
-        ""
-    };
-    msg.push_str(&format!(" Available {axis} columns: {preview:?}{suffix}."));
-    if let Some(suggestion) = available
+    format!(
+        "forced {axis} index column '{column}': missing column. {}",
+        column_suggestion_suffix(axis, column, available)
+    )
+}
+
+/// Build the `"column not found. Available {axis} columns: [...]. Did you mean
+/// '{...}'?"` reason for `EngineError::SchemaError` (the runtime predicate
+/// path: `pyscx.open(...).query().filter_obs("totl_counts >= 500")`). The
+/// suffix structure mirrors [`forced_column_missing_message`] so users see
+/// the same "Available / Did you mean" treatment regardless of whether the
+/// missing-column error originates from convert-time or query-time. —
+/// F5-2026-05-20-Tier2.
+pub fn column_not_found_message(axis: &str, column: &str, available: &[String]) -> String {
+    format!(
+        "column not found. {}",
+        column_suggestion_suffix(axis, column, available)
+    )
+}
+
+/// Find the closest match for `column` in `available` using normalized
+/// Levenshtein distance with a 0.6 acceptance threshold. Returns `None`
+/// when no candidate clears the threshold (i.e. the user's input isn't
+/// a near-typo of any existing column).
+fn best_match(column: &str, available: &[String]) -> Option<String> {
+    available
         .iter()
         .map(|n| (n, strsim::normalized_levenshtein(column, n)))
         .filter(|(_, s)| *s >= 0.6)
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(n, _)| n.clone())
-    {
-        msg.push_str(&format!(" Did you mean '{suggestion}'?"));
+}
+
+/// Render the `"Available {axis} columns: [...]."` footer.
+///
+/// When `show_all` is true and `available.len() <= 64`, lists every
+/// column when strsim has a near-match the user
+/// is "on the right page" and benefits from seeing the full list). The
+/// 64-column cap keeps the worst-case message bounded for atlases with
+/// hundreds of obs columns. Otherwise falls back to the historical
+/// first-8 preview with `", \u{2026}"` (Unicode ellipsis) truncation marker.
+///
+/// Empty `available` yields the empty-axis fallback that hints at no
+/// obs/var metadata being present in the file.
+fn render_available_columns(axis: &str, available: &[String], show_all: bool) -> String {
+    if available.is_empty() {
+        return format!("Available {axis} columns: [] (this h5ad has no {axis} metadata).");
     }
+    let show_all = show_all && available.len() <= 64;
+    if show_all {
+        let items: Vec<&str> = available.iter().map(String::as_str).collect();
+        return format!("Available {axis} columns: {items:?}.");
+    }
+    let preview_n = available.len().min(8);
+    let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
+    // Unicode ellipsis (single char) avoids
+    // the historical `, ....` 4-dot artifact when concatenated with the
+    // trailing sentence terminator. Reads as `, ….` — visually
+    // unambiguous.
+    let suffix = if available.len() > preview_n {
+        ", \u{2026}"
+    } else {
+        ""
+    };
+    format!("Available {axis} columns: {preview:?}{suffix}.")
+}
+
+/// Shared suffix builder for [`forced_column_missing_message`] and
+/// [`column_not_found_message`]. Computes the strsim suggestion first
+/// so the available-columns renderer can decide whether to show all
+/// (suggestion present → user is on the right page)
+/// or fall back to the 8-column preview.
+fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> String {
+    let suggestion = best_match(column, available);
+    let mut msg = render_available_columns(axis, available, suggestion.is_some());
+    if let Some(s) = suggestion {
+        msg.push_str(&format!(" Did you mean '{s}'?"));
+    }
+    msg
+}
+
+/// Aggregate-form of [`forced_column_missing_message`] for callers that
+/// processed multiple `BuildOutcome::ForcedColumnError` entries with
+/// `SkipReason::MissingColumn`. Used by `scx convert --index-obs/--index-var`
+/// (and the parallel `pyscx.from_anndata` path) so the user sees ALL
+/// typos in a single error rather than fixing them one per run.
+///
+/// `missing` is the list of forced columns that came back missing, in
+/// the order they were requested. Each entry gets its own line with a
+/// strsim suggestion (if any); the available-columns preview is shared
+/// across them via the same `column_suggestion_suffix` helper so the
+/// rendered format stays consistent with the single-column message.
+///
+/// For a single missing column, prefer [`forced_column_missing_message`]
+/// — the singular form keeps the existing single-line wording.
+pub fn forced_columns_missing_message(
+    axis: &str,
+    missing: &[String],
+    available: &[String],
+) -> String {
+    if missing.is_empty() {
+        // Degenerate guard. Should not happen in practice — the caller
+        // is supposed to gate on `!missing.is_empty()` before calling.
+        return format!("0 forced {axis} index columns are missing.");
+    }
+    if missing.len() == 1 {
+        return forced_column_missing_message(axis, &missing[0], available);
+    }
+    let mut msg = format!(
+        "{n} forced {axis} index columns are missing:",
+        n = missing.len()
+    );
+    // If ANY missing column has a strsim near-match
+    // in `available`, the user is "on the right page" — show the full
+    // available-columns list (capped at 64) instead of the 8-column
+    // preview so they can scan and pick the right name.
+    let mut any_suggestion = false;
+    for column in missing {
+        let suggestion = best_match(column, available);
+        if suggestion.is_some() {
+            any_suggestion = true;
+        }
+        match suggestion {
+            Some(s) => msg.push_str(&format!("\n  - '{column}': did you mean '{s}'?")),
+            None => msg.push_str(&format!("\n  - '{column}'")),
+        }
+    }
+    msg.push('\n');
+    msg.push_str(&render_available_columns(axis, available, any_suggestion));
     msg
 }
 
@@ -574,11 +679,194 @@ mod forced_column_missing_message_tests {
     fn truncates_long_available_lists() {
         let avail: Vec<String> = (0..20).map(|i| format!("col_{i}")).collect();
         let msg = forced_column_missing_message("var", "missing", &avail);
-        assert!(msg.contains(", ..."), "should signal truncation: {msg}");
+        assert!(
+            msg.contains(", \u{2026}"),
+            "should signal truncation: {msg}"
+        );
         assert!(msg.contains("col_0") && msg.contains("col_7"), "{msg}");
         assert!(
             !msg.contains("col_15"),
             "should not list past index 7: {msg}"
+        );
+    }
+
+    // E1-2026-05-20-Tier2: when the typo has a near-match in available,
+    // the user is on the right page — show ALL columns (up to the 64-col
+    // cap) instead of truncating to 8 so they can scan past index 7.
+    #[test]
+    fn shows_all_columns_when_strsim_suggestion_present() {
+        // 28 obs columns mirroring the census_500k.scx layout; `raw_sum`
+        // is at index 11 (past the 8-column cutoff). The strsim match
+        // for `raw_summ` should be `raw_sum`, which triggers show-all.
+        let mut avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
+        avail[11] = "raw_sum".to_string();
+        let msg = forced_column_missing_message("obs", "raw_summ", &avail);
+        assert!(
+            msg.contains("Did you mean 'raw_sum'?"),
+            "suggestion gate: {msg}"
+        );
+        assert!(
+            !msg.contains(", \u{2026}"),
+            "show-all path should NOT emit the truncation marker: {msg}"
+        );
+        assert!(msg.contains("col_00"), "should show first column: {msg}");
+        assert!(
+            msg.contains("col_27"),
+            "should show LAST column (past 8-col preview): {msg}"
+        );
+        assert!(msg.contains("raw_sum"), "{msg}");
+    }
+
+    // E1 corner: empty-suggestion case keeps the 8-column preview to
+    // avoid overwhelming a "fishing" user with hundreds of column names.
+    #[test]
+    fn keeps_preview_when_no_strsim_suggestion() {
+        let avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
+        let msg = forced_column_missing_message("obs", "totally_unrelated", &avail);
+        assert!(
+            !msg.contains("Did you mean"),
+            "no suggestion expected: {msg}"
+        );
+        assert!(msg.contains(", \u{2026}"), "should keep truncation: {msg}");
+        assert!(
+            !msg.contains("col_27"),
+            "should NOT show past index 7: {msg}"
+        );
+    }
+
+    // The 64-column cap guards the worst-case payload size: an atlas
+    // with > 64 obs columns falls back to the 8-column preview even
+    // when a suggestion is present.
+    #[test]
+    fn cap_at_64_columns_falls_back_to_preview() {
+        let mut avail: Vec<String> = (0..70).map(|i| format!("col_{i:03}")).collect();
+        avail[50] = "raw_sum".to_string();
+        let msg = forced_column_missing_message("obs", "raw_summ", &avail);
+        assert!(msg.contains("Did you mean 'raw_sum'?"), "{msg}");
+        assert!(
+            msg.contains(", \u{2026}"),
+            "should truncate past the 64-col cap: {msg}"
+        );
+        assert!(
+            !msg.contains("col_050"),
+            "the suggested column lives at index 50 — past the 8-col preview: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forced_columns_missing_message_tests {
+    use super::forced_columns_missing_message;
+
+    fn census_obs_columns() -> Vec<String> {
+        vec![
+            "soma_joinid".to_string(),
+            "dataset_id".to_string(),
+            "cell_type".to_string(),
+            "raw_sum".to_string(),
+            "tissue".to_string(),
+            "disease".to_string(),
+        ]
+    }
+
+    #[test]
+    fn aggregates_multiple_misses_with_suggestions() {
+        // F6-2026-05-20-Tier2: both `raw_summ` and `cell_typ` should be
+        // surfaced in a single error, each with its own strsim hint.
+        let missing = vec!["raw_summ".to_string(), "cell_typ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &census_obs_columns());
+        assert!(
+            msg.contains("2 forced obs index columns are missing"),
+            "should aggregate count + axis: {msg}"
+        );
+        assert!(
+            msg.contains("- 'raw_summ': did you mean 'raw_sum'?"),
+            "should include first typo + suggestion: {msg}"
+        );
+        assert!(
+            msg.contains("- 'cell_typ': did you mean 'cell_type'?"),
+            "should include second typo + suggestion: {msg}"
+        );
+        assert!(
+            msg.contains("Available obs columns"),
+            "should include available-columns footer: {msg}"
+        );
+    }
+
+    #[test]
+    fn aggregates_misses_without_near_suggestion() {
+        let missing = vec![
+            "totally_unrelated".to_string(),
+            "another_unrelated".to_string(),
+        ];
+        let msg = forced_columns_missing_message("obs", &missing, &census_obs_columns());
+        assert!(
+            msg.contains("2 forced obs index columns are missing"),
+            "{msg}"
+        );
+        // Both names without suggestions should appear on their own bullets.
+        assert!(msg.contains("- 'totally_unrelated'"), "{msg}");
+        assert!(msg.contains("- 'another_unrelated'"), "{msg}");
+        assert!(
+            !msg.contains("Did you mean") && !msg.contains("did you mean"),
+            "no near match in either case: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_miss_delegates_to_singular_helper() {
+        // The singular path keeps the historical wording so we don't
+        // gratuitously change byte-for-byte output of the single-miss
+        // surface (the most common one in practice).
+        let missing = vec!["raw_summ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &census_obs_columns());
+        assert!(
+            msg.contains("forced obs index column 'raw_summ': missing column."),
+            "should use the singular wording: {msg}"
+        );
+        assert!(msg.contains("Did you mean 'raw_sum'?"), "{msg}");
+        // The aggregate header MUST NOT appear when N == 1.
+        assert!(
+            !msg.contains("forced obs index columns are missing"),
+            "should not emit the aggregate header for single miss: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_available_columns_is_handled() {
+        let missing = vec!["raw_summ".to_string(), "cell_typ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &[]);
+        assert!(
+            msg.contains("2 forced obs index columns are missing"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("[] (this h5ad has no obs metadata)"),
+            "should render the empty-axis footer: {msg}"
+        );
+    }
+
+    // E1-2026-05-20-Tier2: aggregate path inherits the show-all-when-
+    // strsim-matches behaviour from `render_available_columns`. If ANY
+    // of the misses has a near-match, the full column list (≤ 64) shows.
+    #[test]
+    fn aggregate_shows_all_columns_when_any_miss_has_suggestion() {
+        let mut avail: Vec<String> = (0..28).map(|i| format!("col_{i:02}")).collect();
+        avail[11] = "raw_sum".to_string();
+        avail[14] = "cell_type".to_string();
+        let missing = vec!["raw_summ".to_string(), "cell_typ".to_string()];
+        let msg = forced_columns_missing_message("obs", &missing, &avail);
+        assert!(
+            msg.contains("did you mean 'raw_sum'?") && msg.contains("did you mean 'cell_type'?"),
+            "both suggestions should render: {msg}"
+        );
+        assert!(
+            !msg.contains(", \u{2026}"),
+            "show-all path should NOT truncate: {msg}"
+        );
+        assert!(
+            msg.contains("col_27"),
+            "should show LAST column (past 8-col preview): {msg}"
         );
     }
 }

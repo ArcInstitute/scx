@@ -909,7 +909,7 @@ pub async fn pull_filtered(
     let obs_schema = obs_batch.schema();
 
     // Parse and evaluate predicate
-    let predicate = scx_engine::parse_predicate(filter, &obs_schema).map_err(|e| {
+    let predicate = scx_engine::parse_predicate(filter, &obs_schema, "obs").map_err(|e| {
         CloudError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("predicate parse error: {e}"),

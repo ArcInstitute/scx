@@ -1,6 +1,5 @@
-"""F3 regression: `pyscx.accel.highly_variable_genes(layer=name)` reads
-from `adata.layers[name]` instead of `adata.X`. Closes F3 from
-SCX-USER-REPORT-2026-05-19.md.
+"""`pyscx.accel.highly_variable_genes(layer=name)` reads from
+`adata.layers[name]` instead of `adata.X`.
 
 The original bug was that the scanpy idiom
 ``adata.layers["counts"] = adata.X.copy(); normalize_total; log1p;

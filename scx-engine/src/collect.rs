@@ -186,6 +186,23 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     let total_shards = reader.catalog().shards_sorted().len();
     let skipped_shards = total_shards - plan.candidate_shards.len();
 
+    // Sum of rows in candidate shards (post Level 1
+    // catalog-stats pruning, pre Level 2 PredicateIndex / row-evaluator
+    // narrowing). Lets the CLI report "{matched_rows} of {candidate_rows}
+    // candidate-shard rows matched" so users can see Level 2 is doing
+    // work even when Level 1 skipped zero shards.
+    let sorted_shards_for_rows = reader.catalog().shards_sorted();
+    let candidate_shard_rows: usize = plan
+        .candidate_shards
+        .iter()
+        .filter_map(|sc| {
+            sorted_shards_for_rows[sc.shard_idx]
+                .stats
+                .as_ref()
+                .map(|s| (s.row_end - s.row_start) as usize)
+        })
+        .sum();
+
     // Step 2: Read obs metadata
     let obs_batch = reader.read_obs()?;
     let n_obs = obs_batch.num_rows();
@@ -366,6 +383,11 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     // Step 9: Apply fused normalize+log1p
     apply_fused_ops(&mut csr, plan.normalize, plan.log1p);
 
+    // Capture the pre-limit Level-2 match
+    // count so the CLI's pushdown / --explain output isn't confused by
+    // `--limit N` (which truncates `csr` below).
+    let matched_rows = csr.n_rows();
+
     // Step 10: Apply limit
     if let Some(limit) = plan.limit {
         if limit < csr.n_rows() {
@@ -413,6 +435,8 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         var: filtered_var,
         skipped_shards,
         total_shards,
+        candidate_shard_rows,
+        matched_rows,
     })
 }
 
@@ -703,6 +727,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.x.n_rows(), 3);
         assert_eq!(result.obs.num_rows(), 3);
+        // matched_rows must reflect the
+        // pre-limit Level-2 match count (12 rows match the no-predicate
+        // pipeline), not the post-limit returned count.
+        assert_eq!(result.matched_rows, 12);
     }
 
     #[test]
@@ -716,6 +744,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.x.n_rows(), 6);
         assert_eq!(result.obs.num_rows(), 6);
+        // No truncation occurred — matched_rows must equal returned rows.
+        assert_eq!(result.matched_rows, result.x.n_rows());
     }
 
     #[test]

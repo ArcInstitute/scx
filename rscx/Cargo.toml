@@ -19,9 +19,8 @@ scx-accel = { path = "../scx-accel" }
 # extendr-api / extendr-ffi BOTH pinned to =0.8.0 to avoid the
 # cross-version mismatch in 0.8.1: extendr-api 0.8.1 source still
 # references `SEXPTYPE::OBJSXP` while extendr-ffi 0.8.1 removed it,
-# making any (0.8.1, 0.8.1) resolution fail to compile (see B6 in
-# SCX-USER-REPORT-2026-05-19.md). 0.9.x exists but requires a live R
-# toolchain for build.rs and is a separate upgrade.
+# making any (0.8.1, 0.8.1) resolution fail to compile. 0.9.x exists
+# but requires a live R toolchain for build.rs and is a separate upgrade.
 extendr-api = { version = "=0.8.0", features = ["non-api"] }
 extendr-ffi = "=0.8.0"
 arrow = { workspace = true }

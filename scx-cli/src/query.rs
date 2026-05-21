@@ -51,6 +51,7 @@ pub fn run_query(
     log1p: bool,
     limit: Option<usize>,
     json: bool,
+    explain: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Cloud URLs require the tokio runtime to outlive the pipeline
     // (the `CloudSectionReader` stores a `Handle` into it). Hold the
@@ -81,14 +82,51 @@ pub fn run_query(
     // Execute
     let result = pipeline.collect()?;
 
-    // Report pushdown stats
-    eprintln!(
-        "Skipped {}/{} shards via pushdown",
-        result.skipped_shards, result.total_shards
-    );
-
     let n_cells = result.x.n_rows();
     let n_genes = result.x.n_cols();
+
+    // Report pushdown stats. F4-2026-05-20-Tier2: two-line output that
+    // separates Level 1 (catalog-stats) shard elimination from Level 2
+    // (PredicateIndex / row-evaluator) row-mask narrowing. The previous
+    // single line `Skipped 0/31 shards via pushdown` confused users when
+    // every shard had at least one matching row (Level 1 skipped zero)
+    // even though Level 2 was doing all the work.
+    let candidate_shards = result.total_shards - result.skipped_shards;
+    // matched_rows is the pre-limit
+    // Level-2 match count; n_cells (= result.x.n_rows()) reflects post-
+    // limit truncation, so reporting that as "matched" would underreport
+    // whenever --limit truncates.
+    eprintln!(
+        "Pushdown: {}/{} shards eliminated by catalog stats (Level 1); \
+         {} of {} candidate-shard rows matched (Level 2 index/row-eval)",
+        result.skipped_shards,
+        result.total_shards,
+        result.matched_rows,
+        result.candidate_shard_rows,
+    );
+
+    // F3-2026-05-20-Tier2: minimal --explain block. Prints the parsed
+    // filter expression plus the Level 1 / Level 2 breakdown so power-
+    // users can verify the predicate index is being engaged. No per-
+    // predicate path tracing yet (deferred — multi-crate plumbing).
+    if explain {
+        eprintln!("Query plan (explain):");
+        eprintln!("  source: {source}");
+        eprintln!("  obs filter: {filter}");
+        eprintln!("  total shards: {}", result.total_shards);
+        eprintln!(
+            "  Level 1 (catalog-stats) eliminated: {}/{}",
+            result.skipped_shards, result.total_shards
+        );
+        eprintln!(
+            "  Level 2 candidate shards: {}, candidate rows: {}",
+            candidate_shards, result.candidate_shard_rows
+        );
+        eprintln!("  matched rows (pre-limit): {}", result.matched_rows);
+        if result.matched_rows != n_cells {
+            eprintln!("  returned rows (post-limit): {n_cells}");
+        }
+    }
 
     if count {
         if json {
@@ -96,6 +134,8 @@ pub fn run_query(
                 "count": n_cells,
                 "skipped_shards": result.skipped_shards,
                 "total_shards": result.total_shards,
+                "candidate_shard_rows": result.candidate_shard_rows,
+                "matched_rows": result.matched_rows,
             });
             println!("{}", serde_json::to_string_pretty(&json_out)?);
         } else {
@@ -131,10 +171,6 @@ pub fn run_query(
     println!(
         "Query result: {} cells x {} genes, {} nnz",
         n_cells, n_genes, nnz
-    );
-    println!(
-        "Pushdown: skipped {} of {} shards",
-        result.skipped_shards, result.total_shards
     );
 
     Ok(())
