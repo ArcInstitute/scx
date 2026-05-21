@@ -8,10 +8,20 @@
 # Build pyscx: cd pyscx && maturin develop --release --features gpu && cd ..
 #
 # IMPORTANT: Pin cuda-version to match your NVIDIA driver's max CUDA version.
-#   Driver 535.x → cuda-version=12.2
+#   Driver 535.x → cuda-version=12.2  (DO NOT USE — see note below)
 #   Driver 550.x → cuda-version=12.4
-#   Driver 560.x → cuda-version=12.6
+#   Driver 560.x → cuda-version=12.6  (preferred — Chimera's driver)
+# PyTorch is taken from conda-forge's cuda126 builds (the `pytorch-cuda`
+# metapackage on the pytorch channel caps at 12.4 and conflicts).
 # Check with: nvidia-smi (look for "CUDA Version: 12.x" in top-right corner)
+#
+# 2026-05-20: bumped cuda-version 12.2 → 12.6 and relaxed RAPIDS / pyarrow
+# pins. The 12.2-toolkit libcusparse=12.1.2.141 produced wrong
+# CUSPARSE_SPMM_ALG_DEFAULT results, breaking GPU PCA correctness floors
+# (subspace cosines ≈ 0.03 vs ≥ 0.9 absolute floor). Bumping cuda-version
+# pulls in libcusparse ≥ 12.4.x, which fixes it. The existing
+# i64→i32 indptr workaround in scx-gpu/src/cusparse.rs is preserved as
+# defense in depth for older driver/toolkit combos.
 #
 # NOTE: pyscx is built from source inside the env with --features gpu.
 
@@ -22,49 +32,57 @@ channels:
   - defaults
 
 dependencies:
-  # Python
-  - python=3.13
+  # Python — kept loose; conda solver picks 3.12 or 3.13 to match RAPIDS builds.
+  - python>=3.11,<3.14
 
-  # Core single-cell stack (same versions as CPU env)
-  - anndata=0.12.7
-  - scanpy=1.12
-  - scipy=1.16.3
-  - numpy=2.2.0
-  - pandas=2.3.3
-  - h5py=3.16.0
+  # Core single-cell stack
+  - anndata>=0.12
+  - scanpy>=1.12
+  - scipy>=1.15
+  - numpy>=2.0
+  - pandas>=2.2
+  - h5py>=3.14
 
-  # Format-specific
-  - zarr=3.1.5
-  - pyarrow=23.0.1
-  - tiledbsoma=2.3.0
+  # Format-specific. Pyarrow left to solver — cugraph pins it transitively;
+  # 21.0.0 was previously forced and that constraint cascade made the broken
+  # env unable to upgrade cuda-version cleanly.
+  - zarr>=3.0
+  - pyarrow
+  # tiledbsoma is installed via pip below; the conda-forge alias was renamed
+  # to tiledbsoma-py and isn't a drop-in.
 
   # Analysis
-  - scikit-learn=1.8.0
-  - umap-learn=0.5.11
-  - leidenalg=0.11.0
-  - python-igraph=1.0.0
+  - scikit-learn>=1.5
+  - umap-learn>=0.5
+  - leidenalg>=0.10
+  - python-igraph>=0.11
 
   # Visualization
-  - matplotlib=3.10.8
-  - seaborn=0.13.2
+  - matplotlib>=3.8
+  - seaborn>=0.13
 
   # System monitoring
-  - psutil=7.2.2
+  - psutil>=5.9
 
   # Build tooling
-  - maturin>=1.5.0
+  - maturin>=1.5
+  - patchelf  # silences pyscx maturin RPATH warning post-install
 
-  # CUDA + RAPIDS — the reason this env exists
-  # Adjust cuda-version to match your driver (see header comment)
-  - cuda-version=12.2
-  - cuvs>=24.10
-  - cugraph>=24.10
+  # CUDA + RAPIDS — the reason this env exists. cuda-version=12.6 matches
+  # Chimera's driver 560.x. RAPIDS pins relaxed to ≥25.10 so the solver can
+  # pick a cuda12-compatible build (26.04 jumped to cuda13-only).
+  - cuda-version=12.6
+  - cuvs>=25.10,<26
+  - cugraph>=25.10,<26
 
-  # PyTorch with CUDA (for GPU ML loader benchmarks)
-  - pytorch>=2.0
-  - pytorch-cuda=12.1
+  # PyTorch with CUDA (for GPU ML loader benchmarks). Use conda-forge's
+  # `cuda126` builds — the official pytorch channel's `pytorch-cuda`
+  # metapackage caps at 12.4 and conflicts with cuda-version=12.6.
+  - pytorch=*=*cuda126*
 
   # pip-only packages
+  - pip
   - pip:
     - submitit>=1.5.0
+    - tiledbsoma>=2.3.0
     - tiledbsoma-ml>=0.1.0
