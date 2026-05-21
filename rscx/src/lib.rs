@@ -172,6 +172,7 @@ impl ScxExperiment {
                 var,
                 skipped_shards: 0,
                 total_shards: 0,
+                candidate_shard_rows: 0,
             };
             interop::to_seurat_v5(&result)
         }

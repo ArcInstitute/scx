@@ -496,12 +496,34 @@ pub enum BuildOutcome {
 /// callable from `pyscx::anndata::build_and_write_predicate_indexes_inline`
 /// (which is reachable from CPU-only `pyscx.from_anndata` paths).
 pub fn forced_column_missing_message(axis: &str, column: &str, available: &[String]) -> String {
-    let mut msg = format!("forced {axis} index column '{column}': missing column.");
+    format!(
+        "forced {axis} index column '{column}': missing column. {}",
+        column_suggestion_suffix(axis, column, available)
+    )
+}
+
+/// Build the `"column not found. Available {axis} columns: [...]. Did you mean
+/// '{...}'?"` reason for `EngineError::SchemaError` (the runtime predicate
+/// path: `pyscx.open(...).query().filter_obs("totl_counts >= 500")`). The
+/// suffix structure mirrors [`forced_column_missing_message`] so users see
+/// the same "Available / Did you mean" treatment regardless of whether the
+/// missing-column error originates from convert-time or query-time. —
+/// F5-2026-05-20-Tier2.
+pub fn column_not_found_message(axis: &str, column: &str, available: &[String]) -> String {
+    format!(
+        "column not found. {}",
+        column_suggestion_suffix(axis, column, available)
+    )
+}
+
+/// Shared suffix builder for [`forced_column_missing_message`] and
+/// [`column_not_found_message`]. Emits either the empty-axis fallback
+/// (`Available obs columns: [] (this h5ad has no obs metadata).`) or the
+/// `Available {axis} columns: [\"a\", \"b\", ...], ...` preview + the
+/// strsim-based `Did you mean '{best}'?` suggestion (threshold 0.6).
+fn column_suggestion_suffix(axis: &str, column: &str, available: &[String]) -> String {
     if available.is_empty() {
-        msg.push_str(&format!(
-            " Available {axis} columns: [] (this h5ad has no {axis} metadata)."
-        ));
-        return msg;
+        return format!("Available {axis} columns: [] (this h5ad has no {axis} metadata).");
     }
     let preview_n = available.len().min(8);
     let preview: Vec<&str> = available[..preview_n].iter().map(String::as_str).collect();
@@ -510,7 +532,7 @@ pub fn forced_column_missing_message(axis: &str, column: &str, available: &[Stri
     } else {
         ""
     };
-    msg.push_str(&format!(" Available {axis} columns: {preview:?}{suffix}."));
+    let mut msg = format!("Available {axis} columns: {preview:?}{suffix}.");
     if let Some(suggestion) = available
         .iter()
         .map(|n| (n, strsim::normalized_levenshtein(column, n)))

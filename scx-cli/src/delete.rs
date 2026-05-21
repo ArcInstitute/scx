@@ -16,7 +16,7 @@ pub fn run_delete(
     let obs_batch = reader.read_obs()?;
 
     // Parse and evaluate predicate
-    let predicate = parse_predicate(filter, &obs_schema)?;
+    let predicate = parse_predicate(filter, &obs_schema, "obs")?;
     let mask = evaluate(&predicate, &obs_batch)?;
 
     // Collect matching global cell indices

@@ -300,6 +300,12 @@ enum Commands {
         /// JSON output (for --count)
         #[arg(long)]
         json: bool,
+        /// Print a minimal query plan summary on stderr (parsed
+        /// predicate, total/skipped/candidate shards, candidate rows,
+        /// matched rows). Useful to distinguish Level 1 (catalog-stats)
+        /// pushdown from Level 2 (PredicateIndex row-mask) narrowing.
+        #[arg(long)]
+        explain: bool,
     },
     /// Run read/query benchmarks
     Benchmark {
@@ -563,6 +569,7 @@ fn main() {
             log1p,
             limit,
             json,
+            explain,
         } => query::run_query(
             &source,
             &filter,
@@ -573,6 +580,7 @@ fn main() {
             log1p,
             limit,
             json,
+            explain,
         ),
         Commands::Benchmark {
             file,

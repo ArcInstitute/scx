@@ -182,13 +182,30 @@ data = os.environ["SCX_DATA_DIR"]
 t0 = time.time()
 exp = pyscx.open(f"{data}/census_500k.scx")
 
-# Lazy projection — predicate pushdown should mean we never materialize full X
+# Stage 1: predicate-pushdown on a cellxgene-preset-indexed obs column.
+# The preset indexes cell_type / disease / tissue / assay / donor_id /
+# development_stage / sex / suspension_type. Scanpy QC vocabulary
+# (total_counts, pct_counts_mt) does NOT exist on raw CELLxGENE Census
+# obs — those are materialised downstream by calculate_qc_metrics. The
+# nearest pre-computed Census obs column is `raw_sum` (UMI total).
 adata = (
     exp.query()
-       .filter_obs("total_counts >= 500 and pct_counts_mt < 20")
+       .filter_obs("disease == 'normal'")
        .collect()
+       .to_anndata()
 )
 print(f"loaded {adata.shape} in {time.time()-t0:.1f}s")
+
+# Stage 2: CELLxGENE Census uses integer-string var_names and stashes
+# gene symbols in var['feature_name'] — tag MT from feature_name, NOT
+# from var_names (which would yield an all-False mask, silently
+# producing pct_counts_mt = 0 for every cell).
+adata.var["mt"] = adata.var["feature_name"].str.upper().str.startswith("MT-")
+accel.calculate_qc_metrics(adata, qc_vars=["mt"])
+adata = adata[
+    (adata.obs["n_genes_by_counts"] >= 200)
+    & (adata.obs["pct_counts_mt"] < 20)
+].copy()
 
 # HVG on raw counts — seurat_v3 expects counts, so run before normalize/log1p.
 accel.highly_variable_genes(adata, n_top_genes=3000, flavor="seurat_v3",

@@ -600,7 +600,7 @@ fn extract_modality_with_filter(
     let n_obs_global = reader.header().n_obs as usize;
     let row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
         let schema = obs.schema();
-        let pred = scx_engine::parse_predicate(expr, &schema)?;
+        let pred = scx_engine::parse_predicate(expr, &schema, "obs")?;
         let bool_arr = scx_engine::evaluate(&pred, &obs)?;
         let mut mask = vec![false; n_obs_global];
         for (i, slot) in mask.iter_mut().enumerate() {

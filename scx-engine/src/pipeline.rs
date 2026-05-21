@@ -30,10 +30,14 @@ pub struct QueryResult {
     pub obs: arrow::array::RecordBatch,
     /// Variable/gene metadata for projected genes.
     pub var: arrow::array::RecordBatch,
-    /// Number of shards skipped by predicate pushdown.
+    /// Number of shards skipped by Level 1 (catalog-stats) pushdown.
     pub skipped_shards: usize,
     /// Total number of shards in the file.
     pub total_shards: usize,
+    /// Sum of rows in the candidate shards that survived Level 1 pushdown,
+    /// before Level 2 (PredicateIndex / row-evaluator) narrowing. Compare
+    /// against `result.x.n_rows()` to see how much Level 2 trimmed.
+    pub candidate_shard_rows: usize,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -44,6 +48,7 @@ impl std::fmt::Debug for QueryResult {
             .field("var_rows", &self.var.num_rows())
             .field("skipped_shards", &self.skipped_shards)
             .field("total_shards", &self.total_shards)
+            .field("candidate_shard_rows", &self.candidate_shard_rows)
             .finish()
     }
 }
@@ -123,7 +128,7 @@ impl QueryPipeline {
     /// The predicate is validated against the obs schema immediately.
     /// Multiple calls accumulate predicates with AND semantics.
     pub fn filter_obs(mut self, expr: &str) -> Result<Self> {
-        let pred = parse_predicate(expr, &self.obs_schema)?;
+        let pred = parse_predicate(expr, &self.obs_schema, "obs")?;
         self.obs_predicates.push(pred);
         Ok(self)
     }
@@ -133,7 +138,7 @@ impl QueryPipeline {
     /// The predicate is validated against the var schema immediately.
     /// Multiple calls accumulate predicates with AND semantics.
     pub fn filter_var(mut self, expr: &str) -> Result<Self> {
-        let pred = parse_predicate(expr, &self.var_schema)?;
+        let pred = parse_predicate(expr, &self.var_schema, "var")?;
         self.var_predicates.push(pred);
         Ok(self)
     }

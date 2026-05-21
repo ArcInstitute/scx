@@ -186,6 +186,23 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     let total_shards = reader.catalog().shards_sorted().len();
     let skipped_shards = total_shards - plan.candidate_shards.len();
 
+    // Sum of rows in candidate shards (post Level 1
+    // catalog-stats pruning, pre Level 2 PredicateIndex / row-evaluator
+    // narrowing). Lets the CLI report "{matched_rows} of {candidate_rows}
+    // candidate-shard rows matched" so users can see Level 2 is doing
+    // work even when Level 1 skipped zero shards.
+    let sorted_shards_for_rows = reader.catalog().shards_sorted();
+    let candidate_shard_rows: usize = plan
+        .candidate_shards
+        .iter()
+        .filter_map(|sc| {
+            sorted_shards_for_rows[sc.shard_idx]
+                .stats
+                .as_ref()
+                .map(|s| (s.row_end - s.row_start) as usize)
+        })
+        .sum();
+
     // Step 2: Read obs metadata
     let obs_batch = reader.read_obs()?;
     let n_obs = obs_batch.num_rows();
@@ -413,6 +430,7 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         var: filtered_var,
         skipped_shards,
         total_shards,
+        candidate_shard_rows,
     })
 }
 
