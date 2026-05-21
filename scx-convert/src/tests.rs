@@ -5697,10 +5697,10 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
 }
 
 // -----------------------------------------------------------------------
-// B2: `write_dataframe_group_at` must honour the pandas `index_columns`
+// `write_dataframe_group_at` must honour the pandas `index_columns`
 // schema metadata so that `pyscx.from_h5ad → pyscx.to_h5ad` preserves
 // `var_names` / `obs_names` instead of silently swapping them with the
-// first non-index column. See SCX-USER-REPORT-2026-05-19.md § B2.
+// first non-index column.
 // -----------------------------------------------------------------------
 
 fn build_var_batch_with_pandas_metadata(
@@ -5880,8 +5880,7 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
 
 #[test]
 fn read_dataframe_group_index_only_recovers_values() {
-    // Codex P1 (SCX-USER-REPORT-2026-05-19 § B2 follow-up): when a
-    // dataframe group has an empty `column-order` attribute (the
+    // When a dataframe group has an empty `column-order` attribute (the
     // canonical anndata emission for an index-only frame, and what
     // `write_dataframe_body` now emits when all schema fields are the
     // pandas index), `read_dataframe_group` must still read the real

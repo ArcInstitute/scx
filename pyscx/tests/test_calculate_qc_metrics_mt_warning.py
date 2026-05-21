@@ -1,8 +1,7 @@
-"""F2 regression: `pyscx.accel.calculate_qc_metrics` emits a UserWarning
-when `qc_vars=None` AND adata.var_names contains 5+ MT-/mt- prefixed
-gene symbols, so docs-skimmers don't hit `KeyError: 'pct_counts_mt'`
-when they later filter on `adata.obs["pct_counts_mt"]`. Closes F2 from
-SCX-USER-REPORT-2026-05-19.md.
+"""`pyscx.accel.calculate_qc_metrics` emits a UserWarning when
+`qc_vars=None` AND adata.var_names contains 5+ MT-/mt- prefixed gene
+symbols, so docs-skimmers don't hit `KeyError: 'pct_counts_mt'` when
+they later filter on `adata.obs["pct_counts_mt"]`.
 """
 import warnings
 

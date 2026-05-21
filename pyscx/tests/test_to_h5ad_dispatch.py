@@ -1,6 +1,6 @@
-"""F1 regression: pyscx.to_h5ad / from_h5ad / from_h5mu / to_h5mu accept
-str, os.PathLike (pathlib.Path), and a pyscx Experiment handle for the
-source argument. Closes F1 from SCX-USER-REPORT-2026-05-19.md.
+"""pyscx.to_h5ad / from_h5ad / from_h5mu / to_h5mu accept str,
+os.PathLike (pathlib.Path), and a pyscx Experiment handle for the
+source argument.
 
 The bug was that the Rust bindings declared `path: &str`, so passing a
 `pathlib.Path` raised `TypeError: argument 'path': '...' object cannot

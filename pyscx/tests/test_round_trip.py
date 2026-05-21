@@ -235,11 +235,10 @@ def test_empty_obs_var_columns(tmp_dir):
 
 
 # ---------------------------------------------------------------------------
-# B2 (SCX-USER-REPORT-2026-05-19): `pyscx.from_h5ad → pyscx.to_h5ad` must
-# preserve `var_names` / `obs_names` rather than silently swapping the
-# pandas index with the first non-index column. The bug was in
-# `scx-convert/src/h5ad_write.rs::write_dataframe_group_at`, which used
-# `schema.field(0).name()` as the `_index` attribute instead of
+# `pyscx.from_h5ad → pyscx.to_h5ad` must preserve `var_names` / `obs_names`
+# rather than silently swapping the pandas index with the first non-index
+# column. The bug was in `scx-convert/src/h5ad_write.rs::write_dataframe_group_at`,
+# which used `schema.field(0).name()` as the `_index` attribute instead of
 # consulting the pandas `index_columns` schema metadata.
 # ---------------------------------------------------------------------------
 
