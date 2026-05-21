@@ -123,6 +123,17 @@ pub fn run_query(
             candidate_shards, result.candidate_shard_rows
         );
         eprintln!("  matched rows (pre-limit): {}", result.matched_rows);
+        // F1-2026-05-21-Tier2: surface the Level-2 row-mask
+        // elimination count directly rather than making the user
+        // compute `candidate_rows - matched_rows` mentally. Suppressed
+        // when there are no candidate rows (Level 1 took everything)
+        // because the percentage would divide by zero and the line
+        // would carry no information.
+        if result.candidate_shard_rows > 0 {
+            let eliminated = result.candidate_shard_rows - result.matched_rows;
+            let pct = 100.0 * eliminated as f64 / result.candidate_shard_rows as f64;
+            eprintln!("  Level 2 row eliminations: {eliminated} ({pct:.1}% of candidate rows)");
+        }
         if result.matched_rows != n_cells {
             eprintln!("  returned rows (post-limit): {n_cells}");
         }
