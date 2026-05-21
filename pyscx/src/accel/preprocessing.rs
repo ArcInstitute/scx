@@ -838,10 +838,16 @@ fn qc_var_mask_has_true(adata: &Bound<'_, PyAny>, qc_var: &str) -> Option<bool> 
 }
 
 /// Emit qc-vars-related advisories before either the SCX-backed loop or
-/// the scanpy fallback runs. Covers two cases:
+/// the scanpy fallback runs. Covers three cases:
 ///   * **F2-2026-05-19**: `qc_vars` is None AND adata.var_names contains
 ///     5+ MT-/mt- prefixed symbols. Without `qc_vars`, `pct_counts_mt`
 ///     is never computed and a downstream scanpy filter raises KeyError.
+///   * **N1-2026-05-21-Tier2**: `qc_vars` is None AND var_names lacks MT
+///     prefixes (e.g. CELLxGENE Census integer-string indexes) but
+///     `var['feature_name']` has 5+ MT-/mt- prefixed symbols. Same
+///     downstream symptom; the message points at feature_name as the
+///     correct source. The two qc_vars=None branches are mutually
+///     exclusive (else-arm) so var_names wins when both axes have MT.
 ///   * **B1-2026-05-20-Tier2 options 1+2**: a user-supplied qc_var mask
 ///     matches zero genes — `pct_counts_{qc_var}` is silently filled with
 ///     zeros. For `qc_var == "mt"`, when adata.var['feature_name'] has
@@ -866,17 +872,37 @@ fn emit_qc_advisories(
     let mut n_mt_feature_name: Option<usize> = None;
 
     // F2-2026-05-19: qc_vars=None + MT genes visible in var_names.
+    // N1-2026-05-21-Tier2: extend to CELLxGENE Census layout (integer-
+    // string var_names, MT symbols in var['feature_name']) via an
+    // `else if` arm — var_names wins when both axes have MT prefixes so
+    // the existing test_warns_when_mt_genes_present_and_qc_vars_none
+    // fixture (no feature_name column) keeps its message verbatim.
     if qc_vars.is_empty() {
-        let n = *n_mt_var_names.get_or_insert_with(|| count_mt_prefix_in_var_names(adata));
-        if n >= 5 {
+        let n_vn = *n_mt_var_names.get_or_insert_with(|| count_mt_prefix_in_var_names(adata));
+        if n_vn >= 5 {
             let msg = format!(
-                "calculate_qc_metrics: found {n} MT-/mt- prefixed gene \
+                "calculate_qc_metrics: found {n_vn} MT-/mt- prefixed gene \
                  symbols in adata.var_names but `qc_vars` is None, so \
                  `pct_counts_mt` will NOT be computed. To compute it, run:\n  \
                  adata.var['mt'] = adata.var_names.str.upper().str.startswith('MT-')\n  \
                  pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
             );
             warnings.call_method1("warn", (msg, &user_warning))?;
+        } else {
+            let n_fn =
+                *n_mt_feature_name.get_or_insert_with(|| count_mt_prefix_in_feature_name(adata));
+            if n_fn >= 5 {
+                let msg = format!(
+                    "calculate_qc_metrics: `qc_vars` is None but \
+                     adata.var['feature_name'] has {n_fn} MT-/mt- prefixed \
+                     gene symbols (CELLxGENE Census layout: integer-string \
+                     var_names, gene symbols in var['feature_name']). \
+                     pct_counts_mt will NOT be computed. To compute it, run:\n  \
+                     adata.var['mt'] = adata.var['feature_name'].str.upper().str.startswith('MT-')\n  \
+                     pyscx.accel.calculate_qc_metrics(adata, qc_vars=['mt'])"
+                );
+                warnings.call_method1("warn", (msg, &user_warning))?;
+            }
         }
     }
 
