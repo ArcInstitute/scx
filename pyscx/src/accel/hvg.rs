@@ -199,6 +199,32 @@ pub fn highly_variable_genes<'py>(
     }
 
     // ── Fallback to scanpy ──────────────────────────────────────────────
+    // B2-2026-05-20-Tier2 option 1: scx-native HVG only runs when X (or the
+    // chosen layer) is `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`.
+    // Eager scipy/dense X delegates to scanpy and inherits scanpy's
+    // numerical fragility — most notably `seurat_v3` LOESS singularities
+    // and `cell_ranger` pd.cut bin-edge collisions on sparse Census data.
+    // Surface the silent delegation so users can opt into the scx-native
+    // path via `to_anndata(backed=True)` / keeping the source as a lazy
+    // dataset. Python's default warning filter dedupes by (message,
+    // category, location), so repeated calls only emit once per site.
+    let warnings = py.import("warnings")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let msg = format!(
+        "highly_variable_genes(flavor={flavor:?}) on scipy/dense X routes to \
+         scanpy.pp.highly_variable_genes — scx-native HVG only runs when X is \
+         an ScxBackedSparseDataset or ScxLazyTransformedDataset. To get the \
+         scx-native path, open via pyscx.open(...).to_anndata(backed=True) or \
+         keep the source as a ScxLazyTransformedDataset (e.g. immediately \
+         after pyscx.accel.normalize_total / log1p before any op materialises \
+         X). On the scanpy path, `seurat_v3` (LOESS) and `cell_ranger` \
+         (pd.cut) can fail with singularity / bin-edge errors on data with \
+         many low-expression genes — pre-filter via \
+         pyscx.accel.filter_genes(min_cells=10) or use flavor=\"seurat\" \
+         after normalize_total + log1p."
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+
     let sc = py.import("scanpy")?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("n_top_genes", n_top_genes)?;
