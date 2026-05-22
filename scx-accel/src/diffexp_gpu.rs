@@ -436,6 +436,12 @@ where
         let sz = c1 - c0;
         // Reuse the high end of `chunk_dense` for chunks smaller than chunk_size.
         let buf = &mut chunk_dense[..n_obs * sz];
+        // Zero the buf before the materialise closure: the sparse and
+        // streaming closures write only the non-zero CSR entries, so
+        // stale values from chunk N-1 leak into zero positions of chunk
+        // N without this. The dense closure overwrites every cell so
+        // the fill is redundant there but cheap (memset is ~50 GB/s).
+        buf.fill(0.0);
         materialise(c0, sz, buf)?;
 
         // Compute per-gene ref_mean + target_mean[g] (host, rayon-parallel).
@@ -704,6 +710,9 @@ where
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
         let buf = &mut chunk_dense[..n_obs * sz];
+        // See `pdex_ref_gpu_chunked`: sparse / streaming closures only
+        // write non-zero entries; zero the slot to keep chunks isolated.
+        buf.fill(0.0);
         materialise(c0, sz, buf)?;
 
         // Per-group per-gene sums on host (parallel) — needed for logFC.
@@ -1420,6 +1429,110 @@ mod tests {
                     gene,
                     p_cpu,
                     p_gpu
+                );
+            }
+        }
+    }
+
+    /// Multi-chunk regression: a sparse CSR with `n_vars > gene_chunk_size`
+    /// must produce the same per-(group × gene) statistics as the dense
+    /// path. This catches the buf-zeroing bug that the 90×15 dense fixture
+    /// in `test_pdex_ref_gpu_dense_matches_cpu` is too small to surface:
+    /// without a per-chunk `buf.fill(0.0)`, non-zero entries from chunk
+    /// N-1 leak into the zero positions of chunk N and corrupt every U.
+    #[test]
+    fn test_pdex_ref_gpu_sparse_multi_chunk_matches_dense() {
+        let _ = require_gpu_or_skip!();
+
+        // 80 cells × 200 genes — chunk_size = 64 forces 4 chunks. Keep
+        // the matrix sparse-on-purpose (mostly zeros) so the leak would
+        // manifest as non-zero leakage into zero positions.
+        let n_obs = 80usize;
+        let n_vars = 200usize;
+        let groups: Vec<usize> = (0..n_obs).map(|i| i / 40).collect(); // 2 groups of 40
+        let group_names = vec!["ref".to_string(), "test".to_string()];
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g_{i}")).collect();
+
+        // Deterministic sparse fixture: ~10% density, integer counts in [0, 5].
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let mut state: u64 = 0xBEEFCAFEBABE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for cell in 0..n_obs {
+            for gene in 0..n_vars {
+                if (next() % 10) == 0 {
+                    data[cell * n_vars + gene] = (next() % 6) as f32;
+                }
+            }
+        }
+
+        // Build an ScxCsr from the dense matrix.
+        let mut indptr: Vec<i64> = Vec::with_capacity(n_obs + 1);
+        let mut indices: Vec<i32> = Vec::new();
+        let mut sparse_data: Vec<f32> = Vec::new();
+        indptr.push(0);
+        for cell in 0..n_obs {
+            for gene in 0..n_vars {
+                let v = data[cell * n_vars + gene];
+                if v != 0.0 {
+                    indices.push(gene as i32);
+                    sparse_data.push(v);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, sparse_data);
+
+        let mode = GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+
+        let dense_result = pdex_ref_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            mode,
+            epsilon,
+        )
+        .expect("dense GPU pdex_ref failed");
+
+        let sparse_result = pdex_ref_gpu_sparse(
+            0,
+            &csr,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            Some(64),
+            mode,
+            epsilon,
+        )
+        .expect("sparse GPU pdex_ref failed");
+
+        assert_eq!(dense_result.group_names, sparse_result.group_names);
+        for tg in 0..dense_result.group_names.len() {
+            for var in 0..n_vars {
+                let u_d = dense_result.statistics[tg][var];
+                let u_s = sparse_result.statistics[tg][var];
+                if u_d.is_finite() && u_s.is_finite() {
+                    assert!(
+                        (u_d - u_s).abs() < 1e-6,
+                        "multi-chunk U mismatch tg={tg} gene={var}: dense={u_d}, sparse={u_s}"
+                    );
+                }
+                let p_d = dense_result.p_values[tg][var];
+                let p_s = sparse_result.p_values[tg][var];
+                assert!(
+                    (p_d - p_s).abs() < 1e-9 || (p_d - p_s).abs() / p_d.abs().max(1e-12) < 1e-6,
+                    "multi-chunk p mismatch tg={tg} gene={var}: dense={p_d}, sparse={p_s}"
                 );
             }
         }
