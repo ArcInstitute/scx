@@ -48,12 +48,23 @@ static CUSPARSE_MODERN_ABI: OnceLock<bool> = OnceLock::new();
 ///
 /// The first call dlopens libcusparse via `libloading`; subsequent calls
 /// return the cached boolean without re-probing. We try the unversioned
-/// `libcusparse.so` first (matching cudarc's load path), then `libcusparse.so.12`
-/// as a fallback for hosts where only the versioned SONAME is on the loader
-/// path.
+/// `libcusparse.so` first — matching cudarc 0.19's single load path via
+/// `libloading::library_filename("cusparse")` — and then a small fixed list
+/// of versioned SONAMEs as fallbacks for hosts where only the versioned file
+/// is on the loader path (libcusparse-dev not installed, conda-only layouts,
+/// some container images). The candidate list is a strict superset of
+/// cudarc's: `.so.12` is the current CUDA 12.x SONAME, `.so.13` is the
+/// expected CUDA 13.x SONAME (forward-compat), and `.so.0` covers
+/// occasional legacy/symlink layouts. If cudarc could load cuSPARSE on
+/// this host, at least one of these candidates will resolve.
 pub fn cusparse_modern_abi_available() -> bool {
     *CUSPARSE_MODERN_ABI.get_or_init(|| {
-        let candidates = ["libcusparse.so", "libcusparse.so.12"];
+        let candidates = [
+            "libcusparse.so",
+            "libcusparse.so.12",
+            "libcusparse.so.13",
+            "libcusparse.so.0",
+        ];
         for name in candidates {
             // SAFETY: dlopen of a system library by name; not unsafe in the
             // memory-safety sense, but the API is `unsafe` because the library

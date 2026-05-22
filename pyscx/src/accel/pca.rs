@@ -258,19 +258,21 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
 /// The PCA dispatcher then falls through to the CPU path instead of letting
 /// cudarc's lazy `dlsym` panic deep in an FFI call.
 #[cfg(feature = "gpu")]
-fn emit_cusparse_abi_warning(py: Python<'_>) -> PyResult<()> {
+fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResult<()> {
     let warnings = py.import("warnings")?;
     warnings.call_method1(
         "warn",
         (
-            "pyscx.accel.pca(device=\"gpu\") falling back to CPU: the runtime \
-             libcusparse.so is older than cuSPARSE 12.5 and lacks the \
-             cusparseBsrSetStridedBatch symbol that cudarc 0.19+ requires. \
-             Ubuntu's libcusparse-dev is typically 12.0.1.140 (2023-01); the \
-             CUDA Toolkit at /usr/local/cuda*/lib64 ships 12.5+. Fix: export \
-             LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH (or the \
-             matching toolkit path) before invoking Python. See \
-             docs/gpu-setup.md for details.",
+            format!(
+                "pyscx.accel.pca(device={device:?}) falling back to CPU: the runtime \
+                 libcusparse.so is older than cuSPARSE 12.5 and lacks the \
+                 cusparseBsrSetStridedBatch symbol that cudarc 0.19+ requires. \
+                 Ubuntu's libcusparse-dev is typically 12.0.1.140 (2023-01); the \
+                 CUDA Toolkit at /usr/local/cuda*/lib64 ships 12.5+. Fix: export \
+                 LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH (or the \
+                 matching toolkit path) before invoking Python. See \
+                 docs/gpu-setup.md for details."
+            ),
             py.get_type::<pyo3::exceptions::PyUserWarning>(),
         ),
     )?;
@@ -355,7 +357,7 @@ pub fn pca(
     let gpu_device_id = match _device.gpu_id() {
         Some(id) if scx_accel::cusparse_modern_abi_available() => Some(id),
         Some(_) => {
-            emit_cusparse_abi_warning(py)?;
+            emit_cusparse_abi_warning(py, device)?;
             None
         }
         None => None,

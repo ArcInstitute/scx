@@ -100,7 +100,7 @@ pub fn normalize_total(
 
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
-        return gpu_normalize_total(py, adata, target_sum, device_id);
+        return gpu_normalize_total(py, adata, target_sum, device_id, device);
     }
 
     let x = adata.getattr("X")?;
@@ -719,6 +719,7 @@ fn gpu_normalize_total(
     adata: &Bound<'_, PyAny>,
     target_sum: f64,
     device_id: usize,
+    device: &str,
 ) -> PyResult<()> {
     let x = adata.getattr("X")?;
 
@@ -727,7 +728,7 @@ fn gpu_normalize_total(
         // Emit a UserWarning symmetric with `gpu_log1p_dispatch`'s scipy/dense
         // fallback so the silent-fallback regression that the 2026-05-21
         // dogfood report flagged (B4) cannot recur.
-        emit_gpu_normalize_fallback_warning(py, "gpu")?;
+        emit_gpu_normalize_fallback_warning(py, device)?;
         let sc = py.import("scanpy")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("target_sum", target_sum)?;
