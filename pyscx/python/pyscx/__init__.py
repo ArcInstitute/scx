@@ -22,6 +22,23 @@ del _pkg_version, _PkgNotFound
 from .pyscx import *  # noqa: F401, F403, E402
 from .pyscx import ScxBackedSparseDataset, ScxBackedLayerDataset  # noqa: E402
 
+# Register the Rust-side `accel`
+# submodule under `sys.modules` so the dotted import idiom works
+# symmetrically with the already-working `from pyscx import accel`. PyO3's
+# `m.add_submodule(&accel_module)?` (see pyscx/src/lib.rs:774-787) exposes
+# `accel` as an *attribute* on the parent C-extension module but does not
+# populate `sys.modules`; Python's import machinery needs the entry there
+# to resolve `import pyscx.accel as a`. `accel` is the only Rust-side
+# submodule pyscx exposes today; other public surface comes from the
+# `from .pyscx import *` line above. `setdefault` is the safe variant —
+# if anything else has already registered the submodule (rewriting
+# loaders, test harnesses, future Python), we don't clobber it.
+import sys as _sys  # noqa: E402
+from .pyscx import accel as _accel_submodule  # noqa: E402
+
+_sys.modules.setdefault("pyscx.accel", _accel_submodule)
+del _sys, _accel_submodule
+
 # Thin Python wrappers around the native entry points so they accept
 # `os.PathLike` (e.g. `pathlib.Path`) and — for the SCX-side
 # converters (`to_h5ad` / `to_h5mu`) — a `PyExperiment` handle. The

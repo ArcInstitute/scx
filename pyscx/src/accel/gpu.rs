@@ -4,11 +4,36 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+/// Whether GPU support is available — `True` iff `pyscx` was built with
+/// `--features gpu` **and** a CUDA device is detected at runtime.
+///
+/// Use this when you only need a boolean check; `gpu_info()` is the right
+/// call when you need device name / VRAM / etc. (it returns `None` in the
+/// same cases this function returns `False`).
+///
+/// Example:
+///     if pyscx.accel.gpu_available():
+///         pyscx.accel.pca(adata, device="gpu")
+///     else:
+///         pyscx.accel.pca(adata, device="cpu")
+#[pyfunction]
+pub fn gpu_available() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        scx_accel::gpu_available()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
 /// Query GPU device information.
 ///
 /// Returns a dict with keys `device` (name string), `total_vram_gb` (f64),
 /// and `free_vram_gb` (f64). Returns `None` if no GPU is available or the
-/// `gpu` feature is disabled.
+/// `gpu` feature is disabled — in those cases `gpu_available()` returns
+/// `False`. Use `gpu_available()` for a yes/no check, this for device info.
 ///
 /// Example:
 ///     info = pyscx.accel.gpu_info()
