@@ -497,6 +497,12 @@ fn hvg_seurat_v3<'py>(
     // ── 3. Per-batch: loess fit → clip_val (in-memory, no I/O) ───────────
     let mut all_clip_vals: Vec<Vec<f64>> = Vec::new();
     let mut batch_estimat_vars: Vec<Vec<f64>> = Vec::new();
+    // Tracks which batches had their per-batch loess fit fail (singular /
+    // under-determined). Failed batches are skipped in step 5's
+    // per-batch normalised-variance computation and excluded from the
+    // cross-batch mean and median-rank aggregations below — the contract
+    // the UserWarning text promises.
+    let mut batch_failed = vec![false; n_batches_actual];
 
     for (b, batch_cells) in batches.iter().enumerate() {
         let batch_n = batch_cells.len();
@@ -557,10 +563,16 @@ fn hvg_seurat_v3<'py>(
                 Err(e) => {
                     // Singular / under-determined LOESS (common on Census
                     // dataset_id batches with few cells or near-collinear
-                    // log-mean / log-variance). Warn naming the batch, leave
-                    // estimat_var all-zero so the batch contributes no
-                    // normalised variance, and continue with other batches.
+                    // log-mean / log-variance). Warn naming the batch and
+                    // mark it failed so step 5 and the rank step exclude
+                    // it from per-batch and cross-batch aggregation.
+                    // Cannot rely on `estimat_var == 0` to opt out — a
+                    // successful loess fit can legitimately produce zero
+                    // entries, and downstream `reg_std_sq = 10^0 = 1` so
+                    // a zero `estimat_var` would still pass the
+                    // `reg_std_sq > 0` guard.
                     emit_hvg_loess_singularity_warning(py, b, batch_n, &e)?;
+                    batch_failed[b] = true;
                 }
             }
         }
@@ -576,6 +588,19 @@ fn hvg_seurat_v3<'py>(
 
         all_clip_vals.push(clip_val);
         batch_estimat_vars.push(estimat_var);
+    }
+
+    // Surviving batches (per-batch loess fit succeeded). If all batches
+    // failed there's nothing to rank against and dividing by zero in the
+    // cross-batch average below would silently produce NaN HVGs — raise
+    // so the user sees the per-batch UserWarnings as the cause.
+    let n_valid_batches = batch_failed.iter().filter(|&&f| !f).count();
+    if n_valid_batches == 0 {
+        return Err(PyRuntimeError::new_err(format!(
+            "highly_variable_genes(flavor=\"seurat_v3\"): all {n_batches_actual} \
+             batches failed skmisc.loess fitting; see prior UserWarnings for \
+             per-batch causes."
+        )));
     }
 
     // ── 4. Batched streaming clipped sums (single pass for ALL batches) ──
@@ -621,7 +646,9 @@ fn hvg_seurat_v3<'py>(
     let mut all_norm_vars: Vec<Vec<f64>> = Vec::new();
     for (b, batch_cells) in batches.iter().enumerate() {
         let batch_n = batch_cells.len();
-        if batch_n < 2 {
+        if batch_n < 2 || batch_failed[b] {
+            // Push a zero row so `all_norm_vars` stays indexable by batch
+            // id; the rank step skips these by index via `batch_failed`.
             all_norm_vars.push(vec![0.0; n_vars]);
             continue;
         }
@@ -645,27 +672,42 @@ fn hvg_seurat_v3<'py>(
     }
 
     // ── 4. Rank genes and select top N ──────────────────────────────────
-    let n_batches = all_norm_vars.len();
-
-    // Mean normalized variance across batches
+    // Mean normalized variance across **surviving** batches only. Failed
+    // batches contributed a zero row to `all_norm_vars` (see step 5) but
+    // must not enter the average — we divide by `n_valid_batches`, not
+    // `all_norm_vars.len()`.
     let mut mean_norm_var = vec![0.0f64; n_vars];
-    for nv in &all_norm_vars {
+    for (b, nv) in all_norm_vars.iter().enumerate() {
+        if batch_failed[b] {
+            continue;
+        }
         for (j, &v) in nv.iter().enumerate() {
             mean_norm_var[j] += v;
         }
     }
     for v in &mut mean_norm_var {
-        *v /= n_batches as f64;
+        *v /= n_valid_batches as f64;
     }
 
-    // For multi-batch: rank within each batch, then combine ranks
-    let (hvg_mask, ranks) = if n_batches > 1 {
-        // Per-batch ranks: for each batch, rank genes by normalized variance (descending)
+    // Multi-batch ranking when more than one batch survived. When only
+    // one batch survives (`n_valid_batches == 1`), `mean_norm_var` equals
+    // that batch's `norm_gene_var`, so the single-batch ranking branch
+    // produces the same HVG mask as a direct 1-batch run on that batch
+    // alone — that's the contract the parity test in
+    // tests/test_hvg_loess_singularity.py asserts.
+    let (hvg_mask, ranks) = if n_valid_batches > 1 {
+        // Per-batch ranks: for each surviving batch, rank genes by
+        // normalized variance (descending). Failed batches are skipped
+        // so they neither cast a rank vote nor count toward
+        // `nbatches_hv` / `median_ranks`.
         let mut batch_ranks: Vec<Vec<usize>> = Vec::new();
-        for nv in &all_norm_vars {
+        for (b, nv) in all_norm_vars.iter().enumerate() {
+            if batch_failed[b] {
+                continue;
+            }
             let mut indices: Vec<usize> = (0..n_vars).collect();
-            indices.sort_by(|&a, &b| {
-                nv[b]
+            indices.sort_by(|&a, &c| {
+                nv[c]
                     .partial_cmp(&nv[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
