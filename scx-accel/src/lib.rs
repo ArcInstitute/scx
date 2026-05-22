@@ -78,6 +78,8 @@ pub use pca::{
     GPU_COVARIANCE_PCA_THRESHOLD,
 };
 #[cfg(feature = "gpu")]
-pub use scx_gpu::{gpu_log1p, gpu_preprocess_to_csr, GpuDevice, QrMethod};
+pub use scx_gpu::{
+    cusparse_modern_abi_available, gpu_log1p, gpu_preprocess_to_csr, GpuDevice, QrMethod,
+};
 #[cfg(feature = "gpu")]
 pub use umap::compute_umap_gpu;

@@ -305,6 +305,47 @@ Possible causes:
 - pyscx was built without `--features gpu`
 - CUDA runtime initialization failed (check `nvidia-smi` for GPU errors)
 
+### `cusparseBsrSetStridedBatch undefined symbol` panic at GPU PCA
+
+**Symptom:**
+
+```
+thread '<unnamed>' panicked at .../cudarc-0.19.x/src/cusparse/sys/mod.rs:...:
+Expected symbol in library: DlSym { source:
+  "/usr/lib/x86_64-linux-gnu/libcusparse.so: undefined symbol:
+   cusparseBsrSetStridedBatch" }
+pyo3_runtime.PanicException: ...
+```
+
+(Or another `cusparse*` symbol — the exact missing function may differ
+across cudarc versions.)
+
+**Cause:** Ubuntu's `libcusparse-dev` package ships cuSPARSE 12.0.1.140
+(2023-01) at `/usr/lib/x86_64-linux-gnu/libcusparse.so`. cudarc 0.19+
+requires cuSPARSE 12.5+ (CUDA Toolkit 12.5, mid-2024). If the toolkit's
+newer libcusparse at `/usr/local/cuda*/lib64/libcusparse.so` is not
+earlier on `LD_LIBRARY_PATH`, the dynamic loader picks the older system
+version and `cusparseCreate` (or the first SpMM-related call) panics
+during cudarc's lazy `dlsym`.
+
+**Fix:** prepend the toolkit's lib path:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+# or the specific version:
+export LD_LIBRARY_PATH=/usr/local/cuda-12.5/lib64:$LD_LIBRARY_PATH
+```
+
+Verify with `ldd path/to/libpyscx.so | grep libcusparse` — should
+resolve to `/usr/local/cuda*/lib64`, not `/usr/lib/x86_64-linux-gnu`.
+
+**Behaviour as of pyscx 0.4.3+:** the runtime probes for
+`cusparseBsrSetStridedBatch` at the first `accel.pca(device="gpu")` call.
+If the symbol is missing, pyscx emits a one-shot `UserWarning` naming
+this exact fix and routes PCA to CPU instead of panicking. The CPU path
+still produces correct results; restore the GPU path by fixing
+`LD_LIBRARY_PATH` and re-running.
+
 ### cuVS / cuGraph import errors
 
 ```

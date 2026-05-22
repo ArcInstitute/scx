@@ -263,6 +263,15 @@ mkdir -p "$SCX_USER_DIR/logs"
 export SCX_REPO=$SCX_REPO
 export SCX_DATA_DIR=$SCX_DATA_DIR
 
+# Prepend the CUDA toolkit lib path so the loader picks the toolkit's
+# libcusparse (12.5+) ahead of Ubuntu's system libcusparse-dev (12.0.1.140).
+# Without this, cudarc 0.19+ would panic on missing cuSPARSE 12.5 symbols
+# like cusparseBsrSetStridedBatch the first time GPU PCA dispatches. pyscx
+# detects the ABI mismatch and falls back to CPU PCA gracefully as of
+# pyscx 0.4.3+, but setting LD_LIBRARY_PATH preserves the GPU fast path.
+# Adjust the path if your CUDA toolkit lives elsewhere (see docs/gpu-setup.md).
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}
+
 # Pyscx must be built with GPU support; do it inside the job so the active
 # .venv/ matches the active GPU/driver.
 ( cd "\$SCX_REPO/pyscx" && ../.venv/bin/maturin develop --release --features gpu )
