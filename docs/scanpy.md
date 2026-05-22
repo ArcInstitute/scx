@@ -831,13 +831,20 @@ than reading the already-materialized scipy CSR. Any intervening op (PCA,
 kNN, …) silently forfeits the fusion, producing correct — but 1× redundant —
 results.
 
-**`log1p(device="gpu")` standalone** — when there is no fusion marker AND the
-input X is already a materialized scipy/dense matrix, GPU dispatch is 50–100×
-slower than CPU (H→D + D→H copies dominate log1p's trivial math). `pyscx`
-detects this case, emits a `UserWarning`, and runs `sc.pp.log1p` on the host
-instead. To get the GPU fast path, either run
-`pyscx.accel.normalize_total(device="gpu")` first (the fusion marker enables
-a single fused pass), or operate on a backed SCX dataset.
+**Scipy/dense fallback (symmetric for `normalize_total` and `log1p`)** — when
+`device="gpu"` is passed but X is already a materialized scipy/dense matrix,
+GPU dispatch on these per-row ops is dominated by H→D + D→H copies and
+makes no sense. Both `pyscx.accel.normalize_total(device="gpu")` and
+`pyscx.accel.log1p(device="gpu")` detect this, emit a `UserWarning` naming
+the gating condition (X must be `ScxBackedSparseDataset` or
+`ScxLazyTransformedDataset`), and delegate to `sc.pp.normalize_total` /
+`sc.pp.log1p` on the host. To get the GPU fast path — including the
+single-pass `normalize+log1p` fusion via the marker on
+`adata.uns["__scx_gpu_pending_normalize__"]` — open via
+`pyscx.open(...).to_anndata(backed=True)` (or keep the source as
+`ScxLazyTransformedDataset`) and avoid `.copy()` between `normalize_total`
+and `log1p` (that materialises X to scipy CSR and unreachably forfeits the
+fast path for the rest of the pipeline).
 
 **HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
 through GPU atomicAdd kernels for `streaming_mean_var` and

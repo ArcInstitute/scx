@@ -201,6 +201,84 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
     }
 }
 
+/// Catch any cudarc dlsym / FFI panic that escapes `gpu_pca_dispatch` and
+/// translate it to a normal `AccelError::LinAlg`. The proactive
+/// `cusparse_modern_abi_available()` probe at the GPU branch entry handles the
+/// *known* `cusparseBsrSetStridedBatch`-missing failure; this wrapper is a
+/// backstop for any other future cudarc symbol surprise so users never see a
+/// raw `pyo3_runtime.PanicException`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
+    device_id: usize,
+    source: &S,
+    n_comps: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    random_state: u64,
+    method: &str,
+    qr_method: scx_accel::QrMethod,
+) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gpu_pca_dispatch(
+            device_id,
+            source,
+            n_comps,
+            n_oversamples,
+            n_power_iterations,
+            zero_center,
+            random_state,
+            method,
+            qr_method,
+        )
+    }))
+    .unwrap_or_else(|panic_payload| {
+        let msg = panic_payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        Err(scx_accel::AccelError::LinAlg(format!(
+            "GPU PCA panicked: {msg}. If this mentions libcusparse / cusparse* \
+             undefined symbol, set \
+             LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH so the \
+             toolkit's cuSPARSE 12.5+ wins over the system 12.0 — see \
+             docs/gpu-setup.md."
+        )))
+    })
+}
+
+/// Emit a one-shot `UserWarning` when the runtime libcusparse predates
+/// cuSPARSE 12.5 and cudarc's `cusparseBsrSetStridedBatch` symbol probe fails.
+/// The PCA dispatcher then falls through to the CPU path instead of letting
+/// cudarc's lazy `dlsym` panic deep in an FFI call.
+#[cfg(feature = "gpu")]
+fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    warnings.call_method1(
+        "warn",
+        (
+            format!(
+                "pyscx.accel.pca(device={device:?}) falling back to CPU: the runtime \
+                 libcusparse.so is older than cuSPARSE 12.5 and lacks the \
+                 cusparseBsrSetStridedBatch symbol that cudarc 0.19+ requires. \
+                 Ubuntu's libcusparse-dev is typically 12.0.1.140 (2023-01); the \
+                 CUDA Toolkit at /usr/local/cuda*/lib64 ships 12.5+. Fix: export \
+                 LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH (or the \
+                 matching toolkit path) before invoking Python. See \
+                 docs/gpu-setup.md for details."
+            ),
+            py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        ),
+    )?;
+    Ok(())
+}
+
 /// Run randomized PCA on an AnnData whose X is backed by SCX.
 ///
 /// Results are written to `adata.obsm["X_pca"]`, `adata.varm["PCs"]`,
@@ -271,15 +349,28 @@ pub fn pca(
     let x = adata.getattr("X")?;
 
     // ------- GPU path -------
+    // Probe libcusparse for the cuSPARSE 12.5+ ABI before dispatching, so an
+    // Ubuntu host running with the system libcusparse-dev (12.0.1.140) gets
+    // a graceful CPU fallback + actionable UserWarning instead of a deep
+    // cudarc dlsym panic. See `scx_gpu::cusparse_modern_abi_available`.
     #[cfg(feature = "gpu")]
-    if let Some(device_id) = _device.gpu_id() {
+    let gpu_device_id = match _device.gpu_id() {
+        Some(id) if scx_accel::cusparse_modern_abi_available() => Some(id),
+        Some(_) => {
+            emit_cusparse_abi_warning(py, device)?;
+            None
+        }
+        None => None,
+    };
+    #[cfg(feature = "gpu")]
+    if let Some(device_id) = gpu_device_id {
         let qr = parse_qr_method(qr_method)?;
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             let reader = &*backed.backed;
             let (_n_obs, n_vars) = reader.shape();
             let m = resolve_gpu_method(method, n_vars)?;
-            let result = gpu_pca_dispatch(
+            let result = gpu_pca_dispatch_unwind_safe(
                 device_id,
                 reader,
                 n_comps,
@@ -299,7 +390,7 @@ pub fn pca(
             let source = lazy.as_shard_source();
             let (_n_obs, n_vars) = source.shape();
             let m = resolve_gpu_method(method, n_vars)?;
-            let result = gpu_pca_dispatch(
+            let result = gpu_pca_dispatch_unwind_safe(
                 device_id,
                 &source,
                 n_comps,
@@ -328,7 +419,7 @@ pub fn pca(
             };
             let n_vars = source.n_vars();
             let m = resolve_gpu_method(method, n_vars)?;
-            let result = gpu_pca_dispatch(
+            let result = gpu_pca_dispatch_unwind_safe(
                 device_id,
                 &source,
                 n_comps,
@@ -349,7 +440,7 @@ pub fn pca(
         let source = ScxCsrSource { csr: &csr };
         let n_vars = source.n_vars();
         let m = resolve_gpu_method(method, n_vars)?;
-        let result = gpu_pca_dispatch(
+        let result = gpu_pca_dispatch_unwind_safe(
             device_id,
             &source,
             n_comps,

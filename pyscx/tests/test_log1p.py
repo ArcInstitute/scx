@@ -667,7 +667,10 @@ def test_no_marker_for_scipy_normalize_then_gpu_log1p_falls_back():
     a_gpu = anndata.AnnData(X=x.copy())
     a_ref = anndata.AnnData(X=x.copy())
 
-    pyscx.accel.normalize_total(a_gpu, target_sum=1e4, device="gpu")
+    # B4 fix: normalize_total(device="gpu") on scipy/dense X now emits a
+    # symmetric "falls back to CPU" UserWarning (previously silent).
+    with pytest.warns(UserWarning, match="falls back to CPU"):
+        pyscx.accel.normalize_total(a_gpu, target_sum=1e4, device="gpu")
     assert _MARKER_KEY not in a_gpu.uns, (
         "scipy-fallback normalize must NOT stash a fusion marker"
     )

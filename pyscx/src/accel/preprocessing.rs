@@ -100,7 +100,7 @@ pub fn normalize_total(
 
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
-        return gpu_normalize_total(py, adata, target_sum, device_id);
+        return gpu_normalize_total(py, adata, target_sum, device_id, device);
     }
 
     let x = adata.getattr("X")?;
@@ -594,10 +594,37 @@ fn emit_gpu_log1p_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()>
             format!(
                 "pyscx.accel.log1p(device={device:?}) on a materialized scipy/dense \
                  X falls back to CPU: H→D and D→H copies dominate log1p's trivial \
-                 math, making GPU dispatch 50–100× slower than scanpy.pp.log1p. To \
-                 get the GPU fast path, call pyscx.accel.normalize_total(device=\"gpu\") \
-                 first (the fusion marker on adata.uns enables a single fused pass), \
-                 or operate on a backed SCX dataset."
+                 math, making GPU dispatch 50–100× slower than scanpy.pp.log1p. The \
+                 GPU fast path requires X to be ScxBackedSparseDataset or \
+                 ScxLazyTransformedDataset at the time log1p runs — once an \
+                 intermediate step (.copy(), adata[:, mask].copy(), etc.) materialises \
+                 X to scipy CSR, the fast path is unreachable for the rest of the \
+                 pipeline. To enable it, open via pyscx.open(...).to_anndata(backed=True) \
+                 and avoid materialising between normalize_total and log1p."
+            ),
+            py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Symmetric helper for `gpu_normalize_total`'s scipy/dense fallback. Mirrors
+/// `emit_gpu_log1p_fallback_warning`'s shape so a docs-skimmer reading the two
+/// warnings side-by-side sees the same "open backed" recommendation.
+#[cfg(feature = "gpu")]
+fn emit_gpu_normalize_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    warnings.call_method1(
+        "warn",
+        (
+            format!(
+                "pyscx.accel.normalize_total(device={device:?}) on a materialized \
+                 scipy/dense X falls back to CPU (scanpy.pp.normalize_total); the GPU \
+                 shard-streaming path requires an ScxBackedSparseDataset or \
+                 ScxLazyTransformedDataset. To get the GPU fast path (including the \
+                 normalize+log1p fusion marker on adata.uns), open via \
+                 pyscx.open(...).to_anndata(backed=True) or keep the source as \
+                 ScxLazyTransformedDataset until after log1p."
             ),
             py.get_type::<pyo3::exceptions::PyUserWarning>(),
         ),
@@ -692,11 +719,16 @@ fn gpu_normalize_total(
     adata: &Bound<'_, PyAny>,
     target_sum: f64,
     device_id: usize,
+    device: &str,
 ) -> PyResult<()> {
     let x = adata.getattr("X")?;
 
     let Some(gs) = source_from_x(&x)? else {
         // Scipy/dense X: fall back to CPU path (scanpy's normalize_total).
+        // Emit a UserWarning symmetric with `gpu_log1p_dispatch`'s scipy/dense
+        // fallback so the silent-fallback regression that the 2026-05-21
+        // dogfood report flagged (B4) cannot recur.
+        emit_gpu_normalize_fallback_warning(py, device)?;
         let sc = py.import("scanpy")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("target_sum", target_sum)?;

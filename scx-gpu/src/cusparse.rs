@@ -16,7 +16,7 @@
 //! ```
 
 use std::mem::MaybeUninit;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::cusparse::sys::{
     self as csp, cudaDataType, cusparseIndexBase_t, cusparseIndexType_t, cusparseSpMatDescr_t,
@@ -27,6 +27,60 @@ use crate::cast_gpu::cast_i64_to_i32_gpu;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::shard_decode::GpuCsr;
+
+/// Cached cuSPARSE ABI probe — `true` when the runtime libcusparse satisfies
+/// cudarc 0.19+ expectations, `false` when it predates cuSPARSE 12.5 and is
+/// missing required symbols. See `cusparse_modern_abi_available`.
+static CUSPARSE_MODERN_ABI: OnceLock<bool> = OnceLock::new();
+
+/// Probe the runtime `libcusparse.so` for `cusparseBsrSetStridedBatch` — a
+/// canary symbol added in cuSPARSE 12.5 (CUDA Toolkit 12.5, mid-2024) and
+/// expected by cudarc 0.19+. Returns `false` when the library is older than
+/// 12.5, so callers can route to a CPU fallback instead of letting cudarc's
+/// lazy `dlsym` panic deep inside an FFI call.
+///
+/// On Ubuntu hosts the system
+/// `libcusparse-dev` ships 12.0.1.140 (Jan 2023) at
+/// `/usr/lib/x86_64-linux-gnu/libcusparse.so`. If the toolkit's newer
+/// libcusparse at `/usr/local/cuda*/lib64/libcusparse.so` is not earlier on
+/// `LD_LIBRARY_PATH`, the loader picks the system version and `cusparseCreate`
+/// panics with `undefined symbol: cusparseBsrSetStridedBatch`.
+///
+/// The first call dlopens libcusparse via `libloading`; subsequent calls
+/// return the cached boolean without re-probing. We try the unversioned
+/// `libcusparse.so` first — matching cudarc 0.19's single load path via
+/// `libloading::library_filename("cusparse")` — and then a small fixed list
+/// of versioned SONAMEs as fallbacks for hosts where only the versioned file
+/// is on the loader path (libcusparse-dev not installed, conda-only layouts,
+/// some container images). The candidate list is a strict superset of
+/// cudarc's: `.so.12` is the current CUDA 12.x SONAME, `.so.13` is the
+/// expected CUDA 13.x SONAME (forward-compat), and `.so.0` covers
+/// occasional legacy/symlink layouts. If cudarc could load cuSPARSE on
+/// this host, at least one of these candidates will resolve.
+pub fn cusparse_modern_abi_available() -> bool {
+    *CUSPARSE_MODERN_ABI.get_or_init(|| {
+        let candidates = [
+            "libcusparse.so",
+            "libcusparse.so.12",
+            "libcusparse.so.13",
+            "libcusparse.so.0",
+        ];
+        for name in candidates {
+            // SAFETY: dlopen of a system library by name; not unsafe in the
+            // memory-safety sense, but the API is `unsafe` because the library
+            // can run arbitrary `_init` code. We only probe symbols.
+            let lib = match unsafe { libloading::Library::new(name) } {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            // SAFETY: looking up a symbol by name. Not invoking it.
+            let probe: Result<libloading::Symbol<'_, unsafe extern "C" fn()>, _> =
+                unsafe { lib.get(b"cusparseBsrSetStridedBatch\0") };
+            return probe.is_ok();
+        }
+        false
+    })
+}
 
 /// RAII wrapper around a cuSPARSE library handle (`cusparseHandle_t`).
 ///
@@ -468,6 +522,23 @@ mod tests {
     use crate::shard_decode::decode_shard_gpu;
     use crate::test_utils::build_test_shard;
     use scx_codec::{CodecId, ValueEncoding};
+
+    /// The cuSPARSE ABI probe must return a bool without panicking, even when
+    /// no libcusparse is installed (the "no GPU runtime" case on CPU-only CI
+    /// runners). Regardless of GPU availability, calling the probe twice
+    /// returns the same cached value — `OnceLock` semantics.
+    #[test]
+    fn test_cusparse_modern_abi_probe_does_not_panic() {
+        let first = cusparse_modern_abi_available();
+        let second = cusparse_modern_abi_available();
+        assert_eq!(
+            first, second,
+            "probe is OnceLock-cached; the two reads must agree"
+        );
+        // Don't assert the value itself — it depends on whether libcusparse
+        // is installed and whether it predates cuSPARSE 12.5 on this host.
+        // The contract is "doesn't panic and is idempotent".
+    }
 
     /// Build a small test shard for cuSPARSE tests.
     fn build_small_shard() -> Vec<u8> {
