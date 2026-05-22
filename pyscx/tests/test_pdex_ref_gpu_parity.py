@@ -12,7 +12,7 @@ Skipped cleanly when:
 The tiled merge-sort upgrade removed the prior 8192-cell sort cap;
 fixtures of any size now dispatch correctly via the multi-tile path.
 
-Tolerances mirror the v1 spec (section 15 of ACC-GPU-OPT.md):
+Tolerances:
   * U statistic: exact (integer-valued for integer counts).
   * p-value / fdr: atol=1e-9 rtol=1e-6 (sort-order + erfc numerics).
   * means / log2_fold_change / percent_change: atol=1e-4 rtol=1e-4

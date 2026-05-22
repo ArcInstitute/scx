@@ -523,7 +523,7 @@ GPU PCA (both variants) streams shards from disk → GPU kernels shard-by-shard 
 
 #### Differential expression
 
-`pyscx.accel.pdex_ref(..., device=…)` and `pyscx.accel.rank_genes_groups(..., device=…)` both gained a `device="auto"|"cpu"|"gpu"[:N]"` selector. The GPU path implements section 15 v1 of `ACC-GPU-OPT.md`: per-gene CUB `BlockRadixSort` of the reference column once per gene chunk, batched warp-cooperative `searchsorted` to derive U₁ for every test group, merge-walk combined tie correction, and on-device `erfc` p-value matching the CPU formula bit-for-bit.
+`pyscx.accel.pdex_ref(..., device=…)` and `pyscx.accel.rank_genes_groups(..., device=…)` both gained a `device="auto"|"cpu"|"gpu"[:N]"` selector. The GPU path uses per-gene CUB `BlockRadixSort` of the reference column once per gene chunk, batched warp-cooperative `searchsorted` to derive U₁ for every test group, merge-walk combined tie correction, and on-device `erfc` p-value matching the CPU formula bit-for-bit.
 
 | Operation | Dataset | n_pool | CPU | GPU | Speedup | Notes |
 |---|---|---:|---:|---:|---:|---|
