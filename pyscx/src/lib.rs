@@ -861,6 +861,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // semantics change versus the pre-M7 flat registration.
 
 fn register_gpu(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::gpu::gpu_available, m)?)?;
     m.add_function(wrap_pyfunction!(accel::gpu::gpu_info, m)?)?;
     m.add_function(wrap_pyfunction!(accel::gpu::estimate_gpu_memory, m)?)?;
     Ok(())

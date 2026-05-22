@@ -23,6 +23,11 @@ dev = [
     "pytest>=7.0",
     "scanpy>=1.10",
     "python-dotenv",
+    # `maturin[patchelf]` bundles the `patchelf` binary so `maturin develop`
+    # can set the libpyscx rpath. Without it `maturin develop` prints a
+    # non-fatal "Failed to set rpath" warning on every build. (F5 from
+    # SCX-USER-REPORT-2026-05-21-Tier3.md.)
+    "maturin[patchelf]>=1.0,<2.0",
 ]
 eval = [
     "polars>=1.0",

@@ -124,8 +124,18 @@ Python or pip directly.
 uv venv .venv
 
 # Install Python dependencies
-uv pip install maturin pytest numpy scipy pyarrow anndata scanpy \
+# `maturin[patchelf]` bundles the `patchelf` binary; without it, every
+# `maturin develop` prints "Failed to set rpath for libpyscx.so" as a
+# non-fatal warning. (F5 from SCX-USER-REPORT-2026-05-21-Tier3.md.)
+uv pip install 'maturin[patchelf]' pytest numpy scipy pyarrow anndata scanpy \
     scikit-learn leidenalg python-dotenv
+
+# Put the venv's bin/ on PATH so `maturin develop` (invoked below via the
+# explicit `.venv/bin/maturin` path) can find the `patchelf` binary that
+# `maturin[patchelf]` just installed. Alternative: `source .venv/bin/activate`
+# before any maturin call. Without this, maturin's subprocess for patchelf
+# fails and prints the harmless rpath warning.
+export PATH="$(pwd)/.venv/bin:$PATH"
 
 # Build and install pyscx in development mode. The pyscx `[tool.maturin]`
 # default feature set includes `hdf5`, so `pyscx.from_h5ad` / `to_h5ad`

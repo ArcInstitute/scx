@@ -46,6 +46,30 @@ def test_unknown_device_raises_value_error():
         pyscx.accel.normalize_total(a, device="not-a-device")
 
 
+# ---------------------------------------------------------------------------
+# `gpu_available()` boolean probe (always runs, no skipif).
+# Pre-fix, the same `gpu_info() is not None` test had to be repeated in 8
+# pytest files. Post-fix it's a single named API call.
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_available_returns_bool():
+    """`pyscx.accel.gpu_available()` must return a real `bool`, not None or
+    a dict, so `if pyscx.accel.gpu_available():` works cleanly.
+    """
+    result = pyscx.accel.gpu_available()
+    assert isinstance(result, bool), f"expected bool, got {type(result).__name__}"
+
+
+def test_gpu_available_agrees_with_gpu_info():
+    """`gpu_available()` must agree with the `gpu_info() is not None` idiom
+    that 8 existing test files use as their `_gpu_available` helper.
+    """
+    via_new = pyscx.accel.gpu_available()
+    via_old = pyscx.accel.gpu_info() is not None
+    assert via_new == via_old
+
+
 def test_gpu_with_non_integer_suffix_raises_value_error():
     a = _small_adata()
     with pytest.raises(ValueError, match="non-integer suffix"):

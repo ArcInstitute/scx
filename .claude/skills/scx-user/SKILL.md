@@ -272,6 +272,12 @@ export SCX_DATA_DIR=$SCX_DATA_DIR
 # Adjust the path if your CUDA toolkit lives elsewhere (see docs/gpu-setup.md).
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}
 
+# Put the venv's bin/ on PATH so the `maturin develop` call below can find
+# `patchelf` (installed via the `maturin[patchelf]` extra per
+# docs/development.md). Without this, maturin prints a non-fatal
+# "Failed to set rpath" warning at the top of every job log.
+export PATH=\$SCX_REPO/.venv/bin:\$PATH
+
 # Pyscx must be built with GPU support; do it inside the job so the active
 # .venv/ matches the active GPU/driver.
 ( cd "\$SCX_REPO/pyscx" && ../.venv/bin/maturin develop --release --features gpu )
