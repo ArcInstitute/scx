@@ -687,6 +687,83 @@ pub fn gpu_de_pvalues(
     Ok(())
 }
 
+/// All-groups pseudobulk fold: per-(gene × group) `Σ pre(x)` over each
+/// group's cell list.
+///
+/// One kernel launch produces `[n_groups × chunk_size]` f64 sums in one pass.
+/// Cells are flattened into `all_group_cells` with CSR-style `group_offsets`,
+/// so the kernel knows which slice of the permutation each group owns:
+///
+/// ```text
+/// group 0: all_group_cells[group_offsets[0] .. group_offsets[1])
+/// group 1: all_group_cells[group_offsets[1] .. group_offsets[2])
+/// ...
+/// ```
+///
+/// `mode_id` selects the per-cell pre-transform applied before summation:
+///
+/// | id | meaning           | host equivalent                |
+/// |----|-------------------|--------------------------------|
+/// |  0 | ArithRaw / identity | `f(x) = x` (Wilcoxon raw sums) |
+/// |  1 | ArithLog1pExpand  | `f(x) = expm1(x)`              |
+/// |  2 | GeomRaw           | `f(x) = log1p(x)`              |
+/// |  3 | GeomLog1p         | `f(x) = x`                     |
+///
+/// The host divides each sum by `n_cells_in_group` and applies `mode.post()`
+/// to recover the natural-count mean. Sums are kept on device as f64 so
+/// downstream callers can read them without precision loss.
+///
+/// Output `sums` must be pre-zeroed and sized `>= n_groups * chunk_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_pseudobulk_all_groups(
+    dev: &GpuDevice,
+    dense: &CudaSlice<f32>,
+    all_group_cells: &CudaSlice<i32>,
+    group_offsets: &CudaSlice<i32>,
+    sums: &mut CudaSlice<f64>,
+    n_obs: usize,
+    chunk_size: usize,
+    n_groups: usize,
+    mode_id: i32,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || n_groups == 0 {
+        return Ok(());
+    }
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("pseudobulk_all_groups_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("pseudobulk_all_groups_kernel: {e}")))?;
+
+    // Must match PSEUDOBULK_BLOCK_THREADS in diffexp.cu.
+    let block_threads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, n_groups as u32, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: block_threads * 8, // sdata[block_threads] f64
+    };
+
+    let n_obs_i32 = n_obs as i32;
+    let chunk_i32 = chunk_size as i32;
+    let n_groups_i32 = n_groups as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(dense)
+            .arg(all_group_cells)
+            .arg(group_offsets)
+            .arg(sums)
+            .arg(&n_obs_i32)
+            .arg(&chunk_i32)
+            .arg(&n_groups_i32)
+            .arg(&mode_id)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("pseudobulk_all_groups_kernel: {e}")))?;
+
+    Ok(())
+}
+
 /// Heuristic gene-chunk size for streaming GPU DE.
 ///
 /// Budgets ~18% of free VRAM for the dense + slab buffers needed by one
@@ -1043,6 +1120,93 @@ mod tests {
                 expected.as_slice(),
                 "uneven multi-tile sort mismatch on gene {gene}"
             );
+        }
+    }
+
+    /// G1.6 primitive parity: `gpu_de_pseudobulk_all_groups` per-(group × gene)
+    /// sums must match a host f64 reference for all 4 `mode_id` transforms.
+    /// Synthetic 50 cells × 5 genes × 3 groups fixture (ref + 2 test groups).
+    #[test]
+    fn test_gpu_de_pseudobulk_all_modes() {
+        let dev = require_gpu!();
+
+        let n_obs = 50usize;
+        let chunk_size = 5usize;
+
+        // Group layout: ref={0..19} (20 cells), A={20..34} (15), B={35..49} (15).
+        let group_offsets: Vec<i32> = vec![0, 20, 35, 50];
+        let all_group_cells: Vec<i32> = (0..n_obs as i32).collect();
+        let n_groups = group_offsets.len() - 1;
+
+        // Deterministic values in [0.0, 2.0) — chosen so expm1 and log1p both
+        // produce non-trivial spread (avoids the f(0) = 0 trivial case).
+        let mut state: u64 = 0x5EEDC0DE;
+        let mut next_uniform = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0
+        };
+        let mut dense_host = vec![0.0f32; n_obs * chunk_size];
+        for v in dense_host.iter_mut() {
+            *v = next_uniform() as f32;
+        }
+
+        let d_dense = dev.htod_copy(&dense_host).unwrap();
+        let d_cells = dev.htod_copy(&all_group_cells).unwrap();
+        let d_offsets = dev.htod_copy(&group_offsets).unwrap();
+
+        // Host pre transform: keep in lockstep with apply_pre_transform in
+        // diffexp.cu and GeomMeanMode::pre in scx-accel/src/pseudobulk.rs.
+        let host_pre = |x: f32, mode_id: i32| -> f64 {
+            let xd = x as f64;
+            match mode_id {
+                0 | 3 => xd,
+                1 => xd.exp_m1(),
+                2 => xd.ln_1p(),
+                _ => xd,
+            }
+        };
+
+        for mode_id in 0..4i32 {
+            let mut d_sums = dev.alloc_zeros::<f64>(n_groups * chunk_size).unwrap();
+            gpu_de_pseudobulk_all_groups(
+                &dev,
+                &d_dense,
+                &d_cells,
+                &d_offsets,
+                &mut d_sums,
+                n_obs,
+                chunk_size,
+                n_groups,
+                mode_id,
+            )
+            .unwrap();
+            dev.synchronize().unwrap();
+            let gpu_sums = dev.dtoh_copy(&d_sums).unwrap();
+
+            // Host reference: for each (group, gene) accumulate pre(x) over the
+            // group's cell list.
+            for g in 0..n_groups {
+                let start = group_offsets[g] as usize;
+                let end = group_offsets[g + 1] as usize;
+                for gene in 0..chunk_size {
+                    let mut host_sum = 0.0f64;
+                    for i in start..end {
+                        let cell = all_group_cells[i] as usize;
+                        let x = dense_host[cell * chunk_size + gene];
+                        host_sum += host_pre(x, mode_id);
+                    }
+                    let gpu_sum = gpu_sums[g * chunk_size + gene];
+                    let diff = (host_sum - gpu_sum).abs();
+                    let denom = host_sum.abs().max(1.0);
+                    assert!(
+                        diff < 1e-9 || diff / denom < 1e-12,
+                        "mode_id={mode_id} group={g} gene={gene}: host={host_sum}, \
+                         gpu={gpu_sum}, |Δ|={diff}"
+                    );
+                }
+            }
         }
     }
 }

@@ -57,6 +57,77 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// All-groups pseudobulk fold.
+//
+// One block per (gene, group). Threads stride over the group's cell list and
+// accumulate the `pre(x)`-transformed value into a single f64 sum via shared-
+// memory reduction — no atomics, no per-block contention.
+//
+// `mode_id` selects the per-cell transform applied before summation, matching
+// the host `GeomMeanMode::pre`:
+//   0  ArithRaw          → f(x) = x
+//   1  ArithLog1pExpand  → f(x) = expm1(x)
+//   2  GeomRaw           → f(x) = log1p(x)
+//   3  GeomLog1p         → f(x) = x          (post on host does expm1)
+//
+// The host divides each sum by the group's cell count and applies the matching
+// `mode.post` transform (cheap, no kernel needed).
+//
+// Grid: 2D (chunk_size, n_groups). Block: PSEUDOBULK_BLOCK_THREADS.
+// Shared memory: blockDim.x × sizeof(double) bytes (block reduction scratch).
+// ---------------------------------------------------------------------------
+
+#define PSEUDOBULK_BLOCK_THREADS 256
+
+__device__ __forceinline__ double apply_pre_transform(float x, int mode_id) {
+    double xd = (double)x;
+    switch (mode_id) {
+        case 0:  return xd;          // ArithRaw / GeomLog1p (identity)
+        case 1:  return expm1(xd);   // ArithLog1pExpand
+        case 2:  return log1p(xd);   // GeomRaw
+        case 3:  return xd;
+        default: return xd;
+    }
+}
+
+extern "C" __global__ void pseudobulk_all_groups_kernel(
+    const float* __restrict__ dense,            // [n_obs × chunk_size]
+    const int*   __restrict__ all_group_cells,  // flattened, length = sum(n_g)
+    const int*   __restrict__ group_offsets,    // [n_groups + 1] CSR-style
+    double*      __restrict__ sums,             // [n_groups × chunk_size]
+    int n_obs,
+    int chunk_size,
+    int n_groups,
+    int mode_id
+) {
+    extern __shared__ double sdata[];
+
+    int gene  = blockIdx.x;
+    int group = blockIdx.y;
+    if (gene >= chunk_size || group >= n_groups) return;
+
+    int start = group_offsets[group];
+    int end   = group_offsets[group + 1];
+
+    int tid  = threadIdx.x;
+    int nthr = blockDim.x;
+    double local_sum = 0.0;
+    for (int i = start + tid; i < end; i += nthr) {
+        int cell = all_group_cells[i];
+        if (cell < 0 || cell >= n_obs) continue;
+        float x = dense[(long long)cell * chunk_size + gene];
+        local_sum += apply_pre_transform(x, mode_id);
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthr >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) sums[(long long)group * chunk_size + gene] = sdata[0];
+}
+
+// ---------------------------------------------------------------------------
 // Per-gene CUB BlockRadixSort.
 //
 // Sorts each row of `slab` (shape [chunk_size × n_per_gene], row-major)

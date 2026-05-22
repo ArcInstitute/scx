@@ -9,6 +9,7 @@ AnnData:
   - `bench_csc__hvg_csr`        / `_csc`     (`highly_variable_genes`,
                                               single-batch seurat_v3)
   - `bench_csc__de_csr`         / `_csc`     (`rank_genes_groups`)
+  - `bench_csc__pdex_ref_csr`   / `_csc`     (`pdex_ref`)
   - `bench_csc__pseudobulk_csr` / `_csc`     (`pseudobulk_dex`)
 
 CSC variants require a CSC sidecar; the runner converts the fixture
@@ -95,6 +96,16 @@ def bench_csc_dispatch_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
+            name="pdex_ref (CSR)",
+            key="bench_csc__pdex_ref_csr",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="pdex_ref (CSC)",
+            key="bench_csc__pdex_ref_csc",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
             name="pseudobulk_dex (CSR)",
             key="bench_csc__pseudobulk_csr",
             category="accel", runner="accel_runner",
@@ -168,6 +179,35 @@ def _run_de(adata: Any, prefer: str) -> None:
     )
 
 
+def _run_pdex_ref(adata: Any, prefer: str) -> None:
+    """Run pdex_ref with a binary perturbation-style grouping.
+
+    Mirrors `_run_de`'s groupby column selection so the CSC vs CSR
+    comparison is on the same fixture column. Picks the first
+    available group level (alphabetically) as the reference so the
+    benchmark is reproducible across runs.
+    """
+    obs_cols = list(adata.obs.columns)
+    candidates = ["perturbation", "cell_type", "leiden", "louvain", "cluster"]
+    groupby = next((c for c in candidates if c in obs_cols), None)
+    if groupby is None:
+        n = adata.n_obs
+        adata.obs["_bench_group"] = (np.arange(n) < n // 2).astype(str)
+        groupby = "_bench_group"
+    levels = sorted(set(adata.obs[groupby].astype(str).tolist()))
+    if len(levels) < 2:
+        return
+    reference = levels[0]
+    pyscx.accel.pdex_ref(
+        adata,
+        groupby,
+        reference=reference,
+        gene_chunk_size=500,
+        prefer_format=prefer,
+        device="cpu",
+    )
+
+
 def _run_pseudobulk(adata: Any, prefer: str) -> None:
     """For CSC, we project to the top 500 genes (out of 30K+) so the
     `gene_indices` precondition is satisfied. CSR runs the full set
@@ -214,6 +254,8 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
     "bench_csc__hvg_csc":         (_run_hvg, "csc"),
     "bench_csc__de_csr":          (_run_de, "csr"),
     "bench_csc__de_csc":          (_run_de, "csc"),
+    "bench_csc__pdex_ref_csr":    (_run_pdex_ref, "csr"),
+    "bench_csc__pdex_ref_csc":    (_run_pdex_ref, "csc"),
     "bench_csc__pseudobulk_csr":  (_run_pseudobulk, "csr"),
     "bench_csc__pseudobulk_csc":  (_run_pseudobulk, "csc"),
 }

@@ -14,6 +14,7 @@
 
 pub mod dispatch;
 pub mod mean_var;
+pub mod pdex;
 pub mod pseudobulk;
 pub mod wilcoxon;
 
@@ -25,5 +26,6 @@ mod parity_test;
 
 pub use dispatch::{require_csc, PreferFormat};
 pub use mean_var::{streaming_clip_square_sum_csc, streaming_mean_var_csc};
+pub use pdex::pdex_ref_streaming_csc;
 pub use pseudobulk::pseudobulk_aggregate_csc;
 pub use wilcoxon::wilcoxon_rank_sum_streaming_csc;

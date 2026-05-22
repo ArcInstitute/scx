@@ -1006,6 +1006,7 @@ fn run_pdex_ref_inner(
     is_log1p: Option<bool>,
     epsilon: f64,
     gene_chunk_size: Option<usize>,
+    prefer_format: &str,
     gpu_device_id: Option<usize>,
 ) -> PyResult<scx_accel::PdexRefResult> {
     let numpy = py.import("numpy")?;
@@ -1024,6 +1025,76 @@ fn run_pdex_ref_inner(
     let mode = scx_accel::GeomMeanMode::from_flags(geometric_mean, resolved_log1p);
 
     let x = adata.getattr("X")?;
+
+    if prefer_format == "csc" {
+        if gpu_device_id.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' for CSC dispatch or prefer_format='csr' for GPU.",
+            ));
+        }
+        let chunk_size = gene_chunk_size.unwrap_or(500);
+
+        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            if backed.kept_to_global.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "CSC requested but unavailable: a row deletion vector is active",
+                ));
+            }
+            let csc_reader = backed
+                .backed_csc
+                .as_ref()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(
+                        "CSC requested but unavailable: file has no CSC sidecar",
+                    )
+                })?
+                .clone();
+            drop(backed);
+            return py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_streaming_csc(
+                        csc_reader.as_ref(),
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+        }
+        if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+            let lazy_src = lazy.as_column_source().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar, \
+                     the transform chain contains a non-column-local op, or \
+                     a row deletion vector is active",
+                )
+            })?;
+            drop(lazy);
+            return py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_streaming_csc(
+                        &lazy_src,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+        }
+        return Err(PyRuntimeError::new_err(
+            "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
+             dataset; got a regular scipy/dense matrix",
+        ));
+    }
 
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
@@ -1289,7 +1360,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///     gene_chunk_size: Genes per chunk for sparse/backed streaming
 ///         (default: 500). Ignored for dense input.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, device="auto"))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -1300,11 +1371,17 @@ pub fn pdex_ref(
     geometric_mean: bool,
     epsilon: f64,
     gene_chunk_size: Option<usize>,
+    prefer_format: &str,
     device: &str,
 ) -> PyResult<PyObject> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
             "epsilon must be non-negative and finite (got {epsilon})"
+        )));
+    }
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
     let resolved = super::gpu::resolve_device(device)?;
@@ -1324,6 +1401,7 @@ pub fn pdex_ref(
         is_log1p,
         epsilon,
         gene_chunk_size,
+        prefer_format,
         gpu_device_id,
     )?;
     let df = pdex_ref_result_to_dataframe(py, &result)?;

@@ -90,6 +90,7 @@ def pdex_ref(
     geometric_mean: bool = True,
     epsilon: float = 0.0,
     gene_chunk_size: int | None = None,
+    prefer_format: PreferFormat = "csr",
     device: str = "auto",
 ) -> Any: ...
 

@@ -14,20 +14,21 @@
 //!     ≤ [`scx_gpu::GPU_DE_BLOCK_SORT_CAPACITY`] (= 8192) keys; bottom-up
 //!     tiled merge sort otherwise. No upper limit beyond available VRAM —
 //!     `gpu_de_block_sort` dispatches internally.
-//!   * Pseudobulk means (`target_mean` / `ref_mean`) are still computed
-//!     host-side from the same dense chunk uploaded to the device, reusing
-//!     `GeomMeanMode::pre` / `post` verbatim. Becomes the host-compute hot
-//!     spot at census scale now that the sort cap is lifted — G1.6 moves it
-//!     to GPU.
+//!   * Pseudobulk fold (`target_mean` / `ref_mean` for `pdex_ref`; raw
+//!     per-group gene sums for Wilcoxon logFC) runs on device via
+//!     `gpu_de_pseudobulk_all_groups`. The host only does the divide and the
+//!     `GeomMeanMode::post` transform after downloading the per-(group, gene)
+//!     f64 sums.
+//!   * `compute_logfc_hostside` runs on host: it's O(chunk_size) per group
+//!     and uses `libm` log2 / expm1 to match the CPU path bit-for-bit.
 
 #![cfg(feature = "gpu")]
 
-use rayon::prelude::*;
-
 use scx_gpu::{
-    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term, gpu_de_pvalues,
-    gpu_de_scatter_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
-    gpu_de_tie_term, gpu_de_upload_chunk, GpuDevice,
+    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
+    gpu_de_pseudobulk_all_groups, gpu_de_pvalues, gpu_de_scatter_gene_major,
+    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, gpu_de_upload_chunk,
+    CudaSlice, GpuDevice,
 };
 
 use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
@@ -404,6 +405,26 @@ where
         .map(|&g| group_indices[g].iter().map(|&c| c as i32).collect())
         .collect();
 
+    // Flattened cell permutation for the all-groups pseudobulk fold (G1.6).
+    // Group 0 = reference; groups 1..=n_test = test_groups in input order.
+    let n_groups_for_means = 1 + test_groups.len();
+    let mut all_cells_host: Vec<i32> = Vec::with_capacity(n_ref + n_g_max * test_groups.len());
+    let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
+    offsets_host.push(0);
+    all_cells_host.extend(ref_idx_i32.iter().copied());
+    offsets_host.push(all_cells_host.len() as i32);
+    for cells in &group_idx_i32 {
+        all_cells_host.extend(cells.iter().copied());
+        offsets_host.push(all_cells_host.len() as i32);
+    }
+    let d_all_cells = dev
+        .htod_copy(&all_cells_host)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc cell perm: {e}")))?;
+    let d_offsets = dev
+        .htod_copy(&offsets_host)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc offsets: {e}")))?;
+    let mode_id = geom_mean_mode_id(mode);
+
     // Device-side scratch sized to max-pool-per-gene = max(n_ref, n_g_max).
     let n_pool_max = n_ref.max(n_g_max).max(1);
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
@@ -435,18 +456,30 @@ where
         buf.fill(0.0);
         materialise(c0, sz, buf)?;
 
-        // Compute per-gene ref_mean + target_mean[g] (host, rayon-parallel).
-        let (chunk_ref_means, chunk_target_means) = compute_pdex_means(
-            buf,
+        // --- GPU work for this chunk ---
+
+        // 1. Upload dense chunk.
+        gpu_de_upload_chunk(dev, &mut scratch, buf, n_obs, sz)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE upload: {e}")))?;
+
+        // 2. Pseudobulk fold on device (G1.6). Replaces the host rayon
+        //    `compute_pdex_means` that previously dominated host wall time
+        //    on census-tier inputs.
+        let (chunk_ref_means, chunk_target_means) = compute_pdex_means_gpu(
+            dev,
+            &scratch.dense,
+            &d_all_cells,
+            &d_offsets,
             n_obs,
             sz,
-            ref_cells,
-            &group_indices,
-            &test_groups,
+            n_ref,
+            &target_memberships,
             mode,
-        );
+            mode_id,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE pseudobulk: {e}")))?;
 
-        // log2_fc and percent_change (per gene per group).
+        // log2_fc and percent_change (per gene per group) — host, cheap.
         let chunk_log2_fc: Vec<Vec<f64>> = chunk_target_means
             .iter()
             .map(|tm| {
@@ -465,12 +498,6 @@ where
                     .collect()
             })
             .collect();
-
-        // --- GPU work for this chunk ---
-
-        // 1. Upload dense chunk.
-        gpu_de_upload_chunk(dev, &mut scratch, buf, n_obs, sz)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE upload: {e}")))?;
 
         // 2. Build sorted ref slab and ref tie term. We reuse `scratch.slab`
         //    for ref → for each group → swap to group slab. To keep the API
@@ -687,6 +714,30 @@ where
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, max_pool.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
 
+    // Flatten the (cell → group) labelling into a CSR-style permutation for
+    // `gpu_de_pseudobulk_all_groups` (G1.6). Cells with `groups[i] >= n_groups`
+    // (the out-of-range sentinel) get dropped; groups appear in input order so
+    // `host_sums[g * chunk_size + var]` matches `group_gene_sums[g][var]`.
+    let mut wilcoxon_cells_by_group: Vec<Vec<i32>> = vec![Vec::new(); n_groups];
+    for (cell, &g) in groups.iter().enumerate() {
+        if g < n_groups {
+            wilcoxon_cells_by_group[g].push(cell as i32);
+        }
+    }
+    let mut all_cells_host: Vec<i32> = Vec::with_capacity(n_obs);
+    let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups + 1);
+    offsets_host.push(0);
+    for cells in &wilcoxon_cells_by_group {
+        all_cells_host.extend(cells.iter().copied());
+        offsets_host.push(all_cells_host.len() as i32);
+    }
+    let d_all_cells = dev
+        .htod_copy(&all_cells_host)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc cell perm: {e}")))?;
+    let d_offsets = dev
+        .htod_copy(&offsets_host)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc offsets: {e}")))?;
+
     // Accumulators in input gene order.
     let n_test = test_groups.len();
     let mut chunk_results: Vec<DiffExpResult> = Vec::new();
@@ -702,11 +753,22 @@ where
         buf.fill(0.0);
         materialise(c0, sz, buf)?;
 
-        // Per-group per-gene sums on host (parallel) — needed for logFC.
-        let group_gene_sums = compute_group_gene_sums(buf, n_obs, sz, groups, n_groups);
-
         gpu_de_upload_chunk(dev, &mut scratch, buf, n_obs, sz)
             .map_err(|e| AccelError::LinAlg(format!("GPU DE upload: {e}")))?;
+
+        // Per-group per-gene raw sums on device (G1.6) — feeds the host-side
+        // logFC computation further down. `mode_id = 0` selects the identity
+        // pre-transform; Wilcoxon doesn't apply `GeomMeanMode`.
+        let group_gene_sums = compute_group_gene_sums_gpu(
+            dev,
+            &scratch.dense,
+            &d_all_cells,
+            &d_offsets,
+            n_obs,
+            sz,
+            n_groups,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk: {e}")))?;
 
         // Build the sort pool slab once per chunk.
         let (mut d_pool_slab, pool_len, pool_perm_i32) = match (&ref_idx_i32, &all_idx_i32) {
@@ -940,77 +1002,124 @@ fn scatter_projected_into_buf(
     }
 }
 
-/// Per-chunk per-gene ref_mean + target_mean[g] in natural-count space.
-fn compute_pdex_means(
-    dense: &[f32],
-    n_obs: usize,
-    chunk_size: usize,
-    ref_cells: &[usize],
-    group_indices: &[Vec<usize>],
-    test_groups: &[usize],
-    mode: GeomMeanMode,
-) -> (Vec<f64>, Vec<Vec<f64>>) {
-    let n_ref = ref_cells.len();
-    let _ = n_obs;
-    // Per-gene parallel: ref_mean once, then per test group.
-    let per_gene: Vec<(f64, Vec<f64>)> = (0..chunk_size)
-        .into_par_iter()
-        .map(|var| {
-            // Column accumulator using GeomMeanMode::pre.
-            let mut col = Vec::with_capacity(n_obs);
-            col.extend((0..n_obs).map(|cell| dense[cell * chunk_size + var] as f64));
-            let ref_sum: f64 = ref_cells.iter().map(|&c| mode.pre(col[c])).sum();
-            let ref_mean = mode.post(if n_ref == 0 {
-                0.0
-            } else {
-                ref_sum / n_ref as f64
-            });
-            let mut tm = Vec::with_capacity(test_groups.len());
-            for &g in test_groups {
-                let cells = &group_indices[g];
-                if cells.is_empty() {
-                    tm.push(f64::NAN);
-                } else {
-                    let s: f64 = cells.iter().map(|&c| mode.pre(col[c])).sum();
-                    tm.push(mode.post(s / cells.len() as f64));
-                }
-            }
-            (ref_mean, tm)
-        })
-        .collect();
-
-    let mut ref_means = Vec::with_capacity(chunk_size);
-    let mut target_means: Vec<Vec<f64>> = (0..test_groups.len())
-        .map(|_| Vec::with_capacity(chunk_size))
-        .collect();
-    for (rm, tm) in per_gene {
-        ref_means.push(rm);
-        for (i, v) in tm.into_iter().enumerate() {
-            target_means[i].push(v);
-        }
+/// Mode-id encoding for `gpu_de_pseudobulk_all_groups`. Must match the
+/// `apply_pre_transform` switch in `scx-gpu/kernels/diffexp.cu`. The kernel
+/// only applies the `pre()` transform; the matching `mode.post()` runs on host.
+fn geom_mean_mode_id(mode: GeomMeanMode) -> i32 {
+    match mode {
+        GeomMeanMode::ArithRaw => 0,
+        GeomMeanMode::ArithLog1pExpand => 1,
+        GeomMeanMode::GeomRaw => 2,
+        GeomMeanMode::GeomLog1p => 3,
     }
-    (ref_means, target_means)
 }
 
-fn compute_group_gene_sums(
-    dense: &[f32],
+/// GPU version of [`compute_pdex_means`] (G1.6).
+///
+/// Launches `gpu_de_pseudobulk_all_groups` over the already-uploaded `d_dense`
+/// slab with the flattened cell permutation (group 0 = ref, groups 1.. = test
+/// groups in order). Downloads the f64 sums, divides by per-group cell count,
+/// and applies `mode.post()` on host. Output shape matches the host helper's:
+/// `(Vec<f64>, Vec<Vec<f64>>)` = (ref_means, target_means).
+#[allow(clippy::too_many_arguments)]
+fn compute_pdex_means_gpu(
+    dev: &GpuDevice,
+    d_dense: &CudaSlice<f32>,
+    d_all_cells: &CudaSlice<i32>,
+    d_offsets: &CudaSlice<i32>,
     n_obs: usize,
     chunk_size: usize,
-    groups: &[usize],
-    n_groups: usize,
-) -> Vec<Vec<f64>> {
-    let mut sums = vec![vec![0.0f64; chunk_size]; n_groups];
-    for (cell, &g) in groups.iter().enumerate().take(n_obs) {
-        if g >= n_groups {
-            continue;
-        }
-        let row = &dense[cell * chunk_size..cell * chunk_size + chunk_size];
-        let target = &mut sums[g];
-        for (slot, v) in target.iter_mut().zip(row.iter()) {
-            *slot += *v as f64;
-        }
+    n_ref: usize,
+    target_memberships: &[usize],
+    mode: GeomMeanMode,
+    mode_id: i32,
+) -> Result<(Vec<f64>, Vec<Vec<f64>>)> {
+    let n_test = target_memberships.len();
+    let n_groups = 1 + n_test;
+
+    let mut d_sums = dev
+        .alloc_zeros::<f64>(n_groups * chunk_size)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc pseudobulk sums: {e}")))?;
+    gpu_de_pseudobulk_all_groups(
+        dev,
+        d_dense,
+        d_all_cells,
+        d_offsets,
+        &mut d_sums,
+        n_obs,
+        chunk_size,
+        n_groups,
+        mode_id,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE pseudobulk kernel: {e}")))?;
+    let host_sums = dev
+        .dtoh_copy(&d_sums)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh pseudobulk sums: {e}")))?;
+
+    // Group 0 = reference.
+    let mut ref_means = Vec::with_capacity(chunk_size);
+    for var in 0..chunk_size {
+        let s = host_sums[var];
+        ref_means.push(mode.post(if n_ref == 0 { 0.0 } else { s / n_ref as f64 }));
     }
-    sums
+
+    // Groups 1..=n_test = test groups, in input order.
+    let mut target_means: Vec<Vec<f64>> = Vec::with_capacity(n_test);
+    for (i, &n_g) in target_memberships.iter().enumerate() {
+        let base = (i + 1) * chunk_size;
+        let mut tm = Vec::with_capacity(chunk_size);
+        for var in 0..chunk_size {
+            if n_g == 0 {
+                tm.push(f64::NAN);
+            } else {
+                let s = host_sums[base + var];
+                tm.push(mode.post(s / n_g as f64));
+            }
+        }
+        target_means.push(tm);
+    }
+
+    Ok((ref_means, target_means))
+}
+
+/// GPU version of [`compute_group_gene_sums`] (G1.6). Uses identity pre-transform
+/// (`mode_id = 0`); Wilcoxon doesn't apply `GeomMeanMode` and just needs raw
+/// `Σ x` per (group, gene) for the host-side logFC computation.
+#[allow(clippy::too_many_arguments)]
+fn compute_group_gene_sums_gpu(
+    dev: &GpuDevice,
+    d_dense: &CudaSlice<f32>,
+    d_all_cells: &CudaSlice<i32>,
+    d_offsets: &CudaSlice<i32>,
+    n_obs: usize,
+    chunk_size: usize,
+    n_groups: usize,
+) -> Result<Vec<Vec<f64>>> {
+    let mut d_sums = dev
+        .alloc_zeros::<f64>(n_groups * chunk_size)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc Wilcoxon sums: {e}")))?;
+    gpu_de_pseudobulk_all_groups(
+        dev,
+        d_dense,
+        d_all_cells,
+        d_offsets,
+        &mut d_sums,
+        n_obs,
+        chunk_size,
+        n_groups,
+        0, // mode_id = ArithRaw / identity
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk kernel: {e}")))?;
+    let host_sums = dev
+        .dtoh_copy(&d_sums)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh Wilcoxon sums: {e}")))?;
+
+    let mut sums: Vec<Vec<f64>> = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let base = g * chunk_size;
+        sums.push(host_sums[base..base + chunk_size].to_vec());
+    }
+    Ok(sums)
 }
 
 fn compute_logfc_hostside(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
@@ -1643,5 +1752,250 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // G1.7 — dedicated edge-case probes.
+    //
+    // Each test builds a tiny synthetic fixture targeting one explicit edge
+    // case the original G1 spec called out, then asserts CPU↔GPU parity via
+    // `pdex_ref_gpu_dense` against the CPU `pdex_ref`. Earlier coverage was
+    // transitive (via Poisson-sampled parity); G1.7 adds standalone probes
+    // so each edge case has a named failure mode.
+    // ---------------------------------------------------------------------
+
+    /// Shared assertion: CPU↔GPU exact U + tolerance-based p / means. Mirrors
+    /// the comparison block in `test_pdex_ref_gpu_dense_matches_cpu`.
+    fn assert_pdex_parity(cpu: &PdexRefResult, gpu: &PdexRefResult, label: &str) {
+        assert_eq!(cpu.group_names, gpu.group_names, "{label}: group_names");
+        assert_eq!(
+            cpu.feature_names, gpu.feature_names,
+            "{label}: feature_names"
+        );
+        assert_eq!(
+            cpu.ref_membership, gpu.ref_membership,
+            "{label}: ref_membership"
+        );
+        assert_eq!(
+            cpu.target_memberships, gpu.target_memberships,
+            "{label}: target_memberships"
+        );
+        let n_vars = cpu.feature_names.len();
+        for tg in 0..cpu.group_names.len() {
+            for var in 0..n_vars {
+                let u_cpu = cpu.statistics[tg][var];
+                let u_gpu = gpu.statistics[tg][var];
+                if u_cpu.is_finite() && u_gpu.is_finite() {
+                    assert!(
+                        (u_cpu - u_gpu).abs() < 1e-6,
+                        "{label}: U mismatch tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                    );
+                } else {
+                    assert_eq!(
+                        u_cpu.is_finite(),
+                        u_gpu.is_finite(),
+                        "{label}: U finite-mask mismatch tg={tg} gene={var}"
+                    );
+                }
+                let p_cpu = cpu.p_values[tg][var];
+                let p_gpu = gpu.p_values[tg][var];
+                assert!(
+                    (p_cpu - p_gpu).abs() < 1e-9
+                        || (p_cpu - p_gpu).abs() / p_cpu.abs().max(1e-12) < 1e-6,
+                    "{label}: p mismatch tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
+                );
+                let tm_cpu = cpu.target_means[tg][var];
+                let tm_gpu = gpu.target_means[tg][var];
+                if tm_cpu.is_finite() && tm_gpu.is_finite() {
+                    assert!(
+                        (tm_cpu - tm_gpu).abs() < 1e-9
+                            || (tm_cpu - tm_gpu).abs() / tm_cpu.abs().max(1e-9) < 1e-6,
+                        "{label}: target_mean mismatch tg={tg} gene={var}: cpu={tm_cpu}, gpu={tm_gpu}"
+                    );
+                }
+                let l_cpu = cpu.log2_fold_changes[tg][var];
+                let l_gpu = gpu.log2_fold_changes[tg][var];
+                if l_cpu.is_finite() && l_gpu.is_finite() {
+                    assert!(
+                        (l_cpu - l_gpu).abs() < 1e-4
+                            || (l_cpu - l_gpu).abs() / l_cpu.abs().max(1e-9) < 1e-4,
+                        "{label}: log2_fc mismatch tg={tg} gene={var}: cpu={l_cpu}, gpu={l_gpu}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn run_pdex_pair(
+        data: &[f32],
+        n_obs: usize,
+        n_vars: usize,
+        groups: &[usize],
+        group_names: &[String],
+        reference: usize,
+    ) -> (PdexRefResult, PdexRefResult) {
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g_{i}")).collect();
+        let mode = crate::pseudobulk::GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+        let cpu = pdex_ref(
+            data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+        )
+        .expect("CPU pdex_ref failed");
+        let gpu = pdex_ref_gpu_dense(
+            0,
+            data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+        )
+        .expect("GPU pdex_ref_dense failed");
+        (cpu, gpu)
+    }
+
+    /// Edge case 1 — test group with a single cell.
+    /// 11 cells × 3 genes; reference = 10 cells, test_A = {cell 10}.
+    /// Hand-crafted counts: gene 0 puts the singleton above the entire ref
+    /// distribution; gene 1 puts it below; gene 2 puts it inside.
+    #[test]
+    fn test_pdex_ref_gpu_group_of_one_cell() {
+        let _ = require_gpu_or_skip!();
+        let n_obs = 11usize;
+        let n_vars = 3usize;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        // gene 0: ref counts 0..9 (cells 0..10), singleton = 100 (above all).
+        // gene 1: ref counts 10..19, singleton = 0 (below all).
+        // gene 2: ref counts 1,2,2,3,3,3,4,4,5,5; singleton = 3 (mid-range with ties).
+        let ref_g0: [f32; 10] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let ref_g1: [f32; 10] = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0];
+        let ref_g2: [f32; 10] = [1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0];
+        for cell in 0..10 {
+            data[cell * n_vars] = ref_g0[cell];
+            data[cell * n_vars + 1] = ref_g1[cell];
+            data[cell * n_vars + 2] = ref_g2[cell];
+        }
+        data[10 * n_vars] = 100.0;
+        data[10 * n_vars + 1] = 0.0;
+        data[10 * n_vars + 2] = 3.0;
+        let groups: Vec<usize> = (0..11).map(|i| if i < 10 { 0 } else { 1 }).collect();
+        let group_names = vec!["ref".to_string(), "test".to_string()];
+
+        let (cpu, gpu) = run_pdex_pair(&data, n_obs, n_vars, &groups, &group_names, 0);
+        // Sanity-check structure before parity assert: 1 test group, 1-cell membership.
+        assert_eq!(gpu.target_memberships, vec![1usize]);
+        assert_eq!(gpu.ref_membership, 10);
+        // All p_values must be finite (no NaN from divide-by-zero sigma at n_g=1).
+        for var in 0..n_vars {
+            assert!(
+                gpu.p_values[0][var].is_finite(),
+                "group-of-one p-value must be finite at gene {var}, got {}",
+                gpu.p_values[0][var]
+            );
+        }
+        assert_pdex_parity(&cpu, &gpu, "group_of_one_cell");
+    }
+
+    /// Edge case 2 — gene with zero counts in every cell.
+    /// 20 cells × 4 genes, gene 2 is all-zero. ref={0..9}, test_A={10..19}.
+    #[test]
+    fn test_pdex_ref_gpu_all_zero_gene() {
+        let _ = require_gpu_or_skip!();
+        let n_obs = 20usize;
+        let n_vars = 4usize;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        // Non-zero genes: deterministic spread.
+        for cell in 0..n_obs {
+            data[cell * n_vars + 0] = (cell as f32) % 5.0;
+            data[cell * n_vars + 1] = (cell as f32) * 0.5;
+            // gene 2 left as 0.0
+            data[cell * n_vars + 3] = if cell < 10 { 1.0 } else { 3.0 };
+        }
+        let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
+        let group_names = vec!["ref".to_string(), "test".to_string()];
+
+        let (cpu, gpu) = run_pdex_pair(&data, n_obs, n_vars, &groups, &group_names, 0);
+        // For gene 2 (all-zero), both means = 0 and the CPU reports U = n1·n2/2,
+        // p = 1 (everything tied). Verify GPU matches:
+        assert_eq!(gpu.target_means[0][2], 0.0);
+        assert_eq!(gpu.ref_means[2], 0.0);
+        assert!(
+            (gpu.p_values[0][2] - 1.0).abs() < 1e-9,
+            "all-zero gene must give p = 1, got {}",
+            gpu.p_values[0][2]
+        );
+        assert_pdex_parity(&cpu, &gpu, "all_zero_gene");
+    }
+
+    /// Edge case 3 — reference smaller than test group (n_ref=3, n_test=30).
+    /// Exercises the asymmetric `n1 / n2` path in the variance formula.
+    #[test]
+    fn test_pdex_ref_gpu_ref_smaller_than_test_group() {
+        let _ = require_gpu_or_skip!();
+        let n_obs = 33usize;
+        let n_vars = 4usize;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        // Deterministic-ish values; doesn't matter much, just want spread.
+        let mut state: u64 = 0xCAFEBABE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) % 20) as f32
+        };
+        for v in data.iter_mut() {
+            *v = next();
+        }
+        // Reference = first 3 cells; test group A = remaining 30.
+        let groups: Vec<usize> = (0..n_obs).map(|i| if i < 3 { 0 } else { 1 }).collect();
+        let group_names = vec!["ref".to_string(), "test".to_string()];
+
+        let (cpu, gpu) = run_pdex_pair(&data, n_obs, n_vars, &groups, &group_names, 0);
+        assert_eq!(gpu.ref_membership, 3);
+        assert_eq!(gpu.target_memberships, vec![30usize]);
+        assert_pdex_parity(&cpu, &gpu, "ref_smaller_than_test_group");
+    }
+
+    /// Edge case 4 — test group has identical values for one gene
+    /// (zero-variance group). Exercises the combined-tie-term path on a
+    /// pathologically tie-heavy input.
+    #[test]
+    fn test_pdex_ref_gpu_all_equal_values_in_group() {
+        let _ = require_gpu_or_skip!();
+        let n_obs = 20usize;
+        let n_vars = 3usize;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        // Gene 0: normal spread.
+        // Gene 1: ref has spread; test group A is constant 5.0 (zero-variance).
+        // Gene 2: both groups have spread but several values tie with each other.
+        for cell in 0..n_obs {
+            data[cell * n_vars + 0] = ((cell as f32) % 7.0) + 0.5;
+            data[cell * n_vars + 1] = if cell < 10 {
+                (cell as f32) % 11.0 // ref: spread including 5.0 a few times
+            } else {
+                5.0 // test_A: constant
+            };
+            data[cell * n_vars + 2] = if cell % 3 == 0 { 2.0 } else { 4.0 };
+        }
+        let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
+        let group_names = vec!["ref".to_string(), "test".to_string()];
+
+        let (cpu, gpu) = run_pdex_pair(&data, n_obs, n_vars, &groups, &group_names, 0);
+        // Sanity-check the test group for gene 1 truly is constant.
+        for cell in 10..n_obs {
+            assert_eq!(data[cell * n_vars + 1], 5.0);
+        }
+        assert_pdex_parity(&cpu, &gpu, "all_equal_values_in_group");
     }
 }

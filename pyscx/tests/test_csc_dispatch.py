@@ -184,6 +184,54 @@ def test_rank_genes_groups_csc_raises_on_csr_only(small_adata, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# pdex_ref: CSC dispatch matches CSR on the same fixture.
+# ---------------------------------------------------------------------------
+
+
+def test_pdex_ref_csc_matches_csr(small_adata, tmp_path):
+    import pyscx
+
+    a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+
+    df_csr = pyscx.accel.pdex_ref(
+        a_csr, "group", reference="A", geometric_mean=False, gene_chunk_size=4
+    )
+    df_csc = pyscx.accel.pdex_ref(
+        a_csc, "group", reference="A", geometric_mean=False,
+        gene_chunk_size=4, prefer_format="csc",
+    )
+
+    # Order rows the same way before comparing values.
+    df_csr = df_csr.sort(["target", "feature"])
+    df_csc = df_csc.sort(["target", "feature"])
+
+    assert df_csr["target"].to_list() == df_csc["target"].to_list()
+    assert df_csr["feature"].to_list() == df_csc["feature"].to_list()
+    for col in ("target_mean", "ref_mean", "log2_fold_change", "p_value", "statistic", "fdr"):
+        np.testing.assert_allclose(
+            df_csc[col].to_numpy(), df_csr[col].to_numpy(),
+            atol=1e-9, rtol=1e-6, err_msg=col,
+        )
+
+
+def test_pdex_ref_csc_raises_on_csr_only(small_adata, tmp_path):
+    import pyscx
+
+    a_csr = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
+    with pytest.raises(RuntimeError, match="CSC"):
+        pyscx.accel.pdex_ref(a_csr, "group", reference="A", prefer_format="csc")
+
+
+def test_pdex_ref_invalid_prefer_format(small_adata, tmp_path):
+    import pyscx
+
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    with pytest.raises(ValueError, match="prefer_format"):
+        pyscx.accel.pdex_ref(a_csc, "group", reference="A", prefer_format="auto")
+
+
+# ---------------------------------------------------------------------------
 # Pseudobulk: prefer_format="csc" requires gene_indices; matches CSR.
 # ---------------------------------------------------------------------------
 

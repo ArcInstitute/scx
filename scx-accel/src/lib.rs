@@ -25,8 +25,8 @@ pub mod pseudobulk;
 pub mod umap;
 
 pub use csc::{
-    pseudobulk_aggregate_csc, require_csc, streaming_clip_square_sum_csc, streaming_mean_var_csc,
-    wilcoxon_rank_sum_streaming_csc, PreferFormat,
+    pdex_ref_streaming_csc, pseudobulk_aggregate_csc, require_csc, streaming_clip_square_sum_csc,
+    streaming_mean_var_csc, wilcoxon_rank_sum_streaming_csc, PreferFormat,
 };
 pub use diffexp::{
     merge_diff_exp_results, pdex_ref, pdex_ref_sparse, pdex_ref_streaming, wilcoxon_rank_sum,

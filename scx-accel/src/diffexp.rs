@@ -1275,7 +1275,7 @@ pub fn pdex_ref_streaming(
     Ok(result)
 }
 
-fn empty_pdex_result(group_names: &[String], reference: usize) -> PdexRefResult {
+pub(crate) fn empty_pdex_result(group_names: &[String], reference: usize) -> PdexRefResult {
     let group_names_out: Vec<String> = (0..group_names.len())
         .filter(|&g| g != reference)
         .map(|g| group_names[g].clone())
@@ -1296,7 +1296,7 @@ fn empty_pdex_result(group_names: &[String], reference: usize) -> PdexRefResult 
     }
 }
 
-fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResult) {
+pub(crate) fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResult) {
     // The first chunk already initialised the membership counts.
     acc.feature_names.extend(chunk.feature_names);
     acc.ref_means.extend(chunk.ref_means);
@@ -1311,7 +1311,7 @@ fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResult) {
     // Discard chunk.fdrs — we recompute globally after all chunks merge.
 }
 
-fn recompute_pdex_fdrs(result: &mut PdexRefResult) {
+pub(crate) fn recompute_pdex_fdrs(result: &mut PdexRefResult) {
     result.fdrs = result
         .p_values
         .iter()
