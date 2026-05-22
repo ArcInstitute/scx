@@ -9,17 +9,16 @@
 //! Returns the same `PdexRefResult` / `DiffExpResult` types the CPU path
 //! emits, so `pyscx`'s DataFrame conversion is unchanged.
 //!
-//! v1 boundaries:
-//!   * Per-gene CUB block radix sort caps the per-gene pool at
-//!     [`scx_gpu::GPU_DE_BLOCK_SORT_CAPACITY`] cells (= 8192). The dispatch
-//!     functions below reject pools larger than that with an `AccelError`,
-//!     leaving the CPU path as the explicit fallback. A tiled merge-sort
-//!     upgrade is deferred to PR series G4.
-//!   * Pseudobulk means (`target_mean` / `ref_mean`) are computed host-side
-//!     from the same dense chunk that's uploaded to the device. This is cheap
-//!     relative to the MWU work and reuses `GeomMeanMode::pre` / `post`
-//!     verbatim. A device-resident pseudobulk path lands in G4 with the
-//!     `GpuPreprocessedShardSource` consumer.
+//! Boundaries:
+//!   * Per-gene sort: single-tile CUB `BlockRadixSort` when the pool is
+//!     ≤ [`scx_gpu::GPU_DE_BLOCK_SORT_CAPACITY`] (= 8192) keys; bottom-up
+//!     tiled merge sort otherwise. No upper limit beyond available VRAM —
+//!     `gpu_de_block_sort` dispatches internally.
+//!   * Pseudobulk means (`target_mean` / `ref_mean`) are still computed
+//!     host-side from the same dense chunk uploaded to the device, reusing
+//!     `GeomMeanMode::pre` / `post` verbatim. Becomes the host-compute hot
+//!     spot at census scale now that the sort cap is lifted — G1.6 moves it
+//!     to GPU.
 
 #![cfg(feature = "gpu")]
 
@@ -28,7 +27,7 @@ use rayon::prelude::*;
 use scx_gpu::{
     default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term, gpu_de_pvalues,
     gpu_de_scatter_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
-    gpu_de_tie_term, gpu_de_upload_chunk, GpuDevice, GPU_DE_BLOCK_SORT_CAPACITY,
+    gpu_de_tie_term, gpu_de_upload_chunk, GpuDevice,
 };
 
 use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
@@ -386,12 +385,10 @@ where
             group_names[reference]
         )));
     }
-    if n_ref > GPU_DE_BLOCK_SORT_CAPACITY {
-        return Err(AccelError::InvalidInput(format!(
-            "GPU pdex_ref: reference group has {n_ref} cells, exceeds v1 capacity of \
-             {GPU_DE_BLOCK_SORT_CAPACITY}. Use device=\"cpu\" or subsample the reference."
-        )));
-    }
+    // G1.5: the 8192-cell v1 capacity cap has been lifted by the tiled
+    // merge-sort path inside `gpu_de_block_sort` — any pool size now
+    // dispatches correctly. The `GPU_DE_BLOCK_SORT_CAPACITY` constant is
+    // now the fast-path threshold, not a hard ceiling.
     let test_groups: Vec<usize> = (0..n_groups).filter(|&g| g != reference).collect();
     let target_memberships: Vec<usize> = test_groups
         .iter()
@@ -399,12 +396,6 @@ where
         .collect();
 
     let n_g_max = target_memberships.iter().copied().max().unwrap_or(0);
-    if n_g_max > GPU_DE_BLOCK_SORT_CAPACITY {
-        return Err(AccelError::InvalidInput(format!(
-            "GPU pdex_ref: test group max size is {n_g_max}, exceeds v1 capacity of \
-             {GPU_DE_BLOCK_SORT_CAPACITY}. Use device=\"cpu\" or subsample groups."
-        )));
-    }
 
     // Pre-encode cell index permutations as i32 (the kernel signature).
     let ref_idx_i32: Vec<i32> = ref_cells.iter().map(|&c| c as i32).collect();
@@ -498,7 +489,7 @@ where
             sz,
         )
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
-        gpu_de_block_sort(dev, &mut d_ref_slab, sz, n_ref)
+        gpu_de_block_sort(dev, &mut scratch, &mut d_ref_slab, sz, n_ref)
             .map_err(|e| AccelError::LinAlg(format!("GPU DE sort ref: {e}")))?;
         // Ref tie term is reusable across all test groups; keep it on host.
         gpu_de_tie_term(dev, &d_ref_slab, &mut scratch.tie_term, sz, n_ref)
@@ -553,7 +544,7 @@ where
             .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
 
             // Sort group slab for combined tie term.
-            gpu_de_block_sort(dev, &mut d_group_slab, sz, n_g)
+            gpu_de_block_sort(dev, &mut scratch, &mut d_group_slab, sz, n_g)
                 .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
             gpu_de_combined_tie_term(
                 dev,
@@ -662,7 +653,9 @@ where
     };
 
     // For 1-vs-rest the pool size is n_obs (all cells). For ref mode it's
-    // max(n_ref, max test group). v1 sort capacity is GPU_DE_BLOCK_SORT_CAPACITY.
+    // max(n_ref, max test group). G1.5 tiled merge-sort lifts the prior 8192
+    // cap on this pool — `gpu_de_block_sort` dispatches single-tile vs
+    // multi-tile internally, so any pool size sorts correctly.
     let (max_pool, ref_cells_opt): (usize, Option<Vec<usize>>) = match reference {
         Some(r) => {
             let n_ref = group_indices[r].len();
@@ -675,12 +668,6 @@ where
         }
         None => (n_obs, None),
     };
-    if max_pool > GPU_DE_BLOCK_SORT_CAPACITY {
-        return Err(AccelError::InvalidInput(format!(
-            "GPU Wilcoxon: per-gene sort pool is {max_pool}, exceeds v1 capacity \
-             of {GPU_DE_BLOCK_SORT_CAPACITY}. Use device=\"cpu\" for this input."
-        )));
-    }
 
     // Pre-encode all-cells permutation (for 1-vs-rest sort-all) and per-group
     // permutations.
@@ -744,7 +731,7 @@ where
         };
         let _ = pool_perm_i32; // suppress unused (kept for symmetry)
 
-        gpu_de_block_sort(dev, &mut d_pool_slab, sz, pool_len)
+        gpu_de_block_sort(dev, &mut scratch, &mut d_pool_slab, sz, pool_len)
             .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool: {e}")))?;
 
         // Tie term over the pool (used for ref mode + as the base for combined
@@ -808,7 +795,7 @@ where
                 u_host.truncate(sz);
 
                 // Combined tie term for ref vs group.
-                gpu_de_block_sort(dev, &mut d_group_slab, sz, n_g)
+                gpu_de_block_sort(dev, &mut scratch, &mut d_group_slab, sz, n_g)
                     .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
                 gpu_de_combined_tie_term(
                     dev,
@@ -1533,6 +1520,126 @@ mod tests {
                 assert!(
                     (p_d - p_s).abs() < 1e-9 || (p_d - p_s).abs() / p_d.abs().max(1e-12) < 1e-6,
                     "multi-chunk p mismatch tg={tg} gene={var}: dense={p_d}, sparse={p_s}"
+                );
+            }
+        }
+    }
+
+    /// G1.5 regression: `pdex_ref` GPU vs CPU on a fixture large enough to
+    /// force the tiled merge-sort path. At `n_obs = 12_000` with a 50/50
+    /// split, `n_ref ≈ 6_000` (fast path) but the test group cells used to
+    /// rank against ref also exceed 8192 when chained with ref — the
+    /// combined-tie sort + group sort step actually only sees ≤ n_g cells,
+    /// so this hits the fast path on ref. To genuinely exercise the
+    /// multi-tile path inside `gpu_de_block_sort`, we use a fixture where
+    /// the reference group itself is above 8192 cells (12K total, with
+    /// 9000 reference cells and 3000 test cells).
+    #[test]
+    fn test_pdex_ref_gpu_multi_tile_matches_cpu() {
+        let _ = require_gpu_or_skip!();
+
+        let n_obs = 12_000usize;
+        let n_vars = 6usize;
+        // Reference = first 9000 cells (above 8192 → multi-tile sort on ref).
+        // Test groups = next 1500 + last 1500.
+        let groups: Vec<usize> = (0..n_obs)
+            .map(|i| {
+                if i < 9000 {
+                    0
+                } else if i < 10_500 {
+                    1
+                } else {
+                    2
+                }
+            })
+            .collect();
+        let group_names = vec![
+            "non-targeting".to_string(),
+            "KO_A".to_string(),
+            "KO_B".to_string(),
+        ];
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+
+        // Deterministic Poisson-ish counts; perturb gene 2 in KO_A, gene 4 in KO_B.
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let mut state: u64 = 0x1357_2468_ACE0_BDF1;
+        let mut next_uniform = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for cell in 0..n_obs {
+            let g = groups[cell];
+            for gene in 0..n_vars {
+                let lambda: f64 = if g == 1 && gene == 2 {
+                    7.5
+                } else if g == 2 && gene == 4 {
+                    6.0
+                } else {
+                    3.0
+                };
+                let p = (lambda / 10.0).clamp(0.0, 1.0);
+                let mut k = 0u32;
+                for _ in 0..10 {
+                    if next_uniform() < p {
+                        k += 1;
+                    }
+                }
+                data[cell * n_vars + gene] = k as f32;
+            }
+        }
+
+        let mode = crate::pseudobulk::GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+
+        let cpu = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            mode,
+            epsilon,
+        )
+        .expect("CPU pdex_ref failed");
+
+        let gpu = pdex_ref_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            mode,
+            epsilon,
+        )
+        .expect("GPU pdex_ref_dense failed at n_obs=12000 (n_ref=9000 > 8192)");
+
+        assert_eq!(cpu.group_names, gpu.group_names);
+        assert_eq!(cpu.ref_membership, gpu.ref_membership);
+        for tg in 0..cpu.group_names.len() {
+            for var in 0..n_vars {
+                let u_cpu = cpu.statistics[tg][var];
+                let u_gpu = gpu.statistics[tg][var];
+                if u_cpu.is_finite() && u_gpu.is_finite() {
+                    // U statistic is integer-valued; allow a tiny float epsilon
+                    // for the host-side accumulator's f64 rounding.
+                    assert!(
+                        (u_cpu - u_gpu).abs() < 1e-6,
+                        "multi-tile U mismatch tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                    );
+                }
+                let p_cpu = cpu.p_values[tg][var];
+                let p_gpu = gpu.p_values[tg][var];
+                assert!(
+                    (p_cpu - p_gpu).abs() < 1e-9
+                        || (p_cpu - p_gpu).abs() / p_cpu.abs().max(1e-12) < 1e-6,
+                    "multi-tile p mismatch tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
                 );
             }
         }

@@ -60,8 +60,9 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 // Per-gene CUB BlockRadixSort.
 //
 // Sorts each row of `slab` (shape [chunk_size × n_per_gene], row-major)
-// ascending in-place. Caller must guarantee n_per_gene <= BLOCK_SORT_CAPACITY;
-// CPU pre-check rejects larger pools to avoid silent truncation.
+// ascending in-place. Used as the fast-path when n_per_gene ≤ BLOCK_SORT_CAPACITY;
+// above that, the host dispatches to `tile_block_radix_sort_kernel` +
+// `merge_pass_per_gene_kernel` (tiled bottom-up merge sort).
 //
 // Grid: 1D (chunk_size). Block: BLOCK_THREADS.
 // ---------------------------------------------------------------------------
@@ -104,6 +105,190 @@ extern "C" __global__ void block_radix_sort_per_gene_kernel(
             row[idx] = keys[it];
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tiled BlockRadixSort: same body as `block_radix_sort_per_gene_kernel` but
+// indexed by (gene, tile). Each block sorts a contiguous up-to-BLOCK_SORT_CAPACITY
+// slice of the gene's row in place. Tiles that fall past `n_per_gene` exit early;
+// the final partial tile uses the +inf padding trick to stop at the real-data
+// boundary.
+//
+// Grid: 2D (chunk_size, n_tiles). Block: BLOCK_THREADS.
+//
+// Caller pairs this with `merge_pass_per_gene_kernel` to sort rows of arbitrary
+// length via bottom-up merge sort.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void tile_block_radix_sort_kernel(
+    float* __restrict__ slab,
+    int chunk_size,
+    int n_per_gene,
+    int tile_size
+) {
+    using BlockRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    __shared__ typename BlockRadixSort::TempStorage temp_storage;
+
+    int gene = blockIdx.x;
+    int tile = blockIdx.y;
+    if (gene >= chunk_size) return;
+
+    long long tile_start = (long long)tile * tile_size;
+    if (tile_start >= (long long)n_per_gene) return;
+
+    long long tile_end = tile_start + tile_size;
+    if (tile_end > (long long)n_per_gene) tile_end = (long long)n_per_gene;
+    int n_in_tile = (int)(tile_end - tile_start);
+
+    float* row = slab + (long long)gene * n_per_gene + tile_start;
+
+    // Per-thread items; pad above n_in_tile with +inf so they sort to the
+    // end of the tile and can be discarded on writeback.
+    float keys[ITEMS_PER_THREAD];
+    int tid = threadIdx.x;
+
+    #pragma unroll
+    for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
+        int idx = tid * ITEMS_PER_THREAD + it;
+        keys[it] = (idx < n_in_tile) ? row[idx] : CUDART_INF_F;
+    }
+
+    BlockRadixSort(temp_storage).Sort(keys);
+
+    #pragma unroll
+    for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
+        int idx = tid * ITEMS_PER_THREAD + it;
+        if (idx < n_in_tile) {
+            row[idx] = keys[it];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge-path co-rank.
+//
+// For sorted arrays A[0..m) and B[0..n) being merged into C[0..m+n), find the
+// index `i` in [max(0, diag-n), min(diag, m)] such that:
+//     A[i-1] ≤ B[j]      AND     B[j-1] ≤ A[i]      (where j = diag - i)
+// — i.e. the merge has consumed exactly `i` from A and `j` from B by output
+// position `diag`. Boundaries treated as -∞ / +∞ via index guards.
+//
+// Binary-search-based — O(log(min(m, n))) per call. Called twice per thread
+// in `merge_pass_per_gene_kernel` (once for the slice start, once for the end).
+//
+// Reference: Green/McColl/Bader 2012, "GPU merge path: a GPU merging algorithm"
+// (the "MGPU merge" algorithm).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int merge_path_co_rank(
+    const float* __restrict__ A, int m,
+    const float* __restrict__ B, int n,
+    int diag
+) {
+    int i_lo = max(0, diag - n);
+    int i_hi = min(diag, m);
+    while (i_lo < i_hi) {
+        int i = (i_lo + i_hi) >> 1;
+        int j = diag - i;
+        // Two violation checks; ≤ in both directions means stable merge
+        // (ties from A come first when equal values cross the diagonal).
+        if (i > 0 && j < n && A[i - 1] > B[j]) {
+            // i too large — pull back, take fewer from A.
+            i_hi = i;
+        } else if (i < m && j > 0 && B[j - 1] > A[i]) {
+            // i too small — push forward, take more from A.
+            i_lo = i + 1;
+        } else {
+            return i;
+        }
+    }
+    return i_lo;
+}
+
+// ---------------------------------------------------------------------------
+// Merge pass: block-cooperative merge of two adjacent sorted runs of size
+// `run_size` into one sorted run of size up to `2 * run_size`. One block per
+// (gene, pair); within each block, threads partition the output via merge-path
+// co-rank and run sequential merge over their slice.
+//
+// in_slab and out_slab are distinct buffers (ping-pong managed host-side).
+// The host launches `⌈log₂(K)⌉` of these per gene chunk, doubling `run_size`
+// each pass, until run_size ≥ n_per_gene.
+//
+// Edge cases handled inline:
+//   * Pair starts at-or-past n_per_gene: early return.
+//   * B is empty (last pair when only A's run is non-empty): copy A → C verbatim.
+//   * Final partial pair where B's length < run_size: m and n computed per-pair.
+//
+// Grid: 2D (chunk_size, ⌈n_per_gene / (2 * run_size)⌉). Block: MERGE_BLOCK_THREADS.
+// ---------------------------------------------------------------------------
+
+#define MERGE_BLOCK_THREADS 256
+
+extern "C" __global__ void merge_pass_per_gene_kernel(
+    const float* __restrict__ in_slab,
+    float*       __restrict__ out_slab,
+    int chunk_size,
+    int n_per_gene,
+    int run_size
+) {
+    int gene = blockIdx.x;
+    int pair = blockIdx.y;
+    if (gene >= chunk_size) return;
+
+    long long pair_start_ll = (long long)pair * 2 * run_size;
+    if (pair_start_ll >= (long long)n_per_gene) return;
+
+    long long a_end_ll = pair_start_ll + run_size;
+    if (a_end_ll > (long long)n_per_gene) a_end_ll = (long long)n_per_gene;
+    long long b_end_ll = pair_start_ll + 2 * (long long)run_size;
+    if (b_end_ll > (long long)n_per_gene) b_end_ll = (long long)n_per_gene;
+
+    int pair_start = (int)pair_start_ll;
+    int a_end = (int)a_end_ll;
+    int b_start = a_end;
+    int b_end = (int)b_end_ll;
+
+    int m = a_end - pair_start;
+    int n = b_end - b_start;
+
+    const float* A = in_slab + (long long)gene * n_per_gene + pair_start;
+    const float* B = in_slab + (long long)gene * n_per_gene + b_start;
+    float*       C = out_slab + (long long)gene * n_per_gene + pair_start;
+
+    int tid  = threadIdx.x;
+    int nthr = blockDim.x;
+
+    // B empty (odd run count at last level): just copy A → C.
+    if (n == 0) {
+        for (int i = tid; i < m; i += nthr) C[i] = A[i];
+        return;
+    }
+
+    int total = m + n;
+
+    // Each thread handles a contiguous slice of the output [out_start, out_end).
+    int per_thread = (total + nthr - 1) / nthr;
+    int out_start = tid * per_thread;
+    if (out_start >= total) return;
+    int out_end = out_start + per_thread;
+    if (out_end > total) out_end = total;
+
+    // Co-rank at slice boundaries.
+    int i = merge_path_co_rank(A, m, B, n, out_start);
+    int j = out_start - i;
+    int i_end = merge_path_co_rank(A, m, B, n, out_end);
+    int j_end = out_end - i_end;
+
+    // Sequential merge over the slice.
+    int k = out_start;
+    while (i < i_end && j < j_end) {
+        if (A[i] <= B[j]) {
+            C[k++] = A[i++];
+        } else {
+            C[k++] = B[j++];
+        }
+    }
+    while (i < i_end) C[k++] = A[i++];
+    while (j < j_end) C[k++] = B[j++];
 }
 
 // ---------------------------------------------------------------------------

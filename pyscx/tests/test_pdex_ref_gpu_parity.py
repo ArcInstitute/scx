@@ -7,8 +7,10 @@ tolerance there, so CPU↔GPU parity here transitively pins GPU to upstream.
 
 Skipped cleanly when:
   * `pyscx` was built without `--features gpu`, OR
-  * no CUDA device is visible at runtime, OR
-  * the per-gene reference pool exceeds the v1 block-sort capacity (≤ 8192).
+  * no CUDA device is visible at runtime.
+
+The tiled merge-sort upgrade removed the prior 8192-cell sort cap;
+fixtures of any size now dispatch correctly via the multi-tile path.
 
 Tolerances mirror the v1 spec (section 15 of ACC-GPU-OPT.md):
   * U statistic: exact (integer-valued for integer counts).

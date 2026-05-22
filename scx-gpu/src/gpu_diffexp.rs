@@ -27,10 +27,13 @@ use crate::error::GpuError;
 /// PTX source for the GPU DE kernels, compiled at build time by `scx-gpu/build.rs`.
 const DIFFEXP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/diffexp.ptx"));
 
-/// Maximum per-gene pool size supported by the v1 block radix sort.
+/// Fast-path threshold for the single-tile block radix sort.
 ///
 /// Matches `BLOCK_THREADS * ITEMS_PER_THREAD` in `kernels/diffexp.cu`. Pools
-/// larger than this must be rejected before invoking [`gpu_de_block_sort`].
+/// `≤ GPU_DE_BLOCK_SORT_CAPACITY` keys sort in one CUB block (everything in
+/// registers — fast). Pools larger than this dispatch to a tiled bottom-up
+/// merge sort (`tile_block_radix_sort_kernel` + `merge_pass_per_gene_kernel`)
+/// with no upper limit beyond available VRAM. See [`gpu_de_block_sort`].
 pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
 
 /// Reusable per-chunk device buffers for a streaming MWU pipeline.
@@ -46,6 +49,11 @@ pub struct GpuDeChunkScratch {
     /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
     /// each test group (size large enough for whichever is bigger).
     pub slab: CudaSlice<f32>,
+    /// Ping-pong buffer used by the multi-tile path in [`gpu_de_block_sort`]
+    /// when `n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`. Allocated lazily on
+    /// first multi-tile encounter via [`Self::ensure_aux_capacity`]; small-
+    /// pool callers never pay for it.
+    pub slab_aux: CudaSlice<f32>,
     /// `[chunk_max]` f64 tie-term scratch (ref-only or combined).
     pub tie_term: CudaSlice<f64>,
     /// `[chunk_max]` f64 U1 / rank-sum scratch.
@@ -55,6 +63,7 @@ pub struct GpuDeChunkScratch {
     n_obs: usize,
     chunk_max: usize,
     slab_capacity: usize,
+    aux_capacity_elems: usize,
 }
 
 impl GpuDeChunkScratch {
@@ -71,18 +80,25 @@ impl GpuDeChunkScratch {
     ) -> Result<Self, GpuError> {
         let dense = dev.alloc_zeros::<f32>(n_obs * chunk_max)?;
         let slab = dev.alloc_zeros::<f32>(chunk_max * n_pool_max)?;
+        // slab_aux is allocated lazily — empty until the first call that hits
+        // the multi-tile sort path. Allocating a zero-length CudaSlice is
+        // cheap (a few bytes of metadata) and avoids paying VRAM for the
+        // common small-pool case where every pool fits in one tile.
+        let slab_aux = dev.alloc_zeros::<f32>(0)?;
         let tie_term = dev.alloc_zeros::<f64>(chunk_max)?;
         let u_or_rank = dev.alloc_zeros::<f64>(chunk_max)?;
         let p_values = dev.alloc_zeros::<f64>(chunk_max)?;
         Ok(Self {
             dense,
             slab,
+            slab_aux,
             tie_term,
             u_or_rank,
             p_values,
             n_obs,
             chunk_max,
             slab_capacity: n_pool_max,
+            aux_capacity_elems: 0,
         })
     }
 
@@ -95,6 +111,27 @@ impl GpuDeChunkScratch {
         let new_cap = n_pool.next_power_of_two().max(self.slab_capacity * 2);
         self.slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
         self.slab_capacity = new_cap;
+        Ok(())
+    }
+
+    /// Grow the ping-pong aux buffer to hold at least `n_elements` f32 keys.
+    ///
+    /// Called by [`gpu_de_block_sort`] before the multi-tile path. No-op when
+    /// the aux is already large enough. Bumps to `next_power_of_two` to amortise
+    /// repeated growths across a streaming chunk loop.
+    pub fn ensure_aux_capacity(
+        &mut self,
+        dev: &GpuDevice,
+        n_elements: usize,
+    ) -> Result<(), GpuError> {
+        if n_elements <= self.aux_capacity_elems {
+            return Ok(());
+        }
+        let new_cap = n_elements
+            .next_power_of_two()
+            .max(self.aux_capacity_elems * 2);
+        self.slab_aux = dev.alloc_zeros::<f32>(new_cap)?;
+        self.aux_capacity_elems = new_cap;
         Ok(())
     }
 
@@ -208,11 +245,26 @@ pub fn gpu_de_scatter_gene_major(
 
 /// Sort each gene's row of a gene-major slab in ascending order, in-place.
 ///
-/// Backed by CUB `BlockRadixSort` with capacity [`GPU_DE_BLOCK_SORT_CAPACITY`].
-/// Returns [`GpuError::ShapeMismatch`] if `n_per_gene` exceeds the capacity —
-/// the v1 GPU path expects the caller to fall back to CPU in that case.
+/// Two-path dispatch by `n_per_gene`:
+///
+/// * **Fast path** (`n_per_gene ≤ GPU_DE_BLOCK_SORT_CAPACITY`): single CUB
+///   `BlockRadixSort` per gene — everything in registers, one kernel launch
+///   for the whole chunk. No use of `scratch.slab_aux`.
+/// * **Multi-tile path** (`n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`):
+///   bottom-up iterative merge sort. Tile sort with `tile_block_radix_sort_kernel`
+///   (1 block per `(gene, tile)`), then `⌈log₂(K)⌉` merge passes (where
+///   `K = ⌈n_per_gene / GPU_DE_BLOCK_SORT_CAPACITY⌉`) of
+///   `merge_pass_per_gene_kernel`. Ping-pongs between `slab` and
+///   `scratch.slab_aux`; final copy back to `slab` when pass count is odd,
+///   so callers always read the sorted result from `slab`.
+///
+/// `scratch` is taken `&mut` to allow on-demand growth of `slab_aux` via
+/// [`GpuDeChunkScratch::ensure_aux_capacity`]. Fast-path callers can pass
+/// any scratch they have lying around — the aux is only touched on the
+/// multi-tile path.
 pub fn gpu_de_block_sort(
     dev: &GpuDevice,
+    scratch: &mut GpuDeChunkScratch,
     slab: &mut CudaSlice<f32>,
     chunk_size: usize,
     n_per_gene: usize,
@@ -220,13 +272,79 @@ pub fn gpu_de_block_sort(
     if n_per_gene == 0 || chunk_size == 0 {
         return Ok(());
     }
-    if n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY {
-        return Err(GpuError::ShapeMismatch {
-            expected: format!("n_per_gene ≤ {GPU_DE_BLOCK_SORT_CAPACITY}"),
-            got: format!("n_per_gene = {n_per_gene}"),
-        });
+
+    // Fast path: one CUB BlockRadixSort per gene.
+    if n_per_gene <= GPU_DE_BLOCK_SORT_CAPACITY {
+        return gpu_de_single_tile_block_sort(dev, slab, chunk_size, n_per_gene);
     }
 
+    // Multi-tile path: tile sort + iterative merge.
+    let n_elements = chunk_size
+        .checked_mul(n_per_gene)
+        .ok_or_else(|| GpuError::ShapeMismatch {
+            expected: "chunk_size * n_per_gene fits in usize".into(),
+            got: format!("chunk_size={chunk_size}, n_per_gene={n_per_gene}"),
+        })?;
+    scratch.ensure_aux_capacity(dev, n_elements)?;
+
+    // Tile sort in-place into `slab`. Each block handles one tile of one gene;
+    // the final tile may be partial, handled via +inf padding in the kernel.
+    gpu_de_tile_block_sort(dev, slab, chunk_size, n_per_gene)?;
+
+    // Iterate merge passes. After tile sort the row contains K runs of size
+    // ≤ GPU_DE_BLOCK_SORT_CAPACITY. Each pass doubles `run_size` and halves
+    // the run count, terminating when run_size ≥ n_per_gene.
+    let mut run_size = GPU_DE_BLOCK_SORT_CAPACITY;
+    let mut n_passes: usize = 0;
+    while run_size < n_per_gene {
+        if n_passes.is_multiple_of(2) {
+            // pass 0, 2, 4, ... : slab -> aux.
+            gpu_de_merge_pass(
+                dev,
+                &*slab,
+                &mut scratch.slab_aux,
+                chunk_size,
+                n_per_gene,
+                run_size,
+            )?;
+        } else {
+            // pass 1, 3, 5, ... : aux -> slab.
+            gpu_de_merge_pass(
+                dev,
+                &scratch.slab_aux,
+                &mut *slab,
+                chunk_size,
+                n_per_gene,
+                run_size,
+            )?;
+        }
+        n_passes += 1;
+        run_size = run_size.saturating_mul(2);
+    }
+
+    // After an odd number of merge passes the final result lives in `slab_aux`;
+    // copy it back to `slab` so callers downstream (searchsorted, tie-term,
+    // p-value) read from the canonical buffer.
+    if !n_passes.is_multiple_of(2) {
+        let mut slab_view = slab.slice_mut(..n_elements);
+        let aux_view = scratch.slab_aux.slice(..n_elements);
+        dev.stream()
+            .memcpy_dtod(&aux_view, &mut slab_view)
+            .map_err(|e| GpuError::CudaError(format!("memcpy_dtod(aux→slab): {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Single-tile fast path — exactly the v1 single-block kernel from the
+/// pre-tiled-merge implementation. Used directly when `n_per_gene ≤
+/// GPU_DE_BLOCK_SORT_CAPACITY` and as the per-tile work in the multi-tile path.
+fn gpu_de_single_tile_block_sort(
+    dev: &GpuDevice,
+    slab: &mut CudaSlice<f32>,
+    chunk_size: usize,
+    n_per_gene: usize,
+) -> Result<(), GpuError> {
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
     let func = module
         .load_function("block_radix_sort_per_gene_kernel")
@@ -234,7 +352,6 @@ pub fn gpu_de_block_sort(
             GpuError::KernelLaunchFailed(format!("block_radix_sort_per_gene_kernel: {e}"))
         })?;
 
-    // Must match BLOCK_THREADS in diffexp.cu.
     let block_threads: u32 = 1024;
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
@@ -253,6 +370,95 @@ pub fn gpu_de_block_sort(
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("block_radix_sort_per_gene_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// Tile-level block radix sort: one block per `(gene, tile)`. Each block sorts
+/// a contiguous up-to-`GPU_DE_BLOCK_SORT_CAPACITY` slice of the gene's row in
+/// place. Used as the first step of [`gpu_de_block_sort`]'s multi-tile path.
+fn gpu_de_tile_block_sort(
+    dev: &GpuDevice,
+    slab: &mut CudaSlice<f32>,
+    chunk_size: usize,
+    n_per_gene: usize,
+) -> Result<(), GpuError> {
+    let tile_size = GPU_DE_BLOCK_SORT_CAPACITY;
+    let n_tiles = n_per_gene.div_ceil(tile_size);
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("tile_block_radix_sort_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("tile_block_radix_sort_kernel: {e}")))?;
+
+    let block_threads: u32 = 1024;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, n_tiles as u32, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let chunk_i32 = chunk_size as i32;
+    let n_per_gene_i32 = n_per_gene as i32;
+    let tile_size_i32 = tile_size as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(slab)
+            .arg(&chunk_i32)
+            .arg(&n_per_gene_i32)
+            .arg(&tile_size_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("tile_block_radix_sort_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// One merge pass: merge pairs of sorted runs of size `run_size` from
+/// `in_slab` into runs of size `2 * run_size` in `out_slab`. One block per
+/// `(gene, pair)`. Called repeatedly with doubling `run_size` until the row
+/// is fully sorted.
+fn gpu_de_merge_pass(
+    dev: &GpuDevice,
+    in_slab: &CudaSlice<f32>,
+    out_slab: &mut CudaSlice<f32>,
+    chunk_size: usize,
+    n_per_gene: usize,
+    run_size: usize,
+) -> Result<(), GpuError> {
+    // Number of (paired) blocks per gene: each block merges one A-run and one
+    // B-run. Odd run counts at the final pair just memcpy A → C inside the
+    // kernel (see the `n == 0` branch in merge_pass_per_gene_kernel).
+    let n_pairs = n_per_gene.div_ceil(run_size.saturating_mul(2));
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("merge_pass_per_gene_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("merge_pass_per_gene_kernel: {e}")))?;
+
+    // Must match MERGE_BLOCK_THREADS in diffexp.cu.
+    let block_threads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, n_pairs as u32, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let chunk_i32 = chunk_size as i32;
+    let n_per_gene_i32 = n_per_gene as i32;
+    let run_size_i32 = run_size as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(in_slab)
+            .arg(out_slab)
+            .arg(&chunk_i32)
+            .arg(&n_per_gene_i32)
+            .arg(&run_size_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("merge_pass_per_gene_kernel: {e}")))?;
 
     Ok(())
 }
@@ -617,7 +823,7 @@ mod tests {
             chunk_size,
         )
         .unwrap();
-        gpu_de_block_sort(&dev, &mut d_ref_slab, chunk_size, n_ref).unwrap();
+        gpu_de_block_sort(&dev, &mut scratch, &mut d_ref_slab, chunk_size, n_ref).unwrap();
         gpu_de_tie_term(&dev, &d_ref_slab, &mut scratch.tie_term, chunk_size, n_ref).unwrap();
         dev.synchronize().unwrap();
 
@@ -655,7 +861,7 @@ mod tests {
             n_g,
         )
         .unwrap();
-        gpu_de_block_sort(&dev, &mut d_group_slab, chunk_size, n_g).unwrap();
+        gpu_de_block_sort(&dev, &mut scratch, &mut d_group_slab, chunk_size, n_g).unwrap();
         gpu_de_combined_tie_term(
             &dev,
             &d_ref_slab,
@@ -728,7 +934,8 @@ mod tests {
         }
 
         let mut d_slab = dev.htod_copy(&data).unwrap();
-        gpu_de_block_sort(&dev, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
+        gpu_de_block_sort(&dev, &mut scratch, &mut d_slab, chunk_size, n_per_gene).unwrap();
         dev.synchronize().unwrap();
         let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
 
@@ -737,6 +944,96 @@ mod tests {
             cpu_sort_ascending(&mut expected);
             let got = &gpu_sorted[gene * n_per_gene..(gene + 1) * n_per_gene];
             assert_eq!(got, expected.as_slice(), "sort mismatch on gene {gene}");
+        }
+    }
+
+    /// Multi-tile sort: exercises the G1.5 tiled bottom-up merge path on a
+    /// `[16 × 20_000]` slab. With `GPU_DE_BLOCK_SORT_CAPACITY = 8192`, 20_000
+    /// keys per gene partitions into 3 tiles → 2 merge passes (4096 keys
+    /// after pass 1, 8192 after pass 2; final pass merges 8192+4096 etc.).
+    /// Output must match `Vec::sort_by` per row exactly. Includes deliberate
+    /// ties (modulo) to stress the merge-path co-rank.
+    #[test]
+    fn test_gpu_de_block_sort_above_capacity() {
+        let dev = require_gpu!();
+
+        let chunk_size = 16usize;
+        let n_per_gene = 20_000usize;
+        assert!(
+            n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY,
+            "test fixture must exceed the fast-path threshold to exercise the multi-tile path"
+        );
+
+        let mut state: u64 = 0xFEEDBEEF_2026;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut data = vec![0.0f32; chunk_size * n_per_gene];
+        for v in data.iter_mut() {
+            // Mod-128 produces lots of ties across runs → stresses merge-path
+            // co_rank's "ties spanning the diagonal" branches.
+            *v = (next() % 128) as f32;
+        }
+
+        let mut d_slab = dev.htod_copy(&data).unwrap();
+        let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
+        gpu_de_block_sort(&dev, &mut scratch, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        dev.synchronize().unwrap();
+        let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
+
+        for gene in 0..chunk_size {
+            let mut expected: Vec<f32> = data[gene * n_per_gene..(gene + 1) * n_per_gene].to_vec();
+            cpu_sort_ascending(&mut expected);
+            let got = &gpu_sorted[gene * n_per_gene..(gene + 1) * n_per_gene];
+            assert_eq!(
+                got,
+                expected.as_slice(),
+                "multi-tile sort mismatch on gene {gene} (n_per_gene={n_per_gene})"
+            );
+        }
+    }
+
+    /// Multi-tile sort with an awkward, non-power-of-two pool size — exercises
+    /// the partial-tile and odd-pair-count edge cases (the final tile is only
+    /// 1000 keys; the final merge pair pairs a full run with a partial one).
+    #[test]
+    fn test_gpu_de_block_sort_above_capacity_uneven() {
+        let dev = require_gpu!();
+
+        let chunk_size = 4usize;
+        // 8192 + 7000 = 15_192 → 2 tiles (full + partial), 1 merge pass.
+        let n_per_gene = 15_192usize;
+
+        let mut state: u64 = 0xABADCAFE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut data = vec![0.0f32; chunk_size * n_per_gene];
+        for v in data.iter_mut() {
+            *v = ((next() as i32) & 0xffff) as f32; // larger range, fewer ties
+        }
+
+        let mut d_slab = dev.htod_copy(&data).unwrap();
+        let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
+        gpu_de_block_sort(&dev, &mut scratch, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        dev.synchronize().unwrap();
+        let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
+
+        for gene in 0..chunk_size {
+            let mut expected: Vec<f32> = data[gene * n_per_gene..(gene + 1) * n_per_gene].to_vec();
+            cpu_sort_ascending(&mut expected);
+            let got = &gpu_sorted[gene * n_per_gene..(gene + 1) * n_per_gene];
+            assert_eq!(
+                got,
+                expected.as_slice(),
+                "uneven multi-tile sort mismatch on gene {gene}"
+            );
         }
     }
 }

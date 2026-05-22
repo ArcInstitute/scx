@@ -50,16 +50,16 @@ when none match. The chosen column is recorded in
 `result.metadata["groupby"]` so the comparison stays apples-to-apples
 across CPU / GPU variants on the same fixture.
 
-## v1 capacity limit
+## Sort capacity
 
-The GPU path caps per-gene sort pools at
-`scx_gpu::GPU_DE_BLOCK_SORT_CAPACITY = 8192`. For 1-vs-rest Wilcoxon
-the "pool" is all cells, so census-scale datasets (>8192 cells) will
-fail the GPU variant cleanly with `InvalidInput`. The runner catches
-that, logs a warning, and emits `None` for the GPU rows on those
-triples so the gate doesn't see a spurious failure. The pdex-ref path
-caps on the reference group's size, which typically stays well under
-the limit even at census scale.
+The GPU path's per-gene sort dispatches by pool size: `≤ 8192` keys takes
+the single-block CUB `BlockRadixSort` fast path; larger pools use the tiled
+bottom-up merge sort (`tile_block_radix_sort_kernel` +
+`merge_pass_per_gene_kernel`). There's no upper limit beyond available
+VRAM — census-scale 1-vs-rest Wilcoxon (`pool = n_obs ≈ 1M`) sorts in ~7
+merge passes and finishes in a few seconds. Earlier versions of this
+module skipped GPU rows above 8192 cells; those guards were removed when
+G1.5 landed.
 """
 
 from __future__ import annotations
@@ -386,24 +386,9 @@ def run(
         _fixture_cache[groupby_key] = (groupby, reference, synthetic, adata_for_pick)
     groupby, reference, synthetic, base_adata = _fixture_cache[groupby_key]
 
-    # GPU 1-vs-rest Wilcoxon: pool is all n_obs cells. Skip cleanly when
-    # the dataset exceeds the v1 sort capacity.
-    if key == "accel_de__pyscx_wilcoxon_gpu" and base_adata.n_obs > 8192:
-        logger.warning(
-            "accel_de: skipping %s on %s (n_obs=%d > GPU_DE_BLOCK_SORT_CAPACITY=8192)",
-            key, dataset.name, base_adata.n_obs,
-        )
-        return None
-
-    # GPU pdex_ref: pool is the reference group only.
-    if key == "accel_de__pyscx_pdex_ref_gpu":
-        n_ref = int((base_adata.obs[groupby].astype(str) == reference).sum())
-        if n_ref > 8192:
-            logger.warning(
-                "accel_de: skipping %s on %s (n_ref=%d > GPU_DE_BLOCK_SORT_CAPACITY=8192)",
-                key, dataset.name, n_ref,
-            )
-            return None
+    # G1.5: the 8192-cell sort-pool cap has been lifted via tiled merge-sort
+    # in `scx_gpu::gpu_de_block_sort` — every GPU variant now runs at every
+    # dataset tier. The previous early-skip guards have been removed.
 
     result = BenchmarkResult(
         benchmark="accel_de",
