@@ -10,13 +10,22 @@
 //! All kernels share a single PTX module (`diffexp.ptx`, compiled by
 //! `scx-gpu/build.rs` from `kernels/diffexp.cu`).
 //!
-//! ## v1 limitation: block-sort capacity
+//! ## Per-gene sort capacity
 //!
-//! The per-gene CUB block radix sort holds the whole row in registers, capped
-//! at [`GPU_DE_BLOCK_SORT_CAPACITY`] keys. Callers must reject reference /
-//! group pools larger than that and fall back to CPU; the limit covers the
-//! vast majority of Perturb-seq workloads (non-targeting control is typically
-//! under 10K cells). A tiled merge-sort upgrade is deferred to G4.
+//! The per-gene sort in [`gpu_de_block_sort`] is two-path:
+//!
+//! * **Fast path** (`n_per_gene ≤ GPU_DE_BLOCK_SORT_CAPACITY = 8192`): one
+//!   CUB `BlockRadixSort` per gene — the entire row sits in registers across
+//!   one block.
+//! * **Multi-tile path** (`> 8192`): bottom-up iterative merge sort. Tile
+//!   sort with `tile_block_radix_sort_kernel`, then `⌈log₂(K)⌉` passes of
+//!   `merge_pass_per_gene_kernel` (block-cooperative merge-path
+//!   partitioning), ping-ponging between `scratch.slab` and `scratch.slab_aux`.
+//!
+//! No upper limit beyond available VRAM. Callers no longer need to guard
+//! pool sizes against the 8192 threshold — the dispatch handles arbitrary
+//! sizes internally. Tested on census-scale fixtures (n_pool ≈ 1M) where the
+//! multi-tile path engages ~7 merge passes per chunk.
 
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
