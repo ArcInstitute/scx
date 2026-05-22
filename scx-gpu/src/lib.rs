@@ -51,6 +51,7 @@ pub mod cusparse;
 pub mod device;
 pub mod error;
 pub mod forbp_gpu;
+pub mod gpu_diffexp;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
 pub mod gpu_knn;
@@ -75,6 +76,11 @@ pub use cusparse::{
 pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
+pub use gpu_diffexp::{
+    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term, gpu_de_pvalues,
+    gpu_de_scatter_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
+    gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
+};
 pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
     gpu_harmony_correction, gpu_harmony_correction_grouped, gpu_harmony_distances,

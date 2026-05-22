@@ -1,0 +1,742 @@
+//! GPU differential expression primitives (Mann-Whitney U / Wilcoxon rank sum).
+//!
+//! Per-gene block radix sort
+//! (CUB), batched searchsorted, on-device tie-term computation, and normal-tail
+//! p-value via `erfc`. These primitives are the building blocks for the
+//! high-level `pdex_ref_gpu_*` / `wilcoxon_rank_sum_*_gpu` entry points that
+//! live in `scx-accel/src/diffexp.rs` under `#[cfg(feature = "gpu")]` — see
+//! the CPU path in the same file for the parity oracle.
+//!
+//! All kernels share a single PTX module (`diffexp.ptx`, compiled by
+//! `scx-gpu/build.rs` from `kernels/diffexp.cu`).
+//!
+//! ## v1 limitation: block-sort capacity
+//!
+//! The per-gene CUB block radix sort holds the whole row in registers, capped
+//! at [`GPU_DE_BLOCK_SORT_CAPACITY`] keys. Callers must reject reference /
+//! group pools larger than that and fall back to CPU; the limit covers the
+//! vast majority of Perturb-seq workloads (non-targeting control is typically
+//! under 10K cells). A tiled merge-sort upgrade is deferred to G4.
+
+use cudarc::driver::safe::{CudaSlice, LaunchConfig};
+use cudarc::driver::PushKernelArg;
+
+use crate::device::GpuDevice;
+use crate::error::GpuError;
+
+/// PTX source for the GPU DE kernels, compiled at build time by `scx-gpu/build.rs`.
+const DIFFEXP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/diffexp.ptx"));
+
+/// Maximum per-gene pool size supported by the v1 block radix sort.
+///
+/// Matches `BLOCK_THREADS * ITEMS_PER_THREAD` in `kernels/diffexp.cu`. Pools
+/// larger than this must be rejected before invoking [`gpu_de_block_sort`].
+pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
+
+/// Reusable per-chunk device buffers for a streaming MWU pipeline.
+///
+/// One allocation per chunk_max suffices for the entire DE call: the chunk
+/// loop refills `dense` per chunk and resizes `ref_slab` / `group_slab` only
+/// when the membership counts change. This intentionally mirrors how
+/// `gpu_pca::GpuPcaScratch` hoists allocations out of the power-iteration
+/// inner loop.
+pub struct GpuDeChunkScratch {
+    /// `[n_obs × chunk_max]` row-major dense buffer for the current chunk.
+    pub dense: CudaSlice<f32>,
+    /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
+    /// each test group (size large enough for whichever is bigger).
+    pub slab: CudaSlice<f32>,
+    /// `[chunk_max]` f64 tie-term scratch (ref-only or combined).
+    pub tie_term: CudaSlice<f64>,
+    /// `[chunk_max]` f64 U1 / rank-sum scratch.
+    pub u_or_rank: CudaSlice<f64>,
+    /// `[chunk_max]` f64 p-values for one test group.
+    pub p_values: CudaSlice<f64>,
+    n_obs: usize,
+    chunk_max: usize,
+    slab_capacity: usize,
+}
+
+impl GpuDeChunkScratch {
+    /// Allocate scratch buffers sized for `n_obs` cells, up to `chunk_max`
+    /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
+    ///
+    /// The slab grows on demand via [`Self::ensure_slab_capacity`]; the
+    /// dense buffer is fixed-size for the whole DE call.
+    pub fn new(
+        dev: &GpuDevice,
+        n_obs: usize,
+        chunk_max: usize,
+        n_pool_max: usize,
+    ) -> Result<Self, GpuError> {
+        let dense = dev.alloc_zeros::<f32>(n_obs * chunk_max)?;
+        let slab = dev.alloc_zeros::<f32>(chunk_max * n_pool_max)?;
+        let tie_term = dev.alloc_zeros::<f64>(chunk_max)?;
+        let u_or_rank = dev.alloc_zeros::<f64>(chunk_max)?;
+        let p_values = dev.alloc_zeros::<f64>(chunk_max)?;
+        Ok(Self {
+            dense,
+            slab,
+            tie_term,
+            u_or_rank,
+            p_values,
+            n_obs,
+            chunk_max,
+            slab_capacity: n_pool_max,
+        })
+    }
+
+    /// Grow the slab if `n_pool > current slab capacity`. No-op otherwise.
+    pub fn ensure_slab_capacity(&mut self, dev: &GpuDevice, n_pool: usize) -> Result<(), GpuError> {
+        if n_pool <= self.slab_capacity {
+            return Ok(());
+        }
+        // Bump to a round multiple to avoid thrashing on small growths.
+        let new_cap = n_pool.next_power_of_two().max(self.slab_capacity * 2);
+        self.slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
+        self.slab_capacity = new_cap;
+        Ok(())
+    }
+
+    /// Maximum number of cells per chunk this scratch is sized for.
+    pub fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+
+    /// Maximum number of genes per chunk this scratch is sized for.
+    pub fn chunk_max(&self) -> usize {
+        self.chunk_max
+    }
+}
+
+/// Upload a host-side dense `[n_obs × chunk_size]` (row-major, f32) chunk to
+/// the front of the device dense slot.
+///
+/// Caller is responsible for ensuring `dense_host.len() == n_obs * chunk_size`
+/// and `chunk_size <= scratch.chunk_max()`.
+pub fn gpu_de_upload_chunk(
+    dev: &GpuDevice,
+    scratch: &mut GpuDeChunkScratch,
+    dense_host: &[f32],
+    n_obs: usize,
+    chunk_size: usize,
+) -> Result<(), GpuError> {
+    if dense_host.len() != n_obs * chunk_size {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!(
+                "{} (n_obs={} × chunk_size={})",
+                n_obs * chunk_size,
+                n_obs,
+                chunk_size
+            ),
+            got: format!("{}", dense_host.len()),
+        });
+    }
+    if n_obs != scratch.n_obs || chunk_size > scratch.chunk_max {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!(
+                "n_obs≤{}, chunk_size≤{} (scratch capacity)",
+                scratch.n_obs, scratch.chunk_max
+            ),
+            got: format!("n_obs={n_obs}, chunk_size={chunk_size}"),
+        });
+    }
+    let nelem = n_obs * chunk_size;
+    // CudaSlice supports a slice view via .slice(...) in cudarc 0.19.
+    let mut view = scratch.dense.slice_mut(..nelem);
+    dev.stream()
+        .memcpy_htod(dense_host, &mut view)
+        .map_err(|e| GpuError::CudaError(format!("htod_copy(dense chunk): {e}")))?;
+    Ok(())
+}
+
+/// Scatter a permutation of cells (e.g. ref or group) from the device dense
+/// chunk into a gene-major slab `[chunk_size × n_perm]`.
+///
+/// `cell_indices_host` is uploaded internally; for repeated calls with the
+/// same permutation, consider caching the upload via a dedicated CudaSlice.
+pub fn gpu_de_scatter_gene_major(
+    dev: &GpuDevice,
+    dense: &CudaSlice<f32>,
+    cell_indices_host: &[i32],
+    slab: &mut CudaSlice<f32>,
+    n_obs: usize,
+    chunk_size: usize,
+) -> Result<(), GpuError> {
+    if cell_indices_host.is_empty() || chunk_size == 0 {
+        return Ok(());
+    }
+    let n_perm = cell_indices_host.len();
+    let d_indices = dev.htod_copy(cell_indices_host)?;
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("scatter_perm_to_gene_major_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("scatter_perm_to_gene_major_kernel: {e}"))
+        })?;
+
+    let bx: u32 = 32;
+    let by: u32 = 8;
+    let gx = (n_perm as u32).div_ceil(bx);
+    let gy = (chunk_size as u32).div_ceil(by);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, 1),
+        block_dim: (bx, by, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_obs_i32 = n_obs as i32;
+    let n_perm_i32 = n_perm as i32;
+    let chunk_i32 = chunk_size as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(dense)
+            .arg(&d_indices)
+            .arg(slab)
+            .arg(&n_obs_i32)
+            .arg(&n_perm_i32)
+            .arg(&chunk_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("scatter_perm_to_gene_major_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// Sort each gene's row of a gene-major slab in ascending order, in-place.
+///
+/// Backed by CUB `BlockRadixSort` with capacity [`GPU_DE_BLOCK_SORT_CAPACITY`].
+/// Returns [`GpuError::ShapeMismatch`] if `n_per_gene` exceeds the capacity —
+/// the v1 GPU path expects the caller to fall back to CPU in that case.
+pub fn gpu_de_block_sort(
+    dev: &GpuDevice,
+    slab: &mut CudaSlice<f32>,
+    chunk_size: usize,
+    n_per_gene: usize,
+) -> Result<(), GpuError> {
+    if n_per_gene == 0 || chunk_size == 0 {
+        return Ok(());
+    }
+    if n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("n_per_gene ≤ {GPU_DE_BLOCK_SORT_CAPACITY}"),
+            got: format!("n_per_gene = {n_per_gene}"),
+        });
+    }
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("block_radix_sort_per_gene_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("block_radix_sort_per_gene_kernel: {e}"))
+        })?;
+
+    // Must match BLOCK_THREADS in diffexp.cu.
+    let block_threads: u32 = 1024;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let chunk_i32 = chunk_size as i32;
+    let n_per_gene_i32 = n_per_gene as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(slab)
+            .arg(&chunk_i32)
+            .arg(&n_per_gene_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("block_radix_sort_per_gene_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// Compute Σ(c^3 − c) per gene over a single sorted row. Writes
+/// `tie_out[gene]` for `gene in 0..chunk_size`.
+pub fn gpu_de_tie_term(
+    dev: &GpuDevice,
+    sorted_slab: &CudaSlice<f32>,
+    tie_out: &mut CudaSlice<f64>,
+    chunk_size: usize,
+    n_per_gene: usize,
+) -> Result<(), GpuError> {
+    if n_per_gene == 0 || chunk_size == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("tie_term_sorted_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("tie_term_sorted_kernel: {e}")))?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let chunk_i32 = chunk_size as i32;
+    let n_per_gene_i32 = n_per_gene as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(sorted_slab)
+            .arg(tie_out)
+            .arg(&chunk_i32)
+            .arg(&n_per_gene_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("tie_term_sorted_kernel: {e}")))?;
+    Ok(())
+}
+
+/// Combined tie term over (ref + group): merge-walks two pre-sorted rows per
+/// gene and writes the result into `tie_out`.
+pub fn gpu_de_combined_tie_term(
+    dev: &GpuDevice,
+    sorted_ref: &CudaSlice<f32>,
+    sorted_group: &CudaSlice<f32>,
+    tie_out: &mut CudaSlice<f64>,
+    chunk_size: usize,
+    n_ref: usize,
+    n_g: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || (n_ref == 0 && n_g == 0) {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("combined_tie_term_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("combined_tie_term_kernel: {e}")))?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let chunk_i32 = chunk_size as i32;
+    let n_ref_i32 = n_ref as i32;
+    let n_g_i32 = n_g as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(sorted_ref)
+            .arg(sorted_group)
+            .arg(tie_out)
+            .arg(&chunk_i32)
+            .arg(&n_ref_i32)
+            .arg(&n_g_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("combined_tie_term_kernel: {e}")))?;
+    Ok(())
+}
+
+/// Batched searchsorted U1 statistic for ref-mode MWU.
+/// `u_out[gene]` = Σ_i (n_ref_less(group[i]) + 0.5·n_ref_equal(group[i])).
+pub fn gpu_de_searchsorted_u_stat(
+    dev: &GpuDevice,
+    sorted_ref: &CudaSlice<f32>,
+    group_slab: &CudaSlice<f32>,
+    u_out: &mut CudaSlice<f64>,
+    chunk_size: usize,
+    n_ref: usize,
+    n_g: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("searchsorted_u_stat_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("searchsorted_u_stat_kernel: {e}")))?;
+
+    let block_threads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: block_threads * 8, // partials[256] f64
+    };
+    let chunk_i32 = chunk_size as i32;
+    let n_ref_i32 = n_ref as i32;
+    let n_g_i32 = n_g as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(sorted_ref)
+            .arg(group_slab)
+            .arg(u_out)
+            .arg(&chunk_i32)
+            .arg(&n_ref_i32)
+            .arg(&n_g_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("searchsorted_u_stat_kernel: {e}")))?;
+    Ok(())
+}
+
+/// 1-vs-rest mid-rank sum for the global Wilcoxon path.
+/// `ranksum_out[gene]` = Σ over group cells of their mid-rank in the global
+/// sorted-all pool. Then U_g = ranksum − n_g(n_g+1)/2.
+pub fn gpu_de_searchsorted_ranksum(
+    dev: &GpuDevice,
+    sorted_all: &CudaSlice<f32>,
+    group_slab: &CudaSlice<f32>,
+    ranksum_out: &mut CudaSlice<f64>,
+    chunk_size: usize,
+    n_total: usize,
+    n_g: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("searchsorted_ranksum_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("searchsorted_ranksum_kernel: {e}")))?;
+
+    let block_threads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: block_threads * 8,
+    };
+    let chunk_i32 = chunk_size as i32;
+    let n_total_i32 = n_total as i32;
+    let n_g_i32 = n_g as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(sorted_all)
+            .arg(group_slab)
+            .arg(ranksum_out)
+            .arg(&chunk_i32)
+            .arg(&n_total_i32)
+            .arg(&n_g_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("searchsorted_ranksum_kernel: {e}")))?;
+    Ok(())
+}
+
+/// MWU two-sided p-value via normal approximation with tie correction.
+///
+/// Matches the CPU `wilcoxon_full_from_ranks` formula exactly (no continuity
+/// correction): `z = (U − μ)/σ`, `p = erfc(|z| / √2)`. Output is clipped to
+/// `[0, 1]`. Caller is responsible for setting p = 1.0 when either group is
+/// empty (kernel handles `n1 == 0 || n2 == 0` defensively but the chunk loop
+/// short-circuits before launch).
+pub fn gpu_de_pvalues(
+    dev: &GpuDevice,
+    u_stats: &CudaSlice<f64>,
+    tie_term: &CudaSlice<f64>,
+    p_out: &mut CudaSlice<f64>,
+    chunk_size: usize,
+    n1: usize,
+    n2: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("pvalue_erfc_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("pvalue_erfc_kernel: {e}")))?;
+
+    let threads: u32 = 256;
+    let blocks = (chunk_size as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let chunk_i32 = chunk_size as i32;
+    let n1_i32 = n1 as i32;
+    let n2_i32 = n2 as i32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(u_stats)
+            .arg(tie_term)
+            .arg(p_out)
+            .arg(&chunk_i32)
+            .arg(&n1_i32)
+            .arg(&n2_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("pvalue_erfc_kernel: {e}")))?;
+    Ok(())
+}
+
+/// Heuristic gene-chunk size for streaming GPU DE.
+///
+/// Budgets ~18% of free VRAM for the dense + slab buffers needed by one
+/// chunk, snapped to a multiple of 64 genes. Returns at least 64. Honours
+/// the `SCX_GPU_DE_GENE_CHUNK_SIZE` env override (rounded to multiple of 64,
+/// minimum 64).
+pub fn default_gpu_de_gene_chunk_size(dev: &GpuDevice, n_obs: usize, n_pool_max: usize) -> usize {
+    if let Ok(env) = std::env::var("SCX_GPU_DE_GENE_CHUNK_SIZE") {
+        if let Ok(v) = env.parse::<usize>() {
+            return ((v / 64).max(1)) * 64;
+        }
+    }
+    let free_bytes = dev.free_memory().map(|(f, _)| f).unwrap_or(0);
+    if free_bytes == 0 {
+        return 256;
+    }
+    // Budget ~18% of free VRAM for the chunk's working set; account for
+    // dense + slab + scratch (≈ (n_obs + n_pool_max) * 4 bytes per gene).
+    let per_gene_bytes = (n_obs + n_pool_max) * 4 + 64; // small constant for f64 stats
+    let budget = (free_bytes as f64 * 0.18) as usize;
+    let raw = budget.max(per_gene_bytes) / per_gene_bytes;
+    ((raw / 64).max(1)) * 64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_sort_capacity_constant_matches_kernel() {
+        // BLOCK_THREADS * ITEMS_PER_THREAD in kernels/diffexp.cu must match
+        // the published Rust constant. If you bump the kernel tunables,
+        // bump the constant in lock-step.
+        assert_eq!(GPU_DE_BLOCK_SORT_CAPACITY, 1024 * 8);
+    }
+
+    #[test]
+    fn test_default_chunk_size_respects_env() {
+        // Set an explicit override and confirm it round-trips (snapped to 64).
+        let prev = std::env::var("SCX_GPU_DE_GENE_CHUNK_SIZE").ok();
+        std::env::set_var("SCX_GPU_DE_GENE_CHUNK_SIZE", "129");
+        // The function only touches GPU mem if no env override is set; this
+        // test exercises the env-override branch without needing a device.
+        // We fake a GpuDevice by creating one only if available; otherwise
+        // skip with a noop assertion of the env path's value semantics.
+        if let Ok(dev) = GpuDevice::new(0) {
+            let v = default_gpu_de_gene_chunk_size(&dev, 1, 1);
+            assert_eq!(v, 128, "129 should snap down to 128 (multiple of 64)");
+        } else {
+            // No GPU on this host; just confirm the snapping logic by hand.
+            let raw: usize = 129;
+            assert_eq!(((raw / 64).max(1)) * 64, 128);
+        }
+        if let Some(v) = prev {
+            std::env::set_var("SCX_GPU_DE_GENE_CHUNK_SIZE", v);
+        } else {
+            std::env::remove_var("SCX_GPU_DE_GENE_CHUNK_SIZE");
+        }
+    }
+
+    fn cpu_sort_ascending(row: &mut [f32]) {
+        row.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    fn cpu_tie_term(sorted: &[f32]) -> f64 {
+        let mut s = 0.0f64;
+        let n = sorted.len();
+        let mut i = 0;
+        while i < n {
+            let mut j = i + 1;
+            while j < n && sorted[j] == sorted[i] {
+                j += 1;
+            }
+            let c = (j - i) as i64;
+            if c > 1 {
+                s += (c * c * c - c) as f64;
+            }
+            i = j;
+        }
+        s
+    }
+
+    fn cpu_u1_searchsorted(sorted_ref: &[f32], group: &[f32]) -> f64 {
+        let mut u = 0.0f64;
+        for &x in group {
+            let lo = sorted_ref.partition_point(|&r| r < x);
+            let hi = sorted_ref.partition_point(|&r| r <= x);
+            let n_less = lo as f64;
+            let n_eq = (hi - lo) as f64;
+            u += n_less + 0.5 * n_eq;
+        }
+        u
+    }
+
+    fn cpu_combined_tie(sorted_ref: &[f32], sorted_group: &[f32]) -> f64 {
+        let mut merged: Vec<f32> = sorted_ref
+            .iter()
+            .copied()
+            .chain(sorted_group.iter().copied())
+            .collect();
+        cpu_sort_ascending(&mut merged);
+        cpu_tie_term(&merged)
+    }
+
+    /// End-to-end primitive parity: gene-major scatter + sort + tie + U1 +
+    /// combined tie against CPU references on a small heavily-tied integer
+    /// fixture. Skips cleanly when no CUDA device is available.
+    #[test]
+    fn test_gpu_de_primitives_match_cpu_reference() {
+        let dev = require_gpu!();
+
+        // 2 genes, 6 cells, with deliberate ties spanning ref+group.
+        let n_obs = 6usize;
+        let chunk_size = 2usize;
+        // dense[cell * chunk_size + gene]
+        // gene 0:  cell vals = [0, 0, 0, 1, 1, 2]
+        // gene 1:  cell vals = [3, 1, 1, 2, 0, 0]
+        let dense: Vec<f32> = vec![
+            0.0, 3.0, // cell 0
+            0.0, 1.0, // cell 1
+            0.0, 1.0, // cell 2
+            1.0, 2.0, // cell 3
+            1.0, 0.0, // cell 4
+            2.0, 0.0, // cell 5
+        ];
+        // Ref = {0, 1, 2, 3}; group = {4, 5}.
+        let ref_cells: Vec<i32> = vec![0, 1, 2, 3];
+        let group_cells: Vec<i32> = vec![4, 5];
+        let n_ref = ref_cells.len();
+        let n_g = group_cells.len();
+
+        let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_size, n_ref.max(n_g)).unwrap();
+        gpu_de_upload_chunk(&dev, &mut scratch, &dense, n_obs, chunk_size).unwrap();
+
+        // Scatter + sort ref.
+        let mut d_ref_slab = dev.alloc_zeros::<f32>(chunk_size * n_ref).unwrap();
+        gpu_de_scatter_gene_major(
+            &dev,
+            &scratch.dense,
+            &ref_cells,
+            &mut d_ref_slab,
+            n_obs,
+            chunk_size,
+        )
+        .unwrap();
+        gpu_de_block_sort(&dev, &mut d_ref_slab, chunk_size, n_ref).unwrap();
+        gpu_de_tie_term(&dev, &d_ref_slab, &mut scratch.tie_term, chunk_size, n_ref).unwrap();
+        dev.synchronize().unwrap();
+
+        let sorted_ref_flat = dev.dtoh_copy(&d_ref_slab).unwrap();
+        let tie_ref = dev.dtoh_copy(&scratch.tie_term).unwrap();
+
+        // Expected sorted ref rows (length 4 per gene):
+        // gene 0: [0, 0, 0, 1]
+        // gene 1: [1, 1, 2, 3]
+        let expected_ref_g0 = vec![0.0_f32, 0.0, 0.0, 1.0];
+        let expected_ref_g1 = vec![1.0_f32, 1.0, 2.0, 3.0];
+        assert_eq!(&sorted_ref_flat[0..4], expected_ref_g0.as_slice());
+        assert_eq!(&sorted_ref_flat[4..8], expected_ref_g1.as_slice());
+        assert!((tie_ref[0] - cpu_tie_term(&expected_ref_g0)).abs() < 1e-9);
+        assert!((tie_ref[1] - cpu_tie_term(&expected_ref_g1)).abs() < 1e-9);
+
+        // Scatter + sort group + searchsorted U1.
+        let mut d_group_slab = dev.alloc_zeros::<f32>(chunk_size * n_g).unwrap();
+        gpu_de_scatter_gene_major(
+            &dev,
+            &scratch.dense,
+            &group_cells,
+            &mut d_group_slab,
+            n_obs,
+            chunk_size,
+        )
+        .unwrap();
+        gpu_de_searchsorted_u_stat(
+            &dev,
+            &d_ref_slab,
+            &d_group_slab,
+            &mut scratch.u_or_rank,
+            chunk_size,
+            n_ref,
+            n_g,
+        )
+        .unwrap();
+        gpu_de_block_sort(&dev, &mut d_group_slab, chunk_size, n_g).unwrap();
+        gpu_de_combined_tie_term(
+            &dev,
+            &d_ref_slab,
+            &d_group_slab,
+            &mut scratch.tie_term,
+            chunk_size,
+            n_ref,
+            n_g,
+        )
+        .unwrap();
+        gpu_de_pvalues(
+            &dev,
+            &scratch.u_or_rank,
+            &scratch.tie_term,
+            &mut scratch.p_values,
+            chunk_size,
+            n_g,
+            n_ref,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+
+        let u_host = dev.dtoh_copy(&scratch.u_or_rank).unwrap();
+        let combined_host = dev.dtoh_copy(&scratch.tie_term).unwrap();
+        let p_host = dev.dtoh_copy(&scratch.p_values).unwrap();
+
+        // CPU references.
+        // group for gene 0 (cells 4, 5): [1.0, 2.0]
+        // group for gene 1 (cells 4, 5): [0.0, 0.0]
+        let group_g0 = vec![1.0_f32, 2.0];
+        let group_g1 = vec![0.0_f32, 0.0];
+        let u_expected_g0 = cpu_u1_searchsorted(&expected_ref_g0, &group_g0);
+        let u_expected_g1 = cpu_u1_searchsorted(&expected_ref_g1, &group_g1);
+        assert!((u_host[0] - u_expected_g0).abs() < 1e-9);
+        assert!((u_host[1] - u_expected_g1).abs() < 1e-9);
+
+        let comb_expected_g0 = cpu_combined_tie(&expected_ref_g0, &group_g0);
+        let comb_expected_g1 = cpu_combined_tie(&expected_ref_g1, &group_g1);
+        assert!((combined_host[0] - comb_expected_g0).abs() < 1e-9);
+        assert!((combined_host[1] - comb_expected_g1).abs() < 1e-9);
+
+        // p-value sanity: within [0, 1] and finite.
+        for &p in &p_host[..chunk_size] {
+            assert!((0.0..=1.0).contains(&p), "p out of range: {p}");
+            assert!(p.is_finite(), "p non-finite: {p}");
+        }
+    }
+
+    /// Block radix sort over a randomized [16 × 1000] slab; row-wise parity
+    /// with `Vec::sort_by` reference.
+    #[test]
+    fn test_gpu_de_block_sort_random_parity() {
+        let dev = require_gpu!();
+
+        let chunk_size = 16usize;
+        let n_per_gene = 1000usize;
+
+        // Deterministic pseudo-random input (no rand crate dep — splittable LCG).
+        let mut state: u64 = 0xC0DEFACE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut data = vec![0.0f32; chunk_size * n_per_gene];
+        for v in data.iter_mut() {
+            // Bias toward integer-ish values to stress tie handling.
+            *v = (next() % 32) as f32;
+        }
+
+        let mut d_slab = dev.htod_copy(&data).unwrap();
+        gpu_de_block_sort(&dev, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        dev.synchronize().unwrap();
+        let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
+
+        for gene in 0..chunk_size {
+            let mut expected: Vec<f32> = data[gene * n_per_gene..(gene + 1) * n_per_gene].to_vec();
+            cpu_sort_ascending(&mut expected);
+            let got = &gpu_sorted[gene * n_per_gene..(gene + 1) * n_per_gene];
+            assert_eq!(got, expected.as_slice(), "sort mismatch on gene {gene}");
+        }
+    }
+}

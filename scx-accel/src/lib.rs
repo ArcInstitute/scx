@@ -11,6 +11,8 @@
 
 pub mod csc;
 pub mod diffexp;
+#[cfg(feature = "gpu")]
+pub mod diffexp_gpu;
 pub mod error;
 pub mod eval_metrics;
 pub mod harmony;
@@ -63,6 +65,11 @@ pub use pseudobulk::{
 pub use umap::{compute_umap, UmapResult};
 
 // GPU-accelerated variants (behind "gpu" feature)
+#[cfg(feature = "gpu")]
+pub use diffexp_gpu::{
+    pdex_ref_gpu_dense, pdex_ref_gpu_sparse, pdex_ref_gpu_streaming, wilcoxon_rank_sum_gpu_dense,
+    wilcoxon_rank_sum_gpu_sparse, wilcoxon_rank_sum_gpu_streaming,
+};
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]
