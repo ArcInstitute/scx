@@ -504,6 +504,13 @@ fn hvg_seurat_v3<'py>(
     // the UserWarning text promises.
     let mut batch_failed = vec![false; n_batches_actual];
 
+    // Hoist the loess import out of the per-batch closure so a missing
+    // or broken `skmisc.loess` fails fast with its real type
+    // (`ModuleNotFoundError` / `AttributeError`) instead of getting
+    // swallowed by the narrow `PyValueError` catch in the closure below.
+    let loess_mod = py.import("skmisc.loess")?;
+    let loess_cls = loess_mod.getattr("loess")?;
+
     for (b, batch_cells) in batches.iter().enumerate() {
         let batch_n = batch_cells.len();
         if batch_n < 2 {
@@ -537,8 +544,6 @@ fn hvg_seurat_v3<'py>(
             let y_arr = numpy::PyArray::from_vec(py, y_vals);
 
             let fit_result: PyResult<Vec<f64>> = (|| -> PyResult<Vec<f64>> {
-                let loess_mod = py.import("skmisc.loess")?;
-                let loess_cls = loess_mod.getattr("loess")?;
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("span", span)?;
                 kwargs.set_item("degree", 2)?;
@@ -560,19 +565,28 @@ fn hvg_seurat_v3<'py>(
                         }
                     }
                 }
-                Err(e) => {
-                    // Singular / under-determined LOESS (common on Census
-                    // dataset_id batches with few cells or near-collinear
-                    // log-mean / log-variance). Warn naming the batch and
-                    // mark it failed so step 5 and the rank step exclude
-                    // it from per-batch and cross-batch aggregation.
-                    // Cannot rely on `estimat_var == 0` to opt out — a
+                Err(e) if e.is_instance_of::<PyValueError>(py) => {
+                    // Singular / under-determined LOESS — `skmisc.loess`
+                    // raises `ValueError` ("There are other near
+                    // singularities…") on Census-style degenerate
+                    // batches. Warn naming the batch and mark it failed
+                    // so step 5 and the rank step exclude it from
+                    // per-batch and cross-batch aggregation. We cannot
+                    // rely on `estimat_var == 0` to opt out — a
                     // successful loess fit can legitimately produce zero
                     // entries, and downstream `reg_std_sq = 10^0 = 1` so
                     // a zero `estimat_var` would still pass the
                     // `reg_std_sq > 0` guard.
                     emit_hvg_loess_singularity_warning(py, b, batch_n, &e)?;
                     batch_failed[b] = true;
+                }
+                Err(e) => {
+                    // Any other PyErr (TypeError, RuntimeError,
+                    // MemoryError, etc.) is a real environmental issue,
+                    // not a benign singularity — propagate so the user
+                    // sees the real cause instead of a misleading
+                    // "this batch had a singular loess fit" warning.
+                    return Err(e);
                 }
             }
         }

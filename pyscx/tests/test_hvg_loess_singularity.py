@@ -63,6 +63,35 @@ def _patch_loess_to_raise_on_first_batch(monkeypatch):
     return state
 
 
+def _patch_loess_to_raise_runtime_error_on_first_batch(monkeypatch):
+    """Force `skmisc.loess.loess(...).fit()` to raise `RuntimeError` on
+    the first call — used to verify that the catch is narrowed to
+    `ValueError` (singularity) and that any other PyErr propagates.
+    """
+    import skmisc.loess as loess_mod
+
+    real_loess = loess_mod.loess
+    state = {"n_calls": 0}
+
+    class RuntimeFailingLoess:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_loess(*args, **kwargs)
+
+        def __getattr__(self, name):
+            if name == "fit":
+                state["n_calls"] += 1
+                if state["n_calls"] == 1:
+                    def _raise():
+                        raise RuntimeError(
+                            "simulated env breakage (not a singularity)"
+                        )
+
+                    return _raise
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(loess_mod, "loess", RuntimeFailingLoess)
+
+
 def _patch_loess_to_always_raise(monkeypatch):
     """Force every `skmisc.loess.loess(...).fit()` call to raise — used
     to exercise the all-batches-failed edge case.
@@ -305,5 +334,47 @@ def test_all_batches_failed_raises(
     ]
     assert len(sing) == n_batches, (
         f"expected {n_batches} per-batch warnings, got {len(sing)}: "
+        + "; ".join(str(w.message) for w in sing)
+    )
+
+
+def test_non_value_error_propagates_instead_of_warning(
+    synthetic_adata, scx_from_adata, monkeypatch
+):
+    """Errors other than `ValueError` from the loess fit must propagate
+    — not get swallowed by the singularity-warning catch.
+
+    Pre-narrowing, the `Err` arm caught every `PyErr` and emitted a
+    "this batch had a singular loess fit" warning, even for real
+    environment failures like `ModuleNotFoundError`, `TypeError`, or
+    `RuntimeError` — silently degrading HVG output and hiding the
+    real cause from the user. Post-narrowing, only `ValueError`
+    (the actual `skmisc.loess` singularity signature) is caught; any
+    other `PyErr` re-raises.
+    """
+    import pyscx
+
+    path = scx_from_adata(synthetic_adata, "hvg_runtime_propagate.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    _patch_loess_to_raise_runtime_error_on_first_batch(monkeypatch)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError, match="simulated env breakage"):
+            pyscx.accel.highly_variable_genes(
+                adata,
+                n_top_genes=10,
+                flavor="seurat_v3",
+                batch_key="batch",
+                device="cpu",
+            )
+
+    # The narrowed catch must NOT have surfaced this as a singularity.
+    sing = [
+        w for w in caught
+        if "skmisc.loess fit failed on batch" in str(w.message)
+    ]
+    assert not sing, (
+        "non-ValueError leaked into the singularity-warning path; got: "
         + "; ".join(str(w.message) for w in sing)
     )

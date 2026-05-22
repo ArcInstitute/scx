@@ -223,6 +223,12 @@ pub fn gpu_streaming_mean_var_batched(
     let mut batch_counts = vec![0usize; n_batches];
     let mut cell_offset: usize = 0;
 
+    // Single H2D copy of the full cell→batch mapping. `cell_batch` is
+    // small (~`n_obs × 4 B` bytes) and never changes during the pass —
+    // copying it per shard was pure waste. Each shard now slices into
+    // this device buffer instead.
+    let d_cell_batch: CudaSlice<i32> = dev.htod_copy(cell_batch)?;
+
     let loader = DoubleBufferedShardLoader::new(dev, source)?;
     loader.for_each_shard(|_idx, gpu_csr| {
         let shard_n_rows = gpu_csr.shape.0;
@@ -235,7 +241,7 @@ pub fn gpu_streaming_mean_var_batched(
                 batch_counts[b as usize] += 1;
             }
         }
-        let d_row_to_batch: CudaSlice<i32> = dev.htod_copy(window)?;
+        let d_row_to_batch = d_cell_batch.slice(cell_offset..cell_offset + shard_n_rows);
 
         let nnz_i64 = gpu_csr.data.len() as i64;
         let n_rows_i32 = shard_n_rows as i32;
@@ -348,14 +354,17 @@ pub fn gpu_streaming_clip_square_sum_batched(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("col_clip_sq_nonzeros_batched: {e}")))?;
 
     let mut cell_offset: usize = 0;
+    // Single H2D copy of `cell_batch`; sliced per shard inside the loop.
+    // See `gpu_streaming_mean_var_batched` for rationale.
+    let d_cell_batch: CudaSlice<i32> = dev.htod_copy(cell_batch)?;
+
     let loader = DoubleBufferedShardLoader::new(dev, source)?;
     loader.for_each_shard(|_idx, gpu_csr| {
         let shard_n_rows = gpu_csr.shape.0;
         if shard_n_rows == 0 {
             return Ok(());
         }
-        let window = &cell_batch[cell_offset..cell_offset + shard_n_rows];
-        let d_row_to_batch: CudaSlice<i32> = dev.htod_copy(window)?;
+        let d_row_to_batch = d_cell_batch.slice(cell_offset..cell_offset + shard_n_rows);
 
         let nnz_i64 = gpu_csr.data.len() as i64;
         let n_rows_i32 = shard_n_rows as i32;
