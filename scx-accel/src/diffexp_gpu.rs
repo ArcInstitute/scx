@@ -1057,11 +1057,11 @@ fn compute_pdex_means_gpu(
         .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh pseudobulk sums: {e}")))?;
 
     // Group 0 = reference.
-    let mut ref_means = Vec::with_capacity(chunk_size);
-    for var in 0..chunk_size {
-        let s = host_sums[var];
-        ref_means.push(mode.post(if n_ref == 0 { 0.0 } else { s / n_ref as f64 }));
-    }
+    let ref_means: Vec<f64> = host_sums
+        .iter()
+        .take(chunk_size)
+        .map(|&s| mode.post(if n_ref == 0 { 0.0 } else { s / n_ref as f64 }))
+        .collect();
 
     // Groups 1..=n_test = test groups, in input order.
     let mut target_means: Vec<Vec<f64>> = Vec::with_capacity(n_test);

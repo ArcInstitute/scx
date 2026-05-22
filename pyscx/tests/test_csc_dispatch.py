@@ -189,6 +189,7 @@ def test_rank_genes_groups_csc_raises_on_csr_only(small_adata, tmp_path):
 
 
 def test_pdex_ref_csc_matches_csr(small_adata, tmp_path):
+    pytest.importorskip("polars")  # pdex_ref() returns a polars DataFrame
     import pyscx
 
     a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
