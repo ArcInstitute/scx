@@ -229,23 +229,23 @@ def _gpu_available() -> bool:
     reason="CUDA GPU not available — narrow-fallback warning is GPU-only",
 )
 def test_gpu_fallback_warning_includes_device_string(scx_path):
-    """When the GPU HVG path is narrowed to CPU (batched / non-seurat_v3),
+    """When the GPU HVG path is narrowed to CPU (non-`seurat_v3` flavor),
     the `UserWarning` must echo the user's `device` string so that an
     explicit `gpu:N` index isn't silently dropped without acknowledgment.
+
+    `flavor="seurat"` is the remaining narrowing trigger: `batch_key` is
+    now supported on the GPU `seurat_v3` path via per-batch kernels.
     """
     import pyscx
 
     adata = pyscx.open(scx_path).to_anndata(backed=True)
-    # batch_key forces the narrowing branch in hvg.rs.
-    adata.obs["batch"] = ["A"] * (adata.shape[0] // 2) + ["B"] * (
-        adata.shape[0] - adata.shape[0] // 2
-    )
+    pyscx.accel.normalize_total(adata)
+    pyscx.accel.log1p(adata)
 
     with pytest.warns(UserWarning, match=r'device="gpu:0"'):
         pyscx.accel.highly_variable_genes(
             adata,
             n_top_genes=20,
-            flavor="seurat_v3",
-            batch_key="batch",
+            flavor="seurat",
             device="gpu:0",
         )

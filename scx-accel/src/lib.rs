@@ -66,7 +66,10 @@ pub use umap::{compute_umap, UmapResult};
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]
-pub use hvg::{streaming_clip_square_sum_with_device, streaming_mean_var_with_device};
+pub use hvg::{
+    streaming_clip_square_sum_batched_with_device, streaming_clip_square_sum_with_device,
+    streaming_mean_var_batched_with_device, streaming_mean_var_with_device,
+};
 #[cfg(feature = "gpu")]
 pub use neighbors::{build_knn_graph_gpu, cuvs_available};
 #[cfg(feature = "gpu")]

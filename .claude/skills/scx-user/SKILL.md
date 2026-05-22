@@ -285,6 +285,10 @@ adata = exp.to_anndata(backed=True)
 print(f"open+backed: {time.time()-t0:.1f}s, shape={adata.shape}")
 
 # HVG on raw counts — seurat_v3 expects counts, so run before normalize/log1p.
+# The GPU seurat_v3 path supports batch_key via per-batch atomicAdd kernels
+# (per-batch loess fits stay on CPU). If a batch's loess fit is too
+# degenerate (small batch, near-collinear log-mean/log-variance), the call
+# emits a UserWarning naming the batch and skips it from the ranking.
 accel.highly_variable_genes(adata, n_top_genes=3000, flavor="seurat_v3",
                             batch_key="dataset_id", device="gpu")
 adata = adata[:, adata.var["highly_variable"]].copy()
