@@ -841,9 +841,14 @@ a single fused pass), or operate on a backed SCX dataset.
 
 **HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
 through GPU atomicAdd kernels for `streaming_mean_var` and
-`streaming_clip_square_sum`. GPU dispatch is active only for single-batch
-seurat_v3 flavors today; `batch_key` set or `flavor="seurat"` falls back to
-CPU with a `UserWarning`.
+`streaming_clip_square_sum`, including per-batch variants when `batch_key`
+is set. GPU dispatch is active for any `seurat_v3` configuration regardless
+of `batch_key`; `flavor="seurat"` still falls back to CPU with a
+`UserWarning`. The per-batch loess fits run on CPU via `skmisc.loess` — a
+batch whose log-mean / log-variance regression is too degenerate to fit
+(small batch sizes, near-collinear inputs) is caught, surfaced as a
+`UserWarning` naming the batch, and excluded from the per-batch ranking;
+other batches proceed normally.
 
 
 ### Quick example

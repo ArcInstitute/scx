@@ -288,3 +288,86 @@ extern "C" __global__ void outer_sub_kernel(
 
     Z[idx] -= mu[row] * sum_q[col];
 }
+
+// Per-(batch, column) nonzero accumulation: Σ x and Σ x² in f64 grouped by batch.
+//
+// indptr:        [n_rows+1]    CSR row pointers (i64)
+// indices:       [nnz]         column index per nonzero
+// data:          [nnz]         f32 value per nonzero
+// row_to_batch:  [n_rows]      batch id per row (or -1 to skip the row)
+// col_sum_per_batch:    [n_batches × n_vars] f64 accumulators (caller zero-inits)
+// col_sum_sq_per_batch: [n_batches × n_vars] f64 accumulators (caller zero-inits)
+//
+// Layout for the per-batch buffers: row-major over (batch, gene), i.e.
+//   col_sum_per_batch[b * n_vars + c]
+//
+// Thread-per-row. Each thread reads its row's batch from row_to_batch[],
+// skips when -1, and scans that row's nonzero range atomic-adding into the
+// (b, col) slot. f64 atomicAdd (requires compute 6.x+).
+extern "C" __global__ void col_sum_sq_nonzeros_batched_kernel(
+    const long long* __restrict__ indptr,
+    const int* __restrict__ indices,
+    const float* __restrict__ data,
+    const int* __restrict__ row_to_batch,
+    int n_rows,
+    int n_vars,
+    int n_batches,
+    double* __restrict__ col_sum_per_batch,
+    double* __restrict__ col_sum_sq_per_batch
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    int b = row_to_batch[row];
+    if (b < 0 || b >= n_batches) return;
+
+    long long row_base = (long long)b * (long long)n_vars;
+    long long start = indptr[row];
+    long long end = indptr[row + 1];
+    for (long long i = start; i < end; ++i) {
+        int c = indices[i];
+        double v = (double)data[i];
+        atomicAdd(&col_sum_per_batch[row_base + c], v);
+        atomicAdd(&col_sum_sq_per_batch[row_base + c], v * v);
+    }
+}
+
+// Per-(batch, column) clipped nonzero accumulation:
+//   Σ min(x, clip[b, c]) and Σ min(x, clip[b, c])²
+//
+// indptr, indices, data, row_to_batch: same layout as the batched mean/var kernel.
+// clip_val_per_batch:    [n_batches × n_vars] f64 clip threshold per (batch, gene)
+// batch_sum_per_batch:    [n_batches × n_vars] Σ clipped_v
+// sq_batch_sum_per_batch: [n_batches × n_vars] Σ clipped_v²
+//
+// Thread-per-row. Mirrors the unbatched col_clip_sq_nonzeros_kernel but groups
+// the output by row's batch and indexes clip_val by that batch's row in the
+// flat (n_batches × n_vars) buffer.
+extern "C" __global__ void col_clip_sq_nonzeros_batched_kernel(
+    const long long* __restrict__ indptr,
+    const int* __restrict__ indices,
+    const float* __restrict__ data,
+    const int* __restrict__ row_to_batch,
+    int n_rows,
+    int n_vars,
+    int n_batches,
+    const double* __restrict__ clip_val_per_batch,
+    double* __restrict__ batch_sum_per_batch,
+    double* __restrict__ sq_batch_sum_per_batch
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    int b = row_to_batch[row];
+    if (b < 0 || b >= n_batches) return;
+
+    long long row_base = (long long)b * (long long)n_vars;
+    long long start = indptr[row];
+    long long end = indptr[row + 1];
+    for (long long i = start; i < end; ++i) {
+        int c = indices[i];
+        double v = (double)data[i];
+        double cv = clip_val_per_batch[row_base + c];
+        double vc = v > cv ? cv : v;
+        atomicAdd(&batch_sum_per_batch[row_base + c], vc);
+        atomicAdd(&sq_batch_sum_per_batch[row_base + c], vc * vc);
+    }
+}

@@ -81,7 +81,10 @@ pub use gpu_harmony::{
     gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy, gpu_harmony_softmax,
     gpu_harmony_softmax_penalty, gpu_harmony_z_sum,
 };
-pub use gpu_hvg::{gpu_streaming_clip_square_sum, gpu_streaming_mean_var};
+pub use gpu_hvg::{
+    gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched, gpu_streaming_mean_var,
+    gpu_streaming_mean_var_batched,
+};
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
 pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
 pub use gpu_pca_covariance::gpu_covariance_pca;

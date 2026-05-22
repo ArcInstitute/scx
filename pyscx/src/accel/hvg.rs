@@ -19,10 +19,17 @@ use super::filtering::update_layers_col_projection;
 ///
 /// With `device="gpu"`, the per-column mean/variance and clipped-sum kernels
 /// run on GPU (see `scx_gpu::gpu_streaming_mean_var` /
-/// `gpu_streaming_clip_square_sum`). The loess fit, ranking, and result
-/// writing stay on CPU. GPU dispatch is only used for **single-batch
-/// seurat_v3** runs today; other configurations (`batch_key` set, or
-/// `flavor="seurat"`) silently fall back to CPU even when `device="gpu"`.
+/// `gpu_streaming_clip_square_sum`, plus the batched variants used when
+/// `batch_key` is set). The loess fit, ranking, and result writing stay on
+/// CPU. The GPU path runs for any `seurat_v3` configuration regardless of
+/// `batch_key`; `flavor="seurat"` still falls back to CPU (a single warning
+/// is emitted in that case).
+///
+/// Per-batch loess fits are run via `skmisc.loess`. If a batch's variance
+/// structure is too degenerate for loess (small batch sizes, near-singular
+/// log-mean / log-variance regression), the fit is caught, a UserWarning is
+/// emitted naming the batch index and size, and that batch is excluded from
+/// the per-batch normalised-variance ranking. Other batches proceed normally.
 ///
 /// Args:
 ///     adata: AnnData with X as ScxBackedSparseDataset or ScxLazyTransformedDataset
@@ -93,21 +100,21 @@ pub fn highly_variable_genes<'py>(
         return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor);
     }
     let resolved = super::gpu::resolve_device(device)?;
-    // GPU path is only supported for single-batch seurat_v3; emit a warning
-    // and fall back to CPU otherwise so the call succeeds with correct results.
+    // GPU path is supported for any seurat_v3 / seurat_v3_paper config
+    // (including multi-batch via per-batch kernels). For flavor="seurat" the
+    // GPU kernels don't apply — fall back to CPU with a single warning.
     #[cfg(feature = "gpu")]
     let effective_gpu_id: Option<usize> = if let Some(gid) = resolved.gpu_id() {
         let seurat_v3 = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
-        if batch_key.is_some() || !seurat_v3 {
+        if !seurat_v3 {
             let warnings = py.import("warnings")?;
             warnings.call_method1(
                 "warn",
                 (
                     format!(
-                        "highly_variable_genes(device={device:?}) is only implemented \
-                         for single-batch seurat_v3 flavors; falling back to CPU \
-                         (the requested GPU index is ignored). To use the GPU path, \
-                         pass flavor=\"seurat_v3\" with batch_key=None."
+                        "highly_variable_genes(device={device:?}) GPU path is only \
+                         implemented for flavor=\"seurat_v3\" (or \"seurat_v3_paper\"); \
+                         falling back to CPU for flavor={flavor:?}."
                     ),
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
@@ -315,6 +322,37 @@ fn hvg_on_source<'py>(
     }
 }
 
+/// Emit a UserWarning when `skmisc.loess.fit()` raises on a single batch.
+///
+/// Names the failing batch (index + cell count) and the upstream error string
+/// so the user can either drop the batch_key, switch to flavor="seurat" post-
+/// normalize, or pre-filter low-expression genes. The failing batch is then
+/// excluded from the per-batch normalised-variance ranking — semantics
+/// identical to a batch with too few non-constant genes.
+fn emit_hvg_loess_singularity_warning(
+    py: Python<'_>,
+    batch_idx: usize,
+    batch_n: usize,
+    err: &PyErr,
+) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    let msg = format!(
+        "highly_variable_genes(flavor=\"seurat_v3\"): skmisc.loess fit failed on \
+         batch index {batch_idx} (n={batch_n} cells) — {err}. This batch will be \
+         excluded from the per-batch HVG ranking; other batches proceed normally. \
+         Common causes: very small batches, near-collinear log-mean / log-variance, \
+         or many zero-variance genes within this batch. To avoid this, either \
+         pre-filter low-expression genes via pyscx.accel.filter_genes(min_cells=10) \
+         before HVG, switch to flavor=\"seurat\" post-normalize, or drop the \
+         offending batch from batch_key."
+    );
+    warnings.call_method1(
+        "warn",
+        (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
+    )?;
+    Ok(())
+}
+
 /// Build a LazyShardSource, optionally filtered to a batch of cells.
 fn build_shard_source(
     reader: &Arc<scx_format::BackedCsrReader>,
@@ -426,19 +464,21 @@ fn hvg_seurat_v3<'py>(
         n_vars,
         None,
     );
-    // Single-batch + GPU: route to `streaming_mean_var_with_device` for the
-    // GPU atomicAdd accumulation path. Multi-batch stays on CPU because the
-    // GPU kernel doesn't carry per-cell batch membership today.
+    // GPU path: per-batch streaming mean/var via the batched device wrapper.
+    // The wrapper finalises Bessel-corrected means/variances and the global
+    // accumulator on host, matching the CPU formula byte-for-byte.
     #[cfg(feature = "gpu")]
-    let batched_stats = if let (Some(dev_id), 1) = (_device_id, n_batches_actual) {
-        let single = py
-            .allow_threads(|| scx_accel::streaming_mean_var_with_device(&source, "gpu", dev_id))
-            .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var: {e}")))?;
-        scx_accel::BatchedHvgStats {
-            per_batch: vec![single.clone()],
-            global: single,
-            batch_counts: vec![n_obs],
-        }
+    let batched_stats = if let Some(dev_id) = _device_id {
+        py.allow_threads(|| {
+            scx_accel::streaming_mean_var_batched_with_device(
+                &source,
+                &cell_batch,
+                n_batches_actual,
+                "gpu",
+                dev_id,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var_batched: {e}")))?
     } else {
         py.allow_threads(|| {
             scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
@@ -457,6 +497,19 @@ fn hvg_seurat_v3<'py>(
     // ── 3. Per-batch: loess fit → clip_val (in-memory, no I/O) ───────────
     let mut all_clip_vals: Vec<Vec<f64>> = Vec::new();
     let mut batch_estimat_vars: Vec<Vec<f64>> = Vec::new();
+    // Tracks which batches had their per-batch loess fit fail (singular /
+    // under-determined). Failed batches are skipped in step 5's
+    // per-batch normalised-variance computation and excluded from the
+    // cross-batch mean and median-rank aggregations below — the contract
+    // the UserWarning text promises.
+    let mut batch_failed = vec![false; n_batches_actual];
+
+    // Hoist the loess import out of the per-batch closure so a missing
+    // or broken `skmisc.loess` fails fast with its real type
+    // (`ModuleNotFoundError` / `AttributeError`) instead of getting
+    // swallowed by the narrow `PyValueError` catch in the closure below.
+    let loess_mod = py.import("skmisc.loess")?;
+    let loess_cls = loess_mod.getattr("loess")?;
 
     for (b, batch_cells) in batches.iter().enumerate() {
         let batch_n = batch_cells.len();
@@ -490,23 +543,50 @@ fn hvg_seurat_v3<'py>(
             let x_arr = numpy::PyArray::from_vec(py, x_vals);
             let y_arr = numpy::PyArray::from_vec(py, y_vals);
 
-            let loess_mod = py.import("skmisc.loess")?;
-            let loess_cls = loess_mod.getattr("loess")?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("span", span)?;
-            kwargs.set_item("degree", 2)?;
-            let model = loess_cls.call((x_arr, y_arr), Some(&kwargs))?;
-            model.call_method0("fit")?;
-            let fitted: Vec<f64> = model
-                .getattr("outputs")?
-                .getattr("fitted_values")?
-                .extract()?;
+            let fit_result: PyResult<Vec<f64>> = (|| -> PyResult<Vec<f64>> {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("span", span)?;
+                kwargs.set_item("degree", 2)?;
+                let model = loess_cls.call((x_arr, y_arr), Some(&kwargs))?;
+                model.call_method0("fit")?;
+                model
+                    .getattr("outputs")?
+                    .getattr("fitted_values")?
+                    .extract::<Vec<f64>>()
+            })();
 
-            let mut fi = 0;
-            for (j, &nc) in not_const.iter().enumerate() {
-                if nc {
-                    estimat_var[j] = fitted[fi];
-                    fi += 1;
+            match fit_result {
+                Ok(fitted) => {
+                    let mut fi = 0;
+                    for (j, &nc) in not_const.iter().enumerate() {
+                        if nc {
+                            estimat_var[j] = fitted[fi];
+                            fi += 1;
+                        }
+                    }
+                }
+                Err(e) if e.is_instance_of::<PyValueError>(py) => {
+                    // Singular / under-determined LOESS — `skmisc.loess`
+                    // raises `ValueError` ("There are other near
+                    // singularities…") on Census-style degenerate
+                    // batches. Warn naming the batch and mark it failed
+                    // so step 5 and the rank step exclude it from
+                    // per-batch and cross-batch aggregation. We cannot
+                    // rely on `estimat_var == 0` to opt out — a
+                    // successful loess fit can legitimately produce zero
+                    // entries, and downstream `reg_std_sq = 10^0 = 1` so
+                    // a zero `estimat_var` would still pass the
+                    // `reg_std_sq > 0` guard.
+                    emit_hvg_loess_singularity_warning(py, b, batch_n, &e)?;
+                    batch_failed[b] = true;
+                }
+                Err(e) => {
+                    // Any other PyErr (TypeError, RuntimeError,
+                    // MemoryError, etc.) is a real environmental issue,
+                    // not a benign singularity — propagate so the user
+                    // sees the real cause instead of a misleading
+                    // "this batch had a singular loess fit" warning.
+                    return Err(e);
                 }
             }
         }
@@ -524,20 +604,35 @@ fn hvg_seurat_v3<'py>(
         batch_estimat_vars.push(estimat_var);
     }
 
+    // Surviving batches (per-batch loess fit succeeded). If all batches
+    // failed there's nothing to rank against and dividing by zero in the
+    // cross-batch average below would silently produce NaN HVGs — raise
+    // so the user sees the per-batch UserWarnings as the cause.
+    let n_valid_batches = batch_failed.iter().filter(|&&f| !f).count();
+    if n_valid_batches == 0 {
+        return Err(PyRuntimeError::new_err(format!(
+            "highly_variable_genes(flavor=\"seurat_v3\"): all {n_batches_actual} \
+             batches failed skmisc.loess fitting; see prior UserWarnings for \
+             per-batch causes."
+        )));
+    }
+
     // ── 4. Batched streaming clipped sums (single pass for ALL batches) ──
     #[cfg(feature = "gpu")]
-    let all_clipped = if let (Some(dev_id), 1) = (_device_id, n_batches_actual) {
-        let single = py
-            .allow_threads(|| {
-                scx_accel::streaming_clip_square_sum_with_device(
-                    &source,
-                    &all_clip_vals[0],
-                    "gpu",
-                    dev_id,
-                )
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum: {e}")))?;
-        vec![single]
+    let all_clipped = if let Some(dev_id) = _device_id {
+        py.allow_threads(|| {
+            scx_accel::streaming_clip_square_sum_batched_with_device(
+                &source,
+                &cell_batch,
+                n_batches_actual,
+                &all_clip_vals,
+                "gpu",
+                dev_id,
+            )
+        })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum_batched: {e}"))
+        })?
     } else {
         py.allow_threads(|| {
             scx_accel::streaming_clip_square_sum_batched(
@@ -565,7 +660,9 @@ fn hvg_seurat_v3<'py>(
     let mut all_norm_vars: Vec<Vec<f64>> = Vec::new();
     for (b, batch_cells) in batches.iter().enumerate() {
         let batch_n = batch_cells.len();
-        if batch_n < 2 {
+        if batch_n < 2 || batch_failed[b] {
+            // Push a zero row so `all_norm_vars` stays indexable by batch
+            // id; the rank step skips these by index via `batch_failed`.
             all_norm_vars.push(vec![0.0; n_vars]);
             continue;
         }
@@ -589,27 +686,42 @@ fn hvg_seurat_v3<'py>(
     }
 
     // ── 4. Rank genes and select top N ──────────────────────────────────
-    let n_batches = all_norm_vars.len();
-
-    // Mean normalized variance across batches
+    // Mean normalized variance across **surviving** batches only. Failed
+    // batches contributed a zero row to `all_norm_vars` (see step 5) but
+    // must not enter the average — we divide by `n_valid_batches`, not
+    // `all_norm_vars.len()`.
     let mut mean_norm_var = vec![0.0f64; n_vars];
-    for nv in &all_norm_vars {
+    for (b, nv) in all_norm_vars.iter().enumerate() {
+        if batch_failed[b] {
+            continue;
+        }
         for (j, &v) in nv.iter().enumerate() {
             mean_norm_var[j] += v;
         }
     }
     for v in &mut mean_norm_var {
-        *v /= n_batches as f64;
+        *v /= n_valid_batches as f64;
     }
 
-    // For multi-batch: rank within each batch, then combine ranks
-    let (hvg_mask, ranks) = if n_batches > 1 {
-        // Per-batch ranks: for each batch, rank genes by normalized variance (descending)
+    // Multi-batch ranking when more than one batch survived. When only
+    // one batch survives (`n_valid_batches == 1`), `mean_norm_var` equals
+    // that batch's `norm_gene_var`, so the single-batch ranking branch
+    // produces the same HVG mask as a direct 1-batch run on that batch
+    // alone — that's the contract the parity test in
+    // tests/test_hvg_loess_singularity.py asserts.
+    let (hvg_mask, ranks) = if n_valid_batches > 1 {
+        // Per-batch ranks: for each surviving batch, rank genes by
+        // normalized variance (descending). Failed batches are skipped
+        // so they neither cast a rank vote nor count toward
+        // `nbatches_hv` / `median_ranks`.
         let mut batch_ranks: Vec<Vec<usize>> = Vec::new();
-        for nv in &all_norm_vars {
+        for (b, nv) in all_norm_vars.iter().enumerate() {
+            if batch_failed[b] {
+                continue;
+            }
             let mut indices: Vec<usize> = (0..n_vars).collect();
-            indices.sort_by(|&a, &b| {
-                nv[b]
+            indices.sort_by(|&a, &c| {
+                nv[c]
                     .partial_cmp(&nv[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
