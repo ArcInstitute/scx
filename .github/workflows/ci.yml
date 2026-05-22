@@ -108,8 +108,17 @@ jobs:
       # widened cap rather than whatever pyarrow pip happens to resolve.
       # `torch` is added so `pyscx/tests/test_fork_safety.py` runs
       # instead of being skipped via `pytest.importorskip("torch")`.
-      # CPU build only — the fork-safety test does no GPU work.
-      - run: python -m venv .venv && . .venv/bin/activate && pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv "torch>=2.0;sys_platform=='linux'"
+      # CPU build only — the fork-safety test does no GPU work. Install
+      # torch from PyTorch's CPU-only index URL; the default PyPI torch
+      # wheel on Linux pulls a >1 GB CUDA cascade (cuda_toolkit, cudnn,
+      # cusparselt, nccl, nvshmem, triton) that has timed out mid-download
+      # at PyPI in past runs and is wasted bandwidth on a CPU runner.
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0;sys_platform=='linux'"
+          pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv
       # libhdf5 is needed by the `hdf5` pyscx feature, which exposes
       # `pyscx.from_h5ad` and the backed-AnnData → streaming router that
       # `tests/test_streaming_conversion.py` exercises.
