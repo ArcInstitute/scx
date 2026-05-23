@@ -17,7 +17,7 @@ pub fn run_compact(
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
-    index_auto_threshold: usize,
+    index_auto_threshold: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate input exists
     if !input.exists() {
@@ -46,15 +46,26 @@ pub fn run_compact(
     pb.set_message(format!("Compacting {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // Call scx_ops::compact with predicate-index options.
-    let index_options = ConversionPredicateIndexOptions {
-        index_obs,
-        index_var,
-        index_preset,
-        index_auto_threshold,
-    };
-    let summary = scx_ops::compact_with_index_options(input, output, &index_options)?;
-    emit_index_summary("compact", &summary);
+    // Route to `compact` (drops predicate indexes — pre-fix default) when
+    // no `--index-*` flag is set, and to `compact_with_index_options`
+    // (rebuilds / auto-detects) when at least one flag is set.
+    // `--index-auto-threshold N` alone reaches the engine.
+    let any_index_flag = !index_obs.is_empty()
+        || !index_var.is_empty()
+        || index_preset.is_some()
+        || index_auto_threshold.is_some();
+    if any_index_flag {
+        let index_options = ConversionPredicateIndexOptions {
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold: index_auto_threshold.unwrap_or(1000),
+        };
+        let summary = scx_ops::compact_with_index_options(input, output, &index_options)?;
+        emit_index_summary("compact", &summary);
+    } else {
+        scx_ops::compact(input, output)?;
+    }
 
     pb.finish_and_clear();
 

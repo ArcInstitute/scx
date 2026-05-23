@@ -61,6 +61,12 @@ pub enum OpsError {
     #[error("codec error: {0}")]
     Codec(#[from] scx_codec::CodecError),
 
+    #[error("engine error: {0}")]
+    Engine(#[from] scx_engine::EngineError),
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("modality mismatch on merge: {detail}")]
     ModalityMismatch { detail: String },
 

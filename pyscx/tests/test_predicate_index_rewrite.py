@@ -158,3 +158,7 @@ def test_merge_unknown_forced_column_raises(tmp_dir):
             str(out),
             index_obs=["nonexistent_column"],
         )
+    # Issue 1 (P1) — upfront validation must fail BEFORE the merged
+    # output is created. A user who retries on ValueError should not
+    # see a stale merged file from the prior attempt.
+    assert not out.exists(), "merged output must not be on disk after ValueError"

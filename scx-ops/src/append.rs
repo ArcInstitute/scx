@@ -24,7 +24,9 @@ use scx_format::writer::ScxWriter;
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
-use crate::predicate_index::{index_requested, requested_columns, PredicateIndexBuildSummary};
+use crate::predicate_index::{
+    requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+};
 use crate::rollback::build_root_catalog_from_full;
 
 /// Options controlling how new rows are appended to an SCX file.
@@ -77,6 +79,7 @@ pub fn append(
     value_encoding: ValueEncoding,
     options: &AppendOptions,
 ) -> Result<()> {
+    // See `merge` for the `index_auto_threshold = 0` sentinel rationale.
     append_with_index_options(
         target_path,
         new_obs,
@@ -85,7 +88,12 @@ pub fn append(
         new_values,
         value_encoding,
         options,
-        &ConversionPredicateIndexOptions::default(),
+        &ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        },
     )
     .map(|_| ())
 }
@@ -171,7 +179,7 @@ pub fn append_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence.
-    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
+    let old_obs = read_existing_arrow_ipc_section(&mut lock, &prep.old_catalog, "obs")?;
     validate_obs_schema(&old_obs, new_obs)?;
 
     // Seek to EOF for appending and run the per-chunk write loop.
@@ -262,12 +270,18 @@ pub fn append_from_reader(
     options: &AppendOptions,
     source_modality_id: u8,
 ) -> Result<()> {
+    // See `merge` for the `index_auto_threshold = 0` sentinel rationale.
     append_from_reader_with_index_options(
         target_path,
         source,
         options,
         source_modality_id,
-        &ConversionPredicateIndexOptions::default(),
+        &ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        },
     )
     .map(|_| ())
 }
@@ -337,7 +351,7 @@ pub fn append_from_reader_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence (before writing).
-    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
+    let old_obs = read_existing_arrow_ipc_section(&mut lock, &prep.old_catalog, "obs")?;
     validate_obs_schema(&old_obs, &new_obs)?;
 
     // Per-source-shard streaming loop.
@@ -599,15 +613,22 @@ fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, Appe
     ))
 }
 
-/// Read the target file's existing obs Arrow IPC section as a `RecordBatch`,
-/// downcasting LargeUtf8/LargeBinary to their narrow forms so downstream
-/// schema comparison works regardless of when the file was written.
-fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
-    let obs_entry = old_catalog.get("obs").ok_or_else(|| {
-        OpsError::Format(scx_format::ScxError::SectionNotFound("obs".to_string()))
+/// Read an existing Arrow IPC metadata section (`"obs"` or `"var"`) back
+/// into a `RecordBatch`, downcasting `LargeUtf8` / `LargeBinary` to their
+/// narrow forms so downstream schema comparison works regardless of when
+/// the file was written.
+fn read_existing_arrow_ipc_section(
+    lock: &mut FileLock,
+    old_catalog: &FullCatalog,
+    section_name: &str,
+) -> Result<RecordBatch> {
+    let entry = old_catalog.get(section_name).ok_or_else(|| {
+        OpsError::Format(scx_format::ScxError::SectionNotFound(
+            section_name.to_string(),
+        ))
     })?;
-    lock.seek(SeekFrom::Start(obs_entry.offset))?;
-    let mut buf = vec![0u8; obs_entry.length as usize];
+    lock.seek(SeekFrom::Start(entry.offset))?;
+    let mut buf = vec![0u8; entry.length as usize];
     std::io::Read::read_exact(&mut *lock, &mut buf)?;
     let cursor = Cursor::new(buf);
     let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
@@ -615,7 +636,7 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
     let batch = batches.next().ok_or_else(|| {
         OpsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "obs section contains no batches",
+            format!("{section_name} section contains no batches"),
         ))
     })??;
     scx_format::downcast_large_types(&batch).map_err(OpsError::Format)
@@ -947,6 +968,35 @@ fn finalize_append(
         concat_batches(&old_unified.schema(), &[old_unified, new_unified])?
     };
     let merged_obs = scx_format::upcast_to_large_types(&merged_obs).map_err(OpsError::Format)?;
+
+    // Multimodal-skip vs single-modality rebuild decision.
+    // `user_wants_index` treats a non-zero `index_auto_threshold` as an
+    // explicit request — fixes the pre-fix bug where
+    // `--index-auto-threshold N` alone was a no-op.
+    let target_is_multimodal = prep.modality_table.is_some();
+    let want_index = user_wants_index(index_options);
+    let multimodal_skip = if target_is_multimodal && want_index {
+        Some(requested_columns(index_options))
+    } else {
+        None
+    };
+    let rebuild_index = want_index && !target_is_multimodal;
+
+    // Fail fast (before any catalog updates) if forced index columns
+    // are missing. The shard-write loop already ran upstream, so on
+    // error the file still reads as pre-append (the header still
+    // points to the old catalog); the orphaned shard bytes are
+    // recoverable via `scx compact`.
+    //
+    // The var read seeks the lock's cursor away from `write_offset`;
+    // we restore it below so the subsequent alignment-padding /
+    // obs-IPC writes land in the right place.
+    if rebuild_index {
+        let var_schema = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
+        validate_forced_columns(index_options, &merged_obs.schema(), &var_schema.schema())?;
+        lock.seek(SeekFrom::Start(write_offset))?;
+    }
+
     let obs_ipc_bytes = {
         let mut buf = Vec::new();
         let mut writer =
@@ -964,20 +1014,9 @@ fn finalize_append(
     let new_obs_checksum = blake3_hash(&obs_ipc_bytes);
     write_offset += new_obs_length;
 
-    // Predicate-index rebuild (single-modality only). Multimodal
-    // targets surface the request via `multimodal_skip` and write no
-    // section — see `crate::predicate_index` for the rationale.
-    let target_is_multimodal = prep.modality_table.is_some();
-    let want_index = index_requested(index_options);
-    let multimodal_skip = if target_is_multimodal && want_index {
-        Some(requested_columns(index_options))
-    } else {
-        None
-    };
-
     let mut predicate_index_section_entries: Vec<FullCatalogEntry> = Vec::new();
-    let drop_old_predicate_indexes = want_index && !target_is_multimodal;
-    let index_result = if want_index && !target_is_multimodal {
+    let drop_old_predicate_indexes = rebuild_index;
+    let index_result = if rebuild_index {
         // Per-output-shard `(row_start, row_end)` for the full obs:
         // existing CSR shards (modality_id == 0) sorted by row_start,
         // plus the freshly-appended shards in append order.
@@ -996,7 +1035,7 @@ fn finalize_append(
         );
 
         // var is untouched by append — read from the existing catalog.
-        let var = read_existing_var(lock, &prep.old_catalog)?;
+        let var = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
 
         // Hand the open file off to `ScxWriter` for the section emits.
         // The `FileLock` retains the OS-level lock through the
@@ -1013,8 +1052,7 @@ fn finalize_append(
             &shard_row_ranges,
             prep.target_n_vars as usize,
             index_options,
-        )
-        .map_err(|e| OpsError::Io(std::io::Error::other(format!("build predicate index: {e}"))))?;
+        )?;
         let (cloned_file, new_offset, new_entries) = writer.into_in_place_parts()?;
         drop(cloned_file);
         // Resync the lock's cursor to the new EOF so subsequent
@@ -1251,28 +1289,6 @@ fn finalize_append(
         result: index_result,
         multimodal_skip,
     })
-}
-
-/// Read the existing `var` Arrow IPC section back into a `RecordBatch`.
-/// Mirrors `read_existing_obs` — same `LargeUtf8 → Utf8` downcast so the
-/// returned schema matches what the predicate-index builder expects.
-fn read_existing_var(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
-    let var_entry = old_catalog.get("var").ok_or_else(|| {
-        OpsError::Format(scx_format::ScxError::SectionNotFound("var".to_string()))
-    })?;
-    lock.seek(SeekFrom::Start(var_entry.offset))?;
-    let mut buf = vec![0u8; var_entry.length as usize];
-    std::io::Read::read_exact(&mut *lock, &mut buf)?;
-    let cursor = Cursor::new(buf);
-    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-    let mut batches = reader.into_iter();
-    let batch = batches.next().ok_or_else(|| {
-        OpsError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "var section contains no batches",
-        ))
-    })??;
-    scx_format::downcast_large_types(&batch).map_err(OpsError::Format)
 }
 
 /// Return the effective (dictionary-stripped) value type of a `DataType`.

@@ -17,7 +17,9 @@ use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
-use crate::predicate_index::{index_requested, requested_columns, PredicateIndexBuildSummary};
+use crate::predicate_index::{
+    requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+};
 
 /// Merge multiple SCX files into a single output file.
 /// All inputs must have the same n_vars.
@@ -27,10 +29,18 @@ use crate::predicate_index::{index_requested, requested_columns, PredicateIndexB
 /// Use [`merge_with_index_options`] to rebuild predicate indexes on the
 /// merged file in the same pass.
 pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
+    // `index_auto_threshold = 0` is the sentinel that disables all
+    // index work (no forced columns, no preset, no auto-detect). Keeps
+    // legacy `merge(...)` byte-identical to its pre-fix behaviour.
     merge_with_index_options(
         input_paths,
         output_path,
-        &ConversionPredicateIndexOptions::default(),
+        &ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        },
     )
     .map(|_| ())
 }
@@ -111,7 +121,7 @@ pub fn merge_with_index_options(
         // are unimodal-only today; record the skip so the caller can
         // emit a single `PredicateIndexSkippedMultimodal` warning.
         let multimodal_skip =
-            index_requested(index_options).then(|| requested_columns(index_options));
+            user_wants_index(index_options).then(|| requested_columns(index_options));
         merge_multimodal(&readers, input_paths, output_path)?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
@@ -189,10 +199,16 @@ pub fn merge_with_index_options(
         .map(unify_dict_columns)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
-    writer.write_obs(&merged_obs)?;
 
     // Write var from first input
     let var = readers[0].read_var()?;
+
+    // Fail fast if forced columns are missing from the merged schemas.
+    // Runs BEFORE any obs / var / shard writes so the temp output file
+    // is dropped on error and no `output_path` is materialised.
+    validate_forced_columns(index_options, &merged_obs.schema(), &var.schema())?;
+
+    writer.write_obs(&merged_obs)?;
     writer.write_var(&var)?;
 
     // For each input: decode CSR shards and write to output with adjusted row_start.
@@ -359,24 +375,21 @@ pub fn merge_with_index_options(
     }
 
     // Build + write predicate indexes (obs + var) when the caller
-    // requested any. The engine returns per-axis outcomes so callers
-    // can emit `MissingPresetIndexColumn` / `UnsupportedIndexColumn`
-    // warnings; we just collect them here and let the caller decide
-    // how to surface them.
-    let index_result = if index_requested(index_options) {
-        Some(
-            build_and_write_conversion_predicate_indexes(
-                &mut writer,
-                &merged_obs,
-                &var,
-                &output_shard_row_ranges,
-                n_vars as usize,
-                index_options,
-            )
-            .map_err(|e| {
-                OpsError::Io(std::io::Error::other(format!("build predicate index: {e}")))
-            })?,
-        )
+    // requested any. `user_wants_index` treats a non-zero
+    // `index_auto_threshold` as an explicit request — fixes the
+    // pre-fix bug where `--index-auto-threshold N` alone was a no-op.
+    // Forced-column-missing was already caught by
+    // `validate_forced_columns` above, so the engine outcomes here are
+    // limited to preset skips and supported-type checks.
+    let index_result = if user_wants_index(index_options) {
+        Some(build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &merged_obs,
+            &var,
+            &output_shard_row_ranges,
+            n_vars as usize,
+            index_options,
+        )?)
     } else {
         None
     };

@@ -21,7 +21,7 @@ pub fn run_append(
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
-    index_auto_threshold: usize,
+    index_auto_threshold: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open input file
     let input_reader = ScxReader::open(input)?;
@@ -165,20 +165,34 @@ pub fn run_append(
         modality_id: target_modality_id,
     };
 
-    let index_options = ConversionPredicateIndexOptions {
-        index_obs,
-        index_var,
-        index_preset,
-        index_auto_threshold,
-    };
-    let summary = scx_ops::append_from_reader_with_index_options(
-        target,
-        &input_reader,
-        &append_options,
-        input_modality_id,
-        &index_options,
-    )?;
-    emit_index_summary("append", &summary);
+    // Route to the legacy entry point (which preserves pre-existing
+    // predicate-index sections as stale) when the user passed no
+    // `--index-*` flag, and to `*_with_index_options` (which rebuilds /
+    // auto-detects) when at least one flag is set. `--index-auto-threshold N`
+    // alone reaches the engine — this was the silent-no-op bug being
+    // fixed.
+    let any_index_flag = !index_obs.is_empty()
+        || !index_var.is_empty()
+        || index_preset.is_some()
+        || index_auto_threshold.is_some();
+    if any_index_flag {
+        let index_options = ConversionPredicateIndexOptions {
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold: index_auto_threshold.unwrap_or(1000),
+        };
+        let summary = scx_ops::append_from_reader_with_index_options(
+            target,
+            &input_reader,
+            &append_options,
+            input_modality_id,
+            &index_options,
+        )?;
+        emit_index_summary("append", &summary);
+    } else {
+        scx_ops::append_from_reader(target, &input_reader, &append_options, input_modality_id)?;
+    }
 
     println!(
         "Appended {} cells from {} to {}",

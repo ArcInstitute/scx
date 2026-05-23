@@ -198,16 +198,25 @@ fn merge_with_index_options_writes_predicate_index() {
 }
 
 #[test]
-fn merge_without_index_options_writes_no_predicate_index() {
+fn merge_with_zero_threshold_sentinel_writes_no_predicate_index() {
     let dir = TempDir::new().unwrap();
     let a = write_test_file(&dir, "a.scx", 32, 8, "DRUG_A");
     let b = write_test_file(&dir, "b.scx", 32, 8, "DRUG_B");
     let out = dir.path().join("merged.scx");
 
+    // Empty obs/var + no preset + `index_auto_threshold = 0` is the
+    // sentinel that the legacy `merge` wrapper passes — disables both
+    // auto-detect and forced-column rebuilds. Verifies the wrapper's
+    // contract is plumbed through the engine.
     let summary = scx_ops::merge_with_index_options(
         &[a.as_path(), b.as_path()],
         &out,
-        &ConversionPredicateIndexOptions::default(),
+        &ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        },
     )
     .unwrap();
 
@@ -216,7 +225,7 @@ fn merge_without_index_options_writes_no_predicate_index() {
         count_section(&out, SectionType::ObsPredicateIndex),
         0,
         "merged file should NOT have an obs_predicate_index section when \
-         called with empty index options"
+         called with the zero-threshold sentinel"
     );
 }
 
@@ -333,4 +342,236 @@ fn predicate_index_build_summary_defaults_to_skipped() {
     assert!(s.result.is_none());
     assert!(s.multimodal_skip.is_none());
     assert!(!s.was_multimodal_skip());
+}
+
+// ---------------------------------------------------------------------------
+// Issue 5 — multimodal-skip, index_var, stale-index-survives coverage
+// ---------------------------------------------------------------------------
+
+/// Build a minimal multimodal SCX file with `rna` and `adt` modalities,
+/// each carrying a single CSR shard. Modelled on
+/// `scx-ops/tests/integration.rs::write_multimodal_with_csc` but trimmed
+/// to the bits the predicate-index multimodal-skip test needs.
+fn write_multimodal_test_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: usize,
+    adt_n_vars: usize,
+    perturbation: &str,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs(&obs_with_categories(n_obs, perturbation))
+        .unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars))
+        .unwrap();
+    writer
+        .write_var_for(adt_id, &sample_var(adt_n_vars))
+        .unwrap();
+    writer
+        .set_modality_n_vars(rna_id, rna_n_vars as u64)
+        .unwrap();
+    writer
+        .set_modality_n_vars(adt_id, adt_n_vars as u64)
+        .unwrap();
+
+    let (rna_indptr, rna_indices, rna_values) = sample_shard(n_obs, rna_n_vars);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let (adt_indptr, adt_indices, adt_values) = sample_shard(n_obs, adt_n_vars);
+    writer
+        .write_csr_shard_for(
+            adt_id,
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Multimodal merge requests an index → engine read-side is unimodal-only
+/// today, so the merged output must contain NO `ObsPredicateIndex` /
+/// `VarPredicateIndex` sections and `summary.multimodal_skip` must list
+/// the requested columns.
+#[test]
+fn merge_multimodal_skip_records_summary() {
+    let dir = TempDir::new().unwrap();
+    let a = write_multimodal_test_file(&dir, "mm_a.scx", 32, 8, 4, "DRUG_A");
+    let b = write_multimodal_test_file(&dir, "mm_b.scx", 32, 8, 4, "DRUG_B");
+    let out = dir.path().join("mm_merged.scx");
+
+    let summary = scx_ops::merge_with_index_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &forced_obs_pert_options(),
+    )
+    .unwrap();
+
+    assert!(
+        summary.result.is_none(),
+        "no engine result on multimodal skip"
+    );
+    let columns = summary
+        .multimodal_skip
+        .expect("multimodal merge with index opts must record skip");
+    assert!(columns.contains(&"perturbation".to_string()));
+    assert!(columns.contains(&"cell_type".to_string()));
+
+    assert_eq!(
+        count_section(&out, SectionType::ObsPredicateIndex),
+        0,
+        "multimodal merge must not write obs_predicate_index"
+    );
+    assert_eq!(
+        count_section(&out, SectionType::VarPredicateIndex),
+        0,
+        "multimodal merge must not write var_predicate_index"
+    );
+}
+
+/// Asking for `index_var` columns must emit a `VarPredicateIndex` section.
+#[test]
+fn merge_with_index_var_writes_var_predicate_index() {
+    let dir = TempDir::new().unwrap();
+    let a = write_test_file(&dir, "a.scx", 32, 8, "DRUG_A");
+    let b = write_test_file(&dir, "b.scx", 32, 8, "DRUG_B");
+    let out = dir.path().join("merged.scx");
+
+    let options = ConversionPredicateIndexOptions {
+        index_obs: vec![],
+        index_var: vec!["gene_id".to_string()],
+        index_preset: None,
+        index_auto_threshold: 1000,
+    };
+    let summary =
+        scx_ops::merge_with_index_options(&[a.as_path(), b.as_path()], &out, &options).unwrap();
+
+    assert!(summary.result.is_some());
+    assert!(summary.multimodal_skip.is_none());
+    assert_eq!(
+        count_section(&out, SectionType::VarPredicateIndex),
+        1,
+        "merged file should have one var_predicate_index section"
+    );
+}
+
+/// `append_from_reader` (legacy entry point, no index opts) must leave a
+/// pre-existing `ObsPredicateIndex` section in place — the documented
+/// "stale entries preserved unless --index-*" contract from
+/// docs/operations.md.
+#[test]
+fn append_stale_predicate_index_survives_without_index_options() {
+    let dir = TempDir::new().unwrap();
+    // Step 1: build a target with an `ObsPredicateIndex` via
+    // `compact_with_index_options` (the only existing way to bake one
+    // into a test fixture without poking at the engine directly).
+    let src = write_test_file(&dir, "src.scx", 32, 8, "DRUG_A");
+    let target = dir.path().join("target.scx");
+    scx_ops::compact_with_index_options(&src, &target, &forced_obs_pert_options()).unwrap();
+    assert_eq!(
+        count_section(&target, SectionType::ObsPredicateIndex),
+        1,
+        "test setup: target must have a predicate index pre-append"
+    );
+
+    // Step 2: legacy append (no index options) into the same target.
+    // The stale obs_predicate_index entry should remain in the catalog
+    // (it covers only the pre-append rows — semantically stale, but
+    // not dropped).
+    let source = write_test_file(&dir, "source.scx", 32, 8, "DRUG_B");
+    let source_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &source_reader,
+        &AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: NonZeroU32::new(64).unwrap(),
+            modality_id: 0,
+        },
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        count_section(&target, SectionType::ObsPredicateIndex),
+        1,
+        "legacy append must preserve stale predicate-index entries"
+    );
+}
+
+/// Issue 1 (P1) — Forced index column that doesn't exist must fail BEFORE
+/// any output file is created, so retrying is safe. Validates the
+/// `merge_with_index_options` upfront validation in
+/// `validate_forced_columns`.
+#[test]
+fn merge_with_missing_forced_column_does_not_create_output() {
+    let dir = TempDir::new().unwrap();
+    let a = write_test_file(&dir, "a.scx", 16, 4, "DRUG_A");
+    let b = write_test_file(&dir, "b.scx", 16, 4, "DRUG_B");
+    let out = dir.path().join("merged.scx");
+
+    let bogus = ConversionPredicateIndexOptions {
+        index_obs: vec!["nonexistent_column".to_string()],
+        index_var: vec![],
+        index_preset: None,
+        index_auto_threshold: 1000,
+    };
+    let err = scx_ops::merge_with_index_options(&[a.as_path(), b.as_path()], &out, &bogus)
+        .expect_err("must fail upfront");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("nonexistent_column"),
+        "error message should name the missing column: {msg}"
+    );
+    assert!(
+        !out.exists(),
+        "merged output must NOT be on disk after upfront validation failure"
+    );
 }

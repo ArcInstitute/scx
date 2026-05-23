@@ -24,23 +24,34 @@ use crate::anndata;
 // Predicate-index kwarg helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `ConversionPredicateIndexOptions` from the four pyscx kwargs.
-/// Mirrors the option bag construction in
-/// `pyscx::anndata::build_and_write_predicate_indexes_inline` so the
-/// rewrite ops accept the same surface as `pyscx.from_anndata`.
+/// Build a `ConversionPredicateIndexOptions` from the four pyscx kwargs
+/// when at least one was supplied. Returns `None` when every kwarg is
+/// `None`, signalling the caller should fall back to the legacy entry
+/// point that emits no predicate index (pre-fix default behaviour).
+///
+/// `index_auto_threshold` reaching the engine ALONE (without the other
+/// kwargs) is the recently-fixed bug — the caller previously dropped it
+/// silently. Now any non-None kwarg opts the user into the engine path.
 fn build_index_options(
     index_obs: Option<Vec<String>>,
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
-) -> ConversionPredicateIndexOptions {
-    ConversionPredicateIndexOptions {
+) -> Option<ConversionPredicateIndexOptions> {
+    let any_set = index_obs.is_some()
+        || index_var.is_some()
+        || index_preset.is_some()
+        || index_auto_threshold.is_some();
+    if !any_set {
+        return None;
+    }
+    Some(ConversionPredicateIndexOptions {
         index_obs: index_obs.unwrap_or_default(),
         index_var: index_var.unwrap_or_default(),
         index_preset,
         // 1000 mirrors `scx-convert::pipeline::ConvertOptions::default`.
         index_auto_threshold: index_auto_threshold.unwrap_or(1000),
-    }
+    })
 }
 
 /// Map a `PredicateIndexBuildSummary` from a `scx-ops` rewrite back
@@ -169,7 +180,8 @@ fn ops_to_pyerr(e: OpsError) -> PyErr {
         | OpsError::CellIndexOutOfBounds { .. }
         | OpsError::ValueOutOfRange { .. }
         | OpsError::UnknownCodec(_)
-        | OpsError::UnknownValueEncoding(_) => PyValueError::new_err(msg),
+        | OpsError::UnknownValueEncoding(_)
+        | OpsError::InvalidInput(_) => PyValueError::new_err(msg),
         OpsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
             PyFileNotFoundError::new_err(msg)
         }
@@ -255,19 +267,28 @@ pub fn append(
     };
 
     let target_path = PathBuf::from(target);
-    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
-    let summary = py
-        .allow_threads(|| {
-            scx_ops::append_from_reader_with_index_options(
-                &target_path,
-                &input_reader,
-                &options,
-                0,
-                &index_opts,
-            )
-        })
-        .map_err(ops_to_pyerr)?;
-    process_index_summary(py, summary)?;
+    match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
+        Some(index_opts) => {
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::append_from_reader_with_index_options(
+                        &target_path,
+                        &input_reader,
+                        &options,
+                        0,
+                        &index_opts,
+                    )
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)?;
+        }
+        None => {
+            py.allow_threads(|| {
+                scx_ops::append_from_reader(&target_path, &input_reader, &options, 0)
+            })
+            .map_err(ops_to_pyerr)?;
+        }
+    }
 
     Ok(())
 }
@@ -394,22 +415,39 @@ pub fn append_from_anndata(
     };
 
     let target_path = PathBuf::from(target);
-    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
-    let summary = py
-        .allow_threads(|| {
-            scx_ops::append_with_index_options(
-                &target_path,
-                &obs,
-                &indptr,
-                &indices,
-                &values_bytes,
-                value_encoding,
-                &options,
-                &index_opts,
-            )
-        })
-        .map_err(ops_to_pyerr)?;
-    process_index_summary(py, summary)?;
+    match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
+        Some(index_opts) => {
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::append_with_index_options(
+                        &target_path,
+                        &obs,
+                        &indptr,
+                        &indices,
+                        &values_bytes,
+                        value_encoding,
+                        &options,
+                        &index_opts,
+                    )
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)?;
+        }
+        None => {
+            py.allow_threads(|| {
+                scx_ops::append(
+                    &target_path,
+                    &obs,
+                    &indptr,
+                    &indices,
+                    &values_bytes,
+                    value_encoding,
+                    &options,
+                )
+            })
+            .map_err(ops_to_pyerr)?;
+        }
+    }
 
     Ok(())
 }
@@ -477,13 +515,19 @@ pub fn compact(
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
-    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
-    let summary = py
-        .allow_threads(|| {
-            scx_ops::compact_with_index_options(&input_path, &output_path, &index_opts)
-        })
-        .map_err(ops_to_pyerr)?;
-    process_index_summary(py, summary)
+    match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
+        Some(index_opts) => {
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::compact_with_index_options(&input_path, &output_path, &index_opts)
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)
+        }
+        None => py
+            .allow_threads(|| scx_ops::compact(&input_path, &output_path))
+            .map_err(ops_to_pyerr),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,10 +594,18 @@ pub fn merge(
     let input_paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
     let input_refs: Vec<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
     let output_path = PathBuf::from(output);
-    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
 
-    let summary = py
-        .allow_threads(|| scx_ops::merge_with_index_options(&input_refs, &output_path, &index_opts))
-        .map_err(ops_to_pyerr)?;
-    process_index_summary(py, summary)
+    match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
+        Some(index_opts) => {
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::merge_with_index_options(&input_refs, &output_path, &index_opts)
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)
+        }
+        None => py
+            .allow_threads(|| scx_ops::merge(&input_refs, &output_path))
+            .map_err(ops_to_pyerr),
+    }
 }

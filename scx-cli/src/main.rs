@@ -228,10 +228,14 @@ enum Commands {
         /// Named column preset (`cellxgene` | `perturbseq` | `training`).
         #[arg(long, value_name = "NAME")]
         index_preset: Option<String>,
-        /// Cardinality cap for auto-detected index columns when no
-        /// explicit columns or preset are supplied.
-        #[arg(long, default_value_t = 1000)]
-        index_auto_threshold: usize,
+        /// Cardinality cap for auto-detected index columns. Pass this
+        /// flag alone (without `--index-obs`/`--index-var`/`--index-preset`)
+        /// to ask the engine to auto-detect low-cardinality categorical
+        /// columns at the given threshold; omit it to leave any
+        /// pre-existing predicate-index sections in place (stale on
+        /// appended rows).
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
     },
     /// Logically delete cells matching a predicate
     Delete {
@@ -277,10 +281,13 @@ enum Commands {
         /// Named column preset (`cellxgene` | `perturbseq` | `training`).
         #[arg(long, value_name = "NAME")]
         index_preset: Option<String>,
-        /// Cardinality cap for auto-detected index columns when no
-        /// explicit columns or preset are supplied.
-        #[arg(long, default_value_t = 1000)]
-        index_auto_threshold: usize,
+        /// Cardinality cap for auto-detected index columns. Pass this
+        /// flag alone to ask the engine to auto-detect low-cardinality
+        /// categorical columns at the given threshold; omit all
+        /// `--index-*` flags to drop predicate indexes on the compacted
+        /// output (current default).
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -318,10 +325,13 @@ enum Commands {
         /// Named column preset (`cellxgene` | `perturbseq` | `training`).
         #[arg(long, value_name = "NAME")]
         index_preset: Option<String>,
-        /// Cardinality cap for auto-detected index columns when no
-        /// explicit columns or preset are supplied.
-        #[arg(long, default_value_t = 1000)]
-        index_auto_threshold: usize,
+        /// Cardinality cap for auto-detected index columns. Pass this
+        /// flag alone to ask the engine to auto-detect low-cardinality
+        /// categorical columns at the given threshold; omit all
+        /// `--index-*` flags to drop predicate indexes on the merged
+        /// output (current default).
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
     },
     /// Query cells by predicate
     Query {

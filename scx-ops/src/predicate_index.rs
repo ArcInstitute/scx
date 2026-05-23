@@ -17,7 +17,10 @@
 //! `ConvertWarning::MissingPresetIndexColumn` themselves without
 //! `scx-ops` taking a dep on `scx-convert`.
 
-use scx_engine::ConversionPredicateIndexResult;
+use arrow::datatypes::Schema;
+use scx_engine::{ConversionPredicateIndexOptions, ConversionPredicateIndexResult};
+
+use crate::error::{OpsError, Result};
 
 /// Outcome of attempting to build predicate indexes during a `merge`,
 /// `append`, or `compact` rewrite. The caller decides how to surface
@@ -55,10 +58,24 @@ impl PredicateIndexBuildSummary {
     }
 }
 
-/// True when the caller passed at least one index column / preset —
-/// i.e. they expect a predicate-index to land on the output.
-pub fn index_requested(options: &scx_engine::ConversionPredicateIndexOptions) -> bool {
-    !options.index_obs.is_empty() || !options.index_var.is_empty() || options.index_preset.is_some()
+/// True when the user explicitly requested any predicate-index work —
+/// a forced obs / var column, a preset, OR a non-zero auto-threshold.
+/// The legacy `merge` / `compact` / `append` / `append_from_reader`
+/// wrappers delegate with `index_auto_threshold = 0` as a sentinel that
+/// disables both auto-detect and any multimodal-skip warning (preserves
+/// pre-fix behaviour where the legacy entry points emit no predicate
+/// index and no warning).
+///
+/// The single-modality rewrite path calls the engine unconditionally;
+/// this helper only gates the multimodal-skip surface so callers that
+/// passed the legacy `Default::default()` (auto_threshold = 1000) but
+/// hit a multimodal target don't silently see a skip warning they
+/// didn't ask for.
+pub fn user_wants_index(options: &ConversionPredicateIndexOptions) -> bool {
+    !options.index_obs.is_empty()
+        || !options.index_var.is_empty()
+        || options.index_preset.is_some()
+        || options.index_auto_threshold > 0
 }
 
 /// Flatten the requested columns / preset into a single `Vec<String>`
@@ -66,7 +83,7 @@ pub fn index_requested(options: &scx_engine::ConversionPredicateIndexOptions) ->
 /// `scx_convert::mudata_pipeline::emit_multimodal_index_skip_warning`
 /// so the user sees the same payload regardless of the rewrite op that
 /// triggered the skip.
-pub fn requested_columns(options: &scx_engine::ConversionPredicateIndexOptions) -> Vec<String> {
+pub fn requested_columns(options: &ConversionPredicateIndexOptions) -> Vec<String> {
     let mut columns: Vec<String> = Vec::new();
     columns.extend(options.index_obs.iter().cloned());
     columns.extend(options.index_var.iter().cloned());
@@ -74,4 +91,64 @@ pub fn requested_columns(options: &scx_engine::ConversionPredicateIndexOptions) 
         columns.push(format!("preset:{name}"));
     }
     columns
+}
+
+/// Validate that every `index_obs` / `index_var` column the caller forced
+/// is present in the corresponding output schema. Called by each
+/// `*_with_index_options` rewrite op BEFORE any committing I/O so that
+/// missing-forced-column errors fail loudly without leaving a half-built
+/// output on disk.
+///
+/// Engine outcome flow (after writes) still emits
+/// `BuildOutcome::ForcedColumnError` in defensive paths — the rewrite ops
+/// rely on this upfront check to make that path unreachable for
+/// rewrites. See `pyscx::anndata::build_and_write_predicate_indexes_inline`
+/// and `scx-convert::pipeline::process_predicate_index_outcomes` for the
+/// equivalent fail-late paths that this duplicates as fail-fast.
+pub fn validate_forced_columns(
+    options: &ConversionPredicateIndexOptions,
+    obs_schema: &Schema,
+    var_schema: &Schema,
+) -> Result<()> {
+    let obs_missing: Vec<String> = options
+        .index_obs
+        .iter()
+        .filter(|c| obs_schema.column_with_name(c).is_none())
+        .cloned()
+        .collect();
+    let var_missing: Vec<String> = options
+        .index_var
+        .iter()
+        .filter(|c| var_schema.column_with_name(c).is_none())
+        .cloned()
+        .collect();
+    if obs_missing.is_empty() && var_missing.is_empty() {
+        return Ok(());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !obs_missing.is_empty() {
+        let available: Vec<String> = obs_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        parts.push(scx_engine::index::forced_columns_missing_message(
+            "obs",
+            &obs_missing,
+            &available,
+        ));
+    }
+    if !var_missing.is_empty() {
+        let available: Vec<String> = var_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        parts.push(scx_engine::index::forced_columns_missing_message(
+            "var",
+            &var_missing,
+            &available,
+        ));
+    }
+    Err(OpsError::InvalidInput(parts.join("\n")))
 }

@@ -12,10 +12,12 @@ use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
-use crate::error::{OpsError, Result};
+use crate::error::Result;
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
-use crate::predicate_index::{index_requested, requested_columns, PredicateIndexBuildSummary};
+use crate::predicate_index::{
+    requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+};
 
 /// Compact an SCX file: removes deleted rows, stale catalogs, and produces
 /// a clean single-catalog file.
@@ -25,10 +27,16 @@ use crate::predicate_index::{index_requested, requested_columns, PredicateIndexB
 /// input index are stale. Use [`compact_with_index_options`] to rebuild
 /// predicate indexes against the compacted output in the same pass.
 pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
+    // See `merge` for the `index_auto_threshold = 0` sentinel rationale.
     compact_with_index_options(
         input_path,
         output_path,
-        &ConversionPredicateIndexOptions::default(),
+        &ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        },
     )
     .map(|_| ())
 }
@@ -55,7 +63,7 @@ pub fn compact_with_index_options(
         // the caller can emit a single `PredicateIndexSkippedMultimodal`
         // warning.
         let multimodal_skip =
-            index_requested(index_options).then(|| requested_columns(index_options));
+            user_wants_index(index_options).then(|| requested_columns(index_options));
         compact_multimodal(reader, in_header, output_path)?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
@@ -84,6 +92,11 @@ pub fn compact_with_index_options(
     } else {
         obs
     };
+
+    // Fail fast if forced index columns are missing from the compacted
+    // schemas. Must run before `ScxWriter::new` materialises a temp
+    // output file so an invalid request leaves no on-disk artefact.
+    validate_forced_columns(index_options, &filtered_obs.schema(), &var.schema())?;
 
     let new_n_obs = filtered_obs.num_rows();
 
@@ -350,23 +363,20 @@ pub fn compact_with_index_options(
     }
 
     // Predicate indexes: rebuild against the post-deletion obs + the
-    // freshly emitted shard row ranges. Engine outcomes flow back via
-    // the summary so the caller can map them onto its preferred
-    // warning channel.
-    let index_result = if index_requested(index_options) {
-        Some(
-            build_and_write_conversion_predicate_indexes(
-                &mut writer,
-                &filtered_obs,
-                &var,
-                &output_shard_row_ranges,
-                n_vars as usize,
-                index_options,
-            )
-            .map_err(|e| {
-                OpsError::Io(std::io::Error::other(format!("build predicate index: {e}")))
-            })?,
-        )
+    // freshly emitted shard row ranges. `user_wants_index` treats a
+    // non-zero `index_auto_threshold` as an explicit request — fixes
+    // the pre-fix bug where `--index-auto-threshold N` alone was a
+    // no-op. Forced-column-missing was caught upfront by
+    // `validate_forced_columns`.
+    let index_result = if user_wants_index(index_options) {
+        Some(build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &filtered_obs,
+            &var,
+            &output_shard_row_ranges,
+            n_vars as usize,
+            index_options,
+        )?)
     } else {
         None
     };
