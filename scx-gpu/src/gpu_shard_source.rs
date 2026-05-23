@@ -46,6 +46,36 @@ use crate::error::GpuError;
 use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
 
+/// Debug-only check: each row's column indices are strictly increasing.
+///
+/// The GPU CSR-to-dense scatter (`gpu_de_scatter_shard_to_dense`) writes
+/// `dense[row, col - c0] = data[e]` with one thread per nonzero, so a
+/// duplicate `(row, col)` pair races on the same output cell and the
+/// winner is nondeterministic. SCX canonicalisation sorts but does not
+/// dedup column indices, so we enforce the invariant at the host-side
+/// staging boundary in debug builds. The function body is gated by
+/// `#[cfg(debug_assertions)]` so release builds pay no cost.
+fn check_no_duplicate_columns(_csr: &scx_sparse::ScxCsr) {
+    #[cfg(debug_assertions)]
+    {
+        let csr = _csr;
+        for r in 0..csr.n_rows() {
+            let s = csr.indptr[r] as usize;
+            let e = csr.indptr[r + 1] as usize;
+            for w in csr.indices[s..e].windows(2) {
+                debug_assert!(
+                    w[0] < w[1],
+                    "ScxCsr row {r} has unsorted or duplicate column indices: \
+                     {} >= {} — GPU shard scatter requires strictly-increasing \
+                     per-row indices for deterministic output",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+}
+
 /// Sequence of GPU-resident CSR shards.
 ///
 /// Implementors own a shared device CSR slot; the trait yields borrowed
@@ -212,6 +242,7 @@ impl<'a> RawGpuShardSource<'a> {
             if csr.n_rows() == 0 {
                 return Ok(());
             }
+            check_no_duplicate_columns(&csr);
             self.pinned[0].stage(&csr)?;
             self.pinned[0].upload_to(
                 self.dev.stream(),
@@ -277,6 +308,7 @@ impl<'a> RawGpuShardSource<'a> {
                         .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
                 }
 
+                check_no_duplicate_columns(&csr);
                 pinned[pinned_idx].stage(&csr)?;
                 pinned[pinned_idx].upload_to(
                     copy_stream,
@@ -708,5 +740,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `check_no_duplicate_columns` accepts a canonical CSR with strictly
+    /// increasing per-row column indices. No panic, no GPU required.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_check_no_duplicate_columns_accepts_canonical_csr() {
+        // 2 rows, 5 cols, each row strictly increasing.
+        let csr = ScxCsr::new_unchecked(
+            (2, 5),
+            vec![0i64, 3, 5],
+            vec![0i32, 2, 4, 1, 3],
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
+        );
+        check_no_duplicate_columns(&csr);
+    }
+
+    /// `check_no_duplicate_columns` panics in debug builds on an
+    /// intra-row duplicate column index. Catches the foot-gun before the
+    /// CSR is staged to GPU, where parallel writes would race
+    /// nondeterministically.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unsorted or duplicate column indices")]
+    fn test_check_no_duplicate_columns_panics_on_duplicate() {
+        // Row 0: [0, 3, 3] — duplicate column 3.
+        let csr = ScxCsr::new_unchecked(
+            (1, 5),
+            vec![0i64, 3],
+            vec![0i32, 3, 3],
+            vec![1.0f32, 2.0, 3.0],
+        );
+        check_no_duplicate_columns(&csr);
     }
 }

@@ -357,6 +357,14 @@ pub fn gpu_de_scatter_gene_major(
 ///
 /// Grid: one block per shard row (`gridDim.x = n_shard_rows`); threads
 /// stride over the row's nonzero entries.
+///
+/// # Precondition: no duplicate column indices per row
+///
+/// Each row's column indices must be strictly increasing — duplicates yield
+/// nondeterministic dense values because multiple GPU threads race on the
+/// same output cell. SCX canonicalisation sorts but does not dedup, so
+/// upstream callers must enforce this. `RawGpuShardSource` checks this in
+/// debug builds via `check_no_duplicate_columns` before staging each shard.
 pub fn gpu_de_scatter_shard_to_dense(
     dev: &GpuDevice,
     view: &GpuCsrShardView<'_>,
@@ -373,6 +381,11 @@ pub fn gpu_de_scatter_shard_to_dense(
     if n_shard_rows == 0 {
         return Ok(());
     }
+    debug_assert!(
+        n_shard_rows <= i32::MAX as usize,
+        "n_shard_rows {} exceeds i32::MAX — SCX shard layout invariant violated",
+        n_shard_rows
+    );
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
     let func = module
@@ -389,7 +402,7 @@ pub fn gpu_de_scatter_shard_to_dense(
     };
 
     let n_shard_rows_i32 = n_shard_rows as i32;
-    let global_row_offset_i32 = global_row_offset as i32;
+    let global_row_offset_i64 = global_row_offset as i64;
     let chunk_size_i32 = chunk_size as i32;
     let c0_i32 = c0 as i32;
     let c1_i32 = c1 as i32;
@@ -402,7 +415,7 @@ pub fn gpu_de_scatter_shard_to_dense(
             .arg(&view.data)
             .arg(dense)
             .arg(&n_shard_rows_i32)
-            .arg(&global_row_offset_i32)
+            .arg(&global_row_offset_i64)
             .arg(&chunk_size_i32)
             .arg(&c0_i32)
             .arg(&c1_i32)
