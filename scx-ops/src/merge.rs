@@ -5,6 +5,7 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use scx_codec::{CodecId, ValueEncoding};
+use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -16,10 +17,53 @@ use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
+use crate::predicate_index::{
+    requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+};
 
 /// Merge multiple SCX files into a single output file.
 /// All inputs must have the same n_vars.
+///
+/// Drops `ObsPredicateIndex` / `VarPredicateIndex` sections from the
+/// output (the merged row layout invalidates per-shard row ranges).
+/// Use [`merge_with_index_options`] to rebuild predicate indexes on the
+/// merged file in the same pass.
 pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
+    // `index_auto_threshold = 0` is the sentinel that disables all
+    // index work (no forced columns, no preset, no auto-detect). Keeps
+    // legacy `merge(...)` byte-identical to its pre-fix behaviour.
+    merge_with_index_options(
+        input_paths,
+        output_path,
+        &ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        },
+    )
+    .map(|_| ())
+}
+
+/// Merge multiple SCX files and optionally rebuild predicate indexes
+/// on the output.
+///
+/// When `index_options` requests one or more obs / var columns (or
+/// names a preset), the helper writes the matching `ObsPredicateIndex`
+/// / `VarPredicateIndex` sections after the obs / var sections and
+/// before `provenance`. The returned summary carries per-axis outcomes
+/// so the caller can emit user-facing warnings (see
+/// `scx-convert::pipeline::process_predicate_index_outcomes` for the
+/// reference outcome → `ConvertWarning` mapping).
+///
+/// Multimodal merge currently cannot persist predicate-index sections
+/// per modality — the helper sets `summary.multimodal_skip` and the
+/// caller surfaces `ConvertWarning::PredicateIndexSkippedMultimodal`.
+pub fn merge_with_index_options(
+    input_paths: &[&Path],
+    output_path: &Path,
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<PredicateIndexBuildSummary> {
     if input_paths.is_empty() {
         return Err(OpsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -73,8 +117,16 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         }
         // Phase 6: dispatch to multimodal merge — concatenate the
         // global obs row axis and per-modality CSR shards in input
-        // order, preserving each modality's var.
-        return merge_multimodal(&readers, input_paths, output_path);
+        // order, preserving each modality's var. Predicate indexes
+        // are unimodal-only today; record the skip so the caller can
+        // emit a single `PredicateIndexSkippedMultimodal` warning.
+        let multimodal_skip =
+            user_wants_index(index_options).then(|| requested_columns(index_options));
+        merge_multimodal(&readers, input_paths, output_path)?;
+        return Ok(PredicateIndexBuildSummary {
+            result: None,
+            multimodal_skip,
+        });
     }
 
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
@@ -147,16 +199,26 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         .map(unify_dict_columns)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
-    writer.write_obs(&merged_obs)?;
 
     // Write var from first input
     let var = readers[0].read_var()?;
+
+    // Fail fast if forced columns are missing from the merged schemas.
+    // Runs BEFORE any obs / var / shard writes so the temp output file
+    // is dropped on error and no `output_path` is materialised.
+    validate_forced_columns(index_options, &merged_obs.schema(), &var.schema())?;
+
+    writer.write_obs(&merged_obs)?;
     writer.write_var(&var)?;
 
     // For each input: decode CSR shards and write to output with adjusted row_start.
     // Per-shard codec is auto-selected via select_codec() on the re-encoded values,
     // and value_encoding is read from each shard's header for correctness.
     let mut cumulative_rows = 0u64;
+    // Per-output-shard `(row_start, row_end)` ranges, captured during the
+    // write loop so the predicate-index builder can map global row ids to
+    // output-shard local rows.
+    let mut output_shard_row_ranges: Vec<(u64, u64)> = Vec::new();
     for reader in &readers {
         let shards = reader.catalog().shards_sorted();
         for shard_entry in &shards {
@@ -182,6 +244,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             // Auto-select optimal codec for this shard's data
             let shard_codec = select_codec(&values_bytes, shard_value_encoding);
 
+            let row_start = cumulative_rows;
             writer.write_csr_shard(
                 &indptr_u64,
                 &indices_u32,
@@ -191,6 +254,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
                 cumulative_rows,
             )?;
             cumulative_rows += n_rows as u64;
+            output_shard_row_ranges.push((row_start, cumulative_rows));
         }
     }
 
@@ -310,6 +374,26 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         }
     }
 
+    // Build + write predicate indexes (obs + var) when the caller
+    // requested any. `user_wants_index` treats a non-zero
+    // `index_auto_threshold` as an explicit request — fixes the
+    // pre-fix bug where `--index-auto-threshold N` alone was a no-op.
+    // Forced-column-missing was already caught by
+    // `validate_forced_columns` above, so the engine outcomes here are
+    // limited to preset skips and supported-type checks.
+    let index_result = if user_wants_index(index_options) {
+        Some(build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &merged_obs,
+            &var,
+            &output_shard_row_ranges,
+            n_vars as usize,
+            index_options,
+        )?)
+    } else {
+        None
+    };
+
     // Merge provenance
     let mut all_prov_entries = Vec::new();
     for reader in &readers {
@@ -337,7 +421,10 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     writer.write_provenance(all_prov_entries)?;
 
     writer.finish()?;
-    Ok(())
+    Ok(PredicateIndexBuildSummary {
+        result: index_result,
+        multimodal_skip: None,
+    })
 }
 
 /// Phase 6: merge multimodal SCX files with matching modality

@@ -10,6 +10,7 @@ authors.workspace = true
 scx-format = { path = "../scx-format", features = ["deletion-vectors"] }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+scx-engine = { path = "../scx-engine" }
 half = { workspace = true }
 roaring = { workspace = true }
 fs4 = { workspace = true }

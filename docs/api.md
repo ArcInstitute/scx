@@ -332,6 +332,17 @@ CLI flags `--index-obs`, `--index-var`, `--index-preset`,
 `pyscx.open(...).query()` and `scx pull --filter` calls can push
 predicates down without an obs scan.
 
+The same `index_*` knobs are also accepted by the rewrite ops —
+`pyscx.merge` / `pyscx.append` / `pyscx.append_from_anndata` /
+`pyscx.compact` and `scx merge` / `scx append` / `scx compact`.
+Without them, those ops drop (or, on append, leave stale) the
+predicate-index sections — pushdown silently falls back to a full
+obs scan. Pass `index_obs=[...]` (or the matching CLI flag) to
+rebuild a fresh index covering every row of the output in the same
+pass; this is the only supported way to keep pushdown working
+across multi-input atlas builds (fan-out per-perturbation
+conversions → `pyscx.merge(..., index_obs=[...])`).
+
 Behaviour:
 
 - Force-listed columns (`--index-obs`/`--index-var`) **hard-error** if
@@ -343,7 +354,8 @@ Behaviour:
   `≤ index_auto_threshold` (default `1000`).
 - Multimodal inputs emit `PredicateIndexSkippedMultimodal` and skip
   predicate-index emission entirely — the read path is unimodal-only
-  today.
+  today. The same skip-with-warning applies to multimodal
+  `merge` / `append` / `compact`.
 
 Index presets:
 
@@ -799,12 +811,12 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
 
 ### File operations
-- `pyscx.append(target, input, codec=None, shard_size=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match)
-- `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None)` — Append from AnnData
+- `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
+- `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None, in_place=False, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Append from AnnData. Same `index_*` semantics as `append`.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
-- `pyscx.compact(input, output)` — Rewrite reclaiming space
+- `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output.
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
-- `pyscx.merge(inputs, output)` — Merge multiple files
+- `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file.
 
 ### Cloud operations (requires `--features cloud`)
 - `pyscx.pull(source, dest, filter=None, parallelism=None)` — Streaming cloud → local
@@ -1385,11 +1397,11 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`
 
 ### File operations
-- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]` — Streaming append (reads source one shard at a time)
+- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Streaming append (reads source one shard at a time). `--index-*` rebuilds predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
 - `scx delete <file> --filter <expr> [--dry-run]`
-- `scx compact <input> --output <path> [--force]`
+- `scx compact <input> --output <path> [--force] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Rewrite reclaiming space; `--index-*` rebuilds the predicate index against the compacted output.
 - `scx rollback <file> [--to-seq N]`
-- `scx merge <file1> <file2> [<...>] --output <path>`
+- `scx merge <file1> <file2> [<...>] --output <path> [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Merge multiple files; `--index-*` rebuilds the predicate index against the merged output (without it, pushdown regresses to a full obs scan on the merged file).
 - `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
 - `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data

@@ -9,11 +9,11 @@ details, see [docs/format.md](format.md). For sharding details, see
 
 | Operation | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
 |-----------|---------------|--------------|--------------|-------------|-------------------|
-| **append** | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Rebuilt |
+| **append** | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
 | **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
-| **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | Rebuilt |
-| **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | Rebuilt |
-| **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | Rebuilt |
+| **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
 | **rollback** | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
 
 ### Restoring CSC after a mutating operation
@@ -52,7 +52,7 @@ However, metadata must be updated to cover all cells:
 | **Root catalog** | O(catalog) | Rewritten at offset 256 via `pwrite()` (~4 KB). |
 | **Full catalog** | O(catalog) | New catalog appended referencing both original and new sections. |
 | **CSC sidecar** | Dropped | Column-major shard consistency cannot be maintained incrementally. |
-| **Predicate indexes** | O(all cells) | Rebuilt to cover the merged obs. |
+| **Predicate indexes** | O(all cells) when rebuilt | By default the pre-append entries are preserved (stale — they cover only the original rows). Pass `--index-obs` / `--index-var` / `--index-preset` to rebuild covering all rows. Multimodal targets emit `PredicateIndexSkippedMultimodal` and skip the write. |
 
 **Commit point**: the single header `pwrite()` that updates
 `full_catalog_offset`, `n_obs`, `nnz`, `n_csr_shards`, and
