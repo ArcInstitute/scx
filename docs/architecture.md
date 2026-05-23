@@ -620,8 +620,18 @@ auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`
 loads the full `indptr` then iterates `XStreamReader::next_shard`,
 running `sort_csr_rows_in_place` + `drop_explicit_zeros_inplace` per
 shard before `encode_one_shard` → `ScxWriter::write_preencoded_shard`.
-Peak memory is bounded by one shard's worth of CSR plus the resident
-indptr, independent of total dataset size. `csc="always"` triggers a
+`obsm` / `varm` / `obsp` / `varp` are also hyperslab-read one
+row-range at a time (`read_dense_mapping_shard` /
+`read_sparse_mapping_shard`) and emitted as row-sharded sections
+(`<section>/<name>_shard_<idx>`, types 20–23) so peak memory per
+metadata matrix matches one X shard's worth. Peak memory is therefore
+bounded by **one X shard + one row-shard per `obsm` / `varm` / `obsp`
+/ `varp` matrix**, plus the resident indptr — independent of total
+dataset size or per-key embedding dimension. The pyscx backed-routing
+path detects per-section mutation via top-level key comparison
+against the source h5ad; clean sections route through the disk
+streamer, mutated sections are extracted from Python and partitioned
+into the same sharded layout on the way out. `csc="always"` triggers a
 post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
 ~2× the output size during the rebuild).
 
