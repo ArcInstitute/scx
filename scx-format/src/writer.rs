@@ -171,6 +171,76 @@ impl ScxWriter {
         })
     }
 
+    /// Adopt an already-open file mid-write so that section-emit methods
+    /// (notably [`Self::write_obs_predicate_index`] /
+    /// [`Self::write_var_predicate_index`]) can be reused from in-place
+    /// rewrite paths that don't use `ScxWriter`'s standard temp-file →
+    /// rename flow.
+    ///
+    /// Used by `scx-ops::append::finalize_append`: that function writes
+    /// sections directly through a `FileLock`, so this constructor lets it
+    /// hand the file off to `ScxWriter` for the predicate-index writes,
+    /// then take the file + updated offset + new catalog entries back via
+    /// [`Self::into_in_place_parts`]. The caller remains responsible for
+    /// finalising the file (header, root catalog, full catalog, checksum,
+    /// fsync) — [`Self::finish`] must NOT be called on an adopted writer.
+    ///
+    /// `current_offset` must match the file's actual cursor position; this
+    /// method seeks the file there defensively. `existing_entries` should
+    /// be the catalog entries already written ahead of `current_offset`;
+    /// new section writes append to that vector.
+    pub fn adopt_in_place(
+        mut file: File,
+        header: FileHeader,
+        current_offset: u64,
+        existing_entries: Vec<FullCatalogEntry>,
+    ) -> Result<Self> {
+        file.seek(SeekFrom::Start(current_offset))?;
+        let writer = BufWriter::new(file);
+        Ok(ScxWriter {
+            // `final_path` is only consulted by `finish()`, which adopted
+            // writers must not call. Use an empty path to make accidental
+            // use loud (it will surface as an obvious I/O error).
+            final_path: PathBuf::new(),
+            tmp_path: None,
+            file: Some(writer),
+            current_offset,
+            header,
+            entries: existing_entries,
+            csr_shard_count: 0,
+            csc_shard_count: 0,
+            #[cfg(feature = "deletion-vectors")]
+            bitmap_shard_count: 0,
+            #[cfg(feature = "deletion-vectors")]
+            modality_bitmap_counts: Vec::new(),
+            total_nnz: 0,
+            has_obsm: false,
+            has_obsp: false,
+            current_modality_id: 0,
+            modalities: Vec::new(),
+            modality_build_csc: Vec::new(),
+        })
+    }
+
+    /// Tear down an adopted writer: flush the buffer and return the open
+    /// file handle, the post-write offset, and the catalog entry list
+    /// (existing entries from `adopt_in_place` plus any new entries
+    /// pushed by section writes performed in between). The caller
+    /// continues from there with its own header/catalog finalisation.
+    ///
+    /// Pairs with [`Self::adopt_in_place`]; not valid on writers created
+    /// via [`Self::new`].
+    pub fn into_in_place_parts(mut self) -> Result<(File, u64, Vec<FullCatalogEntry>)> {
+        let buf_writer = self.file.take().ok_or(ScxError::WriterAlreadyFinished)?;
+        let file = buf_writer.into_inner().map_err(std::io::Error::from)?;
+        let entries = std::mem::take(&mut self.entries);
+        let current_offset = self.current_offset;
+        // `Drop` runs next: `tmp_path` is `None` for adopted writers, so
+        // no temp-file cleanup occurs; `self.file` is `None`, so no
+        // double-close. The caller now owns `file`.
+        Ok((file, current_offset, entries))
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -2037,6 +2107,71 @@ mod tests {
         let indices = vec![1u32, 3, 0, 2, 4, 2];
         let values: Vec<u8> = vec![5, 10, 1, 3, 7, 2]; // u8 encoding
         (indptr, indices, values)
+    }
+
+    /// Round-trip the `adopt_in_place` / `into_in_place_parts` pair: start
+    /// from a partial file (zero header + one section), hand the file to
+    /// `ScxWriter`, write an `obs_predicate_index` section, take the
+    /// pieces back, and verify the offset advanced and a new catalog
+    /// entry was appended. Used by `scx-ops::append::finalize_append`.
+    #[test]
+    fn adopt_in_place_writes_section_and_returns_state() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adopt.scx");
+
+        // Lay down a placeholder header + one pre-existing fake section so
+        // we exercise the non-empty-entries handoff path.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let initial_bytes = vec![0u8; SECTIONS_START_OFFSET as usize + 16];
+        file.write_all(&initial_bytes).unwrap();
+        let initial_offset = initial_bytes.len() as u64;
+
+        let prior_entry = FullCatalogEntry {
+            name: "obs".to_string(),
+            offset: SECTIONS_START_OFFSET,
+            length: 16,
+            section_type: SectionType::ObsMetadata,
+            checksum: [0u8; 32],
+            modality_id: 0,
+            stats: None,
+        };
+
+        let mut writer =
+            ScxWriter::adopt_in_place(file, sample_header(), initial_offset, vec![prior_entry])
+                .unwrap();
+
+        // Section payload — small placeholder bytes, not a real
+        // PredicateIndex; `write_obs_predicate_index` does not validate
+        // content, it only emits the section.
+        let payload = b"predicate_index_payload";
+        writer.write_obs_predicate_index(payload).unwrap();
+
+        let (file, end_offset, entries) = writer.into_in_place_parts().unwrap();
+
+        // Section bytes were written + alignment padding was applied.
+        assert!(end_offset >= initial_offset + payload.len() as u64);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "obs");
+        assert_eq!(entries[1].name, "obs_predicate_index");
+        assert_eq!(entries[1].section_type, SectionType::ObsPredicateIndex);
+        assert_eq!(entries[1].length, payload.len() as u64);
+        // The new section's offset must equal the (aligned) caller-
+        // supplied current_offset — i.e. it lands immediately after the
+        // prior section.
+        assert!(entries[1].offset >= initial_offset);
+
+        // File on disk matches the returned end_offset.
+        drop(file);
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(on_disk, end_offset);
     }
 
     /// 10.14: Write minimal file → verify header fields and 8-byte alignment

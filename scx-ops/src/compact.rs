@@ -4,6 +4,7 @@ use std::path::Path;
 
 use arrow::compute;
 use scx_codec::{CodecId, ValueEncoding};
+use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -11,13 +12,35 @@ use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
-use crate::error::Result;
+use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
+use crate::predicate_index::{index_requested, requested_columns, PredicateIndexBuildSummary};
 
 /// Compact an SCX file: removes deleted rows, stale catalogs, and produces
 /// a clean single-catalog file.
+///
+/// Drops any input predicate indexes — the row layout is re-sharded
+/// against the post-deletion row count, so per-shard row ranges in the
+/// input index are stale. Use [`compact_with_index_options`] to rebuild
+/// predicate indexes against the compacted output in the same pass.
 pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
+    compact_with_index_options(
+        input_path,
+        output_path,
+        &ConversionPredicateIndexOptions::default(),
+    )
+    .map(|_| ())
+}
+
+/// Compact an SCX file and optionally rebuild predicate indexes on the
+/// output. See [`merge_with_index_options`](crate::merge_with_index_options)
+/// for the shape of `index_options` and the multimodal-skip semantics.
+pub fn compact_with_index_options(
+    input_path: &Path,
+    output_path: &Path,
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<PredicateIndexBuildSummary> {
     // Acquire shared lock to prevent concurrent writers from modifying the
     // file while we read it. The lock is held until `_lock` is dropped.
     let _lock = SharedFileLock::acquire(input_path)?;
@@ -28,7 +51,16 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     // path below assumes one modality and would silently flatten the
     // ModalityTable.
     if reader.is_multimodal() {
-        return compact_multimodal(reader, in_header, output_path);
+        // Predicate indexes are unimodal-only today; capture the skip so
+        // the caller can emit a single `PredicateIndexSkippedMultimodal`
+        // warning.
+        let multimodal_skip =
+            index_requested(index_options).then(|| requested_columns(index_options));
+        compact_multimodal(reader, in_header, output_path)?;
+        return Ok(PredicateIndexBuildSummary {
+            result: None,
+            multimodal_skip,
+        });
     }
     let in_header = &in_header;
 
@@ -136,6 +168,10 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     let mut acc_values: Vec<u8> = Vec::new();
     let mut acc_row_count = 0u64;
     let mut emitted_rows = 0u64; // tracks output row numbering
+                                 // Per-output-shard `(row_start, row_end)` ranges captured during the
+                                 // re-shard loop so predicate-index builders see the actual post-
+                                 // deletion shard boundaries.
+    let mut output_shard_row_ranges: Vec<(u64, u64)> = Vec::new();
 
     for shard_entry in &shards {
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
@@ -182,6 +218,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
                     shard_row_start,
                 )?;
                 emitted_rows += acc_row_count;
+                output_shard_row_ranges.push((shard_row_start, emitted_rows));
                 acc_indptr = vec![0];
                 acc_indices.clear();
                 acc_values.clear();
@@ -203,6 +240,8 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             value_encoding,
             shard_row_start,
         )?;
+        emitted_rows += acc_row_count;
+        output_shard_row_ranges.push((shard_row_start, emitted_rows));
     }
 
     // Copy obsm (row-filtered)
@@ -310,6 +349,28 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
         }
     }
 
+    // Predicate indexes: rebuild against the post-deletion obs + the
+    // freshly emitted shard row ranges. Engine outcomes flow back via
+    // the summary so the caller can map them onto its preferred
+    // warning channel.
+    let index_result = if index_requested(index_options) {
+        Some(
+            build_and_write_conversion_predicate_indexes(
+                &mut writer,
+                &filtered_obs,
+                &var,
+                &output_shard_row_ranges,
+                n_vars as usize,
+                index_options,
+            )
+            .map_err(|e| {
+                OpsError::Io(std::io::Error::other(format!("build predicate index: {e}")))
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Add provenance
     let mut prov_entries = if let Ok(prov) = reader.read_provenance() {
         prov.operations
@@ -329,7 +390,10 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
     writer.write_provenance(prov_entries)?;
 
     writer.finish()?;
-    Ok(())
+    Ok(PredicateIndexBuildSummary {
+        result: index_result,
+        multimodal_skip: None,
+    })
 }
 
 /// Phase 6: compact a multimodal SCX file. Applies the global keep

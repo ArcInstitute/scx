@@ -5,6 +5,7 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use scx_codec::{CodecId, ValueEncoding};
+use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -16,10 +17,43 @@ use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
+use crate::predicate_index::{index_requested, requested_columns, PredicateIndexBuildSummary};
 
 /// Merge multiple SCX files into a single output file.
 /// All inputs must have the same n_vars.
+///
+/// Drops `ObsPredicateIndex` / `VarPredicateIndex` sections from the
+/// output (the merged row layout invalidates per-shard row ranges).
+/// Use [`merge_with_index_options`] to rebuild predicate indexes on the
+/// merged file in the same pass.
 pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
+    merge_with_index_options(
+        input_paths,
+        output_path,
+        &ConversionPredicateIndexOptions::default(),
+    )
+    .map(|_| ())
+}
+
+/// Merge multiple SCX files and optionally rebuild predicate indexes
+/// on the output.
+///
+/// When `index_options` requests one or more obs / var columns (or
+/// names a preset), the helper writes the matching `ObsPredicateIndex`
+/// / `VarPredicateIndex` sections after the obs / var sections and
+/// before `provenance`. The returned summary carries per-axis outcomes
+/// so the caller can emit user-facing warnings (see
+/// `scx-convert::pipeline::process_predicate_index_outcomes` for the
+/// reference outcome → `ConvertWarning` mapping).
+///
+/// Multimodal merge currently cannot persist predicate-index sections
+/// per modality — the helper sets `summary.multimodal_skip` and the
+/// caller surfaces `ConvertWarning::PredicateIndexSkippedMultimodal`.
+pub fn merge_with_index_options(
+    input_paths: &[&Path],
+    output_path: &Path,
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<PredicateIndexBuildSummary> {
     if input_paths.is_empty() {
         return Err(OpsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -73,8 +107,16 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         }
         // Phase 6: dispatch to multimodal merge — concatenate the
         // global obs row axis and per-modality CSR shards in input
-        // order, preserving each modality's var.
-        return merge_multimodal(&readers, input_paths, output_path);
+        // order, preserving each modality's var. Predicate indexes
+        // are unimodal-only today; record the skip so the caller can
+        // emit a single `PredicateIndexSkippedMultimodal` warning.
+        let multimodal_skip =
+            index_requested(index_options).then(|| requested_columns(index_options));
+        merge_multimodal(&readers, input_paths, output_path)?;
+        return Ok(PredicateIndexBuildSummary {
+            result: None,
+            multimodal_skip,
+        });
     }
 
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
@@ -157,6 +199,10 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     // Per-shard codec is auto-selected via select_codec() on the re-encoded values,
     // and value_encoding is read from each shard's header for correctness.
     let mut cumulative_rows = 0u64;
+    // Per-output-shard `(row_start, row_end)` ranges, captured during the
+    // write loop so the predicate-index builder can map global row ids to
+    // output-shard local rows.
+    let mut output_shard_row_ranges: Vec<(u64, u64)> = Vec::new();
     for reader in &readers {
         let shards = reader.catalog().shards_sorted();
         for shard_entry in &shards {
@@ -182,6 +228,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
             // Auto-select optimal codec for this shard's data
             let shard_codec = select_codec(&values_bytes, shard_value_encoding);
 
+            let row_start = cumulative_rows;
             writer.write_csr_shard(
                 &indptr_u64,
                 &indices_u32,
@@ -191,6 +238,7 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
                 cumulative_rows,
             )?;
             cumulative_rows += n_rows as u64;
+            output_shard_row_ranges.push((row_start, cumulative_rows));
         }
     }
 
@@ -310,6 +358,29 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
         }
     }
 
+    // Build + write predicate indexes (obs + var) when the caller
+    // requested any. The engine returns per-axis outcomes so callers
+    // can emit `MissingPresetIndexColumn` / `UnsupportedIndexColumn`
+    // warnings; we just collect them here and let the caller decide
+    // how to surface them.
+    let index_result = if index_requested(index_options) {
+        Some(
+            build_and_write_conversion_predicate_indexes(
+                &mut writer,
+                &merged_obs,
+                &var,
+                &output_shard_row_ranges,
+                n_vars as usize,
+                index_options,
+            )
+            .map_err(|e| {
+                OpsError::Io(std::io::Error::other(format!("build predicate index: {e}")))
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Merge provenance
     let mut all_prov_entries = Vec::new();
     for reader in &readers {
@@ -337,7 +408,10 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     writer.write_provenance(all_prov_entries)?;
 
     writer.finish()?;
-    Ok(())
+    Ok(PredicateIndexBuildSummary {
+        result: index_result,
+        multimodal_skip: None,
+    })
 }
 
 /// Phase 6: merge multimodal SCX files with matching modality

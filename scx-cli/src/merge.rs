@@ -3,13 +3,21 @@
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::reader::ScxReader;
 
+use crate::index_warnings::emit_index_summary;
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_merge(
     inputs: &[PathBuf],
     output: &Path,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate at least 2 inputs
     if inputs.len() < 2 {
@@ -56,8 +64,16 @@ pub fn run_merge(
     // Build refs for the ops API
     let input_refs: Vec<&Path> = inputs.iter().map(|p| p.as_path()).collect();
 
-    // Call scx_ops::merge
-    scx_ops::merge(&input_refs, output)?;
+    // Call scx_ops::merge with predicate-index options. Empty option
+    // bag → behaves like the old no-index call.
+    let index_options = ConversionPredicateIndexOptions {
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+    };
+    let summary = scx_ops::merge_with_index_options(&input_refs, output, &index_options)?;
+    emit_index_summary("merge", &summary);
 
     pb.finish_and_clear();
 

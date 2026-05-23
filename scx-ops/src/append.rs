@@ -7,6 +7,7 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
@@ -18,10 +19,12 @@ use scx_format::section::{write_alignment_padding, SectionType};
 use scx_format::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
+use scx_format::writer::ScxWriter;
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
+use crate::predicate_index::{index_requested, requested_columns, PredicateIndexBuildSummary};
 use crate::rollback::build_root_catalog_from_full;
 
 /// Options controlling how new rows are appended to an SCX file.
@@ -59,6 +62,12 @@ impl Default for AppendOptions {
 /// and modality routing.  Set `options.modality_id` to target a
 /// specific modality on multimodal files (default `0` = global /
 /// single-modality).
+///
+/// Drops any existing predicate-index sections on the target whose
+/// per-shard row ranges no longer cover the post-append obs (i.e. the
+/// stale-index problem on appended rows is preserved as-is). Use
+/// [`append_with_index_options`] to rebuild the predicate index in the
+/// same pass.
 pub fn append(
     target_path: &Path,
     new_obs: &RecordBatch,
@@ -68,14 +77,50 @@ pub fn append(
     value_encoding: ValueEncoding,
     options: &AppendOptions,
 ) -> Result<()> {
+    append_with_index_options(
+        target_path,
+        new_obs,
+        new_indptr,
+        new_indices,
+        new_values,
+        value_encoding,
+        options,
+        &ConversionPredicateIndexOptions::default(),
+    )
+    .map(|_| ())
+}
+
+/// Append new rows and optionally rebuild predicate indexes on the
+/// updated target. The rebuild walks the unified pre- + post-append
+/// obs RecordBatch + the unified per-output-shard row ranges so the
+/// resulting index covers every row. Old `ObsPredicateIndex` /
+/// `VarPredicateIndex` sections are filtered out of the catalog when a
+/// rebuild is requested; otherwise they are left in place (matching
+/// pre-fix behaviour).
+///
+/// Multimodal targets skip the predicate-index write — the engine
+/// read-side ignores `modality_id` on predicate-index sections — and
+/// surface the request via `summary.multimodal_skip` so the caller can
+/// emit `PredicateIndexSkippedMultimodal`.
+#[allow(clippy::too_many_arguments)]
+pub fn append_with_index_options(
+    target_path: &Path,
+    new_obs: &RecordBatch,
+    new_indptr: &[u64],
+    new_indices: &[u32],
+    new_values: &[u8],
+    value_encoding: ValueEncoding,
+    options: &AppendOptions,
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<PredicateIndexBuildSummary> {
     let (mut lock, prep) = prepare_append(target_path, options.modality_id)?;
 
     if new_indptr.is_empty() {
-        return Ok(());
+        return Ok(PredicateIndexBuildSummary::skipped());
     }
     let n_new_rows = new_indptr.len() - 1;
     if n_new_rows == 0 {
-        return Ok(());
+        return Ok(PredicateIndexBuildSummary::skipped());
     }
 
     // Validate CSR shape invariants before touching any on-disk state.
@@ -187,6 +232,7 @@ pub fn append(
         total_new_nnz,
         n_new_rows as u64,
         write_offset,
+        index_options,
     )
 }
 
@@ -206,12 +252,36 @@ pub fn append(
 /// modalities), so the source's obs is concatenated to the target's obs
 /// regardless of the modality_id arguments. CSC sidecars are dropped from
 /// the target on append (same as [`append`]).
+///
+/// Drops any existing predicate-index sections as-is (no rebuild). Use
+/// [`append_from_reader_with_index_options`] to rebuild the predicate
+/// index against the post-append target.
 pub fn append_from_reader(
     target_path: &Path,
     source: &ScxReader,
     options: &AppendOptions,
     source_modality_id: u8,
 ) -> Result<()> {
+    append_from_reader_with_index_options(
+        target_path,
+        source,
+        options,
+        source_modality_id,
+        &ConversionPredicateIndexOptions::default(),
+    )
+    .map(|_| ())
+}
+
+/// `append_from_reader` with predicate-index rebuild knobs. See
+/// [`append_with_index_options`] for the semantics shared with the
+/// in-memory append path.
+pub fn append_from_reader_with_index_options(
+    target_path: &Path,
+    source: &ScxReader,
+    options: &AppendOptions,
+    source_modality_id: u8,
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<PredicateIndexBuildSummary> {
     let (mut lock, prep) = prepare_append(target_path, options.modality_id)?;
 
     // Enumerate the source's CSR shard catalog entries (already sorted by
@@ -225,7 +295,7 @@ pub fn append_from_reader(
 
     if source_csr_entries.is_empty() {
         // Nothing to append — match `append`'s empty-input behaviour.
-        return Ok(());
+        return Ok(PredicateIndexBuildSummary::skipped());
     }
 
     // Detect global per-append invariants from the first source shard header.
@@ -400,6 +470,7 @@ pub fn append_from_reader(
         total_new_nnz,
         cumulative_row_offset,
         write_offset,
+        index_options,
     )
 }
 
@@ -854,8 +925,9 @@ fn raw_copy_csr_shard(
     })
 }
 
-/// Post-shard-loop tail: merge obs, write obs/provenance/(modality table)/
-/// catalog, fsync, rebuild root catalog, finalize header with checksum.
+/// Post-shard-loop tail: merge obs, write obs/(predicate indexes)/provenance/
+/// (modality table)/catalog, fsync, rebuild root catalog, finalize header
+/// with checksum.
 #[allow(clippy::too_many_arguments)]
 fn finalize_append(
     target_path: &Path,
@@ -867,7 +939,8 @@ fn finalize_append(
     total_new_nnz: u64,
     n_new_rows: u64,
     mut write_offset: u64,
-) -> Result<()> {
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<PredicateIndexBuildSummary> {
     let merged_obs = {
         let old_unified = unify_dict_columns(old_obs)?;
         let new_unified = unify_dict_columns(new_obs)?;
@@ -889,6 +962,72 @@ fn finalize_append(
     lock.write_all(&obs_ipc_bytes)?;
     let new_obs_length = obs_ipc_bytes.len() as u64;
     let new_obs_checksum = blake3_hash(&obs_ipc_bytes);
+    write_offset += new_obs_length;
+
+    // Predicate-index rebuild (single-modality only). Multimodal
+    // targets surface the request via `multimodal_skip` and write no
+    // section — see `crate::predicate_index` for the rationale.
+    let target_is_multimodal = prep.modality_table.is_some();
+    let want_index = index_requested(index_options);
+    let multimodal_skip = if target_is_multimodal && want_index {
+        Some(requested_columns(index_options))
+    } else {
+        None
+    };
+
+    let mut predicate_index_section_entries: Vec<FullCatalogEntry> = Vec::new();
+    let drop_old_predicate_indexes = want_index && !target_is_multimodal;
+    let index_result = if want_index && !target_is_multimodal {
+        // Per-output-shard `(row_start, row_end)` for the full obs:
+        // existing CSR shards (modality_id == 0) sorted by row_start,
+        // plus the freshly-appended shards in append order.
+        let mut shard_row_ranges: Vec<(u64, u64)> = prep
+            .old_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+            .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end)))
+            .collect();
+        shard_row_ranges.sort_by_key(|(s, _)| *s);
+        shard_row_ranges.extend(
+            new_shard_entries
+                .iter()
+                .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end))),
+        );
+
+        // var is untouched by append — read from the existing catalog.
+        let var = read_existing_var(lock, &prep.old_catalog)?;
+
+        // Hand the open file off to `ScxWriter` for the section emits.
+        // The `FileLock` retains the OS-level lock through the
+        // duplicate FD (closed below), so concurrent appenders stay
+        // blocked. The clone's cursor advances independently of the
+        // lock's; we resync via `seek` after `into_in_place_parts`.
+        let cloned_file = lock.file().try_clone()?;
+        let mut writer =
+            ScxWriter::adopt_in_place(cloned_file, prep.header.clone(), write_offset, Vec::new())?;
+        let result = build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &merged_obs,
+            &var,
+            &shard_row_ranges,
+            prep.target_n_vars as usize,
+            index_options,
+        )
+        .map_err(|e| OpsError::Io(std::io::Error::other(format!("build predicate index: {e}"))))?;
+        let (cloned_file, new_offset, new_entries) = writer.into_in_place_parts()?;
+        drop(cloned_file);
+        // Resync the lock's cursor to the new EOF so subsequent
+        // `lock.write_all(...)` calls land after the predicate-index
+        // sections rather than overwriting them. (`write_offset` is
+        // refreshed via `lock.stream_position()` below the provenance
+        // write, so we don't update it here.)
+        lock.seek(SeekFrom::Start(new_offset))?;
+        predicate_index_section_entries = new_entries;
+        Some(result)
+    } else {
+        None
+    };
 
     // Provenance
     let prov_entries = {
@@ -954,9 +1093,21 @@ fn finalize_append(
         .entries
         .into_iter()
         .filter(|e| {
-            e.section_type != SectionType::ObsMetadata
+            // Always drop ObsMetadata / Provenance / CscShard — they
+            // are rewritten or invalidated by the append. Drop
+            // ObsPredicateIndex / VarPredicateIndex only when we are
+            // rebuilding them; otherwise the stale entries remain in
+            // place (matches pre-fix behaviour where the index covers
+            // the original rows but not the freshly-appended ones).
+            let base_filter = e.section_type != SectionType::ObsMetadata
                 && e.section_type != SectionType::Provenance
-                && e.section_type != SectionType::CscShard
+                && e.section_type != SectionType::CscShard;
+            if !drop_old_predicate_indexes {
+                return base_filter;
+            }
+            base_filter
+                && e.section_type != SectionType::ObsPredicateIndex
+                && e.section_type != SectionType::VarPredicateIndex
         })
         .collect();
     if had_csc {
@@ -968,6 +1119,7 @@ fn finalize_append(
         );
     }
     new_entries.extend(new_shard_entries);
+    new_entries.extend(predicate_index_section_entries);
     new_entries.push(FullCatalogEntry {
         name: "obs".to_string(),
         offset: new_obs_offset,
@@ -1095,7 +1247,32 @@ fn finalize_append(
     prep.header.front_catalog_length = 0;
 
     finalize_header_with_checksum(lock, &mut prep.header)?;
-    Ok(())
+    Ok(PredicateIndexBuildSummary {
+        result: index_result,
+        multimodal_skip,
+    })
+}
+
+/// Read the existing `var` Arrow IPC section back into a `RecordBatch`.
+/// Mirrors `read_existing_obs` — same `LargeUtf8 → Utf8` downcast so the
+/// returned schema matches what the predicate-index builder expects.
+fn read_existing_var(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
+    let var_entry = old_catalog.get("var").ok_or_else(|| {
+        OpsError::Format(scx_format::ScxError::SectionNotFound("var".to_string()))
+    })?;
+    lock.seek(SeekFrom::Start(var_entry.offset))?;
+    let mut buf = vec![0u8; var_entry.length as usize];
+    std::io::Read::read_exact(&mut *lock, &mut buf)?;
+    let cursor = Cursor::new(buf);
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+    let mut batches = reader.into_iter();
+    let batch = batches.next().ok_or_else(|| {
+        OpsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "var section contains no batches",
+        ))
+    })??;
+    scx_format::downcast_large_types(&batch).map_err(OpsError::Format)
 }
 
 /// Return the effective (dictionary-stripped) value type of a `DataType`.

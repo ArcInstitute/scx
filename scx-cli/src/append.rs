@@ -4,8 +4,12 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use scx_codec::{CodecId, CodecSelection};
+use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::reader::ScxReader;
 
+use crate::index_warnings::emit_index_summary;
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_append(
     target: &Path,
     input: &Path,
@@ -14,6 +18,10 @@ pub fn run_append(
     shard_size: NonZeroU32,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open input file
     let input_reader = ScxReader::open(input)?;
@@ -157,7 +165,20 @@ pub fn run_append(
         modality_id: target_modality_id,
     };
 
-    scx_ops::append_from_reader(target, &input_reader, &append_options, input_modality_id)?;
+    let index_options = ConversionPredicateIndexOptions {
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+    };
+    let summary = scx_ops::append_from_reader_with_index_options(
+        target,
+        &input_reader,
+        &append_options,
+        input_modality_id,
+        &index_options,
+    )?;
+    emit_index_summary("append", &summary);
 
     println!(
         "Appended {} cells from {} to {}",

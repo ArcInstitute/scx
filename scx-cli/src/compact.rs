@@ -3,13 +3,21 @@
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use scx_engine::ConversionPredicateIndexOptions;
 
+use crate::index_warnings::emit_index_summary;
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_compact(
     input: &Path,
     output: &Path,
     force: bool,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate input exists
     if !input.exists() {
@@ -38,8 +46,15 @@ pub fn run_compact(
     pb.set_message(format!("Compacting {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // Call scx_ops::compact
-    scx_ops::compact(input, output)?;
+    // Call scx_ops::compact with predicate-index options.
+    let index_options = ConversionPredicateIndexOptions {
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+    };
+    let summary = scx_ops::compact_with_index_options(input, output, &index_options)?;
+    emit_index_summary("compact", &summary);
 
     pb.finish_and_clear();
 

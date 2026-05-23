@@ -11,13 +11,100 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, SkipReason};
 use scx_format::section::SectionType;
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 use scx_format::ScxReader;
 
-use scx_ops::OpsError;
+use scx_ops::{OpsError, PredicateIndexBuildSummary};
 
 use crate::anndata;
+
+// ---------------------------------------------------------------------------
+// Predicate-index kwarg helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `ConversionPredicateIndexOptions` from the four pyscx kwargs.
+/// Mirrors the option bag construction in
+/// `pyscx::anndata::build_and_write_predicate_indexes_inline` so the
+/// rewrite ops accept the same surface as `pyscx.from_anndata`.
+fn build_index_options(
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
+) -> ConversionPredicateIndexOptions {
+    ConversionPredicateIndexOptions {
+        index_obs: index_obs.unwrap_or_default(),
+        index_var: index_var.unwrap_or_default(),
+        index_preset,
+        // 1000 mirrors `scx-convert::pipeline::ConvertOptions::default`.
+        index_auto_threshold: index_auto_threshold.unwrap_or(1000),
+    }
+}
+
+/// Map a `PredicateIndexBuildSummary` from a `scx-ops` rewrite back
+/// into pyscx-visible signals: forced-column errors become
+/// `PyValueError`; preset skips become `warnings.warn(...)`; the
+/// multimodal skip becomes a single `warnings.warn(...)`. Mirrors the
+/// outcome handling in
+/// `pyscx::anndata::build_and_write_predicate_indexes_inline` so the
+/// rewrite ops surface the same errors / warnings as `from_anndata`.
+fn process_index_summary(py: Python<'_>, summary: PredicateIndexBuildSummary) -> PyResult<()> {
+    let emit_warning = |msg: String| -> PyResult<()> {
+        py.import("warnings")?.call_method1("warn", (msg,))?;
+        Ok(())
+    };
+
+    if let Some(columns) = summary.multimodal_skip {
+        emit_warning(format!(
+            "predicate index skipped: target is multimodal but the engine \
+             read-side is unimodal-only (requested columns: {columns:?})"
+        ))?;
+        return Ok(());
+    }
+
+    let Some(result) = summary.result else {
+        return Ok(());
+    };
+
+    let process = |outcomes: Vec<BuildOutcome>, axis: &str| -> PyResult<()> {
+        let mut forced_missing: Vec<String> = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                BuildOutcome::ForcedColumnError { column, reason } => {
+                    if matches!(reason, SkipReason::MissingColumn) {
+                        forced_missing.push(column);
+                    } else {
+                        return Err(PyValueError::new_err(format!(
+                            "forced {axis} index column '{column}': {reason}"
+                        )));
+                    }
+                }
+                BuildOutcome::PresetSkipped { column, reason } => {
+                    emit_warning(format!(
+                        "predicate index skipped for {axis} column '{column}': {reason}"
+                    ))?;
+                }
+            }
+        }
+        if !forced_missing.is_empty() {
+            // No `available_columns` slice handy at this layer —
+            // surface the missing list directly; the engine's
+            // `forced_columns_missing_message` is only used by the
+            // convert layer where the available columns slice is
+            // cheap to compute. Sub-tier UX, but no surprises.
+            return Err(PyValueError::new_err(format!(
+                "forced {axis} index columns missing from \
+                     output: {forced_missing:?}"
+            )));
+        }
+        Ok(())
+    };
+    process(result.obs_outcomes, "obs")?;
+    process(result.var_outcomes, "var")?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -105,13 +192,21 @@ fn ops_to_pyerr(e: OpsError) -> PyErr {
 ///     pyscx.append("atlas.scx", "new_batch.scx")
 ///     pyscx.append("atlas.scx", "new_batch.scx", codec="auto", shard_size=10000)
 #[pyfunction]
-#[pyo3(signature = (target, input, codec=None, shard_size=None))]
+#[pyo3(signature = (
+    target, input, codec=None, shard_size=None,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+))]
+#[allow(clippy::too_many_arguments)]
 pub fn append(
     py: Python<'_>,
     target: &str,
     input: &str,
     codec: Option<&str>,
     shard_size: Option<i64>,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
@@ -160,8 +255,19 @@ pub fn append(
     };
 
     let target_path = PathBuf::from(target);
-    py.allow_threads(|| scx_ops::append_from_reader(&target_path, &input_reader, &options, 0))
+    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
+    let summary = py
+        .allow_threads(|| {
+            scx_ops::append_from_reader_with_index_options(
+                &target_path,
+                &input_reader,
+                &options,
+                0,
+                &index_opts,
+            )
+        })
         .map_err(ops_to_pyerr)?;
+    process_index_summary(py, summary)?;
 
     Ok(())
 }
@@ -180,7 +286,11 @@ pub fn append(
 ///     pyscx.append_from_anndata("atlas.scx", new_adata)
 ///     pyscx.append_from_anndata("atlas.scx", new_adata, codec="auto", shard_size=10000)
 #[pyfunction]
-#[pyo3(signature = (target, adata, codec=None, shard_size=None, in_place=false))]
+#[pyo3(signature = (
+    target, adata, codec=None, shard_size=None, in_place=false,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+))]
+#[allow(clippy::too_many_arguments)]
 pub fn append_from_anndata(
     py: Python<'_>,
     target: &str,
@@ -188,6 +298,10 @@ pub fn append_from_anndata(
     codec: Option<&str>,
     shard_size: Option<i64>,
     in_place: bool,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
@@ -280,18 +394,22 @@ pub fn append_from_anndata(
     };
 
     let target_path = PathBuf::from(target);
-    py.allow_threads(|| {
-        scx_ops::append(
-            &target_path,
-            &obs,
-            &indptr,
-            &indices,
-            &values_bytes,
-            value_encoding,
-            &options,
-        )
-    })
-    .map_err(ops_to_pyerr)?;
+    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
+    let summary = py
+        .allow_threads(|| {
+            scx_ops::append_with_index_options(
+                &target_path,
+                &obs,
+                &indptr,
+                &indices,
+                &values_bytes,
+                value_encoding,
+                &options,
+                &index_opts,
+            )
+        })
+        .map_err(ops_to_pyerr)?;
+    process_index_summary(py, summary)?;
 
     Ok(())
 }
@@ -333,14 +451,39 @@ pub fn mark_deleted(path: &str, cell_indices: Vec<i64>) -> PyResult<u64> {
 
 /// Rewrite an SCX file reclaiming space from deleted and orphaned sections.
 ///
+/// Optionally rebuilds predicate indexes on the compacted output: pass
+/// `index_obs=[...]` / `index_var=[...]` / `index_preset=...` to mirror
+/// the `scx convert` surface. Without these kwargs the predicate-index
+/// sections are dropped as before (the row layout is re-sharded against
+/// the post-deletion row count).
+///
 /// Example:
 ///     pyscx.compact("experiment.scx", "compacted.scx")
+///     pyscx.compact("experiment.scx", "compacted.scx",
+///                   index_obs=["perturbation", "cell_type"])
 #[pyfunction]
-pub fn compact(py: Python<'_>, input: &str, output: &str) -> PyResult<()> {
+#[pyo3(signature = (
+    input, output,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+))]
+pub fn compact(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
+) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
-    py.allow_threads(|| scx_ops::compact(&input_path, &output_path))
-        .map_err(ops_to_pyerr)
+    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
+    let summary = py
+        .allow_threads(|| {
+            scx_ops::compact_with_index_options(&input_path, &output_path, &index_opts)
+        })
+        .map_err(ops_to_pyerr)?;
+    process_index_summary(py, summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -373,10 +516,31 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
 ///
 /// Requires at least 2 input files. All must have the same n_vars.
 ///
+/// Optionally rebuilds predicate indexes on the merged output: pass
+/// `index_obs=[...]` / `index_var=[...]` / `index_preset=...` to mirror
+/// the `scx convert` surface. Without these kwargs the merged output
+/// has NO predicate-index sections — query-time `filter_obs` pushdown
+/// falls back to a full scan. This was the silent-data-loss bug
+/// reported against multi-input atlas builds.
+///
 /// Example:
 ///     pyscx.merge(["batch1.scx", "batch2.scx", "batch3.scx"], "atlas.scx")
+///     pyscx.merge(["a.scx", "b.scx"], "merged.scx",
+///                 index_obs=["perturbation", "cell_type"])
 #[pyfunction]
-pub fn merge(py: Python<'_>, inputs: Vec<String>, output: &str) -> PyResult<()> {
+#[pyo3(signature = (
+    inputs, output,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+))]
+pub fn merge(
+    py: Python<'_>,
+    inputs: Vec<String>,
+    output: &str,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
+) -> PyResult<()> {
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
             "merge requires at least 2 input files",
@@ -386,7 +550,10 @@ pub fn merge(py: Python<'_>, inputs: Vec<String>, output: &str) -> PyResult<()> 
     let input_paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
     let input_refs: Vec<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
     let output_path = PathBuf::from(output);
+    let index_opts = build_index_options(index_obs, index_var, index_preset, index_auto_threshold);
 
-    py.allow_threads(|| scx_ops::merge(&input_refs, &output_path))
-        .map_err(ops_to_pyerr)
+    let summary = py
+        .allow_threads(|| scx_ops::merge_with_index_options(&input_refs, &output_path, &index_opts))
+        .map_err(ops_to_pyerr)?;
+    process_index_summary(py, summary)
 }

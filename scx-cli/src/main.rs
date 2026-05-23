@@ -6,6 +6,7 @@ use std::process;
 mod append;
 mod benchmark;
 mod compact;
+mod index_warnings;
 use scx_convert as convert;
 mod delete;
 mod info;
@@ -215,6 +216,22 @@ enum Commands {
         /// set (default: 5000). Ignored without `--rebuild-csc`.
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
+        /// Comma-separated obs columns to force-index after appending.
+        /// Mirrors `scx convert --index-obs`; without this flag, any
+        /// pre-existing predicate-index sections remain in place but
+        /// cover only the pre-append rows.
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to force-index after appending.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns when no
+        /// explicit columns or preset are supplied.
+        #[arg(long, default_value_t = 1000)]
+        index_auto_threshold: usize,
     },
     /// Logically delete cells matching a predicate
     Delete {
@@ -247,6 +264,23 @@ enum Commands {
         /// is set (default: 5000). Ignored without `--rebuild-csc`.
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
+        /// Comma-separated obs columns to force-index on the compacted
+        /// output. Mirrors `scx convert --index-obs`. Without this
+        /// flag, compact drops any input predicate-index sections (the
+        /// row layout is re-sharded against the post-deletion row
+        /// count).
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to force-index on the compacted output.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns when no
+        /// explicit columns or preset are supplied.
+        #[arg(long, default_value_t = 1000)]
+        index_auto_threshold: usize,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -272,6 +306,22 @@ enum Commands {
         /// is set (default: 5000). Ignored without `--rebuild-csc`.
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
+        /// Comma-separated obs columns to force-index on the merged
+        /// output. Mirrors `scx convert --index-obs`. Without this
+        /// flag, the merged output has NO predicate-index sections —
+        /// query-time `filter_obs` pushdown falls back to a full scan.
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to force-index on the merged output.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns when no
+        /// explicit columns or preset are supplied.
+        #[arg(long, default_value_t = 1000)]
+        index_auto_threshold: usize,
     },
     /// Query cells by predicate
     Query {
@@ -531,6 +581,10 @@ fn main() {
             shard_size,
             rebuild_csc,
             csc_cols_per_shard,
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
         } => append::run_append(
             &target,
             &input,
@@ -539,6 +593,10 @@ fn main() {
             shard_size,
             rebuild_csc,
             csc_cols_per_shard,
+            parse_index_columns(index_obs.as_deref()),
+            parse_index_columns(index_var.as_deref()),
+            index_preset.filter(|s| !s.trim().is_empty()),
+            index_auto_threshold,
         ),
         Commands::Delete {
             file,
@@ -551,14 +609,41 @@ fn main() {
             force,
             rebuild_csc,
             csc_cols_per_shard,
-        } => compact::run_compact(&input, &output, force, rebuild_csc, csc_cols_per_shard),
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
+        } => compact::run_compact(
+            &input,
+            &output,
+            force,
+            rebuild_csc,
+            csc_cols_per_shard,
+            parse_index_columns(index_obs.as_deref()),
+            parse_index_columns(index_var.as_deref()),
+            index_preset.filter(|s| !s.trim().is_empty()),
+            index_auto_threshold,
+        ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::Merge {
             inputs,
             output,
             rebuild_csc,
             csc_cols_per_shard,
-        } => merge::run_merge(&inputs, &output, rebuild_csc, csc_cols_per_shard),
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
+        } => merge::run_merge(
+            &inputs,
+            &output,
+            rebuild_csc,
+            csc_cols_per_shard,
+            parse_index_columns(index_obs.as_deref()),
+            parse_index_columns(index_var.as_deref()),
+            index_preset.filter(|s| !s.trim().is_empty()),
+            index_auto_threshold,
+        ),
         Commands::Query {
             source,
             filter,

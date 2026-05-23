@@ -3583,6 +3583,7 @@ dependencies = [
  "proptest",
  "roaring",
  "scx-codec",
+ "scx-engine",
  "scx-format",
  "scx-sparse",
  "serde_json",
