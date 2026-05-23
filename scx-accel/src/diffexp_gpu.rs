@@ -1105,8 +1105,13 @@ fn compute_pdex_means_gpu(
         mode_id,
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU DE pseudobulk kernel: {e}")))?;
+    // Slice to the populated prefix — `d_sums` is sized for `chunk_max ×
+    // sums_capacity` but the kernel only writes `n_groups * chunk_size`
+    // elements. Downloading the full buffer wastes PCIe on the final chunk
+    // and whenever `n_groups < sums_capacity`.
     let host_sums = dev
-        .dtoh_copy(d_sums)
+        .stream()
+        .clone_dtoh(&d_sums.slice(..n_groups * chunk_size))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh pseudobulk sums: {e}")))?;
 
     // Group 0 = reference.
@@ -1163,8 +1168,10 @@ fn compute_group_gene_sums_gpu(
         0, // mode_id = ArithRaw / identity
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk kernel: {e}")))?;
+    // See `compute_pdex_means_gpu` for the slice rationale.
     let host_sums = dev
-        .dtoh_copy(d_sums)
+        .stream()
+        .clone_dtoh(&d_sums.slice(..n_groups * chunk_size))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh Wilcoxon sums: {e}")))?;
 
     let mut sums: Vec<Vec<f64>> = Vec::with_capacity(n_groups);

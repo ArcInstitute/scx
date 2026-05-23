@@ -259,6 +259,13 @@ pub fn gpu_randomized_pca(
             // After gpu_qr_q's internal swap, `scratch_slot` holds the empty
             // dummy and `q` owns the n_obs * k buffer of Q. Swap so the
             // scratch field reclaims the Q buffer.
+            debug_assert_eq!(
+                scratch_slot.len(),
+                0,
+                "QR backend must leave its input as a zero-length dummy via \
+                 std::mem::swap; see cusolver::gpu_qr_q / gpu_cholesky_qr2 \
+                 for the contract",
+            );
             std::mem::swap(scratch_slot, &mut q);
             // `q` (now the empty dummy) drops here.
             Ok(())
