@@ -3,13 +3,21 @@
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::reader::ScxReader;
 
+use crate::index_warnings::emit_index_summary;
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_merge(
     inputs: &[PathBuf],
     output: &Path,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    index_obs: Vec<String>,
+    index_var: Vec<String>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate at least 2 inputs
     if inputs.len() < 2 {
@@ -56,8 +64,26 @@ pub fn run_merge(
     // Build refs for the ops API
     let input_refs: Vec<&Path> = inputs.iter().map(|p| p.as_path()).collect();
 
-    // Call scx_ops::merge
-    scx_ops::merge(&input_refs, output)?;
+    // Route to `merge` (drops predicate indexes — pre-fix default) when
+    // no `--index-*` flag is set, and to `merge_with_index_options`
+    // (rebuilds / auto-detects) when at least one flag is set.
+    // `--index-auto-threshold N` alone reaches the engine.
+    let any_index_flag = !index_obs.is_empty()
+        || !index_var.is_empty()
+        || index_preset.is_some()
+        || index_auto_threshold.is_some();
+    if any_index_flag {
+        let index_options = ConversionPredicateIndexOptions {
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold: index_auto_threshold.unwrap_or(1000),
+        };
+        let summary = scx_ops::merge_with_index_options(&input_refs, output, &index_options)?;
+        emit_index_summary("merge", &summary);
+    } else {
+        scx_ops::merge(&input_refs, output)?;
+    }
 
     pb.finish_and_clear();
 
