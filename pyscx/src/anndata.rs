@@ -3068,19 +3068,63 @@ pub(crate) fn route_backed_anndata_to_streaming(
         ));
     }
 
-    // Build the overrides from the in-memory AnnData. Each extraction
-    // mirrors the inline logic used by the non-backed path
-    // (`pandas_to_record_batch`, `sparse_to_coo_record_batch`,
-    // `normalize_uns_value`) so the on-disk SCX output matches what
-    // the user sees in Python.
+    // Build the overrides from the in-memory AnnData. `obs` / `var`
+    // are always extracted from Python — the pandas → Arrow conversion
+    // carries the categorical and nullable-encoding metadata that
+    // scx-convert's pure-Rust `read_dataframe_group` would lose.
+    // `obsm` / `varm` / `obsp` / `varp` / `uns` are extracted only when
+    // mutation detection sees a divergence from the on-disk h5ad —
+    // otherwise the streaming pipeline reads them from disk one shard
+    // at a time. This avoids the per-shard OOM that the wholesale
+    // Python extraction causes for inputs with large embeddings
+    // (e.g. Parse-PBMC obsm reaching tens of GB).
     let obs_override = pandas_to_record_batch(py, &adata.getattr("obs")?)?;
     let var_override = pandas_to_record_batch(py, &adata.getattr("var")?)?;
 
-    let obsm_override = extract_dense_mapping(py, adata, "obsm")?;
-    let varm_override = extract_dense_mapping(py, adata, "varm")?;
-    let obsp_override = extract_coo_mapping(py, adata, "obsp")?;
-    let varp_override = extract_coo_mapping(py, adata, "varp")?;
-    let uns_override = extract_uns_value(py, adata, uns_format_parsed)?;
+    // Open the source h5ad through h5py. We only ever read group
+    // `.keys()` — never any dataset value — so anndata's lazy
+    // `obsm[key]` materialisation path stays untriggered.
+    let h5py = py.import("h5py")?;
+    let h5_kwargs = pyo3::types::PyDict::new(py);
+    h5_kwargs.set_item("mode", "r")?;
+    let h5_file = h5py.call_method("File", (&filename,), Some(&h5_kwargs))?;
+
+    let obsm_clean = section_keys_match(py, &h5_file, adata, "obsm")?;
+    let varm_clean = section_keys_match(py, &h5_file, adata, "varm")?;
+    let obsp_clean = section_keys_match(py, &h5_file, adata, "obsp")?;
+    let varp_clean = section_keys_match(py, &h5_file, adata, "varp")?;
+    let uns_clean = section_keys_match(py, &h5_file, adata, "uns")?;
+
+    let obsm_override = if obsm_clean {
+        None
+    } else {
+        Some(extract_dense_mapping(py, adata, "obsm")?)
+    };
+    let varm_override = if varm_clean {
+        None
+    } else {
+        Some(extract_dense_mapping(py, adata, "varm")?)
+    };
+    let obsp_override = if obsp_clean {
+        None
+    } else {
+        Some(extract_coo_mapping(py, adata, "obsp")?)
+    };
+    let varp_override = if varp_clean {
+        None
+    } else {
+        Some(extract_coo_mapping(py, adata, "varp")?)
+    };
+    let uns_override = if uns_clean {
+        None
+    } else {
+        extract_uns_value(py, adata, uns_format_parsed)?
+    };
+
+    // Close the h5py file handle before scx-convert opens the same path
+    // via the Rust `hdf5` crate. Concurrent libhdf5 access from h5py
+    // and the Rust crate on a single file isn't documented as safe.
+    let _ = h5_file.call_method0("close");
 
     // Layer mutations on a backed AnnData are not propagated — the
     // streaming pipeline always reads layers from disk. Warn so the
@@ -3103,14 +3147,39 @@ pub(crate) fn route_backed_anndata_to_streaming(
         }
     }
 
+    // Breadcrumb for the corner case where a user replaced a value
+    // under an existing key (the keys-only heuristic can't catch this).
+    let routed_from_disk: Vec<&str> = [
+        ("obsm", obsm_clean),
+        ("varm", varm_clean),
+        ("obsp", obsp_clean),
+        ("varp", varp_clean),
+        ("uns", uns_clean),
+    ]
+    .into_iter()
+    .filter_map(|(name, clean)| if clean { Some(name) } else { None })
+    .collect();
+    if !routed_from_disk.is_empty() {
+        let msg = format!(
+            "pyscx: streaming {} from the on-disk h5ad (no Python-side mutation \
+             detected via top-level key comparison). If you replaced a value \
+             under an existing key in-place, the on-disk version wins; re-add \
+             the key under a fresh name to force the Python value through.",
+            routed_from_disk.join(", ")
+        );
+        let _ = py
+            .import("warnings")
+            .and_then(|w| w.call_method1("warn", (msg,)));
+    }
+
     let overrides = scx_convert::StreamingOverrides {
         obs: Some(obs_override),
         var: Some(var_override),
         uns: uns_override,
-        obsm: Some(obsm_override),
-        varm: Some(varm_override),
-        obsp: Some(obsp_override),
-        varp: Some(varp_override),
+        obsm: obsm_override,
+        varm: varm_override,
+        obsp: obsp_override,
+        varp: varp_override,
     };
 
     let opts = scx_convert::ConvertOptions {
@@ -3535,19 +3604,30 @@ fn route_scx_backed_to_scx(
     )?;
 
     // Write remaining metadata (obsm / varm / obsp / varp / uns) after
-    // the X shards, matching the canonical layout.
+    // the X shards, matching the canonical layout. obsm / varm / obsp /
+    // varp are emitted as row-sharded sections so the on-disk layout
+    // matches what the streaming pipeline produces (readers handle
+    // both sharded and legacy single-section layouts transparently).
     py.allow_threads(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
-            writer.write_obsm(k, b)?;
+            for_each_dense_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
+                writer.write_obsm_shard(k, idx, row_start, n_total, shard)
+            })?;
         }
         for (k, b) in &ov.varm {
-            writer.write_varm(k, b)?;
+            for_each_dense_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
+                writer.write_varm_shard(k, idx, row_start, n_total, shard)
+            })?;
         }
         for (k, b) in &ov.obsp {
-            writer.write_obsp(k, b)?;
+            for_each_coo_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
+                writer.write_obsp_shard_coo(k, idx, row_start, n_total, shard)
+            })?;
         }
         for (k, b) in &ov.varp {
-            writer.write_varp(k, b)?;
+            for_each_coo_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
+                writer.write_varp_shard_coo(k, idx, row_start, n_total, shard)
+            })?;
         }
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
@@ -3696,16 +3776,24 @@ fn route_scx_lazy_to_scx(
 
     py.allow_threads(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
-            writer.write_obsm(k, b)?;
+            for_each_dense_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
+                writer.write_obsm_shard(k, idx, row_start, n_total, shard)
+            })?;
         }
         for (k, b) in &ov.varm {
-            writer.write_varm(k, b)?;
+            for_each_dense_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
+                writer.write_varm_shard(k, idx, row_start, n_total, shard)
+            })?;
         }
         for (k, b) in &ov.obsp {
-            writer.write_obsp(k, b)?;
+            for_each_coo_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
+                writer.write_obsp_shard_coo(k, idx, row_start, n_total, shard)
+            })?;
         }
         for (k, b) in &ov.varp {
-            writer.write_varp(k, b)?;
+            for_each_coo_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
+                writer.write_varp_shard_coo(k, idx, row_start, n_total, shard)
+            })?;
         }
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
@@ -3877,6 +3965,189 @@ fn stream_write_layers(
             py.allow_threads(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;
         }
+    }
+    Ok(())
+}
+
+/// Mutation detection for the backed-routing path. Compares the
+/// top-level key set of `getattr(adata, attr)` against the on-disk
+/// h5py group at `/<attr>`. Returns `true` when the two key sets match
+/// exactly (sender hasn't mutated this section in Python, so the
+/// pipeline can stream from the source h5ad instead of materialising
+/// the Python copy).
+///
+/// Cheapness invariants:
+/// 1. `adata.obsm.keys()` on a backed AnnData lists the underlying
+///    h5py group members without loading any dataset.
+/// 2. `h5_file[attr].keys()` is a pure metadata read on h5py.
+///
+/// We never touch `adata.obsm[key]` here — that would force the very
+/// h5py-to-numpy read we're trying to avoid.
+///
+/// Limitation: same-key replacements ("user did `adata.obsm['X_pca'] =
+/// new_array`" without renaming) aren't detected. Document this with a
+/// `UserWarning` on the routing path so users have a breadcrumb.
+fn section_keys_match(
+    py: Python<'_>,
+    h5_file: &Bound<'_, PyAny>,
+    adata: &Bound<'_, PyAny>,
+    attr: &str,
+) -> PyResult<bool> {
+    let py_keys: Vec<String> = match adata.getattr(attr) {
+        Ok(section) => match section.call_method0("keys") {
+            Ok(keys_obj) => py
+                .import("builtins")?
+                .call_method1("list", (keys_obj,))?
+                .extract()
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let disk_keys: Vec<String> = match h5_file.get_item(attr) {
+        Ok(group) => match group.call_method0("keys") {
+            Ok(keys_obj) => py
+                .import("builtins")?
+                .call_method1("list", (keys_obj,))?
+                .extract()
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let py_set: std::collections::BTreeSet<&String> = py_keys.iter().collect();
+    let disk_set: std::collections::BTreeSet<&String> = disk_keys.iter().collect();
+    Ok(py_set == disk_set)
+}
+
+/// Slice a dense obsm/varm `RecordBatch` into row-aligned shards and
+/// emit each via `f`. Used by the SCX-backed / lazy / in-memory
+/// `from_anndata` paths so all pyscx-produced SCX files share the
+/// sharded on-disk layout the streaming pipeline emits.
+fn for_each_dense_shard<F>(
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+    mut f: F,
+) -> std::result::Result<(), scx_format::ScxError>
+where
+    F: FnMut(u32, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
+{
+    let n_rows = batch.num_rows();
+    let n_total = n_rows as u64;
+    if n_rows == 0 {
+        return f(0, 0, 0, batch);
+    }
+    let step = shard_target_rows.max(1) as usize;
+    let mut shard_idx = 0u32;
+    let mut row_start = 0usize;
+    while row_start < n_rows {
+        let n = (n_rows - row_start).min(step);
+        let shard = batch.slice(row_start, n);
+        f(shard_idx, row_start as u64, n_total, &shard)?;
+        row_start += n;
+        shard_idx += 1;
+    }
+    Ok(())
+}
+
+/// Slice a COO obsp/varp `RecordBatch` into row-shards keyed by the
+/// `row` column. Buckets non-zero triples by `row / shard_target_rows`
+/// then emits one shard per non-empty bucket. Used by the in-Python
+/// override paths to keep on-disk obsp/varp layout symmetric with the
+/// streaming pipeline. Returns `ScxError` (not `PyResult`) so callers
+/// can drive it from inside `py.allow_threads(...)`.
+fn for_each_coo_shard<F>(
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+    mut f: F,
+) -> std::result::Result<(), scx_format::ScxError>
+where
+    F: FnMut(u32, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
+{
+    use arrow::array::{Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let invalid = |msg: String| {
+        scx_format::ScxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+    };
+
+    let row_arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| invalid("sparse override: column 0 must be Int32".into()))?;
+    let col_arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| invalid("sparse override: column 1 must be Int32".into()))?;
+    let data_arr = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| invalid("sparse override: column 2 must be Float32".into()))?;
+
+    let metadata = batch.schema_ref().metadata().clone();
+    let n_rows: usize = metadata
+        .get("n_rows")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| invalid("sparse override: missing 'n_rows' metadata".into()))?;
+    let n_cols: usize = metadata
+        .get("n_cols")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| invalid("sparse override: missing 'n_cols' metadata".into()))?;
+
+    let step = shard_target_rows.max(1) as usize;
+    if n_rows == 0 {
+        return f(0, 0, 0, batch);
+    }
+
+    let n_shards = n_rows.div_ceil(step);
+    let mut bucket_row: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut bucket_col: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut bucket_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    for i in 0..row_arr.len() {
+        let r = row_arr.value(i);
+        if r < 0 {
+            return Err(invalid(format!("sparse override: negative row index {r}")));
+        }
+        let shard = (r as usize) / step;
+        if shard >= n_shards {
+            return Err(invalid(format!(
+                "sparse override: row {r} exceeds n_rows={n_rows}"
+            )));
+        }
+        bucket_row[shard].push(r);
+        bucket_col[shard].push(col_arr.value(i));
+        bucket_data[shard].push(data_arr.value(i));
+    }
+
+    let n_total = n_rows as u64;
+    for shard_idx in 0..n_shards {
+        let row_start = (shard_idx * step) as u64;
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Int32, false),
+                Field::new("col", DataType::Int32, false),
+                Field::new("data", DataType::Float32, false),
+            ],
+            std::collections::HashMap::from([
+                ("n_rows".to_string(), n_rows.to_string()),
+                ("n_cols".to_string(), n_cols.to_string()),
+            ]),
+        ));
+        let shard_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(std::mem::take(&mut bucket_row[shard_idx]))),
+                Arc::new(Int32Array::from(std::mem::take(&mut bucket_col[shard_idx]))),
+                Arc::new(Float32Array::from(std::mem::take(
+                    &mut bucket_data[shard_idx],
+                ))),
+            ],
+        )
+        .map_err(scx_format::ScxError::Arrow)?;
+        f(shard_idx as u32, row_start, n_total, &shard_batch)?;
     }
     Ok(())
 }
@@ -4424,24 +4695,50 @@ pub fn from_anndata_impl(
         None
     };
 
-    // 1E.2: Write obsm, varm, obsp, varp, and uns outside GIL (pure Rust)
-    py.allow_threads(|| {
+    // 1E.2: Write obsm, varm, obsp, varp, and uns outside GIL (pure
+    // Rust). obsm / varm / obsp / varp are sharded so the on-disk
+    // layout matches the streaming pipeline.
+    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
         for (key, batch) in &obsm_batches {
-            writer.write_obsm(key, batch)?;
+            for_each_dense_shard(
+                batch,
+                shard_target_rows,
+                |idx, row_start, n_total, shard| {
+                    writer.write_obsm_shard(key, idx, row_start, n_total, shard)
+                },
+            )?;
         }
         for (key, batch) in &varm_batches {
-            writer.write_varm(key, batch)?;
+            for_each_dense_shard(
+                batch,
+                shard_target_rows,
+                |idx, row_start, n_total, shard| {
+                    writer.write_varm_shard(key, idx, row_start, n_total, shard)
+                },
+            )?;
         }
         for (key, batch) in &obsp_batches {
-            writer.write_obsp(key, batch)?;
+            for_each_coo_shard(
+                batch,
+                shard_target_rows,
+                |idx, row_start, n_total, shard| {
+                    writer.write_obsp_shard_coo(key, idx, row_start, n_total, shard)
+                },
+            )?;
         }
         for (key, batch) in &varp_batches {
-            writer.write_varp(key, batch)?;
+            for_each_coo_shard(
+                batch,
+                shard_target_rows,
+                |idx, row_start, n_total, shard| {
+                    writer.write_varp_shard_coo(key, idx, row_start, n_total, shard)
+                },
+            )?;
         }
         if let Some(ref json_val) = uns_json {
             writer.write_uns(json_val)?;
         }
-        Ok::<(), scx_format::ScxError>(())
+        Ok(())
     })
     .map_err(to_pyerr)?;
 

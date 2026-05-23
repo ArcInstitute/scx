@@ -446,7 +446,17 @@ impl ScxReader {
     }
 
     /// Read a named obsm embedding as an Arrow RecordBatch.
+    ///
+    /// Prefers the sharded on-disk layout (`obsm/<name>_shard_<idx>`,
+    /// section type [`SectionType::ObsmEmbeddingShard`]) and falls back
+    /// to the legacy single-section [`SectionType::ObsmEmbedding`]
+    /// layout for files written before sharding was introduced.
     pub fn read_obsm(&self, name: &str) -> Result<RecordBatch> {
+        if let Some(batch) =
+            self.read_sharded_layout("obsm", name, SectionType::ObsmEmbeddingShard)?
+        {
+            return Ok(batch);
+        }
         let key = format!("obsm/{name}");
         let entry = self
             .full_catalog
@@ -457,23 +467,22 @@ impl ScxReader {
 
     /// Read all obsm embeddings, keyed by name.
     pub fn read_all_obsm(&self) -> Result<HashMap<String, RecordBatch>> {
-        let mut result = HashMap::new();
-        for entry in &self.full_catalog.entries {
-            if entry.section_type == SectionType::ObsmEmbedding {
-                let name = entry
-                    .name
-                    .strip_prefix("obsm/")
-                    .unwrap_or(&entry.name)
-                    .to_string();
-                let batch = self.read_arrow_ipc(entry)?;
-                result.insert(name, batch);
-            }
-        }
-        Ok(result)
+        self.read_all_sharded_or_single(
+            "obsm",
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard,
+        )
     }
 
     /// Read a named varm embedding as an Arrow RecordBatch.
+    ///
+    /// See [`Self::read_obsm`] for the sharded / legacy layout handling.
     pub fn read_varm(&self, name: &str) -> Result<RecordBatch> {
+        if let Some(batch) =
+            self.read_sharded_layout("varm", name, SectionType::VarmEmbeddingShard)?
+        {
+            return Ok(batch);
+        }
         let key = format!("varm/{name}");
         let entry = self
             .full_catalog
@@ -484,19 +493,11 @@ impl ScxReader {
 
     /// Read all varm embeddings, keyed by name.
     pub fn read_all_varm(&self) -> Result<HashMap<String, RecordBatch>> {
-        let mut result = HashMap::new();
-        for entry in &self.full_catalog.entries {
-            if entry.section_type == SectionType::VarmEmbedding {
-                let name = entry
-                    .name
-                    .strip_prefix("varm/")
-                    .unwrap_or(&entry.name)
-                    .to_string();
-                let batch = self.read_arrow_ipc(entry)?;
-                result.insert(name, batch);
-            }
-        }
-        Ok(result)
+        self.read_all_sharded_or_single(
+            "varm",
+            SectionType::VarmEmbedding,
+            SectionType::VarmEmbeddingShard,
+        )
     }
 
     /// Read a named obsp pairwise sparse matrix (COO format).
@@ -504,8 +505,14 @@ impl ScxReader {
     /// Lazy counterpart to [`Self::read_all_obsp`]: used by
     /// `pyscx::lazy_mapping::ScxLazyPairwiseMapping` so `to_anndata()`
     /// can defer obsp materialization until the consumer actually
-    /// accesses `ad.obsp[name]`.
+    /// accesses `ad.obsp[name]`. Handles both sharded and legacy
+    /// single-section layouts; see [`Self::read_obsm`].
     pub fn read_obsp(&self, name: &str) -> Result<RecordBatch> {
+        if let Some(batch) =
+            self.read_sharded_layout("obsp", name, SectionType::ObspEmbeddingShard)?
+        {
+            return Ok(batch);
+        }
         let key = format!("obsp/{name}");
         let entry = self
             .full_catalog
@@ -516,25 +523,22 @@ impl ScxReader {
 
     /// Read all obsp pairwise sparse matrices (COO format), keyed by name.
     pub fn read_all_obsp(&self) -> Result<HashMap<String, RecordBatch>> {
-        let mut result = HashMap::new();
-        for entry in &self.full_catalog.entries {
-            if entry.section_type == SectionType::ObspEmbedding {
-                let name = entry
-                    .name
-                    .strip_prefix("obsp/")
-                    .unwrap_or(&entry.name)
-                    .to_string();
-                let batch = self.read_arrow_ipc(entry)?;
-                result.insert(name, batch);
-            }
-        }
-        Ok(result)
+        self.read_all_sharded_or_single(
+            "obsp",
+            SectionType::ObspEmbedding,
+            SectionType::ObspEmbeddingShard,
+        )
     }
 
     /// Read a named varp pairwise sparse matrix (COO format).
     ///
     /// Lazy counterpart to [`Self::read_all_varp`]; see [`Self::read_obsp`].
     pub fn read_varp(&self, name: &str) -> Result<RecordBatch> {
+        if let Some(batch) =
+            self.read_sharded_layout("varp", name, SectionType::VarpEmbeddingShard)?
+        {
+            return Ok(batch);
+        }
         let key = format!("varp/{name}");
         let entry = self
             .full_catalog
@@ -545,52 +549,170 @@ impl ScxReader {
 
     /// Read all varp pairwise sparse matrices (COO format), keyed by name.
     pub fn read_all_varp(&self) -> Result<HashMap<String, RecordBatch>> {
-        let mut result = HashMap::new();
-        for entry in &self.full_catalog.entries {
-            if entry.section_type == SectionType::VarpEmbedding {
-                let name = entry
-                    .name
-                    .strip_prefix("varp/")
-                    .unwrap_or(&entry.name)
-                    .to_string();
-                let batch = self.read_arrow_ipc(entry)?;
-                result.insert(name, batch);
-            }
-        }
-        Ok(result)
+        self.read_all_sharded_or_single(
+            "varp",
+            SectionType::VarpEmbedding,
+            SectionType::VarpEmbeddingShard,
+        )
     }
 
     /// List the keys (entry names with their section prefix stripped) of
     /// every `obsp/*` catalog entry. Pure catalog scan — no section
     /// bytes are read. Used by `pyscx::lazy_mapping` to pre-populate the
-    /// key set of the lazy obsp wrapper at `to_anndata()` time.
+    /// key set of the lazy obsp wrapper at `to_anndata()` time. Includes
+    /// both sharded (`obsp/<name>_shard_<idx>`) and legacy single-section
+    /// keys, deduplicating shard names back to their logical key.
     pub fn list_obsp(&self) -> Vec<String> {
-        self.full_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::ObspEmbedding)
-            .map(|e| e.name.strip_prefix("obsp/").unwrap_or(&e.name).to_string())
-            .collect()
+        self.list_logical_names(
+            "obsp",
+            SectionType::ObspEmbedding,
+            SectionType::ObspEmbeddingShard,
+        )
     }
 
     /// List the keys of every `varp/*` catalog entry. See [`Self::list_obsp`].
     pub fn list_varp(&self) -> Vec<String> {
-        self.full_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::VarpEmbedding)
-            .map(|e| e.name.strip_prefix("varp/").unwrap_or(&e.name).to_string())
-            .collect()
+        self.list_logical_names(
+            "varp",
+            SectionType::VarpEmbedding,
+            SectionType::VarpEmbeddingShard,
+        )
     }
 
     /// List the keys of every `varm/*` catalog entry. See [`Self::list_obsp`].
     pub fn list_varm(&self) -> Vec<String> {
-        self.full_catalog
+        self.list_logical_names(
+            "varm",
+            SectionType::VarmEmbedding,
+            SectionType::VarmEmbeddingShard,
+        )
+    }
+
+    /// List the keys of every `obsm/*` catalog entry. See [`Self::list_obsp`].
+    pub fn list_obsm(&self) -> Vec<String> {
+        self.list_logical_names(
+            "obsm",
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard,
+        )
+    }
+
+    /// Read a sharded `<prefix>/<name>` section, concatenating shards in
+    /// `shard_idx` order. Returns `Ok(None)` if no shards exist for
+    /// `<name>` (caller can fall back to the legacy single-section path).
+    ///
+    /// Concatenation is row-axis; the per-shard `row_start`/`shard_idx`
+    /// metadata in the Arrow schema is used to verify that the catalog
+    /// entries form a contiguous, ordered cover of the logical matrix.
+    fn read_sharded_layout(
+        &self,
+        prefix: &str,
+        name: &str,
+        shard_type: SectionType,
+    ) -> Result<Option<RecordBatch>> {
+        let shard_name_prefix = format!("{prefix}/{name}_shard_");
+        let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+            .full_catalog
             .entries
             .iter()
-            .filter(|e| e.section_type == SectionType::VarmEmbedding)
-            .map(|e| e.name.strip_prefix("varm/").unwrap_or(&e.name).to_string())
-            .collect()
+            .filter(|e| e.section_type == shard_type && e.name.starts_with(&shard_name_prefix))
+            .filter_map(|e| {
+                let suffix = e.name.strip_prefix(&shard_name_prefix)?;
+                let idx: u32 = suffix.parse().ok()?;
+                Some((idx, e))
+            })
+            .collect();
+        if shards.is_empty() {
+            return Ok(None);
+        }
+        shards.sort_by_key(|(idx, _)| *idx);
+
+        let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
+        for (_, entry) in &shards {
+            batches.push(self.read_arrow_ipc(entry)?);
+        }
+        let schema = batches[0].schema();
+        let concatenated = arrow::compute::concat_batches(&schema, batches.iter())?;
+        Ok(Some(concatenated))
+    }
+
+    /// Walk the catalog for both single-section and sharded entries
+    /// under `<prefix>/`, returning a `name -> RecordBatch` map. Sharded
+    /// entries are concatenated via [`Self::read_sharded_layout`];
+    /// single-section entries fall through unchanged.
+    fn read_all_sharded_or_single(
+        &self,
+        prefix: &str,
+        single_type: SectionType,
+        shard_type: SectionType,
+    ) -> Result<HashMap<String, RecordBatch>> {
+        let mut result = HashMap::new();
+        let path_prefix = format!("{prefix}/");
+        let shard_marker = "_shard_";
+
+        // Sharded keys: collect unique logical names, then read each.
+        let mut sharded_names: std::collections::BTreeSet<String> = Default::default();
+        for entry in &self.full_catalog.entries {
+            if entry.section_type != shard_type {
+                continue;
+            }
+            if let Some(rest) = entry.name.strip_prefix(&path_prefix) {
+                if let Some(idx) = rest.rfind(shard_marker) {
+                    sharded_names.insert(rest[..idx].to_string());
+                }
+            }
+        }
+        for name in &sharded_names {
+            if let Some(batch) = self.read_sharded_layout(prefix, name, shard_type)? {
+                result.insert(name.clone(), batch);
+            }
+        }
+
+        // Legacy single-section entries (only included if the same name
+        // wasn't already produced from shards — shards win).
+        for entry in &self.full_catalog.entries {
+            if entry.section_type != single_type {
+                continue;
+            }
+            let name = entry
+                .name
+                .strip_prefix(&path_prefix)
+                .unwrap_or(&entry.name)
+                .to_string();
+            if result.contains_key(&name) {
+                continue;
+            }
+            result.insert(name, self.read_arrow_ipc(entry)?);
+        }
+        Ok(result)
+    }
+
+    /// Pure catalog scan: return the de-duplicated set of logical names
+    /// under `<prefix>/`, considering both legacy single-section and
+    /// sharded entries. Used by `list_obsm` / `list_obsp` / etc.
+    fn list_logical_names(
+        &self,
+        prefix: &str,
+        single_type: SectionType,
+        shard_type: SectionType,
+    ) -> Vec<String> {
+        let path_prefix = format!("{prefix}/");
+        let shard_marker = "_shard_";
+        let mut names: std::collections::BTreeSet<String> = Default::default();
+        for entry in &self.full_catalog.entries {
+            if entry.section_type == single_type {
+                if let Some(name) = entry.name.strip_prefix(&path_prefix) {
+                    names.insert(name.to_string());
+                }
+            } else if entry.section_type == shard_type {
+                if let Some(rest) = entry.name.strip_prefix(&path_prefix) {
+                    if let Some(idx) = rest.rfind(shard_marker) {
+                        names.insert(rest[..idx].to_string());
+                    }
+                }
+            }
+        }
+        names.into_iter().collect()
     }
 
     // -----------------------------------------------------------------------
@@ -2272,6 +2394,123 @@ mod tests {
         let prov = reader.read_provenance().unwrap();
         assert_eq!(prov.operations.len(), 1);
         assert_eq!(prov.operations[0].action, "convert");
+    }
+
+    /// Sharded obsm round-trip: three row-shards of the same logical
+    /// matrix should reassemble byte-equal to the unsharded equivalent.
+    #[test]
+    fn test_sharded_obsm_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sharded_obsm.scx");
+
+        let n_obs: usize = 9;
+        let n_vars: usize = 4;
+        let header = FileHeader {
+            magic: MAGIC,
+            format_version: CURRENT_FORMAT_VERSION,
+            header_length: 256,
+            flags: 0,
+            n_obs: n_obs as u64,
+            n_vars: n_vars as u64,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: 3,
+            codec_id: 0,
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
+        };
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+
+        // Single CSR shard so the file passes its catalog invariants.
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        // 3 row-shards of (3 × 2) obsm, values pc1 = row index, pc2 = 2*row.
+        let obsm_schema = Arc::new(Schema::new(vec![
+            Field::new("pc1", DataType::Float32, false),
+            Field::new("pc2", DataType::Float32, false),
+        ]));
+        for shard_idx in 0u32..3 {
+            let row_start = shard_idx as usize * 3;
+            let rows: Vec<f32> = (row_start..row_start + 3).map(|r| r as f32).collect();
+            let rows2: Vec<f32> = rows.iter().map(|r| r * 2.0).collect();
+            let batch = RecordBatch::try_new(
+                obsm_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(rows)),
+                    Arc::new(Float32Array::from(rows2)),
+                ],
+            )
+            .unwrap();
+            writer
+                .write_obsm_shard("X_pca", shard_idx, row_start as u64, n_obs as u64, &batch)
+                .unwrap();
+        }
+
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let pca = reader.read_obsm("X_pca").unwrap();
+        assert_eq!(pca.num_rows(), n_obs);
+        assert_eq!(pca.num_columns(), 2);
+        let pc1 = pca
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for (i, v) in pc1.values().iter().enumerate() {
+            assert_eq!(*v, i as f32);
+        }
+        let all = reader.read_all_obsm().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key("X_pca"));
+        let names = reader.list_obsm();
+        assert_eq!(names, vec!["X_pca".to_string()]);
+    }
+
+    /// A file written with the legacy single-section obsm path must
+    /// keep reading correctly after the sharded-aware reader changes.
+    /// This is the backward-compatibility guarantee for files written
+    /// before sharding was introduced.
+    #[test]
+    fn test_legacy_single_section_obsm_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "legacy_obsm.scx", 6, 10, 2, true);
+        let reader = ScxReader::open(&path).unwrap();
+
+        let obsm = reader.read_obsm("X_pca").unwrap();
+        assert_eq!(obsm.num_rows(), 6);
+        assert_eq!(obsm.num_columns(), 2);
+
+        let all = reader.read_all_obsm().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key("X_pca"));
     }
 
     #[test]

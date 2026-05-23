@@ -35,6 +35,29 @@ pub enum SectionType {
     /// var × var pairwise sparse matrix (Arrow IPC, COO format).
     /// Section name prefix: `varp/`. Same wire format as `ObspEmbedding`.
     VarpEmbedding = 19,
+    /// Row-shard of an `obsm/<name>` dense embedding (Arrow IPC).
+    /// Section name: `obsm/<name>_shard_<idx>`. Same column schema as
+    /// [`ObsmEmbedding`]; Arrow schema metadata carries `row_start` /
+    /// `shard_idx` / `n_rows_total` so the reader can validate ordering
+    /// and total length. Readers concatenate shards in `shard_idx`
+    /// order to reconstruct the logical matrix; legacy single-section
+    /// [`ObsmEmbedding`] files remain readable.
+    ObsmEmbeddingShard = 20,
+    /// Row-shard of a `varm/<name>` dense embedding (Arrow IPC). Mirror
+    /// of [`ObsmEmbeddingShard`] for the `varm/` axis. Sharded along
+    /// the var (gene) axis.
+    VarmEmbeddingShard = 21,
+    /// Row-shard of an `obsp/<name>` pairwise sparse matrix (Arrow IPC
+    /// COO). Section name: `obsp/<name>_shard_<idx>`. Same column
+    /// schema as [`ObspEmbedding`] (`row: Int32`, `col: Int32`,
+    /// `data: Float32`) with `row` values local to the shard's row
+    /// range; readers add the shard's `row_start` back when
+    /// reassembling. Schema metadata carries `row_start` / `shard_idx`
+    /// / `n_rows_total` / `n_rows` / `n_cols`.
+    ObspEmbeddingShard = 22,
+    /// Row-shard of a `varp/<name>` pairwise sparse matrix. Mirror of
+    /// [`ObspEmbeddingShard`] for the `varp/` axis.
+    VarpEmbeddingShard = 23,
 }
 
 impl SectionType {
@@ -61,6 +84,10 @@ impl SectionType {
             17 => Some(Self::VarmEmbedding),
             18 => Some(Self::ObspEmbedding),
             19 => Some(Self::VarpEmbedding),
+            20 => Some(Self::ObsmEmbeddingShard),
+            21 => Some(Self::VarmEmbeddingShard),
+            22 => Some(Self::ObspEmbeddingShard),
+            23 => Some(Self::VarpEmbeddingShard),
             _ => None,
         }
     }
@@ -113,11 +140,27 @@ mod tests {
         assert_eq!(SectionType::from_u8(17), Some(SectionType::VarmEmbedding));
         assert_eq!(SectionType::from_u8(18), Some(SectionType::ObspEmbedding));
         assert_eq!(SectionType::from_u8(19), Some(SectionType::VarpEmbedding));
+        assert_eq!(
+            SectionType::from_u8(20),
+            Some(SectionType::ObsmEmbeddingShard)
+        );
+        assert_eq!(
+            SectionType::from_u8(21),
+            Some(SectionType::VarmEmbeddingShard)
+        );
+        assert_eq!(
+            SectionType::from_u8(22),
+            Some(SectionType::ObspEmbeddingShard)
+        );
+        assert_eq!(
+            SectionType::from_u8(23),
+            Some(SectionType::VarpEmbeddingShard)
+        );
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(20), None);
+        assert_eq!(SectionType::from_u8(24), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 

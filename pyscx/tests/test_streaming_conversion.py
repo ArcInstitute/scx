@@ -143,6 +143,62 @@ def test_backed_obs_mutation_preserved(h5ad_path, tmp_dir):
     )
 
 
+def test_sharded_obsm_obsp_round_trip(tmp_dir):
+    """A backed AnnData with non-trivial `obsm` + `obsp` should round
+    trip via the sharded streaming layout (`obsm/<k>_shard_<idx>` and
+    `obsp/<k>_shard_<idx>` sections). Reading the SCX file back as an
+    AnnData reconstructs the same matrices."""
+    import anndata as ad
+    import pyscx
+
+    n_obs, n_vars = 9, 4
+    rng = np.random.default_rng(42)
+    X = sp.csr_matrix(rng.random((n_obs, n_vars), dtype=np.float32))
+
+    obs = pd.DataFrame(
+        {"label": [f"c{i}" for i in range(n_obs)]},
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(
+        {"name": [f"g{i}" for i in range(n_vars)]},
+        index=[f"gene_{i}" for i in range(n_vars)],
+    )
+
+    # obsm: a 5-component PCA-like embedding the sharded path must
+    # reassemble correctly across multiple shards (shard_size = 3 below
+    # → 3 shards).
+    X_pca = rng.random((n_obs, 5), dtype=np.float32)
+    # obsp: a sparse symmetric distance graph (kNN-like), one entry per
+    # row pair within the shard's row range.
+    obsp_row = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int32)
+    obsp_col = np.array([1, 2, 3, 4, 5, 6, 7, 8, 0], dtype=np.int32)
+    obsp_data = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], dtype=np.float32)
+    dist = sp.coo_matrix((obsp_data, (obsp_row, obsp_col)), shape=(n_obs, n_obs)).tocsr()
+
+    a = ad.AnnData(X=X, obs=obs, var=var, obsm={"X_pca": X_pca}, obsp={"distances": dist})
+    src = str(tmp_dir / "src.h5ad")
+    a.write_h5ad(src)
+
+    backed = ad.read_h5ad(src, backed="r")
+    out = str(tmp_dir / "sharded.scx")
+    # shard_size=3 forces multiple obsm/obsp shards (n_obs=9).
+    pyscx.from_anndata(backed, out, shard_size=3)
+
+    # Materialise the SCX file back to AnnData and confirm the
+    # logical matrices reassemble correctly from their shards.
+    materialised = pyscx.open(out).to_anndata()
+    assert "X_pca" in materialised.obsm
+    assert "distances" in materialised.obsp
+    np.testing.assert_array_equal(
+        np.asarray(materialised.obsm["X_pca"]), X_pca
+    )
+    # obsp round-trips as a sparse matrix; compare densified values.
+    np.testing.assert_array_equal(
+        materialised.obsp["distances"].toarray(),
+        dist.toarray(),
+    )
+
+
 def test_csc_sidecar_parity(synthetic_adata, h5ad_path, tmp_dir):
     """`csc='always'` should emit a CSC sidecar with the same shard count
     via either entry point. Cell-level byte equality is asserted in the
