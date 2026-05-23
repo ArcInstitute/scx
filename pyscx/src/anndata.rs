@@ -3987,6 +3987,12 @@ fn stream_write_layers(
 /// Limitation: same-key replacements ("user did `adata.obsm['X_pca'] =
 /// new_array`" without renaming) aren't detected. Document this with a
 /// `UserWarning` on the routing path so users have a breadcrumb.
+///
+/// Gated behind the `hdf5` feature because the sole caller
+/// (`route_backed_anndata_to_streaming`) is. Without `hdf5` the
+/// streaming backed-AnnData path falls through to the in-memory branch
+/// in `from_anndata_impl` and this helper would be dead code.
+#[cfg(feature = "hdf5")]
 fn section_keys_match(
     py: Python<'_>,
     h5_file: &Bound<'_, PyAny>,
