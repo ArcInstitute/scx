@@ -232,6 +232,47 @@ def test_pdex_ref_invalid_prefer_format(small_adata, tmp_path):
         pyscx.accel.pdex_ref(a_csc, "group", reference="A", prefer_format="auto")
 
 
+def test_pdex_ref_csc_with_device_auto_falls_back_to_cpu(small_adata, tmp_path):
+    """`device="auto"` + `prefer_format="csc"` must not error on GPU hosts;
+    CSC has no GPU kernel in v1 so we silently fall back to CPU."""
+    pytest.importorskip("polars")
+    import pyscx
+
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    # Default device is "auto"; on a GPU host this used to error.
+    df = pyscx.accel.pdex_ref(
+        a_csc, "group", reference="A", geometric_mean=False,
+        gene_chunk_size=4, prefer_format="csc",
+    )
+    assert df.height > 0
+
+
+def test_pdex_ref_csc_with_explicit_gpu_raises(small_adata, tmp_path):
+    """Explicit `device="gpu"` + `prefer_format="csc"` is still rejected —
+    only the auto path falls back. Skipped on builds without the gpu
+    feature (where `device="gpu"` errors earlier in resolve_device)."""
+    import pyscx
+
+    if not pyscx.accel.gpu_available():
+        pytest.skip("gpu feature not available")
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    with pytest.raises(RuntimeError, match="csc"):
+        pyscx.accel.pdex_ref(
+            a_csc, "group", reference="A",
+            prefer_format="csc", device="gpu",
+        )
+
+
+def test_rank_genes_groups_csc_with_device_auto_falls_back_to_cpu(small_adata, tmp_path):
+    """Same auto-fallback contract as pdex_ref."""
+    import pyscx
+
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    # device defaults to "auto"; CSC must just work.
+    pyscx.accel.rank_genes_groups(a_csc, "group", prefer_format="csc")
+    assert "rank_genes_groups" in a_csc.uns
+
+
 # ---------------------------------------------------------------------------
 # Pseudobulk: prefer_format="csc" requires gene_indices; matches CSR.
 # ---------------------------------------------------------------------------

@@ -1238,9 +1238,9 @@ fn assemble_chunk_diffexp_result(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_pdex_inputs(
-    _data_len: usize,
-    _n_obs: usize,
-    _n_vars: usize,
+    data_len: usize,
+    n_obs: usize,
+    n_vars: usize,
     gene_names_len: usize,
     groups_len: usize,
     group_names_len: usize,
@@ -1252,6 +1252,21 @@ fn validate_pdex_inputs(
     }
     if groups_len == 0 {
         return Err(AccelError::InvalidInput("groups is empty".into()));
+    }
+    if data_len != n_obs * n_vars {
+        return Err(AccelError::InvalidInput(format!(
+            "data length {data_len} != n_obs {n_obs} × n_vars {n_vars}"
+        )));
+    }
+    if groups_len != n_obs {
+        return Err(AccelError::InvalidInput(format!(
+            "groups length {groups_len} != n_obs {n_obs}"
+        )));
+    }
+    if gene_names_len != n_vars {
+        return Err(AccelError::InvalidInput(format!(
+            "gene_names length {gene_names_len} != n_vars {n_vars}"
+        )));
     }
     if reference >= group_names_len {
         return Err(AccelError::InvalidInput(format!(
@@ -1267,9 +1282,9 @@ fn validate_pdex_inputs(
 }
 
 fn validate_wilcoxon_inputs(
-    _data_len: usize,
-    _n_obs: usize,
-    _n_vars: usize,
+    data_len: usize,
+    n_obs: usize,
+    n_vars: usize,
     gene_names_len: usize,
     groups_len: usize,
 ) -> Result<()> {
@@ -1278,6 +1293,21 @@ fn validate_wilcoxon_inputs(
     }
     if groups_len == 0 {
         return Err(AccelError::InvalidInput("groups is empty".into()));
+    }
+    if data_len != n_obs * n_vars {
+        return Err(AccelError::InvalidInput(format!(
+            "data length {data_len} != n_obs {n_obs} × n_vars {n_vars}"
+        )));
+    }
+    if groups_len != n_obs {
+        return Err(AccelError::InvalidInput(format!(
+            "groups length {groups_len} != n_obs {n_obs}"
+        )));
+    }
+    if gene_names_len != n_vars {
+        return Err(AccelError::InvalidInput(format!(
+            "gene_names length {gene_names_len} != n_vars {n_vars}"
+        )));
     }
     Ok(())
 }

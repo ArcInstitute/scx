@@ -553,6 +553,21 @@ pub fn rank_genes_groups(
         let _ = resolved;
         None
     };
+    // CSC has no GPU kernel in v1. Silently fall back to CPU when device
+    // is "auto" (the default) so users passing only `prefer_format="csc"`
+    // on a GPU host don't hit an error. Reject only when the user
+    // explicitly asked for GPU.
+    let gpu_device_id = if prefer_format == "csc" {
+        if device.starts_with("gpu") {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' or device='auto' for CSC dispatch.",
+            ));
+        }
+        None
+    } else {
+        gpu_device_id
+    };
 
     // --- Stratified path ---
     if let Some(ref strat_cols) = stratify_by {
@@ -1391,6 +1406,20 @@ pub fn pdex_ref(
     let gpu_device_id: Option<usize> = {
         let _ = resolved;
         None
+    };
+    // CSC has no GPU kernel in v1. Silently fall back to CPU when device
+    // is "auto" so `prefer_format="csc"` works on GPU hosts; reject only
+    // when the user explicitly asked for GPU.
+    let gpu_device_id = if prefer_format == "csc" {
+        if device.starts_with("gpu") {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' or device='auto' for CSC dispatch.",
+            ));
+        }
+        None
+    } else {
+        gpu_device_id
     };
     let result = run_pdex_ref_inner(
         py,
