@@ -57,6 +57,53 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Scatter one CSR shard's rows into a global dense [n_obs × chunk_size]
+// row-major buffer at row offset `global_row_offset`, filtered to columns
+// [c0, c1). Output column index is (col - c0). Caller MUST zero the
+// affected row range before invoking — zeros are implicit in the CSR.
+//
+// One block per shard row (gridDim.x = n_shard_rows). Each block walks
+// its row's nonzero entries cooperatively; threads stride over
+// (indptr[r+1] − indptr[r]) and predicate `c0 <= col < c1`.
+//
+// PRECONDITION: each row's column indices must be strictly increasing
+// (no duplicates). Threads write `dense[...] = data[e]` in parallel, so
+// duplicate `(row, col)` entries race and the winning value is
+// nondeterministic. The Rust wrapper enforces this via
+// `check_no_duplicate_columns` at the host-side staging boundary in
+// debug builds.
+//
+// `indptr` is 64-bit (matches Rust `i64` and CSR-shard nnz ≥ 2^31);
+// `global_row_offset` is 64-bit so atlases with n_obs > 2^31 don't
+// overflow the row-base address computation. `long long` is used in
+// preference to `long` for portability across LP64 (Linux) and LLP64
+// (Windows) ABIs.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_to_dense_chunk_kernel(
+    const long long* __restrict__ indptr,   // [n_shard_rows + 1]
+    const int*       __restrict__ indices,  // [nnz]
+    const float*     __restrict__ data,     // [nnz]
+    float*           __restrict__ dense,    // [n_obs × chunk_size], row-major
+    int       n_shard_rows,
+    long long global_row_offset,
+    int       chunk_size,
+    int       c0,
+    int       c1
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long long start = indptr[r];
+    long long end   = indptr[r + 1];
+    long long out_row_base = (global_row_offset + (long long)r) * (long long)chunk_size;
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            dense[out_row_base + (col - c0)] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // All-groups pseudobulk fold.
 //
 // One block per (gene, group). Threads stride over the group's cell list and

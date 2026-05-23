@@ -24,11 +24,12 @@
 
 #![cfg(feature = "gpu")]
 
+use scx_format::ShardSource;
 use scx_gpu::{
     default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
     gpu_de_pseudobulk_all_groups, gpu_de_pvalues, gpu_de_scatter_gene_major,
-    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, gpu_de_upload_chunk,
-    CudaSlice, GpuDevice,
+    gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
+    gpu_de_tie_term, CudaSlice, GpuDevice, GpuShardSource, RawGpuShardSource,
 };
 
 use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
@@ -72,6 +73,10 @@ pub fn pdex_ref_gpu_dense(
 
     let dev = open_device(device_id)?;
     let chunk_size = n_vars.min(default_gpu_de_gene_chunk_size(&dev, n_obs, n_obs));
+    // Dense path keeps the legacy host-upload route — the host
+    // already owns a contiguous `[n_obs × n_vars]` f32 array, so a single
+    // `memcpy_htod` per chunk is optimal. No CSR construction tax.
+    let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
     pdex_ref_gpu_chunked(
         &dev,
         n_obs,
@@ -83,15 +88,8 @@ pub fn pdex_ref_gpu_dense(
         reference,
         mode,
         epsilon,
-        |c0, sz, buf| {
-            // Slice the dense row-major source into the chunk buffer.
-            // `data[cell * n_vars + var]` → `buf[cell * sz + (var - c0)]`.
-            for cell in 0..n_obs {
-                let src_off = cell * n_vars + c0;
-                let dst_off = cell * sz;
-                buf[dst_off..dst_off + sz].copy_from_slice(&data[src_off..src_off + sz]);
-            }
-            Ok(())
+        |dev, dense, c0, sz| {
+            populate_dense_from_host_dense(dev, dense, &mut chunk_buf, data, n_obs, n_vars, c0, sz)
         },
     )
 }
@@ -124,6 +122,12 @@ pub fn pdex_ref_gpu_sparse(
     let dev = open_device(device_id)?;
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
 
+    // Route the in-memory CSR through the shared shard-source
+    // pipeline. `InMemoryCsrShardSource` exposes `csr` as a single-shard
+    // `ShardSource`; `RawGpuShardSource` then handles staging + upload.
+    let src = scx_gpu::InMemoryCsrShardSource::new(csr);
+    let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, &src)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
     pdex_ref_gpu_chunked(
         &dev,
         n_obs,
@@ -135,11 +139,8 @@ pub fn pdex_ref_gpu_sparse(
         reference,
         mode,
         epsilon,
-        |c0, sz, buf| {
-            let col_indices: Vec<u32> = (c0 as u32..(c0 + sz) as u32).collect();
-            let projected = scx_engine::project_csr(csr, &col_indices);
-            scatter_projected_into_buf(&projected, n_obs, sz, buf, 0);
-            Ok(())
+        |dev, dense, c0, sz| {
+            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
         },
     )
 }
@@ -173,7 +174,13 @@ pub fn pdex_ref_gpu_streaming(
     let dev = open_device(device_id)?;
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
 
-    let n_shards = reader.index().n_shards();
+    // Device-resident shard pipeline replaces the per-chunk host
+    // materialise (full-matrix project_csr × n_shards + scatter on host)
+    // + `gpu_de_upload_chunk` round-trip. Each shard's CSR uploads once
+    // through the pinned staging ring; per chunk we just zero `scratch.dense`
+    // and dispatch `gpu_de_scatter_shard_to_dense` per shard on device.
+    let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
     pdex_ref_gpu_chunked(
         &dev,
         n_obs,
@@ -185,19 +192,8 @@ pub fn pdex_ref_gpu_streaming(
         reference,
         mode,
         epsilon,
-        |c0, sz, buf| {
-            let col_indices: Vec<u32> = (c0 as u32..(c0 + sz) as u32).collect();
-            buf.fill(0.0);
-            let mut global_row = 0usize;
-            for shard_idx in 0..n_shards {
-                let shard_csr = reader
-                    .read_shard_cached_arc(shard_idx)
-                    .map_err(AccelError::Scx)?;
-                let projected = scx_engine::project_csr(&shard_csr, &col_indices);
-                scatter_projected_into_buf(&projected, n_obs, sz, buf, global_row);
-                global_row += projected.n_rows();
-            }
-            Ok(())
+        |dev, dense, c0, sz| {
+            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
         },
     )
 }
@@ -221,7 +217,7 @@ pub fn wilcoxon_rank_sum_gpu_dense(
 
     let dev = open_device(device_id)?;
     let chunk_size = n_vars.min(default_gpu_de_gene_chunk_size(&dev, n_obs, n_obs));
-
+    let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
     wilcoxon_rank_sum_gpu_chunked(
         &dev,
         n_obs,
@@ -234,13 +230,8 @@ pub fn wilcoxon_rank_sum_gpu_dense(
         log_transformed,
         rankby_abs,
         tie_correct,
-        |c0, sz, buf| {
-            for cell in 0..n_obs {
-                let src_off = cell * n_vars + c0;
-                let dst_off = cell * sz;
-                buf[dst_off..dst_off + sz].copy_from_slice(&data[src_off..src_off + sz]);
-            }
-            Ok(())
+        |dev, dense, c0, sz| {
+            populate_dense_from_host_dense(dev, dense, &mut chunk_buf, data, n_obs, n_vars, c0, sz)
         },
     )
 }
@@ -271,6 +262,9 @@ pub fn wilcoxon_rank_sum_gpu_sparse(
     let dev = open_device(device_id)?;
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
 
+    let src = scx_gpu::InMemoryCsrShardSource::new(csr);
+    let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, &src)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
     wilcoxon_rank_sum_gpu_chunked(
         &dev,
         n_obs,
@@ -283,11 +277,8 @@ pub fn wilcoxon_rank_sum_gpu_sparse(
         log_transformed,
         rankby_abs,
         tie_correct,
-        |c0, sz, buf| {
-            let col_indices: Vec<u32> = (c0 as u32..(c0 + sz) as u32).collect();
-            let projected = scx_engine::project_csr(csr, &col_indices);
-            scatter_projected_into_buf(&projected, n_obs, sz, buf, 0);
-            Ok(())
+        |dev, dense, c0, sz| {
+            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
         },
     )
 }
@@ -318,8 +309,9 @@ pub fn wilcoxon_rank_sum_gpu_streaming(
 
     let dev = open_device(device_id)?;
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
-    let n_shards = reader.index().n_shards();
 
+    let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
     wilcoxon_rank_sum_gpu_chunked(
         &dev,
         n_obs,
@@ -332,27 +324,197 @@ pub fn wilcoxon_rank_sum_gpu_streaming(
         log_transformed,
         rankby_abs,
         tie_correct,
-        |c0, sz, buf| {
-            let col_indices: Vec<u32> = (c0 as u32..(c0 + sz) as u32).collect();
-            buf.fill(0.0);
-            let mut global_row = 0usize;
-            for shard_idx in 0..n_shards {
-                let shard_csr = reader
-                    .read_shard_cached_arc(shard_idx)
-                    .map_err(AccelError::Scx)?;
-                let projected = scx_engine::project_csr(&shard_csr, &col_indices);
-                scatter_projected_into_buf(&projected, n_obs, sz, buf, global_row);
-                global_row += projected.n_rows();
-            }
-            Ok(())
+        |dev, dense, c0, sz| {
+            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
         },
     )
+}
+
+/// pdex `mode="ref"` over any `ShardSource` — the entry point used by the
+/// pyscx wrapper for `ScxLazyTransformedDataset`. The lazy dataset's
+/// per-shard transforms apply on the host inside
+/// `LazyShardSource::read_shard` before staging to GPU (a future G12
+/// follow-on can move them to device via `GpuPreprocessedShardSource`).
+#[allow(clippy::too_many_arguments)]
+pub fn pdex_ref_gpu_lazy(
+    device_id: usize,
+    source: &(dyn ShardSource + Sync),
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    gene_chunk_size: Option<usize>,
+    mode: GeomMeanMode,
+    epsilon: f64,
+) -> Result<PdexRefResult> {
+    let n_obs = source.n_obs();
+    let n_vars = source.n_vars();
+    validate_pdex_inputs(
+        n_obs * n_vars,
+        n_obs,
+        n_vars,
+        gene_names.len(),
+        groups.len(),
+        group_names.len(),
+        reference,
+        epsilon,
+    )?;
+
+    let dev = open_device(device_id)?;
+    let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
+
+    let mut shard_src = RawGpuShardSource::new(&dev, source)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+    pdex_ref_gpu_chunked(
+        &dev,
+        n_obs,
+        n_vars,
+        chunk_size,
+        gene_names,
+        groups,
+        group_names,
+        reference,
+        mode,
+        epsilon,
+        |dev, dense, c0, sz| {
+            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+        },
+    )
+}
+
+/// Wilcoxon rank-sum over any `ShardSource` — pyscx wrapper for
+/// `ScxLazyTransformedDataset`. See [`pdex_ref_gpu_lazy`].
+#[allow(clippy::too_many_arguments)]
+pub fn wilcoxon_rank_sum_gpu_lazy(
+    device_id: usize,
+    source: &(dyn ShardSource + Sync),
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    gene_chunk_size: Option<usize>,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+) -> Result<DiffExpResult> {
+    let n_obs = source.n_obs();
+    let n_vars = source.n_vars();
+    validate_wilcoxon_inputs(
+        n_obs * n_vars,
+        n_obs,
+        n_vars,
+        gene_names.len(),
+        groups.len(),
+    )?;
+
+    let dev = open_device(device_id)?;
+    let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
+
+    let mut shard_src = RawGpuShardSource::new(&dev, source)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+    wilcoxon_rank_sum_gpu_chunked(
+        &dev,
+        n_obs,
+        n_vars,
+        chunk_size,
+        gene_names,
+        groups,
+        group_names,
+        reference,
+        log_transformed,
+        rankby_abs,
+        tie_correct,
+        |dev, dense, c0, sz| {
+            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-chunk `scratch.dense` population
+// ---------------------------------------------------------------------------
+
+/// Populate `scratch.dense[..n_obs * sz]` from a host-side dense
+/// `[n_obs × n_vars]` row-major buffer for the column range `[c0, c0+sz)`.
+/// Host scratch `chunk_buf` is reused across chunks; allocate it once at
+/// the entry point.
+#[allow(clippy::too_many_arguments)]
+fn populate_dense_from_host_dense(
+    dev: &GpuDevice,
+    dense: &mut CudaSlice<f32>,
+    chunk_buf: &mut [f32],
+    src_data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    c0: usize,
+    sz: usize,
+) -> Result<()> {
+    let nelem = n_obs * sz;
+    let buf = &mut chunk_buf[..nelem];
+    for cell in 0..n_obs {
+        let src_off = cell * n_vars + c0;
+        let dst_off = cell * sz;
+        buf[dst_off..dst_off + sz].copy_from_slice(&src_data[src_off..src_off + sz]);
+    }
+    let mut view = dense.slice_mut(..nelem);
+    dev.stream()
+        .memcpy_htod(&buf[..nelem], &mut view)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE upload: {e}")))?;
+    Ok(())
+}
+
+/// G1.8: populate `scratch.dense[..n_obs * sz]` directly from a
+/// `GpuShardSource`. Zeros the chunk's row range, then scatters each
+/// shard's CSR rows (filtered to the chunk's column range) into the
+/// global dense buffer on device — no host materialise, no
+/// `gpu_de_upload_chunk` round-trip.
+///
+/// `S: GpuShardSource` is taken by generic because the trait isn't
+/// dyn-compatible (its `for_each_gpu_shard` callback is generic). All
+/// the entry points use a concrete `RawGpuShardSource` (or a future
+/// `GpuPreprocessedShardSource`), so monomorphisation is fine.
+fn populate_dense_from_shard_source<S: GpuShardSource>(
+    dev: &GpuDevice,
+    source: &mut S,
+    dense: &mut CudaSlice<f32>,
+    n_obs: usize,
+    c0: usize,
+    sz: usize,
+) -> Result<()> {
+    let nelem = n_obs * sz;
+    {
+        let mut view = dense.slice_mut(..nelem);
+        dev.stream()
+            .memset_zeros(&mut view)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE memset_zeros: {e}")))?;
+    }
+    let c1 = c0 + sz;
+    let mut global_row = 0usize;
+    source
+        .for_each_gpu_shard(|_idx, slot| {
+            let view = slot.view();
+            let n_rows = view.shape.0;
+            gpu_de_scatter_shard_to_dense(dev, &view, dense, global_row, sz, c0, c1)?;
+            global_row += n_rows;
+            Ok(())
+        })
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard scatter: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Shared chunked drivers
 // ---------------------------------------------------------------------------
 
+/// Inner pdex_ref driver. `populate_dense` is invoked once per chunk with
+/// the device-side `scratch.dense` slot (`[n_obs × chunk_max]`-capacity,
+/// row-major) and the chunk's `(c0, sz)` column range. It must produce
+/// the full `[n_obs × sz]` row-major chunk for that range — either by
+/// uploading from host (dense entry point) or by per-shard
+/// device-resident scatter on top of a `GpuShardSource` (sparse / streaming
+/// / lazy entry points). Downstream kernels read `scratch.dense` via
+/// global cell positions, so the populate step is responsible for laying
+/// rows out at their global indices.
 #[allow(clippy::too_many_arguments)]
 fn pdex_ref_gpu_chunked<F>(
     dev: &GpuDevice,
@@ -365,10 +527,10 @@ fn pdex_ref_gpu_chunked<F>(
     reference: usize,
     mode: GeomMeanMode,
     epsilon: f64,
-    mut materialise: F,
+    mut populate_dense: F,
 ) -> Result<PdexRefResult>
 where
-    F: FnMut(usize, usize, &mut [f32]) -> Result<()>,
+    F: FnMut(&GpuDevice, &mut CudaSlice<f32>, usize, usize) -> Result<()>,
 {
     if chunk_size == 0 {
         return Err(AccelError::InvalidInput(
@@ -456,28 +618,20 @@ where
     let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
 
-    // Host-side chunk dense buffer (row-major n_obs × chunk_size). Allocate
-    // once with the max chunk capacity; refill via the materialise closure.
-    let mut chunk_dense = vec![0.0f32; n_obs * chunk_size];
-
     for c0 in (0..n_vars).step_by(chunk_size) {
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
-        // Reuse the high end of `chunk_dense` for chunks smaller than chunk_size.
-        let buf = &mut chunk_dense[..n_obs * sz];
-        // Zero the buf before the materialise closure: the sparse and
-        // streaming closures write only the non-zero CSR entries, so
-        // stale values from chunk N-1 leak into zero positions of chunk
-        // N without this. The dense closure overwrites every cell so
-        // the fill is redundant there but cheap (memset is ~50 GB/s).
-        buf.fill(0.0);
-        materialise(c0, sz, buf)?;
+
+        // G1.8: per-chunk dense population is delegated to the entry
+        // point's closure. Dense paths upload from a host buffer; sparse
+        // / streaming / lazy paths zero scratch.dense and scatter each
+        // shard's CSR directly into the global row range on device. The
+        // closure must leave `scratch.dense[..n_obs * sz]` holding the
+        // full row-major `[n_obs × sz]` view of the requested column
+        // range, with row r at offset `r * sz`.
+        populate_dense(dev, &mut scratch.dense, c0, sz)?;
 
         // --- GPU work for this chunk ---
-
-        // 1. Upload dense chunk.
-        gpu_de_upload_chunk(dev, &mut scratch, buf, n_obs, sz)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE upload: {e}")))?;
 
         // 2. Pseudobulk fold on device (G1.6). Replaces the host rayon
         //    `compute_pdex_means` that previously dominated host wall time
@@ -662,6 +816,8 @@ where
     })
 }
 
+/// Inner Wilcoxon driver. See [`pdex_ref_gpu_chunked`] for the
+/// `populate_dense` contract — same shape, same per-chunk semantics.
 #[allow(clippy::too_many_arguments)]
 fn wilcoxon_rank_sum_gpu_chunked<F>(
     dev: &GpuDevice,
@@ -675,10 +831,10 @@ fn wilcoxon_rank_sum_gpu_chunked<F>(
     log_transformed: bool,
     rankby_abs: bool,
     tie_correct: bool,
-    mut materialise: F,
+    mut populate_dense: F,
 ) -> Result<DiffExpResult>
 where
-    F: FnMut(usize, usize, &mut [f32]) -> Result<()>,
+    F: FnMut(&GpuDevice, &mut CudaSlice<f32>, usize, usize) -> Result<()>,
 {
     if chunk_size == 0 {
         return Err(AccelError::InvalidInput(
@@ -778,19 +934,13 @@ where
     let n_test = test_groups.len();
     let mut chunk_results: Vec<DiffExpResult> = Vec::new();
 
-    let mut chunk_dense = vec![0.0f32; n_obs * chunk_size];
-
     for c0 in (0..n_vars).step_by(chunk_size) {
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
-        let buf = &mut chunk_dense[..n_obs * sz];
-        // See `pdex_ref_gpu_chunked`: sparse / streaming closures only
-        // write non-zero entries; zero the slot to keep chunks isolated.
-        buf.fill(0.0);
-        materialise(c0, sz, buf)?;
 
-        gpu_de_upload_chunk(dev, &mut scratch, buf, n_obs, sz)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE upload: {e}")))?;
+        // G1.8: see `pdex_ref_gpu_chunked` — dense population is the
+        // entry point's responsibility.
+        populate_dense(dev, &mut scratch.dense, c0, sz)?;
 
         // Per-group per-gene raw sums on device (G1.6) — feeds the host-side
         // logFC computation further down. `mode_id = 0` selects the identity
@@ -1033,25 +1183,6 @@ fn bucket_cells_by_group(groups: &[usize], n_groups: usize) -> (Vec<Vec<usize>>,
         }
     }
     (indices, oor)
-}
-
-fn scatter_projected_into_buf(
-    projected: &scx_sparse::ScxCsr,
-    n_obs: usize,
-    chunk_size: usize,
-    buf: &mut [f32],
-    global_row_offset: usize,
-) {
-    let _ = n_obs;
-    for row in 0..projected.n_rows() {
-        let s = projected.indptr[row] as usize;
-        let e = projected.indptr[row + 1] as usize;
-        let base = (global_row_offset + row) * chunk_size;
-        for j in s..e {
-            let col = projected.indices[j] as usize;
-            buf[base + col] = projected.data[j];
-        }
-    }
 }
 
 /// Mode-id encoding for `gpu_de_pseudobulk_all_groups`. Must match the
@@ -2087,5 +2218,172 @@ mod tests {
             assert_eq!(data[cell * n_vars + 1], 5.0);
         }
         assert_pdex_parity(&cpu, &gpu, "all_equal_values_in_group");
+    }
+
+    /// `pdex_ref_gpu_lazy` / `wilcoxon_rank_sum_gpu_lazy`
+    /// match the dense (`gpu_de_upload_chunk`) reference on the same fixture.
+    /// We feed the same `ScxCsr` through both paths: dense via
+    /// `pdex_ref_gpu_dense` (legacy host upload), and lazy via
+    /// `pdex_ref_gpu_lazy(&InMemoryCsrShardSource(&csr))` (new device-resident
+    /// scatter). The two paths must agree bit-for-bit on the U statistic
+    /// (integer-valued) and within the documented p-value / FDR
+    /// tolerance.
+    #[test]
+    fn test_gpu_lazy_entry_points_match_dense_reference() {
+        let _ = require_gpu_or_skip!();
+
+        let n_obs = 60usize;
+        let n_vars = 150usize;
+        let groups: Vec<usize> = (0..n_obs).map(|i| i / 30).collect(); // 2 groups of 30
+        let group_names = vec!["ref".to_string(), "test".to_string()];
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g_{i}")).collect();
+
+        // Reproducible sparse fixture (~12% density, integer counts ≤ 5).
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let mut state: u64 = 0xDEADBEEFCAFE_F00D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for cell in 0..n_obs {
+            for gene in 0..n_vars {
+                if (next() % 9) == 0 {
+                    data[cell * n_vars + gene] = (next() % 6) as f32;
+                }
+            }
+        }
+
+        // Build the matching ScxCsr.
+        let mut indptr: Vec<i64> = Vec::with_capacity(n_obs + 1);
+        let mut indices: Vec<i32> = Vec::new();
+        let mut sparse_data: Vec<f32> = Vec::new();
+        indptr.push(0);
+        for cell in 0..n_obs {
+            for gene in 0..n_vars {
+                let v = data[cell * n_vars + gene];
+                if v != 0.0 {
+                    indices.push(gene as i32);
+                    sparse_data.push(v);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, sparse_data);
+        let in_mem = scx_gpu::InMemoryCsrShardSource::new(&csr);
+
+        // ----- pdex_ref -----
+        let mode = GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+        let dense_res = pdex_ref_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            mode,
+            epsilon,
+        )
+        .expect("dense pdex_ref failed");
+        let lazy_res = pdex_ref_gpu_lazy(
+            0,
+            &in_mem,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            Some(50), // 3 chunks
+            mode,
+            epsilon,
+        )
+        .expect("lazy pdex_ref failed");
+
+        assert_eq!(dense_res.group_names, lazy_res.group_names);
+        for tg in 0..dense_res.group_names.len() {
+            for var in 0..n_vars {
+                let u_d = dense_res.statistics[tg][var];
+                let u_l = lazy_res.statistics[tg][var];
+                if u_d.is_finite() && u_l.is_finite() {
+                    assert!(
+                        (u_d - u_l).abs() < 1e-6,
+                        "pdex U mismatch tg={tg} gene={var}: dense={u_d}, lazy={u_l}"
+                    );
+                }
+                let p_d = dense_res.p_values[tg][var];
+                let p_l = lazy_res.p_values[tg][var];
+                assert!(
+                    (p_d - p_l).abs() < 1e-9 || (p_d - p_l).abs() / p_d.abs().max(1e-12) < 1e-6,
+                    "pdex p mismatch tg={tg} gene={var}: dense={p_d}, lazy={p_l}"
+                );
+            }
+        }
+
+        // ----- wilcoxon_rank_sum (1-vs-rest) -----
+        let dense_w = wilcoxon_rank_sum_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+            false,
+            true,
+        )
+        .expect("dense wilcoxon failed");
+        let lazy_w = wilcoxon_rank_sum_gpu_lazy(
+            0,
+            &in_mem,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            Some(50),
+            false,
+            false,
+            true,
+        )
+        .expect("lazy wilcoxon failed");
+
+        assert_eq!(dense_w.group_names.len(), lazy_w.group_names.len());
+        // wilcoxon_rank_sum sorts within each group; merging restores
+        // gene-name ordering. Compare per-(group, gene) by name lookup.
+        for g in 0..dense_w.group_names.len() {
+            let mut d_map: std::collections::HashMap<String, (f64, f64)> =
+                std::collections::HashMap::new();
+            for (i, name) in dense_w.names[g].iter().enumerate() {
+                d_map.insert(name.clone(), (dense_w.scores[g][i], dense_w.pvals[g][i]));
+            }
+            for (i, name) in lazy_w.names[g].iter().enumerate() {
+                let (d_score, d_pval) = d_map[name];
+                let l_score = lazy_w.scores[g][i];
+                let l_pval = lazy_w.pvals[g][i];
+                if d_score.is_finite() && l_score.is_finite() {
+                    assert!(
+                        (d_score - l_score).abs() < 1e-6,
+                        "wilcoxon z mismatch group={} gene={}: dense={}, lazy={}",
+                        dense_w.group_names[g],
+                        name,
+                        d_score,
+                        l_score
+                    );
+                }
+                assert!(
+                    (d_pval - l_pval).abs() < 1e-9
+                        || (d_pval - l_pval).abs() / d_pval.abs().max(1e-12) < 1e-6,
+                    "wilcoxon p mismatch group={} gene={}: dense={}, lazy={}",
+                    dense_w.group_names[g],
+                    name,
+                    d_pval,
+                    l_pval
+                );
+            }
+        }
     }
 }
