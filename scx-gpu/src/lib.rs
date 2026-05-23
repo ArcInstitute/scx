@@ -58,12 +58,14 @@ pub mod gpu_knn;
 pub mod gpu_pca;
 pub mod gpu_pca_covariance;
 pub mod gpu_preprocess;
+pub mod gpu_shard_source;
 pub mod gpu_umap;
 pub mod linear_operator;
 pub mod rice_gpu;
 pub mod shard_decode;
 pub mod shard_pipeline;
 pub mod sparse_dense;
+pub mod staging;
 
 // Re-export primary types for convenience.
 pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, CublasHandle};
@@ -99,12 +101,14 @@ pub use gpu_pca_covariance::gpu_covariance_pca;
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
+pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
 pub use gpu_umap::{gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
 pub use shard_pipeline::DoubleBufferedShardLoader;
 pub use sparse_dense::{sparse_to_dense_gpu, sparse_to_dense_gpu_into};
+pub use staging::{GpuCsrShardView, GpuCsrSlot, PinnedCsrSlot};
 
 // Re-export cudarc types used in public API signatures.
 pub use cudarc::driver::safe::{CudaModule, CudaSlice, CudaStream};

@@ -15,7 +15,20 @@
 //! The constructor never fails due to resource limits; the copy stream is
 //! allocated lazily only in the double-buffered path.
 //!
-//! ## Async H→D (future)
+//! ## Relationship to G3 / [`crate::gpu_shard_source`]
+//!
+//! This legacy loader hands out **owned** `GpuCsr` per shard via
+//! `upload_csr_to_gpu`. The G3 staging infrastructure (pinned host slots,
+//! reusable device CSR slots, cached cuSPARSE descriptors, dedicated
+//! copy stream + event handshake) lives behind the
+//! [`crate::gpu_shard_source::GpuShardSource`] trait. New device-resident
+//! consumers (preprocessing, scVI dataloader) should adopt
+//! [`crate::gpu_shard_source::RawGpuShardSource`] /
+//! [`crate::gpu_shard_source::GpuPreprocessedShardSource`] directly; the
+//! existing `DoubleBufferedShardLoader` callers (HVG, linear operator)
+//! continue working on the legacy path and can migrate incrementally.
+//!
+//! ## Async H→D (deferred per-call-site migration)
 //!
 //! A dedicated `copy_stream` is created so future iterations can issue the
 //! H→D copies from pinned host memory onto that stream (via `memcpy_htod`),
@@ -23,8 +36,9 @@
 //! running the SpMM. The current implementation uploads on `dev.stream()`
 //! (asynchronous anyway but serialized with compute) — sufficient to obtain
 //! decode / compute overlap, which is the dominant win on I/O-bound sources.
-//! Upgrading to pinned + dedicated copy stream is deferred until benchmarks
-//! show H→D on the compute stream is a bottleneck.
+//! Migrating individual call sites to pinned + dedicated copy stream is
+//! handled by adopting `GpuShardSource` (see above), not by mutating this
+//! loader's semantics.
 
 use std::sync::mpsc;
 use std::sync::Arc;

@@ -26,7 +26,7 @@
 //! produces small rounding differences (~1e-6 relative error). For single-cell
 //! RNA-seq data these differences are negligible.
 
-use cudarc::driver::safe::{CudaSlice, LaunchConfig};
+use cudarc::driver::safe::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
 use scx_format::{concatenate_csr, ShardSource};
@@ -34,26 +34,96 @@ use scx_sparse::ScxCsr;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::shard_pipeline::DoubleBufferedShardLoader;
+use crate::gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource};
 
 /// PTX source for the normalize+log1p kernels, compiled at build time.
 const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normalize_log1p.ptx"));
 
+/// Dispatch fused operations on a GPU-resident CSR view (in-place).
+///
+/// Single source of truth for the `(normalize, log1p)` kernel dispatch —
+/// all the public slice-based entry points below are thin wrappers, and
+/// `GpuPreprocessedShardSource` calls this directly on the slot's
+/// exact-sized views. Kernel launches go on `dev.stream()` (the compute
+/// stream); callers that need a different stream must wrap accordingly.
+pub(crate) fn apply_fused_ops_inner(
+    dev: &GpuDevice,
+    indptr: &CudaView<'_, i64>,
+    data: &mut CudaViewMut<'_, f32>,
+    n_rows: usize,
+    normalize: Option<f32>,
+    log1p: bool,
+) -> Result<(), GpuError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+
+    let module = dev.load_module_cached(NORMALIZE_LOG1P_PTX)?;
+    let n_rows_i32 = n_rows as i32;
+    let threads: u32 = 256;
+    let blocks = (n_rows as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    match (normalize, log1p) {
+        (Some(target_sum), true) => {
+            let func = module
+                .load_function("normalize_log1p_kernel")
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!("normalize_log1p_kernel: {e}"))
+                })?;
+            unsafe {
+                dev.stream()
+                    .launch_builder(&func)
+                    .arg(indptr)
+                    .arg(data)
+                    .arg(&n_rows_i32)
+                    .arg(&target_sum)
+                    .launch(cfg)
+            }
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_log1p_kernel: {e}")))?;
+        }
+        (Some(target_sum), false) => {
+            let func = module
+                .load_function("normalize_kernel")
+                .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_kernel: {e}")))?;
+            unsafe {
+                dev.stream()
+                    .launch_builder(&func)
+                    .arg(indptr)
+                    .arg(data)
+                    .arg(&n_rows_i32)
+                    .arg(&target_sum)
+                    .launch(cfg)
+            }
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_kernel: {e}")))?;
+        }
+        (None, true) => {
+            let func = module
+                .load_function("log1p_kernel")
+                .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
+            unsafe {
+                dev.stream()
+                    .launch_builder(&func)
+                    .arg(indptr)
+                    .arg(data)
+                    .arg(&n_rows_i32)
+                    .launch(cfg)
+            }
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
+        }
+        (None, false) => {}
+    }
+    Ok(())
+}
+
 /// Fused normalize_total + log1p on a GPU-resident CSR matrix (in-place).
 ///
-/// For each row:
-///   `data[i] = log1p(data[i] / row_sum * target_sum)`
-///
-/// Equivalent to `scx_engine::fused_ops::fused_normalize_log1p` applied to
-/// all rows, but executed entirely on GPU.
-///
-/// # Arguments
-///
-/// * `dev` — GPU device handle
-/// * `indptr` — CSR row pointers `[n_rows + 1]` (i64, on GPU, not modified)
-/// * `data` — CSR non-zero values `[nnz]` (f32, on GPU, **modified in-place**)
-/// * `n_rows` — number of rows in the CSR matrix
-/// * `target_sum` — target sum for normalization (e.g., 1e4)
+/// For each row: `data[i] = log1p(data[i] / row_sum * target_sum)`.
+/// Equivalent to `scx_engine::fused_ops::fused_normalize_log1p` on GPU.
 pub fn gpu_normalize_log1p(
     dev: &GpuDevice,
     indptr: &CudaSlice<i64>,
@@ -61,52 +131,19 @@ pub fn gpu_normalize_log1p(
     n_rows: usize,
     target_sum: f32,
 ) -> Result<(), GpuError> {
-    if n_rows == 0 {
-        return Ok(());
-    }
-
-    let module = dev.load_module_cached(NORMALIZE_LOG1P_PTX)?;
-    let func = module
-        .load_function("normalize_log1p_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_log1p_kernel: {e}")))?;
-
-    let n_rows_i32 = n_rows as i32;
-    let threads: u32 = 256;
-    let blocks = (n_rows as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(indptr)
-            .arg(data)
-            .arg(&n_rows_i32)
-            .arg(&target_sum)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_log1p_kernel: {e}")))?;
-
-    Ok(())
+    let indptr_view = indptr.slice(..);
+    let mut data_view = data.slice_mut(..);
+    apply_fused_ops_inner(
+        dev,
+        &indptr_view,
+        &mut data_view,
+        n_rows,
+        Some(target_sum),
+        true,
+    )
 }
 
 /// Normalize-only on a GPU-resident CSR matrix (in-place).
-///
-/// For each row:
-///   `data[i] = data[i] / row_sum * target_sum`
-///
-/// No log1p is applied.
-///
-/// # Arguments
-///
-/// * `dev` — GPU device handle
-/// * `indptr` — CSR row pointers `[n_rows + 1]` (i64, on GPU, not modified)
-/// * `data` — CSR non-zero values `[nnz]` (f32, on GPU, **modified in-place**)
-/// * `n_rows` — number of rows in the CSR matrix
-/// * `target_sum` — target sum for normalization (e.g., 1e4)
 pub fn gpu_normalize(
     dev: &GpuDevice,
     indptr: &CudaSlice<i64>,
@@ -114,97 +151,36 @@ pub fn gpu_normalize(
     n_rows: usize,
     target_sum: f32,
 ) -> Result<(), GpuError> {
-    if n_rows == 0 {
-        return Ok(());
-    }
-
-    let module = dev.load_module_cached(NORMALIZE_LOG1P_PTX)?;
-    let func = module
-        .load_function("normalize_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_kernel: {e}")))?;
-
-    let n_rows_i32 = n_rows as i32;
-    let threads: u32 = 256;
-    let blocks = (n_rows as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(indptr)
-            .arg(data)
-            .arg(&n_rows_i32)
-            .arg(&target_sum)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_kernel: {e}")))?;
-
-    Ok(())
+    let indptr_view = indptr.slice(..);
+    let mut data_view = data.slice_mut(..);
+    apply_fused_ops_inner(
+        dev,
+        &indptr_view,
+        &mut data_view,
+        n_rows,
+        Some(target_sum),
+        false,
+    )
 }
 
 /// Log1p-only on a GPU-resident CSR matrix (in-place).
-///
-/// For each row:
-///   `data[i] = log1p(data[i])`
-///
-/// No normalization is applied.
-///
-/// # Arguments
-///
-/// * `dev` — GPU device handle
-/// * `indptr` — CSR row pointers `[n_rows + 1]` (i64, on GPU, not modified)
-/// * `data` — CSR non-zero values `[nnz]` (f32, on GPU, **modified in-place**)
-/// * `n_rows` — number of rows in the CSR matrix
 pub fn gpu_log1p(
     dev: &GpuDevice,
     indptr: &CudaSlice<i64>,
     data: &mut CudaSlice<f32>,
     n_rows: usize,
 ) -> Result<(), GpuError> {
-    if n_rows == 0 {
-        return Ok(());
-    }
-
-    let module = dev.load_module_cached(NORMALIZE_LOG1P_PTX)?;
-    let func = module
-        .load_function("log1p_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
-
-    let n_rows_i32 = n_rows as i32;
-    let threads: u32 = 256;
-    let blocks = (n_rows as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(indptr)
-            .arg(data)
-            .arg(&n_rows_i32)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
-
-    Ok(())
+    let indptr_view = indptr.slice(..);
+    let mut data_view = data.slice_mut(..);
+    apply_fused_ops_inner(dev, &indptr_view, &mut data_view, n_rows, None, true)
 }
 
 /// Dispatch fused operations on a GPU-resident CSR matrix (in-place).
 ///
-/// Selects the optimal kernel based on which operations are requested:
 /// - `(Some(target_sum), true)` → fused normalize+log1p
 /// - `(Some(target_sum), false)` → normalize only
 /// - `(None, true)` → log1p only
 /// - `(None, false)` → no-op
-///
-/// This mirrors `scx_engine::fused_ops::apply_fused_ops` but on GPU.
 pub fn gpu_apply_fused_ops(
     dev: &GpuDevice,
     indptr: &CudaSlice<i64>,
@@ -213,29 +189,26 @@ pub fn gpu_apply_fused_ops(
     normalize: Option<f32>,
     log1p: bool,
 ) -> Result<(), GpuError> {
-    match (normalize, log1p) {
-        (Some(target_sum), true) => gpu_normalize_log1p(dev, indptr, data, n_rows, target_sum),
-        (Some(target_sum), false) => gpu_normalize(dev, indptr, data, n_rows, target_sum),
-        (None, true) => gpu_log1p(dev, indptr, data, n_rows),
-        (None, false) => Ok(()), // no-op
-    }
+    let indptr_view = indptr.slice(..);
+    let mut data_view = data.slice_mut(..);
+    apply_fused_ops_inner(dev, &indptr_view, &mut data_view, n_rows, normalize, log1p)
 }
 
 /// Stream a [`ShardSource`] through [`gpu_apply_fused_ops`] and return a
 /// single concatenated [`ScxCsr`] on the host.
 ///
 /// This is the eager GPU path used by `pyscx.accel.normalize_total(device="gpu")`
-/// and `log1p(device="gpu")`. It uses [`DoubleBufferedShardLoader`] to overlap
-/// shard decode with GPU kernel launches. Per shard:
+/// and `log1p(device="gpu")`. It runs the transforms on a
+/// [`GpuPreprocessedShardSource`] (device-resident) and downloads each
+/// transformed shard's `(indptr, indices, data)` triple at the end — a
+/// **terminal D→H copy** sitting on top of the device-resident
+/// abstraction. New consumers that don't need a host CSR should consume
+/// `GpuPreprocessedShardSource` directly to avoid the download.
 ///
-/// 1. Clone the shard's data buffer on-device (kernels mutate in-place; the
-///    loader hands out shared references).
-/// 2. Apply `gpu_apply_fused_ops` to the clone.
-/// 3. D→H copy `(indptr, indices, data)` for that shard.
-/// 4. Append to a host-side `Vec<ScxCsr>`.
-///
-/// After the stream completes, the per-shard CSRs are concatenated into a
-/// single `ScxCsr` via [`scx_format::concatenate_csr`].
+/// The implementation drops the legacy per-shard `dev.synchronize()`:
+/// `memcpy_dtoh` for pageable host destinations already blocks on the
+/// compute stream, and a single `dev.synchronize()` at the API boundary
+/// provides the final defence-in-depth barrier.
 ///
 /// # Arguments
 ///
@@ -263,39 +236,49 @@ pub fn gpu_preprocess_to_csr(
         return Ok(ScxCsr::new_unchecked((0, n_vars), vec![0], vec![], vec![]));
     }
 
-    let loader = DoubleBufferedShardLoader::new(dev, source)?;
-    let shard_csrs = std::sync::Mutex::new(Vec::<(usize, ScxCsr)>::with_capacity(n_shards));
+    // `for_each_gpu_shard` invokes the callback strictly sequentially on
+    // the calling thread (worker thread only decodes), and
+    // `RawGpuShardSource::run` iterates `0..n_shards` in order — so a plain
+    // `Vec::push` here yields the shards in the correct order without
+    // needing a Mutex or post-hoc sort.
+    let mut shard_csrs = Vec::<ScxCsr>::with_capacity(n_shards);
 
-    loader.for_each_shard(|shard_idx, gpu_csr| {
-        let (n_rows, _) = gpu_csr.shape;
+    let mut gpu_source = GpuPreprocessedShardSource::new(dev, source, normalize, log1p)?;
+    gpu_source.for_each_gpu_shard(|_shard_idx, slot| {
+        let view = slot.view();
+        let n_rows = view.shape.0;
 
-        // Apply fused ops in-place on a cloned data buffer. The loader hands
-        // out a `&GpuCsr`; we must not mutate the underlying device memory
-        // because subsequent passes (if any) would see the post-transform
-        // values. Cloning is a small device-to-device copy and keeps the
-        // API composable.
-        let mut d_data = gpu_csr
-            .data
-            .try_clone()
-            .map_err(|e| GpuError::CudaError(format!("clone shard data: {e}")))?;
-        gpu_apply_fused_ops(dev, &gpu_csr.indptr, &mut d_data, n_rows, normalize, log1p)?;
+        // D→H per shard. `memcpy_dtoh` to a pageable Vec implicitly
+        // synchronises with the compute stream via the driver's staging
+        // logic (it blocks the host thread until the copy completes),
+        // so the per-shard `dev.synchronize()` of the legacy
+        // implementation is no longer required here.
+        let mut indptr = vec![0i64; n_rows + 1];
+        let mut indices = vec![0i32; view.nnz()];
+        let mut data = vec![0.0f32; view.nnz()];
+        dev.stream()
+            .memcpy_dtoh(&view.indptr, &mut indptr)
+            .map_err(|e| GpuError::CudaError(format!("dtoh indptr: {e}")))?;
+        dev.stream()
+            .memcpy_dtoh(&view.indices, &mut indices)
+            .map_err(|e| GpuError::CudaError(format!("dtoh indices: {e}")))?;
+        dev.stream()
+            .memcpy_dtoh(&view.data, &mut data)
+            .map_err(|e| GpuError::CudaError(format!("dtoh data: {e}")))?;
 
-        // Synchronize before D→H copies so the kernel output is visible.
-        dev.synchronize()?;
-
-        let indptr = dev.dtoh_copy(&gpu_csr.indptr)?;
-        let indices = dev.dtoh_copy(&gpu_csr.indices)?;
-        let data = dev.dtoh_copy(&d_data)?;
-        let csr = ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
-        shard_csrs.lock().unwrap().push((shard_idx, csr));
+        shard_csrs.push(ScxCsr::new_unchecked(
+            (n_rows, n_vars),
+            indptr,
+            indices,
+            data,
+        ));
         Ok(())
     })?;
 
-    let mut shard_csrs = shard_csrs.into_inner().unwrap();
-    shard_csrs.sort_by_key(|&(idx, _)| idx);
-    let ordered: Vec<ScxCsr> = shard_csrs.into_iter().map(|(_, csr)| csr).collect();
+    // Boundary sync — host-returning API contract.
+    dev.synchronize()?;
 
-    concatenate_csr(&ordered, n_vars)
+    concatenate_csr(&shard_csrs, n_vars)
         .map_err(|e| GpuError::InvalidShard(format!("concatenate_csr: {e}")))
 }
 
