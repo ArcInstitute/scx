@@ -70,6 +70,46 @@ def _random_count_adata(n_obs: int, n_vars: int, density: float, seed: int):
     return anndata.AnnData(X=x)
 
 
+def _clustered_count_adata(
+    n_obs: int,
+    n_vars: int,
+    n_clusters: int,
+    density: float,
+    seed: int,
+):
+    """Synthetic count AnnData with planted low-rank cluster structure.
+
+    Produces a CSR matrix with a flat sparse Poisson(0.5) background plus
+    cluster-specific marker-gene signal (50 markers per cluster, Poisson(15)
+    expression boost). The leading `n_clusters - 1` PCs separate the
+    clusters and have eigenvalues well above the noise floor — the
+    eigenvalue gap between PC[n_clusters-1] and PC[n_clusters] is typically
+    ~100×, so randomized PCA at 4 power iterations converges to the same
+    cluster-discrimination subspace regardless of the random Ω seed/RNG.
+
+    Use this fixture for tests that need a stable top-`k` subspace to
+    compare against a different PCA implementation. `_random_count_adata`'s
+    flat-spectrum output is fine for testing PCA correctness in isolation
+    but breaks cross-implementation per-PC comparisons because all leading
+    eigenvalues are near-degenerate.
+    """
+    import anndata
+
+    rng = np.random.default_rng(seed)
+    dense = rng.poisson(0.5, size=(n_obs, n_vars)).astype(np.float32)
+    mask = rng.random((n_obs, n_vars)) > density
+    dense[mask] = 0
+
+    # Per-cell cluster assignment + planted marker-gene signal.
+    cluster = rng.integers(n_clusters, size=n_obs)
+    markers = rng.choice(n_vars, size=(n_clusters, 50), replace=True)
+    for i in range(n_obs):
+        for g in markers[cluster[i]]:
+            dense[i, g] += rng.poisson(15.0)
+
+    return anndata.AnnData(X=sp.csr_matrix(dense))
+
+
 # --------------------------------------------------------------------- #
 # 7.1.a — GPU covariance PCA vs CPU covariance PCA
 # --------------------------------------------------------------------- #
@@ -100,12 +140,33 @@ def test_gpu_covariance_vs_cpu_covariance_cosine():
 
 @gpu_only
 def test_gpu_randomized_householder_vs_cpu_randomized():
-    """Matched-seed CPU vs GPU randomized PCA (Householder) — top-30 cosine."""
+    """CPU vs GPU randomized PCA (Householder) on a fixture with a planted
+    well-separated top-`(n_clusters-1)` subspace.
+
+    The CPU path seeds a Rust `ChaCha8` RNG; the GPU path seeds cuRAND's
+    XORWOW generator. Even at matched `random_state`, the two streams
+    produce *different* Ω matrices. Randomized PCA at 4 power iterations
+    therefore only converges to the same per-PC basis where the data has a
+    spectral gap — within a degenerate subspace the two paths can pick
+    different orthonormal bases that nonetheless span the same subspace.
+
+    Pre-fix this test used `_random_count_adata`'s flat Poisson(2) ×
+    density=0.03 spectrum (all top-10 eigenvalues within ~5 %, no spectral
+    gap) and asserted top-10 per-PC cosine ≥ 0.99 — impossible to satisfy
+    across two valid PCA decompositions of a near-degenerate signal.
+    `_clustered_count_adata` plants 5 clusters with marker-gene signal,
+    producing 4 well-separated top PCs (eigenvalue gap ≈ 250× between
+    PC 4 and PC 5).
+    """
     import pyscx
 
+    n_clusters = 5
+    well_separated = n_clusters - 1
     # n_vars > GPU_COVARIANCE_PCA_THRESHOLD to force the randomized path on both
     # sides regardless of the method="auto" routing threshold.
-    adata = _random_count_adata(n_obs=1_000, n_vars=9_000, density=0.03, seed=2)
+    adata = _clustered_count_adata(
+        n_obs=1_000, n_vars=9_000, n_clusters=n_clusters, density=0.03, seed=2,
+    )
     a_cpu = adata.copy()
     a_gpu = adata.copy()
 
@@ -119,10 +180,33 @@ def test_gpu_randomized_householder_vs_cpu_randomized():
         n_oversamples=10, n_power_iterations=4,
     )
 
+    # 1. Top-`(n_clusters - 1)` per-PC cosine: the cluster-discrimination axes
+    #    are well separated, so both algorithms recover the same basis. The
+    #    f64 (CPU) vs f32 (GPU) gap allows for 1e-4 numerical drift here.
     cos = _cosine_sign_agnostic(a_cpu.obsm["X_pca"], a_gpu.obsm["X_pca"])
-    # CPU f64 vs GPU f32 randomized paths can drift on tail PCs; leading PCs
-    # should still be aligned tightly.
-    assert (cos[:10] >= 0.99).all(), f"top-10 cosine: min={cos[:10].min():.4f}"
+    assert (cos[:well_separated] >= 0.99).all(), (
+        f"top-{well_separated} cosine: {cos[:well_separated]}"
+    )
+
+    # 2. variance_ratio across all 30 PCs must agree to f32 numerical noise.
+    #    Unlike per-PC subspace rotation in near-degenerate regimes, the
+    #    eigenvalues themselves are a deterministic property of the data —
+    #    both algorithms must recover them within float precision.
+    vr_cpu = np.asarray(a_cpu.uns["pca"]["variance_ratio"])
+    vr_gpu = np.asarray(a_gpu.uns["pca"]["variance_ratio"])
+    drift = np.max(np.abs(vr_cpu - vr_gpu))
+    assert drift < 1e-3, (
+        f"variance_ratio drift {drift:.3e} exceeds 1e-3 tolerance"
+    )
+
+    # 3. Spectral-gap sanity: the fixture must satisfy our pre-condition
+    #    that the top-`(n_clusters-1)` PCs are well separated from the bulk.
+    #    Without this, assertion (1) is meaningless. ~100× is typical here.
+    gap = vr_cpu[well_separated - 1] / vr_cpu[well_separated]
+    assert gap > 50.0, (
+        f"fixture broke: spectral gap vr[{well_separated - 1}]/vr[{well_separated}]"
+        f" = {gap:.2f} (expected > 50); regenerate _clustered_count_adata"
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -162,20 +246,32 @@ def test_gpu_cholesky_matches_householder():
 
 @gpu_only
 def test_gpu_cholesky_ill_conditioned_raises():
-    """CholeskyQR2 must surface a RuntimeError with 'non-SPD' on near-singular input.
+    """CholeskyQR2 must surface a RuntimeError with 'non-SPD' on a true
+    rank-deficient input — pointing the caller at `qr_method="householder"`.
 
-    Build a (1000 × 9000) matrix whose first two columns are a near-duplicate
-    pair (differ by 1e-8 × noise) — condition number ≈ 10^8. CholeskyQR2 should
-    fail with a clear error pointing to `qr_method="householder"`.
+    Build a `(n_obs × n_vars)` matrix as `X = U @ V^T` with `rank(X) = 5`,
+    well below `k = n_comps + n_oversamples = 30`. Then `Y = (X - μ) @ Ω` has
+    rank ≤ 6 < k, so `Y^T @ Y` is singular and `cusolverDnSpotrf` reports
+    `devInfo > 0`.
+
+    The Rust-level analogue `cusolver::tests::test_gpu_cholesky_qr2_ill_conditioned`
+    tests the primitive directly on a hand-crafted (m × 10) input with two
+    near-duplicate columns — that fixture is enough at the Rust layer
+    because cholesky operates directly on the input. At the Python layer
+    the randomized-PCA pipeline applies a `(n_vars × k)` random projection
+    `Ω` before cholesky sees the data, and that projection hides
+    column-level rank deficiencies in `X` whenever `rank(X) >= k`. We have
+    to make `X` itself rank-deficient at the `k` scale to push singularity
+    through to `Y`.
     """
     import anndata
     import pyscx
 
     rng = np.random.default_rng(7)
-    n_obs, n_vars = 1_000, 9_000
-    dense = rng.standard_normal((n_obs, n_vars)).astype(np.float32)
-    # Make columns 0 and 1 near-identical.
-    dense[:, 1] = dense[:, 0] + 1e-8 * rng.standard_normal(n_obs).astype(np.float32)
+    n_obs, n_vars, rank = 1_000, 9_000, 5
+    u = rng.standard_normal((n_obs, rank)).astype(np.float32)
+    v = rng.standard_normal((n_vars, rank)).astype(np.float32)
+    dense = (u @ v.T).astype(np.float32)
     adata = anndata.AnnData(X=sp.csr_matrix(dense))
 
     with pytest.raises(RuntimeError, match="non-SPD"):
