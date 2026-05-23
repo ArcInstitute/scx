@@ -66,6 +66,12 @@ ALL_BENCHMARKS: list[str] = [
     "accel_leiden",
     "accel_preprocess",
     "accel_hvg",
+    # PR series G1 — pdex_ref + rank_genes_groups (Wilcoxon) CPU vs GPU.
+    # Both entries gained a `device=` parameter in G1; this benchmark
+    # captures CPU baseline + GPU acceleration on the same fixture so
+    # the gate tracks speedup and CPU↔GPU parity. Variants live in
+    # `benchmarks/comprehensive/benchmarks/accel_de.py`.
+    "accel_de",
     # CSC dispatch sweep (Phase L.3): qc_metrics / HVG / DE /
     # pseudobulk × {csr, csc} on a CSC-equipped fixture.
     "bench_csc_dispatch",

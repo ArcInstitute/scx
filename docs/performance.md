@@ -322,6 +322,23 @@ Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):
 
 Full pipeline (PCA -> kNN -> UMAP -> Leiden -> DE) on 1M cells: **870s** (vs 3,971s — **4.6x faster**).
 
+### Differential expression (CPU, full-matrix)
+
+The Wilcoxon DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:
+
+| Dataset | scanpy `rank_genes_groups` | `pyscx.accel.rank_genes_groups` (CPU) | Speedup |
+|---------|---:|---:|---:|
+| pbmc3k (2.7K) | 0.84 s | 0.74 s | 1.1× |
+| pbmc10k (12K) | 11.1 s | 3.4 s | **3.3×** |
+| smartseq2 (18K) | 84.3 s | 22.0 s | **3.8×** |
+| tabula_sapiens_100k (62K) | 304 s | 53.4 s | **5.7×** |
+| census_500k | timeout (≥ 45 min) | 144 s | **≥ 19×** |
+| census_1m | timeout (≥ 45 min) | 210 s | **≥ 13×** |
+
+`pyscx.accel.pdex_ref` (perturbation-screen Mann–Whitney U + pseudobulk geometric-mean log fold change, pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex)) tracks similarly: 0.62 s on pbmc3k, 54 s on tabula_100k, 187 s on census_500k, 317 s on census_1m. The CPU path uses gene-chunked dense materialisation (default `gene_chunk_size=500`) with rayon-parallel per-gene rank tests — peak RSS is `O(n_obs × gene_chunk_size)`, not `O(n_obs × n_vars)`.
+
+Source: `benchmarks/comprehensive/results/baselines/v0.4.3-g1-gpu-de/summary.json` (the `accel_de__pyscx_wilcoxon_cpu` / `accel_de__pyscx_pdex_ref_cpu` / `accel_de__scanpy_wilcoxon_cpu` rows). Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`.
+
 ### Harmony2 batch integration + LISI
 
 Rust-native re-implementation of the Harmony2 algorithm (Korsunsky et al., 2019) and the Local Inverse Simpson Index (LISI). Exposed via `pyscx.accel.harmony_integrate` and `pyscx.accel.compute_lisi`; R wrappers are `rscx::scx_harmony_integrate` and `rscx::scx_compute_lisi`. GPU path available behind the `gpu` feature (`pyscx.accel.harmony_integrate(adata, ..., device="gpu")`).
@@ -461,6 +478,11 @@ Numbers below are from the cluster run on 2026-04-23 (SLURM job 2211369). Pipeli
 | UMAP trustworthiness | pbmc3k | 0.9238 | 0.9233 | — | vs PCA space |
 | Leiden (`device="cpu"`) | census_1m | 55.0 | 56.9 | **1.0×** | Rust-native (`scx_accel::leiden`) |
 | Leiden (`device="gpu"`) | census_1m | 55.0 | ~3.5 | **~16×** | cuGraph (reached directly post-spec — see "Choosing a Leiden backend" below) |
+| pdex_ref (vs reference) | smartseq2 (18K) | 21.4 | 18.5 | **1.16×** | CUB block sort + warp-cooperative searchsorted |
+| pdex_ref (vs reference) | pbmc10k (12K) | 3.6 | 3.4 | 1.07× | (small-data; launch-overhead bound) |
+| pdex_ref (vs reference) | tabula_100k / census | — | skip | — | n_ref > 8192 — v1 capacity cap |
+| Wilcoxon (1-vs-rest) | pbmc3k (2.7K) | 0.74 | 0.92 | 0.80× | (small-data; launch-overhead bound) |
+| Wilcoxon (1-vs-rest) | pbmc10k+ | — | skip | — | n_obs > 8192 — v1 capacity cap |
 | **End-to-end pipeline** | **census_1m** | **837.9** | **120.6** | **6.9×** | all above |
 
 The pipeline 6.9× speedup is headlined by UMAP (18.8×, up from 7.7×) and kNN (5.4× in-pipeline, up from 2.3×). PCA at 2K HVGs × 1M cells shows 1.0× because CPU covariance PCA already takes ~3 s — there's no headroom for a speedup. At `n_vars = 100 K` (tabula_sapiens_100k without HVG subsetting) PCA lands at 1.7×.
@@ -499,41 +521,53 @@ Practical recommendation: **use the GPU preprocessing path only via the `normali
 
 GPU PCA (both variants) streams shards from disk → GPU kernels shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM.
 
+#### Differential expression
+
+`pyscx.accel.pdex_ref(..., device=…)` and `pyscx.accel.rank_genes_groups(..., device=…)` both gained a `device="auto"|"cpu"|"gpu"[:N]"` selector. The GPU path uses per-gene CUB `BlockRadixSort` of the reference column once per gene chunk, batched warp-cooperative `searchsorted` to derive U₁ for every test group, merge-walk combined tie correction, and on-device `erfc` p-value matching the CPU formula bit-for-bit.
+
+| Operation | Dataset | n_pool | CPU | GPU | Speedup | Notes |
+|---|---|---:|---:|---:|---:|---|
+| `pdex_ref` | pbmc3k (2.7K) | n_ref ≈ 540 | 0.62 s | 0.90 s | 0.69× | launch-overhead bound |
+| `pdex_ref` | pbmc10k (12K) | n_ref ≈ 2.4K | 3.6 s | 3.4 s | 1.07× | ~tied |
+| `pdex_ref` | smartseq2 (18K) | n_ref ≈ 3.5K | 21.4 s | 18.5 s | **1.16×** | searchsorted starts winning |
+| `pdex_ref` | tabula_100k → census_1m | n_ref > 8192 | 54 → 317 s | **skip** | — | v1 capacity cap |
+| Wilcoxon (1-vs-rest) | pbmc3k (2.7K) | n_obs = 2.7K | 0.74 s | 0.92 s | 0.80× | launch-overhead bound |
+| Wilcoxon (1-vs-rest) | pbmc10k → census_1m | n_obs > 8192 | 3.4 → 210 s | **skip** | — | v1 capacity cap |
+
+The headline speedup is modest because v1 caps the per-gene sort pool at `GPU_DE_BLOCK_SORT_CAPACITY = 8192` cells — the CUB `BlockRadixSort` is one block per gene, holding the whole row in registers + shared memory. Above that, the dispatch returns `AccelError::InvalidInput("…use device='cpu' or subsample the reference")` and the caller falls back to the rayon-parallel CPU path. Where the GPU does run (small + medium datasets, mid-size reference groups), launch overhead and chunked-upload latency dominate the on-device sort + searchsorted work. The spec-anticipated **10–50× win** lives at Perturb-seq scale (≥ 50K cells × hundreds of perturbation groups, `n_ref` typically a few thousand non-targeting controls) — none of the dataset-tier fixtures match that group structure with the synthetic 2-way `groupby` the benchmark falls back to. Lifting the 8192 cap via a tiled merge-sort upgrade is deferred to PR series G4.
+
+**Correctness signal** (gated via `runs[].extra` in the `v0.4.3-g1-gpu-de` baseline):
+
+| Metric | Threshold | Observed |
+|---|---:|---:|
+| `de_pval_agreement_vs_cpu` (mean Spearman ρ over shared (group × gene) p-values) | ≥ 0.999999 | 1.0 (pbmc3k, pbmc10k), 0.999999 (smartseq2) |
+| `de_top_gene_overlap_vs_cpu` (median top-200 Jaccard per group) | ≥ 0.95 | 1.0 (pbmc3k, pbmc10k), 0.985 (smartseq2) |
+
+Tolerance-based parity for p-values / FDR (not exact) because of `erfc` and sort-order numerics; U statistics agree exactly in f64. The CPU path itself is pinned bit-for-bit to upstream `pdex` via `pyscx/tests/test_pdex_ref_parity.py`, so CPU↔GPU parity here transitively pins the GPU path to the upstream oracle.
+
+`pyscx.accel.rank_genes_groups(device="gpu", prefer_format="csc")` returns `RuntimeError` — CSC dispatch is CPU-only in v1.
+
 #### Canonical baseline
 
-As of **v0.6.0-gpu-phase1-7-multidataset** (promoted 2026-04-24), the
-GPU accelerator benchmarks live in the same comprehensive-framework
-baseline as the format benchmarks. The LATEST baseline covers a full
-60-cell sweep across the three reference datasets:
+Two baselines live side-by-side under `benchmarks/comprehensive/results/baselines/`. **Format / cloud / multimodal** PRs gate against the default `LATEST` symlink; **accel** PRs (PCA / kNN / UMAP / Leiden / preprocess / HVG / DE) pin the accel-only baseline explicitly. The split exists because the multi-surface baseline captures `accel_*` rows but doesn't produce gate signal against them — see [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
 
-| Dataset | accel cells | Source |
-|---|---:|---|
-| pbmc3k (2.7K cells) | 20 | Tier 1 / 3 |
-| tabula_sapiens_100k (100K cells) | 20 | Tier 2 / 3 |
-| census_1m (1M cells) | 20 | Tier 3 + CPU-reference retry |
+| Use | Baseline | Date | Coverage |
+|---|---|---|---|
+| Format / cloud / multimodal | `LATEST` → `v0.6.2-n_counts-augmentation` | 2026-05-11 | 806 rows × 8 datasets (`pbmc3k` → `census_1m`, `cite_seq_pbmc`, `multiome_pbmc`) |
+| Accel (incl. `accel_de`) | `v0.4.3-g1-gpu-de` | 2026-05-22 | 140 rows × 6 datasets × 7 accel benchmarks; PR series G1 promotion |
 
-Per-run correctness metrics (`cosine_sim_min`/`mean`,
-`recall_vs_scanpy`, `trustworthiness`, `ari_vs_leidenalg`,
-`max_abs_diff_vs_scanpy`, `hvg_overlap_vs_scanpy`) flow through
-`runs[].extra` so the floor checks in `thresholds.yaml` evaluate real
-observed values, not `missing` placeholders.
+Per-run correctness metrics (`cosine_sim_min`/`mean`, `recall_vs_scanpy`, `trustworthiness`, `ari_vs_leidenalg`, `max_abs_diff_vs_scanpy`, `hvg_overlap_vs_scanpy`, plus `de_pval_agreement_vs_cpu` / `de_top_gene_overlap_vs_cpu` added in G1) flow through `runs[].extra` so the floor checks in `thresholds.yaml` evaluate real observed values, not `missing` placeholders.
 
 ```bash
-# Gate any post-change head against the canonical baseline (both format and
-# accelerator dimensions). Exit 0 = pass, 1 = unjustified regression.
-python benchmarks/comprehensive/scripts/gate_candidate.py
-# → compares current head's captured snapshot against
-#   benchmarks/comprehensive/results/baselines/LATEST
-#       → v0.6.0-gpu-phase1-7-multidataset
+# Format / cloud / multimodal — default LATEST:
+python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel
+
+# Accel (incl. DE) — pin the accel-only baseline:
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only \
+    --baseline benchmarks/comprehensive/results/baselines/v0.4.3-g1-gpu-de
 ```
 
-The pbmc3k-only `v0.6.0-gpu-phase1-7` baseline (the smoke snapshot
-that briefly held LATEST in late April) remains in-tree for historical
-diff comparison but is no longer the gate target. The earlier stop-gap
-wrappers (`benchmarks/scripts/gpu_regression_{diff,driver}.py` and
-`slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py`
-for accelerator regression runs. See
-[benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
+Older accel-only baselines (`v0.6.0-gpu-phase1-7`, `v0.6.0-gpu-phase1-7-multidataset`) remain in-tree for historical bisects but are no longer the gate targets. The earlier stop-gap wrappers (`benchmarks/scripts/gpu_regression_{diff,driver}.py` and `slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py` for accelerator regression runs.
 
 #### Changes vs previous version
 

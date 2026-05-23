@@ -661,6 +661,13 @@ def accel_formats() -> list[FormatVariant]:
     except ImportError:
         pass
     try:
+        from benchmarks.comprehensive.benchmarks.accel_de import (
+            accel_de_variants,
+        )
+        out.extend(accel_de_variants())
+    except ImportError:
+        pass
+    try:
         from benchmarks.comprehensive.benchmarks.bench_csc_dispatch import (
             bench_csc_dispatch_variants,
         )
@@ -925,6 +932,13 @@ def estimate_memory_gb(
         # Loess fit uses f64 working arrays + per-gene variance accumulators.
         # Observed 33 GB peak on 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "accel_de":
+        # Per-gene chunked dense buffer `n_obs × gene_chunk_size` (CPU)
+        # or device upload of the same (GPU). Rank-test scratch is
+        # bounded by the chunk size, not the full n_vars. Size like
+        # `bench_csc_dispatch` which has the same chunked dense buffer
+        # shape on the CSR-DE path.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark == "bench_csc_dispatch":
         # CSC dispatch benchmark — peak RSS dominated by the operation
         # being run (qc / hvg / de / pseudobulk). DE chunked dense
@@ -1047,6 +1061,12 @@ def estimate_time_minutes(
         "accel_leiden":           90,
         "accel_preprocess":       60,
         "accel_hvg":              45,
+        # PR G1 — pdex_ref + Wilcoxon rank_genes_groups. Per-variant
+        # work is bounded by the rank-test + sort × n_genes inner loop;
+        # the GPU path's BlockRadixSort caps the per-gene pool at 8192
+        # cells, so large datasets short-circuit early. Reference
+        # scanpy run dominates the CPU path on smaller datasets.
+        "accel_de":               45,
         # CSC dispatch sweep runs eight ops (qc/hvg/de/pseudobulk × csr/csc)
         # against a converted CSC-equipped fixture; one-shot conversion is
         # cached per dataset so the per-variant work is bounded by the op

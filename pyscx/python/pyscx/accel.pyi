@@ -36,6 +36,19 @@ def rank_genes_groups(
     rankby_abs: bool = False,
     tie_correct: bool = False,
     prefer_format: PreferFormat = "csr",
+    device: str = "auto",
+) -> Any: ...
+
+
+def rank_genes_groups_df(
+    adata: Any,
+    groupby: str,
+    reference: str = "rest",
+    n_genes: int | None = None,
+    gene_chunk_size: int | None = None,
+    rankby_abs: bool = False,
+    tie_correct: bool = False,
+    device: str = "auto",
 ) -> Any: ...
 
 
@@ -77,6 +90,8 @@ def pdex_ref(
     geometric_mean: bool = True,
     epsilon: float = 0.0,
     gene_chunk_size: int | None = None,
+    prefer_format: PreferFormat = "csr",
+    device: str = "auto",
 ) -> Any: ...
 
 

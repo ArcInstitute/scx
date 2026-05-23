@@ -146,6 +146,7 @@ fn run_rank_genes_groups_inner(
     rankby_abs: bool,
     tie_correct: bool,
     prefer_format: &str,
+    gpu_device_id: Option<usize>,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -213,6 +214,12 @@ fn run_rank_genes_groups_inner(
     let x = adata.getattr("X")?;
 
     if prefer_format == "csc" {
+        if gpu_device_id.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' for CSC dispatch or prefer_format='csr' for GPU.",
+            ));
+        }
         // CSC dispatch: works on both backed and lazy datasets via
         // `as_column_source`. The kernel reads each gene chunk as a
         // CSC slab once, scatters into a row-major dense buffer, and
@@ -294,20 +301,42 @@ fn run_rank_genes_groups_inner(
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let reader = std::sync::Arc::clone(&backed.backed);
         drop(backed);
-        py.allow_threads(|| {
-            scx_accel::wilcoxon_rank_sum_streaming(
-                &reader,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                chunk_size,
-                log_transformed,
-                rankby_abs,
-                tie_correct,
-            )
-        })
-        .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
+        match gpu_device_id {
+            #[cfg(feature = "gpu")]
+            Some(device_id) => py
+                .allow_threads(|| {
+                    scx_accel::wilcoxon_rank_sum_gpu_streaming(
+                        device_id,
+                        &reader,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        Some(chunk_size),
+                        log_transformed,
+                        rankby_abs,
+                        tie_correct,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?,
+            #[cfg(not(feature = "gpu"))]
+            Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
+            None => py
+                .allow_threads(|| {
+                    scx_accel::wilcoxon_rank_sum_streaming(
+                        &reader,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        log_transformed,
+                        rankby_abs,
+                        tie_correct,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?,
+        }
     } else {
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
@@ -334,20 +363,42 @@ fn run_rank_genes_groups_inner(
 
             let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
             let chunk_size = gene_chunk_size.unwrap_or(500);
-            py.allow_threads(|| {
-                scx_accel::wilcoxon_rank_sum_sparse(
-                    &csr,
-                    &gene_names,
-                    &groups,
-                    &unique_groups,
-                    ref_idx,
-                    chunk_size,
-                    log_transformed,
-                    rankby_abs,
-                    tie_correct,
-                )
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            match gpu_device_id {
+                #[cfg(feature = "gpu")]
+                Some(device_id) => py
+                    .allow_threads(|| {
+                        scx_accel::wilcoxon_rank_sum_gpu_sparse(
+                            device_id,
+                            &csr,
+                            &gene_names,
+                            &groups,
+                            &unique_groups,
+                            ref_idx,
+                            Some(chunk_size),
+                            log_transformed,
+                            rankby_abs,
+                            tie_correct,
+                        )
+                    })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                #[cfg(not(feature = "gpu"))]
+                Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
+                None => py
+                    .allow_threads(|| {
+                        scx_accel::wilcoxon_rank_sum_sparse(
+                            &csr,
+                            &gene_names,
+                            &groups,
+                            &unique_groups,
+                            ref_idx,
+                            chunk_size,
+                            log_transformed,
+                            rankby_abs,
+                            tie_correct,
+                        )
+                    })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            }
         } else {
             // Dense numpy array: flatten and use direct wilcoxon_rank_sum
             let dense = numpy
@@ -359,21 +410,44 @@ fn run_rank_genes_groups_inner(
             let flat = dense.call_method0("ravel")?;
             let data: Vec<f32> = flat.extract()?;
 
-            py.allow_threads(|| {
-                scx_accel::wilcoxon_rank_sum(
-                    &data,
-                    n_obs,
-                    n_vars,
-                    &gene_names,
-                    &groups,
-                    &unique_groups,
-                    ref_idx,
-                    log_transformed,
-                    rankby_abs,
-                    tie_correct,
-                )
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            match gpu_device_id {
+                #[cfg(feature = "gpu")]
+                Some(device_id) => py
+                    .allow_threads(|| {
+                        scx_accel::wilcoxon_rank_sum_gpu_dense(
+                            device_id,
+                            &data,
+                            n_obs,
+                            n_vars,
+                            &gene_names,
+                            &groups,
+                            &unique_groups,
+                            ref_idx,
+                            log_transformed,
+                            rankby_abs,
+                            tie_correct,
+                        )
+                    })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                #[cfg(not(feature = "gpu"))]
+                Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
+                None => py
+                    .allow_threads(|| {
+                        scx_accel::wilcoxon_rank_sum(
+                            &data,
+                            n_obs,
+                            n_vars,
+                            &gene_names,
+                            &groups,
+                            &unique_groups,
+                            ref_idx,
+                            log_transformed,
+                            rankby_abs,
+                            tie_correct,
+                        )
+                    })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            }
         }
     };
 
@@ -444,7 +518,7 @@ fn de_result_to_dataframe<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr"))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr", device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -459,6 +533,7 @@ pub fn rank_genes_groups(
     rankby_abs: bool,
     tie_correct: bool,
     prefer_format: &str,
+    device: &str,
 ) -> PyResult<PyObject> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
@@ -470,6 +545,29 @@ pub fn rank_genes_groups(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+    let resolved = super::gpu::resolve_device(device)?;
+    #[cfg(feature = "gpu")]
+    let gpu_device_id = resolved.gpu_id();
+    #[cfg(not(feature = "gpu"))]
+    let gpu_device_id: Option<usize> = {
+        let _ = resolved;
+        None
+    };
+    // CSC has no GPU kernel in v1. Silently fall back to CPU when device
+    // is "auto" (the default) so users passing only `prefer_format="csc"`
+    // on a GPU host don't hit an error. Reject only when the user
+    // explicitly asked for GPU.
+    let gpu_device_id = if prefer_format == "csc" {
+        if device.starts_with("gpu") {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' or device='auto' for CSC dispatch.",
+            ));
+        }
+        None
+    } else {
+        gpu_device_id
+    };
 
     // --- Stratified path ---
     if let Some(ref strat_cols) = stratify_by {
@@ -496,6 +594,7 @@ pub fn rank_genes_groups(
                 rankby_abs,
                 tie_correct,
                 prefer_format,
+                gpu_device_id,
             ) {
                 Ok((result, _unique)) => {
                     let df = de_result_to_dataframe(py, &result, n_genes)?;
@@ -543,6 +642,7 @@ pub fn rank_genes_groups(
         rankby_abs,
         tie_correct,
         prefer_format,
+        gpu_device_id,
     )?;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
@@ -773,7 +873,7 @@ fn de_result_to_cell_eval_dataframe<'py>(
 ///     de_df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
 ///     # de_df is a polars DataFrame with cell-eval columns
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups_df(
     py: Python<'_>,
@@ -784,7 +884,16 @@ pub fn rank_genes_groups_df(
     gene_chunk_size: Option<usize>,
     rankby_abs: bool,
     tie_correct: bool,
+    device: &str,
 ) -> PyResult<PyObject> {
+    let resolved = super::gpu::resolve_device(device)?;
+    #[cfg(feature = "gpu")]
+    let gpu_device_id = resolved.gpu_id();
+    #[cfg(not(feature = "gpu"))]
+    let gpu_device_id: Option<usize> = {
+        let _ = resolved;
+        None
+    };
     // `rank_genes_groups_df` is the cell-eval-style entry; CSC dispatch
     // is reserved for the scanpy-style `rank_genes_groups`. Pin to CSR.
     let (result, _unique_groups) = run_rank_genes_groups_inner(
@@ -796,6 +905,7 @@ pub fn rank_genes_groups_df(
         rankby_abs,
         tie_correct,
         "csr",
+        gpu_device_id,
     )?;
 
     let df = de_result_to_cell_eval_dataframe(py, &result, n_genes)?;
@@ -911,6 +1021,8 @@ fn run_pdex_ref_inner(
     is_log1p: Option<bool>,
     epsilon: f64,
     gene_chunk_size: Option<usize>,
+    prefer_format: &str,
+    gpu_device_id: Option<usize>,
 ) -> PyResult<scx_accel::PdexRefResult> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -929,24 +1041,114 @@ fn run_pdex_ref_inner(
 
     let x = adata.getattr("X")?;
 
+    if prefer_format == "csc" {
+        if gpu_device_id.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' for CSC dispatch or prefer_format='csr' for GPU.",
+            ));
+        }
+        let chunk_size = gene_chunk_size.unwrap_or(500);
+
+        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+            if backed.kept_to_global.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "CSC requested but unavailable: a row deletion vector is active",
+                ));
+            }
+            let csc_reader = backed
+                .backed_csc
+                .as_ref()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(
+                        "CSC requested but unavailable: file has no CSC sidecar",
+                    )
+                })?
+                .clone();
+            drop(backed);
+            return py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_streaming_csc(
+                        csc_reader.as_ref(),
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+        }
+        if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+            let lazy_src = lazy.as_column_source().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar, \
+                     the transform chain contains a non-column-local op, or \
+                     a row deletion vector is active",
+                )
+            })?;
+            drop(lazy);
+            return py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_streaming_csc(
+                        &lazy_src,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+        }
+        return Err(PyRuntimeError::new_err(
+            "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
+             dataset; got a regular scipy/dense matrix",
+        ));
+    }
+
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let reader = std::sync::Arc::clone(&backed.backed);
         drop(backed);
-        return py
-            .allow_threads(|| {
-                scx_accel::pdex_ref_streaming(
-                    &reader,
-                    &gene_names,
-                    &groups,
-                    &unique_groups,
-                    ref_idx,
-                    chunk_size,
-                    mode,
-                    epsilon,
-                )
-            })
-            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+        return match gpu_device_id {
+            #[cfg(feature = "gpu")]
+            Some(device_id) => py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_gpu_streaming(
+                        device_id,
+                        &reader,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        Some(chunk_size),
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string())),
+            #[cfg(not(feature = "gpu"))]
+            Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
+            None => py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_streaming(
+                        &reader,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string())),
+        };
     }
 
     let is_sparse = scipy_sparse
@@ -972,19 +1174,40 @@ fn run_pdex_ref_inner(
 
         let csr = scx_sparse::ScxCsr::new_unchecked(shape, indptr, indices, data);
         let chunk_size = gene_chunk_size.unwrap_or(500);
-        py.allow_threads(|| {
-            scx_accel::pdex_ref_sparse(
-                &csr,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                chunk_size,
-                mode,
-                epsilon,
-            )
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        match gpu_device_id {
+            #[cfg(feature = "gpu")]
+            Some(device_id) => py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_gpu_sparse(
+                        device_id,
+                        &csr,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        Some(chunk_size),
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+            #[cfg(not(feature = "gpu"))]
+            Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
+            None => py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_sparse(
+                        &csr,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+        }
     } else {
         let dense = numpy
             .call_method1("asarray", (&x,))?
@@ -994,20 +1217,42 @@ fn run_pdex_ref_inner(
         let flat = dense.call_method0("ravel")?;
         let data: Vec<f32> = flat.extract()?;
 
-        py.allow_threads(|| {
-            scx_accel::pdex_ref(
-                &data,
-                n_obs,
-                n_vars,
-                &gene_names,
-                &groups,
-                &unique_groups,
-                ref_idx,
-                mode,
-                epsilon,
-            )
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        match gpu_device_id {
+            #[cfg(feature = "gpu")]
+            Some(device_id) => py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_gpu_dense(
+                        device_id,
+                        &data,
+                        n_obs,
+                        n_vars,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+            #[cfg(not(feature = "gpu"))]
+            Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
+            None => py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref(
+                        &data,
+                        n_obs,
+                        n_vars,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+        }
     }
 }
 
@@ -1130,7 +1375,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///     gene_chunk_size: Genes per chunk for sparse/backed streaming
 ///         (default: 500). Ignored for dense input.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -1141,12 +1386,41 @@ pub fn pdex_ref(
     geometric_mean: bool,
     epsilon: f64,
     gene_chunk_size: Option<usize>,
+    prefer_format: &str,
+    device: &str,
 ) -> PyResult<PyObject> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
             "epsilon must be non-negative and finite (got {epsilon})"
         )));
     }
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+        )));
+    }
+    let resolved = super::gpu::resolve_device(device)?;
+    #[cfg(feature = "gpu")]
+    let gpu_device_id = resolved.gpu_id();
+    #[cfg(not(feature = "gpu"))]
+    let gpu_device_id: Option<usize> = {
+        let _ = resolved;
+        None
+    };
+    // CSC has no GPU kernel in v1. Silently fall back to CPU when device
+    // is "auto" so `prefer_format="csc"` works on GPU hosts; reject only
+    // when the user explicitly asked for GPU.
+    let gpu_device_id = if prefer_format == "csc" {
+        if device.starts_with("gpu") {
+            return Err(PyRuntimeError::new_err(
+                "device='gpu' with prefer_format='csc' is not supported in v1; \
+                 use device='cpu' or device='auto' for CSC dispatch.",
+            ));
+        }
+        None
+    } else {
+        gpu_device_id
+    };
     let result = run_pdex_ref_inner(
         py,
         adata,
@@ -1156,6 +1430,8 @@ pub fn pdex_ref(
         is_log1p,
         epsilon,
         gene_chunk_size,
+        prefer_format,
+        gpu_device_id,
     )?;
     let df = pdex_ref_result_to_dataframe(py, &result)?;
     Ok(df.unbind())

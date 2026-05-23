@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "hostname": "GPU0F98",
+    "os": "Linux 5.15.0-176-generic",
+    "python_version": "3.13.13",
+    "numpy_version": "2.2.6",
+    "git_sha": "99e39b7204d27d844eae1c80573a50196faf7030",
+    "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "rayon_num_threads": "1",
+    "pinned_seed": 42,
+    "pinned_threads": 1,
+    "blake3_available": false,
+    "pyscx_version": "0.4.2",
+    "scanpy_version": "1.12.1",
+    "anndata_version": "0.12.16",
+    "scipy_version": "1.16.3",
+    "dataset_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc3k.h5ad"
+  },
+  "timings_seconds": {
+    "pca": 3.4204540639184415,
+    "neighbors": 1.5163638149388134,
+    "umap": 0.07238815887831151,
+    "leiden": 7.401499641127884,
+    "harmony": 1.1991936131380498,
+    "lisi": 0.20413228985853493
+  },
+  "fingerprints": {
+    "pca": {
+      "hash": "sha256:d67e1d5991f5743056bb2d893dddf7be83b1bfc8a560f5e602ece39f87c7e24f",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "pca_variance_ratio": {
+      "hash": "sha256:c9f6bc80ddf8231beeae4853d3691c1b312b12a2e43ef4dacfa0d37275e409ab",
+      "shape": [
+        20
+      ],
+      "dtype": "float64",
+      "nbytes": 160
+    },
+    "neighbors_distances": {
+      "hash": "sha256:8d6882745be22efe2eadc179a736bbb755140b6f95a4618d0eb6e7dd395a9ebb",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "neighbors_connectivities": {
+      "hash": "sha256:c5c02edd1b85969df76cc2a0b40cc2512707cbdd387e7ecae7469d9bccf8276d",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "umap": {
+      "hash": "sha256:7cf13348bc651d705dfa47a98b3b052bf1ca6bec603702fb9aec676531e65b89",
+      "shape": [
+        2700,
+        2
+      ],
+      "dtype": "float32",
+      "nbytes": 21600
+    },
+    "leiden": {
+      "hash": "sha256:4462bb0c4dcd1dc2d0e4bf0c698e9ca037c0c8059b96aa7238cd3038ebfafb3b",
+      "shape": [
+        2700
+      ],
+      "dtype": "int32",
+      "nbytes": 10800
+    },
+    "harmony": {
+      "hash": "sha256:83f535575e7e94b7373831e4fdc8a60c8412b77eb27e10fb53c60da71ec40bd6",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "lisi": {
+      "hash": "sha256:381da665be8ab0944fe2324c25819faf730c196e7c88bbff1d73bdf750318b95",
+      "shape": [
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 21600
+    }
+  }
+}
