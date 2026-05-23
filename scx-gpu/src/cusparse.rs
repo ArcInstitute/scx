@@ -16,6 +16,7 @@
 //! ```
 
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use cudarc::cusparse::sys::{
@@ -222,6 +223,171 @@ impl Drop for DnMatDescr {
     }
 }
 
+/// A strided view into a column-major dense matrix buffer.
+///
+/// Describes a sub-region of `buf` interpreted as a `(rows × cols)` column-major
+/// matrix with leading dimension `ld`, starting at `buf[offset_elems]`.
+///
+/// Used by the strided cuSPARSE SpMM wrappers ([`spmm_csr_view`] /
+/// [`spmm_csr_transpose_view`]) to let SpMM write/read a sub-region of a
+/// larger global buffer without per-shard scatter/gather kernels. `ld` must
+/// be >= `rows` for the contiguous case; for sub-regions, `ld` is the leading
+/// dimension of the full enclosing matrix (e.g. `n_obs` when writing a
+/// `shard_rows × k` view into a `n_obs × k` buffer at row offset `global_row`,
+/// in which case `offset_elems = global_row`).
+#[derive(Copy, Clone)]
+pub struct DnMatView<'a> {
+    pub buf: &'a CudaSlice<f32>,
+    pub offset_elems: usize,
+    pub rows: i64,
+    pub cols: i64,
+    pub ld: i64,
+}
+
+/// Mutable counterpart to [`DnMatView`].
+pub struct DnMatViewMut<'a> {
+    pub buf: &'a mut CudaSlice<f32>,
+    pub offset_elems: usize,
+    pub rows: i64,
+    pub cols: i64,
+    pub ld: i64,
+}
+
+impl<'a> DnMatView<'a> {
+    /// Construct a contiguous view (offset = 0, ld = rows).
+    pub fn contiguous(buf: &'a CudaSlice<f32>, rows: i64, cols: i64) -> Self {
+        Self {
+            buf,
+            offset_elems: 0,
+            rows,
+            cols,
+            ld: rows,
+        }
+    }
+}
+
+impl<'a> DnMatViewMut<'a> {
+    /// Construct a contiguous mutable view (offset = 0, ld = rows).
+    pub fn contiguous(buf: &'a mut CudaSlice<f32>, rows: i64, cols: i64) -> Self {
+        Self {
+            buf,
+            offset_elems: 0,
+            rows,
+            cols,
+            ld: rows,
+        }
+    }
+}
+
+/// Pool of reusable cuSPARSE SpMM workspace buffers.
+///
+/// `spmm_csr` allocates a fresh `CudaSlice<u8>` workspace inside every call.
+/// In iterative GPU PCA (randomized power iteration) that means ~30 × N_shards
+/// × 2 allocations per run. The pool replaces that with one grow-only
+/// `CudaSlice<u8>` slot:
+///
+/// 1. First call queries `cusparseSpMM_bufferSize` for the required size,
+///    allocates the slot, and runs SpMM.
+/// 2. Subsequent calls with `buf_size <= slot capacity` reuse the slot
+///    without allocating.
+/// 3. Calls with a larger `buf_size` grow the slot to `next_power_of_two`
+///    and record the realloc.
+///
+/// The atomic counters `alloc_count` / `reuse_count` expose pool behaviour
+/// for tests (see [`Self::metrics`]) — they're not load-bearing for
+/// correctness.
+///
+/// Thread safety: the pool itself is `!Sync` because a SpMM call needs
+/// exclusive access to the workspace buffer for the duration of the kernel.
+/// Run one pool per stream / device context.
+pub struct CuSparseWorkspacePool {
+    slot: Option<CudaSlice<u8>>,
+    capacity_bytes: usize,
+    alloc_count: AtomicU64,
+    reuse_count: AtomicU64,
+}
+
+/// Snapshot of pool usage counters. Returned by [`CuSparseWorkspacePool::metrics`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CuSparsePoolMetrics {
+    /// Number of slot allocations (initial + growths).
+    pub alloc_count: u64,
+    /// Number of calls served from the existing slot without allocation.
+    pub reuse_count: u64,
+    /// Current slot capacity in bytes (0 if never allocated).
+    pub current_capacity_bytes: usize,
+}
+
+impl Default for CuSparseWorkspacePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CuSparseWorkspacePool {
+    /// Construct an empty pool. The first SpMM call lazily allocates the slot.
+    pub fn new() -> Self {
+        Self {
+            slot: None,
+            capacity_bytes: 0,
+            alloc_count: AtomicU64::new(0),
+            reuse_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the pool's alloc/reuse counters and current capacity.
+    pub fn metrics(&self) -> CuSparsePoolMetrics {
+        CuSparsePoolMetrics {
+            alloc_count: self.alloc_count.load(Ordering::Relaxed),
+            reuse_count: self.reuse_count.load(Ordering::Relaxed),
+            current_capacity_bytes: self.capacity_bytes,
+        }
+    }
+
+    /// Grow the slot if `bytes > current capacity`. No-op when zero-bytes are
+    /// requested (cuSPARSE returns `buf_size = 0` for some trivial SpMM
+    /// shapes) — counted as a reuse so the metrics make sense.
+    fn ensure_capacity(&mut self, dev: &GpuDevice, bytes: usize) -> Result<(), GpuError> {
+        if bytes == 0 {
+            self.reuse_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if bytes <= self.capacity_bytes {
+            self.reuse_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        // Bump to next power-of-two so repeated small growths amortise.
+        let new_cap = bytes.next_power_of_two().max(self.capacity_bytes * 2);
+        self.slot = Some(dev.alloc_zeros::<u8>(new_cap)?);
+        self.capacity_bytes = new_cap;
+        self.alloc_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Lend the slot to a closure that performs one SpMM call. The closure
+    /// receives a `*mut c_void` workspace pointer (or null when `bytes == 0`)
+    /// — pass it straight to `cusparseSpMM`. The pool grows on first call /
+    /// on size increase.
+    fn with_workspace<R>(
+        &mut self,
+        dev: &GpuDevice,
+        stream: &CudaStream,
+        bytes: usize,
+        f: impl FnOnce(*mut core::ffi::c_void) -> Result<R, GpuError>,
+    ) -> Result<R, GpuError> {
+        self.ensure_capacity(dev, bytes)?;
+        if let Some(slot) = self.slot.as_mut() {
+            let (ptr, _guard) = slot.device_ptr_mut(stream);
+            // `_guard` holds the borrow on `slot` until end of scope, which
+            // includes the closure call. Required so concurrent reads/writes
+            // through cudarc's tracking don't reuse the slot mid-kernel.
+            f(ptr as *mut core::ffi::c_void)
+        } else {
+            f(std::ptr::null_mut())
+        }
+    }
+}
+
 /// Compute sparse × dense matrix multiply: `C = α·A·B + β·C`.
 ///
 /// - `A` is a GPU-resident CSR matrix (m × k) via `CusparseSpMatDescr`
@@ -304,41 +470,41 @@ pub fn spmm_csr_transpose(
     )
 }
 
-/// Internal SpMM implementation shared by `spmm_csr` and `spmm_csr_transpose`.
+/// Strided SpMM: `C = α·op(A)·B + β·C` where `B` and `C` are strided views
+/// into possibly-larger column-major buffers.
+///
+/// This is the unified entry point that the contiguous helpers ([`spmm_csr`],
+/// [`spmm_csr_transpose`]) and the strided helpers ([`spmm_csr_view`],
+/// [`spmm_csr_transpose_view`]) all delegate to. `pool` is `Some` when the
+/// caller wants the workspace reused across calls (PCA power iteration);
+/// `None` falls back to per-call `dev.alloc_zeros`.
 #[allow(clippy::too_many_arguments)]
-fn spmm_impl(
+fn spmm_impl_view(
     handle: &CusparseHandle,
     stream: &Arc<CudaStream>,
     dev: &GpuDevice,
+    pool: Option<&mut CuSparseWorkspacePool>,
     op_a: csp::cusparseOperation_t,
     a: &CusparseSpMatDescr,
-    b: &CudaSlice<f32>,
-    c: &mut CudaSlice<f32>,
-    m: usize,
-    k: usize,
-    n: usize,
+    b: DnMatView<'_>,
+    c: DnMatViewMut<'_>,
     alpha: f32,
     beta: f32,
 ) -> Result<(), GpuError> {
     // Bind cuSPARSE handle to our CUDA stream
     handle.set_stream(stream)?;
 
-    // Get raw device pointers for B (read) and C (read-write)
-    let (b_ptr, _guard_b) = b.device_ptr(stream);
-    let (c_ptr, _guard_c) = c.device_ptr_mut(stream);
+    // Resolve the strided base pointers via cudarc slice views. The guards
+    // borrow from the underlying slices for the full SpMM call so cudarc's
+    // synchronization tracking is honoured.
+    let b_view = b.buf.slice(b.offset_elems..);
+    let (b_ptr, _guard_b) = b_view.device_ptr(stream);
+    let mut c_view = c.buf.slice_mut(c.offset_elems..);
+    let (c_ptr, _guard_c) = c_view.device_ptr_mut(stream);
 
-    // Determine dense matrix dimensions based on the operation.
-    // For NON_TRANSPOSE: A is (m×k), B is (k×n), C is (m×n)
-    // For TRANSPOSE:     A^T is (k×m), so the original A is (m×k),
-    //                    B is (m×n), C is (k×n)
-    let (b_rows, b_cols, c_rows, c_cols) = match op_a {
-        csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE => (k, n, m, n),
-        _ => (m, n, k, n), // TRANSPOSE or CONJUGATE_TRANSPOSE
-    };
-
-    // Create dense matrix descriptors (column-major, leading dim = rows)
-    let dn_b = DnMatDescr::new(b_ptr, b_rows as i64, b_cols as i64, b_rows as i64)?;
-    let dn_c = DnMatDescr::new(c_ptr, c_rows as i64, c_cols as i64, c_rows as i64)?;
+    // Create dense matrix descriptors with the caller-provided leading dims.
+    let dn_b = DnMatDescr::new(b_ptr, b.rows, b.cols, b.ld)?;
+    let dn_c = DnMatDescr::new(c_ptr, c.rows, c.cols, c.ld)?;
 
     let alpha_ptr = &alpha as *const f32 as *const core::ffi::c_void;
     let beta_ptr = &beta as *const f32 as *const core::ffi::c_void;
@@ -364,40 +530,172 @@ fn spmm_impl(
         .map_err(|e| GpuError::CuSparseError(format!("cusparseSpMM_bufferSize: {e:?}")))?;
     }
 
-    // Allocate workspace (may be 0 bytes for simple cases)
-    let workspace = if buf_size > 0 {
-        Some(dev.alloc_zeros::<u8>(buf_size)?)
-    } else {
-        None
-    };
-    let workspace_ptr = match &workspace {
-        Some(ws) => {
-            let (ptr, _guard) = ws.device_ptr(stream);
-            ptr as *mut core::ffi::c_void
+    // Branch on whether the caller supplied a workspace pool.
+    let run_spmm = |workspace_ptr: *mut core::ffi::c_void| -> Result<(), GpuError> {
+        unsafe {
+            csp::cusparseSpMM(
+                handle.raw(),
+                op_a,
+                csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE,
+                alpha_ptr,
+                a.raw(),
+                dn_b.raw(),
+                beta_ptr,
+                dn_c.raw(),
+                cudaDataType::CUDA_R_32F,
+                alg,
+                workspace_ptr,
+            )
+            .result()
+            .map_err(|e| GpuError::CuSparseError(format!("cusparseSpMM: {e:?}")))?;
         }
-        None => std::ptr::null_mut(),
+        Ok(())
     };
 
-    // Execute SpMM
-    unsafe {
-        csp::cusparseSpMM(
-            handle.raw(),
-            op_a,
-            csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE,
-            alpha_ptr,
-            a.raw(),
-            dn_b.raw(),
-            beta_ptr,
-            dn_c.raw(),
-            cudaDataType::CUDA_R_32F,
-            alg,
-            workspace_ptr,
-        )
-        .result()
-        .map_err(|e| GpuError::CuSparseError(format!("cusparseSpMM: {e:?}")))?;
+    match pool {
+        Some(p) => p.with_workspace(dev, stream, buf_size, run_spmm)?,
+        None => {
+            // Legacy per-call allocation path.
+            let workspace = if buf_size > 0 {
+                Some(dev.alloc_zeros::<u8>(buf_size)?)
+            } else {
+                None
+            };
+            let workspace_ptr = match &workspace {
+                Some(ws) => {
+                    let (ptr, _guard) = ws.device_ptr(stream);
+                    ptr as *mut core::ffi::c_void
+                }
+                None => std::ptr::null_mut(),
+            };
+            run_spmm(workspace_ptr)?;
+        }
     }
 
     Ok(())
+}
+
+/// Convert `(m, k, n, op_a)` plus contiguous buffers into the equivalent
+/// strided-view dimensions for the legacy `spmm_csr` / `spmm_csr_transpose`
+/// entry points. Centralises the dimension table shared by both wrappers.
+fn contiguous_view_dims(
+    op_a: csp::cusparseOperation_t,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (i64, i64, i64, i64) {
+    match op_a {
+        csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE => {
+            (k as i64, n as i64, m as i64, n as i64)
+        }
+        // TRANSPOSE or CONJUGATE_TRANSPOSE
+        _ => (m as i64, n as i64, k as i64, n as i64),
+    }
+}
+
+/// Legacy contiguous-buffer SpMM, retained for callers that don't yet thread
+/// a `CuSparseWorkspacePool` through. Delegates to [`spmm_impl_view`].
+#[allow(clippy::too_many_arguments)]
+fn spmm_impl(
+    handle: &CusparseHandle,
+    stream: &Arc<CudaStream>,
+    dev: &GpuDevice,
+    op_a: csp::cusparseOperation_t,
+    a: &CusparseSpMatDescr,
+    b: &CudaSlice<f32>,
+    c: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), GpuError> {
+    let (b_rows, b_cols, c_rows, c_cols) = contiguous_view_dims(op_a, m, k, n);
+    let b_view = DnMatView {
+        buf: b,
+        offset_elems: 0,
+        rows: b_rows,
+        cols: b_cols,
+        ld: b_rows,
+    };
+    let c_view = DnMatViewMut {
+        buf: c,
+        offset_elems: 0,
+        rows: c_rows,
+        cols: c_cols,
+        ld: c_rows,
+    };
+    spmm_impl_view(
+        handle, stream, dev, None, op_a, a, b_view, c_view, alpha, beta,
+    )
+}
+
+/// Strided SpMM: `C = α·A·B + β·C` where `B` / `C` are views into larger
+/// column-major buffers.
+///
+/// Same algorithm and tuning as [`spmm_csr`]. Used by the GPU PCA loop to
+/// write a `(shard_rows × k)` SpMM result directly into a `(n_obs × k)`
+/// global buffer at row offset `global_row`, avoiding a per-shard scatter.
+///
+/// `b.ld` and `c.ld` must each be `>= rows`. `pool` is `Some` to reuse
+/// workspace across calls (recommended in iterative loops); `None` allocates
+/// per call.
+#[allow(clippy::too_many_arguments)]
+pub fn spmm_csr_view(
+    handle: &CusparseHandle,
+    stream: &Arc<CudaStream>,
+    dev: &GpuDevice,
+    pool: Option<&mut CuSparseWorkspacePool>,
+    a: &CusparseSpMatDescr,
+    b: DnMatView<'_>,
+    c: DnMatViewMut<'_>,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), GpuError> {
+    spmm_impl_view(
+        handle,
+        stream,
+        dev,
+        pool,
+        csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE,
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+    )
+}
+
+/// Strided transposed SpMM: `C = α·Aᵀ·B + β·C` where `B` / `C` are views
+/// into larger column-major buffers.
+///
+/// Same algorithm and tuning as [`spmm_csr_transpose`]. Used by the GPU PCA
+/// loop to read a `(shard_rows × k)` view from a `(n_obs × k)` buffer at
+/// row offset `global_row`, avoiding a per-shard gather.
+#[allow(clippy::too_many_arguments)]
+pub fn spmm_csr_transpose_view(
+    handle: &CusparseHandle,
+    stream: &Arc<CudaStream>,
+    dev: &GpuDevice,
+    pool: Option<&mut CuSparseWorkspacePool>,
+    a: &CusparseSpMatDescr,
+    b: DnMatView<'_>,
+    c: DnMatViewMut<'_>,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), GpuError> {
+    spmm_impl_view(
+        handle,
+        stream,
+        dev,
+        pool,
+        csp::cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE,
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+    )
 }
 
 /// Raw device pointers for cupy `__cuda_array_interface__` interop.
@@ -807,6 +1105,342 @@ mod tests {
                 c_cpu[i]
             );
         }
+    }
+
+    /// Strided SpMM view parity vs the contiguous `spmm_csr`.
+    ///
+    /// Writes a `(m × n)` result into an oversized `(m + 5) × n` buffer at
+    /// row offset 3 with `ld = m + 5`, then verifies the populated rows
+    /// match the contiguous-buffer result bit-for-bit and that the
+    /// untouched rows remain zero.
+    #[test]
+    fn test_spmm_csr_view_matches_contiguous() {
+        let dev = require_gpu!();
+        let m = 4;
+        let k = 3;
+        let n = 2;
+        let indptr: Vec<i64> = vec![0, 2, 3, 3, 6];
+        let indices: Vec<i32> = vec![0, 2, 1, 0, 1, 2];
+        let data: Vec<f32> = vec![1.0, 3.0, 2.0, 4.0, 5.0, 6.0];
+        let b_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
+        let handle = CusparseHandle::new().unwrap();
+        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
+
+        // Reference: contiguous SpMM.
+        let d_b = dev.htod_copy(&b_host).unwrap();
+        let mut d_c_contig = dev.alloc_zeros::<f32>(m * n).unwrap();
+        spmm_csr(
+            &handle,
+            dev.stream(),
+            &dev,
+            &a_desc,
+            &d_b,
+            &mut d_c_contig,
+            m,
+            k,
+            n,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let c_ref = dev.dtoh_copy(&d_c_contig).unwrap();
+
+        // Strided: write into a `(ld × n)` buffer at row offset 3 with ld = m + 5.
+        let ld = m + 5;
+        let row_off = 3usize;
+        let mut d_c_strided = dev.alloc_zeros::<f32>(ld * n).unwrap();
+
+        let b_view = DnMatView::contiguous(&d_b, k as i64, n as i64);
+        let c_view = DnMatViewMut {
+            buf: &mut d_c_strided,
+            offset_elems: row_off,
+            rows: m as i64,
+            cols: n as i64,
+            ld: ld as i64,
+        };
+        spmm_csr_view(
+            &handle,
+            dev.stream(),
+            &dev,
+            None,
+            &a_desc,
+            b_view,
+            c_view,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let c_strided = dev.dtoh_copy(&d_c_strided).unwrap();
+
+        // Verify the populated sub-region matches the contiguous result.
+        for col in 0..n {
+            for row in 0..m {
+                let strided_idx = col * ld + row_off + row;
+                let contig_idx = col * m + row;
+                assert!(
+                    (c_strided[strided_idx] - c_ref[contig_idx]).abs() < 1e-5,
+                    "strided[{strided_idx}]={} != contiguous[{contig_idx}]={}",
+                    c_strided[strided_idx],
+                    c_ref[contig_idx]
+                );
+            }
+        }
+
+        // Verify untouched rows remain zero — the strided write must not
+        // bleed into rows outside `[row_off, row_off + m)`.
+        for col in 0..n {
+            for row in 0..ld {
+                if row >= row_off && row < row_off + m {
+                    continue;
+                }
+                let idx = col * ld + row;
+                assert_eq!(
+                    c_strided[idx], 0.0,
+                    "strided write leaked into untouched row {row} (col {col})"
+                );
+            }
+        }
+    }
+
+    /// Same as the forward parity test but for the transpose path. Reads a
+    /// strided `(m × n)` view from a `(ld × n)` source buffer.
+    #[test]
+    fn test_spmm_csr_transpose_view_matches_contiguous() {
+        let dev = require_gpu!();
+        let m = 4;
+        let k = 3;
+        let n = 2;
+        let indptr: Vec<i64> = vec![0, 2, 3, 3, 6];
+        let indices: Vec<i32> = vec![0, 2, 1, 0, 1, 2];
+        let data: Vec<f32> = vec![1.0, 3.0, 2.0, 4.0, 5.0, 6.0];
+        let b_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
+        let handle = CusparseHandle::new().unwrap();
+        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
+
+        // Reference: contiguous transposed SpMM.
+        let d_b_contig = dev.htod_copy(&b_host).unwrap();
+        let mut d_c_contig = dev.alloc_zeros::<f32>(k * n).unwrap();
+        super::spmm_csr_transpose(
+            &handle,
+            dev.stream(),
+            &dev,
+            &a_desc,
+            &d_b_contig,
+            &mut d_c_contig,
+            m,
+            k,
+            n,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let c_ref = dev.dtoh_copy(&d_c_contig).unwrap();
+
+        // Strided: read B from a (ld × n) buffer at row offset 3 with ld = m + 5.
+        let ld = m + 5;
+        let row_off = 3usize;
+        let mut b_strided_host = vec![0.0f32; ld * n];
+        for col in 0..n {
+            for row in 0..m {
+                b_strided_host[col * ld + row_off + row] = b_host[col * m + row];
+            }
+        }
+        let d_b_strided = dev.htod_copy(&b_strided_host).unwrap();
+        let mut d_c_view = dev.alloc_zeros::<f32>(k * n).unwrap();
+
+        let b_view = DnMatView {
+            buf: &d_b_strided,
+            offset_elems: row_off,
+            rows: m as i64,
+            cols: n as i64,
+            ld: ld as i64,
+        };
+        let c_view = DnMatViewMut::contiguous(&mut d_c_view, k as i64, n as i64);
+        spmm_csr_transpose_view(
+            &handle,
+            dev.stream(),
+            &dev,
+            None,
+            &a_desc,
+            b_view,
+            c_view,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let c_view_host = dev.dtoh_copy(&d_c_view).unwrap();
+
+        assert_eq!(c_view_host.len(), c_ref.len());
+        for i in 0..c_view_host.len() {
+            assert!(
+                (c_view_host[i] - c_ref[i]).abs() < 1e-5,
+                "transpose view mismatch at {i}: view={}, contiguous={}",
+                c_view_host[i],
+                c_ref[i]
+            );
+        }
+    }
+
+    /// The pool must reuse its single grow-only slot across SpMM calls of the
+    /// same shape.
+    #[test]
+    fn test_workspace_pool_reuses_across_calls() {
+        let dev = require_gpu!();
+        let m = 4;
+        let k = 3;
+        let n = 2;
+        let indptr: Vec<i64> = vec![0, 2, 3, 3, 6];
+        let indices: Vec<i32> = vec![0, 2, 1, 0, 1, 2];
+        let data: Vec<f32> = vec![1.0, 3.0, 2.0, 4.0, 5.0, 6.0];
+        let b_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
+        let handle = CusparseHandle::new().unwrap();
+        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
+        let d_b = dev.htod_copy(&b_host).unwrap();
+        let mut d_c = dev.alloc_zeros::<f32>(m * n).unwrap();
+        let mut pool = CuSparseWorkspacePool::new();
+
+        for _ in 0..10 {
+            let b_view = DnMatView::contiguous(&d_b, k as i64, n as i64);
+            let c_view = DnMatViewMut::contiguous(&mut d_c, m as i64, n as i64);
+            spmm_csr_view(
+                &handle,
+                dev.stream(),
+                &dev,
+                Some(&mut pool),
+                &a_desc,
+                b_view,
+                c_view,
+                1.0,
+                0.0,
+            )
+            .unwrap();
+        }
+
+        let metrics = pool.metrics();
+        // First call allocates (or pool.with_workspace counts a 0-byte reuse
+        // when cuSPARSE returns buf_size = 0). Either way:
+        // - alloc_count ≤ 1 (a single grow event for the largest workspace).
+        // - alloc_count + reuse_count == 10 (one increment per call).
+        assert!(
+            metrics.alloc_count <= 1,
+            "expected at most 1 allocation; got {} (capacity {} bytes)",
+            metrics.alloc_count,
+            metrics.current_capacity_bytes
+        );
+        assert_eq!(
+            metrics.alloc_count + metrics.reuse_count,
+            10,
+            "pool counters should sum to call count"
+        );
+    }
+
+    /// The pool must grow exactly once when a larger shape arrives.
+    #[test]
+    fn test_workspace_pool_grows_on_bigger_shape() {
+        let dev = require_gpu!();
+        // Small CSR: 4×3.
+        let m_small = 4;
+        let k_small = 3;
+        let n_small = 2;
+        let indptr_s: Vec<i64> = vec![0, 2, 3, 3, 6];
+        let indices_s: Vec<i32> = vec![0, 2, 1, 0, 1, 2];
+        let data_s: Vec<f32> = vec![1.0, 3.0, 2.0, 4.0, 5.0, 6.0];
+        let b_small: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        // Larger CSR: 200×100 dense-ish (synthetic, just to force a bigger
+        // workspace). One nonzero per row.
+        let m_big = 200;
+        let k_big = 100;
+        let n_big = 32;
+        let mut indptr_b: Vec<i64> = Vec::with_capacity(m_big + 1);
+        let mut indices_b: Vec<i32> = Vec::with_capacity(m_big);
+        let mut data_b: Vec<f32> = Vec::with_capacity(m_big);
+        indptr_b.push(0);
+        for row in 0..m_big {
+            indices_b.push((row % k_big) as i32);
+            data_b.push(1.0);
+            indptr_b.push(indices_b.len() as i64);
+        }
+        let b_big: Vec<f32> = vec![1.0f32; k_big * n_big];
+
+        let handle = CusparseHandle::new().unwrap();
+        let mut pool = CuSparseWorkspacePool::new();
+
+        // Small call first.
+        {
+            let csr_s =
+                build_simple_gpu_csr(&dev, &indptr_s, &indices_s, &data_s, m_small, k_small);
+            let a_s = csr_s.to_cusparse_csr(&dev, dev.stream()).unwrap();
+            let d_b = dev.htod_copy(&b_small).unwrap();
+            let mut d_c = dev.alloc_zeros::<f32>(m_small * n_small).unwrap();
+            let b_view = DnMatView::contiguous(&d_b, k_small as i64, n_small as i64);
+            let c_view = DnMatViewMut::contiguous(&mut d_c, m_small as i64, n_small as i64);
+            spmm_csr_view(
+                &handle,
+                dev.stream(),
+                &dev,
+                Some(&mut pool),
+                &a_s,
+                b_view,
+                c_view,
+                1.0,
+                0.0,
+            )
+            .unwrap();
+        }
+        let after_small = pool.metrics();
+
+        // Big call — should grow the slot.
+        {
+            let csr_b = build_simple_gpu_csr(&dev, &indptr_b, &indices_b, &data_b, m_big, k_big);
+            let a_b = csr_b.to_cusparse_csr(&dev, dev.stream()).unwrap();
+            let d_b = dev.htod_copy(&b_big).unwrap();
+            let mut d_c = dev.alloc_zeros::<f32>(m_big * n_big).unwrap();
+            let b_view = DnMatView::contiguous(&d_b, k_big as i64, n_big as i64);
+            let c_view = DnMatViewMut::contiguous(&mut d_c, m_big as i64, n_big as i64);
+            spmm_csr_view(
+                &handle,
+                dev.stream(),
+                &dev,
+                Some(&mut pool),
+                &a_b,
+                b_view,
+                c_view,
+                1.0,
+                0.0,
+            )
+            .unwrap();
+        }
+        let after_big = pool.metrics();
+
+        // If the small call required workspace (buf_size > 0), it allocated
+        // exactly once. The big call either reused (small workspace was
+        // already big enough — alloc_count unchanged) or grew (alloc_count
+        // bumped by 1). Cap at 2 total allocations regardless of cuSPARSE's
+        // internal sizing decisions.
+        assert!(
+            after_big.alloc_count <= 2,
+            "expected ≤ 2 grow events, got {}",
+            after_big.alloc_count
+        );
+        assert!(
+            after_big.alloc_count + after_big.reuse_count == 2,
+            "pool counters should sum to 2 calls (got alloc={} reuse={})",
+            after_big.alloc_count,
+            after_big.reuse_count
+        );
+        // If the small call did force an allocation, the big call should not
+        // have shrunk the slot — capacity is monotonic non-decreasing.
+        assert!(
+            after_big.current_capacity_bytes >= after_small.current_capacity_bytes,
+            "pool capacity must be monotonic non-decreasing"
+        );
     }
 
     #[test]

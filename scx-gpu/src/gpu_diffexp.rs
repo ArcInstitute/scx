@@ -69,10 +69,26 @@ pub struct GpuDeChunkScratch {
     pub u_or_rank: CudaSlice<f64>,
     /// `[chunk_max]` f64 p-values for one test group.
     pub p_values: CudaSlice<f64>,
+    /// `[chunk_max × n_ref_max]` gene-major ref slab. G2 hoisted from a
+    /// per-chunk `dev.alloc_zeros` in `pdex_ref_gpu_chunked`. Grow-only via
+    /// [`Self::ensure_ref_slab_capacity`].
+    pub ref_slab: CudaSlice<f32>,
+    /// `[chunk_max × n_group_max]` gene-major group slab. G2 hoisted from
+    /// the per-test-group `dev.alloc_zeros` in both pdex_ref and Wilcoxon
+    /// chunk loops. Grow-only via [`Self::ensure_group_slab_capacity`].
+    pub group_slab: CudaSlice<f32>,
+    /// `[n_groups_max × chunk_max]` f64 pseudobulk sums buffer. G2 hoisted
+    /// from `compute_pdex_means_gpu` / `compute_group_gene_sums_gpu`. Grow-
+    /// only via [`Self::ensure_sums_capacity`].
+    pub sums: CudaSlice<f64>,
     n_obs: usize,
     chunk_max: usize,
     slab_capacity: usize,
     aux_capacity_elems: usize,
+    ref_slab_capacity: usize,
+    group_slab_capacity: usize,
+    sums_capacity: usize,
+    alloc_count: u64,
 }
 
 impl GpuDeChunkScratch {
@@ -97,6 +113,11 @@ impl GpuDeChunkScratch {
         let tie_term = dev.alloc_zeros::<f64>(chunk_max)?;
         let u_or_rank = dev.alloc_zeros::<f64>(chunk_max)?;
         let p_values = dev.alloc_zeros::<f64>(chunk_max)?;
+        // G2 grow-on-demand slots — start at zero size so small DE calls
+        // never pay for them; first `ensure_*_capacity` call allocates.
+        let ref_slab = dev.alloc_zeros::<f32>(0)?;
+        let group_slab = dev.alloc_zeros::<f32>(0)?;
+        let sums = dev.alloc_zeros::<f64>(0)?;
         Ok(Self {
             dense,
             slab,
@@ -104,10 +125,17 @@ impl GpuDeChunkScratch {
             tie_term,
             u_or_rank,
             p_values,
+            ref_slab,
+            group_slab,
+            sums,
             n_obs,
             chunk_max,
             slab_capacity: n_pool_max,
             aux_capacity_elems: 0,
+            ref_slab_capacity: 0,
+            group_slab_capacity: 0,
+            sums_capacity: 0,
+            alloc_count: 0,
         })
     }
 
@@ -120,6 +148,7 @@ impl GpuDeChunkScratch {
         let new_cap = n_pool.next_power_of_two().max(self.slab_capacity * 2);
         self.slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
         self.slab_capacity = new_cap;
+        self.alloc_count += 1;
         Ok(())
     }
 
@@ -141,6 +170,61 @@ impl GpuDeChunkScratch {
             .max(self.aux_capacity_elems * 2);
         self.slab_aux = dev.alloc_zeros::<f32>(new_cap)?;
         self.aux_capacity_elems = new_cap;
+        self.alloc_count += 1;
+        Ok(())
+    }
+
+    /// Grow `ref_slab` to hold at least `chunk_max × n_ref` f32 keys.
+    /// Called once per `pdex_ref_gpu_chunked` invocation before the chunk
+    /// loop. Same grow-only `next_power_of_two` pattern as the slab.
+    pub fn ensure_ref_slab_capacity(
+        &mut self,
+        dev: &GpuDevice,
+        n_ref: usize,
+    ) -> Result<(), GpuError> {
+        if n_ref <= self.ref_slab_capacity {
+            return Ok(());
+        }
+        let new_cap = n_ref.next_power_of_two().max(self.ref_slab_capacity * 2);
+        self.ref_slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
+        self.ref_slab_capacity = new_cap;
+        self.alloc_count += 1;
+        Ok(())
+    }
+
+    /// Grow `group_slab` to hold at least `chunk_max × n_g` f32 keys.
+    /// Called from the per-test-group loop before each scatter; only
+    /// allocates when the current largest group exceeds capacity.
+    pub fn ensure_group_slab_capacity(
+        &mut self,
+        dev: &GpuDevice,
+        n_g: usize,
+    ) -> Result<(), GpuError> {
+        if n_g <= self.group_slab_capacity {
+            return Ok(());
+        }
+        let new_cap = n_g.next_power_of_two().max(self.group_slab_capacity * 2);
+        self.group_slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
+        self.group_slab_capacity = new_cap;
+        self.alloc_count += 1;
+        Ok(())
+    }
+
+    /// Grow `sums` to hold at least `n_groups × chunk_max` f64 values.
+    /// Called above the chunk loop in pdex_ref / Wilcoxon driver before
+    /// any pseudobulk fold.
+    pub fn ensure_sums_capacity(
+        &mut self,
+        dev: &GpuDevice,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        if n_groups <= self.sums_capacity {
+            return Ok(());
+        }
+        let new_cap = n_groups.next_power_of_two().max(self.sums_capacity * 2);
+        self.sums = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
+        self.sums_capacity = new_cap;
+        self.alloc_count += 1;
         Ok(())
     }
 
@@ -152,6 +236,13 @@ impl GpuDeChunkScratch {
     /// Maximum number of genes per chunk this scratch is sized for.
     pub fn chunk_max(&self) -> usize {
         self.chunk_max
+    }
+
+    /// Total scratch-buffer grow events since construction. Used by
+    /// regression tests (`test_pdex_ref_no_realloc_across_chunks`) to
+    /// verify the chunk loop reuses scratch without re-allocating.
+    pub fn alloc_count(&self) -> u64 {
+        self.alloc_count
     }
 }
 
@@ -267,14 +358,20 @@ pub fn gpu_de_scatter_gene_major(
 ///   `scratch.slab_aux`; final copy back to `slab` when pass count is odd,
 ///   so callers always read the sorted result from `slab`.
 ///
-/// `scratch` is taken `&mut` to allow on-demand growth of `slab_aux` via
-/// [`GpuDeChunkScratch::ensure_aux_capacity`]. Fast-path callers can pass
-/// any scratch they have lying around — the aux is only touched on the
-/// multi-tile path.
+/// `slab` is sorted in-place. `aux` is used as the multi-tile ping-pong
+/// buffer and must hold at least `chunk_size × n_per_gene` f32 keys (the
+/// caller must size it via [`GpuDeChunkScratch::ensure_aux_capacity`] when
+/// `n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`). Fast-path callers can pass
+/// any allocation for `aux` — it is not touched on the single-tile path.
+///
+/// Taking `slab` and `aux` as separate `&mut CudaSlice<f32>` arguments lets
+/// callers thread two disjoint fields of `GpuDeChunkScratch` simultaneously
+/// (e.g. `&mut scratch.ref_slab` + `&mut scratch.slab_aux`), which is
+/// required by the G2 chunk-loop hoisting in pdex_ref / Wilcoxon drivers.
 pub fn gpu_de_block_sort(
     dev: &GpuDevice,
-    scratch: &mut GpuDeChunkScratch,
     slab: &mut CudaSlice<f32>,
+    aux: &mut CudaSlice<f32>,
     chunk_size: usize,
     n_per_gene: usize,
 ) -> Result<(), GpuError> {
@@ -294,7 +391,12 @@ pub fn gpu_de_block_sort(
             expected: "chunk_size * n_per_gene fits in usize".into(),
             got: format!("chunk_size={chunk_size}, n_per_gene={n_per_gene}"),
         })?;
-    scratch.ensure_aux_capacity(dev, n_elements)?;
+    if aux.len() < n_elements {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("aux buffer ≥ chunk_size * n_per_gene = {n_elements} f32 keys",),
+            got: format!("aux.len() = {}", aux.len()),
+        });
+    }
 
     // Tile sort in-place into `slab`. Each block handles one tile of one gene;
     // the final tile may be partial, handled via +inf padding in the kernel.
@@ -308,35 +410,21 @@ pub fn gpu_de_block_sort(
     while run_size < n_per_gene {
         if n_passes.is_multiple_of(2) {
             // pass 0, 2, 4, ... : slab -> aux.
-            gpu_de_merge_pass(
-                dev,
-                &*slab,
-                &mut scratch.slab_aux,
-                chunk_size,
-                n_per_gene,
-                run_size,
-            )?;
+            gpu_de_merge_pass(dev, &*slab, aux, chunk_size, n_per_gene, run_size)?;
         } else {
             // pass 1, 3, 5, ... : aux -> slab.
-            gpu_de_merge_pass(
-                dev,
-                &scratch.slab_aux,
-                &mut *slab,
-                chunk_size,
-                n_per_gene,
-                run_size,
-            )?;
+            gpu_de_merge_pass(dev, &*aux, slab, chunk_size, n_per_gene, run_size)?;
         }
         n_passes += 1;
         run_size = run_size.saturating_mul(2);
     }
 
-    // After an odd number of merge passes the final result lives in `slab_aux`;
+    // After an odd number of merge passes the final result lives in `aux`;
     // copy it back to `slab` so callers downstream (searchsorted, tie-term,
     // p-value) read from the canonical buffer.
     if !n_passes.is_multiple_of(2) {
         let mut slab_view = slab.slice_mut(..n_elements);
-        let aux_view = scratch.slab_aux.slice(..n_elements);
+        let aux_view = aux.slice(..n_elements);
         dev.stream()
             .memcpy_dtod(&aux_view, &mut slab_view)
             .map_err(|e| GpuError::CudaError(format!("memcpy_dtod(aux→slab): {e}")))?;
@@ -909,7 +997,17 @@ mod tests {
             chunk_size,
         )
         .unwrap();
-        gpu_de_block_sort(&dev, &mut scratch, &mut d_ref_slab, chunk_size, n_ref).unwrap();
+        scratch
+            .ensure_aux_capacity(&dev, chunk_size * n_ref)
+            .unwrap();
+        gpu_de_block_sort(
+            &dev,
+            &mut d_ref_slab,
+            &mut scratch.slab_aux,
+            chunk_size,
+            n_ref,
+        )
+        .unwrap();
         gpu_de_tie_term(&dev, &d_ref_slab, &mut scratch.tie_term, chunk_size, n_ref).unwrap();
         dev.synchronize().unwrap();
 
@@ -947,7 +1045,15 @@ mod tests {
             n_g,
         )
         .unwrap();
-        gpu_de_block_sort(&dev, &mut scratch, &mut d_group_slab, chunk_size, n_g).unwrap();
+        scratch.ensure_aux_capacity(&dev, chunk_size * n_g).unwrap();
+        gpu_de_block_sort(
+            &dev,
+            &mut d_group_slab,
+            &mut scratch.slab_aux,
+            chunk_size,
+            n_g,
+        )
+        .unwrap();
         gpu_de_combined_tie_term(
             &dev,
             &d_ref_slab,
@@ -1021,7 +1127,17 @@ mod tests {
 
         let mut d_slab = dev.htod_copy(&data).unwrap();
         let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
-        gpu_de_block_sort(&dev, &mut scratch, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        scratch
+            .ensure_aux_capacity(&dev, chunk_size * n_per_gene)
+            .unwrap();
+        gpu_de_block_sort(
+            &dev,
+            &mut d_slab,
+            &mut scratch.slab_aux,
+            chunk_size,
+            n_per_gene,
+        )
+        .unwrap();
         dev.synchronize().unwrap();
         let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
 
@@ -1050,7 +1166,7 @@ mod tests {
             "test fixture must exceed the fast-path threshold to exercise the multi-tile path"
         );
 
-        let mut state: u64 = 0xFEEDBEEF_2026;
+        let mut state: u64 = 0xFEED_BEEF_2026;
         let mut next = || {
             state = state
                 .wrapping_mul(6364136223846793005)
@@ -1066,7 +1182,17 @@ mod tests {
 
         let mut d_slab = dev.htod_copy(&data).unwrap();
         let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
-        gpu_de_block_sort(&dev, &mut scratch, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        scratch
+            .ensure_aux_capacity(&dev, chunk_size * n_per_gene)
+            .unwrap();
+        gpu_de_block_sort(
+            &dev,
+            &mut d_slab,
+            &mut scratch.slab_aux,
+            chunk_size,
+            n_per_gene,
+        )
+        .unwrap();
         dev.synchronize().unwrap();
         let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
 
@@ -1107,7 +1233,17 @@ mod tests {
 
         let mut d_slab = dev.htod_copy(&data).unwrap();
         let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
-        gpu_de_block_sort(&dev, &mut scratch, &mut d_slab, chunk_size, n_per_gene).unwrap();
+        scratch
+            .ensure_aux_capacity(&dev, chunk_size * n_per_gene)
+            .unwrap();
+        gpu_de_block_sort(
+            &dev,
+            &mut d_slab,
+            &mut scratch.slab_aux,
+            chunk_size,
+            n_per_gene,
+        )
+        .unwrap();
         dev.synchronize().unwrap();
         let gpu_sorted = dev.dtoh_copy(&d_slab).unwrap();
 
@@ -1208,5 +1344,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// G2 regression: `ensure_*_capacity` only allocates on initial grow and
+    /// on size increase; same / smaller requests are no-ops. The chunk loops
+    /// in `pdex_ref_gpu_chunked` / `wilcoxon_rank_sum_gpu_chunked` rely on
+    /// this so they can pre-grow once before the loop and never re-allocate
+    /// per chunk.
+    #[test]
+    fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
+        let dev = require_gpu!();
+        let n_obs = 100;
+        let chunk_max = 8;
+        let n_pool_initial = 10;
+
+        let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_max, n_pool_initial).unwrap();
+        // Construction does not call `ensure_*` — alloc_count starts at zero.
+        assert_eq!(scratch.alloc_count(), 0, "fresh scratch has no grow events");
+
+        // First grow of ref_slab beyond the initial slab capacity.
+        scratch.ensure_ref_slab_capacity(&dev, 64).unwrap();
+        assert_eq!(scratch.alloc_count(), 1, "first ref_slab grow");
+
+        // Same size — must be no-op.
+        scratch.ensure_ref_slab_capacity(&dev, 64).unwrap();
+        assert_eq!(scratch.alloc_count(), 1, "same ref_slab size: no realloc");
+
+        // Smaller size — also no-op (capacity is monotonic non-decreasing).
+        scratch.ensure_ref_slab_capacity(&dev, 32).unwrap();
+        assert_eq!(
+            scratch.alloc_count(),
+            1,
+            "smaller ref_slab size: no realloc"
+        );
+
+        // First grow of group_slab.
+        scratch.ensure_group_slab_capacity(&dev, 50).unwrap();
+        assert_eq!(scratch.alloc_count(), 2, "first group_slab grow");
+
+        // Repeat — no-op.
+        scratch.ensure_group_slab_capacity(&dev, 50).unwrap();
+        assert_eq!(scratch.alloc_count(), 2, "same group_slab: no realloc");
+
+        // First grow of sums.
+        scratch.ensure_sums_capacity(&dev, 4).unwrap();
+        assert_eq!(scratch.alloc_count(), 3, "first sums grow");
+
+        // First grow of aux.
+        scratch.ensure_aux_capacity(&dev, 1024).unwrap();
+        assert_eq!(scratch.alloc_count(), 4, "first aux grow");
+
+        // Another grow on ref_slab past current capacity bumps alloc count.
+        // ref_slab grew to next_power_of_two(64) = 64, so 96 forces a grow.
+        let initial = scratch.alloc_count();
+        scratch.ensure_ref_slab_capacity(&dev, 96).unwrap();
+        assert!(
+            scratch.alloc_count() > initial,
+            "growing ref_slab past power-of-two boundary must reallocate"
+        );
+
+        // The whole point: a chunk loop that calls ensure_* once up front
+        // followed by N iterations of buffer reuse only sees a constant
+        // alloc_count.
+        let frozen = scratch.alloc_count();
+        for _ in 0..16 {
+            scratch.ensure_ref_slab_capacity(&dev, 32).unwrap();
+            scratch.ensure_group_slab_capacity(&dev, 50).unwrap();
+            scratch.ensure_sums_capacity(&dev, 4).unwrap();
+            scratch.ensure_aux_capacity(&dev, 1024).unwrap();
+        }
+        assert_eq!(
+            scratch.alloc_count(),
+            frozen,
+            "16 iterations of same/smaller ensure_* must not grow",
+        );
     }
 }

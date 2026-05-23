@@ -84,6 +84,36 @@ extern "C" __global__ void mean_correct_colmajor_kernel(
     Y[idx] -= mc[col];
 }
 
+// Mean-correct a strided slice of a col-major matrix in place:
+//   Y[global_row + r, c] -= mc[c]   for r in [0, shard_rows), c in [0, k)
+//
+// Y is laid out as (ld × k) col-major: Y[r, c] = flat[c * ld + r].
+// The kernel touches only the sub-region (rows [global_row, global_row +
+// shard_rows)) — other rows are not read or written.
+//
+// Used by the strided PCA matmat path to apply mean correction directly to
+// a shard's slice of the global (n_obs × k) buffer without copying back
+// through a contiguous shard temporary.
+//
+// total threads = shard_rows × k
+extern "C" __global__ void mean_correct_colmajor_strided_kernel(
+    float* __restrict__ Y,           // [ld × k], col-major; full matrix
+    const float* __restrict__ mc,    // [k]
+    int shard_rows,
+    int k,
+    int global_row,
+    int ld
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = shard_rows * k;
+    if (idx >= total) return;
+
+    int col = idx / shard_rows;
+    int row = idx % shard_rows;
+    long long flat = (long long)col * (long long)ld + (long long)global_row + (long long)row;
+    Y[flat] -= mc[col];
+}
+
 // Compute column sums of a col-major matrix.
 //
 // X: (m × k) col-major: X[r, c] = flat[c * m + r]
