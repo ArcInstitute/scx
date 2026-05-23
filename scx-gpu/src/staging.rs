@@ -166,12 +166,16 @@ impl PinnedCsrSlot {
 
     /// Grow buffers if needed. No-op when current capacity already
     /// suffices.
+    ///
+    /// `is_pinned` is monotone-downward only: a pinned → pageable grow
+    /// flips it to `false`, but a subsequent pageable → pinned grow does
+    /// not flip it back. The flag is metric-only and not load-bearing for
+    /// correctness — H→D code paths dispatch per-buffer on the actual
+    /// `HostBuf` variant.
     pub fn ensure_capacity(&mut self, indptr_len: usize, nnz: usize) {
         if self.indptr.capacity() < indptr_len {
             let new_cap = indptr_len.next_power_of_two();
             let new_buf = HostBuf::<i64>::new(&self.ctx, new_cap);
-            // If old was pinned and new is pageable, downgrade the
-            // is_pinned flag.
             if matches!(self.indptr, HostBuf::Pinned(_)) && !matches!(new_buf, HostBuf::Pinned(_)) {
                 self.is_pinned = false;
             }
@@ -292,14 +296,11 @@ impl PinnedCsrSlot {
 
         dst.shape = (n_rows, n_cols);
         dst.nnz = nnz;
-        // Buffer addresses haven't changed (no grow), but the live data
-        // contents have — invalidate the cached SpMat descriptor because
-        // its captured pointers point at the SAME buffer addresses but the
-        // logical shape may differ from the previous upload. cuSPARSE
-        // doesn't capture the shape — only pointers — so technically the
-        // descriptor is reusable here. However, we still invalidate when
-        // shape changes to keep the cache rule "descriptor valid iff
-        // shape and pointers unchanged" simple.
+        // Shape-change invalidation is required for correctness:
+        // `cusparseCreateCsr` captures `(rows, cols, nnz)` at descriptor
+        // build time (see [`build_sp_descr_from_slot`]), so a descriptor
+        // built for one shape would silently produce wrong results if
+        // reused after a shape change.
         dst.maybe_invalidate_descr_on_shape_change(n_rows, n_cols, nnz);
         Ok(())
     }
@@ -482,18 +483,10 @@ impl GpuCsrSlot {
             .map(|c| c.sig == sig)
             .unwrap_or(false);
         if !cache_valid {
-            // Build a temporary owned GpuCsr around CLONED views of the
-            // slot buffers? No — to_cusparse_csr takes an owned GpuCsr.
-            // Workaround: construct a synthetic owned GpuCsr from the
-            // slot by allocating fresh buffers? That would defeat the
-            // caching purpose.
-            //
-            // Right answer: have `to_cusparse_csr` operate on the slot's
-            // exact-sized views. The cuSPARSE descriptor captures device
-            // pointers (`indptr.device_ptr(stream)` etc.) — these are
-            // identical regardless of whether you go through the owned
-            // CudaSlice or a CudaView. Re-implement the descriptor build
-            // here to avoid the owned/borrowed mismatch.
+            // Build the cuSPARSE descriptor directly against the slot's
+            // exact-sized views — `GpuCsr::to_cusparse_csr` would require
+            // an owned `GpuCsr`, which would defeat the slot's buffer
+            // reuse. See [`build_sp_descr_from_slot`].
             let descr = build_sp_descr_from_slot(dev, stream, self)?;
             self.cached_desc = Some(CachedDesc { descr, sig });
         }
@@ -537,21 +530,20 @@ impl GpuCsrSlot {
 /// The descriptor downcasts indptr i64 → i32 on-device and stores the
 /// downcast buffer inside the descriptor so cuSPARSE's captured pointer
 /// remains valid for the descriptor's lifetime.
+///
+/// The `stream` argument is plumbed through to the cast kernel so the
+/// downcast `indptr` is produced on the same stream that the cuSPARSE
+/// call will use — without it, the cast would run on `dev.stream()` and
+/// the descriptor would capture a pointer whose contents are not visible
+/// on the caller's stream until an implicit synchronization.
 fn build_sp_descr_from_slot(
     dev: &GpuDevice,
     stream: &CudaStream,
     slot: &GpuCsrSlot,
 ) -> Result<CusparseSpMatDescr, GpuError> {
-    // Construct an exact-sized i64 indptr Vec on host via clone_dtoh —
-    // expensive but only happens when the descriptor cache MISSES. After
-    // the first miss the descriptor is reused across all subsequent
-    // power-iteration calls on the same shard, so the cost is amortised.
-    //
-    // Better: use cast_i64_to_i32_gpu directly on the slot's indptr view.
-    // That avoids the round-trip.
     use crate::cast_gpu::cast_i64_to_i32_gpu_view;
     let indptr_view = slot.indptr.slice(..slot.shape.0 + 1);
-    let i32_indptr = cast_i64_to_i32_gpu_view(dev, &indptr_view)?;
+    let i32_indptr = cast_i64_to_i32_gpu_view(dev, stream, &indptr_view)?;
 
     use cudarc::cusparse::sys::{
         self as csp, cudaDataType, cusparseIndexBase_t, cusparseIndexType_t,
@@ -705,6 +697,44 @@ mod tests {
             p1, p2,
             "descriptor must be reused across calls with same shape"
         );
+    }
+
+    /// Descriptor cache must invalidate when only `nnz` changes (same
+    /// n_rows / n_cols). The existing `*_on_shape_change` test varies
+    /// `n_rows`; this isolates the nnz path.
+    #[test]
+    fn test_gpu_csr_slot_descr_cache_invalidates_on_nnz_change() {
+        let dev = require_gpu!();
+        let ctx = dev.context();
+        let mut host = PinnedCsrSlot::new(ctx, 16, 64);
+        let mut slot = GpuCsrSlot::new(&dev, 16, 64).unwrap();
+
+        // Shape A: 3 rows × 5 cols, nnz = 5.
+        let csr_a = ScxCsr::new_unchecked(
+            (3, 5),
+            vec![0i64, 2, 3, 5],
+            vec![0i32, 2, 1, 0, 4],
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
+        );
+        host.stage(&csr_a).unwrap();
+        host.upload_to(dev.stream(), &mut slot, 3, 5, 5).unwrap();
+        let _p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
+        assert!(slot.has_cached_descr());
+
+        // Shape B: SAME n_rows / n_cols, DIFFERENT nnz (4 instead of 5).
+        let csr_b = ScxCsr::new_unchecked(
+            (3, 5),
+            vec![0i64, 2, 3, 4],
+            vec![0i32, 2, 1, 0],
+            vec![10.0f32, 11.0, 12.0, 13.0],
+        );
+        host.stage(&csr_b).unwrap();
+        host.upload_to(dev.stream(), &mut slot, 3, 4, 5).unwrap();
+        assert!(
+            !slot.has_cached_descr(),
+            "nnz change must invalidate descr cache even when n_rows/n_cols are unchanged"
+        );
+        let _p2 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
     }
 
     #[test]

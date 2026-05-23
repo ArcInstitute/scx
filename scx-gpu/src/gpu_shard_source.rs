@@ -38,12 +38,12 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::safe::CudaStream;
+use cudarc::driver::safe::{CudaEvent, CudaStream};
 use scx_format::ShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::gpu_preprocess::gpu_apply_fused_ops;
+use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
 
 /// Sequence of GPU-resident CSR shards.
@@ -89,35 +89,80 @@ pub trait GpuShardSource {
 /// Adapter from a CPU-side [`ShardSource`] to [`GpuShardSource`].
 ///
 /// Owns the staging pipeline:
-/// - One reusable [`PinnedCsrSlot`] (host-side staging buffer).
+/// - A **2-slot ring** of [`PinnedCsrSlot`]s (host-side staging buffers).
+///   Two are required to fix a host-side reuse race that the previous
+///   single-slot design exhibited: with pinned memory the H→D copy issued
+///   on `copy_stream` is truly asynchronous, so the next iteration's
+///   `stage()` would otherwise overwrite the pinned source buffer while
+///   the prior shard's DMA was still in flight. The ring pings between
+///   the two slots; before re-staging, the loop host-waits on the
+///   captured copy-stream event for that slot.
 /// - One reusable [`GpuCsrSlot`] (device CSR + cached descriptor).
-/// - A dedicated `copy_stream` and per-shard upload events.
+/// - A dedicated `copy_stream` and per-shard upload events for the
+///   device-side handshake (compute waits on copy; next copy waits on
+///   compute reads of the prior shard's device slot).
 ///
 /// The decode loop runs on a scoped worker thread that pre-decodes the
-/// next shard while the main thread processes the current one. The slot
-/// is reused — only the live shard's bytes are uploaded.
+/// next shard while the main thread processes the current one.
 pub struct RawGpuShardSource<'a> {
     dev: &'a GpuDevice,
     source: &'a (dyn ShardSource + Sync),
-    pinned: PinnedCsrSlot,
+    pinned: [PinnedCsrSlot; 2],
+    /// Per-pinned-slot copy-stream events captured immediately after the
+    /// slot's most recent `upload_to`. Host-waited on before the slot is
+    /// reused for the next `stage()` so the CPU never overwrites a buffer
+    /// whose DMA is still in flight.
+    pinned_events: [Option<CudaEvent>; 2],
     slot: GpuCsrSlot,
     copy_stream: Arc<CudaStream>,
 }
 
 impl<'a> RawGpuShardSource<'a> {
-    /// Construct a raw GPU shard source. Sizes the staging buffers from
-    /// the catalog's `max_shard_rows` when available; otherwise grows
-    /// lazily on first upload.
+    /// Construct a raw GPU shard source with lazy-grow staging buffers.
+    ///
+    /// Deliberately does **not** call `ShardSource::max_shard_rows()`
+    /// to pre-size: the default trait impl reads every shard, which would
+    /// defeat the worker-thread pipelining and inflate I/O on backed
+    /// readers without an O(1) override. Backed readers with the O(1)
+    /// override and callers that know their max should use
+    /// [`Self::with_max_shard_rows`] instead.
     pub fn new(dev: &'a GpuDevice, source: &'a (dyn ShardSource + Sync)) -> Result<Self, GpuError> {
-        // Lazy-grow staging slots — we deliberately do not call
-        // `max_shard_rows()` here. The default `ShardSource` impl reads
-        // every shard, which would defeat the worker-thread pipelining
-        // and inflate I/O on backed readers without an O(1) override.
-        // Backed readers with the O(1) override and callers that know
-        // their max can pre-size manually if profiling shows the lazy
-        // first-grow cost dominates.
-        let pinned = PinnedCsrSlot::new(dev.context(), 1, 1);
-        let slot = GpuCsrSlot::new(dev, 1, 1)?;
+        Self::build(dev, source, 1, 1)
+    }
+
+    /// Construct a raw GPU shard source with pinned and device buffers
+    /// pre-sized for the largest expected shard.
+    ///
+    /// `max_rows` is the maximum `n_rows` across shards, `max_nnz` is the
+    /// maximum `nnz`. The slots will grow on demand if these are
+    /// underestimates; over-estimates only cost extra pinned host memory
+    /// and one-time device alloc. Use catalog stats
+    /// (`FullCatalog::max_shard_rows`, `ShardStats::nnz`) when available.
+    pub fn with_max_shard_rows(
+        dev: &'a GpuDevice,
+        source: &'a (dyn ShardSource + Sync),
+        max_rows: usize,
+        max_nnz: usize,
+    ) -> Result<Self, GpuError> {
+        Self::build(
+            dev,
+            source,
+            max_rows.saturating_add(1).max(1),
+            max_nnz.max(1),
+        )
+    }
+
+    fn build(
+        dev: &'a GpuDevice,
+        source: &'a (dyn ShardSource + Sync),
+        indptr_cap: usize,
+        nnz_cap: usize,
+    ) -> Result<Self, GpuError> {
+        let pinned = [
+            PinnedCsrSlot::new(dev.context(), indptr_cap, nnz_cap),
+            PinnedCsrSlot::new(dev.context(), indptr_cap, nnz_cap),
+        ];
+        let slot = GpuCsrSlot::new(dev, indptr_cap, nnz_cap)?;
 
         // Dedicated copy stream — used only when n_shards > 1 (single-
         // shard sources reuse the compute stream below).
@@ -133,6 +178,7 @@ impl<'a> RawGpuShardSource<'a> {
             dev,
             source,
             pinned,
+            pinned_events: [None, None],
             slot,
             copy_stream,
         })
@@ -153,7 +199,11 @@ impl<'a> RawGpuShardSource<'a> {
             return Ok(());
         }
 
-        // Single-shard fast path (no worker thread, no extra copy stream).
+        // Single-shard fast path (no worker thread, no extra copy stream,
+        // no pinned-ring rotation). Safe because there is no successor
+        // `stage()` that could race the in-flight DMA — once `f` returns,
+        // the caller's next host action implicitly orders against the
+        // compute stream and the pinned buffer is free to reuse.
         if n_shards == 1 {
             let csr = self
                 .source
@@ -162,8 +212,8 @@ impl<'a> RawGpuShardSource<'a> {
             if csr.n_rows() == 0 {
                 return Ok(());
             }
-            self.pinned.stage(&csr)?;
-            self.pinned.upload_to(
+            self.pinned[0].stage(&csr)?;
+            self.pinned[0].upload_to(
                 self.dev.stream(),
                 &mut self.slot,
                 csr.n_rows(),
@@ -182,11 +232,12 @@ impl<'a> RawGpuShardSource<'a> {
         let source = self.source;
         let dev = self.dev;
         let pinned = &mut self.pinned;
+        let pinned_events = &mut self.pinned_events;
         let slot = &mut self.slot;
         let copy_stream = &self.copy_stream;
         let compute_stream = dev.stream();
 
-        std::thread::scope(|scope| -> Result<(), GpuError> {
+        let scope_result = std::thread::scope(|scope| -> Result<(), GpuError> {
             use std::sync::mpsc;
             type Msg = Result<(usize, scx_sparse::ScxCsr), scx_format::ScxError>;
             let (tx, rx) = mpsc::sync_channel::<Msg>(1);
@@ -200,6 +251,7 @@ impl<'a> RawGpuShardSource<'a> {
                 }
             });
 
+            let mut pinned_idx: usize = 0;
             while let Ok(msg) = rx.recv() {
                 let (i, csr) = match msg {
                     Ok(v) => v,
@@ -212,40 +264,69 @@ impl<'a> RawGpuShardSource<'a> {
                 if csr.n_rows() == 0 {
                     continue;
                 }
-                pinned.stage(&csr)?;
-                pinned.upload_to(
+
+                // Host-side gate: if this pinned slot still has an
+                // outstanding copy-stream event from a previous shard, we
+                // must wait for that DMA to drain on the host before
+                // overwriting the pinned buffer. The device-side gates
+                // below only order device streams against each other;
+                // they do not prevent the CPU from racing the DMA's
+                // source memory.
+                if let Some(evt) = pinned_events[pinned_idx].take() {
+                    evt.synchronize()
+                        .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
+                }
+
+                pinned[pinned_idx].stage(&csr)?;
+                pinned[pinned_idx].upload_to(
                     copy_stream,
                     slot,
                     csr.n_rows(),
                     csr.data.len(),
                     csr.n_cols(),
                 )?;
-                // Event handshake: upload on copy_stream, kernel reads
-                // on compute_stream. The wait guarantees the kernel
-                // observes the just-uploaded shard data.
+                // Device-side gate (copy → compute): kernel reads must
+                // observe the just-uploaded shard data.
                 let upload_event = copy_stream
                     .record_event(None)
-                    .map_err(|e| GpuError::CudaError(format!("record event: {e}")))?;
+                    .map_err(|e| GpuError::CudaError(format!("record upload event: {e}")))?;
                 compute_stream
                     .wait(&upload_event)
                     .map_err(|e| GpuError::CudaError(format!("compute wait: {e}")))?;
+                // Stash the same event against this pinned slot so the
+                // next iteration that recycles it can host-wait.
+                pinned_events[pinned_idx] = Some(upload_event);
 
                 transform(dev, slot)?;
-
                 f(i, slot)?;
 
-                // Record compute-stream completion so the next shard's
-                // upload (on copy_stream) waits for any reads of this
-                // slot's buffers to finish before re-staging into them.
+                // Device-side gate (compute → copy): the next shard's
+                // upload (which writes into `slot`) must wait for the
+                // current shard's compute reads of `slot` to finish.
                 let compute_event = compute_stream
                     .record_event(None)
-                    .map_err(|e| GpuError::CudaError(format!("record event: {e}")))?;
+                    .map_err(|e| GpuError::CudaError(format!("record compute event: {e}")))?;
                 copy_stream
                     .wait(&compute_event)
                     .map_err(|e| GpuError::CudaError(format!("copy wait: {e}")))?;
+
+                pinned_idx ^= 1;
             }
             Ok(())
-        })
+        });
+
+        // Drain any remaining pinned events so the caller may safely
+        // mutate or drop the pinned host buffers immediately after this
+        // function returns. Cheap in the common case — by the time we
+        // reach this point the DMAs are typically already complete.
+        for evt in self.pinned_events.iter_mut() {
+            if let Some(e) = evt.take() {
+                e.synchronize()
+                    .map_err(|err| GpuError::CudaError(format!("pinned drain sync: {err}")))?;
+            }
+        }
+
+        scope_result
     }
 }
 
@@ -340,99 +421,9 @@ impl<'a> GpuShardSource for GpuPreprocessedShardSource<'a> {
             // touch disjoint fields, which Rust permits through the
             // dedicated `split_indptr_data_mut` accessor.
             let (indptr, mut data) = slot.split_indptr_data_mut();
-            apply_fused_ops_to_views(dev, &indptr, &mut data, n_rows, normalize, log1p)
+            apply_fused_ops_inner(dev, &indptr, &mut data, n_rows, normalize, log1p)
         })
     }
-}
-
-/// View-based wrapper around the CSR-level preprocessing kernels
-/// (`normalize`, `log1p`, fused). Mirrors
-/// [`crate::gpu_preprocess::gpu_apply_fused_ops`] but operates on
-/// [`cudarc::driver::safe::CudaView`] / [`cudarc::driver::safe::CudaViewMut`]
-/// so the slot's grow-only buffers can be transformed in place at the
-/// live shard size.
-fn apply_fused_ops_to_views(
-    dev: &GpuDevice,
-    indptr: &cudarc::driver::safe::CudaView<'_, i64>,
-    data: &mut cudarc::driver::safe::CudaViewMut<'_, f32>,
-    n_rows: usize,
-    normalize: Option<f32>,
-    log1p: bool,
-) -> Result<(), GpuError> {
-    // The kernels in `crate::gpu_preprocess` were written against
-    // `&CudaSlice<T>`. The PushKernelArg trait is also implemented for
-    // `&CudaView` / `&mut CudaViewMut`, so we can launch the same
-    // kernels with view arguments directly — this helper just calls them
-    // through.
-    use cudarc::driver::safe::LaunchConfig;
-    use cudarc::driver::PushKernelArg;
-
-    if n_rows == 0 {
-        return Ok(());
-    }
-
-    const NORMALIZE_LOG1P_PTX: &str =
-        include_str!(concat!(env!("OUT_DIR"), "/normalize_log1p.ptx"));
-    let module = dev.load_module_cached(NORMALIZE_LOG1P_PTX)?;
-
-    let n_rows_i32 = n_rows as i32;
-    let threads: u32 = 256;
-    let blocks = (n_rows as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    let _ = gpu_apply_fused_ops; // anchor for IDE jump-to-def
-    match (normalize, log1p) {
-        (Some(target_sum), true) => {
-            let func = module
-                .load_function("normalize_log1p_kernel")
-                .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_log1p: {e}")))?;
-            unsafe {
-                dev.stream()
-                    .launch_builder(&func)
-                    .arg(indptr)
-                    .arg(data)
-                    .arg(&n_rows_i32)
-                    .arg(&target_sum)
-                    .launch(cfg)
-            }
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_log1p: {e}")))?;
-        }
-        (Some(target_sum), false) => {
-            let func = module
-                .load_function("normalize_kernel")
-                .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize: {e}")))?;
-            unsafe {
-                dev.stream()
-                    .launch_builder(&func)
-                    .arg(indptr)
-                    .arg(data)
-                    .arg(&n_rows_i32)
-                    .arg(&target_sum)
-                    .launch(cfg)
-            }
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize: {e}")))?;
-        }
-        (None, true) => {
-            let func = module
-                .load_function("log1p_kernel")
-                .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p: {e}")))?;
-            unsafe {
-                dev.stream()
-                    .launch_builder(&func)
-                    .arg(indptr)
-                    .arg(data)
-                    .arg(&n_rows_i32)
-                    .launch(cfg)
-            }
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p: {e}")))?;
-        }
-        (None, false) => {}
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -586,5 +577,136 @@ mod tests {
         // Across shards, the cache is invalidated (different shape /
         // different uploaded contents), so addresses may differ — we
         // don't assert that.
+    }
+
+    /// Cached cuSPARSE descriptor is reused **across** shards when the
+    /// shape (`n_rows`, `n_cols`, `nnz`) is identical and the slot's
+    /// device buffers haven't grown. Complements
+    /// [`test_cached_descr_reused_per_shard`] which only checks within-
+    /// shard reuse.
+    #[test]
+    fn test_cross_shard_descr_reuse_same_shape() {
+        let dev = require_gpu!();
+        // Two identically-shaped shards (same n_rows, same nnz). The
+        // first shard's stage() grows the slot from (1,1) once; the
+        // second shard fits in the same capacity so no further grow
+        // happens and the descriptor (built on shard 0) stays valid.
+        let shards = vec![make_csr(4, 6, 1.0), make_csr(4, 6, 100.0)];
+        let src = InMemorySource {
+            shards,
+            n_obs: 8,
+            n_vars: 6,
+        };
+        let mut gpu = RawGpuShardSource::new(&dev, &src).unwrap();
+
+        let mut descr_addrs: Vec<usize> = Vec::new();
+        gpu.for_each_gpu_shard(|_idx, slot| {
+            let p = slot.cached_sp_descr(&dev, dev.stream())?.raw() as usize;
+            descr_addrs.push(p);
+            Ok(())
+        })
+        .unwrap();
+        dev.synchronize().unwrap();
+
+        assert_eq!(descr_addrs.len(), 2);
+        // Same shape across both shards → same descriptor object. The
+        // contents of the device buffers differ between shards, but
+        // cuSPARSE re-reads through the captured pointers on each SpMM
+        // call, so the descriptor remains semantically valid.
+        assert_eq!(
+            descr_addrs[0], descr_addrs[1],
+            "cross-shard cached_sp_descr must reuse the descriptor when shape is unchanged"
+        );
+    }
+
+    /// Regression test for the pinned-host-reuse race fixed by the
+    /// 2-slot pinned ring + host-side event sync.
+    ///
+    /// Pre-fix, `pinned.stage(&csr)` for shard `i+1` could overwrite the
+    /// pinned source buffer while shard `i`'s `memcpy_htod_async` was
+    /// still in flight on `copy_stream`. The device-side event handshake
+    /// only orders streams against each other — it doesn't host-block
+    /// the CPU writer. With pinned memory the H→D copy is truly async,
+    /// so the corruption is observable.
+    ///
+    /// The test stresses the bug by:
+    ///   - Using ≥3 shards so the ring cycles at least once.
+    ///   - Sizing each shard ~10⁴ nnz so the DMA isn't trivially short.
+    ///   - Using a **device-only** consumer (per-shard `memcpy_dtod` into
+    ///     a private capture buffer on the compute stream) — no
+    ///     per-callback host-blocking dtoh that would mask the race.
+    ///   - Repeating across a small outer loop to amplify the race window.
+    #[test]
+    fn test_multi_shard_pinned_no_corruption() {
+        use cudarc::driver::safe::CudaSlice;
+
+        let dev = require_gpu!();
+        let n_vars = 32usize;
+        let rows_per_shard = 10_000usize; // ~10k rows × 1 nnz/row per shard
+        let n_shards = 5usize;
+
+        // Build per-shard CSRs with a per-shard tag value: shard `s`'s
+        // data is `[s*1e6 + row]`. That makes any cross-shard bleed
+        // numerically obvious.
+        let make_tagged_csr = |shard: usize| -> ScxCsr {
+            let mut indptr = Vec::with_capacity(rows_per_shard + 1);
+            let mut indices = Vec::with_capacity(rows_per_shard);
+            let mut data = Vec::with_capacity(rows_per_shard);
+            indptr.push(0i64);
+            for r in 0..rows_per_shard {
+                indices.push((r % n_vars) as i32);
+                data.push(shard as f32 * 1.0e6 + r as f32);
+                indptr.push(indices.len() as i64);
+            }
+            ScxCsr::new_unchecked((rows_per_shard, n_vars), indptr, indices, data)
+        };
+
+        for repeat in 0..5 {
+            let shards: Vec<ScxCsr> = (0..n_shards).map(make_tagged_csr).collect();
+            let src = InMemorySource {
+                shards: shards.clone(),
+                n_obs: n_shards * rows_per_shard,
+                n_vars,
+            };
+            let mut gpu = RawGpuShardSource::new(&dev, &src).unwrap();
+
+            // Per-shard device capture buffers. Filled via dtod on the
+            // compute stream inside each callback — strictly device-side,
+            // so no host-blocking mask of the race.
+            let mut captures: Vec<CudaSlice<f32>> = (0..n_shards)
+                .map(|_| dev.alloc_zeros::<f32>(rows_per_shard).unwrap())
+                .collect();
+
+            gpu.for_each_gpu_shard(|idx, slot| {
+                let view = slot.view();
+                assert_eq!(view.data.len(), rows_per_shard, "shard {idx} nnz mismatch");
+                dev.stream()
+                    .memcpy_dtod(&view.data, &mut captures[idx])
+                    .map_err(|e| GpuError::CudaError(format!("dtod: {e}")))?;
+                Ok(())
+            })
+            .unwrap();
+            // Single boundary sync — everything queued on compute_stream
+            // (the per-shard dtod copies) must complete before we read
+            // the captures back to the host.
+            dev.synchronize().unwrap();
+
+            // Dtoh each capture and verify against the per-shard tagged
+            // values. Any cross-shard pinned-buffer corruption would
+            // produce values from a neighbouring shard.
+            for (idx, capture) in captures.iter().enumerate() {
+                let mut host = vec![0.0f32; rows_per_shard];
+                dev.stream().memcpy_dtoh(capture, &mut host).unwrap();
+                dev.synchronize().unwrap();
+                for (r, &v) in host.iter().enumerate() {
+                    let expected = idx as f32 * 1.0e6 + r as f32;
+                    assert!(
+                        (v - expected).abs() < 0.5,
+                        "repeat {repeat}, shard {idx}, row {r}: got {v}, expected {expected} \
+                         (pinned-host-reuse race?)"
+                    );
+                }
+            }
+        }
     }
 }

@@ -770,7 +770,7 @@ impl GpuCsr {
         // Downcast indptr i64 → i32 on-device (cheap — O(n_rows+1), one pass).
         // Stored inside the descriptor so cuSPARSE's captured pointer remains
         // valid for the descriptor's lifetime.
-        let i32_indptr = cast_i64_to_i32_gpu(dev, &self.indptr)?;
+        let i32_indptr = cast_i64_to_i32_gpu(dev, stream, &self.indptr)?;
 
         // Capture the raw device pointers inside an inner scope so the
         // SyncOnDrop guards (which borrow from `i32_indptr` / `self.*`)
