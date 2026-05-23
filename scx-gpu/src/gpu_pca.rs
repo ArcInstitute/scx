@@ -26,12 +26,13 @@ use faer::Mat;
 use scx_format::total_variance_from_col_sq;
 use scx_format::ShardSource;
 
-use crate::cublas::{gpu_sgemm, gpu_sgemv, CublasHandle};
+use crate::cublas::{gpu_sgemm, CublasHandle};
 use crate::curand::random_gaussian_gpu;
 use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
-use crate::cusparse::{spmm_csr, spmm_csr_transpose, CusparseHandle};
+use crate::cusparse::{CuSparseWorkspacePool, CusparseHandle};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::linear_operator::CenteredSparseOperator;
 use crate::shard_decode::GpuCsr;
 
 /// PTX source for the row-major mean-correction kernel, compiled at build time.
@@ -39,6 +40,64 @@ const MEAN_CORRECT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/spmm_mean
 
 /// PTX source for col-major scatter/gather/mean-correct/column-sum kernels.
 const COLMAJOR_OPS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/colmajor_ops.ptx"));
+
+/// Reusable per-PCA-run device scratch buffers.
+///
+/// Hoists the `(n_obs × k)` forward-SpMM output `d_y` and the `(n_vars × k)`
+/// transpose-SpMM output `d_z` out of the power-iteration inner loop. The
+/// pre-G2 implementation allocated both fresh inside
+/// `streaming_gpu_spmm_forward` / `_transpose` on every call (~6 × per power
+/// iter × ~30 iters); this scratch lets `gpu_randomized_pca` allocate once
+/// and reuse across the whole run.
+///
+/// Sized for a known `k` at construction time; [`Self::ensure_k_capacity`]
+/// grows the buffers in `next_power_of_two` steps when a larger `k` arrives.
+/// Mirrors the grow-only pattern in
+/// [`crate::gpu_diffexp::GpuDeChunkScratch`].
+pub struct GpuPcaScratch {
+    /// `(n_obs × k_capacity)` col-major — receives forward SpMM output and
+    /// is then consumed in-place by `gpu_qr_q` / `gpu_cholesky_qr2`.
+    pub d_y: CudaSlice<f32>,
+    /// `(n_vars × k_capacity)` col-major — receives transpose SpMM output.
+    pub d_z: CudaSlice<f32>,
+    n_obs: usize,
+    n_vars: usize,
+    k_capacity: usize,
+}
+
+impl GpuPcaScratch {
+    /// Allocate scratch sized for `n_obs × k` (forward) and `n_vars × k`
+    /// (transpose).
+    pub fn new(dev: &GpuDevice, n_obs: usize, n_vars: usize, k: usize) -> Result<Self, GpuError> {
+        let d_y = dev.alloc_zeros::<f32>(n_obs * k)?;
+        let d_z = dev.alloc_zeros::<f32>(n_vars * k)?;
+        Ok(Self {
+            d_y,
+            d_z,
+            n_obs,
+            n_vars,
+            k_capacity: k,
+        })
+    }
+
+    /// Grow `d_y` / `d_z` to at least `k` columns, bumping to
+    /// `next_power_of_two` to amortise repeated growths.
+    pub fn ensure_k_capacity(&mut self, dev: &GpuDevice, k: usize) -> Result<(), GpuError> {
+        if k <= self.k_capacity {
+            return Ok(());
+        }
+        let new_cap = k.next_power_of_two().max(self.k_capacity * 2);
+        self.d_y = dev.alloc_zeros::<f32>(self.n_obs * new_cap)?;
+        self.d_z = dev.alloc_zeros::<f32>(self.n_vars * new_cap)?;
+        self.k_capacity = new_cap;
+        Ok(())
+    }
+
+    /// Maximum `k` this scratch is sized for.
+    pub fn k_capacity(&self) -> usize {
+        self.k_capacity
+    }
+}
 
 /// Result of GPU-accelerated randomized PCA.
 pub struct GpuPcaResult {
@@ -147,90 +206,94 @@ pub fn gpu_randomized_pca(
     // Step 2: Generate random Gaussian Ω on GPU (n_vars × k, col-major)
     let d_omega = random_gaussian_gpu(dev, dev.stream(), n_vars, k, seed)?;
 
-    // Step 3: Y = streaming_gpu_spmm_forward(X, Ω) with mean correction
-    // Y is col-major (n_obs × k)
-    let d_y = streaming_gpu_spmm_forward(
+    // G2: hoist the (n_obs × k) and (n_vars × k) dense SpMM outputs into a
+    // single reusable scratch struct + share one cuSPARSE workspace across
+    // every SpMM call in the entire PCA run. Pre-G2 each call inside
+    // streaming_gpu_spmm_forward / _transpose allocated d_y / d_z / d_y_shard
+    // / d_sum_q fresh; the strided matmat_pooled / rmatmat_pooled path on
+    // CenteredSparseOperator now writes directly into scratch.d_y / scratch.d_z
+    // with cuSPARSE workspace served by `pool`.
+    let mut scratch = GpuPcaScratch::new(dev, n_obs, n_vars, k)?;
+    let mut pool = CuSparseWorkspacePool::new();
+    let op = CenteredSparseOperator::new(
         dev,
         &cusparse_handle,
         &cublas_handle,
         source,
-        &d_omega,
         d_means.as_ref(),
-        n_obs,
-        n_vars,
-        k,
-    )?;
+    );
+
+    // Step 3: Y = (X − μ) · Ω with mean correction. Writes directly into
+    // scratch.d_y; gpu_qr_q consumes it in place and returns the Q factor.
+    op.matmat_pooled(&d_omega, &mut scratch.d_y, k, &mut pool)?;
 
     // QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in).
-    // The closure borrows each handle by reference, so it can be invoked at
-    // each of the three QR call-sites without taking ownership.
-    let qr = |a: &mut CudaSlice<f32>,
-              rows: usize,
-              cols: usize|
-     -> Result<CudaSlice<f32>, GpuError> {
-        match qr_method {
-            QrMethod::Householder => gpu_qr_q(&cusolver_handle, dev.stream(), dev, a, rows, cols),
-            QrMethod::Cholesky => {
-                gpu_cholesky_qr2(&cublas_handle, &cusolver_handle, dev, a, rows, cols)
-            }
-        }
-    };
+    // Both backends use `gpu_qr_q`'s swap-and-return pattern: the input
+    // buffer is left as a zero-length dummy and Q is returned in a new
+    // CudaSlice. To keep `scratch.d_y` / `scratch.d_z` alive across the
+    // power loop (avoiding a per-iter re-allocation of the n_obs × k
+    // forward output and n_vars × k transpose output), this closure
+    // swaps the returned Q back into the scratch field and returns the
+    // empty dummy for drop. The caller then reads Q from the scratch
+    // slot. Net cost: two `std::mem::swap`s per QR call (no allocations).
+    let qr_into =
+        |scratch_slot: &mut CudaSlice<f32>, rows: usize, cols: usize| -> Result<(), GpuError> {
+            let mut q = match qr_method {
+                QrMethod::Householder => gpu_qr_q(
+                    &cusolver_handle,
+                    dev.stream(),
+                    dev,
+                    scratch_slot,
+                    rows,
+                    cols,
+                )?,
+                QrMethod::Cholesky => gpu_cholesky_qr2(
+                    &cublas_handle,
+                    &cusolver_handle,
+                    dev,
+                    scratch_slot,
+                    rows,
+                    cols,
+                )?,
+            };
+            // After gpu_qr_q's internal swap, `scratch_slot` holds the empty
+            // dummy and `q` owns the n_obs * k buffer of Q. Swap so the
+            // scratch field reclaims the Q buffer.
+            debug_assert_eq!(
+                scratch_slot.len(),
+                0,
+                "QR backend must leave its input as a zero-length dummy via \
+                 std::mem::swap; see cusolver::gpu_qr_q / gpu_cholesky_qr2 \
+                 for the contract",
+            );
+            std::mem::swap(scratch_slot, &mut q);
+            // `q` (now the empty dummy) drops here.
+            Ok(())
+        };
 
-    // Step 4: Q = qr(Y)
-    let mut d_y_mut = d_y;
-    let mut d_q = qr(&mut d_y_mut, n_obs, k)?;
+    // Step 4: scratch.d_y ← qr(scratch.d_y); Q now lives in scratch.d_y.
+    qr_into(&mut scratch.d_y, n_obs, k)?;
 
-    // Step 5: Power iterations
+    // Step 5: Power iterations. Each iter does:
+    //   B = (X − μ)ᵀ · Q   →  scratch.d_z   (Q lives in scratch.d_y)
+    //   Q_B = qr(scratch.d_z)                (Q_B now in scratch.d_z)
+    //   Y = (X − μ) · Q_B  →  scratch.d_y   (overwrites Q)
+    //   Q = qr(scratch.d_y)                  (new Q in scratch.d_y)
     for _ in 0..n_power_iterations {
-        // B = X^T @ Q (n_vars × k, col-major)
-        let d_b = streaming_gpu_spmm_transpose(
-            dev,
-            &cusparse_handle,
-            source,
-            &d_q,
-            d_means.as_ref(),
-            n_obs,
-            n_vars,
-            k,
-        )?;
+        op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
+        qr_into(&mut scratch.d_z, n_vars, k)?;
 
-        // Q_B = qr(B)
-        let mut d_b_mut = d_b;
-        let d_q_b = qr(&mut d_b_mut, n_vars, k)?;
-
-        // Y = X @ Q_B
-        let d_y2 = streaming_gpu_spmm_forward(
-            dev,
-            &cusparse_handle,
-            &cublas_handle,
-            source,
-            &d_q_b,
-            d_means.as_ref(),
-            n_obs,
-            n_vars,
-            k,
-        )?;
-
-        // Q = qr(Y)
-        let mut d_y2_mut = d_y2;
-        d_q = qr(&mut d_y2_mut, n_obs, k)?;
+        op.matmat_pooled(&scratch.d_z, &mut scratch.d_y, k, &mut pool)?;
+        qr_into(&mut scratch.d_y, n_obs, k)?;
     }
 
-    // Step 6: B = X^T @ Q (final, n_vars × k)
-    let d_b_final = streaming_gpu_spmm_transpose(
-        dev,
-        &cusparse_handle,
-        source,
-        &d_q,
-        d_means.as_ref(),
-        n_obs,
-        n_vars,
-        k,
-    )?;
+    // Step 6: B = (X − μ)ᵀ · Q  (final, n_vars × k) — written into scratch.d_z
+    op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
+    let d_b_final = &scratch.d_z;
 
     // Step 7: Download B to host, SVD via faer (f64 for accuracy)
     dev.synchronize()?;
-    let b_host_f32 = dev.dtoh_copy(&d_b_final)?;
+    let b_host_f32 = dev.dtoh_copy(d_b_final)?;
 
     // Convert B to f64 faer::Mat (col-major → Mat is also col-major, perfect)
     let mut b_mat = Mat::<f64>::zeros(n_vars, k);
@@ -272,10 +335,13 @@ pub fn gpu_randomized_pca(
     let mut d_u = dev.alloc_zeros::<f32>(n_obs * n_components)?;
     // U = Q @ V  →  sgemm with A=Q (n_obs × k col-major), B=V (k × n_components
     // col-major), C=U (n_obs × n_components col-major). Inner dim = eff_k.
+    // Q is in `scratch.d_y` (the last `qr_into` after Step 6 wrote it there;
+    // Step 6 then ran `rmatmat_pooled` reading from `scratch.d_y` into
+    // `scratch.d_z`, leaving `scratch.d_y` untouched).
     gpu_sgemm(
         &cublas_handle,
         dev.stream(),
-        &d_q,
+        &scratch.d_y,
         &d_v_top,
         &mut d_u,
         n_obs,
@@ -341,186 +407,6 @@ pub fn gpu_randomized_pca(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming GPU SpMM helpers
-// ---------------------------------------------------------------------------
-
-/// Streaming forward SpMM on GPU: Y = (X - μ) @ M, shard-by-shard.
-///
-/// For each shard:
-///   1. Read shard to host (via ShardSource)
-///   2. Upload indptr/indices/data to GPU → GpuCsr
-///   3. GpuCsr → CusparseSpMatDescr (zero-copy on GPU)
-///   4. cuSPARSE SpMM: Y_slice = A_shard @ M (accumulated with beta=1.0)
-///   5. Mean-correction kernel on Y_slice rows
-///
-/// Returns Y as col-major (n_obs × k) on GPU.
-#[allow(clippy::too_many_arguments)]
-fn streaming_gpu_spmm_forward(
-    dev: &GpuDevice,
-    cusparse: &CusparseHandle,
-    cublas: &CublasHandle,
-    source: &dyn ShardSource,
-    d_m: &CudaSlice<f32>, // (n_vars × k) col-major on GPU
-    d_means: Option<&CudaSlice<f32>>,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-) -> Result<CudaSlice<f32>, GpuError> {
-    let mut d_y = dev.alloc_zeros::<f32>(n_obs * k)?;
-    let n_shards = source.n_shards();
-
-    // Pre-compute mean correction vector on GPU: mc = Mᵀ · μ   (length k).
-    // M is col-major (n_vars × k). cuBLAS sgemv with op_A = T gives y = Aᵀ · x
-    // where A has backing shape (m, n) = (n_vars, k) and x length n_vars,
-    // producing y of length k. Replaces the D→H round-trip that previously
-    // downloaded the full `d_m` (n_vars × k) to host once per power iteration.
-    let d_mc: Option<CudaSlice<f32>> = if let Some(d_mu) = d_means {
-        let mut mc = dev.alloc_zeros::<f32>(k)?;
-        gpu_sgemv(
-            cublas,
-            dev.stream(),
-            d_m,
-            d_mu,
-            &mut mc,
-            n_vars,
-            k,
-            1.0,
-            0.0,
-            cbs::cublasOperation_t::CUBLAS_OP_T,
-        )?;
-        Some(mc)
-    } else {
-        None
-    };
-
-    let mut global_row = 0usize;
-
-    for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx).map_err(format_scx_error)?;
-        let shard_rows = csr.n_rows();
-
-        if shard_rows == 0 {
-            continue;
-        }
-
-        // Upload CSR to GPU
-        let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
-
-        // Create cuSPARSE descriptor
-        let a_desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
-
-        // Y_shard is a slice of Y starting at row `global_row`.
-        // cuSPARSE SpMM: C = α·A·B + β·C
-        // A: shard CSR (shard_rows × n_vars)
-        // B: M col-major (n_vars × k)
-        // C: Y_shard col-major (shard_rows × k)
-        //
-        // We need to point C at the right offset in d_y.
-        // col-major Y: Y[i, j] = d_y[j * n_obs + i]
-        // Y_shard starts at row global_row: Y_shard[r, j] = d_y[j * n_obs + global_row + r]
-        // This is NOT contiguous in memory for col-major layout (columns are n_obs apart).
-        //
-        // Option: allocate a temporary shard-sized output and then scatter into d_y.
-        let mut d_y_shard = dev.alloc_zeros::<f32>(shard_rows * k)?;
-
-        spmm_csr(
-            cusparse,
-            dev.stream(),
-            dev,
-            &a_desc,
-            d_m,
-            &mut d_y_shard,
-            shard_rows,
-            n_vars,
-            k,
-            1.0,
-            0.0,
-        )?;
-
-        // Apply mean correction on GPU: Y_shard[r, j] -= mc[j]
-        if let Some(ref mc) = d_mc {
-            gpu_mean_correct_colmajor(dev, &mut d_y_shard, mc, shard_rows, k)?;
-        }
-
-        // Scatter shard result into global Y on GPU (col-major)
-        gpu_scatter_colmajor(dev, &d_y_shard, &mut d_y, shard_rows, k, global_row, n_obs)?;
-
-        global_row += shard_rows;
-    }
-
-    Ok(d_y)
-}
-
-/// Streaming transpose SpMM on GPU: Z = (X - μ)^T @ Q, shard-by-shard.
-///
-/// Returns Z as col-major (n_vars × k) on GPU.
-#[allow(clippy::too_many_arguments)]
-fn streaming_gpu_spmm_transpose(
-    dev: &GpuDevice,
-    cusparse: &CusparseHandle,
-    source: &dyn ShardSource,
-    d_q: &CudaSlice<f32>, // (n_obs × k) col-major on GPU
-    d_means: Option<&CudaSlice<f32>>,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-) -> Result<CudaSlice<f32>, GpuError> {
-    let mut d_z = dev.alloc_zeros::<f32>(n_vars * k)?;
-    let n_shards = source.n_shards();
-    let mut global_row = 0usize;
-
-    for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx).map_err(format_scx_error)?;
-        let shard_rows = csr.n_rows();
-
-        if shard_rows == 0 {
-            continue;
-        }
-
-        // Upload CSR to GPU
-        let gpu_csr = upload_csr_to_gpu(dev, &csr)?;
-        let a_desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
-
-        // Extract Q_shard on GPU: Q[global_row..global_row+shard_rows, :]
-        // col-major Q: Q[i, j] = d_q[j * n_obs + i]
-        // Q_shard needs to be a contiguous (shard_rows × k) col-major matrix.
-        let d_q_shard = gpu_gather_colmajor(dev, d_q, shard_rows, k, global_row, n_obs)?;
-
-        // Z += A^T @ Q_shard
-        // A: (shard_rows × n_vars), A^T: (n_vars × shard_rows)
-        // Q_shard: (shard_rows × k)
-        // Result: (n_vars × k) — accumulated into d_z
-        spmm_csr_transpose(
-            cusparse,
-            dev.stream(),
-            dev,
-            &a_desc,
-            &d_q_shard,
-            &mut d_z,
-            shard_rows,
-            n_vars,
-            k,
-            1.0,
-            1.0, // beta=1.0 to accumulate across shards
-        )?;
-
-        global_row += shard_rows;
-    }
-
-    // Mean centering correction on GPU: Z -= μ @ (1^T @ Q)
-    // (1^T @ Q) = column sums of Q = (1 × k)
-    if let Some(d_mu) = d_means {
-        // Compute column sums of Q entirely on GPU
-        let d_sum_q = gpu_column_sums(dev, d_q, n_obs, k)?;
-
-        // Z[v, j] -= means[v] * sum_q[j] — outer product subtraction on GPU
-        gpu_outer_sub(dev, &mut d_z, d_mu, &d_sum_q, n_vars, k)?;
-    }
-
-    Ok(d_z)
-}
-
-// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -541,130 +427,43 @@ pub(crate) fn upload_csr_to_gpu(
     })
 }
 
-/// Scatter a shard's col-major result into the global matrix — GPU kernel.
+/// Strided mean-correct: apply `Y[global_row + r, c] -= mc[c]` over a
+/// `(shard_rows × k)` sub-region of `Y` (which is laid out as a
+/// `(ld × k)` col-major matrix). Untouched rows are not read or written.
 ///
-/// Replaces the CPU round-trip version that downloaded the entire n_obs×k
-/// matrix to host per shard (240 MB for 1M cells × 60 PCs).
-pub(crate) fn gpu_scatter_colmajor(
-    dev: &GpuDevice,
-    src: &CudaSlice<f32>,     // (shard_rows × k) col-major
-    dst: &mut CudaSlice<f32>, // (n_obs × k) col-major
-    shard_rows: usize,
-    k: usize,
-    global_row: usize,
-    n_obs: usize,
-) -> Result<(), GpuError> {
-    let total = shard_rows * k;
-    if total == 0 {
-        return Ok(());
-    }
-    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
-    let func = module
-        .load_function("scatter_colmajor_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("scatter_colmajor: {e}")))?;
-
-    let shard_rows_i32 = shard_rows as i32;
-    let n_obs_i32 = n_obs as i32;
-    let k_i32 = k as i32;
-    let global_row_i32 = global_row as i32;
-
-    let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(src)
-            .arg(dst)
-            .arg(&shard_rows_i32)
-            .arg(&n_obs_i32)
-            .arg(&k_i32)
-            .arg(&global_row_i32)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("scatter_colmajor: {e}")))?;
-
-    Ok(())
-}
-
-/// Gather shard rows from global col-major matrix — GPU kernel.
-///
-/// Replaces the CPU round-trip version that downloaded the entire n_obs×k
-/// matrix to host per shard.
-pub(crate) fn gpu_gather_colmajor(
-    dev: &GpuDevice,
-    src: &CudaSlice<f32>, // (n_obs × k) col-major
-    shard_rows: usize,
-    k: usize,
-    global_row: usize,
-    n_obs: usize,
-) -> Result<CudaSlice<f32>, GpuError> {
-    let total = shard_rows * k;
-    if total == 0 {
-        return dev.alloc_zeros::<f32>(0);
-    }
-    let mut dst = dev.alloc_zeros::<f32>(total)?;
-
-    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
-    let func = module
-        .load_function("gather_colmajor_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("gather_colmajor: {e}")))?;
-
-    let shard_rows_i32 = shard_rows as i32;
-    let n_obs_i32 = n_obs as i32;
-    let k_i32 = k as i32;
-    let global_row_i32 = global_row as i32;
-
-    let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(src)
-            .arg(&mut dst)
-            .arg(&shard_rows_i32)
-            .arg(&n_obs_i32)
-            .arg(&k_i32)
-            .arg(&global_row_i32)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("gather_colmajor: {e}")))?;
-
-    Ok(dst)
-}
-
-/// Mean-correct a col-major matrix on GPU: Y[r, j] -= mc[j].
-///
-/// Replaces the CPU round-trip version that downloaded shard-sized data.
-pub(crate) fn gpu_mean_correct_colmajor(
+/// Used by the strided PCA matmat path: SpMM writes directly into the
+/// global `(n_obs × k)` output at row offset `global_row`, then this kernel
+/// corrects the same slice without copying through a contiguous shard
+/// temporary.
+pub(crate) fn gpu_mean_correct_colmajor_strided(
     dev: &GpuDevice,
     y: &mut CudaSlice<f32>,
     mc: &CudaSlice<f32>,
-    m: usize, // rows
-    k: usize, // cols
+    shard_rows: usize,
+    k: usize,
+    global_row: usize,
+    ld: usize,
 ) -> Result<(), GpuError> {
-    let total = m * k;
+    let total = shard_rows * k;
     if total == 0 {
         return Ok(());
     }
+    debug_assert!(
+        global_row + shard_rows <= ld,
+        "strided mean-correct: global_row + shard_rows ({}) exceeds ld ({})",
+        global_row + shard_rows,
+        ld,
+    );
+
     let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
     let func = module
-        .load_function("mean_correct_colmajor_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_colmajor: {e}")))?;
+        .load_function("mean_correct_colmajor_strided_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_strided: {e}")))?;
 
-    let m_i32 = m as i32;
+    let shard_rows_i32 = shard_rows as i32;
     let k_i32 = k as i32;
+    let global_row_i32 = global_row as i32;
+    let ld_i32 = ld as i32;
 
     let threads: u32 = 256;
     let blocks = (total as u32).div_ceil(threads);
@@ -679,11 +478,13 @@ pub(crate) fn gpu_mean_correct_colmajor(
             .launch_builder(&func)
             .arg(y)
             .arg(mc)
-            .arg(&m_i32)
+            .arg(&shard_rows_i32)
             .arg(&k_i32)
+            .arg(&global_row_i32)
+            .arg(&ld_i32)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_colmajor: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_strided: {e}")))?;
 
     Ok(())
 }

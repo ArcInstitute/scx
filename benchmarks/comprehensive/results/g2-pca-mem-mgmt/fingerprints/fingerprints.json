@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "hostname": "GPU0F98",
+    "os": "Linux 5.15.0-176-generic",
+    "python_version": "3.13.13",
+    "numpy_version": "2.4.3",
+    "git_sha": "3469c4f385cd945a335d79216cd0af3948490d64",
+    "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "rayon_num_threads": "1",
+    "pinned_seed": 42,
+    "pinned_threads": 1,
+    "blake3_available": true,
+    "pyscx_version": "0.4.3",
+    "scanpy_version": "1.12",
+    "anndata_version": "0.12.10",
+    "scipy_version": "1.17.1",
+    "dataset_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc3k.h5ad"
+  },
+  "timings_seconds": {
+    "pca": 3.3556825721170753,
+    "neighbors": 0.8199642121326178,
+    "umap": 0.06057211314328015,
+    "leiden": 0.0018931599333882332,
+    "harmony": 0.1451763149816543,
+    "lisi": 0.20024002785794437
+  },
+  "fingerprints": {
+    "pca": {
+      "hash": "75e8975599864ee4cc10f4ea10f07c6e8f3f9375043221da51068b57d03f2cad",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "pca_variance_ratio": {
+      "hash": "cde1872fbf1924a426068192442a2ee6bf2dd6172712a1fcb31ce55fa2ec69bb",
+      "shape": [
+        20
+      ],
+      "dtype": "float64",
+      "nbytes": 160
+    },
+    "neighbors_distances": {
+      "hash": "f53864bff4ccac147fa861ec84de9084a463d3072efd596c14d826a03642cdaf",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "neighbors_connectivities": {
+      "hash": "15e095ab90b667915f07249605958bcc69229e3cf22eff0f18bbe99ce7f070d9",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "umap": {
+      "hash": "34bef8cfdca721b73aedb7f838a3411e4cc754cb3469df9ff6ffb0f3c6de5512",
+      "shape": [
+        2700,
+        2
+      ],
+      "dtype": "float32",
+      "nbytes": 21600
+    },
+    "leiden": {
+      "error": "RuntimeError('cugraph not available. Install for GPU Leiden: conda install -c rapidsai -c conda-forge cugraph')"
+    },
+    "harmony": {
+      "hash": "71b27f7048c0d829734172e88fdff21282abd6edfda204f8eeb369d07115fd2e",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "lisi": {
+      "hash": "9e4b492c59552103393aa6eaef2af1de73db42e19cff4d32374dae2b3216d864",
+      "shape": [
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 21600
+    }
+  }
+}

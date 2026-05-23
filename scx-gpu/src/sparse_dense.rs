@@ -323,13 +323,15 @@ mod tests {
         );
         assert_eq!(gpu_dense, cpu_dense, "HVG-projected dense must match CPU");
 
-        // Verify specific values:
+        // Verify specific values for row 0 (so the row-major index reduces
+        // to a plain column index — leaving the explicit `0 * n_output_cols`
+        // here trips `clippy::erasing_op` on toolchain ≥ 1.94).
         // Row 0 has col=0 (val=1.0), col=10 (val=2.0), col=50 (val=3.0)
         // Mapped: col 0→out 0, col 10→out 2, col 50→out 3
-        assert_eq!(gpu_dense[0 * n_output_cols + 0], 1.0, "row0 col0");
-        assert_eq!(gpu_dense[0 * n_output_cols + 2], 2.0, "row0 col10→out2");
-        assert_eq!(gpu_dense[0 * n_output_cols + 3], 3.0, "row0 col50→out3");
+        assert_eq!(gpu_dense[0], 1.0, "row0 col0");
+        assert_eq!(gpu_dense[2], 2.0, "row0 col10→out2");
+        assert_eq!(gpu_dense[3], 3.0, "row0 col50→out3");
         // Unmapped columns should be zero
-        assert_eq!(gpu_dense[0 * n_output_cols + 1], 0.0, "row0 unmapped col2");
+        assert_eq!(gpu_dense[1], 0.0, "row0 unmapped col2");
     }
 }

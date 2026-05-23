@@ -8,80 +8,34 @@
 //   For a matrix M (rows × cols): M[r, c] = flat[c * rows + r]
 //   Given flat idx: col = idx / rows, row = idx % rows
 
-// Scatter a shard's col-major result into the global matrix.
+// Mean-correct a strided slice of a col-major matrix in place:
+//   Y[global_row + r, c] -= mc[c]   for r in [0, shard_rows), c in [0, k)
 //
-// src: (shard_rows × k) col-major — the shard SpMM output
-// dst: (n_obs × k) col-major — the global accumulator
+// Y is laid out as (ld × k) col-major: Y[r, c] = flat[c * ld + r].
+// The kernel touches only the sub-region (rows [global_row, global_row +
+// shard_rows)) — other rows are not read or written.
 //
-// For each element (row, col) in src:
-//   dst[(global_row + row), col] = src[row, col]
-//   i.e. dst[col * n_obs + global_row + row] = src[col * shard_rows + row]
-//
-// total threads = shard_rows × k
-extern "C" __global__ void scatter_colmajor_kernel(
-    const float* __restrict__ src,   // [shard_rows × k], col-major
-    float* __restrict__ dst,         // [n_obs × k], col-major
-    int shard_rows,
-    int n_obs,
-    int k,
-    int global_row
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = shard_rows * k;
-    if (idx >= total) return;
-
-    int col = idx / shard_rows;
-    int row = idx % shard_rows;
-
-    dst[col * n_obs + global_row + row] = src[col * shard_rows + row];
-}
-
-// Gather shard rows from global col-major matrix into a contiguous shard buffer.
-//
-// src: (n_obs × k) col-major — the global matrix (e.g., Q)
-// dst: (shard_rows × k) col-major — contiguous shard buffer
-//
-// For each element (row, col) in dst:
-//   dst[row, col] = src[(global_row + row), col]
-//   i.e. dst[col * shard_rows + row] = src[col * n_obs + global_row + row]
+// Used by the strided PCA matmat path to apply mean correction directly to
+// a shard's slice of the global (n_obs × k) buffer without copying back
+// through a contiguous shard temporary.
 //
 // total threads = shard_rows × k
-extern "C" __global__ void gather_colmajor_kernel(
-    const float* __restrict__ src,   // [n_obs × k], col-major
-    float* __restrict__ dst,         // [shard_rows × k], col-major
-    int shard_rows,
-    int n_obs,
-    int k,
-    int global_row
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = shard_rows * k;
-    if (idx >= total) return;
-
-    int col = idx / shard_rows;
-    int row = idx % shard_rows;
-
-    dst[col * shard_rows + row] = src[col * n_obs + global_row + row];
-}
-
-// Mean-correct a col-major matrix: Y[r, c] -= mc[c].
-//
-// Y: (m × k) col-major: Y[r, c] = flat[c * m + r]
-// mc: [k] correction vector
-//
-// total threads = m × k
-extern "C" __global__ void mean_correct_colmajor_kernel(
-    float* __restrict__ Y,           // [m × k], col-major
+extern "C" __global__ void mean_correct_colmajor_strided_kernel(
+    float* __restrict__ Y,           // [ld × k], col-major; full matrix
     const float* __restrict__ mc,    // [k]
-    int m,
-    int k
+    int shard_rows,
+    int k,
+    int global_row,
+    int ld
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = m * k;
+    int total = shard_rows * k;
     if (idx >= total) return;
 
-    int col = idx / m;
-    Y[idx] -= mc[col];
+    int col = idx / shard_rows;
+    int row = idx % shard_rows;
+    long long flat = (long long)col * (long long)ld + (long long)global_row + (long long)row;
+    Y[flat] -= mc[col];
 }
 
 // Compute column sums of a col-major matrix.

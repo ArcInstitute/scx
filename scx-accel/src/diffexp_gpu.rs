@@ -429,6 +429,23 @@ where
     let n_pool_max = n_ref.max(n_g_max).max(1);
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
+    // G2: pre-grow per-chunk reusable slots to their worst-case sizes for
+    // this DE call so the chunk loop never re-allocates. Mirrors the slab
+    // sizing already done by `GpuDeChunkScratch::new` for the (ref-or-pool)
+    // path. `ensure_aux_capacity` covers the multi-tile sort ping-pong on
+    // census-scale inputs where `chunk_size × max_pool > 8192`.
+    scratch
+        .ensure_ref_slab_capacity(dev, n_ref)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure ref_slab: {e}")))?;
+    scratch
+        .ensure_group_slab_capacity(dev, n_g_max.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure group_slab: {e}")))?;
+    scratch
+        .ensure_sums_capacity(dev, n_groups_for_means)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure sums: {e}")))?;
+    scratch
+        .ensure_aux_capacity(dev, chunk_size * n_pool_max)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure aux: {e}")))?;
 
     // Accumulators (per test group × gene, in input gene order).
     let n_test = test_groups.len();
@@ -464,12 +481,14 @@ where
 
         // 2. Pseudobulk fold on device (G1.6). Replaces the host rayon
         //    `compute_pdex_means` that previously dominated host wall time
-        //    on census-tier inputs.
+        //    on census-tier inputs. G2: reuses `scratch.sums` instead of a
+        //    per-chunk allocation.
         let (chunk_ref_means, chunk_target_means) = compute_pdex_means_gpu(
             dev,
             &scratch.dense,
             &d_all_cells,
             &d_offsets,
+            &mut scratch.sums,
             n_obs,
             sz,
             n_ref,
@@ -499,27 +518,24 @@ where
             })
             .collect();
 
-        // 2. Build sorted ref slab and ref tie term. We reuse `scratch.slab`
-        //    for ref → for each group → swap to group slab. To keep the API
-        //    simple, allocate an additional ref-slab CudaSlice this chunk;
-        //    sizes are small (n_ref × chunk_size × 4 ≤ ~32MB for typical
-        //    Perturb-seq settings). G2's scratch-pool work will hoist this.
-        let mut d_ref_slab = dev
-            .alloc_zeros::<f32>(sz * n_ref)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc ref slab: {e}")))?;
+        // 2. Build sorted ref slab and ref tie term. G2 reuses
+        //    `scratch.ref_slab` across chunks — no per-chunk allocation. The
+        //    scatter kernel writes (sz × n_ref) of (chunk_max × n_ref_max)
+        //    capacity; subsequent kernels are told the logical
+        //    `(chunk_size, n_per_gene) = (sz, n_ref)` so the layout matches.
         gpu_de_scatter_gene_major(
             dev,
             &scratch.dense,
             &ref_idx_i32,
-            &mut d_ref_slab,
+            &mut scratch.ref_slab,
             n_obs,
             sz,
         )
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
-        gpu_de_block_sort(dev, &mut scratch, &mut d_ref_slab, sz, n_ref)
+        gpu_de_block_sort(dev, &mut scratch.ref_slab, &mut scratch.slab_aux, sz, n_ref)
             .map_err(|e| AccelError::LinAlg(format!("GPU DE sort ref: {e}")))?;
         // Ref tie term is reusable across all test groups; keep it on host.
-        gpu_de_tie_term(dev, &d_ref_slab, &mut scratch.tie_term, sz, n_ref)
+        gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, n_ref)
             .map_err(|e| AccelError::LinAlg(format!("GPU DE tie term ref: {e}")))?;
         let mut tie_ref_host = dev
             .dtoh_copy(&scratch.tie_term)
@@ -544,14 +560,13 @@ where
                 continue;
             }
 
-            let mut d_group_slab = dev
-                .alloc_zeros::<f32>(sz * n_g)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc group slab: {e}")))?;
+            // G2: scratch.group_slab is grown to chunk_size × n_g_max at
+            // driver entry; the scatter writes (sz × n_g) into its prefix.
             gpu_de_scatter_gene_major(
                 dev,
                 &scratch.dense,
                 &group_idx_i32[tg_idx],
-                &mut d_group_slab,
+                &mut scratch.group_slab,
                 n_obs,
                 sz,
             )
@@ -561,8 +576,8 @@ where
             // reads group_slab in any order). Write into scratch.u_or_rank.
             gpu_de_searchsorted_u_stat(
                 dev,
-                &d_ref_slab,
-                &d_group_slab,
+                &scratch.ref_slab,
+                &scratch.group_slab,
                 &mut scratch.u_or_rank,
                 sz,
                 n_ref,
@@ -571,12 +586,12 @@ where
             .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
 
             // Sort group slab for combined tie term.
-            gpu_de_block_sort(dev, &mut scratch, &mut d_group_slab, sz, n_g)
+            gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
                 .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
             gpu_de_combined_tie_term(
                 dev,
-                &d_ref_slab,
-                &d_group_slab,
+                &scratch.ref_slab,
+                &scratch.group_slab,
                 &mut scratch.tie_term,
                 sz,
                 n_ref,
@@ -713,6 +728,27 @@ where
 
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, max_pool.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
+    // G2: pre-grow the per-chunk reusable slots once (max_pool already
+    // covers both ref-mode pool-size = n_ref and 1-vs-rest pool-size =
+    // n_obs). `n_g_max_for_wil` is the largest test-group size; for
+    // 1-vs-rest n_g_max ≤ max_pool, for ref-mode it's already in max_pool.
+    let n_g_max_for_wil = test_groups
+        .iter()
+        .map(|&g| group_indices[g].len())
+        .max()
+        .unwrap_or(0);
+    scratch
+        .ensure_ref_slab_capacity(dev, max_pool.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure ref_slab: {e}")))?;
+    scratch
+        .ensure_group_slab_capacity(dev, n_g_max_for_wil.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure group_slab: {e}")))?;
+    scratch
+        .ensure_sums_capacity(dev, n_groups)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure sums: {e}")))?;
+    scratch
+        .ensure_aux_capacity(dev, chunk_size * max_pool.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure aux: {e}")))?;
 
     // Flatten the (cell → group) labelling into a CSR-style permutation for
     // `gpu_de_pseudobulk_all_groups` (G1.6). Cells with `groups[i] >= n_groups`
@@ -758,47 +794,64 @@ where
 
         // Per-group per-gene raw sums on device (G1.6) — feeds the host-side
         // logFC computation further down. `mode_id = 0` selects the identity
-        // pre-transform; Wilcoxon doesn't apply `GeomMeanMode`.
+        // pre-transform; Wilcoxon doesn't apply `GeomMeanMode`. G2: reuses
+        // `scratch.sums` instead of a per-chunk allocation.
         let group_gene_sums = compute_group_gene_sums_gpu(
             dev,
             &scratch.dense,
             &d_all_cells,
             &d_offsets,
+            &mut scratch.sums,
             n_obs,
             sz,
             n_groups,
         )
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk: {e}")))?;
 
-        // Build the sort pool slab once per chunk.
-        let (mut d_pool_slab, pool_len, pool_perm_i32) = match (&ref_idx_i32, &all_idx_i32) {
+        // Build the sort pool slab once per chunk. G2: the pool slab lives in
+        // `scratch.ref_slab` (already sized to chunk_size × max_pool); the
+        // scatter writes (sz × pool_len) into the prefix.
+        let (pool_len, _pool_perm_i32) = match (&ref_idx_i32, &all_idx_i32) {
             (Some(ref_i32), _) => {
                 let n_ref = ref_i32.len();
-                let mut slab = dev
-                    .alloc_zeros::<f32>(sz * n_ref)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc ref slab: {e}")))?;
-                gpu_de_scatter_gene_major(dev, &scratch.dense, ref_i32, &mut slab, n_obs, sz)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
-                (slab, n_ref, Some(ref_i32))
+                gpu_de_scatter_gene_major(
+                    dev,
+                    &scratch.dense,
+                    ref_i32,
+                    &mut scratch.ref_slab,
+                    n_obs,
+                    sz,
+                )
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
+                (n_ref, Some(ref_i32))
             }
             (None, Some(all_i32)) => {
-                let mut slab = dev
-                    .alloc_zeros::<f32>(sz * n_obs)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc all slab: {e}")))?;
-                gpu_de_scatter_gene_major(dev, &scratch.dense, all_i32, &mut slab, n_obs, sz)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter all: {e}")))?;
-                (slab, n_obs, Some(all_i32))
+                gpu_de_scatter_gene_major(
+                    dev,
+                    &scratch.dense,
+                    all_i32,
+                    &mut scratch.ref_slab,
+                    n_obs,
+                    sz,
+                )
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter all: {e}")))?;
+                (n_obs, Some(all_i32))
             }
             (None, None) => unreachable!(),
         };
-        let _ = pool_perm_i32; // suppress unused (kept for symmetry)
 
-        gpu_de_block_sort(dev, &mut scratch, &mut d_pool_slab, sz, pool_len)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool: {e}")))?;
+        gpu_de_block_sort(
+            dev,
+            &mut scratch.ref_slab,
+            &mut scratch.slab_aux,
+            sz,
+            pool_len,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool: {e}")))?;
 
         // Tie term over the pool (used for ref mode + as the base for combined
         // ties in ref mode; for 1-vs-rest this is the global tie correction).
-        gpu_de_tie_term(dev, &d_pool_slab, &mut scratch.tie_term, sz, pool_len)
+        gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, pool_len)
             .map_err(|e| AccelError::LinAlg(format!("GPU DE pool tie: {e}")))?;
         let mut pool_tie_host = dev
             .dtoh_copy(&scratch.tie_term)
@@ -825,14 +878,13 @@ where
                 continue;
             }
 
-            let mut d_group_slab = dev
-                .alloc_zeros::<f32>(sz * n_g)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc group slab: {e}")))?;
+            // G2: scratch.group_slab is pre-sized for the largest test group;
+            // the scatter writes (sz × n_g) into its prefix.
             gpu_de_scatter_gene_major(
                 dev,
                 &scratch.dense,
                 &group_idx_i32[tg_idx],
-                &mut d_group_slab,
+                &mut scratch.group_slab,
                 n_obs,
                 sz,
             )
@@ -843,8 +895,8 @@ where
             let (u_host, tie_host_for_p, n1, n2) = if reference.is_some() {
                 gpu_de_searchsorted_u_stat(
                     dev,
-                    &d_pool_slab,
-                    &d_group_slab,
+                    &scratch.ref_slab,
+                    &scratch.group_slab,
                     &mut scratch.u_or_rank,
                     sz,
                     pool_len,
@@ -857,12 +909,12 @@ where
                 u_host.truncate(sz);
 
                 // Combined tie term for ref vs group.
-                gpu_de_block_sort(dev, &mut scratch, &mut d_group_slab, sz, n_g)
+                gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
                     .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
                 gpu_de_combined_tie_term(
                     dev,
-                    &d_pool_slab,
-                    &d_group_slab,
+                    &scratch.ref_slab,
+                    &scratch.group_slab,
                     &mut scratch.tie_term,
                     sz,
                     pool_len,
@@ -877,8 +929,8 @@ where
             } else {
                 gpu_de_searchsorted_ranksum(
                     dev,
-                    &d_pool_slab,
-                    &d_group_slab,
+                    &scratch.ref_slab,
+                    &scratch.group_slab,
                     &mut scratch.u_or_rank,
                     sz,
                     pool_len,
@@ -1027,6 +1079,7 @@ fn compute_pdex_means_gpu(
     d_dense: &CudaSlice<f32>,
     d_all_cells: &CudaSlice<i32>,
     d_offsets: &CudaSlice<i32>,
+    d_sums: &mut CudaSlice<f64>,
     n_obs: usize,
     chunk_size: usize,
     n_ref: usize,
@@ -1037,23 +1090,28 @@ fn compute_pdex_means_gpu(
     let n_test = target_memberships.len();
     let n_groups = 1 + n_test;
 
-    let mut d_sums = dev
-        .alloc_zeros::<f64>(n_groups * chunk_size)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc pseudobulk sums: {e}")))?;
+    // G2: `d_sums` is a borrowed slice from `GpuDeChunkScratch::sums` sized
+    // to hold at least `n_groups * chunk_size` f64 values; the caller has
+    // already grown it via `ensure_sums_capacity` before the chunk loop.
     gpu_de_pseudobulk_all_groups(
         dev,
         d_dense,
         d_all_cells,
         d_offsets,
-        &mut d_sums,
+        d_sums,
         n_obs,
         chunk_size,
         n_groups,
         mode_id,
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU DE pseudobulk kernel: {e}")))?;
+    // Slice to the populated prefix — `d_sums` is sized for `chunk_max ×
+    // sums_capacity` but the kernel only writes `n_groups * chunk_size`
+    // elements. Downloading the full buffer wastes PCIe on the final chunk
+    // and whenever `n_groups < sums_capacity`.
     let host_sums = dev
-        .dtoh_copy(&d_sums)
+        .stream()
+        .clone_dtoh(&d_sums.slice(..n_groups * chunk_size))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh pseudobulk sums: {e}")))?;
 
     // Group 0 = reference.
@@ -1091,27 +1149,29 @@ fn compute_group_gene_sums_gpu(
     d_dense: &CudaSlice<f32>,
     d_all_cells: &CudaSlice<i32>,
     d_offsets: &CudaSlice<i32>,
+    d_sums: &mut CudaSlice<f64>,
     n_obs: usize,
     chunk_size: usize,
     n_groups: usize,
 ) -> Result<Vec<Vec<f64>>> {
-    let mut d_sums = dev
-        .alloc_zeros::<f64>(n_groups * chunk_size)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc Wilcoxon sums: {e}")))?;
+    // G2: `d_sums` is a borrowed slice from `GpuDeChunkScratch::sums`; see
+    // `compute_pdex_means_gpu` for the lifetime / sizing contract.
     gpu_de_pseudobulk_all_groups(
         dev,
         d_dense,
         d_all_cells,
         d_offsets,
-        &mut d_sums,
+        d_sums,
         n_obs,
         chunk_size,
         n_groups,
         0, // mode_id = ArithRaw / identity
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk kernel: {e}")))?;
+    // See `compute_pdex_means_gpu` for the slice rationale.
     let host_sums = dev
-        .dtoh_copy(&d_sums)
+        .stream()
+        .clone_dtoh(&d_sums.slice(..n_groups * chunk_size))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh Wilcoxon sums: {e}")))?;
 
     let mut sums: Vec<Vec<f64>> = Vec::with_capacity(n_groups);

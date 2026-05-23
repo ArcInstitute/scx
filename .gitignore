@@ -18,6 +18,8 @@ data/*.h5ad
 external-repos/
 benchmarks/logs/
 benchmarks/comprehensive/results/raw/
+benchmarks/comprehensive/results/*/raw/
+benchmarks/comprehensive/results/*/fingerprints/arrays/
 benchmarks/comprehensive/results/raw_archive_*/
 benchmarks/comprehensive/results/reports/figures/
 benchmarks/comprehensive/results/reports_archive_*/
@@ -26,6 +28,7 @@ benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/
 benchmarks/comprehensive/results/accel_smoke_*/
 benchmarks/comprehensive/results/tier*/
+
 build_artifacts/
 LINT_WARNINGS.json
 dashboard_history.json
