@@ -4,7 +4,7 @@
 //! needed when the decode kernels produce `u32` but the CSR output
 //! requires `i32` (indices) and `f32` (values).
 
-use cudarc::driver::safe::{CudaSlice, LaunchConfig};
+use cudarc::driver::safe::{CudaSlice, CudaView, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
 use crate::device::GpuDevice;
@@ -96,6 +96,51 @@ pub fn cast_i64_to_i32_gpu(
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("cast_i64_to_i32: {e}")))?;
+
+    Ok(output)
+}
+
+/// Cast a `CudaView<i64>` (sub-slice of a larger CudaSlice) to a newly
+/// allocated `CudaSlice<i32>`.
+///
+/// Functionally identical to [`cast_i64_to_i32_gpu`] — used by the slot-
+/// based cuSPARSE descriptor builder ([`crate::staging::GpuCsrSlot`]) so
+/// the cached descriptor can capture an `indptr` pointer derived from a
+/// sub-slice of a grow-only buffer without going through `try_clone`.
+pub fn cast_i64_to_i32_gpu_view(
+    dev: &GpuDevice,
+    input: &CudaView<'_, i64>,
+) -> Result<CudaSlice<i32>, GpuError> {
+    let n = input.len();
+    if n == 0 {
+        return dev.alloc_zeros::<i32>(0);
+    }
+
+    let module = dev.load_module_cached(CAST_PTX)?;
+    let kernel = module
+        .load_function("cast_i64_to_i32")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("load cast_i64_to_i32: {e}")))?;
+
+    let mut output = dev.alloc_zeros::<i32>(n)?;
+    let n_u32 = n as u32;
+
+    let threads: u32 = 256;
+    let grid = (n as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&kernel)
+            .arg(input)
+            .arg(&mut output)
+            .arg(&n_u32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("cast_i64_to_i32_view: {e}")))?;
 
     Ok(output)
 }

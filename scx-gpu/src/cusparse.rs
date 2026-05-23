@@ -155,6 +155,25 @@ impl CusparseSpMatDescr {
     pub fn raw(&self) -> cusparseSpMatDescr_t {
         self.raw
     }
+
+    /// Construct from a raw descriptor and an owned downcast `i32` indptr
+    /// buffer. The descriptor must already reference the buffer's device
+    /// pointer; this constructor only assumes ownership for lifetime
+    /// extension.
+    ///
+    /// Used by [`crate::staging::GpuCsrSlot`] to build a cached descriptor
+    /// over a slot's exact-sized buffer views without going through
+    /// [`crate::shard_decode::GpuCsr::to_cusparse_csr`] (which requires an
+    /// owned `GpuCsr`).
+    pub(crate) fn from_raw_with_i32_indptr(
+        raw: cusparseSpMatDescr_t,
+        i32_indptr: CudaSlice<i32>,
+    ) -> Self {
+        Self {
+            raw,
+            _i32_indptr: Some(i32_indptr),
+        }
+    }
 }
 
 impl Drop for CusparseSpMatDescr {
