@@ -523,6 +523,59 @@ impl GpuCsrSlot {
     }
 }
 
+// --------------------------------------------------------------------------
+// InMemoryCsrShardSource
+// --------------------------------------------------------------------------
+
+/// Adapter exposing a borrowed [`ScxCsr`] as a single-shard
+/// [`scx_format::ShardSource`].
+///
+/// Lets the in-memory-CSR GPU DE entry points (`pdex_ref_gpu_sparse`,
+/// `wilcoxon_rank_sum_gpu_sparse`) feed the refactored chunked driver,
+/// which consumes any `&dyn ShardSource + Sync` through
+/// [`crate::gpu_shard_source::RawGpuShardSource`]. The driver's per-shard
+/// device-resident scatter (`gpu_de_scatter_shard_to_dense`) then
+/// replaces the per-chunk host materialise + `gpu_de_upload_chunk` path.
+///
+/// `read_shard(0)` returns `csr.clone()` — `ScxCsr` owns its buffers, so
+/// cloning is an `Arc`-free vector copy. The cost is paid once at the
+/// start of the call and amortised across every chunk; the alternative
+/// (avoiding the clone with a `Cow`-style trait change) would force a
+/// signature break on `ShardSource` for a one-shot adapter.
+pub struct InMemoryCsrShardSource<'a> {
+    csr: &'a ScxCsr,
+}
+
+impl<'a> InMemoryCsrShardSource<'a> {
+    pub fn new(csr: &'a ScxCsr) -> Self {
+        Self { csr }
+    }
+}
+
+impl<'a> scx_format::ShardSource for InMemoryCsrShardSource<'a> {
+    fn n_shards(&self) -> usize {
+        1
+    }
+    fn n_obs(&self) -> usize {
+        self.csr.shape.0
+    }
+    fn n_vars(&self) -> usize {
+        self.csr.shape.1
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        if shard_idx != 0 {
+            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: 1,
+            });
+        }
+        Ok(self.csr.clone())
+    }
+    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+        Ok(self.csr.shape.0)
+    }
+}
+
 /// Build a cuSPARSE CSR descriptor pointing at the slot's live buffers.
 ///
 /// Functionally equivalent to [`GpuCsr::to_cusparse_csr`] but works on

@@ -338,6 +338,42 @@ fn run_rank_genes_groups_inner(
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?,
         }
     } else {
+        // ScxLazyTransformedDataset (non-CSC GPU path) — route
+        // through `wilcoxon_rank_sum_gpu_lazy` (device-resident shard
+        // pipeline) before falling through to the scipy/numpy paths.
+        // CPU lazy without CSC keeps the scipy/numpy fallback.
+        #[cfg(feature = "gpu")]
+        {
+            if let Some(device_id) = gpu_device_id {
+                if let Ok(lazy) =
+                    x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+                {
+                    let chunk_size = gene_chunk_size.unwrap_or(500);
+                    let lazy_src = lazy.as_shard_source();
+                    drop(lazy);
+                    let result = py
+                        .allow_threads(|| {
+                            scx_accel::wilcoxon_rank_sum_gpu_lazy(
+                                device_id,
+                                &lazy_src,
+                                &gene_names,
+                                &groups,
+                                &unique_groups,
+                                ref_idx,
+                                Some(chunk_size),
+                                log_transformed,
+                                rankby_abs,
+                                tie_correct,
+                            )
+                        })
+                        .map_err(|e: scx_accel::AccelError| {
+                            PyRuntimeError::new_err(e.to_string())
+                        })?;
+                    return Ok((result, unique_groups));
+                }
+            }
+        }
+
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
             .extract::<bool>()?;
@@ -1149,6 +1185,33 @@ fn run_pdex_ref_inner(
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string())),
         };
+    }
+
+    // G1.8: ScxLazyTransformedDataset (non-CSC GPU path). See the matching
+    // branch in `run_rank_genes_groups_inner`. CPU lazy without CSC still
+    // falls through to scipy-CSR / numpy materialisation below.
+    #[cfg(feature = "gpu")]
+    if let Some(device_id) = gpu_device_id {
+        if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+            let chunk_size = gene_chunk_size.unwrap_or(500);
+            let lazy_src = lazy.as_shard_source();
+            drop(lazy);
+            return py
+                .allow_threads(|| {
+                    scx_accel::pdex_ref_gpu_lazy(
+                        device_id,
+                        &lazy_src,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        Some(chunk_size),
+                        mode,
+                        epsilon,
+                    )
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
+        }
     }
 
     let is_sparse = scipy_sparse

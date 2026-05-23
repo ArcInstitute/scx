@@ -57,6 +57,40 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Scatter one CSR shard's rows into a global dense [n_obs × chunk_size]
+// row-major buffer at row offset `global_row_offset`, filtered to columns
+// [c0, c1). Output column index is (col - c0). Caller MUST zero the
+// affected row range before invoking — zeros are implicit in the CSR.
+//
+// One block per shard row (gridDim.x = n_shard_rows). Each block walks
+// its row's nonzero entries cooperatively; threads stride over
+// (indptr[r+1] − indptr[r]) and predicate `c0 <= col < c1`.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_to_dense_chunk_kernel(
+    const long*  __restrict__ indptr,   // [n_shard_rows + 1]
+    const int*   __restrict__ indices,  // [nnz]
+    const float* __restrict__ data,     // [nnz]
+    float*       __restrict__ dense,    // [n_obs × chunk_size], row-major
+    int n_shard_rows,
+    int global_row_offset,
+    int chunk_size,
+    int c0,
+    int c1
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long start = indptr[r];
+    long end   = indptr[r + 1];
+    long out_row_base = (long long)(global_row_offset + r) * chunk_size;
+    for (long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            dense[out_row_base + (col - c0)] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // All-groups pseudobulk fold.
 //
 // One block per (gene, group). Threads stride over the group's cell list and

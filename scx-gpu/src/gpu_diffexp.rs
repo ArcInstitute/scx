@@ -32,6 +32,7 @@ use cudarc::driver::PushKernelArg;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::staging::GpuCsrShardView;
 
 /// PTX source for the GPU DE kernels, compiled at build time by `scx-gpu/build.rs`.
 const DIFFEXP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/diffexp.ptx"));
@@ -339,6 +340,75 @@ pub fn gpu_de_scatter_gene_major(
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("scatter_perm_to_gene_major_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// Scatter one CSR shard into a global dense `[n_obs × chunk_size]`
+/// row-major buffer at row offset `global_row_offset`, filtering to columns
+/// `[c0, c1)`. The shard's column index `col` lands at output column
+/// `col - c0`.
+///
+/// Caller is responsible for zeroing the affected row range of `dense`
+/// before the first shard's scatter — zeros are implicit in the CSR. Use
+/// `dev.stream().memset_zeros(&mut dense.slice_mut(..n_obs * chunk_size))`
+/// once per chunk. The chunked DE driver in `scx-accel` does this above
+/// the `GpuShardSource::for_each_gpu_shard` loop.
+///
+/// Grid: one block per shard row (`gridDim.x = n_shard_rows`); threads
+/// stride over the row's nonzero entries.
+pub fn gpu_de_scatter_shard_to_dense(
+    dev: &GpuDevice,
+    view: &GpuCsrShardView<'_>,
+    dense: &mut CudaSlice<f32>,
+    global_row_offset: usize,
+    chunk_size: usize,
+    c0: usize,
+    c1: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_shard_rows = view.shape.0;
+    if n_shard_rows == 0 {
+        return Ok(());
+    }
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csr_shard_to_dense_chunk_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("csr_shard_to_dense_chunk_kernel: {e}"))
+        })?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (n_shard_rows as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_shard_rows_i32 = n_shard_rows as i32;
+    let global_row_offset_i32 = global_row_offset as i32;
+    let chunk_size_i32 = chunk_size as i32;
+    let c0_i32 = c0 as i32;
+    let c1_i32 = c1 as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&view.indptr)
+            .arg(&view.indices)
+            .arg(&view.data)
+            .arg(dense)
+            .arg(&n_shard_rows_i32)
+            .arg(&global_row_offset_i32)
+            .arg(&chunk_size_i32)
+            .arg(&c0_i32)
+            .arg(&c1_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_to_dense_chunk_kernel: {e}")))?;
 
     Ok(())
 }
@@ -1418,5 +1488,139 @@ mod tests {
             frozen,
             "16 iterations of same/smaller ensure_* must not grow",
         );
+    }
+
+    /// `gpu_de_scatter_shard_to_dense` reproduces, on device, the dense
+    /// `[n_obs × sz]` row-major chunk that the legacy host materialise
+    /// closure built in `pdex_ref_gpu_chunked`'s streaming variant. Three
+    /// fixtures cover: (a) full column range, (b) middle column subrange,
+    /// (c) an empty shard interleaved with non-empty shards.
+    #[test]
+    fn test_csr_shard_to_dense_chunk_parity() {
+        use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
+        use scx_format::ShardSource;
+        use scx_sparse::ScxCsr;
+
+        let dev = require_gpu!();
+
+        // Tiny in-memory shard source for the test. Shard 0 has 3 rows
+        // with ties + missing columns; shard 1 has 0 rows (empty);
+        // shard 2 has 4 rows with one row entirely outside the chunk.
+        struct InMemorySource {
+            shards: Vec<ScxCsr>,
+            n_obs: usize,
+            n_vars: usize,
+        }
+        impl ShardSource for InMemorySource {
+            fn n_shards(&self) -> usize {
+                self.shards.len()
+            }
+            fn n_obs(&self) -> usize {
+                self.n_obs
+            }
+            fn n_vars(&self) -> usize {
+                self.n_vars
+            }
+            fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+                Ok(self.shards[shard_idx].clone())
+            }
+        }
+
+        // 8 columns; each row written explicitly so the parity comparison
+        // also catches col→(col-c0) miscalculation.
+        let n_vars = 8usize;
+        let shard0 = ScxCsr::new_unchecked(
+            (3, n_vars),
+            vec![0i64, 3, 5, 7],
+            vec![0i32, 3, 6, 1, 5, 2, 7],
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        );
+        // Empty shard: indptr length n_rows+1 = 1, no nonzeros. Note the
+        // RawGpuShardSource driver itself skips a `csr.n_rows() == 0`
+        // shard before invoking the callback, so this shard advances
+        // `global_row` by 0 — the next shard's global_row stays correct.
+        let shard1 = ScxCsr::new_unchecked((0, n_vars), vec![0i64], vec![], vec![]);
+        let shard2 = ScxCsr::new_unchecked(
+            (4, n_vars),
+            vec![0i64, 2, 2, 4, 6],
+            vec![0i32, 4, 2, 7, 1, 3],
+            vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0],
+        );
+        let shards = vec![shard0.clone(), shard1.clone(), shard2.clone()];
+        // total rows in the dense matrix: 3 + 0 + 4 = 7
+        let n_obs = 7usize;
+        let src = InMemorySource {
+            shards: shards.clone(),
+            n_obs,
+            n_vars,
+        };
+
+        // Reference dense `[n_obs × sz]` built on host for a given column
+        // range. Matches what `pdex_ref_gpu_chunked`'s legacy closure
+        // wrote into `chunk_dense` before `gpu_de_upload_chunk`.
+        let host_reference = |c0: usize, c1: usize| -> Vec<f32> {
+            let sz = c1 - c0;
+            let mut buf = vec![0.0f32; n_obs * sz];
+            let mut global_row = 0usize;
+            for shard in &shards {
+                let n_rows = shard.n_rows();
+                for r in 0..n_rows {
+                    let s = shard.indptr[r] as usize;
+                    let e = shard.indptr[r + 1] as usize;
+                    for k in s..e {
+                        let col = shard.indices[k] as usize;
+                        if col >= c0 && col < c1 {
+                            buf[(global_row + r) * sz + (col - c0)] = shard.data[k];
+                        }
+                    }
+                }
+                global_row += n_rows;
+            }
+            buf
+        };
+
+        // Run the GPU scatter for a (c0, c1) range against the host
+        // reference. The dense buffer is allocated freshly each
+        // sub-test to verify the zeroed-prefix contract.
+        let run_case = |c0: usize, c1: usize| {
+            let sz = c1 - c0;
+            let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
+            let mut dense = dev.alloc_zeros::<f32>(n_obs * sz).unwrap();
+            // Zero is already the alloc_zeros postcondition; a real
+            // chunked driver re-zeros each iteration via memset_zeros.
+
+            let mut global_row = 0usize;
+            gpu_src
+                .for_each_gpu_shard(|_idx, slot| {
+                    let view = slot.view();
+                    let n_rows = view.shape.0;
+                    crate::gpu_diffexp::gpu_de_scatter_shard_to_dense(
+                        &dev, &view, &mut dense, global_row, sz, c0, c1,
+                    )?;
+                    global_row += n_rows;
+                    Ok(())
+                })
+                .unwrap();
+            dev.synchronize().unwrap();
+
+            let mut host_actual = vec![0.0f32; n_obs * sz];
+            dev.stream().memcpy_dtoh(&dense, &mut host_actual).unwrap();
+            dev.synchronize().unwrap();
+
+            let host_expected = host_reference(c0, c1);
+            assert_eq!(
+                host_actual, host_expected,
+                "shard-to-dense scatter mismatch for c0={c0}, c1={c1}"
+            );
+        };
+
+        // (a) full column range
+        run_case(0, n_vars);
+        // (b) middle subrange — excludes col 0 and col 7, includes ties at col 1..6
+        run_case(1, 6);
+        // (c) narrow subrange — only one shard contributes to col 4
+        run_case(4, 5);
+        // (d) empty intersection — should leave dense fully zero
+        run_case(0, 0); // c0 == c1 short-circuits in the wrapper
     }
 }

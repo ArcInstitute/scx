@@ -81,8 +81,8 @@ pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_diffexp::{
     default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
     gpu_de_pseudobulk_all_groups, gpu_de_pvalues, gpu_de_scatter_gene_major,
-    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, gpu_de_upload_chunk,
-    GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
+    gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
+    gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
 pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
@@ -108,7 +108,7 @@ pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
 pub use shard_pipeline::DoubleBufferedShardLoader;
 pub use sparse_dense::{sparse_to_dense_gpu, sparse_to_dense_gpu_into};
-pub use staging::{GpuCsrShardView, GpuCsrSlot, PinnedCsrSlot};
+pub use staging::{GpuCsrShardView, GpuCsrSlot, InMemoryCsrShardSource, PinnedCsrSlot};
 
 // Re-export cudarc types used in public API signatures.
 pub use cudarc::driver::safe::{CudaModule, CudaSlice, CudaStream};
