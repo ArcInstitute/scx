@@ -601,9 +601,19 @@ impl ScxReader {
     /// `shard_idx` order. Returns `Ok(None)` if no shards exist for
     /// `<name>` (caller can fall back to the legacy single-section path).
     ///
-    /// Concatenation is row-axis; the per-shard `row_start`/`shard_idx`
-    /// metadata in the Arrow schema is used to verify that the catalog
-    /// entries form a contiguous, ordered cover of the logical matrix.
+    /// Concatenation is row-axis. The per-shard `shard_idx` /
+    /// `row_start` / `n_shard_rows` / `n_rows_total` metadata stamped
+    /// by the writer (see `stamp_dense_shard_metadata`) is used to
+    /// verify that the catalog entries form a contiguous, ordered cover
+    /// of the logical matrix; any gap, duplicate, mismatch, or missing
+    /// metadata returns `ScxError::InvalidCatalog` rather than silently
+    /// producing a truncated matrix.
+    ///
+    /// The returned `RecordBatch`'s schema metadata has the per-shard
+    /// fields stripped (`shard_idx` / `row_start` / `n_shard_rows`) so
+    /// downstream consumers don't see misleading first-shard values;
+    /// `n_rows_total` and any payload-level metadata (e.g. sparse
+    /// `n_rows` / `n_cols`) are preserved.
     fn read_sharded_layout(
         &self,
         prefix: &str,
@@ -631,9 +641,71 @@ impl ScxReader {
         for (_, entry) in &shards {
             batches.push(self.read_arrow_ipc(entry)?);
         }
-        let schema = batches[0].schema();
-        let concatenated = arrow::compute::concat_batches(&schema, batches.iter())?;
-        Ok(Some(concatenated))
+
+        // Verify the shards form a contiguous, ordered cover by walking
+        // their stamped metadata. Any gap, duplicate, mismatch, or
+        // missing metadata is a hard error.
+        let logical = format!("{prefix}/{name}");
+        let first_hdr = parse_shard_metadata(&logical, &batches[0])?;
+        if first_hdr.shard_idx != 0 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: first shard has shard_idx={} (expected 0)",
+                first_hdr.shard_idx
+            )));
+        }
+        if first_hdr.row_start != 0 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: first shard has row_start={} (expected 0)",
+                first_hdr.row_start
+            )));
+        }
+        let n_rows_total = first_hdr.n_rows_total;
+        let mut next_expected_row_start = first_hdr.n_shard_rows;
+        for (i, batch) in batches.iter().enumerate().skip(1) {
+            let hdr = parse_shard_metadata(&logical, batch)?;
+            let expected_idx = i as u32;
+            if hdr.shard_idx != expected_idx {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "{logical}: shard at position {i} has shard_idx={} (expected {expected_idx})",
+                    hdr.shard_idx
+                )));
+            }
+            if hdr.n_rows_total != n_rows_total {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "{logical}: shard {i} has n_rows_total={} but shard 0 has {n_rows_total}",
+                    hdr.n_rows_total
+                )));
+            }
+            if hdr.row_start != next_expected_row_start {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "{logical}: shard {i} has row_start={} (expected {next_expected_row_start})",
+                    hdr.row_start
+                )));
+            }
+            next_expected_row_start = next_expected_row_start.saturating_add(hdr.n_shard_rows);
+        }
+        if next_expected_row_start != n_rows_total {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: shards cover {next_expected_row_start} rows but n_rows_total={n_rows_total}"
+            )));
+        }
+
+        let first_schema = batches[0].schema();
+        let concatenated = arrow::compute::concat_batches(&first_schema, batches.iter())?;
+
+        // Strip the per-shard metadata (shard_idx / row_start /
+        // n_shard_rows) from the merged batch's schema. Keep
+        // n_rows_total and any payload-level metadata.
+        let mut clean_metadata = first_schema.metadata().clone();
+        clean_metadata.remove("shard_idx");
+        clean_metadata.remove("row_start");
+        clean_metadata.remove("n_shard_rows");
+        let clean_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            first_schema.fields().clone(),
+            clean_metadata,
+        ));
+        let clean_batch = RecordBatch::try_new(clean_schema, concatenated.columns().to_vec())?;
+        Ok(Some(clean_batch))
     }
 
     /// Walk the catalog for both single-section and sharded entries
@@ -1278,6 +1350,47 @@ impl ScxReader {
 
         concatenate_csc_along_cols(decoded, n_rows)
     }
+}
+
+/// Per-shard metadata stamped by the writer
+/// (see `crate::writer::stamp_dense_shard_metadata`). Parsed by the
+/// sharded reader path to verify a contiguous, ordered cover of the
+/// logical matrix. Distinct from `crate::shard::ShardHeader`, which is
+/// the on-disk 76-byte CSR/CSC shard header.
+struct ObsmShardMetadata {
+    shard_idx: u32,
+    row_start: u64,
+    n_shard_rows: u64,
+    n_rows_total: u64,
+}
+
+/// Pull `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total`
+/// off a sharded batch's schema metadata. Returns
+/// `ScxError::InvalidCatalog` if any field is missing or unparseable,
+/// naming the logical section so the caller can produce a useful error.
+fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardMetadata> {
+    let md = batch.schema_ref().metadata();
+    let get = |key: &str| -> Result<u64> {
+        md.get(key)
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!("{logical}: shard schema missing '{key}'"))
+            })
+            .and_then(|s| {
+                s.parse::<u64>().map_err(|_| {
+                    ScxError::InvalidCatalog(format!(
+                        "{logical}: shard schema '{key}'='{s}' is not a u64"
+                    ))
+                })
+            })
+    };
+    let shard_idx = u32::try_from(get("shard_idx")?)
+        .map_err(|_| ScxError::InvalidCatalog(format!("{logical}: shard_idx exceeds u32::MAX")))?;
+    Ok(ObsmShardMetadata {
+        shard_idx,
+        row_start: get("row_start")?,
+        n_shard_rows: get("n_shard_rows")?,
+        n_rows_total: get("n_rows_total")?,
+    })
 }
 
 /// Concatenate a list of CSC shards along the column axis.
@@ -2469,7 +2582,14 @@ mod tests {
             )
             .unwrap();
             writer
-                .write_obsm_shard("X_pca", shard_idx, row_start as u64, n_obs as u64, &batch)
+                .write_obsm_shard(
+                    "X_pca",
+                    shard_idx,
+                    row_start as u64,
+                    batch.num_rows() as u64,
+                    n_obs as u64,
+                    &batch,
+                )
                 .unwrap();
         }
 
@@ -2511,6 +2631,244 @@ mod tests {
         let all = reader.read_all_obsm().unwrap();
         assert_eq!(all.len(), 1);
         assert!(all.contains_key("X_pca"));
+    }
+
+    /// Helper for the sharded-reader regression tests: writes a minimal
+    /// SCX file with one CSR shard and `obsm/X_pca` split into
+    /// `n_obs / shard_rows` dense shards, then hands the caller the
+    /// `ScxWriter` mid-flight so it can override the obsm shard layout
+    /// (skip a shard, duplicate a `shard_idx`, etc.) before `finish()`.
+    fn build_obsm_test_writer(
+        path: &std::path::Path,
+        n_obs: usize,
+        n_vars: usize,
+        shard_rows: u32,
+    ) -> ScxWriter {
+        let header = FileHeader {
+            magic: MAGIC,
+            format_version: CURRENT_FORMAT_VERSION,
+            header_length: 256,
+            flags: 0,
+            n_obs: n_obs as u64,
+            n_vars: n_vars as u64,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: shard_rows,
+            codec_id: 0,
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
+        };
+        let mut writer = ScxWriter::new(path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+    }
+
+    fn dense_obsm_shard_batch(row_start: usize, n_rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pc1", DataType::Float32, false),
+            Field::new("pc2", DataType::Float32, false),
+        ]));
+        let rows: Vec<f32> = (row_start..row_start + n_rows).map(|r| r as f32).collect();
+        let rows2: Vec<f32> = rows.iter().map(|r| r * 2.0).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float32Array::from(rows)),
+                Arc::new(Float32Array::from(rows2)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A sharded `obsm/X_pca` whose middle shard is missing must fail
+    /// reads with `InvalidCatalog`, not silently return a truncated
+    /// matrix. Regression guard for the contiguity-check fix.
+    #[test]
+    fn test_sharded_read_rejects_missing_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_shard.scx");
+        let n_obs = 9usize;
+        let mut writer = build_obsm_test_writer(&path, n_obs, 4, 3);
+
+        // Write shard 0 and shard 2 only — shard 1 is missing.
+        for &shard_idx in &[0u32, 2u32] {
+            let row_start = shard_idx as usize * 3;
+            let batch = dense_obsm_shard_batch(row_start, 3);
+            writer
+                .write_obsm_shard(
+                    "X_pca",
+                    shard_idx,
+                    row_start as u64,
+                    batch.num_rows() as u64,
+                    n_obs as u64,
+                    &batch,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let err = reader.read_obsm("X_pca").unwrap_err();
+        assert!(
+            matches!(err, ScxError::InvalidCatalog(_)),
+            "expected InvalidCatalog, got {err:?}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("X_pca"),
+            "error should name the logical section: {msg}"
+        );
+    }
+
+    /// Two shards with the same `shard_idx` must be rejected as
+    /// `InvalidCatalog` — the second shard's stamped `shard_idx`
+    /// won't match its position after sorting.
+    #[test]
+    fn test_sharded_read_rejects_duplicate_shard_idx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup_shard.scx");
+        let n_obs = 6usize;
+        let mut writer = build_obsm_test_writer(&path, n_obs, 4, 3);
+
+        // Two physical shards both stamped with shard_idx = 0. The
+        // second one's catalog name is `..._shard_1` (so the catalog
+        // walk picks both up), but its schema-stamped `shard_idx` is
+        // still 0 — the reader should reject the position/stamp
+        // mismatch.
+        let batch0 = dense_obsm_shard_batch(0, 3);
+        writer
+            .write_obsm_shard(
+                "X_pca",
+                0,
+                0,
+                batch0.num_rows() as u64,
+                n_obs as u64,
+                &batch0,
+            )
+            .unwrap();
+        let batch1 = dense_obsm_shard_batch(3, 3);
+        // Stamp shard_idx = 0 on the second shard by re-using the
+        // first shard's logical position in the metadata; section name
+        // still carries `_shard_1` so it lands in the catalog.
+        writer
+            .write_obsm_shard(
+                "X_pca",
+                1, // section-name index — chosen so the catalog has _shard_1
+                0, // row_start = 0 deliberately duplicates the first shard
+                batch1.num_rows() as u64,
+                n_obs as u64,
+                &batch1,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let err = reader.read_obsm("X_pca").unwrap_err();
+        assert!(
+            matches!(err, ScxError::InvalidCatalog(_)),
+            "expected InvalidCatalog, got {err:?}"
+        );
+    }
+
+    /// A zero-row `obsm` shard must round-trip — `n_rows == 0` is the
+    /// edge case that disappeared from the disk-streaming path before
+    /// this fix landed. The writer-side override path and the
+    /// scx-convert disk-streaming branch both emit a single zero-row
+    /// shard; this test asserts the reader reassembles it as a
+    /// zero-row batch (not a `SectionNotFound`).
+    #[test]
+    fn test_sharded_read_zero_row_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_row.scx");
+        let mut writer = build_obsm_test_writer(&path, 6, 4, 3);
+        let empty = dense_obsm_shard_batch(0, 0);
+        writer
+            .write_obsm_shard("X_empty", 0, 0, 0, 0, &empty)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let names = reader.list_obsm();
+        assert_eq!(names, vec!["X_empty".to_string()]);
+        let batch = reader.read_obsm("X_empty").unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
+    }
+
+    /// The merged `RecordBatch` returned by `read_obsm` must NOT carry
+    /// per-shard metadata (`shard_idx`, `row_start`, `n_shard_rows`) —
+    /// those describe a single shard, not the reassembled matrix.
+    /// Stripping them prevents downstream consumers from being misled.
+    #[test]
+    fn test_sharded_read_strips_shard_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strip_meta.scx");
+        let n_obs = 6usize;
+        let mut writer = build_obsm_test_writer(&path, n_obs, 4, 3);
+        for shard_idx in 0u32..2 {
+            let row_start = shard_idx as usize * 3;
+            let batch = dense_obsm_shard_batch(row_start, 3);
+            writer
+                .write_obsm_shard(
+                    "X_pca",
+                    shard_idx,
+                    row_start as u64,
+                    batch.num_rows() as u64,
+                    n_obs as u64,
+                    &batch,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        let pca = reader.read_obsm("X_pca").unwrap();
+        let md = pca.schema_ref().metadata();
+        assert!(
+            !md.contains_key("shard_idx"),
+            "merged batch should not carry shard_idx (got metadata: {md:?})"
+        );
+        assert!(
+            !md.contains_key("row_start"),
+            "merged batch should not carry row_start (got metadata: {md:?})"
+        );
+        assert!(
+            !md.contains_key("n_shard_rows"),
+            "merged batch should not carry n_shard_rows (got metadata: {md:?})"
+        );
+        // n_rows_total describes the logical matrix and is preserved.
+        assert_eq!(
+            md.get("n_rows_total").map(String::as_str),
+            Some("6"),
+            "n_rows_total should survive (got metadata: {md:?})"
+        );
     }
 
     #[test]

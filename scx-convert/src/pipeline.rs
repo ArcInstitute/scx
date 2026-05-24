@@ -2133,15 +2133,16 @@ fn write_dense_mapping_section(
                 name: &str,
                 shard_idx: u32,
                 row_start: u64,
+                n_shard_rows: u64,
                 n_total: u64,
                 batch: &RecordBatch|
      -> Result<(), ConvertError> {
         match kind {
             DenseMappingKind::Obsm => {
-                w.write_obsm_shard(name, shard_idx, row_start, n_total, batch)
+                w.write_obsm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
             }
             DenseMappingKind::Varm => {
-                w.write_varm_shard(name, shard_idx, row_start, n_total, batch)
+                w.write_varm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
             }
         }
         .map_err(ConvertError::from)
@@ -2152,7 +2153,7 @@ fn write_dense_mapping_section(
             let n_rows = batch.num_rows();
             let n_total = n_rows as u64;
             if n_rows == 0 {
-                emit(writer, name, 0, 0, 0, batch)?;
+                emit(writer, name, 0, 0, 0, 0, batch)?;
                 continue;
             }
             let step = shard_target_rows.max(1) as usize;
@@ -2161,7 +2162,15 @@ fn write_dense_mapping_section(
             while row_start < n_rows {
                 let n = (n_rows - row_start).min(step);
                 let shard = batch.slice(row_start, n);
-                emit(writer, name, shard_idx, row_start as u64, n_total, &shard)?;
+                emit(
+                    writer,
+                    name,
+                    shard_idx,
+                    row_start as u64,
+                    n as u64,
+                    n_total,
+                    &shard,
+                )?;
                 row_start += n;
                 shard_idx += 1;
             }
@@ -2173,17 +2182,26 @@ fn write_dense_mapping_section(
     let infos = list_dense_mapping_shapes(file, group_path)?;
     for info in &infos {
         let n_total = info.n_rows as u64;
+        // Zero-row dense mappings: emit a single empty shard so the key
+        // survives round-trip (mirrors the override-path special case).
+        if info.n_rows == 0 {
+            let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
+            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            continue;
+        }
         let step = shard_target_rows.max(1) as usize;
         let mut shard_idx = 0u32;
         let mut row_start = 0usize;
         while row_start < info.n_rows {
             let row_end = (row_start + step).min(info.n_rows);
             let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
+            let n_shard_rows = (row_end - row_start) as u64;
             emit(
                 writer,
                 &info.name,
                 shard_idx,
                 row_start as u64,
+                n_shard_rows,
                 n_total,
                 &batch,
             )?;
@@ -2210,15 +2228,16 @@ fn write_sparse_mapping_section(
                 name: &str,
                 shard_idx: u32,
                 row_start: u64,
+                n_shard_rows: u64,
                 n_total: u64,
                 batch: &RecordBatch|
      -> Result<(), ConvertError> {
         match kind {
             SparseMappingKind::Obsp => {
-                w.write_obsp_shard_coo(name, shard_idx, row_start, n_total, batch)
+                w.write_obsp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
             }
             SparseMappingKind::Varp => {
-                w.write_varp_shard_coo(name, shard_idx, row_start, n_total, batch)
+                w.write_varp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
             }
         }
         .map_err(ConvertError::from)
@@ -2229,8 +2248,16 @@ fn write_sparse_mapping_section(
             partition_coo_to_shards(
                 batch,
                 shard_target_rows,
-                |shard_idx, row_start, n_total, sub| {
-                    emit(writer, name, shard_idx, row_start, n_total, sub)
+                |shard_idx, row_start, n_shard_rows, n_total, sub| {
+                    emit(
+                        writer,
+                        name,
+                        shard_idx,
+                        row_start,
+                        n_shard_rows,
+                        n_total,
+                        sub,
+                    )
                 },
             )?;
         }
@@ -2240,17 +2267,27 @@ fn write_sparse_mapping_section(
     let infos = list_sparse_mapping_shapes(file, group_path)?;
     for info in &infos {
         let n_total = info.n_rows as u64;
+        // Zero-row sparse mappings: emit a single empty shard so the
+        // key survives round-trip (mirrors the override-path special
+        // case in `partition_coo_to_shards`).
+        if info.n_rows == 0 {
+            let batch = read_sparse_mapping_shard(file, group_path, info, 0, 0)?;
+            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            continue;
+        }
         let step = shard_target_rows.max(1) as usize;
         let mut shard_idx = 0u32;
         let mut row_start = 0usize;
         while row_start < info.n_rows {
             let row_end = (row_start + step).min(info.n_rows);
             let batch = read_sparse_mapping_shard(file, group_path, info, row_start, row_end)?;
+            let n_shard_rows = (row_end - row_start) as u64;
             emit(
                 writer,
                 &info.name,
                 shard_idx,
                 row_start as u64,
+                n_shard_rows,
                 n_total,
                 &batch,
             )?;
@@ -2270,7 +2307,7 @@ fn partition_coo_to_shards<F>(
     mut f: F,
 ) -> Result<(), ConvertError>
 where
-    F: FnMut(u32, u64, u64, &RecordBatch) -> Result<(), ConvertError>,
+    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> Result<(), ConvertError>,
 {
     use arrow::array::{Float32Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -2310,7 +2347,7 @@ where
     let step = shard_target_rows.max(1) as usize;
     if n_rows == 0 {
         let sub = batch.slice(0, 0);
-        f(0, 0, 0, &sub)?;
+        f(0, 0, 0, 0, &sub)?;
         return Ok(());
     }
 
@@ -2345,7 +2382,8 @@ where
 
     let n_total = n_rows as u64;
     for shard_idx in 0..n_shards {
-        let row_start = (shard_idx * step) as u64;
+        let row_start = shard_idx * step;
+        let n_shard_rows = step.min(n_rows - row_start);
         let schema = Arc::new(Schema::new_with_metadata(
             vec![
                 Field::new("row", DataType::Int32, false),
@@ -2371,7 +2409,13 @@ where
                 ))),
             ],
         )?;
-        f(shard_idx as u32, row_start, n_total, &shard_batch)?;
+        f(
+            shard_idx as u32,
+            row_start as u64,
+            n_shard_rows as u64,
+            n_total,
+            &shard_batch,
+        )?;
     }
     Ok(())
 }

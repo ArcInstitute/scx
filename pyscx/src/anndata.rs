@@ -3610,24 +3610,40 @@ fn route_scx_backed_to_scx(
     // both sharded and legacy single-section layouts transparently).
     py.allow_threads(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
-            for_each_dense_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
-                writer.write_obsm_shard(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_dense_shard(
+                b,
+                out_shard_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         for (k, b) in &ov.varm {
-            for_each_dense_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
-                writer.write_varm_shard(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_dense_shard(
+                b,
+                out_shard_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_varm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         for (k, b) in &ov.obsp {
-            for_each_coo_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
-                writer.write_obsp_shard_coo(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_coo_shard(
+                b,
+                out_shard_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         for (k, b) in &ov.varp {
-            for_each_coo_shard(b, out_shard_rows, |idx, row_start, n_total, shard| {
-                writer.write_varp_shard_coo(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_coo_shard(
+                b,
+                out_shard_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_varp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
@@ -3776,24 +3792,40 @@ fn route_scx_lazy_to_scx(
 
     py.allow_threads(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
-            for_each_dense_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
-                writer.write_obsm_shard(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_dense_shard(
+                b,
+                shard_target_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         for (k, b) in &ov.varm {
-            for_each_dense_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
-                writer.write_varm_shard(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_dense_shard(
+                b,
+                shard_target_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_varm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         for (k, b) in &ov.obsp {
-            for_each_coo_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
-                writer.write_obsp_shard_coo(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_coo_shard(
+                b,
+                shard_target_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         for (k, b) in &ov.varp {
-            for_each_coo_shard(b, shard_target_rows, |idx, row_start, n_total, shard| {
-                writer.write_varp_shard_coo(k, idx, row_start, n_total, shard)
-            })?;
+            for_each_coo_shard(
+                b,
+                shard_target_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_varp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )?;
         }
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
@@ -4030,18 +4062,23 @@ fn section_keys_match(
 /// emit each via `f`. Used by the SCX-backed / lazy / in-memory
 /// `from_anndata` paths so all pyscx-produced SCX files share the
 /// sharded on-disk layout the streaming pipeline emits.
+///
+/// The callback signature is `(shard_idx, row_start, n_shard_rows,
+/// n_rows_total, batch)`; `n_shard_rows == batch.num_rows()` for dense
+/// but the parameter is passed explicitly so the writer's contiguity
+/// metadata is sourced from one place.
 fn for_each_dense_shard<F>(
     batch: &RecordBatch,
     shard_target_rows: u32,
     mut f: F,
 ) -> std::result::Result<(), scx_format::ScxError>
 where
-    F: FnMut(u32, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
+    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
 {
     let n_rows = batch.num_rows();
     let n_total = n_rows as u64;
     if n_rows == 0 {
-        return f(0, 0, 0, batch);
+        return f(0, 0, 0, 0, batch);
     }
     let step = shard_target_rows.max(1) as usize;
     let mut shard_idx = 0u32;
@@ -4049,7 +4086,7 @@ where
     while row_start < n_rows {
         let n = (n_rows - row_start).min(step);
         let shard = batch.slice(row_start, n);
-        f(shard_idx, row_start as u64, n_total, &shard)?;
+        f(shard_idx, row_start as u64, n as u64, n_total, &shard)?;
         row_start += n;
         shard_idx += 1;
     }
@@ -4068,7 +4105,7 @@ fn for_each_coo_shard<F>(
     mut f: F,
 ) -> std::result::Result<(), scx_format::ScxError>
 where
-    F: FnMut(u32, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
+    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
 {
     use arrow::array::{Float32Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -4105,7 +4142,7 @@ where
 
     let step = shard_target_rows.max(1) as usize;
     if n_rows == 0 {
-        return f(0, 0, 0, batch);
+        return f(0, 0, 0, 0, batch);
     }
 
     let n_shards = n_rows.div_ceil(step);
@@ -4130,7 +4167,8 @@ where
 
     let n_total = n_rows as u64;
     for shard_idx in 0..n_shards {
-        let row_start = (shard_idx * step) as u64;
+        let row_start = shard_idx * step;
+        let n_shard_rows = step.min(n_rows - row_start);
         let schema = Arc::new(Schema::new_with_metadata(
             vec![
                 Field::new("row", DataType::Int32, false),
@@ -4153,7 +4191,13 @@ where
             ],
         )
         .map_err(scx_format::ScxError::Arrow)?;
-        f(shard_idx as u32, row_start, n_total, &shard_batch)?;
+        f(
+            shard_idx as u32,
+            row_start as u64,
+            n_shard_rows as u64,
+            n_total,
+            &shard_batch,
+        )?;
     }
     Ok(())
 }
@@ -4709,8 +4753,8 @@ pub fn from_anndata_impl(
             for_each_dense_shard(
                 batch,
                 shard_target_rows,
-                |idx, row_start, n_total, shard| {
-                    writer.write_obsm_shard(key, idx, row_start, n_total, shard)
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
                 },
             )?;
         }
@@ -4718,8 +4762,8 @@ pub fn from_anndata_impl(
             for_each_dense_shard(
                 batch,
                 shard_target_rows,
-                |idx, row_start, n_total, shard| {
-                    writer.write_varm_shard(key, idx, row_start, n_total, shard)
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_varm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
                 },
             )?;
         }
@@ -4727,8 +4771,8 @@ pub fn from_anndata_impl(
             for_each_coo_shard(
                 batch,
                 shard_target_rows,
-                |idx, row_start, n_total, shard| {
-                    writer.write_obsp_shard_coo(key, idx, row_start, n_total, shard)
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsp_shard_coo(key, idx, row_start, n_shard_rows, n_total, shard)
                 },
             )?;
         }
@@ -4736,8 +4780,8 @@ pub fn from_anndata_impl(
             for_each_coo_shard(
                 batch,
                 shard_target_rows,
-                |idx, row_start, n_total, shard| {
-                    writer.write_varp_shard_coo(key, idx, row_start, n_total, shard)
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_varp_shard_coo(key, idx, row_start, n_shard_rows, n_total, shard)
                 },
             )?;
         }

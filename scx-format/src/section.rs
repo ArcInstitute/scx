@@ -37,9 +37,10 @@ pub enum SectionType {
     VarpEmbedding = 19,
     /// Row-shard of an `obsm/<name>` dense embedding (Arrow IPC).
     /// Section name: `obsm/<name>_shard_<idx>`. Same column schema as
-    /// [`ObsmEmbedding`]; Arrow schema metadata carries `row_start` /
-    /// `shard_idx` / `n_rows_total` so the reader can validate ordering
-    /// and total length. Readers concatenate shards in `shard_idx`
+    /// [`ObsmEmbedding`]; Arrow schema metadata carries `shard_idx` /
+    /// `row_start` / `n_shard_rows` / `n_rows_total` so the reader can
+    /// verify that the catalog entries form a contiguous, ordered cover
+    /// of the logical matrix. Readers concatenate shards in `shard_idx`
     /// order to reconstruct the logical matrix; legacy single-section
     /// [`ObsmEmbedding`] files remain readable.
     ObsmEmbeddingShard = 20,
@@ -50,10 +51,11 @@ pub enum SectionType {
     /// Row-shard of an `obsp/<name>` pairwise sparse matrix (Arrow IPC
     /// COO). Section name: `obsp/<name>_shard_<idx>`. Same column
     /// schema as [`ObspEmbedding`] (`row: Int32`, `col: Int32`,
-    /// `data: Float32`) with `row` values local to the shard's row
-    /// range; readers add the shard's `row_start` back when
-    /// reassembling. Schema metadata carries `row_start` / `shard_idx`
-    /// / `n_rows_total` / `n_rows` / `n_cols`.
+    /// `data: Float32`) with `row` values stored as **global** indices
+    /// (no shard-local renumbering). Readers concatenate shards in
+    /// `shard_idx` order without offset application. Schema metadata
+    /// carries `shard_idx` / `row_start` / `n_shard_rows` /
+    /// `n_rows_total` / `n_rows` / `n_cols`.
     ObspEmbeddingShard = 22,
     /// Row-shard of a `varp/<name>` pairwise sparse matrix. Mirror of
     /// [`ObspEmbeddingShard`] for the `varp/` axis.
