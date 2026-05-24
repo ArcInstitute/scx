@@ -747,15 +747,18 @@ fn drop_explicit_zeros(
 }
 
 /// Read obsm embeddings from h5ad file (root `/obsm`).
+///
+/// Kept for callers that need the non-streaming, fully-materialised
+/// view (the streaming pipeline now goes through
+/// [`list_dense_mapping_shapes`] + [`read_dense_mapping_shard`]). The
+/// `_at` form is also exposed for h5mu per-modality paths.
+#[allow(dead_code)]
 pub fn read_obsm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, ConvertError> {
     read_obsm_at(file, "obsm")
 }
 
-/// Read varm embeddings from h5ad file (root `/varm`).
-///
-/// `varm` has the same on-disk shape as `obsm`: a group of 2-D dense
-/// matrices, each `(n_vars, k)`. obsp/varp readers are a follow-on —
-/// they're typically pairwise sparse and need a different shape.
+/// Read varm embeddings from h5ad file (root `/varm`). See [`read_obsm`].
+#[allow(dead_code)]
 pub fn read_varm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, ConvertError> {
     read_obsm_at(file, "varm")
 }
@@ -816,6 +819,241 @@ fn read_obsm_entry(obsm_group: &hdf5::Group, name: &str) -> Result<RecordBatch, 
 
     let schema = Schema::new(fields);
     Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming readers for obsm / varm / obsp / varp.
+//
+// The non-streaming readers above (`read_obsm`, `read_varm`) materialise the
+// full dense matrix in one allocation before column-splitting, which dominates
+// peak RSS for inputs with large embeddings (n_obs × k × 4 B per matrix). The
+// helpers below expose a per-shard API the pipeline drives one row-range at a
+// time, bounding peak memory to `shard_rows × k × 4 B` (dense) or
+// `shard_rows × density × n_cols × 16 B` (sparse) per matrix.
+// ---------------------------------------------------------------------------
+
+/// Describes a dense obsm/varm dataset without reading any value bytes.
+/// Returned by [`list_dense_mapping_shapes`] so the pipeline can pre-plan
+/// the per-key shard schedule from h5py metadata only.
+///
+/// `n_cols` is unused by the current pipeline (the per-shard read in
+/// [`read_dense_mapping_shard`] re-derives it from the dataset shape)
+/// but is carried here so callers wanting to budget total memory ahead
+/// of time can do so without a second hdf5 open.
+#[derive(Debug, Clone)]
+pub struct DenseMappingInfo {
+    pub name: String,
+    pub n_rows: usize,
+    #[allow(dead_code)]
+    pub n_cols: usize,
+}
+
+/// Walk `<group_path>` in `file` and return each member's name + shape.
+/// Members that are not 2D datasets are skipped silently. Missing group →
+/// empty vec.
+pub fn list_dense_mapping_shapes(
+    file: &hdf5::File,
+    group_path: &str,
+) -> Result<Vec<DenseMappingInfo>, ConvertError> {
+    let mut result = Vec::new();
+    let group = match file.group(group_path) {
+        Ok(g) => g,
+        Err(_) => return Ok(result),
+    };
+    let names = group.member_names()?;
+    for name in &names {
+        let ds = match group.dataset(name) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let shape = ds.shape();
+        if shape.len() != 2 {
+            continue;
+        }
+        result.push(DenseMappingInfo {
+            name: name.clone(),
+            n_rows: shape[0],
+            n_cols: shape[1],
+        });
+    }
+    Ok(result)
+}
+
+/// Read a row-range `[row_start, row_end)` of `<group_path>/<name>` as
+/// an Arrow `RecordBatch`. The returned batch has `n_cols` columns named
+/// `"0", "1", ..., "{n_cols-1}"`, mirroring [`read_obsm_entry`].
+///
+/// Peak memory: `(row_end - row_start) × n_cols × 4 B` for the f32 slab
+/// plus an equivalent amount during column transpose.
+pub fn read_dense_mapping_shard(
+    file: &hdf5::File,
+    group_path: &str,
+    name: &str,
+    row_start: usize,
+    row_end: usize,
+) -> Result<RecordBatch, ConvertError> {
+    let group = file.group(group_path)?;
+    let ds = group.dataset(name)?;
+    let shape = ds.shape();
+    if shape.len() != 2 {
+        return Err(ConvertError::Other(format!(
+            "{group_path}/{name} is not 2D (shape: {shape:?})"
+        )));
+    }
+    let n_cols = shape[1];
+
+    // Hyperslab read of the row range; widen to f32 if necessary.
+    use crate::dense_stream::{read_dense_slab_f32, DenseDtype};
+    let desc = ds.dtype()?.to_descriptor()?;
+    let dtype = DenseDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "{group_path}/{name}: dtype {desc:?} cannot be read as f32"
+        ))
+    })?;
+    let flat: Vec<f32> = read_dense_slab_f32(&ds, dtype, row_start, row_end)?;
+
+    let n_local = row_end - row_start;
+    let mut fields = Vec::with_capacity(n_cols);
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(n_cols);
+    for col in 0..n_cols {
+        let col_data: Vec<f32> = (0..n_local).map(|row| flat[row * n_cols + col]).collect();
+        fields.push(Field::new(format!("{col}"), DataType::Float32, false));
+        arrays.push(Arc::new(Float32Array::from(col_data)));
+    }
+    let schema = Schema::new(fields);
+    Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
+}
+
+/// Describes a sparse obsp/varp pairwise matrix without reading the
+/// indptr/indices/data datasets. Carries the open `indptr` array so the
+/// pipeline can chunk the per-row CSR slice ranges without rereading
+/// `indptr` once per shard.
+pub struct SparseMappingInfo {
+    pub name: String,
+    pub n_rows: usize,
+    pub n_cols: usize,
+    /// Eagerly-loaded indptr (length = n_rows + 1). `n_rows + 1` int64s
+    /// — `(10⁶ + 1) × 8 B = 8 MB` for a million-row obsp, which is
+    /// already in the noise relative to the per-shard nnz reads.
+    pub indptr: Vec<i64>,
+}
+
+/// Walk `<group_path>` in `file` and return per-member shape + indptr.
+/// Members that aren't CSR sparse groups are silently skipped.
+pub fn list_sparse_mapping_shapes(
+    file: &hdf5::File,
+    group_path: &str,
+) -> Result<Vec<SparseMappingInfo>, ConvertError> {
+    let mut result = Vec::new();
+    let parent = match file.group(group_path) {
+        Ok(g) => g,
+        Err(_) => return Ok(result),
+    };
+    let names = parent.member_names()?;
+    for name in &names {
+        let sub = match parent.group(name) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let shape_attr: Vec<i64> = match sub.attr("shape").and_then(|a| a.read_1d::<i64>()) {
+            Ok(arr) => arr.to_vec(),
+            Err(_) => continue,
+        };
+        if shape_attr.len() != 2 {
+            continue;
+        }
+        let n_rows = shape_attr[0] as usize;
+        let n_cols = shape_attr[1] as usize;
+        let indptr_ds = match sub.dataset("indptr") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let indptr = match read_i64_dataset(&indptr_ds) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if indptr.len() != n_rows + 1 {
+            continue;
+        }
+        result.push(SparseMappingInfo {
+            name: name.clone(),
+            n_rows,
+            n_cols,
+            indptr,
+        });
+    }
+    Ok(result)
+}
+
+/// Read a row-range `[row_start, row_end)` of `<group_path>/<name>` as
+/// an Arrow `RecordBatch` in COO format (`row: Int32`, `col: Int32`,
+/// `data: Float32` + schema metadata `n_rows` / `n_cols` of the logical
+/// matrix). `row` values are global, not shard-local — the reader-side
+/// concatenation does not need to apply an offset.
+///
+/// `info.indptr` must be the cached full-indptr from
+/// [`list_sparse_mapping_shapes`] for this same key; the function only
+/// reads the indices/data slices `[indptr[row_start], indptr[row_end])`.
+pub fn read_sparse_mapping_shard(
+    file: &hdf5::File,
+    group_path: &str,
+    info: &SparseMappingInfo,
+    row_start: usize,
+    row_end: usize,
+) -> Result<RecordBatch, ConvertError> {
+    use crate::h5ad_stream::{read_slice_f32, read_slice_i32};
+
+    let parent = file.group(group_path)?;
+    let sub = parent.group(&info.name)?;
+    let nnz_start = info.indptr[row_start] as usize;
+    let nnz_end = info.indptr[row_end] as usize;
+
+    let cols = if nnz_end > nnz_start {
+        let indices_ds = sub.dataset("indices")?;
+        read_slice_i32(&indices_ds, nnz_start, nnz_end)?
+    } else {
+        Vec::new()
+    };
+    let data = if nnz_end > nnz_start {
+        let data_ds = sub.dataset("data")?;
+        read_slice_f32(&data_ds, nnz_start, nnz_end)?
+    } else {
+        Vec::new()
+    };
+    let mut rows: Vec<i32> = Vec::with_capacity(nnz_end - nnz_start);
+    for r in row_start..row_end {
+        let r_lo = info.indptr[r] as usize;
+        let r_hi = info.indptr[r + 1] as usize;
+        let r_i32 = i32::try_from(r).map_err(|_| {
+            ConvertError::Other(format!(
+                "{group_path}/{}: row index {r} exceeds i32::MAX (Arrow COO uses i32 row indices)",
+                info.name
+            ))
+        })?;
+        for _ in r_lo..r_hi {
+            rows.push(r_i32);
+        }
+    }
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), info.n_rows.to_string()),
+            ("n_cols".to_string(), info.n_cols.to_string()),
+        ]),
+    ));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(rows)),
+            Arc::new(Int32Array::from(cols)),
+            Arc::new(Float32Array::from(data)),
+        ],
+    )?)
 }
 
 /// Read uns (unstructured) section from h5ad file as JSON.

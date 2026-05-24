@@ -16,7 +16,8 @@ use super::dense_stream::{open_dense_layer_streaming, open_dense_streaming};
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
 use super::dtype::{detect_value_encoding, values_to_raw_bytes};
 use super::h5ad_read::{
-    read_dataframe_group, read_layers, read_obsm, read_uns, read_varm, read_x_matrix,
+    list_dense_mapping_shapes, list_sparse_mapping_shapes, read_dataframe_group,
+    read_dense_mapping_shard, read_layers, read_sparse_mapping_shard, read_uns, read_x_matrix,
 };
 use super::h5ad_stream::{open_layer_streaming, open_x_streaming};
 use super::h5ad_write::write_scx_to_h5ad;
@@ -657,12 +658,41 @@ pub fn h5ad_to_scx(
         )?;
     }
 
-    // Write optional sections
-    if let Ok(obsm_map) = read_obsm(&file) {
-        for (name, batch) in &obsm_map {
-            writer.write_obsm(name, batch)?;
-        }
-    }
+    // Write optional sections. Even on this non-streaming path we emit
+    // obsm/varm/obsp/varp as sharded sections so the on-disk layout is
+    // uniform with `h5ad_to_scx_streaming`.
+    write_dense_mapping_section(
+        &file,
+        &mut writer,
+        None,
+        "obsm",
+        opts.shard_target_rows,
+        DenseMappingKind::Obsm,
+    )?;
+    write_dense_mapping_section(
+        &file,
+        &mut writer,
+        None,
+        "varm",
+        opts.shard_target_rows,
+        DenseMappingKind::Varm,
+    )?;
+    write_sparse_mapping_section(
+        &file,
+        &mut writer,
+        None,
+        "obsp",
+        opts.shard_target_rows,
+        SparseMappingKind::Obsp,
+    )?;
+    write_sparse_mapping_section(
+        &file,
+        &mut writer,
+        None,
+        "varp",
+        opts.shard_target_rows,
+        SparseMappingKind::Varp,
+    )?;
 
     // Read /uns only when the group exists; key-level failures route
     // through the sink (lenient) or propagate (strict).
@@ -919,9 +949,15 @@ pub struct StreamingOverrides {
 /// [`scx_ops::rebuild_csc_inplace`] pass over the just-written file;
 /// peak disk briefly reaches ~2× the output size during the rebuild.
 ///
-/// `varm` is read and written; `obsp` / `varp` are silently skipped
-/// unless caller-supplied via [`StreamingOverrides`] (same gap the
-/// non-streaming CLI converter has). CSC-on-disk and dense `X` are
+/// `obsm` / `varm` / `obsp` / `varp` are hyperslab-read one row-range
+/// at a time and emitted as row-sharded sections
+/// (`<section>/<name>_shard_<idx>`). Peak memory per matrix is bounded
+/// by `shard_target_rows × k × 4 B` (dense) or
+/// `shard_target_rows × density × n_cols × 16 B` (sparse). Caller
+/// overrides supplied via [`StreamingOverrides`] are partitioned
+/// into the same row-shards on the way out. `uns` is read in full
+/// from disk when not overridden (typically KB–MB; no shard format
+/// makes sense for a JSON tree). CSC-on-disk and dense `X` are
 /// rejected up front with [`ConvertError::StreamingUnsupported`].
 pub fn h5ad_to_scx_streaming(
     input: &Path,
@@ -1027,48 +1063,47 @@ pub fn h5ad_to_scx_streaming(
     )?;
     drop(x_reader);
 
-    // obsm / varm / uns. Small dense sections — non-streaming reads,
-    // override-or-disk per section. obsp / varp have no on-disk
-    // readers yet, so they're only written when an override supplies
-    // them (matches the non-streaming converter's gap for now).
-    match overrides.obsm.as_ref() {
-        Some(entries) => {
-            for (name, batch) in entries {
-                writer.write_obsm(name, batch)?;
-            }
-        }
-        None => {
-            if let Ok(obsm_map) = read_obsm(&file) {
-                for (name, batch) in &obsm_map {
-                    writer.write_obsm(name, batch)?;
-                }
-            }
-        }
-    }
-    match overrides.varm.as_ref() {
-        Some(entries) => {
-            for (name, batch) in entries {
-                writer.write_varm(name, batch)?;
-            }
-        }
-        None => {
-            if let Ok(varm_map) = read_varm(&file) {
-                for (name, batch) in &varm_map {
-                    writer.write_varm(name, batch)?;
-                }
-            }
-        }
-    }
-    if let Some(entries) = overrides.obsp.as_ref() {
-        for (name, batch) in entries {
-            writer.write_obsp(name, batch)?;
-        }
-    }
-    if let Some(entries) = overrides.varp.as_ref() {
-        for (name, batch) in entries {
-            writer.write_varp(name, batch)?;
-        }
-    }
+    // obsm / varm / obsp / varp / uns. The dense + sparse mappings are
+    // emitted as row-sharded sections — one Arrow IPC section per
+    // shard — so peak memory is bounded by `shard_target_rows` worth
+    // of rows per matrix. Override path: an in-memory `RecordBatch`
+    // supplied by the caller (typically pyscx's backed-routing path
+    // for sections the user mutated in Python) is sliced into shards
+    // on the way out, also keeping peak memory to one shard at a time.
+    // Disk-streaming path: the source h5ad is hyperslab-read one
+    // row-range at a time per key.
+    write_dense_mapping_section(
+        &file,
+        &mut writer,
+        overrides.obsm.as_ref(),
+        "obsm",
+        opts.shard_target_rows,
+        DenseMappingKind::Obsm,
+    )?;
+    write_dense_mapping_section(
+        &file,
+        &mut writer,
+        overrides.varm.as_ref(),
+        "varm",
+        opts.shard_target_rows,
+        DenseMappingKind::Varm,
+    )?;
+    write_sparse_mapping_section(
+        &file,
+        &mut writer,
+        overrides.obsp.as_ref(),
+        "obsp",
+        opts.shard_target_rows,
+        SparseMappingKind::Obsp,
+    )?;
+    write_sparse_mapping_section(
+        &file,
+        &mut writer,
+        overrides.varp.as_ref(),
+        "varp",
+        opts.shard_target_rows,
+        SparseMappingKind::Varp,
+    )?;
     match overrides.uns.as_ref() {
         Some(json) => writer.write_uns(json)?,
         None => {
@@ -2064,6 +2099,325 @@ fn write_csr_shards(
         shard_idx += 1;
     }
     Ok(row_ranges)
+}
+
+/// Dispatch tag for [`write_dense_mapping_section`] so the shard
+/// writer can pick the right `ScxWriter` method without duplicating
+/// the obsm/varm loops.
+#[derive(Debug, Clone, Copy)]
+enum DenseMappingKind {
+    Obsm,
+    Varm,
+}
+
+/// Same for [`write_sparse_mapping_section`] over obsp/varp.
+#[derive(Debug, Clone, Copy)]
+enum SparseMappingKind {
+    Obsp,
+    Varp,
+}
+
+/// Emit one logical obsm/varm matrix as a sequence of row-shards. Used
+/// by [`h5ad_to_scx_streaming`] for both the override path (in-memory
+/// `RecordBatch` from pyscx) and the disk-streaming path (h5py
+/// hyperslab reads per shard).
+fn write_dense_mapping_section(
+    file: &hdf5::File,
+    writer: &mut ScxWriter,
+    override_entries: Option<&Vec<(String, RecordBatch)>>,
+    group_path: &str,
+    shard_target_rows: u32,
+    kind: DenseMappingKind,
+) -> Result<(), ConvertError> {
+    let emit = |w: &mut ScxWriter,
+                name: &str,
+                shard_idx: u32,
+                row_start: u64,
+                n_shard_rows: u64,
+                n_total: u64,
+                batch: &RecordBatch|
+     -> Result<(), ConvertError> {
+        match kind {
+            DenseMappingKind::Obsm => {
+                w.write_obsm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
+            }
+            DenseMappingKind::Varm => {
+                w.write_varm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
+            }
+        }
+        .map_err(ConvertError::from)
+    };
+
+    if let Some(entries) = override_entries {
+        for (name, batch) in entries {
+            let n_rows = batch.num_rows();
+            let n_total = n_rows as u64;
+            if n_rows == 0 {
+                emit(writer, name, 0, 0, 0, 0, batch)?;
+                continue;
+            }
+            let step = shard_target_rows.max(1) as usize;
+            let mut shard_idx = 0u32;
+            let mut row_start = 0usize;
+            while row_start < n_rows {
+                let n = (n_rows - row_start).min(step);
+                let shard = batch.slice(row_start, n);
+                emit(
+                    writer,
+                    name,
+                    shard_idx,
+                    row_start as u64,
+                    n as u64,
+                    n_total,
+                    &shard,
+                )?;
+                row_start += n;
+                shard_idx += 1;
+            }
+        }
+        return Ok(());
+    }
+
+    // Disk-streaming path. Skip silently when the group is missing.
+    let infos = list_dense_mapping_shapes(file, group_path)?;
+    for info in &infos {
+        let n_total = info.n_rows as u64;
+        // Zero-row dense mappings: emit a single empty shard so the key
+        // survives round-trip (mirrors the override-path special case).
+        if info.n_rows == 0 {
+            let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
+            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            continue;
+        }
+        let step = shard_target_rows.max(1) as usize;
+        let mut shard_idx = 0u32;
+        let mut row_start = 0usize;
+        while row_start < info.n_rows {
+            let row_end = (row_start + step).min(info.n_rows);
+            let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
+            let n_shard_rows = (row_end - row_start) as u64;
+            emit(
+                writer,
+                &info.name,
+                shard_idx,
+                row_start as u64,
+                n_shard_rows,
+                n_total,
+                &batch,
+            )?;
+            row_start = row_end;
+            shard_idx += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Emit one logical obsp/varp matrix as a sequence of row-shards. The
+/// override path takes a single materialised COO `RecordBatch` per key
+/// and partitions its triples by `row` into shard ranges; the
+/// disk-streaming path reads h5py CSR slices per row range.
+fn write_sparse_mapping_section(
+    file: &hdf5::File,
+    writer: &mut ScxWriter,
+    override_entries: Option<&Vec<(String, RecordBatch)>>,
+    group_path: &str,
+    shard_target_rows: u32,
+    kind: SparseMappingKind,
+) -> Result<(), ConvertError> {
+    let emit = |w: &mut ScxWriter,
+                name: &str,
+                shard_idx: u32,
+                row_start: u64,
+                n_shard_rows: u64,
+                n_total: u64,
+                batch: &RecordBatch|
+     -> Result<(), ConvertError> {
+        match kind {
+            SparseMappingKind::Obsp => {
+                w.write_obsp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
+            }
+            SparseMappingKind::Varp => {
+                w.write_varp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
+            }
+        }
+        .map_err(ConvertError::from)
+    };
+
+    if let Some(entries) = override_entries {
+        for (name, batch) in entries {
+            partition_coo_to_shards(
+                batch,
+                shard_target_rows,
+                |shard_idx, row_start, n_shard_rows, n_total, sub| {
+                    emit(
+                        writer,
+                        name,
+                        shard_idx,
+                        row_start,
+                        n_shard_rows,
+                        n_total,
+                        sub,
+                    )
+                },
+            )?;
+        }
+        return Ok(());
+    }
+
+    let infos = list_sparse_mapping_shapes(file, group_path)?;
+    for info in &infos {
+        let n_total = info.n_rows as u64;
+        // Zero-row sparse mappings: emit a single empty shard so the
+        // key survives round-trip (mirrors the override-path special
+        // case in `partition_coo_to_shards`).
+        if info.n_rows == 0 {
+            let batch = read_sparse_mapping_shard(file, group_path, info, 0, 0)?;
+            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            continue;
+        }
+        let step = shard_target_rows.max(1) as usize;
+        let mut shard_idx = 0u32;
+        let mut row_start = 0usize;
+        while row_start < info.n_rows {
+            let row_end = (row_start + step).min(info.n_rows);
+            let batch = read_sparse_mapping_shard(file, group_path, info, row_start, row_end)?;
+            let n_shard_rows = (row_end - row_start) as u64;
+            emit(
+                writer,
+                &info.name,
+                shard_idx,
+                row_start as u64,
+                n_shard_rows,
+                n_total,
+                &batch,
+            )?;
+            row_start = row_end;
+            shard_idx += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Slice an in-memory COO `RecordBatch` into row-aligned shards and
+/// invoke `f` once per shard. Used only on the override path — the
+/// disk-streaming path reads pre-sliced shards directly.
+fn partition_coo_to_shards<F>(
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+    mut f: F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> Result<(), ConvertError>,
+{
+    use arrow::array::{Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let row_arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| ConvertError::Other("sparse override: column 0 must be Int32".into()))?;
+    let col_arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| ConvertError::Other("sparse override: column 1 must be Int32".into()))?;
+    let data_arr = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| ConvertError::Other("sparse override: column 2 must be Float32".into()))?;
+
+    let metadata = batch.schema_ref().metadata().clone();
+    let n_rows: usize = metadata
+        .get("n_rows")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            ConvertError::Other("sparse override: schema metadata missing 'n_rows'".into())
+        })?;
+    let n_cols: usize = metadata
+        .get("n_cols")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            ConvertError::Other("sparse override: schema metadata missing 'n_cols'".into())
+        })?;
+
+    let step = shard_target_rows.max(1) as usize;
+    if n_rows == 0 {
+        let sub = batch.slice(0, 0);
+        f(0, 0, 0, 0, &sub)?;
+        return Ok(());
+    }
+
+    let nnz = row_arr.len();
+    let row_values = row_arr.values();
+    let col_values = col_arr.values();
+    let data_values = data_arr.values();
+
+    // Group COO triples by shard via a single linear pass; the override
+    // batch may be unsorted by row, so we bucket into per-shard Vecs.
+    let n_shards = n_rows.div_ceil(step);
+    let mut buckets_row: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut buckets_col: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut buckets_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    for i in 0..nnz {
+        let r = row_values[i];
+        if r < 0 {
+            return Err(ConvertError::Other(format!(
+                "sparse override: negative row index {r}"
+            )));
+        }
+        let shard = (r as usize) / step;
+        if shard >= n_shards {
+            return Err(ConvertError::Other(format!(
+                "sparse override: row {r} exceeds n_rows={n_rows}"
+            )));
+        }
+        buckets_row[shard].push(r);
+        buckets_col[shard].push(col_values[i]);
+        buckets_data[shard].push(data_values[i]);
+    }
+
+    let n_total = n_rows as u64;
+    for shard_idx in 0..n_shards {
+        let row_start = shard_idx * step;
+        let n_shard_rows = step.min(n_rows - row_start);
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Int32, false),
+                Field::new("col", DataType::Int32, false),
+                Field::new("data", DataType::Float32, false),
+            ],
+            HashMap::from([
+                ("n_rows".to_string(), n_rows.to_string()),
+                ("n_cols".to_string(), n_cols.to_string()),
+            ]),
+        ));
+        let shard_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(std::mem::take(
+                    &mut buckets_row[shard_idx],
+                ))),
+                Arc::new(Int32Array::from(std::mem::take(
+                    &mut buckets_col[shard_idx],
+                ))),
+                Arc::new(Float32Array::from(std::mem::take(
+                    &mut buckets_data[shard_idx],
+                ))),
+            ],
+        )?;
+        f(
+            shard_idx as u32,
+            row_start as u64,
+            n_shard_rows as u64,
+            n_total,
+            &shard_batch,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

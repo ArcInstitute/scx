@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
 use byteorder::{LittleEndian, ReadBytesExt};
 use scx_codec::{CodecId, ValueEncoding};
 
@@ -121,6 +123,40 @@ pub struct PreEncodedSection {
     pub section_type: SectionType,
     /// NNZ count for this shard.
     pub nnz: u64,
+}
+
+/// Stamp a sharded `obsm` / `varm` / `obsp` / `varp` batch with the
+/// per-shard metadata the reader uses to verify a contiguous, ordered
+/// cover of the logical matrix and reassemble it. Stamped fields
+/// (`shard_idx`, `row_start`, `n_shard_rows`, `n_rows_total`) ride on
+/// the Arrow schema metadata so the reader can recover them without a
+/// separate sidecar section.
+///
+/// For dense shards `n_shard_rows == batch.num_rows()` and the field
+/// is redundant; for sparse shards `batch.num_rows()` counts COO
+/// triples (= nnz in the shard's row range) rather than the row span,
+/// so the stamped value is the only authoritative source.
+fn stamp_dense_shard_metadata(
+    batch: &RecordBatch,
+    shard_idx: u32,
+    row_start: u64,
+    n_shard_rows: u64,
+    n_rows_total: u64,
+) -> RecordBatch {
+    let mut metadata = batch.schema_ref().metadata().clone();
+    metadata.insert("shard_idx".to_string(), shard_idx.to_string());
+    metadata.insert("row_start".to_string(), row_start.to_string());
+    metadata.insert("n_shard_rows".to_string(), n_shard_rows.to_string());
+    metadata.insert("n_rows_total".to_string(), n_rows_total.to_string());
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        batch.schema_ref().fields().clone(),
+        metadata,
+    ));
+    // Columns and field count are unchanged — this can only fail if the
+    // input batch is itself malformed, in which case `write_arrow_ipc`
+    // would have failed too. We unwrap to keep the API ergonomic.
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .expect("shard metadata stamping preserves schema fields")
 }
 
 impl ScxWriter {
@@ -377,6 +413,117 @@ impl ScxWriter {
         self.write_section_bytes(
             format!("varp/{name}"),
             SectionType::VarpEmbedding,
+            &data,
+            None,
+        )
+    }
+
+    /// Write a row-shard of an `obsm/<name>` dense embedding (Arrow IPC).
+    ///
+    /// Section name: `obsm/<name>_shard_<shard_idx>`. The batch's
+    /// `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total` are
+    /// stamped into the schema metadata before encoding so the reader
+    /// can verify a contiguous, ordered cover of the logical matrix
+    /// when reassembling shards. For dense shards
+    /// `n_shard_rows == batch.num_rows()`; the field is redundant
+    /// but stamped uniformly so the reader's verification path is the
+    /// same for dense and sparse. Readers (`ScxReader::read_obsm`)
+    /// concatenate shards in `shard_idx` order; legacy single-section
+    /// `ObsmEmbedding` files remain readable.
+    pub fn write_obsm_shard(
+        &mut self,
+        name: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        self.has_obsm = true;
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        self.write_section_bytes(
+            format!("obsm/{name}_shard_{shard_idx}"),
+            SectionType::ObsmEmbeddingShard,
+            &data,
+            None,
+        )
+    }
+
+    /// Write a row-shard of a `varm/<name>` dense embedding (Arrow IPC).
+    ///
+    /// Mirror of [`Self::write_obsm_shard`] for the `varm/` axis.
+    pub fn write_varm_shard(
+        &mut self,
+        name: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        self.write_section_bytes(
+            format!("varm/{name}_shard_{shard_idx}"),
+            SectionType::VarmEmbeddingShard,
+            &data,
+            None,
+        )
+    }
+
+    /// Write a row-shard of an `obsp/<name>` pairwise sparse matrix
+    /// (Arrow IPC COO).
+    ///
+    /// The batch must have the same column schema as the single-section
+    /// [`Self::write_obsp`] (`row: Int32`, `col: Int32`, `data: Float32`)
+    /// and contain only the non-zero triples whose `row` is in
+    /// `[row_start, row_start + n_rows_in_shard)`. `row` values are
+    /// stored as **global** indices (no shard-local renumbering); the
+    /// reader concatenates shards without offset application. Schema
+    /// metadata is augmented with `shard_idx`, `row_start`,
+    /// `n_shard_rows`, and `n_rows_total`; the original `n_rows`/`n_cols`
+    /// (the logical matrix shape) is preserved.
+    pub fn write_obsp_shard_coo(
+        &mut self,
+        name: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        self.has_obsp = true;
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        self.write_section_bytes(
+            format!("obsp/{name}_shard_{shard_idx}"),
+            SectionType::ObspEmbeddingShard,
+            &data,
+            None,
+        )
+    }
+
+    /// Write a row-shard of a `varp/<name>` pairwise sparse matrix
+    /// (Arrow IPC COO). Mirror of [`Self::write_obsp_shard_coo`].
+    pub fn write_varp_shard_coo(
+        &mut self,
+        name: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        self.write_section_bytes(
+            format!("varp/{name}_shard_{shard_idx}"),
+            SectionType::VarpEmbeddingShard,
             &data,
             None,
         )

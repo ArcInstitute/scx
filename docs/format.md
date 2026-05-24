@@ -188,7 +188,11 @@ opening a v1 file.
 | 17 | `varm_embedding` (Arrow IPC; dense `n_vars × n_components` embedding — mirror of `obsm_embedding`) |
 | 18 | `obsp_embedding` (Arrow IPC; COO sparse `n_obs × n_obs` pairwise matrix — see § COO wire format below) |
 | 19 | `varp_embedding` (Arrow IPC; COO sparse `n_vars × n_vars` pairwise matrix — same wire format as `obsp_embedding`) |
-| 20–31 | Reserved for multimodal/spatial extensions |
+| 20 | `obsm_embedding_shard` (Arrow IPC; row-shard of an `obsm/<name>` dense embedding — see § Sharded obsm/varm/obsp/varp below) |
+| 21 | `varm_embedding_shard` (Arrow IPC; row-shard of a `varm/<name>` dense embedding) |
+| 22 | `obsp_embedding_shard` (Arrow IPC COO; row-shard of an `obsp/<name>` pairwise sparse matrix) |
+| 23 | `varp_embedding_shard` (Arrow IPC COO; row-shard of a `varp/<name>` pairwise sparse matrix) |
+| 24–31 | Reserved for multimodal/spatial extensions |
 | 32–239 | Reserved for future use |
 | 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
@@ -410,6 +414,34 @@ section.
   `obsp` to the kept rows and columns at read time so the materialized
   AnnData satisfies `obsp[k].shape == (n_obs, n_obs)`. `varp` lives on the
   var axis and is not affected by deletion vectors.
+
+#### Sharded layout (section types 20–23)
+
+Files written by pyscx 0.5+ and the `scx-convert` streaming pipeline
+shard the `obsm` / `varm` / `obsp` / `varp` sections into row-aligned
+chunks so the converter and the consumer can bound peak RSS at one
+`shard_target_rows`-worth of rows per matrix, regardless of total
+`n_obs` / `n_vars` or per-key `k`. The shape on disk is:
+
+- **`obsm_embedding_shard` (20)** — name `obsm/<key>_shard_<idx>`. Arrow
+  IPC of a dense `(n_local_rows × n_components)` `RecordBatch` covering
+  rows `[row_start, row_start + n_local_rows)` of the logical matrix.
+  Schema metadata: `row_start: u64`, `shard_idx: u32`,
+  `n_rows_total: u64`.
+- **`varm_embedding_shard` (21)** — symmetric, on the var axis.
+- **`obsp_embedding_shard` (22)** — name `obsp/<key>_shard_<idx>`. Arrow
+  IPC COO `RecordBatch` (`row: Int32`, `col: Int32`, `data: Float32`)
+  containing the non-zero triples whose `row` is in
+  `[row_start, row_start + n_local_rows)`. Schema metadata carries
+  `n_rows` / `n_cols` (logical matrix shape) plus `row_start` /
+  `shard_idx` / `n_rows_total`. `row` values are global indices.
+- **`varp_embedding_shard` (23)** — symmetric, on the var axis.
+
+`ScxReader::read_obsm` and the obsm/varm/obsp/varp friends transparently
+scan the catalog for sharded entries, sort by `shard_idx`, and
+concatenate via `arrow::compute::concat_batches`. Legacy single-section
+files (types 8 / 17 / 18 / 19) keep reading via the fall-through path
+in the same accessor — no migration required.
 
 ## 6. Predicate Indexes
 

@@ -209,9 +209,11 @@ and float data (e.g., log-normalized layers) uses Pcodec for 7–16% better comp
 
 For h5ad files that don't fit in RAM, use `pyscx.from_h5ad(path, out)`. It
 opens the file in Rust via `scx-convert` and writes one shard's worth of
-rows at a time, bounding peak memory to roughly `shard_target_rows × n_vars × density × ~16 bytes` plus the always-resident `indptr` (`(n_obs + 1) × 8`
-bytes — ~80 MB at 10M cells, ~800 MB at 100M cells).
-No Python AnnData object is constructed.
+rows at a time, bounding peak memory to roughly `shard_target_rows × n_vars × density × ~16 bytes` per X shard, plus one row-shard per
+`obsm` / `varm` / `obsp` / `varp` matrix (hyperslab-read from the source
+h5ad and written as row-aligned sections), plus the always-resident
+`indptr` (`(n_obs + 1) × 8` bytes — ~80 MB at 10M cells, ~800 MB at
+100M cells). No Python AnnData object is constructed.
 
 ```python
 import pyscx

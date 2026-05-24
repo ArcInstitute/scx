@@ -706,7 +706,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
 - `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
-  plus the always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
+  per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
+  `obsp` / `varp` matrix (each is now hyperslab-read and emitted as
+  row-sharded sections — see [§ Sharded obsm/varm/obsp/varp in the
+  format spec](format.md#sharded-layout-section-types-20-23)), plus the
+  always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
   entry point for files larger than RAM. `csc="always"` performs a
   two-pass write (streaming CSR → `rebuild_csc_inplace` on the
   finished file) — peak disk briefly reaches ~2× the output size during
@@ -732,7 +736,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     (see [Memory budgets](#memory-budgets)).
   - `stream=False` falls back to the materialising path (kept for
     parity / debugging).
-  - `obsp` / `varp` on the input are silently skipped.
+  - `obsm` / `varm` / `obsp` / `varp` on the input are hyperslab-read
+    one row-range at a time and emitted as row-sharded sections
+    (`<section>/<name>_shard_<idx>`); peak memory per matrix is
+    bounded by one shard's worth of rows.
   - `reader_threads`: streaming reader worker count.
     `None` (default) resolves to `RAYON_NUM_THREADS` if set, else
     `os.cpu_count()`. `1` forces the sequential coordinator. `> 1`

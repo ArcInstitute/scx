@@ -138,15 +138,21 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// **Backed AnnData auto-routes to streaming.** When `adata.isbacked` is
 /// true and `adata.filename` (or `adata.file.filename`) resolves to a
 /// readable h5ad path, the call dispatches to the streaming pipeline
-/// instead of materialising `X`. Peak memory becomes bounded by one
-/// shard's worth of CSR plus encode buffers, matching `from_h5ad`.
-/// In-Python mutations to `obs` / `var` / `uns` / `obsm` / `varm` /
-/// `obsp` / `varp` are preserved verbatim — the on-disk values are
-/// overridden by the caller's. Layers are streamed directly from disk;
-/// if the in-memory AnnData has layer mutations, a `UserWarning` fires
-/// (use `from_h5ad` after rewriting an h5ad if you need them
-/// preserved). Backed AnnDatas without a resolvable filename (e.g.
-/// zarr-backed) raise `NotImplementedError`.
+/// instead of materialising `X`. Peak memory becomes bounded by one X
+/// shard's worth of CSR plus one row-shard per `obsm` / `varm` / `obsp`
+/// / `varp` matrix (each shard is `shard_size × k × 4 B` for dense
+/// embeddings, `shard_size × density × 16 B` for sparse pairwise).
+/// `obs` / `var` are extracted from Python once (typically a few hundred
+/// MB at most). In-Python mutations to `obs` / `var` / `uns` / `obsm` /
+/// `varm` / `obsp` / `varp` are preserved when detected via top-level
+/// key comparison against the on-disk h5py groups; if a user replaced a
+/// value under an existing key in place, the on-disk version wins and a
+/// `UserWarning` fires listing the sections routed from disk. Layers
+/// are always streamed directly from disk; if the in-memory AnnData has
+/// layer mutations, a separate `UserWarning` fires (use `from_h5ad`
+/// after rewriting an h5ad if you need them preserved). Backed
+/// AnnDatas without a resolvable filename (e.g. zarr-backed) raise
+/// `NotImplementedError`.
 ///
 /// Example:
 ///     pyscx.from_anndata(adata, "output.scx")
@@ -210,11 +216,15 @@ fn from_anndata(
 ///
 /// `pyscx.from_h5ad(path, out)` reads `path` from disk through the
 /// `scx-convert` streaming pipeline and writes `out` shard-by-shard.
-/// Peak memory is bounded by one shard's worth of CSR plus encode
-/// buffers (plus the always-resident `indptr`, ~80 MB at 10M cells),
-/// so this is the recommended entry point for h5ad files larger than
-/// node RAM. For files that comfortably fit in memory, `from_anndata`
-/// remains a touch faster.
+/// Peak memory is bounded by one X shard plus one row-shard per
+/// `obsm` / `varm` / `obsp` / `varp` matrix (plus the always-resident
+/// `indptr`, ~80 MB at 10M cells), so this is the recommended entry
+/// point for h5ad files larger than node RAM. `obsm` / `varm` /
+/// `obsp` / `varp` are read by hyperslab from h5py one row-range at a
+/// time, then emitted as row-sharded sections — `obsm`-heavy inputs
+/// (e.g. embeddings totalling tens of GB) no longer materialise their
+/// matrices in memory. For files that comfortably fit in memory,
+/// `from_anndata` remains a touch faster.
 ///
 /// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
 /// `from_anndata` exactly.
