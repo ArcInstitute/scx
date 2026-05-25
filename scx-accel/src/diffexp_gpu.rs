@@ -646,6 +646,155 @@ fn pdex_ref_chunk_gpu_sequence(
     Ok(())
 }
 
+/// G10.5: wilcoxon per-chunk GPU kernel sequence (pool scatter, sort,
+/// tie, then per-test-group sequence with stage_dtod). The wilcoxon
+/// analogue of `pdex_ref_chunk_gpu_sequence`; the per-tg sequence
+/// branches on `is_ref_mode`:
+///
+/// - **Ref-mode** (`reference: Some(...)`, `is_ref_mode = true`):
+///   `gpu_de_searchsorted_u_stat → gpu_de_block_sort →
+///    gpu_de_combined_tie_term → memcpy_dtod u → memcpy_dtod tie`.
+///   Per-tg tie staged into `scratch.tie_per_group` for batched dtoh
+///   after the captured region (see `wilcoxon_rank_sum_gpu_chunked`'s
+///   post-pass).
+/// - **1-vs-rest** (`reference: None`, `is_ref_mode = false`):
+///   `gpu_de_searchsorted_ranksum → memcpy_dtod u`. The per-chunk
+///   pool tie in `scratch.tie_term` survives to the caller's
+///   post-capture dtoh; no per-tg tie work.
+///
+/// Pre-condition: `scratch.dense` populated, `scratch.ref_slab` /
+/// `scratch.group_slab` / `scratch.u_or_rank` / per-group slabs
+/// pre-grown by the caller. Empty test groups (`n_g == 0`) are
+/// skipped — those rows in the per-group slabs are left
+/// uninitialized; the host-side post-pass synthesizes NaN
+/// scores / p=1 for them.
+#[allow(clippy::too_many_arguments)]
+fn wilcoxon_chunk_gpu_sequence(
+    dev: &GpuDevice,
+    scratch: &mut scx_gpu::GpuDeChunkScratch,
+    pool_idx_i32: &[i32],
+    group_idx_i32: &[Vec<i32>],
+    test_groups: &[usize],
+    group_indices: &[Vec<usize>],
+    sz: usize,
+    n_obs: usize,
+    pool_len: usize,
+    chunk_max: usize,
+    is_ref_mode: bool,
+) -> Result<()> {
+    // Pool slab + sort + tie. The pool is the ref set in ref-mode or
+    // all cells in 1-vs-rest; either way `scratch.ref_slab` holds it
+    // after the scatter and `scratch.tie_term` holds its tie term.
+    gpu_de_scatter_gene_major(
+        dev,
+        &scratch.dense,
+        pool_idx_i32,
+        &mut scratch.ref_slab,
+        n_obs,
+        sz,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter pool: {e}")))?;
+    gpu_de_block_sort(
+        dev,
+        &mut scratch.ref_slab,
+        &mut scratch.slab_aux,
+        sz,
+        pool_len,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool: {e}")))?;
+    gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, pool_len)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE pool tie: {e}")))?;
+
+    // Per-test-group sequence.
+    for (tg_idx, &g) in test_groups.iter().enumerate() {
+        let n_g = group_indices[g].len();
+        if n_g == 0 {
+            continue;
+        }
+
+        gpu_de_scatter_gene_major(
+            dev,
+            &scratch.dense,
+            &group_idx_i32[tg_idx],
+            &mut scratch.group_slab,
+            n_obs,
+            sz,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
+
+        if is_ref_mode {
+            // U1 from ref searchsorted → scratch.u_or_rank.
+            gpu_de_searchsorted_u_stat(
+                dev,
+                &scratch.ref_slab,
+                &scratch.group_slab,
+                &mut scratch.u_or_rank,
+                sz,
+                pool_len,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
+            // Combined tie for ref ∪ group → scratch.tie_term
+            // (overwrites the pool tie computed above — that's fine
+            // in ref-mode; pool tie is unused downstream there).
+            gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
+            gpu_de_combined_tie_term(
+                dev,
+                &scratch.ref_slab,
+                &scratch.group_slab,
+                &mut scratch.tie_term,
+                sz,
+                pool_len,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE combined tie: {e}")))?;
+            // Stage combined tie → tie_per_group (ref-mode only).
+            let tie_off = tg_idx * chunk_max;
+            let tie_src = scratch
+                .tie_term
+                .try_slice(..sz)
+                .ok_or_else(|| AccelError::LinAlg("tie_term source slice OOB".into()))?;
+            let mut tie_dst = scratch
+                .tie_per_group
+                .try_slice_mut(tie_off..tie_off + sz)
+                .ok_or_else(|| AccelError::LinAlg("tie_per_group dest slice OOB".into()))?;
+            dev.stream()
+                .memcpy_dtod(&tie_src, &mut tie_dst)
+                .map_err(|e| AccelError::LinAlg(format!("stage tie: {e}")))?;
+        } else {
+            // Rank sum via all-searchsorted → scratch.u_or_rank.
+            // No per-tg tie work; the pool tie in scratch.tie_term
+            // (set above) is the global tie correction for every tg.
+            gpu_de_searchsorted_ranksum(
+                dev,
+                &scratch.ref_slab,
+                &scratch.group_slab,
+                &mut scratch.u_or_rank,
+                sz,
+                pool_len,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted rank: {e}")))?;
+        }
+
+        // Stage u_or_rank → u_per_group (both modes).
+        let u_off = tg_idx * chunk_max;
+        let u_src = scratch
+            .u_or_rank
+            .try_slice(..sz)
+            .ok_or_else(|| AccelError::LinAlg("u_or_rank source slice OOB".into()))?;
+        let mut u_dst = scratch
+            .u_per_group
+            .try_slice_mut(u_off..u_off + sz)
+            .ok_or_else(|| AccelError::LinAlg("u_per_group dest slice OOB".into()))?;
+        dev.stream()
+            .memcpy_dtod(&u_src, &mut u_dst)
+            .map_err(|e| AccelError::LinAlg(format!("stage U: {e}")))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pdex_ref_gpu_chunked<F>(
     dev: &GpuDevice,
@@ -870,6 +1019,7 @@ where
                 n_ref: n_ref as u32,
                 n_g_max: n_g_max as u32,
                 n_test_groups: n_test as u32,
+                mode: 0, // pdex_ref
             };
             let pts_clone = pts.clone();
             let mut cache = dev.graph_cache();
@@ -1134,7 +1284,16 @@ where
     let n_test = test_groups.len();
     let mut chunk_results: Vec<DiffExpResult> = Vec::new();
 
-    for c0 in (0..n_vars).step_by(chunk_size) {
+    // G10.5: side-stream + dev clone for graph capture (mirrors
+    // pdex_ref_gpu_chunked). Each chunk's captureable region runs on
+    // `dev_pts.stream()` = per_thread_stream when graphs are enabled
+    // and the chunk has no empty groups. Chunk 0 runs direct on
+    // `dev_pts` to warm the module cache; chunks 1+ go through
+    // `cache.get_or_capture` and replay.
+    let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+    let dev_pts = dev.with_stream(pts.clone());
+
+    for (chunk_idx, c0) in (0..n_vars).step_by(chunk_size).enumerate() {
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
 
@@ -1158,159 +1317,116 @@ where
         )
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk: {e}")))?;
 
-        // Build the sort pool slab once per chunk. G2: the pool slab lives in
-        // `scratch.ref_slab` (already sized to chunk_size × max_pool); the
-        // scatter writes (sz × pool_len) into the prefix.
-        let (pool_len, _pool_perm_i32) = match (&ref_idx_i32, &all_idx_i32) {
-            (Some(ref_i32), _) => {
-                let n_ref = ref_i32.len();
-                gpu_de_scatter_gene_major(
-                    dev,
-                    &scratch.dense,
-                    ref_i32,
-                    &mut scratch.ref_slab,
-                    n_obs,
-                    sz,
-                )
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
-                (n_ref, Some(ref_i32))
-            }
-            (None, Some(all_i32)) => {
-                gpu_de_scatter_gene_major(
-                    dev,
-                    &scratch.dense,
-                    all_i32,
-                    &mut scratch.ref_slab,
-                    n_obs,
-                    sz,
-                )
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter all: {e}")))?;
-                (n_obs, Some(all_i32))
-            }
+        // Resolve the pool index slice + length per mode. Ref-mode
+        // uses the reference group's cells; 1-vs-rest uses all cells.
+        // Kernel parameterisation is the same in either case (the
+        // pool is the searchsorted "haystack").
+        let pool_idx_i32: &[i32] = match (&ref_idx_i32, &all_idx_i32) {
+            (Some(r), _) => r,
+            (None, Some(a)) => a,
             (None, None) => unreachable!(),
         };
+        let pool_len = pool_idx_i32.len();
+        let is_ref_mode = reference.is_some();
 
-        gpu_de_block_sort(
-            dev,
-            &mut scratch.ref_slab,
-            &mut scratch.slab_aux,
-            sz,
-            pool_len,
-        )
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool: {e}")))?;
+        // G10.5: graph-aware dispatch of the per-chunk GPU sequence
+        // (pool scatter+sort+tie + per-tg searchsort{_u | _ranksum} +
+        // [ref-mode] sort+combined_tie+stage_tie + stage_u). Mirrors
+        // G10.4 pdex_ref. Skip capture when any test group is empty
+        // (different chunk-kernel count vs the cached graph). Cache
+        // key includes `mode` so ref-mode and 1-vs-rest graphs never
+        // collide.
+        let chunk_max = scratch.chunk_max();
+        let any_empty = test_groups.iter().any(|&g| group_indices[g].is_empty());
+        let graphs_active = cuda_graphs_enabled() && !any_empty;
 
-        // Tie term over the pool (used for ref mode + as the base for combined
-        // ties in ref mode; for 1-vs-rest this is the global tie correction).
-        gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, pool_len)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE pool tie: {e}")))?;
-        let mut pool_tie_host = dev
-            .dtoh_copy(&scratch.tie_term)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh pool tie: {e}")))?;
-        pool_tie_host.truncate(sz);
-
-        // Per test group: searchsorted, p-value, z, logFC.
-        // Tuple = (group_name, gene_names, scores, pvals, logfc) — packaged
-        // per chunk and consumed by `assemble_chunk_diffexp_result`.
-        type ChunkGroupRow = (String, Vec<String>, Vec<f64>, Vec<f64>, Vec<f64>);
-        let mut chunk_per_group: Vec<ChunkGroupRow> = Vec::with_capacity(n_test);
-
-        for (tg_idx, &g) in test_groups.iter().enumerate() {
-            let group_cells = &group_indices[g];
-            let n_g = group_cells.len();
-            let group_name = group_names[g].clone();
-
-            if n_g == 0 {
-                let names = gene_names[c0..c1].to_vec();
-                let scores = vec![f64::NAN; sz];
-                let pvals = vec![1.0f64; sz];
-                let logfc = vec![f64::NAN; sz];
-                chunk_per_group.push((group_name, names, scores, pvals, logfc));
-                continue;
-            }
-
-            // G2: scratch.group_slab is pre-sized for the largest test group;
-            // the scatter writes (sz × n_g) into its prefix.
-            gpu_de_scatter_gene_major(
-                dev,
-                &scratch.dense,
-                &group_idx_i32[tg_idx],
-                &mut scratch.group_slab,
-                n_obs,
+        if !graphs_active || chunk_idx == 0 {
+            let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };
+            wilcoxon_chunk_gpu_sequence(
+                target_dev,
+                &mut scratch,
+                pool_idx_i32,
+                &group_idx_i32,
+                &test_groups,
+                &group_indices,
                 sz,
-            )
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
-
-            // G10.4: GPU-only path. Kernel sequence writes to
-            // `scratch.u_or_rank` (U or rank-sum) and (ref mode only)
-            // `scratch.tie_term` (combined tie). Both get `memcpy_dtod`-
-            // staged into the per-tg slabs; the dtoh batches at chunk
-            // end. No per-tg host sync here.
-            if reference.is_some() {
-                gpu_de_searchsorted_u_stat(
-                    dev,
-                    &scratch.ref_slab,
-                    &scratch.group_slab,
-                    &mut scratch.u_or_rank,
+                n_obs,
+                pool_len,
+                chunk_max,
+                is_ref_mode,
+            )?;
+        } else {
+            let mode_byte: u8 = if is_ref_mode { 1 } else { 2 };
+            let key = GraphKey::DeChunk {
+                chunk_size: sz as u32,
+                n_ref: pool_len as u32,
+                n_g_max: n_g_max_for_wil as u32,
+                n_test_groups: n_test as u32,
+                mode: mode_byte,
+            };
+            let pts_clone = pts.clone();
+            let mut cache = dev.graph_cache();
+            let cache_result = cache.get_or_capture(key, &pts_clone, |_stream| {
+                wilcoxon_chunk_gpu_sequence(
+                    &dev_pts,
+                    &mut scratch,
+                    pool_idx_i32,
+                    &group_idx_i32,
+                    &test_groups,
+                    &group_indices,
                     sz,
+                    n_obs,
                     pool_len,
-                    n_g,
+                    chunk_max,
+                    is_ref_mode,
                 )
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
-                gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
-                gpu_de_combined_tie_term(
-                    dev,
-                    &scratch.ref_slab,
-                    &scratch.group_slab,
-                    &mut scratch.tie_term,
-                    sz,
-                    pool_len,
-                    n_g,
-                )
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE combined tie: {e}")))?;
-                // Stage tie_term → tie_per_group (ref-mode only).
-                let tie_off = tg_idx * chunk_size;
-                let tie_src = scratch
-                    .tie_term
-                    .try_slice(..sz)
-                    .ok_or_else(|| AccelError::LinAlg("tie_term source slice OOB".into()))?;
-                let mut tie_dst = scratch
-                    .tie_per_group
-                    .try_slice_mut(tie_off..tie_off + sz)
-                    .ok_or_else(|| AccelError::LinAlg("tie_per_group dest slice OOB".into()))?;
-                dev.stream()
-                    .memcpy_dtod(&tie_src, &mut tie_dst)
-                    .map_err(|e| AccelError::LinAlg(format!("stage tie: {e}")))?;
-            } else {
-                gpu_de_searchsorted_ranksum(
-                    dev,
-                    &scratch.ref_slab,
-                    &scratch.group_slab,
-                    &mut scratch.u_or_rank,
-                    sz,
-                    pool_len,
-                    n_g,
-                )
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted rank: {e}")))?;
+                .map_err(|e| scx_gpu::GpuError::CudaError(format!("{e}")))
+            });
+            match cache_result {
+                Ok(graph) => graph
+                    .launch()
+                    .map_err(|e| AccelError::LinAlg(format!("wilcoxon graph.launch: {e}")))?,
+                Err(_) => {
+                    drop(cache);
+                    wilcoxon_chunk_gpu_sequence(
+                        &dev_pts,
+                        &mut scratch,
+                        pool_idx_i32,
+                        &group_idx_i32,
+                        &test_groups,
+                        &group_indices,
+                        sz,
+                        n_obs,
+                        pool_len,
+                        chunk_max,
+                        is_ref_mode,
+                    )?;
+                }
             }
-            // Stage u_or_rank → u_per_group (both modes).
-            let u_off = tg_idx * chunk_size;
-            let u_src = scratch
-                .u_or_rank
-                .try_slice(..sz)
-                .ok_or_else(|| AccelError::LinAlg("u_or_rank source slice OOB".into()))?;
-            let mut u_dst = scratch
-                .u_per_group
-                .try_slice_mut(u_off..u_off + sz)
-                .ok_or_else(|| AccelError::LinAlg("u_per_group dest slice OOB".into()))?;
-            dev.stream()
-                .memcpy_dtod(&u_src, &mut u_dst)
-                .map_err(|e| AccelError::LinAlg(format!("stage U: {e}")))?;
         }
 
-        // G10.4: batched dtoh of u_per_group (and tie_per_group in ref
-        // mode). 1-vs-rest reuses the global pool_tie_host already
-        // populated above; ref-mode reads combined tie per tg.
+        // G10.5: post-capture dtoh of the pool tie (1-vs-rest only —
+        // ref-mode overwrites scratch.tie_term per tg with the
+        // combined tie, and pool_tie_host is unused in the ref-mode
+        // host post-pass anyway). Previously dtoh'd UNCONDITIONALLY
+        // inside the captureable region; that interrupted capture
+        // and wasted host time on a buffer that ref-mode never reads.
+        let pool_tie_host: Vec<f64> = if !is_ref_mode {
+            let view = scratch
+                .tie_term
+                .try_slice(..sz)
+                .ok_or_else(|| AccelError::LinAlg("tie_term pool slice OOB".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh pool tie: {e}")))?
+        } else {
+            Vec::new()
+        };
+
+        // G10.4 / G10.5: batched dtoh of u_per_group (and
+        // tie_per_group in ref mode). 1-vs-rest's per-chunk pool tie
+        // already dtoh'd above (G10.5: moved out of the captureable
+        // region); ref-mode reads combined tie per tg here.
         let u_batch_len = n_test * chunk_size;
         let u_batch = if n_test == 0 {
             Vec::new()
@@ -1337,6 +1453,8 @@ where
 
         // Host post-pass: per-tg slice from batched dtoh, compute z+p,
         // logFC, package into chunk_per_group.
+        type ChunkGroupRow = (String, Vec<String>, Vec<f64>, Vec<f64>, Vec<f64>);
+        let mut chunk_per_group: Vec<ChunkGroupRow> = Vec::with_capacity(n_test);
         for (tg_idx, &g) in test_groups.iter().enumerate() {
             let group_cells = &group_indices[g];
             let n_g = group_cells.len();
@@ -2108,6 +2226,184 @@ mod tests {
                     gene,
                     p_cpu,
                     p_gpu
+                );
+            }
+        }
+    }
+
+    /// G10.5 parity (1-vs-rest): graph-captured wilcoxon path
+    /// produces identical results to the direct path. Wilcoxon's
+    /// captureable kernels (scatter / block_sort / tie / searchsorted /
+    /// ranksum) are deterministic given fixed input — atomicAdd lives
+    /// only in `gpu_de_pseudobulk_all_groups`, which runs OUTSIDE the
+    /// captured region — so we can assert fp32-tight tolerance on U /
+    /// p / score, same shape as
+    /// `test_pdex_ref_gpu_graph_vs_direct_parity`.
+    #[test]
+    fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
+        let _ = require_gpu_or_skip!();
+
+        let (data, n_obs, n_vars, gene_names, groups, group_names, _reference) = make_fixture();
+
+        let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
+        let direct = wilcoxon_rank_sum_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,  // 1-vs-rest
+            false, // not log-transformed
+            false, // rankby_abs
+            true,  // tie_correct
+        )
+        .expect("direct wilcoxon 1-vs-rest failed");
+
+        scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        let graph = wilcoxon_rank_sum_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+            false,
+            true,
+        )
+        .expect("graph wilcoxon 1-vs-rest failed");
+
+        scx_gpu::set_cuda_graphs_enabled_override(prev);
+
+        assert_eq!(direct.group_names, graph.group_names);
+
+        use std::collections::HashMap;
+        let group_to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
+            res.names[g]
+                .iter()
+                .zip(res.scores[g].iter().zip(res.pvals[g].iter()))
+                .map(|(n, (&s, &p))| (n.clone(), (s, p)))
+                .collect()
+        };
+
+        for g in 0..direct.group_names.len() {
+            let d_map = group_to_map(&direct, g);
+            let g_map = group_to_map(&graph, g);
+            for gene in &gene_names {
+                let (s_d, p_d) = d_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+                let (s_g, p_g) = g_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+                if s_d.is_finite() && s_g.is_finite() {
+                    assert!(
+                        (s_d - s_g).abs() < 1e-6,
+                        "score mismatch group={} gene={}: direct={}, graph={}",
+                        direct.group_names[g],
+                        gene,
+                        s_d,
+                        s_g
+                    );
+                }
+                assert!(
+                    (p_d - p_g).abs() < 1e-9 || (p_d - p_g).abs() / p_d.abs().max(1e-12) < 1e-6,
+                    "pval mismatch group={} gene={}: direct={}, graph={}",
+                    direct.group_names[g],
+                    gene,
+                    p_d,
+                    p_g
+                );
+            }
+        }
+    }
+
+    /// G10.5 parity (ref-mode): graph-captured wilcoxon path matches
+    /// direct in ref-mode. Same kernel determinism contract as the
+    /// 1-vs-rest test above, but exercises the second `GraphKey`
+    /// variant (`mode=1`) and the per-tg combined-tie + tie_per_group
+    /// staging path.
+    ///
+    /// The shared `make_fixture` provides a reference group via its
+    /// last return value; passing it as `reference: Some(...)` routes
+    /// the GPU driver into the ref-mode capture path.
+    #[test]
+    fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
+        let _ = require_gpu_or_skip!();
+
+        let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
+        // `reference` is a `usize` (group index) — make_fixture always
+        // supplies one for pdex_ref. For wilcoxon we wrap it in `Some`
+        // to drive the ref-mode capture path (mode = 1).
+
+        let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
+        let direct = wilcoxon_rank_sum_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            Some(reference),
+            false,
+            false,
+            true,
+        )
+        .expect("direct wilcoxon ref-mode failed");
+
+        scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        let graph = wilcoxon_rank_sum_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            Some(reference),
+            false,
+            false,
+            true,
+        )
+        .expect("graph wilcoxon ref-mode failed");
+
+        scx_gpu::set_cuda_graphs_enabled_override(prev);
+
+        assert_eq!(direct.group_names, graph.group_names);
+
+        use std::collections::HashMap;
+        let group_to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
+            res.names[g]
+                .iter()
+                .zip(res.scores[g].iter().zip(res.pvals[g].iter()))
+                .map(|(n, (&s, &p))| (n.clone(), (s, p)))
+                .collect()
+        };
+
+        for g in 0..direct.group_names.len() {
+            let d_map = group_to_map(&direct, g);
+            let g_map = group_to_map(&graph, g);
+            for gene in &gene_names {
+                let (s_d, p_d) = d_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+                let (s_g, p_g) = g_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+                if s_d.is_finite() && s_g.is_finite() {
+                    assert!(
+                        (s_d - s_g).abs() < 1e-6,
+                        "ref-mode score mismatch group={} gene={}: direct={}, graph={}",
+                        direct.group_names[g],
+                        gene,
+                        s_d,
+                        s_g
+                    );
+                }
+                assert!(
+                    (p_d - p_g).abs() < 1e-9 || (p_d - p_g).abs() / p_d.abs().max(1e-12) < 1e-6,
+                    "ref-mode pval mismatch group={} gene={}: direct={}, graph={}",
+                    direct.group_names[g],
+                    gene,
+                    p_d,
+                    p_g
                 );
             }
         }

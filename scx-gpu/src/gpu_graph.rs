@@ -66,13 +66,26 @@ pub enum GraphKey {
     },
     /// GPU DE per-chunk kernel sequence (scatter → sort → searchsort →
     /// tie → pvalues, summed over test groups). One graph per
-    /// `(chunk_size_actual, n_ref, n_g_max, n_test_groups)` — chunks with
-    /// the same shape replay one cached graph.
+    /// `(chunk_size_actual, n_ref, n_g_max, n_test_groups, mode)`.
+    ///
+    /// `mode` distinguishes the three captureable DE flavours, each of
+    /// which has a different per-test-group kernel count:
+    /// - `0` — `pdex_ref` (scatter+searchsort_u+sort+combined_tie+pvalues
+    ///   +stage_u+stage_p).
+    /// - `1` — wilcoxon ref-mode (scatter+searchsort_u+sort+combined_tie
+    ///   +stage_u+stage_tie).
+    /// - `2` — wilcoxon 1-vs-rest (scatter+searchsort_ranksum+stage_u).
+    ///
+    /// `n_ref` is `n_ref` for pdex_ref / wilcoxon-ref, and `n_pool`
+    /// (= n_obs in 1-vs-rest, since the pool is all cells) for the
+    /// 1-vs-rest variant; the kernels parameterise on this size the
+    /// same way regardless of mode.
     DeChunk {
         chunk_size: u32,
         n_ref: u32,
         n_g_max: u32,
         n_test_groups: u32,
+        mode: u8,
     },
 }
 
